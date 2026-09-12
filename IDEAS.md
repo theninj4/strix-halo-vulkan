@@ -56,6 +56,24 @@ at a de-aliased stride a 64-address gather reads within 2% of a contiguous
 sweep, so request shape is free and the [N,K] weight layout is usable as-is.
 See §5.1b.
 
+**§5.1b's own follow-up is done too, and it turned the coverage law into a
+law about concurrency.** One `-D` swaps the probe's traversal so consecutive
+*waves* start on consecutive rows instead of walking along one — the same
+bytes, the same instructions, the same checksum, and only which addresses
+are outstanding together changes. It costs **3.9x** on a plainly contiguous
+read at a K=4096 fp16 matrix's natural 8192 B stride, and up to **8x** on a
+tensor with *no padding at all*, which retires this item's own "a densely
+packed tensor is never at risk". The unification: the achievable fraction of
+peak is `min(1, C/gcd(stride, 4096))` where **C is the contiguous run of
+bytes the requests in flight at one moment hold in a row** — the whole row
+when waves walk along it, one request's run when they do not — and a ladder
+that gives each wave 1/2/4/8 KB of its row measures 0.25/0.50/1.00/1.00 of
+peak exactly as that predicts. The top rung is one wave per row, which is
+the GEMV/W4A8 shape, and it is clean at every stride: decode was never
+exposed, and the 1.12x that bounded it is not there. What *is* exposed is
+tiling, and rule 1 (pad to 256 B past a multiple of 4 KB) already defends
+against all of it. See §5.1b's mechanism 3.
+
 ## The roofline, and why it says there's a lot left on the table
 
 Hardware numbers for this part (AMD Radeon 8060S, gfx1151, 40 CU, sclk
@@ -1195,15 +1213,137 @@ At 16 MiB touched a pure read delivers **930-965 GB/s** — above the 805 GB/s
   32 MiB for 3.4x" premise only holds for a fully-covering access pattern.**
   A blocked panel with a bad stride does not get the MALL either.
 
-One MALL-resident oddity is reproducible and unexplained: the *purest*
+One MALL-resident oddity looked reproducible and unexplained: the *purest*
 pattern — the fully contiguous shape at zero pad, i.e. a plain linear sweep —
-measures **782 GB/s in all three row-length groups** while every
-fully-covering perturbed stride of the same shape reaches 805-966. It is the one cell where adding a
-pad helps a contiguous read, it came out at exactly 782 three times in the
-committed run, and two earlier runs put it at 794-839 twice and 942 once. If
-it is real it is a cross-wave phasing effect, which is exactly what the
-follow-up below is about. Cache-resident numbers here carry ~10% one-sided
-scatter in any case (see `strideBatches`).
+measured **782 GB/s in all three row-length groups** while every
+fully-covering perturbed stride of the same shape reached 805-966. It was the
+one cell where adding a pad helped a contiguous read, it came out at exactly
+782 three times in one committed run, and two earlier runs put it at 794-839
+twice and 942 once. **Mechanism 3 has since retired it, and not as
+scatter**: at 1 KB rows the walk and cross-wave shaders compile to the *same*
+mapping, and in the last run before the fix below that identical pair
+measured 782 and 942. What 782 actually marked was *position* — it was the
+first timed case of each 16 MiB group, in all three row lengths to three
+digits, and only of the cache-resident ones (the 64 MiB groups start at a
+normal 243). The buffer is filled by the host immediately before, so the
+first cache-resident pass measures the residue of that fill rather than its
+own access pattern; writeback competing for DRAM is the likeliest cause, and
+the clock differs by 1% between the twins so it is not that. Measurement
+lesson, not a memory-system finding: **discard the first cache-resident case
+after a host fill.** `RunStride` now runs and throws away one case per (row
+length, footprint) group, and those cells read 884-950 in the committed run
+— inside the ~10% one-sided scatter every cache-resident case here carries —
+with the identical twins 2.3% apart.
+
+#### Mechanism 3: the traversal — the coverage law is about what is *in flight*
+
+**[measured]** The one pattern the sweep above could not reach was
+concurrent-but-contiguous requests from *different* waves at an aliased
+stride: every shape there varies the addresses inside one request, and the
+contiguous shape deliberately walks along a row, so consecutive waves are
+never a stride apart. `CROSS_WAVE` on `strided_read.comp` swaps the two loop
+orders over the (row-group, column-block) grid so consecutive requests
+advance down the rows instead of along one. It is a permutation of exactly
+the same (row, chunk) set — same bytes, same footprint, same instruction
+count, same host checksum — and the only thing that moves is which addresses
+are outstanding at the same moment.
+
+It is the largest effect in this family, it **subsumes mechanism 1**, and it
+fires with no padding involved at all.
+
+8192 B rows, 64 MiB touched, contiguous 1 KB requests, GB/s:
+
+| stride | 8192* | 8208 | 8256 | 8320 | 8448 | 8704 | 9216 | 10240 | 11264 | 12288* | 14336 | 16384* |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `gcd(stride,4096)` | 4096 | 16 | 64 | 128 | 256 | 512 | 1024 | 2048 | 1024 | 4096 | 2048 | 4096 |
+| **model** | **0.25** | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | **0.50** | 1.00 | **0.25** | **0.50** | **0.25** |
+| walk along a row | 243 | 238 | 238 | 240 | 242 | 243 | 244 | 244 | 243 | 243 | 243 | 243 |
+| cross-wave | **63** | 208 | 220 | 217 | 229 | 236 | 238 | **124** | 238 | **63** | **123** | **62** |
+
+The model is the same `min(1, C/gcd(stride, 4096))` as mechanism 1 with one
+substitution: **C is not the row length, it is the contiguous run of bytes
+that the requests outstanding at one moment hold in a single row.** Walking
+along a row, consecutive requests continue where the last one stopped, so C
+is the whole row and the law reads exactly as §5.1b first stated it.
+Cross-wave, consecutive requests are a stride apart, so C is only what one
+request holds — here 64 lanes × 16 B = 1024 B. It predicts every cell of
+that row to within 2% (0.26/0.51/0.26/0.51/0.26 measured against
+0.25/0.50/0.25/0.50/0.25), and a 3.9x loss on a plainly contiguous read at
+the stride a K=4096 fp16 matrix has by default.
+
+**The ladder that proves the mechanism and exonerates the GEMV kernels.**
+`LOADS_PER_WAVE` makes each request issue *n* loads along its own row before
+retiring, which is what a real kernel's inner loop does. Same bytes, same
+strides, 8192 B rows, 64 MiB, GB/s:
+
+| bytes of a row in flight per wave | 1 KB | 2 KB | 4 KB | 8 KB (whole row) |
+|---|---|---|---|---|
+| **model at a 4 KB-multiple stride** | 0.25 | 0.50 | 1.00 | 1.00 |
+| stride 8192* | **63** | 122 | 239 | 238 |
+| stride 12288* | **63** | 121 | 238 | 237 |
+| stride 16384* | **62** | 121 | 237 | 237 |
+| stride 8448 (de-aliased control) | 229 | 229 | 238 | 238 |
+
+C is a property of the *wave*, not of the instruction: doubling what one
+wave has outstanding doubles the bandwidth, and at 4 KB — one full
+interleave rotation — the penalty is gone at every stride. The 2048 B-row
+group runs the same ladder one rung shorter and says it again: at a dense
+2048 B stride, one wave holding 1 KB of its row reads 120 GB/s and one
+holding the whole 2 KB reads 237. The top rung is
+one wave streaming a whole row with consecutive waves on consecutive rows,
+which is precisely the GEMV/W4A8 access pattern, and it reads at the full
+238-244 GB/s at every stride in the sweep. That is the answer to the
+question this item opened: **the GEMV shape is not exposed** — consistent
+with W4A8 measuring 89% of the bus against a 2048 B row stride — and the
+1.12x that bounded the decode side of it is not there to be had.
+
+At the top rung there is only one column group, so the two traversals
+compile to the same mapping; those cells are printed with `=` and are a
+repeatability check. At 64 MiB they come out at 1.00x in all twelve, which
+also **retires the 782 GB/s oddity above**: the same degenerate pair at 16
+MiB measured 782 and 942, and 782 turned out to be where in the *sweep* a
+case sat (the first cache-resident case after the host fills the buffer),
+not what it read. The harness now discards that case, and the committed run
+has no 782 in it.
+
+**What is exposed is a dense, unpadded tensor.** §5.1b's first corollary —
+"a densely packed tensor is never at risk, because `stride == rowBytes`
+forces `gcd ≤ rowBytes`" — was derived with C = rowBytes and does not
+survive this axis. 64 MiB touched, **no padding anywhere**, GB/s:
+
+| rows | stride | in flight per row | walk | cross-wave | model |
+|---|---|---|---|---|---|
+| 1024 B | 1024 | 1024 B | 243 | 243 | 1.00 |
+| 1024 B | 1024 | 256 B | 243 | **61** | 0.25 |
+| 2048 B | 2048 | 1024 B | 243 | **120** | 0.50 |
+| 2048 B | 2048 | 256 B | 246 | **31** | 0.125 |
+
+A tensor with nothing wrong with it, read by waves that each hold 256 B of a
+row, runs at an eighth of this chip's DRAM bandwidth. The defect is in the
+kernel's traversal, and the fix is in the tensor's stride.
+
+**The model is exact for contiguous requests and only indicative for
+gathers**, and it misses in *both* directions there. Where it predicts a
+severe penalty the gathers beat it by 1.4-8x — at stride 8192 the
+64-address gather measures 0.03x against a model of 0.004 — because their
+rows start at every multiple of `gcd`, so neighbouring requests partly refill
+the lines the model counts as untouched. Where it predicts no penalty at all
+they fall short of it, to 0.53-0.93x: the second mechanism's per-request
+cost is still there, and cross-wave it is far larger than the 1.32x a walking
+traversal shows. Both are outside the law and neither affects a contiguous
+request, which is the shape real kernels issue and where the model holds to
+2%.
+
+**The MALL is not immune to this one.** §5.1b found the MALL indifferent to
+request *shape*; it is not indifferent to traversal. At 16 MiB touched,
+2048 B rows at a dense 2048 B stride, the walk shapes read 868-942 GB/s and
+the cross-wave traversal **484** with 1 KB in flight (model 0.50) and **128**
+with 256 B (model 0.125) — the same law with the same C, scaled to the
+MALL's own peak. The ladder's top rung recovers it there too: a wave holding
+the whole 2 KB row reads 928. It does not explain every MALL cell — the same
+rows at a 4096 B stride are at model 0.50 and measure 774-919 — so the
+slice-structure question this item already had stays open, but the traversal
+penalty itself carries across the cache.
 
 #### The answer to (b) retires §2.3's open question
 
@@ -1226,10 +1366,27 @@ the bandwidth penalty rather than merely inheriting it.
 
 #### Engine rules, all three free
 
+**One law, stated once:** the fraction of peak bandwidth an access pattern
+can reach is
+
+> **coverage = min(1, C / gcd(stride, 4096))**, where **C** is the contiguous
+> run of bytes, inside one row, that the requests outstanding at any one
+> moment hold.
+
+Mechanisms 1 and 3 are that law with two different C's — the whole row when
+consecutive waves walk along it, one wave's own run when they do not — and
+it holds to within 2% wherever C is a genuine contiguous run. Mechanism 2,
+the ≤1.32x per-request gather penalty, is a separate and much smaller
+residue on top.
+
 1. **Pad every row-major tensor's leading dimension to 256 B past a multiple
-   of 4 KB.** One rule covers both mechanisms: `gcd(stride, 4096)` becomes
-   256, so coverage is full for any row of ≥256 B, and the stride is off the
-   4 KB multiple, so gathers de-alias. 256 B per row — 3% at K=4096 fp16.
+   of 4 KB.** One rule covers all three mechanisms: `gcd(stride, 4096)`
+   becomes 256, which is at or below the bytes *any* request shape in this
+   family holds in one row, so coverage is full however the kernel
+   traverses the tensor, and the stride is off the 4 KB multiple, so gathers
+   de-alias. 256 B per row — 3% at K=4096 fp16. Mechanism 3 promotes this
+   from a 1.3x tidy-up to the rule that defends against a **4x**, and
+   against a case that needs no padding to occur (see the corollary below).
 2. **Never round a row stride up to a page.** A K=1024 fp16 weight matrix
    aligned to 4096 B reads at **half** this chip's DRAM bandwidth; 1024 B
    rows at an 8192 B stride, a **quarter**. It is a loss a tidy allocator
@@ -1238,47 +1395,62 @@ the bandwidth penalty rather than merely inheriting it.
    more pad buys nothing and costs footprint — which is what made §2.3's
    GEMM sweep appear to *decline* past +256 B (see the correction there).
 
-Two corollaries of the coverage law worth stating on their own, because they
-decide where rule 1 actually earns its 3%:
+Three corollaries worth stating on their own, because they decide where
+rule 1 actually earns its 3%:
 
-- **A densely packed tensor is never at risk.** If `stride == rowBytes` then
-  `gcd(stride, 4096) ≤ rowBytes` for *any* row length, so coverage is 1 by
-  construction. This mechanism does not exist until something introduces a
-  gap — which means it is created by padding, and only by *badly chosen*
-  padding. It is also why every kernel in the suite that streams a whole
-  dense matrix has been fine all along, W4A8 at 89% of the bus included.
-- **But any kernel that reads a *strip* of a larger tensor is exposed, and
-  that is what tiling is.** A blocked GEMM that sweeps a 1 KB-wide panel of a
-  K=4096 fp16 matrix has `rowBytes` 1024 against a stride of 8192, so
-  `gcd` is 4096 and coverage is **0.25** — a quarter of DRAM bandwidth, for a
-  kernel doing nothing wrong except tiling. Padding that matrix's stride to
-  8448 restores coverage to 1 for *every* panel width (its `gcd` is 256).
-  This is the same (rowBytes, gcd) regime as the measured 1024 B/4096 B point
-  above, not an extrapolation from it. It also makes rule 1 a prerequisite
-  for §2.4 and for the MALL-blocking half of this item rather than a 3%
-  optimisation: block a panel out of an unpadded weight matrix and the
-  blocking can cost more than it saves.
+- **A dense tensor is at risk after all** — the corollary this item first
+  drew ("`stride == rowBytes` forces `gcd ≤ rowBytes`, so coverage is 1 by
+  construction") was right about the row and wrong about what the law
+  measures. It holds only for a kernel whose concurrent waves walk along a
+  row. One wave per row with 256 B in flight reads a *dense* 1024 B-row
+  tensor at **61 of 243 GB/s**, and a dense 2048 B-row tensor at 31. What
+  saves the suite's GEMV kernels is not the packing, it is that each of
+  their waves streams a whole row (mechanism 3's ladder), and W4A8's 89% of
+  the bus is that and not luck.
+- **Any kernel that reads a *strip* of a larger tensor is exposed, and that
+  is what tiling is.** A blocked GEMM that sweeps a 1 KB-wide panel of a
+  K=4096 fp16 matrix has C ≤ 1024 against a stride of 8192, so `gcd` is 4096
+  and coverage is **0.25** — a quarter of DRAM bandwidth, for a kernel doing
+  nothing wrong except tiling. Padding that matrix's stride to 8448 restores
+  coverage to 1 for *every* panel width and every traversal (its `gcd` is
+  256). This is the same regime as the measured 1024 B/4096 B point above,
+  not an extrapolation from it. It also makes rule 1 a prerequisite for §2.4
+  and for the MALL-blocking half of this item rather than a 3% optimisation:
+  block a panel out of an unpadded weight matrix and the blocking can cost
+  more than it saves.
+- **A kernel with a bad stride can also buy its way out with depth.** Four
+  KB of a row in flight per wave — one full interleave rotation — restores
+  full bandwidth at every stride measured, without touching the layout. That
+  is the escape hatch when the tensor's stride is not the engine's to choose
+  (a weight file mapped as-is), and it is a second reason to prefer wide
+  loads and deep unrolling in the inner loop beyond §1.3's instruction count.
 
 **Effort**: low (done). **Value**: high (delivered) — the probe was written
-to quantify a 1.35x and found a 2-4x cliff next to it.
+to quantify a 1.35x, found a 2-4x cliff next to it, and then found that the
+cliff is really about concurrency and can reach 8x.
 
-**What this leaves open**, and it is now the sharpest item in the file: every
-shape here varies the addresses inside *one* request, and the contiguous
-shape deliberately walks along a row, so **consecutive waves are never a
-stride apart**. That is exactly the GEMV/W4A8 pattern — one wave per row,
-contiguous within it, rows 8192 B apart — and §2.3 found the cross-request
-stride was what mattered for the LDS staging loads ("what matters is the
-address stride across the concurrent loads, not which instruction issues
-them"). The 782 GB/s oddity above is a hint that it is real. One `-D` on
-`strided_read.comp` swaps the traversal so consecutive waves start on
-consecutive rows; that is the whole experiment, and W4A8's 89% of the bus
-bounds what it can be worth for decode at 1.12x.
-
-**Also still open from this item** is its original half: deliberately
+**What this leaves open** is the original half of this item: deliberately
 scheduling work to stay inside the 32 MiB MALL (attention K/V tiles,
-per-expert MoE weights, a blocked GEMM B-panel). Unaffected by the above,
-except that the MALL's indifference to request shape makes it slightly more
-attractive and its sensitivity to coverage slightly more dangerous.
+per-expert MoE weights, a blocked GEMM B-panel), and the slice-structure
+question under it — partial coverage keeps a working set resident only while
+its span is also inside 32 MiB, one case lands halfway, and the traversal
+axis has now added MALL cells the coverage law fits (2048 B rows at a dense
+2048 B stride, cross-wave: 484 against the 868-942 the walk shapes read
+there, model 0.50) next to cells it does not (the same rows at a 4096 B
+stride, walk: 774-919 at model 0.50). A footprint sweep at a
+fixed bad stride is still the experiment that separates effective capacity
+from bus width, and the `stride` family already runs it from flags
+(`-stridefootprints 4,8,16,24,32,48 -striderowbytes 1024
+-stridepads 0,1024,3072`).
+
+Also worth a cheap look now that traversal is a measured axis: **§2.3's
+unexplained residue.** A coopmat fragment load holds 32 B of a row, so a
+tiled GEMM sits at the far end of mechanism 3, and its waves do not walk
+along rows — a mechanism §2.3 did not have. Padding to `gcd` 256 does not
+fully clear that end of the range: the 32- and 64-row cross-wave shapes read
+0.87x and 0.73x of their walk counterparts *at a de-aliased stride*, which
+is the right order of magnitude for a residue §2.3 measured at 1.6x and
+could not attribute.
 
 ### 5.2 Heap topology, carveout size and page size
 
@@ -1407,22 +1579,24 @@ done** — the `stride` family, which measured the memory system directly,
 corrected §2.3's period from 2 KB to 4 KB, found a *larger* second effect
 (whole channels left unaddressed when a row is shorter than
 `gcd(stride, 4096)`, costing 2-4x and hitting contiguous reads too), and
-retired the request-shape explanation for §2.3's residue. What those five
-left behind:
+retired the request-shape explanation for §2.3's residue. **§5.1b's own
+follow-up — the traversal axis — is done as well**, and it generalised that
+second effect into one law about *concurrency*: the achievable fraction of
+peak is `min(1, C/gcd(stride, 4096))` with C the contiguous run the requests
+in flight hold in a row, which is 3.9-8x rather than 2-4x, applies to
+unpadded tensors, exonerates the GEMV shape outright, and points the finger
+at tiling. What those six left behind:
 
 **Next:**
-- **The one access pattern §5.1b did not cover: concurrent-but-contiguous
-  requests from *different* waves at an aliased stride.** Every shape in the
-  `stride` family varies the addresses inside *one* request, and its
-  contiguous shape deliberately walks along a row, so consecutive waves are
-  never a stride apart. That is exactly the GEMV/W4A8 pattern (one wave per
-  row, contiguous within it, rows 8192 B apart) and it is what §2.3 found
-  mattered for the LDS staging loads — "what matters is the address stride
-  across the concurrent loads, not which instruction issues them". One `-D`
-  on `strided_read.comp` swaps the traversal so consecutive waves start on
-  consecutive rows; that is the whole experiment. It also *bounds* the
-  answer for decode before it is run: W4A8 is at 89% of the bus, so at most
-  1.12x is available there.
+- **§2.3's residue, re-aimed by the traversal axis.** Mechanism 3 says the
+  binding quantity is the contiguous run of bytes a wave has in flight, and
+  a coopmat fragment load holds 32 B of a row — the far end of the range,
+  where a de-aliased stride still leaves 0.73-0.87x on the table. That is
+  the first mechanism anyone has had for the 1.6x transposed-B gap that
+  survived padding, and testing it needs no new probe: give the WMMA kernel's
+  inner loop more of a row in flight (wider fragment loads, or several K-tiles
+  outstanding) and see whether the gap moves. Cheap, and it is the same lever
+  §1.3 measures for GEMV.
 - **The MALL's own slice structure**, which §5.1b opened and could not
   close. Under *partial* channel coverage the 32 MiB MALL keeps a working
   set only while its span is also inside 32 MiB, and one case lands halfway
@@ -1443,15 +1617,14 @@ left behind:
   operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
   unpack version stays downgraded: there is no int8 matrix-rate bonus, and
   §2.1's winner has no LDS tile to make cheaper.)
-- **Pad the strides everywhere else** — but §5.1b has *demoted* this and
-  says why. The GEMV, W4A8 and W8A8 kernels all index weights by a
-  power-of-two row stride and none has a stride push constant, but each
-  reads its row *contiguously* within a wave and each row is at least
-  `gcd(stride, 4096)` bytes long, so both of §5.1b's mechanisms predict **no
-  effect** — which is consistent with W4A8 already reaching 89% of the bus.
-  Worth doing as a falsification test of the model rather than as an
-  expected win, and the item above is the version of it with a real
-  hypothesis behind it.
+- **Pad the strides everywhere else** — still demoted, and now for a better
+  reason. §5.1b's mechanism 3 predicted these kernels *were* exposed (one
+  wave per row, rows a stride apart) right up until its ladder measured the
+  top rung — one wave streaming a whole row — at full bandwidth at every
+  stride. So the model's prediction for the GEMV, W4A8 and W8A8 kernels is
+  **no effect**, now from the mechanism that was most likely to find one,
+  and consistent with W4A8's 89% of the bus. Worth running once as a
+  falsification test, not as an expected win.
 
 **Then (cheap, and still untouched):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
@@ -1477,9 +1650,11 @@ matrix rate, and no LDS tile to make cheaper), §4.1 (answered: ~300 ns),
 §4.2/§4.3 (the GPU-side half of the concern is ruled out), the packed-fp16
 half of §1.3 (1.10x, not 2x), the **LDS-staging and multi-wave-workgroup
 half of §2.1 itself**, which the 32 MiB MALL makes redundant on this part,
-and now **"pad the strides in the GEMV kernels"** — §5.1b's model says their
-contiguous-within-a-row requests cannot hit either mechanism, so that item
-is a falsification test rather than an expected win. Also **retired as an
+and now **"pad the strides in the GEMV kernels"** — mechanism 3 looked like
+it had caught them (one wave per row, rows a stride apart) until its own
+ladder measured that exact shape at the full bus at every stride, so that
+item is a falsification test rather than an expected win, from the mechanism
+most likely to have found one. Also **retired as an
 explanation**: request shape as the cause of §2.3's residue, which §5.1b
 measured at within 2% of contiguous.
 
@@ -1487,18 +1662,23 @@ The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
 bytes — and W4A8 now reads 4 bits/weight at 211 of those 236 GB/s, so
 decode is finished as a kernel problem and continues only as a format
-problem. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
+problem — and the traversal probe that looked most likely to reopen it
+instead confirmed the one-wave-per-row shape reads at the full bus at every
+stride. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
 first by raising arithmetic intensity from 8 to 32 FLOP/byte in registers —
 with no shared memory, because the 32 MiB MALL already does that job — and
 then, for free, by moving every operand's row stride 256 B off a multiple of
 4 KB. That last number is the interleave rotation of sixteen 256 B channels,
 and getting it wrong costs in two independent ways: a load whose addresses
 are all one aliased stride apart aims them at a single channel (up to 1.34x
-of bandwidth, up to 1.6x through a GEMM), and a row shorter than
-`gcd(stride, 4096)` never addresses some channels at all (2x or 4x, and it
-hits a plainly contiguous read just as hard — so aligning weight rows to a
-page is the most expensive tidy-looking thing an engine could do here).
-Request *shape* is free once the stride is right, so the [N,K] layout real
-weights come in is usable as-is. What is left in prefill is traffic
-ordering, not tiling and not request shape. And neither dispatch overhead
+of bandwidth, up to 1.6x through a GEMM), and — the big one — whenever the
+bytes the concurrent waves hold in flight cover less of the 4 KB rotation
+than `gcd(stride, 4096)`, the remaining channels are never addressed at all
+(2x, 4x, 8x; it hits a plainly contiguous read just as hard, it needs no
+padding to happen, and aligning weight rows to a page is the most expensive
+tidy-looking thing an engine could do here). Request *shape* is free once
+the stride is right, so the [N,K] layout real weights come in is usable
+as-is — but request *timing* is not: one wave per row is safe at any stride,
+a wave that grabs a fragment and retires is where the 4x lives, and a tiled
+kernel is the second kind. And neither dispatch overhead
 nor a nonexistent int8 matrix-rate bonus is worth designing around.**

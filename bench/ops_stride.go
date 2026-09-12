@@ -93,32 +93,104 @@ var StridePadsBytes = []int{0, 16, 64, 128, 256, 512, 1024, 2048, 3072, 4096, 61
 // table; the mechanism there is inferred, not measured.
 var StrideFootprintsMB = []int{16, 64}
 
-// strideShape is one request shape of shaders/strided_read.comp, i.e. one
-// lane->address mapping over an identical set of touched bytes.
-// lanesPerRow consecutive 16-byte chunks of a row go to consecutive lanes,
-// so one 64-lane load instruction spans rowsPerReq = 64/lanesPerRow
-// distinct rows. That is the quantity the aliasing mechanism is about: a
-// request whose addresses are all `stride` apart can put all of them in one
-// memory channel, and a contiguous request never can.
+// strideShape is one case of shaders/strided_read.comp, i.e. one
+// lane->address mapping over an identical set of touched bytes. Three
+// things distinguish them:
+//
+//   - lanesPerRow: how many consecutive 16-byte chunks of a row go to
+//     consecutive lanes, so one 64-lane load instruction spans
+//     rowsPerReq = 64/lanesPerRow distinct rows. That is the quantity the
+//     per-request aliasing mechanism is about: a request whose addresses
+//     are all `stride` apart can put all of them in one memory channel, and
+//     a contiguous request never can.
+//   - crossWave: whether consecutive *requests* advance by a row group or
+//     by a column block. The shapes above vary addresses only inside one
+//     request; this varies which addresses different waves hold at the same
+//     moment, which is the thing IDEAS §2.3 suspected mattered to the LDS
+//     staging loads and the one pattern the original sweep could not reach.
+//   - loadsPerWave: how many loads one request issues along its own row
+//     before retiring. 1 leaves every wave phase-locked with its
+//     neighbours; at chunksPerRow/lanesPerRow a wave streams a whole row,
+//     which is the shape the GEMV kernels have. Only meaningful with
+//     crossWave, and at the top of the ladder the two traversals coincide
+//     (one column group, nothing left to permute).
 type strideShape struct {
-	name        string
-	spirv       []byte
-	lanesPerRow int
+	name         string
+	spirv        []byte
+	lanesPerRow  int
+	crossWave    bool
+	loadsPerWave int
 }
 
 func (s strideShape) rowsPerReq() int { return 64 / s.lanesPerRow }
 
+// loads is loadsPerWave with the zero value read as 1, so the common shapes
+// can leave it out of their literals.
+func (s strideShape) loads() int {
+	if s.loadsPerWave < 1 {
+		return 1
+	}
+	return s.loadsPerWave
+}
+
+// bytesInFlight is the contiguous run of bytes one request holds in one row,
+// which is the quantity strideChannelCoverage turns out to be about once the
+// traversal is cross-wave: the addresses outstanding at any moment are then
+// these runs, one per row, one stride apart.
+func (s strideShape) bytesInFlight() int { return s.lanesPerRow * 16 * s.loads() }
+
+// label is how the shape appears in the pivot grid: the rows one request
+// spans, plus markers for the cross-wave traversal and for a request that
+// issues more than one load.
+func (s strideShape) label() string {
+	out := fmt.Sprintf("%d", s.rowsPerReq())
+	if s.crossWave {
+		out += " xw"
+	}
+	if s.loads() > 1 {
+		out += fmt.Sprintf(" L%d", s.loads())
+	}
+	return out
+}
+
+// traversal names the axis for CSV/Detail consumers: `walk` follows one row
+// with consecutive requests, `xw` follows one column.
+func (s strideShape) traversal() string {
+	if s.crossWave {
+		return "xw"
+	}
+	return "walk"
+}
+
 // strideShapes runs from a plain contiguous sweep to a maximally divergent
-// gather. `rows16` is the shape IDEAS §5.1b asks for (16 addresses of 16
-// bytes each); `rows32` is what a 16x16 fp16 coopMatLoad actually issues on
-// a wave32 subgroup (32 lanes x 16 B over 16 rows, two lanes per row);
-// `rows1` is the contiguous control that the `bandwidth` family measures.
+// gather, each in both traversals. `rows16` is the shape IDEAS §5.1b asks
+// for (16 addresses of 16 bytes each); `rows32` is what a 16x16 fp16
+// coopMatLoad actually issues on a wave32 subgroup (32 lanes x 16 B over 16
+// rows, two lanes per row); `rows1` is the contiguous control that the
+// `bandwidth` family measures, and `rows1_xw` is the GEMV/W4A8 pattern —
+// each wave reading one row contiguously, consecutive waves one stride
+// apart. The pairs are adjacent in the list so each traversal comparison is
+// also adjacent in time, which keeps the ~10% scatter of the cache-resident
+// cases from landing preferentially on one side of it.
 var strideShapes = []strideShape{
 	{name: "rows1", spirv: shaders.StridedReadLPR64, lanesPerRow: 64},
+	{name: "rows1_xw", spirv: shaders.StridedReadXWLPR64, lanesPerRow: 64, crossWave: true},
 	{name: "rows4", spirv: shaders.StridedReadLPR16, lanesPerRow: 16},
+	{name: "rows4_xw", spirv: shaders.StridedReadXWLPR16, lanesPerRow: 16, crossWave: true},
 	{name: "rows16", spirv: shaders.StridedReadLPR4, lanesPerRow: 4},
+	{name: "rows16_xw", spirv: shaders.StridedReadXWLPR4, lanesPerRow: 4, crossWave: true},
 	{name: "rows32", spirv: shaders.StridedReadLPR2, lanesPerRow: 2},
+	{name: "rows32_xw", spirv: shaders.StridedReadXWLPR2, lanesPerRow: 2, crossWave: true},
 	{name: "rows64", spirv: shaders.StridedReadLPR1, lanesPerRow: 1},
+	{name: "rows64_xw", spirv: shaders.StridedReadXWLPR1, lanesPerRow: 1, crossWave: true},
+	// The ladder from a phase-locked one-load-per-wave dispatch up to one
+	// wave streaming a whole row, which is the GEMV kernels' shape. Only
+	// the row lengths with enough column blocks run each rung; the rest are
+	// skipped per case (see RunStride), and at the rung where a wave covers
+	// the whole row the traversal no longer exists as a choice.
+	{name: "rows1_xw_l2", spirv: shaders.StridedReadXWL2, lanesPerRow: 64, crossWave: true, loadsPerWave: 2},
+	{name: "rows1_xw_l4", spirv: shaders.StridedReadXWL4, lanesPerRow: 64, crossWave: true, loadsPerWave: 4},
+	{name: "rows1_xw_l8", spirv: shaders.StridedReadXWL8, lanesPerRow: 64, crossWave: true, loadsPerWave: 8},
 }
 
 // RunStride measures read bandwidth over a fixed set of bytes as a function
@@ -132,12 +204,16 @@ var strideShapes = []strideShape{
 // same number of 16-byte load instructions, and only the stride between
 // rows and the lane->address mapping change.
 //
-// Two independent effects come out of it, and only the first is §2.3's:
-// a request whose addresses are all one stride apart loses up to 1.32x when
-// that stride is a multiple of the 4 KB channel-interleave rotation, and a
-// row shorter than gcd(stride, 4096) leaves whole channels unaddressed,
-// which costs 2x or 4x and hits a contiguous read just as hard. See
-// strideChannelCoverage for the second, which is the larger of the two.
+// Three effects come out of it, and only the first is §2.3's: a request
+// whose addresses are all one stride apart loses up to 1.32x when that
+// stride is a multiple of the 4 KB channel-interleave rotation; a row
+// shorter than gcd(stride, 4096) leaves whole channels unaddressed, which
+// costs 2x or 4x and hits a contiguous read just as hard; and — the largest,
+// which subsumes the second — whenever the bytes the *concurrent* requests
+// hold in one row cover less than gcd(stride, 4096), the same channels go
+// unaddressed, which costs up to 8x and needs no padding at all to happen.
+// See strideChannelCoverage for the law and strideInFlightBytes for the
+// quantity it is really a function of.
 func RunStride(dev *vk.Device, footprintsMB, rowBytesList, pads []int, warmup, iters uint32) ([]Result, error) {
 	mods := make([]*vk.ShaderModule, len(strideShapes))
 	for i, s := range strideShapes {
@@ -177,6 +253,16 @@ func RunStride(dev *vk.Device, footprintsMB, rowBytesList, pads []int, warmup, i
 				return nil, fmt.Errorf("footprint %dMB at %dB rows needs %d threads, not a multiple of the %d-thread workgroup",
 					fpMB, rowBytes, rows*chunksPerRow, strideLocalSize)
 			}
+			// Both traversals tile the matrix as (row group x column block),
+			// so the row count has to divide into whole row groups or the
+			// last group would run off the end — which the checksum would
+			// report as missing coverage rather than as a geometry error.
+			for _, shape := range strideShapes {
+				if rows%shape.rowsPerReq() != 0 {
+					return nil, fmt.Errorf("footprint %dMB at %dB rows is %d rows, not a multiple of the %d rows shape %s spans per request",
+						fpMB, rowBytes, rows, shape.rowsPerReq(), shape.name)
+				}
+			}
 			// One buffer per (row length, footprint), sized for the largest
 			// stride in the sweep and reused by every (stride, shape) case:
 			// the strides then differ in nothing but the push-constant word,
@@ -186,6 +272,10 @@ func RunStride(dev *vk.Device, footprintsMB, rowBytesList, pads []int, warmup, i
 			if err != nil {
 				return nil, err
 			}
+			// Sized for the shape with the most workgroups — one load per
+			// request. A shape whose requests issue several loads runs a
+			// proportionally smaller grid and writes into the front of the
+			// same buffer.
 			groups := uint32(rows * chunksPerRow / strideLocalSize)
 			dst, err := dev.NewBuffer(int(groups) * 4)
 			if err != nil {
@@ -194,12 +284,48 @@ func RunStride(dev *vk.Device, footprintsMB, rowBytesList, pads []int, warmup, i
 			}
 			fillStridePattern(src)
 
+			// Discard one case before timing anything in this group. The
+			// fill above writes the whole buffer from the host — up to
+			// 128 MiB of dirty lines — and whatever that leaves behind
+			// (writeback stealing DRAM bandwidth is the likeliest
+			// candidate) costs the first *cache-resident* case 13-17%,
+			// reproducibly by position rather than by pattern: it measured
+			// exactly 782 GB/s in all three row-length groups of one run,
+			// and its shape-identical twin measured 942 immediately after.
+			// The clock rules itself out at 1% between them. A case is
+			// three 50 ms batches, which is enough for the effect to be
+			// gone by the second, and the 64 MiB groups never showed it.
+			if len(pads) > 0 {
+				warmStride := rowBytes + pads[0]
+				if _, err := runStrideCase(dev, mods[0], strideShapes[0], src, dst,
+					rows, warmStride, chunksPerRow, groups,
+					expectedStrideSum(rows, warmStride, chunksPerRow), warmup, iters); err != nil {
+					src.Destroy()
+					dst.Destroy()
+					return nil, fmt.Errorf("stride warm row=%dB footprint=%dMB stride=%dB: %w",
+						rowBytes, fpMB, warmStride, err)
+				}
+			}
+
 			for _, pad := range pads {
 				stride := rowBytes + pad
 				want := expectedStrideSum(rows, stride, chunksPerRow)
 				for i, shape := range strideShapes {
+					// A multi-load request covers loadsPerWave whole column
+					// blocks, so a row too short to hold one of those groups
+					// has no such shape: skip it rather than mis-shaping the
+					// grid. (1 KB rows are one column block wide, so every
+					// rung of the ladder above the first is skipped there —
+					// and their rows1 case already *is* one wave per row.)
+					if chunksPerRow%(shape.lanesPerRow*shape.loads()) != 0 {
+						continue
+					}
+					shapeGroups := uint32(rows * chunksPerRow / shape.loads() / strideLocalSize)
+					if shapeGroups == 0 {
+						continue
+					}
 					r, err := runStrideCase(dev, mods[i], shape, src, dst,
-						rows, stride, chunksPerRow, groups, want, warmup, iters)
+						rows, stride, chunksPerRow, shapeGroups, want, warmup, iters)
 					if err != nil {
 						src.Destroy()
 						dst.Destroy()
@@ -276,9 +402,10 @@ func runStrideCase(dev *vk.Device, mod *vk.ShaderModule, shape strideShape, src,
 		NsPerIter: ns,
 		Clocks:    clocks,
 		GBPS:      bytesTouched / (ns / 1e9) / 1e9,
-		Detail: fmt.Sprintf("touch=%dMiB row=%dB span=%dMiB rows=%d lanes/row=%d rows/req=%d stride_mod_4k=%d",
+		Detail: fmt.Sprintf("touch=%dMiB row=%dB span=%dMiB rows=%d lanes/row=%d rows/req=%d traversal=%s loads/req=%d inflight=%dB stride_mod_4k=%d",
 			int(bytesTouched)/(1024*1024), chunksPerRow*16, span/(1024*1024), rows,
-			shape.lanesPerRow, shape.rowsPerReq(), stride%strideAliasChunk),
+			shape.lanesPerRow, shape.rowsPerReq(), shape.traversal(), shape.loads(),
+			shape.bytesInFlight(), stride%strideAliasChunk),
 	}, nil
 }
 
@@ -376,7 +503,7 @@ func PrintStrideSummary(w io.Writer, results []Result) {
 			if row == nil {
 				continue
 			}
-			fmt.Fprintf(tw, "%d", shape.rowsPerReq())
+			fmt.Fprint(tw, shape.label())
 			baseline := row[g.rowBytes]
 			for _, s := range strideList {
 				v, ok := row[s]
@@ -396,8 +523,107 @@ func PrintStrideSummary(w io.Writer, results []Result) {
 		fmt.Fprintf(w, "(* = stride is a multiple of %d B, one full rotation of sixteen %d B channel chunks.\n", strideAliasChunk, strideChannelChunk)
 		fmt.Fprintf(w, " model = the fraction of those channels this (row, stride) pattern touches at all,\n")
 		fmt.Fprintf(w, " which bounds every shape; what a row loses below its own model figure is the\n")
-		fmt.Fprintf(w, " per-request penalty for a gather whose addresses all land in one channel.)\n\n")
+		fmt.Fprintf(w, " per-request penalty for a gather whose addresses all land in one channel.\n")
+		fmt.Fprintf(w, " xw = the cross-wave traversal: consecutive requests advance down the rows, so\n")
+		fmt.Fprintf(w, " the loads in flight together are one stride apart instead of contiguous.)\n\n")
+
+		printStrideTraversalGrid(w, g.rowBytes, strideList, func(shape strideShape) map[int]float64 {
+			return cells[key{g, shape.name}]
+		})
 	}
+}
+
+// printStrideTraversalGrid is the third axis on its own: for each request
+// shape, the cross-wave traversal's bandwidth divided by the walk-along-a-row
+// traversal's at the same stride, over an identical set of bytes read by an
+// identical number of identical instructions. Anything away from 1.00x is
+// the cost (or gain) of *when* addresses are outstanding rather than of what
+// they are — the one thing IDEAS §5.1b's original sweep held fixed, and the
+// pattern every GEMV kernel in the suite actually has.
+//
+// Each cell carries the prediction beside the measurement, from the same
+// strideChannelCoverage the main grid's model row uses but evaluated on the
+// bytes one request holds instead of on the whole row — which is what the
+// coverage law turns out to be about (see strideInFlightBytes). It is exact
+// for the contiguous-request shapes, which is what real kernels issue, and
+// only indicative for the gathers: they beat it by 1.4-8x where it predicts
+// a severe penalty, and fall short of it (0.53-0.93x) where it predicts
+// none, since the per-request penalty of the second mechanism is still
+// there and is much larger cross-wave than the 1.32x a walk shows.
+//
+// It is printed as its own grid rather than as a second parenthetical in the
+// main one because the two ratios answer different questions: there, each
+// row against its own unpadded stride (the aliasing penalty); here, one
+// traversal against the other (the concurrency penalty).
+func printStrideTraversalGrid(w io.Writer, rowBytes int, strideList []int, cellsFor func(strideShape) map[int]float64) {
+	var pairs [][2]strideShape
+	for _, xw := range strideShapes {
+		if !xw.crossWave {
+			continue
+		}
+		for _, walk := range strideShapes {
+			if !walk.crossWave && walk.lanesPerRow == xw.lanesPerRow {
+				pairs = append(pairs, [2]strideShape{walk, xw})
+			}
+		}
+	}
+	if len(pairs) == 0 {
+		return
+	}
+
+	fmt.Fprintf(w, "  cross-wave traversal effect, %dB rows (xw / walk at the same stride)\n", rowBytes)
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprint(tw, "  SHAPE")
+	for _, s := range strideList {
+		fmt.Fprintf(tw, "\t%d%s", s, strideAliasMark(s))
+	}
+	fmt.Fprintln(tw)
+	degenerate := false
+	for _, p := range pairs {
+		walkRow, xwRow := cellsFor(p[0]), cellsFor(p[1])
+		if walkRow == nil || xwRow == nil {
+			continue
+		}
+		// One request covering a whole row leaves the two traversals with
+		// nothing to permute: there is a single column group, so the
+		// mappings are identical and the cell is a repeatability check
+		// rather than a measurement. That is also the top rung of the
+		// loads-per-request ladder, and it is the GEMV kernels' shape.
+		same := p[1].bytesInFlight() == rowBytes
+		if same {
+			degenerate = true
+		}
+		fmt.Fprintf(tw, "  %s", p[1].label())
+		for _, s := range strideList {
+			a, okA := walkRow[s]
+			b, okB := xwRow[s]
+			if !okA || !okB || a <= 0 {
+				fmt.Fprint(tw, "\t-")
+				continue
+			}
+			mark := ""
+			if same {
+				mark = "="
+			}
+			model := strideChannelCoverage(strideInFlightBytes(p[1], rowBytes), s) /
+				strideChannelCoverage(strideInFlightBytes(p[0], rowBytes), s)
+			fmt.Fprintf(tw, "\t%.2fx%s (%.2f)", b/a, mark, model)
+		}
+		fmt.Fprintln(tw)
+	}
+	tw.Flush()
+	fmt.Fprintf(w, "  (bracketed = predicted, from the same coverage law read on the bytes one request\n")
+	fmt.Fprintf(w, "   holds rather than on the whole row. Exact for the contiguous shapes; only\n")
+	fmt.Fprintf(w, "   indicative for the gathers, which beat it where it predicts a severe penalty\n")
+	fmt.Fprintf(w, "   (neighbouring requests refill lines it counts as untouched) and miss it where it\n")
+	fmt.Fprintf(w, "   predicts none (the per-request penalty it omits is far larger cross-wave).\n")
+	if degenerate {
+		fmt.Fprintf(w, "   = : one request already covers a whole %dB row, so both traversals compile to\n", rowBytes)
+		fmt.Fprintf(w, "   the same mapping and the cell measures run-to-run scatter, not traversal.\n")
+		fmt.Fprintf(w, "   That case is one wave per row, which is what the GEMV kernels do.\n")
+	}
+	fmt.Fprintln(w, "  )")
+	fmt.Fprintln(w)
 }
 
 // The two constants the whole family measures. strideChannelChunk is the
@@ -437,6 +663,26 @@ func strideChannelCoverage(rowBytes, stride int) float64 {
 		return 1
 	}
 	return float64(rowBytes) / float64(g)
+}
+
+// strideInFlightBytes is the contiguous run of bytes, inside one row, that
+// the requests outstanding at any one moment cover — which is the quantity
+// strideChannelCoverage is really about, and the thing the traversal axis
+// changes. Walking along a row, consecutive requests continue where the
+// previous one stopped, so the run is the whole row and the law reads as
+// IDEAS §5.1b first stated it. Cross-wave, consecutive requests are a
+// stride apart, so the run is only what a single request holds: lanesPerRow
+// chunks, times however many loads it issues before retiring.
+//
+// That is why "a densely packed tensor is never at risk" (§5.1b's first
+// corollary) does not survive this axis: at 1 KB rows packed at a 1 KB
+// stride, a cross-wave traversal holding 256 B per row reads at a quarter
+// of DRAM bandwidth, with no padding anywhere to blame.
+func strideInFlightBytes(s strideShape, rowBytes int) int {
+	if s.crossWave && s.bytesInFlight() < rowBytes {
+		return s.bytesInFlight()
+	}
+	return rowBytes
 }
 
 func gcdInt(a, b int) int {

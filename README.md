@@ -36,12 +36,23 @@ addresses some of them**, and the achievable fraction of DRAM bandwidth is
 exactly `min(1, rowBytes/gcd(stride, 4096))`. A K=1024 fp16 weight matrix
 whose rows were aligned to 4 KB reads at **half** this chip's bandwidth; 1 KB
 rows at an 8 KB stride, a **quarter** — and unlike the aliasing above this
-hits a plainly contiguous read as hard as a gather. A *densely* packed
-tensor is safe by construction, but any kernel reading a strip of a larger
-one is exposed, which is what tiling is: a 1 KB-wide panel of a K=4096 fp16
-matrix gets a quarter of the bus. Pad every row stride to 256 B past a
-multiple of 4 KB and both effects go away, for every panel width. `IDEAS.md` explains
-how each kernel gets where it is and what is still on the table.
+hits a plainly contiguous read as hard as a gather.
+
+Swapping the probe's traversal so consecutive *waves* start on consecutive
+rows — the same bytes, the same instructions, the same checksum — then
+generalised that into one law about concurrency: the achievable
+fraction of peak is `min(1, C/gcd(stride, 4096))` where **C is the
+contiguous run of bytes the requests in flight at one moment hold in a
+row**, which is the whole row only when consecutive waves walk along it. A
+*densely* packed tensor is not safe after all: 1 KB rows packed at a 1 KB
+stride, read with 256 B of each row in flight, run at **61 of 243 GB/s**,
+with no padding anywhere to blame. One wave streaming a *whole* row
+— the GEMV kernels' shape — is clean at every stride, and 4 KB of a row in
+flight per wave restores full bandwidth whatever the stride is. What is
+exposed is tiling: a 1 KB-wide panel of a K=4096 fp16 matrix gets a quarter
+of the bus. Pad every row stride to 256 B past a multiple of 4 KB and all
+three effects go away, for every panel width and every traversal. `IDEAS.md`
+explains how each kernel gets where it is and what is still on the table.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
@@ -126,12 +137,19 @@ are cheap to run and worth running first.
   identical and only the stride and the lane→address mapping change;
   `LANES_PER_ROW` sets how many consecutive chunks of a row go to
   consecutive lanes, so one request spans 1 row (contiguous) up to 64 rows (a
-  gather). `-stridepads`, `-striderowbytes` and `-stridefootprints` set the
-  three sweeps; the printed grid carries a `model` row giving
-  `min(1, rowBytes/gcd(stride, 4096))`, which the measurements track to
-  within 2%. Each case is checked against a host checksum over its (row,
-  chunk) set, so a mis-derived index fails instead of reporting a plausible
-  bandwidth.
+  gather); `CROSS_WAVE` swaps the traversal so consecutive *requests* advance
+  down the rows rather than along one, which is the only way to put
+  concurrent waves a stride apart; and `LOADS_PER_WAVE` gives each request
+  more of its row in flight, up to a whole row, which is what a real kernel's
+  inner loop does. `-stridepads`, `-striderowbytes` and `-stridefootprints`
+  set the three sweeps; the printed grid carries a `model` row giving
+  `min(1, C/gcd(stride, 4096))`, and the cross-wave grid under it carries the
+  same model per shape, which the measurements track to within 2% wherever C
+  is a genuine contiguous run and only indicatively for the gather shapes. Each case is checked against a host checksum
+  over its (row, chunk) set, so a mis-derived index fails instead of
+  reporting a plausible bandwidth — and the shapes where both traversals
+  compile to the same mapping are marked, since those cells measure
+  repeatability rather than traversal.
 - **`gemv_cold`** measures the decode-shape GEMV against weights several
   times larger than the last-level cache. The square `gemv` sweep's largest
   case holds 33.5MB of fp16 weights (16.8MB at int8, 8.4MB at int4), which
@@ -168,9 +186,11 @@ reader:
   things go wrong there (IDEAS §2.3, §5.1b): a load whose addresses are all
   one stride apart aims them at a single 256 B-interleaved channel when that
   stride is a multiple of the 4 KB interleave rotation, costing up to 1.34x
-  of bandwidth and up to 1.6x on a WMMA GEMM; and a row shorter than
-  `gcd(stride, 4096)` leaves whole channels unaddressed, costing 2x or 4x
-  even for a contiguous read. The `gemm` family's WMMA cases therefore take
+  of bandwidth and up to 1.6x on a WMMA GEMM; and — the larger one —
+  whenever the bytes the concurrent waves hold in flight cover less of the
+  4 KB rotation than `gcd(stride, 4096)`, the remaining channels are never
+  addressed at all, costing 2x, 4x or 8x even for a contiguous read and even
+  with no padding present. The `gemm` family's WMMA cases therefore take
   both leading dimensions as push constants and carry `strideA`/`strideB` in
   their `detail` column, and the `_pada128`/`_pad*` rows are the same SPIR-V
   at a padded stride — so a row's stride is visible rather than implied by
@@ -187,6 +207,15 @@ reader:
   keeps the fastest. DRAM-resident cases reproduce to within 2% and are
   unaffected. Run one benchmark at a time, and treat cache-resident numbers
   elsewhere in the suite as carrying the same one-sided noise.
+- **The first cache-resident case after a host fill is not a measurement.**
+  Filling a 128 MiB buffer from the CPU cost the next case 13-17%,
+  reproducibly by *position* rather than by access pattern: it came out at
+  exactly 782 GB/s in all three row-length groups of one run, while a
+  shape-identical twin measured immediately afterwards read 942 and the
+  clock differed by 1%. `RunStride` now runs and discards one case per
+  group, which puts those cells back at 884-950. Writeback from the fill
+  competing for DRAM is the likeliest cause; it was never visible in the
+  DRAM-resident groups.
 
 ## Adding a new shader
 

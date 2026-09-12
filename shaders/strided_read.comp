@@ -20,7 +20,7 @@
 // chunks touched in each, rows spaced `strideChunks` chunks apart. Every
 // touched chunk is read exactly once, whatever LANES_PER_ROW is, so the set
 // of bytes and the number of load instructions are identical across
-// variants and only the lane->address mapping differs. That makes two
+// variants and only the lane->address mapping differs. That makes four
 // independent sweeps possible over one kernel:
 //
 //   (a) stride, at constant bytes touched. Holding rows and chunksPerRow
@@ -35,11 +35,20 @@
 //       16 bytes each, and 2 is the shape a 16x16 fp16 coopMatLoad actually
 //       issues. This is the question §2.3's residue turns on and the one a
 //       GEMM cannot separate from its tiling.
+//   (c) traversal, at constant stride, shape and bytes touched. CROSS_WAVE
+//       swaps which of (row-group, column-block) consecutive *requests*
+//       advance through, so the loads in flight together are a stride apart
+//       rather than contiguous with one another. (a) and (b) both vary the
+//       addresses inside one request and leave this fixed; see CROSS_WAVE.
+//   (d) loads per request, at constant everything else. LOADS_PER_WAVE
+//       makes each request step along its row instead of retiring after one
+//       load, which is what a real kernel's inner loop does; see
+//       LOADS_PER_WAVE.
 //
-// Both sweeps were run, and the *row length* turned out to be the third,
-// larger axis. Row k starts at k*stride, so row starts land only on the
-// multiples of g = gcd(stride, 4096) inside one rotation and each row covers
-// chunksPerRow*16 bytes from its start; when that is less than g, the union
+// (a) and (b) were run first, and the *row length* turned out to be a
+// larger axis than either. Row k starts at k*stride, so row starts land
+// only on the multiples of g = gcd(stride, 4096) in one rotation, and each
+// row covers chunksPerRow*16 bytes from its start; when that is less than g, the union
 // never addresses some channels at all and the achievable fraction of peak
 // is exactly min(1, rowBytes/g) — measured to within 2% everywhere, and
 // unlike (b) it applies to a plainly contiguous read. Which is why
@@ -59,6 +68,52 @@
 // the address arithmetic folds to shifts when it is a constant.
 #ifndef LANES_PER_ROW
 #define LANES_PER_ROW 64
+#endif
+
+// (c) traversal: which addresses *concurrent requests* hold, at constant
+// stride, constant bytes touched and constant request shape. This is the
+// third axis, added after (a) and (b) were run, and it is the one the rest
+// of the file could not reach: LANES_PER_ROW decides the addresses inside
+// one load instruction, but the requests that are actually in flight
+// together are consecutive `req` values — four waves of one workgroup plus
+// whatever neighbouring workgroups are resident — and those walk along a
+// row in the default mapping, so they are never a stride apart.
+//
+// CROSS_WAVE swaps the two loop orders over the (row-group, column-block)
+// grid so consecutive requests advance by a row group instead of by a
+// column block. It is a permutation of exactly the same (row, chunk) set,
+// so the byte set, the footprint, the instruction count and the host
+// checksum are all unchanged, and the only thing that moves is which
+// addresses are outstanding at the same moment. That is the GEMV/W4A8
+// pattern — one wave per row, contiguous within it, rows a stride apart —
+// and IDEAS §2.3 found the stride *across* concurrent loads was what
+// mattered to the LDS staging path ("what matters is the address stride
+// across the concurrent loads, not which instruction issues them").
+//
+// Note the degenerate case, because it is already in the committed data:
+// when one request covers a whole row (chunksPerRow == LANES_PER_ROW, e.g.
+// 1024 B rows in the contiguous shape) there is only one column block, the
+// two orders coincide, and CROSS_WAVE changes nothing.
+#ifndef CROSS_WAVE
+#define CROSS_WAVE 0
+#endif
+
+// (d) how many loads one request issues before it retires, stepping along
+// its own row(s) by LANES_PER_ROW chunks each time. This is the axis that
+// decides whether (c) is a property of the bus or of a *kernel*: at
+// LOADS_PER_WAVE 1 every wave issues one load and dies, so the dispatch's
+// waves stay phase-locked and the addresses in flight are rigidly one
+// stride apart, while at LOADS_PER_WAVE = chunksPerRow/LANES_PER_ROW each
+// wave streams a whole row and consecutive waves take consecutive rows —
+// which is exactly what every GEMV kernel in this suite does, W4A8
+// included. Sweeping between them says how much of a row a wave has to
+// have in flight before the traversal stops mattering.
+//
+// Note that at the top of that ladder there is only one column group, so
+// the two traversals coincide and CROSS_WAVE is moot: "one wave per row"
+// *is* the cross-wave pattern, with nothing left to permute.
+#ifndef LOADS_PER_WAVE
+#define LOADS_PER_WAVE 1
 #endif
 
 layout(local_size_x = 256) in;
@@ -92,16 +147,39 @@ void main() {
 
     uint chunkInRow = lane % uint(LANES_PER_ROW);
     uint rowInReq = lane / uint(LANES_PER_ROW);
-    uint colBlocks = pc.chunksPerRow / uint(LANES_PER_ROW);
-    uint row = (req / colBlocks) * (64u / uint(LANES_PER_ROW)) + rowInReq;
-    uint chunk = (req % colBlocks) * uint(LANES_PER_ROW) + chunkInRow;
+    uint rowsPerReq = 64u / uint(LANES_PER_ROW);
+    // One column *group* is the LOADS_PER_WAVE consecutive column blocks a
+    // single request covers; at LOADS_PER_WAVE 1 it is one block, which is
+    // the original geometry.
+    uint colGroups = pc.chunksPerRow / (uint(LANES_PER_ROW) * uint(LOADS_PER_WAVE));
+#if CROSS_WAVE
+    // Consecutive requests advance down the rows, so the loads in flight at
+    // any moment are a stride apart. Needs rows % rowsPerReq == 0, which the
+    // host checks, or the tail of the grid would fall outside the matrix and
+    // the checksum would catch it as skipped coverage.
+    uint rowGroups = pc.rows / rowsPerReq;
+    uint rowGroup = req % rowGroups;
+    uint colGroup = req / rowGroups;
+#else
+    // Consecutive requests walk along one row, so they are contiguous with
+    // each other and no concurrent pair is a stride apart.
+    uint rowGroup = req / colGroups;
+    uint colGroup = req % colGroups;
+#endif
+    uint row = rowGroup * rowsPerReq + rowInReq;
+    uint chunk = colGroup * (uint(LANES_PER_ROW) * uint(LOADS_PER_WAVE)) + chunkInRow;
 
     // Guarded rather than returned from: subgroupAdd below needs uniform
-    // control flow across the wave.
+    // control flow across the wave. The loop steps one request's width at a
+    // time, so the chunks stay disjoint across requests and the host
+    // checksum is unchanged by LOADS_PER_WAVE.
     uint acc = 0u;
     if (row < pc.rows) {
-        uvec4 v = src[row * pc.strideChunks + chunk];
-        acc = v.x + v.y + v.z + v.w;
+        uint base = row * pc.strideChunks + chunk;
+        for (uint i = 0u; i < uint(LOADS_PER_WAVE); i++) {
+            uvec4 v = src[base + i * uint(LANES_PER_ROW)];
+            acc += v.x + v.y + v.z + v.w;
+        }
     }
 
     uint total = subgroupAdd(acc);

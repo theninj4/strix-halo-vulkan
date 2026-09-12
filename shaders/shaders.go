@@ -49,6 +49,59 @@ var StridedReadLPR2 []byte
 //go:embed strided_read_lpr1.spv
 var StridedReadLPR1 []byte
 
+// The same five shapes with the traversal swapped (IDEAS §5.1b's remaining
+// question): CROSS_WAVE makes consecutive 64-lane requests advance by a row
+// group instead of by a column block, so the loads in flight together are a
+// stride apart rather than contiguous with one another. Same byte set, same
+// instruction count, same checksum — only which addresses are outstanding
+// at the same moment changes. This is the GEMV/W4A8 pattern, and it is the
+// one thing the five variants above cannot express, because each of them
+// varies addresses only *inside* a request.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=64 -o strided_read_xw_lpr64.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=16 -o strided_read_xw_lpr16.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=4 -o strided_read_xw_lpr4.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=2 -o strided_read_xw_lpr2.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=1 -o strided_read_xw_lpr1.spv strided_read.comp
+
+//go:embed strided_read_xw_lpr64.spv
+var StridedReadXWLPR64 []byte
+
+//go:embed strided_read_xw_lpr16.spv
+var StridedReadXWLPR16 []byte
+
+//go:embed strided_read_xw_lpr4.spv
+var StridedReadXWLPR4 []byte
+
+//go:embed strided_read_xw_lpr2.spv
+var StridedReadXWLPR2 []byte
+
+//go:embed strided_read_xw_lpr1.spv
+var StridedReadXWLPR1 []byte
+
+// The cross-wave traversal again, with each request issuing LOADS_PER_WAVE
+// loads along its own row instead of retiring after one. At the top of the
+// ladder (LOADS_PER_WAVE = chunksPerRow/LANES_PER_ROW) one wave streams a
+// whole row and consecutive waves take consecutive rows, which is the shape
+// every GEMV kernel here has — so this is what says whether the traversal
+// penalty is something a real kernel inherits or something only a
+// one-load-per-wave dispatch can produce. Contiguous requests only
+// (LANES_PER_ROW=64): the gather shapes have their own, separate penalty
+// and would confound the ladder.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=64 -DLOADS_PER_WAVE=2 -o strided_read_xw_l2.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=64 -DLOADS_PER_WAVE=4 -o strided_read_xw_l4.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DCROSS_WAVE=1 -DLANES_PER_ROW=64 -DLOADS_PER_WAVE=8 -o strided_read_xw_l8.spv strided_read.comp
+
+//go:embed strided_read_xw_l2.spv
+var StridedReadXWL2 []byte
+
+//go:embed strided_read_xw_l4.spv
+var StridedReadXWL4 []byte
+
+//go:embed strided_read_xw_l8.spv
+var StridedReadXWL8 []byte
+
 // Per-dispatch overhead floor: a shader that does nothing.
 
 //go:generate glslc --target-env=vulkan1.2 -O -o empty.spv empty.comp
