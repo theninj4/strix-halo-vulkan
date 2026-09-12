@@ -16,6 +16,8 @@ Ultimately we want to be able to run these tasks:
   4. Image generation via Tongyi's `z-image-turbo`:
     * https://huggingface.co/Tongyi-MAI/Z-Image-Turbo
     * https://arxiv.org/html/2511.22699v5
+    * With this smaller model to generate in-progress previews: 
+      * https://huggingface.co/madebyollin/taef1
   5. Compute embeddings via Qwen's `Qwen3-Embedding-0.6B`:
     * https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
     * https://arxiv.org/html/2506.05176v3
