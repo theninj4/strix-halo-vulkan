@@ -1,0 +1,119 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Strided-read bandwidth probe — IDEAS §5.1b, the ceiling half of §2.3.
+//
+// The `bandwidth` family (copy.comp) only ever measures a *contiguous*
+// sweep, so the 236 GB/s DRAM and 805 GB/s MALL figures it reports are
+// best-case numbers that a strided kernel does not automatically get: §2.3
+// found that moving a GEMM operand's row stride 256 B off a power-of-two is
+// worth up to 1.6x, because a K-strided cooperative-matrix fragment load at
+// a power-of-two leading dimension aims every one of its addresses at the
+// same 256 B-interleaved memory channel. This kernel measures that effect
+// directly, without a GEMM's tiling in the way — and found the interleave
+// rotation to be 4 KB (sixteen 256 B chunks) rather than the 2 KB §2.3
+// inferred from three strides of one kernel.
+//
+// The access pattern is a matrix: `rows` rows, `chunksPerRow` 16-byte
+// chunks touched in each, rows spaced `strideChunks` chunks apart. Every
+// touched chunk is read exactly once, whatever LANES_PER_ROW is, so the set
+// of bytes and the number of load instructions are identical across
+// variants and only the lane->address mapping differs. That makes two
+// independent sweeps possible over one kernel:
+//
+//   (a) stride, at constant bytes touched. Holding rows and chunksPerRow
+//       fixed and varying strideChunks changes only the gap between rows —
+//       exactly what padding a real weight matrix's leading dimension does,
+//       including the fact that the pad bytes are never read.
+//   (b) request shape, at constant stride and constant bytes touched.
+//       LANES_PER_ROW is how many consecutive 16-byte chunks of one row go
+//       to consecutive lanes, so one wave's load instruction spans
+//       waveSize/LANES_PER_ROW distinct rows: 64 gives a plain contiguous
+//       sweep (one row, 1 KB per request), 1 gives a 64-address gather of
+//       16 bytes each, and 2 is the shape a 16x16 fp16 coopMatLoad actually
+//       issues. This is the question §2.3's residue turns on and the one a
+//       GEMM cannot separate from its tiling.
+//
+// Both sweeps were run, and the *row length* turned out to be the third,
+// larger axis. Row k starts at k*stride, so row starts land only on the
+// multiples of g = gcd(stride, 4096) inside one rotation and each row covers
+// chunksPerRow*16 bytes from its start; when that is less than g, the union
+// never addresses some channels at all and the achievable fraction of peak
+// is exactly min(1, rowBytes/g) — measured to within 2% everywhere, and
+// unlike (b) it applies to a plainly contiguous read. Which is why
+// chunksPerRow is a push constant rather than the fixed 512 the original
+// design needed: sweeping it is what exposed that.
+//
+// Reads go through a sum into one output word per workgroup: the loads have
+// to feed *something* or they are dead code, and a per-workgroup reduction
+// writes 4 bytes per 4 KB read instead of doubling the traffic the way a
+// copy would. The sum is also checked against a host-computed one, which
+// verifies the mapping touches each intended chunk exactly once — a
+// mis-derived index would otherwise show up as a plausible bandwidth
+// number rather than as an error.
+
+// How many consecutive 16-byte chunks of a single row are assigned to
+// consecutive lanes. Compile-time because it is the axis being swept and
+// the address arithmetic folds to shifts when it is a constant.
+#ifndef LANES_PER_ROW
+#define LANES_PER_ROW 64
+#endif
+
+layout(local_size_x = 256) in;
+
+// uvec4 = one 16-byte chunk = one buffer_load_b128 per lane, which is the
+// widest load the hardware issues and the one every kernel in §2.1/§2.3's
+// inner loop uses.
+layout(binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(binding = 1) writeonly buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;         // rows touched
+    uint chunksPerRow; // 16-byte chunks touched per row
+    uint strideChunks; // row-to-row distance in 16-byte chunks (>= chunksPerRow)
+} pc;
+
+// 256 threads over a minimum subgroup size of 16 — more than RDNA can
+// produce (32 or 64), sized to the limit rather than to the expectation so
+// a wave32 device cannot overflow it.
+const uint MAX_SUBGROUPS = 16u;
+shared uint part[MAX_SUBGROUPS];
+
+void main() {
+    // The mapping is expressed in units of 64 lanes whatever the device's
+    // subgroup size is: it decides which addresses are *adjacent in lane
+    // order*, and a wave of 32 takes half of one such group, which is the
+    // same shape at half the addresses per request.
+    uint g = gl_GlobalInvocationID.x;
+    uint lane = g & 63u;
+    uint req = g >> 6u;
+
+    uint chunkInRow = lane % uint(LANES_PER_ROW);
+    uint rowInReq = lane / uint(LANES_PER_ROW);
+    uint colBlocks = pc.chunksPerRow / uint(LANES_PER_ROW);
+    uint row = (req / colBlocks) * (64u / uint(LANES_PER_ROW)) + rowInReq;
+    uint chunk = (req % colBlocks) * uint(LANES_PER_ROW) + chunkInRow;
+
+    // Guarded rather than returned from: subgroupAdd below needs uniform
+    // control flow across the wave.
+    uint acc = 0u;
+    if (row < pc.rows) {
+        uvec4 v = src[row * pc.strideChunks + chunk];
+        acc = v.x + v.y + v.z + v.w;
+    }
+
+    uint total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        part[gl_SubgroupID] = total;
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        uint s = 0u;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) {
+            s += part[i];
+        }
+        dst[gl_WorkGroupID.x] = s;
+    }
+}

@@ -301,6 +301,20 @@ func (b *Buffer) ReadFloat32(n int) []float32 {
 	return out
 }
 
+// ReadUint32 reads n uint32s back out of the buffer's mapped memory.
+func (b *Buffer) ReadUint32(n int) []uint32 {
+	src := unsafe.Slice((*uint32)(b.mapped), n)
+	out := make([]uint32, n)
+	copy(out, src)
+	return out
+}
+
+// MappedPointer returns the start of the buffer's host mapping, for callers
+// that want to fill or read it as a type the Write*/Read* helpers don't
+// cover, or to fill a multi-hundred-MB buffer in place rather than building
+// a host-side copy of it first.
+func (b *Buffer) MappedPointer() unsafe.Pointer { return b.mapped }
+
 // WriteBytes copies src into the buffer's mapped memory starting at byte 0.
 func (b *Buffer) WriteBytes(src []byte) {
 	dst := unsafe.Slice((*byte)(b.mapped), len(src))

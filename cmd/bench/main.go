@@ -32,7 +32,10 @@ func main() {
 	warmup := flag.Uint("warmup", 3, "untimed warmup dispatches before each timed measurement")
 	iters := flag.Uint("iters", 20, "back-to-back timed dispatches averaged per measurement")
 	csvPath := flag.String("csv", "", "optional path to write results as CSV")
-	skip := flag.String("skip", "", "comma-separated op families to skip (peak,overhead,bandwidth,elementwise,gemv,gemv_cold,gemm,reduce)")
+	skip := flag.String("skip", "", "comma-separated op families to skip (peak,overhead,bandwidth,stride,elementwise,gemv,gemv_cold,gemm,reduce)")
+	stridePadsFlag := flag.String("stridepads", "", "comma-separated row-padding values in bytes for the strided-read sweep (default: IDEAS §5.1b's sweep across the 2 KB channel-interleave period); each must be a multiple of 16")
+	strideFootprintsFlag := flag.String("stridefootprints", "", "comma-separated touched footprints in MB for the strided-read sweep (default: one under and one over the 32 MB last-level cache)")
+	strideRowBytesFlag := flag.String("striderowbytes", "", "comma-separated bytes-touched-per-row for the strided-read sweep (default: a K=4096 and a K=1024 fp16 weight row); each must be a multiple of 1024")
 	coldFootprintsFlag := flag.String("coldfootprints", "16,64,256", "comma-separated weight footprints in MB (fp16-equivalent) for the DRAM-resident gemv_cold sweep; entries well above the ~32MB last-level cache are the ones that measure real decode")
 	coldN := flag.Int("coldn", 4096, "reduction length N for the gemv_cold sweep; its row count M is derived from each footprint")
 	warmClock := flag.Duration("warmclock", 3*time.Second, "maximum ALU-heavy warmup before each timed measurement; stops as soon as the GPU reaches its top advertised clock, so a hot GPU costs one short burst (0 disables)")
@@ -56,6 +59,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("-coldfootprints: %v", err)
 	}
+	stridePads := bench.StridePadsBytes
+	if *stridePadsFlag != "" {
+		if stridePads, err = parseInts(*stridePadsFlag); err != nil {
+			log.Fatalf("-stridepads: %v", err)
+		}
+	}
+	strideFootprints := bench.StrideFootprintsMB
+	if *strideFootprintsFlag != "" {
+		if strideFootprints, err = parseInts(*strideFootprintsFlag); err != nil {
+			log.Fatalf("-stridefootprints: %v", err)
+		}
+	}
+	strideRowBytes := bench.StrideRowBytesList
+	if *strideRowBytesFlag != "" {
+		if strideRowBytes, err = parseInts(*strideRowBytesFlag); err != nil {
+			log.Fatalf("-striderowbytes: %v", err)
+		}
+	}
 	skipSet := map[string]bool{}
 	for _, s := range strings.Split(*skip, ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -66,6 +87,7 @@ func main() {
 	cfg := config{
 		sizes: sizes, bwSizes: bwSizes, blocks: blocks,
 		coldFootprints: coldFootprints, coldN: *coldN,
+		stridePads: stridePads, strideFootprints: strideFootprints, strideRowBytes: strideRowBytes,
 		warmup: uint32(*warmup), iters: uint32(*iters),
 		warmClock: *warmClock, clockSample: *clockSample, cus: *cus,
 		csvPath: *csvPath, skip: skipSet,
@@ -97,6 +119,9 @@ type config struct {
 	sizes, bwSizes, blocks []int
 	coldFootprints         []int
 	coldN                  int
+	stridePads             []int
+	strideFootprints       []int
+	strideRowBytes         []int
 	warmup, iters          uint32
 	warmClock, clockSample time.Duration
 	cus                    int
@@ -183,6 +208,15 @@ func run(cfg config) error {
 	if err := run("bandwidth", func() ([]bench.Result, error) { return bench.RunBandwidth(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
+	// stride follows bandwidth because it is that number's qualifier: the
+	// contiguous sweep bandwidth reports is the best case, and this says
+	// what the same bytes cost at a channel-aliased stride or in a gather.
+	if err := run("stride", func() ([]bench.Result, error) {
+		return bench.RunStride(dev, cfg.strideFootprints, cfg.strideRowBytes, cfg.stridePads, cfg.warmup, cfg.iters)
+	}); err != nil {
+		return err
+	}
+	bench.PrintStrideSummary(os.Stdout, results)
 	if err := run("elementwise", func() ([]bench.Result, error) { return bench.RunElementwise(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}

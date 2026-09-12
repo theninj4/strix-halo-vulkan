@@ -20,6 +20,35 @@ var Double []byte
 //go:embed copy.spv
 var Copy []byte
 
+// Strided read bandwidth (IDEAS §5.1b): the same fixed set of bytes read
+// with the rows spaced an arbitrary stride apart, in five request shapes.
+// LANES_PER_ROW is how many consecutive 16-byte chunks of one row go to
+// consecutive lanes, so one 64-lane load instruction spans 64/LANES_PER_ROW
+// distinct rows: 64 is a plain contiguous sweep, 1 is a 64-address gather of
+// 16 bytes each, and 2 is the shape a 16x16 fp16 coopMatLoad issues. The
+// stride is a push constant, so each variant sweeps it without recompiling.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DLANES_PER_ROW=64 -o strided_read_lpr64.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DLANES_PER_ROW=16 -o strided_read_lpr16.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DLANES_PER_ROW=4 -o strided_read_lpr4.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DLANES_PER_ROW=2 -o strided_read_lpr2.spv strided_read.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DLANES_PER_ROW=1 -o strided_read_lpr1.spv strided_read.comp
+
+//go:embed strided_read_lpr64.spv
+var StridedReadLPR64 []byte
+
+//go:embed strided_read_lpr16.spv
+var StridedReadLPR16 []byte
+
+//go:embed strided_read_lpr4.spv
+var StridedReadLPR4 []byte
+
+//go:embed strided_read_lpr2.spv
+var StridedReadLPR2 []byte
+
+//go:embed strided_read_lpr1.spv
+var StridedReadLPR1 []byte
+
 // Per-dispatch overhead floor: a shader that does nothing.
 
 //go:generate glslc --target-env=vulkan1.2 -O -o empty.spv empty.comp

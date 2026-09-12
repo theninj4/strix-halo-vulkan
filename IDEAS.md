@@ -29,12 +29,32 @@ layout that halves the instruction count is 2.8x slower. See §2.1, §2.3, §6.1
 the layout question that raised it.** The cause is DRAM channel aliasing:
 every fragment load in these kernels is K-strided, a power-of-two leading
 dimension puts all 16 addresses of one load in the same channel, and the
-penalty is periodic in the stride with a 2 KB period. Padding each operand's
-leading dimension 256 B off a multiple of 2 KB — a host-side allocation
-change, no shader restructuring — is worth 1.6x on the transposed-B kernel,
+penalty is periodic in the stride — with a **4 KB** period, per §5.1b's
+direct measurement of it; §2.3 had only three strides and read it as 2 KB.
+Padding each operand's leading dimension 256 B off a multiple of 4 KB — a
+host-side allocation change, no shader restructuring — is worth 1.6x on the
+transposed-B kernel,
 **up to 1.35x on the kernels that already won**, and takes the suite's best
 GEMM to **28.4 TFLOP/s (51% of the WMMA ceiling)**. It also retires the
 "pinned at the MALL's 805 GB/s" reading of §2.1's plateau. See §2.3.
+
+**§5.1b's strided-bandwidth probe is done too**, and it is the one item so
+far that found something nobody was looking for. It reads a fixed set of
+bytes at a swept row stride in five request shapes, with no tiling in the
+way, and it separates two effects §2.3 had seen as one. The small one is
+§2.3's: a load whose addresses are all one stride apart, with that stride a
+multiple of the interleave rotation, loses up to **1.34x** — and the rotation
+is **4 KB** (sixteen 256 B channels), not the 2 KB §2.3 inferred from three
+strides. The large one is new and applies to *plainly contiguous* reads: when
+a row is shorter than `gcd(stride, 4096)`, the access pattern **never
+addresses some channels at all**, and the achievable fraction of peak is
+exactly `min(1, rowBytes/gcd(stride, 4096))` — measured to within 2% at every
+point. A K=1024 fp16 weight matrix whose rows someone aligned to 4 KB reads
+at **half** this chip's DRAM bandwidth; 1024 B rows at an 8 KB stride, a
+**quarter**. It also retires §2.3's leading suspect for its own residue:
+at a de-aliased stride a 64-address gather reads within 2% of a contiguous
+sweep, so request shape is free and the [N,K] weight layout is usable as-is.
+See §5.1b.
 
 ## The roofline, and why it says there's a lot left on the table
 
@@ -48,13 +68,23 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 
 | Ceiling | Measured peak | Ops/clk/CU | Best real kernel | Utilisation |
 |---|---|---|---|---|
-| DRAM bandwidth | **236 GB/s** (92% of the 256 GB/s bus) | — | 236 GB/s | **~100%** ✅ |
-| MALL (32 MiB) bandwidth | **805 GB/s** | — | 805 GB/s | **~100%** ✅ |
+| DRAM bandwidth | **236 GB/s** (92% of the 256 GB/s bus) † | — | 236 GB/s | **~100%** ✅ |
+| MALL (32 MiB) bandwidth | **805 GB/s** copy, **965 GB/s** pure read † | — | 805 GB/s | **~100%** ✅ |
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
 | WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **28.4 TFLOP/s** (`wmma_reg64_bt_padab128`) | **51%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
+
+† **[measured] §5.1b** Both bandwidth rows are *conditional on the access
+pattern*, which is why they carry a dagger: they are what a contiguous sweep
+gets. A row stride that leaves `gcd(stride, 4096) > rowBytes` cuts DRAM to
+`rowBytes/gcd` of the figure above — half at 2 KB rows with a 4 KB stride, a
+quarter at 1 KB rows with an 8 KB stride — and does so for a plainly
+contiguous read; a stride that is a multiple of 4 KB additionally costs a
+multi-row gather up to 1.32x. The MALL row is also two numbers, not one: the
+805 GB/s §0.4 reported is a read+write copy, and a pure read reaches
+940-965 GB/s. See §5.1b.
 
 (Real-kernel column is the best measured anywhere in `results.csv`; the
 GEMM entries are at N=4096 except the WMMA fp16 one, whose best shape is now
@@ -133,8 +163,9 @@ measurements:
    arithmetic intensity at all: operand *stride*.** Every fragment load in
    these kernels is K-strided, and a power-of-two leading dimension puts all
    16 of its addresses in one memory channel; padding each stride 256 B off
-   a 2 KB multiple is worth 0-5% at N=4096, 4-35% at N=2048 and 2.6x on the
-   [N,K] weight layout, for a new best of 28.4 TFLOP/s (51%). It also breaks
+   a multiple of the 4 KB interleave rotation (§5.1b's correction to the
+   2 KB §2.3 inferred) is worth 0-5% at N=4096, 4-35% at N=2048 and 2.6x on
+   the [N,K] weight layout, for a new best of 28.4 TFLOP/s (51%). It also breaks
    the "pinned at 760 GB/s" reading above: the de-aliased AI-32 kernels
    imply 742-887 GB/s of MALL traffic, i.e. at or *past* the 805 GB/s
    ceiling, so the L1s must be absorbing part of what that arithmetic
@@ -243,6 +274,15 @@ fully-cached fp32 case is 8388608 elements × 4 B = **exactly 32 MiB**, at
 809 GB/s, and the next point (50 MB) falls to 236. So the MALL is 32 MiB,
 delivers **~805 GB/s**, and DRAM delivers 236 GB/s — a **3.4x** cliff, and a
 hard budget for any "keep it resident" strategy (§5).
+
+**[measured] §5.1b qualifies both numbers.** 805 GB/s is what a *copy*
+gets; the `stride` family's read-only kernel reaches **940-965 GB/s** from
+the same 32 MiB, so the MALL cliff is closer to **4x** for read-dominated
+work — which is what weight streaming is. And neither figure is a function
+of footprint alone: at a row stride whose `gcd` with 4 KB exceeds the bytes
+read per row, DRAM drops to half or a quarter of 236 GB/s and the MALL drops
+*further* than the model predicts, because the same address bits that select
+a channel also select a cache slice.
 
 ### 0.5 Per-dispatch overhead — **done** ✅ (not originally in §0; see §4.1)
 Added as the `overhead` family while the plumbing was open, because §0.4's
@@ -764,16 +804,51 @@ survives de-aliasing. Two candidate explanations are already out:
 Discriminating what is left needs the memory system measured directly rather
 than inferred through a GEMM: fixed bytes touched, sweeping request size,
 request count and stride independently — §5.1b, which is the right place for
-it.
+it. **[measured] That probe is now built, and it rules out the request-shape
+explanation: see below.**
+
+**[measured] §5.1b has since measured the memory system directly, and it
+corrects two things here without disturbing the conclusion.** The
+strided-read probe reads a fixed set of bytes at a swept stride with no
+tiling in the way (`shaders/strided_read.comp`), so it separates what this
+sweep could not:
+
+- **The period is 4 KB, not 2 KB.** With nine strides inside one rotation,
+  10240 B and 14336 B — both multiples of 2 KB — read at the full rate,
+  and only the multiples of **4 KB** are slow. The interleave is 256 B over
+  **sixteen** channels, which is what a 256-bit LPDDR5X bus of 16-bit
+  sub-channels gives. The mechanism named above is right; the rotation is
+  twice as wide as three strides could show.
+- **The decline past +256 B in the sweep above is footprint, not aliasing.**
+  B is `N * (K+padB) * 2` bytes, so at N=K=4096 the unpadded case is
+  *exactly* the 32 MiB MALL and every pad step pushes it further out: 8192 B
+  → 32 MiB, 8448 → 33, 9216 → 36, 10240 → 40, 12288 → 48 MiB. At constant
+  bytes touched the probe shows no such decline — a flat plateau from +128 B
+  across a whole period, with only the 4 KB multiples down. So this sweep is
+  the product of two terms: a de-aliasing step that is complete by
+  +128-256 B, and a monotone footprint cost after it. Both are visible in
+  it, which is why +256 B read as a peak rather than as the start of a
+  plateau.
+
+Two figures worth carrying: the *bus* penalty for a 4 KB-multiple stride is
+at most **1.34x** and only for a gather (a contiguous read pays nothing),
+while this kernel lost **1.63x** to it — so a GEMM amplifies the bandwidth
+penalty rather than merely inheriting it. And request shape *per se* is free:
+at a de-aliased stride a 64-address gather reads within 2% of a contiguous
+sweep, which retires the leading candidate for the residue below.
+
 
 **Engine implication, and it is free:** allocate every GEMM operand with its
-leading dimension padded off a multiple of 2 KB (+256 B is the measured
-optimum at K=4096), including the weight tensors. It costs 128 halves of
+leading dimension padded 256 B past a multiple of **4 KB** (§5.1b's
+correction to the 2 KB written here originally, and +256 B is both the
+measured optimum at K=4096 and the value that makes the rule shape-independent
+— see §5.1b), including the weight tensors. It costs 128 halves of
 padding per row — 3% of memory at K=4096 — needs no shader change now that
 the strides are push constants, and is worth 0-5% at N=4096 (kernel-dependent, and inside the run-to-run
 spread for one of the three), 4-35% at N=2048,
 and 2.6x on the transposed-B layout that a real `Linear` weight already
-has.
+has. Pad by that and no more: §5.1b shows the extra footprint is a real cost
+and the extra de-aliasing is not.
 **Effort**: low (done). **Value**: high (delivered).
 
 ### 2.4 Workgroup swizzle / tile reordering for MALL locality
@@ -977,7 +1052,7 @@ weights, with a staging upload at load time — which is a small change to
 the weight loader for a possibly free few-percent on everything.
 **Effort**: low. **Value**: high (bandwidth is the binding constraint).
 
-### 5.1b Exploit the 3.4x MALL cliff deliberately
+### 5.1b The MALL cliff, and the strided-bandwidth probe — **probe DONE** ✅
 **[measured]** §0.4 pinned the last-level cache at exactly **32 MiB
 delivering ~805 GB/s**, against 236 GB/s from DRAM. That is a 3.4x
 bandwidth difference available to any kernel whose working set can be kept
@@ -995,25 +1070,218 @@ show whether the blocking holds.
 **Effort**: varies by kernel. **Value**: high, and it multiplies with
 everything in §2 and §3.
 
-**[measured] §2.3 adds a second axis to this family and one specific probe
-it should own.** Bandwidth on this part is not a function of footprint
-alone: at a fixed footprint, moving an operand's row stride 256 B off a
-2 KB multiple is worth up to 1.35x on the GEMM kernels, because a K-strided
-fragment load at a power-of-two stride puts all 16 of its addresses in one
-of eight 256 B-interleaved channels. The `bandwidth` family only ever
-measures contiguous streaming, so it cannot see this, and the 805/236 GB/s
-ceilings it reports are therefore *best-case* figures that a strided kernel
-does not automatically get.
-**Change**: extend the bandwidth microbenchmark with a strided variant —
-fixed bytes touched, sweeping (a) the stride against the 2 KB period to
-measure the channel-alias penalty directly, and (b) request *shape* at constant
-stride and constant bytes touched — one 16-address/16-bytes-each gather
-against a contiguous sweep — which is what §2.3's unexplained residue turns
-on and what its GEMM rows cannot separate from tiling. (a) tells the engine
-how to pad every allocation; (b) tells it whether the [N,K] weight layout is
-usable at all above MALL size.
-**Effort**: low. **Value**: high — it is the ceiling half of §2.3, and both
-answers are engine-wide rather than kernel-specific.
+**[measured] §2.3 added a second axis to this family and one specific probe
+it should own. That probe is now built, and it found two mechanisms rather
+than one — the larger of which nothing in the suite was looking for, because
+it needs neither a gather nor a kernel to trigger.**
+
+§2.3 measured a GEMM gaining up to 1.6x purely from moving an operand's row
+stride 256 B off a power-of-two, but the `bandwidth` family only ever
+measures a contiguous sweep, so the 805/236 GB/s ceilings it reports are
+best-case figures a strided kernel does not automatically get — and a GEMM
+cannot separate the stride from its own tiling.
+
+**Built**: `shaders/strided_read.comp` + `bench/ops_stride.go`, run as the
+`stride` family. The pattern is `rows` rows of which the first `rowBytes`
+are touched, spaced `stride` bytes apart, one `uvec4` per lane. Every
+touched 16-byte chunk is read exactly once in every variant, so the byte
+set, the footprint and the number of `buffer_load_b128`s are identical
+across the sweep and only two things move:
+
+- **the stride**, which adds a gap and changes nothing about what is read —
+  exactly what padding a real matrix's leading dimension does, including
+  that the pad bytes are never read;
+- **the request shape**, via `LANES_PER_ROW`: how many consecutive 16-byte
+  chunks of one row go to consecutive lanes, so one 64-lane load spans
+  `64/LANES_PER_ROW` distinct rows. 1 row is a contiguous 1 KB sweep, 64
+  rows is the 64-address/16-bytes-each gather, 32 rows is what a 16×16 fp16
+  `coopMatLoad` issues.
+
+Each case is checked against a host checksum over its (row, chunk) set,
+computed from the geometry and deliberately *not* from the shader's lane
+mapping, so a variant that covered a chunk twice or skipped one fails
+instead of reporting a plausible bandwidth.
+
+#### Mechanism 1: channel coverage — 2-4x, and it hits contiguous reads
+
+The interleave on this part is 256 B across **sixteen** channels, i.e. a
+**4 KB rotation** (what a 256-bit LPDDR5X bus of 16-bit sub-channels gives).
+Row *k* starts at `k*stride`, so row starts land only on the multiples of
+`g = gcd(stride, 4096)` inside one rotation, and each row covers `rowBytes`
+from its start. When `rowBytes < g` the union of them **never addresses some
+channels at all**, and the achievable fraction of peak is exactly the
+fraction of channels touched:
+
+> **coverage = min(1, rowBytes / gcd(stride, 4096))**
+
+1024 B rows, 64 MiB touched, GB/s (`model` is the formula; rows are how many
+distinct rows one request spans):
+
+| rows/req | 1024 | 1280 | 2048 | 3072 | 4096* | 5120 | 9216 |
+|---|---|---|---|---|---|---|---|
+| **model** | 1.00 | 1.00 | **0.50** | 1.00 | **0.25** | 1.00 | 1.00 |
+| 1 (contiguous) | 243 | 241 | **120** | 242 | **61** | 245 | 239 |
+| 4 | 243 | 241 | 122 | 243 | 61 | 245 | 239 |
+| 16 | 234 | 238 | 113 | 233 | 55 | 237 | 231 |
+| 32 | 230 | 239 | 113 | 234 | 58 | 238 | 232 |
+| 64 (gather) | 232 | 240 | 120 | 237 | 59 | 242 | 235 |
+
+The model holds to within 2% at every point, for every shape. Note which
+strides are the bad ones — 2048, 4096, 8192, the ones a tidy allocator picks
+— while 1280 and 3072 are perfect. At 2048 B rows (a K=1024 fp16 weight row)
+it is the same law one notch weaker: 243 GB/s at stride 2048, **123 at 4096**,
+242 at 6144, **121 at 8192**.
+
+None of this is visible to anything §2.3 measured: a K=4096 fp16 row is
+8192 B, already ≥ any `g`, so its coverage is full at every stride.
+
+#### Mechanism 2: per-request aliasing — up to 1.32x, and it needs a gather
+
+With coverage full (8192 B rows), a stride that is a multiple of 4 KB costs a
+contiguous read *nothing* and costs progressively more the more rows one
+request spans. 64 MiB touched, GB/s:
+
+| rows/req | 8192* | 8208 | 8256 | 8320 | 8448 | 8704 | 9216 | 10240 | 11264 | 12288* | 14336 | 16384* |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 (contiguous) | 243 | 238 | 238 | 240 | 242 | 243 | 244 | 244 | 243 | 242 | 243 | 243 |
+| 4 | 231 | 226 | 228 | 230 | 236 | 240 | 244 | 245 | 242 | 232 | 245 | 233 |
+| 16 | 205 | 210 | 216 | 229 | 236 | 237 | 237 | 238 | 236 | 202 | 236 | 202 |
+| 32 | 204 | 205 | 214 | 238 | 235 | 236 | 238 | 238 | 236 | 201 | 236 | 200 |
+| 64 (gather) | **182** | 198 | 230 | 237 | 230 | 233 | **239** | 237 | 238 | **174** | 238 | **180** |
+
+(* = multiple of 4 KB. Identical to within 1% at 256 MiB touched, so this is
+a property of DRAM and not of the footprint.)
+
+**The period is 4 KB, not the 2 KB §2.3 inferred.** With nine strides inside
+one rotation the sweep is unambiguous: 10240 and 14336 **are** multiples of
+2 KB and run at the full rate, while 8192, 12288 and 16384 — the multiples of
+4 KB — are the only slow strides. And recovery inside a period is complete by
++128-256 B, then flat: +16 B gets a third of it, +64 B most of it, and
+everything from +128 B to +3072 B is within noise of the best.
+
+#### The MALL behaves differently on both counts
+
+At 16 MiB touched a pure read delivers **930-965 GB/s** — above the 805 GB/s
+§0.4 measured with a read+write copy — and:
+
+- it is **immune to the gather penalty**: the 64-row gather measures 824-896
+  GB/s at *every* stride, aliased or not, i.e. a flat ~0.93x of the other
+  shapes rather than DRAM's 1.32x spread;
+- **the coverage law does not carry over to it**, and what replaces it is not
+  yet pinned down. Six cases at 16 MiB touched, all with the same bytes read:
+
+  | row | stride | coverage | span | measured |
+  |---|---|---|---|---|
+  | 1024 B | 3072 / 5120 / 9216 | 1.00 | 48-144 MiB | 780-968 (MALL) |
+  | 2048 B | 2048 | 1.00 | 16 MiB | 782-945 (MALL) |
+  | 2048 B | 4096 | 0.50 | 32 MiB | 769-924 (**MALL, no penalty**) |
+  | 1024 B | 2048 | 0.50 | 32 MiB | 353-469 (**halfway**) |
+  | 2048 B | 8192 | 0.50 | 64 MiB | 118-121 (DRAM × 0.50) |
+  | 1024 B | 4096 | 0.25 | 64 MiB | 55-61 (DRAM × 0.25) |
+
+  Read down it: **full coverage keeps the set resident however far it is
+  spread** — a 16 MiB working set scattered over a 144 MiB span still gets
+  MALL bandwidth, which is worth knowing on its own. **Partial coverage keeps
+  it only while the span is also inside 32 MiB**, and past that the DRAM law
+  reappears undiminished. The one case that is neither (1024 B rows, 2048 B
+  stride: partial coverage, 32 MiB span) lands halfway. The plausible reading
+  is that the address bits selecting a channel also select a cache slice, so
+  partial coverage concentrates the touched lines onto a fraction of the sets
+  and shrinks the effective capacity — but that is inference, and pinning it
+  needs its own experiment: a footprint sweep at a fixed bad stride, which
+  the `stride` family can already run from flags.
+
+  Note the direction of the engine consequence: **§5.1b's own "keep it under
+  32 MiB for 3.4x" premise only holds for a fully-covering access pattern.**
+  A blocked panel with a bad stride does not get the MALL either.
+
+One MALL-resident oddity is reproducible and unexplained: the *purest*
+pattern — the fully contiguous shape at zero pad, i.e. a plain linear sweep —
+measures **782 GB/s in all three row-length groups** while every
+fully-covering perturbed stride of the same shape reaches 805-966. It is the one cell where adding a
+pad helps a contiguous read, it came out at exactly 782 three times in the
+committed run, and two earlier runs put it at 794-839 twice and 942 once. If
+it is real it is a cross-wave phasing effect, which is exactly what the
+follow-up below is about. Cache-resident numbers here carry ~10% one-sided
+scatter in any case (see `strideBatches`).
+
+#### The answer to (b) retires §2.3's open question
+
+At a de-aliased stride a 64-address gather reads at **239 GB/s against a
+contiguous sweep's 244** — within 2%, over identical bytes. **Request shape
+costs essentially nothing once the stride is right.** So:
+
+- The [N,K] layout a real `Linear` weight already has is **fully usable above
+  MALL size**; there is no bandwidth reason to transpose weights at load
+  time.
+- The residue §2.3 could not explain — transposed-B still 1.6x behind
+  row-major at N=4096 *with both strides padded* — is **not** a
+  memory-request-shape effect, which was the leading candidate. §2.3 ruled
+  out request count and cache-line survival; this rules out request shape.
+  What is left is in the kernel, not the bus.
+
+Worth carrying: the *bus* penalty for an aliased stride is at most 1.32x and
+only for a gather, while §2.3's kernel lost 1.63x to it — a GEMM **amplifies**
+the bandwidth penalty rather than merely inheriting it.
+
+#### Engine rules, all three free
+
+1. **Pad every row-major tensor's leading dimension to 256 B past a multiple
+   of 4 KB.** One rule covers both mechanisms: `gcd(stride, 4096)` becomes
+   256, so coverage is full for any row of ≥256 B, and the stride is off the
+   4 KB multiple, so gathers de-alias. 256 B per row — 3% at K=4096 fp16.
+2. **Never round a row stride up to a page.** A K=1024 fp16 weight matrix
+   aligned to 4096 B reads at **half** this chip's DRAM bandwidth; 1024 B
+   rows at an 8192 B stride, a **quarter**. It is a loss a tidy allocator
+   inflicts on itself while looking like it is doing the right thing.
+3. **Do not over-pad.** Recovery is complete by +128-256 B and then flat, so
+   more pad buys nothing and costs footprint — which is what made §2.3's
+   GEMM sweep appear to *decline* past +256 B (see the correction there).
+
+Two corollaries of the coverage law worth stating on their own, because they
+decide where rule 1 actually earns its 3%:
+
+- **A densely packed tensor is never at risk.** If `stride == rowBytes` then
+  `gcd(stride, 4096) ≤ rowBytes` for *any* row length, so coverage is 1 by
+  construction. This mechanism does not exist until something introduces a
+  gap — which means it is created by padding, and only by *badly chosen*
+  padding. It is also why every kernel in the suite that streams a whole
+  dense matrix has been fine all along, W4A8 at 89% of the bus included.
+- **But any kernel that reads a *strip* of a larger tensor is exposed, and
+  that is what tiling is.** A blocked GEMM that sweeps a 1 KB-wide panel of a
+  K=4096 fp16 matrix has `rowBytes` 1024 against a stride of 8192, so
+  `gcd` is 4096 and coverage is **0.25** — a quarter of DRAM bandwidth, for a
+  kernel doing nothing wrong except tiling. Padding that matrix's stride to
+  8448 restores coverage to 1 for *every* panel width (its `gcd` is 256).
+  This is the same (rowBytes, gcd) regime as the measured 1024 B/4096 B point
+  above, not an extrapolation from it. It also makes rule 1 a prerequisite
+  for §2.4 and for the MALL-blocking half of this item rather than a 3%
+  optimisation: block a panel out of an unpadded weight matrix and the
+  blocking can cost more than it saves.
+
+**Effort**: low (done). **Value**: high (delivered) — the probe was written
+to quantify a 1.35x and found a 2-4x cliff next to it.
+
+**What this leaves open**, and it is now the sharpest item in the file: every
+shape here varies the addresses inside *one* request, and the contiguous
+shape deliberately walks along a row, so **consecutive waves are never a
+stride apart**. That is exactly the GEMV/W4A8 pattern — one wave per row,
+contiguous within it, rows 8192 B apart — and §2.3 found the cross-request
+stride was what mattered for the LDS staging loads ("what matters is the
+address stride across the concurrent loads, not which instruction issues
+them"). The 782 GB/s oddity above is a hint that it is real. One `-D` on
+`strided_read.comp` swaps the traversal so consecutive waves start on
+consecutive rows; that is the whole experiment, and W4A8's 89% of the bus
+bounds what it can be worth for decode at 1.12x.
+
+**Also still open from this item** is its original half: deliberately
+scheduling work to stay inside the 32 MiB MALL (attention K/V tiles,
+per-expert MoE weights, a blocked GEMM B-panel). Unaffected by the above,
+except that the MALL's indifference to request shape makes it slightly more
+attractive and its sensitivity to coverage slightly more dangerous.
+
+### 5.2 Heap topology, carveout size and page size
+
 Heap 1 reports 83.8 GiB device-local on a machine with 117 GiB of usable
 RAM (and heap 0 another 41.9 GiB) — the two heaps overlap the same physical
 memory, so the driver is largely handing out GTT rather than a fixed
@@ -1134,18 +1402,37 @@ kernel problem. **§2.1 is done** — the register-blocked WMMA GEMM at 25.2
 TFLOP/s, 45% of the matrix cores, so prefill is no longer the gaping hole
 either. **§2.3 is done** — the contradiction §2.1 ran into was DRAM channel
 aliasing on K-strided fragment loads, and padding the operand strides took
-the best GEMM to 28.4 TFLOP/s / 51%. What those four left behind:
+the best GEMM to 28.4 TFLOP/s / 51%. **§5.1b's strided-bandwidth probe is
+done** — the `stride` family, which measured the memory system directly,
+corrected §2.3's period from 2 KB to 4 KB, found a *larger* second effect
+(whole channels left unaddressed when a row is shorter than
+`gcd(stride, 4096)`, costing 2-4x and hitting contiguous reads too), and
+retired the request-shape explanation for §2.3's residue. What those five
+left behind:
 
 **Next:**
-- **§5.1b's strided-bandwidth probe**, which is §2.3's unfinished half. Two
-  questions, one microbenchmark: how much a channel-aliased stride costs at
-  constant footprint (the engine needs this number to pad every allocation
-  correctly, and only the 256 B/2 KB case has been measured, on one kernel),
-  and what the machine delivers for one 16-address/16-bytes-each gather
-  versus a contiguous sweep of the same bytes at the same stride. The second
-  is the shape question §2.3's residue turns on — a GEMM cannot separate it
-  from tiling — and it decides whether the [N,K] layout a real `Linear`
-  weight already has is usable above MALL size.
+- **The one access pattern §5.1b did not cover: concurrent-but-contiguous
+  requests from *different* waves at an aliased stride.** Every shape in the
+  `stride` family varies the addresses inside *one* request, and its
+  contiguous shape deliberately walks along a row, so consecutive waves are
+  never a stride apart. That is exactly the GEMV/W4A8 pattern (one wave per
+  row, contiguous within it, rows 8192 B apart) and it is what §2.3 found
+  mattered for the LDS staging loads — "what matters is the address stride
+  across the concurrent loads, not which instruction issues them". One `-D`
+  on `strided_read.comp` swaps the traversal so consecutive waves start on
+  consecutive rows; that is the whole experiment. It also *bounds* the
+  answer for decode before it is run: W4A8 is at 89% of the bus, so at most
+  1.12x is available there.
+- **The MALL's own slice structure**, which §5.1b opened and could not
+  close. Under *partial* channel coverage the 32 MiB MALL keeps a working
+  set only while its span is also inside 32 MiB, and one case lands halfway
+  — so the cliff is not a function of bytes touched alone, and "block it
+  under 32 MiB for 3.4x" is conditional on the access pattern covering the
+  channels. A footprint sweep at a fixed bad stride, which the `stride`
+  family already runs from flags (`-stridefootprints 4,8,16,24,32,48
+  -striderowbytes 1024 -stridepads 0,1024,3072`), should separate effective
+  capacity from bus width. This blocks the §5.1b/§2.4/§3.3 blocking work
+  from being sized correctly.
 - **§2.4 workgroup swizzle.** Still the cheapest structural item, but its
   premise needs restating: §2.3 pushed the AI-32 kernels to 742-887 GB/s of
   implied MALL traffic, *past* the 805 GB/s ceiling, so they are not simply
@@ -1156,10 +1443,15 @@ the best GEMM to 28.4 TFLOP/s / 51%. What those four left behind:
   operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
   unpack version stays downgraded: there is no int8 matrix-rate bonus, and
   §2.1's winner has no LDS tile to make cheaper.)
-- **Pad the strides everywhere else**, now that §2.3 has shown what it is
-  worth in GEMM. The GEMV, W4A8 and W8A8 kernels all index weights by a
-  power-of-two row stride; none of them has a stride push constant, and none
-  has been measured against a padded one.
+- **Pad the strides everywhere else** — but §5.1b has *demoted* this and
+  says why. The GEMV, W4A8 and W8A8 kernels all index weights by a
+  power-of-two row stride and none has a stride push constant, but each
+  reads its row *contiguously* within a wave and each row is at least
+  `gcd(stride, 4096)` bytes long, so both of §5.1b's mechanisms predict **no
+  effect** — which is consistent with W4A8 already reaching 89% of the bus.
+  Worth doing as a falsification test of the model rather than as an
+  expected win, and the item above is the version of it with a real
+  hypothesis behind it.
 
 **Then (cheap, and still untouched):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
@@ -1183,9 +1475,13 @@ register-blocked WMMA kernel to build its two matmuls out of.
 **Dropped or downgraded by measurement:** §2.2's Q4 unpack (no 2x int8
 matrix rate, and no LDS tile to make cheaper), §4.1 (answered: ~300 ns),
 §4.2/§4.3 (the GPU-side half of the concern is ruled out), the packed-fp16
-half of §1.3 (1.10x, not 2x), and — unexpectedly — the **LDS-staging and
-multi-wave-workgroup half of §2.1 itself**, which the 32 MiB MALL makes
-redundant on this part.
+half of §1.3 (1.10x, not 2x), the **LDS-staging and multi-wave-workgroup
+half of §2.1 itself**, which the 32 MiB MALL makes redundant on this part,
+and now **"pad the strides in the GEMV kernels"** — §5.1b's model says their
+contiguous-within-a-row requests cannot hit either mechanism, so that item
+is a falsification test rather than an expected win. Also **retired as an
+explanation**: request shape as the cause of §2.3's residue, which §5.1b
+measured at within 2% of contiguous.
 
 The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
@@ -1194,9 +1490,15 @@ decode is finished as a kernel problem and continues only as a format
 problem. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
 first by raising arithmetic intensity from 8 to 32 FLOP/byte in registers —
 with no shared memory, because the 32 MiB MALL already does that job — and
-then, for free, by moving every operand's row stride 256 B off a 2 KB
-multiple, because a power-of-two leading dimension aims all 16 addresses of
-a K-strided fragment load at one memory channel. What is left in prefill is
-request shape and traffic ordering, not tiling. And neither dispatch
-overhead nor a nonexistent int8 matrix-rate bonus is worth designing
-around.**
+then, for free, by moving every operand's row stride 256 B off a multiple of
+4 KB. That last number is the interleave rotation of sixteen 256 B channels,
+and getting it wrong costs in two independent ways: a load whose addresses
+are all one aliased stride apart aims them at a single channel (up to 1.34x
+of bandwidth, up to 1.6x through a GEMM), and a row shorter than
+`gcd(stride, 4096)` never addresses some channels at all (2x or 4x, and it
+hits a plainly contiguous read just as hard — so aligning weight rows to a
+page is the most expensive tidy-looking thing an engine could do here).
+Request *shape* is free once the stride is right, so the [N,K] layout real
+weights come in is usable as-is. What is left in prefill is traffic
+ordering, not tiling and not request shape. And neither dispatch overhead
+nor a nonexistent int8 matrix-rate bonus is worth designing around.**
