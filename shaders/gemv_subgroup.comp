@@ -1,0 +1,74 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#if defined(PRECISION_Q8) || defined(PRECISION_Q4)
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#endif
+
+// Same shape as gemv_naive.comp (y = W * x) but one workgroup — assumed to
+// be exactly one subgroup (local_size_x must equal this device's subgroup
+// size, 64) — per output row, with subgroupAdd reducing the row's partial
+// sums instead of a serial loop.
+layout(local_size_x = 64) in;
+
+#if defined(PRECISION_Q8)
+layout(binding = 0) readonly buffer W { int8_t w[]; };
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_Q4)
+layout(binding = 0) readonly buffer W { uint8_t w[]; };
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_F16)
+layout(binding = 0) readonly buffer W { float16_t w[]; };
+layout(binding = 1) readonly buffer Scales { float dummy[]; };
+#else
+layout(binding = 0) readonly buffer W { float w[]; };
+layout(binding = 1) readonly buffer Scales { float dummy[]; };
+#endif
+
+layout(binding = 2) readonly buffer X { float x[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint block;
+} pc;
+
+float loadWeight(uint row, uint n) {
+#if defined(PRECISION_Q8)
+    uint idx = row * pc.N + n;
+    uint blockIdx = row * (pc.N / pc.block) + (n / pc.block);
+    return float(w[idx]) * float(scales[blockIdx]);
+#elif defined(PRECISION_Q4)
+    uint idx = row * pc.N + n;
+    uint byteIdx = idx / 2u;
+    uint packed = uint(w[byteIdx]);
+    int nibble = (idx & 1u) == 0u ? int(packed & 0xFu) : int(packed >> 4u);
+    int signedNibble = nibble - 8;
+    uint blockIdx = row * (pc.N / pc.block) + (n / pc.block);
+    return float(signedNibble) * float(scales[blockIdx]);
+#elif defined(PRECISION_F16)
+    return float(w[row * pc.N + n]);
+#else
+    return w[row * pc.N + n];
+#endif
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) {
+        return;
+    }
+    float partial = 0.0;
+    for (uint n = gl_LocalInvocationID.x; n < pc.N; n += gl_WorkGroupSize.x) {
+        partial += loadWeight(row, n) * x[n];
+    }
+    float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        y[row] = total;
+    }
+}

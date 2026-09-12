@@ -1,0 +1,57 @@
+#version 450
+
+// Softmax over one row of N elements per workgroup: max-reduce, exp,
+// sum-reduce, normalize. Both reductions via a shared-memory tree.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint n;
+} pc;
+
+shared float partials[256];
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint base = row * pc.n;
+    uint tid = gl_LocalInvocationID.x;
+
+    float m = -3.402823e38;
+    for (uint i = tid; i < pc.n; i += gl_WorkGroupSize.x) {
+        m = max(m, x[base + i]);
+    }
+    partials[tid] = m;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] = max(partials[tid], partials[tid + stride]);
+        }
+        barrier();
+    }
+    float rowMax = partials[0];
+    barrier();
+
+    float sum = 0.0;
+    for (uint i = tid; i < pc.n; i += gl_WorkGroupSize.x) {
+        sum += exp(x[base + i] - rowMax);
+    }
+    partials[tid] = sum;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        barrier();
+    }
+    float rowSum = partials[0];
+
+    for (uint i = tid; i < pc.n; i += gl_WorkGroupSize.x) {
+        y[base + i] = exp(x[base + i] - rowMax) / rowSum;
+    }
+}

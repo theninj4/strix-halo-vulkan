@@ -1,0 +1,46 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Same as rmsnorm_shared.comp but the sum-of-squares reduction happens via
+// subgroupAdd; workgroup size must equal this device's subgroup size (64)
+// so the whole workgroup is a single subgroup.
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer Weight { float weight[]; };
+layout(binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint n;
+    float eps;
+} pc;
+
+shared float rmsShared;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint base = row * pc.n;
+    uint tid = gl_LocalInvocationID.x;
+
+    float sumSq = 0.0;
+    for (uint i = tid; i < pc.n; i += gl_WorkGroupSize.x) {
+        float v = x[base + i];
+        sumSq += v * v;
+    }
+    float total = subgroupAdd(sumSq);
+    if (subgroupElect()) {
+        rmsShared = sqrt(total / float(pc.n) + pc.eps);
+    }
+    barrier();
+
+    float rms = rmsShared;
+    for (uint i = tid; i < pc.n; i += gl_WorkGroupSize.x) {
+        y[base + i] = (x[base + i] / rms) * weight[i];
+    }
+}

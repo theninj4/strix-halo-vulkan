@@ -1,0 +1,84 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#if defined(PRECISION_Q8) || defined(PRECISION_Q4)
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#endif
+
+// C = A * B. A is MxK activations, B is KxN weights (the quantizable
+// operand), C is MxN. One thread per output element, no shared memory.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#ifdef PRECISION_F16
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+#else
+layout(binding = 0) readonly buffer A { float a[]; };
+#endif
+
+#if defined(PRECISION_Q8)
+layout(binding = 1) readonly buffer B { int8_t b[]; };
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_Q4)
+layout(binding = 1) readonly buffer B { uint8_t b[]; }; // 2 signed nibbles per byte
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_F16)
+layout(binding = 1) readonly buffer B { float16_t b[]; };
+layout(binding = 2) readonly buffer Scales { float dummy[]; };
+#else
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) readonly buffer Scales { float dummy[]; };
+#endif
+
+layout(binding = 3) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block; // quantization block size along K; unused for f32/f16
+} pc;
+
+float loadA(uint row, uint k) {
+#ifdef PRECISION_F16
+    return float(a[row * pc.K + k]);
+#else
+    return a[row * pc.K + k];
+#endif
+}
+
+float loadB(uint k, uint col) {
+#if defined(PRECISION_Q8)
+    uint idx = k * pc.N + col;
+    uint blocksPerRow = pc.N / pc.block;
+    uint blockIdx = k * blocksPerRow + (col / pc.block);
+    return float(b[idx]) * float(scales[blockIdx]);
+#elif defined(PRECISION_Q4)
+    uint idx = k * pc.N + col;
+    uint byteIdx = idx / 2u;
+    uint packed = uint(b[byteIdx]);
+    int nibble = (idx & 1u) == 0u ? int(packed & 0xFu) : int(packed >> 4u);
+    int signedNibble = nibble - 8; // symmetric range [-8, 7]
+    uint blocksPerRow = pc.N / pc.block;
+    uint blockIdx = k * blocksPerRow + (col / pc.block);
+    return float(signedNibble) * float(scales[blockIdx]);
+#elif defined(PRECISION_F16)
+    return float(b[k * pc.N + col]);
+#else
+    return b[k * pc.N + col];
+#endif
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    if (row >= pc.M || col >= pc.N) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.K; k++) {
+        acc += loadA(row, k) * loadB(k, col);
+    }
+    c[row * pc.N + col] = acc;
+}

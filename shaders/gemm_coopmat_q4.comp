@@ -1,0 +1,78 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+// C = A * B, fused single-pass: B is stored as Q4 (packed int4, 2
+// nibbles/byte, one float16 scale per block along N per row) and
+// dequantized tile-by-tile straight into shared memory, then fed to the
+// cooperative-matrix accelerator via coopMatLoad from that shared tile —
+// no separate dequant pass or fp16-sized scratch buffer needed. A is fp16.
+// TILE_M/N/K are specialization constants bound at pipeline-creation time
+// (see vk.PhysicalDevice.CooperativeMatrixShapes), same as
+// gemm_coopmat_fp16.comp.
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+layout(binding = 1) readonly buffer B { uint8_t b[]; }; // Q4 packed, 2 signed nibbles per byte
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 3) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block; // quantization block size along N, per row of B
+} pc;
+
+shared float16_t tileB[TILE_K * TILE_N];
+
+float dequantB(uint k, uint col) {
+    uint idx = k * pc.N + col;
+    uint byteIdx = idx / 2u;
+    uint packedByte = uint(b[byteIdx]);
+    int nibble = (idx & 1u) == 0u ? int(packedByte & 0xFu) : int(packedByte >> 4u);
+    int signedNibble = nibble - 8; // symmetric range [-8, 7]
+    uint blocksPerRow = pc.N / pc.block;
+    uint blockIdx = k * blocksPerRow + (col / pc.block);
+    return float(signedNibble) * float(scales[blockIdx]);
+}
+
+void main() {
+    uint tileRow = gl_WorkGroupID.y;
+    uint tileCol = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    uint numTiles = pc.K / TILE_K;
+    uint tileElems = TILE_K * TILE_N;
+    for (uint t = 0u; t < numTiles; t++) {
+        for (uint e = tid; e < tileElems; e += gl_WorkGroupSize.x) {
+            uint lk = e / TILE_N;
+            uint ln = e % TILE_N;
+            uint k = t * TILE_K + lk;
+            uint col = tileCol * TILE_N + ln;
+            tileB[e] = float16_t(dequantB(k, col));
+        }
+        barrier();
+
+        coopMatLoad(matA, a, (tileRow * TILE_M) * pc.K + t * TILE_K, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, tileB, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+        barrier();
+    }
+
+    coopMatStore(matC, c, (tileRow * TILE_M) * pc.N + tileCol * TILE_N, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}

@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+
+// C = A * B via VK_KHR_cooperative_matrix with int8 operands accumulated in
+// int32 — the theoretical best case for fully-quantized (W8A8) inference
+// throughput on this hardware, going through the same matrix-multiply
+// acceleration as gemm_coopmat_fp16.comp. TILE_M/N/K are specialization
+// constants for the same reason as there: the native shape is only known
+// at runtime via vk.PhysicalDevice.CooperativeMatrixShapes.
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A { int8_t a[]; };
+layout(binding = 1) readonly buffer B { int8_t b[]; };
+layout(binding = 2) readonly buffer Scales { float dummy[]; }; // unused, kept for a uniform 4-binding layout
+layout(binding = 3) writeonly buffer C { int32_t c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block;
+} pc;
+
+void main() {
+    uint tileRow = gl_WorkGroupID.y;
+    uint tileCol = gl_WorkGroupID.x;
+
+    coopmat<int8_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<int8_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<int32_t, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<int32_t, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0);
+
+    uint numTiles = pc.K / TILE_K;
+    for (uint t = 0u; t < numTiles; t++) {
+        coopMatLoad(matA, a, (tileRow * TILE_M) * pc.K + t * TILE_K, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, b, (t * TILE_K) * pc.N + tileCol * TILE_N, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+    }
+
+    coopMatStore(matC, c, (tileRow * TILE_M) * pc.N + tileCol * TILE_N, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}

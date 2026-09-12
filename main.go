@@ -8,6 +8,7 @@ import (
 	"log"
 
 	"strix-halo-vulkan/shaders"
+	"strix-halo-vulkan/vk"
 )
 
 const strixHaloDeviceID = 0x1586
@@ -24,7 +25,7 @@ func main() {
 }
 
 func run() error {
-	instance, err := NewInstance("strix-halo-vulkan")
+	instance, err := vk.NewInstance("strix-halo-vulkan")
 	if err != nil {
 		return err
 	}
@@ -43,7 +44,7 @@ func run() error {
 		return err
 	}
 
-	device, err := NewDevice(phys, queueFamily)
+	device, err := vk.NewDevice(phys, queueFamily, vk.DeviceFeatures{})
 	if err != nil {
 		return err
 	}
@@ -91,7 +92,7 @@ func run() error {
 
 // pickDevice prefers the Strix Halo iGPU by deviceID, falling back to the
 // first device the instance reports.
-func pickDevice(devices []PhysicalDevice) *PhysicalDevice {
+func pickDevice(devices []vk.PhysicalDevice) *vk.PhysicalDevice {
 	for i := range devices {
 		if devices[i].DeviceID == strixHaloDeviceID {
 			return &devices[i]

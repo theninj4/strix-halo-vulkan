@@ -1,0 +1,63 @@
+#version 450
+
+#ifdef PRECISION_F16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+#ifndef TILE
+#define TILE 16
+#endif
+
+// C = A * B via classic shared-memory tiling. A is MxK, B is KxN, C is MxN.
+layout(local_size_x = TILE, local_size_y = TILE) in;
+
+#ifdef PRECISION_F16
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+layout(binding = 1) readonly buffer B { float16_t b[]; };
+#else
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+#endif
+layout(binding = 2) readonly buffer Scales { float dummy[]; }; // unused, kept for a uniform 4-binding layout
+layout(binding = 3) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block;
+} pc;
+
+shared float tileA[TILE][TILE];
+shared float tileB[TILE][TILE];
+
+void main() {
+    uint row = gl_GlobalInvocationID.y;
+    uint col = gl_GlobalInvocationID.x;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+
+    float acc = 0.0;
+    uint numTiles = (pc.K + TILE - 1u) / TILE;
+    for (uint t = 0u; t < numTiles; t++) {
+        uint aCol = t * TILE + lx;
+        uint bRow = t * TILE + ly;
+#ifdef PRECISION_F16
+        tileA[ly][lx] = (row < pc.M && aCol < pc.K) ? float(a[row * pc.K + aCol]) : 0.0;
+        tileB[ly][lx] = (bRow < pc.K && col < pc.N) ? float(b[bRow * pc.N + col]) : 0.0;
+#else
+        tileA[ly][lx] = (row < pc.M && aCol < pc.K) ? a[row * pc.K + aCol] : 0.0;
+        tileB[ly][lx] = (bRow < pc.K && col < pc.N) ? b[bRow * pc.N + col] : 0.0;
+#endif
+        barrier();
+        for (uint k = 0u; k < TILE; k++) {
+            acc += tileA[ly][k] * tileB[k][lx];
+        }
+        barrier();
+    }
+
+    if (row < pc.M && col < pc.N) {
+        c[row * pc.N + col] = acc;
+    }
+}

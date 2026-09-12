@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#if defined(PRECISION_Q8) || defined(PRECISION_Q4)
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#endif
+
+// Computes y = W * x, W is MxN (row-major), x is Nx1, y is Mx1 — the shape
+// of the dominant op in autoregressive LLM decode (batch=1). One thread per
+// output row, serial dot product.
+layout(local_size_x = 64) in;
+
+#if defined(PRECISION_Q8)
+layout(binding = 0) readonly buffer W { int8_t w[]; };
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_Q4)
+layout(binding = 0) readonly buffer W { uint8_t w[]; }; // 2 signed nibbles per byte
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+#elif defined(PRECISION_F16)
+layout(binding = 0) readonly buffer W { float16_t w[]; };
+layout(binding = 1) readonly buffer Scales { float dummy[]; };
+#else
+layout(binding = 0) readonly buffer W { float w[]; };
+layout(binding = 1) readonly buffer Scales { float dummy[]; };
+#endif
+
+layout(binding = 2) readonly buffer X { float x[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint block; // quantization block size (elements per scale); unused for f32/f16
+} pc;
+
+float loadWeight(uint row, uint n) {
+#if defined(PRECISION_Q8)
+    uint idx = row * pc.N + n;
+    uint blockIdx = row * (pc.N / pc.block) + (n / pc.block);
+    return float(w[idx]) * float(scales[blockIdx]);
+#elif defined(PRECISION_Q4)
+    uint idx = row * pc.N + n;
+    uint byteIdx = idx / 2u;
+    uint packed = uint(w[byteIdx]);
+    int nibble = (idx & 1u) == 0u ? int(packed & 0xFu) : int(packed >> 4u);
+    int signedNibble = nibble - 8; // symmetric range [-8, 7]
+    uint blockIdx = row * (pc.N / pc.block) + (n / pc.block);
+    return float(signedNibble) * float(scales[blockIdx]);
+#elif defined(PRECISION_F16)
+    return float(w[row * pc.N + n]);
+#else
+    return w[row * pc.N + n];
+#endif
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.M) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint n = 0u; n < pc.N; n++) {
+        acc += loadWeight(row, n) * x[n];
+    }
+    y[row] = acc;
+}

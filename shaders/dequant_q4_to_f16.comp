@@ -1,0 +1,47 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+// Dequantizes a Q4-packed (int4, 2 nibbles/byte, symmetric [-8,7], one
+// float16 scale per block of `block` elements along a row) rows x cols
+// matrix into a plain float16 buffer. Used for the two-pass "dequant once,
+// reuse fp16 weights across every subsequent cooperative-matrix matmul"
+// strategy — real inference engines load weights once and reuse them for
+// every forward pass, so this one-time cost is worth measuring separately
+// from steady-state matmul throughput.
+layout(local_size_x = 256) in;
+
+layout(binding = 0) readonly buffer Packed { uint8_t packedData[]; };
+layout(binding = 1) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 2) writeonly buffer Out { float16_t outv[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;
+    uint cols;
+    uint block;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.rows * pc.cols;
+    if (idx >= total) {
+        return;
+    }
+
+    uint row = idx / pc.cols;
+    uint col = idx % pc.cols;
+
+    uint byteIdx = idx / 2u;
+    uint packedByte = uint(packedData[byteIdx]);
+    int nibble = (idx & 1u) == 0u ? int(packedByte & 0xFu) : int(packedByte >> 4u);
+    int signedNibble = nibble - 8;
+
+    uint blocksPerRow = pc.cols / pc.block;
+    uint blockIdx = row * blocksPerRow + (col / pc.block);
+    float scale = float(scales[blockIdx]);
+
+    outv[idx] = float16_t(float(signedNibble) * scale);
+}

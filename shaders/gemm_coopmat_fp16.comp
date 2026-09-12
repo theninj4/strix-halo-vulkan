@@ -1,0 +1,52 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// C = A * B via VK_KHR_cooperative_matrix (RDNA3.5's matrix-multiply
+// acceleration). A/B are fp16, accumulated in fp32. TILE_M/N/K are
+// specialization constants bound at pipeline-creation time to a shape this
+// device actually reports supporting (see vk.PhysicalDevice.CooperativeMatrixShapes) —
+// they can't be regular GLSL constants because the native shape is only
+// known at runtime, after this shader has already been compiled to SPIR-V.
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+
+// One workgroup == one subgroup (64 threads on this device) computes one
+// TILE_M x TILE_N tile of C.
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+layout(binding = 1) readonly buffer B { float16_t b[]; };
+layout(binding = 2) readonly buffer Scales { float dummy[]; }; // unused, kept for a uniform 4-binding layout
+layout(binding = 3) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block;
+} pc;
+
+void main() {
+    uint tileRow = gl_WorkGroupID.y;
+    uint tileCol = gl_WorkGroupID.x;
+
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> matC;
+
+    matC = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(0.0);
+
+    uint numTiles = pc.K / TILE_K;
+    for (uint t = 0u; t < numTiles; t++) {
+        coopMatLoad(matA, a, (tileRow * TILE_M) * pc.K + t * TILE_K, pc.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, b, (t * TILE_K) * pc.N + tileCol * TILE_N, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+    }
+
+    coopMatStore(matC, c, (tileRow * TILE_M) * pc.N + tileCol * TILE_N, pc.N, gl_CooperativeMatrixLayoutRowMajor);
+}
