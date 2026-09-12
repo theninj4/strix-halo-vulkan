@@ -64,6 +64,16 @@ func float16ToFloat32(h uint16) float32 {
 	return math.Float32frombits(sign | (uint32(exp) << 23) | (mant << 13))
 }
 
+// float32SliceToBytes reinterprets fp32 values as their little-endian byte
+// representation, for buffers a shader reads as plain `float`.
+func float32SliceToBytes(v []float32) []byte {
+	out := make([]byte, len(v)*4)
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(f))
+	}
+	return out
+}
+
 func float16SliceToBytes(v []uint16) []byte {
 	out := make([]byte, len(v)*2)
 	for i, x := range v {

@@ -66,7 +66,7 @@ func runCopyCase(dev *vk.Device, shaderMod *vk.ShaderModule, n int, warmup, iter
 		}
 	}
 
-	ns, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -75,6 +75,7 @@ func runCopyCase(dev *vk.Device, shaderMod *vk.ShaderModule, n int, warmup, iter
 	return Result{
 		Op: "bandwidth", Variant: "copy", Size: n,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GBPS:      bytesMoved / (ns / 1e9) / 1e9,
 	}, nil
 }

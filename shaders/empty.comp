@@ -1,0 +1,21 @@
+#version 450
+
+// Does nothing measurable: isolates the per-dispatch cost (command-buffer
+// launch + the pipeline barrier bench.TimeDispatch puts between iterations)
+// from any actual work, so that floor can be subtracted from — or at least
+// compared against — every other kernel's time. The store is guarded on a
+// push constant the host always sets to 0, so no invocation ever writes,
+// but the compiler cannot prove that and eliminate the shader.
+layout(local_size_x = 64) in;
+
+layout(binding = 0) writeonly buffer Out { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint writeFlag;
+} pc;
+
+void main() {
+    if (pc.writeFlag != 0u) {
+        dst[gl_GlobalInvocationID.x] = pc.writeFlag;
+    }
+}

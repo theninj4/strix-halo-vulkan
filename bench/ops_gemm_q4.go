@@ -84,7 +84,7 @@ func runGEMMCoopMatQ4TwoPass(dev *vk.Device, phys *vk.PhysicalDevice, sizes []in
 		dequantPC := newPC().U32(uint32(K)).U32(uint32(N)).U32(uint32(block)).Bytes()
 		dequantGroups := groupsFor(K*N, 256)
 
-		dequantNs, err := TimeDispatch(dequantPipe, dequantGroups, 1, 1, warmup, iters, dequantPC)
+		dequantNs, dequantClocks, err := TimeDispatch(dequantPipe, dequantGroups, 1, 1, warmup, iters, dequantPC)
 		if err != nil {
 			return nil, err
 		}
@@ -93,6 +93,7 @@ func runGEMMCoopMatQ4TwoPass(dev *vk.Device, phys *vk.PhysicalDevice, sizes []in
 		results = append(results, Result{
 			Op: "dequant", Variant: "q4_to_fp16", WeightFormat: "q4", BlockSize: block, Size: n,
 			NsPerIter: dequantNs,
+			Clocks:    dequantClocks,
 			GBPS:      dequantBytes / (dequantNs / 1e9) / 1e9,
 		})
 
@@ -131,7 +132,7 @@ func runGEMMCoopMatQ4TwoPass(dev *vk.Device, phys *vk.PhysicalDevice, sizes []in
 		pc := gemmPushConstants(M, N, K, 0)
 		groupsX, groupsY := uint32(N/shape.N), uint32(M/shape.M)
 
-		ns, err := TimeDispatch(coopPipe, groupsX, groupsY, 1, warmup, iters, pc)
+		ns, clocks, err := TimeDispatch(coopPipe, groupsX, groupsY, 1, warmup, iters, pc)
 		if err != nil {
 			return nil, err
 		}
@@ -140,6 +141,7 @@ func runGEMMCoopMatQ4TwoPass(dev *vk.Device, phys *vk.PhysicalDevice, sizes []in
 		results = append(results, Result{
 			Op: "gemm", Variant: "coopmat_dequant", WeightFormat: "q4", BlockSize: block, Size: n,
 			NsPerIter: ns,
+			Clocks:    clocks,
 			GFLOPS:    flops / (ns / 1e9) / 1e9,
 		})
 
@@ -428,7 +430,7 @@ func timeCoopMatQ4Fused(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatSh
 	pc := gemmPushConstants(M, N, K, block)
 	groupsX, groupsY := uint32(N/shape.N), uint32(M/shape.M)
 
-	ns, err := TimeDispatch(b.pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(b.pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -437,6 +439,7 @@ func timeCoopMatQ4Fused(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatSh
 	return Result{
 		Op: "gemm", Variant: "coopmat_fused", WeightFormat: "q4", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }

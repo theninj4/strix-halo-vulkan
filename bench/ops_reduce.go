@@ -150,7 +150,7 @@ func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 		return Result{}, fmt.Errorf("correctness check failed: %w", err)
 	}
 
-	ns, err := TimeDispatch(pipe, uint32(rows), 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, uint32(rows), 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -159,6 +159,7 @@ func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 	return Result{
 		Op: "rmsnorm", Variant: variant, Size: n,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GBPS:      bytesMoved / (ns / 1e9) / 1e9,
 	}, nil
 }
@@ -197,7 +198,7 @@ func runSoftmax(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 		return Result{}, fmt.Errorf("correctness check failed: %w", err)
 	}
 
-	ns, err := TimeDispatch(pipe, uint32(rows), 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, uint32(rows), 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -206,6 +207,7 @@ func runSoftmax(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 	return Result{
 		Op: "softmax", Variant: variant, Size: n,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GBPS:      bytesMoved / (ns / 1e9) / 1e9,
 	}, nil
 }

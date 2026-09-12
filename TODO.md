@@ -9,194 +9,179 @@ RADV STRIX_HALO), to figure out how to build an inference engine tuned for
 it — with a specific focus on whether ~4-bit quantized weights can be made
 to perform well.
 
-**Everything below is implemented, builds clean (`go build ./...`,
-`gofmt -l .`, `go vet ./...` all clean), and has passed its correctness
-checks against a CPU reference on real hardware.** `results.csv` (433 rows)
-is current as of this session's full sweep. Not yet committed — the
-previous commit was `a2bf6e7` (block-size follow-up); this session's W8A8 +
-tiled-Q8/Q4 work (see below) is new on top of that.
+Everything below builds clean (`go build ./...`, `gofmt -l .`,
+`go vet ./...` all clean) and has passed its correctness checks on real
+hardware. `results.csv` (549 rows) was regenerated this session with the
+new instrumentation; **every earlier number in it should be considered
+superseded**, for the reasons in the next section.
 
-### This session: bonus item 3 from the prior TODO — W8A8 + tiled Q8/Q4
+Two documents carry the analysis: **`IDEAS.md`** is the prioritised
+experiment backlog (~30 items, each with hypothesis / change / expected
+gain / how to measure, and marked up with what has since been measured).
+**`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-Picked up "Next steps" item 3 (scoped-out bonus items). Both sub-items are
-now done, plus a real bug fix found along the way:
+### This session: the §0 "measurement validity" block from IDEAS.md
 
-- **Bug fix**: `vk/shim.c`'s `shim_create_device` built the
-  `VkPhysicalDeviceShaderIntegerDotProductFeatures` struct into the
-  `pNext` chain and set `shaderIntegerDotProduct` on it, but never added
-  `VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME` to the enabled
-  extensions list — required since this instance targets Vulkan 1.2 (the
-  feature/extension was only promoted to core in 1.3). The feature was
-  being silently requested-but-not-actually-enabled. Fixed by adding it
-  alongside the existing coopMatrix extension request.
-- **W8A8 GEMV/GEMM** (`shaders/gemv_w8a8.comp`, `shaders/gemm_w8a8.comp`,
-  `bench/ops_w8a8.go`): both weights and activations quantized to int8,
-  reduced via `VK_KHR_shader_integer_dot_product`'s `dotPacked4x8EXT` —
-  RDNA's `V_DOT4_I32_I8`, one instruction for 4 int8 MACs — instead of the
-  existing Q8 path's dequantize-then-float-multiply. Both operands are
-  stored as plain packed-`uint32` buffers (4 signed int8 lanes per word,
-  the same byte layout `quantizeQ8` already produces — no new packing code
-  needed, no 8-bit-storage extension needed since nothing is read back as
-  `int8_t`). GEMV uses subgroup reduction (compared directly against the
-  existing subgroup champion); GEMM uses a naive one-thread-per-element
-  kernel — not pitted against the coopmat variants, which go through a
-  completely different hardware path already covered by
-  `gemm_coopmat_int8.comp`. GEMM's weight operand is stored **transposed**
-  (`[N,K]` instead of `[K,N]`) so a column's K-values are contiguous and
-  packable — exactly how a real engine stores a `Linear` layer's weight
-  (`[out_features, in_features]`), not a benchmark-only contrivance.
-  Gated on `PhysicalDevice.SupportedFeatures().IntegerDotProduct`, skipped
-  with a message if unsupported (same pattern as the coopmat checks).
-- **Q8/Q4 for tiled GEMM** (`shaders/gemm_tiled.comp`): extended with the
-  same `PRECISION_Q8`/`PRECISION_Q4` block-dequant-into-shared-memory
-  scheme `gemm_naive.comp` already used — B is dequantized once per tile
-  fill, the inner product loop is unchanged regardless of weight format.
-  Closes the gap where only naive GEMM had Q4.
+Previous session produced `IDEAS.md`. This session implemented its §0 —
+the work that had to happen before optimising against any of the existing
+numbers — and it changed several answers.
 
-**Results, both genuinely surprising:**
+**New code:**
+- `shaders/alu_peak.comp` (5 variants: fp32 FMA, packed-fp16 FMA,
+  `dotPacked4x8AccSatEXT`, WMMA fp16, WMMA int8) + `bench/ops_peak.go` —
+  the `peak` family. Operands are register-resident before the loop and
+  each iteration feeds the next accumulator, so the timed loop touches no
+  memory and cannot be hoisted; 4-8 independent accumulator chains hide
+  instruction latency. This establishes the *measured* ceilings every other
+  kernel should be judged against.
+- `shaders/empty.comp` + `bench/ops_overhead.go` — the `overhead` family:
+  dispatch + pipeline-barrier cost with no work.
+- `bench/ops_gemv_cold.go` — the `gemv_cold` family: decode-shape GEMV
+  against weight matrices several times the last-level cache, swept by
+  fp16-equivalent footprint so every format in a row holds the same number
+  of weights. Fills buffers with cheap deterministic patterns rather than
+  quantizing float32 weights (which would be gigabytes at these sizes) and
+  deliberately skips the CPU reference, which `RunGEMV` already does at
+  small sizes — only a cheap output sanity check runs.
+- `bench/sysmon.go` — clock/power instrumentation. Every `Result` now
+  carries mean/min/max sclk and package power for its timed batch (four new
+  CSV columns plus a `detail` column), and `TimeDispatch` drives the GPU
+  with ALU-heavy work before each measurement until sclk reaches 97% of the
+  advertised maximum. **Closed-loop, not a fixed duration** — a first
+  attempt with a fixed 200ms warmup still left expensive cases measured
+  mid-ramp at 1068-2400 MHz while cheap ones ran at 2900.
+- `cmd/bench`: new families registered, plus `-coldfootprints`, `-coldn`,
+  `-warmclock`, `-clocksample`, `-cus`; `-bwsizes` now defaults to 12
+  points from a 2MB to a 512MB footprint instead of 4.
 
-- **New GEMV decode champion: subgroup W8A8, ~1020 GFLOP/s at N=4096**
-  (block=128) — **~2.5-2.6x the previous champion**, subgroup Q4 at ~398
-  GFLOP/s. Block-size effect is noisy here (994/903/1020/690/1012/1013
-  GFLOP/s at blocks 32/64/128/256/512/1024) rather than the clean
-  monotonic trend seen in the coopmat-fused-Q4 case — worth another look
-  if this becomes the production path, but even the worst block (690)
-  beats every non-W8A8 GEMV format measured.
-- **Naive W8A8 GEMM is extremely block-size-sensitive**: 454 GFLOP/s at
-  block=32 climbing to 1421 GFLOP/s at block=1024 at N=4096 (~3.1x) —
-  same "fewer scale-lookups per coarser block" story as the coopmat-fused
-  Q4 finding, but on a kernel with no shared-memory tiling at all. At its
-  best block, naive W8A8 (1421) beats every other *naive* GEMM format by
-  1.7-3x (naive fp16 825, naive q8/q4 445-536) and gets within ~13% of
-  *tiled* fp32 (1623) — the packed-dot instruction alone recovers most of
-  what tiling buys elsewhere.
-- **Tiled Q8/Q4 GEMM lands right where expected**: 2400-2620 GFLOP/s at
-  N=4096 across all block sizes (flat — block size barely matters here,
-  unlike naive W8A8 or coopmat-fused Q4, because the dequant happens once
-  per shared-memory tile-fill regardless of block granularity), matching
-  tiled fp32's 1623-2757 fp16 range and confirming quantized weights carry
-  no penalty once tiled — same story tiled already told for fp32 vs fp16.
+**Measured hardware ceilings** (40 CUs at 2900 MHz), the main deliverable:
 
-**This changes the "Working conclusion" below**: W8A8 (packed dot-product,
-not coopmat) is now the recommended decode-shape GEMV path, not Q4.
+| ceiling | measured | ops/clk/CU | best real kernel | utilisation |
+|---|---|---|---|---|
+| DRAM bandwidth | 236 GB/s | — | 236 GB/s | ~100% |
+| MALL (32 MiB) | ~805 GB/s | — | ~805 GB/s | ~100% |
+| fp32 FMA | 22.9 TFLOP/s | 198 | 2.76 TFLOP/s | ~12% |
+| packed fp16 FMA | 25.3 TFLOP/s | 218 | unused | — |
+| `dotPacked4x8` | 54.0 TOP/s | 465 | 2.2 TOP/s | ~4% |
+| WMMA fp16 | 55.5 TFLOP/s | 479 | 4.9 TFLOP/s | ~9% |
+| WMMA int8 | 55.7 TOP/s | 480 | 4.7 TOP/s | ~8% |
 
-### What got built
+**Five findings that change prior conclusions:**
 
-- **`vk/`** — the engine, moved out of `package main` so `cmd/bench` can
-  import it too. Extended well beyond the original PoC: optional device
-  features (fp16, int8, integer dot-product, cooperative-matrix) negotiated
-  at `NewDevice`, N-buffer pipelines with push constants and specialization
-  constants (`Device.NewPipeline`/`vk.PipelineSpec`), GPU-timestamp-based
-  timing (`ComputePipeline.DispatchTimed`), buffer allocation now prefers
-  this APU's `DEVICE_LOCAL|HOST_VISIBLE` unified-memory type,
-  `PhysicalDevice.CooperativeMatrixShapes()` queries which MxNxK/type/scope
-  combos `VK_KHR_cooperative_matrix` actually supports here (discovered:
-  16x16x16, subgroup scope, both fp16→fp32 and int8→int32).
-- **`shaders/`** — 17 `.comp` sources compiling to 30 SPIR-V variants
-  (precision/tile variants generated via `glslc -D`, not duplicated GLSL):
-  bandwidth baseline, elementwise/relu, GEMV (naive/subgroup ×
-  fp32/fp16/q8/q4, plus a subgroup W8A8 variant), GEMM (naive/tiled ×
-  fp32/fp16/q8/q4, cooperative-matrix fp16/int8/q4, plus a naive W8A8
-  variant), RMSNorm/softmax (shared-memory/subgroup reduction), and a
-  standalone Q4→fp16 dequant kernel. W8A8 (both operands int8) reduces via
-  `VK_KHR_shader_integer_dot_product`'s `dotPacked4x8EXT` instead of
-  dequant-and-multiply — see this session's notes above.
+1. **WMMA int8 is exactly as fast as WMMA fp16 here — not 2x.** 479 vs 480
+   ops/clk/CU. The discrete-RDNA3 assumption that int8 matrix throughput
+   doubles does not hold for RDNA3.5. The apparent 2x in the old data
+   (`coopmat,q8` 9.6 TOPS vs `coopmat,fp16` 4.4 TFLOP/s at N=512) was a
+   *memory* effect — int8 reads half the bytes and both kernels are
+   memory-bound. This removes the main reason to write a W4A8 coopmat
+   kernel (IDEAS §2.2, downgraded).
+2. **Packed fp16 FMA is only 1.10x scalar fp32 FMA**, not the 2x the packed
+   ALU should give. Needs an ISA dump to find out whether `v_pk_fma_f16` is
+   even being emitted (IDEAS §6.1).
+3. **The DVFS artefacts were real and large.** With warming,
+   `gemv,subgroup,w8a8,block=128,N=1024` went 190 → **522** GFLOP/s,
+   `gemv,subgroup,q4,block=128,N=2048` went 135 → **401**, and
+   `bandwidth,copy` at 1M elements went 262 → **775** GB/s. Both GEMV
+   sweeps are now monotonic in size. **The previous session's "the W8A8
+   GEMV block-size effect is noisy rather than a clean trend" was this, not
+   the kernel** — block size now barely matters anywhere in GEMV.
+4. **Per-dispatch overhead is ~300 ns**, plus ~0.7 ns per workgroup
+   scheduled — not the tens of microseconds that would have capped decode
+   throughput. ~500 dispatches per token is under 1% of a ~20 ms token, so
+   kernel fusion is justified by DRAM round-trips, not launch cost. (This
+   measures dispatch + barrier *inside* a command buffer; CPU-side
+   `vkQueueSubmit` + fence wait is still unmeasured.)
+5. **The cache cliff is exactly 32 MiB, and it is a cliff, not a slope**:
+   804 GB/s at a 32 MiB footprint, 235 GB/s at 48 MB. The in-place
+   `elementwise` sweep agrees to the element — its last fully-cached fp32
+   case is 8388608 × 4 B = exactly 32 MiB. So there is a **3.4x** bandwidth
+   prize for any working set that can be kept under 32 MiB.
+
+**The decode answer, corrected.** `gemv_cold` at a 256MB fp16-equivalent
+footprint (M=32768, N=4096), which is the regime real decode runs in:
+
+| format | bytes/weight | best achieved | DRAM-bound ceiling | % of ceiling |
+|---|---|---|---|---|
+| fp16 | 2 | 179 GFLOP/s @ 179 GB/s | 236 | 76% |
+| q8 | 1 | 232 GFLOP/s @ 122 GB/s | 464 | 50% |
+| **q4** | 0.5 | **284 GFLOP/s @ 73 GB/s** | **916** | **31%** |
+| w8a8 | 1 | 344 GFLOP/s @ 173 GB/s | 464 | 73% |
+
+- The old square sweep **overstates decode by 3.0x** (W8A8: 1033 vs 344).
+- W8A8's lead over Q4 collapses from ~2.6x to **1.2x** once weights come
+  from DRAM.
+- But the prediction that Q4 would *overtake* W8A8 was wrong, and the
+  reason is the useful part: **Q4 is ALU-bound in its nibble unpack even
+  against DRAM**, moving only 73 of 236 GB/s. Its own bandwidth ceiling is
+  916 GFLOP/s; matching W8A8's 73% efficiency would put it at ~670 —
+  **2x the current champion**. That is now the highest-value item in
+  `IDEAS.md` (§1.1, W4A8: load Q4 as `uint`, unpack 8 nibbles to two
+  packed-int8 words with mask/subtract, feed `dotPacked4x8EXT`, scale once
+  per block).
+
+### What got built (earlier sessions)
+
+- **`vk/`** — the engine: optional device features (fp16, int8, integer
+  dot-product, cooperative-matrix) negotiated at `NewDevice`, N-buffer
+  pipelines with push and specialization constants, GPU-timestamp timing
+  (`ComputePipeline.DispatchTimed`), buffer allocation preferring this
+  APU's `DEVICE_LOCAL|HOST_VISIBLE` unified memory,
+  `PhysicalDevice.CooperativeMatrixShapes()` (this device reports only
+  16x16x16, subgroup scope, fp16→fp32 and int8→int32).
+- **`shaders/`** — 19 `.comp` sources compiling to 36 SPIR-V variants
+  (precision/tile variants via `glslc -D`, not duplicated GLSL): bandwidth
+  baseline, elementwise/relu, GEMV (naive/subgroup × fp32/fp16/q8/q4 plus
+  subgroup W8A8), GEMM (naive/tiled × fp32/fp16/q8/q4, cooperative-matrix
+  fp16/int8/q4, plus naive W8A8), RMSNorm/softmax (shared/subgroup), a
+  standalone Q4→fp16 dequant kernel, and this session's ALU-peak and empty
+  kernels.
 - **`bench/`** — the harness: `bench.go` (timing + adaptive iteration
-  capping, see "GPU watchdog" below), `quant.go` (fp16 conversion with
-  correct round-to-nearest, GGML-style Q8/Q4 block quantize/dequantize),
-  `ops_*.go` (one file per op family wiring shaders + buffers + a CPU
-  correctness check to a size sweep).
-- **`cmd/bench`** — the CLI. `go run ./cmd/bench -h` for flags (`-sizes`,
-  `-bwsizes`, `-blocks`, `-warmup`, `-iters`, `-csv`, `-skip`).
+  capping), `quant.go` (fp16 conversion with round-to-nearest, GGML-style
+  Q8/Q4 block quantize/dequantize), `sysmon.go` (clock/power), `ops_*.go`
+  (one file per op family).
+- **`cmd/bench`** — the CLI (`go run ./cmd/bench -h`).
 - Original demo (`main.go`, `./strix-halo-vulkan`) still works unchanged.
 
-### Two real bugs hit and fixed along the way (worth remembering)
+### Bugs hit and fixed in earlier sessions (worth remembering)
 
 1. **GPU driver hang watchdog**: naive GEMM at N=4096 batched into 20
-   back-to-back dispatches in one command buffer took long enough to trip
-   amdgpu's TDR → `VK_ERROR_DEVICE_LOST`, which poisons the device for
-   every case still queued. Fixed in `bench.TimeDispatch`: it now probes
-   with 1 iteration first and caps any batch to ~500ms worth of iterations.
-2. **O(N³) CPU reference GEMM inside the size sweep**: `runGEMMCoopMatQ4TwoPass`
-   originally ran a full CPU-side `cpuGEMM` correctness check at *every*
-   swept size instead of once at a small size like every other variant does.
-   At N=4096 that's ~137 billion scalar float ops in pure Go — the process
-   sat at 98% CPU for 18+ minutes doing nothing but this before I caught it.
-   Fixed by moving it to a one-time `verifyCoopMatQ4TwoPass` before the
-   sweep. **If adding a new op/variant, verify once at a small fixed size,
-   never inside the sweep loop.**
-
-### Headline findings (full run: `results.csv` in the repo root, 433 rows)
-
-- **Sustained memory bandwidth: ~236 GB/s** (measured at 64MB buffers, past
-  cache effects — smaller buffers read 700+ GB/s from cache, not DRAM).
-- **GEMV (decode-shape, N=4096)**: subgroup reduction beats naive by
-  ~5-8x at every precision. Q4 was the previous champion at 399 GFLOP/s;
-  **W8A8 (packed dot-product) is now the champion at ~1020 GFLOP/s**
-  (block=128) — see this session's notes above for the full block-size
-  breakdown and its caveats.
-- **GEMM (N=4096)**: naive ~445-825 GFLOP/s depending on precision (fp16
-  fastest of the non-W8A8 naive formats, q8/q4 slowest — dequant overhead
-  dominates at this granularity), naive W8A8 445-1421 GFLOP/s depending
-  heavily on quantization block size, tiled ~1600-2760 GFLOP/s (now
-  including q8/q4, flat across block size — see this session's notes),
-  cooperative-matrix 4200-7700 GFLOP/s — coopmat is still the dominant
-  lever for GEMM, 1.5-5x over hand-tiled.
-- **The Q4 answer** (what we set out to find): dequantizing Q4→fp16 once
-  and reusing for coopmat (`coopmat_dequant`) runs at **~4170-4210 GFLOP/s
-  at N=4096 regardless of block size — indistinguishable from plain fp16
-  coopmat (4196 GFLOP/s)**, because the dequant itself is cheap (~215µs at
-  N=4096, ~200GB/s, vs. ~32.7ms for the matmul — under 1% overhead,
-  one-time per weight load). It's flat across block size because block
-  size only affects the one-time dequant pass, not the matmul that follows.
-  The single-pass fused kernel (`coopmat_fused`, dequantizes each K-tile
-  into shared memory inline, no scratch buffer) climbs hard with block
-  size and **wins outright once block ≥256: 3267 (32) → 4558 (64) → 4753
-  (128) → 4871 (256) → 4915 (512) → 4878 (1024) GFLOP/s at N=4096** —
-  beating plain fp16 coopmat (4196) *and* coopmat int8 (4705), making
-  fused Q4 at block 256-512 the single fastest GEMM variant measured on
-  this chip. Confirmed as a real, plateauing trend, not noise (see
-  resolved item below) — driven by fewer scale-lookups/branches per
-  shared-memory tile fill as blocks get coarser; it flattens (and dips
-  fractionally) past ~512, plausibly register/shared-memory pressure from
-  holding a larger per-tile scale table offsetting the win.
-
-**Working conclusion (updated this session)**: for an inference engine on
-this chip, store weights as Q4 (8x smaller than fp32) for the *matmul*
-(prefill/large-batch) path — the fused single-pass Q4 coopmat kernel with
-block size 256-512 is still the fastest GEMM variant found here (~4900
-GFLOP/s @ N=4096) — but for *decode* (the memory-bound GEMV shape that
-dominates autoregressive generation), **W8A8 via packed dot-product now
-beats Q4 by ~2.5x** (~1020 vs ~399 GFLOP/s @ N=4096) and should be the
-default there instead. Both quantization schemes trade off weight/activation
-accuracy in a real model that this benchmark doesn't measure (Q4's wider
-dynamic range per block; W8A8's dynamic activation quantization introducing
-its own error) — worth validating against a real model's perplexity before
-committing either into production. If small Q4 blocks (32-64) are needed
-for matmul accuracy, the two-pass dequant-once approach is the better
-choice there since it's block-size-agnostic (~4200 GFLOP/s regardless).
+   back-to-back dispatches took long enough to trip amdgpu's TDR →
+   `VK_ERROR_DEVICE_LOST`, which poisons the device for every case still
+   queued. `bench.TimeDispatch` now probes with 1 iteration and caps any
+   batch to ~500ms worth.
+2. **O(N³) CPU reference GEMM inside the size sweep** sat at 98% CPU for
+   18+ minutes at N=4096. **If adding a new op/variant, verify once at a
+   small fixed size, never inside the sweep loop.**
+3. **`VK_KHR_shader_integer_dot_product` was requested but never enabled**:
+   `vk/shim.c`'s `shim_create_device` built the feature struct into the
+   `pNext` chain but never added the extension name to the enabled list
+   (required since the instance targets Vulkan 1.2, where it is not yet
+   core). Fixed.
 
 ## Next steps (pick up here)
 
-1. ~~Investigate the fused-kernel block-size effect~~ **Done.** Real,
-   plateauing trend, not noise — see headline findings above.
-2. ~~Scoped-out bonus items: W8A8 GEMV/GEMM, Q8/Q4 tiled GEMM~~ **Done this
-   session** — see the notes at the top of this file. Also fixed a real
-   bug along the way: `VK_KHR_shader_integer_dot_product` was queried and
-   requested via the feature struct but never actually enabled as a device
-   extension (`vk/shim.c`).
-3. `results.csv` in the repo root is current as of this session's full
-   sweep (433 rows; re-run via
-   `go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv`).
-   Re-run again if shaders/harness change before the next session.
-4. The W8A8 GEMV block-size effect (994/903/1020/690/1012/1013 GFLOP/s
-   across blocks 32-1024) is noisy rather than a clean trend — worth
-   investigating if W8A8 GEMV becomes the production decode path, same way
-   the coopmat-fused-Q4 block effect got investigated and confirmed real
-   last session.
-5. Consider a visual report/dashboard from the CSV (offered earlier, not
-   done) — with W8A8 now in the mix this is probably the right next
-   deliverable if the user wants one.
-6. Not yet committed to git — the last commit was `a2bf6e7`. Commit this
-   session's work (shim.c fix, new shaders, bench harness, README/TODO,
-   results.csv) if the user wants a commit.
+`IDEAS.md` has the full backlog with its "Suggested order of attack"
+section updated for what §0 found. In short:
+
+1. **IDEAS §1.1 — W4A8 GEMV.** The highest-value item: a measured 2x on
+   decode, from closing Q4's 31%-of-bandwidth-ceiling gap.
+2. **IDEAS §2.1 — register-blocked coopmat GEMM.** 9% of a measured 55.5
+   TFLOP/s, with 8 FLOP/byte of arithmetic intensity where 235 is needed.
+   Largest absolute gain on the chip. Note the occupancy floor §0.1 found:
+   **WMMA needs 2 waves per CU** for full rate (27.9 TFLOP/s at 40 waves,
+   55.5 at 80), so register blocking must not drop occupancy below that.
+3. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
+   and `n / pc.block` in every quantized inner loop). Cheapest real win,
+   and it is on the critical path of the kernel §1.1 rewrites.
+4. **IDEAS §6.1 — ISA dumps** (`RADV_DEBUG=asm`). Now has three specific
+   questions: is `v_pk_fma_f16` emitted (finding 2 above), is
+   `V_DOT4_I32_I8` emitted, and what are the VGPR counts that decide
+   whether §2.1's register blocking fits in 2 waves per CU.
+5. **Still open from §0**: CPU-side submit/fence cost (the half of §4.1 the
+   `overhead` family does not measure), and `-blocks` is worth re-sweeping
+   only where a block-size effect survives warming — in GEMV it does not.
+6. **Not yet committed to git.** Last commit was `b362606`. This session's
+   changes: 2 new shaders + 5 new SPIR-V variants, 4 new `bench/` files,
+   modifications to `bench.go`/`quant.go`/all `ops_*.go` (TimeDispatch now
+   returns clock stats)/`cmd/bench/main.go`/`shaders/shaders.go`, plus
+   `README.md`, `IDEAS.md` and a regenerated `results.csv`.

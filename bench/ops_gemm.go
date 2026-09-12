@@ -282,7 +282,7 @@ func timeGEMMPlain(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat s
 	pc := gemmPushConstants(M, N, K, 0)
 	groupsX, groupsY := groupsFor(N, localSize), groupsFor(M, localSize)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -291,6 +291,7 @@ func timeGEMMPlain(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat s
 	return Result{
 		Op: "gemm", Variant: variant, WeightFormat: weightFormat, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }
@@ -421,7 +422,7 @@ func timeGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize,
 	pc := gemmPushConstants(M, N, K, block)
 	groupsX, groupsY := groupsFor(N, localSize), groupsFor(M, localSize)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -430,6 +431,7 @@ func timeGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize,
 	return Result{
 		Op: "gemm", Variant: variant, WeightFormat: "q8", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }
@@ -560,7 +562,7 @@ func timeGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize,
 	pc := gemmPushConstants(M, N, K, block)
 	groupsX, groupsY := groupsFor(N, localSize), groupsFor(M, localSize)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -569,6 +571,7 @@ func timeGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize,
 	return Result{
 		Op: "gemm", Variant: variant, WeightFormat: "q4", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }
@@ -700,7 +703,7 @@ func timeCoopMatFP16(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatShape
 	pc := gemmPushConstants(M, N, K, 0)
 	groupsX, groupsY := uint32(N/shape.N), uint32(M/shape.M)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -709,6 +712,7 @@ func timeCoopMatFP16(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatShape
 	return Result{
 		Op: "gemm", Variant: "coopmat", WeightFormat: "fp16", Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }
@@ -854,7 +858,7 @@ func timeCoopMatInt8(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatShape
 	pc := gemmPushConstants(M, N, K, 0)
 	groupsX, groupsY := uint32(N/shape.N), uint32(M/shape.M)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -863,6 +867,7 @@ func timeCoopMatInt8(dev *vk.Device, mod *vk.ShaderModule, shape vk.CoopMatShape
 	return Result{
 		Op: "gemm", Variant: "coopmat", WeightFormat: "q8", Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }

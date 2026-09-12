@@ -1,0 +1,195 @@
+#version 450
+
+// Memory-free ALU/matrix-core peak microbenchmark: establishes this chip's
+// actual instruction-issue ceilings so every other kernel's GFLOP/s can be
+// read as a percentage of something measured rather than of a spec-sheet
+// figure extrapolated from discrete RDNA3 parts.
+//
+// The operands are loaded from a buffer ONCE before the loop, so the loop
+// body touches no memory at all — but each iteration's result feeds the
+// next (the accumulator is both an input and the output of every
+// multiply-add), so the compiler cannot hoist the work out of the loop or
+// strength-reduce it. ACC independent accumulator chains run interleaved to
+// hide instruction latency; without that, the measurement would report
+// latency rather than throughput.
+//
+// Modes (select with -DMODE_*):
+//   MODE_FMA      — scalar fp32 fma(), the plain vector-ALU rate
+//   MODE_PKFMA    — f16vec2 multiply-add, RDNA's packed-fp16 ALU (v_pk_fma_f16)
+//   MODE_DOT4     — dotPacked4x8AccSatEXT, the packed int8 dot (v_dot4_i32_i8)
+//   MODE_WMMA_F16 — coopMatMulAdd fp16->fp32, the matrix cores
+//   MODE_WMMA_I8  — coopMatMulAdd int8->int32, the matrix cores
+
+#if defined(MODE_PKFMA)
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+#if defined(MODE_DOT4)
+#extension GL_EXT_integer_dot_product : enable
+#endif
+
+#if defined(MODE_WMMA_F16) || defined(MODE_WMMA_I8)
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#endif
+
+#if defined(MODE_WMMA_F16)
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+#if defined(MODE_WMMA_I8)
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : enable
+#endif
+
+// Number of independent accumulator chains. More hides more latency at the
+// cost of registers; swept from the host side via separate -DACC variants.
+#ifndef ACC
+#define ACC 8
+#endif
+
+// One workgroup == one subgroup (64 lanes on this device), matching the
+// coopmat kernels: the cooperative-matrix scope is gl_ScopeSubgroup, so a
+// workgroup-per-subgroup keeps "waves in flight" equal to the dispatched
+// workgroup count.
+layout(local_size_x = 64) in;
+
+#if defined(MODE_WMMA_F16) || defined(MODE_WMMA_I8)
+// Bound at pipeline creation to a shape the device actually reports (see
+// vk.PhysicalDevice.CooperativeMatrixShapes), same as the GEMM coopmat kernels.
+layout(constant_id = 0) const uint TILE_M = 16;
+layout(constant_id = 1) const uint TILE_N = 16;
+layout(constant_id = 2) const uint TILE_K = 16;
+#endif
+
+#if defined(MODE_PKFMA) || defined(MODE_WMMA_F16)
+layout(binding = 0) readonly buffer In { float16_t src[]; };
+#elif defined(MODE_DOT4)
+layout(binding = 0) readonly buffer In { uint src[]; };
+#elif defined(MODE_WMMA_I8)
+layout(binding = 0) readonly buffer In { int8_t src[]; };
+#else
+layout(binding = 0) readonly buffer In { float src[]; };
+#endif
+
+#if defined(MODE_DOT4)
+layout(binding = 1) writeonly buffer Out { int dst[]; };
+#elif defined(MODE_WMMA_I8)
+layout(binding = 1) writeonly buffer Out { int32_t dst[]; };
+#else
+layout(binding = 1) writeonly buffer Out { float dst[]; };
+#endif
+
+layout(push_constant) uniform PC {
+    uint reps; // multiply-add issues per accumulator chain
+} pc;
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+#if defined(MODE_WMMA_F16)
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<float16_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopMatLoad(matA, src, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, src, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> acc[ACC];
+    for (int i = 0; i < ACC; i++) {
+        acc[i] = coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(float(i));
+    }
+    for (uint r = 0u; r < pc.reps; r++) {
+        for (int i = 0; i < ACC; i++) {
+            acc[i] = coopMatMulAdd(matA, matB, acc[i]);
+        }
+    }
+    coopmat<float, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> sum = acc[0];
+    for (int i = 1; i < ACC; i++) {
+        sum += acc[i];
+    }
+    coopMatStore(sum, dst, gl_WorkGroupID.x * TILE_M * TILE_N, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+#elif defined(MODE_WMMA_I8)
+    coopmat<int8_t, gl_ScopeSubgroup, TILE_M, TILE_K, gl_MatrixUseA> matA;
+    coopmat<int8_t, gl_ScopeSubgroup, TILE_K, TILE_N, gl_MatrixUseB> matB;
+    coopMatLoad(matA, src, 0, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, src, 0, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+    coopmat<int32_t, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> acc[ACC];
+    for (int i = 0; i < ACC; i++) {
+        acc[i] = coopmat<int32_t, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator>(i);
+    }
+    for (uint r = 0u; r < pc.reps; r++) {
+        for (int i = 0; i < ACC; i++) {
+            acc[i] = coopMatMulAdd(matA, matB, acc[i]);
+        }
+    }
+    coopmat<int32_t, gl_ScopeSubgroup, TILE_M, TILE_N, gl_MatrixUseAccumulator> sum = acc[0];
+    for (int i = 1; i < ACC; i++) {
+        sum += acc[i];
+    }
+    coopMatStore(sum, dst, gl_WorkGroupID.x * TILE_M * TILE_N, TILE_N, gl_CooperativeMatrixLayoutRowMajor);
+
+#elif defined(MODE_PKFMA)
+    // Written as a*b + acc rather than fma() so it compiles without relying
+    // on float16 fma() overloads; ACO fuses it into v_pk_fma_f16 either way.
+    f16vec2 a = f16vec2(src[lid], src[lid + 64u]);
+    f16vec2 b = f16vec2(src[lid + 128u], src[lid + 192u]);
+    f16vec2 acc[ACC];
+    for (int i = 0; i < ACC; i++) {
+        acc[i] = a + f16vec2(float16_t(i));
+    }
+    for (uint r = 0u; r < pc.reps; r++) {
+        for (int i = 0; i < ACC; i++) {
+            acc[i] = a * b + acc[i];
+        }
+    }
+    f16vec2 s = f16vec2(0.0hf);
+    for (int i = 0; i < ACC; i++) {
+        s += acc[i];
+    }
+    dst[gid] = float(s.x) + float(s.y);
+
+#elif defined(MODE_DOT4)
+    // The accumulating form (v_dot4_i32_i8 with its accumulator operand) is
+    // what creates the loop-carried dependency; the non-accumulating
+    // dotPacked4x8EXT would be loop-invariant and get hoisted.
+    int a = int(src[lid]);
+    int b = int(src[lid + 64u]);
+    int acc[ACC];
+    for (int i = 0; i < ACC; i++) {
+        acc[i] = i;
+    }
+    for (uint r = 0u; r < pc.reps; r++) {
+        for (int i = 0; i < ACC; i++) {
+            acc[i] = dotPacked4x8AccSatEXT(a, b, acc[i]);
+        }
+    }
+    int s = 0;
+    for (int i = 0; i < ACC; i++) {
+        s += acc[i];
+    }
+    dst[gid] = s;
+
+#else // MODE_FMA
+    float a = src[lid];
+    float b = src[lid + 64u];
+    float acc[ACC];
+    for (int i = 0; i < ACC; i++) {
+        acc[i] = a + float(i);
+    }
+    for (uint r = 0u; r < pc.reps; r++) {
+        for (int i = 0; i < ACC; i++) {
+            acc[i] = fma(a, b, acc[i]);
+        }
+    }
+    float s = 0.0;
+    for (int i = 0; i < ACC; i++) {
+        s += acc[i];
+    }
+    dst[gid] = s;
+#endif
+}

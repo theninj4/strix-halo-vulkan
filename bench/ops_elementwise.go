@@ -83,14 +83,14 @@ func runElementwiseF32(dev *vk.Device, mod *vk.ShaderModule, n int, warmup, iter
 
 	// Reset input (relu is destructive) before the timed run.
 	buf.WriteFloat32(data)
-	ns, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
 
 	bytesMoved := float64(n) * 4 * 2 // one read + one write, in place
 	return Result{Op: "elementwise", Variant: "relu", WeightFormat: "fp32", Size: n,
-		NsPerIter: ns, GBPS: bytesMoved / (ns / 1e9) / 1e9}, nil
+		NsPerIter: ns, GBPS: bytesMoved / (ns / 1e9) / 1e9, Clocks: clocks}, nil
 }
 
 func runElementwiseF16(dev *vk.Device, mod *vk.ShaderModule, n int, warmup, iters uint32) (Result, error) {
@@ -129,12 +129,12 @@ func runElementwiseF16(dev *vk.Device, mod *vk.ShaderModule, n int, warmup, iter
 	}
 
 	buf.WriteBytes(float32SliceToFloat16Bytes(data))
-	ns, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groups, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
 
 	bytesMoved := float64(n) * 2 * 2 // one read + one write, in place, fp16
 	return Result{Op: "elementwise", Variant: "relu", WeightFormat: "fp16", Size: n,
-		NsPerIter: ns, GBPS: bytesMoved / (ns / 1e9) / 1e9}, nil
+		NsPerIter: ns, GBPS: bytesMoved / (ns / 1e9) / 1e9, Clocks: clocks}, nil
 }

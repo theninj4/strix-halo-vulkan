@@ -20,6 +20,42 @@ var Double []byte
 //go:embed copy.spv
 var Copy []byte
 
+// Per-dispatch overhead floor: a shader that does nothing.
+
+//go:generate glslc --target-env=vulkan1.2 -O -o empty.spv empty.comp
+
+//go:embed empty.spv
+var Empty []byte
+
+// ALU / matrix-core peak microbenchmarks. Operands are register-resident
+// before the loop, so these measure pure instruction-issue throughput with
+// no memory traffic — the denominator for reading every other kernel's
+// GFLOP/s as a fraction of what the hardware can actually issue. ACC (the
+// number of independent accumulator chains) is baked per variant; the
+// scalar paths get 8, the coopmat paths 4 (each accumulator is a full
+// 16x16 fp32/int32 tile and so far more register-hungry).
+
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_FMA -DACC=8 -o alu_peak_fma.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_PKFMA -DACC=8 -o alu_peak_pkfma.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_DOT4 -DACC=8 -o alu_peak_dot4.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=4 -o alu_peak_wmma_f16.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_I8 -DACC=4 -o alu_peak_wmma_i8.spv alu_peak.comp
+
+//go:embed alu_peak_fma.spv
+var ALUPeakFMA []byte
+
+//go:embed alu_peak_pkfma.spv
+var ALUPeakPackedFMA []byte
+
+//go:embed alu_peak_dot4.spv
+var ALUPeakDot4 []byte
+
+//go:embed alu_peak_wmma_f16.spv
+var ALUPeakWMMAFP16 []byte
+
+//go:embed alu_peak_wmma_i8.spv
+var ALUPeakWMMAInt8 []byte
+
 // Elementwise / activation.
 
 //go:generate glslc --target-env=vulkan1.2 -O -o elementwise_f32.spv elementwise.comp

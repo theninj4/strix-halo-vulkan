@@ -204,7 +204,7 @@ func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat st
 		return Result{}, fmt.Errorf("correctness check failed: %w", err)
 	}
 
-	ns, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -214,6 +214,7 @@ func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat st
 	return Result{
 		Op: "gemv", Variant: variant, WeightFormat: weightFormat, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 		GBPS:      weightBytes / (ns / 1e9) / 1e9,
 	}, nil
@@ -270,7 +271,7 @@ func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 		return Result{}, fmt.Errorf("correctness check failed: %w", err)
 	}
 
-	ns, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -280,6 +281,7 @@ func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 	return Result{
 		Op: "gemv", Variant: variant, WeightFormat: "q8", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 		GBPS:      weightBytes / (ns / 1e9) / 1e9,
 	}, nil
@@ -336,7 +338,7 @@ func runGEMVQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 		return Result{}, fmt.Errorf("correctness check failed: %w", err)
 	}
 
-	ns, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -346,6 +348,7 @@ func runGEMVQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 	return Result{
 		Op: "gemv", Variant: variant, WeightFormat: "q4", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 		GBPS:      weightBytes / (ns / 1e9) / 1e9,
 	}, nil

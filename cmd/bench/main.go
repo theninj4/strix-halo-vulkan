@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"strix-halo-vulkan/bench"
 	"strix-halo-vulkan/vk"
@@ -21,12 +22,22 @@ const strixHaloDeviceID = 0x1586
 
 func main() {
 	sizesFlag := flag.String("sizes", "256,512,1024,2048,4096", "comma-separated matrix/vector dimensions to sweep (gemv, gemm, reductions)")
-	bwSizesFlag := flag.String("bwsizes", "1048576,4194304,16777216,67108864", "comma-separated element counts to sweep for bandwidth/elementwise (needs millions of elements to leave the dispatch-overhead-bound regime and reach steady-state memory bandwidth)")
+	// Each bandwidth/elementwise element is one fp32 read plus one fp32
+	// write, so the footprint touched per iteration is 8 bytes per element:
+	// this list runs from 2MB up to 512MB, deliberately fine-grained around
+	// this chip's ~32MB last-level cache so the cache-to-DRAM cliff can be
+	// located rather than merely straddled.
+	bwSizesFlag := flag.String("bwsizes", "262144,524288,1048576,2097152,3145728,4194304,6291456,8388608,12582912,16777216,33554432,67108864", "comma-separated element counts to sweep for bandwidth/elementwise (footprint per iteration is 8 bytes/element; needs millions of elements to leave the dispatch-overhead-bound regime and reach steady-state memory bandwidth)")
 	blocksFlag := flag.String("blocks", "32,64,128", "comma-separated quantization block sizes to sweep")
 	warmup := flag.Uint("warmup", 3, "untimed warmup dispatches before each timed measurement")
 	iters := flag.Uint("iters", 20, "back-to-back timed dispatches averaged per measurement")
 	csvPath := flag.String("csv", "", "optional path to write results as CSV")
-	skip := flag.String("skip", "", "comma-separated op families to skip (bandwidth,elementwise,gemv,gemm,reduce)")
+	skip := flag.String("skip", "", "comma-separated op families to skip (peak,overhead,bandwidth,elementwise,gemv,gemv_cold,gemm,reduce)")
+	coldFootprintsFlag := flag.String("coldfootprints", "16,64,256", "comma-separated weight footprints in MB (fp16-equivalent) for the DRAM-resident gemv_cold sweep; entries well above the ~32MB last-level cache are the ones that measure real decode")
+	coldN := flag.Int("coldn", 4096, "reduction length N for the gemv_cold sweep; its row count M is derived from each footprint")
+	warmClock := flag.Duration("warmclock", 3*time.Second, "maximum ALU-heavy warmup before each timed measurement; stops as soon as the GPU reaches its top advertised clock, so a hot GPU costs one short burst (0 disables)")
+	clockSample := flag.Duration("clocksample", time.Millisecond, "sampling period for the sclk/power counters recorded with each measurement")
+	cus := flag.Int("cus", 40, "compute-unit count, used only to express the measured peak rates as ops/clock/CU")
 	flag.Parse()
 
 	sizes, err := parseInts(*sizesFlag)
@@ -41,6 +52,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("-blocks: %v", err)
 	}
+	coldFootprints, err := parseInts(*coldFootprintsFlag)
+	if err != nil {
+		log.Fatalf("-coldfootprints: %v", err)
+	}
 	skipSet := map[string]bool{}
 	for _, s := range strings.Split(*skip, ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -48,7 +63,14 @@ func main() {
 		}
 	}
 
-	if err := run(sizes, bwSizes, blocks, uint32(*warmup), uint32(*iters), *csvPath, skipSet); err != nil {
+	cfg := config{
+		sizes: sizes, bwSizes: bwSizes, blocks: blocks,
+		coldFootprints: coldFootprints, coldN: *coldN,
+		warmup: uint32(*warmup), iters: uint32(*iters),
+		warmClock: *warmClock, clockSample: *clockSample, cus: *cus,
+		csvPath: *csvPath, skip: skipSet,
+	}
+	if err := run(cfg); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -69,7 +91,20 @@ func parseInts(s string) ([]int, error) {
 	return out, nil
 }
 
-func run(sizes, bwSizes, blocks []int, warmup, iters uint32, csvPath string, skip map[string]bool) error {
+// config is one invocation's worth of sweep parameters, gathered into a
+// struct because run's parameter list had outgrown being readable.
+type config struct {
+	sizes, bwSizes, blocks []int
+	coldFootprints         []int
+	coldN                  int
+	warmup, iters          uint32
+	warmClock, clockSample time.Duration
+	cus                    int
+	csvPath                string
+	skip                   map[string]bool
+}
+
+func run(cfg config) error {
 	instance, err := vk.NewInstance("strix-halo-bench")
 	if err != nil {
 		return err
@@ -102,11 +137,23 @@ func run(sizes, bwSizes, blocks []int, warmup, iters uint32, csvPath string, ski
 	}
 	defer dev.Destroy()
 
-	fmt.Printf("sweeping sizes=%v bwsizes=%v blocks=%v warmup=%d iters=%d\n\n", sizes, bwSizes, blocks, warmup, iters)
+	// Instrumentation is installed before any measurement: it both lifts
+	// the GPU off its idle clock ahead of each timed batch and records the
+	// clock alongside every result, so a number taken at a low clock is
+	// visible as such instead of looking like a slow kernel.
+	inst, err := bench.NewInstruments(dev, cfg.warmClock, cfg.clockSample)
+	if err != nil {
+		return err
+	}
+	defer inst.Destroy()
+	bench.SetInstruments(inst)
+
+	fmt.Printf("sweeping sizes=%v bwsizes=%v blocks=%v warmup=%d iters=%d\n", cfg.sizes, cfg.bwSizes, cfg.blocks, cfg.warmup, cfg.iters)
+	fmt.Printf("instrumentation: %s\n\n", inst.Describe())
 
 	var results []bench.Result
 	run := func(name string, fn func() ([]bench.Result, error)) error {
-		if skip[name] {
+		if cfg.skip[name] {
 			fmt.Printf("== %s (skipped) ==\n", name)
 			return nil
 		}
@@ -121,27 +168,48 @@ func run(sizes, bwSizes, blocks []int, warmup, iters uint32, csvPath string, ski
 		return nil
 	}
 
-	if err := run("bandwidth", func() ([]bench.Result, error) { return bench.RunBandwidth(dev, bwSizes, warmup, iters) }); err != nil {
+	// peak and overhead run first: they establish the ceiling and the floor
+	// that every subsequent number should be read against.
+	if err := run("peak", func() ([]bench.Result, error) { return bench.RunPeak(dev, phys, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
-	if err := run("elementwise", func() ([]bench.Result, error) { return bench.RunElementwise(dev, bwSizes, warmup, iters) }); err != nil {
+	bench.PrintPeakSummary(os.Stdout, results, cfg.cus)
+	if len(results) > 0 {
+		fmt.Println()
+	}
+	if err := run("overhead", func() ([]bench.Result, error) { return bench.RunOverhead(dev, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
-	if err := run("gemv", func() ([]bench.Result, error) { return bench.RunGEMV(dev, phys, sizes, blocks, warmup, iters) }); err != nil {
+	if err := run("bandwidth", func() ([]bench.Result, error) { return bench.RunBandwidth(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
-	if err := run("gemm", func() ([]bench.Result, error) { return bench.RunGEMM(dev, phys, sizes, blocks, warmup, iters) }); err != nil {
+	if err := run("elementwise", func() ([]bench.Result, error) { return bench.RunElementwise(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
-	if err := run("reduce", func() ([]bench.Result, error) { return bench.RunReductions(dev, sizes, warmup, iters) }); err != nil {
+	if err := run("gemv", func() ([]bench.Result, error) {
+		return bench.RunGEMV(dev, phys, cfg.sizes, cfg.blocks, cfg.warmup, cfg.iters)
+	}); err != nil {
+		return err
+	}
+	if err := run("gemv_cold", func() ([]bench.Result, error) {
+		return bench.RunGEMVCold(dev, phys, cfg.coldFootprints, cfg.coldN, cfg.blocks, cfg.warmup, cfg.iters)
+	}); err != nil {
+		return err
+	}
+	if err := run("gemm", func() ([]bench.Result, error) {
+		return bench.RunGEMM(dev, phys, cfg.sizes, cfg.blocks, cfg.warmup, cfg.iters)
+	}); err != nil {
+		return err
+	}
+	if err := run("reduce", func() ([]bench.Result, error) { return bench.RunReductions(dev, cfg.sizes, cfg.warmup, cfg.iters) }); err != nil {
 		return err
 	}
 
-	if csvPath != "" {
-		if err := bench.WriteCSV(csvPath, results); err != nil {
+	if cfg.csvPath != "" {
+		if err := bench.WriteCSV(cfg.csvPath, results); err != nil {
 			return err
 		}
-		fmt.Printf("wrote %d results to %s\n", len(results), csvPath)
+		fmt.Printf("wrote %d results to %s\n", len(results), cfg.csvPath)
 	}
 	return nil
 }

@@ -136,7 +136,7 @@ func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, block int, warmup,
 	pc := gemvW8A8PushConstants(M, N, block, xScale)
 	groupsX := uint32(M)
 
-	ns, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -146,6 +146,7 @@ func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, block int, warmup,
 	return Result{
 		Op: "gemv", Variant: "subgroup", WeightFormat: "w8a8", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 		GBPS:      weightBytes / (ns / 1e9) / 1e9,
 	}, nil
@@ -296,7 +297,7 @@ func timeGEMMW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, K, block int, warm
 	pc := gemmPushConstants(M, N, K, block)
 	groupsX, groupsY := groupsFor(N, 16), groupsFor(M, 16)
 
-	ns, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
 	if err != nil {
 		return Result{}, err
 	}
@@ -305,6 +306,7 @@ func timeGEMMW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, K, block int, warm
 	return Result{
 		Op: "gemm", Variant: "naive", WeightFormat: "w8a8", BlockSize: block, Size: N,
 		NsPerIter: ns,
+		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }

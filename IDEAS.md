@@ -1,113 +1,200 @@
 # IDEAS — experiments worth running to squeeze more out of Strix Halo
 
-Written after reviewing `TODO.md`, all 433 rows of `results.csv`, every
-shader in `shaders/`, and the device's actual reported capabilities
-(`vulkaninfo`, `/sys/class/drm/card1/device/pp_dpm_sclk`). This is a
-prioritised experiment backlog, not a plan — each item states a
-*hypothesis*, the *change*, the *expected gain*, and *how we'd know*.
+Written after reviewing `TODO.md`, every shader in `shaders/`, the full
+`results.csv`, and the device's actual reported capabilities (`vulkaninfo`,
+`/sys/class/drm/card1/device/pp_dpm_sclk`). This is a prioritised
+experiment backlog, not a plan — each item states a *hypothesis*, the
+*change*, the *expected gain*, and *how we'd know*.
+
+**§0 has since been implemented and run** (549-row `results.csv`
+regenerated with clock instrumentation). Items it confirmed, refuted, or
+re-aimed are marked **[measured]** in place rather than rewritten away, so
+the wrong predictions stay visible next to what actually happened.
 
 ## The roofline, and why it says there's a lot left on the table
 
 Hardware numbers for this part (AMD Radeon 8060S, gfx1151, 40 CU, sclk
 tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 
-| Ceiling | Theoretical | Best measured | Utilisation |
-|---|---|---|---|
-| DRAM bandwidth | 256 GB/s | **236 GB/s** (`bandwidth,copy` @64MB) | **92%** ✅ |
-| Vector FP32 FMA | ~14.8 TFLOP/s (29.7 dual-issue) | 2.76 TFLOP/s (`tiled,fp16`) | ~19% |
-| WMMA fp16→fp32 | ~59 TFLOP/s (512 FLOP/clk/CU) | 5.84 TFLOP/s (`coopmat,fp16` @N=1024) | **~10%** ❌ |
-| WMMA int8→int32 | ~119 TOPS | 9.62 TOPS (`coopmat,q8` @N=512) | **~8%** ❌ |
+> **Updated after running §0.** The ceilings below are now *measured* on
+> this chip (`go run ./cmd/bench -skip ...` → the `peak` family), not
+> extrapolated from discrete RDNA3 parts, and several §0 hypotheses turned
+> out to be wrong. Corrections are marked **[measured]** throughout.
 
-Two conclusions drive everything below:
+| Ceiling | Measured peak | Ops/clk/CU | Best real kernel | Utilisation |
+|---|---|---|---|---|
+| DRAM bandwidth | **236 GB/s** (92% of the 256 GB/s bus) | — | 236 GB/s | **~100%** ✅ |
+| MALL (32 MiB) bandwidth | **805 GB/s** | — | 805 GB/s | **~100%** ✅ |
+| Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
+| Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
+| `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | 4.9 TFLOP/s (`coopmat_fused,q4`) | **~9%** ❌ |
+| WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
-1. **DRAM bandwidth is already saturated** (92% of theoretical). No kernel
+(Real-kernel column is the best measured anywhere in `results.csv`; the
+GEMM entries are at N=4096, the `naive,w8a8` entry at N=256 where it is
+still cache-resident.)
+
+Four things in that table were not what §0 predicted:
+
+1. **WMMA int8 is exactly as fast as WMMA fp16 on this chip — not 2x.**
+   Both measure 479-480 ops/clk/CU. The discrete-RDNA3 assumption that int8
+   matrix throughput doubles does not hold for RDNA3.5 here. This falsifies
+   the original reasoning below that "int8 coopmat has 2x the hardware rate
+   yet lands at the same GFLOP/s, therefore the kernel is memory-bound" —
+   the two land together because the *hardware* rates are equal. The
+   memory-bound conclusion still stands, but now rests on the much stronger
+   direct evidence in the last column: the best GEMM kernel reaches 9% of a
+   ceiling that was measured on this very device.
+2. **WMMA fp16 hits 479 of the assumed 512 FLOP/clk/CU** — so the one
+   extrapolated figure that *was* roughly right is the fp16 WMMA peak
+   (55.5 TFLOP/s measured vs ~59 predicted).
+3. **Packed fp16 FMA is only 1.10x scalar fp32 FMA, not 2x** (218 vs 198
+   ops/clk/CU). Either `v_pk_fma_f16` isn't being emitted, or it doesn't
+   dual-issue the way fp32 does. This substantially weakens §1.3's
+   packed-fp16 argument — see the note there.
+4. **fp32 FMA reaches 198 ops/clk/CU**, above the 128 that single-issue
+   64-lane FMA allows, so RDNA3's dual-issue (VOPD) is working — at 77% of
+   the 256 it would allow. It is also *power*-limited rather than
+   issue-limited: throughput peaks at 320 waves (22.9 TFLOP/s, 118 W) and
+   then *falls* at 640 and 1280 waves (20.0 and 19.2 TFLOP/s) as package
+   power climbs to 138 W. The WMMA paths, by contrast, are flat across wave
+   count and draw only ~95-110 W at full rate — matrix-core work is both
+   2.4x faster and lower-power than scalar FMA here.
+
+One more result worth designing around: **WMMA needs 2 waves per CU to
+reach full rate.** wmma_fp16 measures 27.9 TFLOP/s at 40 waves (1/CU) and
+55.5 at 80 waves (2/CU), then stays flat to 1280. Any coopmat kernel must
+keep ≥80 workgroups resident, which also means a register-blocked kernel
+(§2.1) must not blow occupancy down to one wave per CU.
+
+Two conclusions drive everything below, both strengthened by the
+measurements:
+
+1. **DRAM bandwidth is already saturated** (236 of 256 GB/s). No kernel
    trick will beat it. So for *decode*, the only lever is **reading fewer
-   bytes per weight** — which makes the current "W8A8 beats Q4 by 2.5x"
-   conclusion suspect (see §1.1, the highest-priority item here).
-2. **The matrix cores are ~90% idle.** The coopmat kernels are nowhere near
-   an MMA-issue limit; they're memory/latency-bound because of how they're
-   written, not because of the hardware. That the int8 coopmat path (2x the
-   hardware MMA rate of fp16) lands at roughly the *same* GFLOP/s as fp16
-   (4729 vs 4200 @N=4096) is direct evidence: if MMA throughput were the
-   limit, int8 would be ~2x ahead. So for *prefill/batch*, the lever is
-   **arithmetic intensity** (§2.1).
+   bytes per weight**. The corollary is sharper than expected: see §1.1,
+   which is now backed by per-format DRAM-resident ceilings.
+2. **The matrix cores are ~91% idle.** The best GEMM kernel on this chip
+   reaches 4.9 of 55.5 TFLOP/s. The coopmat kernels are nowhere near an
+   MMA-issue limit; they are memory-bound because of how they are written
+   (8 FLOP/byte of arithmetic intensity where ~235 is needed to saturate
+   55.5 TFLOP/s at 236 GB/s), not because of the hardware. So for
+   *prefill/batch*, the lever is **arithmetic intensity** (§2.1).
 
-Caveat worth resolving first: the 512 FLOP/clk/CU WMMA figure is derived
-from RDNA3 discrete parts (7900 XTX: 122.8 TFLOP/s ÷ 96 CU ÷ 2.5 GHz), and
-RDNA3.5's WMMA may differ. §0.1 measures it directly rather than trusting
-the arithmetic.
-
----
-
-## 0. Measurement-validity work (cheap, and it gates the rest)
-
-Several existing numbers are probably not measuring what we think. Fix
-these before optimising against them.
-
-### 0.1 Establish the real MMA ceiling with a memory-free microbenchmark
-**Hypothesis**: we don't actually know this chip's peak WMMA rate, so we
-can't say how much headroom the coopmat kernels have.
-**Change**: a shader that loads one `matA`/`matB` into registers *before*
-the loop, then runs N thousand `coopMatMulAdd`s on register-resident
-operands (accumulator chain, with enough independent accumulators to hide
-latency), writing the result once at the end. Zero memory traffic in the
-loop. Same for the int8 shape and for `dotPacked4x8EXT`.
-**Expected**: a hard number for fp16 WMMA, int8 WMMA, packed-dot, and
-plain FMA rates on gfx1151 — the denominator for every other experiment.
-**Measure**: GFLOP/s vs the table above; also divide by 2.9 GHz × 40 CU to
-recover FLOP/clk/CU and compare against the 512 assumption.
-**Effort**: low. **Value**: high — it turns guesses into a roofline.
-
-### 0.2 Log GPU clock and power during the sweep
-**Hypothesis**: some results are DVFS artefacts, not kernel properties.
-The GPU idles at **636 MHz** out of 2900, and `bench.TimeDispatch` probes
-with a *single* dispatch before batching — on short kernels that probe (and
-possibly the timed batch) can land before the clocks ramp. Smoking guns in
-`results.csv`: `gemv,subgroup,w8a8,128` goes 382 → **190** → 592 GFLOP/s at
-N=512/1024/2048; `gemv,subgroup,q4,128` goes 381 → **135** → 373 at
-N=1024/2048/4096. Those dips are not plausible kernel behaviour.
-**Change**: sample `hwmon*/freq1_input` and `power1_average` (both exist
-on this card) plus `gpu_busy_percent` around each timed batch; record
-min/max sclk as CSV columns. Add a fixed pre-sweep "clock warmer" dispatch
-loop (~200ms of heavy work) and increase warmup so every case is measured
-at boost.
-**Expected**: the non-monotonic dips disappear; numbers become comparable
-across sizes. Possibly a uniform uplift on all short kernels.
-**Measure**: re-run and check monotonicity; compare pre/post GFLOP/s.
-**Effort**: low. **Value**: high — the W8A8 block-size "noise" flagged as
-TODO item 4 is very likely this, not the kernel.
-
-### 0.3 Distinguish cache-resident from DRAM-resident measurements
-**Hypothesis**: most of the interesting results are measuring the 32MB
-MALL/Infinity Cache, not DRAM, and therefore overstate real inference.
-Evidence: `bandwidth,copy` reads **908 GB/s** at 16MB and 236 GB/s at
-64MB. A 4096² fp16 weight matrix is 33.5MB, int8 16.8MB, Q4 8.4MB — so the
-GEMV sweep's weights are *entirely cache-resident* at every size, and the
-timing loop re-reads the same matrix 100s of times. `gemv,subgroup,w8a8`
-reports **518 GB/s** — more than 2x DRAM bandwidth, which is only possible
-from cache. In real decode the weights are gigabytes and every byte comes
-from DRAM, once per token.
-**Change**: add a "cold weights" GEMV/GEMM mode — allocate K weight
-matrices totalling >>32MB (say 8×64MB) and round-robin which one each
-iteration touches, so no iteration hits a warm line. Report both numbers.
-**Expected**: all GEMV variants collapse toward `bytes ÷ 236 GB/s`, and
-the ranking **reorders by bytes-per-weight**: Q4 (0.5 B/weight + scales)
-should beat W8A8 (1 B/weight) by ~2x, the opposite of the current
-conclusion.
-**Measure**: GB/s should pin at ~236 for every format; GFLOP/s should then
-be ~2x for Q4 vs Q8/W8A8 vs 4x vs fp16.
-**Effort**: medium. **Value**: **highest in this document** — it directly
-decides the weight format for the whole engine, and the current answer
-(W8A8) may be an artefact.
-
-### 0.4 Fine-grained bandwidth-vs-working-set curve
-**Change**: sweep `-bwsizes` at 2/4/8/12/16/20/24/28/32/40/48/64/128 MB
-instead of the current four points.
-**Expected**: maps the MALL cliff precisely, giving a hard budget for "how
-much of a layer's weights can stay resident" and for KV-cache sizing.
-**Effort**: trivial (a flag + a re-run). **Value**: high, informs §5.
+There is also a third, newly quantified lever: **the 32 MiB MALL delivers
+805 GB/s, 3.4x DRAM.** Anything that can be restructured to work out of a
+sub-32MiB tile — attention K/V tiles, a single quantized layer's weights,
+activations — gets 3.4x the bandwidth of anything that streams.
 
 ---
+
+## 0. Measurement-validity work — **DONE**, and it changed the answers
+
+All four items are implemented and run. The harness now measures the
+hardware's ceilings, records the clock every number was taken at, and has a
+DRAM-resident decode benchmark. Three of the four hypotheses were confirmed;
+one was wrong in an instructive way.
+
+### 0.1 Real MMA ceiling from a memory-free microbenchmark — **done** ✅
+`shaders/alu_peak.comp` + `bench/ops_peak.go`, run as the `peak` family.
+Operands are loaded into registers before the loop and each iteration feeds
+the next accumulator, so the loop touches no memory and cannot be hoisted;
+4-8 independent accumulator chains hide instruction latency. Results and
+the four surprises are in the roofline table at the top of this document.
+The headline: **fp16 and int8 WMMA are both ~55.5 T-ops/s (479-480
+ops/clk/CU), identical to each other**, and the best GEMM kernel achieves
+9% of that.
+
+### 0.2 Clock/power logging and warmup — **done** ✅, hypothesis **confirmed**
+`bench/sysmon.go`. Every `Result` now carries the mean/min/max shader clock
+and package power observed during its timed batch, in the table and in four
+new CSV columns. Before each measurement the harness drives the GPU with
+ALU-heavy work until the clock reaches 97% of the advertised maximum —
+**closed-loop rather than a fixed duration**, because the ramp time depends
+on how much host-side work (generating and quantizing weights) preceded the
+case, and a fixed 200ms warmup left the expensive cases still mid-ramp at
+1068-2400 MHz while cheap ones ran at 2900.
+
+The suspected DVFS artefacts were exactly that:
+
+| case | before | after | ratio |
+|---|---|---|---|
+| `gemv,subgroup,w8a8,block=128,N=1024` | 190 GFLOP/s | **522** | 2.75x |
+| `gemv,subgroup,q4,block=128,N=2048` | 135 GFLOP/s | **401** | 2.98x |
+| `bandwidth,copy,n=1048576` | 262 GB/s | **775** | 2.96x |
+
+Both GEMV sweeps are now monotonic in size, and the bandwidth curve is
+monotonic up to its cache cliff. Every measurement in the current
+`results.csv` was taken between 2776 and 2900 MHz. Note the third row:
+the small-buffer bandwidth anomaly was *also* clock, not the dispatch
+overhead §4.1 suspected — cache-resident bandwidth scales with core clock.
+
+### 0.3 Cache-resident vs DRAM-resident decode — **done** ✅, hypothesis **half right**
+`bench/ops_gemv_cold.go`, run as the `gemv_cold` family: the same subgroup
+GEMV kernels against weight matrices several times the 32 MiB cache, swept
+over fp16-equivalent footprints so every format in a row holds the same
+number of weights. One large matrix suffices rather than round-robining
+several — within a dispatch each weight is read exactly once, so there is
+no intra-dispatch reuse to defeat.
+
+**Confirmed: the existing headline numbers overstate decode by ~3x.**
+W8A8 GEMV reports 1033 GFLOP/s on the cache-resident square sweep and
+**344 GFLOP/s** on a 256MB weight footprint — a **3.0x** overstatement.
+
+**Wrong: the ranking did not invert.** The prediction was that Q4, reading
+half the bytes, would overtake W8A8 once DRAM-bound. It did not — W8A8 still
+wins (344 vs 284 GFLOP/s). The reason is the interesting part, and it
+*redirects* rather than weakens §1.1: **Q4 is still not bandwidth-bound even
+when DRAM-resident.** Per-format, at a 256MB fp16-equivalent footprint:
+
+| format | bytes/weight | best achieved | DRAM-bound ceiling | fraction of its ceiling |
+|---|---|---|---|---|
+| fp16 | 2 | 179 GFLOP/s @ 179 GB/s | 236 GFLOP/s | 76% |
+| q8 | 1 | 232 GFLOP/s @ 122 GB/s | 464 GFLOP/s | 50% |
+| **q4** | 0.5 | **284 GFLOP/s @ 73 GB/s** | **916 GFLOP/s** | **31%** ❌ |
+| w8a8 | 1 | 344 GFLOP/s @ 173 GB/s | 464 GFLOP/s | 73% |
+
+Block size, swept 32→1024, now barely matters in any of these (q4 varies
+267-284, w8a8 328-344) — further evidence that the old sweep's dramatic
+block-size "sensitivity" in GEMV was the clock artefact of §0.2, not a
+property of the kernels.
+
+Q4 leaves the most on the table by far: it is ALU-bound in its nibble
+unpack, moving only 74 of the available 236 GB/s. Fixing that (§1.1) should
+land it near 670-900 GFLOP/s — **2-2.7x the current W8A8 champion** — which
+is a stronger case for W4A8 than the original bytes-only argument, and a
+quantified one. Secondary finding: *nothing* reaches 236 GB/s (best is 75%),
+so there is another ~25% in the GEMV memory access pattern itself (§1.3,
+§1.4).
+
+### 0.4 Fine-grained bandwidth-vs-working-set curve — **done** ✅
+`-bwsizes` now defaults to 12 points from a 2MB to a 512MB footprint. The
+cache cliff is not just straddled but pinned exactly:
+
+| footprint | copy GB/s |
+|---|---|
+| 2 / 4 / 8 MB | 673 / 740 / 775 |
+| 16 / 24 / **32 MiB** | 797 / 802 / **804** |
+| **48 MB** | **235** ← cliff |
+| 64 / 128 / 256 / 512 MB | 237 / 235 / 237 / 236 |
+
+The in-place `elementwise` sweep agrees to the element: its last
+fully-cached fp32 case is 8388608 elements × 4 B = **exactly 32 MiB**, at
+809 GB/s, and the next point (50 MB) falls to 236. So the MALL is 32 MiB,
+delivers **~805 GB/s**, and DRAM delivers 236 GB/s — a **3.4x** cliff, and a
+hard budget for any "keep it resident" strategy (§5).
+
+### 0.5 Per-dispatch overhead — **done** ✅ (not originally in §0; see §4.1)
+Added as the `overhead` family while the plumbing was open, because §0.4's
+small-size anomaly needed it to be ruled out. An empty dispatch costs
+**~300 ns**, plus ~0.7 ns per workgroup scheduled (359 ns at 1 workgroup,
+689 ns at 640, 45.5 µs at 65536). This **falsifies the §4.1 worry**: at
+~500 dispatches per token, launch overhead is ~0.15 ms against a ~20 ms
+token — negligible. Fusion (§3.1-3.2) is justified by DRAM round-trips, not
+by launch cost. Caveat: this measures dispatch + pipeline barrier *within*
+one command buffer, which is what the harness does; it does not measure
+CPU-side `vkQueueSubmit` + fence wait, so §4.2's question is still open.
 
 ## 1. Decode path (GEMV / memory-bound) — the tok/s lever
 
@@ -115,22 +202,29 @@ much of a layer's weights can stay resident" and for KV-cache sizing.
 **Hypothesis**: the best decode kernel reads 4-bit weights *and* uses the
 packed-int8 dot instruction. Today those are mutually exclusive — Q4 goes
 through the float dequant path and W8A8 reads 8-bit weights.
-Supporting evidence: Q4 GEMV achieves only **96–112 GB/s** while W8A8 hits
-518 GB/s — Q4 is nowhere near any bandwidth limit, it's **ALU-bound in the
-unpack**, reading one `uint8_t` at a time and doing a float multiply per
-nibble (`gemv_subgroup.comp:46-53`).
+
+**[measured]** §0.3 turned this from an inference into a quantity. With
+weights held DRAM-resident, Q4 GEMV moves only **74 of the available 236
+GB/s — 31% of its own bandwidth ceiling**, while W8A8 reaches 73%. Q4 is
+not bandwidth-bound at all; it is **ALU-bound in the unpack**, reading one
+`uint8_t` at a time and doing a float multiply per nibble
+(`gemv_subgroup.comp:46-53`). The bytes are already being saved; the kernel
+just cannot consume them fast enough to benefit.
 **Change**: new `gemv_w4a8.comp`. Load weights as `uint` (8 nibbles/word),
 unpack to two packed-int8 words with bit tricks — roughly
 `lo = (v & 0x0F0F0F0F) - 0x08080808`, `hi = ((v >> 4) & 0x0F0F0F0F) -
 0x08080808` (~6 ALU ops for 8 weights) — then two `dotPacked4x8EXT` calls.
 Accumulate in **int32 per block** and apply the scale once per block, not
 per element.
-**Expected**: half the weight bytes of W8A8 at comparable ALU cost. Under
-DRAM-bound conditions (§0.3) that's ~**2x W8A8**; even cache-resident it
-should beat Q4's current 400 GFLOP/s by 2x+.
-**Measure**: GB/s should approach W8A8's, GFLOP/s should roughly double.
-**Effort**: medium. **Value**: very high — this is plausibly *the*
-production decode kernel.
+**Expected**: Q4's DRAM-bound ceiling is **916 GFLOP/s**. Reaching W8A8's
+73% bandwidth efficiency would put it at ~670 GFLOP/s — **2x the current
+W8A8 champion (344)** — and reaching fp16's 75% would be ~690. Even a
+partial fix that gets Q4 from 31% to 50% wins outright.
+**Measure**: `gemv_cold` GB/s for q4 should climb from 74 toward 170+; the
+cache-resident `gemv` row is the wrong one to watch, since it was never
+bandwidth-limited.
+**Effort**: medium. **Value**: **highest remaining item in this document** —
+the only decode change with a measured 2x behind it.
 
 ### 1.2 Kill the runtime integer divisions in the inner loop
 **Hypothesis**: every quantized kernel does **two runtime integer
@@ -162,9 +256,17 @@ per instruction. `gemv_w8a8.comp:52` loads one `uint` per lane per step;
 step; for fp16 use `f16vec2`/`f16vec4` and keep the math in packed fp16
 (`v_pk_fma_f16`, 2 FLOP/lane/clk) rather than converting to fp32 scalar.
 **Expected**: 1.3-2x on the ALU-bound variants; smaller on already
-bandwidth-saturated ones. Also engages RDNA3's packed-fp16 ALU which the
-current code never touches.
-**Effort**: low-medium. **Value**: high.
+bandwidth-saturated ones.
+**[measured] The packed-fp16 half of this argument does not hold.** §0.1
+measures packed f16vec2 multiply-add at 25.3 TFLOP/s against scalar fp32
+FMA's 22.9 — **1.10x, not the 2x the packed ALU should give** (218 vs 198
+ops/clk/CU). So "switch the math to f16vec2" is worth ~10%, not 2x. Worth
+one ISA dump (§6.1) to find out whether `v_pk_fma_f16` is even being
+emitted before investing here. The *load* half of the idea stands on its
+own: wider loads reduce memory-instruction issue regardless of what ALU
+consumes them, and §0.3 showed every GEMV variant stuck at 50-75% of its
+bandwidth ceiling.
+**Effort**: low-medium. **Value**: medium (downgraded from high).
 
 ### 1.4 Multiple output rows per workgroup
 **Hypothesis**: one workgroup (one wave64) per output row means the
@@ -174,14 +276,20 @@ each wave does a full `subgroupAdd` tree for a single scalar output.
 registers/LDS once and reusing it across rows; emit R results per
 `subgroupElect`.
 **Expected**: R-fold reduction in activation traffic and 1/R the reduction
-overhead. Modest when cache-resident, more once §0.3 makes traffic honest.
+overhead. **[measured]** §0.3 gives this a target: no GEMV format exceeds
+75% of its DRAM bandwidth ceiling, so ~25-50% is sitting in the access
+pattern, and this plus §1.3 are the two candidates for it.
 **Effort**: medium. **Value**: medium.
 
 ### 1.5 Find the GEMV→coopmat crossover for small batch
 **Hypothesis**: for M=2..16 (speculative decoding, beam search, batched
 serving) padding M up to 16 and using the WMMA path beats M separate GEMV
 dispatches, even though up to 15/16 of the MMA work is wasted — because
-the MMA path has ~10x the throughput.
+the MMA path has far more throughput available (**[measured]** 55.5
+TFLOP/s of WMMA ceiling, and even today's unoptimised coopmat GEMM does
+4.9 TFLOP/s against the best DRAM-resident GEMV's 0.34). §0.5's ~300 ns dispatch cost
+also means the "M separate dispatches" alternative is not penalised by
+launch overhead, so this is a pure work-efficiency question.
 **Change**: benchmark `gemm_coopmat_*` and `gemv_*` at M = 1,2,4,8,16,32,64
 with K=N=4096, and find the crossover.
 **Expected**: a concrete batch threshold for the engine's scheduler to
@@ -211,9 +319,16 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 One workgroup = one wave64 = **one** 16×16 accumulator, and the K-loop
 loads A and B straight from global memory every iteration
 (`gemm_coopmat_fp16.comp:46-48`). Arithmetic intensity: 2·16·16·K flops per
-(16K + 16K)·2 bytes = **8 FLOP/byte**. Saturating ~59 TFLOP/s at 236 GB/s
-needs ~250 FLOP/byte. The measured 4.2-5.8 TFLOP/s is exactly what an
-8 FLOP/byte kernel gets with MALL help — the MMA units are starved.
+(16K + 16K)·2 bytes = **8 FLOP/byte**. **[measured]** Saturating the
+measured 55.5 TFLOP/s at 236 GB/s needs **235 FLOP/byte**; the kernel
+supplies 8. The measured 4.2-4.9 TFLOP/s is exactly what an 8 FLOP/byte
+kernel gets with MALL help — the MMA units are starved.
+
+The original supporting argument for this (int8 coopmat having 2x the
+hardware rate yet matching fp16) was **wrong**: §0.1 shows fp16 and int8
+WMMA are the same speed here. But the conclusion is now on far firmer
+ground, because the ceiling is no longer extrapolated: **4.9 of 55.5
+TFLOP/s, measured on this device, is 9%.**
 **Change**: the standard tiled-WMMA structure:
 - 4 waves per workgroup (256 threads), workgroup tile 128×128.
 - Each wave holds a **2×4 or 4×4 grid of accumulator coopmats** (8-16
@@ -223,29 +338,35 @@ needs ~250 FLOP/byte. The measured 4.2-5.8 TFLOP/s is exactly what an
   — so global traffic is amortised across all 4 waves and all accumulators.
 - Double-buffer the LDS slabs so there's one `barrier()` per K-step
   instead of the current two, and loads overlap MMA.
-**Expected**: **2-4x** over the current 4.2-5.0 TFLOP/s, i.e. 10-20
-TFLOP/s. This is the single largest absolute gain available on the chip.
-**Measure**: GFLOP/s at N=4096 vs §0.1's ceiling; expect utilisation to go
-from ~10% to 25-40%.
+**Expected**: **2-4x** over the current 4.2-4.9 TFLOP/s, i.e. 10-20
+TFLOP/s against a 55.5 TFLOP/s ceiling. This is the single largest absolute
+gain available on the chip.
+**Measure**: GFLOP/s at N=4096 as a fraction of the `peak wmma_fp16` row;
+expect utilisation to go from 9% to 25-40%. **[measured] Occupancy
+constraint**: §0.1 found WMMA needs **2 waves per CU** for full rate (27.9
+TFLOP/s at 40 waves, 55.5 at 80). A register-blocked kernel must therefore
+keep ≥80 workgroups resident — check VGPR counts (§6.1) rather than
+assuming, since 8-16 accumulators per wave is exactly the kind of change
+that drops occupancy to one wave per CU and gives back half the peak.
 **Effort**: high (this is a real GEMM kernel). **Value**: highest for
 prefill, image generation, and the Parakeet encoder.
 
-### 2.2 W4A8 coopmat — Q4 weights into the *int8* MMA path
-**Hypothesis**: the two best GEMM results are being left un-combined.
-`coopmat,q8` (int8 MMA, 2x hardware rate) hits 9.6 TOPS cache-resident,
-and `coopmat_fused,q4` (4-bit weights, 1/4 the bytes) hits 5.0 TFLOP/s —
-but the Q4 path dequantizes to **fp16** and feeds the slower MMA shape
-(`gemm_coopmat_q4.comp:67`). Unpacking Q4 nibbles to int8 is *cheaper*
-than to fp16 (no float conversion at all — just the mask/subtract from
-§1.1) and feeds the 2x-rate MMA.
-**Change**: `gemm_coopmat_w4a8.comp` — unpack Q4 → int8 into LDS,
-`coopmat<int8_t,...>` × `coopmat<int8_t,...>` → `coopmat<int32_t,...>`,
-with per-block scales applied to the int32 accumulator after each block's
-worth of K. (Requires block size to be a multiple of TILE_K=16, which
-every swept block size already is.)
-**Expected**: up to 2x over `coopmat_fused,q4`, at 1/4 the weight bytes of
-fp16. Stacked with §2.1 this is the intended production prefill kernel.
-**Effort**: high. **Value**: very high.
+### 2.2 W4A8 coopmat — Q4 weights into the int8 MMA path — **downgraded**
+**Hypothesis (as written, now falsified in part)**: that feeding Q4 into
+the int8 MMA path would get both 1/4 the weight bytes *and* the 2x int8
+matrix rate. **[measured] There is no 2x int8 matrix rate** — §0.1 measures
+fp16 and int8 WMMA at 479 and 480 ops/clk/CU respectively. The apparent 2x
+in the old data (`coopmat,q8` at 9.6 TOPS vs `coopmat,fp16` at 4.4 TFLOP/s
+at N=512) was a *memory* effect: int8 reads half the bytes of fp16, and
+both kernels are memory-bound. Consistent with §2.1, not with an MMA-rate
+difference.
+**What remains worth doing**: the unpack itself is cheaper into int8 than
+into fp16 (mask/subtract, no float conversion), and the LDS tile is half
+the size, which helps occupancy — but the payoff is now "somewhat cheaper
+tile fill", not 2x. **Do §2.1 first**; once the kernel is
+arithmetic-intensity-bound rather than memory-bound, re-measure whether the
+tile-fill cost is even on the critical path before writing this.
+**Effort**: high. **Value**: medium (downgraded from very high).
 
 ### 2.3 Test B stored [N,K] with a column-major `coopMatLoad`
 **Hypothesis**: B is stored K-major ([K,N]) and loaded row-major, but real
@@ -354,36 +475,49 @@ prototype to find out whether it's matmul-bound (good — coopmat) or
 serialised on the state update (bad — needs careful chunking).
 **Effort**: high. **Value**: high but only for Qwen3-Next.
 
-### 3.7 Fix the reduction kernels — `subgroup` is *slower* than `shared`
-**Anomaly in the data**: `rmsnorm,subgroup` gets 64 GB/s where
-`rmsnorm,shared` gets 202 GB/s, and softmax tops out at 104 GB/s. Both are
-far below the 236 GB/s these purely-bandwidth ops should reach.
-**Hypothesis**: the subgroup variants use one wave64 per row → only 64
-lanes and scalar loads per row, so they're latency-bound, not
-bandwidth-bound.
-**Change**: one workgroup of 256 doing `uvec4`-vectorised loads →
-per-subgroup `subgroupAdd` → tiny LDS combine across the 4 subgroups.
-**Expected**: 2-3x on both, up to the ~236 GB/s bandwidth wall.
-**Effort**: low. **Value**: medium (small ops, but they're per-layer and
-currently leaving 2-3x on the floor).
+### 3.7 Fix the reduction kernels — the `subgroup` variants are 3.3x slower
+**[measured]** Re-running these warmed changes the picture from what the
+original data suggested. At N=4096, against the 236 GB/s DRAM ceiling:
 
----
+| kernel | GB/s | % of DRAM ceiling |
+|---|---|---|
+| `rmsnorm,shared` | 224 | **95%** — essentially optimal, nothing to win |
+| `softmax,shared` | 157 | 67% |
+| `rmsnorm,subgroup` | 68 | 29% |
+| `softmax,subgroup` | 48 | 20% |
+
+So the original framing ("both are 2-3x off achievable bandwidth") was
+wrong about the shared-memory RMSNorm, which is already at 95% of the bus.
+Two narrower findings replace it:
+1. **The `subgroup` variants are 3.3x slower than their `shared`
+   counterparts at every size.** They use one wave64 per row, so a row is
+   reduced by 64 lanes doing scalar loads — latency-bound, not
+   bandwidth-bound. Either rewrite them as one 256-thread workgroup doing
+   `uvec4` loads → per-subgroup `subgroupAdd` → a 4-element LDS combine, or
+   delete them; as they stand they are a strictly worse option that the
+   engine should never pick.
+2. **Softmax is 1.4x off RMSNorm's efficiency** (67% vs 95%) despite being
+   the same shape of traversal, because it makes two passes (max, then
+   exp-sum) plus a normalise. An online/single-pass softmax would close
+   most of that — and in the fused attention kernel (§3.3) it disappears
+   entirely.
+**Effort**: low. **Value**: medium — small ops, but the subgroup gap is
+large and the fix is mechanical.
 
 ## 4. Dispatch overhead and engine-level plumbing
 
-### 4.1 Measure per-dispatch launch + barrier cost
-**Hypothesis**: decode is a long chain of *small* kernels. A 48-layer model
-with ~10 dispatches per layer is ~500 dispatches per token; at 20 tok/s
-that's 10k dispatches/s. If a dispatch+barrier costs even 20µs, overhead
-alone caps throughput — and nothing in the suite measures it.
-**Change**: time an empty (immediate-return) kernel at 1/10/100/1000
-iterations, with and without the `vkCmdPipelineBarrier` that
-`shim_dispatch_timed` inserts between iterations (`vk/shim.c:516-522`);
-separately time CPU-side command-buffer build + submit + fence wait.
-**Expected**: a hard per-dispatch floor in µs. This sets the fusion budget
-(§3.1-3.2) and tells us whether pre-recorded/reused command buffers are
-mandatory.
-**Effort**: low. **Value**: high — an easy-to-miss ceiling.
+### 4.1 Per-dispatch launch + barrier cost — **DONE**, worry **falsified** ✅
+Measured as the `overhead` family (§0.5). A dispatch plus the pipeline
+barrier between iterations costs **~300 ns**, plus ~0.7 ns per workgroup
+scheduled. The feared 20 µs would have capped decode throughput on its own;
+300 ns does not — ~500 dispatches per token is ~0.15 ms against a ~20 ms
+token, under 1%.
+**Consequence**: kernel fusion (§3.1-3.2) should be justified by the DRAM
+round-trips it removes, *not* by launch overhead, and §4.2/§4.3 drop in
+priority accordingly. **Still open**: this measures dispatch + barrier
+*inside* a command buffer. CPU-side `vkQueueSubmit` + fence wait is not
+measured, and a real engine submits per token (or per layer), so that cost
+— which §4.2 would remove — is the one still worth a number.
 
 ### 4.2 Pre-recorded command buffers for the decode step
 **Hypothesis**: a decode step is the same dispatch graph every token, so it
@@ -392,8 +526,11 @@ better, a descriptor-indexed buffer of per-step params) changing. The
 current harness rebuilds the command buffer per call.
 **Change**: record a whole-layer or whole-model command buffer; drive
 per-step variation through buffer contents rather than re-recording.
-**Expected**: removes most CPU-side overhead from §4.1.
-**Effort**: medium (engine change, not a shader).
+**Expected**: removes the CPU-side submit/record cost §4.1 did *not*
+measure. Measure that cost first — if it is also sub-microsecond, this is
+unnecessary.
+**Effort**: medium (engine change, not a shader). **Value**: medium
+(downgraded — the GPU-side half of the concern is now ruled out).
 
 ### 4.3 Barrier granularity
 Full `VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT` memory barriers between every
@@ -427,6 +564,24 @@ run the 64MB copy from each.
 weights, with a staging upload at load time — which is a small change to
 the weight loader for a possibly free few-percent on everything.
 **Effort**: low. **Value**: high (bandwidth is the binding constraint).
+
+### 5.1b Exploit the 3.4x MALL cliff deliberately
+**[measured]** §0.4 pinned the last-level cache at exactly **32 MiB
+delivering ~805 GB/s**, against 236 GB/s from DRAM. That is a 3.4x
+bandwidth difference available to any kernel whose working set can be kept
+under 32 MiB — and it is a *hard* cliff, not a gradual falloff (32 MiB:
+804 GB/s, 48 MB: 235 GB/s).
+**Change**: treat 32 MiB as a first-class budget in the engine's
+scheduling. Candidates: tile attention so the K/V slab per pass stays under
+it (§3.3); size MoE expert groups so one expert's Q4 weights plus
+activations fit; for prefill, block the GEMM's B panel to a sub-32MiB
+strip and sweep all tiles of A against it before moving on (this is §2.4's
+swizzle, but sized against a now-known number rather than guessed).
+**Measure**: the `gemv_cold` footprint sweep already shows the transition
+for a real kernel — the same sweep shape applied to a blocked GEMM would
+show whether the blocking holds.
+**Effort**: varies by kernel. **Value**: high, and it multiplies with
+everything in §2 and §3.
 
 ### 5.2 Does the BIOS VRAM carveout matter?
 Heap 1 reports 83.8 GiB device-local on a machine with 117 GiB of usable
@@ -525,23 +680,47 @@ experiments, but they gate the format decision:
 
 ## Suggested order of attack
 
-**First (a day's work, unblocks everything):** §0.3 cold/DRAM-resident
-benchmarking, §0.2 clock logging, §0.1 the MMA-ceiling microbenchmark,
-§6.1 ISA dumps, §1.2 remove integer divisions, §5.1 memory-type bandwidth,
-§4.1 dispatch-overhead measurement.
+**§0 is done** — the harness now measures its own ceilings, records the
+clock behind every number, and has a DRAM-resident decode benchmark
+(`peak`, `overhead`, `gemv_cold` families; `results.csv` regenerated).
+Three items came out of it that change the ordering below: Q4 GEMV is
+ALU-bound even against DRAM, the matrix cores run at 9% of a *measured*
+ceiling, and dispatch overhead is a non-issue.
 
-**Then (the two big kernels):** §1.1 W4A8 GEMV for decode, §2.1
-register-blocked coopmat GEMM for prefill — and if §2.1 works, §2.2 W4A8
-coopmat to combine it with 4-bit weights.
+**Next (the two big kernels):**
+- **§1.1 W4A8 GEMV** — the highest-value item now. Q4 reaches 31% of its
+  DRAM bandwidth ceiling where W8A8 reaches 73%; closing that gap is a
+  measured ~2x on decode.
+- **§2.1 register-blocked coopmat GEMM** — 9% of 55.5 TFLOP/s, with an
+  8 FLOP/byte arithmetic intensity where 235 is needed. Largest absolute
+  gain on the chip. Watch the 2-waves-per-CU occupancy floor.
+
+**Then (cheap, and now better targeted):**
+- **§1.2 remove the runtime integer divisions** — still the cheapest real
+  win, and it is on the critical path of exactly the kernel §1.1 rewrites.
+- **§6.1 ISA dumps** — now has three specific questions to answer: is
+  `v_pk_fma_f16` even emitted (§1.3's 1.10x surprise), is
+  `V_DOT4_I32_I8` emitted, and what are the VGPR counts that will decide
+  whether §2.1's register blocking fits in 2 waves per CU.
+- **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is still
+  the binding constraint on decode.
+- **§3.7 fix the reduction kernels**, **§2.4 workgroup swizzle**, **§6.2
+  wave32 vs wave64**, **§1.3/§1.4 GEMV access pattern** (§0.3 showed every
+  GEMV format stuck at 50-75% of its bandwidth ceiling).
 
 **Then (the missing pillars):** §3.3 attention/flash-attention, §3.4 real
-model shapes, §3.1-3.2 fusion, §3.5 MoE grouped GEMM.
+model shapes, §3.1-3.2 fusion (justified by DRAM round-trips, not launch
+overhead), §3.5 MoE grouped GEMM.
 
-**Opportunistically (cheap, independent):** §2.4 workgroup swizzle, §6.2
-wave32 vs wave64, §3.7 fixed reduction kernels, §1.3 vectorised loads.
+**Dropped or downgraded by §0:** §2.2 W4A8 coopmat (there is no 2x int8
+matrix rate), §4.1 (answered: ~300 ns), §4.2/§4.3 (the GPU-side half of the
+concern is ruled out), and the packed-fp16 half of §1.3 (1.10x, not 2x).
 
-The one-line summary: **DRAM bandwidth is maxed, so decode wins come only
-from reading fewer bytes (→ W4A8); the matrix cores are ~90% idle, so
-prefill wins come from arithmetic intensity (→ register-blocked WMMA); and
-before either, fix the benchmark so it measures DRAM and boost clocks
-rather than cache and idle clocks.**
+The one-line summary, now with measured numbers behind each clause: **DRAM
+bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
+bytes — and Q4 already reads them, it just can't unpack them fast enough
+(31% of its ceiling), which is what W4A8 fixes. The matrix cores run at 9%
+of a measured 55.5 TFLOP/s, so prefill wins come from arithmetic intensity.
+The 32 MiB MALL is worth 3.4x DRAM for anything that can be kept resident.
+And neither dispatch overhead nor a nonexistent int8 matrix-rate bonus is
+worth designing around.**

@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"strix-halo-vulkan/vk"
@@ -22,9 +23,18 @@ type Result struct {
 	WeightFormat string // "fp32", "fp16", "q8", "q4", or "" if not applicable
 	BlockSize    int    // quantization block size, 0 if not applicable
 	Size         int    // case-defined primary size (vector/matrix dimension)
-	NsPerIter    float64
-	GFLOPS       float64 // 0 if not a compute-bound op
-	GBPS         float64 // 0 if not a bandwidth-bound op
+	// Detail is an optional free-form description of anything else that
+	// distinguishes this case (e.g. the fixed dimension of a non-square
+	// shape). Must contain no commas, since it becomes a CSV field.
+	Detail    string
+	NsPerIter float64
+	GFLOPS    float64 // 0 if not a compute-bound op
+	GBPS      float64 // 0 if not a bandwidth-bound op
+	// Clocks records the GPU's shader clock and power draw while this
+	// measurement ran. Zero when no instrumentation was installed (see
+	// SetInstruments). Without it a result taken at the 636 MHz idle clock
+	// is indistinguishable from a slow kernel measured at 2900 MHz.
+	Clocks ClockStats
 }
 
 // maxBatchNs bounds how long any single DispatchTimed call (a batch of
@@ -42,10 +52,20 @@ const maxBatchNs = 500_000_000
 // warmup dispatches and the timed batch to maxBatchNs worth of iterations —
 // so a very slow kernel is measured with fewer iterations rather than
 // risking a driver timeout.
-func TimeDispatch(pipe *vk.ComputePipeline, groupsX, groupsY, groupsZ, warmup, iters uint32, pushConstants []byte) (float64, error) {
+//
+// If instrumentation is installed (SetInstruments), the GPU is first driven
+// with ALU-heavy work to lift it off its idle clock, and the shader clock
+// and power are sampled throughout the timed batch and returned alongside
+// the timing. Both steps exist because this part idles at 636 MHz of a
+// 2900 MHz maximum, so an un-warmed measurement can understate a kernel by
+// several times — and silently, unless the clock is recorded with it.
+func TimeDispatch(pipe *vk.ComputePipeline, groupsX, groupsY, groupsZ, warmup, iters uint32, pushConstants []byte) (float64, ClockStats, error) {
+	if err := instruments.Warm(); err != nil {
+		return 0, ClockStats{}, fmt.Errorf("clock warmup: %w", err)
+	}
 	probe, err := pipe.DispatchTimed(groupsX, groupsY, groupsZ, 1, pushConstants)
 	if err != nil {
-		return 0, err
+		return 0, ClockStats{}, err
 	}
 	probeNs := float64(probe.Nanoseconds())
 	if probeNs <= 0 {
@@ -64,23 +84,25 @@ func TimeDispatch(pipe *vk.ComputePipeline, groupsX, groupsY, groupsZ, warmup, i
 
 	if warmup > 1 {
 		if _, err := pipe.DispatchTimed(groupsX, groupsY, groupsZ, capToBudget(warmup-1), pushConstants); err != nil {
-			return 0, err
+			return 0, ClockStats{}, err
 		}
 	}
 	actualIters := capToBudget(iters)
+	stop := instruments.Watch()
 	d, err := pipe.DispatchTimed(groupsX, groupsY, groupsZ, actualIters, pushConstants)
+	clocks := stop()
 	if err != nil {
-		return 0, err
+		return 0, ClockStats{}, err
 	}
-	return float64(d.Nanoseconds()) / float64(actualIters), nil
+	return float64(d.Nanoseconds()) / float64(actualIters), clocks, nil
 }
 
 // PrintTable writes a human-readable results table to w.
 func PrintTable(w io.Writer, results []Result) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "OP\tVARIANT\tFORMAT\tBLOCK\tSIZE\tNS/ITER\tGFLOP/S\tGB/S")
+	fmt.Fprintln(tw, "OP\tVARIANT\tFORMAT\tBLOCK\tSIZE\tNS/ITER\tGFLOP/S\tGB/S\tSCLK MHZ\tW")
 	for _, r := range results {
-		gflops, gbps, block := "-", "-", "-"
+		gflops, gbps, block, sclk, power := "-", "-", "-", "-", "-"
 		if r.GFLOPS > 0 {
 			gflops = fmt.Sprintf("%.2f", r.GFLOPS)
 		}
@@ -90,24 +112,37 @@ func PrintTable(w io.Writer, results []Result) {
 		if r.BlockSize > 0 {
 			block = fmt.Sprintf("%d", r.BlockSize)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%.1f\t%s\t%s\n",
-			r.Op, r.Variant, r.WeightFormat, block, r.Size, r.NsPerIter, gflops, gbps)
+		if r.Clocks.Samples > 0 {
+			// min/max as well as mean: a wide spread means the clock moved
+			// during the measurement, which invalidates the comparison
+			// rather than merely annotating it.
+			sclk = fmt.Sprintf("%.0f (%.0f-%.0f)", r.Clocks.SclkMHz, r.Clocks.SclkMinMHz, r.Clocks.SclkMaxMHz)
+			power = fmt.Sprintf("%.1f", r.Clocks.PowerW)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%.1f\t%s\t%s\t%s\t%s\n",
+			r.Op, r.Variant, r.WeightFormat, block, r.Size, r.NsPerIter, gflops, gbps, sclk, power)
 	}
 	tw.Flush()
 }
 
-// WriteCSV writes results to path in the format described in the plan:
-// op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps.
+// WriteCSV writes results to path as
+// op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps
+// followed by sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w (zero when no
+// instrumentation was installed) and detail. The new columns are appended
+// rather than interleaved so existing column-indexed analysis of the first
+// eight keeps working.
 func WriteCSV(path string, results []Result) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps")
+	fmt.Fprintln(f, "op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps,sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail")
 	for _, r := range results {
-		fmt.Fprintf(f, "%s,%s,%s,%d,%d,%.3f,%.4f,%.4f\n",
-			r.Op, r.Variant, r.WeightFormat, r.BlockSize, r.Size, r.NsPerIter, r.GFLOPS, r.GBPS)
+		fmt.Fprintf(f, "%s,%s,%s,%d,%d,%.3f,%.4f,%.4f,%.1f,%.1f,%.1f,%.2f,%s\n",
+			r.Op, r.Variant, r.WeightFormat, r.BlockSize, r.Size, r.NsPerIter, r.GFLOPS, r.GBPS,
+			r.Clocks.SclkMHz, r.Clocks.SclkMinMHz, r.Clocks.SclkMaxMHz, r.Clocks.PowerW,
+			strings.ReplaceAll(r.Detail, ",", ";"))
 	}
 	return nil
 }
