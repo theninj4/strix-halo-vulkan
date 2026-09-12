@@ -6,8 +6,8 @@ Written after reviewing `TODO.md`, every shader in `shaders/`, the full
 experiment backlog, not a plan — each item states a *hypothesis*, the
 *change*, the *expected gain*, and *how we'd know*.
 
-**§0 has since been implemented and run** (549-row `results.csv`
-regenerated with clock instrumentation). Items it confirmed, refuted, or
+**§0 has since been implemented and run** (`results.csv` regenerated with
+clock instrumentation behind every row). Items it confirmed, refuted, or
 re-aimed are marked **[measured]** in place rather than rewritten away, so
 the wrong predictions stay visible next to what actually happened.
 
@@ -22,8 +22,19 @@ more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
 and 45% of the measured WMMA ceiling**, up from 8%. Two of its sub-hypotheses were wrong in
 useful ways — LDS staging and multi-wave workgroups are both *unnecessary* on
 this part, because the 32 MiB MALL already supplies the reuse they exist to
-provide — and §2.3 turned into a sharp, unresolved contradiction: the B
+provide — and §2.3 turned into a sharp contradiction: the B
 layout that halves the instruction count is 2.8x slower. See §2.1, §2.3, §6.1.
+
+**§2.3's contradiction is now resolved, and resolving it was worth more than
+the layout question that raised it.** The cause is DRAM channel aliasing:
+every fragment load in these kernels is K-strided, a power-of-two leading
+dimension puts all 16 addresses of one load in the same channel, and the
+penalty is periodic in the stride with a 2 KB period. Padding each operand's
+leading dimension 256 B off a multiple of 2 KB — a host-side allocation
+change, no shader restructuring — is worth 1.6x on the transposed-B kernel,
+**up to 1.35x on the kernels that already won**, and takes the suite's best
+GEMM to **28.4 TFLOP/s (51% of the WMMA ceiling)**. It also retires the
+"pinned at the MALL's 805 GB/s" reading of §2.1's plateau. See §2.3.
 
 ## The roofline, and why it says there's a lot left on the table
 
@@ -42,13 +53,15 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
-| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **25.2 TFLOP/s** (`wmma_wg128x256`) | **45%** |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **28.4 TFLOP/s** (`wmma_reg64_bt_padab128`) | **51%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
 (Real-kernel column is the best measured anywhere in `results.csv`; the
-GEMM entries are at N=4096, the `naive,w8a8` entry at N=256 where it is
-still cache-resident. The WMMA fp16 row was 4.9 TFLOP/s / 9% until §2.1
-register-blocked the kernel; the int8 row is still the un-blocked one and
+GEMM entries are at N=4096 except the WMMA fp16 one, whose best shape is now
+N=1024 (26.0 TFLOP/s at N=4096), and the `naive,w8a8` entry at N=256 where it
+is still cache-resident. The WMMA fp16 row was 4.9 TFLOP/s / 9% until §2.1
+register-blocked the kernel and 25.2 / 45% until §2.3 de-aliased its operand
+strides; the int8 row is still the un-blocked one and
 would move the same way if §2.2 were written. The `dotPacked4x8` row's 4% is not the indictment it
 looks like: the kernels that use that instruction — W8A8 and now W4A8 GEMV
 — are memory-bound by construction, and W4A8 runs at 89% of the *bandwidth*
@@ -116,6 +129,17 @@ measurements:
    stop: 25.2 TFLOP/s is the plateau, bound by neither ceiling. Note what
    did **not** matter — LDS staging, more waves per workgroup, and the
    occupancy floor below were all irrelevant or harmful here.
+   **[measured] §2.3 then found a second, independent lever that is not
+   arithmetic intensity at all: operand *stride*.** Every fragment load in
+   these kernels is K-strided, and a power-of-two leading dimension puts all
+   16 of its addresses in one memory channel; padding each stride 256 B off
+   a 2 KB multiple is worth 0-5% at N=4096, 4-35% at N=2048 and 2.6x on the
+   [N,K] weight layout, for a new best of 28.4 TFLOP/s (51%). It also breaks
+   the "pinned at 760 GB/s" reading above: the de-aliased AI-32 kernels
+   imply 742-887 GB/s of MALL traffic, i.e. at or *past* the 805 GB/s
+   ceiling, so the L1s must be absorbing part of what that arithmetic
+   attributes to the MALL — and the AI-85 plateau at 26.0 TFLOP/s implies
+   only 306 GB/s, so whatever binds it is not bandwidth at any level.
 
 There is also a third, newly quantified lever: **the 32 MiB MALL delivers
 805 GB/s, 3.4x DRAM.** Anything that can be restructured to work out of a
@@ -441,7 +465,7 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
-### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x**
+### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x** (6.3x after §2.3)
 **Hypothesis**: `gemm_coopmat_fp16.comp` is memory-bound by construction.
 One workgroup = one wave64 = **one** 16×16 accumulator, and the K-loop
 loads A and B straight from global memory every iteration
@@ -546,6 +570,19 @@ room. The fix is exactly what §2.3's B layout does to the instruction
 stream — 389 instructions and 144 address ops instead of 577 and 232 — and
 it costs 2.8x in memory behaviour instead of winning. Closing that
 contradiction is the highest-value follow-up in this section.
+
+**[measured] It has since been closed (§2.3), and it moved this kernel
+too.** The memory behaviour was DRAM channel aliasing on the K-strided
+fragment loads, which both layouts have — A is K-strided in every variant
+here — so de-aliasing the strides raised the register-blocked kernels
+themselves: `wmma_wg128x256` 25331 → **26008** GFLOP/s at N=4096 and
+`wmma_reg64` 20216 → **27260** at N=2048 (1.35x, the shape where aliasing
+was costing the most). With *both* strides padded, the transposed-B kernel —
+the 389-instruction one this paragraph wanted — reaches **28377 GFLOP/s at
+N=1024, 51% of the ceiling** and the suite's best GEMM number, though it
+still loses at N=4096. So the address-arithmetic diagnosis above is now partly
+testable rather than hypothetical: the shorter instruction stream does win,
+but only where its operand fits the caches.
 **Effort**: high (this is a real GEMM kernel). **Value**: highest for
 prefill, image generation, and the Parakeet encoder. **Delivered.**
 
@@ -575,7 +612,7 @@ its operand bytes. That, not the Q4-unpack version, is the next step here.
 **Effort**: low for the int8 arm, high for the Q4 unpack.
 **Value**: medium-high for int8, medium for Q4 (downgraded from very high).
 
-### 2.3 B stored [N,K] with a column-major `coopMatLoad` — **DONE**, and it **loses** ❌
+### 2.3 B stored [N,K] with a column-major `coopMatLoad` — **RESOLVED** ✅ (it was channel aliasing)
 **Hypothesis**: B is stored K-major ([K,N]) and loaded row-major, but real
 `Linear` weights are stored `[out_features, in_features]` = [N,K], and
 RDNA's WMMA B-operand lane layout may favour the transposed load. The
@@ -621,15 +658,123 @@ One mechanism was tested and **refuted**: that a column-major B fragment
 consumes only 32 of each 128-byte cache line and depends on the line
 surviving three more K-steps. Deepening the K-slab to 64 so one MMA block
 consumes a full line (`wmma_reg64_bt_k64`) changes nothing — 8583 vs 8543.
-**Still untested, and the obvious next probe**: channel/bank aliasing from
-the power-of-two leading dimension. A column-major fragment load issues 16
-addresses `K·2` bytes apart *within one instruction*, and every K swept here
-is a power of two; padding the leading dimension to break the alias would
-distinguish this cleanly, and needs a separate stride push constant since
-the kernel currently reuses `pc.K` as both extent and stride.
-**Effort**: low. **Value**: high but blocked on the above — §2.1 identifies
-this layout as the way to halve its address-arithmetic overhead, so the
-contradiction is worth resolving rather than filing.
+
+**[measured] The remaining hypothesis — channel/bank aliasing from the
+power-of-two leading dimension — is confirmed, and it was the dominant
+term.** B's leading dimension is now a push constant of its own (`pc.ldb`,
+and `pc.lda` for A) rather than a reuse of `pc.K`/`pc.N`, so the row stride
+can be padded at run time while the extents stay powers of two. Every padded
+case below reuses its unpadded case's SPIR-V and differs in nothing but that
+one push constant. `wmma_reg64_bt`, N=K=4096, as committed in
+`results.csv`; five runs of this sweep agree to ≤2% on every row here, so
+the ordering below is the finding and the third digit is not:
+
+| pad (halves) | stride | stride mod 2 KB | GFLOP/s | vs unpadded |
+|---|---|---|---|---|
+| 0 | 8192 B | **0** | 8618 | — |
+| 8 | 8208 B | 16 B | 11713 | 1.36x |
+| 64 | 8320 B | 128 B | 13052 | 1.51x |
+| **128** | 8448 B | 256 B | **14028** | **1.63x** |
+| 256 | 8704 B | 512 B | 13132 | 1.52x |
+| 512 | 9216 B | 1 KB | 11804 | 1.37x |
+| 1024 | 10240 B | **0** | 9917 | 1.15x |
+| 2048 | 12288 B | **0** | 9284 | 1.08x |
+
+The effect is **periodic in the stride with a 2 KB period**, not monotone in
+the pad: the three strides that are multiples of 2 KB are the three slowest
+rows, every off-multiple stride beats all three, and the peak sits 256 B
+past a multiple with a broad plateau from 128 to 512 B. 2 KB is exactly one
+interleave rotation of eight 256 B channel chunks, so a fragment load whose
+16 addresses are a multiple of 2 KB apart puts all 16 in the same channel —
+and one K-strided fragment load is precisely that. Two controls place the
+mechanism:
+
+- **Padding a row-major B changes nothing** (`wmma_reg64_pad64`: 23538 at
+  N=4096 against the unpadded kernel's 24530, and 0.2-2.7% lower at the
+  other two sizes — inside the 23.5-24.9 TFLOP/s this kernel spans across
+  five runs). Its B fragments are gathered element by element along N, so there
+  is no 16-address strided load to de-alias. Padding per se is neither the
+  fix nor a cost; the strided gather is.
+- **Deepening the K-slab still does nothing, now that aliasing is out of the
+  way** (`wmma_reg64_bt_k64_pad128`: 14026 vs `wmma_reg64_bt_pad128`'s
+  14028 — the same number twice). Partial-line consumption is refuted a second time, on a kernel
+  where it could no longer be masked.
+
+One prediction made here was **wrong**, and instructively: the LDS path's
+global B reads were expected to be immune, because they are contiguous
+128-bit staging loads rather than `coopMatLoad` gathers. They are not —
+`wmma_lds128_db_bt` goes 13286 → **20597** with the same pad (1.55x), which
+closes essentially all of its gap to the row-major `wmma_lds128_db` (21214).
+The reason is that a staging load is contiguous only *within* a row: thread
+i reads 16 B from slab row i, and consecutive slab rows are `ldb*2` bytes
+apart, so the wave's 64 addresses are the same aliased pattern. **What
+matters is the address stride across the concurrent loads, not which
+instruction issues them.**
+
+**And the same aliasing was costing the kernels that already won.** A is
+read with a K-stride in *every* variant here, so padding A alone (`_pada128`,
++256 B on A's stride, B untouched) speeds up the §2.1 winners — most at the
+shape that was anomalously slow:
+
+| kernel | N=1024 | N=2048 | N=4096 |
+|---|---|---|---|
+| `wmma_reg64` | 23229 | 20216 | 24530 |
+| `wmma_reg64_pada128` | 24541 (1.06x) | **27260 (1.35x)** | 23747 (0.97x) |
+| `wmma_reg64x128` | 18759 | 20008 | 25371 |
+| `wmma_reg64x128_pada128` | 19595 (1.04x) | 23862 (1.19x) | 25498 (1.01x) |
+| `wmma_wg128x256` | 18987 | 23363 | 25331 |
+| `wmma_wg128x256_pada128` | 19858 (1.05x) | 24359 (1.04x) | **26008 (1.03x)** |
+| `wmma_reg64_bt` | 11002 | 8070 | 8618 |
+| `wmma_reg64_bt_padab128` (both padded) | **28377 (2.6x)** | 19127 (2.4x) | 15669 (1.8x) |
+
+Unlike the stride sweep, these rows are only reproducible to 2-4% across
+runs, and the pad-A effect at N=4096 is inside that: over four runs it is
++3-5% on `wg128x256`, +0.5-4.5% on `reg64x128` and −3 to +0.5% on `reg64`. So
+the N=4096 claim is "small and kernel-dependent"; the solid ones are the
+1.2-1.4x at N=2048 and the 1.8-2.6x on transposed-B, each reproduced in
+every run.
+
+So the §2.1 plateau was partly an aliasing artefact. **New bests: 28377
+GFLOP/s (51% of the 55.5 TFLOP/s ceiling, up from 45%) and 26008 at N=4096
+(47%)** — the first from the transposed-B kernel with both strides padded,
+which is the fastest in the suite at N=1024 despite being the loser of the
+original comparison, and closely matched by `reg64_pada128`'s 27260 at
+N=2048. The N=2048 dip visible in every unpadded row (20-23 TFLOP/s against
+24-25 at N=4096) was aliasing all along, which is why that shape moves most.
+
+**What is still unexplained** is the residue: with both strides padded, the
+transposed-B kernel is still 1.6x behind row-major B at N=4096 (15669 vs
+24530) while *beating* it at N=1024, so the footprint-dependent part of §2.3
+survives de-aliasing. Two candidate explanations are already out:
+
+- **Not request count.** Both kernels' *A* loads are the identical gather
+  (16 rows, 32 B each, `lda*2` apart), so the difference is entirely in B —
+  and the column-major B fragment is 2 `buffer_load_b128` where the
+  row-major one is 64 scalar 2-byte loads. The faster kernel is the one
+  issuing *more* and smaller requests.
+- **Not cache-line survival, above MALL size.** A column-major fragment
+  takes 32 B from each of 16 lines and needs the line to last three more
+  K-steps, where the wave's four row-major fragments sweep a whole 128 B
+  line per k. But deepening the K-slab so one slab consumes the full line
+  measures as nothing at N≥2048, twice (`_bt_k64`: 8560 vs 8618;
+  `_bt_k64_pad128`: 14026 vs 14028) — while *helping* at N=1024 (11002 →
+  13321 unpadded, 17661 → 19212 padded). Line survival is real while the
+  operand is cache-resident and is not the binding term once it isn't.
+
+Discriminating what is left needs the memory system measured directly rather
+than inferred through a GEMM: fixed bytes touched, sweeping request size,
+request count and stride independently — §5.1b, which is the right place for
+it.
+
+**Engine implication, and it is free:** allocate every GEMM operand with its
+leading dimension padded off a multiple of 2 KB (+256 B is the measured
+optimum at K=4096), including the weight tensors. It costs 128 halves of
+padding per row — 3% of memory at K=4096 — needs no shader change now that
+the strides are push constants, and is worth 0-5% at N=4096 (kernel-dependent, and inside the run-to-run
+spread for one of the three), 4-35% at N=2048,
+and 2.6x on the transposed-B layout that a real `Linear` weight already
+has.
+**Effort**: low (done). **Value**: high (delivered).
 
 ### 2.4 Workgroup swizzle / tile reordering for MALL locality
 **Hypothesis**: linear `gl_WorkGroupID` ordering walks C row-by-row, so
@@ -641,14 +786,22 @@ tiles into e.g. 8×8 super-tiles); pure index arithmetic, no structural
 change.
 **Expected**: 10-30% on large N, more once §2.1 makes tiles bigger. A
 standard, well-documented GEMM win.
-**[measured] §2.1 promotes this.** Its best kernel is pinned at ~760 of the
-805 GB/s the MALL delivers at AI 16 and 32, so it is *literally* MALL-
-bandwidth-bound, and a swizzle is the one remaining change that reduces MALL
-traffic without touching the tile shape or the register budget. §2.1 also
-showed that neither LDS staging nor grouping waves into a workgroup buys
-anything, which means all the cross-tile reuse this kernel gets is already
-coming from the MALL — exactly the resource a swizzle reorders. It is now
-the cheapest untried item with a measured constraint behind it.
+**[measured] §2.1 promotes this, and §2.3 sharpens what it would be
+testing.** §2.1's best kernel sat at ~760 of the 805 GB/s the MALL delivers
+at AI 16 and 32, which read as *literally* MALL-bandwidth-bound; §2.3 then
+raised the same kernels past that figure (742-887 GB/s implied at AI 32) by
+de-aliasing their strides, so part of that traffic must be served by the
+L1s and "pinned at the MALL" is no longer the right description. What
+survives is the shape of the argument: the AI-32 kernels are still within
+~10% of a bandwidth ceiling at *some* level, a swizzle is still the only
+remaining change that reduces cross-tile traffic without touching the tile
+shape or the register budget, and §2.1's finding that neither LDS staging
+nor multi-wave workgroups help still means every bit of cross-tile reuse
+this kernel gets comes from a cache it does not manage. Note that the
+AI-85 variant is *not* bandwidth-bound anywhere (306 GB/s implied), so a
+swizzle should help the AI-32 kernels and do nothing for that one — which
+is itself the cleanest way to tell whether the swizzle is doing what it
+claims.
 **Effort**: low. **Value**: high (upgraded).
 
 ### 2.5 Split-K for skinny shapes
@@ -842,7 +995,25 @@ show whether the blocking holds.
 **Effort**: varies by kernel. **Value**: high, and it multiplies with
 everything in §2 and §3.
 
-### 5.2 Does the BIOS VRAM carveout matter?
+**[measured] §2.3 adds a second axis to this family and one specific probe
+it should own.** Bandwidth on this part is not a function of footprint
+alone: at a fixed footprint, moving an operand's row stride 256 B off a
+2 KB multiple is worth up to 1.35x on the GEMM kernels, because a K-strided
+fragment load at a power-of-two stride puts all 16 of its addresses in one
+of eight 256 B-interleaved channels. The `bandwidth` family only ever
+measures contiguous streaming, so it cannot see this, and the 805/236 GB/s
+ceilings it reports are therefore *best-case* figures that a strided kernel
+does not automatically get.
+**Change**: extend the bandwidth microbenchmark with a strided variant —
+fixed bytes touched, sweeping (a) the stride against the 2 KB period to
+measure the channel-alias penalty directly, and (b) request *shape* at constant
+stride and constant bytes touched — one 16-address/16-bytes-each gather
+against a contiguous sweep — which is what §2.3's unexplained residue turns
+on and what its GEMM rows cannot separate from tiling. (a) tells the engine
+how to pad every allocation; (b) tells it whether the [N,K] weight layout is
+usable at all above MALL size.
+**Effort**: low. **Value**: high — it is the ceiling half of §2.3, and both
+answers are engine-wide rather than kernel-specific.
 Heap 1 reports 83.8 GiB device-local on a machine with 117 GiB of usable
 RAM (and heap 0 another 41.9 GiB) — the two heaps overlap the same physical
 memory, so the driver is largely handing out GTT rather than a fixed
@@ -961,26 +1132,34 @@ clock behind every number, and has a DRAM-resident decode benchmark
 819 GFLOP/s / 211 GB/s, 89% of the DRAM bus, so decode is finished as a
 kernel problem. **§2.1 is done** — the register-blocked WMMA GEMM at 25.2
 TFLOP/s, 45% of the matrix cores, so prefill is no longer the gaping hole
-either. What those three left behind:
+either. **§2.3 is done** — the contradiction §2.1 ran into was DRAM channel
+aliasing on K-strided fragment loads, and padding the operand strides took
+the best GEMM to 28.4 TFLOP/s / 51%. What those four left behind:
 
-**Next (resolve the contradiction §2.1 ran into):**
-- **§2.3, why the better instruction stream is slower.** Storing B [N,K]
-  and loading it column-major cuts `wmma_reg64`'s loop from 577 instructions
-  to 389 and is 2.8x slower at N=4096, only once B stops being
-  cache-resident. §2.1's remaining gap to the ceiling looks like exactly the
-  address-arithmetic pressure that layout removes, so this is the one place
-  where a single answer unblocks the largest kernel on the chip. The
-  untested mechanism is channel/bank aliasing from the power-of-two leading
-  dimension; padding it needs a stride push constant, which is an afternoon.
-- **§2.4 workgroup swizzle.** Upgraded to high value: §2.1 is pinned at ~760
-  of the MALL's 805 GB/s, and a swizzle is the only remaining change that
-  reduces MALL traffic without touching the tile shape or the register
-  budget. Cheapest item in the document with a measured constraint behind it.
+**Next:**
+- **§5.1b's strided-bandwidth probe**, which is §2.3's unfinished half. Two
+  questions, one microbenchmark: how much a channel-aliased stride costs at
+  constant footprint (the engine needs this number to pad every allocation
+  correctly, and only the 256 B/2 KB case has been measured, on one kernel),
+  and what the machine delivers for one 16-address/16-bytes-each gather
+  versus a contiguous sweep of the same bytes at the same stride. The second
+  is the shape question §2.3's residue turns on — a GEMM cannot separate it
+  from tiling — and it decides whether the [N,K] layout a real `Linear`
+  weight already has is usable above MALL size.
+- **§2.4 workgroup swizzle.** Still the cheapest structural item, but its
+  premise needs restating: §2.3 pushed the AI-32 kernels to 742-887 GB/s of
+  implied MALL traffic, *past* the 805 GB/s ceiling, so they are not simply
+  MALL-pinned. The sharper test is that a swizzle should help those and do
+  nothing for the AI-85 variant, which implies only 306 GB/s.
 - **§2.2's int8 arm** — a `PRECISION_I8` variant of `gemm_wmma.comp`
   accumulating in int32. Small change to a kernel that now works, halves the
   operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
   unpack version stays downgraded: there is no int8 matrix-rate bonus, and
   §2.1's winner has no LDS tile to make cheaper.)
+- **Pad the strides everywhere else**, now that §2.3 has shown what it is
+  worth in GEMM. The GEMV, W4A8 and W8A8 kernels all index weights by a
+  power-of-two row stride; none of them has a stride push constant, and none
+  has been measured against a padded one.
 
 **Then (cheap, and still untouched):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
@@ -1012,10 +1191,12 @@ The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
 bytes — and W4A8 now reads 4 bits/weight at 211 of those 236 GB/s, so
 decode is finished as a kernel problem and continues only as a format
-problem. Prefill was 8% of a measured 55.5 TFLOP/s and is now 45%, bought
-entirely by raising arithmetic intensity from 8 to 32 FLOP/byte in
-registers — with no shared memory, because the 32 MiB MALL already does
-that job and hands the kernel 760 of its 805 GB/s. What is left
-in prefill is address-arithmetic and MALL-traffic ordering, not tiling. And
-neither dispatch overhead nor a nonexistent int8 matrix-rate bonus is worth
-designing around.**
+problem. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
+first by raising arithmetic intensity from 8 to 32 FLOP/byte in registers —
+with no shared memory, because the 32 MiB MALL already does that job — and
+then, for free, by moving every operand's row stride 256 B off a 2 KB
+multiple, because a power-of-two leading dimension aims all 16 addresses of
+a K-strided fragment load at one memory channel. What is left in prefill is
+request shape and traffic ordering, not tiling. And neither dispatch
+overhead nor a nonexistent int8 matrix-rate bonus is worth designing
+around.**

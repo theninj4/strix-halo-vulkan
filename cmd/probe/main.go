@@ -10,7 +10,7 @@
 //	RADV_DEBUG=shaderstats go run ./cmd/probe shaders/gemm_wmma_reg64.spv
 //	RADV_DEBUG=asm         go run ./cmd/probe shaders/gemm_wmma_reg64.spv
 //
-// The shader is dispatched with one workgroup, no push constants, and a
+// The shader is dispatched with one workgroup, zeroed push constants, and a
 // single small buffer bound at every binding it declares, so it is only
 // useful for compilation-time questions — nothing it prints depends on the
 // shader computing anything meaningful. Kernels that need real buffers or a
@@ -30,6 +30,11 @@ const strixHaloDeviceID = 0x1586
 // probeBindings is bound-above the binding count of any shader here; extra
 // descriptors in the set are harmless, a missing one is not.
 const probeBindings = 8
+
+// probePushConstants is likewise bound-above the push-constant block of any
+// shader here (the largest is gemm_wmma.comp's 20 bytes). A layout range
+// smaller than the block the shader declares is invalid, so err large.
+const probePushConstants = 64
 
 func main() {
 	if len(os.Args) != 2 {
@@ -92,12 +97,12 @@ func run(path string) error {
 		bufs[i] = b
 	}
 
-	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{Buffers: bufs, PushConstantSize: 16})
+	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{Buffers: bufs, PushConstantSize: probePushConstants})
 	if err != nil {
 		return err
 	}
 	defer pipe.Destroy()
 
-	_, err = pipe.DispatchTimed(1, 1, 1, 1, make([]byte, 16))
+	_, err = pipe.DispatchTimed(1, 1, 1, 1, make([]byte, probePushConstants))
 	return err
 }

@@ -203,6 +203,12 @@ var GEMMW8A8 []byte
 //
 // Tile geometry is -D rather than specialization constants because it sizes
 // register and `shared` arrays; see the shader header.
+//
+// Operand *strides* are deliberately not an axis here: the kernel takes both
+// leading dimensions as push constants, so the stride-padding cases that
+// IDEAS §2.3 turned into a 1.13x on the best kernel (and a 1.6x on the
+// transposed-B one) reuse these same binaries at a different `ldb`/`lda`.
+// See the `pad*` rows in bench/ops_gemm_wmma.go.
 
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -o gemm_wmma_reg32.spv gemm_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -o gemm_wmma_reg64.spv gemm_wmma.comp

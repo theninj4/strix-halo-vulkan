@@ -18,10 +18,16 @@ instruction through its mixed-signedness overload, at **819 GFLOP/s and 211
 GB/s against DRAM-resident weights — 89% of this machine's 236 GB/s memory
 bandwidth**, 2.4x the int8-weight kernel it replaces. For **prefill** (GEMM,
 compute-bound), the register-blocked cooperative-matrix GEMM
-(`shaders/gemm_wmma.comp`): **25.2 TFLOP/s at N=4096, 45% of this chip's
-measured 55.5 TFLOP/s of matrix-core throughput** and 6.0x the
-straightforward coopmat kernel it replaces at that shape. `IDEAS.md` explains how each
-gets there and what is still on the table.
+(`shaders/gemm_wmma.comp`): **28.4 TFLOP/s, 51% of this chip's measured
+55.5 TFLOP/s of matrix-core throughput** (26.0 TFLOP/s at N=4096), 6.2x the
+straightforward coopmat kernel it replaces at that shape. The last 1.13x of
+that came from neither tiling nor instruction selection but from *operand
+strides*: every fragment load in a WMMA GEMM is K-strided, a power-of-two
+leading dimension aims all 16 addresses of one load at the same memory
+channel, and padding each stride 256 B off a 2 KB multiple — a host-side
+allocation change — is worth up to 1.35x on the kernels that were already
+winning and 2.6x on the [N,K] weight layout. `IDEAS.md` explains how each gets
+there and what is still on the table.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
@@ -107,7 +113,7 @@ are cheap to run and worth running first.
   the swept weight footprints in MB (fp16-equivalent, so every format in a
   row holds the same number of weights), `-coldn` the reduction length.
 
-Two measurement hazards the harness handles rather than leaves to the
+Three measurement hazards the harness handles rather than leaves to the
 reader:
 
 - **Clock.** This GPU idles at 637 MHz out of 2900 (see
@@ -128,6 +134,17 @@ reader:
   naive GEMM at large sizes) is simply measured with fewer iterations
   rather than risking `VK_ERROR_DEVICE_LOST`, which would otherwise poison
   the device for every case still queued.
+- **Operand stride.** A sweep over powers of two sweeps, by construction,
+  only the strides that alias worst on this memory system: a K-strided
+  fragment load whose rows are a multiple of 2 KB apart puts all 16 of its
+  addresses in the same 256 B-interleaved channel, and moving the stride
+  256 B off that multiple is worth up to 1.35x on the WMMA GEMM kernels
+  (IDEAS §2.3). The `gemm` family's WMMA cases therefore take both leading
+  dimensions as push constants and carry `strideA`/`strideB` in their
+  `detail` column, and the `_pada128`/`_pad*` rows are the same SPIR-V at a
+  padded stride — so a row's stride is visible rather than implied by its
+  size. Nothing outside that family has been measured against a padded
+  stride yet; assume its numbers are the aliased ones.
 
 ## Adding a new shader
 

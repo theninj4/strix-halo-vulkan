@@ -12,14 +12,132 @@ to perform well.
 Everything below builds clean (`go build ./...`, `gofmt -l .`,
 `go vet ./...` all clean) and has passed its correctness checks on real
 hardware. `results.csv` was regenerated again this session, with the new
-register-blocked WMMA GEMM rows.
+stride-padded WMMA GEMM rows, by
+`go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv` — the
+non-default block list is what the committed file has always used, so keep it
+if the file is to stay comparable row for row.
 
 Two documents carry the analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
 gain / how to measure, and marked up with what has since been measured).
 **`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-### This session: IDEAS §2.1, the register-blocked WMMA GEMM
+### This session: IDEAS §2.3 — the transposed-B contradiction, resolved
+
+`IDEAS.md` §2.3's open question was why the *better* instruction stream is
+2.8x slower: storing B as [N,K] and loading it column-major cuts
+`wmma_reg64`'s loop from 577 instructions to 389, and loses badly at
+N=4096. Its one untested mechanism was channel/bank aliasing from the
+power-of-two leading dimension. **It is that, it is periodic in the stride
+with a 2 KB period, and it was costing the kernels that already won — so
+fixing it raised the suite's best GEMM from 25.2 to 28.4 TFLOP/s, 45% → 51%
+of this chip's measured WMMA ceiling, with no change to any kernel's
+structure.**
+
+**New code** (small — this session is a measurement, not a kernel):
+- `shaders/gemm_wmma.comp` takes both leading dimensions as push constants
+  (`pc.ldb`, `pc.lda`) instead of reusing `pc.K`/`pc.N` as extent *and*
+  stride. So a padded case reuses its unpadded case's SPIR-V and differs in
+  exactly one push-constant word — which is what makes the pair a clean
+  test. Verified the codegen didn't regress: `reg64_bt` is still 389
+  instructions with 16 `buffer_load_b128` and no `buffer_load_d16_b16`.
+- `bench/ops_gemm_wmma.go` gains `padA`/`padB` on `wmmaVariant` (in halves,
+  and they must be multiples of 8 or the rows stop being 16-byte aligned and
+  `coopMatLoad` falls back to scalar loads, which would measure alignment
+  instead of aliasing), `padRows`, and fourteen new cases: a seven-point
+  stride sweep on `reg64_bt`, three controls, and four pad-A cases — the
+  three §2.1 winners plus a both-operands-padded `reg64_bt`.
+  `Detail` now carries `strideA`/`strideB` in bytes. The push-constant size
+  is a named constant checked against the built blob, because getting it
+  wrong (20 bytes declared against a 24-byte block, which happened here)
+  leaves the last field reading out of range and RADV answers that with
+  plausible numbers rather than an error.
+- `cmd/probe/main.go` pushes 64 bytes of push constants instead of 16, since
+  a layout range smaller than the block the shader declares is invalid.
+
+**The stride sweep** (`wmma_reg64_bt`, N=K=4096, as committed in
+`results.csv`; five runs agree to ≤2% on every row here, so the ordering is
+the finding and the third digit is not):
+
+| pad (halves) | stride | mod 2 KB | GFLOP/s | vs unpadded |
+|---|---|---|---|---|
+| 0 | 8192 B | **0** | 8618 | — |
+| 8 | 8208 B | 16 B | 11713 | 1.36x |
+| 64 | 8320 B | 128 B | 13052 | 1.51x |
+| **128** | 8448 B | 256 B | **14028** | **1.63x** |
+| 256 | 8704 B | 512 B | 13132 | 1.52x |
+| 512 | 9216 B | 1 KB | 11804 | 1.37x |
+| 1024 | 10240 B | **0** | 9917 | 1.15x |
+| 2048 | 12288 B | **0** | 9284 | 1.08x |
+
+**The prefill table, after padding A by 256 B** (`_pada128`; B untouched):
+
+| kernel | N=1024 | N=2048 | N=4096 | best, % of 55.5 T |
+|---|---|---|---|---|
+| `wmma_reg64` | 23229 | 20216 | 24530 | 44% |
+| `wmma_reg64_pada128` | 24541 | **27260** | 23747 | 49% |
+| `wmma_reg64x128` | 18759 | 20008 | 25371 | 46% |
+| `wmma_reg64x128_pada128` | 19595 | 23862 | 25498 | 46% |
+| `wmma_wg128x256` | 18987 | 23363 | 25331 | 46% |
+| `wmma_wg128x256_pada128` | 19858 | 24359 | **26008** | 47% |
+| `wmma_reg64_bt` | 11002 | 8070 | 8618 | 20% |
+| `wmma_reg64_bt_padab128` | **28377** | 19127 | 15669 | **51%** |
+
+These rows, unlike the stride sweep, reproduce only to 2-4% across runs, and
+the pad-A effect at N=4096 is inside that (over four runs: +3-5% on
+`wg128x256`, +0.5-4.5% on `reg64x128`, −3 to +0.5% on `reg64`). The solid
+effects are the 1.2-1.4x at N=2048 and the 1.8-2.6x on transposed-B, both
+present in every run.
+
+**Five things worth carrying forward:**
+
+1. **The penalty is periodic in the stride, not monotone in the pad.** The
+   three strides that are multiples of 2 KB (8192, 10240, 12288 B) are the
+   three slowest rows; the fast ones sit 128-512 B past a multiple. 2 KB is
+   one interleave rotation of eight 256 B channel chunks, so a K-strided
+   fragment load at a power-of-two stride aims all 16 of its addresses at
+   one channel. **+256 B is the measured optimum**, and a pad that lands
+   back on a 2 KB multiple buys nothing — which is the difference between
+   this being aliasing and it being "any pad helps".
+2. **It is the strided gather that is fixed, not addresses in general.**
+   Padding a *row-major* B changes nothing (`wmma_reg64_pad64`: 23538 at
+   N=4096 against 24530 unpadded, and 0.2-2.7% lower at the other two sizes
+   — inside the 23.5-24.9 TFLOP/s that kernel spans across five runs) because
+   its B fragments are gathered element by element along N. Padding costs
+   nothing either, so the engine should just always do it.
+3. **A is K-strided in every variant, so this was taxing the winners.**
+   That is the whole reason this item paid: `wmma_reg64` at N=2048 goes
+   20216 → 27260 (1.35x), and the N=2048 dip visible in every unpadded row
+   was aliasing all along. At N=4096 the same pad is worth 0-5% depending on
+   the kernel, i.e. at the edge of the run-to-run spread, so the effect is
+   shape-dependent and has to be measured per shape, not assumed.
+4. **One prediction here was wrong, instructively.** The LDS path's global
+   B reads were expected to be immune, being contiguous 128-bit staging
+   loads rather than `coopMatLoad` gathers. They are not:
+   `wmma_lds128_db_bt` goes 13286 → **20597** with the same pad, closing
+   almost all of its gap to row-major. A staging load is contiguous only
+   *within* a row, and consecutive slab rows are `ldb*2` bytes apart, so the
+   wave's 64 addresses are the same aliased pattern. **What matters is the
+   address stride across concurrent loads, not which instruction issues
+   them.**
+5. **The residue is still open, and the obvious explanations are already
+   refuted.** With both strides padded, transposed-B still loses 1.6x at
+   N=4096 (15669 vs 24530) while *winning* at N=1024, so the
+   footprint-dependent half of §2.3 survives de-aliasing. It is not request
+   count: the two kernels' A loads are identical gathers, and the *faster*
+   one's B fragments are 64 scalar 2-byte loads against the slower one's 16
+   wide ones. Nor is it cache-line survival above MALL size —
+   `wmma_reg64_bt_k64_pad128` (deeper K-slab, so one slab consumes a whole
+   128 B line) measures 14026 against 14028 at N=4096, i.e. nothing, on a
+   kernel where aliasing can no longer mask it, though the same change does
+   help at N=1024. Settling it needs the memory system measured directly
+   rather than through a GEMM: a strided-load microbenchmark at fixed
+   bytes-touched, sweeping request size, request count and stride
+   independently. That is IDEAS §5.1b, and it would also turn the alias
+   penalty into a curve the engine can allocate against instead of one
+   kernel's anecdote.
+
+### Previous session: IDEAS §2.1, the register-blocked WMMA GEMM
 
 `IDEAS.md`'s largest remaining item is done, and it beat its own forecast.
 **A register-blocked cooperative-matrix GEMM reaches 25.2 TFLOP/s at
@@ -110,6 +228,8 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    untested one is channel/bank aliasing from the power-of-two leading
    dimension — a column-major fragment load issues 16 addresses `K·2` bytes
    apart within one instruction, and every K swept here is a power of two.
+   **[That is what it was; see this session's section above, which also
+   found the same tax on the kernels that won.]**
 5. **The occupancy floor never bound anything.** §0.1's warning was that
    8-16 accumulators per wave would drop below the 2-waves-per-CU WMMA needs.
    `shaderstats` says **144 VGPRs for 16 accumulators, 252 for 32, no spills
@@ -117,7 +237,7 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    the 256-VGPR wave64 limit, not by occupancy, which also makes §6.2
    (wave32) more interesting than it was: WMMA is natively a wave32 shape.
 
-### This session: IDEAS §1.1, the W4A8 GEMV kernel
+### Two sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
 
 The highest-value item in `IDEAS.md` is done, and it delivered more than it
 promised. **W4A8 GEMV — 4-bit weights against int8 activations, both fed to
@@ -194,9 +314,9 @@ the 64MB footprint, where 4-bit weights still fit the 32MB MALL.
    §1.2's "no integer division" is also folded into this kernel: it takes
    `log2(block)` and shifts.
 
-### Previous session: the §0 "measurement validity" block from IDEAS.md
+### Three sessions ago: the §0 "measurement validity" block from IDEAS.md
 
-The session before produced `IDEAS.md`. That session implemented its §0 —
+The session that produced `IDEAS.md` implemented its §0 —
 the work that had to happen before optimising against any of the existing
 numbers — and it changed several answers. **Every number predating it
 should be considered superseded.**
@@ -336,59 +456,69 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
 ## Next steps (pick up here)
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
-updated for what §0, §1.1 and §2.1 found. In short:
+updated for what §0, §1.1, §2.1 and §2.3 found. In short:
 
-1. **IDEAS §2.3 — resolve why the better instruction stream is slower.**
-   Storing B [N,K] and loading it column-major cuts the best GEMM kernel's
-   loop from 577 instructions to 389 and is **2.8x slower** at N=4096, only
-   once B stops being cache-resident. §2.1's remaining gap to the ceiling
-   looks like exactly the address-arithmetic pressure that layout removes,
-   so one answer here unblocks the largest kernel on the chip. Untested
-   mechanism: channel/bank aliasing from the power-of-two leading dimension.
-   Testing it needs a separate stride push constant (the kernel currently
-   reuses `pc.K` as both extent and stride) so the leading dimension can be
-   padded off a power of two — an afternoon's work.
-2. **IDEAS §2.4 — workgroup swizzle.** Upgraded to high value by §2.1: the
-   best kernel is pinned at ~760 of the MALL's 805 GB/s, and a swizzle is
-   the only remaining change that cuts MALL traffic without touching the
-   tile shape or the 256-VGPR budget. §2.1 also showed all its cross-tile
-   reuse comes from the MALL (neither LDS nor multi-wave workgroups help),
-   which is precisely the resource a swizzle reorders. Cheapest item with a
-   measured constraint behind it.
-3. **IDEAS §2.2's int8 arm — a `PRECISION_I8` variant of
+1. **IDEAS §5.1b — the strided-bandwidth probe, which is §2.3's unfinished
+   half.** Two questions, one microbenchmark, both engine-wide rather than
+   kernel-specific: (a) what a channel-aliased stride costs at constant
+   footprint — only the 256 B/2 KB case has been measured, on one kernel,
+   and the engine needs the shape of that curve to pad every allocation;
+   (b) what the machine delivers for one 16-address/16-bytes-each gather
+   versus a contiguous sweep of the same bytes at the same stride — the
+   shape question left by the 1.6x transposed-B still loses at N=4096, and
+   the thing a GEMM measurement cannot separate from tiling. It decides
+   whether the [N,K] layout a real `Linear` weight already has is usable
+   above MALL size.
+   The `bandwidth` family only ever measures contiguous streaming, so its
+   805/236 GB/s ceilings are best-case figures a strided kernel does not
+   automatically get.
+2. **IDEAS §2.4 — workgroup swizzle.** Still the cheapest structural item,
+   but restate the premise before building it: §2.3 pushed the AI-32
+   kernels to 742-887 GB/s of *implied* MALL traffic, past the 805 GB/s
+   ceiling, so they are not simply MALL-pinned and some of that traffic is
+   being served by the L1s. The sharp test is that a swizzle should help
+   the AI-32 kernels and do nothing for the AI-85 variant (306 GB/s
+   implied).
+3. **Pad the strides in the other kernels.** GEMV, W4A8 and W8A8 all index
+   weights by a power-of-two row stride, none has a stride push constant,
+   and none has been measured against a padded one. §2.3 makes this cheap
+   to try and hard to justify skipping — though note decode is already at
+   89% of the DRAM bus, so the headroom there is small by construction.
+4. **IDEAS §2.2's int8 arm — a `PRECISION_I8` variant of
    `gemm_wmma.comp`**, accumulating in int32. Small change to a kernel that
    now reaches 45% of the ceiling, halves its operand bytes, and gives W8A8
    prefill its number. (The *Q4*-unpack version stays downgraded: there is
    no int8 matrix-rate bonus on this chip, and the winning kernel has no LDS
    tile whose fill cost a cheaper unpack would improve.)
-4. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
+5. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
    on W4A8. fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%,
    where W4A8 now reaches 89%.
-5. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
+6. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
    and `n / pc.block`) from everything W4A8 did not rewrite: the
    naive/tiled GEMM paths and the old quantized GEMV variants.
    `gemv,naive,q4` is still slower than naive fp32, which is the symptom.
-6. **IDEAS §6.2 — wave32 vs wave64**, now more interesting than when it was
+7. **IDEAS §6.2 — wave32 vs wave64**, now more interesting than when it was
    filed: WMMA is natively a 16x16x16 wave32 shape, RADV runs these shaders
    at wave64, and §2.1's tile size is capped by the 256-VGPR wave64 limit
    rather than by occupancy. Needs a small `vk/shim.c` change to pass
    `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize`.
-7. **IDEAS §1.6 — the activation-quantize cost W8A8 and W4A8 both hide.**
+8. **IDEAS §1.6 — the activation-quantize cost W8A8 and W4A8 both hide.**
    Both kernels get `x` quantized on the host, outside the timed loop, and
    W4A8 additionally gets its per-block activation sums for free. A real
    decode step must produce both on-GPU between layers. The sums are one
    extra reduction over N (cheap, and fusable into the quantize pass), but
    it should be measured rather than assumed — it is the one place where
    these numbers are friendlier than production would be.
-8. **Still open from §0**: CPU-side submit/fence cost (the half of §4.1 the
+9. **Still open from §0**: CPU-side submit/fence cost (the half of §4.1 the
    `overhead` family does not measure), and the last ISA question from §6.1
    (is `v_pk_fma_f16` actually emitted, given §0.1's 1.10x packed-fp16
    surprise). `-blocks` is worth re-sweeping only where a block-size effect
    survives warming — in GEMV it does not.
-9. **Not committed to git.** The W4A8 work went in as 620f23f; this
-   session's is still outstanding: new `shaders/gemm_wmma.comp`,
-   `bench/ops_gemm_wmma.go` and `cmd/probe/main.go`, edits to
-   `shaders/shaders.go` and `bench/ops_gemm.go`, plus `README.md`,
-   `IDEAS.md`, this file, and a regenerated `results.csv`. Note `*.spv` is
-   gitignored, so **`go generate ./...` is required after a fresh
-   checkout** — the 12 WMMA variants are all built from the one `.comp`.
+10. **Not committed to git.** The §2.1 WMMA work went in as dfb68b7; this
+   session's §2.3 work is still outstanding: `shaders/gemm_wmma.comp`
+   (the two stride push constants), `bench/ops_gemm_wmma.go` (the pad knobs
+   and the new rows), `cmd/probe/main.go`, plus `IDEAS.md`, `README.md`,
+   this file, and a regenerated `results.csv`. Note `*.spv` is gitignored,
+   so **`go generate ./...` is required after a fresh checkout** — the 12
+   WMMA variants are all built from the one `.comp`, and the padded cases
+   reuse those same binaries.

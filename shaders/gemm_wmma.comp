@@ -67,8 +67,38 @@
 //     exactly as B stops being cache-resident, so it is a memory-system
 //     effect on a strided gather. Deepening the K-slab so each 128-byte
 //     cache line is fully consumed within one MMA block does not help, which
-//     rules out partial-line consumption. Unresolved; IDEAS §2.3 has the
-//     remaining hypothesis.
+//     rules out partial-line consumption.
+//
+// Both operands' leading dimensions are therefore push constants of their
+// own (`pc.lda`, `pc.ldb`) rather than K and N: that makes each row stride
+// paddable at run time while the extents stay powers of two, which is how
+// IDEAS §2.3's one remaining hypothesis — channel/bank aliasing between the
+// 16 addresses one fragment load issues inside a single instruction, all
+// `ld*2` bytes apart — gets tested without recompiling the shader. Pads must
+// be a multiple of 8 halves to keep every row 16-byte aligned; otherwise
+// coopMatLoad loses the `buffer_load_b128` this layout exists to get.
+//
+// **That hypothesis is now confirmed, and it is the dominant term.** Padding
+// B's stride by 256 B takes `wmma_reg64_bt` from 8618 to 14028 GFLOP/s at
+// N=4096 (1.63x), and the effect is periodic in the stride with a 2 KB
+// period: strides at 0 mod 2 KB (8192, 10240, 12288 B) all measure
+// 8.6-9.9 TFLOP/s, everything off-multiple measures 11.7-14.0, peaking 256 B
+// past a multiple. 2 KB is exactly one interleave rotation of
+// eight 256 B channel chunks, so a K-strided fragment load at a
+// power-of-two stride puts all 16 of its addresses in one channel. The same
+// pad on a row-major B (`wmma_reg64_pad64`, whose B fragments are gathered
+// element by element instead) changes nothing — 23538 GFLOP/s against the
+// unpadded kernel's 24530, which itself spans 23.5-24.9 across runs — so it is
+// the strided gather that is being fixed, not the addresses in general.
+//
+// And because A is K-strided in every variant here, the same pad on A alone
+// speeds up the kernels that already won: `wmma_reg64` 20216 -> 27260 at
+// N=2048 (1.35x — the N=2048 dip in every unpadded row was this), and
+// `wmma_wg128x256` 25331 -> 26008 at N=4096, where the gain is only 0-5% and
+// kernel-dependent. With both strides padded, the transposed-B kernel is the
+// fastest in the suite at N=1024 (28377, 51% of the ceiling)
+// and still loses at N=4096, so the footprint-dependent part of the effect
+// is something else; IDEAS §2.3 and §5.1b carry that residue.
 //
 // Tile geometry is compile-time (glslc -D), not specialization constants:
 // the accumulator grid sizes a register array and the LDS slabs size
@@ -142,6 +172,22 @@ layout(push_constant) uniform PC {
     uint N;
     uint K;
     uint block;
+    // Leading dimension of B in elements, i.e. the distance between
+    // consecutive rows of however B is stored: K + pad for the [N,K]
+    // column-major layout, N + pad for the [K,N] row-major one. Separate
+    // from K and N so the *stride* can be padded while the *extents* stay
+    // powers of two, which is what IDEAS §2.3's channel/bank-aliasing
+    // hypothesis needs: a column-major fragment load issues 16 addresses
+    // ldb*2 bytes apart inside one instruction, and every K swept here is a
+    // power of two, so without a separate stride every one of those 16
+    // addresses lands in the same DRAM channel and bank.
+    uint ldb;
+    // Leading dimension of A, same idea: A is [M, K + pad], K-contiguous.
+    // A's fragment loads are the *same* shape of strided gather as the
+    // column-major B ones — 16 rows, K*2 bytes apart, inside one
+    // instruction — so every variant here is exposed to the aliasing, not
+    // just the _bt ones.
+    uint lda;
 } pc;
 
 #if USE_LDS
@@ -190,10 +236,10 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
 // read if the compiler ever declined to fold the constant condition.
 #if B_COLMAJOR
 // slab row r is output column n0+r, contiguous along K
-#define B_SLAB_ELEM(r, kk, col) ((n0 + (r)) * pc.K + (kk) + (col))
+#define B_SLAB_ELEM(r, kk, col) ((n0 + (r)) * pc.ldb + (kk) + (col))
 #else
 // slab row r is reduction index kk+r, contiguous along N
-#define B_SLAB_ELEM(r, kk, col) (((kk) + (r)) * pc.N + n0 + (col))
+#define B_SLAB_ELEM(r, kk, col) (((kk) + (r)) * pc.ldb + n0 + (col))
 #endif
 
 // One slab row is BK halves wide for A, and for B too once B is stored [N,K].
@@ -221,7 +267,7 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
         if (i < A_VECS) {                                                      \
             uint r = i / A_VECS_PER_ROW;                                       \
             uint col = (i % A_VECS_PER_ROW) * 8u;                              \
-            stageA[s] = a4[((m0 + r) * pc.K + (kk) + col) >> 3u];              \
+            stageA[s] = a4[((m0 + r) * pc.lda + (kk) + col) >> 3u];            \
         }                                                                      \
     }                                                                          \
     [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
@@ -279,16 +325,16 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
 #endif
 #else
 #define LOAD_FRAG_A(i, abase, kt)                                              \
-    coopMatLoad(fragA[i], a, (wm0 + (i) * TILE) * pc.K + (abase) + (kt) * TILE, \
-        pc.K, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(fragA[i], a, (wm0 + (i) * TILE) * pc.lda + (abase) + (kt) * TILE, \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
 #if B_COLMAJOR
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], b, (wn0 + (j) * TILE) * pc.K + (bbase) + (kt) * TILE, \
-        pc.K, gl_CooperativeMatrixLayoutColumnMajor);
+    coopMatLoad(fragB[j], b, (wn0 + (j) * TILE) * pc.ldb + (bbase) + (kt) * TILE, \
+        pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
 #else
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], b, ((bbase) + (kt) * TILE) * pc.N + wn0 + (j) * TILE, \
-        pc.N, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(fragB[j], b, ((bbase) + (kt) * TILE) * pc.ldb + wn0 + (j) * TILE, \
+        pc.ldb, gl_CooperativeMatrixLayoutRowMajor);
 #endif
 #endif
 
