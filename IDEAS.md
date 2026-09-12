@@ -11,6 +11,12 @@ regenerated with clock instrumentation). Items it confirmed, refuted, or
 re-aimed are marked **[measured]** in place rather than rewritten away, so
 the wrong predictions stay visible next to what actually happened.
 
+**§1.1 (W4A8 GEMV) has since been implemented and run too**, and it
+delivered: 819 GFLOP/s against DRAM-resident weights, **2.4x** the previous
+best decode kernel and **89% of the DRAM bus**. Decode is now a solved
+bandwidth problem at 4 bits/weight; see §1.1 for what it took and §1.3 for
+the load-width half of it.
+
 ## The roofline, and why it says there's a lot left on the table
 
 Hardware numbers for this part (AMD Radeon 8060S, gfx1151, 40 CU, sclk
@@ -33,7 +39,10 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 
 (Real-kernel column is the best measured anywhere in `results.csv`; the
 GEMM entries are at N=4096, the `naive,w8a8` entry at N=256 where it is
-still cache-resident.)
+still cache-resident. The `dotPacked4x8` row's 4% is not the indictment it
+looks like: the kernels that use that instruction — W8A8 and now W4A8 GEMV
+— are memory-bound by construction, and W4A8 runs at 89% of the *bandwidth*
+ceiling, which is the one that binds it.)
 
 Four things in that table were not what §0 predicted:
 
@@ -74,7 +83,11 @@ measurements:
 1. **DRAM bandwidth is already saturated** (236 of 256 GB/s). No kernel
    trick will beat it. So for *decode*, the only lever is **reading fewer
    bytes per weight**. The corollary is sharper than expected: see §1.1,
-   which is now backed by per-format DRAM-resident ceilings.
+   which is now backed by per-format DRAM-resident ceilings. **[measured]**
+   §1.1 has since been built: the W4A8 kernel reads 4 bits/weight *and*
+   reaches 211 of 236 GB/s, so decode has gone from "the format that reads
+   fewest bytes can't consume them" to "the bus is the limit". The lever
+   that remains for decode is the format itself, not the kernel.
 2. **The matrix cores are ~91% idle.** The best GEMM kernel on this chip
    reaches 4.9 of 55.5 TFLOP/s. The coopmat kernels are nowhere near an
    MMA-issue limit; they are memory-bound because of how they are written
@@ -198,7 +211,7 @@ CPU-side `vkQueueSubmit` + fence wait, so §4.2's question is still open.
 
 ## 1. Decode path (GEMV / memory-bound) — the tok/s lever
 
-### 1.1 W4A8: Q4 weights fed to `dotPacked4x8EXT`
+### 1.1 W4A8: Q4 weights fed to `dotPacked4x8EXT` — **DONE** ✅, **2.4x**
 **Hypothesis**: the best decode kernel reads 4-bit weights *and* uses the
 packed-int8 dot instruction. Today those are mutually exclusive — Q4 goes
 through the float dequant path and W8A8 reads 8-bit weights.
@@ -226,6 +239,73 @@ bandwidth-limited.
 **Effort**: medium. **Value**: **highest remaining item in this document** —
 the only decode change with a measured 2x behind it.
 
+**[measured] Built and run** — `shaders/gemv_w4a8.comp`, `bench/ops_w4a8.go`,
+in both the warm `gemv` and DRAM-resident `gemv_cold` families. It is now
+the fastest decode kernel in the suite by a wide margin. At the 256MB
+fp16-equivalent footprint (M=32768, N=4096, block=128), which is the regime
+real decode runs in:
+
+| format | kernel | GFLOP/s | GB/s | % of its own DRAM ceiling |
+|---|---|---|---|---|
+| q4 | float unpack (old) | 283 | 73 | 31% |
+| w8a8 | packed dot | 339 | 172 | 73% |
+| **w4a8** | packed dot, `uint` loads | **698** | 180 | 76% |
+| **w4a8** | packed dot, `uvec4` loads | **819** | **211** | **89%** |
+
+**2.4x the previous champion** (W8A8's 339) and 2.9x the old Q4 path —
+comfortably past the ~670 GFLOP/s this section predicted. That prediction
+was too conservative because it assumed W4A8 would land at W8A8's *efficiency*
+(73%); it actually reached **89% of the 236 GB/s DRAM bus**, the highest
+utilisation any kernel in the suite achieves apart from the pure bandwidth
+benchmark. Decode is now genuinely bandwidth-bound at 4 bits/weight, which
+is the end state this whole section was aiming at: there is at most 11%
+left in this kernel, and further decode gains have to come from reading
+fewer bytes (finer-grained or lower-bit formats), not from better
+arithmetic. Cache-resident (`gemv`, N=1024, block=128) it is 1326 GFLOP/s
+against W8A8's 523 and Q4's 378; at the 64MB footprint, where the q4
+weights still fit the MALL, it reaches 2538 GFLOP/s at 654 GB/s.
+
+Four implementation notes, since two of them differ from the sketch above:
+
+1. **The bit trick above does not work.** `(v & 0x0F0F0F0F) - 0x08080808`
+   borrows across byte lanes: a nibble below 8 underflows its byte and
+   corrupts the next one. There is no borrow-free per-byte subtract. The
+   kernel instead leaves the nibbles *unsigned* (`u ∈ [0,15]`), feeds them
+   to the **mixed-signedness** overload `dotPacked4x8EXT(int, uint)` — this
+   device reports `integerDotProduct4x8BitPackedMixedSignednessAccelerated`,
+   so it is one hardware instruction — and removes the bias afterwards with
+   `sum (u-8)x = sum u*x - 8*sum x`. The per-block `sum x` is identical for
+   every weight row, so it is computed once per GEMV (a fifth binding) and
+   costs one short loop over `blocksPerRow`, not a single instruction in
+   the inner loop. A real engine gets those sums for free from the
+   activation-quantize pass.
+2. **The weights are repacked offline** (`bench.repackQ4ToW4A8`). Masking a
+   word of `quantizeQ4`'s interleaved layout (low nibble = even element)
+   would yield lanes that need the *activations* permuted per token to
+   match. Instead one word holds 8 consecutive weights with its 4 low
+   nibbles carrying elements n..n+3 and its high nibbles n+4..n+7, so the
+   two masked halves line up with two consecutive words of a plainly
+   packed int8 activation vector — the same x layout `gemv_w8a8.comp`
+   already consumes. This is a one-time cost on a model's weights, and it
+   is a pure permutation, so the CPU reference is still built from
+   `dequantizeQ4` on the pre-repack array (which checks the repack too).
+3. **The ISA is what was intended** (`RADV_DEBUG=asm`, and one of §6.1's
+   three questions answered early). The `VEC=4` inner loop is 3
+   `buffer_load_b128` (32 weights + 8 activation words), one
+   `buffer_load_d16_b16` for the fp16 scale, 8 `v_and_b32`/`v_lshrrev_b32`
+   pairs splitting the nibbles, **8 chained
+   `v_dot4_i32_iu8 ... neg_lo:[1,0,0] clamp`** — the mixed-signedness
+   hardware dot, signed first operand, unsigned second, exactly as asked
+   for — then one `v_cvt_f32_i32` and one `v_fma_mix_f32` that applies the
+   fp16 scale without a separate convert. No integer division, no
+   scalarized byte extraction. The W8A8 kernel by comparison emits
+   `neg_lo:[1,1,0]` (both signed), one dot per iteration.
+4. **Scale per load, not per block.** A load's worth of weights is required
+   to sit inside one quantization block (`block >= weightsPerLoad`), so the
+   int32 accumulator covers 8 or 32 weights and the fp16 scale is applied
+   once per load. Block size barely matters (660–819 GFLOP/s across
+   32/64/128, the larger blocks slightly ahead on scale traffic).
+
 ### 1.2 Kill the runtime integer divisions in the inner loop
 **Hypothesis**: every quantized kernel does **two runtime integer
 divisions per element** in its innermost loop. E.g.
@@ -246,6 +326,16 @@ Q4. Possibly also flattens the mysterious block-size sensitivity.
 **Measure**: dump ISA (§6.1) and confirm the `v_rcp_f32`/`v_mul_hi_u32`
 division sequences are gone; then re-benchmark all quantized variants.
 **Effort**: low. **Value**: high — cheapest real win in this document.
+
+**[measured] Done for the one kernel that mattered most, still open for the
+rest.** `gemv_w4a8.comp` takes `log2(block)` in its push constants and
+shifts, and every other divisor in it is a compile-time power of two, so it
+contains no integer division at all. That is bundled into §1.1's 2.4x and
+was not measured in isolation. The naive/tiled GEMM paths and the existing
+`gemv_subgroup`/`gemv_naive` quantized variants still divide twice per
+element — and `gemv,naive,q4` is still the slowest kernel in the suite
+(16 GFLOP/s at N=1024, *half* naive fp32's 32), which remains the strongest
+circumstantial evidence for this item.
 
 ### 1.3 Vectorise the loads (uvec4 / 128-bit per lane)
 **Hypothesis**: GEMV is issuing 32-bit loads where it could issue 128-bit
@@ -268,6 +358,18 @@ consumes them, and §0.3 showed every GEMV variant stuck at 50-75% of its
 bandwidth ceiling.
 **Effort**: low-medium. **Value**: medium (downgraded from high).
 
+**[measured] The load half is confirmed, and it is worth ~15%.**
+`gemv_w4a8.comp` compiles in two variants off one source, `VEC=1` (one
+`uint`, 8 weights per lane per step) and `VEC=4` (one `uvec4`, 32 weights),
+which differ in nothing else. Against DRAM-resident weights the wide loads
+are **1.17x** (698 → 819 GFLOP/s, 180 → 211 GB/s at block=128) and
+cache-resident **1.10x** (1204 → 1326 GFLOP/s at N=1024). That is the
+difference between 76% and 89% of the DRAM ceiling — i.e. most of what was
+left in the access pattern was memory-instruction issue, exactly as this
+item argued. Worth repeating on the fp16 and W8A8 GEMV kernels, which are
+still at 75% and 73%. The packed-fp16 *math* half remains unattractive
+(1.10x on the ALU peak) and untested.
+
 ### 1.4 Multiple output rows per workgroup
 **Hypothesis**: one workgroup (one wave64) per output row means the
 activation vector `x` is re-read from cache by all 4096 workgroups, and
@@ -279,7 +381,10 @@ registers/LDS once and reusing it across rows; emit R results per
 overhead. **[measured]** §0.3 gives this a target: no GEMV format exceeds
 75% of its DRAM bandwidth ceiling, so ~25-50% is sitting in the access
 pattern, and this plus §1.3 are the two candidates for it.
-**Effort**: medium. **Value**: medium.
+**Effort**: medium. **Value**: medium. **[measured]** §1.3's wide loads
+took W4A8 to 89% of its ceiling on their own, leaving this only ~10% to
+chase on the kernel that matters; it stays interesting for the other
+formats and for the small-M batched shapes in §1.5.
 
 ### 1.5 Find the GEMV→coopmat crossover for small batch
 **Hypothesis**: for M=2..16 (speculative decoding, beam search, batched
@@ -687,26 +792,38 @@ Three items came out of it that change the ordering below: Q4 GEMV is
 ALU-bound even against DRAM, the matrix cores run at 9% of a *measured*
 ceiling, and dispatch overhead is a non-issue.
 
-**Next (the two big kernels):**
-- **§1.1 W4A8 GEMV** — the highest-value item now. Q4 reaches 31% of its
-  DRAM bandwidth ceiling where W8A8 reaches 73%; closing that gap is a
-  measured ~2x on decode.
+**§1.1 is done too** — W4A8 GEMV is built, verified and measured at 819
+GFLOP/s / 211 GB/s against DRAM-resident weights, 2.4x the previous best
+decode kernel and 89% of the DRAM bus. Decode is no longer the open
+problem; prefill is.
+
+**Next (the one big kernel):**
 - **§2.1 register-blocked coopmat GEMM** — 9% of 55.5 TFLOP/s, with an
-  8 FLOP/byte arithmetic intensity where 235 is needed. Largest absolute
-  gain on the chip. Watch the 2-waves-per-CU occupancy floor.
+  8 FLOP/byte arithmetic intensity where 235 is needed. Now the largest
+  absolute gain left on the chip by a distance. Watch the 2-waves-per-CU
+  occupancy floor.
 
 **Then (cheap, and now better targeted):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
-  win, and it is on the critical path of exactly the kernel §1.1 rewrites.
+  win on everything W4A8 didn't rewrite (the naive/tiled GEMM paths and the
+  old quantized GEMV variants, where `gemv,naive,q4` is still slower than
+  naive fp32).
+- **§1.3 wide loads on the remaining GEMV kernels** — measured at 1.17x on
+  W4A8; fp16 and W8A8 GEMV are still at 75% and 73% of their ceilings and
+  are the obvious next targets.
 - **§6.1 ISA dumps** — now has three specific questions to answer: is
   `v_pk_fma_f16` even emitted (§1.3's 1.10x surprise), is
-  `V_DOT4_I32_I8` emitted, and what are the VGPR counts that will decide
-  whether §2.1's register blocking fits in 2 waves per CU.
+  `V_DOT4_I32_IU8` emitted for W4A8's mixed-signedness dot (the device
+  advertises it as accelerated, and the kernel's 90%-of-DRAM result implies
+  it, but it has not been confirmed in the disassembly), and what are the
+  VGPR counts that will decide whether §2.1's register blocking fits in 2
+  waves per CU.
 - **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is still
   the binding constraint on decode.
 - **§3.7 fix the reduction kernels**, **§2.4 workgroup swizzle**, **§6.2
-  wave32 vs wave64**, **§1.3/§1.4 GEMV access pattern** (§0.3 showed every
-  GEMV format stuck at 50-75% of its bandwidth ceiling).
+  wave32 vs wave64**, **§1.4 GEMV access pattern** (§0.3 showed every GEMV
+  format stuck at 50-75% of its bandwidth ceiling; W4A8 has since reached
+  90%, so the others have the most room).
 
 **Then (the missing pillars):** §3.3 attention/flash-attention, §3.4 real
 model shapes, §3.1-3.2 fusion (justified by DRAM round-trips, not launch
@@ -718,9 +835,10 @@ concern is ruled out), and the packed-fp16 half of §1.3 (1.10x, not 2x).
 
 The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
-bytes — and Q4 already reads them, it just can't unpack them fast enough
-(31% of its ceiling), which is what W4A8 fixes. The matrix cores run at 9%
-of a measured 55.5 TFLOP/s, so prefill wins come from arithmetic intensity.
-The 32 MiB MALL is worth 3.4x DRAM for anything that can be kept resident.
-And neither dispatch overhead nor a nonexistent int8 matrix-rate bonus is
-worth designing around.**
+bytes — and W4A8 now reads 4 bits/weight at 211 of those 236 GB/s, so
+decode is finished as a kernel problem and continues only as a format
+problem. The matrix cores still run at 9% of a measured 55.5 TFLOP/s, so
+prefill wins come from arithmetic intensity, and that is now the single
+biggest thing left. The 32 MiB MALL is worth 3.4x DRAM for anything that
+can be kept resident. And neither dispatch overhead nor a nonexistent int8
+matrix-rate bonus is worth designing around.**

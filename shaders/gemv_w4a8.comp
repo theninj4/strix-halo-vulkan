@@ -1,0 +1,140 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_integer_dot_product : enable
+
+// y = W*x with 4-bit weights and int8 activations ("W4A8"), one subgroup
+// per output row. This is IDEAS.md §1.1: Q4 reads the fewest weight bytes
+// of any format here, but the existing PRECISION_Q4 path (gemv_subgroup.comp)
+// unpacks one nibble at a time into a float multiply and only manages 73 of
+// the 236 GB/s this chip can supply — 31% of its own bandwidth ceiling,
+// i.e. ALU-bound on the unpack rather than bandwidth-bound. This kernel
+// keeps the 0.5 bytes/weight and does the arithmetic the way gemv_w8a8.comp
+// does: through dotPacked4x8EXT (RDNA's V_DOT4_I32_IU8), 4 int8 MACs per
+// instruction.
+//
+// Three things make that possible:
+//
+// 1. **Weight layout.** quantizeQ4's interleaved layout (low nibble = even
+//    element, high nibble = odd) would need the activations permuted to
+//    match. Instead the weights are repacked *offline* (a one-time cost on
+//    a real model's weights, see bench.repackQ4ToW4A8) so that one 32-bit
+//    word holds 8 consecutive weights with the low nibbles of its 4 bytes
+//    carrying elements n..n+3 and the high nibbles n+4..n+7. Masking then
+//    yields two ready-made packed-int8 words that line up with two
+//    consecutive words of a plainly-packed int8 activation vector — the
+//    same x layout gemv_w8a8.comp already consumes.
+//
+// 2. **Mixed-signedness dot.** The nibbles are stored biased ([-8,7] held
+//    as [0,15], matching quantizeQ4), and `x & 0x0F0F0F0F` cannot be
+//    de-biased in place: subtracting 0x08080808 borrows across byte lanes.
+//    So the unsigned nibbles are fed straight to the signed×unsigned
+//    overload `dotPacked4x8EXT(int, uint)` and the bias is removed
+//    afterwards, using the identity
+//        sum (u_i - 8) x_i = sum u_i x_i - 8 * sum x_i
+//    where `sum x_i` over each quantization block is the same for every
+//    row. It is therefore precomputed once per GEMV (binding 4), and the
+//    correction costs one short loop over blocksPerRow (64 iterations for
+//    a 4096-wide row at block=64, spread over 64 lanes) instead of extra
+//    instructions in the inner loop. This device reports
+//    integerDotProduct4x8BitPackedMixedSignednessAccelerated, so the mixed
+//    form is a hardware instruction, not an emulation.
+//
+// 3. **No integer division** (IDEAS.md §1.2). log2(block) is pushed
+//    instead of block, so the block index of a load is a shift; every
+//    other divisor (weights per load) is a compile-time power of two.
+//
+// VEC selects the load width: 1 = one uint (8 weights) per lane per step,
+// 4 = one uvec4 (32 weights). The wide variant is IDEAS.md §1.3's "load"
+// half — fewer, larger memory instructions for the same bytes.
+
+#ifndef VEC
+#define VEC 1
+#endif
+
+// Weights consumed per lane per loop step. Compile-time, and a power of
+// two, so `pc.N / WEIGHTS_PER_LOAD` is a shift.
+#define WEIGHTS_PER_LOAD (8u * uint(VEC))
+// Activation words (4 int8 lanes each) consumed per lane per loop step.
+#define XWORDS_PER_LOAD (2u * uint(VEC))
+
+layout(local_size_x = 64) in;
+
+#if VEC == 4
+layout(binding = 0) readonly buffer W { uvec4 w[]; };   // M x (N/32) uvec4
+layout(binding = 2) readonly buffer X { uvec4 x[]; };   // N/16 uvec4
+#else
+layout(binding = 0) readonly buffer W { uint w[]; };    // M x (N/8) words
+layout(binding = 2) readonly buffer X { uint x[]; };    // N/4 packed int8 words
+#endif
+layout(binding = 1) readonly buffer WScales { float16_t wScales[]; }; // M * (N/block)
+layout(binding = 3) writeonly buffer Y { float y[]; };
+layout(binding = 4) readonly buffer XBlockSums { int xBlockSums[]; };  // N/block
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint logBlock; // log2 of the quantization block size along N; block >= WEIGHTS_PER_LOAD
+    float xScale;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) {
+        return;
+    }
+    uint loadsPerRow = pc.N / WEIGHTS_PER_LOAD;
+    uint blocksPerRow = pc.N >> pc.logBlock;
+    uint scaleBase = row * blocksPerRow;
+
+    float partial = 0.0;
+    for (uint j = gl_LocalInvocationID.x; j < loadsPerRow; j += gl_WorkGroupSize.x) {
+        // Gather this step's activation words. A whole load's worth of
+        // weights sits inside one quantization block (block >=
+        // WEIGHTS_PER_LOAD is required), so a single int32 accumulator can
+        // hold the step and the fp16 scale is applied once per step rather
+        // than once per weight.
+        uint xs[XWORDS_PER_LOAD];
+#if VEC == 4
+        uvec4 xa = x[2u * j];
+        uvec4 xb = x[2u * j + 1u];
+        xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
+        xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
+        uvec4 packed = w[row * loadsPerRow + j];
+#else
+        xs[0] = x[2u * j];
+        xs[1] = x[2u * j + 1u];
+        uint packed = w[row * loadsPerRow + j];
+#endif
+
+        int acc = 0;
+        for (uint c = 0u; c < uint(VEC); ++c) {
+#if VEC == 4
+            uint v = packed[c];
+#else
+            uint v = packed;
+#endif
+            // Low nibbles hold elements n..n+3, high nibbles n+4..n+7 —
+            // exactly the two activation words xs[2c], xs[2c+1].
+            acc = dotPacked4x8AccSatEXT(int(xs[2u * c]), v & 0x0F0F0F0Fu, acc);
+            acc = dotPacked4x8AccSatEXT(int(xs[2u * c + 1u]), (v >> 4u) & 0x0F0F0F0Fu, acc);
+        }
+        uint blockIdx = (j * WEIGHTS_PER_LOAD) >> pc.logBlock;
+        partial += float(acc) * float(wScales[scaleBase + blockIdx]);
+    }
+
+    // Remove the +8 bias the packed nibbles carry: one term per block, and
+    // blocksPerRow is far smaller than loadsPerRow, so this loop is noise
+    // next to the one above.
+    for (uint b = gl_LocalInvocationID.x; b < blocksPerRow; b += gl_WorkGroupSize.x) {
+        partial -= 8.0 * float(wScales[scaleBase + b]) * float(xBlockSums[b]);
+    }
+
+    float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        y[row] = total * pc.xScale;
+    }
+}

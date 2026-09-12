@@ -68,13 +68,20 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 	}
 	defer q4Mod.Destroy()
 	var w8a8Mod *vk.ShaderModule
+	w4a8Mods := make([]*vk.ShaderModule, len(w4a8Variants))
 	if feat.IntegerDotProduct {
 		if w8a8Mod, err = dev.NewShaderModule(shaders.GEMVW8A8); err != nil {
 			return nil, err
 		}
 		defer w8a8Mod.Destroy()
+		for i, v := range w4a8Variants {
+			if w4a8Mods[i], err = dev.NewShaderModule(v.spirv); err != nil {
+				return nil, err
+			}
+			defer w4a8Mods[i].Destroy()
+		}
 	} else {
-		fmt.Fprintln(os.Stderr, "gemv_cold w8a8: shaderIntegerDotProduct not supported, skipping")
+		fmt.Fprintln(os.Stderr, "gemv_cold w8a8/w4a8: shaderIntegerDotProduct not supported, skipping")
 	}
 
 	var results []Result
@@ -125,27 +132,60 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 				format: "w8a8", M: M, N: N, block: block,
 				weightBytes: M * N,
 				fillWeights: fillInt8Pattern,
-				int8Acts:    true,
+				kind:        coldInt8Acts,
 			}, warmup, iters)
 			if err != nil {
 				return nil, fmt.Errorf("gemv_cold w8a8 block=%d footprint=%dMB: %w", block, fpMB, err)
 			}
 			results = append(results, r)
+
+			for i, v := range w4a8Variants {
+				if !w4a8BlockOK(block, v.weightsPerLoad) || N%v.weightsPerLoad != 0 {
+					continue
+				}
+				r, err = runGEMVColdCase(dev, w4a8Mods[i], coldCase{
+					format: "w4a8", variant: v.name, M: M, N: N, block: block,
+					weightBytes: M * N / 2,
+					fillWeights: fillNibblePattern,
+					kind:        coldW4A8,
+				}, warmup, iters)
+				if err != nil {
+					return nil, fmt.Errorf("gemv_cold w4a8 %s block=%d footprint=%dMB: %w", v.name, block, fpMB, err)
+				}
+				results = append(results, r)
+			}
 		}
 	}
 	return results, nil
 }
 
+// coldKind selects the calling convention of the shader under test: which
+// buffers it binds and what its push constants look like.
+type coldKind int
+
+const (
+	// coldFloatActs is the fp16/q8/q4 subgroup shaders: fp32 activations,
+	// {M,N,block}.
+	coldFloatActs coldKind = iota
+	// coldInt8Acts is gemv_w8a8.comp: activations packed as int8 words plus
+	// a scalar scale, {M,N,block,xScale}.
+	coldInt8Acts
+	// coldW4A8 is gemv_w4a8.comp: int8 activations as above, plus a fifth
+	// binding holding the per-block activation sums that cancel the packed
+	// nibbles' +8 bias, and log2(block) in place of block.
+	coldW4A8
+)
+
 // coldCase is one (format, shape) pair to time.
 type coldCase struct {
-	format      string
+	format string
+	// variant names the kernel flavour for the results table; empty means
+	// "subgroup", which all of these are except the wide-load W4A8 one.
+	variant     string
+	kind        coldKind
 	M, N, block int
 	weightBytes int
 	fillWeights func(buf []byte)
-	// int8Acts selects the W8A8 shader's buffer layout and push constants:
-	// activations packed as int8 words plus a scalar scale, rather than
-	// fp32 activations with a per-block weight scale applied in float.
-	int8Acts bool
 }
 
 func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, iters uint32) (Result, error) {
@@ -179,21 +219,22 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	scalesBuf.WriteBytes(fillFloat16Const(scaleCount, 0.01))
 
 	var xBuf *vk.Buffer
-	var xScale float32
-	if c.int8Acts {
-		// N int8 lanes packed 4-per-word, the layout gemv_w8a8.comp reads.
-		if xBuf, err = dev.NewBuffer(c.N); err != nil {
-			return Result{}, err
-		}
-		xBytes := make([]byte, c.N)
-		fillInt8Pattern(xBytes)
-		xBuf.WriteBytes(xBytes)
-		xScale = 0.01
-	} else {
+	var xBytes []byte
+	const xScale = 0.01
+	if c.kind == coldFloatActs {
 		if xBuf, err = dev.NewBuffer(c.N * 4); err != nil {
 			return Result{}, err
 		}
 		xBuf.WriteFloat32(randomFloats(c.N))
+	} else {
+		// N int8 lanes packed 4-per-word, the layout gemv_w8a8.comp and
+		// gemv_w4a8.comp both read.
+		if xBuf, err = dev.NewBuffer(c.N); err != nil {
+			return Result{}, err
+		}
+		xBytes = make([]byte, c.N)
+		fillInt8Pattern(xBytes)
+		xBuf.WriteBytes(xBytes)
 	}
 	defer xBuf.Destroy()
 
@@ -203,14 +244,32 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	}
 	defer yBuf.Destroy()
 
-	// gemv_w8a8.comp binds {W, WScales, X, Y}; the fp16/q8/q4 shaders bind
-	// {W, Scales, X, Y} — the same order, so one layout serves both.
+	// All three shaders bind {W, Scales, X, Y} in that order; W4A8 adds a
+	// fifth binding for the per-block activation sums. Those are computed
+	// from the same bytes the x buffer was filled with, so the bias
+	// correction is the real one even though this sweep skips the CPU
+	// reference (see the doc comment).
+	buffers := []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf}
 	pushSize := uint32(12)
-	if c.int8Acts {
+	pc := newPC().U32(uint32(c.M)).U32(uint32(c.N)).U32(uint32(c.block))
+	switch c.kind {
+	case coldInt8Acts:
 		pushSize = 16
+		pc = pc.F32(xScale)
+	case coldW4A8:
+		pushSize = 16
+		pc = newPC().U32(uint32(c.M)).U32(uint32(c.N)).U32(log2u(c.block)).F32(xScale)
+		sums := int8BlockSums(bytesToInt8(xBytes), c.block)
+		sumsBuf, err := dev.NewBuffer(len(sums) * 4)
+		if err != nil {
+			return Result{}, err
+		}
+		defer sumsBuf.Destroy()
+		sumsBuf.WriteBytes(int32SliceToBytes(sums))
+		buffers = append(buffers, sumsBuf)
 	}
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf},
+		Buffers:          buffers,
 		PushConstantSize: pushSize,
 	})
 	if err != nil {
@@ -218,10 +277,6 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	}
 	defer pipe.Destroy()
 
-	pc := newPC().U32(uint32(c.M)).U32(uint32(c.N)).U32(uint32(c.block))
-	if c.int8Acts {
-		pc = pc.F32(xScale)
-	}
 	pcBytes := pc.Bytes()
 
 	groupsX := uint32(c.M) // the subgroup kernels use one workgroup per output row
@@ -237,10 +292,14 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 		return Result{}, err
 	}
 
+	variant := c.variant
+	if variant == "" {
+		variant = "subgroup"
+	}
 	bytesRead := float64(c.weightBytes + scaleCount*2)
 	flops := float64(2 * c.M * c.N)
 	return Result{
-		Op: "gemv_cold", Variant: "subgroup", WeightFormat: c.format, BlockSize: c.block, Size: c.M,
+		Op: "gemv_cold", Variant: variant, WeightFormat: c.format, BlockSize: c.block, Size: c.M,
 		Detail:    fmt.Sprintf("N=%d;weightMB=%.1f", c.N, bytesRead/(1024*1024)),
 		NsPerIter: ns,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,

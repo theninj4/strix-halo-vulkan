@@ -21,8 +21,9 @@ type gemvVariant struct {
 
 // RunGEMV measures y = W*x — the dominant op in autoregressive LLM decode —
 // across naive/subgroup reduction strategies and fp32/fp16/q8/q4 weights,
-// plus a W8A8 (int8 weights AND activations, via packed dot-product
-// instructions) variant if the device supports it.
+// plus the packed-dot-product variants if the device supports them: W8A8
+// (int8 weights and activations) and W4A8 (4-bit weights, int8
+// activations).
 func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
 	variants := []gemvVariant{
 		{
@@ -99,13 +100,19 @@ func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 		return nil, err
 	}
 	if !feat.IntegerDotProduct {
-		fmt.Fprintln(os.Stderr, "gemv w8a8: shaderIntegerDotProduct not supported, skipping")
+		fmt.Fprintln(os.Stderr, "gemv w8a8/w4a8: shaderIntegerDotProduct not supported, skipping")
 	} else {
 		w8a8, err := runGEMVW8A8(dev, sizes, blocks, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, w8a8...)
+
+		w4a8, err := runGEMVW4A8(dev, sizes, blocks, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, w4a8...)
 	}
 	return results, nil
 }

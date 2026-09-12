@@ -8,8 +8,15 @@ the implementation "flavours" that matter on this hardware: naive vs.
 shared-memory-tiled vs. subgroup-reduced vs. cooperative-matrix
 (`VK_KHR_cooperative_matrix`, RDNA3.5's matrix-multiply accelerator), and
 fp32 vs. fp16 vs. quantized (int8/int4, GGML-style block scales) weights vs.
-W8A8 (both weights and activations int8, reduced via
+W8A8 and W4A8 (int8 or 4-bit weights against int8 activations, reduced via
 `VK_KHR_shader_integer_dot_product`'s packed-dot instructions).
+
+The fastest decode kernel here so far is **W4A8 GEMV**
+(`shaders/gemv_w4a8.comp`): 4-bit weights fed to the packed-int8 dot
+instruction through its mixed-signedness overload, at **819 GFLOP/s and 211
+GB/s against DRAM-resident weights — 89% of this machine's 236 GB/s memory
+bandwidth**, 2.4x the int8-weight kernel it replaces. `IDEAS.md` explains
+how it gets there and what is still on the table.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader

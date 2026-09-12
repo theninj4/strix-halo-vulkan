@@ -96,6 +96,20 @@ var GEMVNaiveQ4 []byte
 //go:embed gemv_w8a8.spv
 var GEMVW8A8 []byte
 
+// GEMV W4A8: 4-bit weights fed to the same packed-int8 dot instruction,
+// against int8 activations. Q4's bytes with W8A8's arithmetic — see
+// gemv_w4a8.comp. VEC=1 loads one uint (8 weights) per lane per step,
+// VEC=4 one uvec4 (32 weights), which is the load-width half of IDEAS §1.3.
+
+//go:generate glslc --target-env=vulkan1.2 -O -o gemv_w4a8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=4 -o gemv_w4a8_v4.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8.spv
+var GEMVW4A8 []byte
+
+//go:embed gemv_w4a8_v4.spv
+var GEMVW4A8Vec4 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp
