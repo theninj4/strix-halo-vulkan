@@ -1,0 +1,55 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_integer_dot_product : enable
+
+// C = A * B with BOTH operands int8 ("W8A8"), one thread per output
+// element, using dotPacked4x8EXT (VK_KHR_shader_integer_dot_product's
+// packed-int8 dot, RDNA's V_DOT4_I32_I8) instead of dequant-then-multiply —
+// see gemv_w8a8.comp for the rationale.
+//
+// A is MxK activations, quantized per row to int8 with one scale per row
+// (dynamic/per-token activation quantization, as real W8A8 inference
+// engines do). B (the weights) is stored TRANSPOSED as NxK — row n holds
+// output channel n's K weights contiguously, block-quantized along K — so
+// that 4 consecutive K elements pack into one dotPacked4x8EXT operand for
+// both operands. This is not a benchmark-only contrivance: it's exactly how
+// a real engine stores a Linear layer's weight matrix ([out_features,
+// in_features], row-major). Both operands are plain packed-uint32 buffers,
+// 4 signed int8 lanes per word — the same byte layout quantizeQ8 already
+// produces, no repacking needed on the host side.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) readonly buffer A { uint a[]; };                   // M x (K/4) packed
+layout(binding = 1) readonly buffer AScales { float16_t aScales[]; };  // M, one scale per row
+layout(binding = 2) readonly buffer B { uint b[]; };                   // N x (K/4) packed, transposed
+layout(binding = 3) readonly buffer BScales { float16_t bScales[]; };  // N * (K/block)
+layout(binding = 4) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block; // quantization block size along K for B; multiple of 4
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.y; // m
+    uint col = gl_GlobalInvocationID.x; // n
+    if (row >= pc.M || col >= pc.N) {
+        return;
+    }
+
+    uint wordsPerRow = pc.K / 4u;
+    uint wordsPerBlock = pc.block / 4u;
+    uint blocksPerRow = pc.K / pc.block;
+
+    float acc = 0.0;
+    for (uint j = 0u; j < wordsPerRow; j++) {
+        int d = dotPacked4x8EXT(int(a[row * wordsPerRow + j]), int(b[col * wordsPerRow + j]));
+        uint blockIdx = j / wordsPerBlock;
+        acc += float(d) * float(bScales[col * blocksPerRow + blockIdx]);
+    }
+    c[row * pc.N + col] = acc * float(aScales[row]);
+}

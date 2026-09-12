@@ -2,6 +2,7 @@ package bench
 
 import (
 	"fmt"
+	"os"
 
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
@@ -19,8 +20,10 @@ type gemvVariant struct {
 }
 
 // RunGEMV measures y = W*x — the dominant op in autoregressive LLM decode —
-// across naive/subgroup reduction strategies and fp32/fp16/q8/q4 weights.
-func RunGEMV(dev *vk.Device, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
+// across naive/subgroup reduction strategies and fp32/fp16/q8/q4 weights,
+// plus a W8A8 (int8 weights AND activations, via packed dot-product
+// instructions) variant if the device supports it.
+func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
 	variants := []gemvVariant{
 		{
 			name: "naive", shaderF32: shaders.GEMVNaiveF32, shaderF16: shaders.GEMVNaiveF16,
@@ -89,6 +92,20 @@ func RunGEMV(dev *vk.Device, sizes []int, blocks []int, warmup, iters uint32) ([
 				results = append(results, r)
 			}
 		}
+	}
+
+	feat, err := phys.SupportedFeatures()
+	if err != nil {
+		return nil, err
+	}
+	if !feat.IntegerDotProduct {
+		fmt.Fprintln(os.Stderr, "gemv w8a8: shaderIntegerDotProduct not supported, skipping")
+	} else {
+		w8a8, err := runGEMVW8A8(dev, sizes, blocks, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, w8a8...)
 	}
 	return results, nil
 }

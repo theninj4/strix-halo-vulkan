@@ -127,7 +127,7 @@ func run(sizes, bwSizes, blocks []int, warmup, iters uint32, csvPath string, ski
 	if err := run("elementwise", func() ([]bench.Result, error) { return bench.RunElementwise(dev, bwSizes, warmup, iters) }); err != nil {
 		return err
 	}
-	if err := run("gemv", func() ([]bench.Result, error) { return bench.RunGEMV(dev, sizes, blocks, warmup, iters) }); err != nil {
+	if err := run("gemv", func() ([]bench.Result, error) { return bench.RunGEMV(dev, phys, sizes, blocks, warmup, iters) }); err != nil {
 		return err
 	}
 	if err := run("gemm", func() ([]bench.Result, error) { return bench.RunGEMM(dev, phys, sizes, blocks, warmup, iters) }); err != nil {

@@ -75,17 +75,29 @@ func RunGEMM(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 	results = append(results, tiledF16...)
 
 	for _, block := range blocks {
-		q8, err := runGEMMQ8Variant(dev, shaders.GEMMNaiveQ8, 16, block, sizes, warmup, iters)
+		q8, err := runGEMMQ8Variant(dev, "naive", shaders.GEMMNaiveQ8, 16, block, sizes, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, q8...)
 
-		q4, err := runGEMMQ4Variant(dev, shaders.GEMMNaiveQ4, 16, block, sizes, warmup, iters)
+		q4, err := runGEMMQ4Variant(dev, "naive", shaders.GEMMNaiveQ4, 16, block, sizes, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, q4...)
+
+		tiledQ8, err := runGEMMQ8Variant(dev, "tiled", shaders.GEMMTiledQ8, 16, block, sizes, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, tiledQ8...)
+
+		tiledQ4, err := runGEMMQ4Variant(dev, "tiled", shaders.GEMMTiledQ4, 16, block, sizes, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, tiledQ4...)
 	}
 
 	coopFP16, err := runGEMMCoopMatFP16(dev, phys, sizes, warmup, iters)
@@ -112,6 +124,20 @@ func RunGEMM(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 			return nil, err
 		}
 		results = append(results, fused...)
+	}
+
+	feat, err := phys.SupportedFeatures()
+	if err != nil {
+		return nil, err
+	}
+	if !feat.IntegerDotProduct {
+		fmt.Fprintln(os.Stderr, "gemm w8a8: shaderIntegerDotProduct not supported, skipping")
+	} else {
+		w8a8, err := runGEMMW8A8(dev, sizes, blocks, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, w8a8...)
 	}
 
 	return results, nil
@@ -269,7 +295,7 @@ func timeGEMMPlain(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat s
 	}, nil
 }
 
-func runGEMMQ8Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes []int, warmup, iters uint32) ([]Result, error) {
+func runGEMMQ8Variant(dev *vk.Device, variant string, spirv []byte, localSize, block int, sizes []int, warmup, iters uint32) ([]Result, error) {
 	mod, err := dev.NewShaderModule(spirv)
 	if err != nil {
 		return nil, err
@@ -277,7 +303,7 @@ func runGEMMQ8Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes 
 	defer mod.Destroy()
 
 	if err := verifyGEMMQ8(dev, mod, block); err != nil {
-		return nil, fmt.Errorf("gemm naive q8 block=%d correctness check: %w", block, err)
+		return nil, fmt.Errorf("gemm %s q8 block=%d correctness check: %w", variant, block, err)
 	}
 
 	var results []Result
@@ -285,9 +311,9 @@ func runGEMMQ8Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes 
 		if n%block != 0 {
 			continue
 		}
-		res, err := timeGEMMQ8(dev, mod, localSize, n, n, n, block, warmup, iters)
+		res, err := timeGEMMQ8(dev, mod, variant, localSize, n, n, n, block, warmup, iters)
 		if err != nil {
-			return nil, fmt.Errorf("gemm naive q8 block=%d size=%d: %w", block, n, err)
+			return nil, fmt.Errorf("gemm %s q8 block=%d size=%d: %w", variant, block, n, err)
 		}
 		results = append(results, res)
 	}
@@ -351,7 +377,7 @@ func verifyGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
 	return compareMat(got, want, 1e-2)
 }
 
-func timeGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, localSize, M, N, K, block int, warmup, iters uint32) (Result, error) {
+func timeGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize, M, N, K, block int, warmup, iters uint32) (Result, error) {
 	aData := randomFloats(M * K)
 	bData := randomFloats(K * N)
 	q, scales := quantizeQ8(bData, K, N, block)
@@ -402,13 +428,13 @@ func timeGEMMQ8(dev *vk.Device, mod *vk.ShaderModule, localSize, M, N, K, block 
 
 	flops := float64(2 * M * N * K)
 	return Result{
-		Op: "gemm", Variant: "naive", WeightFormat: "q8", BlockSize: block, Size: N,
+		Op: "gemm", Variant: variant, WeightFormat: "q8", BlockSize: block, Size: N,
 		NsPerIter: ns,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil
 }
 
-func runGEMMQ4Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes []int, warmup, iters uint32) ([]Result, error) {
+func runGEMMQ4Variant(dev *vk.Device, variant string, spirv []byte, localSize, block int, sizes []int, warmup, iters uint32) ([]Result, error) {
 	mod, err := dev.NewShaderModule(spirv)
 	if err != nil {
 		return nil, err
@@ -416,7 +442,7 @@ func runGEMMQ4Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes 
 	defer mod.Destroy()
 
 	if err := verifyGEMMQ4(dev, mod, block); err != nil {
-		return nil, fmt.Errorf("gemm naive q4 block=%d correctness check: %w", block, err)
+		return nil, fmt.Errorf("gemm %s q4 block=%d correctness check: %w", variant, block, err)
 	}
 
 	var results []Result
@@ -424,9 +450,9 @@ func runGEMMQ4Variant(dev *vk.Device, spirv []byte, localSize, block int, sizes 
 		if n%block != 0 {
 			continue
 		}
-		res, err := timeGEMMQ4(dev, mod, localSize, n, n, n, block, warmup, iters)
+		res, err := timeGEMMQ4(dev, mod, variant, localSize, n, n, n, block, warmup, iters)
 		if err != nil {
-			return nil, fmt.Errorf("gemm naive q4 block=%d size=%d: %w", block, n, err)
+			return nil, fmt.Errorf("gemm %s q4 block=%d size=%d: %w", variant, block, n, err)
 		}
 		results = append(results, res)
 	}
@@ -490,7 +516,7 @@ func verifyGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, block int) error {
 	return compareMat(got, want, 1e-2)
 }
 
-func timeGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, localSize, M, N, K, block int, warmup, iters uint32) (Result, error) {
+func timeGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, localSize, M, N, K, block int, warmup, iters uint32) (Result, error) {
 	aData := randomFloats(M * K)
 	bData := randomFloats(K * N)
 	packed, scales := quantizeQ4(bData, K, N, block)
@@ -541,7 +567,7 @@ func timeGEMMQ4(dev *vk.Device, mod *vk.ShaderModule, localSize, M, N, K, block 
 
 	flops := float64(2 * M * N * K)
 	return Result{
-		Op: "gemm", Variant: "naive", WeightFormat: "q4", BlockSize: block, Size: N,
+		Op: "gemm", Variant: variant, WeightFormat: "q4", BlockSize: block, Size: N,
 		NsPerIter: ns,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,
 	}, nil

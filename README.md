@@ -7,7 +7,9 @@ built from — GEMM, GEMV, elementwise/activation, softmax/RMSNorm — across
 the implementation "flavours" that matter on this hardware: naive vs.
 shared-memory-tiled vs. subgroup-reduced vs. cooperative-matrix
 (`VK_KHR_cooperative_matrix`, RDNA3.5's matrix-multiply accelerator), and
-fp32 vs. fp16 vs. quantized (int8/int4, GGML-style block scales) weights.
+fp32 vs. fp16 vs. quantized (int8/int4, GGML-style block scales) weights vs.
+W8A8 (both weights and activations int8, reduced via
+`VK_KHR_shader_integer_dot_product`'s packed-dot instructions).
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader

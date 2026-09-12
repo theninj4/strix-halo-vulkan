@@ -51,6 +51,15 @@ var GEMVNaiveQ8 []byte
 //go:embed gemv_naive_q4.spv
 var GEMVNaiveQ4 []byte
 
+// GEMV W8A8: both weights and activations int8, reduced via
+// VK_KHR_shader_integer_dot_product's packed dot instruction instead of
+// dequant-and-multiply. Subgroup reduction only (see gemv_w8a8.comp).
+
+//go:generate glslc --target-env=vulkan1.2 -O -o gemv_w8a8.spv gemv_w8a8.comp
+
+//go:embed gemv_w8a8.spv
+var GEMVW8A8 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp
@@ -99,12 +108,30 @@ var DequantQ4ToF16 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -DTILE=16 -o gemm_tiled_f32.spv gemm_tiled.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DTILE=16 -DPRECISION_F16 -o gemm_tiled_f16.spv gemm_tiled.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DTILE=16 -DPRECISION_Q8 -o gemm_tiled_q8.spv gemm_tiled.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DTILE=16 -DPRECISION_Q4 -o gemm_tiled_q4.spv gemm_tiled.comp
 
 //go:embed gemm_tiled_f32.spv
 var GEMMTiledF32 []byte
 
 //go:embed gemm_tiled_f16.spv
 var GEMMTiledF16 []byte
+
+//go:embed gemm_tiled_q8.spv
+var GEMMTiledQ8 []byte
+
+//go:embed gemm_tiled_q4.spv
+var GEMMTiledQ4 []byte
+
+// GEMM W8A8: both A and B int8, reduced via dotPacked4x8EXT. Naive (one
+// thread per output element) only — see gemm_w8a8.comp for why this isn't
+// pitted against the coopmat variants (different hardware path, already
+// covered by gemm_coopmat_int8.comp).
+
+//go:generate glslc --target-env=vulkan1.2 -O -o gemm_w8a8.spv gemm_w8a8.comp
+
+//go:embed gemm_w8a8.spv
+var GEMMW8A8 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_fp16.spv gemm_coopmat_fp16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_int8.spv gemm_coopmat_int8.comp

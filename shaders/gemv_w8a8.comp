@@ -1,0 +1,60 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_integer_dot_product : enable
+
+// y = W*x with BOTH operands int8 ("W8A8"), one subgroup per output row
+// (same shape as gemv_subgroup.comp). Unlike the PRECISION_Q8 path in
+// gemv_naive.comp/gemv_subgroup.comp (dequantize each weight to float, then
+// float-multiply-add against x), this reduces 4 weight/activation elements
+// at a time via dotPacked4x8EXT — VK_KHR_shader_integer_dot_product's
+// packed-int8 dot instruction (RDNA's V_DOT4_I32_I8) — one instruction
+// doing 4 int8 MACs instead of 4 float MACs. Both W and X are stored as
+// plain uint words, 4 packed signed int8 lanes per word (the same byte
+// layout quantizeQ8 already produces — no repacking needed on the host
+// side); no 8-bit storage extension is needed since nothing is read as
+// int8_t, only as packed uint32.
+//
+// Applying each block's scale right after its packed dot (rather than
+// accumulating a whole block in integer and scaling once) is mathematically
+// equivalent — scale is constant within a block, so distributing the
+// multiply over the sum changes nothing but rounding order — and avoids
+// needing block boundaries to align with the subgroup's striding over
+// words.
+layout(local_size_x = 64) in;
+
+layout(binding = 0) readonly buffer W { uint w[]; };          // M x (N/4) packed int8 words
+layout(binding = 1) readonly buffer WScales { float16_t wScales[]; }; // M * (N/block)
+layout(binding = 2) readonly buffer X { uint x[]; };          // N/4 packed int8 words
+layout(binding = 3) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint block; // quantization block size along N for W; multiple of 4
+    float xScale;
+} pc;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.M) {
+        return;
+    }
+    uint wordsPerRow = pc.N / 4u;
+    uint wordsPerBlock = pc.block / 4u;
+    uint blocksPerRow = pc.N / pc.block;
+
+    float partial = 0.0;
+    for (uint j = gl_LocalInvocationID.x; j < wordsPerRow; j += gl_WorkGroupSize.x) {
+        int d = dotPacked4x8EXT(int(w[row * wordsPerRow + j]), int(x[j]));
+        uint blockIdx = j / wordsPerBlock;
+        partial += float(d) * float(wScales[row * blocksPerRow + blockIdx]);
+    }
+    float total = subgroupAdd(partial);
+    if (subgroupElect()) {
+        y[row] = total * pc.xScale;
+    }
+}

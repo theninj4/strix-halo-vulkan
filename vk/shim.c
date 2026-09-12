@@ -193,6 +193,9 @@ VkResult shim_create_device(VkPhysicalDevice phys, uint32_t queueFamily, const S
     if (request->coopMatrix) {
         extensions[extCount++] = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME;
     }
+    if (request->integerDotProduct) {
+        extensions[extCount++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+    }
 
     VkDeviceCreateInfo createInfo = {0};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
