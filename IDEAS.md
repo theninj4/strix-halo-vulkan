@@ -17,6 +17,14 @@ best decode kernel and **89% of the DRAM bus**. Decode is now a solved
 bandwidth problem at 4 bits/weight; see §1.1 for what it took and §1.3 for
 the load-width half of it.
 
+**§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
+more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
+and 45% of the measured WMMA ceiling**, up from 8%. Two of its sub-hypotheses were wrong in
+useful ways — LDS staging and multi-wave workgroups are both *unnecessary* on
+this part, because the 32 MiB MALL already supplies the reuse they exist to
+provide — and §2.3 turned into a sharp, unresolved contradiction: the B
+layout that halves the instruction count is 2.8x slower. See §2.1, §2.3, §6.1.
+
 ## The roofline, and why it says there's a lot left on the table
 
 Hardware numbers for this part (AMD Radeon 8060S, gfx1151, 40 CU, sclk
@@ -34,12 +42,14 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
-| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | 4.9 TFLOP/s (`coopmat_fused,q4`) | **~9%** ❌ |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **25.2 TFLOP/s** (`wmma_wg128x256`) | **45%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
 (Real-kernel column is the best measured anywhere in `results.csv`; the
 GEMM entries are at N=4096, the `naive,w8a8` entry at N=256 where it is
-still cache-resident. The `dotPacked4x8` row's 4% is not the indictment it
+still cache-resident. The WMMA fp16 row was 4.9 TFLOP/s / 9% until §2.1
+register-blocked the kernel; the int8 row is still the un-blocked one and
+would move the same way if §2.2 were written. The `dotPacked4x8` row's 4% is not the indictment it
 looks like: the kernels that use that instruction — W8A8 and now W4A8 GEMV
 — are memory-bound by construction, and W4A8 runs at 89% of the *bandwidth*
 ceiling, which is the one that binds it.)
@@ -75,7 +85,11 @@ One more result worth designing around: **WMMA needs 2 waves per CU to
 reach full rate.** wmma_fp16 measures 27.9 TFLOP/s at 40 waves (1/CU) and
 55.5 at 80 waves (2/CU), then stays flat to 1280. Any coopmat kernel must
 keep ≥80 workgroups resident, which also means a register-blocked kernel
-(§2.1) must not blow occupancy down to one wave per CU.
+(§2.1) must not blow occupancy down to one wave per CU. **[measured]** In
+practice this never bound §2.1: its heaviest variant uses 252 of the 256
+VGPRs a wave64 may hold, with no spills, which is still 3 waves per SIMD,
+and a 64×128 tile at N=4096 launches 2048 workgroups. Register blocking
+here is capped by the VGPR *limit*, not by occupancy.
 
 Two conclusions drive everything below, both strengthened by the
 measurements:
@@ -94,6 +108,14 @@ measurements:
    (8 FLOP/byte of arithmetic intensity where ~235 is needed to saturate
    55.5 TFLOP/s at 236 GB/s), not because of the hardware. So for
    *prefill/batch*, the lever is **arithmetic intensity** (§2.1).
+   **[measured]** §2.1 has since been built and this was right: raising
+   arithmetic intensity from 8 to 32 FLOP/byte by register-blocking the
+   accumulators took the kernel from 4.2 to 24.3 TFLOP/s, 8% → 44% of the
+   ceiling, and the returns were *linear in intensity* because the kernel
+   sits pinned at ~760 of the 805 GB/s the MALL delivers. Past AI 32 they
+   stop: 25.2 TFLOP/s is the plateau, bound by neither ceiling. Note what
+   did **not** matter — LDS staging, more waves per workgroup, and the
+   occupancy floor below were all irrelevant or harmful here.
 
 There is also a third, newly quantified lever: **the 32 MiB MALL delivers
 805 GB/s, 3.4x DRAM.** Anything that can be restructured to work out of a
@@ -419,7 +441,7 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
-### 2.1 Register-block the coopmat kernels (the big one)
+### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x**
 **Hypothesis**: `gemm_coopmat_fp16.comp` is memory-bound by construction.
 One workgroup = one wave64 = **one** 16×16 accumulator, and the K-loop
 loads A and B straight from global memory every iteration
@@ -446,15 +468,86 @@ TFLOP/s, measured on this device, is 9%.**
 **Expected**: **2-4x** over the current 4.2-4.9 TFLOP/s, i.e. 10-20
 TFLOP/s against a 55.5 TFLOP/s ceiling. This is the single largest absolute
 gain available on the chip.
-**Measure**: GFLOP/s at N=4096 as a fraction of the `peak wmma_fp16` row;
-expect utilisation to go from 9% to 25-40%. **[measured] Occupancy
-constraint**: §0.1 found WMMA needs **2 waves per CU** for full rate (27.9
-TFLOP/s at 40 waves, 55.5 at 80). A register-blocked kernel must therefore
-keep ≥80 workgroups resident — check VGPR counts (§6.1) rather than
-assuming, since 8-16 accumulators per wave is exactly the kind of change
-that drops occupancy to one wave per CU and gives back half the peak.
+
+**[measured] Built and run** — `shaders/gemm_wmma.comp` + `bench/ops_gemm_wmma.go`,
+twelve variants off one source forming an ablation over four axes
+(accumulator grid, waves per workgroup, LDS staging, double buffering, B
+layout). It beat the prediction: **25.2 TFLOP/s at N=4096, 6.0x the
+baseline coopmat kernel at the same shape and 45% of the measured WMMA
+ceiling**, up from 8%. (Against the baseline's own best figure anywhere in
+the sweep — 5.4 TFLOP/s at N=1024 — it is 4.6x.) At N=4096, with implied
+A+B traffic computed as GFLOP/s ÷ arithmetic intensity so each row can be
+placed against the 805 GB/s MALL and 236 GB/s DRAM ceilings:
+
+| kernel | tile | waves/wg | AI | GFLOP/s | % of 55.5 T | implied traffic |
+|---|---|---|---|---|---|---|
+| `coopmat` (baseline) | 16×16 | 1 | 8 | 4190 | 7.5% | 524 GB/s |
+| `wmma_reg32` | 32×32 | 1 | 16 | 12233 | 22% | **765 GB/s** |
+| `wmma_reg64` | 64×64 | 1 | 32 | 24276 | 44% | **759 GB/s** |
+| **`wmma_reg64x128`** | 64×128 | 1 | 43 | **24458** | **44%** | 573 GB/s |
+| `wmma_wg128` | 128×128 | 4 | ≤64 | 23409 | 42% | ≤366 GB/s |
+| **`wmma_wg128x256`** | 128×256 | 4 | ≤85 | **25245** | **45%** | ≤296 GB/s |
+| `wmma_lds128` | 128×128 | 4 | 64 | 17163 | 31% | 268 GB/s |
+| `wmma_lds128_db` | 128×128 | 4 | 64 | 21223 | 38% | 332 GB/s |
+| `wmma_lds128_db_bt` | 128×128 | 4 | 64 | 12944 | 23% | 202 GB/s |
+| `wmma_lds256x128_db_bt` | 256×128 | 4 | 85 | 12716 | 23% | 149 GB/s |
+| `wmma_reg64_bt` | 64×64 | 1 | 32 | 8543 | 15% | 267 GB/s |
+
+The `wg*` rows' intensity is an upper bound rather than a fact: their four
+waves issue overlapping fragment loads and only reach it if L0/L1 dedups
+them, which is what those rows exist to test.
+
+Four findings, two of which contradict the plan above.
+
+1. **Arithmetic intensity was exactly the right variable, and the returns
+   are linear once the MALL is saturated.** AI 8 → 16 → 32 gives 4.19 →
+   12.2 → 24.3 TFLOP/s, and the traffic column explains the shape of that:
+   at AI 16 and 32 the kernel is pinned at **765 and 759 GB/s** (766-814
+   GB/s across the sizes swept), i.e. at the measured 805 GB/s MALL
+   bandwidth, so the 16 → 32 step is *exactly* 2.0x — a doubling of reuse
+   buying a doubling of throughput out of a fixed budget. The 8 → 16 step is
+   2.9x rather than 2x because the baseline's 524 GB/s shows it was not even
+   bandwidth-saturated: with one accumulator per wave there is no
+   independent work to hide load latency behind, so it lost twice over.
+2. **Getting rid of LDS staging is the win; grouping waves is neither here
+   nor there.** The top two configurations tie within run-to-run noise —
+   `wmma_reg64x128` (one wave per workgroup, no shared memory) and
+   `wmma_wg128x256` (four waves, no shared memory, no barriers) — while
+   *every* LDS variant loses, the best of them by 1.2x. And the LDS variants
+   are nowhere near bandwidth-bound (149-332 GB/s of a 805 GB/s budget);
+   they are bound by their own shared-memory reads and barriers. So **the 32
+   MiB MALL is already supplying the cross-wave reuse that LDS staging
+   exists to provide**, and explicitly staging it just adds barriers and
+   `ds_load`s on top. That is an APU-shaped result: on a discrete part with a
+   small L2 this ordering would very likely invert.
+3. **Double buffering does work — 1.24x — on the path that loses anyway.**
+   `wmma_lds128` → `wmma_lds128_db` is 17.2 → 21.2 TFLOP/s for one barrier
+   per K-step instead of two, with the next slab's global loads issued
+   before the current slab's MMAs (the compiler sinks the `s_waitcnt` to the
+   first use, so the latency is spent under the matrix work). The mechanism
+   is confirmed; it is just not enough to make LDS competitive here.
+4. **The occupancy floor was never the constraint.** §0.1's worry was that
+   8-16 accumulators per wave would drop below the 2 waves/CU WMMA needs.
+   `RADV_DEBUG=shaderstats` says 144 VGPRs for the 16-accumulator variants
+   and 252 for the 32-accumulator ones, **no spills and no scratch** in any
+   of them — 3-5 waves per SIMD, comfortably above the floor. Register
+   blocking on this part is limited by the 256-VGPR wave64 cap, not by
+   occupancy, which makes §6.2 (wave32) more interesting than it was.
+
+**What binds it at 25 TFLOP/s** is neither ceiling: 573 GB/s of a 805 GB/s
+MALL and 45% of a 55.5 TFLOP/s MMA rate. The instruction mix names the
+likely culprit — `wmma_reg64`'s loop body is **577 instructions for 16
+`v_wmma_f32_16x16x16_f16`**, of which 232 are pure address arithmetic
+(`v_lshlrev_b32` + `v_add3_u32`) feeding the scalarized B-fragment loads
+described in §2.3. At roughly 34 SIMD-cycles per wave64 WMMA, ~36 VALU
+instructions per MMA is the same order as the matrix work itself, so the
+address math plausibly co-issues into the MMA shadow and then runs out of
+room. The fix is exactly what §2.3's B layout does to the instruction
+stream — 389 instructions and 144 address ops instead of 577 and 232 — and
+it costs 2.8x in memory behaviour instead of winning. Closing that
+contradiction is the highest-value follow-up in this section.
 **Effort**: high (this is a real GEMM kernel). **Value**: highest for
-prefill, image generation, and the Parakeet encoder.
+prefill, image generation, and the Parakeet encoder. **Delivered.**
 
 ### 2.2 W4A8 coopmat — Q4 weights into the int8 MMA path — **downgraded**
 **Hypothesis (as written, now falsified in part)**: that feeding Q4 into
@@ -471,9 +564,18 @@ the size, which helps occupancy — but the payoff is now "somewhat cheaper
 tile fill", not 2x. **Do §2.1 first**; once the kernel is
 arithmetic-intensity-bound rather than memory-bound, re-measure whether the
 tile-fill cost is even on the critical path before writing this.
-**Effort**: high. **Value**: medium (downgraded from very high).
+**[measured] §2.1 is now done, and it re-aims this item.** The winning
+kernel has no LDS tile at all, so "the LDS tile is half the size" is moot;
+and the remaining gap to the ceiling looks like address-arithmetic and
+load-issue pressure rather than operand-fill cost. What §2.1 *does* make
+newly attractive is the plain **int8 register-blocked GEMM** — a
+`PRECISION_I8` arm of `gemm_wmma.comp` accumulating in int32, which is a
+small change to a kernel that now reaches 45% of the ceiling and would halve
+its operand bytes. That, not the Q4-unpack version, is the next step here.
+**Effort**: low for the int8 arm, high for the Q4 unpack.
+**Value**: medium-high for int8, medium for Q4 (downgraded from very high).
 
-### 2.3 Test B stored [N,K] with a column-major `coopMatLoad`
+### 2.3 B stored [N,K] with a column-major `coopMatLoad` — **DONE**, and it **loses** ❌
 **Hypothesis**: B is stored K-major ([K,N]) and loaded row-major, but real
 `Linear` weights are stored `[out_features, in_features]` = [N,K], and
 RDNA's WMMA B-operand lane layout may favour the transposed load. The
@@ -483,7 +585,51 @@ coopmat paths don't.
 `gl_CooperativeMatrixLayoutColumnMajor`; benchmark both.
 **Expected**: unclear sign, but it's nearly free to test and removes a
 host-side transpose from the engine's weight loader if it wins.
-**Effort**: low. **Value**: medium.
+
+**[measured] The codegen half of the hypothesis is emphatically right and
+the performance half is emphatically wrong.** Tested as the `_bt` variants
+of `gemm_wmma.comp` (§2.1), which differ from their pairs in nothing else.
+
+RADV's `coopMatLoad` has a strong layout preference, isolated with a
+four-case probe (`cmd/probe` + `RADV_DEBUG=asm`, one fragment load per case):
+
+| operand | layout | instructions emitted |
+|---|---|---|
+| `gl_MatrixUseA` | RowMajor | 2 × `buffer_load_b128` ✅ |
+| `gl_MatrixUseA` | ColumnMajor | 16 × `buffer_load_d16_b16` |
+| `gl_MatrixUseB` | RowMajor | 16 × `buffer_load_d16_b16` |
+| `gl_MatrixUseB` | **ColumnMajor** | 2 × `buffer_load_b128` ✅ |
+
+So the hardware WMMA operand layout is K-contiguous for *both* operands,
+and a [K,N] row-major B has to be gathered element by element — which is
+what `gemm_coopmat_fp16.comp` has been paying on every fragment all along.
+Storing B [N,K] removes it: `wmma_reg64`'s loop body goes from **577
+instructions (8 wide loads + 64 scalar 16-bit loads, and 232 address-
+arithmetic ops to compute them) to 389 (16 wide loads, 144 address ops)**,
+for the same 16 `v_wmma`.
+
+**And it is 2.8x slower at N=4096** — 8543 vs 24276 GFLOP/s — across every
+tiling tried: the register-blocked pair, the LDS pair
+(`wmma_lds128_db` 21223 → `wmma_lds128_db_bt` 12944), and the 256×128 tile.
+The penalty is size-dependent and appears exactly when B stops being
+cache-resident: at N=512 `_bt` is *faster* (14265 vs 12838), at N=1024 it
+is 2.0x slower, at N≥2048 it is 2.5-2.8x slower. So this is a memory-system
+effect on a strided gather, not an instruction-count effect — the
+instruction count moves the *other* way.
+
+One mechanism was tested and **refuted**: that a column-major B fragment
+consumes only 32 of each 128-byte cache line and depends on the line
+surviving three more K-steps. Deepening the K-slab to 64 so one MMA block
+consumes a full line (`wmma_reg64_bt_k64`) changes nothing — 8583 vs 8543.
+**Still untested, and the obvious next probe**: channel/bank aliasing from
+the power-of-two leading dimension. A column-major fragment load issues 16
+addresses `K·2` bytes apart *within one instruction*, and every K swept here
+is a power of two; padding the leading dimension to break the alias would
+distinguish this cleanly, and needs a separate stride push constant since
+the kernel currently reuses `pc.K` as both extent and stride.
+**Effort**: low. **Value**: high but blocked on the above — §2.1 identifies
+this layout as the way to halve its address-arithmetic overhead, so the
+contradiction is worth resolving rather than filing.
 
 ### 2.4 Workgroup swizzle / tile reordering for MALL locality
 **Hypothesis**: linear `gl_WorkGroupID` ordering walks C row-by-row, so
@@ -495,7 +641,15 @@ tiles into e.g. 8×8 super-tiles); pure index arithmetic, no structural
 change.
 **Expected**: 10-30% on large N, more once §2.1 makes tiles bigger. A
 standard, well-documented GEMM win.
-**Effort**: low. **Value**: medium-high (great effort/reward ratio).
+**[measured] §2.1 promotes this.** Its best kernel is pinned at ~760 of the
+805 GB/s the MALL delivers at AI 16 and 32, so it is *literally* MALL-
+bandwidth-bound, and a swizzle is the one remaining change that reduces MALL
+traffic without touching the tile shape or the register budget. §2.1 also
+showed that neither LDS staging nor grouping waves into a workgroup buys
+anything, which means all the cross-tile reuse this kernel gets is already
+coming from the MALL — exactly the resource a swizzle reorders. It is now
+the cheapest untried item with a measured constraint behind it.
+**Effort**: low. **Value**: high (upgraded).
 
 ### 2.5 Split-K for skinny shapes
 **Hypothesis**: real transformer GEMMs aren't square. When M·N is small
@@ -720,6 +874,22 @@ generated GCN/RDNA assembly. Use it to confirm:
 - `coopMatMulAdd` really became `V_WMMA_*` and not a scalar fallback.
 - The integer-division sequences of §1.2 exist (and then disappear).
 - **VGPR/SGPR counts and LDS usage per kernel** → waves/SIMD occupancy.
+**[measured] Done, and it is now a tool rather than a one-off.** `cmd/probe`
+dispatches any single `.spv` once so `RADV_DEBUG=asm` (disassembly) and
+`RADV_DEBUG=shaderstats` (VGPR/SGPR/LDS/spills) can be pointed at it.
+Answers so far:
+- `dotPacked4x8EXT` → `v_dot4_i32_iu8 ... neg_lo:[1,0,0]`, the
+  mixed-signedness hardware dot, in W4A8 (§1.1); `neg_lo:[1,1,0]` in W8A8.
+- `coopMatMulAdd` → `v_wmma_f32_16x16x16_f16`, no scalar fallback, and
+  subgroup size is **64** even in a coopmat shader, so a 256-thread
+  workgroup is 4 waves.
+- VGPR counts: 144 for a 16-accumulator wave, **252** for 32 accumulators,
+  no spills or scratch in either — §2.1's occupancy worry was unfounded.
+- **And one finding nothing else would have surfaced**: `coopMatLoad` emits
+  2 `buffer_load_b128` for a row-major A or column-major B operand and
+  **16 scalar `buffer_load_d16_b16`** for the other two combinations. That
+  is §2.3, and it is the single most useful thing reading the ISA has
+  produced. `v_pk_fma_f16` (§1.3's 1.10x surprise) is still unchecked.
 **Effort**: low. **Value**: high — it converts speculation into fact, and
 every item above gets cheaper to evaluate once we can read the ISA.
 
@@ -787,58 +957,65 @@ experiments, but they gate the format decision:
 
 **§0 is done** — the harness now measures its own ceilings, records the
 clock behind every number, and has a DRAM-resident decode benchmark
-(`peak`, `overhead`, `gemv_cold` families; `results.csv` regenerated).
-Three items came out of it that change the ordering below: Q4 GEMV is
-ALU-bound even against DRAM, the matrix cores run at 9% of a *measured*
-ceiling, and dispatch overhead is a non-issue.
+(`peak`, `overhead`, `gemv_cold` families). **§1.1 is done** — W4A8 GEMV at
+819 GFLOP/s / 211 GB/s, 89% of the DRAM bus, so decode is finished as a
+kernel problem. **§2.1 is done** — the register-blocked WMMA GEMM at 25.2
+TFLOP/s, 45% of the matrix cores, so prefill is no longer the gaping hole
+either. What those three left behind:
 
-**§1.1 is done too** — W4A8 GEMV is built, verified and measured at 819
-GFLOP/s / 211 GB/s against DRAM-resident weights, 2.4x the previous best
-decode kernel and 89% of the DRAM bus. Decode is no longer the open
-problem; prefill is.
+**Next (resolve the contradiction §2.1 ran into):**
+- **§2.3, why the better instruction stream is slower.** Storing B [N,K]
+  and loading it column-major cuts `wmma_reg64`'s loop from 577 instructions
+  to 389 and is 2.8x slower at N=4096, only once B stops being
+  cache-resident. §2.1's remaining gap to the ceiling looks like exactly the
+  address-arithmetic pressure that layout removes, so this is the one place
+  where a single answer unblocks the largest kernel on the chip. The
+  untested mechanism is channel/bank aliasing from the power-of-two leading
+  dimension; padding it needs a stride push constant, which is an afternoon.
+- **§2.4 workgroup swizzle.** Upgraded to high value: §2.1 is pinned at ~760
+  of the MALL's 805 GB/s, and a swizzle is the only remaining change that
+  reduces MALL traffic without touching the tile shape or the register
+  budget. Cheapest item in the document with a measured constraint behind it.
+- **§2.2's int8 arm** — a `PRECISION_I8` variant of `gemm_wmma.comp`
+  accumulating in int32. Small change to a kernel that now works, halves the
+  operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
+  unpack version stays downgraded: there is no int8 matrix-rate bonus, and
+  §2.1's winner has no LDS tile to make cheaper.)
 
-**Next (the one big kernel):**
-- **§2.1 register-blocked coopmat GEMM** — 9% of 55.5 TFLOP/s, with an
-  8 FLOP/byte arithmetic intensity where 235 is needed. Now the largest
-  absolute gain left on the chip by a distance. Watch the 2-waves-per-CU
-  occupancy floor.
-
-**Then (cheap, and now better targeted):**
+**Then (cheap, and still untouched):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
   win on everything W4A8 didn't rewrite (the naive/tiled GEMM paths and the
   old quantized GEMV variants, where `gemv,naive,q4` is still slower than
   naive fp32).
 - **§1.3 wide loads on the remaining GEMV kernels** — measured at 1.17x on
-  W4A8; fp16 and W8A8 GEMV are still at 75% and 73% of their ceilings and
-  are the obvious next targets.
-- **§6.1 ISA dumps** — now has three specific questions to answer: is
-  `v_pk_fma_f16` even emitted (§1.3's 1.10x surprise), is
-  `V_DOT4_I32_IU8` emitted for W4A8's mixed-signedness dot (the device
-  advertises it as accelerated, and the kernel's 90%-of-DRAM result implies
-  it, but it has not been confirmed in the disassembly), and what are the
-  VGPR counts that will decide whether §2.1's register blocking fits in 2
-  waves per CU.
-- **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is still
-  the binding constraint on decode.
-- **§3.7 fix the reduction kernels**, **§2.4 workgroup swizzle**, **§6.2
-  wave32 vs wave64**, **§1.4 GEMV access pattern** (§0.3 showed every GEMV
-  format stuck at 50-75% of its bandwidth ceiling; W4A8 has since reached
-  90%, so the others have the most room).
+  W4A8; fp16 and W8A8 GEMV are still at 75% and 73% of their ceilings.
+- **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is the
+  binding constraint on both of the paths that now work.
+- **§3.7 fix the reduction kernels**, **§6.2 wave32 vs wave64** (now more
+  interesting: WMMA is natively a wave32 shape and §2.1 runs at wave64
+  against a 256-VGPR cap that is what limits its tile size), **§1.4 GEMV
+  access pattern**, and the one ISA question §6.1 has left (`v_pk_fma_f16`).
 
 **Then (the missing pillars):** §3.3 attention/flash-attention, §3.4 real
 model shapes, §3.1-3.2 fusion (justified by DRAM round-trips, not launch
-overhead), §3.5 MoE grouped GEMM.
+overhead), §3.5 MoE grouped GEMM. §3.3 in particular now has a working
+register-blocked WMMA kernel to build its two matmuls out of.
 
-**Dropped or downgraded by §0:** §2.2 W4A8 coopmat (there is no 2x int8
-matrix rate), §4.1 (answered: ~300 ns), §4.2/§4.3 (the GPU-side half of the
-concern is ruled out), and the packed-fp16 half of §1.3 (1.10x, not 2x).
+**Dropped or downgraded by measurement:** §2.2's Q4 unpack (no 2x int8
+matrix rate, and no LDS tile to make cheaper), §4.1 (answered: ~300 ns),
+§4.2/§4.3 (the GPU-side half of the concern is ruled out), the packed-fp16
+half of §1.3 (1.10x, not 2x), and — unexpectedly — the **LDS-staging and
+multi-wave-workgroup half of §2.1 itself**, which the 32 MiB MALL makes
+redundant on this part.
 
 The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
 bytes — and W4A8 now reads 4 bits/weight at 211 of those 236 GB/s, so
 decode is finished as a kernel problem and continues only as a format
-problem. The matrix cores still run at 9% of a measured 55.5 TFLOP/s, so
-prefill wins come from arithmetic intensity, and that is now the single
-biggest thing left. The 32 MiB MALL is worth 3.4x DRAM for anything that
-can be kept resident. And neither dispatch overhead nor a nonexistent int8
-matrix-rate bonus is worth designing around.**
+problem. Prefill was 8% of a measured 55.5 TFLOP/s and is now 45%, bought
+entirely by raising arithmetic intensity from 8 to 32 FLOP/byte in
+registers — with no shared memory, because the 32 MiB MALL already does
+that job and hands the kernel 760 of its 805 GB/s. What is left
+in prefill is address-arithmetic and MALL-traffic ordering, not tiling. And
+neither dispatch overhead nor a nonexistent int8 matrix-rate bonus is worth
+designing around.**

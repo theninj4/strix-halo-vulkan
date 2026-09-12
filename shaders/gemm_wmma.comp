@@ -1,0 +1,373 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// C = A * B, fp16 in / fp32 accumulate, via VK_KHR_cooperative_matrix —
+// but register-blocked, which is the whole point of this file versus
+// gemm_coopmat_fp16.comp. That kernel gives each wave a *single* 16x16
+// accumulator and reloads A and B from global memory every K-step, so it
+// does 2*16*16*16 flops per (16+16)*16*2 bytes = 8 FLOP/byte. Saturating
+// this chip's measured 55.5 TFLOP/s of WMMA against its 236 GB/s of DRAM
+// needs ~235 FLOP/byte, and it duly measures 4.2-4.9 TFLOP/s — 9% of the
+// matrix cores, starved on memory rather than limited by MMA issue
+// (IDEAS.md §2.1).
+//
+// Four independently switchable changes, so the ablation is measurable
+// rather than assumed. Which of them actually won on this part is not what
+// the conventional wisdom predicts — see the notes after the list.
+//
+//   1. Register blocking (always on). Each wave holds a WM x WN grid of
+//      16x16 fp32 accumulators and, per K-step, loads WM A-fragments and
+//      WN B-fragments, then issues WM*WN MMAs against them. Intensity goes
+//      from 8 to 16*WM*WN/(WM+WN) FLOP/byte — 32 at WM=WN=4.
+//   2. LDS staging (USE_LDS=1). WAVES_M x WAVES_N waves cooperate on one
+//      BM x BN workgroup tile, staging each slab of A and B into shared
+//      memory once per K-step, so the global traffic is amortised over
+//      every wave in the workgroup as well as every accumulator in the
+//      wave. Intensity becomes 16*BM*BN/(BM+BN) — 64 at BM=BN=128.
+//   3. Double-buffered LDS (DOUBLE_BUFFER=1, requires USE_LDS). The next
+//      K-slab's global loads are issued into registers *before* the current
+//      slab's MMAs and written to the other LDS buffer after them, so there
+//      is one barrier per K-step instead of two and the global load latency
+//      sits underneath the matrix work instead of in front of it.
+//   4. B stored [N,K] and loaded column-major (B_COLMAJOR=1). Not a tiling
+//      change but a codegen one. RADV's coopMatLoad emits two
+//      `buffer_load_b128` for a *row-major A* operand and a *column-major B*
+//      operand, but **sixteen scalar `buffer_load_d16_b16`** for the other
+//      two combinations — the hardware WMMA operand layout is K-contiguous
+//      for both operands, so the conventional [K,N] row-major B has to be
+//      gathered element by element. This halves the loop's instruction count
+//      (577 -> 389 at WM=WN=4, of which address arithmetic 232 -> 144) and is
+//      also how a real `Linear` weight already sits in memory.
+//
+// What the measurements said (N=4096, against a measured 55.5 TFLOP/s WMMA
+// ceiling; see IDEAS.md §2.1 for the full table):
+//
+//   - Register blocking is the entire win: 4.19 -> 12.2 -> 24.3 TFLOP/s as
+//     intensity goes 8 -> 16 -> 32, because at AI 16 and 32 the kernel sits
+//     pinned at ~760 of the 805 GB/s this chip's 32 MiB MALL delivers, so
+//     every doubling of reuse doubles throughput out of a fixed budget. The
+//     plateau is ~25.2 TFLOP/s, 45% of the ceiling.
+//   - LDS staging *loses* here. Whether the waves are grouped into a
+//     workgroup barely matters — WM=4,WN=8 at one wave and WAVES=2x2 at four
+//     tie within noise — but every USE_LDS=1 variant is behind, the best by
+//     1.2x. They are nowhere near bandwidth-bound (149-332 GB/s of 805);
+//     they are bound by their own shared-memory reads and barriers, and the
+//     MALL was already supplying the cross-wave reuse that staging exists to
+//     provide. Expect this to invert on a discrete part with a small L2.
+//   - Double buffering does work: 17.2 -> 21.2 TFLOP/s on the LDS path. Just
+//     not enough to make that path competitive.
+//   - B_COLMAJOR is **2.8x slower** at N=4096 (8.5 vs 24.3 TFLOP/s) despite
+//     the better instruction stream, and *faster* at N=512 — it degrades
+//     exactly as B stops being cache-resident, so it is a memory-system
+//     effect on a strided gather. Deepening the K-slab so each 128-byte
+//     cache line is fully consumed within one MMA block does not help, which
+//     rules out partial-line consumption. Unresolved; IDEAS §2.3 has the
+//     remaining hypothesis.
+//
+// Tile geometry is compile-time (glslc -D), not specialization constants:
+// the accumulator grid sizes a register array and the LDS slabs size
+// `shared` arrays, both of which must be known to the front end. The 16x16x16
+// cooperative-matrix shape is likewise hard-coded, because it is the *only*
+// shape this device reports (every entry of
+// VkPhysicalDeviceCooperativeMatrixPropertiesKHR is 16x16x16); the Go side
+// checks that and skips these variants if it ever stops being true.
+//
+// Wave size is assumed to be 64, matching every other kernel here. That is
+// what the device reports for a coopmat compute shader, and the bench's
+// correctness pass would fail loudly on a driver that chose otherwise,
+// since the wave -> tile mapping below would then overlap.
+
+#ifndef WM
+#define WM 4        // accumulator tiles per wave, M direction
+#endif
+#ifndef WN
+#define WN 4        // accumulator tiles per wave, N direction
+#endif
+#ifndef WAVES_M
+#define WAVES_M 1   // waves per workgroup, M direction
+#endif
+#ifndef WAVES_N
+#define WAVES_N 1   // waves per workgroup, N direction
+#endif
+#ifndef BK_TILES
+#define BK_TILES 1  // K-slab depth, in 16-wide cooperative-matrix steps
+#endif
+#ifndef USE_LDS
+#define USE_LDS 0
+#endif
+#ifndef DOUBLE_BUFFER
+#define DOUBLE_BUFFER 0
+#endif
+#ifndef B_COLMAJOR
+#define B_COLMAJOR 0
+#endif
+#ifndef LDS_PAD
+#define LDS_PAD 0   // extra halves per LDS row, to skew the bank mapping
+#endif
+
+#define TILE 16
+#define WAVE 64
+
+#define BM (WAVES_M * WM * TILE)
+#define BN (WAVES_N * WN * TILE)
+#define BK (BK_TILES * TILE)
+#define NWAVES (WAVES_M * WAVES_N)
+#define NTHREADS (NWAVES * WAVE)
+
+layout(local_size_x = NTHREADS) in;
+
+// With LDS staging the slabs are filled with 128-bit loads (IDEAS §1.3 found
+// wide loads worth 1.17x on the W4A8 GEMV), so those two bindings are
+// declared as uvec4 and reinterpreted on the way into shared memory. Without
+// staging, coopMatLoad reads the buffers directly and needs them typed as
+// their component type.
+#if USE_LDS
+layout(binding = 0) readonly buffer A { uvec4 a4[]; };
+layout(binding = 1) readonly buffer B { uvec4 b4[]; };
+#else
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+layout(binding = 1) readonly buffer B { float16_t b[]; };
+#endif
+layout(binding = 2) readonly buffer Scales { float dummy[]; }; // unused, kept for a uniform 4-binding layout
+layout(binding = 3) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block;
+} pc;
+
+#if USE_LDS
+// The A slab is always [BM rows][BK], K-contiguous. The B slab is [BN][BK]
+// when B is stored [N,K], and [BK][BN] otherwise — in both cases laid out so
+// the staging loads are contiguous in memory, which is what makes them 128-bit.
+#define LDS_A_ROWS BM
+#define LDS_A_STRIDE (BK + LDS_PAD)
+#if B_COLMAJOR
+#define LDS_B_ROWS BN
+#define LDS_B_STRIDE (BK + LDS_PAD)
+#else
+#define LDS_B_ROWS BK
+#define LDS_B_STRIDE (BN + LDS_PAD)
+#endif
+
+#define LDS_A_PLANE (LDS_A_ROWS * LDS_A_STRIDE)
+#define LDS_B_PLANE (LDS_B_ROWS * LDS_B_STRIDE)
+#if DOUBLE_BUFFER
+#define LDS_PLANES 2
+#else
+#define LDS_PLANES 1
+#endif
+
+shared float16_t ldsA[LDS_PLANES * LDS_A_PLANE];
+shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
+
+// One uvec4 is 8 halves. These expand to eight scalar stores in source, but
+// the compiler coalesces them back into one ds_store_b128 (verified in the
+// disassembly), so the shared arrays can stay typed as float16_t — which is
+// what coopMatLoad requires.
+#define SPREAD8(arr, base, v) {                       \
+    f16vec2 h0 = unpackFloat2x16((v).x);              \
+    f16vec2 h1 = unpackFloat2x16((v).y);              \
+    f16vec2 h2 = unpackFloat2x16((v).z);              \
+    f16vec2 h3 = unpackFloat2x16((v).w);              \
+    arr[(base) + 0u] = h0.x; arr[(base) + 1u] = h0.y; \
+    arr[(base) + 2u] = h1.x; arr[(base) + 3u] = h1.y; \
+    arr[(base) + 4u] = h2.x; arr[(base) + 5u] = h2.y; \
+    arr[(base) + 6u] = h3.x; arr[(base) + 7u] = h3.y; \
+}
+
+// Element index in B of the staging load for slab row r, K-slab kk, column
+// col. A #if rather than a ternary because both arms are real loads: GLSL's
+// ?: is not short-circuit, so the unused arm would be an out-of-range global
+// read if the compiler ever declined to fold the constant condition.
+#if B_COLMAJOR
+// slab row r is output column n0+r, contiguous along K
+#define B_SLAB_ELEM(r, kk, col) ((n0 + (r)) * pc.K + (kk) + (col))
+#else
+// slab row r is reduction index kk+r, contiguous along N
+#define B_SLAB_ELEM(r, kk, col) (((kk) + (r)) * pc.N + n0 + (col))
+#endif
+
+// One slab row is BK halves wide for A, and for B too once B is stored [N,K].
+#define A_VECS_PER_ROW (BK / 8u)
+#define A_VECS (LDS_A_ROWS * A_VECS_PER_ROW)
+#if B_COLMAJOR
+#define B_VECS_PER_ROW (BK / 8u)
+#else
+#define B_VECS_PER_ROW (BN / 8u)
+#endif
+#define B_VECS (LDS_B_ROWS * B_VECS_PER_ROW)
+
+// 128-bit loads per thread needed to cover one slab. Held in registers between
+// LOAD_STAGE and STORE_STAGE, which is what lets the two straddle the MMAs.
+#define A_STAGE ((A_VECS + NTHREADS - 1u) / NTHREADS)
+#define B_STAGE ((B_VECS + NTHREADS - 1u) / NTHREADS)
+
+// Global -> registers for the slab starting at reduction index kk. Deliberately
+// separate from STORE_STAGE: the compiler sinks the s_waitcnt to the first use
+// of stageA/stageB, so with DOUBLE_BUFFER the memory latency is spent on the
+// MMAs issued in between rather than stalling at a barrier.
+#define LOAD_STAGE(kk) {                                                       \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < A_VECS) {                                                      \
+            uint r = i / A_VECS_PER_ROW;                                       \
+            uint col = (i % A_VECS_PER_ROW) * 8u;                              \
+            stageA[s] = a4[((m0 + r) * pc.K + (kk) + col) >> 3u];              \
+        }                                                                      \
+    }                                                                          \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < B_VECS) {                                                      \
+            uint r = i / B_VECS_PER_ROW;                                       \
+            uint col = (i % B_VECS_PER_ROW) * 8u;                              \
+            stageB[s] = b4[(B_SLAB_ELEM(r, kk, col)) >> 3u];                   \
+        }                                                                      \
+    }                                                                          \
+}
+
+#define STORE_STAGE(buf) {                                                     \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < A_VECS) {                                                      \
+            uint r = i / A_VECS_PER_ROW;                                       \
+            uint col = (i % A_VECS_PER_ROW) * 8u;                              \
+            SPREAD8(ldsA, (buf) * LDS_A_PLANE + r * LDS_A_STRIDE + col, stageA[s]) \
+        }                                                                      \
+    }                                                                          \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < B_VECS) {                                                      \
+            uint r = i / B_VECS_PER_ROW;                                       \
+            uint col = (i % B_VECS_PER_ROW) * 8u;                              \
+            SPREAD8(ldsB, (buf) * LDS_B_PLANE + r * LDS_B_STRIDE + col, stageB[s]) \
+        }                                                                      \
+    }                                                                          \
+}
+#endif
+
+// One K-slab's worth of matrix work: load WM A-fragments and WN B-fragments,
+// then issue WM*WN MMAs against them. The loads are hoisted out of the MMA
+// nest so each fragment is fetched once and reused across a whole accumulator
+// row or column — that reuse *is* the arithmetic intensity this file is about.
+//
+// abase/bbase are the reduction offset k0 when reading global memory, and the
+// LDS plane offset when reading shared memory.
+#if USE_LDS
+#define LOAD_FRAG_A(i, abase, kt)                                              \
+    coopMatLoad(fragA[i], ldsA,                                                \
+        (abase) + (waveM * (WM * TILE) + (i) * TILE) * LDS_A_STRIDE + (kt) * TILE, \
+        LDS_A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#if B_COLMAJOR
+#define LOAD_FRAG_B(j, bbase, kt)                                              \
+    coopMatLoad(fragB[j], ldsB,                                                \
+        (bbase) + (waveN * (WN * TILE) + (j) * TILE) * LDS_B_STRIDE + (kt) * TILE, \
+        LDS_B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+#define LOAD_FRAG_B(j, bbase, kt)                                              \
+    coopMatLoad(fragB[j], ldsB,                                                \
+        (bbase) + ((kt) * TILE) * LDS_B_STRIDE + waveN * (WN * TILE) + (j) * TILE, \
+        LDS_B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+#else
+#define LOAD_FRAG_A(i, abase, kt)                                              \
+    coopMatLoad(fragA[i], a, (wm0 + (i) * TILE) * pc.K + (abase) + (kt) * TILE, \
+        pc.K, gl_CooperativeMatrixLayoutRowMajor);
+#if B_COLMAJOR
+#define LOAD_FRAG_B(j, bbase, kt)                                              \
+    coopMatLoad(fragB[j], b, (wn0 + (j) * TILE) * pc.K + (bbase) + (kt) * TILE, \
+        pc.K, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+#define LOAD_FRAG_B(j, bbase, kt)                                              \
+    coopMatLoad(fragB[j], b, ((bbase) + (kt) * TILE) * pc.N + wn0 + (j) * TILE, \
+        pc.N, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+#endif
+
+#define MMA_BLOCK(abase, bbase) {                                              \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> fragA[WM]; \
+        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> fragB[WN]; \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) } \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, bbase, kt) } \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);      \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+
+void main() {
+    // Wave's position in the workgroup's wave grid. Both divisors are
+    // compile-time powers of two, so these are shifts and masks, not the
+    // integer-division sequences IDEAS §1.2 is about.
+    uint waveM = gl_SubgroupID / WAVES_N;
+    uint waveN = gl_SubgroupID % WAVES_N;
+
+    // Top-left corner of this workgroup's C tile, and of this wave's slice.
+    uint m0 = gl_WorkGroupID.y * BM;
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint wm0 = m0 + waveM * (WM * TILE);
+    uint wn0 = n0 + waveN * (WN * TILE);
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+#if USE_LDS
+    uint tid = gl_LocalInvocationID.x;
+    uvec4 stageA[A_STAGE];
+    uvec4 stageB[B_STAGE];
+#endif
+
+#if USE_LDS && DOUBLE_BUFFER
+    LOAD_STAGE(0u)
+    STORE_STAGE(0u)
+    barrier();
+    uint buf = 0u;
+#endif
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+#if USE_LDS && DOUBLE_BUFFER
+        // The next slab's loads are issued here but not consumed until
+        // STORE_STAGE below, so their latency overlaps this slab's MMAs.
+        bool more = k0 + BK < pc.K;
+        if (more) LOAD_STAGE(k0 + BK)
+        MMA_BLOCK(buf * LDS_A_PLANE, buf * LDS_B_PLANE)
+        // Writing the *other* buffer means there is no hazard against the
+        // waves still reading this one, so one barrier per K-step suffices.
+        if (more) STORE_STAGE(1u - buf)
+        barrier();
+        buf = 1u - buf;
+#elif USE_LDS
+        LOAD_STAGE(k0)
+        STORE_STAGE(0u)
+        barrier();
+        MMA_BLOCK(0u, 0u)
+        // Second barrier: the next iteration overwrites the slabs this wave
+        // has just read, and waves within a workgroup are not lockstep.
+        barrier();
+#else
+        MMA_BLOCK(k0, k0)
+#endif
+    }
+
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            coopMatStore(acc[i][j], c, (wm0 + i * TILE) * pc.N + wn0 + j * TILE,
+                pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

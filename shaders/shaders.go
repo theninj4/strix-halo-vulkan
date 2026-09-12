@@ -183,6 +183,76 @@ var GEMMTiledQ4 []byte
 //go:embed gemm_w8a8.spv
 var GEMMW8A8 []byte
 
+// GEMM WMMA, register-blocked: the same cooperative-matrix hardware as
+// gemm_coopmat_fp16.comp, restructured for arithmetic intensity (IDEAS §2.1).
+// The variants form an ablation over four independent axes, so each effect is
+// attributable rather than bundled:
+//
+//   - register blocking: WM x WN 16x16 accumulators per wave instead of one,
+//     raising arithmetic intensity from 8 to 16..85 FLOP/byte
+//   - four waves per workgroup with no LDS (wg*): the waves share A rows and
+//     B columns through the L0/L1 caches rather than through shared memory,
+//     which costs nothing but relies on the cache to dedup the overlap
+//   - LDS staging (lds*): four waves share each staged K-slab explicitly
+//   - double buffering (*_db): one barrier per K-step instead of two, with
+//     the next slab's global loads issued underneath the current slab's MMAs
+//   - B stored [N,K] and loaded column-major (*_bt), IDEAS §2.3: this is the
+//     layout RDNA's WMMA B operand actually wants — without it every B
+//     fragment is gathered by sixteen scalar 16-bit loads rather than two
+//     buffer_load_b128 — and it is also how a real Linear weight is stored
+//
+// Tile geometry is -D rather than specialization constants because it sizes
+// register and `shared` arrays; see the shader header.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -o gemm_wmma_reg32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -o gemm_wmma_reg64.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -o gemm_wmma_reg64_bt.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=8 -o gemm_wmma_reg64x128.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=4 -o gemm_wmma_reg64_bt_k64.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -o gemm_wmma_wg128.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -o gemm_wmma_wg128x256.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -o gemm_wmma_lds128.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -o gemm_wmma_lds128_db.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -o gemm_wmma_lds128_db_bt.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -DBK_TILES=2 -o gemm_wmma_lds128k32_db_bt.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=8 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -o gemm_wmma_lds256x128_db_bt.spv gemm_wmma.comp
+
+//go:embed gemm_wmma_reg32.spv
+var GEMMWMMAReg32 []byte
+
+//go:embed gemm_wmma_reg64.spv
+var GEMMWMMAReg64 []byte
+
+//go:embed gemm_wmma_reg64_bt.spv
+var GEMMWMMAReg64BT []byte
+
+//go:embed gemm_wmma_reg64x128.spv
+var GEMMWMMAReg64x128 []byte
+
+//go:embed gemm_wmma_reg64_bt_k64.spv
+var GEMMWMMAReg64BTK64 []byte
+
+//go:embed gemm_wmma_wg128.spv
+var GEMMWMMAWG128 []byte
+
+//go:embed gemm_wmma_wg128x256.spv
+var GEMMWMMAWG128x256 []byte
+
+//go:embed gemm_wmma_lds128.spv
+var GEMMWMMALDS128 []byte
+
+//go:embed gemm_wmma_lds128_db.spv
+var GEMMWMMALDS128DB []byte
+
+//go:embed gemm_wmma_lds128_db_bt.spv
+var GEMMWMMALDS128DBBT []byte
+
+//go:embed gemm_wmma_lds128k32_db_bt.spv
+var GEMMWMMALDS128K32DBBT []byte
+
+//go:embed gemm_wmma_lds256x128_db_bt.spv
+var GEMMWMMALDS256x128DBBT []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_fp16.spv gemm_coopmat_fp16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_int8.spv gemm_coopmat_int8.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_q4.spv gemm_coopmat_q4.comp

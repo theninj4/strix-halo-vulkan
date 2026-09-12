@@ -112,6 +112,12 @@ func RunGEMM(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 	}
 	results = append(results, coopInt8...)
 
+	wmma, err := runGEMMWMMA(dev, phys, sizes, warmup, iters)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, wmma...)
+
 	for _, block := range blocks {
 		twoPass, err := runGEMMCoopMatQ4TwoPass(dev, phys, sizes, block, warmup, iters)
 		if err != nil {

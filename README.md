@@ -11,12 +11,17 @@ fp32 vs. fp16 vs. quantized (int8/int4, GGML-style block scales) weights vs.
 W8A8 and W4A8 (int8 or 4-bit weights against int8 activations, reduced via
 `VK_KHR_shader_integer_dot_product`'s packed-dot instructions).
 
-The fastest decode kernel here so far is **W4A8 GEMV**
+Two kernels here are the current answers for the two shapes inference comes
+in. For **decode** (GEMV, memory-bound), **W4A8**
 (`shaders/gemv_w4a8.comp`): 4-bit weights fed to the packed-int8 dot
 instruction through its mixed-signedness overload, at **819 GFLOP/s and 211
 GB/s against DRAM-resident weights — 89% of this machine's 236 GB/s memory
-bandwidth**, 2.4x the int8-weight kernel it replaces. `IDEAS.md` explains
-how it gets there and what is still on the table.
+bandwidth**, 2.4x the int8-weight kernel it replaces. For **prefill** (GEMM,
+compute-bound), the register-blocked cooperative-matrix GEMM
+(`shaders/gemm_wmma.comp`): **25.2 TFLOP/s at N=4096, 45% of this chip's
+measured 55.5 TFLOP/s of matrix-core throughput** and 6.0x the
+straightforward coopmat kernel it replaces at that shape. `IDEAS.md` explains how each
+gets there and what is still on the table.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
@@ -39,6 +44,10 @@ fields is itself a pointer into other Go memory — and Vulkan's
 - `shaders/*.comp` — the compute shaders (GLSL); `shaders/shaders.go`
   embeds their compiled SPIR-V via `go:embed`. Precision/tile-size variants
   of the same source are generated via `glslc -D` flags, not duplicated GLSL.
+- `cmd/probe/main.go` — dispatches a single `.spv` once, so
+  `RADV_DEBUG=asm` / `RADV_DEBUG=shaderstats` can be pointed at any shader to
+  read its disassembly or its VGPR/LDS/spill counts. Compilation-time
+  questions only; it binds dummy buffers and computes nothing meaningful.
 - `bench/` — the benchmark harness: GPU-timestamp-based timing
   (`bench.go`), fp16/int8/int4 quantization helpers matching GGML-style
   block scales (`quant.go`), clock/power instrumentation (`sysmon.go`), and
