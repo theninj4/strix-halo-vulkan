@@ -11,9 +11,9 @@ to perform well.
 
 **Everything below is implemented, builds clean (`go build ./...`,
 `gofmt -l .`, `go vet ./...` all clean), and has passed its correctness
-checks against a CPU reference on real hardware.** Not yet committed to
-git — `git status` shows the rename (`engine.go`/`shim.*` → `vk/`) staged
-and everything else (bench/, cmd/, new shaders, README) untracked/modified.
+checks against a CPU reference on real hardware.** Committed to git as of
+this session (`32c593d` initial demo, `f06ca56` the full `vk/` restructure +
+shader library + bench harness) — working tree is clean.
 
 ### What got built
 
@@ -58,7 +58,7 @@ and everything else (bench/, cmd/, new shaders, README) untracked/modified.
    sweep. **If adding a new op/variant, verify once at a small fixed size,
    never inside the sweep loop.**
 
-### Headline findings (full run: `results.csv` in the repo root, 217 rows)
+### Headline findings (full run: `results.csv` in the repo root, 325 rows)
 
 - **Sustained memory bandwidth: ~236 GB/s** (measured at 64MB buffers, past
   cache effects — smaller buffers read 700+ GB/s from cache, not DRAM).
@@ -72,31 +72,44 @@ and everything else (bench/, cmd/, new shaders, README) untracked/modified.
   dominant lever, 3-9x over hand-tiled.
 - **The Q4 answer** (what we set out to find): dequantizing Q4→fp16 once
   and reusing for coopmat (`coopmat_dequant`) runs at **~4170-4210 GFLOP/s
-  at N=4096 — indistinguishable from plain fp16 coopmat (4201 GFLOP/s)**,
-  because the dequant itself is cheap (~215µs at N=4096, ~200GB/s, vs.
-  ~32.7ms for the matmul — under 1% overhead, one-time per weight load).
+  at N=4096 regardless of block size — indistinguishable from plain fp16
+  coopmat (4196 GFLOP/s)**, because the dequant itself is cheap (~215µs at
+  N=4096, ~200GB/s, vs. ~32.7ms for the matmul — under 1% overhead,
+  one-time per weight load). It's flat across block size because block
+  size only affects the one-time dequant pass, not the matmul that follows.
   The single-pass fused kernel (`coopmat_fused`, dequantizes each K-tile
-  into shared memory inline, no scratch buffer) is competitive and, with
-  **block size 128, actually wins at N=4096: 4828 GFLOP/s**, edging out
-  even the two-pass approach and plain fp16 coopmat. Smaller blocks (32)
-  hurt the fused kernel more (3278 GFLOP/s) — worth another look before
-  calling that final (see below).
+  into shared memory inline, no scratch buffer) climbs hard with block
+  size and **wins outright once block ≥256: 3267 (32) → 4558 (64) → 4753
+  (128) → 4871 (256) → 4915 (512) → 4878 (1024) GFLOP/s at N=4096** —
+  beating plain fp16 coopmat (4196) *and* coopmat int8 (4705), making
+  fused Q4 at block 256-512 the single fastest GEMM variant measured on
+  this chip. Confirmed as a real, plateauing trend, not noise (see
+  resolved item below) — driven by fewer scale-lookups/branches per
+  shared-memory tile fill as blocks get coarser; it flattens (and dips
+  fractionally) past ~512, plausibly register/shared-memory pressure from
+  holding a larger per-tile scale table offsetting the win.
 
 **Working conclusion**: for an inference engine on this chip, store weights
-as Q4 (8x smaller than fp32) and either (a) dequantize once to fp16 at load
-time and run coopmat fp16 matmul, or (b) use the fused single-pass Q4
-coopmat kernel with block size ≥128 — both get full cooperative-matrix
-throughput. Use subgroup-reduced Q4 GEMV for decode.
+as Q4 (8x smaller than fp32). For the matmul itself, the fused single-pass
+Q4 coopmat kernel with block size 256-512 is the fastest option found here
+(~4900 GFLOP/s @ N=4096, beating every other GEMM variant including plain
+fp16 and int8 coopmat) — but note larger quantization blocks trade off
+weight accuracy in a real model (fewer scale factors, wider dynamic range
+per block), which this benchmark doesn't measure. If small blocks (32-64)
+are needed for accuracy, the two-pass dequant-once approach is the better
+choice there since it's block-size-agnostic (~4200 GFLOP/s regardless).
+Use subgroup-reduced Q4 GEMV for decode.
 
 ## Next steps (pick up here)
 
-1. **Investigate the fused-kernel block-size effect** (32 → 3278, 64 →
-   4547, 128 → 4828 GFLOP/s at N=4096) — is this a real trend (larger block
-   = fewer scale lookups/branches per shared-memory fill) or noise? Try
-   block=256 to see if it keeps climbing or plateaus/reverses.
-2. `results.csv` in the repo root is current as of this session; re-run
-   (`go run ./cmd/bench -csv results.csv`, ~3-4 min now that the O(N³) bug
-   is fixed) if shaders/harness change before the next session.
+1. ~~Investigate the fused-kernel block-size effect~~ **Done this session.**
+   Real, plateauing trend, not noise — see headline findings above. Pushed
+   the sweep to block=256/512/1024 (results.csv now has 325 rows, blocks
+   32-1024); block 256-512 is the sweet spot, 1024 dips fractionally.
+2. `results.csv` in the repo root is current as of this session (re-run via
+   `go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv`,
+   ~2.5 min). Re-run again if shaders/harness change before the next
+   session.
 3. Scoped-out bonus items from the original plan, not yet built:
    - W8A8 full-integer GEMV/GEMM (both operands int8, using
      `VK_KHR_shader_integer_dot_product`'s packed dot instructions instead
@@ -104,8 +117,9 @@ throughput. Use subgroup-reduced Q4 GEMV for decode.
    - Q8/Q4 for the shared-memory-tiled GEMM variant (only naive has Q4;
      tiled only has fp32/fp16 today).
 4. Consider a visual report/dashboard from the CSV (offered earlier, not
-   done) — probably the right final deliverable once the block-size
-   question above is settled.
-5. Nothing has been committed to git yet — decide on commit structure
-   (probably: one commit for the `vk/` restructure, one for the shader
-   library + bench harness) when ready.
+   done) — now that the block-size question is settled, this is probably
+   the right next deliverable if the user wants one.
+5. ~~Commit to git~~ **Done.** `32c593d` (initial demo) + `f06ca56` (`vk/`
+   restructure, shader library, bench harness, first results.csv/TODO).
+   The block-size follow-up in this session (updated results.csv + this
+   TODO) is not yet committed — do that next if the user wants a commit.
