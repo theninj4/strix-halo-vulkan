@@ -40,10 +40,42 @@ banks are ever live together. (The wall-clock figures this file has carried for
 trusting: the family is now **896 rows in ~9 minutes**, having grown three
 more GEMV builds and eight mixed-width dispatch plans since.)
 
-Two documents carry the analysis: **`IDEAS.md`** is the prioritised
+**`PIPELINE.md`** is the current work: the z-image-turbo vertical slice,
+its stage list and the model's real dimensions. It is rewritten each
+session rather than appended to, so it is the one file to read first.
+
+Three documents carry the older analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
-gain / how to measure, and marked up with what has since been measured).
-**`GOALS.md`** is the long-term target (four models, HTTP API in Go).
+gain / how to measure, and marked up with what has since been measured),
+plus the measured roofline and the order of attack. **`research/`** is the
+findings archive — one file per *completed* section, indexed in
+`research/README.md`; when an item closes, its write-up moves there and
+`IDEAS.md` keeps the heading, a one-line result and a link. **`GOALS.md`**
+is the long-term target (five models, HTTP API in Go).
+
+`§N.M` is the stable address across all of them and is cited from the code
+itself (293 comments in `shaders/`, `bench/`, `cmd/`, `vk/`). Never
+renumber a section; give a new experiment the next free number.
+
+## Phase 2 — build the pipeline, profile it, then optimise
+
+The microbenchmark phase ended 2026-09-13. The current plan, the model's
+real dimensions and the stage list live in **[`PIPELINE.md`](PIPELINE.md)**,
+which is *rewritten* each session rather than appended to. Session handoffs
+still accumulate below.
+
+**Done this session:** `safetensors/` (mmap checkpoint reader, F32/F16/BF16,
+sharded and single-file) and `cmd/inspect`. Verified against 10,574 golden
+narrowing cases from CPython's `struct 'e'`, an exhaustive 65,536-pattern
+fp16 round trip, and a value-for-value cross-check of real tensors against
+an independent Python read. The golden table caught a real bug: the
+underflow boundary was one exponent too high, so values in [2^-25, 2^-24)
+flushed to zero instead of rounding up to the smallest subnormal.
+
+This is the first time the project has loaded a real checkpoint, and it
+immediately corrected the hand-transcribed shape table — the DiT has **34
+attention blocks, not 30**, and `adaLN_modulation` was not modelled at all.
+See `PIPELINE.md` for the full inventory.
 
 ### This session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
