@@ -18,15 +18,23 @@ instruction through its mixed-signedness overload, at **819 GFLOP/s and 211
 GB/s against DRAM-resident weights — 89% of this machine's 236 GB/s memory
 bandwidth**, 2.4x the int8-weight kernel it replaces. For **prefill** (GEMM,
 compute-bound), the register-blocked cooperative-matrix GEMM
-(`shaders/gemm_wmma.comp`): **28.4 TFLOP/s, 51% of this chip's measured
-55.5 TFLOP/s of matrix-core throughput** (26.0 TFLOP/s at N=4096), 6.2x the
-straightforward coopmat kernel it replaces at that shape. The last 1.13x of
-that came from neither tiling nor instruction selection but from *operand
-strides*: every fragment load in a WMMA GEMM is K-strided, a power-of-two
-leading dimension aims all the addresses of one load at the same memory
-channel, and padding each stride 256 B off a 4 KB multiple — a host-side
-allocation change — is worth up to 1.35x on the kernels that were already
-winning and 2.6x on the [N,K] weight layout.
+(`shaders/gemm_wmma.comp`): **39.0 TFLOP/s, 70% of this chip's measured
+55.5 TFLOP/s of matrix-core throughput** (30.6 TFLOP/s at N=4096), 7.6x the
+straightforward coopmat kernel it replaces at that shape. Two thirds of that
+came from neither tiling nor instruction selection but from how the operands
+meet the memory system. First *stride*: every fragment load in a WMMA GEMM is
+K-strided, a power-of-two leading dimension aims all the addresses of one
+load at the same memory channel, and padding each stride 256 B off a 4 KB
+multiple — a host-side allocation change — is worth up to 1.35x on the
+kernels that were already winning and 2.6x on the [N,K] weight layout. Then
+*concurrency*: issuing a whole K-slab's fragment loads before the slab's
+first MMA, rather than one K-tile's worth at a time, is worth a further
+**2.1x** for identical bytes, identical instruction counts and an identical
+tile — only the scheduling moves, from 16 loads in flight to 45. The same
+slab depth *without* that change leaves 16 in flight and is worth nothing,
+which is what says the variable is concurrency rather than depth. Together
+they make the [N,K] layout a real `Linear` weight already has the fastest
+one, where it used to be 2.8x the slowest.
 
 The `stride` family then measured that memory system directly
 (`shaders/strided_read.comp`) and found a second, larger effect with no
@@ -51,7 +59,9 @@ with no padding anywhere to blame. One wave streaming a *whole* row
 flight per wave restores full bandwidth whatever the stride is. What is
 exposed is tiling: a 1 KB-wide panel of a K=4096 fp16 matrix gets a quarter
 of the bus. Pad every row stride to 256 B past a multiple of 4 KB and all
-three effects go away, for every panel width and every traversal. `IDEAS.md`
+three effects go away, for every panel width and every traversal — and where
+the stride is not the engine's to choose, depth in the inner loop buys the
+same thing, which is the 2.1x the GEMM above collects. `IDEAS.md`
 explains how each kernel gets where it is and what is still on the table.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a

@@ -74,6 +74,19 @@ exposed, and the 1.12x that bounded it is not there. What *is* exposed is
 tiling, and rule 1 (pad to 256 B past a multiple of 4 KB) already defends
 against all of it. See §5.1b's mechanism 3.
 
+**§2.7 took that law back to the GEMM kernel, and it closed the last thing
+this file could not explain.** A tiled GEMM is the exposed shape: a coopmat
+fragment load holds 32 B of a row and its waves retire after one, so C is an
+eighth of the `gcd` even a padded stride leaves. Issuing a whole K-slab's
+fragment loads before the slab's first MMA — identical bytes, identical
+instruction counts, identical tile and intensity, only the scheduling —
+is worth **2.1x**, takes the suite's best GEMM to **38990 GFLOP/s, 70% of the
+WMMA ceiling**, and makes the transposed-B kernel *faster* than row-major at
+every size, closing and reversing the 1.6x residue §2.3 carried. The control
+that makes it attributable had been sitting in the suite since §2.3: the same
+slab depth *without* hoisting leaves 16 loads in flight instead of 45 and
+measures as nothing. Depth is not the variable; concurrency is. See §2.7.
+
 ## The roofline, and why it says there's a lot left on the table
 
 Hardware numbers for this part (AMD Radeon 8060S, gfx1151, 40 CU, sclk
@@ -91,7 +104,7 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
-| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **28.4 TFLOP/s** (`wmma_reg64_bt_padab128`) | **51%** |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **39.0 TFLOP/s** (`wmma_reg64_bt_hka4_padab128`) | **70%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
 † **[measured] §5.1b** Both bandwidth rows are *conditional on the access
@@ -106,10 +119,11 @@ multi-row gather up to 1.32x. The MALL row is also two numbers, not one: the
 
 (Real-kernel column is the best measured anywhere in `results.csv`; the
 GEMM entries are at N=4096 except the WMMA fp16 one, whose best shape is now
-N=1024 (26.0 TFLOP/s at N=4096), and the `naive,w8a8` entry at N=256 where it
+N=2048 (30.6 TFLOP/s at N=4096), and the `naive,w8a8` entry at N=256 where it
 is still cache-resident. The WMMA fp16 row was 4.9 TFLOP/s / 9% until §2.1
-register-blocked the kernel and 25.2 / 45% until §2.3 de-aliased its operand
-strides; the int8 row is still the un-blocked one and
+register-blocked the kernel, 25.2 / 45% until §2.3 de-aliased its operand
+strides, and 28.4 / 51% until §2.7 gave its inner loop a whole K-slab of
+loads in flight at once; the int8 row is still the un-blocked one and
 would move the same way if §2.2 were written. The `dotPacked4x8` row's 4% is not the indictment it
 looks like: the kernels that use that instruction — W8A8 and now W4A8 GEMV
 — are memory-bound by construction, and W4A8 runs at 89% of the *bandwidth*
@@ -189,6 +203,16 @@ measurements:
    ceiling, so the L1s must be absorbing part of what that arithmetic
    attributes to the MALL — and the AI-85 plateau at 26.0 TFLOP/s implies
    only 306 GB/s, so whatever binds it is not bandwidth at any level.
+   **[measured] §2.7 then found a third lever, and it is neither intensity
+   nor stride: how many of the slab's fragment loads are in flight at once.**
+   Issuing a whole K-slab's loads before its first MMA — same bytes, same
+   instruction counts, same tile, same intensity, only the scheduling —
+   is worth 2.1x on the transposed-B kernel, takes the suite to **39.0
+   TFLOP/s (70%)**, and closes the 1.6x residue §2.3 left behind. At 38990
+   GFLOP/s the AI-32 arithmetic implies 1218 GB/s of A+B traffic, past even
+   the 965 GB/s the MALL delivers on a pure read, so the L1s are now demonstrably
+   serving a large share of it and "implied traffic" has stopped being a
+   useful ceiling check for these kernels.
 
 There is also a third, newly quantified lever: **the 32 MiB MALL delivers
 805 GB/s, 3.4x DRAM.** Anything that can be restructured to work out of a
@@ -641,6 +665,15 @@ N=1024, 51% of the ceiling** and the suite's best GEMM number, though it
 still loses at N=4096. So the address-arithmetic diagnosis above is now partly
 testable rather than hypothetical: the shorter instruction stream does win,
 but only where its operand fits the caches.
+
+**[measured] §2.7 has since finished that argument.** Giving the inner loop
+a whole K-slab of fragment loads in flight instead of one K-tile's worth
+takes the transposed-B kernel — the 389-instruction one — to **38990
+GFLOP/s, 70% of the ceiling**, ahead of row-major at every size. So the
+address-arithmetic diagnosis was right: the shorter instruction stream is
+the better kernel, and everything that made it look otherwise was the memory
+system, in two layers (channel aliasing, §2.3; loads-in-flight coverage,
+§2.7). The plateau this paragraph describes was never an MMA-issue limit.
 **Effort**: high (this is a real GEMM kernel). **Value**: highest for
 prefill, image generation, and the Parakeet encoder. **Delivered.**
 
@@ -800,8 +833,9 @@ original comparison, and closely matched by `reg64_pada128`'s 27260 at
 N=2048. The N=2048 dip visible in every unpadded row (20-23 TFLOP/s against
 24-25 at N=4096) was aliasing all along, which is why that shape moves most.
 
-**What is still unexplained** is the residue: with both strides padded, the
-transposed-B kernel is still 1.6x behind row-major B at N=4096 (15669 vs
+**What is still unexplained** — **[measured] and now explained; see §2.7,
+which closed it and reversed it** — is the residue: with both strides padded,
+the transposed-B kernel is still 1.6x behind row-major B at N=4096 (15669 vs
 24530) while *beating* it at N=1024, so the footprint-dependent part of §2.3
 survives de-aliasing. Two candidate explanations are already out:
 
@@ -824,6 +858,16 @@ than inferred through a GEMM: fixed bytes touched, sweeping request size,
 request count and stride independently — §5.1b, which is the right place for
 it. **[measured] That probe is now built, and it rules out the request-shape
 explanation: see below.**
+
+**[measured] And its traversal follow-up named the survivor, which §2.7 then
+confirmed on the kernel.** The third thing ruled out above was request
+*shape*; what was left was request *timing*. A coopmat fragment load holds
+32 B of a row and a tiled kernel's waves retire after one, so C — the
+contiguous run the in-flight requests hold — is an eighth of the `gcd` a
++256 B pad leaves. Hoisting a whole K-slab's loads raises C and nothing else,
+and it takes this kernel from 15697 to **30609 at N=4096, past row-major's
+24466**. The residue was the traversal. §2.7 has the ladder, the controls and
+what it costs in registers.
 
 **[measured] §5.1b has since measured the memory system directly, and it
 corrects two things here without disturbing the conclusion.** The
@@ -866,7 +910,12 @@ the strides are push constants, and is worth 0-5% at N=4096 (kernel-dependent, a
 spread for one of the three), 4-35% at N=2048,
 and 2.6x on the transposed-B layout that a real `Linear` weight already
 has. Pad by that and no more: §5.1b shows the extra footprint is a real cost
-and the extra de-aliasing is not.
+and the extra de-aliasing is not. **[measured]** The pad composes with §2.7's
+hoisting rather than being replaced by it — together they are 3.6x on the
+transposed-B kernel at N=4096 — but note §2.7 also measures the pad's worth
+*decaying* as the kernel holds more of a row in flight, from 1.44x at 32 B to
+1.10x at 256 B. It stays free, so keep it; it is simply not the whole of the
+stride story.
 **Effort**: low (done). **Value**: high (delivered).
 
 ### 2.4 Workgroup swizzle / tile reordering for MALL locality
@@ -918,6 +967,141 @@ kernel (bias + activation + optional int8-quantize of the result).
 **Expected**: ~M·N·2 bytes saved per GEMM, and one whole DRAM round-trip
 per fused op eliminated — at 236 GB/s that's directly measurable.
 **Effort**: low-medium. **Value**: medium-high.
+
+### 2.7 Hoist the K-slab's fragment loads — **DONE** ✅, **2.1x**, and it closed §2.3's residue
+**Hypothesis** (§5.1b's mechanism 3, aimed at §2.3's leftover): the residue
+§2.3 could not explain — transposed-B still 1.6x behind row-major at N=4096
+*with both strides padded*, while beating it at N=1024 — is the same
+coverage effect the strided probe measured, at the far end of its range. The
+law is `coverage = min(1, C/gcd(stride, 4096))` with **C the contiguous run
+of one row that the requests in flight hold**, and a 16x16 fp16 fragment
+load holds **32 B** of each row it touches. A tiled GEMM's waves grab a
+fragment and retire; they never walk along a row. Padding takes `gcd` to 256,
+so even a de-aliased stride leaves C an eighth of it.
+**Change**: raise C and change nothing else. `HOIST_A` / `HOIST_B` in
+`gemm_wmma.comp` issue a whole K-slab of one operand's fragment loads before
+the slab's first MMA, so a wave holds `32*BK_TILES` bytes of each row instead
+of 32. The byte set, the MMA count, the tile shape, the accumulator grid and
+the arithmetic intensity are all identical to the row each variant is
+compared against.
+**Expected**: if the mechanism is right, the gap moves and the transposed-B
+kernel converges on row-major. If it is wrong, nothing happens — which is
+exactly what the *existing* `_bt_k64` control already measured, twice.
+
+**[measured] It moved, by more than the residue was worth.** New suite best:
+**38990 GFLOP/s at N=2048 — 70% of the measured 55.5 TFLOP/s WMMA ceiling**,
+up from 28510 and 51%. All figures from the committed `results.csv`; a second
+independent run agrees to ≤2% on every row quoted here and ≤1% on the
+headline ones.
+
+The ladder, `wmma_reg64*`, WM=WN=4 (AI 32), every stride padded +256 B,
+GFLOP/s. "C in flight" is the nominal rung — `32*BK_TILES`, what the source
+asks for; the ISA table below has what the scheduler actually delivers, which
+is lower:
+
+| rung | C in flight | N=1024 | N=2048 | N=4096 |
+|---|---|---|---|---|
+| `reg64_bt_padab128` (none) | 32 B | 28510 | 18982 | 15697 |
+| `reg64_bt_hkab2_padab128` | 64 B | **31504** | 20926 | 15167 |
+| `reg64_bt_hka4_padab128` | 128 B | 28354 | **38990** | 30297 |
+| `reg64_bt_hkb4_padab128` | 128 B | 27178 | 38424 | **30609** |
+| `reg64_pada128` (row-major, none) | — | 24620 | 27895 | 24466 |
+| `reg64_hka4_pada128` (row-major) | — | 21505 | 29070 | 26668 |
+
+**§2.3's residue is gone, and it inverted.** At N=4096 the transposed-B
+kernel was 15697 against row-major's 24466 — the 1.56x this file has carried
+as unexplained since §2.3. At rung 4 it is **30609 against 26668, 1.15x
+ahead**. The kernel with the better instruction stream is now also the faster
+one, at every size, which is what §2.1's address-arithmetic diagnosis
+predicted before the memory system got in the way.
+
+**The control says it is concurrency, not depth.** `wmma_reg64_bt_k64` has
+been in the suite since §2.3: BK_TILES=4, the same 64 `buffer_load_b128` and
+64 `v_wmma` per loop body as the hoisted kernel, the same bytes — and no
+hoisting. `RADV_DEBUG=asm` (via `cmd/probe`) counts the loads the scheduler
+actually leaves outstanding before the first `s_waitcnt`:
+
+| kernel | loads in flight | ≈ C | N=4096, unpadded |
+|---|---|---|---|
+| `reg64_bt` | 16 | 32 B | 8587 |
+| `reg64_bt_k64` (depth, no hoist) | **16** | 32 B | 8734 |
+| `reg64_bt_hkab2` | 32 | 64 B | 10358 |
+| `reg64_bt_hka4` | **45** | ~90 B | **18363** |
+| `reg64_bt_hkb4` | **45** | ~90 B | **19083** |
+
+Deepening the slab without hoisting leaves the scheduler issuing exactly one
+K-tile's worth of loads at a time, and measures as nothing — which is why it
+measured as nothing twice before, and it was never a refutation of anything
+except itself. Forcing the slab's fragments into a live register array is
+what makes the loads concurrent, and that is worth **2.1x** over the
+identical instruction stream. Note that the 2.1x above is measured
+**unpadded**, on a stride that is a multiple of 4 KB — so this is §5.1b's
+third engine rule arriving on a real kernel: a kernel whose stride is not its
+to choose (a weight file mapped as-is) can buy its way out with depth. The
+padded pair is the same size — 14152 → 30297 — though not exactly matched,
+since `_bt_k64_pad128` pads only B where `_bt_hka4_padab128` pads both, so
+take the unpadded pair as the clean one. It is also why the scheduler's 45
+matters more than the nominal 128 B: the rung buys what it buys even short of
+one full interleave rotation.
+
+**Hoisting A and hoisting B are the same thing here**, 30297 vs 30609 and
+18363 vs 19083, because at 252 VGPRs either one gives the scheduler the
+headroom to pull the other forward too: both compile to 45 loads in flight
+and 534 instructions. So this experiment does *not* attribute the residue to
+an operand, only to the traversal. That is a limit of the lever, not a
+finding.
+
+**The differential control fires, and it is large.** Hoisting deepens A's
+runs in both layouts (A is K-contiguous either way) but can only deepen B's
+in the transposed one, because a row-major B fragment is gathered element by
+element along N. At N=4096 the transposed-B arm gains **2.88x** from the
+ladder (5604 → 16126, AI-16 grid) and the row-major arm **1.14x** (12363 →
+14145). The lever acts on exactly the loads the mechanism says it should.
+
+**And the padding benefit decays as C grows, which is the mechanism's own
+signature.** The AI-16 grid (WM=WN=2) reaches rung 8, where C is 256 B — the
+`gcd` a +256 B pad leaves, i.e. the rung at which the law says the stride
+stops mattering. Ratio of padded to unpadded at N=4096:
+
+| rung | C | unpadded | padded | pad worth |
+|---|---|---|---|---|
+| `reg32_bt` | 32 B | 5604 | 8042 | **1.44x** |
+| `reg32_bt_hkab2` | 64 B | 11434 | 14157 | 1.24x |
+| `reg32_bt_hkab4` | 128 B | 12939 | 11420 | *0.88x* |
+| `reg32_bt_hka8` | 256 B | 16407 | 17811 | **1.09x** |
+| `reg32_bt_hkb8` | 256 B | 16126 | 17792 | **1.10x** |
+
+A stride pad is worth 1.44x to a kernel holding 32 B of a row and 1.10x to
+the same kernel holding 256 B. That is the coverage law's prediction stated
+as a trend rather than as a single number, and it is the closest this suite
+comes to confirming the *mechanism* rather than the lever. Two caveats,
+both honest: the same table at N=2048 does not decay monotonically (2.04x,
+1.36x, 0.87x, 1.22x, 1.43x), and the rung-4 cell where padding *hurts* is
+reproducible across runs at both sizes and is not explained. More loads in
+flight also buys plain latency hiding, and this experiment does not separate
+that from channel coverage; the decaying pad benefit is evidence for
+coverage, the `_k64` control is evidence against depth, and neither rules
+latency hiding out.
+
+**What it costs, and where it stops: registers.** On wave64 an accumulator
+is ~8 VGPRs and a fragment ~4, so WM=WN=4's sixteen accumulators take 128 of
+the 256 a wave may hold. `RADV_DEBUG=shaderstats` prices every rung:
+`reg64` 144 VGPR, `hkab2` 192, `hka4`/`hkb4` 252 — and hoisting *both*
+operands at BK_TILES=4 spills (140 VGPRs, 3 KB of scratch), at BK_TILES=8
+catastrophically (380-488 VGPRs, 70 KB). The ladder therefore stops at rung 4
+at AI 32 and needs the four-accumulator AI-16 grid to reach rung 8. **This
+makes §6.2 (wave32) materially more interesting than it was**: wave32 halves
+the per-fragment register cost of the same tile, which is the exact currency
+this lever spends.
+
+**Engine implication**: hoist the K-slab. It is a source-level change to the
+inner loop with no layout, no shared memory and no host-side cost, it is
+worth 2.1x on the [N,K] layout real `Linear` weights already have, and it
+composes with the +256 B stride pad rather than replacing it — the two
+together are 30609 against the unpadded, unhoisted kernel's 8587, **3.6x**.
+Take it as far as the register file allows and no further; the cliff is a
+spill, not a slope.
+**Effort**: low (done). **Value**: high (delivered).
 
 ---
 
@@ -1452,6 +1636,20 @@ fully clear that end of the range: the 32- and 64-row cross-wave shapes read
 is the right order of magnitude for a residue §2.3 measured at 1.6x and
 could not attribute.
 
+**[measured] Done, in §2.7, and the prediction held.** Raising C inside the
+WMMA kernel — a whole K-slab of fragment loads in flight instead of one
+K-tile's worth, same bytes and same instruction counts — is worth **2.1x**
+on the transposed-B kernel, closes the 1.6x residue outright and reverses
+it, and takes the suite's best GEMM to **38990 GFLOP/s, 70% of the WMMA
+ceiling**. Two things there are worth carrying back here. The stride pad's
+value *decays with C* exactly as this law says it should (1.44x at C=32 B,
+1.10x at C=256 B), which is the first confirmation of the mechanism from
+outside this probe. And the escape hatch in corollary 3 is real on a real
+kernel: the 2.1x is available with no padding at all, so a weight file whose
+stride the engine does not control can still be read at rate by a deep enough
+inner loop. What §2.7 could *not* do is separate coverage from plain latency
+hiding, since more loads in flight buys both.
+
 ### 5.2 Heap topology, carveout size and page size
 
 Heap 1 reports 83.8 GiB device-local on a machine with 117 GiB of usable
@@ -1585,18 +1783,33 @@ second effect into one law about *concurrency*: the achievable fraction of
 peak is `min(1, C/gcd(stride, 4096))` with C the contiguous run the requests
 in flight hold in a row, which is 3.9-8x rather than 2-4x, applies to
 unpadded tensors, exonerates the GEMV shape outright, and points the finger
-at tiling. What those six left behind:
+at tiling. **§2.7 is done**, and it took that law back to the GEMM: a whole
+K-slab's fragment loads in flight instead of one K-tile's is worth 2.1x, and
+at **38990 GFLOP/s / 70% of the WMMA ceiling** it closes and reverses §2.3's
+residue, which is the last thing this file was carrying as unexplained.
+What those seven left behind:
 
 **Next:**
-- **§2.3's residue, re-aimed by the traversal axis.** Mechanism 3 says the
-  binding quantity is the contiguous run of bytes a wave has in flight, and
-  a coopmat fragment load holds 32 B of a row — the far end of the range,
-  where a de-aliased stride still leaves 0.73-0.87x on the table. That is
-  the first mechanism anyone has had for the 1.6x transposed-B gap that
-  survived padding, and testing it needs no new probe: give the WMMA kernel's
-  inner loop more of a row in flight (wider fragment loads, or several K-tiles
-  outstanding) and see whether the gap moves. Cheap, and it is the same lever
-  §1.3 measures for GEMV.
+- **§6.2 wave32, promoted by §2.7.** Register blocking is capped by the
+  256-VGPR wave64 limit, and §2.7 turned that cap into the thing that stops
+  the best lever in the file: hoisting both operands at BK_TILES=4 spills,
+  so the AI-32 kernel stops at rung 4 and rung 8 needs a smaller tile.
+  wave32 halves the per-fragment register cost of the same tile, which is
+  the exact currency both levers spend, and WMMA is natively a wave32 shape.
+  Needs `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize` in
+  `vk/shim.c`. This is now the highest-value cheap item in the file.
+- **Hoist the other winners, and finish §2.7's attribution.** The ladder was
+  run on `reg64_bt` and `reg32_bt` only. `reg64x128` and `wg128x256` hold 32
+  accumulators and already sit at 252 VGPRs, so they cannot hoist as they
+  stand — but they are the AI-43/85 shapes, and whether the lever survives
+  into them is what says how it composes with intensity. Also missing: a
+  row-major `hkb4`, which would complete the 2x2 of (operand hoisted) x
+  (layout) that §2.7 could only half-fill.
+- **Explain the rung-4 cell where padding hurts.** `reg32_bt_hkab4` is
+  slower padded than unpadded (0.88x at N=4096, 0.87x at N=2048),
+  reproducibly, at both sizes, in both runs. Every other rung on that ladder
+  goes the other way. It is small and it is the only cell in §2.7 that the
+  coverage law gets backwards.
 - **The MALL's own slice structure**, which §5.1b opened and could not
   close. Under *partial* channel coverage the 32 MiB MALL keeps a working
   set only while its span is also inside 32 MiB, and one case lands halfway
@@ -1607,11 +1820,15 @@ at tiling. What those six left behind:
   -striderowbytes 1024 -stridepads 0,1024,3072`), should separate effective
   capacity from bus width. This blocks the §5.1b/§2.4/§3.3 blocking work
   from being sized correctly.
-- **§2.4 workgroup swizzle.** Still the cheapest structural item, but its
-  premise needs restating: §2.3 pushed the AI-32 kernels to 742-887 GB/s of
-  implied MALL traffic, *past* the 805 GB/s ceiling, so they are not simply
-  MALL-pinned. The sharper test is that a swizzle should help those and do
-  nothing for the AI-85 variant, which implies only 306 GB/s.
+- **§2.4 workgroup swizzle.** Still a cheap structural item, but its premise
+  has now been restated twice: §2.3 pushed the AI-32 kernels to 742-887 GB/s
+  of implied MALL traffic, past the 805 GB/s ceiling, and §2.7 pushed the
+  best of them to **1218 GB/s implied**, past even the 965 GB/s a pure MALL
+  read delivers. So "implied traffic" no longer bounds anything for these
+  kernels — the L1s are serving a large share — and the swizzle's
+  cross-tile-reuse argument has lost the number it was sized against. Test it
+  as a swizzle-helps-AI-32-and-not-AI-85 discriminator, not as a
+  bandwidth fix.
 - **§2.2's int8 arm** — a `PRECISION_I8` variant of `gemm_wmma.comp`
   accumulating in int32. Small change to a kernel that now works, halves the
   operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
@@ -1635,10 +1852,9 @@ at tiling. What those six left behind:
   W4A8; fp16 and W8A8 GEMV are still at 75% and 73% of their ceilings.
 - **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is the
   binding constraint on both of the paths that now work.
-- **§3.7 fix the reduction kernels**, **§6.2 wave32 vs wave64** (now more
-  interesting: WMMA is natively a wave32 shape and §2.1 runs at wave64
-  against a 256-VGPR cap that is what limits its tile size), **§1.4 GEMV
-  access pattern**, and the one ISA question §6.1 has left (`v_pk_fma_f16`).
+- **§3.7 fix the reduction kernels**, **§1.4 GEMV access pattern**, and the
+  one ISA question §6.1 has left (`v_pk_fma_f16`). (§6.2 wave32 has been
+  promoted out of this list by §2.7 — see **Next** above.)
 
 **Then (the missing pillars):** §3.3 attention/flash-attention, §3.4 real
 model shapes, §3.1-3.2 fusion (justified by DRAM round-trips, not launch
@@ -1679,6 +1895,8 @@ padding to happen, and aligning weight rows to a page is the most expensive
 tidy-looking thing an engine could do here). Request *shape* is free once
 the stride is right, so the [N,K] layout real weights come in is usable
 as-is — but request *timing* is not: one wave per row is safe at any stride,
-a wave that grabs a fragment and retires is where the 4x lives, and a tiled
-kernel is the second kind. And neither dispatch overhead
+a wave that grabs a fragment and retires is where the 4x lives, a tiled
+kernel is the second kind, and §2.7 is what fixing that from inside the
+kernel is worth (2.1x, paid for in registers, ending at a spill rather than
+a slope). And neither dispatch overhead
 nor a nonexistent int8 matrix-rate bonus is worth designing around.**

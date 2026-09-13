@@ -153,6 +153,69 @@ var wmmaVariants = []wmmaVariant{
 	{name: "wmma_reg64x128_pada128", spirv: shaders.GEMMWMMAReg64x128, bm: 64, bn: 128, bk: 16, waves: 1, padA: 128},
 	{name: "wmma_wg128x256_pada128", spirv: shaders.GEMMWMMAWG128x256, bm: 128, bn: 256, bk: 16, waves: 4, padA: 128},
 	{name: "wmma_reg64_bt_padab128", spirv: shaders.GEMMWMMAReg64BT, bm: 64, bn: 64, bk: 16, waves: 1, colMajorB: true, padA: 128, padB: 128},
+
+	// IDEAS §5.1b mechanism 3, aimed at the residue §2.3 could not explain:
+	// with both strides padded the transposed-B kernel is still 1.6x behind
+	// row-major at N=4096 while *beating* it at N=1024. The coverage law says
+	// the fraction of peak bandwidth an access pattern reaches is
+	// min(1, C/gcd(stride, 4096)), with C the contiguous run of one row that
+	// the requests in flight hold — and a 16x16 fp16 fragment holds 32 B of
+	// each row it touches, the far end of the measured range, where even a
+	// de-aliased stride left 0.73-0.87x on the table in the probe.
+	//
+	// These raise C and nothing else. Hoisting issues a whole K-slab of an
+	// operand's fragment loads before the slab's first MMA, so a wave holds
+	// 32*BK_TILES bytes of each row instead of 32: rungs of 32/64/128/256 B,
+	// with 256 B the rung where the law says the penalty is gone against the
+	// gcd a +256 B pad leaves. Same bytes, same MMAs, same tile, same
+	// accumulator grid, same arithmetic intensity as the row it is compared
+	// against.
+	//
+	// The control that makes this attributable is already above:
+	// `wmma_reg64_bt_k64` and `_bt_k64_pad128` deepen the slab to BK_TILES=4
+	// *without* hoisting, and measured as nothing, twice. If slab depth per se
+	// were the variable those rows would have moved; if concurrency is the
+	// variable, only these do.
+	//
+	// Two grids, because the register file sets how far the ladder goes (see
+	// shaders.go for the measured VGPR cost of every rung): rung 4 at
+	// WM=WN=4, the AI-32 shape §2.1 and §2.3 measured, and rung 8 at WM=WN=2,
+	// the AI-16 shape that §2.1 found pinned at 765 GB/s — literally
+	// bandwidth-bound, so the place a bandwidth-coverage effect should be most
+	// visible. Both arms hoist a single operand at their top rung, because
+	// hoisting both there spills; that is a limitation of the lever, not of
+	// the test, and it is why each top rung appears twice, once per operand.
+	{name: "wmma_reg32_bt", spirv: shaders.GEMMWMMAReg32BT, bm: 32, bn: 32, bk: 16, waves: 1, colMajorB: true},
+	{name: "wmma_reg32_bt_hkab2", spirv: shaders.GEMMWMMAReg32BTHKAB2, bm: 32, bn: 32, bk: 32, waves: 1, colMajorB: true},
+	{name: "wmma_reg32_bt_hkab4", spirv: shaders.GEMMWMMAReg32BTHKAB4, bm: 32, bn: 32, bk: 64, waves: 1, colMajorB: true},
+	{name: "wmma_reg32_bt_hka8", spirv: shaders.GEMMWMMAReg32BTHKA8, bm: 32, bn: 32, bk: 128, waves: 1, colMajorB: true},
+	{name: "wmma_reg32_bt_hkb8", spirv: shaders.GEMMWMMAReg32BTHKB8, bm: 32, bn: 32, bk: 128, waves: 1, colMajorB: true},
+	{name: "wmma_reg32_bt_padab128", spirv: shaders.GEMMWMMAReg32BT, bm: 32, bn: 32, bk: 16, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg32_bt_hkab2_padab128", spirv: shaders.GEMMWMMAReg32BTHKAB2, bm: 32, bn: 32, bk: 32, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg32_bt_hkab4_padab128", spirv: shaders.GEMMWMMAReg32BTHKAB4, bm: 32, bn: 32, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg32_bt_hka8_padab128", spirv: shaders.GEMMWMMAReg32BTHKA8, bm: 32, bn: 32, bk: 128, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg32_bt_hkb8_padab128", spirv: shaders.GEMMWMMAReg32BTHKB8, bm: 32, bn: 32, bk: 128, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	// Row-major control at the same grid and the same rungs. Its A loads
+	// deepen exactly as the transposed-B arm's do; its B fragments are
+	// gathered along N and cannot deepen at all. So whatever part of the
+	// effect is A's shows up here too, and whatever is B's does not.
+	{name: "wmma_reg32_hkab4", spirv: shaders.GEMMWMMAReg32HKAB4, bm: 32, bn: 32, bk: 64, waves: 1},
+	{name: "wmma_reg32_hka8", spirv: shaders.GEMMWMMAReg32HKA8, bm: 32, bn: 32, bk: 128, waves: 1},
+	{name: "wmma_reg32_hkab4_pada128", spirv: shaders.GEMMWMMAReg32HKAB4, bm: 32, bn: 32, bk: 64, waves: 1, padA: 128},
+	{name: "wmma_reg32_hka8_pada128", spirv: shaders.GEMMWMMAReg32HKA8, bm: 32, bn: 32, bk: 128, waves: 1, padA: 128},
+
+	// The AI-32 grid, where only one operand fits past rung 2 — which makes
+	// hka4 vs hkb4 a free bonus the AI-16 arm cannot give: the same depth
+	// applied to A alone or to B alone, on the same kernel, so the residue can
+	// be attributed to an operand rather than to the pair.
+	{name: "wmma_reg64_bt_hkab2", spirv: shaders.GEMMWMMAReg64BTHKAB2, bm: 64, bn: 64, bk: 32, waves: 1, colMajorB: true},
+	{name: "wmma_reg64_bt_hkb4", spirv: shaders.GEMMWMMAReg64BTHKB4, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true},
+	{name: "wmma_reg64_bt_hka4", spirv: shaders.GEMMWMMAReg64BTHKA4, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true},
+	{name: "wmma_reg64_bt_hkab2_padab128", spirv: shaders.GEMMWMMAReg64BTHKAB2, bm: 64, bn: 64, bk: 32, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg64_bt_hkb4_padab128", spirv: shaders.GEMMWMMAReg64BTHKB4, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg64_bt_hka4_padab128", spirv: shaders.GEMMWMMAReg64BTHKA4, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128},
+	{name: "wmma_reg64_hka4", spirv: shaders.GEMMWMMAReg64HKA4, bm: 64, bn: 64, bk: 64, waves: 1},
+	{name: "wmma_reg64_hka4_pada128", spirv: shaders.GEMMWMMAReg64HKA4, bm: 64, bn: 64, bk: 64, waves: 1, padA: 128},
 }
 
 // runGEMMWMMA measures the register-blocked cooperative-matrix GEMM

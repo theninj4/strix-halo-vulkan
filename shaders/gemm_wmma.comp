@@ -17,7 +17,7 @@
 // matrix cores, starved on memory rather than limited by MMA issue
 // (IDEAS.md §2.1).
 //
-// Four independently switchable changes, so the ablation is measurable
+// Five independently switchable changes, so the ablation is measurable
 // rather than assumed. Which of them actually won on this part is not what
 // the conventional wisdom predicts — see the notes after the list.
 //
@@ -44,6 +44,14 @@
 //      gathered element by element. This halves the loop's instruction count
 //      (577 -> 389 at WM=WN=4, of which address arithmetic 232 -> 144) and is
 //      also how a real `Linear` weight already sits in memory.
+//   5. Hoisted K-tile loads (HOIST_A / HOIST_B). One operand's fragment loads
+//      for the *whole* K-slab are issued before the slab's first MMA, instead
+//      of one K-tile's worth at a time. Not a tiling change and not a codegen
+//      one: the byte set, the instruction counts, the tile and the
+//      accumulator grid are all identical to BK_TILES on its own. What moves
+//      is how much of each row the wave has outstanding at one moment — 32 B
+//      per K-tile in flight — which IDEAS §5.1b's mechanism 3 measured as the
+//      quantity the memory system actually prices.
 //
 // What the measurements said (N=4096, against a measured 55.5 TFLOP/s WMMA
 // ceiling; see IDEAS.md §2.1 for the full table):
@@ -100,6 +108,28 @@
 // and still loses at N=4096, so the footprint-dependent part of the effect
 // is something else; IDEAS §2.3 and §5.1b carry that residue.
 //
+// **That residue was the fifth axis, and closing it reversed the comparison.**
+// A 16x16 fp16 fragment load holds 32 B of each row it touches, and a tiled
+// kernel's waves retire after one — so the contiguous run these kernels have
+// in flight is an eighth of the `gcd` even a padded stride leaves, which is
+// the regime IDEAS §5.1b's mechanism 3 measured a 4-8x in. HOIST_A/HOIST_B
+// raise it: `wmma_reg64_bt_hka4_padab128` reaches **38990 GFLOP/s at N=2048,
+// 70% of the ceiling**, and at N=4096 the transposed-B kernel goes from 15697
+// to 30609, *past* row-major's 24466. The [N,K] layout is now the fast one at
+// every size.
+//
+// What makes that attributable rather than merely true is the control that
+// was already here: `_bt_k64` is BK_TILES=4 with no hoisting — the same 64
+// `buffer_load_b128` and 64 `v_wmma` per loop body, the same bytes — and
+// RADV_DEBUG=asm shows the scheduler leaving **16** loads outstanding before
+// the first s_waitcnt against the hoisted kernel's **45**. 8734 vs 18363
+// GFLOP/s unpadded. Slab depth on its own does nothing and never did; what
+// the register array buys is concurrency. Note also what stops it: an
+// accumulator costs ~8 VGPRs on wave64 and a fragment ~4, so hoisting both
+// operands at BK_TILES=4 spills (140 VGPRs, 3 KB scratch) and at BK_TILES=8
+// ruinously (380-488, 70 KB). The ceiling on this lever is the 256-VGPR
+// wave64 budget, which is why IDEAS §6.2 (wave32) is now the next item.
+//
 // Tile geometry is compile-time (glslc -D), not specialization constants:
 // the accumulator grid sizes a register array and the LDS slabs size
 // `shared` arrays, both of which must be known to the front end. The 16x16x16
@@ -137,6 +167,19 @@
 #ifndef B_COLMAJOR
 #define B_COLMAJOR 0
 #endif
+// Hoisting: issue a whole K-slab's fragment loads for this operand before the
+// slab's first MMA, so a wave has BK_TILES*32 bytes of each row it touches
+// outstanding at once instead of 32 (IDEAS §5.1b mechanism 3). Per operand,
+// because the register file is the binding constraint: at WM=WN=4 a hoisted
+// operand costs BK_TILES*W*4 VGPRs on top of the 128 the accumulators already
+// hold, and hoisting both at BK_TILES>=4 spills.
+#ifndef HOIST_A
+#define HOIST_A 0
+#endif
+#ifndef HOIST_B
+#define HOIST_B 0
+#endif
+#define HOIST (HOIST_A || HOIST_B)
 #ifndef LDS_PAD
 #define LDS_PAD 0   // extra halves per LDS row, to skew the bank mapping
 #endif
@@ -300,6 +343,23 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
 }
 #endif
 
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+// Where a fragment load lands. With HOIST_K the register file holds every
+// K-tile of the slab at once, so the destination is indexed by the K-tile as
+// well; without it there is one set of fragments, reused each K-tile.
+#if HOIST_A
+#define FRAG_A(kt, i) fragA[kt][i]
+#else
+#define FRAG_A(kt, i) fragA[i]
+#endif
+#if HOIST_B
+#define FRAG_B(kt, j) fragB[kt][j]
+#else
+#define FRAG_B(kt, j) fragB[j]
+#endif
+
 // One K-slab's worth of matrix work: load WM A-fragments and WN B-fragments,
 // then issue WM*WN MMAs against them. The loads are hoisted out of the MMA
 // nest so each fragment is fetched once and reused across a whole accumulator
@@ -309,48 +369,96 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
 // LDS plane offset when reading shared memory.
 #if USE_LDS
 #define LOAD_FRAG_A(i, abase, kt)                                              \
-    coopMatLoad(fragA[i], ldsA,                                                \
+    coopMatLoad(FRAG_A(kt, i), ldsA,                                                \
         (abase) + (waveM * (WM * TILE) + (i) * TILE) * LDS_A_STRIDE + (kt) * TILE, \
         LDS_A_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
 #if B_COLMAJOR
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], ldsB,                                                \
+    coopMatLoad(FRAG_B(kt, j), ldsB,                                                \
         (bbase) + (waveN * (WN * TILE) + (j) * TILE) * LDS_B_STRIDE + (kt) * TILE, \
         LDS_B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
 #else
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], ldsB,                                                \
+    coopMatLoad(FRAG_B(kt, j), ldsB,                                                \
         (bbase) + ((kt) * TILE) * LDS_B_STRIDE + waveN * (WN * TILE) + (j) * TILE, \
         LDS_B_STRIDE, gl_CooperativeMatrixLayoutRowMajor);
 #endif
 #else
 #define LOAD_FRAG_A(i, abase, kt)                                              \
-    coopMatLoad(fragA[i], a, (wm0 + (i) * TILE) * pc.lda + (abase) + (kt) * TILE, \
+    coopMatLoad(FRAG_A(kt, i), a, (wm0 + (i) * TILE) * pc.lda + (abase) + (kt) * TILE, \
         pc.lda, gl_CooperativeMatrixLayoutRowMajor);
 #if B_COLMAJOR
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], b, (wn0 + (j) * TILE) * pc.ldb + (bbase) + (kt) * TILE, \
+    coopMatLoad(FRAG_B(kt, j), b, (wn0 + (j) * TILE) * pc.ldb + (bbase) + (kt) * TILE, \
         pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
 #else
 #define LOAD_FRAG_B(j, bbase, kt)                                              \
-    coopMatLoad(fragB[j], b, ((bbase) + (kt) * TILE) * pc.ldb + wn0 + (j) * TILE, \
+    coopMatLoad(FRAG_B(kt, j), b, ((bbase) + (kt) * TILE) * pc.ldb + wn0 + (j) * TILE, \
         pc.ldb, gl_CooperativeMatrixLayoutRowMajor);
 #endif
 #endif
 
+#if HOIST
+// The same work, with each hoisted operand's whole slab of loads issued
+// before the slab's first MMA. The byte set, the MMA count, the tile shape
+// and the accumulator grid are all unchanged; what moves is how much of each
+// row a wave has outstanding at one moment, which IDEAS §5.1b's mechanism 3
+// says is the quantity the memory system actually prices (see the note at the
+// top of this file). The unhoisted operand keeps the original structure —
+// one set of fragments, refilled per K-tile.
+#if HOIST_A
+#define DECL_A FRAG_A_T fragA[BK_TILES][WM];
+#define PRE_A(abase, kt)  [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) }
+#define INNER_A(abase, kt)
+#else
+#define DECL_A
+#define PRE_A(abase, kt)
+#define INNER_A(abase, kt) FRAG_A_T fragA[WM];                                 \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) }
+#endif
+#if HOIST_B
+#define DECL_B FRAG_B_T fragB[BK_TILES][WN];
+#define PRE_B(bbase, kt)  [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, bbase, kt) }
+#define INNER_B(bbase, kt)
+#else
+#define DECL_B
+#define PRE_B(bbase, kt)
+#define INNER_B(bbase, kt) FRAG_B_T fragB[WN];                                 \
+    [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, bbase, kt) }
+#endif
+
 #define MMA_BLOCK(abase, bbase) {                                              \
+    DECL_A                                                                     \
+    DECL_B                                                                     \
     [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
-        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA> fragA[WM]; \
-        coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB> fragB[WN]; \
-        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) } \
-        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, bbase, kt) } \
+        PRE_A(abase, kt)                                                       \
+        PRE_B(bbase, kt)                                                       \
+    }                                                                          \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        INNER_A(abase, kt)                                                     \
+        INNER_B(bbase, kt)                                                     \
         [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
             [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
-                acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);      \
+                acc[i][j] = coopMatMulAdd(FRAG_A(kt, i), FRAG_B(kt, j), acc[i][j]); \
             }                                                                  \
         }                                                                      \
     }                                                                          \
 }
+#else
+#define MMA_BLOCK(abase, bbase) {                                              \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        FRAG_A_T fragA[WM];                                                    \
+        FRAG_B_T fragB[WN];                                                    \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) } \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, bbase, kt) } \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(FRAG_A(kt, i), FRAG_B(kt, j), acc[i][j]); \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+#endif
 
 void main() {
     // Wave's position in the workgroup's wave grid. Both divisors are

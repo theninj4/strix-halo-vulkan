@@ -282,6 +282,13 @@ var GEMMW8A8 []byte
 //     layout RDNA's WMMA B operand actually wants — without it every B
 //     fragment is gathered by sixteen scalar 16-bit loads rather than two
 //     buffer_load_b128 — and it is also how a real Linear weight is stored
+//   - hoisted K-tile loads (*_hka/_hkb/_hkab), IDEAS §5.1b mechanism 3: a
+//     whole K-slab of one operand's fragment loads is issued before the slab's
+//     first MMA, so the bytes of a single row a wave has outstanding go from
+//     32 (one fragment) to 32*BK_TILES. The byte set, the MMA count, the tile
+//     and the accumulator grid are unchanged; only the number of loads in
+//     flight moves. Pairs with the existing *_k64 rows, which deepen the slab
+//     *without* hoisting and measured as nothing, twice.
 //
 // Tile geometry is -D rather than specialization constants because it sizes
 // register and `shared` arrays; see the shader header.
@@ -304,6 +311,47 @@ var GEMMW8A8 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -o gemm_wmma_lds128_db_bt.spv gemm_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -DBK_TILES=2 -o gemm_wmma_lds128k32_db_bt.spv gemm_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=8 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DUSE_LDS=1 -DDOUBLE_BUFFER=1 -DB_COLMAJOR=1 -o gemm_wmma_lds256x128_db_bt.spv gemm_wmma.comp
+
+// The hoisted-K ladder (IDEAS §5.1b mechanism 3, aimed at §2.3's residue).
+// BK_TILES is the rung: a 16x16 fp16 fragment holds 32 B of each row it
+// touches, so 1/2/4/8 K-tiles in flight hold 32/64/128/256 B — and 256 B is
+// exactly the gcd a +256 B pad leaves against the 4 KB channel rotation, i.e.
+// the rung at which the coverage law predicts the penalty is gone.
+//
+// Hoisting is per operand because the register file, not the idea, sets how
+// far the ladder goes. On wave64 an accumulator costs ~8 VGPRs and a fragment
+// ~4, and RADV_DEBUG=shaderstats (via cmd/probe) prices every rung:
+//
+//   WM=WN=4  reg64      144 VGPR   hkab2  192   hka4/hkb4  252   hkab4  spills
+//                                                            (140 VGPR, 3 KB scratch)
+//   WM=WN=2  reg32_bt    48 VGPR   hkab2   84   hkab4      144   hkab8  spills (38)
+//                                                            hka8/hkb8  192
+//
+// So the ladder is run twice and each arm stops where the registers do: to
+// rung 4 at WM=WN=4 (AI 32, the shape §2.1 and §2.3 measured), where past
+// rung 2 only one operand fits at a time — which is a bonus, since hka4 vs
+// hkb4 attributes the effect to an operand rather than to the pair — and to
+// rung 8 at WM=WN=2 (AI 16, four accumulators), single-operand at the top
+// rung. The AI-16 arm is also where §2.1 measured the kernel pinned at 765
+// GB/s — literally bandwidth-bound — which is where a bandwidth-coverage
+// effect should show up most clearly if it is real.
+//
+// The transposed-B arm is the one under test: both its operands are
+// K-contiguous gathers, so hoisting deepens both runs. The row-major arm is
+// the control — its A loads deepen identically, but a row-major B fragment is
+// gathered element by element along N, so hoisting B cannot deepen anything.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DB_COLMAJOR=1 -o gemm_wmma_reg32_bt.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=2 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg32_bt_hkab2.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg32_bt_hkab4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=8 -DHOIST_A=1 -o gemm_wmma_reg32_bt_hka8.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=8 -DHOIST_B=1 -o gemm_wmma_reg32_bt_hkb8.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg32_hkab4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=2 -DWN=2 -DBK_TILES=8 -DHOIST_A=1 -o gemm_wmma_reg32_hka8.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=2 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg64_bt_hkab2.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_B=1 -o gemm_wmma_reg64_bt_hkb4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_bt_hka4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_hka4.spv gemm_wmma.comp
 
 //go:embed gemm_wmma_reg32.spv
 var GEMMWMMAReg32 []byte
@@ -340,6 +388,39 @@ var GEMMWMMALDS128K32DBBT []byte
 
 //go:embed gemm_wmma_lds256x128_db_bt.spv
 var GEMMWMMALDS256x128DBBT []byte
+
+//go:embed gemm_wmma_reg32_bt.spv
+var GEMMWMMAReg32BT []byte
+
+//go:embed gemm_wmma_reg32_bt_hkab2.spv
+var GEMMWMMAReg32BTHKAB2 []byte
+
+//go:embed gemm_wmma_reg32_bt_hkab4.spv
+var GEMMWMMAReg32BTHKAB4 []byte
+
+//go:embed gemm_wmma_reg32_bt_hka8.spv
+var GEMMWMMAReg32BTHKA8 []byte
+
+//go:embed gemm_wmma_reg32_bt_hkb8.spv
+var GEMMWMMAReg32BTHKB8 []byte
+
+//go:embed gemm_wmma_reg32_hkab4.spv
+var GEMMWMMAReg32HKAB4 []byte
+
+//go:embed gemm_wmma_reg32_hka8.spv
+var GEMMWMMAReg32HKA8 []byte
+
+//go:embed gemm_wmma_reg64_bt_hkab2.spv
+var GEMMWMMAReg64BTHKAB2 []byte
+
+//go:embed gemm_wmma_reg64_bt_hkb4.spv
+var GEMMWMMAReg64BTHKB4 []byte
+
+//go:embed gemm_wmma_reg64_bt_hka4.spv
+var GEMMWMMAReg64BTHKA4 []byte
+
+//go:embed gemm_wmma_reg64_hka4.spv
+var GEMMWMMAReg64HKA4 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_fp16.spv gemm_coopmat_fp16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_int8.spv gemm_coopmat_int8.comp

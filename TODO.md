@@ -11,21 +11,90 @@ to perform well.
 
 Everything below builds clean (`go build ./...`, `gofmt -l .`,
 `go vet ./...` all clean) and has passed its correctness checks on real
-hardware. `results.csv` was regenerated again this session, with the
-`stride` family's two new axes behind its rows, by
+hardware. `results.csv` was regenerated again this session, with the WMMA
+family's new hoisted-K ladder behind its rows, by
 `go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv` — the
 non-default block list is what the committed file has always used, so keep it
 if the file is to stay comparable row for row. Run it with nothing else on
-the GPU (see the measurement lessons below). It takes ~23 minutes now, of
-which the `stride` family is ~14: 816 cases, since the traversal axis more
-than doubled its shape list.
+the GPU (see the measurement lessons below). It takes ~28 minutes now, of
+which the `stride` family is ~14 (816 cases) and the `gemm` family ~8 (the
+WMMA ablation is 48 variants).
 
 Two documents carry the analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
 gain / how to measure, and marked up with what has since been measured).
 **`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-### This session: IDEAS §5.1b's follow-up — the traversal axis
+### This session: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
+
+The handoff's item 1 was "§2.3's residue, re-aimed by the traversal axis":
+the 1.6x that transposed-B stayed behind row-major at N=4096 **with both
+strides padded**, which §2.3 ruled out three explanations for and could not
+attribute. §5.1b's mechanism 3 had supplied the first candidate — a coopmat
+fragment load holds 32 B of a row, a tiled GEMM's waves retire after one, so
+the contiguous run in flight is an eighth of the `gcd` even a padded stride
+leaves — and said the test needed no new probe, just more of a row in flight
+inside the WMMA kernel. That is now done, and it is the largest single win
+the GEMM has had since register blocking.
+
+**New code:**
+- `shaders/gemm_wmma.comp` gains a fifth axis, `HOIST_A` / `HOIST_B`: one
+  operand's fragment loads for the *whole* K-slab are issued before the
+  slab's first MMA, instead of one K-tile's worth at a time. The byte set,
+  the MMA count, the tile, the accumulator grid and the arithmetic intensity
+  are all unchanged; only how much of each row is outstanding at one moment
+  moves. It is per operand because the register file, not the idea, sets how
+  far it goes. The non-hoisted path is left byte-identical — the existing
+  twelve variants recompile to the same SPIR-V, verified with `cmp`.
+- `shaders/shaders.go` gains eleven variants: a transposed-B `reg32`
+  baseline, the rung-2/4/8 ladder on both grids, and the row-major controls. Each
+  generate line's VGPR cost is recorded in the comment above them.
+- `bench/ops_gemm_wmma.go` gains 22 rows — the ladder unpadded and with
+  §2.3's +256 B pad, plus the row-major arm — bringing the WMMA ablation to
+  48 variants.
+
+**The finding: the residue was the traversal, and it reverses.** New suite
+best **38990 GFLOP/s at N=2048 — 70% of the measured 55.5 TFLOP/s WMMA
+ceiling**, up from 28510 and 51%. At N=4096 the transposed-B kernel goes from
+15697 to **30609**, past row-major's 24466: the kernel with the better
+instruction stream is now the faster one at every size, which is what §2.1
+predicted before the memory system got in the way. Both runs of the sweep
+agree to ≤1% on those rows.
+
+**The control was already in the suite, and it had been misread.**
+`wmma_reg64_bt_k64` is BK_TILES=4 without hoisting — the same 64
+`buffer_load_b128` and 64 `v_wmma` per loop body as the hoisted kernel, the
+same bytes. `RADV_DEBUG=asm` via `cmd/probe` counts what the scheduler
+actually leaves outstanding before the first `s_waitcnt`: **16 loads for the
+unhoisted kernel, 45 for the hoisted one**, and 8734 vs 18363 GFLOP/s
+unpadded at N=4096. So "deepening the K-slab does nothing", which this file
+recorded as a refutation twice, was the control measuring its own no-op.
+Depth is not the variable; concurrency is.
+
+**Two things make it attributable rather than merely true.** The lever is
+worth 2.88x on the transposed-B layout (both operands K-contiguous gathers)
+and 1.14x on row-major (whose B fragments are gathered along N and cannot
+deepen) — it acts on exactly the loads the mechanism names. And the *stride
+pad's* value decays as the kernel holds more of a row: 1.44x at C=32 B,
+1.24x at 64 B, 1.09-1.10x at 256 B, which is the coverage law's own
+prediction observed from outside the probe that produced it. What this does
+**not** separate is channel coverage from plain latency hiding; more loads in
+flight buys both, and the experiment has no lever that buys only one.
+
+**Where it stops: registers.** On wave64 an accumulator is ~8 VGPRs and a
+fragment ~4, so WM=WN=4's sixteen accumulators take 128 of 256. Hoisting both
+operands at BK_TILES=4 spills (140 VGPRs, 3 KB scratch), at BK_TILES=8
+catastrophically (380-488, 70 KB). The AI-32 ladder therefore stops at rung 4
+and rung 8 needs the four-accumulator AI-16 grid. **This promotes §6.2
+(wave32)** from a curiosity to the next item: wave32 halves the per-fragment
+register cost of the same tile, which is the exact currency this lever
+spends, and WMMA is natively a wave32 shape.
+
+**One cell is unexplained and reproducible:** `reg32_bt_hkab4` is *slower*
+padded than unpadded (0.88x at N=4096, 0.87x at N=2048, both runs). Every
+other rung on that ladder goes the other way.
+
+### Previous session: IDEAS §5.1b's follow-up — the traversal axis
 
 §5.1b left one access pattern unmeasured and called it the sharpest item in
 the file: **concurrent-but-contiguous requests from *different* waves at an
@@ -137,7 +206,7 @@ It was filed as a 1.3x tidy-up against gathers; it is a defence against a 4x
 that needs no padding to occur. The second escape, when the stride is not the
 engine's to choose, is depth: 4 KB of a row in flight per wave.
 
-### Previous session: IDEAS §5.1b — the strided-bandwidth probe
+### Two sessions ago: IDEAS §5.1b — the strided-bandwidth probe
 
 `IDEAS.md` §5.1b asked for the memory system to be measured directly instead
 of inferred through a GEMM: fixed bytes touched, sweeping (a) the stride
@@ -260,7 +329,7 @@ consequence points the same way as the corollaries above: **"keep it under
   timed batches and keeps the fastest (`strideBatches`); DRAM-resident cases
   reproduce to within 2% either way and are unaffected by that choice.
 
-### Two sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
+### Three sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
 
 `IDEAS.md` §2.3's open question was why the *better* instruction stream is
 2.8x slower: storing B as [N,K] and loading it column-major cuts
@@ -375,7 +444,7 @@ present in every run.
    penalty into a curve the engine can allocate against instead of one
    kernel's anecdote.
 
-### Three sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
+### Four sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
 
 `IDEAS.md`'s largest remaining item is done, and it beat its own forecast.
 **A register-blocked cooperative-matrix GEMM reaches 25.2 TFLOP/s at
@@ -475,7 +544,7 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    the 256-VGPR wave64 limit, not by occupancy, which also makes §6.2
    (wave32) more interesting than it was: WMMA is natively a wave32 shape.
 
-### Four sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
+### Five sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
 
 The highest-value item in `IDEAS.md` is done, and it delivered more than it
 promised. **W4A8 GEMV — 4-bit weights against int8 activations, both fed to
@@ -552,7 +621,7 @@ the 64MB footprint, where 4-bit weights still fit the 32MB MALL.
    §1.2's "no integer division" is also folded into this kernel: it takes
    `log2(block)` and shifts.
 
-### Five sessions ago: the §0 "measurement validity" block from IDEAS.md
+### Six sessions ago: the §0 "measurement validity" block from IDEAS.md
 
 The session that produced `IDEAS.md` implemented its §0 —
 the work that had to happen before optimising against any of the existing
@@ -694,19 +763,29 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
 ## Next steps (pick up here)
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
-updated for what §0, §1.1, §2.1, §2.3, §5.1b and §5.1b's traversal follow-up
-found. In short:
+updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up and
+§2.7 found. In short:
 
-1. **IDEAS §2.3's residue, re-aimed.** The traversal axis is the first
-   mechanism anyone has had for the 1.6x that transposed-B stayed behind
-   row-major *with both strides padded*. A coopmat fragment load holds 32 B
-   of a row — the far end of mechanism 3, where even a de-aliased stride
-   leaves 0.73-0.87x on the table — and a tiled GEMM's waves grab a fragment
-   and retire rather than walking along a row. No new probe needed: give the
-   WMMA kernel's inner loop more of a row in flight (wider fragment loads, or
-   several K-tiles outstanding) and see whether the gap moves. Same lever as
-   §1.3, and the ladder says what a full rotation buys.
-2. **The MALL's own slice structure — still open, and now with one more
+1. **IDEAS §6.2 — wave32 vs wave64, promoted by §2.7.** Register blocking is
+   capped by the 256-VGPR wave64 limit, and §2.7 turned that cap into the
+   thing that stops the best lever in the file: hoisting both operands at
+   BK_TILES=4 spills, so the AI-32 kernel stops at rung 4 and rung 8 needs a
+   smaller tile. wave32 halves the per-fragment register cost of the same
+   tile — the exact currency both levers spend — and WMMA is natively a
+   wave32 shape. Needs a small `vk/shim.c` change to pass
+   `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize`. Note the `stride`
+   family's mapping is expressed in units of 64 lanes whatever the subgroup
+   size is, so it would still measure the same shapes at half the addresses
+   per request.
+2. **Finish §2.7's ladder on the other winners.** It was run on `reg64_bt`
+   and `reg32_bt` only. `reg64x128` and `wg128x256` are the AI-43/85 shapes
+   and already sit at 252 VGPRs with 32 accumulators, so they cannot hoist as
+   they stand — whether the lever survives into them is what says how it
+   composes with arithmetic intensity, and it probably needs item 1 first.
+   Also missing: a row-major `hkb4`, which completes the 2x2 of (operand
+   hoisted) x (layout) that §2.7 could only half-fill, and an explanation for
+   the one reproducible cell where padding *hurts* (`reg32_bt_hkab4`, 0.88x).
+3. **The MALL's own slice structure — still open, and now with one more
    clue.** Under partial channel coverage the MALL keeps a working set only
    while its *span* is also inside 32 MiB, one case lands halfway, and the
    traversal axis has added MALL cells the coverage law fits (2048 B rows at
@@ -717,41 +796,36 @@ found. In short:
    0,1024,3072` separates effective capacity from bus width. Worth doing
    before any MALL-blocking work in §5.1b/§2.4/§3.3, which needs a number to
    size against.
-3. **IDEAS §2.4 — workgroup swizzle.** Still the cheapest structural item,
-   and the traversal axis sharpens it: a swizzle changes exactly which
-   addresses are in flight together, which is now a measured axis with a
-   model behind it. §2.3 pushed the AI-32 kernels to 742-887 GB/s of implied
-   MALL traffic, past the 805 GB/s ceiling, so they are not simply
-   MALL-pinned; the sharp test is that a swizzle should help those and do
-   nothing for the AI-85 variant (306 GB/s implied).
-4. **Pad the strides in the other kernels — a falsification test, and the
+4. **IDEAS §2.4 — workgroup swizzle.** Still cheap and structural, and the
+   traversal axis sharpens what it would be testing: a swizzle changes
+   exactly which addresses are in flight together, which is now a measured
+   axis with a model behind it. But its bandwidth premise is gone — §2.3
+   pushed the AI-32 kernels to 742-887 GB/s of implied MALL traffic and §2.7
+   pushed the best of them to **1218 GB/s**, past even the 965 GB/s a pure
+   MALL read delivers, so implied traffic no longer bounds these kernels at
+   all. Run it as a discriminator (helps AI-32, does nothing for AI-85), not
+   as a bandwidth fix.
+5. **Pad the strides in the other kernels — a falsification test, and the
    model now predicts *no* effect for a better reason.** Mechanism 3 looked
    like it had caught the GEMV kernels red-handed (one wave per row, rows a
    stride apart) until its own ladder measured that exact shape at the full
    bus at every stride. GEMV, W4A8 and W8A8 should therefore be unmoved by a
    stride push constant. Run it once to check the model, not to gain
    throughput.
-5. **IDEAS §2.2's int8 arm — a `PRECISION_I8` variant of
+6. **IDEAS §2.2's int8 arm — a `PRECISION_I8` variant of
    `gemm_wmma.comp`**, accumulating in int32. Small change to a kernel that
-   now reaches 51% of the ceiling, halves its operand bytes, and gives W8A8
+   now reaches 70% of the ceiling, halves its operand bytes, and gives W8A8
    prefill its number. (The *Q4*-unpack version stays downgraded: there is
    no int8 matrix-rate bonus on this chip, and the winning kernel has no LDS
    tile whose fill cost a cheaper unpack would improve.)
-6. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
+7. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
    on W4A8. fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%, where
    W4A8 now reaches 89%. The traversal work adds a second reason to want
    them: load width is one of the two things that set C.
-7. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
+8. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
    and `n / pc.block`) from everything W4A8 did not rewrite: the
    naive/tiled GEMM paths and the old quantized GEMV variants.
    `gemv,naive,q4` is still slower than naive fp32, which is the symptom.
-8. **IDEAS §6.2 — wave32 vs wave64.** WMMA is natively a 16x16x16 wave32
-   shape, RADV runs these shaders at wave64, and §2.1's tile size is capped
-   by the 256-VGPR wave64 limit rather than by occupancy. Needs a small
-   `vk/shim.c` change to pass `VK_EXT_subgroup_size_control`'s
-   `requiredSubgroupSize`. Note the `stride` family's mapping is expressed in
-   units of 64 lanes whatever the subgroup size is, so it would still measure
-   the same shapes at half the addresses per request.
 9. **IDEAS §1.6 — the activation-quantize cost W8A8 and W4A8 both hide.**
    Both kernels get `x` quantized on the host, outside the timed loop, and
    W4A8 additionally gets its per-block activation sums for free. A real
@@ -764,10 +838,14 @@ found. In short:
    (is `v_pk_fma_f16` actually emitted, given §0.1's 1.10x packed-fp16
    surprise). `-blocks` is worth re-sweeping only where a block-size effect
    survives warming — in GEMV it does not.
-11. **Not committed to git.** The §5.1b probe went in as ebe959a; this
-   session's traversal work is outstanding: the two new axes in
-   `shaders/strided_read.comp` and their eight registry entries,
-   `bench/ops_stride.go`, plus `IDEAS.md`, `README.md`, this file, and a
+11. **Not committed to git.** This session's §2.7 work is outstanding: the
+   `HOIST_A`/`HOIST_B` axis in `shaders/gemm_wmma.comp`, its eleven registry
+   entries in `shaders/shaders.go`, the 22 new rows in
+   `bench/ops_gemm_wmma.go`, plus `IDEAS.md`, `README.md`, this file, and a
    regenerated `results.csv`. Note `*.spv` is gitignored, so **`go generate
    ./...` is required after a fresh checkout** — the thirteen `strided_read`
-   variants and the 12 WMMA ones are each built from a single `.comp`.
+   variants and the 23 WMMA ones are each built from a single `.comp`.
+   Worth knowing when reading ISA: RADV caches compiled pipelines on disk, so
+   `RADV_DEBUG=shaderstats` and `RADV_DEBUG=asm` print **nothing** on a
+   second run of the same shader. Set `MESA_SHADER_CACHE_DISABLE=true`
+   alongside them.
