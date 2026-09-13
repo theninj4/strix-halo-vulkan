@@ -75,6 +75,25 @@ the stride is not the engine's to choose, depth in the inner loop buys the
 same thing, which is the 2.1x the GEMM above collects. `IDEAS.md`
 explains how each kernel gets where it is and what is still on the table.
 
+All of the above was measured on square N x N x N, which no transformer layer
+is. The `shapes` family runs the same kernels over the actual (M,N,K) triples
+of the models in `GOALS.md` — read out of their own configs — and two of the
+answers change. **Decode gets easier**: every reduction length those models
+use is a non-power-of-two, so its 4-bit weight row has a *smaller* `gcd` with
+the 4 KB channel rotation than the square sweep's rows did, and the load width
+stops mattering. At K=2560, the width every Qwen projection reduces over, the
+kernel reads 239-242 GB/s at *all four* built widths including the narrowest
+— where at the square sweep's N=8192 only the widest got there. Only K=1024
+still needs a `uvec4` (211 → 239 GB/s), and nothing in any of the five models
+needs a load wider than the kernel already has. **Prefill gets a second
+kernel**: the suite's headline GEMM wins every shape with 1024 or more tokens
+in the batch and *loses every shape below that*, by up to 2.8x, to the
+small-tile wave32 variant the square sweep only ever crowned at N=1024. Real
+batches are below it constantly — 128 caption tokens, 384 audio frames, and
+40 tokens per expert when a 2048-token prompt is routed across 512 of them.
+The crossover is in M alone, and a sweep with M tied to N and K cannot see
+it.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -110,6 +129,8 @@ fields is itself a pointer into other Go memory — and Vulkan's
   block scales (`quant.go`), clock/power instrumentation (`sysmon.go`), and
   one file per op family (`ops_*.go`) wiring shader variants + buffer
   layouts + a CPU-reference correctness check to a size sweep.
+  `modelshapes.go` is the odd one out: not code but data — the weight-matrix
+  dimensions of the models in `GOALS.md`, with the config each was read from.
 - `cmd/bench/main.go` — the benchmark CLI; `bench/families.go` is the
   registry of targetable op families it dispatches to.
 - `results/` — one CSV per op family, the committed measurements.
@@ -131,13 +152,13 @@ go build ./...
 
 go run ./cmd/bench -list          # the op families a run can target
 go run ./cmd/bench gemv gemv_cold # run two of them
-go run ./cmd/bench all            # the whole suite (~33 min)
+go run ./cmd/bench all            # the whole suite (~38 min)
                                   # -h for the sweep flags (sizes, blocks,
                                   # warmup/iters, per-family sweeps)
 ```
 
-A run has to name what it is measuring: the full suite takes about half an
-hour and produces ~1900 rows, so sweeping all of it to answer one question is
+A run has to name what it is measuring: the full suite takes well over half
+an hour and produces ~2100 rows, so sweeping all of it to answer one question is
 mostly waste. `all` is still there for the occasions that want it.
 
 `cmd/bench` prints a results table per op family and writes one CSV per
@@ -151,10 +172,14 @@ by `sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail`, so
 `tail -q -n +2 results/*.csv` reconstructs the single flat table the suite
 used to write if an analysis wants it.
 
-The families are the ten listed by `-list`: `peak`, `overhead`, `bandwidth`,
-`stride`, `elementwise`, `gemv`, `gemv_cold`, `gemm`, `gemm_wmma`, `reduce`.
-`gemm_wmma` — the hand-tuned WMMA ladder — is separate from `gemm` because it
-is the larger half of the GEMM rows and is iterated on by itself.
+The families are the eleven listed by `-list`: `peak`, `overhead`,
+`bandwidth`, `stride`, `elementwise`, `gemv`, `gemv_cold`, `gemm`,
+`gemm_wmma`, `shapes`, `reduce`. `gemm_wmma` — the hand-tuned WMMA ladder —
+is separate from `gemm` because it is the larger half of the GEMM rows and is
+iterated on by itself. `shapes` is the one family that sweeps nothing: it runs
+the kernels the other families picked over the real model dimensions in
+`bench/modelshapes.go`, takes ~5 min, and ignores `-sizes`/`-blocks` because
+the shapes are the models' rather than the flags'.
 
 ## Reading the numbers honestly
 
@@ -205,6 +230,22 @@ are cheap to run and worth running first.
   decode streams a whole model from DRAM per token. `-coldfootprints` sets
   the swept weight footprints in MB (fp16-equivalent, so every format in a
   row holds the same number of weights), `-coldn` the reduction length.
+- **`shapes`** is the check on everything above: the same kernels, at the
+  dimensions the models in `GOALS.md` are actually made of, because a square
+  N x N x N sweep ties three independent variables together and every real
+  layer separates them. Its decode arm gives each reduction length a
+  DRAM-resident twin — the model's own row geometry, with enough rows that
+  the weights cannot fit the MALL — because a single real weight matrix is
+  usually small enough to be cache-resident on its own while the model it
+  belongs to is not. Its prefill arm pads M and N up to the kernel's tile and
+  charges the padding to the result: the reported GFLOP/s is the model's own
+  FLOPs over the padded dispatch's time, so a 40-row expert in a 64-row tile
+  reads as the 62%-efficient thing it is, with the rate the kernel itself hit
+  in `exec_gflops`. K is never padded — that would compute a different
+  product — so a variant whose K-slab does not divide the model's K is
+  skipped instead. The arm runs a 200-iteration floor rather than the suite's
+  20: these dispatches are tens of microseconds, and at 20 iterations a few
+  cells per run came back 2x low at a pinned clock.
 
 Three measurement hazards the harness handles rather than leaves to the
 reader:

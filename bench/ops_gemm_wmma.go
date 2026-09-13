@@ -336,7 +336,15 @@ func RunGEMMWMMA(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, warmup, i
 func buildWMMAPipeline(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K int) (pipe *vk.ComputePipeline, aBuf, bBuf, cBuf *vk.Buffer, aData, bData []float32, err error) {
 	aData = randomFloats(M * K)
 	bData = randomFloats(K * N)
+	pipe, aBuf, bBuf, cBuf, err = buildWMMAPipelineWith(dev, mod, v, M, N, K, aData, bData)
+	return
+}
 
+// buildWMMAPipelineWith is the same, with the operands supplied rather than
+// generated. The shapes family (IDEAS §3.4) runs several variants over one
+// shape, and generating and converting tens of millions of floats per
+// variant costs more host time than the dispatch costs GPU time.
+func buildWMMAPipelineWith(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K int, aData, bData []float32) (pipe *vk.ComputePipeline, aBuf, bBuf, cBuf *vk.Buffer, err error) {
 	lda, ldb, bRows := v.lda(K), v.ldb(N, K), v.bRows(N, K)
 	if aBuf, err = dev.NewBuffer(M * lda * 2); err != nil {
 		return
@@ -434,10 +442,13 @@ func verifyGEMMWMMA(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant) error {
 	return compareMat(got, want, 5e-2)
 }
 
-func timeGEMMWMMA(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K int, warmup, iters uint32) (Result, error) {
-	pipe, aBuf, bBuf, cBuf, _, _, err := buildWMMAPipeline(dev, mod, v, M, N, K)
+// runWMMACase dispatches one (variant, shape) pair and returns the raw
+// timing. The shapes family builds a different Result out of the same
+// measurement, so the timing and the labelling are separated here.
+func runWMMACase(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K int, aData, bData []float32, warmup, iters uint32) (float64, ClockStats, error) {
+	pipe, aBuf, bBuf, cBuf, err := buildWMMAPipelineWith(dev, mod, v, M, N, K, aData, bData)
 	if err != nil {
-		return Result{}, err
+		return 0, ClockStats{}, err
 	}
 	defer pipe.Destroy()
 	defer aBuf.Destroy()
@@ -445,12 +456,15 @@ func timeGEMMWMMA(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K i
 	defer cBuf.Destroy()
 
 	pc := wmmaPushConstants(M, N, K, v.ldb(N, K), v.lda(K))
-	groupsX, groupsY := uint32(N/v.bn), uint32(M/v.bm)
+	return TimeDispatch(pipe, uint32(N/v.bn), uint32(M/v.bm), 1, warmup, iters, pc)
+}
 
-	ns, clocks, err := TimeDispatch(pipe, groupsX, groupsY, 1, warmup, iters, pc)
+func timeGEMMWMMA(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K int, warmup, iters uint32) (Result, error) {
+	ns, clocks, err := runWMMACase(dev, mod, v, M, N, K, randomFloats(M*K), randomFloats(K*N), warmup, iters)
 	if err != nil {
 		return Result{}, err
 	}
+	groupsX, groupsY := uint32(N/v.bn), uint32(M/v.bm)
 
 	// Workgroup count matters here in a way it doesn't for the other GEMMs:
 	// §0.1 found WMMA needs 2 waves per CU (80 waves on this part) to reach

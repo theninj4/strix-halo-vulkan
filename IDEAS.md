@@ -1324,7 +1324,7 @@ amplified here because the standalone `softmax` kernel measures a poor
 **104 GB/s** — the fused version never materialises the score matrix at all.
 **Effort**: high. **Value**: very high — it's a whole missing pillar.
 
-### 3.4 Benchmark the *real* shapes from the target models
+### 3.4 Benchmark the *real* shapes from the target models — **DONE** ✅, **and it moved two answers**
 **Gap**: the sweep is square N×N×N, which no transformer layer is.
 **Change**: pull the actual dims from the four models in `GOALS.md`
 (Qwen3-Next hidden/FFN/expert dims and head config; Parakeet's conformer
@@ -1335,6 +1335,123 @@ pathological (odd dims, non-multiples of 16 needing padding/tail handling
 — none of the current kernels handle a K that isn't a multiple of TILE_K,
 `gemm_coopmat_fp16.comp:44` silently truncates `pc.K / TILE_K`).
 **Effort**: low-medium. **Value**: high — refocuses all other work.
+
+**[measured]** Now the `shapes` family: `bench/modelshapes.go` holds 60
+weight matrices read out of the models' own configs (Z-Image from the local
+checkout including the FFN width, which only its safetensors headers state;
+the rest from their Hugging Face `config.json`), each with the token count it
+runs at and how many times per forward pass. `bench/ops_shapes.go` runs the
+W4A8 GEMV over every decode reduction length and the WMMA GEMM over every
+deduplicated rectangle, and adds the whole thing up per model. 242 rows in
+`results/shapes.csv`, ~5 minutes, median run-to-run spread 0.2%.
+
+**What the square sweep got wrong is not a kernel, it is which variable is
+free.** N×N×N ties the batch, the output width and the reduction length
+together; every real layer separates them, and both of the suite's standing
+answers turn out to depend on the separation.
+
+**1. The load-width rule is satisfied for free at the real reduction
+lengths, and `VEC=32` is dead.** §1.7's law wants a lane-step to cover
+`gcd(rowBytes, 4096)`. The square sweep's power-of-two N made that gcd as
+large as it can be; the models' reduction lengths are 640, 1024, 2560 and
+6144, whose 4-bit rows are 320, 512, 1280 and 3072 B, with gcds of 64, 512,
+256 and 1024. Measured DRAM-resident, GB/s of the 236 GB/s bus:
+
+| K | rowB | gcd | `VEC=1` | `VEC=4` | `VEC=8` | `VEC=16` | who |
+|---|---|---|---|---|---|---|---|
+| 640 | 320 | 64 | 209 | **215** | 213 | 196 | MoE down-projections; Parakeet LSTM |
+| 1024 | 512 | 512 | 211 | **239** | 237 | 222 | Parakeet joint |
+| 2560 | 1280 | 256 | 239 | 241 | 241 | **242** | every Qwen projection |
+| 6144 | 3072 | 1024 | 236 | **239** | 238 | 239 | attention and DeltaNet outputs |
+
+At K=2560 — most of the decode traffic in `GOALS.md`'s text model — *every*
+width reads 101-102% of the bus, the narrowest included. Only K=1024 gains
+anything from a wider load (1.13x), and it is the one row where the law's
+threshold actually binds. The largest reduction length any of the five models
+decodes over is 6144, so the `VEC=32` item the last two handoffs carried
+"for when a model needs it" has no model to need it: **retired**.
+
+Two cells the law does not get right, in opposite directions. At K=6144 it
+predicts `VEC=1` reaches 0.25 of the bus and it reaches 1.00 — the
+below-threshold pessimism §1.7 already documented, and here total. At K=640
+*nothing* reaches the bus: 209-215 GB/s, 88-91%, at every width, where the
+law predicts full coverage from the narrowest load onward. 320-byte rows are
+the shortest in the set and the only ones below the 4 KB rotation by more
+than an order of magnitude; this is the one decode shape left with something
+on the table, and it is 480 of a token's 1861 matmuls.
+
+**2. Prefill has two winners, and which one applies is set by M alone.**
+§2.7's `wmma_reg64_bt_hka4_padab128` wins **every** rectangle with M ≥ 1024
+and **loses every rectangle below it** to `wmma_reg32_bt_hkab4_w32_padab128`
+— §6.2's AI-16 wave32 arm, which the square sweep only ever crowned at
+N=1024 and which is behind at N=2048 and N=4096. Across the 22 real
+rectangles at M ≤ 512 it wins 21, by 1.06-2.80x; across the 16 at M ≥ 1024 it
+wins none, losing by up to 2.8x the other way. The crossover is clean and it
+is in the batch: N and K predict nothing once M is known.
+
+The attribution is in the data too, because the same tile exists at both wave
+sizes. Holding tile, hoist rung and pads fixed, wave32 is 1.2-2.3x the wave64
+AI-16 arm at *every* shape measured (median 1.74x at M ≤ 512, 2.00x above) —
+consistent with §6.2's 1.9-2.1x on that grid. And holding the wave at 64, the
+AI-16 tile beats the AI-32 tile 1.43x at M=128 (11631 vs 8138 at N=K=768).
+So it is both: the smaller tile for the occupancy a short batch cannot
+otherwise fill, and wave32 for the fragment registers. One exception worth
+keeping: at M=128 with N=9728 the wave32 arm *loses* 0.63x, the only
+small-M cell it does, so the rule is "small M", not "small work".
+
+**3. The padding problem is M, not K.** Every K in all five models is a
+multiple of 64 — the predicted "K not a multiple of TILE_K" hazard does not
+occur once, and the kernels never have to pad a reduction. Every N is a
+multiple of 64 except Parakeet's 8198-wide joint output (vocab 8193 plus
+five duration classes), which pads to 8224 for 0.3% waste. The one shape that
+hurts is the MoE expert at prefill: routing 2048 tokens over 512 experts
+gives each **40 rows**, which a 64-row tile runs at **62% useful**, and the
+best kernel on it returns 7600 useful GFLOP/s — 14% of the WMMA ceiling and
+5.1x behind the same matrix run densely at M=2048. That is §3.5's case made
+from measurement rather than from first principles.
+
+**4. The budget, which is the thing the shapes were written down for.**
+
+| model / phase | q4 weights | GFLOP | flop/byte | mem-bound share | dispatches |
+|---|---|---|---|---|---|
+| qwen3.8-flash-next decode | 2.89 GB | 11.6 | 4.0 | 100% | 1861 |
+| qwen3.8-flash-next prefill (2048 tok) | 61.79 GB | 21067 | 341 | 98% | 74148 |
+| parakeet encoder (30 s audio) | 0.49 GB | 1269 | 2586 | 0% | 336 |
+| kokoro (128 phonemes) | 0.05 GB | 38 | 830 | 0% | 90 |
+| z-image transformer (1024², 1 step) | 5.09 GB | 53455 | 10498 | 0% | 391 |
+| z-image text encoder (128 tok) | 1.82 GB | 930 | 512 | 0% | 252 |
+| qwen3-embedding (512 tok) | 0.35 GB | 1533 | 4352 | 0% | 280 |
+
+One matrix's own intensity against 4-bit weights is `4*M` and nothing else,
+so the aggregate ratio is the wrong statistic for a mixed pass — hence the
+mem-bound column, the share of a pass's weight bytes sitting in matrices
+below the 235 flop/byte crossover. It says the thing the totals hide:
+**prefill of the MoE model is 98% memory-bound**, because the batch reaches
+the experts divided by 512.
+
+One matrix in that table is worth naming on its own. The text model's LM head
+is 248320 x 2560, **312.6 MB at 4 bits**, and it is measured here at its real
+size rather than through a twin — genuinely DRAM-resident, 240-242 GB/s at
+every load width, **1.36 ms**. That is 11% of a token's weight traffic in a
+single dispatch, and it is the one matrix a speculative or multi-token
+decoder would amortise rather than pay per token.
+
+At the best measured DRAM-resident decode rate (242 GB/s) the text model
+reads 2.89 GB per token = **11.9 ms = 84 tok/s** before attention, and its
+1861 matmul dispatches add 0.56 ms of launch cost on top (5%, at §4.1's
+measured 300 ns) — the first time that number has been large enough to
+matter, and it is an argument for §3.5's grouped GEMM (which collapses 1440
+expert dispatches into 48) rather than for §4.2's pre-recorded command
+buffers.
+
+**What this re-aims.** §3.5 (grouped/MoE GEMM) is now the highest-value item
+in the file on two independent counts — the 5.1x at M=40 and the 1440
+dispatches — where it was previously argued for from the model card alone.
+§1.3/§1.7's "carry the load-width rule to the other GEMV kernels" keeps its
+value but loses its urgency: the widths that matter at real K are the narrow
+ones those kernels already issue. And §2.4's swizzle finally has a
+discriminator worth running it on, since small-M shapes are where tile
+scheduling, not bandwidth, should show up.
 
 ### 3.5 Grouped / MoE GEMM
 Qwen3-Next is an MoE model: each token goes to a few of many experts, so
@@ -2144,16 +2261,45 @@ decodes at. The third probe, the `stride` family at both wave sizes, was
 **not run and is retired**: it existed to isolate a wave-size effect, and
 there is no longer one to isolate.
 
+**§3.4 is done**, the item the last handoff said to run before anything on
+this list: the models' own shapes are now in `bench/modelshapes.go` and the
+`shapes` family runs the suite's chosen kernels over them. It retired one item
+on this list outright and re-aimed two. **Decode needs no wider load**: the
+real reduction lengths are 640, 1024, 2560 and 6144, none a power of two, so
+their 4-bit rows have small gcds with the 4 KB rotation and K=2560 — most of
+the text model's traffic — reads 101% of the bus at *every* built width
+including the narrowest. `VEC=32` has no model to serve. **Prefill has two
+winners split by M**: §2.7's kernel takes every rectangle with M ≥ 1024 and
+loses all 22 below it, by up to 2.8x, to §6.2's AI-16 wave32 arm — a
+crossover a square sweep cannot express, since it never separates the batch
+from the other two extents. And the budget the shapes add up to says the MoE
+model's *prefill* is 98% memory-bound, because 2048 tokens reach an expert as
+40 rows, which the best kernel runs at 14% of the WMMA ceiling.
+
 **Next:**
-- **`VEC=32`, if a target model needs it.** §1.7's rule is `VEC = N/512` at
-  wave64 and the kernel stops at `VEC=16`, i.e. N=8192. An N=16384 matrix
-  would read at ~70% of the bus as things stand. Two lines of the same
-  `W4A8_GROUP` macro; worth doing once §3.4 says which N the real models use.
-- **Carry the rule to the other GEMV kernels.** fp16, W8A8 and the
+- **§3.5, the grouped/MoE GEMM.** Promoted to the top by §3.4 on two
+  independent measurements rather than by the model card: routing a
+  2048-token prompt across 512 experts gives each expert **40 rows**, which
+  the best kernel in the suite runs at **7600 useful GFLOP/s — 14% of the
+  WMMA ceiling and 5.1x behind the same matrix at M=2048** — and 62% of that
+  dispatch is tile padding. The dispatch count says it too: 1440 of a
+  decode token's 1861 matmuls are expert projections, and a grouped kernel
+  collapses them to 48. This is now the largest single number left in the
+  file.
+- **K=640's 88-91% of the bus.** The one decode shape §3.4 found that does
+  *not* reach DRAM bandwidth at any load width (209-215 GB/s, flat across
+  `VEC` 1/4/8/16), and it is the MoE down-projection — 480 of a token's
+  matmuls. 320-byte rows are the shortest in any of the five models and the
+  coverage law says they should be fine, so this is an unexplained deficit
+  of the same kind §1.7 chased, in the shape the engine will run most often.
+- **Carry the load-width rule to the other GEMV kernels.** fp16, W8A8 and the
   `gemv_subgroup` precisions were never given a load width at all, and they
   sit at 73-75% of their ceilings (§1.3). The rule is format-independent —
   it is about bytes of a row per lane-step — so each needs the same `VEC`
   treatment, and W8A8's row is twice as wide per weight, so its `VEC` is half.
+  §3.4 lowered the ceiling on this: at the real reduction lengths the width
+  that wins is usually the narrowest, so the expected gain is the gap to the
+  bus on *these* kernels, not W4A8's 1.43x.
 - **Hoist the other winners, and finish §2.7's attribution.** The ladder was
   run on `reg64_bt` and `reg32_bt` only. `reg64x128` and `wg128x256` hold 32
   accumulators and already sit at 252 VGPRs, so they cannot hoist as they
@@ -2184,7 +2330,10 @@ there is no longer one to isolate.
   kernels — the L1s are serving a large share — and the swizzle's
   cross-tile-reuse argument has lost the number it was sized against. Test it
   as a swizzle-helps-AI-32-and-not-AI-85 discriminator, not as a
-  bandwidth fix.
+  bandwidth fix. §3.4 supplies a better discriminator still: the real
+  rectangles at M ≤ 512 launch few enough workgroups that *which* tile runs
+  next is visible, which is where a swizzle acts, and they are 22 of the 38
+  shapes the models actually use.
 - **§2.2's int8 arm** — a `PRECISION_I8` variant of `gemm_wmma.comp`
   accumulating in int32. Small change to a kernel that now works, halves the
   operand bytes, and gives the W8A8 prefill story its number. (The *Q4*

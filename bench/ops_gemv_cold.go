@@ -205,10 +205,45 @@ type coldCase struct {
 	rowsPerWG int
 }
 
+// runGEMVColdCase times one case and labels it as a gemv_cold row. The
+// measurement itself is timeColdGEMV, which the shapes family (IDEAS §3.4)
+// also calls — it needs the same "fill the bytes directly, skip the host
+// reference" treatment for the same reason, at the models' own shapes rather
+// than at a swept footprint.
 func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, iters uint32) (Result, error) {
-	wBuf, err := dev.NewBuffer(c.weightBytes)
+	m, err := timeColdGEMV(dev, mod, c, warmup, iters)
 	if err != nil {
 		return Result{}, err
+	}
+	variant := c.variant
+	if variant == "" {
+		variant = "subgroup"
+	}
+	flops := float64(2 * c.M * c.N)
+	return Result{
+		Op: "gemv_cold", Variant: variant, WeightFormat: c.format, BlockSize: c.block, Size: c.M,
+		Detail:    fmt.Sprintf("N=%d;weightMB=%.1f", c.N, m.bytesRead/(1024*1024)),
+		NsPerIter: m.ns,
+		GFLOPS:    flops / (m.ns / 1e9) / 1e9,
+		GBPS:      m.bytesRead / (m.ns / 1e9) / 1e9,
+		Clocks:    m.clocks,
+	}, nil
+}
+
+// coldMeasurement is one timed case: the per-iteration time, the clock it ran
+// at, and how many weight bytes that iteration read — which is the number
+// both callers turn into GB/s, and the only one that depends on the weight
+// format rather than the shape.
+type coldMeasurement struct {
+	ns        float64
+	clocks    ClockStats
+	bytesRead float64
+}
+
+func timeColdGEMV(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, iters uint32) (coldMeasurement, error) {
+	wBuf, err := dev.NewBuffer(c.weightBytes)
+	if err != nil {
+		return coldMeasurement{}, err
 	}
 	defer wBuf.Destroy()
 	weights := make([]byte, c.weightBytes)
@@ -230,7 +265,7 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	}
 	scalesBuf, err := dev.NewBuffer(scalesBytes)
 	if err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
 	defer scalesBuf.Destroy()
 	scalesBuf.WriteBytes(fillFloat16Const(scaleCount, 0.01))
@@ -240,14 +275,14 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	const xScale = 0.01
 	if c.kind == coldFloatActs {
 		if xBuf, err = dev.NewBuffer(c.N * 4); err != nil {
-			return Result{}, err
+			return coldMeasurement{}, err
 		}
 		xBuf.WriteFloat32(randomFloats(c.N))
 	} else {
 		// N int8 lanes packed 4-per-word, the layout gemv_w8a8.comp and
 		// gemv_w4a8.comp both read.
 		if xBuf, err = dev.NewBuffer(c.N); err != nil {
-			return Result{}, err
+			return coldMeasurement{}, err
 		}
 		xBytes = make([]byte, c.N)
 		fillInt8Pattern(xBytes)
@@ -257,7 +292,7 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 
 	yBuf, err := dev.NewBuffer(c.M * 4)
 	if err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
 	defer yBuf.Destroy()
 
@@ -279,7 +314,7 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 		sums := int8BlockSums(bytesToInt8(xBytes), c.block)
 		sumsBuf, err := dev.NewBuffer(len(sums) * 4)
 		if err != nil {
-			return Result{}, err
+			return coldMeasurement{}, err
 		}
 		defer sumsBuf.Destroy()
 		sumsBuf.WriteBytes(int32SliceToBytes(sums))
@@ -291,7 +326,7 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 		RequiredSubgroupSize: c.waveSize,
 	})
 	if err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
 	defer pipe.Destroy()
 
@@ -301,31 +336,17 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 	// subgroups in a workgroup (IDEAS §6.2's follow-up).
 	groupsX := w4a8Groups(c.M, c.rowsPerWG)
 	if _, err := pipe.DispatchTimed(groupsX, 1, 1, 1, pcBytes); err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
 	if err := sanityCheckOutput(yBuf, c.M); err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
 
 	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pcBytes)
 	if err != nil {
-		return Result{}, err
+		return coldMeasurement{}, err
 	}
-
-	variant := c.variant
-	if variant == "" {
-		variant = "subgroup"
-	}
-	bytesRead := float64(c.weightBytes + scaleCount*2)
-	flops := float64(2 * c.M * c.N)
-	return Result{
-		Op: "gemv_cold", Variant: variant, WeightFormat: c.format, BlockSize: c.block, Size: c.M,
-		Detail:    fmt.Sprintf("N=%d;weightMB=%.1f", c.N, bytesRead/(1024*1024)),
-		NsPerIter: ns,
-		GFLOPS:    flops / (ns / 1e9) / 1e9,
-		GBPS:      bytesRead / (ns / 1e9) / 1e9,
-		Clocks:    clocks,
-	}, nil
+	return coldMeasurement{ns: ns, clocks: clocks, bytesRead: float64(c.weightBytes + scaleCount*2)}, nil
 }
 
 // sanityCheckOutput is the cheap stand-in for the CPU reference check the
