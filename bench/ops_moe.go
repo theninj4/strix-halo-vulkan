@@ -251,8 +251,14 @@ func RunMoE(dev *vk.Device, phys *vk.PhysicalDevice, warmup, iters uint32) ([]Re
 		return nil, nil
 	}
 
-	routings := make(map[int]moeRouting, len(moeTokens))
-	for _, t := range moeTokens {
+	// The prefill batches and the decode ones (IDEAS §3.5's open item, run by
+	// bench/ops_moe_gemv.go) share one routing per token count: the two lists
+	// overlap at t=1, and the same seed there means the GEMV arm and the GEMM
+	// arm are measured over the same assignment rather than over two draws
+	// of it.
+	q4Tokens := mergeTokens(moeTokens, moeDecodeTokens)
+	routings := make(map[int]moeRouting, len(q4Tokens))
+	for _, t := range q4Tokens {
 		routings[t] = routeTokens(t)
 	}
 
@@ -278,13 +284,45 @@ func RunMoE(dev *vk.Device, phys *vk.PhysicalDevice, warmup, iters uint32) ([]Re
 	q4 := filterWaveVariants(moeQ4Variants, mustSubgroupSizeControl(phys),
 		func(v moeQ4Variant) (string, uint32) { return "moe " + v.name, v.waveSize })
 	for _, s := range moeShapes {
-		rs, err := runMoEShapeQ4(dev, s, q4, routings, warmup, iters)
+		// The decode batches are in this list as well as the prefill ones,
+		// because "decode runs the grouped GEMM at M=1" is the claim the GEMV
+		// arm below is measured against and it has to be measured, not
+		// assumed.
+		rs, err := runMoEShapeQ4(dev, s, q4, routings, q4Tokens, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, rs...)
+	}
+
+	// The grouped GEMV: the decode kernel §3.5 said this family needed and did
+	// not have (bench/ops_moe_gemv.go).
+	gemv := filterWaveVariants(moeGEMVVariants, mustSubgroupSizeControl(phys),
+		func(v moeGEMVVariant) (string, uint32) { return "moe " + v.name, v.waveSize })
+	for _, s := range moeShapes {
+		rs, err := runMoEShapeGEMV(dev, s, gemv, routings, moeDecodeTokens, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, rs...)
 	}
 	return results, nil
+}
+
+// mergeTokens unions two batch lists, in ascending order.
+func mergeTokens(a, b []int) []int {
+	seen := map[int]bool{}
+	var out []int
+	for _, list := range [][]int{a, b} {
+		for _, t := range list {
+			if !seen[t] {
+				seen[t] = true
+				out = append(out, t)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -903,6 +941,7 @@ func PrintMoESummary(w io.Writer, results []Result, p Params) {
 	printMoERoute(w, results)
 	printMoELayerBudget(w, results)
 	printMoEQ4Budget(w, results)
+	PrintMoEGEMVSummary(w, results)
 }
 
 func printMoEGroupedVsPerExpert(w io.Writer, results []Result) {

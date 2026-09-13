@@ -93,6 +93,39 @@
 #ifndef ROWS
 #define ROWS 1
 #endif
+
+// GROUPED is the MoE decode arm (IDEAS §3.5's "not done"): instead of one
+// dispatch computing y = W*x for one matrix, one dispatch computes it for
+// every (token, expert) pair a batch routes, reading each pair's weight-bank
+// row, activation row and output row out of a table. The grid is
+// two-dimensional — x is the output row inside an expert's matrix, y is the
+// pair — so the pair index costs no division, and the row a lane addresses is
+// a table lookup plus gl_WorkGroupID.x.
+//
+// It is the kernel §3.5 said decode needs and did not have. That file measured
+// decode with the grouped *GEMM* at M=1, which is the same weights through a
+// 16-row cooperative-matrix tile: the weight traffic is identical but 15 of
+// every 16 rows of the A fragment — and of the FLOPs — are padding, and A's
+// own traffic is multiplied by the same 16. A GEMV has no tile to pad.
+//
+// Two things the grouped form needs that the plain one does not:
+//
+//   - **A row stride.** The bank is [E*N, ldw] with ldw >= K nibbles, because
+//     the stride is the thing IDEAS §5.1b's rule is about and the expert
+//     shapes are where it bites: a 4-bit K=640 row is 320 B, gcd 64 with the
+//     4 KB channel rotation, below the [128, 256] plateau. ldw must be a
+//     multiple of 32 nibbles (16 B, one uvec4) and of the quantization block.
+//   - **Per-row activations.** x is [rows, lda] int8 and the block sums are
+//     [rows, N/block], so a pair reads its own token's vector. No gather pass
+//     is needed — that pass exists in the GEMM path only because a coopmat A
+//     fragment reads 16 *consecutive* rows, and a subgroup can read any row it
+//     is told to.
+#ifndef GROUPED
+#define GROUPED 0
+#endif
+#if GROUPED && ROWS > 1
+#error "GROUPED addresses one row per workgroup; ROWS > 1 is the non-grouped control"
+#endif
 layout(local_size_x = (WAVE * ROWS)) in;
 
 // Which lane of which row this invocation is. Macros rather than locals
@@ -121,12 +154,22 @@ layout(binding = 2) readonly buffer X { uint x[]; };    // N/4 packed int8 words
 layout(binding = 1) readonly buffer WScales { float16_t wScales[]; }; // M * (N/block)
 layout(binding = 3) writeonly buffer Y { float y[]; };
 layout(binding = 4) readonly buffer XBlockSums { int xBlockSums[]; };  // N/block
+#if GROUPED
+// One entry per routed (token, expert) pair: (row of the expert's first
+// output row in the [E*N, ldw] bank, activation row, output row).
+layout(binding = 5) readonly buffer Groups { uvec4 groups[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint M;
     uint N;
     uint logBlock; // log2 of the quantization block size along N; block >= WEIGHTS_PER_LOAD
     float xScale;
+#if GROUPED
+    uint ldw;       // weight-bank row stride in *elements* (nibbles); >= N
+    uint lda;       // activation row stride in int8 elements; >= N
+    uint groupBase; // first table entry this dispatch covers
+#endif
 } pc;
 
 // One uvec4 of weights (32 of them) against the two uvec4 of activations
@@ -152,7 +195,13 @@ layout(push_constant) uniform PC {
     }
 
 void main() {
-#if ROWS > 1
+#if GROUPED
+    uvec4 grp = groups[pc.groupBase + gl_WorkGroupID.y];
+    uint row = gl_WorkGroupID.x;   // output row inside this expert's matrix
+    uint wrow = grp.x + row;       // its row in the [E*N, ldw] bank
+    uint arow = grp.y;             // the token row this pair reads
+    uint orow = grp.z;             // the pair's row in y
+#elif ROWS > 1
     uint row = gl_WorkGroupID.x * uint(ROWS) + gl_SubgroupID;
 #else
     uint row = gl_WorkGroupID.x;
@@ -162,7 +211,14 @@ void main() {
     }
     uint loadsPerRow = pc.N / WEIGHTS_PER_LOAD;
     uint blocksPerRow = pc.N >> pc.logBlock;
+#if GROUPED
+    // The scale plane follows the bank's stride, so a padded row carries the
+    // scales its own nibbles would have had.
+    uint scaleBase = wrow * (pc.ldw >> pc.logBlock);
+    uint sumBase = arow * blocksPerRow;
+#else
     uint scaleBase = row * blocksPerRow;
+#endif
 
     float partial = 0.0;
     for (uint j = LANE; j < loadsPerRow; j += LANES) {
@@ -172,14 +228,27 @@ void main() {
         // step rather than once per weight.
         int acc = 0;
 #if VEC == 1
+#if GROUPED
+        uint packed = w[wrow * (pc.ldw >> 3u) + j];
+        acc = dotPacked4x8AccSatEXT(int(x[arow * (pc.lda >> 2u) + 2u * j]), packed & 0x0F0F0F0Fu, acc);
+        acc = dotPacked4x8AccSatEXT(int(x[arow * (pc.lda >> 2u) + 2u * j + 1u]), (packed >> 4u) & 0x0F0F0F0Fu, acc);
+#else
         uint packed = w[row * loadsPerRow + j];
         // Low nibbles hold elements n..n+3, high nibbles n+4..n+7 — exactly
         // the two consecutive activation words.
         acc = dotPacked4x8AccSatEXT(int(x[2u * j]), packed & 0x0F0F0F0Fu, acc);
         acc = dotPacked4x8AccSatEXT(int(x[2u * j + 1u]), (packed >> 4u) & 0x0F0F0F0Fu, acc);
+#endif
+#else
+#if GROUPED
+        // ldw is a multiple of 32 nibbles, so a row is a whole number of
+        // uvec4s and the row base needs no rounding.
+        uint wbase = wrow * (pc.ldw >> 5u) + WVEC4S * j;
+        uint xbase = arow * (pc.lda >> 4u) + XVEC4S * j;
 #else
         uint wbase = WVEC4S * (row * loadsPerRow + j);
         uint xbase = XVEC4S * j;
+#endif
         W4A8_GROUP(0u)
 #if VEC >= 8
         W4A8_GROUP(1u)
@@ -197,11 +266,19 @@ void main() {
     // blocksPerRow is far smaller than loadsPerRow, so this loop is noise
     // next to the one above.
     for (uint b = LANE; b < blocksPerRow; b += LANES) {
+#if GROUPED
+        partial -= 8.0 * float(wScales[scaleBase + b]) * float(xBlockSums[sumBase + b]);
+#else
         partial -= 8.0 * float(wScales[scaleBase + b]) * float(xBlockSums[b]);
+#endif
     }
 
     float total = subgroupAdd(partial);
     if (subgroupElect()) {
+#if GROUPED
+        y[orow * pc.M + row] = total * pc.xScale;
+#else
         y[row] = total * pc.xScale;
+#endif
     }
 }

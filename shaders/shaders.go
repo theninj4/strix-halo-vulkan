@@ -268,6 +268,49 @@ var GEMVW4A8Vec8Rows2 []byte
 //go:embed gemv_w4a8_v8_w32_r2.spv
 var GEMVW4A8Vec8W32Rows2 []byte
 
+// The grouped (MoE decode) arm of the same kernel: -DGROUPED=1 adds a table
+// of routed (token, expert) pairs, a weight-bank row stride and per-row
+// activations, so one dispatch covers every pair a decode step routes. This
+// is the kernel IDEAS §3.5 called the honest decode measurement and did not
+// have — it measured decode with the grouped *GEMM* at M=1, where 15 of every
+// 16 rows of each cooperative-matrix tile, and of A's traffic, are padding.
+//
+// The load widths are the same four, because §1.7's rule (one lane-step
+// covers a whole weight row, VEC = K/(8*WAVE)) predicts a different winner
+// for each of the two expert shapes: VEC=4 covers a 4-bit K=640 row and VEC=8
+// a K=2560 one, both at wave64. The two wave32 arms are the control that says
+// whether the wave size does anything once C is held fixed, which §1.7 says
+// it does not.
+//
+// GROUPED=0 is the default and is textually the file these binaries were
+// already built from, so every non-grouped .spv above is byte-identical
+// across this change (`cmp`-verified).
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -o gemv_w4a8_g.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -o gemv_w4a8_g_v4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=8 -o gemv_w4a8_g_v8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=16 -o gemv_w4a8_g_v16.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DWAVE=32 -o gemv_w4a8_g_v4_w32.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=8 -DWAVE=32 -o gemv_w4a8_g_v8_w32.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g.spv
+var GEMVW4A8Grouped []byte
+
+//go:embed gemv_w4a8_g_v4.spv
+var GEMVW4A8GroupedVec4 []byte
+
+//go:embed gemv_w4a8_g_v8.spv
+var GEMVW4A8GroupedVec8 []byte
+
+//go:embed gemv_w4a8_g_v16.spv
+var GEMVW4A8GroupedVec16 []byte
+
+//go:embed gemv_w4a8_g_v4_w32.spv
+var GEMVW4A8GroupedVec4W32 []byte
+
+//go:embed gemv_w4a8_g_v8_w32.spv
+var GEMVW4A8GroupedVec8W32 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp

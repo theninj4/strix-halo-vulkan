@@ -161,7 +161,7 @@ func lookupMoEQ4Variant(name string) (moeQ4Variant, bool) {
 
 // runMoEShapeQ4 is runMoEShape's Q4 twin: same routing, same tile table, same
 // two schedules, with the expert bank at 4 bits per weight plus its scales.
-func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings map[int]moeRouting, warmup, iters uint32) ([]Result, error) {
+func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings map[int]moeRouting, tokens []int, warmup, iters uint32) ([]Result, error) {
 	maxLda, maxLdb, maxRows, maxTiles, minQBlock := 0, 0, 0, 0, 1<<30
 	for _, v := range variants {
 		ldb, ok := v.ldb(s.K)
@@ -177,7 +177,7 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 		if v.qblock < minQBlock {
 			minQBlock = v.qblock
 		}
-		for _, t := range moeTokens {
+		for _, t := range tokens {
 			lay := layoutGroups(routings[t], v.bm)
 			if lay.total > maxRows {
 				maxRows = lay.total
@@ -253,11 +253,11 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 		}
 		defer pipe.Destroy()
 
-		for _, tokens := range moeTokens {
-			if v.strideArm && tokens != moeStrideTokens {
+		for _, t := range tokens {
+			if v.strideArm && t != moeStrideTokens {
 				continue
 			}
-			r := routings[tokens]
+			r := routings[t]
 			lay := layoutGroups(r, v.bm)
 			tiles := buildTiles(r, lay, v.bm, v.bn, s.N)
 			tileBuf.WriteBytes(uint32SliceToBytes(tiles.table))
@@ -267,7 +267,7 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 			pc := moePushConstants(s.N, s.K, ldb, v.lda(s.K), 0)
 			ns, clocks, err := TimeDispatch(pipe, uint32(tiles.total()), 1, 1, warmup, iters, pc)
 			if err != nil {
-				return nil, fmt.Errorf("moe q4 %s %s grouped t=%d: %w", s.layer, v.name, tokens, err)
+				return nil, fmt.Errorf("moe q4 %s %s grouped t=%d: %w", s.layer, v.name, t, err)
 			}
 			results = append(results, base.finish(mode1, 1, ns, clocks))
 
@@ -286,7 +286,7 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 			}
 			ns, clocks, err = TimeDispatchSequence(pipe, groups, 1, 1, warmup, iters, pcs)
 			if err != nil {
-				return nil, fmt.Errorf("moe q4 %s %s per-expert t=%d: %w", s.layer, v.name, tokens, err)
+				return nil, fmt.Errorf("moe q4 %s %s per-expert t=%d: %w", s.layer, v.name, t, err)
 			}
 			results = append(results, base.finish("per_expert", len(groups), ns, clocks))
 		}

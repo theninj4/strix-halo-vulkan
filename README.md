@@ -150,6 +150,32 @@ once a kernel is not bandwidth-bound**, since padding into it still costs
 bytes — on the down projection, climbing from its natural gcd of 64 into the
 128-256 B plateau costs 1.20-2.40x the traffic and measures slower.
 
+All of that is prefill. **Decode** on the same block was, until now, measured
+with that same grouped GEMM run at one row per expert — 15 of every 16 rows of
+each cooperative-matrix tile being padding, and the 8 MB an expert slice
+occupies sitting inside the 32 MiB MALL, so the timing loop re-read it out of
+cache. The honest kernel is the W4A8 GEMV with the same table
+(`shaders/gemv_w4a8.comp -DGROUPED=1`): one subgroup per output row, one
+workgroup per (row, routed pair), and **no gather pass at all**, since the
+gather exists only to make an expert's rows consecutive for a fragment load
+and a subgroup reads whichever row the table names. It is **1.3-3.3x the GEMM
+at M=1** — same weight bytes, but 2-6 GB/s of activation traffic against 17-41
+and no 7-11%-useful tiles — reads **235 GB/s of distinct weight bytes, 100% of
+the bus**, and takes one token's MoE FFN from 9.56 ms to **5.47 ms across 48
+layers (183 tok/s), 91% of the 5.00 ms its 1.18 GB of 4-bit weights cost at the
+bus**. Three things fell out of it. **Grouping is worth 1.29-1.81x even though
+every dispatch it merges already fills the machine**, because what a barrier
+costs a memory-bound dispatch is the *drain* — 1163 ns median, against the
+300 ns an empty shader's launch measures. **The crossover back to the GEMM is
+at about 1.2 rows per expert**, not at the 16 a tile holds, because the
+question is how many rows of *one* expert routing supplies. And, reversing the
+rule above once more, **an expert bank should not be padded at all**: with
+every stride 64 B-aligned so the pad is never read, the unpadded stride wins at
+both projections — including the down projection's gcd-64 row, which the
+plateau says should be the slow end — and padding into the window costs
+1.12-1.15x. The plateau is a property of a *tiled* read, where a fragment holds
+32 B of a row; a kernel that walks whole matrices just wants them contiguous.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -214,7 +240,7 @@ go build ./...
 
 go run ./cmd/bench -list          # the op families a run can target
 go run ./cmd/bench gemv gemv_cold # run two of them
-go run ./cmd/bench all            # the whole suite (~50 min)
+go run ./cmd/bench all            # the whole suite (~60 min)
                                   # -h for the sweep flags (sizes, blocks,
                                   # warmup/iters, per-family sweeps)
 ```
@@ -241,13 +267,14 @@ ladder — is separate from `gemm` because it is the larger half of the GEMM
 rows and is iterated on by itself. `shapes` and `moe` are the two that sweep
 nothing: `shapes` runs the kernels the other families picked over the real
 model dimensions in `bench/modelshapes.go` (~5 min), and `moe` runs the
-grouped/MoE GEMM over qwen3.8-flash-next's 512-expert bank, at fp16 and at
-4 bits (~8 min). Both ignore `-sizes`/`-blocks`, because their shapes are the
+grouped/MoE GEMM over qwen3.8-flash-next's 512-expert bank at fp16 and at
+4 bits, plus the grouped W4A8 GEMV the decode half of that block wants
+(~18 min). Both ignore `-sizes`/`-blocks`, because their shapes are the
 models' rather than the flags'. `moe` also allocates the largest buffers in
 the suite — a 512-expert fp16 weight bank is 1.8-4.0 GB depending on the row
-stride under test — so it wants headroom rather than a loaded machine; its
-Q4 arm runs in a second pass once those are freed, so the two banks are never
-live at the same time.
+stride under test — so it wants headroom rather than a loaded machine; its Q4
+GEMM arm runs in a second pass once those are freed and its GEMV arm in a
+third, so no two banks are ever live at the same time.
 
 ## Reading the numbers honestly
 

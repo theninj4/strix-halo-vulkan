@@ -29,6 +29,19 @@ and 8192 alike. §6.2's unexplained wave32 1.07x is explained there and turns
 out to be a deficit in one cell rather than a win — and the wave32 pin is
 withdrawn with it.
 
+**§1.8 (the grouped GEMV for MoE decode) is done as well**, and it is the
+decode half of the text-generation goal: the same W4A8 kernel with a table of
+routed (token, expert) pairs, which is **1.8-2.0x the grouped GEMM at M=1**
+that every decode row in this file used to be measured with, reads **235 GB/s
+of distinct weight bytes — 100% of the bus — on the gate/up projection**, and
+takes one token's MoE FFN from 9.56 ms to **5.47 ms over 48 layers, 91% of the
+5.00 ms its 1.18 GB of 4-bit weights cost at the bus**. Two of its results were
+not in the plan: grouping is worth 1.29-1.81x even though every dispatch it
+merges already fills the machine (the barrier's *drain* is 1163 ns against
+§4.1's 300 ns launch), and **an expert bank should not be padded at all** — the
+unpadded stride wins at both shapes, including `down`'s gcd-64 row, which
+§3.5's [128, 256] plateau says should be the slow end.
+
 **§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
 more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
 and 45% of the measured WMMA ceiling**, up from 8%. Two of its sub-hypotheses were wrong in
@@ -720,6 +733,165 @@ takes the decode path from 70-89% of the DRAM bus to 99-101% *at every shape
 rather than one*, and the 1.39x at N=8192 is on the shape the target models
 actually decode at.
 
+### 1.8 A grouped GEMV for MoE decode — **DONE** ✅, **1.8-2.0x the GEMM at M=1, and decode reaches 91% of its bus floor**
+**Hypothesis** (promoted out of §3.5's "not done", and the largest gap in this
+file once §2.2 landed): every decode number the `moe` family reports is the
+grouped *GEMM* run at M=1. A cooperative-matrix A fragment is 16 rows tall and
+these tiles are 16-64, so a one-row expert group fills 1/16th to 1/64th of one:
+the weights are read once either way — which is why §3.5 called the waste
+free — but A's traffic and the executed FLOPs are multiplied by the tile
+height. And the 10 experts one token routes to are 8 MB of 4-bit weights per
+projection, *inside* the 32 MiB MALL, so the timing loop re-reads them out of
+cache. The honest kernel is §1.1's W4A8 GEMV with §3.5's table, and decode is
+the phase `GOALS.md` is actually asking about.
+
+**Change**: `gemv_w4a8.comp` took a `GROUPED` mode — one extra binding holding
+one entry per routed (token, expert) pair (the pair's row in the `[E*N, ldw]`
+bank, its activation row, its output row), and a two-dimensional grid whose x
+is the output row inside an expert's matrix and whose y is the pair, so the
+pair index costs no division and consecutive workgroups sweep one expert's
+rows in address order. Six builds (VEC 1/4/8/16 at wave64, VEC 4/8 at wave32);
+the bank's row stride and the quantization block are pushed, so one binary
+sweeps both. `GROUPED=0` is textually the file the twelve existing binaries
+were built from and every one of them is byte-identical across the change
+(`cmp`-verified), so `results/gemv{,_cold}.csv` and `results/shapes.csv` stay
+comparable. Measured over §3.5's routing at decode batches of 1, 4, 16 and 64
+sequences — the batch is what moves the footprint off the MALL (8, 34, 117,
+315 MB) while rows per expert stay at 1.00-1.72, so every cell is still a GEMV
+shape. `bench/ops_moe_gemv.go`, `results/moe.csv`, and the Q4 GEMM arm was
+re-run at the same four batches so the comparison is the same routing through
+two kernels rather than two measurements.
+
+**Finding 1: the GEMV is 1.30-3.26x the GEMM at M=1, and what it removes is
+activations, not weights.** Best-of-arm against best-of-arm, grouped, both Q4,
+distinct weight bytes over the time (GB/s of the 236 GB/s bus):
+
+| layer | tokens | footprint | GEMV ms | GEMV W | GEMV act | GEMM ms | GEMM W | GEMM act | GEMV/GEMM |
+|---|---|---|---|---|---|---|---|---|---|
+| gate_up | 1 | 8 MB (MALL) | 0.012 | 676 | 4 | 0.031 | 293 | 39 | **2.66x** |
+| gate_up | 4 | 34 MB | 0.083 | 408 | 2 | 0.272 | 135 | 18 | **3.26x** |
+| gate_up | 16 | 117 MB | 0.497 | **235** | 2 | 0.999 | 128 | 17 | **2.01x** |
+| gate_up | 64 | 315 MB | 1.432 | 220 | 2 | 2.605 | 132 | 18 | **1.82x** |
+| down | 1 | 8 MB (MALL) | 0.019 | 430 | 6 | 0.044 | 207 | 41 | **2.39x** |
+| down | 4 | 34 MB | 0.115 | 295 | 4 | 0.204 | 181 | 36 | **1.77x** |
+| down | 16 | 117 MB | 0.590 | **198** | 3 | 0.770 | 166 | 33 | **1.30x** |
+| down | 64 | 315 MB | 1.997 | 158 | 3 | 2.005 | 171 | 34 | 1.00x |
+
+The GEMM's best tile at this shape is the smallest built (16x32 at wave32) and
+it is still **7-11% useful rows**; it moves 17-41 GB/s of activations where the
+GEMV moves 2-6, and its weight rate tops out at 128-171 GB/s where the GEMV
+reaches **235 GB/s — 100% of the bus** on gate_up. So the ceiling §3.5 said
+this phase was at was the format's, not the kernel's, and at M=1 the kernel
+was leaving half of it.
+
+**Finding 2, which the table above also contains: the crossover is at about
+1.2 rows per expert, and it is a re-read.** This GEMV runs one workgroup grid
+per *pair*, so two tokens routed to the same expert read its weights twice,
+while one GEMM tile amortizes them over 16-64 rows. At t=16 (1.15 pairs per
+expert) that costs little and the GEMV wins 1.30-2.01x; at t=64 (1.72) the
+down projection ties outright. That is §1.5's GEMV→coopmat crossover, measured
+at last, and it lands *far* below the M=16 a tile can hold — because the
+comparison is not "one row against sixteen" but "one row against sixteen rows
+of the same expert", which routing only supplies at batch. The fix is not the
+GEMM: it is an M-blocked GEMV (several activation rows against one weight row,
+one extra accumulator each), which is not built.
+
+**Finding 3: grouping is worth 1.29-1.81x, and at decode it is the barrier,
+not occupancy.** §3.5 tied the grouped GEMM's 1.1-4.1x to how many workgroups
+one expert's dispatch launches, with the effect gone by the 80 waves §0.1 says
+this part needs resident. A GEMV launches one workgroup *per output row* — 640
+or 2560 per pair, 8-32x that threshold — so on that mechanism grouping should
+be worth the launch cost alone. It is worth much more: dividing the
+grouped-vs-per-pair gap by the number of dispatches it removes gives **690-1555
+ns per dispatch, median 1163**, against §4.1's **300 ns** for an empty shader
+with a barrier. What the extra ~900 ns buys is the drain: a memory-bound
+dispatch's last waves are still waiting on DRAM when the barrier stops the next
+dispatch from starting, and §4.1's empty shader has nothing to drain. So §3.5's
+occupancy law and this are two different costs of the same barrier, and an
+engine pays the second even when every dispatch fills the machine.
+
+**Finding 4: the load width is worth 3-5% here, and §1.7's rule explains why
+it is not worth 1.43x.** DRAM-resident (t=16, t=64), the spread across VEC
+1/4/8/16 is 269-377 GB/s of issued bytes at gate_up and 208-271 at down, with
+VEC=16 the worst cell at both. The reason is the rule itself: a 4-bit expert
+row is 1280 B (gate_up) or 320 B (down), whose gcds with the 4 KB rotation are
+256 and 64 — small enough that even VEC=1's 256 B lane-step covers them. This
+is §3.4's finding 1 again ("at the real reduction lengths the width that wins
+is usually the narrowest"), now at the shapes a MoE model actually decodes,
+and it means the `VEC` knob is a 5% engine decision here rather than the 1.43x
+it is at N=8192.
+
+**Finding 5: on a kernel that reads its scales the way it reads its weights,
+the scale plane costs exactly its bytes.** QBLOCK=32 against QBLOCK=128 adds
+4.7% of the bank (6.25% of it against 1.56%) and costs **1.045-1.116x** of
+time. Worth recording next to §2.2's finding 4, where the same axis was worth
+**1.24x between two instruction-identical GEMM binaries** and the bytes did not
+explain it: whatever that was, it was not the scale traffic.
+
+**Finding 6, the one that changes an allocator: do not pad an expert bank at
+all.** The handoff carried "K=640 is explained, and the fix is to stop padding
+it" as a separate item; this arm answers it, and the answer is stronger than
+the item. Every stride in the sweep is a multiple of 64 B, so every row still
+starts on a cache line and the padding bytes are **never read** — unlike
+§2.2's arm, which had to buy coverage with 1.2-2.4x the traffic, this one buys
+it with nothing but address span. Distinct bytes read are identical (315 MB) in
+every row below (grouped, t=64, GB/s asked for):
+
+| gcd(stride, 4096) | 64 | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|
+| gate_up (1280 B row) | 356 | 371 | **376** (unpadded) | 323 | 244 |
+| down (320 B row) | **268** (unpadded) | 239 | 233 | 203 | 110 |
+
+The unpadded stride wins at both shapes, and on `down` it wins *at gcd 64*,
+below the [128, 256] plateau §3.5 established on the GEMM — padding it into
+that window costs **1.12-1.15x** and padding it to gcd 1024 costs 2.4x. So the
+plateau is a property of a *tiled* read, where a fragment holds 32 B of a row
+and the gcd is what the waves in flight span, and not of a read that walks a
+whole matrix: a grouped GEMV at the natural stride makes each expert one
+contiguous 845 KB run that consecutive workgroups continue, and any pad punches
+a hole in every row of it. Neither the gcd nor the pad size orders the rest of
+the sweep on its own (down's 768 B / gcd 256 beats its 512 B / gcd 512), which
+is unexplained; what is not in doubt is the engine rule, and it is the cheapest
+one in this file: **leave the bank alone.**
+
+**Finding 7: what a decode token's MoE FFN costs.** Per *distinct* expert —
+the quantity that transfers, because a real step's 10 experts have not been
+touched for 47 layers — at the least-duplicated DRAM-resident batch:
+
+| | gate+up / expert | down / expert | one block | x48 layers | FFN-only tok/s |
+|---|---|---|---|---|---|
+| grouped GEMV | 7.2 us | 4.2 us | 0.114 ms | **5.47 ms** | **183** |
+| grouped GEMM at M=1 | 14.4 us | 5.5 us | 0.199 ms | 9.56 ms | 105 |
+| the bus (1.18 GB at 236 GB/s) | — | — | 0.104 ms | 5.00 ms | 200 |
+
+**91% of the only ceiling that can matter**, and 1.75x the kernel the suite has
+been measuring decode with. For scale: §3.4's whole-token budget is 2.89 GB and
+11.9 ms at the best measured rate, of which this is 1.18 GB — so the MoE FFN is
+41% of a decode token's weight traffic and is now within 9% of reading it at
+the bus.
+
+**One cell left open.** The down projection reads 198 GB/s per distinct expert
+where gate_up reads 235, for identical bytes (845 KB per expert either way).
+Its rows are 4x as many and a quarter as long, so it launches 4x the workgroups
+and issues 4x the output writes, and at VEC=4 its 640-nibble row is only 20
+lane-steps for a 64-lane wave. The lane-count explanation is the testable one
+and it **fails**: the wave32 arms, where the same row is 20 steps over 32
+lanes, measure within 1% of wave64 (0.590 against 0.594 ms). So it is not lane
+occupancy, and the remaining candidates are the workgroup count and the write
+pattern.
+
+**What this changes for the engine**: decode a MoE FFN with the grouped GEMV,
+one dispatch per projection per layer, no gather pass at all (the gather exists
+in the GEMM path only because a coopmat fragment reads 16 *consecutive* rows;
+a subgroup reads whichever row the table names), and do not pad the bank.
+Switch to the grouped GEMM when routing gives an expert more than ~1.2 rows,
+or — better, and not built — give the GEMV an M block.
+
+**Effort**: medium (done). **Value**: high — it is the decode half of
+`GOALS.md`'s text-generation goal, it is 1.75x on a phase that is 41% of a
+token's bytes, and it retires the last measurement in this file that was
+standing in for a kernel that did not exist.
+
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
 ### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x** (6.3x after §2.3)
@@ -974,6 +1146,11 @@ difference standing behind a 24% one. What is left is **where the scale loads
 land**: at QBLOCK=32 a slab's 128 staging chunks read 64 rows of a scale
 plane whose own row stride is 160 B, so each 2-byte scale drags in its own
 cache line. This is measured, not attributed — see the open item below.
+**[narrowed by §1.8]** The same axis on the grouped GEMV, which reads its
+scales exactly the way it reads its weights, costs **1.045-1.116x** — its bytes
+and nothing more. So the extra ~1.1x here belongs to how the *GEMM* stages
+them, not to the traffic, which leaves the scale plane's layout as the one
+candidate standing.
 
 **Finding 5: the LDS row pad is the single biggest knob in the file, 1.68x
 and 1.83x.** Without it (`LDS_PAD=0`) the B slab's rows are `BK` halves =
@@ -1723,13 +1900,15 @@ kernel (§2.2) is now quantified rather than argued.** (§2.2 has since built
 it: 13.37 ms against 28.13, and the bandwidth problem becomes a matrix-core
 one on the way.)
 
-**Not done:** decode's grouped path is measured with this GEMM kernel at
-M=1, which wastes 15 of every 16 rows of an MMA tile — free, since the
-weights are read once either way, but the honest decode kernel is a grouped
-*GEMV* and does not exist. (Still true after §2.2, which is prefill only and
-which makes this the largest remaining gap.) And the T=1 cases touch 10 experts, 33 MB, which
-sits inside the 32 MiB MALL, so those rows are cache-resident and are not a
-decode measurement.
+**Not done here, and since done in §1.8:** decode's grouped path was measured
+with this GEMM kernel at M=1, which wastes 15 of every 16 rows of an MMA tile —
+free on weight bytes, since they are read once either way, but not free on A's,
+which the tile height multiplies. The honest kernel is a grouped *GEMV*, it now
+exists, and it is **1.30-3.26x this one** at the decode batches, with the
+activation traffic (2-6 GB/s against 17-41 GB/s) and the 7-11% useful rows
+being where the difference is. The T=1 cases here touch 10 experts and 33 MB,
+inside the 32 MiB MALL, so those rows were cache-resident as well; §1.8 sweeps
+the decode batch out to 315 MB for that reason.
 
 ### 3.6 Gated DeltaNet / linear-attention chunk kernel
 Qwen3-Next mixes linear attention with full attention. The chunked
@@ -2178,6 +2357,21 @@ residue on top.
    the *unpadded* stride and down's gcd-256 row is too, so "large gcd is
    slow" is not "large stride is slow".
 
+   **[amended again by §1.8, and the two amendments point opposite ways]**
+   The plateau above is a property of a *tiled* read. §1.8 ran the same sweep
+   on the grouped GEMV, where a wave holds a whole weight row and consecutive
+   workgroups continue the previous one's address, and every pad in it is
+   64 B-aligned so the padding bytes are never read — a pure coverage
+   experiment at constant traffic. There the **unpadded stride wins at both
+   shapes**, and on the 320 B `down` row it wins at gcd **64**, below the
+   plateau: padding into [128, 256] costs 1.12-1.15x and padding to gcd 1024
+   costs 2.4x. So rule 1 applies to kernels whose requests span a *fraction*
+   of a row; a kernel that walks whole matrices wants its rows contiguous and
+   nothing else. An engine that knows which kernel will read a tensor should
+   pad for the tiled one and leave the streamed one alone — and an MoE expert
+   bank, which decode streams and prefill tiles, is read both ways, which is
+   a trade this file has not priced.
+
    Mechanism 3 promotes this from a 1.3x tidy-up to the rule that defends
    against a **4x**, and against a case that needs no padding to occur (see
    the corollary below).
@@ -2617,37 +2811,49 @@ layers, and the gather and combine a grouped kernel makes necessary are 5% of
 it. It also closed the second item on this list from an unexpected direction —
 see below.
 
+**§1.8 is done**, the item that stood at the top of this list, and it is the
+one that finishes the decode path for a MoE model. The grouped GEMV — the same
+W4A8 kernel with a table of routed (token, expert) pairs and a two-dimensional
+grid — is **1.30-3.26x the grouped GEMM at M=1** the file had been measuring
+decode with, reads **100% of the bus** on the gate/up projection, and takes a
+token's MoE FFN to **5.47 ms over 48 layers, 91% of its 5.00 ms bus floor**,
+against 9.56 ms for the GEMM. Three things it found that were not in the plan:
+grouping is worth 1.29-1.81x even where every dispatch already fills the
+machine, because a barrier costs the *drain* of a memory-bound dispatch
+(1163 ns median) and not §4.1's 300 ns launch; the crossover back to the GEMM
+is at about **1.2 rows per expert**, not at the M=16 a tile holds, because the
+question is how many rows of *one expert* routing supplies; and an expert bank
+should **not be padded at all** — every pad costs, including the ones §3.5's
+[128, 256] plateau recommends, because a kernel that walks whole matrices wants
+its rows contiguous. That also closes the "K=640 is explained, stop padding it"
+item this list was carrying separately, and the load-width item with it: at the
+expert shapes `VEC` is worth 3-5%, exactly as §3.4 predicted.
+
 **Next:**
-- **A grouped GEMV for decode, now the largest gap in the file.** Every
-  number above is prefill. §3.5's decode rows run the grouped *GEMM* at M=1,
-  which wastes 15 of 16 rows of every MMA tile and whose 10-expert working
-  set is 33 MB — inside the MALL, so they are not a decode measurement at
-  all. The honest kernel is `gemv_w4a8.comp` with §3.5's tile table, decode
-  is the phase `GOALS.md` is actually asking about, and §2.2 has just removed
-  the reason to keep deferring it: the 4-bit bank a grouped GEMV would read
-  is the one that now exists.
+- **Give the grouped GEMV an M block, which is the crossover §1.8 measured.**
+  It runs one grid per routed *pair*, so two tokens on one expert read its
+  weights twice; a tile amortizes them over 16-64 rows, and at 1.72 pairs per
+  expert the down projection already ties. Several activation rows against one
+  weight row — one extra int32 accumulator and one extra x-row pointer each,
+  `MROWS` as a `-D` — would hold the GEMV's 1.8-2.0x out to the batches a
+  serving engine actually decodes at, and it is the cheapest item on this list.
+  `GROUPED` currently forbids `ROWS > 1` for an unrelated reason (it addresses
+  one row per workgroup), so the two knobs want thinking about together.
+- **Explain the down projection's 198 GB/s against gate_up's 235**, for
+  identical bytes per expert. It launches 4x the workgroups, each a quarter as
+  long, and issues 4x the output writes. §1.8 killed the obvious explanation:
+  at VEC=4 its 640-nibble row is 20 lane-steps for a 64-lane wave, but the
+  wave32 arms — 20 steps over 32 lanes — measure within 1%. Candidates left are
+  the workgroup count and the write pattern; the probe is a build that gives
+  one workgroup several output rows.
 - **§2.2's own two leftovers, both cheap and both attribution rather than
   gain.** The scale plane's layout — 1.24x with no mechanism attached,
   between two binaries that are instruction-for-instruction identical, which
-  a blocked scale layout would settle — and the dequant's two packed fp16
+  a blocked scale layout would settle, and which §1.8 has narrowed by
+  elimination: the same axis on the GEMV costs 1.045-1.116x, i.e. its bytes
+  and nothing more, so whatever the GEMM's extra 1.1x is, it is not traffic — and the dequant's two packed fp16
   ops per two weights, whose cheap halving is numerically invalid (§2.2
   finding 9) and whose valid form is an fp32-epilogue row sum.
-- **K=640 is explained, and the fix is to stop padding it.** §3.4 left this
-  as an unexplained deficit — the MoE down projection reading 209-215 GB/s
-  at every load width. §3.5's stride sweep answers it on the GEMM side and
-  the answer generalises: the engine rule was never "pad by 256 B", it is
-  "land `gcd(stride, 4096)` in [128, 256] B", and a 640-wide fp16 row is at
-  gcd 256 *unpadded* while the suite's fixed +256 B pad moves it to 512 and
-  costs **1.19x**. The remaining work is to carry that back to the GEMV
-  kernels, where the 4-bit K=640 row is 320 B at gcd 64 — below the plateau,
-  which is the end §3.5 found costs 5-17% — and to re-run §3.4's decode arm
-  with the row stride chosen rather than assumed. See §5.1b rule 1.
-- **A grouped GEMV for decode.** §3.5's decode rows run the grouped *GEMM*
-  at M=1, which is free on bandwidth (the weights are read once either way)
-  but wastes 15 of 16 rows of every MMA tile, and its 10-expert working set
-  is 33 MB, inside the MALL — so those rows are not a decode measurement.
-  The honest kernel is W4A8's GEMV with the same tile table, and decode is
-  the phase GOALS.md is actually asking about.
 - **Carry the load-width rule to the other GEMV kernels.** fp16, W8A8 and the
   `gemv_subgroup` precisions were never given a load width at all, and they
   sit at 73-75% of their ceilings (§1.3). The rule is format-independent —
@@ -2655,7 +2861,9 @@ see below.
   treatment, and W8A8's row is twice as wide per weight, so its `VEC` is half.
   §3.4 lowered the ceiling on this: at the real reduction lengths the width
   that wins is usually the narrowest, so the expected gain is the gap to the
-  bus on *these* kernels, not W4A8's 1.43x.
+  bus on *these* kernels, not W4A8's 1.43x. §1.8 lowered it again on the
+  W4A8 side — at the MoE shapes the spread across VEC 1-16 is 3-5% — so what
+  is left here is the *other formats'* 25% gap, not the width itself.
 - **Hoist the other winners, and finish §2.7's attribution.** The ladder was
   run on `reg64_bt` and `reg32_bt` only. `reg64x128` and `wg128x256` hold 32
   accumulators and already sit at 252 VGPRs, so they cannot hoist as they
