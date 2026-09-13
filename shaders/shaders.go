@@ -447,6 +447,32 @@ var GEMVW4A8GroupedVec4M2N4 []byte
 //go:embed gemv_w4a8_g_v4_m4_n4.spv
 var GEMVW4A8GroupedVec4M4N4 []byte
 
+// The three corner cells §1.11 left unbuilt, and the reason each was left.
+// (8, 4) was ruled out on registers before they were measured: §1.11 finding 6
+// then read 83 VGPRs at (4, 4) and found no scratch anywhere in the family, so
+// the ceiling it was avoiding is not there. (2, 8) and (4, 8) were ruled out
+// by the same argument one axis over — NROWS=8 was called past the register
+// knee on its own — and the row-block table has NROWS=8 as the *best*
+// single-axis block on `down` at t=64 and t=256, which makes it the block an M
+// block should be composed with rather than the one to stop before.
+//
+// They are the fixed-width half of the selection arm below: an engine that
+// sizes its block from the routing histogram can only pick from what is built,
+// and at t=256 routing hands `down` 5.05 rows per expert with a tail out to 12.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=8 -DNROWS=4 -o gemv_w4a8_g_v4_m8_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=2 -DNROWS=8 -o gemv_w4a8_g_v4_m2_n8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=4 -DNROWS=8 -o gemv_w4a8_g_v4_m4_n8.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g_v4_m8_n4.spv
+var GEMVW4A8GroupedVec4M8N4 []byte
+
+//go:embed gemv_w4a8_g_v4_m2_n8.spv
+var GEMVW4A8GroupedVec4M2N8 []byte
+
+//go:embed gemv_w4a8_g_v4_m4_n8.spv
+var GEMVW4A8GroupedVec4M4N8 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp

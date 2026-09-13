@@ -735,6 +735,100 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
     return VK_SUCCESS;
 }
 
+VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *pipes,
+                                    const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
+                                    uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
+                                    const void *pushConstants, uint32_t pushConstantSize,
+                                    uint64_t *out_start, uint64_t *out_end) {
+    if (iterations == 0) {
+        iterations = 1;
+    }
+    if (count == 0) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    // The recording lives in the first pipeline's command buffer; every other
+    // pipeline contributes only its VkPipeline, layout and descriptor set.
+    const ShimComputePipeline *rec = &pipes[0];
+
+    VkCommandBufferBeginInfo beginInfo = {0};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+    VkResult r = vkBeginCommandBuffer(rec->cmdBuf, &beginInfo);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    vkCmdResetQueryPool(rec->cmdBuf, rec->queryPool, 0, 2);
+    vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, rec->queryPool, 0);
+
+    VkMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    const uint8_t *pc = (const uint8_t *)pushConstants;
+    for (uint32_t it = 0; it < iterations; it++) {
+        for (uint32_t i = 0; i < count; i++) {
+            const ShimComputePipeline *p = &pipes[i];
+            vkCmdBindPipeline(rec->cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
+            vkCmdBindDescriptorSets(rec->cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipelineLayout, 0, 1,
+                                     &p->descSet, 0, NULL);
+            if (pushConstantSize > 0 && pc != NULL) {
+                vkCmdPushConstants(rec->cmdBuf, p->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                    pushConstantSize, pc + (size_t)i * pushConstantSize);
+            }
+            vkCmdDispatch(rec->cmdBuf, groupsX[i], groupsY[i], groupsZ);
+            // Within an iteration the barrier is the caller's choice; between
+            // iterations it is not, since the next iteration overwrites what
+            // this one wrote.
+            int last = (i + 1 == count);
+            if ((!last && barriers) || (last && it + 1 < iterations)) {
+                vkCmdPipelineBarrier(rec->cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+            }
+        }
+    }
+
+    vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, 1);
+
+    r = vkEndCommandBuffer(rec->cmdBuf);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    r = vkResetFences(device, 1, &rec->fence);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &rec->cmdBuf;
+
+    r = vkQueueSubmit(queue, 1, &submitInfo, rec->fence);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    r = vkWaitForFences(device, 1, &rec->fence, VK_TRUE, 20000000000ULL);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    uint64_t timestamps[2];
+    r = vkGetQueryPoolResults(device, rec->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    *out_start = timestamps[0];
+    *out_end = timestamps[1];
+    return VK_SUCCESS;
+}
+
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p) {
     if (p->queryPool) vkDestroyQueryPool(device, p->queryPool, NULL);
     if (p->fence) vkDestroyFence(device, p->fence, NULL);

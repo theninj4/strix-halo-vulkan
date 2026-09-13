@@ -563,6 +563,82 @@ func (p *ComputePipeline) DispatchSequenceTimed(groupsX []uint32, groupsY, group
 	return time.Duration(ticks * p.dev.phys.TimestampPeriod), nil
 }
 
+// MultiDispatch is one dispatch of a mixed-pipeline sequence: which pipeline
+// runs, over what grid, with which push constants.
+type MultiDispatch struct {
+	Pipeline      *ComputePipeline
+	GroupsX       uint32
+	GroupsY       uint32
+	PushConstants []byte
+}
+
+// DispatchMultiTimed is DispatchSequenceTimed for a sequence whose dispatches
+// use *different pipelines* and *different grid extents*.
+//
+// It exists for the mixed-width MoE decode dispatch (IDEAS §1.12). The M block
+// a grouped GEMV carries is compiled in, so covering a routing histogram with
+// several widths at once is one dispatch per width, each binding the build for
+// that width and naming its own contiguous slice of the shared slot table. The
+// dispatches write disjoint output rows, so `barriers` is a knob rather than a
+// requirement: false lets the widths overlap the way an engine would let them,
+// true charges the split a compute->compute barrier between every pair, which
+// is what it costs if the overlap cannot be had.
+//
+// Every pipeline must have been built over the same buffers and the same
+// push-constant size — the recording uses the first one's command buffer,
+// query pool and fence — and every push-constant block must be the same
+// length, since each pipeline layout declares one range.
+func DispatchMultiTimed(dispatches []MultiDispatch, groupsZ, iterations uint32, barriers bool) (time.Duration, error) {
+	if len(dispatches) == 0 {
+		return 0, fmt.Errorf("DispatchMultiTimed: empty dispatch sequence")
+	}
+	dev := dispatches[0].Pipeline.dev
+	// The pipelines are copied by value rather than referenced: a
+	// ShimComputePipeline holds nothing but Vulkan handles, so a Go slice of
+	// them carries no Go pointers and can cross the cgo boundary, which a
+	// slice of *C.ShimComputePipeline could not.
+	handles := make([]C.ShimComputePipeline, len(dispatches))
+	groupsX := make([]C.uint32_t, len(dispatches))
+	groupsY := make([]C.uint32_t, len(dispatches))
+	var flat []byte
+	pcSize := len(dispatches[0].PushConstants)
+	for i, d := range dispatches {
+		if d.Pipeline == nil {
+			return 0, fmt.Errorf("DispatchMultiTimed: dispatch %d has no pipeline", i)
+		}
+		if d.Pipeline.dev != dev {
+			return 0, fmt.Errorf("DispatchMultiTimed: dispatch %d is on a different device", i)
+		}
+		if len(d.PushConstants) != pcSize {
+			return 0, fmt.Errorf("DispatchMultiTimed: push-constant block %d is %d bytes, block 0 is %d",
+				i, len(d.PushConstants), pcSize)
+		}
+		handles[i] = d.Pipeline.handle
+		groupsX[i] = C.uint32_t(d.GroupsX)
+		groupsY[i] = C.uint32_t(d.GroupsY)
+		flat = append(flat, d.PushConstants...)
+	}
+
+	var start, end C.uint64_t
+	var pcPtr unsafe.Pointer
+	if len(flat) > 0 {
+		pcPtr = unsafe.Pointer(&flat[0])
+	}
+	var barrierFlag C.uint32_t
+	if barriers {
+		barrierFlag = 1
+	}
+	if err := check("vkQueueSubmit", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
+		&handles[0],
+		&groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
+		C.uint32_t(groupsZ), C.uint32_t(iterations), barrierFlag,
+		pcPtr, C.uint32_t(pcSize), &start, &end)); err != nil {
+		return 0, err
+	}
+	ticks := float64(uint64(end)) - float64(uint64(start))
+	return time.Duration(ticks * dev.phys.TimestampPeriod), nil
+}
+
 // Dispatch records and submits a single dispatch covering groupsX
 // workgroups on the X axis, then blocks until it completes. Its GPU timing
 // is discarded — use DispatchTimed for benchmarking.

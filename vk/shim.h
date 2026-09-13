@@ -170,6 +170,28 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
                                   const void *pushConstants, uint32_t pushConstantSize,
                                   uint64_t *out_start, uint64_t *out_end);
 
+// The same again, for a sequence whose dispatches use *different pipelines*.
+// It exists for the mixed-width MoE decode dispatch (IDEAS §1.12): the M block
+// a grouped GEMV carries is a compile-time constant, so covering a routing
+// histogram with several block widths at once means one dispatch per width,
+// each binding its own pipeline and naming its own slice of the one shared
+// slot table. Every pipeline must have been built over the same buffers and
+// the same push-constant size; the recording borrows p[0]'s command buffer,
+// query pool and fence, and binds each dispatch's own pipeline, descriptor set
+// and layout.
+//
+// `barriers` selects what separates the dispatches *within* one iteration: 0
+// records none, because the widths write disjoint output rows and a real
+// engine would let them overlap, and 1 records a compute->compute barrier
+// between each, which is what the split costs if the engine cannot prove that.
+// Iterations are always separated by a barrier, exactly as the two calls above
+// do it, so the loop measures steady state either way.
+VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *pipes,
+                                    const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
+                                    uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
+                                    const void *pushConstants, uint32_t pushConstantSize,
+                                    uint64_t *out_start, uint64_t *out_end);
+
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p);
 
 #endif

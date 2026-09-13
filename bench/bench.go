@@ -145,6 +145,50 @@ func TimeDispatchSequence(pipe *vk.ComputePipeline, groupsX []uint32, groupsY, g
 	return float64(d.Nanoseconds()) / float64(actualIters), clocks, nil
 }
 
+// TimeDispatchMulti is TimeDispatch for a sequence whose dispatches use
+// different pipelines and different grids — the mixed-width MoE decode
+// dispatch (IDEAS §1.12), where one width per dispatch covers the part of the
+// routing histogram that width fits best. One "iteration" is the whole
+// sequence, so the returned nanoseconds are per sequence and compare directly
+// against the single dispatch of one fixed-width build.
+func TimeDispatchMulti(dispatches []vk.MultiDispatch, groupsZ, warmup, iters uint32, barriers bool) (float64, ClockStats, error) {
+	if err := instruments.Warm(); err != nil {
+		return 0, ClockStats{}, fmt.Errorf("clock warmup: %w", err)
+	}
+	probe, err := vk.DispatchMultiTimed(dispatches, groupsZ, 1, barriers)
+	if err != nil {
+		return 0, ClockStats{}, err
+	}
+	probeNs := float64(probe.Nanoseconds())
+	if probeNs <= 0 {
+		probeNs = 1
+	}
+	capToBudget := func(n uint32) uint32 {
+		maxByBudget := uint32(maxBatchNs / probeNs)
+		if maxByBudget < 1 {
+			maxByBudget = 1
+		}
+		if n > maxByBudget {
+			return maxByBudget
+		}
+		return n
+	}
+
+	if warmup > 1 {
+		if _, err := vk.DispatchMultiTimed(dispatches, groupsZ, capToBudget(warmup-1), barriers); err != nil {
+			return 0, ClockStats{}, err
+		}
+	}
+	actualIters := capToBudget(iters)
+	stop := instruments.Watch()
+	d, err := vk.DispatchMultiTimed(dispatches, groupsZ, actualIters, barriers)
+	clocks := stop()
+	if err != nil {
+		return 0, ClockStats{}, err
+	}
+	return float64(d.Nanoseconds()) / float64(actualIters), clocks, nil
+}
+
 // PrintTable writes a human-readable results table to w.
 func PrintTable(w io.Writer, results []Result) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)

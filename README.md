@@ -252,9 +252,48 @@ calls the worst available. And the corner **never spills**: 83 VGPRs at
 (4, 4) against the plain kernel's 47, with no scratch access anywhere in the
 family, so the register competition the arm was built to look for does not
 appear. Single-stream decode is unchanged at 195 tok/s, since the M axis is a
-loss at one row per expert; the one cell of the decode path still under the
-bus is `down` at 256 sequences (66%), a quarter of which is pad slots a
-runtime-sized block would remove.
+loss at one row per expert.
+
+The last cell under the bus — `down` at 256 sequences, 66% of it — closed by
+taking the M block out of the binary. `MROWS` is a compile-time constant and
+routing is not: at 256 sequences an expert gets 5.05 pairs on average with a
+tail out to 12, so a compiled block of four spends **23% of its slots on
+padding**. A two-term cost model (`T = groups*w + slots*s`, fitted from the
+rows the sweep already produces) reads the width off the routing histogram
+instead, and it **picks the width that actually won in 28 of 40 cells and is
+within 1% in 32**, against a 1.11-1.66x spread across the four built widths —
+and **calibrating it once, at the cheapest batch there is, is as good as
+re-fitting it per batch**. Then the width stops having to be one number at all:
+a group's slots must all name one expert, but the width is fixed per
+*dispatch*, so bucketing the groups by width and issuing one dispatch per
+bucket covers the histogram with several widths at once, out of the binaries
+that already exist. On `down` at a serving batch that is worth **1.09-1.13x**
+over the best fixed width — 2.761 ms to **2.530 ms**, 157 to **169 GB/s** of
+distinct weight bytes, 66% to **72%** of the bus — and takes a token's MoE FFN
+at 256 sequences to **848 tok/s** against the Q4 grouped GEMM's 545, with
+`down` itself back from the GEMM it had gone to (0.99x → **1.07x**), so both
+projections are the GEMV's at every batch measured.
+
+The interesting half is the plan that *loses*. Two ways to cover an expert
+routed five pairs: one group of eight (three pads, one weight read) or a four
+and a one (no pads, two weight reads). The pad-minimal plan gets the slot count
+down to a 5% pad where the fixed build ran 23% — and it is **0.72-0.96x**,
+losing by up to 1.4x, while the plan that gives each expert a single width
+repeated wins. What separates them is the one quantity a cost model written in
+groups and slots cannot see: whether an expert's groups land in the same
+dispatch. Pricing the residual against a count of the ones that do not gives
+**3.3-5.9 µs per crossing, against 3.58 µs for a cold DRAM read of that
+expert's 845 KB**, where a group *inside* the part is priced at 0.45-1.67 µs.
+So a group is not a fixed cost: one whose expert the previous dispatch just
+read is a cache hit, and one whose expert was last read a dispatch ago pays the
+bus again — the same mechanism the M block was buying all along, seen from the
+side where it can be lost. Barriers between the parts cost +0.2-1.3%, so it is
+locality and not scheduling. **An expert belongs to exactly one dispatch**, and
+the fitted "a group is worth 45 pad slots on gate_up, 6.5 on down" turns out to
+be a *cache-resident* number — at 256 sequences it is 1.0-2.7 on both.
+What is left of down's deficit is not the table: it is the per-output-row cost
+inside the wave, paid over four times as many rows, which is the one kernel arm
+this file has never built.
 
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
@@ -298,7 +337,12 @@ fields is itself a pointer into other Go memory — and Vulkan's
   with differing push constants, which is `vk.ComputePipeline`'s
   `DispatchSequenceTimed`. `ops_moe_q4.go` is its 4-bit arm — the same
   routing, tile table and schedules against a Q4 expert bank, so the two
-  formats' rows subtract.
+  formats' rows subtract. `ops_moe_gemv.go` is the decode kernel and its two
+  compile-time blocks, and `ops_moe_select.go` is what replaces them with a
+  choice: a cost model fitted from those rows, a plan that covers the routing
+  histogram with several block widths at once, and `vk.DispatchMultiTimed` —
+  the one timed sequence in the harness whose dispatches differ in their
+  *pipeline* rather than just their push constants.
 - `cmd/bench/main.go` — the benchmark CLI; `bench/families.go` is the
   registry of targetable op families it dispatches to.
 - `results/` — one CSV per op family, the committed measurements.

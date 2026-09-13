@@ -1506,6 +1506,206 @@ build** (1.12-1.27x over its own axes) at 256 sequences, `gate_up` to **96% of
 the DRAM bus**, the FFN to **818 tok/s**, and the GEMM crossover §1.9 opened on
 `down` closed — against ties at 16-64 tokens and losses below.
 
+
+### 1.12 Sizing the M block from the routing histogram — **DONE** ✅, **1.09-1.13x on `down`'s last cell, and a locality law the cost model cannot see**
+**Hypothesis** (the item that stood at the top of this file's Next list):
+§1.11 left exactly one cell of the decode path under the bus — `down` at 256
+sequences in flight, at 66% where every other cell reads 93-100% — and priced
+about a quarter of the gap as **pad slots**: its best build runs 829 groups of
+four against 2560 routed pairs, so 756 of 3316 slots (23%) do a slot's work
+and write an output row nothing reads. Routing does not hand out multiples of
+four. The `MROWS` of a build is a compile-time constant and the histogram is
+not, so what was missing was not another binary but a **selection**: build the
+table at several widths per dispatch, pick, and see whether the choice is worth
+what the pads cost.
+
+**Change**: no kernel change at all beyond three builds. Three things, all
+host-side:
+1. A **two-term cost model** fitted from the rows the M sweep already
+   produces — `T = groups*w + slots*s`, §1.11 finding 3's fit, one (w, s) per
+   (layer, batch, `NROWS`) by non-negative least squares over the four M
+   widths — and a **rule** that picks the cheapest built width off the routing
+   counts. Measured against the **oracle**, the width that actually won.
+2. A **mixed-width dispatch**. A group's slots must all name one expert, but
+   nothing says two groups must be the same size: the width is fixed per
+   *dispatch*, not per table. So an expert routed five pairs can take one group
+   of eight (three pads, one weight read) or a four and a one (no pads, two
+   weight reads), and which is cheaper is the ratio the model carries. Two
+   planners, differing only in whether an expert may take more than one width:
+   `split` decomposes the count with a DP over the built widths, which
+   minimises the pad; `whole` picks a single width and repeats it, `ceil(c/w)`
+   groups, padding only the last. Groups are bucketed by width, each bucket is
+   one dispatch reading its own contiguous slice of the table through the
+   existing `groupBase` push constant, and the buckets write disjoint output
+   rows so they need no barrier between them.
+3. The two **cheap builds** §1.11 left: `MROWS=8` x `NROWS=4`, and `NROWS=8`
+   against an M block (at `MROWS` 2 and 4) on the shape where 8 is the best
+   single-axis block. The shader's corner arm was written for `NROWS <= 4`;
+   extending it to 8 is four more macro rows, and every pre-existing `.spv` is
+   byte-identical afterwards (md5-verified across the tree).
+
+New plumbing for (2): `vk.DispatchMultiTimed` / `shim_dispatch_multi_timed`,
+which records a sequence of dispatches that differ in their **pipeline** as
+well as their push constants, with the within-iteration barrier as a flag — so
+"what the split costs if the parts may not overlap" is a measured control
+rather than an assumption. `shaders/gemv_w4a8.comp`, `shaders/shaders.go`,
+`bench/ops_moe_select.go` (new), `bench/ops_moe_select_test.go` (new),
+`bench/ops_moe_gemv.go`, `bench/bench.go`, `vk/engine.go`, `vk/shim.[ch]`,
+`results/moe.csv`.
+
+**Finding 1: the rule picks the oracle, and it does not need to be recalibrated
+per batch.** Choosing wrong is worth something to begin with: across the four
+built widths at t=256 the spread is **1.11-1.66x** at a fixed `NROWS`. Over all
+40 (layer, batch, `NROWS`) cells, the width the cost model names against the
+width that actually won:
+
+| calibration | picks the oracle | within 1% | worst | worst outside the degenerate cell |
+|---|---|---|---|---|
+| fitted at this batch | 28 / 40 | 32 / 40 | 0.78x | 0.92x (gate_up t=256, `NROWS=1`) |
+| fitted once at t=4 | 28 / 40 | 33 / 40 | 0.78x | 0.95x (down t=256, `NROWS=4`) |
+
+The 0.78x is one degenerate cell both share (gate_up t=4 at `NROWS=8`, where
+the fit puts a slot at 2 ns — pads really are nearly free there — and the
+oracle is a 0.076 ms dispatch). Otherwise the miss is never worse than 8%
+against a 1.1-1.7x spread, and **the cheap calibration is not the worse one**:
+at gate_up's t=256 `NROWS=1` cell the t=4 fit picks `MROWS=8`, the oracle,
+where the fit taken *at that batch* picks 4 and loses 8%. So an engine may
+calibrate once, on the cheapest batch there is, and read the width off the
+histogram for nothing.
+
+**Finding 2: the group-to-slot ratio collapses with the batch, and §1.11's
+engine rule is a cache-resident number.** The same fit, by batch:
+
+| layer | `NROWS` | t=4 | t=16 | t=64 | t=256 |
+|---|---|---|---|---|---|
+| gate_up | 1 | 9.9:1 | 29.0:1 | 9.6:1 | **1.8:1** |
+| gate_up | 2 | 18.5:1 | 55.4:1 | 9.9:1 | **1.4:1** |
+| gate_up | 4 | 18.4:1 | 71.5:1 | 10.4:1 | **1.1:1** |
+| down | 1 | 5.8:1 | 8.3:1 | 5.9:1 | **2.7:1** |
+| down | 2 | 4.9:1 | 9.5:1 | 5.4:1 | **1.5:1** |
+| down | 4 | 4.5:1 | 9.3:1 | 4.8:1 | **1.2:1** |
+
+§1.11 finding 3 measured "a group is worth 45 pad slots on gate_up and 6.5 on
+down" **at t=4**, where the whole bank is MALL-resident and a group is a cache
+hit. At a serving batch a group costs about what *one* pad slot costs, on both
+projections, because the weight read is now coming off DRAM and the slot's
+per-output-row work has the machine to itself. The engine rule inherits the
+correction: over-cover an expert freely when the batch is small and the bank is
+hot, and barely at all at t=256 — which is exactly why `MROWS=8`, the widest
+block, wins at gate_up's t=256 on the fixed sweep and 4 wins on down.
+
+**Finding 3: covering the histogram with several widths at once is worth
+1.09-1.13x on the cell that was under the bus — but only if an expert stays
+inside one dispatch.** At t=256, against the best *fixed* width measured at
+that cell:
+
+| layer | `NROWS` | best fixed | `split` | `whole` |
+|---|---|---|---|---|
+| down | 1 | `m8` 3.541 ms | 3.413 (1.04x) | **3.152 (1.12x)** |
+| down | 2 | `m8` 3.076 ms | 3.193 (0.96x) | **2.730 (1.13x)** |
+| down | 4 | `m4` 2.761 ms | 2.926 (0.94x) | **2.530 (1.09x)** |
+| down | 8 | `m4` 2.733 ms | 3.530 (0.77x) | **2.631 (1.04x)** |
+| gate_up | 1 | `m8` 2.075 ms | 2.632 (0.79x) | **2.033 (1.02x)** |
+| gate_up | 2 | `m8` 1.931 ms | 2.585 (0.75x) | 1.911 (1.01x) |
+| gate_up | 4 | `m4` 1.879 ms | 2.620 (0.72x) | 1.880 (1.00x) |
+| gate_up | 8 | `m4` 2.046 ms | 2.760 (0.74x) | 2.088 (0.98x) |
+
+The `whole` plan is strictly between the two fixed widths it replaces on *both*
+counts — 581 groups against `m4`'s 829 and `m8`'s 544, 3177 slots against 3316
+and 4352 — which is the whole idea, and on `down` it is worth 1.09-1.13x. The
+`split` plan has *fewer slots still* (2692, a 5% pad against `m4`'s 23%) and
+**loses**, by up to 1.4x. At the batches below t=256 the two plans are the same
+table — routing gives no expert enough pairs to need two widths — and both are
+worth 1.02-1.07x at t=64 and 1.00-1.04x at t=16, i.e. the mixed dispatch is
+never a loss where it is not also a split.
+
+**Finding 4: what `split` pays is a cold read of the expert, once per group
+that lands in a different dispatch from its expert's first.** The two plans
+differ in one number the cost model cannot see: `XPART`, an expert's groups
+that fall outside the part its first group is in — zero for `whole` by
+construction, 128-378 for `split`. Pricing the residual against it, at t=256:
+
+| layer | `NROWS` | plan | groups | slots | `XPART` | measured | model | residual | per `XPART` |
+|---|---|---|---|---|---|---|---|---|---|
+| down | 4 | split | 710 | 2692 | 203 | 2926 us | 2172 | 754 | **3.72 us** |
+| down | 4 | whole | 581 | 3177 | 0 | 2530 us | 2375 | 155 | — |
+| down | 8 | split | 961 | 2560 | 378 | 3530 us | 2296 | 1234 | **3.26 us** |
+| down | 8 | whole | 1043 | 2797 | 0 | 2631 us | 2505 | 125 | — |
+| gate_up | 4 | split | 710 | 2692 | 203 | 2620 us | 1426 | 1195 | **5.88 us** |
+| gate_up | 4 | whole | 581 | 3177 | 0 | 1880 us | 1567 | 312 | — |
+
+Across all eight t=256 cells the residual per cross-part group is
+**3.26-5.88 us**, against **3.58 us** for a cold DRAM read of one expert's
+844,800 bytes at 236 GB/s — and an *in-part* group is priced by the same fit at
+0.45-1.67 us. So a group is not a fixed cost at all: **a group whose expert was
+read by the previous dispatch is a cache hit and costs a fraction of a
+microsecond; a group whose expert was last read a whole dispatch ago pays the
+bus again.** That is the same mechanism §1.9 finding 2 and §1.10 finding 5
+found from the other side — the M block's value *is* the MALL serving re-reads
+— and it puts a hard constraint on any engine that wants to be clever with the
+table: **an expert must be covered by one dispatch**. The model's error tracks
+it directly: -18% to -46% for `split` against -5% to -17% for `whole`.
+
+**Finding 5: it is not the schedule.** The barrier arm is the control, and it
+says the multi-dispatch mechanics are free: putting a full compute-to-compute
+barrier between every part costs **+0.2% to +1.3%** at t=256 (three or four
+parts), against §1.8 finding 3's 1163 ns per barrier, which is what three
+barriers on a 2.5 ms dispatch should cost and does. So the parts overlapping or
+not is worth a rounding error, and the 1.4x `split` loses is entirely the
+locality of finding 4. (At `PARTS=1` the two arms record the same commands, so
+that column doubles as a noise reading: ±1% everywhere except the ≤20 us t=1
+dispatches.)
+
+**Finding 6: what it buys.** `down` at 256 sequences — the cell this item
+existed for — goes from 2.761 ms to **2.530 ms**, from 157 to **169 GB/s** of
+distinct weight bytes, **66% to 72% of the bus**. A token's MoE FFN at a
+serving batch goes from 821 to **848 tok/s** against the Q4 grouped GEMM's 545,
+and `down` itself goes from **0.99x to 1.07x the GEMM**, so at every batch
+measured both projections are now the GEMV's. The rest of down's deficit is not
+pads — the `whole` plan's own residual is 5-13% of its time, its pad is 617
+slots of 3177, and re-planning it to fewer pads is what `split` does and loses
+by — it is §1.10's per-output-row cost paid over four times the rows, which is
+the lane-slice kernel this file has left.
+
+**Finding 7: of the two cheap builds, the one that pays is `NROWS=8` with an M
+block on `down`.** `m4_n8` is the fastest *fixed* build at down's t=256 cell
+(2.733 ms against `m4_n4`'s 2.761, 1.01x) and `m2_n8` ties it (2.769); on
+gate_up both lose by 1.09-1.15x, exactly as §1.10's sizing rule says
+(`NROWS >= 8*VEC*WAVE/K` is 4 at K=640 and 1 at K=2560, so 8 is one step past
+the rule on down and three past it on gate_up). `MROWS=8` x `NROWS=4` is a wash
+on gate_up (1.884 against `m4_n4`'s 1.879) and 1.05x slower on down. The cost
+of the 32-cell corner is visible and it is not spills: from
+`RADV_DEBUG=shaderstats`, **48 VGPRs and 32 subgroups per SIMD** on the plain
+kernel, **84 and 18** at (4,4) or (2,8), **144 and 10** at (8,4) or (4,8), with
+**zero scratch in every build of the family**. The ladder stops where occupancy
+halves, not where the register file runs out.
+
+**The engine rule this leaves**, replacing §1.9's and §1.11's statements of it:
+1. Fit `(w, s)` once, at the smallest batch that routes one pair per expert.
+2. Per dispatch, read the routing histogram and give **each expert a single
+   width**, `argmin_w ceil(c/w) * (w_cost + w * slot_cost)`, bucketing the
+   groups by width into one dispatch each, in descending width order.
+3. Never let an expert's groups cross a dispatch boundary. The pad that saves
+   is worth less than the cold read it buys, by 3-6x per crossing.
+4. `NROWS` stays §1.10's closed form (`>= 8*VEC*WAVE/K`), and may be taken one
+   step higher on the projection whose rows are short.
+
+**Still open:**
+- **A width-1 part is a big part.** At t=256 the `whole` plan puts 17 experts
+  in the width-1 bucket and 248 in the width-8 one; at t=16 it is 121 of 139 in
+  width-1. Nothing measures whether a part below some group count is worth
+  folding into its neighbour rather than dispatched.
+- **The fit is over four points and re-fitted per cell.** Finding 1 says a
+  single t=4 calibration transfers; nothing here tests whether one calibration
+  transfers across *shapes*, which is what an engine would want.
+- **`down`'s remaining 28%** is finding 6's pointer to the lane-slice kernel,
+  not to anything the table can fix.
+
+**Effort**: low-medium (one C shim entry point, one Go pass, no kernel work
+beyond three binaries). **Value**: 1.09-1.13x on the one cell that was under
+the bus, **848 tok/s** at a serving batch, and a locality law — an expert
+belongs to one dispatch — that any table-driven MoE kernel has to obey.
+
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
 ### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x** (6.3x after §2.3)
@@ -3505,24 +3705,33 @@ the register-competition branch of the hypothesis did not happen. The two
 probes beside it also ran: wave32 + N block pays **1.065x at down's t=256** and
 nowhere else, with §1.7's coverage rule explaining the rest.
 
+**§1.12 is done as well**, the item that stood here, and it closed the cell:
+sizing the M block off the routing histogram takes `down` at 256 sequences from
+2.761 ms to **2.530 ms** (66% → 72% of the bus) and the MoE FFN at a serving
+batch to **848 tok/s**, with `down` back from the Q4 GEMM (0.99x → 1.07x). The
+selection half is free — a two-term cost model picks the oracle width in 28 of
+40 cells and is within 1% in 32, and **calibrating it once at t=4 is as good as
+fitting it at the batch**. The mixed-width half turned up the finding: a plan
+may give an expert several widths (fewer pads) or one width repeated (fewer
+groups), and the pad-minimal plan **loses by up to 1.4x** while the other wins,
+because the two differ in the one quantity the model cannot see — whether an
+expert's groups land in the same *dispatch*. Each group that does not costs
+**3.3-5.9 us**, the price of a cold read of that expert (3.58 us), where a
+group inside the part costs 0.45-1.67 us. Barriers between the parts cost
++0.2-1.3%, so it is locality and not schedule. §1.11's "a group is worth 45 pad
+slots on gate_up, 6.5 on down" is corrected too: that is a t=4, MALL-resident
+number, and at t=256 a group is worth **1.0-2.7 pad slots** on both.
+
 **Next:**
-- **`down` at 256 sequences is the last cell of the decode path under the
-  bus** (66% of it, where every other cell is at 93-100%). §1.11 finding 2
-  prices about a quarter of the gap as **pad slots** — its best build spends
-  23% of its slots on padding — and the fix is the one the engine rule already
-  implies: size `MROWS` from the routing histogram per dispatch instead of
-  compiling one width in. That needs a table built per dispatch, which the
-  bench builds already; what is missing is measuring the *selection*, not
-  another binary. The rest of the gap is §1.10's per-output-row cost paid over
-  4x the rows, which points at the lane-slice kernel below.
-- **The two corner cells not built**: `MROWS=8` x `NROWS=4`, now that the
-  register measurement says there is room, and `NROWS=8` against an M block on
-  `down`, where 8 is the best single-axis block at t=64 and t=256.
 - **Filling the lanes properly** — disjoint lane slices per output row, reduced
   with `subgroupClusteredAdd`. §1.10 finding 4 lowered the expected gain to
   near zero and §1.11 finding 4 raised it again from the other side: if what
   the memory system responds to is bytes in flight per wave, the lane map is
-  the third way to buy them, and it is the only one untried.
+  the third way to buy them, and it is the only one untried. §1.12 finding 6
+  now points at it directly: what is left of `down`'s 28% deficit is not the
+  table — the best plan's own residual over its cost model is 5-13% and
+  re-planning it to fewer pads is what *loses* — it is §1.10's per-output-row
+  cost paid over four times the rows.
 - **§2.2's own two leftovers, both cheap and both attribution rather than
   gain.** The scale plane's layout — 1.24x with no mechanism attached,
   between two binaries that are instruction-for-instruction identical, which
@@ -3698,4 +3907,15 @@ its grid and not because of its idle lanes — the build that fills them is
 slower — but because a fifth of its time is a fixed cost paid once per output
 row, and giving one wave four of them (`NROWS >= 8*VEC*WAVE/K`, the load-width
 rule read along the other axis of the matrix) takes it to 98% of gate_up's
-rate and a decode token's MoE FFN to 97% of its bus floor.**
+rate and a decode token's MoE FFN to 97% of its bus floor. And the last thing
+the M block was still getting wrong was that it was a constant: read off the
+routing histogram per dispatch instead — one width per expert, chosen by a
+two-term cost model calibrated once on the cheapest batch there is — and the
+last cell under the bus comes up to 72% and a serving batch to 848 tok/s. The
+plan that minimises the *pad*, which is what that cell's deficit was made of,
+is the one that loses, by up to 1.4x, and the reason is the sharpest
+statement this file has of what a grouped kernel actually buys: a group
+whose expert the previous dispatch already read costs half a microsecond, and
+a group whose expert was last read a dispatch ago costs the 3.6 us its 845 KB
+take off the bus — so an expert belongs to exactly one dispatch, and no cost
+model written in groups and slots can see the difference.**

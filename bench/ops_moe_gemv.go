@@ -125,6 +125,19 @@ type moeGEMVVariant struct {
 	// default to one, which is the kernel that has always run here.
 	rows  int
 	nrows int
+	// mixed marks the selection arm (IDEAS §1.12): not a build at all, but a
+	// *plan* over the builds above — one dispatch per M width, each covering
+	// the part of the routing histogram that width fits best. It has no
+	// spirv of its own, it is skipped by every table that reads a build's
+	// knobs, and its nrows is the one every width in the plan shares. See
+	// bench/ops_moe_select.go.
+	mixed bool
+	// wholeExpert picks the plan a mixed variant runs: false decomposes an
+	// expert's count into groups of several widths (which can put one expert
+	// in several dispatches), true picks a single width for the whole expert
+	// (which never does). The two differ only in the table; the binaries they
+	// dispatch are the same.
+	wholeExpert bool
 }
 
 // wavesPerWG is the shader's ROWS and rowsPerWave its NROWS, each normalised
@@ -317,6 +330,40 @@ var moeGEMVVariants = []moeGEMVVariant{
 	{name: "moe_gemv_v4_m2_n4", spirv: shaders.GEMVW4A8GroupedVec4M2N4, weightsPerLoad: 32, block: 128, mrows: 2, nrows: 4},
 	{name: "moe_gemv_v4_m4_n4", spirv: shaders.GEMVW4A8GroupedVec4M4N4, weightsPerLoad: 32, block: 128, mrows: 4, nrows: 4},
 
+	// The three corner cells §1.11 ruled out on registers it had not yet
+	// measured. §1.11 finding 6 read 83 VGPRs at (4, 4) and no scratch
+	// anywhere in the family, and NROWS=8 is the best single-axis block on
+	// `down` at t=64 and t=256, so the block it was the wrong side of is the
+	// one worth composing with. They are also the widths the selection arm
+	// below picks from: an engine sizing its block off the routing histogram
+	// can only choose among what is built.
+	{name: "moe_gemv_v4_m8_n4", spirv: shaders.GEMVW4A8GroupedVec4M8N4, weightsPerLoad: 32, block: 128, mrows: 8, nrows: 4},
+	{name: "moe_gemv_v4_m2_n8", spirv: shaders.GEMVW4A8GroupedVec4M2N8, weightsPerLoad: 32, block: 128, mrows: 2, nrows: 8},
+	{name: "moe_gemv_v4_m4_n8", spirv: shaders.GEMVW4A8GroupedVec4M4N8, weightsPerLoad: 32, block: 128, mrows: 4, nrows: 8},
+
+	// The selection arm (IDEAS §1.12). Not builds: plans. Each covers one
+	// dispatch per M width over the slice of the routing histogram that width
+	// fits best, so the block stops being a compile-time constant and becomes
+	// a function of the counts the router produced. One per row block, since
+	// every width in a plan has to agree on NROWS — the widths available to
+	// the n8 plan are 1, 2 and 4, because (8, 8) is the one corner cell not
+	// built.
+	// `mix` decomposes an expert's routed count into groups of several widths
+	// — five pairs as a four and a one — which minimises the pad but can put
+	// one expert's weights in two dispatches. `one` picks a single width for
+	// the whole expert and repeats it, which pads more and keeps every group
+	// of an expert inside one dispatch. The M block is a cache lever, so the
+	// difference between them is a locality question and not an arithmetic
+	// one, and it has to be measured rather than reasoned about.
+	{name: "moe_gemv_v4_mix", spirv: nil, weightsPerLoad: 32, block: 128, mixed: true},
+	{name: "moe_gemv_v4_mix_n2", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 2, mixed: true},
+	{name: "moe_gemv_v4_mix_n4", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 4, mixed: true},
+	{name: "moe_gemv_v4_mix_n8", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 8, mixed: true},
+	{name: "moe_gemv_v4_one", spirv: nil, weightsPerLoad: 32, block: 128, mixed: true, wholeExpert: true},
+	{name: "moe_gemv_v4_one_n2", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 2, mixed: true, wholeExpert: true},
+	{name: "moe_gemv_v4_one_n4", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 4, mixed: true, wholeExpert: true},
+	{name: "moe_gemv_v4_one_n8", spirv: nil, weightsPerLoad: 32, block: 128, nrows: 8, mixed: true, wholeExpert: true},
+
 	// The stride arm (the handoff's "K=640 is explained, and the fix is to
 	// stop padding it"). One binary, one push-constant word, every 64 B-
 	// aligned stride whose gcd with the 4 KB rotation is a given power of two.
@@ -413,6 +460,11 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 	maxLdw, minBlock, maxPairs, maxTokens := 0, 1<<30, 0, 0
 	usable := variants[:0:0]
 	for _, v := range variants {
+		// A mixed plan has no binary of its own; it dispatches the builds
+		// above and runs in its own pass once they have all been measured.
+		if v.mixed {
+			continue
+		}
 		ldw, ok := v.ldw(s.K)
 		if !ok {
 			fmt.Fprintf(os.Stderr, "moe gemv %s %s: no %d-element pad reaches gcd %d at K=%d, skipping\n",
@@ -504,6 +556,11 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 	sumsBuf.FillRepeating(int32SliceToBytes(randomSmallInts(moePatternBytes/4, 1<<13)))
 
 	var results []Result
+	// The selection pass below dispatches these same pipelines in mixed-width
+	// sequences, so they are kept rather than let go at the end of each
+	// iteration. Every `defer` in this loop already holds them to the end of
+	// the function; the map is what lets the pass name one.
+	pipes := map[string]*vk.ComputePipeline{}
 	for _, v := range usable {
 		ldw, _ := v.ldw(s.K)
 		mod, err := dev.NewShaderModule(v.spirv)
@@ -524,6 +581,7 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 			return nil, fmt.Errorf("moe gemv %s pipeline: %w", v.name, err)
 		}
 		defer pipe.Destroy()
+		pipes[v.name] = pipe
 
 		for _, t := range tokens {
 			if v.strideArm && t != moeGEMVStrideTokens {
@@ -571,7 +629,22 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 			results = append(results, base.finish("per_pair", g.groups, ns, clocks))
 		}
 	}
-	return results, nil
+
+	// The selection arm (IDEAS §1.12), which needs every fixed build's timings
+	// to fit the cost model it plans with, and so runs last.
+	sel, err := runMoEGEMVSelection(dev, s, variants, pipes, routings, tokens, results,
+		gemvBuffers{w: wBuf, scales: scalesBuf, x: xBuf, y: yBuf, sums: sumsBuf, groups: groupBuf},
+		warmup, iters)
+	if err != nil {
+		return nil, err
+	}
+	return append(results, sel...), nil
+}
+
+// gemvBuffers is the set runMoEShapeGEMV allocates, handed to the selection
+// pass so it dispatches over the same bank the fixed builds were measured on.
+type gemvBuffers struct {
+	w, scales, x, y, sums, groups *vk.Buffer
 }
 
 // randomSmallInts fills n int32s with values in [-mag, mag], for buffers whose
@@ -602,32 +675,45 @@ type moeGEMVCase struct {
 	touched float64 // weight bytes distinct across the dispatch — the residency figure
 	acts    float64 // int8 activations read plus fp32 outputs written
 	xreq    float64 // activation bytes *asked for*: one row per wave per slot
+	// extra is appended to Detail verbatim, for the fields only one arm has
+	// (the selection arm's plan and its fitted coefficients).
+	extra string
 }
 
 func moeGEMVResult(s moeShape, v moeGEMVVariant, r moeRouting, g moeGroups, ldw int) moeGEMVCase {
+	return moeGEMVCounts(s, v, r, g.pairs, g.slots, g.groups, ldw)
+}
+
+// moeGEMVCounts is moeGEMVResult over a table described by its counts rather
+// than by a moeGroups, because the selection arm's table is a list of
+// per-width slices and its groups are not all the same size.
+func moeGEMVCounts(s moeShape, v moeGEMVVariant, r moeRouting, pairs, slots, groups, ldw int) moeGEMVCase {
 	// Bytes of one expert matrix as the kernel reads it: K nibbles per row
 	// plus one fp16 scale per block. The row pad is never read — every stride
 	// in the sweep is 64 B-aligned, so it costs footprint and not traffic.
 	perExpert := float64(s.N) * (float64(s.K)/2 + float64(s.K/v.block)*2)
 	return moeGEMVCase{
 		shape: s, variant: v, ldw: ldw, tokens: r.tokens,
-		pairs: g.pairs, slots: g.slots, groups: g.groups, experts: r.touched,
-		useful: 2 * float64(g.pairs) * float64(s.N) * float64(s.K),
+		pairs: pairs, slots: slots, groups: groups, experts: r.touched,
+		useful: 2 * float64(pairs) * float64(s.N) * float64(s.K),
 		// The weight read is per *group*, which is the whole point of the M
 		// block: at mrows == 1 a group is a pair and this is what it was.
-		issued:  float64(g.groups) * perExpert,
+		issued:  float64(groups) * perExpert,
 		touched: float64(r.touched) * perExpert,
 		// One activation row per real pair — a pad slot repeats the row its
 		// neighbour just read — and one output row per slot, because the pad
 		// writes a scratch row it still has to write.
-		acts: float64(g.pairs)*float64(s.K) + float64(g.slots)*float64(s.N)*4,
+		acts: float64(pairs)*float64(s.K) + float64(slots)*float64(s.N)*4,
 		// What the kernel actually asks the memory system for on the
 		// activation side, which is a different number and the one the N block
 		// moves: every wave re-reads its pair's whole K-byte row, and a group
 		// has N/NROWS waves each covering MROWS slots. At NROWS=1 this is
 		// N times `acts`' activation half — all of it cache hits, and §1.9
 		// finding 2 is the reason that is not the same as free.
-		xreq: float64(g.groups) * float64(s.N/v.rowsPerWave()) * float64(v.mblock()) * float64(s.K),
+		// (Stated in slots rather than groups*MROWS, which is the same number
+		// at every fixed build and is the only one of the two a mixed plan
+		// has.)
+		xreq: float64(slots) * float64(s.N/v.rowsPerWave()) * float64(s.K),
 	}
 }
 
@@ -650,7 +736,7 @@ func (c moeGEMVCase) finish(mode string, dispatches int, ns float64, clocks Cloc
 			dispatches, c.shape.N/c.variant.rowsPerWG()*c.groups/dispatches,
 			c.shape.N/c.variant.rowsPerWave()*c.groups,
 			c.issued/(ns/1e9)/1e9, c.acts/(ns/1e9)/1e9, c.xreq/(ns/1e9)/1e9,
-			ns/1e3/float64(c.pairs)),
+			ns/1e3/float64(c.pairs)) + c.extra,
 		NsPerIter: ns,
 		GFLOPS:    c.useful / (ns / 1e9) / 1e9,
 		GBPS:      (c.issued + c.acts) / (ns / 1e9) / 1e9,
@@ -820,6 +906,7 @@ func PrintMoEGEMVSummary(w io.Writer, results []Result) {
 	printMoEGEMVMBlock(w, results)
 	printMoEGEMVRowBlock(w, results)
 	printMoEGEMVCorner(w, results)
+	printMoEGEMVSelection(w, results)
 	printMoEGEMVSchedule(w, results)
 	printMoEGEMVStride(w, results)
 	printMoEGEMVvsGEMM(w, results)
@@ -854,7 +941,7 @@ func printMoEGEMVLoadWidth(w io.Writer, results []Result) {
 		// The M-blocked and row-blocked builds read the same widths against a
 		// different number of pairs or output rows per workgroup, so they
 		// belong to their own tables below rather than to this one.
-		if v, ok := lookupMoEGEMVVariant(r.Variant); !ok || v.mblock() > 1 || v.rowsPerWG() > 1 {
+		if v, ok := lookupMoEGEMVVariant(r.Variant); !ok || v.mixed || v.mblock() > 1 || v.rowsPerWG() > 1 {
 			continue
 		}
 		layer, tok := detailField(r.Detail, "layer"), detailField(r.Detail, "tokens")
@@ -924,7 +1011,7 @@ func moeGEMVUnblocked(v moeGEMVVariant) (moeGEMVVariant, bool) {
 // moeGEMVSibling(v, 1, 1).
 func moeGEMVSibling(v moeGEMVVariant, mrows, nrows int) (moeGEMVVariant, bool) {
 	for _, c := range moeGEMVVariants {
-		if c.strideArm || c.mblock() != mrows || c.rowsPerWave() != nrows || c.wavesPerWG() != 1 {
+		if c.strideArm || c.mixed || c.mblock() != mrows || c.rowsPerWave() != nrows || c.wavesPerWG() != 1 {
 			continue
 		}
 		if c.weightsPerLoad == v.weightsPerLoad && c.waveSize == v.waveSize && c.block == v.block {
@@ -1053,7 +1140,7 @@ func printMoEGEMVRowBlock(w io.Writer, results []Result) {
 	blocked := map[shape][]string{}
 	for _, r := range moeGEMVRows(results, mode1, false) {
 		v, ok := lookupMoEGEMVVariant(r.Variant)
-		if !ok || v.mblock() > 1 {
+		if !ok || v.mixed || v.mblock() > 1 {
 			continue
 		}
 		layer, tok := detailField(r.Detail, "layer"), detailField(r.Detail, "tokens")

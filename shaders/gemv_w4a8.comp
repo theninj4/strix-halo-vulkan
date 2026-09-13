@@ -215,18 +215,22 @@
 // §1.11 measured it: they compose, and at 256 sequences in flight the fastest
 // build at both expert shapes has both blocks on.
 //
-// One cell of the product is out of range rather than untested: the combined
-// arm is written for NROWS <= 4, because NROWS=8 is already past the register
-// knee on its own (§1.10 finding 7) and an 8-row block carrying MROWS slots
-// would hold 8*MROWS accumulators.
+// The corner now runs to NROWS=8 as well. It was written for NROWS <= 4 on
+// the argument that an 8-row block carrying MROWS slots would hold 8*MROWS
+// accumulators, and §1.11 finding 6 measured that argument wrong from the
+// register side — 83 VGPRs at (4, 4) and no scratch anywhere in the family —
+// while the same session's row-block table has NROWS=8 as the best single-axis
+// block on `down` at t=64 and t=256. So (2, 8) and (4, 8) are built; the
+// corner's register cost is the product of its two blocks, and what stops the
+// list is the measured spill rather than the predicted one.
 #ifndef NROWS
 #define NROWS 1
 #endif
 #if NROWS > 1 && !GROUPED
 #error "NROWS reads its output rows through the table and needs GROUPED=1"
 #endif
-#if NROWS > 4 && MROWS > 1
-#error "the M x N corner is built at NROWS <= 4; 8 rows per wave is past the register knee"
+#if NROWS > 8 || (NROWS & (NROWS - 1)) != 0
+#error "NROWS is 1, 2, 4 or 8"
 #endif
 
 layout(local_size_x = (WAVE * ROWS)) in;
@@ -813,7 +817,20 @@ void main() {
 #define MN_RL2(S, SITE)
 #define MN_RL3(S, SITE)
 #endif
-#define MN_RL(S, SITE) MN_RL0(S, SITE) MN_RL1(S, SITE) MN_RL2(S, SITE) MN_RL3(S, SITE)
+#if NROWS >= 8
+#define MN_RL4(S, SITE) SITE(4u, S)
+#define MN_RL5(S, SITE) SITE(5u, S)
+#define MN_RL6(S, SITE) SITE(6u, S)
+#define MN_RL7(S, SITE) SITE(7u, S)
+#else
+#define MN_RL4(S, SITE)
+#define MN_RL5(S, SITE)
+#define MN_RL6(S, SITE)
+#define MN_RL7(S, SITE)
+#endif
+#define MN_RL(S, SITE)                                                         \
+    MN_RL0(S, SITE) MN_RL1(S, SITE) MN_RL2(S, SITE) MN_RL3(S, SITE)            \
+    MN_RL4(S, SITE) MN_RL5(S, SITE) MN_RL6(S, SITE) MN_RL7(S, SITE)
 
 #define MN_SL0(SITE) SITE(0u, 0u)
 #define MN_SL1(SITE) SITE(0u, 1u)
