@@ -1,0 +1,107 @@
+#version 450
+// Direct 2-D convolution, stride 1, symmetric zero padding, weights in
+// PyTorch's [OC, IC, KH, KW] order. Covers both shapes the decoder uses:
+// 3x3 pad 1 and the 1x1 pad 0 residual shortcuts.
+//
+// Each thread owns one output pixel and OC_BLOCK output channels, so the
+// activation window it reads is multiplied into OC_BLOCK accumulators held
+// in registers. The grid is (spatial tiles, output-channel blocks) and each
+// workgroup stages its slice of the filter through shared memory, a block of
+// input channels at a time.
+//
+// The register blocking is the load-bearing part, and it is IDEAS §2.1's
+// result applied to a different operator. Profiling the first version of
+// this decoder put conv3x3 at 90.3% of the whole decode at ~750 GFLOP/s,
+// 3% of this part's measured 22.9 TFLOP/s fp32 FMA ceiling. Staging the
+// weights in shared memory -- i.e. fixing the *weight* traffic -- moved that
+// only to ~850, which is what said the weights were never the problem: the
+// kernel re-reads each activation once per output channel, and the fix is to
+// raise arithmetic intensity by computing several channels per read rather
+// than to move bytes closer.
+//
+// Input-channel blocking keeps the LDS footprint off the occupancy: the full
+// 512-channel filter for eight output channels would be 147 KB, a 32-channel
+// block of it is 9 KB.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+const uint OC_BLOCK = 8u;
+const uint IC_BLOCK = 32u;
+const uint MAX_TAPS = 9u;
+
+shared float shW[OC_BLOCK * IC_BLOCK * MAX_TAPS];
+
+void main() {
+    uint ocBase = gl_WorkGroupID.y * OC_BLOCK;
+    uint t = gl_LocalInvocationID.x;
+    uint outHW = pc.H * pc.W;                 // stride 1 with pad preserves H,W
+    uint p = gl_WorkGroupID.x * 256u + t;     // this thread's output pixel
+
+    uint ow = p % pc.W;
+    uint oh = p / pc.W;
+    bool live = p < outHW;
+
+    uint taps = pc.KH * pc.KW;
+
+    float acc[OC_BLOCK];
+    for (uint o = 0u; o < OC_BLOCK; ++o) {
+        uint oc = ocBase + o;
+        acc[o] = (oc < pc.OC && pc.bOff != NO_BIAS) ? wbuf[pc.bOff + oc] : 0.0;
+    }
+
+    for (uint ic0 = 0u; ic0 < pc.C; ic0 += IC_BLOCK) {
+        uint n = min(IC_BLOCK, pc.C - ic0);
+        uint span = OC_BLOCK * n * taps;
+        barrier();
+        for (uint i = t; i < span; i += 256u) {
+            uint o = i / (n * taps);
+            uint rem = i - o * n * taps;
+            uint icl = rem / taps;
+            uint tap = rem - icl * taps;
+            uint oc = ocBase + o;
+            float v = 0.0;
+            if (oc < pc.OC) {
+                v = wbuf[pc.wOff + (oc * pc.C + ic0 + icl) * taps + tap];
+            }
+            shW[(o * IC_BLOCK + icl) * MAX_TAPS + tap] = v;
+        }
+        barrier();
+
+        if (!live) {
+            continue;
+        }
+        for (uint j = 0u; j < n; ++j) {
+            uint srcBase = pc.inOff + (ic0 + j) * outHW;
+            for (uint kh = 0u; kh < pc.KH; ++kh) {
+                int ih = int(oh) + int(kh) - int(pc.pad);
+                if (ih < 0 || ih >= int(pc.H)) {
+                    continue;
+                }
+                uint rowBase = srcBase + uint(ih) * pc.W;
+                for (uint kw = 0u; kw < pc.KW; ++kw) {
+                    int iw = int(ow) + int(kw) - int(pc.pad);
+                    if (iw < 0 || iw >= int(pc.W)) {
+                        continue;
+                    }
+                    // One activation read feeding OC_BLOCK accumulators.
+                    float v = act[rowBase + uint(iw)];
+                    uint wIdx = j * MAX_TAPS + kh * pc.KW + kw;
+                    for (uint o = 0u; o < OC_BLOCK; ++o) {
+                        acc[o] += shW[o * IC_BLOCK * MAX_TAPS + wIdx] * v;
+                    }
+                }
+            }
+        }
+    }
+
+    if (live) {
+        for (uint o = 0u; o < OC_BLOCK; ++o) {
+            uint oc = ocBase + o;
+            if (oc < pc.OC) {
+                act[pc.outOff + oc * outHW + p] = acc[o];
+            }
+        }
+    }
+}

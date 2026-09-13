@@ -1,0 +1,34 @@
+#version 450
+// Transpose a [rows, dim] matrix into [dim, rowStride], where rowStride is
+// rows padded so the destination's row stride does not alias DRAM channels.
+//
+// This exists for one access pattern, and IDEAS §5.1b is what names it. The
+// attention kernel's score loop has thread t read key row (base+t) at a
+// fixed component d, so consecutive threads land dim*4 = 2048 bytes apart.
+// The coverage law says the achievable fraction of peak is
+// min(1, C/gcd(stride, 4096)) with C the contiguous run the requests in
+// flight hold: here C is 4 bytes against a gcd of 2048, i.e. 0.2%, and the
+// kernel measured 50 GFLOP/s at 67 GB/s of a 236 GB/s bus.
+//
+// Transposed, the same loop reads consecutive keys at consecutive addresses,
+// so C becomes the workgroup's 256 lanes x 4 B = 1024 B. Padding the row
+// stride 64 elements past `rows` then puts gcd(rowStride*4, 4096) at 256 or
+// below, which is §5.1b's window, and the ratio saturates.
+//
+// pc.C is dim, pc.aux0 is rows, pc.aux1 is the padded destination stride.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint rows = pc.aux0;
+    uint dim = pc.C;
+    if (idx >= rows * dim) {
+        return;
+    }
+    uint d = idx % dim;
+    uint r = idx / dim;
+    act[pc.outOff + d * pc.aux1 + r] = act[pc.inOff + r * dim + d];
+}

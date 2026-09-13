@@ -1,0 +1,14 @@
+#version 450
+// out = in + residual, elementwise. The decoder's every skip connection.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.aux0) {
+        return;
+    }
+    act[pc.outOff + idx] = act[pc.inOff + idx] + act[pc.resOff + idx];
+}

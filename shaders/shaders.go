@@ -936,3 +936,50 @@ var SoftmaxSubgroup []byte
 
 //go:embed softmax_subgroup_w32.spv
 var SoftmaxSubgroupW32 []byte
+
+// VAE decoder (PIPELINE.md stage 2b). Every one of these declares the same
+// two bindings and the same 64-byte push-constant block, defined in
+// vae_common.glsl, so a whole decode can be recorded into one command buffer
+// by vk.DispatchMultiTimed. All fp32: this is the correctness port, with
+// zimage/vae's CPU implementation as its oracle.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_conv2d.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_groupnorm.spv vae_groupnorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_silu.spv vae_silu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_add.spv vae_add.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_upsample2x.spv vae_upsample2x.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_nchw_to_rows.spv vae_nchw_to_rows.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_rows_to_nchw_add.spv vae_rows_to_nchw_add.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_linear.spv vae_linear.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_attention.spv vae_attention.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_transpose.spv vae_transpose.comp
+
+//go:embed vae_conv2d.spv
+var VAEConv2D []byte
+
+//go:embed vae_groupnorm.spv
+var VAEGroupNorm []byte
+
+//go:embed vae_silu.spv
+var VAESiLU []byte
+
+//go:embed vae_add.spv
+var VAEAdd []byte
+
+//go:embed vae_upsample2x.spv
+var VAEUpsample2x []byte
+
+//go:embed vae_nchw_to_rows.spv
+var VAENCHWToRows []byte
+
+//go:embed vae_rows_to_nchw_add.spv
+var VAERowsToNCHWAdd []byte
+
+//go:embed vae_linear.spv
+var VAELinear []byte
+
+//go:embed vae_attention.spv
+var VAEAttention []byte
+
+//go:embed vae_transpose.spv
+var VAETranspose []byte

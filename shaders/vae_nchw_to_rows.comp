@@ -1,0 +1,22 @@
+#version 450
+// (C, H, W) -> (H*W, C): attention runs over pixels with the channel axis as
+// the feature, which is the transpose diffusers writes as
+// view(B, C, H*W).transpose(1, 2).
+//
+// One invocation per output element, so the scattered access is on the read
+// side and the (H*W, C) rows the projections consume come out contiguous.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint hw = pc.H * pc.W;
+    if (idx >= hw * pc.C) {
+        return;
+    }
+    uint c = idx % pc.C;
+    uint p = idx / pc.C;
+    act[pc.outOff + idx] = act[pc.inOff + c * hw + p];
+}

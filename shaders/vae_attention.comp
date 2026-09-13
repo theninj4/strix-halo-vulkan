@@ -1,0 +1,132 @@
+#version 450
+// Single-head self-attention over pixels: softmax(q k^T * scale) v.
+//
+// Two passes over the keys rather than one, and never materialising the
+// score matrix. That is not a memory optimisation, it is a correctness
+// requirement measured on this model: the VAE's mid-block scores reach
+// 1.16e7 and its softmax is a hard one-hot with entropy 0, so the row max
+// has to be subtracted before any exponential. Recomputing the dot products
+// in the second pass costs 2x the arithmetic and removes the need to store
+// or rescale anything.
+//
+// One workgroup per query row. Keys are processed in chunks of the workgroup
+// size so the shared footprint does not grow with the sequence length: at
+// a 1024x1024 image the mid block runs at 16384 pixels, where a materialised
+// score row alone would be 64 KB.
+//
+// K arrives *transposed* to [dim, kStride] (see vae_transpose.comp). In the
+// natural [rows, dim] layout the score loop has thread t read key row base+t
+// at a fixed component, so consecutive threads land dim*4 = 2048 B apart and
+// IDEAS §5.1b's coverage law gives 4/2048 of the bus -- measured at 50
+// GFLOP/s. Transposed, the same loop reads consecutive keys at consecutive
+// addresses.
+//
+// pc.C is the head dimension (512 here, the full channel width), pc.aux0 is
+// the row count, pc.aux1 holds the scale as a bit pattern, inOff/resOff/aux2
+// point at q, kT and v, and pc.groups carries kT's padded row stride.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float shQ[512];      // the query row, reused by every key
+shared float shW[256];      // one chunk of exponentiated weights
+shared float shCtx[512];    // the running context vector
+shared float shRed[256];    // scratch for the max and sum reductions
+
+float reduceMax(float v) {
+    uint t = gl_LocalInvocationID.x;
+    shRed[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            shRed[t] = max(shRed[t], shRed[t + s]);
+        }
+        barrier();
+    }
+    float r = shRed[0];
+    barrier();
+    return r;
+}
+
+float reduceSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    shRed[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            shRed[t] += shRed[t + s];
+        }
+        barrier();
+    }
+    float r = shRed[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint row  = gl_WorkGroupID.x;
+    uint t    = gl_LocalInvocationID.x;
+    uint dim  = pc.C;
+    uint rows = pc.aux0;
+    float scale = uintBitsToFloat(pc.aux1);
+    uint qOff = pc.inOff, kOff = pc.resOff, vOff = pc.aux2;
+
+    if (row >= rows) {
+        return;
+    }
+
+    for (uint d = t; d < dim; d += 256u) {
+        shQ[d] = act[qOff + row * dim + d];
+        shCtx[d] = 0.0;
+    }
+    barrier();
+
+    // Pass 1: the row maximum.
+    float localMax = -1.0 / 0.0;
+    for (uint base = 0u; base < rows; base += 256u) {
+        uint j = base + t;
+        if (j < rows) {
+            float s = 0.0;
+            for (uint d = 0u; d < dim; ++d) {
+                s += shQ[d] * act[kOff + d * pc.groups + j];
+            }
+            localMax = max(localMax, s * scale);
+        }
+    }
+    float rowMax = reduceMax(localMax);
+
+    // Pass 2: exponentiate against that maximum and accumulate.
+    float denom = 0.0;
+    for (uint base = 0u; base < rows; base += 256u) {
+        uint j = base + t;
+        float w = 0.0;
+        if (j < rows) {
+            float s = 0.0;
+            for (uint d = 0u; d < dim; ++d) {
+                s += shQ[d] * act[kOff + d * pc.groups + j];
+            }
+            w = exp(s * scale - rowMax);
+        }
+        shW[t] = w;
+        denom += w;
+        barrier();
+
+        // Each thread owns a disjoint set of output dimensions, so the
+        // accumulation across the chunk's keys needs no atomics.
+        uint n = min(256u, rows - base);
+        for (uint d = t; d < dim; d += 256u) {
+            float acc = shCtx[d];
+            for (uint jj = 0u; jj < n; ++jj) {
+                acc += shW[jj] * act[vOff + (base + jj) * dim + d];
+            }
+            shCtx[d] = acc;
+        }
+        barrier();
+    }
+
+    float total = reduceSum(denom);
+    for (uint d = t; d < dim; d += 256u) {
+        act[pc.outOff + row * dim + d] = shCtx[d] / total;
+    }
+}

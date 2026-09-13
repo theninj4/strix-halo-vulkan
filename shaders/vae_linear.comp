@@ -1,0 +1,30 @@
+#version 450
+// y[r] = W x[r] + b over rows of length C, with W in PyTorch's [OC, C]
+// order. The attention block's four projections.
+//
+// One invocation per output element. This is a GEMM with M = H*W and it is
+// deliberately the naive one: stage 2b's job is to be right, and the
+// register-blocked WMMA kernels in shaders/gemm_wmma.comp are what this
+// becomes once it is.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint rows = pc.H * pc.W;
+    if (idx >= rows * pc.OC) {
+        return;
+    }
+    uint o = idx % pc.OC;
+    uint r = idx / pc.OC;
+
+    float sum = (pc.bOff == NO_BIAS) ? 0.0 : wbuf[pc.bOff + o];
+    uint wRow = pc.wOff + o * pc.C;
+    uint xRow = pc.inOff + r * pc.C;
+    for (uint i = 0u; i < pc.C; ++i) {
+        sum += wbuf[wRow + i] * act[xRow + i];
+    }
+    act[pc.outOff + idx] = sum;
+}

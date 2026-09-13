@@ -1,0 +1,23 @@
+#version 450
+// Nearest-neighbour 2x upsample, which is what diffusers' Upsample2D does
+// before its smoothing convolution. One invocation per *output* element, so
+// the writes are contiguous and the reads are the replicated ones.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint outW = pc.W * 2u;
+    uint outH = pc.H * 2u;
+    uint outHW = outW * outH;
+    if (idx >= pc.C * outHW) {
+        return;
+    }
+    uint ow = idx % outW;
+    uint oh = (idx / outW) % outH;
+    uint c  = idx / outHW;
+    uint src = pc.inOff + c * pc.H * pc.W + (oh >> 1) * pc.W + (ow >> 1);
+    act[pc.outOff + idx] = act[src];
+}

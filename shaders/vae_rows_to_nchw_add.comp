@@ -1,0 +1,20 @@
+#version 450
+// (H*W, C) -> (C, H, W), adding the attention block's residual on the way
+// back. Fused because the alternative is a second full pass over the tensor
+// for an elementwise add, and IDEAS §3.2's point is that these passes are
+// pure bandwidth and the only win is not doing them.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint hw = pc.H * pc.W;
+    if (idx >= hw * pc.C) {
+        return;
+    }
+    uint p = idx % hw;
+    uint c = idx / hw;
+    act[pc.outOff + idx] = act[pc.inOff + p * pc.C + c] + act[pc.resOff + idx];
+}

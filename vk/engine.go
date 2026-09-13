@@ -336,6 +336,17 @@ func (b *Buffer) ReadFloat32(n int) []float32 {
 	return out
 }
 
+// ReadFloat32At reads n float32s starting at an element offset. Reading a
+// whole buffer to recover a tensor near its end is the difference between
+// copying a few megabytes and copying gigabytes, which for the VAE decoder's
+// activation arena was 23x the GPU time of the decode itself.
+func (b *Buffer) ReadFloat32At(off, n int) []float32 {
+	src := unsafe.Slice((*float32)(b.mapped), off+n)
+	out := make([]float32, n)
+	copy(out, src[off:])
+	return out
+}
+
 // ReadUint32 reads n uint32s back out of the buffer's mapped memory.
 func (b *Buffer) ReadUint32(n int) []uint32 {
 	src := unsafe.Slice((*uint32)(b.mapped), n)
