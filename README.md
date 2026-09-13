@@ -104,7 +104,9 @@ fields is itself a pointer into other Go memory — and Vulkan's
   block scales (`quant.go`), clock/power instrumentation (`sysmon.go`), and
   one file per op family (`ops_*.go`) wiring shader variants + buffer
   layouts + a CPU-reference correctness check to a size sweep.
-- `cmd/bench/main.go` — the benchmark CLI.
+- `cmd/bench/main.go` — the benchmark CLI; `bench/families.go` is the
+  registry of targetable op families it dispatches to.
+- `results/` — one CSV per op family, the committed measurements.
 
 ## Requirements
 
@@ -121,14 +123,32 @@ go build ./...
 
 ./strix-halo-vulkan   # original demo
 
-go run ./cmd/bench    # benchmark suite; see -h for flags (sizes, blocks,
-                      # warmup/iters, -csv output, -skip op families)
+go run ./cmd/bench -list          # the op families a run can target
+go run ./cmd/bench gemv gemv_cold # run two of them
+go run ./cmd/bench all            # the whole suite (~33 min)
+                                  # -h for the sweep flags (sizes, blocks,
+                                  # warmup/iters, per-family sweeps)
 ```
 
-`cmd/bench` prints a results table per op family and, with `-csv`, writes
-`op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps` rows,
-followed by `sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail`, for further
-analysis (e.g. "which quantization block size + matrix shape wins").
+A run has to name what it is measuring: the full suite takes about half an
+hour and produces ~1900 rows, so sweeping all of it to answer one question is
+mostly waste. `all` is still there for the occasions that want it.
+
+`cmd/bench` prints a results table per op family and writes one CSV per
+family into `-resultsdir` (default `results/`) — `results/gemv.csv`,
+`results/stride.csv`, and so on. Each file is written as soon as its family
+finishes, so an interrupted run keeps what completed, and re-running one
+family refreshes only its own file and leaves the rest of the committed
+numbers untouched. Every file has the same columns:
+`op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps` followed
+by `sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail`, so
+`tail -q -n +2 results/*.csv` reconstructs the single flat table the suite
+used to write if an analysis wants it.
+
+The families are the ten listed by `-list`: `peak`, `overhead`, `bandwidth`,
+`stride`, `elementwise`, `gemv`, `gemv_cold`, `gemm`, `gemm_wmma`, `reduce`.
+`gemm_wmma` — the hand-tuned WMMA ladder — is separate from `gemm` because it
+is the larger half of the GEMM rows and is iterated on by itself.
 
 ## Reading the numbers honestly
 

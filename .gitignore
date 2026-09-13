@@ -1,2 +1,3 @@
 /strix-halo-vulkan
 *.spv
+/models/*

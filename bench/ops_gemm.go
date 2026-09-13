@@ -47,6 +47,10 @@ func gemmPushConstants(M, N, K, block int) []byte {
 // which MxNxK shapes VK_KHR_cooperative_matrix actually supports on this
 // device; coopmat cases are skipped (not failed) if the feature or a
 // matching shape isn't available.
+//
+// The hand-tuned WMMA ladder is a family of its own (RunGEMMWMMA): it is
+// several times the row count of everything here and is iterated on by
+// itself, so it is not worth re-running whenever a q4 block size changes.
 func RunGEMM(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
 	var results []Result
 
@@ -111,12 +115,6 @@ func RunGEMM(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 		return nil, err
 	}
 	results = append(results, coopInt8...)
-
-	wmma, err := runGEMMWMMA(dev, phys, sizes, warmup, iters)
-	if err != nil {
-		return nil, err
-	}
-	results = append(results, wmma...)
 
 	for _, block := range blocks {
 		twoPass, err := runGEMMCoopMatQ4TwoPass(dev, phys, sizes, block, warmup, iters)

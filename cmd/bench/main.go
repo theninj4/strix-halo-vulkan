@@ -3,15 +3,28 @@
 // reductions) across implementation flavours (naive/tiled/subgroup/
 // cooperative-matrix; fp32/fp16/int8/int4 weights) on the local GPU,
 // picking the Strix Halo iGPU if present.
+//
+// A run targets named op families rather than sweeping everything: the full
+// suite takes long enough, and produces enough rows, that running it to
+// answer one question is mostly waste. Each family's results are written to
+// their own CSV under -resultsdir, so re-running one family refreshes only
+// that file.
+//
+//	go run ./cmd/bench -list          # what can be targeted
+//	go run ./cmd/bench gemv gemv_cold # two families
+//	go run ./cmd/bench all            # everything, the old behaviour
 package main
 
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"strix-halo-vulkan/bench"
@@ -21,80 +34,105 @@ import (
 const strixHaloDeviceID = 0x1586
 
 func main() {
-	sizesFlag := flag.String("sizes", "256,512,1024,2048,4096", "comma-separated matrix/vector dimensions to sweep (gemv, gemm, reductions)")
-	// Each bandwidth/elementwise element is one fp32 read plus one fp32
-	// write, so the footprint touched per iteration is 8 bytes per element:
-	// this list runs from 2MB up to 512MB, deliberately fine-grained around
-	// this chip's ~32MB last-level cache so the cache-to-DRAM cliff can be
-	// located rather than merely straddled.
-	bwSizesFlag := flag.String("bwsizes", "262144,524288,1048576,2097152,3145728,4194304,6291456,8388608,12582912,16777216,33554432,67108864", "comma-separated element counts to sweep for bandwidth/elementwise (footprint per iteration is 8 bytes/element; needs millions of elements to leave the dispatch-overhead-bound regime and reach steady-state memory bandwidth)")
-	blocksFlag := flag.String("blocks", "32,64,128", "comma-separated quantization block sizes to sweep")
-	warmup := flag.Uint("warmup", 3, "untimed warmup dispatches before each timed measurement")
-	iters := flag.Uint("iters", 20, "back-to-back timed dispatches averaged per measurement")
-	csvPath := flag.String("csv", "", "optional path to write results as CSV")
-	skip := flag.String("skip", "", "comma-separated op families to skip (peak,overhead,bandwidth,stride,elementwise,gemv,gemv_cold,gemm,reduce)")
+	def := bench.DefaultParams()
+	list := flag.Bool("list", false, "list the op families a run can target, then exit")
+	resultsDir := flag.String("resultsdir", "results", "directory to write one CSV per targeted family into (empty disables CSV output)")
+	sizesFlag := flag.String("sizes", intsToFlag(def.Sizes), "comma-separated matrix/vector dimensions to sweep (gemv, gemm, gemm_wmma, reduce)")
+	bwSizesFlag := flag.String("bwsizes", intsToFlag(def.BWSizes), "comma-separated element counts to sweep for bandwidth/elementwise (footprint per iteration is 8 bytes/element; needs millions of elements to leave the dispatch-overhead-bound regime and reach steady-state memory bandwidth)")
+	blocksFlag := flag.String("blocks", intsToFlag(def.Blocks), "comma-separated quantization block sizes to sweep")
+	warmup := flag.Uint("warmup", uint(def.Warmup), "untimed warmup dispatches before each timed measurement")
+	iters := flag.Uint("iters", uint(def.Iters), "back-to-back timed dispatches averaged per measurement")
 	stridePadsFlag := flag.String("stridepads", "", "comma-separated row-padding values in bytes for the strided-read sweep (default: IDEAS §5.1b's sweep across the 2 KB channel-interleave period); each must be a multiple of 16")
 	strideFootprintsFlag := flag.String("stridefootprints", "", "comma-separated touched footprints in MB for the strided-read sweep (default: one under and one over the 32 MB last-level cache)")
 	strideRowBytesFlag := flag.String("striderowbytes", "", "comma-separated bytes-touched-per-row for the strided-read sweep (default: a K=4096 and a K=1024 fp16 weight row); each must be a multiple of 1024")
-	coldFootprintsFlag := flag.String("coldfootprints", "16,64,256", "comma-separated weight footprints in MB (fp16-equivalent) for the DRAM-resident gemv_cold sweep; entries well above the ~32MB last-level cache are the ones that measure real decode")
-	coldN := flag.Int("coldn", 4096, "reduction length N for the gemv_cold sweep; its row count M is derived from each footprint")
+	coldFootprintsFlag := flag.String("coldfootprints", intsToFlag(def.ColdFootprints), "comma-separated weight footprints in MB (fp16-equivalent) for the DRAM-resident gemv_cold sweep; entries well above the ~32MB last-level cache are the ones that measure real decode")
+	coldN := flag.Int("coldn", def.ColdN, "reduction length N for the gemv_cold sweep; its row count M is derived from each footprint")
 	warmClock := flag.Duration("warmclock", 3*time.Second, "maximum ALU-heavy warmup before each timed measurement; stops as soon as the GPU reaches its top advertised clock, so a hot GPU costs one short burst (0 disables)")
 	clockSample := flag.Duration("clocksample", time.Millisecond, "sampling period for the sclk/power counters recorded with each measurement")
-	cus := flag.Int("cus", 40, "compute-unit count, used only to express the measured peak rates as ops/clock/CU")
+	cus := flag.Int("cus", def.CUs, "compute-unit count, used only to express the measured peak rates as ops/clock/CU")
+	flag.Usage = usage
 	flag.Parse()
 
-	sizes, err := parseInts(*sizesFlag)
+	if *list {
+		printFamilies(os.Stdout)
+		return
+	}
+
+	families, err := bench.SelectFamilies(flag.Args())
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "bench: %v\n\n", err)
+		printFamilies(os.Stderr)
+		os.Exit(2)
+	}
+
+	p := def
+	if p.Sizes, err = parseInts(*sizesFlag); err != nil {
 		log.Fatalf("-sizes: %v", err)
 	}
-	bwSizes, err := parseInts(*bwSizesFlag)
-	if err != nil {
+	if p.BWSizes, err = parseInts(*bwSizesFlag); err != nil {
 		log.Fatalf("-bwsizes: %v", err)
 	}
-	blocks, err := parseInts(*blocksFlag)
-	if err != nil {
+	if p.Blocks, err = parseInts(*blocksFlag); err != nil {
 		log.Fatalf("-blocks: %v", err)
 	}
-	coldFootprints, err := parseInts(*coldFootprintsFlag)
-	if err != nil {
+	if p.ColdFootprints, err = parseInts(*coldFootprintsFlag); err != nil {
 		log.Fatalf("-coldfootprints: %v", err)
 	}
-	stridePads := bench.StridePadsBytes
 	if *stridePadsFlag != "" {
-		if stridePads, err = parseInts(*stridePadsFlag); err != nil {
+		if p.StridePads, err = parseInts(*stridePadsFlag); err != nil {
 			log.Fatalf("-stridepads: %v", err)
 		}
 	}
-	strideFootprints := bench.StrideFootprintsMB
 	if *strideFootprintsFlag != "" {
-		if strideFootprints, err = parseInts(*strideFootprintsFlag); err != nil {
+		if p.StrideFootprints, err = parseInts(*strideFootprintsFlag); err != nil {
 			log.Fatalf("-stridefootprints: %v", err)
 		}
 	}
-	strideRowBytes := bench.StrideRowBytesList
 	if *strideRowBytesFlag != "" {
-		if strideRowBytes, err = parseInts(*strideRowBytesFlag); err != nil {
+		if p.StrideRowBytes, err = parseInts(*strideRowBytesFlag); err != nil {
 			log.Fatalf("-striderowbytes: %v", err)
 		}
 	}
-	skipSet := map[string]bool{}
-	for _, s := range strings.Split(*skip, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			skipSet[s] = true
-		}
-	}
+	p.ColdN = *coldN
+	p.Warmup = uint32(*warmup)
+	p.Iters = uint32(*iters)
+	p.CUs = *cus
 
 	cfg := config{
-		sizes: sizes, bwSizes: bwSizes, blocks: blocks,
-		coldFootprints: coldFootprints, coldN: *coldN,
-		stridePads: stridePads, strideFootprints: strideFootprints, strideRowBytes: strideRowBytes,
-		warmup: uint32(*warmup), iters: uint32(*iters),
-		warmClock: *warmClock, clockSample: *clockSample, cus: *cus,
-		csvPath: *csvPath, skip: skipSet,
+		params:      p,
+		families:    families,
+		warmClock:   *warmClock,
+		clockSample: *clockSample,
+		resultsDir:  *resultsDir,
 	}
 	if err := run(cfg); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func usage() {
+	fmt.Fprintf(flag.CommandLine.Output(), "usage: bench [flags] <family> [family...]\n\n")
+	printFamilies(flag.CommandLine.Output())
+	fmt.Fprintf(flag.CommandLine.Output(), "\nflags:\n")
+	flag.PrintDefaults()
+}
+
+func printFamilies(w io.Writer) {
+	fmt.Fprintln(w, "op families a run can target:")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	for _, f := range bench.Families() {
+		fmt.Fprintf(tw, "  %s\t%s\n", f.Name, f.Desc)
+	}
+	fmt.Fprintf(tw, "  %s\t%s\n", "all", "every family above, in the order listed")
+	tw.Flush()
+}
+
+func intsToFlag(v []int) string {
+	parts := make([]string, len(v))
+	for i, n := range v {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ",")
 }
 
 func parseInts(s string) ([]int, error) {
@@ -113,20 +151,13 @@ func parseInts(s string) ([]int, error) {
 	return out, nil
 }
 
-// config is one invocation's worth of sweep parameters, gathered into a
-// struct because run's parameter list had outgrown being readable.
+// config is one invocation: which families to run, the sweeps to run them
+// over, and where to put the results.
 type config struct {
-	sizes, bwSizes, blocks []int
-	coldFootprints         []int
-	coldN                  int
-	stridePads             []int
-	strideFootprints       []int
-	strideRowBytes         []int
-	warmup, iters          uint32
+	params                 bench.Params
+	families               []bench.Family
 	warmClock, clockSample time.Duration
-	cus                    int
-	csvPath                string
-	skip                   map[string]bool
+	resultsDir             string
 }
 
 func run(cfg config) error {
@@ -184,81 +215,47 @@ func run(cfg config) error {
 	defer inst.Destroy()
 	bench.SetInstruments(inst)
 
-	fmt.Printf("sweeping sizes=%v bwsizes=%v blocks=%v warmup=%d iters=%d\n", cfg.sizes, cfg.bwSizes, cfg.blocks, cfg.warmup, cfg.iters)
+	p := cfg.params
+	fmt.Printf("running %s\n", strings.Join(familyNames(cfg.families), ", "))
+	fmt.Printf("sweeping sizes=%v bwsizes=%v blocks=%v warmup=%d iters=%d\n", p.Sizes, p.BWSizes, p.Blocks, p.Warmup, p.Iters)
 	fmt.Printf("instrumentation: %s\n\n", inst.Describe())
 
-	var results []bench.Result
-	run := func(name string, fn func() ([]bench.Result, error)) error {
-		if cfg.skip[name] {
-			fmt.Printf("== %s (skipped) ==\n", name)
-			return nil
-		}
-		fmt.Printf("== %s ==\n", name)
-		r, err := fn()
+	// Each family's CSV is written as soon as that family finishes, so a run
+	// that dies partway (or is interrupted) still leaves the families that
+	// did complete on disk.
+	var written []string
+	for _, f := range cfg.families {
+		fmt.Printf("== %s ==\n", f.Name)
+		results, err := f.Run(dev, phys, p)
 		if err != nil {
-			return fmt.Errorf("%s: %w", name, err)
+			return fmt.Errorf("%s: %w", f.Name, err)
 		}
-		bench.PrintTable(os.Stdout, r)
-		fmt.Println()
-		results = append(results, r...)
-		return nil
-	}
-
-	// peak and overhead run first: they establish the ceiling and the floor
-	// that every subsequent number should be read against.
-	if err := run("peak", func() ([]bench.Result, error) { return bench.RunPeak(dev, phys, cfg.warmup, cfg.iters) }); err != nil {
-		return err
-	}
-	bench.PrintPeakSummary(os.Stdout, results, cfg.cus)
-	if len(results) > 0 {
-		fmt.Println()
-	}
-	if err := run("overhead", func() ([]bench.Result, error) { return bench.RunOverhead(dev, cfg.warmup, cfg.iters) }); err != nil {
-		return err
-	}
-	if err := run("bandwidth", func() ([]bench.Result, error) { return bench.RunBandwidth(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
-		return err
-	}
-	// stride follows bandwidth because it is that number's qualifier: the
-	// contiguous sweep bandwidth reports is the best case, and this says
-	// what the same bytes cost at a channel-aliased stride or in a gather.
-	if err := run("stride", func() ([]bench.Result, error) {
-		return bench.RunStride(dev, cfg.strideFootprints, cfg.strideRowBytes, cfg.stridePads, cfg.warmup, cfg.iters)
-	}); err != nil {
-		return err
-	}
-	bench.PrintStrideSummary(os.Stdout, results)
-	if err := run("elementwise", func() ([]bench.Result, error) { return bench.RunElementwise(dev, cfg.bwSizes, cfg.warmup, cfg.iters) }); err != nil {
-		return err
-	}
-	if err := run("gemv", func() ([]bench.Result, error) {
-		return bench.RunGEMV(dev, phys, cfg.sizes, cfg.blocks, cfg.warmup, cfg.iters)
-	}); err != nil {
-		return err
-	}
-	if err := run("gemv_cold", func() ([]bench.Result, error) {
-		return bench.RunGEMVCold(dev, phys, cfg.coldFootprints, cfg.coldN, cfg.blocks, cfg.warmup, cfg.iters)
-	}); err != nil {
-		return err
-	}
-	if err := run("gemm", func() ([]bench.Result, error) {
-		return bench.RunGEMM(dev, phys, cfg.sizes, cfg.blocks, cfg.warmup, cfg.iters)
-	}); err != nil {
-		return err
-	}
-	if err := run("reduce", func() ([]bench.Result, error) {
-		return bench.RunReductions(dev, phys, cfg.sizes, cfg.warmup, cfg.iters)
-	}); err != nil {
-		return err
-	}
-
-	if cfg.csvPath != "" {
-		if err := bench.WriteCSV(cfg.csvPath, results); err != nil {
-			return err
+		bench.PrintTable(os.Stdout, results)
+		if f.Summary != nil {
+			f.Summary(os.Stdout, results, p)
 		}
-		fmt.Printf("wrote %d results to %s\n", len(results), cfg.csvPath)
+		if cfg.resultsDir != "" {
+			path, err := bench.WriteFamilyCSV(cfg.resultsDir, f.Name, results)
+			if err != nil {
+				return fmt.Errorf("%s: %w", f.Name, err)
+			}
+			fmt.Printf("\nwrote %d results to %s\n", len(results), path)
+			written = append(written, filepath.Base(path))
+		}
+		fmt.Println()
+	}
+	if len(written) > 0 {
+		fmt.Printf("results in %s/: %s\n", cfg.resultsDir, strings.Join(written, " "))
 	}
 	return nil
+}
+
+func familyNames(families []bench.Family) []string {
+	names := make([]string, len(families))
+	for i, f := range families {
+		names[i] = f.Name
+	}
+	return names
 }
 
 // pickDevice prefers the Strix Halo iGPU by deviceID, falling back to the

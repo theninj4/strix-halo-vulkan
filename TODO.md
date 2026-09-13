@@ -11,14 +11,22 @@ to perform well.
 
 Everything below builds clean (`go build ./...`, `gofmt -l .`,
 `go vet ./...` all clean) and has passed its correctness checks on real
-hardware. `results.csv` was regenerated again this session, with the wave32
-arm of every subgroup-shaped kernel behind its rows, by
-`go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv` — the
-non-default block list is what the committed file has always used, so keep it
-if the file is to stay comparable row for row. Run it with nothing else on
-the GPU (see the measurement lessons below). It takes ~33 minutes now, of
-which the `stride` family is ~14 (816 cases) and the `gemm` family ~10 (the
-WMMA ablation is 57 variants).
+hardware. The measurements live in **`results/`, one CSV per op family**
+(`results/gemv.csv`, `results/stride.csv`, …) — the single 1900-row
+`results.csv` was split into them, row for row, when the CLI stopped
+sweeping everything by default. A run now has to name its targets:
+
+    go run ./cmd/bench -blocks 32,64,128,256,512,1024 gemv gemm
+
+`go run ./cmd/bench -list` prints the ten families; `all` is the old
+whole-suite behaviour. The non-default block list above is what the committed
+files have always used, so keep it if they are to stay comparable row for
+row. Run with nothing else on the GPU (see the measurement lessons below).
+The whole suite takes ~33 minutes, of which `stride` is ~14 (816 cases) and
+the GEMM families ~10 — which is the reason for targeting: refreshing
+`gemv` alone is a couple of minutes and rewrites only `results/gemv.csv`.
+Note `gemm_wmma` (the 57-variant WMMA ablation, 285 rows) is its own family,
+split out of `gemm`, since it is tuned on its own.
 
 Two documents carry the analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected

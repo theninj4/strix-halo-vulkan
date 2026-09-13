@@ -1,0 +1,6 @@
+op,variant,weight_format,block_size,size,ns_per_iter,gflops,gbps,sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail
+overhead,empty_dispatch,,0,1,358.650,0.0000,0.0000,2899.0,2899.0,2899.0,101.64,
+overhead,empty_dispatch,,0,40,288.500,0.0000,0.0000,2899.0,2899.0,2899.0,102.60,
+overhead,empty_dispatch,,0,640,693.300,0.0000,0.0000,2899.0,2899.0,2899.0,103.51,
+overhead,empty_dispatch,,0,4096,3071.800,0.0000,0.0000,2899.0,2899.0,2899.0,104.33,
+overhead,empty_dispatch,,0,65536,45506.450,0.0000,0.0000,2899.0,2899.0,2899.0,105.19,

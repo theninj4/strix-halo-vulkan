@@ -270,10 +270,13 @@ var wmmaVariants = []wmmaVariant{
 	{name: "wmma_reg64_hka4_w32_pada128", spirv: shaders.GEMMWMMAReg64HKA4W32, bm: 64, bn: 64, bk: 64, waves: 1, padA: 128, waveSize: 32},
 }
 
-// runGEMMWMMA measures the register-blocked cooperative-matrix GEMM
+// RunGEMMWMMA measures the register-blocked cooperative-matrix GEMM
 // (IDEAS.md §2.1) against the same fp16 inputs and fp32 output as
-// runGEMMCoopMatFP16, so the two are directly comparable row for row.
-func runGEMMWMMA(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, warmup, iters uint32) ([]Result, error) {
+// runGEMMCoopMatFP16, so the two are directly comparable row for row. It is
+// its own family rather than part of RunGEMM: this ladder is the bulk of
+// the GEMM rows and is tuned on its own, so it is worth running — and
+// storing — separately.
+func RunGEMMWMMA(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, warmup, iters uint32) ([]Result, error) {
 	shape, ok, err := findCoopMatShape(phys, vk.ComponentFloat16, vk.ComponentFloat32)
 	if err != nil {
 		return nil, err

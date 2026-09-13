@@ -6,6 +6,11 @@ Written after reviewing `TODO.md`, every shader in `shaders/`, the full
 experiment backlog, not a plan — each item states a *hypothesis*, the
 *change*, the *expected gain*, and *how we'd know*.
 
+> Note on where the numbers live: every reference to `results.csv` below
+> predates the split of that file into `results/<family>.csv` (one CSV per op
+> family, same columns, same rows). Read `results.csv` as "the measurements";
+> `tail -q -n +2 results/*.csv` is the flat table it used to be.
+
 **§0 has since been implemented and run** (`results.csv` regenerated with
 clock instrumentation behind every row). Items it confirmed, refuted, or
 re-aimed are marked **[measured]** in place rather than rewritten away, so
