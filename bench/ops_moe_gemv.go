@@ -59,9 +59,20 @@ import (
 // thing "decode uses the GEMM at M=1" means in practice.
 
 // moeDecodeTokens is the decode batch sweep: sequences decoding at once, each
-// contributing one token. See the head of this file for why it runs to 64 —
-// the footprint, not the shape, is what needs the larger batches.
-var moeDecodeTokens = []int{1, 4, 16, 64}
+// contributing one token. See the head of this file for why it runs past 16 —
+// the footprint, not the shape, is what needs the larger batches. The last
+// entry is the M-block arm's: at 256 sequences routing gives an expert 5.0
+// rows on average, which is the first batch in this list where a block of 4
+// has something to amortize over (IDEAS §1.8 finding 2 measured the crossover
+// at 1.2).
+var moeDecodeTokens = []int{1, 4, 16, 64, 256}
+
+// moeGEMVPerPairMaxTokens caps the one-dispatch-per-pair baseline. It answers
+// a schedule question that the four smaller batches already answer (§1.8
+// finding 3, 690-1555 ns per dispatch removed), and at 256 tokens it is 2560
+// dispatches per iteration, so it would cost more time than the answer is
+// worth repeating.
+const moeGEMVPerPairMaxTokens = 64
 
 // moeGEMVStrideTokens is the batch the stride arm runs at: the largest one, so
 // that what it measures is a DRAM stride effect rather than a MALL one.
@@ -98,6 +109,19 @@ type moeGEMVVariant struct {
 	// exactly this. Zero means the natural stride, K.
 	gcdTarget int
 	strideArm bool
+	// mrows is the shader's MROWS: how many routed pairs of one expert share
+	// a workgroup, and therefore share its weight loads. Zero and one are the
+	// same unblocked kernel; see moeGEMVVariants' M-block block.
+	mrows int
+}
+
+// mblock is the variant's MROWS with zero normalised to one, since an
+// unblocked build is a block of one.
+func (v moeGEMVVariant) mblock() int {
+	if v.mrows < 1 {
+		return 1
+	}
+	return v.mrows
 }
 
 func (v moeGEMVVariant) wave() int {
@@ -175,6 +199,24 @@ var moeGEMVVariants = []moeGEMVVariant{
 	// are the mechanism this row costs 4.4% and nothing else.
 	{name: "moe_gemv_v4_qb32", spirv: shaders.GEMVW4A8GroupedVec4, weightsPerLoad: 32, block: 32},
 
+	// The M block (IDEAS §1.8 finding 2). The unblocked kernel runs one grid
+	// per routed *pair*, so the two tokens an expert gets at t=64 read its
+	// weights twice; MROWS=n gives one workgroup n activation rows against one
+	// weight row, so the read is shared. The sweep is 2/4/8 at the width that
+	// won the unblocked arm at both shapes, plus one VEC=8 cell because both
+	// knobs spend the same registers — a VEC=8, MROWS=2 step holds two uvec4
+	// of weights and four of activations live at once.
+	//
+	// They are run at every batch, including the two where routing gives each
+	// expert exactly one row, because what a block costs when there is nothing
+	// to amortize is half the engine rule: a short group is padded to MROWS
+	// slots, and a pad slot re-reads a cache-hot activation row and writes an
+	// output row nothing reads.
+	{name: "moe_gemv_v4_m2", spirv: shaders.GEMVW4A8GroupedVec4M2, weightsPerLoad: 32, block: 128, mrows: 2},
+	{name: "moe_gemv_v4_m4", spirv: shaders.GEMVW4A8GroupedVec4M4, weightsPerLoad: 32, block: 128, mrows: 4},
+	{name: "moe_gemv_v4_m8", spirv: shaders.GEMVW4A8GroupedVec4M8, weightsPerLoad: 32, block: 128, mrows: 8},
+	{name: "moe_gemv_v8_m2", spirv: shaders.GEMVW4A8GroupedVec8M2, weightsPerLoad: 64, block: 128, mrows: 2},
+
 	// The stride arm (the handoff's "K=640 is explained, and the fix is to
 	// stop padding it"). One binary, one push-constant word, every 64 B-
 	// aligned stride whose gcd with the 4 KB rotation is a given power of two.
@@ -208,30 +250,56 @@ func moeGEMVPushConstants(N, K, block, ldw, lda, groupBase int, xScale float32) 
 	return pc
 }
 
-// moeGroups is the table the grouped GEMV reads: one entry per routed
-// (token, expert) pair, plus the slicing the one-dispatch-at-a-time baseline
-// walks it with.
+// moeGroups is the table the grouped GEMV reads: one entry per *slot*, plus
+// the slicing the one-dispatch-at-a-time baseline walks it with.
 //
 // Experts are outermost, as in buildTiles, so that consecutive entries — and
 // therefore the workgroups that run next to each other — share an expert's
 // weights. A pair is a whole matrix's worth of rows, so unlike the GEMM's tile
 // table there is nothing inside an entry to order.
+//
+// With an M block (mrows > 1) a *group* is mrows consecutive slots of one
+// expert, and the grid's y extent is the group count rather than the pair
+// count. An expert whose routed count is not a multiple of mrows gets a short
+// group padded out with slots that repeat its last pair's activation row and
+// write to a scratch output row one past the real ones — so the kernel's inner
+// loop needs no branch and the pad costs a cache-hot row read plus a row of
+// writes nothing reads. At mrows == 1 every group is one slot and the table is
+// exactly what it was before the block existed.
 type moeGroups struct {
-	table  []uint32 // 4 words per pair: (bank row of the expert, token row, output row)
-	base   []uint32 // first pair index of expert e
+	table  []uint32 // 4 words per slot: (bank row of the expert, token row, output row)
+	base   []uint32 // first group index of expert e
 	counts []uint32 // pairs routed to expert e
-	pairs  int
+	pairs  int      // routed (token, expert) pairs
+	slots  int      // table entries, pairs plus the pad
+	groups int      // dispatched groups: the grid's y extent
+	mrows  int
 }
 
-func buildMoEGroups(r moeRouting, N int) moeGroups {
-	g := moeGroups{base: make([]uint32, moeExperts), counts: make([]uint32, moeExperts)}
+func buildMoEGroups(r moeRouting, N, mrows int) moeGroups {
+	if mrows < 1 {
+		mrows = 1
+	}
+	g := moeGroups{base: make([]uint32, moeExperts), counts: make([]uint32, moeExperts), mrows: mrows}
+	// The scratch output row sits past every real one, so a pad slot's writes
+	// land somewhere allocated and nothing else reads them.
+	scratch := uint32(r.rows())
 	for e := 0; e < moeExperts; e++ {
-		g.base[e] = uint32(g.pairs)
-		for _, tok := range r.perExpert[e] {
-			g.table = append(g.table, uint32(e*N), uint32(tok), uint32(g.pairs), 0)
-			g.pairs++
+		g.base[e] = uint32(g.groups)
+		toks := r.perExpert[e]
+		for i := 0; i < len(toks); i += mrows {
+			for m := 0; m < mrows; m++ {
+				if i+m < len(toks) {
+					g.table = append(g.table, uint32(e*N), uint32(toks[i+m]), uint32(g.pairs), 0)
+					g.pairs++
+				} else {
+					g.table = append(g.table, uint32(e*N), uint32(toks[len(toks)-1]), scratch, 0)
+				}
+				g.slots++
+			}
+			g.groups++
 		}
-		g.counts[e] = uint32(len(r.perExpert[e]))
+		g.counts[e] = uint32(len(toks))
 	}
 	return g
 }
@@ -275,6 +343,12 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 			maxTokens = t
 		}
 	}
+	maxMRows := 1
+	for _, v := range usable {
+		if m := v.mblock(); m > maxMRows {
+			maxMRows = m
+		}
+	}
 
 	bankBytes := moeExperts * s.N * maxLdw / 2
 	wBuf, err := dev.NewBuffer(bankBytes)
@@ -292,7 +366,9 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 		return nil, err
 	}
 	defer xBuf.Destroy()
-	yBuf, err := dev.NewBuffer(maxPairs * s.N * 4)
+	// One row past the last pair's, for the pad slots of a short M-blocked
+	// group to write into.
+	yBuf, err := dev.NewBuffer((maxPairs + 1) * s.N * 4)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +378,10 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 		return nil, err
 	}
 	defer sumsBuf.Destroy()
-	groupBuf, err := dev.NewBuffer(maxPairs * 16)
+	// An M-blocked table is at most one pad slot short of a whole extra group
+	// per expert, which is (mrows-1) slots each; the largest block in the
+	// sweep bounds it.
+	groupBuf, err := dev.NewBuffer((maxPairs + moeExperts*(maxMRows-1)) * 16)
 	if err != nil {
 		return nil, err
 	}
@@ -344,20 +423,23 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 				continue
 			}
 			r := routings[t]
-			g := buildMoEGroups(r, s.N)
+			g := buildMoEGroups(r, s.N, v.mblock())
 			groupBuf.WriteBytes(uint32SliceToBytes(g.table))
 			base := moeGEMVResult(s, v, r, g, ldw)
 
-			// The grid is (output row, pair): x first, so the workgroups that
-			// issue together sweep one expert's rows in address order.
+			// The grid is (output row, group): x first, so the workgroups that
+			// issue together sweep one expert's rows in address order. At
+			// mrows == 1 a group is a pair and this is the original grid.
 			pc := moeGEMVPushConstants(s.N, s.K, v.block, ldw, s.K, 0, 1.0/127.0)
-			ns, clocks, err := TimeDispatch(pipe, uint32(s.N), uint32(g.pairs), 1, warmup, iters, pc)
+			ns, clocks, err := TimeDispatch(pipe, uint32(s.N), uint32(g.groups), 1, warmup, iters, pc)
 			if err != nil {
 				return nil, fmt.Errorf("moe gemv %s %s grouped t=%d: %w", s.layer, v.name, t, err)
 			}
 			results = append(results, base.finish(mode1, 1, ns, clocks))
 
-			if v.strideArm {
+			// The per-pair baseline is a schedule question, and an M block is
+			// not: one dispatch per group would be measuring both at once.
+			if v.strideArm || v.mblock() > 1 || t > moeGEMVPerPairMaxTokens {
 				continue
 			}
 
@@ -368,8 +450,8 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 			// vk.DispatchSequenceTimed can express: the grid's y extent is
 			// fixed across a sequence, and a per-expert dispatch would need it
 			// to be that expert's pair count.)
-			groupsX := make([]uint32, g.pairs)
-			pcs := make([][]byte, g.pairs)
+			groupsX := make([]uint32, g.groups)
+			pcs := make([][]byte, g.groups)
 			for i := range groupsX {
 				groupsX[i] = uint32(s.N)
 				pcs[i] = moeGEMVPushConstants(s.N, s.K, v.block, ldw, s.K, i, 1.0/127.0)
@@ -378,7 +460,7 @@ func runMoEShapeGEMV(dev *vk.Device, s moeShape, variants []moeGEMVVariant, rout
 			if err != nil {
 				return nil, fmt.Errorf("moe gemv %s %s per-pair t=%d: %w", s.layer, v.name, t, err)
 			}
-			results = append(results, base.finish("per_pair", g.pairs, ns, clocks))
+			results = append(results, base.finish("per_pair", g.groups, ns, clocks))
 		}
 	}
 	return results, nil
@@ -404,9 +486,11 @@ type moeGEMVCase struct {
 	ldw     int
 	tokens  int
 	pairs   int
+	slots   int
+	groups  int
 	experts int
 	useful  float64 // FLOPs the model needs
-	issued  float64 // weight bytes the kernel asks for (a pair re-reads its expert)
+	issued  float64 // weight bytes the kernel asks for (a group re-reads its expert)
 	touched float64 // weight bytes distinct across the dispatch — the residency figure
 	acts    float64 // int8 activations read plus fp32 outputs written
 }
@@ -417,11 +501,17 @@ func moeGEMVResult(s moeShape, v moeGEMVVariant, r moeRouting, g moeGroups, ldw 
 	// in the sweep is 64 B-aligned, so it costs footprint and not traffic.
 	perExpert := float64(s.N) * (float64(s.K)/2 + float64(s.K/v.block)*2)
 	return moeGEMVCase{
-		shape: s, variant: v, ldw: ldw, tokens: r.tokens, pairs: g.pairs, experts: r.touched,
-		useful:  2 * float64(g.pairs) * float64(s.N) * float64(s.K),
-		issued:  float64(g.pairs) * perExpert,
+		shape: s, variant: v, ldw: ldw, tokens: r.tokens,
+		pairs: g.pairs, slots: g.slots, groups: g.groups, experts: r.touched,
+		useful: 2 * float64(g.pairs) * float64(s.N) * float64(s.K),
+		// The weight read is per *group*, which is the whole point of the M
+		// block: at mrows == 1 a group is a pair and this is what it was.
+		issued:  float64(g.groups) * perExpert,
 		touched: float64(r.touched) * perExpert,
-		acts:    float64(g.pairs)*float64(s.K) + float64(g.pairs)*float64(s.N)*4,
+		// One activation row per real pair — a pad slot repeats the row its
+		// neighbour just read — and one output row per slot, because the pad
+		// writes a scratch row it still has to write.
+		acts: float64(g.pairs)*float64(s.K) + float64(g.slots)*float64(s.N)*4,
 	}
 }
 
@@ -431,13 +521,15 @@ func (c moeGEMVCase) finish(mode string, dispatches int, ns float64, clocks Cloc
 		Op: "moe", Variant: c.variant.name, WeightFormat: "w4a8", BlockSize: c.variant.block,
 		Size: c.tokens,
 		Detail: fmt.Sprintf("layer=%s;mode=%s;tokens=%d;pairs=%d;experts=%d;rowsperexpert=%.2f;"+
+			"mrows=%d;groups=%d;slots=%d;padslots=%d;"+
 			"vec=%d;wave=%d;cover=%dB;rowB=%d;strideB=%dB;gcd4K=%d;touchedMB=%.0f;resident=%s;"+
 			"dispatches=%d;wgperdispatch=%d;weightGBps=%.0f;actGBps=%.0f;perpairus=%.2f",
 			c.shape.layer, mode, c.tokens, c.pairs, c.experts,
 			float64(c.pairs)/float64(c.experts),
+			c.variant.mblock(), c.groups, c.slots, c.slots-c.pairs,
 			c.variant.vec(), c.variant.wave(), c.variant.coverage(c.shape.K), c.shape.K/2,
 			strideB, gcdInt(strideB, strideAliasChunk), c.touched/1e6, c.residency(),
-			dispatches, c.shape.N*c.pairs/dispatches,
+			dispatches, c.shape.N*c.groups/dispatches,
 			c.issued/(ns/1e9)/1e9, c.acts/(ns/1e9)/1e9, ns/1e3/float64(c.pairs)),
 		NsPerIter: ns,
 		GFLOPS:    c.useful / (ns / 1e9) / 1e9,
@@ -475,6 +567,14 @@ func (c moeGEMVCase) residency() string {
 // index), a token read by two different experts, and an expert whose rows are
 // not the first in the bank.
 //
+// The M block adds two more things to get wrong, and the same routing covers
+// both: with mrows == 2 the two-pair experts fill a group exactly while the
+// one-pair expert is padded, and with mrows == 4 or 8 every group is short, so
+// a build that let a pad slot write over a real output row — or that gave a
+// slot its neighbour's activation row — fails here. The table comes from
+// buildMoEGroups rather than from a second copy of the padding rule, so what
+// is checked is the layout the timed runs use.
+//
 // The reference is built from the pre-repack Q4 arrays, so it checks
 // repackQ4ToW4A8's permutation as well as the kernel — the same reference
 // verifyGEMVW4A8 uses, at a shape it cannot reach.
@@ -484,6 +584,13 @@ func verifyMoEGroupedGEMV(dev *vk.Device, mod *vk.ShaderModule, v moeGEMVVariant
 	ldw := K + v.block // padded, and still a whole number of uvec4s and blocks
 	const tokens = 4
 	pairs := [][2]int{{0, 0}, {0, 2}, {1, 1}, {2, 3}, {2, 0}} // (expert, token)
+	// The same assignment as a routing, which is what buildMoEGroups reads.
+	// Pairs are listed in expert order above, so pair i is output row i.
+	route := moeRouting{tokens: tokens, perExpert: make([][]int32, moeExperts), touched: experts}
+	for _, p := range pairs {
+		route.perExpert[p[0]] = append(route.perExpert[p[0]], int32(p[1]))
+	}
+	g := buildMoEGroups(route, N, v.mblock())
 
 	bData := randomFloats(experts * N * K)
 	packed, scales := quantizeQ4(bData, experts*N, K, v.block)
@@ -510,7 +617,9 @@ func verifyMoEGroupedGEMV(dev *vk.Device, mod *vk.ShaderModule, v moeGEMVVariant
 		return err
 	}
 	defer xBuf.Destroy()
-	yBuf, err := dev.NewBuffer(len(pairs) * N * 4)
+	// One row past the pad slots' scratch row, which buildMoEGroups puts at
+	// route.rows().
+	yBuf, err := dev.NewBuffer((route.rows() + 1) * N * 4)
 	if err != nil {
 		return err
 	}
@@ -520,7 +629,7 @@ func verifyMoEGroupedGEMV(dev *vk.Device, mod *vk.ShaderModule, v moeGEMVVariant
 		return err
 	}
 	defer sumsBuf.Destroy()
-	groupBuf, err := dev.NewBuffer(len(pairs) * 16)
+	groupBuf, err := dev.NewBuffer(len(g.table) * 4)
 	if err != nil {
 		return err
 	}
@@ -530,11 +639,7 @@ func verifyMoEGroupedGEMV(dev *vk.Device, mod *vk.ShaderModule, v moeGEMVVariant
 	scalesBuf.WriteBytes(padScaleRows(scales, experts*N, K/v.block, ldw/v.block))
 	xBuf.WriteBytes(int8SliceToBytes(packedX))
 	sumsBuf.WriteBytes(int32SliceToBytes(int8BlockSums(packedX, v.block)))
-	var table []uint32
-	for i, p := range pairs {
-		table = append(table, uint32(p[0]*N), uint32(p[1]), uint32(i), 0)
-	}
-	groupBuf.WriteBytes(uint32SliceToBytes(table))
+	groupBuf.WriteBytes(uint32SliceToBytes(g.table))
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
 		Buffers:              []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf, sumsBuf, groupBuf},
@@ -547,7 +652,7 @@ func verifyMoEGroupedGEMV(dev *vk.Device, mod *vk.ShaderModule, v moeGEMVVariant
 	defer pipe.Destroy()
 
 	pc := moeGEMVPushConstants(N, K, v.block, ldw, K, 0, xScale)
-	if _, err := pipe.DispatchTimed(uint32(N), uint32(len(pairs)), 1, 1, pc); err != nil {
+	if _, err := pipe.DispatchTimed(uint32(N), uint32(g.groups), 1, 1, pc); err != nil {
 		return err
 	}
 	got := yBuf.ReadFloat32(len(pairs) * N)
@@ -584,6 +689,7 @@ func padW4A8Rows(words []uint32, rows, cols, ldElems int) []byte {
 // kernel is worth against the GEMM the suite has been measuring decode with.
 func PrintMoEGEMVSummary(w io.Writer, results []Result) {
 	printMoEGEMVLoadWidth(w, results)
+	printMoEGEMVMBlock(w, results)
 	printMoEGEMVSchedule(w, results)
 	printMoEGEMVStride(w, results)
 	printMoEGEMVvsGEMM(w, results)
@@ -615,6 +721,12 @@ func printMoEGEMVLoadWidth(w io.Writer, results []Result) {
 	cells := map[key]float64{}
 	var variants, layers, tokens []string
 	for _, r := range moeGEMVRows(results, mode1, false) {
+		// The M-blocked builds read the same widths against a different number
+		// of output rows, so they belong to their own table below rather than
+		// to this one.
+		if v, ok := lookupMoEGEMVVariant(r.Variant); !ok || v.mblock() > 1 {
+			continue
+		}
 		layer, tok := detailField(r.Detail, "layer"), detailField(r.Detail, "tokens")
 		gbps, _ := strconv.ParseFloat(detailField(r.Detail, "weightGBps"), 64)
 		cells[key{r.Variant, layer, tok}] = gbps
@@ -659,9 +771,102 @@ func printMoEGEMVLoadWidth(w io.Writer, results []Result) {
 	}
 	tw.Flush()
 	fmt.Fprintf(w, "  these are bytes *asked for*; where several pairs share an expert the MALL serves the\n"+
-		"  repeats, so only the t=16 and t=64 columns — which touch 3.5x and 9.4x the %d MB cache — are\n"+
-		"  DRAM rates. COVER/ROW is §1.7's C against the 4-bit row: the rule says the bus is reached when\n"+
-		"  they are equal\n", mallBytes>>20)
+		"  repeats, so only the t=16 and t=64 columns — which touch 3.5x and 9.4x the %d MB cache at\n"+
+		"  1.15 and 1.72 pairs per expert — are close to DRAM rates. The t=256 column is a cache rate\n"+
+		"  again, and obviously so: 5.05 pairs per expert put it at 3x the bus, with DRAM itself at 148\n"+
+		"  GB/s underneath. That gap is what the M block below is for. COVER/ROW is §1.7's C against the\n"+
+		"  4-bit row: the rule says the bus is reached when they are equal\n", mallBytes>>20)
+}
+
+// moeGEMVUnblocked is the MROWS=1 build an M-blocked one is a speedup over:
+// same load width, same wave, same quantization block, one routed pair per
+// workgroup. It is a lookup rather than a name suffix so that the pairing is
+// a property of the variant table.
+func moeGEMVUnblocked(v moeGEMVVariant) (moeGEMVVariant, bool) {
+	for _, c := range moeGEMVVariants {
+		if c.strideArm || c.mblock() != 1 {
+			continue
+		}
+		if c.weightsPerLoad == v.weightsPerLoad && c.waveSize == v.waveSize && c.block == v.block {
+			return c, true
+		}
+	}
+	return moeGEMVVariant{}, false
+}
+
+// printMoEGEMVMBlock is IDEAS §1.8 finding 2 turned into a knob: how much a
+// workgroup gains by carrying several of one expert's routed pairs at once,
+// against how much routing actually gives it to carry.
+//
+// The two quantities that decide it are both in the table. PAIRS/EXPERT is
+// what routing supplies — 1.00 at the small batches, 1.72 at 64 and 5.00 at
+// 256 — and PAD is the slots a short group has to fill to keep the inner loop
+// branchless, which is the cost side. ISSUED is what the kernel asks the
+// memory system for, and it is the thing the block removes; DISTINCT is what
+// DRAM must supply either way, and it is the thing that cannot improve. A
+// block that moves DISTINCT is a block that was costing cache traffic, not
+// bus traffic.
+func printMoEGEMVMBlock(w io.Writer, results []Result) {
+	type key struct {
+		variant, layer, tokens string
+	}
+	type cell struct {
+		ns, issued, distinct float64
+		pairs, experts       int
+		groups, pad          int
+	}
+	cells := map[key]cell{}
+	var keys []key
+	for _, r := range moeGEMVRows(results, mode1, false) {
+		k := key{r.Variant, detailField(r.Detail, "layer"), detailField(r.Detail, "tokens")}
+		issued, _ := strconv.ParseFloat(detailField(r.Detail, "weightGBps"), 64)
+		touched, _ := strconv.ParseFloat(detailField(r.Detail, "touchedMB"), 64)
+		cells[k] = cell{
+			ns: r.NsPerIter, issued: issued, distinct: touched * 1e6 / r.NsPerIter,
+			pairs:   atoiOr(detailField(r.Detail, "pairs")),
+			experts: atoiOr(detailField(r.Detail, "experts")),
+			groups:  atoiOr(detailField(r.Detail, "groups")),
+			pad:     atoiOr(detailField(r.Detail, "padslots")),
+		}
+		if v, ok := lookupMoEGEMVVariant(r.Variant); ok && v.mblock() > 1 {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].layer != keys[j].layer {
+			return keys[i].layer < keys[j].layer
+		}
+		if keys[i].tokens != keys[j].tokens {
+			return atoiOr(keys[i].tokens) < atoiOr(keys[j].tokens)
+		}
+		return keys[i].variant < keys[j].variant
+	})
+
+	fmt.Fprintln(w, "\nthe M block: routed pairs of one expert sharing a workgroup's weight loads")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "LAYER\tTOKENS\tPAIRS/EXPERT\tKERNEL\tMROWS\tGROUPS\tPAD\tMS\tISSUED GB/S\tDISTINCT GB/S\tVS MROWS=1")
+	for _, k := range keys {
+		v, _ := lookupMoEGEMVVariant(k.variant)
+		c := cells[k]
+		base, ok := moeGEMVUnblocked(v)
+		speedup := ""
+		if ok {
+			if b, hit := cells[key{base.name, k.layer, k.tokens}]; hit {
+				speedup = fmt.Sprintf("%.2fx", b.ns/c.ns)
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%.2f\t%s\t%d\t%d\t%d\t%.3f\t%.0f\t%.0f\t%s\n",
+			shortLayer(k.layer), k.tokens, float64(c.pairs)/float64(c.experts), k.variant,
+			v.mblock(), c.groups, c.pad, c.ns/1e6, c.issued, c.distinct, speedup)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "  a group is MROWS slots of one expert, so the grid's y extent is GROUPS rather than pairs")
+	fmt.Fprintln(w, "  and the expert's weights are read once per group. PAD is the slots a short group needs to")
+	fmt.Fprintln(w, "  stay branchless: each re-reads a cache-hot activation row and writes an output row nothing")
+	fmt.Fprintln(w, "  reads, which is what the block costs when routing has nothing for it to amortize")
 }
 
 // printMoEGEMVSchedule is §3.5's grouped-vs-per-dispatch question asked of a
@@ -766,11 +971,12 @@ func printMoEGEMVStride(w io.Writer, results []Result) {
 func printMoEGEMVvsGEMM(w io.Writer, results []Result) {
 	type key struct{ layer, tokens string }
 	type best struct {
-		variant   string
-		ns, gbps  float64
-		actGBps   float64
-		touchedMB float64
-		resident  string
+		variant        string
+		ns, gbps       float64
+		actGBps        float64
+		touchedMB      float64
+		resident       string
+		pairs, experts int
 	}
 	gemv, gemm := map[key]best{}, map[key]best{}
 	seen := map[key]bool{}
@@ -797,12 +1003,13 @@ func printMoEGEMVvsGEMM(w io.Writer, results []Result) {
 				continue
 			}
 			touched, _ := strconv.ParseFloat(detailField(r.Detail, "touchedMB"), 64)
-			note(gemv, k, best{r.Variant, r.NsPerIter, gbps, act, touched, detailField(r.Detail, "resident")})
+			note(gemv, k, best{r.Variant, r.NsPerIter, gbps, act, touched, detailField(r.Detail, "resident"),
+				atoiOr(detailField(r.Detail, "pairs")), atoiOr(detailField(r.Detail, "experts"))})
 		case "q4":
 			if v, ok := lookupMoEQ4Variant(r.Variant); !ok || v.strideArm {
 				continue
 			}
-			note(gemm, k, best{r.Variant, r.NsPerIter, gbps, act, 0, ""})
+			note(gemm, k, best{r.Variant, r.NsPerIter, gbps, act, 0, "", 0, 0})
 		}
 	}
 	if len(seen) == 0 {
@@ -840,6 +1047,41 @@ func printMoEGEMVvsGEMM(w io.Writer, results []Result) {
 	tw.Flush()
 	fmt.Fprintln(w, "  both read the same weight bytes; what the GEMM adds is a 16-to-64-row A fragment per")
 	fmt.Fprintln(w, "  one-row group, so its activation traffic and its FLOPs are multiplied by the tile height")
+
+	// The same two kernels read as a serving engine would read them: per
+	// token of the batch, over a whole MoE block and a whole 48-layer pass.
+	// This is the axis §1.8's crossover lives on — the GEMV wins outright
+	// while routing gives an expert about one row and loses as the batch piles
+	// rows onto one expert, and the M block is the attempt to hold the win.
+	fmt.Fprintln(w, "\nthe same rows per token of the batch (one MoE block is gate + up + down, x48 layers)")
+	tw = tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "TOKENS\tPAIRS/EXPERT\tGEMV BLOCK MS\tGEMV x48\tGEMV TOK/S\tGEMM BLOCK MS\tGEMM x48\tGEMM TOK/S\tGEMV/GEMM\tGEMV KERNEL")
+	var toks []string
+	for _, k := range keys {
+		if k.layer == "moe.gate_up" && !containsString(toks, k.tokens) {
+			toks = append(toks, k.tokens)
+		}
+	}
+	for _, t := range toks {
+		up, ok1 := gemv[key{"moe.gate_up", t}]
+		down, ok2 := gemv[key{"moe.down", t}]
+		mup, ok3 := gemm[key{"moe.gate_up", t}]
+		mdown, ok4 := gemm[key{"moe.down", t}]
+		if !ok1 || !ok2 || !ok3 || !ok4 {
+			continue
+		}
+		n := float64(atoiOr(t))
+		vBlock := (2*up.ns + down.ns) / 1e6
+		mBlock := (2*mup.ns + mdown.ns) / 1e6
+		vPass, mPass := float64(moeLayers)*vBlock, float64(moeLayers)*mBlock
+		fmt.Fprintf(tw, "%s\t%.2f\t%.3f\t%.2f ms\t%.0f\t%.3f\t%.2f ms\t%.0f\t%.2fx\t%s\n",
+			t, float64(up.pairs)/float64(up.experts), vBlock, vPass, n*1e3/vPass,
+			mBlock, mPass, n*1e3/mPass, mPass/vPass, up.variant)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "  TOK/S is the FFN alone at that batch — every token in it decodes one step — so it rises")
+	fmt.Fprintln(w, "  with the batch for both kernels; what the column pair says is which kernel to dispatch")
+	fmt.Fprintln(w, "  at a given number of sequences in flight")
 }
 
 // printMoEGEMVBudget turns the per-matrix rows into what GOALS.md is asking

@@ -176,6 +176,29 @@ plateau says should be the slow end — and padding into the window costs
 1.12-1.15x. The plateau is a property of a *tiled* read, where a fragment holds
 32 B of a row; a kernel that walks whole matrices just wants them contiguous.
 
+That 1.2-rows-per-expert crossover is the one thing a serving engine cannot
+live with, so the same kernel took an **M block** (`-DMROWS=n`): a workgroup
+loads an expert's weight row once and dots it against *n* routed tokens, each
+with its own accumulator and output row, with short groups padded out to keep
+the inner loop branchless. At 256 sequences in flight — 5.05 rows per expert —
+it is worth **1.39-1.66x**, and it takes the FFN to **694 tok/s against the
+GEMM's 546**.
+At *one* row per expert it is worth **0.39x**, which is the other half of the
+result: the block has to be picked from the routing, not compiled in once, and
+the rule is arithmetic — a fitted cost model puts one group (an expert's
+845 KB through all its output rows) at **6.5-10.5x one slot**, so blocking
+pays as soon as it removes one group per 6-10 pads it creates, i.e. `MROWS` ≈
+the mean rows per expert. What the block actually takes off is **not the bus
+but the cache**: unblocked at five rows per expert the kernel asks for
+**746 GB/s**, 3.2x the bus, while DRAM underneath it runs at 148 — four fifths
+of the requests are re-reads the MALL is serving, and that is what sets the
+time. Blocked, issue falls 4.7x and DRAM reaches **206 GB/s, 87% of the bus**.
+The GEMM crossover moves out 4x and splits by projection: the `down` tie at
+t=64 becomes a 1.16x win, and at t=256 `gate_up` stays 1.70x ahead of the GEMM
+while `down` goes to it, because a 16-row tile covers 5.05 rows in one pass
+where a compile-time block of 4 needs 1.62. Single-stream decode is unchanged
+at 5.43 ms and 184 tok/s — this is a throughput lever with no latency effect.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -399,6 +422,14 @@ reader:
   variant kept. `ROWS` changes nothing anywhere except the single cell where
   `VEC` is one step short of a row, and is kept as the control that showed
   that (IDEAS §1.7).
+- **The grouped arm's M block (`MROWS`).** `gemv_w4a8.comp -DGROUPED=1
+  -DMROWS=n` gives one workgroup *n* routed tokens of the same expert against
+  one weight row (`_m2`, `_m4`, `_m8` rows). Unlike `VEC` this is not a
+  machine constant to be found once: it has to match how many rows routing
+  gives an expert, and it is a real loss when it does not (0.39x at one row
+  per expert, 1.66x at five). An engine keeps several builds and picks per
+  dispatch. `MROWS > 1` requires `GROUPED`, and `GROUPED` still forbids
+  `ROWS > 1` (IDEAS §1.9).
 - **Cache-resident measurements are contended.** A MALL-resident working
   set is shared with everything else touching memory — the display this iGPU
   also drives, or a second benchmark process — and losing part of it drops a

@@ -126,6 +126,39 @@
 #if GROUPED && ROWS > 1
 #error "GROUPED addresses one row per workgroup; ROWS > 1 is the non-grouped control"
 #endif
+
+// MROWS is the grouped arm's **M block**, and it is the thing IDEAS §1.8
+// finding 2 measured the need for. That arm runs one workgroup grid per
+// routed *pair*, so two tokens routed to the same expert read that expert's
+// weights twice, where one cooperative-matrix tile amortizes them over 16-64
+// rows. The crossover back to the GEMM measured at about **1.2 rows per
+// expert** — far below the M=16 a tile holds, because the question is never
+// "one row against sixteen" but "one row against sixteen rows of the *same*
+// expert", which routing only supplies at batch.
+//
+// With MROWS > 1 one workgroup covers one weight row against MROWS activation
+// rows: the group's MROWS table slots all name the same expert, the row's
+// nibbles are loaded once per step instead of once per step per pair, and
+// each slot carries its own int32 accumulator, its own activation-row base,
+// its own block-sum base and its own output row. That is the whole change —
+// the dot products, the scale application and the bias correction are the
+// same instructions, run MROWS times against one load.
+//
+// A short group — an expert whose routed count is not a multiple of MROWS —
+// is padded by the host with slots that repeat the last real pair's
+// activation row and write to a scratch output row, so the inner loop needs
+// no branch and a pad costs one cache-hot activation row plus one output row
+// of writes. bench.buildMoEGroups builds the table; the pad is why its slot
+// count and its pair count are reported separately.
+//
+// Legal values are 1, 2, 4 and 8, and MROWS > 1 requires GROUPED (there is
+// nothing to block over without a table of rows).
+#ifndef MROWS
+#define MROWS 1
+#endif
+#if MROWS > 1 && !GROUPED
+#error "MROWS is the grouped arm's M block and needs GROUPED=1"
+#endif
 layout(local_size_x = (WAVE * ROWS)) in;
 
 // Which lane of which row this invocation is. Macros rather than locals
@@ -193,6 +226,180 @@ layout(push_constant) uniform PC {
         acc = dotPacked4x8AccSatEXT(int(xb.z), pk.w & 0x0F0F0F0Fu, acc);       \
         acc = dotPacked4x8AccSatEXT(int(xb.w), (pk.w >> 4u) & 0x0F0F0F0Fu, acc); \
     }
+
+#if MROWS > 1
+// The M-blocked step, split where W4A8_GROUP is not. W4A8_GROUP loads the
+// weights *and* the activations it dots them with, which is right when one
+// load serves one output; here one load serves MROWS of them, so the load is
+// hoisted into M_LOAD_W and M_DOTS does one slot's eight
+// dotPacked4x8AccSatEXT per uvec4 against weights that are already in
+// registers. Same instructions per (weight, activation) pair as the
+// unblocked kernel; what changes is how many times each weight load is used.
+//
+// M_LOAD_W and M_DOTS are written out per VEC rather than as a loop over
+// WVEC4S for the reason in W4A8_GROUP's comment: a rolled group loop has to
+// index its operands dynamically and spills them to scratch.
+#if VEC >= 4
+#define W4A8_ROW(PK, XB, ACC)                                                  \
+    {                                                                          \
+        uvec4 xa = x[(XB)];                                                    \
+        uvec4 xb = x[(XB) + 1u];                                               \
+        ACC = dotPacked4x8AccSatEXT(int(xa.x), (PK).x & 0x0F0F0F0Fu, ACC);     \
+        ACC = dotPacked4x8AccSatEXT(int(xa.y), ((PK).x >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int(xa.z), (PK).y & 0x0F0F0F0Fu, ACC);     \
+        ACC = dotPacked4x8AccSatEXT(int(xa.w), ((PK).y >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int(xb.x), (PK).z & 0x0F0F0F0Fu, ACC);     \
+        ACC = dotPacked4x8AccSatEXT(int(xb.y), ((PK).z >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int(xb.z), (PK).w & 0x0F0F0F0Fu, ACC);     \
+        ACC = dotPacked4x8AccSatEXT(int(xb.w), ((PK).w >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+// Where a slot's activation row starts, and how far one lane-step advances
+// inside it, in the units the buffer is declared with.
+#define M_XBASE(AROW) ((AROW) * (pc.lda >> 4u))
+#define M_XSTEP XVEC4S
+#else
+#define W4A8_ROW(PK, XB, ACC)                                                  \
+    {                                                                          \
+        ACC = dotPacked4x8AccSatEXT(int(x[(XB)]), (PK) & 0x0F0F0F0Fu, ACC);    \
+        ACC = dotPacked4x8AccSatEXT(int(x[(XB) + 1u]), ((PK) >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+#define M_XBASE(AROW) ((AROW) * (pc.lda >> 2u))
+#define M_XSTEP 2u
+#endif
+
+#if VEC == 16
+#define M_LOAD_W                                                               \
+    uvec4 pk0 = w[wbase];                                                      \
+    uvec4 pk1 = w[wbase + 1u];                                                 \
+    uvec4 pk2 = w[wbase + 2u];                                                 \
+    uvec4 pk3 = w[wbase + 3u];
+#define M_DOTS(XB, ACC)                                                        \
+    W4A8_ROW(pk0, (XB), ACC)                                                   \
+    W4A8_ROW(pk1, (XB) + 2u, ACC)                                              \
+    W4A8_ROW(pk2, (XB) + 4u, ACC)                                              \
+    W4A8_ROW(pk3, (XB) + 6u, ACC)
+#elif VEC == 8
+#define M_LOAD_W                                                               \
+    uvec4 pk0 = w[wbase];                                                      \
+    uvec4 pk1 = w[wbase + 1u];
+#define M_DOTS(XB, ACC)                                                        \
+    W4A8_ROW(pk0, (XB), ACC)                                                   \
+    W4A8_ROW(pk1, (XB) + 2u, ACC)
+#elif VEC == 4
+#define M_LOAD_W uvec4 pk0 = w[wbase];
+#define M_DOTS(XB, ACC) W4A8_ROW(pk0, (XB), ACC)
+#else
+#define M_LOAD_W uint pk0 = w[wbase];
+#define M_DOTS(XB, ACC) W4A8_ROW(pk0, (XB), ACC)
+#endif
+
+// The four places a slot appears in the kernel. Each takes the same five
+// arguments — its index in the group and the four names its state lives
+// under — so that one M_ROWS(SITE) line instantiates a site for every slot,
+// and adding an MROWS value means adding one M_ROWn rather than editing four
+// unrolled blocks. M_STEP reads `j`, `sc` and the loaded weights from the
+// loop it sits in, M_BIAS reads `b` and `ws`, and M_WRITE reads `row`, the
+// way W4A8_GROUP already reads `wbase`.
+#define M_SLOT(I, XR, OROW, SUMB, PART)                                        \
+    uint XR = M_XBASE(groups[slot + (I)].y);                                   \
+    uint SUMB = groups[slot + (I)].y * blocksPerRow;                           \
+    uint OROW = groups[slot + (I)].z;                                          \
+    float PART = 0.0;
+#define M_STEP(I, XR, OROW, SUMB, PART)                                        \
+    {                                                                          \
+        int acc = 0;                                                           \
+        M_DOTS((XR) + M_XSTEP * j, acc)                                        \
+        PART += float(acc) * sc;                                               \
+    }
+#define M_BIAS(I, XR, OROW, SUMB, PART)                                        \
+    PART -= ws * float(xBlockSums[(SUMB) + b]);
+#define M_WRITE(I, XR, OROW, SUMB, PART)                                       \
+    {                                                                          \
+        float total = subgroupAdd(PART);                                       \
+        if (subgroupElect()) {                                                 \
+            y[(OROW) * pc.M + row] = total * pc.xScale;                        \
+        }                                                                      \
+    }
+
+#define M_ROW0(SITE) SITE(0u, xrow0, orow0, sum0, part0)
+#if MROWS >= 2
+#define M_ROW1(SITE) SITE(1u, xrow1, orow1, sum1, part1)
+#else
+#define M_ROW1(SITE)
+#endif
+#if MROWS >= 3
+#define M_ROW2(SITE) SITE(2u, xrow2, orow2, sum2, part2)
+#else
+#define M_ROW2(SITE)
+#endif
+#if MROWS >= 4
+#define M_ROW3(SITE) SITE(3u, xrow3, orow3, sum3, part3)
+#else
+#define M_ROW3(SITE)
+#endif
+#if MROWS >= 5
+#define M_ROW4(SITE) SITE(4u, xrow4, orow4, sum4, part4)
+#else
+#define M_ROW4(SITE)
+#endif
+#if MROWS >= 6
+#define M_ROW5(SITE) SITE(5u, xrow5, orow5, sum5, part5)
+#else
+#define M_ROW5(SITE)
+#endif
+#if MROWS >= 7
+#define M_ROW6(SITE) SITE(6u, xrow6, orow6, sum6, part6)
+#else
+#define M_ROW6(SITE)
+#endif
+#if MROWS >= 8
+#define M_ROW7(SITE) SITE(7u, xrow7, orow7, sum7, part7)
+#else
+#define M_ROW7(SITE)
+#endif
+#define M_ROWS(SITE)                                                           \
+    M_ROW0(SITE) M_ROW1(SITE) M_ROW2(SITE) M_ROW3(SITE)                        \
+    M_ROW4(SITE) M_ROW5(SITE) M_ROW6(SITE) M_ROW7(SITE)
+
+void main() {
+    // One workgroup is one weight row of one expert against MROWS activation
+    // rows. Every slot of a group names the same expert — the host guarantees
+    // it — so the bank row comes from the first slot and the others contribute
+    // only their token and output rows.
+    uint slot = pc.groupBase + gl_WorkGroupID.y * uint(MROWS);
+    uint row = gl_WorkGroupID.x;
+    uint wrow = groups[slot].x + row;
+    if (row >= pc.M) {
+        return;
+    }
+    uint loadsPerRow = pc.N / WEIGHTS_PER_LOAD;
+    uint blocksPerRow = pc.N >> pc.logBlock;
+    uint scaleBase = wrow * (pc.ldw >> pc.logBlock);
+    M_ROWS(M_SLOT)
+
+    for (uint j = LANE; j < loadsPerRow; j += LANES) {
+#if VEC >= 4
+        uint wbase = wrow * (pc.ldw >> 5u) + WVEC4S * j;
+#else
+        uint wbase = wrow * (pc.ldw >> 3u) + j;
+#endif
+        M_LOAD_W
+        // One scale for the whole step, as in the unblocked kernel, and one
+        // for every slot: the weights are shared, so the scale is too.
+        float sc = float(wScales[scaleBase + ((j * WEIGHTS_PER_LOAD) >> pc.logBlock)]);
+        M_ROWS(M_STEP)
+    }
+
+    // The +8 bias, per slot: the weight scale is shared and the block sum is
+    // the slot's own, so the shared half is hoisted out of the instantiation.
+    for (uint b = LANE; b < blocksPerRow; b += LANES) {
+        float ws = 8.0 * float(wScales[scaleBase + b]);
+        M_ROWS(M_BIAS)
+    }
+
+    M_ROWS(M_WRITE)
+}
+#else
 
 void main() {
 #if GROUPED
@@ -282,3 +489,4 @@ void main() {
 #endif
     }
 }
+#endif

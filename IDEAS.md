@@ -42,6 +42,17 @@ merges already fills the machine (the barrier's *drain* is 1163 ns against
 unpadded stride wins at both shapes, including `down`'s gcd-64 row, which
 §3.5's [128, 256] plateau says should be the slow end.
 
+**§1.9 gave that kernel an M block**, which is the one thing §1.8 said it was
+missing, and it turns decode's *throughput* end into a separate answer from
+its latency end. `MROWS` routed pairs of one expert sharing a workgroup's
+weight loads is worth **1.39-1.66x at 256 sequences in flight** and **0.39x at
+one row per expert**, so the block has to be chosen from the routing rather
+than tuned once. What it takes off is the cache and not the bus: unblocked at
+five rows per expert the kernel asks for 746 GB/s — 3.2x the bus — and DRAM
+underneath runs at 148, which is the measurement that says an expert's
+duplicate pairs were never free. Blocked, DRAM reaches 206 GB/s, 87% of the
+bus, and a 256-sequence batch's FFN runs at **694 tok/s against 212 at 16**.
+
 **§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
 more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
 and 45% of the measured WMMA ceiling**, up from 8%. Two of its sub-hypotheses were wrong in
@@ -794,7 +805,9 @@ at last, and it lands *far* below the M=16 a tile can hold — because the
 comparison is not "one row against sixteen" but "one row against sixteen rows
 of the same expert", which routing only supplies at batch. The fix is not the
 GEMM: it is an M-blocked GEMV (several activation rows against one weight row,
-one extra accumulator each), which is not built.
+one extra accumulator each), which **§1.9 has since built** — it takes this
+t=64 `down` cell from the 1.00x tie above to 1.16x, and the tie itself moves
+out to 5 rows per expert.
 
 **Finding 3: grouping is worth 1.29-1.81x, and at decode it is the barrier,
 not occupancy.** §3.5 tied the grouped GEMM's 1.1-4.1x to how many workgroups
@@ -885,12 +898,166 @@ one dispatch per projection per layer, no gather pass at all (the gather exists
 in the GEMM path only because a coopmat fragment reads 16 *consecutive* rows;
 a subgroup reads whichever row the table names), and do not pad the bank.
 Switch to the grouped GEMM when routing gives an expert more than ~1.2 rows,
-or — better, and not built — give the GEMV an M block.
+or — better — give the GEMV an M block, which §1.9 has now built and which
+moves that crossover to 5 rows on one of the two projections and past it on
+the other.
 
 **Effort**: medium (done). **Value**: high — it is the decode half of
 `GOALS.md`'s text-generation goal, it is 1.75x on a phase that is 41% of a
 token's bytes, and it retires the last measurement in this file that was
 standing in for a kernel that did not exist.
+
+### 1.9 An M block for the grouped GEMV — **DONE** ✅, **1.66x at a serving batch, and what it takes off is the cache, not the bus**
+**Hypothesis** (§1.8 finding 2, the item at the top of this file's Next list):
+the grouped GEMV runs one workgroup grid per routed *pair*, so two tokens
+routed to the same expert read that expert's whole 4-bit matrix twice, while
+one cooperative-matrix tile amortizes 16-64 rows over one read. §1.8 measured
+the crossover back to the GEMM at **1.2 rows per expert** — the `down`
+projection ties at t=64 — and named the fix: several activation rows against
+one weight row, one extra int32 accumulator and one extra activation-row
+pointer each. Expected: the GEMV's 1.8-2.0x holds out to the batches a serving
+engine actually decodes at.
+
+**Change**: `gemv_w4a8.comp` took an `MROWS` knob on the grouped arm. A
+*group* is `MROWS` consecutive table slots naming one expert; a workgroup
+loads that expert's weight row once per step and dots it against `MROWS`
+activation rows, each with its own accumulator, activation base, block-sum
+base and output row. An expert whose routed count is not a multiple of `MROWS`
+gets a short group padded with slots that repeat the last real pair's
+activation row and write a scratch output row, so the inner loop stays
+branchless. Four builds (VEC=4 at MROWS 2/4/8, VEC=8 at MROWS=2); MROWS=1 is
+textually the previous file and all eighteen existing binaries are
+`cmp`-identical. The decode sweep gained **t=256**, where routing gives an
+expert 5.05 rows — the first batch in the list with something for a block of 4
+to amortize. `bench/ops_moe_gemv.go`, `results/moe.csv`.
+
+**Finding 1: the block pays exactly in proportion to what routing gives it,
+and the sign flips at about 1.7 rows per expert.** Against the same VEC at
+MROWS=1, best cell per layer:
+
+| pairs/expert | batch | gate_up MROWS=2 | 4 | 8 | down MROWS=2 | 4 | 8 |
+|---|---|---|---|---|---|---|---|
+| 1.00 | 1 | 0.92x | 0.64x | 0.41x | 0.98x | 0.69x | **0.39x** |
+| 1.00 | 4 | 0.96x | 0.81x | 0.62x | 0.95x | 0.75x | 0.52x |
+| 1.15 | 16 | 1.01x | 0.99x | 0.91x | 0.99x | 0.85x | 0.67x |
+| 1.72 | 64 | 1.06x | **1.07x** | 1.00x | **1.17x** | 1.07x | 0.81x |
+| 5.05 | 256 | 1.21x | 1.29x | **1.39x** | 1.47x | **1.66x** | 1.65x |
+
+The best block is the one nearest the rows routing supplies, and the penalty
+for over-blocking is steep and monotone: at one row per expert an MROWS=8
+kernel does eight slots of work for one pair's worth of output and takes 2.4x
+as long. There is no free setting — `MROWS` is a routing-dependent choice, not
+a tuning constant.
+
+**Finding 2, the mechanism: the block removes *cache* traffic, and at batch
+that was the binding constraint rather than DRAM.** The rates the two columns
+report are the whole story (t=256, 512 experts touched, 428 MB distinct per
+projection either way):
+
+| layer | MROWS | groups | issued GB/s | distinct GB/s | ms |
+|---|---|---|---|---|---|
+| gate_up | 1 | 2560 | **746** | 148 | 2.898 |
+| gate_up | 2 | 1407 | 496 | 179 | 2.395 |
+| gate_up | 4 | 829 | 312 | 191 | 2.245 |
+| gate_up | 8 | 544 | 221 | **206** | **2.078** |
+| down | 1 | 2560 | 369 | 73 | 5.860 |
+| down | 2 | 1407 | 298 | 107 | 3.993 |
+| down | 4 | 829 | 199 | **121** | **3.526** |
+| down | 8 | 544 | 129 | 120 | 3.555 |
+
+Unblocked, the kernel asks for **746 GB/s** — 3.2x the 236 GB/s bus — and DRAM
+underneath it runs at **148**, 63% of the bus. Four fifths of the requests are
+re-reads of an expert a previous pair already pulled in, the MALL serves them
+at roughly the 750-965 GB/s §5.1b measured for a cache-resident read, and
+*that* rate is what sets the time. Blocking to MROWS=8 cuts the issue by 4.7x
+and DRAM rises to **206 GB/s, 87% of the bus**. So the answer to "are an
+expert's duplicate pairs free because the cache serves them?" is no: they are
+cheaper than a DRAM read and dearer than a register, and at five duplicates
+deep the cache is the bottleneck. This also retires the reading of §1.8's
+issued column that took 220-377 GB/s as evidence the bus was saturated — it
+was evidence of the opposite.
+
+**Finding 3: a pad slot costs a tenth of a pair, which is why the penalty
+curve is as shallow as it is.** At t=1 and t=4 every expert has exactly one
+routed pair, so an `MROWS=m` build reads the same weights as MROWS=1 and does
+`m` slots of work — a controlled measurement of a slot with the weight traffic
+held fixed. Fitting `T = groups*w + slots*s` at t=4 gives **w = 1.92 µs and
+s = 0.182 µs per gate_up group/slot (10.5:1)** and **w = 2.53 µs, s = 0.390 µs
+at down (6.5:1)**. A group is one expert's 845 KB of weights through 640 or
+2560 output rows; a slot is one more accumulator, one more activation row
+(cache-hot) and one more fp32 output row. So the rule an engine needs is
+arithmetic: blocking pays as soon as it removes one group per 6-10 pads it
+creates, which at Poisson-ish routing means **`MROWS` ≈ the mean rows per
+expert**, and erring low is much cheaper than erring high.
+
+Note what this says about the slot cost itself: down's slot is 2.1x gate_up's
+where its output rows are 4x and its reduction length is a quarter. The cost
+per slot is therefore neither the dot products (which would order it the other
+way) nor purely the writes — it sits between, which is what a fixed
+per-output-row cost (a `subgroupAdd` and a store, both independent of K) plus
+a small K-proportional part looks like. That is the same suspect §1.8's open
+cell has: `down` reads 198 GB/s against gate_up's 235 for identical bytes, and
+it is the shape with 4x the output rows.
+
+**Finding 4: the crossover with the GEMM moves out by 4x, and it is now a
+per-projection decision.** Best GEMV (blocked or not) against best Q4 grouped
+GEMM, same routing:
+
+| batch | pairs/expert | gate_up | down | GEMV kernel |
+|---|---|---|---|---|
+| 1 | 1.00 | 2.76x | 2.35x | unblocked |
+| 4 | 1.00 | 3.26x | 1.79x | unblocked |
+| 16 | 1.15 | 2.04x | 1.31x | `v4_m2` at gate_up |
+| 64 | 1.72 | 1.94x | **1.16x** (was 1.00x) | `v4_m4`, `v4_m2` |
+| 256 | 5.05 | **1.70x** | **0.77x** | `v4_m8`, `v4_m4` |
+
+The `down` tie §1.8 measured at t=64 is now a 1.16x win, and the GEMV holds
+both projections out to 1.72 rows per expert. At 5.05 it splits: gate_up stays
+1.70x ahead, `down` goes to the GEMM. The reason is visible in finding 2's
+table — a 16-row tile covers all 5.05 of an expert's rows in *one* pass, so
+the GEMM's groups equal its experts, while an MROWS=4 block still needs 1.62
+passes and MROWS=8 pays 1792 pads to get to 1.06. The M block is a coarser
+instrument than a tile: it is a compile-time constant against a per-expert
+count, and the tile rounds up for free.
+
+**Finding 5: what this is worth to a serving engine.** The FFN alone, all 48
+blocks, per token of the batch:
+
+| sequences in flight | GEMV block | x48 layers | FFN tok/s | GEMM tok/s | kernel |
+|---|---|---|---|---|---|
+| 1 | 0.041 ms | 1.98 ms | 504 (MALL) | 196 | unblocked |
+| 16 | 1.573 ms | 75.5 ms | 212 | 120 | `v4_m2` |
+| 64 | 4.403 ms | 211 ms | 303 | 185 | `v4_m4` |
+| 256 | 7.681 ms | 369 ms | **694** | 546 | `v4_m8` |
+
+At 256 sequences the FFN is 694 tok/s against 212 at 16, because the 1.18 GB a
+token's experts cost is being shared: the distinct weight traffic per pass
+stops growing once routing touches all 512 experts, and everything after that
+is free. The t=1 row is the MALL flattering an 8 MB working set, as always.
+
+**Finding 6: the single-stream decode budget is unchanged.** The headline
+§1.8 set — one cold token's MoE FFN at **5.43 ms over 48 layers, 184 tok/s,
+92% of the 5.00 ms bus floor** — is the same number with the block available
+(it picks `v4_m2` at 1.15 rows per expert, worth 1.01x). The M block is a
+throughput lever, not a latency one, which is what finding 1's top rows say:
+at one row per expert there is nothing to amortize and the pads cost.
+
+**What this changes for the engine**: keep one build per `MROWS` in {1, 2, 4,
+8} and pick per dispatch from the routing's mean rows per expert — 1 below
+~1.5, then the nearest block at or below the mean. Past ~5 rows per expert,
+send `down` to the grouped GEMM and keep `gate_up` on the blocked GEMV; that
+is two kernels for one FFN, and it is worth 1.7x on the half that stays.
+
+**Still open**: `down`'s per-output-row cost, now with a second measurement
+pointing at it (§1.8's open cell, and this section's finding 3). The probe both
+suggest is the same one: give a workgroup several *output* rows rather than
+several activation rows — the `ROWS` knob the non-grouped kernel already has,
+which `GROUPED` currently forbids.
+
+**Effort**: low (done — one `-D`, a table-builder change and four binaries).
+**Value**: high at batch, zero at a single stream: 1.39-1.66x at 256 sequences,
+1.07-1.17x at 64, and it is what lets one kernel serve both the latency and
+the throughput end of decode.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
@@ -2829,23 +2996,40 @@ its rows contiguous. That also closes the "K=640 is explained, stop padding it"
 item this list was carrying separately, and the load-width item with it: at the
 expert shapes `VEC` is worth 3-5%, exactly as §3.4 predicted.
 
+**§1.9 is done**, the item that stood here, and it settles the M block as a
+*throughput* lever and nothing else. `MROWS` activation rows against one
+weight row is worth **1.39-1.66x at 256 sequences in flight**, 1.07-1.17x at
+64, a wash at 16 and a **0.39x disaster** at one row per expert, where an
+over-blocked kernel does eight slots of work for one pair's output. The best
+block is the one nearest the rows routing actually supplies, and the reason it
+has to be chosen rather than tuned is a fitted cost model that is worth
+carrying: a group (one expert's 845 KB through all its output rows) costs
+**6.5-10.5x what a slot costs**, so blocking pays as soon as it removes one
+group per 6-10 pads it creates. The mechanism is not the one the item was
+promoted on. What the block removes is **cache** traffic: unblocked at 5.05
+rows per expert the kernel asks for **746 GB/s** — 3.2x the bus — while DRAM
+underneath it runs at 148, so the MALL serving the four-fifths of requests
+that are re-reads *is* the bottleneck; blocked, issue falls 4.7x and DRAM
+rises to **206 GB/s, 87% of the bus**. It moved the GEMM crossover out by 4x
+and split it by projection: `down`'s t=64 tie is now a 1.16x win, but at 5.05
+rows a 16-row tile covers an expert in one pass where an `MROWS=4` block needs
+1.62, so `down` goes to the GEMM there and `gate_up` stays 1.70x ahead of it.
+
 **Next:**
-- **Give the grouped GEMV an M block, which is the crossover §1.8 measured.**
-  It runs one grid per routed *pair*, so two tokens on one expert read its
-  weights twice; a tile amortizes them over 16-64 rows, and at 1.72 pairs per
-  expert the down projection already ties. Several activation rows against one
-  weight row — one extra int32 accumulator and one extra x-row pointer each,
-  `MROWS` as a `-D` — would hold the GEMV's 1.8-2.0x out to the batches a
-  serving engine actually decodes at, and it is the cheapest item on this list.
-  `GROUPED` currently forbids `ROWS > 1` for an unrelated reason (it addresses
-  one row per workgroup), so the two knobs want thinking about together.
 - **Explain the down projection's 198 GB/s against gate_up's 235**, for
   identical bytes per expert. It launches 4x the workgroups, each a quarter as
   long, and issues 4x the output writes. §1.8 killed the obvious explanation:
   at VEC=4 its 640-nibble row is 20 lane-steps for a 64-lane wave, but the
   wave32 arms — 20 steps over 32 lanes — measure within 1%. Candidates left are
   the workgroup count and the write pattern; the probe is a build that gives
-  one workgroup several output rows.
+  one workgroup several output rows. **§1.9 has narrowed it by half**: its pad
+  slots price one more output row at constant weight traffic, and down's slot
+  costs 2.1x gate_up's where its rows are 4x as many and its reduction a
+  quarter as long — an ordering the dot products get backwards and a fixed
+  per-output-row cost (one `subgroupAdd`, one store) gets right. The probe is
+  now the same one from both directions: the `ROWS` knob the non-grouped
+  kernel already has, which `GROUPED` forbids, and which would amortize that
+  fixed cost over several rows instead of several tokens.
 - **§2.2's own two leftovers, both cheap and both attribution rather than
   gain.** The scale plane's layout — 1.24x with no mechanism attached,
   between two binaries that are instruction-for-instruction identical, which
@@ -3007,5 +3191,11 @@ that LDS tile must have its rows padded off the 32-bank rotation, for
 that are instruction-for-instruction identical; and §5.1b's stride window
 stops paying the moment the kernel stops being bandwidth-bound, because the
 padding that buys it still costs bytes. Prefill is now a solved format
-problem as well as a solved kernel one, and what is left unmeasured is
-decode's own grouped kernel.**
+problem as well as a solved kernel one, and decode's own grouped kernel — the
+W4A8 GEMV with the same table, 1.3-3.3x the GEMM it was being measured with
+and 91% of its bus floor at a single stream — now has the M block that
+separates its throughput end from its latency end: `MROWS` pairs of one expert
+per workgroup is 1.66x at 256 sequences and 0.39x at one, because what it
+takes off is not the bus but the cache serving four-fifths of a batched
+kernel's requests, and the block has to be read off the routing rather than
+compiled in once.**

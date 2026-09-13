@@ -311,6 +311,32 @@ var GEMVW4A8GroupedVec4W32 []byte
 //go:embed gemv_w4a8_g_v8_w32.spv
 var GEMVW4A8GroupedVec8W32 []byte
 
+// The M-blocked grouped builds (IDEAS §1.8 finding 2, the "not built" fix):
+// -DMROWS=n gives one workgroup n activation rows against one weight row, so
+// an expert's weights are read once per n routed pairs instead of once per
+// pair. The sweep is 2/4/8 at the width that won the unblocked arm at both
+// expert shapes (VEC=4), plus one VEC=8 cell to say whether the load width
+// and the M block interact — at MROWS=8 a step holds eight slots' activation
+// uvec4s live at once, so this axis spends registers where the load width
+// spends them too.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=2 -o gemv_w4a8_g_v4_m2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=4 -o gemv_w4a8_g_v4_m4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=8 -o gemv_w4a8_g_v4_m8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=8 -DMROWS=2 -o gemv_w4a8_g_v8_m2.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g_v4_m2.spv
+var GEMVW4A8GroupedVec4M2 []byte
+
+//go:embed gemv_w4a8_g_v4_m4.spv
+var GEMVW4A8GroupedVec4M4 []byte
+
+//go:embed gemv_w4a8_g_v4_m8.spv
+var GEMVW4A8GroupedVec4M8 []byte
+
+//go:embed gemv_w4a8_g_v8_m2.spv
+var GEMVW4A8GroupedVec8M2 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp
