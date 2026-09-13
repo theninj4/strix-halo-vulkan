@@ -48,8 +48,17 @@
 //    other divisor (weights per load) is a compile-time power of two.
 //
 // VEC selects the load width: 1 = one uint (8 weights) per lane per step,
-// 4 = one uvec4 (32 weights). The wide variant is IDEAS.md §1.3's "load"
-// half — fewer, larger memory instructions for the same bytes.
+// 4 = one uvec4 (32 weights), 8 = two uvec4 (64), 16 = four uvec4 (128).
+// This is IDEAS.md §1.3's "load" half — fewer, larger memory instructions
+// for the same bytes — and past VEC=4 it is IDEAS §1.7. The
+// quantity that turned out to matter is how much of one weight *row* a wave
+// asks for in a single step: `WAVE * VEC * 4` bytes, against a row of
+// `pc.N / 2`. When one step covers the whole row the kernel reads at the
+// full DRAM bus; when it takes several steps it does not. So the right VEC
+// for a given N is the one that makes those equal — VEC=4 at N=2048, 8 at
+// N=4096, 16 at N=8192, all at wave64.
+//
+// Legal values are 1, 4, 8 and 16.
 
 #ifndef VEC
 #define VEC 1
@@ -58,18 +67,51 @@
 // Weights consumed per lane per loop step. Compile-time, and a power of
 // two, so `pc.N / WEIGHTS_PER_LOAD` is a shift.
 #define WEIGHTS_PER_LOAD (8u * uint(VEC))
-// Activation words (4 int8 lanes each) consumed per lane per loop step.
-#define XWORDS_PER_LOAD (2u * uint(VEC))
+// uvec4s of weights, and of activations, per lane per loop step. Only the
+// wide (VEC >= 4) path uses these.
+#define WVEC4S (uint(VEC) / 4u)
+#define XVEC4S (uint(VEC) / 2u)
 
-// One workgroup = one subgroup = one output row, so this must match the size
-// the host pins the pipeline to with VK_EXT_subgroup_size_control
-// (IDEAS §6.2); a mismatch would have subgroupAdd reduce half a row.
+// One subgroup = one output row, so WAVE must match the size the host pins
+// the pipeline to with VK_EXT_subgroup_size_control (IDEAS §6.2); a mismatch
+// would have subgroupAdd reduce half a row.
 #ifndef WAVE
 #define WAVE 64
 #endif
-layout(local_size_x = WAVE) in;
 
-#if VEC == 4
+// ROWS is how many subgroups — and therefore how many output rows — share a
+// workgroup. The default 1 is the original kernel, where the workgroup *is*
+// the subgroup. ROWS=2 was added for IDEAS §1.7: it restores a wave32
+// pipeline to the 64 threads per workgroup (and half the workgroup count)
+// that wave64 has, so that "half the lanes sweeping each row" can be
+// separated from "twice as many workgroups in the grid" — the two things the
+// wave size changes at once. It turned out to move nothing anywhere except
+// the single cell where VEC is one step short of covering a row, and it is
+// kept as the control that showed that. Requires REQUIRE_FULL_SUBGROUPS,
+// which the host sets whenever it pins a size, so every subgroup here is full
+// and takes the `row >= pc.M` branch together.
+#ifndef ROWS
+#define ROWS 1
+#endif
+layout(local_size_x = (WAVE * ROWS)) in;
+
+// Which lane of which row this invocation is. Macros rather than locals
+// because binding them to a variable reads the builtin a few instructions
+// earlier, which changes nothing about the kernel but does change the
+// SPIR-V; as macros, adding ROWS left every pre-existing binary
+// byte-identical (`cmp`-verified at the time). The later VEC=16 work gave
+// that up deliberately — the wide path became the macro below — so the
+// VEC=1 and VEC=4 binaries are no longer the committed ones, and
+// results/gemv{,_cold}.csv were regenerated against the current source.
+#if ROWS > 1
+#define LANE gl_SubgroupInvocationID
+#define LANES gl_SubgroupSize
+#else
+#define LANE gl_LocalInvocationID.x
+#define LANES gl_WorkGroupSize.x
+#endif
+
+#if VEC >= 4
 layout(binding = 0) readonly buffer W { uvec4 w[]; };   // M x (N/32) uvec4
 layout(binding = 2) readonly buffer X { uvec4 x[]; };   // N/16 uvec4
 #else
@@ -87,8 +129,34 @@ layout(push_constant) uniform PC {
     float xScale;
 } pc;
 
+// One uvec4 of weights (32 of them) against the two uvec4 of activations
+// that line up with it, accumulated into `acc`. Instantiated once per group
+// by the step body rather than written as a `for (g < WVEC4S)` loop, because
+// glslc's -O leaves a loop like that rolled and a rolled group loop has to
+// index the operands dynamically — which spills them to scratch, the one
+// thing a load-width arm must not do. Reads `w`, `x`, `wbase`, `xbase` and
+// `acc` from the scope it is used in.
+#define W4A8_GROUP(G)                                                          \
+    {                                                                          \
+        uvec4 pk = w[wbase + (G)];                                             \
+        uvec4 xa = x[xbase + 2u * (G)];                                        \
+        uvec4 xb = x[xbase + 2u * (G) + 1u];                                   \
+        acc = dotPacked4x8AccSatEXT(int(xa.x), pk.x & 0x0F0F0F0Fu, acc);       \
+        acc = dotPacked4x8AccSatEXT(int(xa.y), (pk.x >> 4u) & 0x0F0F0F0Fu, acc); \
+        acc = dotPacked4x8AccSatEXT(int(xa.z), pk.y & 0x0F0F0F0Fu, acc);       \
+        acc = dotPacked4x8AccSatEXT(int(xa.w), (pk.y >> 4u) & 0x0F0F0F0Fu, acc); \
+        acc = dotPacked4x8AccSatEXT(int(xb.x), pk.z & 0x0F0F0F0Fu, acc);       \
+        acc = dotPacked4x8AccSatEXT(int(xb.y), (pk.z >> 4u) & 0x0F0F0F0Fu, acc); \
+        acc = dotPacked4x8AccSatEXT(int(xb.z), pk.w & 0x0F0F0F0Fu, acc);       \
+        acc = dotPacked4x8AccSatEXT(int(xb.w), (pk.w >> 4u) & 0x0F0F0F0Fu, acc); \
+    }
+
 void main() {
+#if ROWS > 1
+    uint row = gl_WorkGroupID.x * uint(ROWS) + gl_SubgroupID;
+#else
     uint row = gl_WorkGroupID.x;
+#endif
     if (row >= pc.M) {
         return;
     }
@@ -97,37 +165,30 @@ void main() {
     uint scaleBase = row * blocksPerRow;
 
     float partial = 0.0;
-    for (uint j = gl_LocalInvocationID.x; j < loadsPerRow; j += gl_WorkGroupSize.x) {
-        // Gather this step's activation words. A whole load's worth of
-        // weights sits inside one quantization block (block >=
-        // WEIGHTS_PER_LOAD is required), so a single int32 accumulator can
-        // hold the step and the fp16 scale is applied once per step rather
-        // than once per weight.
-        uint xs[XWORDS_PER_LOAD];
-#if VEC == 4
-        uvec4 xa = x[2u * j];
-        uvec4 xb = x[2u * j + 1u];
-        xs[0] = xa.x; xs[1] = xa.y; xs[2] = xa.z; xs[3] = xa.w;
-        xs[4] = xb.x; xs[5] = xb.y; xs[6] = xb.z; xs[7] = xb.w;
-        uvec4 packed = w[row * loadsPerRow + j];
-#else
-        xs[0] = x[2u * j];
-        xs[1] = x[2u * j + 1u];
-        uint packed = w[row * loadsPerRow + j];
-#endif
-
+    for (uint j = LANE; j < loadsPerRow; j += LANES) {
+        // A whole step's worth of weights sits inside one quantization block
+        // (block >= WEIGHTS_PER_LOAD is required), so a single int32
+        // accumulator holds the step and the fp16 scale is applied once per
+        // step rather than once per weight.
         int acc = 0;
-        for (uint c = 0u; c < uint(VEC); ++c) {
-#if VEC == 4
-            uint v = packed[c];
+#if VEC == 1
+        uint packed = w[row * loadsPerRow + j];
+        // Low nibbles hold elements n..n+3, high nibbles n+4..n+7 — exactly
+        // the two consecutive activation words.
+        acc = dotPacked4x8AccSatEXT(int(x[2u * j]), packed & 0x0F0F0F0Fu, acc);
+        acc = dotPacked4x8AccSatEXT(int(x[2u * j + 1u]), (packed >> 4u) & 0x0F0F0F0Fu, acc);
 #else
-            uint v = packed;
+        uint wbase = WVEC4S * (row * loadsPerRow + j);
+        uint xbase = XVEC4S * j;
+        W4A8_GROUP(0u)
+#if VEC >= 8
+        W4A8_GROUP(1u)
 #endif
-            // Low nibbles hold elements n..n+3, high nibbles n+4..n+7 —
-            // exactly the two activation words xs[2c], xs[2c+1].
-            acc = dotPacked4x8AccSatEXT(int(xs[2u * c]), v & 0x0F0F0F0Fu, acc);
-            acc = dotPacked4x8AccSatEXT(int(xs[2u * c + 1u]), (v >> 4u) & 0x0F0F0F0Fu, acc);
-        }
+#if VEC >= 16
+        W4A8_GROUP(2u)
+        W4A8_GROUP(3u)
+#endif
+#endif
         uint blockIdx = (j * WEIGHTS_PER_LOAD) >> pc.logBlock;
         partial += float(acc) * float(wScales[scaleBase + blockIdx]);
     }
@@ -135,7 +196,7 @@ void main() {
     // Remove the +8 bias the packed nibbles carry: one term per block, and
     // blocksPerRow is far smaller than loadsPerRow, so this loop is noise
     // next to the one above.
-    for (uint b = gl_LocalInvocationID.x; b < blocksPerRow; b += gl_WorkGroupSize.x) {
+    for (uint b = LANE; b < blocksPerRow; b += LANES) {
         partial -= 8.0 * float(wScales[scaleBase + b]) * float(xBlockSums[b]);
     }
 

@@ -8,10 +8,11 @@ import (
 	"strix-halo-vulkan/vk"
 )
 
-// w4a8Variant is one load width of shaders/gemv_w4a8.comp. VEC=1 reads one
-// uint (8 weights) per lane per step, VEC=4 one uvec4 (32 weights) — the
-// same kernel otherwise, so the pair isolates load width (IDEAS §1.3) from
-// everything else the W4A8 path changes.
+// w4a8Variant is one configuration of shaders/gemv_w4a8.comp: a load width
+// (VEC), a subgroup size, and how many subgroups share a workgroup (ROWS).
+// VEC=1 reads one uint (8 weights) per lane per step, VEC=4 one uvec4 (32
+// weights), VEC=8 two (64) — the same kernel otherwise, so the set isolates
+// load width (IDEAS §1.3) from everything else the W4A8 path changes.
 type w4a8Variant struct {
 	name           string
 	spirv          []byte
@@ -20,19 +21,61 @@ type w4a8Variant struct {
 	// default of 64. The kernel reduces a whole row with subgroupAdd, so a
 	// binary built with -DWAVE=32 must be run at 32 and nothing else.
 	waveSize uint32
+	// rowsPerWG is the shader's ROWS: subgroups (and so output rows) per
+	// workgroup. Zero and one both mean the original one-row workgroup. It
+	// only changes the grid width, not the work, so it is not a kernel
+	// flavour so much as a way to hold threads-per-workgroup fixed while the
+	// wave size varies.
+	rowsPerWG int
 }
 
+// The eight W4A8 arms are a 2x2x2 over (wave size) x (load width) x (rows
+// per workgroup), and the reason it is a full factorial rather than a list
+// is IDEAS §6.2: its wave32 VEC=4 arm reads 96% of the DRAM bus against
+// wave64's 89%, reproducibly, and nothing in the file explains it. Halving
+// the wave changes three things at once — lanes sweeping each row, bytes the
+// row asks for per request round, and the width of the grid — and each of
+// the two new knobs pins one of them:
+//
+//   - VEC=8 restores the request round. wave32 at VEC=8 asks for the same
+//     1024 B per row per round as wave64 at VEC=4.
+//   - ROWS=2 restores the workgroup. wave32 with two subgroups per workgroup
+//     has wave64's 64 threads per workgroup and wave64's grid width, with 32
+//     lanes still sweeping each row.
+//
+// The wave64 cells are the controls: if either knob moves wave64 on its own,
+// the effect is not about the wave size at all.
+//
+// VEC=16 is not part of that factorial. It was added after it answered: the
+// quantity that predicts every cell turned out to be how much of one weight
+// row a wave asks for per step, and VEC=16 at wave64 is what makes that a
+// whole row at N=8192 — the shape the target models decode at.
 var w4a8Variants = []w4a8Variant{
 	{name: "subgroup", spirv: shaders.GEMVW4A8, weightsPerLoad: 8},
 	{name: "subgroup_vec4", spirv: shaders.GEMVW4A8Vec4, weightsPerLoad: 32},
-	// IDEAS §6.2 on the kernel that is already at 89% of the DRAM bus, so the
-	// prediction is "no change" — which is worth a row because the wave size
-	// is the one knob here that changes the *access pattern*: 32 lanes
-	// sweeping a row means each lane's stride doubles, and §5.1b's coverage
-	// law prices strides. A move either way is informative; a flat pair is the
-	// falsification test the law asks for.
+	{name: "subgroup_vec8", spirv: shaders.GEMVW4A8Vec8, weightsPerLoad: 64},
+	{name: "subgroup_vec16", spirv: shaders.GEMVW4A8Vec16, weightsPerLoad: 128},
+	{name: "subgroup_vec4_r2", spirv: shaders.GEMVW4A8Vec4Rows2, weightsPerLoad: 32, rowsPerWG: 2},
+	{name: "subgroup_vec8_r2", spirv: shaders.GEMVW4A8Vec8Rows2, weightsPerLoad: 64, rowsPerWG: 2},
+	// IDEAS §6.2's wave32 arms. The VEC=1 pair was the falsification test for
+	// §5.1b's coverage law (it came out flat, 0.98x); the VEC=4 pair is the
+	// 1.07x these four new cells exist to explain.
 	{name: "subgroup_w32", spirv: shaders.GEMVW4A8W32, weightsPerLoad: 8, waveSize: 32},
 	{name: "subgroup_vec4_w32", spirv: shaders.GEMVW4A8Vec4W32, weightsPerLoad: 32, waveSize: 32},
+	{name: "subgroup_vec8_w32", spirv: shaders.GEMVW4A8Vec8W32, weightsPerLoad: 64, waveSize: 32},
+	{name: "subgroup_vec16_w32", spirv: shaders.GEMVW4A8Vec16W32, weightsPerLoad: 128, waveSize: 32},
+	{name: "subgroup_vec4_w32_r2", spirv: shaders.GEMVW4A8Vec4W32Rows2, weightsPerLoad: 32, waveSize: 32, rowsPerWG: 2},
+	{name: "subgroup_vec8_w32_r2", spirv: shaders.GEMVW4A8Vec8W32Rows2, weightsPerLoad: 64, waveSize: 32, rowsPerWG: 2},
+}
+
+// w4a8Groups is the grid width for a W4A8 dispatch: one workgroup per output
+// row, divided by however many rows a workgroup handles. Rounded up, which is
+// why the shader carries its `row >= pc.M` guard.
+func w4a8Groups(M, rowsPerWG int) uint32 {
+	if rowsPerWG < 1 {
+		rowsPerWG = 1
+	}
+	return uint32((M + rowsPerWG - 1) / rowsPerWG)
 }
 
 // runGEMVW4A8 measures y = W*x with 4-bit weights and int8 activations, both
@@ -60,7 +103,7 @@ func runGEMVW4A8(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []
 			if !w4a8BlockOK(block, v.weightsPerLoad) {
 				continue
 			}
-			if err := verifyGEMVW4A8(dev, mod, v.waveSize, block); err != nil {
+			if err := verifyGEMVW4A8(dev, mod, v, block); err != nil {
 				return nil, fmt.Errorf("gemv %s w4a8 block=%d correctness check: %w", v.name, block, err)
 			}
 			for _, n := range sizes {
@@ -150,7 +193,7 @@ func buildGEMVW4A8Buffers(dev *vk.Device, M, N, block int) (bufs w4a8Buffers, xD
 	return
 }
 
-func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, waveSize uint32, block int) error {
+func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, v w4a8Variant, block int) error {
 	n := gemmCorrectnessSize
 	if n%block != 0 {
 		n = block * 2
@@ -166,7 +209,7 @@ func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, waveSize uint32, block
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
 		Buffers:              bufs.list(),
 		PushConstantSize:     16,
-		RequiredSubgroupSize: waveSize,
+		RequiredSubgroupSize: v.waveSize,
 	})
 	if err != nil {
 		return err
@@ -174,7 +217,7 @@ func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, waveSize uint32, block
 	defer pipe.Destroy()
 
 	pc := gemvW4A8PushConstants(M, N, block, bufs.xScale)
-	if _, err := pipe.DispatchTimed(uint32(M), 1, 1, 1, pc); err != nil {
+	if _, err := pipe.DispatchTimed(w4a8Groups(M, v.rowsPerWG), 1, 1, 1, pc); err != nil {
 		return err
 	}
 	got := bufs.y.ReadFloat32(M)
@@ -206,7 +249,7 @@ func timeGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, v w4a8Variant, M, N, blo
 	defer pipe.Destroy()
 
 	pc := gemvW4A8PushConstants(M, N, block, bufs.xScale)
-	groupsX := uint32(M)
+	groupsX := w4a8Groups(M, v.rowsPerWG)
 
 	ns, clocks, err := TimeDispatch(pipe, groupsX, 1, 1, warmup, iters, pc)
 	if err != nil {

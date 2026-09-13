@@ -33,7 +33,83 @@ experiment backlog (~30 items, each with hypothesis / change / expected
 gain / how to measure, and marked up with what has since been measured).
 **`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-### This session: IDEAS §6.2 — wave32, and the payoff landed somewhere else
+### This session: IDEAS §1.7 — the wave32 W4A8 win, explained and superseded
+
+The handoff's item 1 was "explain the wave32 W4A8 win, and see how far it
+goes": §6.2 had measured the DRAM-resident W4A8 decode GEMV at 225.7 of
+236 GB/s at wave32 against 211 at wave64, reproducible to under 1%, specific
+to the `VEC=4` arm, and unexplained — §5.1b's coverage law predicted the
+wrong sign. It named three probes. Two were run and answered it; the third
+was retired by the answer.
+
+**The answer: it was never the wave size.** The quantity that predicts every
+cell is **C, the contiguous run of one weight row that a lane-step holds** =
+`min(WAVE, N/(8·VEC)) · VEC · 4` bytes. Hold C fixed and vary the wave size
+and the bandwidth is identical — at N=8192, `vec8` at wave64 and `vec16` at
+wave32 both hold 2048 B and measure **198.83 and 198.93 GB/s**. The 1.07x is a
+*deficit* in one cell, N=4096 at `VEC=4`, where a wave64 step holds exactly
+half a row so every wave in the grid addresses the same half of the 4 KB
+channel rotation at once; it does not occur at N=2048 or N=8192, and two
+unrelated changes each erase it (`ROWS=2`, and `VEC=8`).
+
+**And the rule that replaces it finished the decode path.** §5.1b's
+`coverage = min(1, C/gcd(stride, 4096))` with the weight row as the stride
+says the bus is reached exactly when a lane-step covers a whole row, i.e.
+**`VEC = N/(8·WAVE)`**. That threshold is hit on the nose at all three
+reduction lengths swept:
+
+| N | best kernel | GB/s | % of the 236 GB/s bus | previous best |
+|---|---|---|---|---|
+| 2048 | `vec4` wave64 | 243.0 | 103% | — (never measured) |
+| 4096 | `vec16` wave32 / `vec8` wave64 | 238.9 / 234.8 | 101% | 225.6 |
+| 8192 | `vec16` wave64 | 234.6 | 99% | 164.3 |
+
+The N=8192 row is the one that matters: it is the shape a real model decodes
+at, the previous kernel got 70% of the bus there, and this is **1.43x**. The
+cache-resident `gemv` sweep gained too, which was not predicted: its best
+W4A8 row at N=4096 goes from 563.5 GB/s to **734.0**, 1.30x. The
+law is exact about the cliff edge and far too pessimistic below it (it
+predicts 3% of peak where the measurement is 57%), which is expected — it was
+derived for one wave's requests, and here thousands of waves on adjacent rows
+cover the rotation between them.
+
+**New code:**
+- `shaders/gemv_w4a8.comp`: `VEC` now accepts 8 and 16 as well as 1 and 4,
+  and the wide path is a `W4A8_GROUP(G)` macro instantiated once per `uvec4`
+  of weights. The macro is not a loop on purpose: a `for (g < VEC/4)` loop
+  survives `glslc -O` rolled, and a rolled group loop indexes its operands
+  dynamically, which puts them in scratch — the one thing a load-width arm
+  must not do. New `ROWS` `-D` puts several subgroups (several output rows) in
+  one workgroup via `gl_SubgroupID`, with `LANE`/`LANES` macros selecting the
+  subgroup-relative or workgroup-relative builtins; they are macros rather
+  than locals so the `ROWS=1` expansion is unchanged.
+- `shaders/shaders.go`: eight new binaries — `_v8`, `_v16`, `_v4_r2`,
+  `_v8_r2` and their `_w32` pairs.
+- `bench/ops_w4a8.go`: the variant table is now a 2x2x2 over (wave size) x
+  (load width) x (rows per workgroup) plus the two `VEC=16` arms, with
+  `w4a8Groups(M, rowsPerWG)` for the grid width.
+- `bench/ops_gemv_cold.go`: `coldCase.rowsPerWG`, threaded to the dispatch.
+
+**Caveat on comparability:** the `VEC=1` and `VEC=4` SPIR-V changed when the
+wide path became a macro (the `xs[]` staging array is gone; RADV's ISA is
+equivalent — same `buffer_load_b128` and `v_dot4` counts, 48 VGPRs, no
+spills). `results/gemv.csv` and `results/gemv_cold.csv` were both regenerated,
+so every row in them is from the current source. The earlier steps of this
+session did hold byte-identity (`cmp`-verified) while `ROWS` was added; it was
+given up deliberately when `VEC=16` needed the macro.
+
+**One residue.** At N=2048 the wave32 `vec8` arm satisfies both clauses of the
+rule — whole row per step, every lane issuing — and still reads 219.2 against
+wave64 `vec4`'s 243.0. At equal C and equal lane occupancy, 64 outstanding
+requests per wave beat 32 by 10%. Not chased further; the engine rule (use
+wave64, pick `VEC = N/512`) is on the right side of it either way.
+
+**Not run, and why:** the third probe §6.2 asked for was the `stride` family
+at both wave sizes, ~14 minutes each. It existed to isolate a wave-size effect
+from everything else a GEMV does. There is no longer a wave-size effect to
+isolate, so it was retired rather than run.
+
+### Previous session: IDEAS §6.2 — wave32, and the payoff landed somewhere else
 
 The handoff's item 1 was §6.2, promoted by §2.7 on a specific argument: the
 best lever in the file stops at the 256-VGPR wave64 budget, and wave32 was
@@ -111,7 +187,7 @@ low instead. Read the pattern across sizes, not any single cell. The
 DRAM-resident `gemv_cold` rows reproduce to under 1% and are the ones to
 trust.
 
-### Previous session: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
+### Two sessions ago: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
 
 The handoff's item 1 was "§2.3's residue, re-aimed by the traversal axis":
 the 1.6x that transposed-B stayed behind row-major at N=4096 **with both
@@ -180,7 +256,7 @@ spends, and WMMA is natively a wave32 shape.
 padded than unpadded (0.88x at N=4096, 0.87x at N=2048, both runs). Every
 other rung on that ladder goes the other way.
 
-### Two sessions ago: IDEAS §5.1b's follow-up — the traversal axis
+### Three sessions ago: IDEAS §5.1b's follow-up — the traversal axis
 
 §5.1b left one access pattern unmeasured and called it the sharpest item in
 the file: **concurrent-but-contiguous requests from *different* waves at an
@@ -292,7 +368,7 @@ It was filed as a 1.3x tidy-up against gathers; it is a defence against a 4x
 that needs no padding to occur. The second escape, when the stride is not the
 engine's to choose, is depth: 4 KB of a row in flight per wave.
 
-### Three sessions ago: IDEAS §5.1b — the strided-bandwidth probe
+### Four sessions ago: IDEAS §5.1b — the strided-bandwidth probe
 
 `IDEAS.md` §5.1b asked for the memory system to be measured directly instead
 of inferred through a GEMM: fixed bytes touched, sweeping (a) the stride
@@ -415,7 +491,7 @@ consequence points the same way as the corollaries above: **"keep it under
   timed batches and keeps the fastest (`strideBatches`); DRAM-resident cases
   reproduce to within 2% either way and are unaffected by that choice.
 
-### Four sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
+### Five sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
 
 `IDEAS.md` §2.3's open question was why the *better* instruction stream is
 2.8x slower: storing B as [N,K] and loading it column-major cuts
@@ -530,7 +606,7 @@ present in every run.
    penalty into a curve the engine can allocate against instead of one
    kernel's anecdote.
 
-### Five sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
+### Six sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
 
 `IDEAS.md`'s largest remaining item is done, and it beat its own forecast.
 **A register-blocked cooperative-matrix GEMM reaches 25.2 TFLOP/s at
@@ -630,7 +706,7 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    the 256-VGPR wave64 limit, not by occupancy, which also makes §6.2
    (wave32) more interesting than it was: WMMA is natively a wave32 shape.
 
-### Six sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
+### Seven sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
 
 The highest-value item in `IDEAS.md` is done, and it delivered more than it
 promised. **W4A8 GEMV — 4-bit weights against int8 activations, both fed to
@@ -707,7 +783,7 @@ the 64MB footprint, where 4-bit weights still fit the 32MB MALL.
    §1.2's "no integer division" is also folded into this kernel: it takes
    `log2(block)` and shifts.
 
-### Seven sessions ago: the §0 "measurement validity" block from IDEAS.md
+### Eight sessions ago: the §0 "measurement validity" block from IDEAS.md
 
 The session that produced `IDEAS.md` implemented its §0 —
 the work that had to happen before optimising against any of the existing
@@ -850,22 +926,16 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
 updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
-§2.7 and §6.2 found. In short:
+§2.7, §6.2 and §1.7 found. In short:
 
-1. **Explain the wave32 W4A8 decode win, and see how far it goes.** §6.2's one
-   engine-relevant result is 211 → 226 GB/s on DRAM-resident W4A8 decode, 89%
-   → 96% of the bus, reproducible to under 1% across three runs — and nothing
-   in this repo explains it. It is specific to the `VEC=4` arm (`VEC=1` is
-   0.98x, i.e. nothing), it runs the *opposite* way to every cache-resident
-   GEMV row, and §5.1b's coverage law predicts the wrong sign (wave32 halves C
-   from 1024 B to 512 B). Three cheap probes, in order: a `VEC=8` arm, to see
-   whether this is really about bytes-per-lane; wave32 with two rows per
-   workgroup, which restores the thread count the cache-resident rows miss and
-   separates "fewer threads" from "shorter wave"; and the `stride` family at
-   both wave sizes, which is the only kernel here that can isolate this from
-   everything else a GEMV does. Worth doing because it is the last 4% of the
-   decode bus, and because a reproducible 1.07x nobody can explain is a
-   mechanism nobody is using deliberately.
+1. **`VEC=32`, when §3.4 says a target model needs it.** §1.7's rule is
+   `VEC = N/512` at wave64 and the kernel stops at `VEC=16`, i.e. N=8192. An
+   N=16384 weight matrix would read at roughly 70% of the bus as things
+   stand, the same way N=8192 did before this session. It is two more
+   `W4A8_GROUP` instantiations and an embed. Not worth doing blind — do §3.4
+   first and find out which N the four models in `GOALS.md` actually decode
+   at, since the whole point of the rule is that the right width is per
+   matrix.
 2. **Finish §2.7's ladder on the other winners.** It was run on `reg64_bt`
    and `reg32_bt` only. `reg64x128` and `wg128x256` are the AI-43/85 shapes
    and already sit at 252 VGPRs with 32 accumulators, so they cannot hoist as
@@ -909,12 +979,15 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
    prefill its number. (The *Q4*-unpack version stays downgraded: there is
    no int8 matrix-rate bonus on this chip, and the winning kernel has no LDS
    tile whose fill cost a cheaper unpack would improve.)
-7. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
-   on W4A8. fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%, where
-   W4A8 now reaches 96%. The traversal work adds a second reason to want
-   them: load width is one of the two things that set C — and §6.2 found load
-   width interacting with wave size on W4A8 in a way nothing predicts, so
-   these two items now want doing together.
+7. **IDEAS §1.3/§1.7 — the load-width rule on the other GEMV kernels.**
+   fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%, where W4A8 now
+   reaches 101% at every N it was swept at. This is no longer "try wider
+   loads and see": §1.7 gives the target width in closed form — make one
+   lane-step cover a whole weight row — and it is format-independent, since
+   it is about bytes of a row, not weights. A W8A8 row is twice the bytes per
+   weight, so its `VEC` is half W4A8's at the same N; an fp16 row is four
+   times, so a quarter. Highest-value item on this list after §3.3/§3.4,
+   because it is a known-size win on kernels that already exist.
 8. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
    and `n / pc.block`) from everything W4A8 did not rewrite: the
    naive/tiled GEMM paths and the old quantized GEMV variants.

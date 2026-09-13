@@ -211,6 +211,63 @@ var GEMVW4A8W32 []byte
 //go:embed gemv_w4a8_v4_w32.spv
 var GEMVW4A8Vec4W32 []byte
 
+// The four cells that complete IDEAS §6.2's follow-up into a 2x2x2 over
+// (wave size) x (load width) x (rows per workgroup). §6.2 measured only the
+// ROWS=1 face of it and found the wave32 VEC=4 decode GEMV reading 96% of
+// the DRAM bus against wave64's 89%, reproducibly and unexplained; the wave
+// size changes three things at once there, and these arms separate them.
+//
+//   - VEC=8 doubles the bytes one lane asks for per step, so wave32 at VEC=8
+//     issues the same 1024 B per row per request round that wave64 does at
+//     VEC=4. If the win is a function of that round size, this cell inherits
+//     wave64's number, not wave32's.
+//   - ROWS=2 puts two subgroups in a workgroup, which gives a wave32
+//     pipeline back the 64 threads per workgroup and half the grid width
+//     that wave64 has, while leaving 32 lanes sweeping each row. If the win
+//     is about workgroup count or scheduling rather than the per-row sweep,
+//     it disappears here.
+//
+// Both knobs are orthogonal to the wave size, so the four wave64 cells are
+// the controls that say whether either does anything on its own.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=8 -o gemv_w4a8_v8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=8 -DWAVE=32 -o gemv_w4a8_v8_w32.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=16 -o gemv_w4a8_v16.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=16 -DWAVE=32 -o gemv_w4a8_v16_w32.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=4 -DROWS=2 -o gemv_w4a8_v4_r2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=4 -DWAVE=32 -DROWS=2 -o gemv_w4a8_v4_w32_r2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=8 -DROWS=2 -o gemv_w4a8_v8_r2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=8 -DWAVE=32 -DROWS=2 -o gemv_w4a8_v8_w32_r2.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_v8.spv
+var GEMVW4A8Vec8 []byte
+
+//go:embed gemv_w4a8_v8_w32.spv
+var GEMVW4A8Vec8W32 []byte
+
+// VEC=16 is the arm the VEC=8 result asked for: at wave64 it puts 4096 B of
+// one row in a single lane-step, which is a whole weight row at N=8192 — the
+// shape the target models actually decode at, and the one N where VEC=8 is
+// still two steps short of the bus.
+
+//go:embed gemv_w4a8_v16.spv
+var GEMVW4A8Vec16 []byte
+
+//go:embed gemv_w4a8_v16_w32.spv
+var GEMVW4A8Vec16W32 []byte
+
+//go:embed gemv_w4a8_v4_r2.spv
+var GEMVW4A8Vec4Rows2 []byte
+
+//go:embed gemv_w4a8_v4_w32_r2.spv
+var GEMVW4A8Vec4W32Rows2 []byte
+
+//go:embed gemv_w4a8_v8_r2.spv
+var GEMVW4A8Vec8Rows2 []byte
+
+//go:embed gemv_w4a8_v8_w32_r2.spv
+var GEMVW4A8Vec8W32Rows2 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp

@@ -19,10 +19,15 @@ the wrong predictions stay visible next to what actually happened.
 **§1.1 (W4A8 GEMV) has since been implemented and run too**, and it
 delivered: 819 GFLOP/s against DRAM-resident weights, **2.4x** the previous
 best decode kernel and **89% of the DRAM bus** — since taken to **96%** by
-pinning the pipeline to wave32 (§6.2), which is a host-side line and not a
-shader change. Decode is now a solved bandwidth problem at 4 bits/weight; see
-§1.1 for what it took, §1.3 for the load-width half of it, and §6.2 for the
-last 7%.
+pinning the pipeline to wave32 (§6.2), and then to **101%** of that measured
+peak, at every reduction length rather than one, by §1.7. Decode is a solved
+bandwidth problem at 4 bits/weight; see §1.1 for what it took, §1.3 for the
+load-width half of it, §6.2 for the wave-size arm, and **§1.7 for the rule
+that finished it**: make one lane-step cover a whole weight row
+(`VEC = N/(8·WAVE)`) and the kernel reads 99-103% of the bus at N=2048, 4096
+and 8192 alike. §6.2's unexplained wave32 1.07x is explained there and turns
+out to be a deficit in one cell rather than a win — and the wave32 pin is
+withdrawn with it.
 
 **§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
 more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
@@ -123,7 +128,7 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 
 | Ceiling | Measured peak | Ops/clk/CU | Best real kernel | Utilisation |
 |---|---|---|---|---|
-| DRAM bandwidth | **236 GB/s** (92% of the 256 GB/s bus) † | — | 236 GB/s | **~100%** ✅ |
+| DRAM bandwidth | **236 GB/s** (92% of the 256 GB/s bus) † | — | 239 GB/s (`gemv_cold` W4A8, §1.7) | **~100%** ✅ |
 | MALL (32 MiB) bandwidth | **805 GB/s** copy, **965 GB/s** pure read † | — | 805 GB/s | **~100%** ✅ |
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
@@ -201,6 +206,13 @@ measurements:
    reaches 211 of 236 GB/s, so decode has gone from "the format that reads
    fewest bytes can't consume them" to "the bus is the limit". The lever
    that remains for decode is the format itself, not the kernel.
+   **[measured] §1.7 then removed the remaining 11%, and the caveat that the
+   211 was one shape's number.** Sizing the load width so that a lane-step
+   covers a whole weight row reads **239 GB/s at N=4096, 243 at N=2048 and
+   235 at N=8192** — 99-103% of this row's measured peak. The N=8192 figure
+   is the one that mattered: the kernel behind the 211 gets **164** there,
+   and N=8192 is the shape a real model decodes at. The lever that remains
+   for decode is now genuinely only the format.
 2. **The matrix cores are ~91% idle.** The best GEMM kernel on this chip
    reaches 4.9 of 55.5 TFLOP/s. The coopmat kernels are nowhere near an
    MMA-issue limit; they are memory-bound because of how they are written
@@ -568,6 +580,145 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 **Effort**: low. **Value**: high — needed to fairly compare W8A8 vs Q4.
 
 ---
+
+### 1.7 Match the load width to the weight row — **DONE** ✅, **and decode reaches the bus at every N**
+**Hypothesis** (promoted out of §6.2, which ended on an unexplained 1.07x):
+the DRAM-resident W4A8 GEMV read 225.7 of 236 GB/s at wave32 against 211 at
+wave64, reproducibly, only in the `VEC=4` arm, and §5.1b's coverage law
+predicted the wrong sign. §6.2 named three cheap probes — a `VEC=8` arm,
+wave32 with two rows per workgroup, and the `stride` family at both wave
+sizes — on the reasoning that the wave size changes three things at once
+(lanes sweeping a row, bytes the row asks for per request round, and the
+width of the grid) and each probe pins one of them.
+**Change**: `gemv_w4a8.comp` took two new `-D`s. `VEC` now accepts 8 and 16
+as well as 1 and 4 (two and four `uvec4` of weights per lane per step; the
+wide path became a `W4A8_GROUP(G)` macro instantiated once per `uvec4`,
+because a `for (g < VEC/4)` loop survives `glslc -O` rolled and a rolled
+group loop indexes its operands dynamically, which is the one thing a
+load-width arm must not do). `ROWS` puts several subgroups — several output
+rows — in one workgroup, so a wave32 pipeline can be given back wave64's 64
+threads per workgroup and wave64's grid width while 32 lanes still sweep each
+row. Both are orthogonal to the wave size, so the wave64 cells are controls.
+`bench/ops_w4a8.go` carries the resulting grid and `runGEMVColdCase` divides
+the dispatch by `rowsPerWG`.
+**Expected**: an attribution for the 1.07x. What came out is an attribution
+*and* a rule that finishes the decode path.
+
+**[measured] It was never the wave size. It is how much of one weight row a
+wave asks for in a single step.** DRAM-resident (256 MB of fp16-equivalent
+weights, 8x the MALL), block=256, GB/s, with **C** = the contiguous run of
+one row that a lane-step holds = `min(WAVE, N/(8·VEC)) · VEC · 4` bytes:
+
+| N (row bytes) | kernel | C | steps/row | GB/s |
+|---|---|---|---|---|
+| 2048 (1024 B) | `vec1` w64 | 256 | 4 | 201.1 |
+| | `vec4` w32 | 512 | 2 | 214.8 |
+| | **`vec4` w64** | **1024** | **1** | **243.0** |
+| 4096 (2048 B) | `vec1` w64 | 256 | 8 | 180.1 |
+| | `vec4` w64 | 1024 | 2 | 210.6 |
+| | `vec4` w32 | 512 | 4 | 221.1 |
+| | `vec8` w32 | 1024 | 2 | 224.9 |
+| | `vec16` w64 (half the wave idle) | 2048 | 1 | 212.3 |
+| | **`vec8` w64** | **2048** | **1** | **234.8** |
+| | **`vec16` w32** | **2048** | **1** | **238.9** |
+| 8192 (4096 B) | `vec1` w32 | 128 | 32 | 134.8 |
+| | `vec1` w64 | 256 | 16 | 157.2 |
+| | `vec4` w32 | 512 | 8 | 161.1 |
+| | `vec8` w32 | 1024 | 4 | 162.3 |
+| | `vec4` w64 | 1024 | 4 | 164.3 |
+| | `vec8` w64 | 2048 | 2 | 198.8 |
+| | `vec16` w32 | 2048 | 2 | 198.9 |
+| | **`vec16` w64** | **4096** | **1** | **234.6** |
+
+Four things fall out of that table.
+
+**1. The best cell at every N is the one where a lane-step covers a whole
+weight row, and it reads the bus.** 243.0, 238.9 and 234.6 GB/s against a
+measured DRAM peak of 236 — 99-103%. The condition is a one-liner: one step
+covers the row when `WAVE · VEC · 4 == N/2`, i.e. **`VEC = N / (8 · WAVE)`**,
+which at wave64 is `VEC = N/512`: 4 at N=2048, 8 at N=4096, 16 at N=8192. The
+previous committed best was 211 GB/s at N=4096 (`vec4` w64) and the kernel had
+never been run at any other N; at N=8192 it was **164**, 70% of the bus, which
+is the number a real model's decode would have got.
+
+**2. It is the coverage law, applied to the right variable.** §5.1b's
+`coverage = min(1, C/gcd(stride, 4096))` is stated for requests in flight; the
+stride here is the weight row, `N/2` bytes, and at these N `gcd(N/2, 4096) =
+N/2`, so the law says full bandwidth exactly when a step holds the whole row.
+That threshold is hit on the nose in all three sweeps. What the law gets wrong
+is everything *below* the threshold, where it is far too pessimistic (it
+predicts 1/32 of peak at N=8192 `vec1` w32; the measurement is 57%) — expected,
+because the law was derived for one wave's requests and here thousands of waves
+on adjacent rows partially cover the rotation between them. So: **the law
+predicts the cliff edge exactly and the slope not at all.** §6.2 said the law
+"predicts the wrong sign" for the wave32 effect. It does, for the wave size.
+It is right about the thing the wave size was standing in for.
+
+**3. Same C, different wave size, same bandwidth — to 0.05%.** At N=8192,
+`vec8` at wave64 and `vec16` at wave32 both hold 2048 B of a row per step, and
+measure **198.83 and 198.93 GB/s**. At N=4096 the two whole-row cells,
+`vec8` w64 and `vec16` w32, measure 234.8 and 238.9. That is the direct
+falsification of §6.2's wave-size reading: hold C fixed and the wave size
+buys nothing.
+
+**4. The 1.07x was a deficit in one cell, not a win in another.** The
+wave32-beats-wave64 inversion occurs at exactly one (N, VEC) pair — N=4096,
+`VEC=4` — and not at N=2048 or N=8192, where wave64 leads at the same VEC. At
+that pair the wave64 kernel takes exactly two steps per row and each step
+holds exactly half of it, so every wave in the grid is addressing the same
+half of the 4 KB rotation at the same time and the other half's channels sit
+idle: §5.1b's mechanism 3, from inside the kernel. Two unrelated changes
+each recover it — `ROWS=2` at wave64 (210.6 → 225.5, and ROWS does nothing
+in any other cell) and `VEC=8` (→ 234.8, which is the bus). The wave32 arm
+was a third. None of them is the fix to reach for; making C the whole row is.
+
+**One more clause the rule needs: every lane must be issuing.** `vec16` at
+wave64 and N=4096 has `loadsPerRow = 32` against 64 lanes, so half the wave
+is idle. Its C is still a whole row, and it still loses — 212.3 against
+234.8 — because it has half as many requests outstanding. The two clauses are
+satisfied together by the same equality, which is why the rule is one line and
+not two.
+
+**Also: this is why wave64 is the default again.** §6.2's engine rule was
+"pin wave32 for the DRAM-resident W4A8 decode GEMV at VEC=4". That is now
+superseded: at every N, once VEC is right for wave64, wave32 is equal
+(N=4096, 238.9 vs 234.8, inside run-to-run spread) or clearly worse (N=2048,
+219.2 vs 243.0 — wave32 satisfies both clauses there and still loses 10%,
+which is the one residue this item leaves behind: at equal C and equal lane
+occupancy, 64 outstanding requests per wave beat 32).
+
+**Committed numbers, and how to reproduce the rest**: `results/gemv_cold.csv`
+holds the default `-coldn 4096`, where the best DRAM-resident decode row is
+now **239.1 GB/s** (`subgroup_vec16_w32`, block=1024) against 225.6 before
+this item and 211 before §6.2. The N=2048 and N=8192 columns of the table
+above are not in that file — one CSV per family means a second N would
+overwrite the first — and come from
+
+    go run ./cmd/bench -resultsdir "" -coldfootprints 256 -coldn 8192 \
+        -blocks 256 -warmup 5 -iters 20 gemv_cold
+
+with `-coldn 2048` for the other. Both reproduce to ~1% across runs; the
+`vec8` w64 cell at N=4096 measured 237.5, 234.8 and 237.8 in three.
+
+**It carries into the cache-resident sweep too, which was not expected.**
+The `gemv` family is MALL-resident at these sizes and §6.2 found wave32
+*costing* 0.58-0.95x on every row of it. Under the new widths the same sweep's
+best W4A8 row at N=4096 goes from **563.5 GB/s** (`vec4`, the committed
+previous best) to **734.0** (`vec16_w32`) — **1.30x**. The rule was derived
+against DRAM and the MALL has no 4 KB channel rotation to miss, so this is
+presumably the plainer half of the same thing (fewer, larger requests per row),
+but it was not predicted and it is not explained here.
+
+**What this changes for the engine**: pick `VEC = N/512` per weight matrix at
+wave64 — it is a compile-time `-D`, so a real engine ships the two or three
+widths its layer shapes need and selects per matrix. The kernel currently
+tops out at `VEC=16`, which is N=8192; an N=16384 matrix would want `VEC=32`
+(eight `uvec4` per lane) and is a two-line extension of the same macro.
+
+**Effort**: low (done). **Value**: high — it closes §6.2's open question, it
+takes the decode path from 70-89% of the DRAM bus to 99-101% *at every shape
+rather than one*, and the 1.39x at N=8192 is on the shape the target models
+actually decode at.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
@@ -1871,6 +2022,17 @@ requests to fill the bus, and the shorter wave wins on something else. Not
 attributed further; §5.1b's coverage law predicts wave32 *worse* here
 (C 1024 B → 512 B), so whatever this is, it is not coverage.
 
+> **[superseded by §1.7]** It is coverage, applied to the right variable. The
+> three probes this section asked for were run, and they say the wave size is
+> not the cause: hold C — the bytes of a weight row one lane-step holds —
+> fixed and vary the wave size, and the bandwidth is the same to 0.05%. The
+> 1.07x is a *deficit* in this cell (N=4096 at `VEC=4`, where a wave64 step
+> holds exactly half a row, so every wave in the grid addresses the same half
+> of the 4 KB rotation at once), not a win in the wave32 one, and it does not
+> occur at N=2048 or N=8192. Raising C to a whole row instead —
+> `VEC = N/(8·WAVE)` — reads 99-103% of the DRAM bus at every N, including
+> 234.6 GB/s at N=8192 where the kernel measured here gets 164. See §1.7.
+
 **4. It also settles §3.7.** The subgroup reductions at N=4096: `shared`
 223.7 GB/s at 256 threads per row, `subgroup` 68.5 at 64, `subgroup_w32` 35.7
 at 32. Halving the wave halves the bandwidth, to 0.52x — the third point on a
@@ -1879,8 +2041,9 @@ variants were latency-bound on too few lanes; this measures it. The fix is
 threads, not reduction ops, and there is nothing wave-size-shaped to tune.
 
 **Engine rule**: it is a per-pipeline knob and the default should stay 64.
-Pin 32 for the DRAM-resident W4A8 decode GEMV at `VEC=4` (1.07x, and it is the
-op that runs once per token per layer), and for a fragment-heavy low-intensity
+~~Pin 32 for the DRAM-resident W4A8 decode GEMV at `VEC=4`~~ — **withdrawn by
+§1.7**: that 1.07x was the `VEC=4` cell being wrong at wave64, and widening
+the load beats both wave sizes. Pin 32 for a fragment-heavy low-intensity
 GEMM tile if one is ever the right shape. Leave it at 64 everywhere else, and
 never pin it on a kernel that spills at 32 — that is the one case where it
 costs 25%.
@@ -1967,18 +2130,30 @@ the fragment-dominated AI-16 GEMM grid gains 1.9-2.1x. It also closed §3.7 as a
 side effect.
 What those eight left behind:
 
+**§1.7 is done**, the item that stood here: the wave32 W4A8 win is explained,
+and explaining it finished the decode path. Two of the three probes it named
+were run (`VEC=8`, later `VEC=16`, and `ROWS=2`) and they agree that the wave
+size was never the cause — hold C, the bytes of a weight row a lane-step
+holds, fixed and vary the wave size and the bandwidth is identical to 0.05%.
+The 1.07x is a deficit in one cell (N=4096 at `VEC=4`), not a win. What
+replaces it is §5.1b's coverage law applied to C: size the load width so one
+lane-step covers a whole row, `VEC = N/(8·WAVE)`, and DRAM-resident decode
+reads **99-103% of the bus at N=2048, 4096 and 8192** — including **234.6
+GB/s at N=8192, 1.43x** the previous kernel at the shape a real model actually
+decodes at. The third probe, the `stride` family at both wave sizes, was
+**not run and is retired**: it existed to isolate a wave-size effect, and
+there is no longer one to isolate.
+
 **Next:**
-- **Explain the wave32 W4A8 win, and see how far it goes.** §6.2's one
-  engine-relevant result — DRAM-resident W4A8 decode at 225.7 of 236 GB/s at
-  wave32 against 211 at wave64 — is reproducible to under 1% and *unexplained*.
-  It is specific to the `VEC=4` arm (at `VEC=1` wave32 is 0.98x, i.e. nothing),
-  it runs the opposite way to every cache-resident GEMV row, and §5.1b's
-  coverage law predicts the wrong sign. The cheap next probes: a `VEC=8` arm,
-  wave32 with two rows per workgroup (which restores the thread count the
-  cache-resident rows miss), and the `stride` family run at both wave sizes,
-  which is the one kernel in the suite that can isolate this from everything
-  else a GEMV also does. Worth doing because it is the last 4% of the decode
-  bus and because a 1.07x nobody can explain is a mechanism nobody is using.
+- **`VEC=32`, if a target model needs it.** §1.7's rule is `VEC = N/512` at
+  wave64 and the kernel stops at `VEC=16`, i.e. N=8192. An N=16384 matrix
+  would read at ~70% of the bus as things stand. Two lines of the same
+  `W4A8_GROUP` macro; worth doing once §3.4 says which N the real models use.
+- **Carry the rule to the other GEMV kernels.** fp16, W8A8 and the
+  `gemv_subgroup` precisions were never given a load width at all, and they
+  sit at 73-75% of their ceilings (§1.3). The rule is format-independent —
+  it is about bytes of a row per lane-step — so each needs the same `VEC`
+  treatment, and W8A8's row is twice as wide per weight, so its `VEC` is half.
 - **Hoist the other winners, and finish §2.7's attribution.** The ladder was
   run on `reg64_bt` and `reg32_bt` only. `reg64x128` and `wg128x256` hold 32
   accumulators and already sit at 252 VGPRs, so they cannot hoist as they
@@ -2048,6 +2223,10 @@ register-blocked WMMA kernel to build its two matmuls out of.
 matrix rate, and no LDS tile to make cheaper), **wave32 as a register-headroom
 lever for the GEMM** (§6.2: the fragment cost halves but the accumulator cost
 does not and the ceiling halves with the wave, so §2.7's winner spills),
+**wave32 as a decode lever** (§1.7: at equal bytes-of-row-per-step the two
+wave sizes measure identically, and wave64 wins outright at N=2048), **the
+`stride` family at both wave sizes** (§6.2 asked for it to isolate a wave-size
+effect; §1.7 removed the effect),
 §4.1 (answered: ~300 ns),
 §4.2/§4.3 (the GPU-side half of the concern is ruled out), the packed-fp16
 half of §1.3 (1.10x, not 2x), the **LDS-staging and multi-wave-workgroup
@@ -2062,12 +2241,14 @@ measured at within 2% of contiguous.
 
 The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
-bytes — and W4A8 now reads 4 bits/weight at 226 of those 236 GB/s once its
-pipeline is pinned to wave32 (§6.2), so
-decode is finished as a kernel problem and continues only as a format
-problem — and the traversal probe that looked most likely to reopen it
-instead confirmed the one-wave-per-row shape reads at the full bus at every
-stride. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
+bytes — and W4A8 now reads 4 bits/weight at 99-103% of that bus at every
+reduction length, once its load width is sized so one lane-step covers a
+whole weight row, `VEC = N/(8·WAVE)` (§1.7); the wave32 pin §6.2 proposed is
+withdrawn, because the 1.07x behind it was one cell being wrong at wave64 and
+not the wave size doing anything. Decode is finished as a kernel problem and
+continues only as a format problem — and the traversal probe that looked most
+likely to reopen it instead confirmed the one-wave-per-row shape reads at the
+full bus at every stride. Prefill was 8% of a measured 55.5 TFLOP/s and is now 51%, bought
 first by raising arithmetic intensity from 8 to 32 FLOP/byte in registers —
 with no shared memory, because the 32 MiB MALL already does that job — and
 then, for free, by moving every operand's row stride 256 B off a multiple of

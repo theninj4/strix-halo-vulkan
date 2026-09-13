@@ -14,14 +14,20 @@ W8A8 and W4A8 (int8 or 4-bit weights against int8 activations, reduced via
 Two kernels here are the current answers for the two shapes inference comes
 in. For **decode** (GEMV, memory-bound), **W4A8**
 (`shaders/gemv_w4a8.comp`): 4-bit weights fed to the packed-int8 dot
-instruction through its mixed-signedness overload, at **226 GB/s against
-DRAM-resident weights — 96% of this machine's 236 GB/s memory bandwidth**,
-2.4x the int8-weight kernel it replaces. The last 7% of that is a host-side
-line and not a shader change: pinning the pipeline to **wave32** with
-`VK_EXT_subgroup_size_control` takes the wide-load arm from 211 GB/s to 226
-(IDEAS §6.2), reproducible to under 1% across runs. It is worth nothing at the
-narrow load width and it *costs* 0.6-0.9x on every cache-resident GEMV, so it
-is a per-pipeline knob rather than a default. For **prefill** (GEMM,
+instruction through its mixed-signedness overload, at **239 GB/s against
+DRAM-resident weights — 101% of this machine's 236 GB/s measured memory
+bandwidth**, 2.4x the int8-weight kernel it replaces. The last 13% of that is
+one compile-time constant. Size the load width so that a single lane-step
+covers a whole weight row — `VEC = N/(8·WAVE)`, i.e. `uvec4` at N=2048, two
+at N=4096, four at N=8192 for a wave64 pipeline — and the kernel reads
+**99-103% of the bus at every one of those N**: 243, 239 and 235 GB/s. Get it
+wrong and it does not: the same kernel at one `uvec4` reads 164 GB/s at
+N=8192, 70% of the bus. This is the `stride` family's coverage law (below)
+applied from inside a kernel, with the weight row as the stride, and it is
+what an earlier reading of the same data mistook for a **wave32** effect —
+holding the bytes-per-lane-step fixed and varying the wave size instead
+measures the same bandwidth to 0.05%, so the wave32 pin that used to be
+recommended here is withdrawn (IDEAS §1.7). For **prefill** (GEMM,
 compute-bound), the register-blocked cooperative-matrix GEMM
 (`shaders/gemm_wmma.comp`): **39.0 TFLOP/s, 70% of this chip's measured
 55.5 TFLOP/s of matrix-core throughput** (30.6 TFLOP/s at N=4096), 7.6x the
@@ -243,9 +249,20 @@ reader:
   binary would run as a half-idle wave64 and `subgroupAdd` would reduce half a
   row. The `*_w32` rows are those pairs; they are dropped whole, with a note on
   stderr, on a device that will not let a pipeline name a size. It is not a
-  free knob in either direction: 1.07x on the DRAM-resident W4A8 decode GEMV,
-  up to 2.1x on a fragment-heavy WMMA tile, and 0.58-0.9x almost everywhere
-  else (IDEAS §6.2). Rows without `_w32` are at the driver's default of 64.
+  free knob in either direction: up to 2.1x on a fragment-heavy WMMA tile, and
+  0.58-0.9x almost everywhere else (IDEAS §6.2). The 1.07x it used to be worth
+  on the DRAM-resident W4A8 decode GEMV was not a wave-size effect at all —
+  at equal bytes-of-row-per-lane-step the two sizes measure the same to 0.05%
+  (IDEAS §1.7). Rows without `_w32` are at the driver's default of 64.
+- **W4A8 load width (`VEC`) and rows per workgroup (`ROWS`).**
+  `gemv_w4a8.comp` takes both as `glslc -D`s: `VEC` ∈ {1,4,8,16} is `uvec4`s
+  of weights per lane per step (`subgroup`, `_vec4`, `_vec8`, `_vec16` rows),
+  `ROWS` is subgroups per workgroup (`_r2`). `VEC` is the one that matters and
+  its right value depends on the reduction length — `N/(8·WAVE)`, so a row is
+  covered in one step — which is why the rows are swept rather than one
+  variant kept. `ROWS` changes nothing anywhere except the single cell where
+  `VEC` is one step short of a row, and is kept as the control that showed
+  that (IDEAS §1.7).
 - **Cache-resident measurements are contended.** A MALL-resident working
   set is shared with everything else touching memory — the display this iGPU
   also drives, or a second benchmark process — and losing part of it drops a

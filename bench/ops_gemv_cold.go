@@ -154,6 +154,7 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 					fillWeights: fillNibblePattern,
 					kind:        coldW4A8,
 					waveSize:    v.waveSize,
+					rowsPerWG:   v.rowsPerWG,
 				}, warmup, iters)
 				if err != nil {
 					return nil, fmt.Errorf("gemv_cold w4a8 %s block=%d footprint=%dMB: %w", v.name, block, fpMB, err)
@@ -198,6 +199,10 @@ type coldCase struct {
 	// 32-thread binary at the default would measure a half-idle wave64 and
 	// label it wave32.
 	waveSize uint32
+	// rowsPerWG is the W4A8 kernel's ROWS: output rows per workgroup, which
+	// divides the grid width. Zero and one both mean one row per workgroup,
+	// which is what every other kernel here is.
+	rowsPerWG int
 }
 
 func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, iters uint32) (Result, error) {
@@ -292,7 +297,9 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 
 	pcBytes := pc.Bytes()
 
-	groupsX := uint32(c.M) // the subgroup kernels use one workgroup per output row
+	// One workgroup per output row, except for the W4A8 arms that put two
+	// subgroups in a workgroup (IDEAS §6.2's follow-up).
+	groupsX := w4a8Groups(c.M, c.rowsPerWG)
 	if _, err := pipe.DispatchTimed(groupsX, 1, 1, 1, pcBytes); err != nil {
 		return Result{}, err
 	}
