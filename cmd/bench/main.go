@@ -147,8 +147,18 @@ func run(cfg config) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("features: fp16=%v int8=%v integerDotProduct=%v coopMatrix=%v\n",
-		feat.Float16, feat.Int8, feat.IntegerDotProduct, feat.CoopMatrix)
+	fmt.Printf("features: fp16=%v int8=%v integerDotProduct=%v coopMatrix=%v subgroupSizeControl=%v\n",
+		feat.Float16, feat.Int8, feat.IntegerDotProduct, feat.CoopMatrix, feat.SubgroupSizeControl)
+
+	// IDEAS §6.2: the wave32 rows are only meaningful if the device will let
+	// a pipeline pin its wave size, so report the range rather than leave a
+	// silently-skipped family to be noticed in the CSV.
+	sgs, err := phys.SubgroupSizeControl()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("subgroup sizes: supported=%v range=%d..%d fullSubgroups=%v\n",
+		sgs.Supported, sgs.MinSubgroupSize, sgs.MaxSubgroupSize, sgs.ComputeFullSubgroups)
 
 	queueFamily, err := phys.ComputeQueueFamily()
 	if err != nil {
@@ -156,6 +166,7 @@ func run(cfg config) error {
 	}
 	dev, err := vk.NewDevice(phys, queueFamily, vk.DeviceFeatures{
 		Float16: true, Int8: true, IntegerDotProduct: true, CoopMatrix: true,
+		SubgroupSizeControl: sgs.Supported,
 	})
 	if err != nil {
 		return err
@@ -235,7 +246,9 @@ func run(cfg config) error {
 	}); err != nil {
 		return err
 	}
-	if err := run("reduce", func() ([]bench.Result, error) { return bench.RunReductions(dev, cfg.sizes, cfg.warmup, cfg.iters) }); err != nil {
+	if err := run("reduce", func() ([]bench.Result, error) {
+		return bench.RunReductions(dev, phys, cfg.sizes, cfg.warmup, cfg.iters)
+	}); err != nil {
 		return err
 	}
 

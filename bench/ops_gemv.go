@@ -17,6 +17,11 @@ type gemvVariant struct {
 	shaderQ8  []byte
 	shaderQ4  []byte
 	groupsX   func(M int) uint32
+	// waveSize pins the pipeline's subgroup size (IDEAS §6.2). Zero takes the
+	// driver's default of 64. The subgroup kernels assume workgroup ==
+	// subgroup, so a variant naming a size here must carry binaries built with
+	// the matching -DWAVE; the pairing lives in RunGEMV's table.
+	waveSize uint32
 }
 
 // RunGEMV measures y = W*x — the dominant op in autoregressive LLM decode —
@@ -36,7 +41,26 @@ func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 			shaderQ8: shaders.GEMVSubgroupQ8, shaderQ4: shaders.GEMVSubgroupQ4,
 			groupsX: func(M int) uint32 { return uint32(M) },
 		},
+		// IDEAS §6.2's wave32 arm. One workgroup is still one row, so halving
+		// the wave halves the lanes sweeping each row and doubles the rows in
+		// flight for the same number of workgroups — which is why this is a
+		// different measurement from the GEMM's, where the wave size changes
+		// registers and scheduling but not the access pattern.
+		{
+			name: "subgroup_w32", shaderF32: shaders.GEMVSubgroupF32W32, shaderF16: shaders.GEMVSubgroupF16W32,
+			shaderQ8: shaders.GEMVSubgroupQ8W32, shaderQ4: shaders.GEMVSubgroupQ4W32,
+			groupsX:  func(M int) uint32 { return uint32(M) },
+			waveSize: 32,
+		},
 	}
+
+	// A variant that pins its wave size is dropped whole where the device
+	// won't allow one, rather than failing at pipeline creation.
+	sgs, err := phys.SubgroupSizeControl()
+	if err != nil {
+		return nil, err
+	}
+	variants = filterWaveVariants(variants, sgs, func(v gemvVariant) (string, uint32) { return v.name, v.waveSize })
 
 	var results []Result
 	for _, v := range variants {
@@ -64,13 +88,13 @@ func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 		for _, n := range sizes {
 			M, N := n, n
 
-			r, err := runGEMVFloat(dev, f32Mod, v.name, "fp32", v.groupsX(M), M, N, warmup, iters, false)
+			r, err := runGEMVFloat(dev, f32Mod, v.name, "fp32", v.waveSize, v.groupsX(M), M, N, warmup, iters, false)
 			if err != nil {
 				return nil, fmt.Errorf("gemv %s fp32 size=%d: %w", v.name, n, err)
 			}
 			results = append(results, r)
 
-			r, err = runGEMVFloat(dev, f16Mod, v.name, "fp16", v.groupsX(M), M, N, warmup, iters, true)
+			r, err = runGEMVFloat(dev, f16Mod, v.name, "fp16", v.waveSize, v.groupsX(M), M, N, warmup, iters, true)
 			if err != nil {
 				return nil, fmt.Errorf("gemv %s fp16 size=%d: %w", v.name, n, err)
 			}
@@ -80,13 +104,13 @@ func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 				if N%block != 0 {
 					continue
 				}
-				r, err = runGEMVQ8(dev, q8Mod, v.name, v.groupsX(M), M, N, block, warmup, iters)
+				r, err = runGEMVQ8(dev, q8Mod, v.name, v.waveSize, v.groupsX(M), M, N, block, warmup, iters)
 				if err != nil {
 					return nil, fmt.Errorf("gemv %s q8 block=%d size=%d: %w", v.name, block, n, err)
 				}
 				results = append(results, r)
 
-				r, err = runGEMVQ4(dev, q4Mod, v.name, v.groupsX(M), M, N, block, warmup, iters)
+				r, err = runGEMVQ4(dev, q4Mod, v.name, v.waveSize, v.groupsX(M), M, N, block, warmup, iters)
 				if err != nil {
 					return nil, fmt.Errorf("gemv %s q4 block=%d size=%d: %w", v.name, block, n, err)
 				}
@@ -102,13 +126,13 @@ func RunGEMV(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int,
 	if !feat.IntegerDotProduct {
 		fmt.Fprintln(os.Stderr, "gemv w8a8/w4a8: shaderIntegerDotProduct not supported, skipping")
 	} else {
-		w8a8, err := runGEMVW8A8(dev, sizes, blocks, warmup, iters)
+		w8a8, err := runGEMVW8A8(dev, phys, sizes, blocks, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, w8a8...)
 
-		w4a8, err := runGEMVW4A8(dev, sizes, blocks, warmup, iters)
+		w4a8, err := runGEMVW4A8(dev, phys, sizes, blocks, warmup, iters)
 		if err != nil {
 			return nil, err
 		}
@@ -149,7 +173,7 @@ func compareVec(got, want []float32, relTol float32) error {
 	return nil
 }
 
-func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat string, groupsX uint32, M, N int, warmup, iters uint32, isF16 bool) (Result, error) {
+func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat string, waveSize, groupsX uint32, M, N int, warmup, iters uint32, isF16 bool) (Result, error) {
 	wData := randomFloats(M * N)
 
 	elemSize := 4
@@ -185,8 +209,9 @@ func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat st
 	defer y.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, x, y},
-		PushConstantSize: 12,
+		Buffers:              []*vk.Buffer{wBuf, scalesBuf, x, y},
+		PushConstantSize:     12,
+		RequiredSubgroupSize: waveSize,
 	})
 	if err != nil {
 		return Result{}, err
@@ -227,7 +252,7 @@ func runGEMVFloat(dev *vk.Device, mod *vk.ShaderModule, variant, weightFormat st
 	}, nil
 }
 
-func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uint32, M, N, block int, warmup, iters uint32) (Result, error) {
+func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, waveSize, groupsX uint32, M, N, block int, warmup, iters uint32) (Result, error) {
 	wData := randomFloats(M * N)
 	q, scales := quantizeQ8(wData, M, N, block)
 
@@ -257,8 +282,9 @@ func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 	defer y.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, x, y},
-		PushConstantSize: 12,
+		Buffers:              []*vk.Buffer{wBuf, scalesBuf, x, y},
+		PushConstantSize:     12,
+		RequiredSubgroupSize: waveSize,
 	})
 	if err != nil {
 		return Result{}, err
@@ -294,7 +320,7 @@ func runGEMVQ8(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 	}, nil
 }
 
-func runGEMVQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uint32, M, N, block int, warmup, iters uint32) (Result, error) {
+func runGEMVQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, waveSize, groupsX uint32, M, N, block int, warmup, iters uint32) (Result, error) {
 	wData := randomFloats(M * N)
 	packed, scales := quantizeQ4(wData, M, N, block)
 
@@ -324,8 +350,9 @@ func runGEMVQ4(dev *vk.Device, mod *vk.ShaderModule, variant string, groupsX uin
 	defer y.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, x, y},
-		PushConstantSize: 12,
+		Buffers:              []*vk.Buffer{wBuf, scalesBuf, x, y},
+		PushConstantSize:     12,
+		RequiredSubgroupSize: waveSize,
 	})
 	if err != nil {
 		return Result{}, err

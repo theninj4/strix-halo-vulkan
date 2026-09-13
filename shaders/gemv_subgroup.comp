@@ -9,11 +9,21 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
 #endif
 
-// Same shape as gemv_naive.comp (y = W * x) but one workgroup — assumed to
-// be exactly one subgroup (local_size_x must equal this device's subgroup
-// size, 64) — per output row, with subgroupAdd reducing the row's partial
-// sums instead of a serial loop.
-layout(local_size_x = 64) in;
+// Same shape as gemv_naive.comp (y = W * x) but one workgroup — exactly one
+// subgroup — per output row, with subgroupAdd reducing the row's partial sums
+// instead of a serial loop.
+//
+// WAVE is the subgroup size, and it must be the *pipeline's*: the host pins it
+// with VK_EXT_subgroup_size_control's requiredSubgroupSize (IDEAS §6.2), and a
+// binary built for one size run at the other would split this workgroup into
+// two subgroups, so subgroupAdd would reduce half a row and subgroupElect
+// would fire twice into the same `y[row]`. 64 is this device's default.
+// Halving it halves the lanes sweeping each row and doubles the rows in
+// flight, which is the whole question this axis asks of a memory-bound kernel.
+#ifndef WAVE
+#define WAVE 64
+#endif
+layout(local_size_x = WAVE) in;
 
 #if defined(PRECISION_Q8)
 layout(binding = 0) readonly buffer W { int8_t w[]; };

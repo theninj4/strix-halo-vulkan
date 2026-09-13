@@ -100,6 +100,69 @@ VkResult shim_query_device_features(VkPhysicalDevice phys, ShimDeviceFeatures *o
     out->int8 = f16Feat.shaderInt8;
     out->integerDotProduct = dotFeat.shaderIntegerDotProduct;
     out->coopMatrix = coopFeat.cooperativeMatrix;
+
+    ShimSubgroupSizeControl sgs;
+    shim_query_subgroup_size_control(phys, &sgs);
+    out->subgroupSizeControl = sgs.supported;
+    return VK_SUCCESS;
+}
+
+// True if `name` appears in this device's extension list. Needed because the
+// instance is created at Vulkan 1.2, where subgroup size control is still an
+// EXT rather than core — so the feature/property structs below are only
+// meaningful once the extension is known to be there.
+static VkBool32 shim_has_device_extension(VkPhysicalDevice phys, const char *name) {
+    uint32_t count = 0;
+    if (vkEnumerateDeviceExtensionProperties(phys, NULL, &count, NULL) != VK_SUCCESS || count == 0) {
+        return VK_FALSE;
+    }
+    VkExtensionProperties *props = calloc(count, sizeof(*props));
+    if (!props) {
+        return VK_FALSE;
+    }
+    VkResult r = vkEnumerateDeviceExtensionProperties(phys, NULL, &count, props);
+    VkBool32 found = VK_FALSE;
+    if (r == VK_SUCCESS || r == VK_INCOMPLETE) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (strcmp(props[i].extensionName, name) == 0) {
+                found = VK_TRUE;
+                break;
+            }
+        }
+    }
+    free(props);
+    return found;
+}
+
+VkResult shim_query_subgroup_size_control(VkPhysicalDevice phys, ShimSubgroupSizeControl *out) {
+    memset(out, 0, sizeof(*out));
+    if (!shim_has_device_extension(phys, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+        return VK_SUCCESS;
+    }
+
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT feat = {0};
+    feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    VkPhysicalDeviceFeatures2 features2 = {0};
+    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features2.pNext = &feat;
+    vkGetPhysicalDeviceFeatures2(phys, &features2);
+
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sizeProps = {0};
+    sizeProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 props2 = {0};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &sizeProps;
+    vkGetPhysicalDeviceProperties2(phys, &props2);
+
+    // Two more conditions on top of the extension check above, all three of
+    // which must hold before a pipeline may name a size: the feature bit, and
+    // COMPUTE among the stages that accept one.
+    out->supported = feat.subgroupSizeControl &&
+                     (sizeProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) ? VK_TRUE : VK_FALSE;
+    out->computeFullSubgroups = feat.computeFullSubgroups;
+    out->minSubgroupSize = sizeProps.minSubgroupSize;
+    out->maxSubgroupSize = sizeProps.maxSubgroupSize;
+    out->maxComputeWorkgroupSubgroups = sizeProps.maxComputeWorkgroupSubgroups;
     return VK_SUCCESS;
 }
 
@@ -163,9 +226,19 @@ VkResult shim_create_device(VkPhysicalDevice phys, uint32_t queueFamily, const S
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &priority;
 
+    // Chained first so it is last in the pNext list; the driver ignores an
+    // all-false struct, so this is harmless when the caller didn't ask.
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sizeFeat = {0};
+    sizeFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    sizeFeat.subgroupSizeControl = request->subgroupSizeControl;
+    sizeFeat.computeFullSubgroups = request->subgroupSizeControl;
+
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeat = {0};
     coopFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
     coopFeat.cooperativeMatrix = request->coopMatrix;
+    if (request->subgroupSizeControl) {
+        coopFeat.pNext = &sizeFeat;
+    }
 
     VkPhysicalDeviceShaderIntegerDotProductFeatures dotFeat = {0};
     dotFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
@@ -195,6 +268,9 @@ VkResult shim_create_device(VkPhysicalDevice phys, uint32_t queueFamily, const S
     }
     if (request->integerDotProduct) {
         extensions[extCount++] = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME;
+    }
+    if (request->subgroupSizeControl) {
+        extensions[extCount++] = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME;
     }
 
     VkDeviceCreateInfo createInfo = {0};
@@ -323,6 +399,7 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
                                        const VkBuffer *buffers, uint32_t bufferCount,
                                        uint32_t pushConstantSize,
                                        const ShimSpecConstant *specConstants, uint32_t specConstantCount,
+                                       uint32_t requiredSubgroupSize,
                                        uint32_t queueFamily, ShimComputePipeline *out) {
     memset(out, 0, sizeof(*out));
 
@@ -384,6 +461,15 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
         specInfo.pData = specValues;
     }
 
+    // IDEAS §6.2: pin the wave size rather than take the driver's default.
+    // REQUIRE_FULL_SUBGROUPS goes with it because every shader here declares a
+    // local_size_x that is an exact multiple of the size being asked for, and
+    // the flag makes a future one that isn't fail at pipeline creation instead
+    // of silently running a partly-inactive last wave through subgroup ops.
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT sizeInfo = {0};
+    sizeInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    sizeInfo.requiredSubgroupSize = requiredSubgroupSize;
+
     VkPipelineShaderStageCreateInfo stageInfo = {0};
     stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -391,6 +477,10 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
     stageInfo.pName = "main";
     if (specConstantCount > 0) {
         stageInfo.pSpecializationInfo = &specInfo;
+    }
+    if (requiredSubgroupSize > 0) {
+        stageInfo.pNext = &sizeInfo;
+        stageInfo.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
     }
 
     VkComputePipelineCreateInfo pipelineInfo = {0};

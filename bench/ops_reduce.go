@@ -51,64 +51,71 @@ func cpuSoftmax(x []float32, rows, n int) []float32 {
 	return y
 }
 
+// reduceVariant is one reduction strategy for one of the two ops: a
+// shared-memory tree over the whole workgroup, or subgroup ops over a
+// workgroup that *is* one subgroup. waveSize pins the latter's wave size
+// (IDEAS §6.2) and is zero for the shared-memory rows, whose 256-thread
+// workgroup reduces through `shared` and does not care how it is cut into
+// waves.
+//
+// §3.7 has the subgroup flavours measuring 3.3x slower than the shared-memory
+// ones, which is backwards and unexplained; the wave size is one of the two
+// cheap things that could be behind it, so it belongs in the same table rather
+// than in a separate sweep.
+type reduceVariant struct {
+	name     string
+	rms      []byte
+	softmax  []byte
+	waveSize uint32
+}
+
+var reduceVariants = []reduceVariant{
+	{name: "shared", rms: shaders.RMSNormShared, softmax: shaders.SoftmaxShared},
+	{name: "subgroup", rms: shaders.RMSNormSubgroup, softmax: shaders.SoftmaxSubgroup},
+	{name: "subgroup_w32", rms: shaders.RMSNormSubgroupW32, softmax: shaders.SoftmaxSubgroupW32, waveSize: 32},
+}
+
 // RunReductions measures RMSNorm and softmax — the normalization ops in
 // every transformer block — across shared-memory-tree and subgroup-op
-// reduction strategies.
-func RunReductions(dev *vk.Device, sizes []int, warmup, iters uint32) ([]Result, error) {
+// reduction strategies, the latter at both wave sizes.
+func RunReductions(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, warmup, iters uint32) ([]Result, error) {
+	variants := filterWaveVariants(reduceVariants, mustSubgroupSizeControl(phys), func(v reduceVariant) (string, uint32) {
+		return "reduce " + v.name, v.waveSize
+	})
+
 	var results []Result
-
-	rmsShared, err := dev.NewShaderModule(shaders.RMSNormShared)
-	if err != nil {
-		return nil, err
-	}
-	defer rmsShared.Destroy()
-	rmsSub, err := dev.NewShaderModule(shaders.RMSNormSubgroup)
-	if err != nil {
-		return nil, err
-	}
-	defer rmsSub.Destroy()
-	smShared, err := dev.NewShaderModule(shaders.SoftmaxShared)
-	if err != nil {
-		return nil, err
-	}
-	defer smShared.Destroy()
-	smSub, err := dev.NewShaderModule(shaders.SoftmaxSubgroup)
-	if err != nil {
-		return nil, err
-	}
-	defer smSub.Destroy()
-
-	for _, n := range sizes {
-		r, err := runRMSNorm(dev, rmsShared, "shared", n, warmup, iters)
+	for _, v := range variants {
+		rmsMod, err := dev.NewShaderModule(v.rms)
 		if err != nil {
-			return nil, fmt.Errorf("rmsnorm shared size=%d: %w", n, err)
+			return nil, err
 		}
-		results = append(results, r)
-
-		r, err = runRMSNorm(dev, rmsSub, "subgroup", n, warmup, iters)
+		defer rmsMod.Destroy()
+		smMod, err := dev.NewShaderModule(v.softmax)
 		if err != nil {
-			return nil, fmt.Errorf("rmsnorm subgroup size=%d: %w", n, err)
+			return nil, err
 		}
-		results = append(results, r)
+		defer smMod.Destroy()
 
-		r, err = runSoftmax(dev, smShared, "shared", n, warmup, iters)
-		if err != nil {
-			return nil, fmt.Errorf("softmax shared size=%d: %w", n, err)
-		}
-		results = append(results, r)
+		for _, n := range sizes {
+			r, err := runRMSNorm(dev, rmsMod, v.name, v.waveSize, n, warmup, iters)
+			if err != nil {
+				return nil, fmt.Errorf("rmsnorm %s size=%d: %w", v.name, n, err)
+			}
+			results = append(results, r)
 
-		r, err = runSoftmax(dev, smSub, "subgroup", n, warmup, iters)
-		if err != nil {
-			return nil, fmt.Errorf("softmax subgroup size=%d: %w", n, err)
+			r, err = runSoftmax(dev, smMod, v.name, v.waveSize, n, warmup, iters)
+			if err != nil {
+				return nil, fmt.Errorf("softmax %s size=%d: %w", v.name, n, err)
+			}
+			results = append(results, r)
 		}
-		results = append(results, r)
 	}
 	return results, nil
 }
 
 const rmsEps = float32(1e-6)
 
-func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, warmup, iters uint32) (Result, error) {
+func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, waveSize uint32, n int, warmup, iters uint32) (Result, error) {
 	rows := reduceRows
 	xData := randomFloats(rows * n)
 	wData := randomFloats(n)
@@ -133,7 +140,9 @@ func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 	}
 	defer y.Destroy()
 
-	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{Buffers: []*vk.Buffer{x, w, y}, PushConstantSize: 12})
+	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
+		Buffers: []*vk.Buffer{x, w, y}, PushConstantSize: 12, RequiredSubgroupSize: waveSize,
+	})
 	if err != nil {
 		return Result{}, err
 	}
@@ -164,7 +173,7 @@ func runRMSNorm(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 	}, nil
 }
 
-func runSoftmax(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, warmup, iters uint32) (Result, error) {
+func runSoftmax(dev *vk.Device, mod *vk.ShaderModule, variant string, waveSize uint32, n int, warmup, iters uint32) (Result, error) {
 	rows := reduceRows
 	xData := randomFloats(rows * n)
 
@@ -181,7 +190,9 @@ func runSoftmax(dev *vk.Device, mod *vk.ShaderModule, variant string, n int, war
 	}
 	defer y.Destroy()
 
-	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{Buffers: []*vk.Buffer{x, y}, PushConstantSize: 8})
+	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
+		Buffers: []*vk.Buffer{x, y}, PushConstantSize: 8, RequiredSubgroupSize: waveSize,
+	})
 	if err != nil {
 		return Result{}, err
 	}

@@ -24,7 +24,13 @@
 // multiply over the sum changes nothing but rounding order — and avoids
 // needing block boundaries to align with the subgroup's striding over
 // words.
-layout(local_size_x = 64) in;
+// One workgroup = one subgroup = one output row, so this must match the size
+// the host pins the pipeline to with VK_EXT_subgroup_size_control
+// (IDEAS §6.2); a mismatch would have subgroupAdd reduce half a row.
+#ifndef WAVE
+#define WAVE 64
+#endif
+layout(local_size_x = WAVE) in;
 
 layout(binding = 0) readonly buffer W { uint w[]; };          // M x (N/4) packed int8 words
 layout(binding = 1) readonly buffer WScales { float16_t wScales[]; }; // M * (N/block)

@@ -138,10 +138,20 @@
 // VkPhysicalDeviceCooperativeMatrixPropertiesKHR is 16x16x16); the Go side
 // checks that and skips these variants if it ever stops being true.
 //
-// Wave size is assumed to be 64, matching every other kernel here. That is
-// what the device reports for a coopmat compute shader, and the bench's
-// correctness pass would fail loudly on a driver that chose otherwise,
-// since the wave -> tile mapping below would then overlap.
+// Wave size is a -D like the tile geometry, because it sizes `local_size_x`
+// and the front end needs that as a literal. 64 is this device's default for a
+// coopmat compute shader (RADV_DEBUG=asm confirmed it, IDEAS §6.1); building
+// with -DWAVE=32 only changes how many threads a workgroup declares, so the
+// *host* must also pin the pipeline to that size with
+// VK_EXT_subgroup_size_control's requiredSubgroupSize, or the driver will pack
+// two 32-wide waves' worth of tiles into one 32-thread workgroup and the
+// wave -> tile mapping below overlaps. The bench passes them together
+// (IDEAS §6.2), and the correctness pass fails loudly if they ever disagree.
+//
+// Why it is worth an axis at all: the register file is per lane, so the same
+// accumulator grid and the same hoisted K-slab cost a *different* number of
+// VGPRs at each wave size, and §2.7 ended on exactly that cliff — the best
+// lever in the file stops at rung 4 because hoisting both operands spills.
 
 #ifndef WM
 #define WM 4        // accumulator tiles per wave, M direction
@@ -185,7 +195,9 @@
 #endif
 
 #define TILE 16
-#define WAVE 64
+#ifndef WAVE
+#define WAVE 64     // threads per wave; see the note above — the host must agree
+#endif
 
 #define BM (WAVES_M * WM * TILE)
 #define BN (WAVES_N * WN * TILE)

@@ -68,13 +68,18 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 	}
 	defer q4Mod.Destroy()
 	var w8a8Mod *vk.ShaderModule
-	w4a8Mods := make([]*vk.ShaderModule, len(w4a8Variants))
+	// The wave32 W4A8 arms (IDEAS §6.2) matter more here than in RunGEMV:
+	// this is the DRAM-resident sweep, so it is where a wave-size effect on
+	// decode would actually show up rather than being absorbed by the MALL.
+	coldW4A8Variants := filterWaveVariants(w4a8Variants, mustSubgroupSizeControl(phys),
+		func(v w4a8Variant) (string, uint32) { return "gemv_cold " + v.name + " w4a8", v.waveSize })
+	w4a8Mods := make([]*vk.ShaderModule, len(coldW4A8Variants))
 	if feat.IntegerDotProduct {
 		if w8a8Mod, err = dev.NewShaderModule(shaders.GEMVW8A8); err != nil {
 			return nil, err
 		}
 		defer w8a8Mod.Destroy()
-		for i, v := range w4a8Variants {
+		for i, v := range coldW4A8Variants {
 			if w4a8Mods[i], err = dev.NewShaderModule(v.spirv); err != nil {
 				return nil, err
 			}
@@ -139,7 +144,7 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 			}
 			results = append(results, r)
 
-			for i, v := range w4a8Variants {
+			for i, v := range coldW4A8Variants {
 				if !w4a8BlockOK(block, v.weightsPerLoad) || N%v.weightsPerLoad != 0 {
 					continue
 				}
@@ -148,6 +153,7 @@ func RunGEMVCold(dev *vk.Device, phys *vk.PhysicalDevice, footprintsMB []int, N 
 					weightBytes: M * N / 2,
 					fillWeights: fillNibblePattern,
 					kind:        coldW4A8,
+					waveSize:    v.waveSize,
 				}, warmup, iters)
 				if err != nil {
 					return nil, fmt.Errorf("gemv_cold w4a8 %s block=%d footprint=%dMB: %w", v.name, block, fpMB, err)
@@ -186,6 +192,12 @@ type coldCase struct {
 	M, N, block int
 	weightBytes int
 	fillWeights func(buf []byte)
+	// waveSize pins the pipeline's subgroup size, and must match the -DWAVE
+	// the shader module was built with (IDEAS §6.2). Zero is the default 64.
+	// Every kernel here reduces a whole row with subgroupAdd, so running a
+	// 32-thread binary at the default would measure a half-idle wave64 and
+	// label it wave32.
+	waveSize uint32
 }
 
 func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, iters uint32) (Result, error) {
@@ -269,8 +281,9 @@ func runGEMVColdCase(dev *vk.Device, mod *vk.ShaderModule, c coldCase, warmup, i
 		buffers = append(buffers, sumsBuf)
 	}
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          buffers,
-		PushConstantSize: pushSize,
+		Buffers:              buffers,
+		PushConstantSize:     pushSize,
+		RequiredSubgroupSize: c.waveSize,
 	})
 	if err != nil {
 		return Result{}, err

@@ -10,6 +10,14 @@
 //	RADV_DEBUG=shaderstats go run ./cmd/probe shaders/gemm_wmma_reg64.spv
 //	RADV_DEBUG=asm         go run ./cmd/probe shaders/gemm_wmma_reg64.spv
 //
+// An optional second argument pins the wave size the shader is compiled for
+// (IDEAS.md §6.2), which is the only way to see what a variant costs at
+// wave32 — the register file is per lane, so the VGPR count RADV prints is a
+// different number at each size and it is the number that decides how far the
+// hoisting ladder of §2.7 can go:
+//
+//	RADV_DEBUG=shaderstats go run ./cmd/probe shaders/gemm_wmma_reg64_w32.spv 32
+//
 // The shader is dispatched with one workgroup, zeroed push constants, and a
 // single small buffer bound at every binding it declares, so it is only
 // useful for compilation-time questions — nothing it prints depends on the
@@ -21,6 +29,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 
 	"strix-halo-vulkan/vk"
 )
@@ -37,15 +46,23 @@ const probeBindings = 8
 const probePushConstants = 64
 
 func main() {
-	if len(os.Args) != 2 {
-		log.Fatalf("usage: %s <shader.spv>", os.Args[0])
+	if len(os.Args) != 2 && len(os.Args) != 3 {
+		log.Fatalf("usage: %s <shader.spv> [subgroup-size]", os.Args[0])
 	}
-	if err := run(os.Args[1]); err != nil {
+	subgroupSize := 0
+	if len(os.Args) == 3 {
+		n, err := strconv.Atoi(os.Args[2])
+		if err != nil {
+			log.Fatalf("subgroup size %q: %v", os.Args[2], err)
+		}
+		subgroupSize = n
+	}
+	if err := run(os.Args[1], uint32(subgroupSize)); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(path string) error {
+func run(path string, subgroupSize uint32) error {
 	spirv, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -73,8 +90,17 @@ func run(path string) error {
 	if err != nil {
 		return err
 	}
+	sgs, err := phys.SubgroupSizeControl()
+	if err != nil {
+		return err
+	}
+	if subgroupSize != 0 && !sgs.Supported {
+		return fmt.Errorf("device does not support a required subgroup size")
+	}
+
 	dev, err := vk.NewDevice(phys, queueFamily, vk.DeviceFeatures{
 		Float16: true, Int8: true, IntegerDotProduct: true, CoopMatrix: true,
+		SubgroupSizeControl: sgs.Supported,
 	})
 	if err != nil {
 		return err
@@ -97,7 +123,9 @@ func run(path string) error {
 		bufs[i] = b
 	}
 
-	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{Buffers: bufs, PushConstantSize: probePushConstants})
+	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
+		Buffers: bufs, PushConstantSize: probePushConstants, RequiredSubgroupSize: subgroupSize,
+	})
 	if err != nil {
 		return err
 	}

@@ -30,7 +30,22 @@ typedef struct {
     VkBool32 int8;
     VkBool32 integerDotProduct;
     VkBool32 coopMatrix;
+    VkBool32 subgroupSizeControl;
 } ShimDeviceFeatures;
+
+// What VK_EXT_subgroup_size_control will let a *compute* pipeline ask for
+// (IDEAS.md §6.2). `supported` folds together three separate conditions the
+// caller would otherwise have to check by hand — the device extension is
+// present, the subgroupSizeControl feature is set, and COMPUTE is in
+// requiredSubgroupSizeStages — because a pipeline may only pass a
+// requiredSubgroupSize when all three hold.
+typedef struct {
+    VkBool32 supported;
+    VkBool32 computeFullSubgroups;
+    uint32_t minSubgroupSize;
+    uint32_t maxSubgroupSize;
+    uint32_t maxComputeWorkgroupSubgroups;
+} ShimSubgroupSizeControl;
 
 // Mirrors VkCooperativeMatrixPropertiesKHR (AType/BType/CType/ResultType are
 // VkComponentTypeKHR values, scope is a VkScopeKHR value) as flat uint32s so
@@ -76,6 +91,11 @@ VkResult shim_find_compute_queue_family(VkPhysicalDevice phys, uint32_t *out_fam
 // (independent of what's been enabled on any logical device).
 VkResult shim_query_device_features(VkPhysicalDevice phys, ShimDeviceFeatures *out);
 
+// Queries the subgroup sizes a compute pipeline on this device may require.
+// Always fills *out; out->supported == VK_FALSE means requiredSubgroupSize
+// must be left at 0 and the driver's default wave size is all there is.
+VkResult shim_query_subgroup_size_control(VkPhysicalDevice phys, ShimSubgroupSizeControl *out);
+
 // Enumerates the MxNxK/type/scope combinations VK_KHR_cooperative_matrix
 // supports on this device. Returns VK_SUCCESS with *count == 0 if the
 // extension isn't supported at all (callers should check
@@ -108,10 +128,19 @@ void shim_destroy_shader_module(VkDevice device, VkShaderModule module);
 // bindings (0..bufferCount-1, one per entry in `buffers`), an optional
 // push-constant range of `pushConstantSize` bytes, and an optional set of
 // uint32 specialization constants.
+//
+// requiredSubgroupSize, when non-zero, pins the wave size this shader runs at
+// via VK_EXT_subgroup_size_control (IDEAS.md §6.2) instead of letting the
+// driver pick. It must be a power of two within the device's
+// [minSubgroupSize, maxSubgroupSize] and the shader's local_size_x must be a
+// multiple of it; the device must have been created with
+// ShimDeviceFeatures.subgroupSizeControl. Zero keeps the driver's default,
+// byte for byte the same pipeline this shim built before the knob existed.
 VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
                                        const VkBuffer *buffers, uint32_t bufferCount,
                                        uint32_t pushConstantSize,
                                        const ShimSpecConstant *specConstants, uint32_t specConstantCount,
+                                       uint32_t requiredSubgroupSize,
                                        uint32_t queueFamily, ShimComputePipeline *out);
 
 // Records, in one command buffer: a timestamp, `iterations` dispatches of

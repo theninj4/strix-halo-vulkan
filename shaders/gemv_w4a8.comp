@@ -61,7 +61,13 @@
 // Activation words (4 int8 lanes each) consumed per lane per loop step.
 #define XWORDS_PER_LOAD (2u * uint(VEC))
 
-layout(local_size_x = 64) in;
+// One workgroup = one subgroup = one output row, so this must match the size
+// the host pins the pipeline to with VK_EXT_subgroup_size_control
+// (IDEAS §6.2); a mismatch would have subgroupAdd reduce half a row.
+#ifndef WAVE
+#define WAVE 64
+#endif
+layout(local_size_x = WAVE) in;
 
 #if VEC == 4
 layout(binding = 0) readonly buffer W { uvec4 w[]; };   // M x (N/32) uvec4

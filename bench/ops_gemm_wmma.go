@@ -32,6 +32,23 @@ type wmmaVariant struct {
 	// every variant here — so unlike padB it applies to the kernels that
 	// already win, not only to the transposed-B ones.
 	padA int
+	// waveSize pins the pipeline's subgroup size (IDEAS §6.2). Zero takes the
+	// driver's default, which on this part is 64 even in a coopmat shader.
+	// It is not a run-time knob like the pads: the SPIR-V declares
+	// local_size_x = waves*WAVE, so a variant that names a size here must
+	// also have been built with a matching -DWAVE or the wave-to-tile mapping
+	// overlaps. The pairing lives in wmmaVariants below and nowhere else.
+	waveSize uint32
+}
+
+// waveLabel names the wave size for the Detail column. Left blank at the
+// default so every pre-§6.2 row's detail string is unchanged and the CSV
+// stays comparable to the committed one.
+func (v wmmaVariant) waveLabel() string {
+	if v.waveSize == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" wave=%d", v.waveSize)
 }
 
 // lda is A's leading dimension in elements: A is always [M, K+padA].
@@ -216,6 +233,41 @@ var wmmaVariants = []wmmaVariant{
 	{name: "wmma_reg64_bt_hka4_padab128", spirv: shaders.GEMMWMMAReg64BTHKA4, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128},
 	{name: "wmma_reg64_hka4", spirv: shaders.GEMMWMMAReg64HKA4, bm: 64, bn: 64, bk: 64, waves: 1},
 	{name: "wmma_reg64_hka4_pada128", spirv: shaders.GEMMWMMAReg64HKA4, bm: 64, bn: 64, bk: 64, waves: 1, padA: 128},
+
+	// IDEAS §6.2, promoted by §2.7 because §2.7 ended on the register file:
+	// the best lever in the suite stops at rung 4 because hoisting both
+	// operands spills 256 wave64 VGPRs. The proposal was that wave32 halves
+	// the per-fragment register cost of the same tile and so extends the
+	// ladder.
+	//
+	// RADV_DEBUG=shaderstats refutes that before a single one of these rows
+	// runs, and in the opposite direction: a 16x16 fragment spread over 32
+	// lanes holds *twice* as many elements per lane as over 64, so the same
+	// variant costs more VGPRs at wave32, and reg64_bt_hka4 — the suite's
+	// best kernel — spills 62 of them. The table is in shaders/shaders.go
+	// next to the -DWAVE=32 build lines.
+	//
+	// What that leaves is the half of the hypothesis the register file cannot
+	// answer: wave32 issues a dependent instruction in one pass instead of
+	// two and schedules at half the granularity, against half the lanes per
+	// instruction. These rows pair each wave32 binary with the wave64 row it
+	// is identical to in every other respect — same tile, same accumulator
+	// grid, same hoist rung, same strides, same bytes — so the difference is
+	// the wave size and nothing else.
+	//
+	// Unpadded first, because §2.7's clean 2.1x pair is unpadded; then the
+	// padded ladder at both grids, plus the row-major control. A variant that
+	// names a waveSize here is skipped whole if the device won't let a
+	// pipeline pin one.
+	{name: "wmma_reg64_bt_w32", spirv: shaders.GEMMWMMAReg64BTW32, bm: 64, bn: 64, bk: 16, waves: 1, colMajorB: true, waveSize: 32},
+	{name: "wmma_reg64_bt_hka4_w32", spirv: shaders.GEMMWMMAReg64BTHKA4W32, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true, waveSize: 32},
+	{name: "wmma_reg64_bt_w32_padab128", spirv: shaders.GEMMWMMAReg64BTW32, bm: 64, bn: 64, bk: 16, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg64_bt_hkab2_w32_padab128", spirv: shaders.GEMMWMMAReg64BTHKAB2W32, bm: 64, bn: 64, bk: 32, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg64_bt_hka4_w32_padab128", spirv: shaders.GEMMWMMAReg64BTHKA4W32, bm: 64, bn: 64, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg32_bt_w32_padab128", spirv: shaders.GEMMWMMAReg32BTW32, bm: 32, bn: 32, bk: 16, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg32_bt_hkab4_w32_padab128", spirv: shaders.GEMMWMMAReg32BTHKAB4W32, bm: 32, bn: 32, bk: 64, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg32_bt_hka8_w32_padab128", spirv: shaders.GEMMWMMAReg32BTHKA8W32, bm: 32, bn: 32, bk: 128, waves: 1, colMajorB: true, padA: 128, padB: 128, waveSize: 32},
+	{name: "wmma_reg64_hka4_w32_pada128", spirv: shaders.GEMMWMMAReg64HKA4W32, bm: 64, bn: 64, bk: 64, waves: 1, padA: 128, waveSize: 32},
 }
 
 // runGEMMWMMA measures the register-blocked cooperative-matrix GEMM
@@ -239,8 +291,15 @@ func runGEMMWMMA(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, warmup, i
 		return nil, nil
 	}
 
+	// IDEAS §6.2's rows pin their own wave size, which needs
+	// VK_EXT_subgroup_size_control and 32 inside the device's reported range.
+	// Dropping them whole is better than letting pipeline creation fail: the
+	// wave64 half of the suite is still a complete measurement without them.
+	variants := filterWaveVariants(wmmaVariants, mustSubgroupSizeControl(phys),
+		func(v wmmaVariant) (string, uint32) { return "gemm " + v.name, v.waveSize })
+
 	var results []Result
-	for _, v := range wmmaVariants {
+	for _, v := range variants {
 		mod, err := dev.NewShaderModule(v.spirv)
 		if err != nil {
 			return nil, err
@@ -305,8 +364,9 @@ func buildWMMAPipeline(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N
 	}
 
 	pipe, err = dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{aBuf, bBuf, scalesBuf, cBuf},
-		PushConstantSize: wmmaPushConstantSize,
+		Buffers:              []*vk.Buffer{aBuf, bBuf, scalesBuf, cBuf},
+		PushConstantSize:     wmmaPushConstantSize,
+		RequiredSubgroupSize: v.waveSize,
 	})
 	return
 }
@@ -397,8 +457,8 @@ func timeGEMMWMMA(dev *vk.Device, mod *vk.ShaderModule, v wmmaVariant, M, N, K i
 	flops := float64(2 * M * N * K)
 	return Result{
 		Op: "gemm", Variant: v.name, WeightFormat: "fp16", Size: N,
-		Detail: fmt.Sprintf("tile=%dx%dx%d waves=%d ai=%.0f strideA=%dB strideB=%dB",
-			v.bm, v.bn, v.bk, waves, v.intensity(), v.lda(K)*2, v.ldb(N, K)*2),
+		Detail: fmt.Sprintf("tile=%dx%dx%d waves=%d ai=%.0f strideA=%dB strideB=%dB%s",
+			v.bm, v.bn, v.bk, waves, v.intensity(), v.lda(K)*2, v.ldb(N, K)*2, v.waveLabel()),
 		NsPerIter: ns,
 		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,

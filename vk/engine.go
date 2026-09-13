@@ -73,15 +73,32 @@ type DeviceFeatures struct {
 	Int8              bool
 	IntegerDotProduct bool
 	CoopMatrix        bool
+	// SubgroupSizeControl enables VK_EXT_subgroup_size_control, without which
+	// PipelineSpec.RequiredSubgroupSize must stay 0 and every shader runs at
+	// whatever wave size the driver picks (IDEAS.md §6.2).
+	SubgroupSizeControl bool
 }
 
 func (f DeviceFeatures) toShim() C.ShimDeviceFeatures {
 	return C.ShimDeviceFeatures{
-		float16:           boolToVk(f.Float16),
-		int8:              boolToVk(f.Int8),
-		integerDotProduct: boolToVk(f.IntegerDotProduct),
-		coopMatrix:        boolToVk(f.CoopMatrix),
+		float16:             boolToVk(f.Float16),
+		int8:                boolToVk(f.Int8),
+		integerDotProduct:   boolToVk(f.IntegerDotProduct),
+		coopMatrix:          boolToVk(f.CoopMatrix),
+		subgroupSizeControl: boolToVk(f.SubgroupSizeControl),
 	}
+}
+
+// SubgroupSizeControl is what wave sizes a compute pipeline on this device
+// may require. Supported folds together the extension's presence, the
+// feature bit and whether the compute stage accepts a required size, because
+// a pipeline may only name one when all three hold.
+type SubgroupSizeControl struct {
+	Supported                    bool
+	ComputeFullSubgroups         bool
+	MinSubgroupSize              uint32
+	MaxSubgroupSize              uint32
+	MaxComputeWorkgroupSubgroups uint32
 }
 
 // ComponentType mirrors VkComponentTypeKHR — the element type of a
@@ -180,10 +197,28 @@ func (p *PhysicalDevice) SupportedFeatures() (DeviceFeatures, error) {
 		return DeviceFeatures{}, err
 	}
 	return DeviceFeatures{
-		Float16:           out.float16 != 0,
-		Int8:              out.int8 != 0,
-		IntegerDotProduct: out.integerDotProduct != 0,
-		CoopMatrix:        out.coopMatrix != 0,
+		Float16:             out.float16 != 0,
+		Int8:                out.int8 != 0,
+		IntegerDotProduct:   out.integerDotProduct != 0,
+		CoopMatrix:          out.coopMatrix != 0,
+		SubgroupSizeControl: out.subgroupSizeControl != 0,
+	}, nil
+}
+
+// SubgroupSizeControl reports the wave sizes this device will let a compute
+// pipeline pin itself to. Supported == false means the default wave size is
+// all there is.
+func (p *PhysicalDevice) SubgroupSizeControl() (SubgroupSizeControl, error) {
+	var out C.ShimSubgroupSizeControl
+	if err := check("vkGetPhysicalDeviceProperties2", C.shim_query_subgroup_size_control(p.handle, &out)); err != nil {
+		return SubgroupSizeControl{}, err
+	}
+	return SubgroupSizeControl{
+		Supported:                    out.supported != 0,
+		ComputeFullSubgroups:         out.computeFullSubgroups != 0,
+		MinSubgroupSize:              uint32(out.minSubgroupSize),
+		MaxSubgroupSize:              uint32(out.maxSubgroupSize),
+		MaxComputeWorkgroupSubgroups: uint32(out.maxComputeWorkgroupSubgroups),
 	}, nil
 }
 
@@ -373,6 +408,13 @@ type PipelineSpec struct {
 	Buffers          []*Buffer
 	PushConstantSize uint32
 	SpecConstants    []SpecConstant
+	// RequiredSubgroupSize pins the wave size the shader runs at instead of
+	// letting the driver choose (IDEAS.md §6.2). Zero keeps the default. It
+	// must be a power of two inside the device's reported
+	// [MinSubgroupSize, MaxSubgroupSize], the shader's local_size_x must be a
+	// multiple of it, and the device must have been created with
+	// DeviceFeatures.SubgroupSizeControl — otherwise pipeline creation fails.
+	RequiredSubgroupSize uint32
 }
 
 // ComputePipeline is a full pipeline (descriptor set layout, pipeline,
@@ -411,6 +453,7 @@ func (d *Device) NewPipeline(shader *ShaderModule, spec PipelineSpec) (*ComputeP
 	if err := check("vkCreateComputePipelines",
 		C.shim_create_compute_pipeline(d.handle, shader.handle, bufPtr, C.uint32_t(len(bufHandles)),
 			C.uint32_t(spec.PushConstantSize), specPtr, C.uint32_t(len(specC)),
+			C.uint32_t(spec.RequiredSubgroupSize),
 			C.uint32_t(d.queueFamily), &p.handle)); err != nil {
 		p.Destroy()
 		return nil, err

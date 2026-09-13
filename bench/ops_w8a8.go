@@ -13,31 +13,51 @@ import (
 // dequantize-then-float-multiply PRECISION_Q8 path RunGEMV already covers.
 // Subgroup reduction only, to compare directly against subgroup q8/q4 —
 // the variants that actually win on this hardware (see TODO.md).
-func runGEMVW8A8(dev *vk.Device, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
-	mod, err := dev.NewShaderModule(shaders.GEMVW8A8)
-	if err != nil {
-		return nil, err
-	}
-	defer mod.Destroy()
+func runGEMVW8A8(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
+	// One entry per wave size (IDEAS §6.2) and nothing else — this kernel has
+	// no other axis. The wave32 binary is the same source built with
+	// -DWAVE=32; the pipeline must pin the matching size because the kernel
+	// reduces a whole row with subgroupAdd.
+	variants := filterWaveVariants([]w8a8Variant{
+		{name: "subgroup", spirv: shaders.GEMVW8A8},
+		{name: "subgroup_w32", spirv: shaders.GEMVW8A8W32, waveSize: 32},
+	}, mustSubgroupSizeControl(phys), func(v w8a8Variant) (string, uint32) {
+		return "gemv " + v.name + " w8a8", v.waveSize
+	})
 
 	var results []Result
-	for _, block := range blocks {
-		if err := verifyGEMVW8A8(dev, mod, block); err != nil {
-			return nil, fmt.Errorf("gemv w8a8 block=%d correctness check: %w", block, err)
+	for _, v := range variants {
+		mod, err := dev.NewShaderModule(v.spirv)
+		if err != nil {
+			return nil, err
 		}
-		for _, n := range sizes {
-			M, N := n, n
-			if N%block != 0 {
-				continue
+		defer mod.Destroy()
+
+		for _, block := range blocks {
+			if err := verifyGEMVW8A8(dev, mod, v.waveSize, block); err != nil {
+				return nil, fmt.Errorf("gemv %s w8a8 block=%d correctness check: %w", v.name, block, err)
 			}
-			res, err := timeGEMVW8A8(dev, mod, M, N, block, warmup, iters)
-			if err != nil {
-				return nil, fmt.Errorf("gemv w8a8 block=%d size=%d: %w", block, n, err)
+			for _, n := range sizes {
+				M, N := n, n
+				if N%block != 0 {
+					continue
+				}
+				res, err := timeGEMVW8A8(dev, mod, v, M, N, block, warmup, iters)
+				if err != nil {
+					return nil, fmt.Errorf("gemv %s w8a8 block=%d size=%d: %w", v.name, block, n, err)
+				}
+				results = append(results, res)
 			}
-			results = append(results, res)
 		}
 	}
 	return results, nil
+}
+
+// w8a8Variant is one wave size of shaders/gemv_w8a8.comp.
+type w8a8Variant struct {
+	name     string
+	spirv    []byte
+	waveSize uint32
 }
 
 // w8a8PushConstants packs {M,N,block,xScale} matching gemv_w8a8.comp.
@@ -75,7 +95,7 @@ func buildGEMVW8A8Buffers(dev *vk.Device, M, N, block int) (wBuf, scalesBuf, xBu
 	return
 }
 
-func verifyGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
+func verifyGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, waveSize uint32, block int) error {
 	n := gemmCorrectnessSize
 	if n%block != 0 {
 		n = block * 2
@@ -92,8 +112,9 @@ func verifyGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
 	defer yBuf.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf},
-		PushConstantSize: 16,
+		Buffers:              []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf},
+		PushConstantSize:     16,
+		RequiredSubgroupSize: waveSize,
 	})
 	if err != nil {
 		return err
@@ -114,7 +135,7 @@ func verifyGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
 	return compareVec(got, want, 2e-2)
 }
 
-func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, block int, warmup, iters uint32) (Result, error) {
+func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, v w8a8Variant, M, N, block int, warmup, iters uint32) (Result, error) {
 	wBuf, scalesBuf, xBuf, yBuf, _, _, xScale, err := buildGEMVW8A8Buffers(dev, M, N, block)
 	if err != nil {
 		return Result{}, err
@@ -125,8 +146,9 @@ func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, block int, warmup,
 	defer yBuf.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf},
-		PushConstantSize: 16,
+		Buffers:              []*vk.Buffer{wBuf, scalesBuf, xBuf, yBuf},
+		PushConstantSize:     16,
+		RequiredSubgroupSize: v.waveSize,
 	})
 	if err != nil {
 		return Result{}, err
@@ -144,7 +166,7 @@ func timeGEMVW8A8(dev *vk.Device, mod *vk.ShaderModule, M, N, block int, warmup,
 	weightBytes := float64(M*N) + float64((M*N/block)*2)
 	flops := float64(2 * M * N)
 	return Result{
-		Op: "gemv", Variant: "subgroup", WeightFormat: "w8a8", BlockSize: block, Size: N,
+		Op: "gemv", Variant: v.name, WeightFormat: "w8a8", BlockSize: block, Size: N,
 		NsPerIter: ns,
 		Clocks:    clocks,
 		GFLOPS:    flops / (ns / 1e9) / 1e9,

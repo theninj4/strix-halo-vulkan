@@ -11,21 +11,99 @@ to perform well.
 
 Everything below builds clean (`go build ./...`, `gofmt -l .`,
 `go vet ./...` all clean) and has passed its correctness checks on real
-hardware. `results.csv` was regenerated again this session, with the WMMA
-family's new hoisted-K ladder behind its rows, by
+hardware. `results.csv` was regenerated again this session, with the wave32
+arm of every subgroup-shaped kernel behind its rows, by
 `go run ./cmd/bench -blocks 32,64,128,256,512,1024 -csv results.csv` — the
 non-default block list is what the committed file has always used, so keep it
 if the file is to stay comparable row for row. Run it with nothing else on
-the GPU (see the measurement lessons below). It takes ~28 minutes now, of
-which the `stride` family is ~14 (816 cases) and the `gemm` family ~8 (the
-WMMA ablation is 48 variants).
+the GPU (see the measurement lessons below). It takes ~33 minutes now, of
+which the `stride` family is ~14 (816 cases) and the `gemm` family ~10 (the
+WMMA ablation is 57 variants).
 
 Two documents carry the analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
 gain / how to measure, and marked up with what has since been measured).
 **`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-### This session: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
+### This session: IDEAS §6.2 — wave32, and the payoff landed somewhere else
+
+The handoff's item 1 was §6.2, promoted by §2.7 on a specific argument: the
+best lever in the file stops at the 256-VGPR wave64 budget, and wave32 was
+supposed to halve what a coopmat fragment costs, which is the currency that
+lever spends. Wave size is now a per-pipeline knob, every kernel whose
+workgroup *is* one subgroup can be built for either, and the answer came out
+in three pieces — none of which is the one the promotion predicted.
+
+**New code:**
+- `vk/shim.c`/`shim.h`: `VK_EXT_subgroup_size_control` is queried
+  (`shim_query_subgroup_size_control` → min/max size, `computeFullSubgroups`,
+  and whether COMPUTE accepts a required size), enabled at device creation
+  when asked for, and `shim_create_compute_pipeline` takes a
+  `requiredSubgroupSize` — passed as
+  `VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT` alongside
+  `REQUIRE_FULL_SUBGROUPS`, so a shader whose `local_size_x` is not a multiple
+  of the size asked for fails at pipeline creation rather than silently
+  running a partly-inactive wave through `subgroupAdd`. Zero keeps the
+  driver's default and builds byte-identically to before.
+- `vk/engine.go`: `DeviceFeatures.SubgroupSizeControl`,
+  `PhysicalDevice.SubgroupSizeControl()`, `PipelineSpec.RequiredSubgroupSize`.
+- `shaders/*.comp`: `WAVE` is a `-D` on `gemm_wmma.comp`,
+  `gemv_subgroup.comp`, `gemv_w4a8.comp`, `gemv_w8a8.comp`,
+  `rmsnorm_subgroup.comp` and `softmax_subgroup.comp`. The wave64 SPIR-V is
+  byte-identical to what it was before (`cmp`-verified), so every pre-existing
+  row is comparable.
+- `shaders/shaders.go`: 16 new `_w32` binaries — seven WMMA tiles, the four
+  `gemv_subgroup` precisions, both W4A8 load widths, W8A8, and both
+  reductions.
+- `bench/wavesize.go`: `filterWaveVariants` drops any variant naming a size
+  the device won't allow, with a note on stderr, so the wave64 half of the
+  suite is still a complete run on an older driver. Used by all five families.
+- `bench/ops_*.go`: a `waveSize` field on the `wmma`/`gemv`/`w4a8`/`w8a8`/
+  `reduce`/`coldCase` variant tables, threaded to the pipeline. `ops_w8a8.go`
+  and `ops_reduce.go` became table-driven to take it.
+- `cmd/probe/main.go`: optional second argument pins the wave size, which is
+  the only way to price a variant's registers at wave32.
+- `cmd/bench/main.go`: prints the device's subgroup-size range next to the
+  feature line.
+
+**What it found** (full detail in IDEAS §6.2):
+
+1. **The GEMM: 0.67x-2.13x, and the suite's headline does not move.** The
+   fragment-dominated AI-16 grid gains **1.9-2.1x at every size**
+   (`reg32_bt_hkab4_padab128`: 11417 → 24313 GFLOP/s at N=4096), and wave32
+   takes the N=1024 crown at 33603. But §2.7's winner `reg64_bt_hka4_padab128`
+   **spills 62 VGPRs at wave32** and loses 18-25%, so N=2048 and N=4096 stay
+   with wave64 at 39039 and 31183. A second run agrees to ≤1.5% everywhere.
+2. **Why, and it is half of what was predicted.** The calibration is the three
+   *non-coopmat* kernels, whose register use per unit work cannot change with
+   the wave: they report exactly 48 → 96 VGPRs, so 2x is the no-change
+   baseline. Every coopmat variant comes in under it, and the most
+   fragment-heavy (`reg32_bt_hka8`, eighteen fragments against four
+   accumulators) reports the *identical* 192 at both sizes — half the per-work
+   cost. So the fragment saving is real. The accumulators do not shrink and the
+   256 ceiling is in the same halving units, so the roof does not lift.
+3. **The one engine-relevant win is on decode, not prefill.** DRAM-resident
+   W4A8 GEMV at `VEC=4`, 68 MB of weights, three runs:
+   **209.8 / 210.2 / 212.8 GB/s at wave64 → 225.6 / 226.3 / 225.1 at wave32**,
+   i.e. 89% → **96% of the 236 GB/s bus**, under 1% spread. It is specific to
+   the wide-load arm (at `VEC=1` wave32 is 0.98x) and it is **unexplained** —
+   §5.1b's coverage law predicts the wrong sign. See "Next steps" item 1.
+4. **Every cache-resident GEMV loses**, 0.58-0.95x, and so do the reductions.
+   Which closed §3.7 for free: `shared` 223.7 GB/s at 256 threads per row,
+   `subgroup` 68.5 at 64, `subgroup_w32` 35.7 at 32 — a line through the
+   origin in threads per row, so the 3.3x gap is the lane count and has
+   nothing to do with `subgroupAdd`.
+
+**One caveat on the committed CSV.** The cache-resident `gemv` square sweep
+carries the one-sided dropout noise the README documents for MALL-resident
+cases, and one wave32 cell in this run is a dropout:
+`gemv,subgroup_w32,w4a8,block=64,size=1024` reads 61.5 GB/s and reran at
+270-281. A second run put a different cell (`subgroup_vec4_w32` at N=2048)
+low instead. Read the pattern across sizes, not any single cell. The
+DRAM-resident `gemv_cold` rows reproduce to under 1% and are the ones to
+trust.
+
+### Previous session: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
 
 The handoff's item 1 was "§2.3's residue, re-aimed by the traversal axis":
 the 1.6x that transposed-B stayed behind row-major at N=4096 **with both
@@ -94,7 +172,7 @@ spends, and WMMA is natively a wave32 shape.
 padded than unpadded (0.88x at N=4096, 0.87x at N=2048, both runs). Every
 other rung on that ladder goes the other way.
 
-### Previous session: IDEAS §5.1b's follow-up — the traversal axis
+### Two sessions ago: IDEAS §5.1b's follow-up — the traversal axis
 
 §5.1b left one access pattern unmeasured and called it the sharpest item in
 the file: **concurrent-but-contiguous requests from *different* waves at an
@@ -206,7 +284,7 @@ It was filed as a 1.3x tidy-up against gathers; it is a defence against a 4x
 that needs no padding to occur. The second escape, when the stride is not the
 engine's to choose, is depth: 4 KB of a row in flight per wave.
 
-### Two sessions ago: IDEAS §5.1b — the strided-bandwidth probe
+### Three sessions ago: IDEAS §5.1b — the strided-bandwidth probe
 
 `IDEAS.md` §5.1b asked for the memory system to be measured directly instead
 of inferred through a GEMM: fixed bytes touched, sweeping (a) the stride
@@ -329,7 +407,7 @@ consequence points the same way as the corollaries above: **"keep it under
   timed batches and keeps the fastest (`strideBatches`); DRAM-resident cases
   reproduce to within 2% either way and are unaffected by that choice.
 
-### Three sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
+### Four sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
 
 `IDEAS.md` §2.3's open question was why the *better* instruction stream is
 2.8x slower: storing B as [N,K] and loading it column-major cuts
@@ -444,7 +522,7 @@ present in every run.
    penalty into a curve the engine can allocate against instead of one
    kernel's anecdote.
 
-### Four sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
+### Five sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
 
 `IDEAS.md`'s largest remaining item is done, and it beat its own forecast.
 **A register-blocked cooperative-matrix GEMM reaches 25.2 TFLOP/s at
@@ -544,7 +622,7 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    the 256-VGPR wave64 limit, not by occupancy, which also makes §6.2
    (wave32) more interesting than it was: WMMA is natively a wave32 shape.
 
-### Five sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
+### Six sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
 
 The highest-value item in `IDEAS.md` is done, and it delivered more than it
 promised. **W4A8 GEMV — 4-bit weights against int8 activations, both fed to
@@ -621,7 +699,7 @@ the 64MB footprint, where 4-bit weights still fit the 32MB MALL.
    §1.2's "no integer division" is also folded into this kernel: it takes
    `log2(block)` and shifts.
 
-### Six sessions ago: the §0 "measurement validity" block from IDEAS.md
+### Seven sessions ago: the §0 "measurement validity" block from IDEAS.md
 
 The session that produced `IDEAS.md` implemented its §0 —
 the work that had to happen before optimising against any of the existing
@@ -763,25 +841,30 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
 ## Next steps (pick up here)
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
-updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up and
-§2.7 found. In short:
+updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
+§2.7 and §6.2 found. In short:
 
-1. **IDEAS §6.2 — wave32 vs wave64, promoted by §2.7.** Register blocking is
-   capped by the 256-VGPR wave64 limit, and §2.7 turned that cap into the
-   thing that stops the best lever in the file: hoisting both operands at
-   BK_TILES=4 spills, so the AI-32 kernel stops at rung 4 and rung 8 needs a
-   smaller tile. wave32 halves the per-fragment register cost of the same
-   tile — the exact currency both levers spend — and WMMA is natively a
-   wave32 shape. Needs a small `vk/shim.c` change to pass
-   `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize`. Note the `stride`
-   family's mapping is expressed in units of 64 lanes whatever the subgroup
-   size is, so it would still measure the same shapes at half the addresses
-   per request.
+1. **Explain the wave32 W4A8 decode win, and see how far it goes.** §6.2's one
+   engine-relevant result is 211 → 226 GB/s on DRAM-resident W4A8 decode, 89%
+   → 96% of the bus, reproducible to under 1% across three runs — and nothing
+   in this repo explains it. It is specific to the `VEC=4` arm (`VEC=1` is
+   0.98x, i.e. nothing), it runs the *opposite* way to every cache-resident
+   GEMV row, and §5.1b's coverage law predicts the wrong sign (wave32 halves C
+   from 1024 B to 512 B). Three cheap probes, in order: a `VEC=8` arm, to see
+   whether this is really about bytes-per-lane; wave32 with two rows per
+   workgroup, which restores the thread count the cache-resident rows miss and
+   separates "fewer threads" from "shorter wave"; and the `stride` family at
+   both wave sizes, which is the only kernel here that can isolate this from
+   everything else a GEMV does. Worth doing because it is the last 4% of the
+   decode bus, and because a reproducible 1.07x nobody can explain is a
+   mechanism nobody is using deliberately.
 2. **Finish §2.7's ladder on the other winners.** It was run on `reg64_bt`
    and `reg32_bt` only. `reg64x128` and `wg128x256` are the AI-43/85 shapes
    and already sit at 252 VGPRs with 32 accumulators, so they cannot hoist as
    they stand — whether the lever survives into them is what says how it
-   composes with arithmetic intensity, and it probably needs item 1 first.
+   composes with arithmetic intensity. §6.2 has now closed off the wave32
+   route to that: the register ceiling halves with the wave, so a
+   32-accumulator variant spills at wave32 rather than gaining headroom.
    Also missing: a row-major `hkb4`, which completes the 2x2 of (operand
    hoisted) x (layout) that §2.7 could only half-fill, and an explanation for
    the one reproducible cell where padding *hurts* (`reg32_bt_hkab4`, 0.88x).
@@ -820,8 +903,10 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up 
    tile whose fill cost a cheaper unpack would improve.)
 7. **IDEAS §1.3 — wide loads on the other GEMV kernels.** Measured at 1.17x
    on W4A8. fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%, where
-   W4A8 now reaches 89%. The traversal work adds a second reason to want
-   them: load width is one of the two things that set C.
+   W4A8 now reaches 96%. The traversal work adds a second reason to want
+   them: load width is one of the two things that set C — and §6.2 found load
+   width interacting with wave size on W4A8 in a way nothing predicts, so
+   these two items now want doing together.
 8. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
    and `n / pc.block`) from everything W4A8 did not rewrite: the
    naive/tiled GEMM paths and the old quantized GEMV variants.
@@ -838,13 +923,21 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up 
    (is `v_pk_fma_f16` actually emitted, given §0.1's 1.10x packed-fp16
    surprise). `-blocks` is worth re-sweeping only where a block-size effect
    survives warming — in GEMV it does not.
-11. **Not committed to git.** This session's §2.7 work is outstanding: the
-   `HOIST_A`/`HOIST_B` axis in `shaders/gemm_wmma.comp`, its eleven registry
-   entries in `shaders/shaders.go`, the 22 new rows in
-   `bench/ops_gemm_wmma.go`, plus `IDEAS.md`, `README.md`, this file, and a
-   regenerated `results.csv`. Note `*.spv` is gitignored, so **`go generate
-   ./...` is required after a fresh checkout** — the thirteen `strided_read`
-   variants and the 23 WMMA ones are each built from a single `.comp`.
+11. **IDEAS §3.7 — rewrite the subgroup reductions**, now that §6.2 has
+   measured *why* they lose rather than guessing: bandwidth is linear in
+   threads per row (256 → 223.7 GB/s, 64 → 68.5, 32 → 35.7), so the fix is a
+   256-thread workgroup doing `uvec4` loads → per-subgroup `subgroupAdd` → a
+   small LDS combine, and there is no wave-size knob worth trying first.
+   Mechanical, and it deletes a variant the engine should never pick.
+12. **Not committed to git.** This session's §6.2 work is outstanding:
+   `requiredSubgroupSize` through `vk/shim.c`/`shim.h`/`vk/engine.go`, the
+   `WAVE` `-D` on six `.comp` files, 16 new registry entries in
+   `shaders/shaders.go`, `bench/wavesize.go`, the `waveSize` field and rows
+   across five `bench/ops_*.go` files, `cmd/probe`'s size argument, plus
+   `IDEAS.md`, `README.md`, this file, and a regenerated `results.csv`. Note
+   `*.spv` is gitignored, so **`go generate ./...` is required after a fresh
+   checkout** — the thirteen `strided_read` variants and the 30 WMMA ones are
+   each built from a single `.comp`.
    Worth knowing when reading ISA: RADV caches compiled pipelines on disk, so
    `RADV_DEBUG=shaderstats` and `RADV_DEBUG=asm` print **nothing** on a
    second run of the same shader. Set `MESA_SHADER_CACHE_DISABLE=true`

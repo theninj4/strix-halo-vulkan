@@ -16,20 +16,40 @@ type w4a8Variant struct {
 	name           string
 	spirv          []byte
 	weightsPerLoad int
+	// waveSize pins the pipeline's subgroup size (IDEAS §6.2); zero takes the
+	// default of 64. The kernel reduces a whole row with subgroupAdd, so a
+	// binary built with -DWAVE=32 must be run at 32 and nothing else.
+	waveSize uint32
 }
 
 var w4a8Variants = []w4a8Variant{
 	{name: "subgroup", spirv: shaders.GEMVW4A8, weightsPerLoad: 8},
 	{name: "subgroup_vec4", spirv: shaders.GEMVW4A8Vec4, weightsPerLoad: 32},
+	// IDEAS §6.2 on the kernel that is already at 89% of the DRAM bus, so the
+	// prediction is "no change" — which is worth a row because the wave size
+	// is the one knob here that changes the *access pattern*: 32 lanes
+	// sweeping a row means each lane's stride doubles, and §5.1b's coverage
+	// law prices strides. A move either way is informative; a flat pair is the
+	// falsification test the law asks for.
+	{name: "subgroup_w32", spirv: shaders.GEMVW4A8W32, weightsPerLoad: 8, waveSize: 32},
+	{name: "subgroup_vec4_w32", spirv: shaders.GEMVW4A8Vec4W32, weightsPerLoad: 32, waveSize: 32},
 }
 
 // runGEMVW4A8 measures y = W*x with 4-bit weights and int8 activations, both
 // fed to the packed-int8 dot instruction (shaders/gemv_w4a8.comp). This is
 // IDEAS.md §1.1: same bytes as the PRECISION_Q4 path, same arithmetic as
 // the W8A8 path.
-func runGEMVW4A8(dev *vk.Device, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
+func runGEMVW4A8(dev *vk.Device, phys *vk.PhysicalDevice, sizes []int, blocks []int, warmup, iters uint32) ([]Result, error) {
+	sgs, err := phys.SubgroupSizeControl()
+	if err != nil {
+		return nil, err
+	}
+	variants := filterWaveVariants(w4a8Variants, sgs, func(v w4a8Variant) (string, uint32) {
+		return "gemv " + v.name + " w4a8", v.waveSize
+	})
+
 	var results []Result
-	for _, v := range w4a8Variants {
+	for _, v := range variants {
 		mod, err := dev.NewShaderModule(v.spirv)
 		if err != nil {
 			return nil, err
@@ -40,7 +60,7 @@ func runGEMVW4A8(dev *vk.Device, sizes []int, blocks []int, warmup, iters uint32
 			if !w4a8BlockOK(block, v.weightsPerLoad) {
 				continue
 			}
-			if err := verifyGEMVW4A8(dev, mod, block); err != nil {
+			if err := verifyGEMVW4A8(dev, mod, v.waveSize, block); err != nil {
 				return nil, fmt.Errorf("gemv %s w4a8 block=%d correctness check: %w", v.name, block, err)
 			}
 			for _, n := range sizes {
@@ -130,7 +150,7 @@ func buildGEMVW4A8Buffers(dev *vk.Device, M, N, block int) (bufs w4a8Buffers, xD
 	return
 }
 
-func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
+func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, waveSize uint32, block int) error {
 	n := gemmCorrectnessSize
 	if n%block != 0 {
 		n = block * 2
@@ -144,8 +164,9 @@ func verifyGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, block int) error {
 	}
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          bufs.list(),
-		PushConstantSize: 16,
+		Buffers:              bufs.list(),
+		PushConstantSize:     16,
+		RequiredSubgroupSize: waveSize,
 	})
 	if err != nil {
 		return err
@@ -175,8 +196,9 @@ func timeGEMVW4A8(dev *vk.Device, mod *vk.ShaderModule, v w4a8Variant, M, N, blo
 	}
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          bufs.list(),
-		PushConstantSize: 16,
+		Buffers:              bufs.list(),
+		PushConstantSize:     16,
+		RequiredSubgroupSize: v.waveSize,
 	})
 	if err != nil {
 		return Result{}, err

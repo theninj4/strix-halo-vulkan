@@ -14,9 +14,14 @@ W8A8 and W4A8 (int8 or 4-bit weights against int8 activations, reduced via
 Two kernels here are the current answers for the two shapes inference comes
 in. For **decode** (GEMV, memory-bound), **W4A8**
 (`shaders/gemv_w4a8.comp`): 4-bit weights fed to the packed-int8 dot
-instruction through its mixed-signedness overload, at **819 GFLOP/s and 211
-GB/s against DRAM-resident weights — 89% of this machine's 236 GB/s memory
-bandwidth**, 2.4x the int8-weight kernel it replaces. For **prefill** (GEMM,
+instruction through its mixed-signedness overload, at **226 GB/s against
+DRAM-resident weights — 96% of this machine's 236 GB/s memory bandwidth**,
+2.4x the int8-weight kernel it replaces. The last 7% of that is a host-side
+line and not a shader change: pinning the pipeline to **wave32** with
+`VK_EXT_subgroup_size_control` takes the wide-load arm from 211 GB/s to 226
+(IDEAS §6.2), reproducible to under 1% across runs. It is worth nothing at the
+narrow load width and it *costs* 0.6-0.9x on every cache-resident GEMV, so it
+is a per-pipeline knob rather than a default. For **prefill** (GEMM,
 compute-bound), the register-blocked cooperative-matrix GEMM
 (`shaders/gemm_wmma.comp`): **39.0 TFLOP/s, 70% of this chip's measured
 55.5 TFLOP/s of matrix-core throughput** (30.6 TFLOP/s at N=4096), 7.6x the
@@ -75,11 +80,12 @@ fields is itself a pointer into other Go memory — and Vulkan's
 ## Layout
 
 - `vk/` — the engine: `shim.c`/`shim.h` do the actual Vulkan calls
-  (instance/device setup with optional fp16/int8/cooperative-matrix device
-  features, buffer allocation preferring device-local+host-visible memory,
-  N-buffer pipeline creation with push constants and specialization
-  constants, GPU-timestamp-timed dispatch); `engine.go` is the idiomatic Go
-  wrapper (`Instance`, `Device`, `Buffer`, `ShaderModule`, `ComputePipeline`).
+  (instance/device setup with optional fp16/int8/cooperative-matrix/
+  subgroup-size-control device features, buffer allocation preferring
+  device-local+host-visible memory, N-buffer pipeline creation with push
+  constants, specialization constants and an optional required subgroup size,
+  GPU-timestamp-timed dispatch); `engine.go` is the idiomatic Go wrapper
+  (`Instance`, `Device`, `Buffer`, `ShaderModule`, `ComputePipeline`).
 - `main.go` — the original demo: picks the Strix Halo iGPU, uploads a float
   array, runs `shaders/double.comp`, reads it back, verifies it.
 - `shaders/*.comp` — the compute shaders (GLSL); `shaders/shaders.go`
@@ -87,8 +93,12 @@ fields is itself a pointer into other Go memory — and Vulkan's
   of the same source are generated via `glslc -D` flags, not duplicated GLSL.
 - `cmd/probe/main.go` — dispatches a single `.spv` once, so
   `RADV_DEBUG=asm` / `RADV_DEBUG=shaderstats` can be pointed at any shader to
-  read its disassembly or its VGPR/LDS/spill counts. Compilation-time
-  questions only; it binds dummy buffers and computes nothing meaningful.
+  read its disassembly or its VGPR/LDS/spill counts. An optional second
+  argument pins the wave size the shader is compiled for, since the register
+  file is per lane and the VGPR count is a different number at each. Note that
+  RADV caches compiled pipelines, so a repeat probe of the same shader prints
+  nothing — set `MESA_SHADER_CACHE_DISABLE=1`. Compilation-time questions
+  only; it binds dummy buffers and computes nothing meaningful.
 - `bench/` — the benchmark harness: GPU-timestamp-based timing
   (`bench.go`), fp16/int8/int4 quantization helpers matching GGML-style
   block scales (`quant.go`), clock/power instrumentation (`sysmon.go`), and
@@ -206,6 +216,16 @@ reader:
   at a padded stride — so a row's stride is visible rather than implied by
   its size. Nothing outside that family has been measured against a padded
   stride yet; assume its numbers are the aliased ones.
+- **Wave size.** Every kernel whose workgroup *is* one subgroup takes `WAVE`
+  as a `glslc -D`, and the pipeline pins the matching size with
+  `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize`
+  (`PipelineSpec.RequiredSubgroupSize`) — the two must agree or a 32-thread
+  binary would run as a half-idle wave64 and `subgroupAdd` would reduce half a
+  row. The `*_w32` rows are those pairs; they are dropped whole, with a note on
+  stderr, on a device that will not let a pipeline name a size. It is not a
+  free knob in either direction: 1.07x on the DRAM-resident W4A8 decode GEMV,
+  up to 2.1x on a fragment-heavy WMMA tile, and 0.58-0.9x almost everywhere
+  else (IDEAS §6.2). Rows without `_w32` are at the driver's default of 64.
 - **Cache-resident measurements are contended.** A MALL-resident working
   set is shared with everything else touching memory — the display this iGPU
   also drives, or a second benchmark process — and losing part of it drops a

@@ -13,9 +13,11 @@ the wrong predictions stay visible next to what actually happened.
 
 **§1.1 (W4A8 GEMV) has since been implemented and run too**, and it
 delivered: 819 GFLOP/s against DRAM-resident weights, **2.4x** the previous
-best decode kernel and **89% of the DRAM bus**. Decode is now a solved
-bandwidth problem at 4 bits/weight; see §1.1 for what it took and §1.3 for
-the load-width half of it.
+best decode kernel and **89% of the DRAM bus** — since taken to **96%** by
+pinning the pipeline to wave32 (§6.2), which is a host-side line and not a
+shader change. Decode is now a solved bandwidth problem at 4 bits/weight; see
+§1.1 for what it took, §1.3 for the load-width half of it, and §6.2 for the
+last 7%.
 
 **§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
 more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
@@ -86,6 +88,23 @@ every size, closing and reversing the 1.6x residue §2.3 carried. The control
 that makes it attributable had been sitting in the suite since §2.3: the same
 slab depth *without* hoisting leaves 16 loads in flight instead of 45 and
 measures as nothing. Depth is not the variable; concurrency is. See §2.7.
+
+**§6.2 (wave32) is done, and it is the first item here whose payoff landed on
+a different family from the one it was promoted for.** §2.7 asked for it
+because its ladder ends on the 256-VGPR wave64 budget and wave32 was supposed
+to halve what a fragment costs. Half of that is true — a 16×16 fragment is the
+native wave32 WMMA operand, and the most fragment-heavy variant reports the
+*same* VGPR count at both wave sizes, i.e. half the per-work cost — but the
+accumulators do not shrink and the register ceiling halves along with the wave,
+so §2.7's winning kernel spills at wave32 and loses 25%, and the suite's best
+GEMM numbers are unchanged. What did move: the fragment-dominated AI-16 GEMM
+grid gains **1.9-2.1x at every size**, wave32 takes the N=1024 crown at 33603
+GFLOP/s, and — the one number that changes an engine decision — **the
+DRAM-resident W4A8 decode GEMV at `VEC=4` reads 225.7 of 236 GB/s at wave32,
+96% of the bus, against wave64's 89%**, reproducible to under 1% over three
+runs. It also closed §3.7: the subgroup reductions scale linearly in threads
+per row (256 → 224 GB/s, 64 → 68.5, 32 → 35.7), so their 3.3x gap is the lane
+count and nothing to do with `subgroupAdd`. See §6.2.
 
 ## The roofline, and why it says there's a lot left on the table
 
@@ -639,6 +658,10 @@ Four findings, two of which contradict the plan above.
    of them — 3-5 waves per SIMD, comfortably above the floor. Register
    blocking on this part is limited by the 256-VGPR wave64 cap, not by
    occupancy, which makes §6.2 (wave32) more interesting than it was.
+   **[measured] §6.2 has since run and the cap does not move**: RADV's 256
+   ceiling is in units that halve with the wave, so wave32 buys headroom only
+   for the *fragments*, whose per-work cost genuinely halves, and not for the
+   accumulators. The 32-accumulator variants spill at wave32.
 
 **What binds it at 25 TFLOP/s** is neither ceiling: 573 GB/s of a 805 GB/s
 MALL and 45% of a 55.5 TFLOP/s MMA rate. The instruction mix names the
@@ -1093,6 +1116,16 @@ at AI 32 and needs the four-accumulator AI-16 grid to reach rung 8. **This
 makes §6.2 (wave32) materially more interesting than it was**: wave32 halves
 the per-fragment register cost of the same tile, which is the exact currency
 this lever spends.
+**[measured] §6.2 has since run, and that last sentence is half right in a way
+that matters.** The per-*fragment* cost does halve — a 16x16 fragment is the
+native wave32 WMMA operand and wave64 carries it redundantly across the two
+halves of the wave — but the per-accumulator cost does not, and RADV's 256
+ceiling is in units that halve with the wave, so the absolute reach is
+unchanged: `reg64_bt_hka4` fits wave64 at 252 VGPRs and **spills 62 at
+wave32**, losing 18-25%. Where the lever does land is the fragment-dominated
+AI-16 grid, where wave32 is worth **1.9-2.1x** at every size. So wave32 does
+not extend this ladder; it makes a different, lower-intensity rung of it
+competitive. See §6.2.
 
 **Engine implication**: hoist the K-slab. It is a source-level change to the
 inner loop with no layout, no shared memory and no host-side cost, it is
@@ -1185,6 +1218,13 @@ Two narrower findings replace it:
    `uvec4` loads → per-subgroup `subgroupAdd` → a 4-element LDS combine, or
    delete them; as they stand they are a strictly worse option that the
    engine should never pick.
+   **[measured] §6.2's wave32 arm turned that diagnosis from a guess into a
+   line.** Same kernels at 32 lanes per row instead of 64, N=4096:
+   `rmsnorm` goes 68.5 → 35.7 GB/s and `softmax` 47.7 → 24.7, both 0.52x for
+   0.5x the threads. With `shared`'s 223.7 at 256 threads per row that is
+   three points proportional to threads per row and nothing else: it is the
+   lane count, not `subgroupAdd`, and not the wave size as such. So the
+   rewrite above is the fix, and there is no wave-size knob to try first.
 2. **Softmax is 1.4x off RMSNorm's efficiency** (67% vs 95%) despite being
    the same shape of traversal, because it makes two passes (max, then
    exp-sum) plus a normalise. An online/single-pass softmax would close
@@ -1702,20 +1742,145 @@ Answers so far:
 **Effort**: low. **Value**: high — it converts speculation into fact, and
 every item above gets cheaper to evaluate once we can read the ISA.
 
-### 6.2 wave32 vs wave64
+### 6.2 wave32 vs wave64 — **DONE** ✅, and it split three ways
 **Hypothesis**: this device reports `minSubgroupSize=32`,
 `maxSubgroupSize=64`, `subgroupSizeControl=true` with compute in
-`requiredSubgroupSizeStages` — so we can *choose*. Everything is currently
-written for wave64 (`local_size_x = 64`). RDNA's WMMA 16×16×16 shape maps
-naturally onto wave32, and wave32 halves the latency of a dependent
-instruction chain and reduces divergence cost; wave64 halves instruction
-issue count. Which wins is empirical and differs per kernel.
-**Change**: use `VK_EXT_subgroup_size_control`'s
-`requiredSubgroupSize=32` pipeline creation flag and re-benchmark the
-coopmat GEMMs and the subgroup GEMV/reduction kernels at both sizes.
-**Expected**: 0-20% either way, per kernel. Cheap to test, and it's a
-per-pipeline knob we'd want to tune once and hard-code.
-**Effort**: low-medium (small `vk/shim.c` change). **Value**: medium-high.
+`requiredSubgroupSizeStages` — so we can *choose*. Everything was written for
+wave64 (`local_size_x = 64`). RDNA's WMMA 16×16×16 shape maps naturally onto
+wave32, and wave32 halves the latency of a dependent instruction chain and
+reduces divergence cost; wave64 halves instruction issue count. §2.7 promoted
+this item by ending on the register file: its ladder stops at rung 4 because
+hoisting both operands spills the 256-VGPR wave64 budget, and wave32 was
+supposed to halve the per-fragment cost of the same tile, which is the exact
+currency that lever spends.
+**Change**: `WAVE` became a `-D` on every kernel whose workgroup is one
+subgroup (`gemm_wmma.comp`, `gemv_subgroup.comp`, `gemv_w4a8.comp`,
+`gemv_w8a8.comp`, `rmsnorm_subgroup.comp`, `softmax_subgroup.comp`), and the
+host pins the pipeline to the matching size with
+`VK_EXT_subgroup_size_control`'s `requiredSubgroupSize` plus
+`REQUIRE_FULL_SUBGROUPS` (`vk/shim.c`, `PipelineSpec.RequiredSubgroupSize`).
+`cmd/probe` takes the size as a second argument, so `RADV_DEBUG=shaderstats`
+can price a variant at either. The wave64 SPIR-V is byte-identical to what it
+was before `WAVE` existed, verified with `cmp`.
+**Expected**: 0-20% either way, per kernel.
+
+**[measured] The range is 0.58x to 2.13x, and which end a kernel lands on is
+predictable.** Three families, three different answers.
+
+**1. The GEMM: up to 2.13x, but not where §2.7 wanted it.** Same tile, same
+accumulator grid, same hoist rung, same strides, same bytes — only the wave
+size differs. GFLOP/s, wave64 → wave32:
+
+| kernel (padded unless noted) | N=1024 | N=2048 | N=4096 |
+|---|---|---|---|
+| `reg32_bt` | 11693 → 20606 (1.76x) | 9011 → 10422 (1.16x) | 8034 → 8354 (1.04x) |
+| `reg32_bt_hkab4` | 17200 → **32946** (1.92x) | 13569 → **28292** (2.08x) | 11417 → **24313** (2.13x) |
+| `reg32_bt_hka8` | 18338 → 30776 (1.68x) | 24321 → 22035 (0.91x) | 17537 → 18552 (1.06x) |
+| `reg64_bt` | 28408 → 31502 (1.11x) | 18946 → 18237 (0.96x) | 15667 → 14707 (0.94x) |
+| `reg64_bt_hkab2` | 31664 → **33603** (1.06x) | 20966 → 19952 (0.95x) | 15178 → 15922 (1.05x) |
+| `reg64_bt_hka4` | 28174 → 25730 (0.91x) | **39039** → 32127 (0.82x) | **30933** → 23297 (0.75x) |
+| `reg64_hka4` (row-major) | 21494 → 26114 (1.21x) | 28905 → 31495 (1.09x) | 26558 → 28092 (1.06x) |
+| `reg64_bt_hka4`, *unpadded* | 13205 → 23892 (1.81x) | 22176 → 15297 (0.69x) | 18494 → 15097 (0.82x) |
+
+A second independent run agrees to ≤1.5% on every cell quoted, and the wave64
+column reproduces the committed `results.csv` row for row.
+
+**wave32 takes N=1024 and loses N=2048 and N=4096.** The new best at N=1024 is
+`reg64_bt_hkab2_w32_padab128` at 33603 (60% of the 55.5 TFLOP/s ceiling),
+against wave64's 31664. At the two larger sizes §2.7's `reg64_bt_hka4` /
+`_hkb4` pair still wins at **39039** and **31183**, and wave32 costs them
+18-25%. So the suite's headline number does not move; what moves is which
+kernel to pick at which size.
+
+**Why: the fragments get cheaper at wave32 and the accumulators do not.**
+`RADV_DEBUG=shaderstats` prices every variant at both sizes, and the first
+thing to establish is the unit, because RADV's wave32 VGPR figure is not
+directly comparable to its wave64 one. The calibration is the three
+*non-coopmat* kernels, whose register use per unit of work cannot change with
+the wave size: `gemv_subgroup_f16`, `gemv_w4a8` and `gemv_w4a8_v4` all report
+**48 → 96**, exactly 2x, with "Subgroups per SIMD" halving 32 → 16. That 2x is
+the no-change baseline. Against it:
+
+| variant | w64 VGPR | w32 VGPR | 2x w64 | w32 sg/SIMD | spill |
+|---|---|---|---|---|---|
+| `gemv_w4a8_v4` (control) | 48 | 96 | 96 | 16 | — |
+| `reg32_bt` | 48 | 72 | 96 | 16 | — |
+| `reg32_bt_hkab4` | 144 | 168 | 288 | 9 | — |
+| `reg32_bt_hka8` | 192 | **192** | 384 | 8 | — |
+| `reg64_bt` | 144 | 192 | 288 | 8 | — |
+| `reg64_bt_hkab2` | 192 | 256 | 384 | 5 | — |
+| `reg64_bt_hka4` | 252 | 256 | 504 | 5 | **62** |
+| `reg64_bt_hkab4` | spills (140, 3 KB) | 256 | — | 5 | **324**, 12 KB |
+
+Every coopmat kernel comes in *under* 2x, and the more fragment-heavy it is
+the further under: `reg32_bt_hka8` holds eighteen fragments against four
+accumulators and reports the identical 192 at both sizes, i.e. half the
+per-work cost. That is §6.2's hypothesis, confirmed — a 16×16 fragment is the
+native wave32 WMMA operand shape and wave64 carries it redundantly across the
+two halves of the wave. **But the 256 ceiling is in the same reported units**,
+so the absolute reach is not extended: `reg64_bt_hka4`, which fits wave64 at
+252, spills 62 at wave32. The lever is real and it is aimed at fragments; it
+does not lift the roof.
+
+Which is exactly what the timings say. The AI-16 grid is fragment-dominated
+(four accumulators), so at wave32 rung 4 becomes nearly free and is worth
+**1.9-2.1x at every size**. The AI-32 grid is accumulator-dominated (sixteen),
+so wave32 buys it little and costs it a spill at the rung that wins.
+
+**2. The GEMV kernels: a uniform loss, 0.58-0.95x.** GB/s at N=4096, wave64 →
+wave32: fp32 148 → 132, fp16 407 → 258, q8 199 → 116, q4 105 → 70, w8a8
+508 → 390, w4a8 418 → 326, w4a8 vec4 563 → 491. These kernels are one
+workgroup per output row and the workgroup *is* the subgroup, so halving the
+wave halves the lanes sweeping each row while the grid stays at M workgroups —
+half the threads, half the requests in flight, and no register benefit to show
+for it since (per the table above) their register cost per unit work is flat.
+The GEMM pays the same halving and wins anyway; these have nothing to buy with
+it. Two caveats: these are the cache-resident square sweep, so they carry the
+one-sided dropout noise README documents for MALL-resident cases — one wave32
+cell in the committed run (`gemv,subgroup_w32,w4a8,block=64,N=1024`, 61.5 GB/s)
+is such a dropout and reran at 270-281; and a second run put a different cell
+(`subgroup_vec4_w32` at N=2048) low instead. Read the *pattern*, not any one
+cell.
+
+**3. The DRAM-resident decode kernel: 1.07x, and it is the one number here
+that moves an engine decision.** `gemv_cold` at a 68 MB W4A8 weight matrix —
+twice the MALL, so every iteration refills from DRAM — over three runs:
+
+| kernel | run 1 | run 2 | run 3 | % of the 236 GB/s bus |
+|---|---|---|---|---|
+| `subgroup_vec4` (wave64) | 209.8 | 210.2 | 212.8 | 89% |
+| `subgroup_vec4_w32` | **225.6** | **226.3** | **225.1** | **96%** |
+| `subgroup` (wave64) | 182.2 | 182.5 | 181.0 | 77% |
+| `subgroup_w32` | 177.8 | 177.1 | 179.1 | 76% |
+
+Under 1% spread across runs, and the wave64 rows reproduce the committed
+`results.csv` to 0.1%. **The wide-load W4A8 GEMV at wave32 reads 225.7 GB/s of
+the 236 GB/s bus** — the decode path's best number, up from 89%. The effect is
+specific to the wide-load arm: at `VEC=1` wave32 is 0.98x, i.e. nothing. So it
+is not the wave size on its own, it is the wave size at a load width that
+already saturates each lane; and it runs the opposite way to the cache-resident
+square sweep above, which is why the two families needed separate rows. This is
+the counter-example to the "wave32 halves your threads and your requests"
+reading that explains family 2 — at 16 B per lane, 32 lanes is already enough
+requests to fill the bus, and the shorter wave wins on something else. Not
+attributed further; §5.1b's coverage law predicts wave32 *worse* here
+(C 1024 B → 512 B), so whatever this is, it is not coverage.
+
+**4. It also settles §3.7.** The subgroup reductions at N=4096: `shared`
+223.7 GB/s at 256 threads per row, `subgroup` 68.5 at 64, `subgroup_w32` 35.7
+at 32. Halving the wave halves the bandwidth, to 0.52x — the third point on a
+line through the origin in *threads per row*. §3.7 guessed the subgroup
+variants were latency-bound on too few lanes; this measures it. The fix is
+threads, not reduction ops, and there is nothing wave-size-shaped to tune.
+
+**Engine rule**: it is a per-pipeline knob and the default should stay 64.
+Pin 32 for the DRAM-resident W4A8 decode GEMV at `VEC=4` (1.07x, and it is the
+op that runs once per token per layer), and for a fragment-heavy low-intensity
+GEMM tile if one is ever the right shape. Leave it at 64 everywhere else, and
+never pin it on a kernel that spills at 32 — that is the one case where it
+costs 25%.
+**Effort**: low-medium (done). **Value**: medium — one real decode win, one
+retired hypothesis, and §3.7 closed as a side effect.
 
 ### 6.3 Occupancy tuning via workgroup size and LDS budget
 Once §6.1 gives VGPR counts, sweep workgroup sizes (64/128/256/512) and
@@ -1767,8 +1932,8 @@ experiments, but they gate the format decision:
 **§0 is done** — the harness now measures its own ceilings, records the
 clock behind every number, and has a DRAM-resident decode benchmark
 (`peak`, `overhead`, `gemv_cold` families). **§1.1 is done** — W4A8 GEMV at
-819 GFLOP/s / 211 GB/s, 89% of the DRAM bus, so decode is finished as a
-kernel problem. **§2.1 is done** — the register-blocked WMMA GEMM at 25.2
+819 GFLOP/s / 211 GB/s, 89% of the DRAM bus (226 GB/s and 96% once §6.2 pins
+it to wave32), so decode is finished as a kernel problem. **§2.1 is done** — the register-blocked WMMA GEMM at 25.2
 TFLOP/s, 45% of the matrix cores, so prefill is no longer the gaping hole
 either. **§2.3 is done** — the contradiction §2.1 ran into was DRAM channel
 aliasing on K-strided fragment loads, and padding the operand strides took
@@ -1787,17 +1952,28 @@ at tiling. **§2.7 is done**, and it took that law back to the GEMM: a whole
 K-slab's fragment loads in flight instead of one K-tile's is worth 2.1x, and
 at **38990 GFLOP/s / 70% of the WMMA ceiling** it closes and reverses §2.3's
 residue, which is the last thing this file was carrying as unexplained.
-What those seven left behind:
+**§6.2 is done**, the item §2.7 promoted: wave size is now a per-pipeline knob
+(`VK_EXT_subgroup_size_control`), and it did not extend §2.7's ladder — the
+fragment cost halves but the accumulator cost does not and the register ceiling
+moves with the wave, so the suite's best GEMM *spills* at wave32 and loses 25%.
+It paid off somewhere else instead: **the DRAM-resident W4A8 decode GEMV at
+`VEC=4` reads 225.7 of 236 GB/s at wave32, 96% of the bus, up from 89%**, and
+the fragment-dominated AI-16 GEMM grid gains 1.9-2.1x. It also closed §3.7 as a
+side effect.
+What those eight left behind:
 
 **Next:**
-- **§6.2 wave32, promoted by §2.7.** Register blocking is capped by the
-  256-VGPR wave64 limit, and §2.7 turned that cap into the thing that stops
-  the best lever in the file: hoisting both operands at BK_TILES=4 spills,
-  so the AI-32 kernel stops at rung 4 and rung 8 needs a smaller tile.
-  wave32 halves the per-fragment register cost of the same tile, which is
-  the exact currency both levers spend, and WMMA is natively a wave32 shape.
-  Needs `VK_EXT_subgroup_size_control`'s `requiredSubgroupSize` in
-  `vk/shim.c`. This is now the highest-value cheap item in the file.
+- **Explain the wave32 W4A8 win, and see how far it goes.** §6.2's one
+  engine-relevant result — DRAM-resident W4A8 decode at 225.7 of 236 GB/s at
+  wave32 against 211 at wave64 — is reproducible to under 1% and *unexplained*.
+  It is specific to the `VEC=4` arm (at `VEC=1` wave32 is 0.98x, i.e. nothing),
+  it runs the opposite way to every cache-resident GEMV row, and §5.1b's
+  coverage law predicts the wrong sign. The cheap next probes: a `VEC=8` arm,
+  wave32 with two rows per workgroup (which restores the thread count the
+  cache-resident rows miss), and the `stride` family run at both wave sizes,
+  which is the one kernel in the suite that can isolate this from everything
+  else a GEMV also does. Worth doing because it is the last 4% of the decode
+  bus and because a 1.07x nobody can explain is a mechanism nobody is using.
 - **Hoist the other winners, and finish §2.7's attribution.** The ladder was
   run on `reg64_bt` and `reg32_bt` only. `reg64x128` and `wg128x256` hold 32
   accumulators and already sit at 252 VGPRs, so they cannot hoist as they
@@ -1840,8 +2016,8 @@ What those seven left behind:
   top rung — one wave streaming a whole row — at full bandwidth at every
   stride. So the model's prediction for the GEMV, W4A8 and W8A8 kernels is
   **no effect**, now from the mechanism that was most likely to find one,
-  and consistent with W4A8's 89% of the bus. Worth running once as a
-  falsification test, not as an expected win.
+  and consistent with W4A8's 96% of the bus at wave32 (§6.2). Worth running
+  once as a falsification test, not as an expected win.
 
 **Then (cheap, and still untouched):**
 - **§1.2 remove the runtime integer divisions** — still the cheapest real
@@ -1852,9 +2028,11 @@ What those seven left behind:
   W4A8; fp16 and W8A8 GEMV are still at 75% and 73% of their ceilings.
 - **§5.1 memory-type bandwidth** — untouched, cheap, and bandwidth is the
   binding constraint on both of the paths that now work.
-- **§3.7 fix the reduction kernels**, **§1.4 GEMV access pattern**, and the
-  one ISA question §6.1 has left (`v_pk_fma_f16`). (§6.2 wave32 has been
-  promoted out of this list by §2.7 — see **Next** above.)
+- **§3.7 fix the reduction kernels** — now with its cause measured rather than
+  guessed (§6.2's wave32 arm made it a line through the origin in threads per
+  row), so the rewrite is a 256-thread workgroup and nothing else. Plus
+  **§1.4 GEMV access pattern** and the one ISA question §6.1 has left
+  (`v_pk_fma_f16`).
 
 **Then (the missing pillars):** §3.3 attention/flash-attention, §3.4 real
 model shapes, §3.1-3.2 fusion (justified by DRAM round-trips, not launch
@@ -1862,7 +2040,10 @@ overhead), §3.5 MoE grouped GEMM. §3.3 in particular now has a working
 register-blocked WMMA kernel to build its two matmuls out of.
 
 **Dropped or downgraded by measurement:** §2.2's Q4 unpack (no 2x int8
-matrix rate, and no LDS tile to make cheaper), §4.1 (answered: ~300 ns),
+matrix rate, and no LDS tile to make cheaper), **wave32 as a register-headroom
+lever for the GEMM** (§6.2: the fragment cost halves but the accumulator cost
+does not and the ceiling halves with the wave, so §2.7's winner spills),
+§4.1 (answered: ~300 ns),
 §4.2/§4.3 (the GPU-side half of the concern is ruled out), the packed-fp16
 half of §1.3 (1.10x, not 2x), the **LDS-staging and multi-wave-workgroup
 half of §2.1 itself**, which the 32 MiB MALL makes redundant on this part,
@@ -1876,7 +2057,8 @@ measured at within 2% of contiguous.
 
 The one-line summary, now with measured numbers behind each clause: **DRAM
 bandwidth is maxed at 236 GB/s so decode wins come only from reading fewer
-bytes — and W4A8 now reads 4 bits/weight at 211 of those 236 GB/s, so
+bytes — and W4A8 now reads 4 bits/weight at 226 of those 236 GB/s once its
+pipeline is pinned to wave32 (§6.2), so
 decode is finished as a kernel problem and continues only as a format
 problem — and the traversal probe that looked most likely to reopen it
 instead confirmed the one-wave-per-row shape reads at the full bus at every

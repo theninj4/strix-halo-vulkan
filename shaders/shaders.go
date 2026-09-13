@@ -174,9 +174,13 @@ var GEMVNaiveQ4 []byte
 // dequant-and-multiply. Subgroup reduction only (see gemv_w8a8.comp).
 
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_w8a8.spv gemv_w8a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -o gemv_w8a8_w32.spv gemv_w8a8.comp
 
 //go:embed gemv_w8a8.spv
 var GEMVW8A8 []byte
+
+//go:embed gemv_w8a8_w32.spv
+var GEMVW8A8W32 []byte
 
 // GEMV W4A8: 4-bit weights fed to the same packed-int8 dot instruction,
 // against int8 activations. Q4's bytes with W8A8's arithmetic — see
@@ -185,6 +189,8 @@ var GEMVW8A8 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_w4a8.spv gemv_w4a8.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DVEC=4 -o gemv_w4a8_v4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -o gemv_w4a8_w32.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DVEC=4 -DWAVE=32 -o gemv_w4a8_v4_w32.spv gemv_w4a8.comp
 
 //go:embed gemv_w4a8.spv
 var GEMVW4A8 []byte
@@ -192,10 +198,27 @@ var GEMVW4A8 []byte
 //go:embed gemv_w4a8_v4.spv
 var GEMVW4A8Vec4 []byte
 
+// The wave32 arm of IDEAS §6.2. Decode is bandwidth-bound — W4A8 already
+// reads at 89% of the DRAM bus — so the expected answer here is "no change",
+// and that is worth a measurement precisely because it is the family where
+// the wave size changes the *access pattern*: half the lanes per row means
+// each lane strides twice as far, and §5.1b's coverage law is about exactly
+// that. The pair is the falsification test the law asks for.
+
+//go:embed gemv_w4a8_w32.spv
+var GEMVW4A8W32 []byte
+
+//go:embed gemv_w4a8_v4_w32.spv
+var GEMVW4A8Vec4W32 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q4 -o gemv_subgroup_q4.spv gemv_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -o gemv_subgroup_f32_w32.spv gemv_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DPRECISION_F16 -o gemv_subgroup_f16_w32.spv gemv_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DPRECISION_Q8 -o gemv_subgroup_q8_w32.spv gemv_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DPRECISION_Q4 -o gemv_subgroup_q4_w32.spv gemv_subgroup.comp
 
 //go:embed gemv_subgroup_f32.spv
 var GEMVSubgroupF32 []byte
@@ -208,6 +231,18 @@ var GEMVSubgroupQ8 []byte
 
 //go:embed gemv_subgroup_q4.spv
 var GEMVSubgroupQ4 []byte
+
+//go:embed gemv_subgroup_f32_w32.spv
+var GEMVSubgroupF32W32 []byte
+
+//go:embed gemv_subgroup_f16_w32.spv
+var GEMVSubgroupF16W32 []byte
+
+//go:embed gemv_subgroup_q8_w32.spv
+var GEMVSubgroupQ8W32 []byte
+
+//go:embed gemv_subgroup_q4_w32.spv
+var GEMVSubgroupQ4W32 []byte
 
 // GEMM: C = A*B. Naive (fp32/fp16/Q8 weights), shared-memory tiled
 // (fp32/fp16), and cooperative-matrix (fp16 and int8, via the RDNA3.5
@@ -353,6 +388,43 @@ var GEMMW8A8 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_bt_hka4.spv gemm_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_hka4.spv gemm_wmma.comp
 
+// The same ladder at wave32 (IDEAS §6.2). §2.7 ended on the 256-VGPR wave64
+// budget — hoisting both operands at BK_TILES=4 spills — and predicted wave32
+// would buy headroom back, on the grounds that RDNA's WMMA 16x16x16 is
+// natively a wave32 shape. **RADV_DEBUG=shaderstats says the opposite, before
+// any of these is run**: a 16x16 fragment spread over 32 lanes puts twice as
+// many elements in each lane as over 64, so every variant costs *more* VGPRs
+// per lane at wave32, not fewer:
+//
+//   variant             w64 VGPR / sg per SIMD   w32 VGPR / sg per SIMD
+//   reg32_bt              48 / 32                  72 / 16
+//   reg32_bt_hkab4       144 / 10                 168 /  9
+//   reg32_bt_hka8        192 /  8                 192 /  8
+//   reg64_bt             144 / 10                 192 /  8
+//   reg64_bt_hkab2       192 /  8                 256 /  5
+//   reg64_bt_hka4        252 /  6                 256 /  5, 62 spilled
+//   reg64_bt_hkab4       spills (140 VGPR, 3 KB)  256 /  5, 324 spilled, 12 KB
+//
+// So wave32 does not extend the ladder; it shortens it — the rung that is the
+// suite's best kernel at wave64 spills at wave32. What is left worth measuring
+// is the other half of §6.2's hypothesis, which the register file does not
+// speak to: shorter dependent-instruction latency and finer scheduling
+// granularity, against half the lanes per instruction issued. These binaries
+// are built so that question gets a number instead of an argument.
+//
+// -DWAVE=32 only changes `local_size_x`; the host must pin the pipeline to the
+// same size with VK_EXT_subgroup_size_control, which bench/ops_gemm_wmma.go's
+// `waveSize` field does. The wave64 binaries above are byte-identical to what
+// they were before WAVE became a -D (verified with cmp).
+
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=4 -DWN=4 -DB_COLMAJOR=1 -o gemm_wmma_reg64_bt_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=2 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg64_bt_hkab2_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=4 -DWN=4 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_bt_hka4_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=2 -DWN=2 -DB_COLMAJOR=1 -o gemm_wmma_reg32_bt_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_reg32_bt_hkab4_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=2 -DWN=2 -DB_COLMAJOR=1 -DBK_TILES=8 -DHOIST_A=1 -o gemm_wmma_reg32_bt_hka8_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_reg64_hka4_w32.spv gemm_wmma.comp
+
 //go:embed gemm_wmma_reg32.spv
 var GEMMWMMAReg32 []byte
 
@@ -422,6 +494,27 @@ var GEMMWMMAReg64BTHKA4 []byte
 //go:embed gemm_wmma_reg64_hka4.spv
 var GEMMWMMAReg64HKA4 []byte
 
+//go:embed gemm_wmma_reg64_bt_w32.spv
+var GEMMWMMAReg64BTW32 []byte
+
+//go:embed gemm_wmma_reg64_bt_hkab2_w32.spv
+var GEMMWMMAReg64BTHKAB2W32 []byte
+
+//go:embed gemm_wmma_reg64_bt_hka4_w32.spv
+var GEMMWMMAReg64BTHKA4W32 []byte
+
+//go:embed gemm_wmma_reg32_bt_w32.spv
+var GEMMWMMAReg32BTW32 []byte
+
+//go:embed gemm_wmma_reg32_bt_hkab4_w32.spv
+var GEMMWMMAReg32BTHKAB4W32 []byte
+
+//go:embed gemm_wmma_reg32_bt_hka8_w32.spv
+var GEMMWMMAReg32BTHKA8W32 []byte
+
+//go:embed gemm_wmma_reg64_hka4_w32.spv
+var GEMMWMMAReg64HKA4W32 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_fp16.spv gemm_coopmat_fp16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_int8.spv gemm_coopmat_int8.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_q4.spv gemm_coopmat_q4.comp
@@ -440,6 +533,7 @@ var GEMMCoopMatQ4 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -o rmsnorm_shared.spv rmsnorm_shared.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o rmsnorm_subgroup.spv rmsnorm_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -o rmsnorm_subgroup_w32.spv rmsnorm_subgroup.comp
 
 //go:embed rmsnorm_shared.spv
 var RMSNormShared []byte
@@ -447,11 +541,23 @@ var RMSNormShared []byte
 //go:embed rmsnorm_subgroup.spv
 var RMSNormSubgroup []byte
 
+//go:embed rmsnorm_subgroup_w32.spv
+var RMSNormSubgroupW32 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o softmax_shared.spv softmax_shared.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o softmax_subgroup.spv softmax_subgroup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DWAVE=32 -o softmax_subgroup_w32.spv softmax_subgroup.comp
 
 //go:embed softmax_shared.spv
 var SoftmaxShared []byte
 
 //go:embed softmax_subgroup.spv
 var SoftmaxSubgroup []byte
+
+// IDEAS §3.7 has the subgroup reductions measuring 3.3x *slower* than the
+// shared-memory tree, which is backwards and unexplained. §6.2's wave32 arm is
+// one of the two candidate causes worth ruling in or out cheaply: a
+// 64-thread workgroup sweeping a row with subgroupAdd against a 32-thread one.
+
+//go:embed softmax_subgroup_w32.spv
+var SoftmaxSubgroupW32 []byte

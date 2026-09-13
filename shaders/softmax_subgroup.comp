@@ -4,8 +4,13 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 
 // Same as softmax_shared.comp but both reductions use subgroupMax/subgroupAdd;
-// workgroup size must equal this device's subgroup size (64).
-layout(local_size_x = 64) in;
+// the workgroup is a single subgroup, so its size must equal the size the host
+// pins the pipeline to with VK_EXT_subgroup_size_control (IDEAS §6.2). 64 is
+// this device's default; -DWAVE=32 builds the other arm.
+#ifndef WAVE
+#define WAVE 64
+#endif
+layout(local_size_x = WAVE) in;
 
 layout(binding = 0) readonly buffer X { float x[]; };
 layout(binding = 1) writeonly buffer Y { float y[]; };
