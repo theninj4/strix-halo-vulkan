@@ -1,3 +1,5 @@
 /strix-halo-vulkan
 *.spv
 /models/*
+.venv/
+reference/out/

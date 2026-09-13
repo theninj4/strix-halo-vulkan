@@ -5,7 +5,7 @@
 > handoffs) and `research/` (closed findings); if a paragraph here is about
 > the past, it is in the wrong file. Keep it under ~150 lines.
 
-**Status**: stage 1 of 6 done — the checkpoint loads and is verified.
+**Status**: stage 1 done; stage 2's CPU reference done and matching diffusers.
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 **Accept for now**: ~20-30 s/image. Correctness first, then profile.
 
@@ -58,7 +58,8 @@ whole pipeline is resident in 128 GB unified memory at once.
 | # | Stage | State | Notes |
 |---|---|---|---|
 | 1 | Checkpoint loader | **done** | `safetensors/`, `cmd/inspect` |
-| 2 | VAE decoder | next | needs conv2d — **no convolution kernel exists in this repo** |
+| 2a | VAE decoder, CPU reference | **done** | `zimage/vae/`, validated stagewise against diffusers |
+| 2b | VAE decoder, Vulkan | next | needs conv2d — **no convolution kernel exists in this repo** |
 | 3 | Attention | | IDEAS §3.3; 4096 tokens, 30 heads, 3D RoPE, qk_norm |
 | 4 | DiT graph | | 34 blocks over kernels already near ceiling, + adaLN, + SwiGLU |
 | 5 | Text encoder + tokenizer | | Qwen3-4B, GQA; BPE from `tokenizer/` |
@@ -67,14 +68,29 @@ whole pipeline is resident in 128 GB unified memory at once.
 **Stage 2 is first on purpose**: it can be validated against a latent
 decoded by diffusers before any of the DiT exists, and it is the largest
 genuinely new piece — convolution is an operator class the benchmark suite
-never covered.
+never covered. Each stage gets a CPU implementation in Go first: it
+separates "do I understand the architecture" from "is the shader right", and
+once it matches diffusers it is the oracle the GPU port is debugged against.
 
 ## The rule for every stage
 
 Validate against the **diffusers reference**, not against a shape table.
-Dump the reference tensor from Python, run the Go/Vulkan stage on the same
-input, compare. That is also the only thing that unblocks `IDEAS.md` §7,
-which gates every remaining format decision.
+`reference/dump_vae.py` is the pattern: decode a fixed input with diffusers
+in fp32 on CPU, dump **every submodule's output**, and have the Go test walk
+the graph stage by stage. Stagewise is the point — an end-to-end check tells
+you the image is wrong, this tells you which of the 40 convolutions is.
+
+Every such test needs a **negative control** that deliberately breaks the
+implementation and asserts the break is caught. Without one the test proves
+only that it runs. `zimage/vae`'s control perturbs an output channel, the
+padding, a residual and a projection, and they land 141x to 14000x above the
+tolerance — which is also how the tolerance got set, rather than by taste.
+
+Set tolerances from measurement: `zimage/vae` sees 6.2e-5 legitimate drift
+over 40 convolutions of independent float32 summation order, and bounds at
+2e-4. Normalise the error by the tensor's **RMS**, not per-element — the
+activations here cross zero constantly, and a per-element relative error
+reports 0.19 for a tensor that agrees to seven digits.
 
 ## What the kernels already give us
 
@@ -92,6 +108,23 @@ should be built to respect them rather than re-derive them:
 - **Kernel choice splits at M**: `wmma_reg64_bt_hka4_padab128` wins every
   rectangle with M >= 1024, `wmma_reg32_bt_hkab4_w32_padab128` (wave32) wins
   every one below it (§3.4).
+
+## What building stage 2 found
+
+- **The VAE's attention scores overflow fp16 and its activations do not.**
+  Activation absmax through the whole decoder is 497, comfortably inside
+  fp16 — but the mid block's score matrix reaches **1.16e7**, 177x past
+  fp16's 65504. So scores must accumulate in fp32 (which the WMMA fp16->fp32
+  path does natively) and the row max must be subtracted before any
+  exponential. This is why the VAE config sets `force_upcast`.
+- **That attention is fully saturated**: entropy 0, a hard one-hot, with the
+  argmax set by `||k_j||` rather than by q's direction. Transposing `to_q`
+  changes the output by 1.5e-5 — i.e. not at all — so no test can catch a
+  q-projection bug at this input. Validate `to_v` instead, and do not read a
+  passing q test as coverage.
+- The reference harness needs no GPU and no Vulkan, so stage 2b can be
+  developed against a failing test rather than against a picture that looks
+  slightly wrong.
 
 Promoting those last two from prose into an executable kernel-selection
 policy — with a test asserting it against `results/shapes.csv` — is the
