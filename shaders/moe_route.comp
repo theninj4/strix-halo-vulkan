@@ -1,0 +1,113 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The two data-movement halves of an MoE FFN (IDEAS §3.5), which the grouped
+// GEMM itself cannot do and which nothing else in this suite measures.
+//
+// A grouped GEMM needs each expert's rows contiguous, because a
+// cooperative-matrix fragment load reads 16 rows at one fixed stride. Real
+// routing does not produce that: token t goes to experts e_1..e_k scattered
+// through the bank. So an engine pays two extra passes over the activations
+// per MoE layer, and they are pure bandwidth:
+//
+//   MODE_GATHER  — build the grouped-GEMM's A operand. dst row r takes
+//                  src row idx[r], or zeros when idx[r] is the sentinel,
+//                  which is how each expert's group is padded up to the
+//                  kernel's BM without the kernel needing to mask.
+//   MODE_COMBINE — undo it. Token t's output is the weighted sum of the
+//                  TOPK expert rows it was routed to: dst[t] = sum_j
+//                  w[t*TOPK+j] * src[idx[t*TOPK+j]]. This is where the
+//                  routing weights are applied, so it is a real fused op and
+//                  not just the gather backwards.
+//
+// Both sides are fp16 here, including MODE_COMBINE's source. The grouped
+// GEMM as built writes fp32 C (IDEAS §2.6's fp16-output item is still open),
+// so an engine using it today would pay twice this read traffic on the
+// combine; the number below is what the combine costs once that item lands,
+// and the doubling is stated where it is reported rather than buried in it.
+//
+// Both are one workgroup per destination row, striding along K in uvec4 —
+// eight halves per lane-step, the width IDEAS §1.3 measured wide loads at.
+// A row is 1280 or 5120 bytes here (K = 640 or 2560), so one workgroup of
+// 256 lanes covers it in one or two steps and the traversal is contiguous:
+// this is deliberately the easy access pattern, because the question is what
+// the *traffic* costs, not whether a copy can be written badly.
+
+#define MODE_GATHER 0
+#define MODE_COMBINE 1
+#ifndef MODE
+#define MODE MODE_GATHER
+#endif
+
+#ifndef TOPK
+#define TOPK 10     // experts per token; only read in MODE_COMBINE
+#endif
+
+#define THREADS 256
+layout(local_size_x = THREADS) in;
+
+layout(binding = 0) readonly buffer Src { uvec4 src[]; };
+layout(binding = 1) readonly buffer Idx { uint idx[]; };
+layout(binding = 2) readonly buffer Weights { float wt[]; };
+layout(binding = 3) writeonly buffer Dst { uvec4 dst[]; };
+
+layout(push_constant) uniform PC {
+    uint rows;    // destination rows
+    uint K;       // halves per row
+    uint ldSrc;   // source row stride in halves
+    uint ldDst;   // destination row stride in halves
+} pc;
+
+// The sentinel index for a padding row: a group rounded up to the kernel's
+// BM has rows that correspond to no token, and they must read as zero rather
+// than as whatever the allocation happened to hold — a coopmat A fragment
+// reads all 16 of its rows whether they mean anything or not, and a NaN or
+// an inf in one of them would poison the whole tile's accumulator.
+#define NO_ROW 0xffffffffu
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint vecs = pc.K / 8u;               // uvec4s per row
+    uint srcBase = pc.ldSrc / 8u;
+    uint dstBase = pc.ldDst / 8u;
+
+#if MODE == MODE_GATHER
+    uint s = idx[row];
+    for (uint i = gl_LocalInvocationID.x; i < vecs; i += THREADS) {
+        dst[row * dstBase + i] = (s == NO_ROW) ? uvec4(0u) : src[s * srcBase + i];
+    }
+#else
+    for (uint i = gl_LocalInvocationID.x; i < vecs; i += THREADS) {
+        // Accumulate in fp32 and pack back to fp16 once: TOPK is 10 here, and
+        // summing ten fp16 products in fp16 loses bits the router's weights
+        // are the whole point of.
+        vec4 lo = vec4(0.0);
+        vec4 hi = vec4(0.0);
+        [[unroll]] for (uint j = 0u; j < TOPK; j++) {
+            uint s = idx[row * TOPK + j];
+            if (s == NO_ROW) {
+                continue;
+            }
+            float w = wt[row * TOPK + j];
+            uvec4 v = src[s * srcBase + i];
+            f16vec2 h0 = unpackFloat2x16(v.x);
+            f16vec2 h1 = unpackFloat2x16(v.y);
+            f16vec2 h2 = unpackFloat2x16(v.z);
+            f16vec2 h3 = unpackFloat2x16(v.w);
+            lo += w * vec4(float(h0.x), float(h0.y), float(h1.x), float(h1.y));
+            hi += w * vec4(float(h2.x), float(h2.y), float(h3.x), float(h3.y));
+        }
+        dst[row * dstBase + i] = uvec4(
+            packFloat2x16(f16vec2(float16_t(lo.x), float16_t(lo.y))),
+            packFloat2x16(f16vec2(float16_t(lo.z), float16_t(lo.w))),
+            packFloat2x16(f16vec2(float16_t(hi.x), float16_t(hi.y))),
+            packFloat2x16(f16vec2(float16_t(hi.z), float16_t(hi.w))));
+    }
+#endif
+}

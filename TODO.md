@@ -18,25 +18,151 @@ sweeping everything by default. A run now has to name its targets:
 
     go run ./cmd/bench -blocks 32,64,128,256,512,1024 gemv gemm
 
-`go run ./cmd/bench -list` prints the eleven families; `all` is the old
+`go run ./cmd/bench -list` prints the twelve families; `all` is the old
 whole-suite behaviour. The non-default block list above is what the committed
 files have always used, so keep it if they are to stay comparable row for
 row. Run with nothing else on the GPU (see the measurement lessons below).
-The whole suite takes ~38 minutes, of which `stride` is ~14 (816 cases), the
-GEMM families ~10 and `shapes` ~5 — which is the reason for targeting:
-refreshing `gemv` alone is a couple of minutes and rewrites only
+The whole suite takes ~40 minutes, of which `stride` is ~14 (816 cases), the
+GEMM families ~10, `shapes` ~5 and `moe` ~2 — which is the reason for
+targeting: refreshing `gemv` alone is a couple of minutes and rewrites only
 `results/gemv.csv`. Note `gemm_wmma` (the 57-variant WMMA ablation, 285 rows)
 is its own family, split out of `gemm`, since it is tuned on its own, and
-`shapes` sweeps nothing at all — it runs the kernels the other families
-picked over the model dimensions in `bench/modelshapes.go`, so `-sizes` and
-`-blocks` do not apply to it.
+`shapes` and `moe` sweep nothing at all — they run the kernels the other
+families picked over the model dimensions in `bench/modelshapes.go` and over
+qwen3.8-flash-next's 512-expert bank, so `-sizes` and `-blocks` do not apply
+to them. `moe` allocates the largest buffers in the suite (a 512-expert fp16
+bank is 1.8-4.0 GB depending on the row stride under test), so give it
+headroom.
 
 Two documents carry the analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
 gain / how to measure, and marked up with what has since been measured).
 **`GOALS.md`** is the long-term target (four models, HTTP API in Go).
 
-### This session: IDEAS §3.4 — the models' real shapes, and two answers that move
+### This session: IDEAS §3.5 — the grouped/MoE GEMM, and three answers that were not the expected ones
+
+The handoff's item 1 was "§3.5, the grouped/MoE GEMM", promoted to the top of
+`IDEAS.md` by §3.4 on two measurements: 40 rows per expert running at 14% of
+the WMMA ceiling with 62% tile padding, and 1440 of a decode token's 1861
+matmuls being expert projections. It is now done, and **neither of those was
+the mechanism.**
+
+**New code:**
+- `shaders/gemm_wmma.comp`: a `GROUPED` mode. One extra binding holds a tile
+  table — (row in the gathered activations, row in the `[E*N, K]` expert
+  bank, column in the output) — and the tile origin is read out of it
+  instead of derived from `gl_WorkGroupID`, plus one push-constant word
+  naming the first table entry a dispatch covers. Nothing below the origin
+  changes: `RADV_DEBUG=shaderstats` prices the grouped binaries at exactly
+  the VGPR counts of their non-grouped twins (252/144/168), and the
+  non-grouped SPIR-V is instruction-for-instruction identical (the ids shift
+  by one `#if`; `spirv-dis` with ids renumbered diffs clean, and every file
+  is the same size to the byte).
+- `shaders/moe_route.comp`: the gather and combine passes a grouped GEMM
+  makes necessary, since a coopmat fragment reads 16 rows at one stride and
+  real routing does not put an expert's tokens next to each other.
+- `vk/shim.c`, `vk/engine.go`: `DispatchSequenceTimed` — a command buffer of
+  N dispatches with *differing* push constants and a barrier between each.
+  That is what the per-expert baseline is, and `DispatchTimed` cannot express
+  it (one constant block per command buffer). `bench.TimeDispatchSequence`
+  wraps it with the same clock-warmup and 500 ms budget cap.
+- `vk/engine.go`: `Buffer.FillRepeating`, because a 512-expert fp16 bank is
+  1.8-4.0 GB and building a host-side copy of it costs more than the
+  measurement.
+- `bench/ops_moe.go`: the `moe` family. Uniform-random top-10 routing over
+  512 experts at 1/512/2048/8192 tokens; five tile geometries and a
+  seven-point stride sweep; grouped and per-expert arms of each; the
+  gather/combine passes; and five summary tables.
+- `bench/families.go`: `moe` registered between `shapes` and `reduce`.
+
+**Finding 1: grouping is worth 1.08-4.14x, and it is occupancy.** Sort every
+(kernel, layer, batch) cell by how many workgroups *one expert's* dispatch
+launches:
+
+| workgroups per expert dispatch | grouped / per-expert |
+|---|---|
+| 10 | 3.18-4.14x |
+| 20 | 1.58-3.27x |
+| 30-41 | 1.12-2.54x |
+| 80-119 | 1.09-1.27x |
+| 209-837 | 0.75-1.14x |
+
+80 waves is what §0.1 measured this 40-CU part needs resident to issue WMMA
+at rate, and one workgroup here is one wave. A per-expert dispatch that
+cannot fill the machine is slow, and the barrier after it makes the idleness
+serial. §4.1's 300 ns launch is 1.5% of a 20 µs dispatch and explains none of
+it — so the dispatch count, which is what promoted this item, was the wrong
+lever. Two cells **invert** (0.74-0.75x, both `moe.gate_up` at 8192 tokens in
+the two narrowest-BN kernels, reproducible across three runs) and are not
+explained.
+
+**Finding 2: the tile padding is real and costs nothing.** A 16-row tile
+takes a 40-row group from 62% useful to 84% and is *slower* — 7146 against
+7596 useful GFLOP/s on gate_up. At this shape the binding constraint is
+weight bytes: the grouped kernel moves **190 GB/s of the 236 GB/s bus**, so
+what a smaller tile buys in useful rows it loses in operand bytes re-read.
+Against the memory-bound ceiling the fp16 bank implies (1.68 GB of weights
+plus 252 MB of activations, 8.2 ms at 236 GB/s, 8.2 TFLOP/s useful) the
+grouped kernel is at **93%**. §3.4's "14% of the WMMA ceiling" was the wrong
+ceiling for a shape that never sees the matrix cores, and its "5.1x behind
+M=2048" compared two MALL-resident dispatches.
+
+**Finding 3, which nobody asked for: "pad every stride by 256 B" is the wrong
+statement of its own rule.** These are the first non-power-of-two reduction
+lengths anything in the suite has run a GEMM at (2560 and 640), and they
+separate "pad by 256 B" from "land on a gcd of 256". Sweeping
+`gcd(row stride, 4096)` over every power of two, at fixed tile, two kernels,
+two shapes (GB/s of the 236 GB/s bus):
+
+| gcd | 16 | 64 | **128** | **256** | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|---|---|
+| gate_up K=2560, reg64 | 181 | 186 | **192** | 190 | 190 | 173 | 133 |
+| gate_up K=2560, reg16x64 | 149 | 165 | **179** | 179 | 173 | 137 | 89 |
+| down K=640, reg64 | 167 | 165 | 175 | **175** | 152 | 118 | 98 |
+| down K=640, reg16x64 | 164 | 166 | 182 | **183** | 155 | 114 | 86 |
+
+A plateau at 128-256 B with a cliff on both sides. The 640-wide down
+projection is at gcd 256 **unpadded**, and the +256 B pad every other kernel
+in this suite carries moves it to 512 for a measured **1.19x loss**. The
+confound is broken by construction: gate_up's gcd-1024 row is the unpadded
+stride and down's gcd-256 row is too, so this is not "large stride is slow".
+`IDEAS.md` §5.1b's first engine rule is amended accordingly, and this also
+answers §3.4's second open item (K=640 at 88-91% of the bus) on the GEMM
+side.
+
+**Finding 4: the routing passes are 5% of the block.** Gather 0.90 ms
+(368 GB/s — above the DRAM bus, because it re-reads a 10 MB token buffer ten
+times out of the MALL), combine 0.52 ms, against 28.1 ms of matmul.
+
+**Finding 5: the budget.** One MoE block at 2048 tokens is **29.99 ms grouped
+against 38.49 ms expert-at-a-time**, 5 dispatches against 1538; times 48
+layers, **1.44 s against 1.85 s** per prompt chunk. All fp16, where the bank
+alone is 5.03 GB per block and 21.3 ms of unavoidable traffic — so what is
+left of MoE prefill is the *format*, and a Q4 grouped GEMM (§2.2) is now the
+largest number in `IDEAS.md`.
+
+**Not done, deliberately:** the decode rows run the grouped GEMM at M=1,
+which is free on bandwidth but wastes 15 of 16 rows of every MMA tile, and
+their 10-expert working set is 33 MB — inside the MALL, so they are not a
+decode measurement. The honest decode kernel is a grouped *GEMV*.
+
+**One thing this session found by accident, worth knowing before trusting a
+small cell.** Adding `GROUPED` shifts the SPIR-V ids in the non-grouped
+binaries without changing a single instruction (`spirv-dis` with ids
+renumbered diffs clean; every file is the same size to the byte), so
+`gemm_wmma` was re-run as a regression check. Median ratio 1.0005 over all
+285 rows — and two cells off by 0.23x and 1.51x. Re-measuring both at 200
+iterations, twice: `wmma_reg32_hka8_pada128` at N=256 is 7551/7553 against
+the committed 7526 (the 0.23x was a one-off low cell in the *check* run), and
+`wmma_reg64_bt` at N=512 is 14754/14745 against the committed **9790** — so
+that committed cell is the wrong one, and it is wrong by 1.5x. Both are the
+default 20 iterations on dispatches of tens of microseconds, which is exactly
+the regime §3.4 raised the `shapes` floor to 200 for. **`results/gemm_wmma.csv`
+at N=256 and N=512 should not be trusted to better than ~1.5x**; the file is
+left as measured rather than partially refreshed, and the fix is to re-run
+that family with `-iters 200`.
+
+### Previous session: IDEAS §3.4 — the models' real shapes, and two answers that move
 
 The handoff's item 1 was "`VEC=32`, when §3.4 says a target model needs it",
 and item 1's own instruction was to do §3.4 first. That is now done, and it
@@ -127,7 +253,7 @@ above is a weights-only floor; the KV cache at long context is not in it. And
 the decode arm measures W4A8 only — the shapes family is not the place to
 re-run a format ablation.
 
-### Previous session: IDEAS §1.7 — the wave32 W4A8 win, explained and superseded
+### Two sessions ago: IDEAS §1.7 — the wave32 W4A8 win, explained and superseded
 
 The handoff's item 1 was "explain the wave32 W4A8 win, and see how far it
 goes": §6.2 had measured the DRAM-resident W4A8 decode GEMV at 225.7 of
@@ -203,7 +329,7 @@ at both wave sizes, ~14 minutes each. It existed to isolate a wave-size effect
 from everything else a GEMV does. There is no longer a wave-size effect to
 isolate, so it was retired rather than run.
 
-### Two sessions ago: IDEAS §6.2 — wave32, and the payoff landed somewhere else
+### Three sessions ago: IDEAS §6.2 — wave32, and the payoff landed somewhere else
 
 The handoff's item 1 was §6.2, promoted by §2.7 on a specific argument: the
 best lever in the file stops at the 256-VGPR wave64 budget, and wave32 was
@@ -281,7 +407,7 @@ low instead. Read the pattern across sizes, not any single cell. The
 DRAM-resident `gemv_cold` rows reproduce to under 1% and are the ones to
 trust.
 
-### Three sessions ago: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
+### Four sessions ago: IDEAS §2.7 — hoisting the K-slab, and §2.3's residue closed
 
 The handoff's item 1 was "§2.3's residue, re-aimed by the traversal axis":
 the 1.6x that transposed-B stayed behind row-major at N=4096 **with both
@@ -350,7 +476,7 @@ spends, and WMMA is natively a wave32 shape.
 padded than unpadded (0.88x at N=4096, 0.87x at N=2048, both runs). Every
 other rung on that ladder goes the other way.
 
-### Four sessions ago: IDEAS §5.1b's follow-up — the traversal axis
+### Five sessions ago: IDEAS §5.1b's follow-up — the traversal axis
 
 §5.1b left one access pattern unmeasured and called it the sharpest item in
 the file: **concurrent-but-contiguous requests from *different* waves at an
@@ -462,7 +588,7 @@ It was filed as a 1.3x tidy-up against gathers; it is a defence against a 4x
 that needs no padding to occur. The second escape, when the stride is not the
 engine's to choose, is depth: 4 KB of a row in flight per wave.
 
-### Five sessions ago: IDEAS §5.1b — the strided-bandwidth probe
+### Six sessions ago: IDEAS §5.1b — the strided-bandwidth probe
 
 `IDEAS.md` §5.1b asked for the memory system to be measured directly instead
 of inferred through a GEMM: fixed bytes touched, sweeping (a) the stride
@@ -585,7 +711,7 @@ consequence points the same way as the corollaries above: **"keep it under
   timed batches and keeps the fastest (`strideBatches`); DRAM-resident cases
   reproduce to within 2% either way and are unaffected by that choice.
 
-### Six sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
+### Seven sessions ago: IDEAS §2.3 — the transposed-B contradiction, resolved
 
 `IDEAS.md` §2.3's open question was why the *better* instruction stream is
 2.8x slower: storing B as [N,K] and loading it column-major cuts
@@ -700,7 +826,7 @@ present in every run.
    penalty into a curve the engine can allocate against instead of one
    kernel's anecdote.
 
-### Seven sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
+### Eight sessions ago: IDEAS §2.1, the register-blocked WMMA GEMM
 
 `IDEAS.md`'s largest remaining item is done, and it beat its own forecast.
 **A register-blocked cooperative-matrix GEMM reaches 25.2 TFLOP/s at
@@ -800,7 +926,7 @@ issue overlapping fragment loads and only reach it if L0/L1 dedups them.
    the 256-VGPR wave64 limit, not by occupancy, which also makes §6.2
    (wave32) more interesting than it was: WMMA is natively a wave32 shape.
 
-### Eight sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
+### Nine sessions ago: IDEAS §1.1, the W4A8 GEMV kernel
 
 The highest-value item in `IDEAS.md` is done, and it delivered more than it
 promised. **W4A8 GEMV — 4-bit weights against int8 activations, both fed to
@@ -877,7 +1003,7 @@ the 64MB footprint, where 4-bit weights still fit the 32MB MALL.
    §1.2's "no integer division" is also folded into this kernel: it takes
    `log2(block)` and shifts.
 
-### Nine sessions ago: the §0 "measurement validity" block from IDEAS.md
+### Ten sessions ago: the §0 "measurement validity" block from IDEAS.md
 
 The session that produced `IDEAS.md` implemented its §0 —
 the work that had to happen before optimising against any of the existing
@@ -1020,28 +1146,44 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
 updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
-§2.7, §6.2, §1.7 and §3.4 found. In short:
+§2.7, §6.2, §1.7, §3.4 and §3.5 found. In short:
 
-1. **IDEAS §3.5 — the grouped/MoE GEMM.** §3.4 promoted this to the top of
-   the file on two measurements rather than on the model card. Routing a
-   2048-token prompt across 512 experts gives each expert 40 rows: the best
-   kernel in the suite gets 7600 useful GFLOP/s there, 14% of the WMMA
-   ceiling and 5.1x behind the same matrix at M=2048, with 62% of the
-   dispatch being tile padding. And 1440 of a decode token's 1861 matmuls
-   are expert projections, which a grouped kernel collapses to 48 — worth
-   0.4 ms of the 0.56 ms of launch cost a token currently pays. Both halves
-   of §3.5 (the gather/scatter of token rows, and a kernel reading per-expert
-   (offset, count) from a buffer) now have a number to beat.
-2. **K=640 reads 88-91% of the bus and nothing moves it.** The one decode
-   shape §3.4 found short of DRAM bandwidth — 209-215 GB/s flat across all
-   four load widths, where the coverage law says 320-byte rows should be
-   fine at the narrowest. It is the MoE down-projection, 480 of a token's
-   matmuls, so it is the shape the engine runs most often after the expert
-   gate/up. Same class of question §1.7 answered for N=4096, still open here.
-3. **`VEC=32` is retired.** Left here so it is not re-proposed: the largest
+1. **IDEAS §2.2's Q4/int8 arm — now the largest number in the file.** §3.5
+   measured the MoE prefill at 93% of the ceiling its *format* implies, and
+   that ceiling is entirely weight bytes: 5.03 GB per block at fp16, 21.3 ms
+   of unavoidable DRAM traffic against a 28-30 ms block. There is nothing
+   left in the kernel — the grouped GEMM moves 190 of 236 GB/s, the tile
+   geometry is worth 1.17x across a 3x range of arithmetic intensity, and
+   the schedule is settled. A 4-bit bank is a quarter of those bytes, and
+   §1.1 already has 4-bit weights feeding `dotPacked4x8EXT` at the full bus
+   in the GEMV. Build `PRECISION_I8`/Q4 arms of `gemm_wmma.comp` accumulating
+   in int32, grouped and not, and the whole of prefill's story is told.
+2. **Carry §3.5's stride window back to the GEMV kernels, and re-run §3.4's
+   decode arm with it.** §3.4 left K=640 as an unexplained deficit (209-215
+   GB/s flat across all four load widths). §3.5 answers it on the GEMM side
+   and the answer is a *window*: `gcd(row stride, 4096)` wants to be 128-256
+   B, and both ends of that cost — over is 1.4-2.0x, under is 5-17%. A 4-bit
+   K=640 weight row is 320 B, gcd 64: **below** the window, which is exactly
+   the end §3.4 could not see because the suite had no shape there. The row
+   stride is not currently a knob in the W4A8 kernels; make it one (it is a
+   push constant in the WMMA path already) and sweep it.
+3. **A grouped GEMV for decode.** §3.5's decode rows run the grouped *GEMM*
+   at M=1: free on bandwidth, since the weights are read once either way, but
+   15 of every 16 rows of an MMA tile are waste, and the 10-expert working
+   set is 33 MB — inside the MALL, so those rows are not a decode
+   measurement at all. The honest kernel is `gemv_w4a8.comp` with §3.5's tile
+   table, and decode is the phase `GOALS.md` is actually asking about.
+4. **`VEC=32` is retired.** Left here so it is not re-proposed: the largest
    reduction length any of the five models decodes over is 6144, and at
    6144 every built width already reads the bus. There is no matrix for it.
-4. **Finish §2.7's ladder on the other winners.** It was run on `reg64_bt`
+5. **The two inverted cells in §3.5.** `moe.gate_up` at 8192 tokens in
+   `reg32_bt_hkab4` and `reg16x32_bt_hkab4_w32`: the *grouped* dispatch is
+   0.74-0.75x the per-expert loop, reproducibly across three runs, where
+   every other cell goes the other way and the occupancy story predicts a
+   tie. Both are the narrow-BN kernels at the largest dispatch (51k and 102k
+   workgroups). Small, and the only cell in `moe` that the attribution gets
+   backwards.
+6. **Finish §2.7's ladder on the other winners.** It was run on `reg64_bt`
    and `reg32_bt` only. `reg64x128` and `wg128x256` are the AI-43/85 shapes
    and already sit at 252 VGPRs with 32 accumulators, so they cannot hoist as
    they stand — whether the lever survives into them is what says how it
@@ -1051,7 +1193,7 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
    Also missing: a row-major `hkb4`, which completes the 2x2 of (operand
    hoisted) x (layout) that §2.7 could only half-fill, and an explanation for
    the one reproducible cell where padding *hurts* (`reg32_bt_hkab4`, 0.88x).
-5. **The MALL's own slice structure — still open, and now with one more
+7. **The MALL's own slice structure — still open, and now with one more
    clue.** Under partial channel coverage the MALL keeps a working set only
    while its *span* is also inside 32 MiB, one case lands halfway, and the
    traversal axis has added MALL cells the coverage law fits (2048 B rows at
@@ -1062,7 +1204,7 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
    0,1024,3072` separates effective capacity from bus width. Worth doing
    before any MALL-blocking work in §5.1b/§2.4/§3.3, which needs a number to
    size against.
-6. **IDEAS §2.4 — workgroup swizzle.** Still cheap and structural, and the
+8. **IDEAS §2.4 — workgroup swizzle.** Still cheap and structural, and the
    traversal axis sharpens what it would be testing: a swizzle changes
    exactly which addresses are in flight together, which is now a measured
    axis with a model behind it. But its bandwidth premise is gone — §2.3
@@ -1071,20 +1213,15 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
    MALL read delivers, so implied traffic no longer bounds these kernels at
    all. Run it as a discriminator (helps AI-32, does nothing for AI-85), not
    as a bandwidth fix.
-7. **Pad the strides in the other kernels — a falsification test, and the
-   model now predicts *no* effect for a better reason.** Mechanism 3 looked
-   like it had caught the GEMV kernels red-handed (one wave per row, rows a
-   stride apart) until its own ladder measured that exact shape at the full
-   bus at every stride. GEMV, W4A8 and W8A8 should therefore be unmoved by a
-   stride push constant. Run it once to check the model, not to gain
-   throughput.
-8. **IDEAS §2.2's int8 arm — a `PRECISION_I8` variant of
-   `gemm_wmma.comp`**, accumulating in int32. Small change to a kernel that
-   now reaches 70% of the ceiling, halves its operand bytes, and gives W8A8
-   prefill its number. (The *Q4*-unpack version stays downgraded: there is
-   no int8 matrix-rate bonus on this chip, and the winning kernel has no LDS
-   tile whose fill cost a cheaper unpack would improve.)
-9. **IDEAS §1.3/§1.7 — the load-width rule on the other GEMV kernels.**
+9. **Pad the strides in the other kernels — superseded by item 2.** This
+   used to be a falsification test that the model predicted would find
+   nothing: mechanism 3 looked like it had caught the GEMV kernels red-handed
+   (one wave per row, rows a stride apart) until its own ladder measured that
+   exact shape at the full bus at every stride. §3.5 changed the prediction —
+   the rule is a window, [128, 256] B of gcd, and the real 4-bit weight rows
+   sit *below* it — so it is now a sweep with an expected win rather than a
+   check, and it is folded into item 2.
+10. **IDEAS §1.3/§1.7 — the load-width rule on the other GEMV kernels.**
    fp16 GEMV sits at 75% of its DRAM ceiling and W8A8 at 73%, where W4A8 now
    reaches 101% at every N it was swept at. This is no longer "try wider
    loads and see": §1.7 gives the target width in closed form — make one
@@ -1095,29 +1232,29 @@ updated for what §0, §1.1, §2.1, §2.3, §5.1b, §5.1b's traversal follow-up,
    at the models' real reduction lengths the width that reaches the bus is
    usually the narrowest one, so what is on offer here is these kernels' own
    27% gap, not the 1.43x W4A8 collected at N=8192.
-10. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
+11. **IDEAS §1.2 — remove the runtime integer divisions** (`pc.N / pc.block`
    and `n / pc.block`) from everything W4A8 did not rewrite: the
    naive/tiled GEMM paths and the old quantized GEMV variants.
    `gemv,naive,q4` is still slower than naive fp32, which is the symptom.
-11. **IDEAS §1.6 — the activation-quantize cost W8A8 and W4A8 both hide.**
+12. **IDEAS §1.6 — the activation-quantize cost W8A8 and W4A8 both hide.**
    Both kernels get `x` quantized on the host, outside the timed loop, and
    W4A8 additionally gets its per-block activation sums for free. A real
    decode step must produce both on-GPU between layers. The sums are one
    extra reduction over N (cheap, and fusable into the quantize pass), but
    it should be measured rather than assumed — it is the one place where
    these numbers are friendlier than production would be.
-12. **Still open from §0**: CPU-side submit/fence cost (the half of §4.1 the
+13. **Still open from §0**: CPU-side submit/fence cost (the half of §4.1 the
    `overhead` family does not measure), and the last ISA question from §6.1
    (is `v_pk_fma_f16` actually emitted, given §0.1's 1.10x packed-fp16
    surprise). `-blocks` is worth re-sweeping only where a block-size effect
    survives warming — in GEMV it does not.
-13. **IDEAS §3.7 — rewrite the subgroup reductions**, now that §6.2 has
+14. **IDEAS §3.7 — rewrite the subgroup reductions**, now that §6.2 has
    measured *why* they lose rather than guessing: bandwidth is linear in
    threads per row (256 → 223.7 GB/s, 64 → 68.5, 32 → 35.7), so the fix is a
    256-thread workgroup doing `uvec4` loads → per-subgroup `subgroupAdd` → a
    small LDS combine, and there is no wave-size knob worth trying first.
    Mechanical, and it deletes a variant the engine should never pick.
-14. **Note on a fresh checkout.** `*.spv` is gitignored, so
+15. **Note on a fresh checkout.** `*.spv` is gitignored, so
    **`go generate ./...` is required** before anything runs — the thirteen
    `strided_read` variants and the 30 WMMA ones are each built from a single
    `.comp`. This session added no shaders, so nothing there changed; the

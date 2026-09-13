@@ -148,6 +148,14 @@ var families = []Family{
 		Summary: func(w io.Writer, results []Result, p Params) { PrintShapesSummary(w, results, p) },
 	},
 	{
+		Name: "moe",
+		Desc: "the grouped/MoE GEMM, the per-expert dispatch loop it replaces, and the gather/combine around it",
+		Run: func(dev *vk.Device, phys *vk.PhysicalDevice, p Params) ([]Result, error) {
+			return RunMoE(dev, phys, p.Warmup, p.Iters)
+		},
+		Summary: func(w io.Writer, results []Result, p Params) { PrintMoESummary(w, results, p) },
+	},
+	{
 		Name: "reduce",
 		Desc: "softmax/rmsnorm reductions, shared-memory and subgroup",
 		Run: func(dev *vk.Device, phys *vk.PhysicalDevice, p Params) ([]Result, error) {

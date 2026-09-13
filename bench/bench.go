@@ -97,6 +97,54 @@ func TimeDispatch(pipe *vk.ComputePipeline, groupsX, groupsY, groupsZ, warmup, i
 	return float64(d.Nanoseconds()) / float64(actualIters), clocks, nil
 }
 
+// TimeDispatchSequence is TimeDispatch for a sequence of dispatches that
+// differ in their push constants — IDEAS §3.5's one-dispatch-per-expert
+// baseline. One "iteration" is the whole sequence, so the returned
+// nanoseconds are per *sequence*, which is what the grouped kernel's single
+// dispatch is being compared against.
+//
+// The budget cap works the same way, and matters more here: a 512-dispatch
+// sequence recorded 70 times is 36000 commands in one command buffer, and
+// the probe is what keeps that from becoming a driver timeout on a shape
+// that turns out to be slow.
+func TimeDispatchSequence(pipe *vk.ComputePipeline, groupsX []uint32, groupsY, groupsZ, warmup, iters uint32, pushConstants [][]byte) (float64, ClockStats, error) {
+	if err := instruments.Warm(); err != nil {
+		return 0, ClockStats{}, fmt.Errorf("clock warmup: %w", err)
+	}
+	probe, err := pipe.DispatchSequenceTimed(groupsX, groupsY, groupsZ, 1, pushConstants)
+	if err != nil {
+		return 0, ClockStats{}, err
+	}
+	probeNs := float64(probe.Nanoseconds())
+	if probeNs <= 0 {
+		probeNs = 1
+	}
+	capToBudget := func(n uint32) uint32 {
+		maxByBudget := uint32(maxBatchNs / probeNs)
+		if maxByBudget < 1 {
+			maxByBudget = 1
+		}
+		if n > maxByBudget {
+			return maxByBudget
+		}
+		return n
+	}
+
+	if warmup > 1 {
+		if _, err := pipe.DispatchSequenceTimed(groupsX, groupsY, groupsZ, capToBudget(warmup-1), pushConstants); err != nil {
+			return 0, ClockStats{}, err
+		}
+	}
+	actualIters := capToBudget(iters)
+	stop := instruments.Watch()
+	d, err := pipe.DispatchSequenceTimed(groupsX, groupsY, groupsZ, actualIters, pushConstants)
+	clocks := stop()
+	if err != nil {
+		return 0, ClockStats{}, err
+	}
+	return float64(d.Nanoseconds()) / float64(actualIters), clocks, nil
+}
+
 // PrintTable writes a human-readable results table to w.
 func PrintTable(w io.Writer, results []Result) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)

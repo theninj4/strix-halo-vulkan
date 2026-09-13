@@ -94,6 +94,31 @@ batches are below it constantly — 128 caption tokens, 384 audio frames, and
 The crossover is in M alone, and a sweep with M tied to N and K cannot see
 it.
 
+The one shape none of that covers is the **MoE** FFN: qwen3.8-flash-next
+routes each token to 10 of 512 experts, so its feed-forward block is 512
+GEMMs over 40-row groups rather than one GEMM, and at prefill it is 1440 of
+the 1861 matmuls a token costs. The `moe` family builds it — the same WMMA
+kernel with its tile origin read out of a table instead of derived from
+`gl_WorkGroupID`, so one dispatch covers every expert — and measures it
+against the expert-at-a-time loop it replaces, plus the gather and combine
+passes it makes necessary. Three answers, none of which was the expected one.
+**Grouping is worth 1.1-4.1x, and it is an occupancy effect, not a launch
+one**: sort the cells by how many workgroups one expert's dispatch launches
+and the speedup falls monotonically from 4.1x at 10 workgroups to ~1.1x at
+80, which is exactly the two-waves-per-CU this part needs to issue WMMA at
+rate — the 300 ns launch itself is nothing against a 20 µs dispatch. **Tile
+padding is real and costs nothing**: a 16-row tile takes an expert's group
+from 62% useful to 84%, and is *slower*, because at these shapes the binding
+constraint is weight bytes and a smaller tile reads more of them. The grouped
+kernel moves 190 GB/s of a 236 GB/s bus at the real prefill shape, so there is
+no room for the FLOPs to matter. And **the "pad every stride by 256 B" rule
+this suite has been carrying is the wrong statement of itself**: sweeping
+`gcd(row stride, 4096)` over every power of two at two non-power-of-two
+reduction lengths gives a plateau at 128-256 B and a cliff on both sides, so
+what matters is landing the gcd at 128-256 B — which the 640-wide down
+projection already does unpadded, and which padding it by 256 B *breaks*, for
+1.19x.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -131,6 +156,10 @@ fields is itself a pointer into other Go memory — and Vulkan's
   layouts + a CPU-reference correctness check to a size sweep.
   `modelshapes.go` is the odd one out: not code but data — the weight-matrix
   dimensions of the models in `GOALS.md`, with the config each was read from.
+  `ops_moe.go` is the only family that needs more than one dispatch shape per
+  measurement: its per-expert baseline is a command buffer of 512 dispatches
+  with differing push constants, which is `vk.ComputePipeline`'s
+  `DispatchSequenceTimed`.
 - `cmd/bench/main.go` — the benchmark CLI; `bench/families.go` is the
   registry of targetable op families it dispatches to.
 - `results/` — one CSV per op family, the committed measurements.
@@ -152,13 +181,13 @@ go build ./...
 
 go run ./cmd/bench -list          # the op families a run can target
 go run ./cmd/bench gemv gemv_cold # run two of them
-go run ./cmd/bench all            # the whole suite (~38 min)
+go run ./cmd/bench all            # the whole suite (~40 min)
                                   # -h for the sweep flags (sizes, blocks,
                                   # warmup/iters, per-family sweeps)
 ```
 
 A run has to name what it is measuring: the full suite takes well over half
-an hour and produces ~2100 rows, so sweeping all of it to answer one question is
+an hour and produces ~2600 rows, so sweeping all of it to answer one question is
 mostly waste. `all` is still there for the occasions that want it.
 
 `cmd/bench` prints a results table per op family and writes one CSV per
@@ -172,14 +201,18 @@ by `sclk_mhz,sclk_mhz_min,sclk_mhz_max,power_w,detail`, so
 `tail -q -n +2 results/*.csv` reconstructs the single flat table the suite
 used to write if an analysis wants it.
 
-The families are the eleven listed by `-list`: `peak`, `overhead`,
+The families are the twelve listed by `-list`: `peak`, `overhead`,
 `bandwidth`, `stride`, `elementwise`, `gemv`, `gemv_cold`, `gemm`,
-`gemm_wmma`, `shapes`, `reduce`. `gemm_wmma` — the hand-tuned WMMA ladder —
-is separate from `gemm` because it is the larger half of the GEMM rows and is
-iterated on by itself. `shapes` is the one family that sweeps nothing: it runs
-the kernels the other families picked over the real model dimensions in
-`bench/modelshapes.go`, takes ~5 min, and ignores `-sizes`/`-blocks` because
-the shapes are the models' rather than the flags'.
+`gemm_wmma`, `shapes`, `moe`, `reduce`. `gemm_wmma` — the hand-tuned WMMA
+ladder — is separate from `gemm` because it is the larger half of the GEMM
+rows and is iterated on by itself. `shapes` and `moe` are the two that sweep
+nothing: `shapes` runs the kernels the other families picked over the real
+model dimensions in `bench/modelshapes.go` (~5 min), and `moe` runs the
+grouped/MoE GEMM over qwen3.8-flash-next's 512-expert bank (~2 min). Both
+ignore `-sizes`/`-blocks`, because their shapes are the models' rather than
+the flags'. `moe` also allocates the largest buffers in the suite — a
+512-expert fp16 weight bank is 1.8-4.0 GB depending on the row stride under
+test — so it wants headroom rather than a loaded machine.
 
 ## Reading the numbers honestly
 

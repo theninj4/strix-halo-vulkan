@@ -154,6 +154,22 @@ VkResult shim_dispatch_timed(VkDevice device, VkQueue queue, const ShimComputePi
                               const void *pushConstants, uint32_t pushConstantSize,
                               uint64_t *out_start, uint64_t *out_end);
 
+// The same, for a *sequence* of dispatches that differ in their push
+// constants — IDEAS §3.5's "one dispatch per expert" baseline, which is the
+// thing a grouped kernel is supposed to beat and which cannot be expressed
+// with shim_dispatch_timed's single constant block. One iteration records
+// `count` dispatches, the i-th pushing `pushConstants + i*pushConstantSize`
+// and covering groupsX[i] workgroups on the X axis; a compute->compute
+// barrier separates every dispatch from the next, across iteration
+// boundaries as well as within one, because that barrier is precisely the
+// serialisation the baseline is being charged for. groupsY/groupsZ are one
+// value for the whole sequence, since every caller here varies only X.
+VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *p,
+                                  const uint32_t *groupsX, uint32_t count,
+                                  uint32_t groupsY, uint32_t groupsZ, uint32_t iterations,
+                                  const void *pushConstants, uint32_t pushConstantSize,
+                                  uint64_t *out_start, uint64_t *out_end);
+
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p);
 
 #endif

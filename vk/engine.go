@@ -356,6 +356,23 @@ func (b *Buffer) WriteBytes(src []byte) {
 	copy(dst, src)
 }
 
+// FillRepeating tiles block across the whole buffer, in place. It exists for
+// the multi-gigabyte weight banks IDEAS §3.5 needs: a 512-expert fp16 bank is
+// 1.8 GB, and building a host-side copy of that to hand to WriteBytes costs
+// more than the measurement it feeds. Only the addresses matter for a timing
+// run, so a repeating block of real values is as good as a unique one — and
+// it must be real values, because reinterpreting whatever the allocation held
+// as fp16 can produce infinities that change what the arithmetic costs.
+func (b *Buffer) FillRepeating(block []byte) {
+	if len(block) == 0 {
+		return
+	}
+	dst := unsafe.Slice((*byte)(b.mapped), b.size)
+	for off := 0; off < len(dst); off += len(block) {
+		copy(dst[off:], block)
+	}
+}
+
 // ReadBytes reads n bytes back out of the buffer's mapped memory.
 func (b *Buffer) ReadBytes(n int) []byte {
 	src := unsafe.Slice((*byte)(b.mapped), n)
@@ -490,6 +507,60 @@ func (p *ComputePipeline) DispatchTimed(groupsX, groupsY, groupsZ, iterations ui
 	ticks := float64(uint64(end)) - float64(uint64(start))
 	ns := ticks * p.dev.phys.TimestampPeriod
 	return time.Duration(ns), nil
+}
+
+// DispatchSequenceTimed is DispatchTimed for a sequence of dispatches that
+// differ in their push constants: the i-th covers groupsX[i] workgroups on
+// the X axis and pushes pushConstants[i], and a barrier separates every
+// dispatch from the next — within one iteration and across iterations alike.
+//
+// It exists for IDEAS §3.5's baseline. A grouped kernel's claim is that one
+// dispatch over a tile table beats one dispatch per expert, and the losing
+// arm of that comparison is a sequence of 512 dispatches whose only
+// difference is where in the table each starts. Expressing that with
+// DispatchTimed is impossible (one constant block per command buffer), and
+// expressing it as 512 separate submits would measure the CPU's submit path
+// instead of the GPU's.
+//
+// Every element of pushConstants must be the same length, since the pipeline
+// layout declares one range.
+func (p *ComputePipeline) DispatchSequenceTimed(groupsX []uint32, groupsY, groupsZ, iterations uint32, pushConstants [][]byte) (time.Duration, error) {
+	if len(groupsX) == 0 {
+		return 0, fmt.Errorf("DispatchSequenceTimed: empty dispatch sequence")
+	}
+	if len(pushConstants) != 0 && len(pushConstants) != len(groupsX) {
+		return 0, fmt.Errorf("DispatchSequenceTimed: %d push-constant blocks for %d dispatches",
+			len(pushConstants), len(groupsX))
+	}
+	// Flattened into one contiguous buffer because cgo will not let a Go
+	// slice of Go slices cross the boundary.
+	var flat []byte
+	var pcSize int
+	if len(pushConstants) > 0 {
+		pcSize = len(pushConstants[0])
+		flat = make([]byte, 0, pcSize*len(pushConstants))
+		for i, b := range pushConstants {
+			if len(b) != pcSize {
+				return 0, fmt.Errorf("DispatchSequenceTimed: push-constant block %d is %d bytes, block 0 is %d",
+					i, len(b), pcSize)
+			}
+			flat = append(flat, b...)
+		}
+	}
+
+	var start, end C.uint64_t
+	var pcPtr unsafe.Pointer
+	if len(flat) > 0 {
+		pcPtr = unsafe.Pointer(&flat[0])
+	}
+	if err := check("vkQueueSubmit", C.shim_dispatch_seq_timed(p.dev.handle, p.dev.queue, &p.handle,
+		(*C.uint32_t)(unsafe.Pointer(&groupsX[0])), C.uint32_t(len(groupsX)),
+		C.uint32_t(groupsY), C.uint32_t(groupsZ), C.uint32_t(iterations),
+		pcPtr, C.uint32_t(pcSize), &start, &end)); err != nil {
+		return 0, err
+	}
+	ticks := float64(uint64(end)) - float64(uint64(start))
+	return time.Duration(ticks * p.dev.phys.TimestampPeriod), nil
 }
 
 // Dispatch records and submits a single dispatch covering groupsX

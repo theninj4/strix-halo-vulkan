@@ -572,6 +572,66 @@ var GEMMWMMAReg32BTHKA8W32 []byte
 //go:embed gemm_wmma_reg64_hka4_w32.spv
 var GEMMWMMAReg64HKA4W32 []byte
 
+// IDEAS §3.5, the grouped/MoE GEMM. Same source, same inner loop, same
+// operand layout as the winners above; the only change is -DGROUPED=1, which
+// replaces "derive the tile origin from gl_WorkGroupID" with "read it out of
+// a table". That is what lets one dispatch cover every expert's tiles at
+// once, against the 512 dispatches an expert-at-a-time loop needs, and it is
+// why the two arms are directly comparable: they run the same binary.
+//
+// (Adding GROUPED shifted the SPIR-V ids in the non-grouped binaries — the
+// preprocessor sees one more `#if` — but not a single instruction:
+// `spirv-dis` output with ids renumbered is identical, and every file is the
+// same size to the byte.)
+//
+// The geometries are the two §3.4 crowned, plus the ones only an MoE shape
+// motivates. At prefill an expert sees ~40 rows, so the M tile is most of the
+// question:
+//
+//   BM=64  40 rows -> one tile of 64      62% useful
+//   BM=32  40 rows -> two tiles of 32     62% useful
+//   BM=16  40 rows -> three tiles of 48   83% useful
+//
+// so BM=16 is the padding arm — it buys back a third of the waste and pays
+// for it in arithmetic intensity (10.7-12.8 FLOP/byte against 16 and 32),
+// which is the trade this family exists to price. All five hoist at
+// BK_TILES=4, §2.7's rung, because that lever is about the memory system and
+// nothing here changes the memory system.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DB_COLMAJOR=1 -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -o gemm_wmma_moe_reg64_bt_hka4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DB_COLMAJOR=1 -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_moe_reg32_bt_hkab4.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DB_COLMAJOR=1 -DWAVE=32 -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_moe_reg32_bt_hkab4_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DB_COLMAJOR=1 -DWAVE=32 -DWM=1 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_moe_reg16x32_bt_hkab4_w32.spv gemm_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DB_COLMAJOR=1 -DWAVE=32 -DWM=1 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DHOIST_B=1 -o gemm_wmma_moe_reg16x64_bt_hkab4_w32.spv gemm_wmma.comp
+
+//go:embed gemm_wmma_moe_reg64_bt_hka4.spv
+var GEMMWMMAMoEReg64BTHKA4 []byte
+
+//go:embed gemm_wmma_moe_reg32_bt_hkab4.spv
+var GEMMWMMAMoEReg32BTHKAB4 []byte
+
+//go:embed gemm_wmma_moe_reg32_bt_hkab4_w32.spv
+var GEMMWMMAMoEReg32BTHKAB4W32 []byte
+
+//go:embed gemm_wmma_moe_reg16x32_bt_hkab4_w32.spv
+var GEMMWMMAMoEReg16x32BTHKAB4W32 []byte
+
+//go:embed gemm_wmma_moe_reg16x64_bt_hkab4_w32.spv
+var GEMMWMMAMoEReg16x64BTHKAB4W32 []byte
+
+// The gather and combine passes the grouped GEMM cannot do for itself
+// (IDEAS §3.5). TOPK is baked in because it sizes the combine's unrolled
+// accumulation; 10 is qwen3.8-flash-next's num_experts_per_tok.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE=0 -o moe_gather.spv moe_route.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE=1 -DTOPK=10 -o moe_combine.spv moe_route.comp
+
+//go:embed moe_gather.spv
+var MoEGather []byte
+
+//go:embed moe_combine.spv
+var MoECombine []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_fp16.spv gemm_coopmat_fp16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_int8.spv gemm_coopmat_int8.comp
 //go:generate glslc --target-env=vulkan1.2 -O -o gemm_coopmat_q4.spv gemm_coopmat_q4.comp

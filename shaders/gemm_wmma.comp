@@ -193,6 +193,21 @@
 #ifndef LDS_PAD
 #define LDS_PAD 0   // extra halves per LDS row, to skew the bank mapping
 #endif
+// Grouped / MoE mode (IDEAS §3.5). The kernel is unchanged below the tile
+// origin: what moves is where the origin comes from. Instead of deriving it
+// from gl_WorkGroupID, each workgroup reads one uvec4 out of a tile table —
+// (row in the gathered activations, row in the expert-major weight bank,
+// column in the output) — so a *single* dispatch can cover every expert's
+// tiles at once, with each expert's B living at a different offset in one
+// buffer. Every group is padded up to BM rows by the host, so no masking is
+// needed and the padding is charged to the measurement rather than hidden.
+//
+// Only the B_COLMAJOR layout is built grouped: an expert bank is [E*N, K],
+// which is how the weights already sit, and the row-major arm would need a
+// different offset per K-step.
+#ifndef GROUPED
+#define GROUPED 0
+#endif
 
 #define TILE 16
 #ifndef WAVE
@@ -221,6 +236,13 @@ layout(binding = 1) readonly buffer B { float16_t b[]; };
 #endif
 layout(binding = 2) readonly buffer Scales { float dummy[]; }; // unused, kept for a uniform 4-binding layout
 layout(binding = 3) writeonly buffer C { float c[]; };
+#if GROUPED
+// One entry per workgroup: .x the tile's first row in A and C, .y its first
+// row in the [E*N, K] weight bank, .z its first column in C. .w is unused
+// padding, which is also what keeps the entry 16-byte aligned so the whole
+// table is one vector load per workgroup.
+layout(binding = 4) readonly buffer Tiles { uvec4 tiles[]; };
+#endif
 
 layout(push_constant) uniform PC {
     uint M;
@@ -243,6 +265,13 @@ layout(push_constant) uniform PC {
     // instruction — so every variant here is exposed to the aliasing, not
     // just the _bt ones.
     uint lda;
+#if GROUPED
+    // First tile-table entry this dispatch covers. Zero for the grouped
+    // launch, which takes the whole table in one go; the per-expert baseline
+    // (IDEAS §3.5) walks it one expert's slice at a time, so that the two
+    // arms differ in their dispatch count and in nothing else.
+    uint tileBase;
+#endif
 } pc;
 
 #if USE_LDS
@@ -480,10 +509,24 @@ void main() {
     uint waveN = gl_SubgroupID % WAVES_N;
 
     // Top-left corner of this workgroup's C tile, and of this wave's slice.
+    // B's row base and C's column base are separate because grouped mode puts
+    // every expert's weights in one bank: the tile's B rows start at
+    // expert*N + n0 while its C columns still start at n0. They are the same
+    // number in every non-grouped variant, which is why nothing above this
+    // line changes.
+#if GROUPED
+    uvec4 tile = tiles[pc.tileBase + gl_WorkGroupID.x];
+    uint m0 = tile.x;
+    uint n0 = tile.y;
+    uint cn0 = tile.z;
+#else
     uint m0 = gl_WorkGroupID.y * BM;
     uint n0 = gl_WorkGroupID.x * BN;
+    uint cn0 = n0;
+#endif
     uint wm0 = m0 + waveM * (WM * TILE);
     uint wn0 = n0 + waveN * (WN * TILE);
+    uint wc0 = cn0 + waveN * (WN * TILE);
 
     coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[WM][WN];
     [[unroll]] for (uint i = 0u; i < WM; i++) {
@@ -532,7 +575,7 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < WM; i++) {
         [[unroll]] for (uint j = 0u; j < WN; j++) {
-            coopMatStore(acc[i][j], c, (wm0 + i * TILE) * pc.N + wn0 + j * TILE,
+            coopMatStore(acc[i][j], c, (wm0 + i * TILE) * pc.N + wc0 + j * TILE,
                 pc.N, gl_CooperativeMatrixLayoutRowMajor);
         }
     }

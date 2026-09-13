@@ -650,6 +650,91 @@ VkResult shim_dispatch_timed(VkDevice device, VkQueue queue, const ShimComputePi
     return VK_SUCCESS;
 }
 
+VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *p,
+                                  const uint32_t *groupsX, uint32_t count,
+                                  uint32_t groupsY, uint32_t groupsZ, uint32_t iterations,
+                                  const void *pushConstants, uint32_t pushConstantSize,
+                                  uint64_t *out_start, uint64_t *out_end) {
+    if (iterations == 0) {
+        iterations = 1;
+    }
+    if (count == 0) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkCommandBufferBeginInfo beginInfo = {0};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+
+    VkResult r = vkBeginCommandBuffer(p->cmdBuf, &beginInfo);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    vkCmdResetQueryPool(p->cmdBuf, p->queryPool, 0, 2);
+    vkCmdBindPipeline(p->cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipeline);
+    vkCmdBindDescriptorSets(p->cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, p->pipelineLayout, 0, 1, &p->descSet, 0, NULL);
+
+    vkCmdWriteTimestamp(p->cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, p->queryPool, 0);
+
+    VkMemoryBarrier barrier = {0};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    const uint8_t *pc = (const uint8_t *)pushConstants;
+    for (uint32_t it = 0; it < iterations; it++) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (pushConstantSize > 0 && pc != NULL) {
+                vkCmdPushConstants(p->cmdBuf, p->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                    pushConstantSize, pc + (size_t)i * pushConstantSize);
+            }
+            vkCmdDispatch(p->cmdBuf, groupsX[i], groupsY, groupsZ);
+            if (it + 1 < iterations || i + 1 < count) {
+                vkCmdPipelineBarrier(p->cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                      0, 1, &barrier, 0, NULL, 0, NULL);
+            }
+        }
+    }
+
+    vkCmdWriteTimestamp(p->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p->queryPool, 1);
+
+    r = vkEndCommandBuffer(p->cmdBuf);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    r = vkResetFences(device, 1, &p->fence);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &p->cmdBuf;
+
+    r = vkQueueSubmit(queue, 1, &submitInfo, p->fence);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    r = vkWaitForFences(device, 1, &p->fence, VK_TRUE, 20000000000ULL);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    uint64_t timestamps[2];
+    r = vkGetQueryPoolResults(device, p->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t),
+                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    *out_start = timestamps[0];
+    *out_end = timestamps[1];
+    return VK_SUCCESS;
+}
+
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p) {
     if (p->queryPool) vkDestroyQueryPool(device, p->queryPool, NULL);
     if (p->fence) vkDestroyFence(device, p->fence, NULL);
