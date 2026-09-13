@@ -1,0 +1,367 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// C = A * B with **B held as 4-bit weights** — IDEAS §2.2, aimed at the one
+// phase §3.5 left with a number on it: MoE prefill, measured at 93% of the
+// ceiling its *format* implies, where that ceiling is entirely weight bytes
+// (5.03 GB per block at fp16, 21.3 ms of unavoidable DRAM traffic against a
+// 28-30 ms block). A 4-bit bank is a quarter of those bytes. Nothing else in
+// this suite is left holding a 4x.
+//
+// This is a separate file from gemm_wmma.comp rather than another -D on it,
+// and the reason is that the B operand stops being a coopMatLoad from the
+// weight buffer. A cooperative-matrix fragment's lane layout is not exposed
+// by GL_KHR_cooperative_matrix — `m[i]` is defined but which (row, col) it
+// means is not — so 4-bit weights cannot be unpacked straight into registers
+// and declared a fragment. They have to be written somewhere coopMatLoad can
+// read them from with a defined layout, and the only such place that is not
+// DRAM is LDS. So:
+//
+//   A   fp16, [M, lda], K-contiguous, read by coopMatLoad from global, exactly
+//       as in gemm_wmma.comp — including §2.7's HOIST_A, which is about the
+//       memory system and is unaffected by anything here.
+//   B   Q4, [E*N, ldb] nibbles along K, two per byte (bench/quant.go's
+//       quantizeQ4 layout, unpermuted — this is how the weights already sit),
+//       one fp16 scale per QBLOCK consecutive nibbles of a row. Each
+//       workgroup dequantizes its own BN x BK slab into LDS per K-step and
+//       coopMatLoads the B fragments out of that.
+//   C   fp32, as everywhere else in the suite.
+//
+// **The LDS here is not the LDS gemm_wmma.comp measured losing.** That one
+// was a *reuse* mechanism — stage a slab so WAVES_M x WAVES_N waves share it
+// — and it lost because this part's 32 MiB MALL was already supplying the
+// reuse for free. This one is a *format conversion*: one wave per workgroup,
+// the slab is exactly that wave's own B tile, and no other wave ever reads
+// it. Nothing is being shared, so nothing is being paid for twice; what is
+// paid for is the round trip through LDS and the barriers, which is the
+// price of the layout and is what this kernel exists to measure.
+//
+// What the arithmetic says to expect, at gate_up (N=640, K=2560) and 2048
+// tokens, against §3.5's 8.8 ms / 7596 useful GFLOP/s for the fp16 grouped
+// kernel:
+//
+//   weights   512 experts x 640 x 2560 x 0.5 B = 419 MB, +26 MB of scales at
+//             QBLOCK=32 -> 1.9 ms at the measured 236 GB/s bus, was 8.8 ms.
+//   FLOPs     20480 real rows over 64-row tiles is 62% useful, so 108 GFLOP
+//             executed -> 4.3 ms at 25 TFLOP/s, 2.8 ms at 39.
+//   dequant   839 M nibbles, ~3.5 ALU ops each, plus 1.7 GB written to LDS
+//             and read back.
+//
+// So the prediction is that **Q4 moves this shape off the memory system and
+// onto the matrix cores**, landing somewhere near 4-5 ms — a ~2x, not the 4x
+// the byte count alone suggests — and that it does so by making FLOPs
+// expensive again. §3.5's finding 2 (tile padding is real and costs nothing,
+// because at fp16 the FLOPs were free) should therefore **invert here**: the
+// 16-row tiles that lost at fp16 by re-reading operands should win at Q4 by
+// wasting fewer MMAs. That inversion is the sharpest thing this kernel can be
+// wrong about, which is why the geometry arm is the same five tiles §3.5 ran.
+//
+// **[measured] Both predictions held, and two things nobody predicted cost
+// more than either.** gate_up at 2048 tokens: 3.82 ms against the best fp16
+// kernel's 8.77, and one whole MoE block 13.37 ms against 28.13 — 2.10x, from
+// 4x fewer bytes, exactly because the constraint moved (190 -> 113 GB/s of a
+// 236 GB/s bus, 22% -> 51% of the matrix cores). The 16-row tile does now
+// win among the QBLOCK=32 builds, by executing fewer FLOPs, 1.02-1.05x. What
+// was not predicted: **LDS_PAD is worth 1.68-1.83x** — a BK-half slab row is
+// 128 B, exactly one rotation of the 32 LDS banks, so a 16-row fragment load
+// hits one bank sixteen times — and **QBLOCK=128 is worth 1.24x over
+// QBLOCK=32 between two binaries that are instruction-for-instruction
+// identical**, which 4.4% of nominal scale bytes does not explain and which
+// is still unattributed. Double buffering is worth nothing here. See
+// IDEAS §2.2.
+
+#ifndef WM
+#define WM 4        // accumulator tiles per wave, M direction
+#endif
+#ifndef WN
+#define WN 4        // accumulator tiles per wave, N direction
+#endif
+#ifndef BK_TILES
+#define BK_TILES 4  // K-slab depth in 16-wide cooperative-matrix steps
+#endif
+// Hoist A's whole K-slab of fragment loads before the slab's first MMA
+// (IDEAS §2.7): 32 B of each A row in flight per K-tile instead of one
+// K-tile's worth, which is the quantity the memory system prices. B is never
+// hoisted — its fragments come from LDS, where concurrency is not the
+// currency; its *global* loads are all issued together by construction.
+#ifndef HOIST_A
+#define HOIST_A 1
+#endif
+// Issue the next K-slab's global Q4 loads before this slab's MMAs and write
+// them to the other LDS buffer afterwards, so one barrier per K-step instead
+// of two and the load latency sits under the matrix work. Worth 1.23x on
+// gemm_wmma.comp's LDS path; whether it is worth anything when the staged
+// operand is a quarter the size is one of the questions here.
+#ifndef DOUBLE_BUFFER
+#define DOUBLE_BUFFER 0
+#endif
+// Extra halves per LDS row. The B slab's rows are BK halves = 128 B apart at
+// BK_TILES=4, which is exactly 32 dwords — one full rotation of the 32 LDS
+// banks — so a fragment load that touches 16 rows hits one bank 16 times
+// without a pad. 8 halves moves consecutive rows 4 banks apart and keeps the
+// row 16-byte aligned.
+#ifndef LDS_PAD
+#define LDS_PAD 8
+#endif
+// Nibbles per fp16 scale along a row of B. Compile-time because the scale
+// index is then a shift rather than IDEAS §1.2's runtime integer division,
+// and because it is also a bandwidth knob: at QBLOCK=32 the scales are
+// 2 B per 16 B of weights, 6.2% on top of the bank; at 128 they are 1.6%.
+#ifndef QBLOCK
+#define QBLOCK 32
+#endif
+#if (QBLOCK < 32) || ((QBLOCK & (QBLOCK - 1)) != 0)
+#error "QBLOCK must be a power of two >= 32 (one uvec4 of nibbles must lie in one block)"
+#endif
+// Grouped / MoE mode, identical in meaning to gemm_wmma.comp's: the tile
+// origin is read out of a table instead of derived from gl_WorkGroupID, so
+// one dispatch covers every expert's tiles with each expert's weights at a
+// different row offset in one bank. Built grouped only, because the shape
+// that motivates a 4-bit GEMM at all is the MoE FFN; the dense arm is one
+// #if away and has never been run, so it is not claimed to work.
+#ifndef GROUPED
+#define GROUPED 1
+#endif
+#ifndef WAVE
+#define WAVE 64     // threads per wave; the host must pin the pipeline to match
+#endif
+
+#define TILE 16
+#define BM (WM * TILE)
+#define BN (WN * TILE)
+#define BK (BK_TILES * TILE)
+#define NTHREADS WAVE
+
+layout(local_size_x = NTHREADS) in;
+
+layout(binding = 0) readonly buffer A { float16_t a[]; };
+// 32 nibbles per uvec4. Declared this way rather than as uint8_t so that one
+// staging load is a buffer_load_b128 — IDEAS §1.3's load width, and the
+// reason a whole 32-element chunk of a weight row arrives in one instruction.
+layout(binding = 1) readonly buffer Bq { uvec4 bq[]; };
+layout(binding = 2) readonly buffer Scales { float16_t scales[]; };
+layout(binding = 3) writeonly buffer C { float c[]; };
+#if GROUPED
+layout(binding = 4) readonly buffer Tiles { uvec4 tiles[]; };
+#endif
+
+layout(push_constant) uniform PC {
+    uint M;
+    uint N;
+    uint K;
+    uint block;   // unused: the quantization block is QBLOCK, a compile-time -D
+    // B's row stride in *elements* (nibbles), not bytes and not halves. Must
+    // be a multiple of QBLOCK, which at QBLOCK=32 also makes every row
+    // 16-byte aligned and every uvec4 load in range. Separate from K for the
+    // same reason as everywhere else in this suite: it is the stride, not the
+    // extent, that the memory system prices (IDEAS §5.1b).
+    uint ldb;
+    uint lda;     // A's row stride in halves
+#if GROUPED
+    uint tileBase;
+#endif
+} pc;
+
+#define LDS_B_STRIDE (BK + LDS_PAD)
+#define LDS_B_PLANE (BN * LDS_B_STRIDE)
+#if DOUBLE_BUFFER
+#define LDS_PLANES 2
+#else
+#define LDS_PLANES 1
+#endif
+shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
+
+// One staging load is one uvec4 = 32 nibbles = one chunk of one slab row.
+#define CHUNK 32
+#define B_CHUNKS_PER_ROW (BK / CHUNK)
+#define B_CHUNKS (BN * B_CHUNKS_PER_ROW)
+#define B_STAGE ((B_CHUNKS + NTHREADS - 1u) / NTHREADS)
+#if (BK % CHUNK) != 0
+#error "BK must be a multiple of 32 (BK_TILES even)"
+#endif
+
+// Chunk i of the slab, as (row within the BN-row tile, chunk within the row).
+// Both divisors are compile-time powers of two.
+#define B_ROW(i) ((i) / B_CHUNKS_PER_ROW)
+#define B_COL(i) (((i) % B_CHUNKS_PER_ROW) * CHUNK)
+
+// Dequantize one uvec4 of nibbles into 32 consecutive halves of an LDS row.
+//
+// The +8-biased nibble is turned into a half without a single integer->float
+// conversion: fp16 1024.0 is 0x6400 and its ulp at that exponent is exactly
+// 1.0, so OR-ing a 4-bit value into the mantissa yields 1024+n, and
+// subtracting 1032 yields n-8 exactly. Two nibbles are done at a time in one
+// packed f16vec2, so the whole chunk is 4 words x 4 bytes x (one OR, one
+// packed subtract, one packed multiply) — the unpack is two packed fp16 ops
+// per two weights, not a conversion sequence per weight.
+//
+// The eight scalar stores per word coalesce back into one ds_store_b128, the
+// same way gemm_wmma.comp's SPREAD8 does; the array has to stay typed
+// float16_t because that is what coopMatLoad reads.
+//
+// **The obvious further saving is wrong, and it was measured wrong.** Folding
+// the bias into the multiply — fma(q, s, -1032*s), with the addend computed
+// once per chunk, so the per-weight cost is one packed op instead of two —
+// was built as an arm and **failed the correctness check by 8%**, not by an
+// ulp: -0.661 against -0.717. The reason is cancellation. 1032*s is ~145
+// when the result (n-8)*s is ~1, and rounding that addend to fp16's 11-bit
+// significand puts ~0.07 of error onto a quantity of magnitude 1. The bias
+// has to come off *before* the scale multiply, at nibble magnitude, where it
+// is exact. The version that would work carries the bias out to the fp32
+// epilogue as a per-K-block row sum of A — which is what gemv_w4a8.comp does
+// in int32, and there it is exact rather than merely bigger. That is worth
+// writing only if the dequant's two packed ops per two weights turn out to
+// be what binds; see IDEAS §2.2 for what actually does.
+#define DEQUANT_CHUNK(base, v, s) {                                            \
+    [[unroll]] for (uint w = 0u; w < 4u; w++) {                                \
+        uint word = (v)[w];                                                    \
+        [[unroll]] for (uint p = 0u; p < 4u; p++) {                            \
+            uint byte = (word >> (8u * p)) & 0xFFu;                            \
+            f16vec2 q = unpackFloat2x16(0x64006400u | (byte & 0xFu)            \
+                                        | ((byte & 0xF0u) << 12u));            \
+            f16vec2 d = (q - f16vec2(1032.0hf)) * (s);                         \
+            ldsB[(base) + w * 8u + p * 2u + 0u] = d.x;                         \
+            ldsB[(base) + w * 8u + p * 2u + 1u] = d.y;                         \
+        }                                                                      \
+    }                                                                          \
+}
+
+// Global -> registers for the Q4 slab starting at reduction index kk. Kept
+// separate from STORE_STAGE so that with DOUBLE_BUFFER the compiler sinks the
+// s_waitcnt past the MMAs issued in between; without it the two are adjacent
+// and it behaves as one fused staging step.
+#define LOAD_STAGE(kk) {                                                       \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < B_CHUNKS) {                                                    \
+            uint elem = (n0 + B_ROW(i)) * pc.ldb + (kk) + B_COL(i);            \
+            stageB[s] = bq[elem >> 5u];                                        \
+            stageS[s] = scales[(n0 + B_ROW(i)) * (pc.ldb / QBLOCK)             \
+                               + ((kk) + B_COL(i)) / QBLOCK];                  \
+        }                                                                      \
+    }                                                                          \
+}
+
+#define STORE_STAGE(buf) {                                                     \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        uint i = tid + s * NTHREADS;                                           \
+        if (i < B_CHUNKS) {                                                    \
+            DEQUANT_CHUNK((buf) * LDS_B_PLANE + B_ROW(i) * LDS_B_STRIDE        \
+                          + B_COL(i), stageB[s], stageS[s])                    \
+        }                                                                      \
+    }                                                                          \
+}
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+#if HOIST_A
+#define FRAG_A(kt, i) fragA[kt][i]
+#else
+#define FRAG_A(kt, i) fragA[i]
+#endif
+
+#define LOAD_FRAG_A(i, abase, kt)                                              \
+    coopMatLoad(FRAG_A(kt, i), a, (m0 + (i) * TILE) * pc.lda + (abase) + (kt) * TILE, \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+// The LDS slab is [BN rows][BK], K-contiguous, i.e. exactly the [N,K] the
+// weights arrive in — so the fragment load is the same column-major one
+// gemm_wmma.comp's winning _bt variants use, just against shared memory.
+#define LOAD_FRAG_B(j, buf, kt)                                                \
+    coopMatLoad(fragB[j], ldsB, (buf) * LDS_B_PLANE + (j) * TILE * LDS_B_STRIDE \
+        + (kt) * TILE, LDS_B_STRIDE, gl_CooperativeMatrixLayoutColumnMajor);
+
+#if HOIST_A
+#define DECL_A FRAG_A_T fragA[BK_TILES][WM];
+#define PRE_A(abase)  [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {     \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) } }
+#define INNER_A(abase, kt)
+#else
+#define DECL_A
+#define PRE_A(abase)
+#define INNER_A(abase, kt) FRAG_A_T fragA[WM];                                 \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(i, abase, kt) }
+#endif
+
+#define MMA_BLOCK(abase, buf) {                                                \
+    DECL_A                                                                     \
+    PRE_A(abase)                                                               \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        INNER_A(abase, kt)                                                     \
+        FRAG_B_T fragB[WN];                                                    \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(j, buf, kt) }  \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(FRAG_A(kt, i), fragB[j], acc[i][j]); \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+    // Top-left corner of this workgroup's tile. n0 is its first row in the
+    // [E*N, K] bank and cn0 its first column in C; grouped mode makes those
+    // different numbers, since every expert's weights live in one buffer.
+#if GROUPED
+    uvec4 tile = tiles[pc.tileBase + gl_WorkGroupID.x];
+    uint m0 = tile.x;
+    uint n0 = tile.y;
+    uint cn0 = tile.z;
+#else
+    uint m0 = gl_WorkGroupID.y * BM;
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint cn0 = n0;
+#endif
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    uvec4 stageB[B_STAGE];
+    float16_t stageS[B_STAGE];
+
+#if DOUBLE_BUFFER
+    LOAD_STAGE(0u)
+    STORE_STAGE(0u)
+    barrier();
+    uint buf = 0u;
+#endif
+
+    for (uint k0 = 0u; k0 < pc.K; k0 += BK) {
+#if DOUBLE_BUFFER
+        bool more = k0 + BK < pc.K;
+        if (more) LOAD_STAGE(k0 + BK)
+        MMA_BLOCK(k0, buf)
+        if (more) STORE_STAGE(1u - buf)
+        barrier();
+        buf = 1u - buf;
+#else
+        LOAD_STAGE(k0)
+        STORE_STAGE(0u)
+        // Both barriers are needed even at one wave per workgroup: they are
+        // what orders this wave's LDS writes against its own coopMatLoads,
+        // and the second one against the next K-step overwriting the slab.
+        barrier();
+        MMA_BLOCK(k0, 0u)
+        barrier();
+#endif
+    }
+
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            coopMatStore(acc[i][j], c, (m0 + i * TILE) * pc.N + cn0 + j * TILE,
+                pc.N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}

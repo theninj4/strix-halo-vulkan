@@ -204,6 +204,18 @@ func randomFloats(n int) []float32 {
 	return out
 }
 
+// randomBytes is randomFloats' equivalent for buffers whose contents are not
+// numbers at all — a packed 4-bit weight bank, where every bit pattern is a
+// valid weight and only the addresses matter to a timing run.
+func randomBytes(n int) []byte {
+	r := rand.New(rand.NewSource(43))
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = byte(r.Intn(256))
+	}
+	return out
+}
+
 func groupsFor(n, localSize int) uint32 {
 	return uint32((n + localSize - 1) / localSize)
 }

@@ -271,6 +271,19 @@ func RunMoE(dev *vk.Device, phys *vk.PhysicalDevice, warmup, iters uint32) ([]Re
 		}
 		results = append(results, rs...)
 	}
+
+	// The Q4 arm (IDEAS §2.2), in its own loop so that its ~1-2 GB of
+	// buffers are allocated after the fp16 bank's 2-4 GB have been freed
+	// rather than alongside them.
+	q4 := filterWaveVariants(moeQ4Variants, mustSubgroupSizeControl(phys),
+		func(v moeQ4Variant) (string, uint32) { return "moe " + v.name, v.waveSize })
+	for _, s := range moeShapes {
+		rs, err := runMoEShapeQ4(dev, s, q4, routings, warmup, iters)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, rs...)
+	}
 	return results, nil
 }
 
@@ -370,21 +383,21 @@ func (t moeTiles) total() int { return len(t.table) / 4 }
 // grouped dispatch share an expert's weights. That ordering is free and it is
 // the same lever IDEAS §2.4 calls a swizzle; it is not swept here, but it is
 // the reason the grouped arm gets any weight reuse at all.
-func buildTiles(r moeRouting, lay moeLayout, v moeVariant, N int) moeTiles {
+func buildTiles(r moeRouting, lay moeLayout, bm, bn, N int) moeTiles {
 	t := moeTiles{base: make([]uint32, moeExperts), counts: make([]uint32, moeExperts)}
-	nTiles := N / v.bn
+	nTiles := N / bn
 	for e := 0; e < moeExperts; e++ {
 		t.base[e] = uint32(t.total())
 		if lay.count[e] == 0 {
 			continue
 		}
-		mTiles := (lay.count[e] + v.bm - 1) / v.bm
+		mTiles := (lay.count[e] + bm - 1) / bm
 		for mt := 0; mt < mTiles; mt++ {
 			for nt := 0; nt < nTiles; nt++ {
 				t.table = append(t.table,
-					uint32(lay.start[e]+mt*v.bm), // row in the gathered A and in C
-					uint32(e*N+nt*v.bn),          // row in the [E*N, K] bank
-					uint32(nt*v.bn),              // column in C
+					uint32(lay.start[e]+mt*bm), // row in the gathered A and in C
+					uint32(e*N+nt*bn),          // row in the [E*N, K] bank
+					uint32(nt*bn),              // column in C
 					0)
 			}
 		}
@@ -438,7 +451,7 @@ func runMoEShape(dev *vk.Device, s moeShape, variants []moeVariant, routings map
 			if lay.total > maxRows {
 				maxRows = lay.total
 			}
-			if n := buildTiles(routings[t], lay, v, s.N).total(); n > maxTiles {
+			if n := buildTiles(routings[t], lay, v.bm, v.bn, s.N).total(); n > maxTiles {
 				maxTiles = n
 			}
 		}
@@ -511,7 +524,7 @@ func runMoEShape(dev *vk.Device, s moeShape, variants []moeVariant, routings map
 			}
 			r := routings[tokens]
 			lay := layoutGroups(r, v.bm)
-			tiles := buildTiles(r, lay, v, s.N)
+			tiles := buildTiles(r, lay, v.bm, v.bn, s.N)
 			tileBuf.WriteBytes(uint32SliceToBytes(tiles.table))
 
 			base := moeResult(s, v, r, lay, tiles)
@@ -620,7 +633,7 @@ func verifyMoEGrouped(dev *vk.Device, mod *vk.ShaderModule, v moeVariant) error 
 		}
 	}
 	lay := layoutGroups(r, v.bm)
-	tiles := buildTiles(r, lay, v, N)
+	tiles := buildTiles(r, lay, v.bm, v.bn, N)
 
 	lda, ldb := v.lda(K), v.ldb(K)
 	aData := randomFloats(lay.total * K)
@@ -885,8 +898,11 @@ func PrintMoESummary(w io.Writer, results []Result, p Params) {
 	printMoETileGrid(w, results)
 	printMoEOccupancy(w, results)
 	printMoEStrideGrid(w, results)
+	printMoEQ4Grid(w, results)
+	printMoEQ4StrideGrid(w, results)
 	printMoERoute(w, results)
 	printMoELayerBudget(w, results)
+	printMoEQ4Budget(w, results)
 }
 
 func printMoEGroupedVsPerExpert(w io.Writer, results []Result) {
@@ -900,6 +916,9 @@ func printMoEGroupedVsPerExpert(w io.Writer, results []Result) {
 	best := map[string]map[string]cell{} // "layer|tokens" -> mode -> best
 	var order []string
 	for _, r := range results {
+		if r.WeightFormat != "fp16" {
+			continue
+		}
 		mode := detailField(r.Detail, "mode")
 		if mode != "grouped" && mode != "per_expert" {
 			continue
@@ -962,6 +981,9 @@ func printMoETileGrid(w io.Writer, results []Result) {
 	grid := map[string]map[string]row{} // variant -> layer -> row
 	var variants, layers []string
 	for _, r := range results {
+		if r.WeightFormat != "fp16" {
+			continue
+		}
 		if detailField(r.Detail, "mode") != mode1 || detailField(r.Detail, "tokens") != tokens {
 			continue
 		}
@@ -1027,6 +1049,9 @@ func printMoEStrideGrid(w io.Writer, results []Result) {
 	rows := map[key][]cell{}
 	var kernels, layers []string
 	for _, r := range results {
+		if r.WeightFormat != "fp16" {
+			continue
+		}
 		v, ok := lookupMoEVariant(r.Variant)
 		if !ok || !v.strideArm {
 			continue
@@ -1098,6 +1123,9 @@ func printMoEOccupancy(w io.Writer, results []Result) {
 	}{}
 	for _, r := range results {
 		if moeIsStrideArm(r.Variant) {
+			continue
+		}
+		if v, ok := lookupMoEQ4Variant(r.Variant); ok && v.strideArm {
 			continue
 		}
 		key := r.Variant + "|" + detailField(r.Detail, "layer") + "|" + detailField(r.Detail, "tokens")
@@ -1182,7 +1210,7 @@ func printMoELayerBudget(w io.Writer, results []Result) {
 		mode := detailField(r.Detail, "mode")
 		switch mode {
 		case mode1, "per_expert":
-			if moeIsStrideArm(r.Variant) {
+			if r.WeightFormat != "fp16" || moeIsStrideArm(r.Variant) {
 				continue
 			}
 			key := detailField(r.Detail, "layer") + "|" + mode
@@ -1249,7 +1277,8 @@ func moeIsStrideArm(name string) bool {
 func moeStrideGain(results []Result, layer string) float64 {
 	var fixed, best float64
 	for _, r := range results {
-		if detailField(r.Detail, "layer") != layer ||
+		if r.WeightFormat != "fp16" ||
+			detailField(r.Detail, "layer") != layer ||
 			detailField(r.Detail, "mode") != mode1 ||
 			detailField(r.Detail, "tokens") != strconv.Itoa(moeStrideTokens) {
 			continue

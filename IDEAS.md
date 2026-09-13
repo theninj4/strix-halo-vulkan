@@ -856,7 +856,7 @@ system, in two layers (channel aliasing, §2.3; loads-in-flight coverage,
 **Effort**: high (this is a real GEMM kernel). **Value**: highest for
 prefill, image generation, and the Parakeet encoder. **Delivered.**
 
-### 2.2 W4A8 coopmat — Q4 weights into the int8 MMA path — **downgraded**
+### 2.2 Q4 weights into the coopmat path — **DONE** ✅, **2.10x a MoE block**
 **Hypothesis (as written, now falsified in part)**: that feeding Q4 into
 the int8 MMA path would get both 1/4 the weight bytes *and* the 2x int8
 matrix rate. **[measured] There is no 2x int8 matrix rate** — §0.1 measures
@@ -881,6 +881,179 @@ small change to a kernel that now reaches 45% of the ceiling and would halve
 its operand bytes. That, not the Q4-unpack version, is the next step here.
 **Effort**: low for the int8 arm, high for the Q4 unpack.
 **Value**: medium-high for int8, medium for Q4 (downgraded from very high).
+
+**[measured] §3.5 re-promoted the Q4 arm to the top of the file, and it has
+now been built and run.** What changed between those two readings is that
+§3.5 put a number on the thing a 4-bit bank removes: the MoE prefill at 93%
+of the ceiling its *format* implies, 5.03 GB of expert weights per block,
+21.3 ms of unavoidable DRAM traffic inside a 28-30 ms block. That is not a
+tile-fill argument, which is what this item kept being downgraded on — it is
+the whole of the phase.
+
+Built as `shaders/gemm_wmma_q4.comp`, a separate file rather than another -D
+on `gemm_wmma.comp`, for one reason: **a cooperative-matrix fragment's lane
+layout is not exposed**. `GL_KHR_cooperative_matrix` defines `m[i]` and
+`m.length()` but not which (row, col) an element is, so 4-bit weights cannot
+be unpacked into registers and declared a fragment. They have to be written
+somewhere `coopMatLoad` can read with a defined layout, and the only such
+place that is not DRAM is LDS. So the kernel is §2.7's winner with one
+operand rerouted: A stays fp16 from global with `HOIST_A`, and B's 4-bit
+slab is dequantized into an LDS tile per K-step and read back with the same
+column-major fragment load the `_bt` variants already use.
+
+**This is not the LDS that §2.1 measured losing.** That one was a *reuse*
+mechanism — stage a slab so `WAVES_M x WAVES_N` waves share it — and it lost
+because the 32 MiB MALL was already supplying the reuse for free. This one is
+a *format conversion*: one wave per workgroup, the slab is that wave's own B
+tile, nothing is shared. What is paid for is the round trip and the barriers.
+
+The unpack avoids integer-to-float conversion entirely. fp16 `1024.0` is
+`0x6400` and its ulp at that exponent is exactly 1.0, so OR-ing a 4-bit value
+into the mantissa gives `1024+n` exactly; subtract 1032 and multiply by the
+block scale, two nibbles at a time in one `f16vec2`. Two packed fp16 ops per
+two weights, no conversions, and every intermediate exact.
+
+Eight builds: §3.5's five tile geometries unchanged, so the two formats'
+tables subtract row for row, plus one axis each for the scale block, the LDS
+row pad and double buffering. A stride arm on top. `results/moe.csv`, same
+routing, same tile table, same two schedules, weight bytes counted as packed
+nibbles plus fp16 scales.
+
+**Finding 1: 2.10x on a whole MoE block, and 2.24x on the matmuls.** Best
+fp16 configuration measured anywhere in the family against best Q4, at 2048
+tokens:
+
+| | gate_up (N=640, K=2560) | down (N=2560, K=640) | block | x48 layers |
+|---|---|---|---|---|
+| fp16 | 8.77 ms | 9.18 ms | 28.13 ms | 1.35 s |
+| Q4 | **3.82 ms** | **4.31 ms** | **13.37 ms** | **0.64 s** |
+| | 2.29x | 2.13x | **2.10x** | |
+
+Against the geometry arm alone — like for like, both formats at their arm's
+default stride — it reads 2.32x and 2.52x, and 2.24x on the block; the
+difference is that fp16 had 1.18x of stride left on `down` (§3.5 finding 3)
+and Q4 has none, for the reason in finding 6. The whole-block ratio is below
+the matmul ratio because the gather and combine do not shrink: they were 5%
+of the fp16 block and are **10.6%** of the Q4 one.
+
+**Finding 2: the constraint moved, which is what the 2x rather than 4x is.**
+The byte count falls 4x and the time falls 2.1x, and the two numbers that say
+why are in the same rows:
+
+| | weight GB/s (of 236) | exec GFLOP/s (of 55500) |
+|---|---|---|
+| fp16, gate_up | 190 — **80% of the bus** | 12137 — 22% |
+| Q4, gate_up | 113 — 48% | 28104 — **51% of the matrix cores** |
+| Q4, down | 100 — 42% | 24900 — 45% |
+
+At fp16 the kernel was pinned against the bus and the FLOPs were free. At Q4
+it is at roughly *half* of each ceiling and pinned against neither — the
+dequant path itself is what is left, which is 513 VALU instructions in a loop
+body that issues 64 MMAs, plus two barriers per K-step. The 4-bit bank's own
+floor is 5.5-6.0 ms per block against a 11.95 ms of matmul, so bytes are no
+longer the story even in principle.
+
+**Finding 3: §3.5's finding 2 inverts, as predicted, and then loses to
+something else.** There, a 16-row tile bought 84% useful rows instead of 62%
+and was *slower*, because the padding cost FLOPs and FLOPs were free. Here
+they are not, and among the QBLOCK=32 geometries the 16-row tile is now the
+fastest at both layers — `moe_q4_reg16x32_w32` at 4.63/4.32 ms against
+`moe_q4_reg64`'s 4.73/4.53 — winning by *executing fewer FLOPs* (17247 exec
+GFLOP/s against 22697, at a higher useful rate). The inversion is real and
+it is small, 1.02-1.05x. It is beaten outright by a variant that is not a
+geometry at all:
+
+**Finding 4: the scale block is worth 1.24x, and the two binaries are
+instruction-for-instruction identical.** `QBLOCK=128` against `QBLOCK=32` at
+the same tile takes gate_up from 4.73 to 3.82 ms. `RADV_DEBUG=shaderstats`
+prices them at the same 252 VGPRs, the same 5064-byte code, the same 802
+instructions, the same 513 VALU and the same 100 VMEM — the only difference
+in the source is the shift in the scale index. And the nominal bytes do not
+explain it either: scales go from 6.2% of the bank to 1.6%, a 4.4% traffic
+difference standing behind a 24% one. What is left is **where the scale loads
+land**: at QBLOCK=32 a slab's 128 staging chunks read 64 rows of a scale
+plane whose own row stride is 160 B, so each 2-byte scale drags in its own
+cache line. This is measured, not attributed — see the open item below.
+
+**Finding 5: the LDS row pad is the single biggest knob in the file, 1.68x
+and 1.83x.** Without it (`LDS_PAD=0`) the B slab's rows are `BK` halves =
+128 B apart, which is exactly one rotation of the 32 LDS banks, so a fragment
+load touching 16 rows hits one bank 16 times: 7.93/7.88 ms against 4.73/4.53.
+Eight halves of pad fixes it. Anyone building an LDS-staged dequant kernel
+pays this before they pay anything else, and it is invisible in the
+instruction stream (28 bytes of code and 1 KB of LDS separate the two).
+
+**Finding 6: the coverage law loses to the traffic buying it costs.** The
+stride arm sweeps `gcd(row bytes, 4096)` on the 4-bit bank, which is half the
+bytes of the fp16 one and so lands somewhere else: gate_up's 1280 B row is at
+gcd 256 *unpadded*, inside §5.1b's [128, 256] window, and down's 320 B row is
+at gcd 64, below it — the end §3.5 measured costing 5-17%.
+
+| layer | gcd | stride B | extra traffic | useful GFLOP/s |
+|---|---|---|---|---|
+| gate_up | 256 (natural) | 1280 | 1.00x | **14215** |
+| gate_up | 128 | 1408 | 1.10x | 14151 |
+| down | 64 (natural) | 320 | 1.00x | **14799** |
+| down | 128 | 384 | 1.20x | 13826 |
+| down | 256 | 768 | 2.40x | 12710 |
+
+So on `down` climbing *into* the window costs 1.07x and 1.16x rather than
+paying. The amendment to §5.1b rule 1 is: the window prices **bandwidth**,
+and a kernel that is no longer bandwidth-bound has nothing to spend it on,
+while the padding's extra bytes are charged either way. Read the rule as
+"prefer a stride already in the window" — it is a layout choice, not a pad to
+buy — and note that a 4-bit row is half an fp16 one, so the pad reaching a
+given gcd is twice as large a share of it.
+
+**Finding 7: grouping is worth *more* at Q4, not less.** §3.5's occupancy law
+holds — the speedup is still monotone in workgroups per expert dispatch — but
+every cell moves up: 5.2-8.1x at 10 workgroups where fp16 measured 3.2-4.2x,
+2.8-2.9x at 30 where fp16 measured 2.6x. Which is what the occupancy
+explanation predicts and the launch-cost one does not: the idle time an
+under-filled dispatch leaves is roughly fixed, so it is a larger share of a
+faster kernel. The per-expert loop gets *worse* the better the kernel gets.
+
+**Finding 8: double buffering is worth nothing here** — 4.54 against 4.73 ms
+on gate_up, 4.59 against 4.53 on down. It was worth 1.23x on
+`gemm_wmma.comp`'s LDS path; the staged operand here is a quarter the size,
+and it costs the last 4 VGPRs (256, at the wave64 ceiling) and half the
+occupancy (4 subgroups per SIMD against 6).
+
+**Finding 9, negative and worth keeping: folding the bias into the multiply
+is wrong.** `fma(q, s, -1032*s)`, with the addend computed once per chunk,
+would halve the dequant's arithmetic — and it **fails the correctness check
+by 8%**, not by an ulp: -0.661 against -0.717. `1032*s` is ~145 where the
+result `(n-8)*s` is ~1, and rounding that addend into fp16's 11-bit
+significand puts 0.07 of error onto a quantity of magnitude 1. The bias has
+to come off at nibble magnitude, before the scale, where it is exact. The
+version that would work carries it out to the fp32 epilogue as a per-K-block
+row sum of A — which is what `gemv_w4a8.comp` does, in int32, where it is
+exact rather than merely bigger.
+
+**A note on the clock.** The Q4 rows run at 2796-2870 MHz and 118-133 W
+against fp16's 2880 MHz and 104-106 W: more arithmetic per byte is more
+power, and this part answers that by dropping 1-3% of clock. The ratios above
+are therefore very slightly *understated*.
+
+**What is left here.**
+- **The scale plane's layout.** Finding 4 is a 1.24x with no mechanism
+  attached, from two identical binaries. The test is a blocked scale layout —
+  one slab's 64 scales contiguous instead of 160 B apart — which would make
+  QBLOCK=32 cost what QBLOCK=128 costs and settle whether it is locality.
+  Accuracy wants the small block; this is what it would cost.
+- **The dequant's two packed ops.** Finding 2 says the loop body is what
+  binds now and finding 9 says the cheap way to halve it is invalid. The
+  valid way is the epilogue row-sum; it needs a second buffer and a pass, and
+  should be sized against finding 4 first.
+- **The int8 arm is still unbuilt and is now much less interesting.** A
+  `PRECISION_I8` `gemm_wmma.comp` halves operand bytes against fp16 — but Q4
+  quarters them, has no matrix-rate penalty (§0.1), and is the format a real
+  4-bit checkpoint arrives in. Build it only if a W8A8 prefill story is
+  wanted for its own sake.
+- **Decode.** All of this is prefill. The grouped *GEMV* for decode is still
+  unwritten and is the phase `GOALS.md` is actually asking about.
+**Effort**: was high; it was. **Value**: delivered — 2.10x on the largest
+single number the file was carrying.
 
 ### 2.3 B stored [N,K] with a column-major `coopMatLoad` — **RESOLVED** ✅ (it was channel aliasing)
 **Hypothesis**: B is stored K-major ([K,N]) and loaded row-major, but real
@@ -1546,12 +1719,15 @@ layers that is **1.44 s against 1.85 s** for a prompt chunk, with the stride
 fix taking the grouped figure to 28.09 ms/block. All of it at fp16, where the
 bank alone is 5.03 GB per block and 21.3 ms of unavoidable DRAM traffic — so
 **the whole prefill is a bandwidth problem and the case for a Q4 grouped
-kernel (§2.2) is now quantified rather than argued.**
+kernel (§2.2) is now quantified rather than argued.** (§2.2 has since built
+it: 13.37 ms against 28.13, and the bandwidth problem becomes a matrix-core
+one on the way.)
 
 **Not done:** decode's grouped path is measured with this GEMM kernel at
 M=1, which wastes 15 of every 16 rows of an MMA tile — free, since the
 weights are read once either way, but the honest decode kernel is a grouped
-*GEMV* and does not exist. And the T=1 cases touch 10 experts, 33 MB, which
+*GEMV* and does not exist. (Still true after §2.2, which is prefill only and
+which makes this the largest remaining gap.) And the T=1 cases touch 10 experts, 33 MB, which
 sits inside the 32 MiB MALL, so those rows are cache-resident and are not a
 decode measurement.
 
@@ -2371,6 +2547,17 @@ It paid off somewhere else instead: **the DRAM-resident W4A8 decode GEMV at
 `VEC=4` reads 225.7 of 236 GB/s at wave32, 96% of the bus, up from 89%**, and
 the fragment-dominated AI-16 GEMM grid gains 1.9-2.1x. It also closed §3.7 as a
 side effect.
+**§2.2 is done**, the item that stood at the top of this list, and it
+delivered: the Q4 grouped GEMM takes one MoE block from 28.13 ms to
+**13.37 ms**, a prompt chunk's 48 of them from 1.35 s to **0.64 s**, and it
+does it by moving the phase off the memory system — 190 GB/s of bus at fp16
+becomes 113, while the padded tiles' own rate goes from 22% to **51% of the
+matrix cores**. 4x the bytes removed buys 2.1x, and the gap is the whole
+finding. Three of its results were not in the plan: the LDS row pad is worth
+1.68-1.83x (a `BK`-half slab row is exactly one 32-bank rotation), the scale
+block is worth 1.24x between two instruction-identical binaries, and
+§5.1b's coverage window *loses* to the traffic that buying it costs once the
+kernel is no longer bandwidth-bound.
 **§3.5 is done**, the item §3.4 promoted to the top of the file, and it
 settled the MoE FFN as a kernel problem: the grouped GEMM is worth
 1.08-4.14x over the expert-at-a-time loop, the mechanism is occupancy (a
@@ -2431,15 +2618,20 @@ it. It also closed the second item on this list from an unexpected direction —
 see below.
 
 **Next:**
-- **§2.2's Q4/int8 grouped GEMM, now the largest number in the file.** §3.5
-  measured the MoE prefill at 93% of the ceiling its *format* implies, and
-  that ceiling is entirely weight bytes: 5.03 GB per block at fp16, 21.3 ms
-  of unavoidable DRAM traffic against a 28-30 ms block. Nothing about the
-  kernel is left to win. A 4-bit bank is a quarter of those bytes, and §1.1
-  already showed 4-bit weights feeding `dotPacked4x8EXT` at the full bus in
-  the GEMV. This is no longer "small change to a kernel that works" — it is
-  the only remaining lever on the phase §3.4 called 98% memory-bound, and
-  §3.5 has now bounded everything else about it.
+- **A grouped GEMV for decode, now the largest gap in the file.** Every
+  number above is prefill. §3.5's decode rows run the grouped *GEMM* at M=1,
+  which wastes 15 of 16 rows of every MMA tile and whose 10-expert working
+  set is 33 MB — inside the MALL, so they are not a decode measurement at
+  all. The honest kernel is `gemv_w4a8.comp` with §3.5's tile table, decode
+  is the phase `GOALS.md` is actually asking about, and §2.2 has just removed
+  the reason to keep deferring it: the 4-bit bank a grouped GEMV would read
+  is the one that now exists.
+- **§2.2's own two leftovers, both cheap and both attribution rather than
+  gain.** The scale plane's layout — 1.24x with no mechanism attached,
+  between two binaries that are instruction-for-instruction identical, which
+  a blocked scale layout would settle — and the dequant's two packed fp16
+  ops per two weights, whose cheap halving is numerically invalid (§2.2
+  finding 9) and whose valid form is an fp32-epilogue row sum.
 - **K=640 is explained, and the fix is to stop padding it.** §3.4 left this
   as an unexplained deficit — the MoE down projection reading 209-215 GB/s
   at every load width. §3.5's stride sweep answers it on the GEMM side and
@@ -2499,10 +2691,11 @@ see below.
   next is visible, which is where a swizzle acts, and they are 22 of the 38
   shapes the models actually use.
 - **§2.2's int8 arm** — a `PRECISION_I8` variant of `gemm_wmma.comp`
-  accumulating in int32. Small change to a kernel that now works, halves the
-  operand bytes, and gives the W8A8 prefill story its number. (The *Q4*
-  unpack version stays downgraded: there is no int8 matrix-rate bonus, and
-  §2.1's winner has no LDS tile to make cheaper.)
+  accumulating in int32. Still unbuilt, and §2.2's Q4 arm has made it much
+  less interesting: int8 halves the operand bytes where Q4 quarters them,
+  there is no int8 matrix-rate bonus (§0.1), and Q4 is the format a real
+  4-bit checkpoint arrives in. Build it only if a W8A8 *prefill* story is
+  wanted for its own sake.
 - **Pad the strides everywhere else** — still demoted, but §3.5 has changed
   what the test is. §5.1b's mechanism 3 predicted these kernels *were*
   exposed (one wave per row, rows a stride apart) right up until its ladder
@@ -2591,7 +2784,20 @@ FFN looked like the counterexample, 1440 of a token's 1861 matmuls, and it is
 not: grouping its 512 experts into one dispatch is worth 1.08-4.14x and the
 whole of that is occupancy, a monotone function of how many workgroups one
 expert's dispatch launches against the 80 waves this part needs resident,
-with the launches themselves 1.5% of it. What is left of MoE prefill is
+with the launches themselves 1.5% of it. What was left of MoE prefill was
 weight bytes and only weight bytes — 93% of the ceiling its format implies,
-5.03 GB per block at fp16 — which makes a 4-bit grouped GEMM the largest
-number left in this file.**
+5.03 GB per block at fp16 — and the 4-bit grouped GEMM that follows from that
+is now built and is worth **2.10x a whole block**, 1.35 s of prompt chunk
+down to 0.64 s. Removing 4x of the bytes buys 2.1x of the time because the
+phase stops being a memory problem in the middle of the change: 80% of the
+bus becomes 48%, and 22% of the matrix cores becomes 51%. What it cost was
+one thing the plan had and three it did not — the operand has to round-trip
+through LDS, because no cooperative-matrix extension exposes a fragment's
+lane layout and 4-bit weights therefore cannot be unpacked into registers;
+that LDS tile must have its rows padded off the 32-bank rotation, for
+1.68-1.83x; the quantization block size is worth 1.24x between two binaries
+that are instruction-for-instruction identical; and §5.1b's stride window
+stops paying the moment the kernel stops being bandwidth-bound, because the
+padding that buys it still costs bytes. Prefill is now a solved format
+problem as well as a solved kernel one, and what is left unmeasured is
+decode's own grouped kernel.**

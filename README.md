@@ -119,6 +119,37 @@ what matters is landing the gcd at 128-256 B — which the 640-wide down
 projection already does unpadded, and which padding it by 256 B *breaks*, for
 1.19x.
 
+That left MoE prefill with exactly one lever — it was at 93% of the ceiling
+its *format* implies, and that ceiling is 5.03 GB of fp16 expert weights per
+block. Holding the same kernel and the same schedule and putting the bank at
+**4 bits** (`shaders/gemm_wmma_q4.comp`) takes one MoE block from 28.13 ms to
+**13.37 ms** and a 48-layer prompt chunk from 1.35 s to **0.64 s**. Removing
+4x of the bytes buys 2.1x of the time, and the gap is the finding: the phase
+stops being a memory problem partway through the change. Weight traffic goes
+from 190 GB/s of a 236 GB/s bus to 113, while the padded tiles' own rate goes
+from 22% of the matrix cores to **51%** — half of each ceiling, pinned
+against neither, with the dequant loop body left as what binds.
+
+Three things that cost more than the arithmetic did. **The operand has to
+round-trip through LDS**, because no cooperative-matrix extension exposes a
+fragment's lane layout — `m[i]` is defined, which (row, col) it means is not
+— so 4-bit weights cannot be unpacked into registers and declared a fragment.
+**That LDS tile's rows must be padded off the 32-bank rotation**: a slab row
+is 128 B, exactly one rotation, so a 16-row fragment load hits one bank
+sixteen times, and eight halves of pad are worth **1.68-1.83x** for 28 bytes
+of code. And **the quantization block size is worth 1.24x between two
+binaries that are instruction-for-instruction identical** — same VGPRs, same
+code size, same VALU and VMEM counts, 4.4% of nominal bytes standing behind a
+24% difference — which is still unattributed. Two predictions did come true:
+the 16-row tile that *lost* at fp16 because padding cost FLOPs and FLOPs were
+free now wins, and grouping is worth *more* than it was (5-8x at ten
+workgroups per expert dispatch, against fp16's 3-4x), because the idle time
+an under-filled dispatch leaves is fixed and a faster kernel makes it a bigger
+share. One rule got amended instead: **the stride window above stops paying
+once a kernel is not bandwidth-bound**, since padding into it still costs
+bytes — on the down projection, climbing from its natural gcd of 64 into the
+128-256 B plateau costs 1.20-2.40x the traffic and measures slower.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -159,7 +190,9 @@ fields is itself a pointer into other Go memory — and Vulkan's
   `ops_moe.go` is the only family that needs more than one dispatch shape per
   measurement: its per-expert baseline is a command buffer of 512 dispatches
   with differing push constants, which is `vk.ComputePipeline`'s
-  `DispatchSequenceTimed`.
+  `DispatchSequenceTimed`. `ops_moe_q4.go` is its 4-bit arm — the same
+  routing, tile table and schedules against a Q4 expert bank, so the two
+  formats' rows subtract.
 - `cmd/bench/main.go` — the benchmark CLI; `bench/families.go` is the
   registry of targetable op families it dispatches to.
 - `results/` — one CSV per op family, the committed measurements.
@@ -181,7 +214,7 @@ go build ./...
 
 go run ./cmd/bench -list          # the op families a run can target
 go run ./cmd/bench gemv gemv_cold # run two of them
-go run ./cmd/bench all            # the whole suite (~40 min)
+go run ./cmd/bench all            # the whole suite (~50 min)
                                   # -h for the sweep flags (sizes, blocks,
                                   # warmup/iters, per-family sweeps)
 ```
@@ -208,11 +241,13 @@ ladder — is separate from `gemm` because it is the larger half of the GEMM
 rows and is iterated on by itself. `shapes` and `moe` are the two that sweep
 nothing: `shapes` runs the kernels the other families picked over the real
 model dimensions in `bench/modelshapes.go` (~5 min), and `moe` runs the
-grouped/MoE GEMM over qwen3.8-flash-next's 512-expert bank (~2 min). Both
-ignore `-sizes`/`-blocks`, because their shapes are the models' rather than
-the flags'. `moe` also allocates the largest buffers in the suite — a
-512-expert fp16 weight bank is 1.8-4.0 GB depending on the row stride under
-test — so it wants headroom rather than a loaded machine.
+grouped/MoE GEMM over qwen3.8-flash-next's 512-expert bank, at fp16 and at
+4 bits (~8 min). Both ignore `-sizes`/`-blocks`, because their shapes are the
+models' rather than the flags'. `moe` also allocates the largest buffers in
+the suite — a 512-expert fp16 weight bank is 1.8-4.0 GB depending on the row
+stride under test — so it wants headroom rather than a loaded machine; its
+Q4 arm runs in a second pass once those are freed, so the two banks are never
+live at the same time.
 
 ## Reading the numbers honestly
 

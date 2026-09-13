@@ -619,6 +619,59 @@ var GEMMWMMAMoEReg16x32BTHKAB4W32 []byte
 //go:embed gemm_wmma_moe_reg16x64_bt_hkab4_w32.spv
 var GEMMWMMAMoEReg16x64BTHKAB4W32 []byte
 
+// IDEAS §2.2, the Q4 grouped GEMM: the same grouped schedule over the same
+// tile table, with the expert bank held at 4 bits per weight and dequantized
+// into LDS a K-slab at a time (shaders/gemm_wmma_q4.comp). §3.5 measured the
+// fp16 grouped kernel at 93% of the ceiling its format implies and that
+// ceiling is entirely weight bytes, so this is the only lever the MoE prefill
+// has left.
+//
+// The geometry arm is the same five tiles §3.5 ran, so the two formats are
+// comparable row for row — and so that §3.5's finding 2 (tile padding costs
+// nothing, because FLOPs were free) can be re-tested where FLOPs are not
+// expected to be free any more.
+//
+// The other three vary one thing each against the first of those:
+//
+//	qb128     one fp16 scale per 128 nibbles instead of 32, which takes the
+//	          scales from 6.2% of the bank's bytes to 1.6%
+//	ldspad0   no LDS row pad, so the B slab's rows are 128 B = one full
+//	          rotation of the 32 LDS banks apart
+//	db        the next K-slab's global loads issued before this slab's MMAs
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -o gemm_wmma_q4_moe_reg64.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=2 -DWN=2 -o gemm_wmma_q4_moe_reg32.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWAVE=32 -DWM=2 -DWN=2 -o gemm_wmma_q4_moe_reg32_w32.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWAVE=32 -DWM=1 -DWN=2 -o gemm_wmma_q4_moe_reg16x32_w32.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWAVE=32 -DWM=1 -DWN=4 -o gemm_wmma_q4_moe_reg16x64_w32.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DQBLOCK=128 -o gemm_wmma_q4_moe_reg64_qb128.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DLDS_PAD=0 -o gemm_wmma_q4_moe_reg64_ldspad0.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DDOUBLE_BUFFER=1 -o gemm_wmma_q4_moe_reg64_db.spv gemm_wmma_q4.comp
+
+//go:embed gemm_wmma_q4_moe_reg64.spv
+var GEMMWMMAQ4MoEReg64 []byte
+
+//go:embed gemm_wmma_q4_moe_reg32.spv
+var GEMMWMMAQ4MoEReg32 []byte
+
+//go:embed gemm_wmma_q4_moe_reg32_w32.spv
+var GEMMWMMAQ4MoEReg32W32 []byte
+
+//go:embed gemm_wmma_q4_moe_reg16x32_w32.spv
+var GEMMWMMAQ4MoEReg16x32W32 []byte
+
+//go:embed gemm_wmma_q4_moe_reg16x64_w32.spv
+var GEMMWMMAQ4MoEReg16x64W32 []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_qb128.spv
+var GEMMWMMAQ4MoEReg64QB128 []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_ldspad0.spv
+var GEMMWMMAQ4MoEReg64LDSPad0 []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_db.spv
+var GEMMWMMAQ4MoEReg64DB []byte
+
 // The gather and combine passes the grouped GEMM cannot do for itself
 // (IDEAS §3.5). TOPK is baked in because it sizes the combine's unrolled
 // accumulation; 10 is qwen3.8-flash-next's num_experts_per_tok.
