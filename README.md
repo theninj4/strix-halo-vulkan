@@ -199,6 +199,63 @@ while `down` goes to it, because a 16-row tile covers 5.05 rows in one pass
 where a compile-time block of 4 needs 1.62. Single-stream decode is unchanged
 at 5.43 ms and 184 tok/s — this is a throughput lever with no latency effect.
 
+The *other* axis of that block is what closed the one cell this suite had left
+open on the decode path. The `down` projection read **198 GB/s** per distinct
+expert where `gate_up` read **235**, for the same 845 KB of weights either
+way; what differs is the aspect ratio, 2560 rows of 640 against 640 rows of
+2560, so down launches 4x the workgroups and issues 4x the output writes. Two
+arms that divide the workgroup count *identically* separate the causes:
+packing several subgroups into a workgroup (`-DROWS=n`, same waves, same
+loads, same stores) is worth **1.02x**, while giving one subgroup several of
+an expert's weight rows against one activation row (`-DNROWS=n`, so the wave
+count falls too) is worth **1.17x** and takes down to **98% of gate_up's
+rate**. Fitting `T = A/n + B` prices the difference exactly: **19.8% of down's
+time is a fixed cost per output row** — one `subgroupAdd`, one store, one
+activation row, paid four times as often against a quarter of the loads — and
+**-0.4% of gate_up's is**. It is not the lanes, twice over: halving the wave
+is a wash, and the one build that actually *fills* down's 64 lanes (VEC=1, 80
+loads per row) is **1.05x slower** than the VEC=4 build whose 44 idle lanes
+the N block leaves exactly as idle as it found them. The sizing rule is the
+load-width rule read along the other axis of the matrix — **one lane-step
+should cover a weight row (`VEC`), and one wave-step should cover the lanes
+(`NROWS >= 8*VEC*WAVE/K`)** — which is 4 at K=640 and 1 at K=2560, as
+measured. Unlike the M block this one takes nothing from routing, never pads,
+and is a **latency** lever: a single token's MoE FFN goes to **5.15 ms over 48
+layers, 194 tok/s, 97% of its 5.00 ms bus floor**, and `down` beats the Q4
+grouped GEMM by 1.38x at 64 sequences where the M block managed 1.16x.
+
+Those two blocks are the two axes of one kernel, and **putting both in one
+wave is where a serving batch actually sits**. A workgroup takes `MROWS` of an
+expert's routed tokens and each of its subgroups takes `NROWS` of that
+expert's weight rows, so every weight load is dotted `MROWS` times and every
+activation load `NROWS` times. They **compose**: at 256 sequences in flight it
+is **1.12x each of its own axes on `gate_up` and 1.19x on `down`**, **1.10x
+the best single-axis build of any width in the sweep** at both shapes, and
+1.54x/2.11x the unblocked kernel. At 16-64 tokens it ties the best
+single-axis build within 1% — those cells are already at the bus — and below
+that, where the M block is a real loss, the corner loses with it. What that buys is the last of the decode path's
+bandwidth: `gate_up` reads **228 GB/s of distinct weight bytes, 96% of the
+bus**, where the M block alone reached 87% and the unblocked kernel 63%, and
+the FFN runs at **818 tok/s against the Q4 grouped GEMM's 545** — so `down`,
+which the M block had handed to the GEMM at five rows per expert (0.77x),
+comes back to **0.98x** there and `gate_up` to 1.88x. Three things fell out of
+it. An N block makes the M block's **pad slots 4x cheaper on `gate_up` and
+1.2x on `down`** — a pad costs a per-wave part, which `NROWS` divides, plus a
+per-output-row part, which it does not, and down's slot is 2560 output rows
+against gate_up's 640 — so the fitted "block when it removes one group per
+6-10 pads" becomes one per **45** pads on gate_up and one per 6.5 on down, and
+the M block may be sized *above* the mean rows per expert where its rows are
+few. The row block **partly substitutes for the load width**: `NROWS=4` is
+worth 1.67x at VEC=1 against 1.37x at VEC=4, and `VEC=1` + `NROWS=4` is the
+fastest single-axis build at gate_up's 256-sequence cell — a width §1.7's rule
+calls the worst available. And the corner **never spills**: 83 VGPRs at
+(4, 4) against the plain kernel's 47, with no scratch access anywhere in the
+family, so the register competition the arm was built to look for does not
+appear. Single-stream decode is unchanged at 195 tok/s, since the M axis is a
+loss at one row per expert; the one cell of the decode path still under the
+bus is `down` at 256 sequences (66%), a quarter of which is pad slots a
+runtime-sized block would remove.
+
 No third-party Go modules — `go.mod` has no dependencies. Vulkan access is a
 hand-written cgo binding straight against the system Vulkan loader
 (`vulkan/vulkan.h` + `libvulkan.so`), with the struct-heavy parts of the
@@ -422,14 +479,18 @@ reader:
   variant kept. `ROWS` changes nothing anywhere except the single cell where
   `VEC` is one step short of a row, and is kept as the control that showed
   that (IDEAS §1.7).
-- **The grouped arm's M block (`MROWS`).** `gemv_w4a8.comp -DGROUPED=1
-  -DMROWS=n` gives one workgroup *n* routed tokens of the same expert against
-  one weight row (`_m2`, `_m4`, `_m8` rows). Unlike `VEC` this is not a
-  machine constant to be found once: it has to match how many rows routing
-  gives an expert, and it is a real loss when it does not (0.39x at one row
-  per expert, 1.66x at five). An engine keeps several builds and picks per
-  dispatch. `MROWS > 1` requires `GROUPED`, and `GROUPED` still forbids
-  `ROWS > 1` (IDEAS §1.9).
+- **The grouped arm's two blocks (`MROWS`, `NROWS`).** `gemv_w4a8.comp
+  -DGROUPED=1 -DMROWS=m -DNROWS=n` gives one workgroup *m* routed tokens of
+  the same expert and each of its subgroups *n* of that expert's weight rows
+  (`_m2`, `_n4`, `_m4_n4` rows). They combine, and they are sized by different
+  things. `NROWS` is a model constant like `VEC` — `8*VEC*WAVE/K`, so 4 at
+  K=640 and 1 at K=2560 — and never hurts at the shapes it is sized for.
+  `MROWS` has to match how many rows routing gives an expert and is a real
+  loss when it does not (0.39x at one row per expert, 1.66x at five), so an
+  engine keeps several builds and picks per dispatch. Both require `GROUPED`;
+  `NROWS` is capped at 4 when combined with an M block, and `ROWS` (subgroups
+  per workgroup) works under `GROUPED` too, as the control that showed the
+  cost is inside the wave rather than in the grid (IDEAS §1.9, §1.10, §1.11).
 - **Cache-resident measurements are contended.** A MALL-resident working
   set is shared with everything else touching memory — the display this iGPU
   also drives, or a second benchmark process — and losing part of it drops a

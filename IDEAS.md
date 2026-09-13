@@ -53,6 +53,23 @@ underneath runs at 148, which is the measurement that says an expert's
 duplicate pairs were never free. Blocked, DRAM reaches 206 GB/s, 87% of the
 bus, and a 256-sequence batch's FFN runs at **694 tok/s against 212 at 16**.
 
+**§1.10 gave it the other block and §1.11 put both in one wave**, which
+finishes the decode kernel. `NROWS` consecutive weight rows per subgroup
+against one activation row closed §1.8's last open cell — `down`'s 198 GB/s
+against `gate_up`'s 235 is a **fixed cost per output row**, 19.8% of down's
+time and -0.4% of gate_up's, and dividing the workgroup count without the wave
+count is worth only 1.02x — and unlike the M block it is a *latency* lever, so
+a single token's FFN reached **5.14 ms over 48 layers, 195 tok/s, 97% of the
+bus floor**. Combining the two is worth **1.12-1.19x over each of its own
+axes, and 1.10x over the best single-blocked build of any width**, at 256
+sequences; it takes `gate_up` to **96% of the DRAM bus** and the FFN to
+**818 tok/s** — 1.50x the Q4 grouped GEMM, where §1.9's M block alone measured
+1.27x. The two rules to size them by are independent: `VEC` and `NROWS` come
+from the model (`VEC = K/(8*WAVE)` and `NROWS >= 8*VEC*WAVE/K`, the same
+coverage rule read along the two axes of the matrix), `MROWS` comes from the
+routing histogram, and the one place they interact is the pad — an N block
+makes a pad slot 4x cheaper where a slot is few output rows.
+
 **§2.1 (register-blocked coopmat GEMM) is done as well**, and it delivered
 more: **25.2 TFLOP/s, 6.0x the previous best GEMM kernel at the same shape
 and 45% of the measured WMMA ceiling**, up from 8%. Two of its sub-hypotheses were wrong in
@@ -883,15 +900,20 @@ been measuring decode with. For scale: §3.4's whole-token budget is 2.89 GB and
 41% of a decode token's weight traffic and is now within 9% of reading it at
 the bus.
 
-**One cell left open.** The down projection reads 198 GB/s per distinct expert
-where gate_up reads 235, for identical bytes (845 KB per expert either way).
-Its rows are 4x as many and a quarter as long, so it launches 4x the workgroups
-and issues 4x the output writes, and at VEC=4 its 640-nibble row is only 20
-lane-steps for a 64-lane wave. The lane-count explanation is the testable one
-and it **fails**: the wave32 arms, where the same row is 20 steps over 32
-lanes, measure within 1% of wave64 (0.590 against 0.594 ms). So it is not lane
-occupancy, and the remaining candidates are the workgroup count and the write
-pattern.
+**One cell left open — since closed by §1.10.** The down projection reads
+198 GB/s per distinct expert where gate_up reads 235, for identical bytes
+(845 KB per expert either way). Its rows are 4x as many and a quarter as long,
+so it launches 4x the workgroups and issues 4x the output writes, and at VEC=4
+its 640-nibble row is only 20 lane-steps for a 64-lane wave. The lane-count
+explanation is the testable one and it **fails**: the wave32 arms, where the
+same row is 20 steps over 32 lanes, measure within 1% of wave64 (0.590 against
+0.594 ms). So it is not lane occupancy, and the remaining candidates are the
+workgroup count and the write pattern. **§1.10 has since separated those two
+and it is neither of them exactly**: the grid is worth a couple of percent at
+this cell, and what the deficit is made of is a *fixed cost per output row*
+inside the wave — one `subgroupAdd`, one store and one activation row, paid
+once per wave against a quarter of gate_up's loads. Give one wave four of
+down's rows and its rate goes to 98% of gate_up's.
 
 **What this changes for the engine**: decode a MoE FFN with the grouped GEMV,
 one dispatch per projection per layer, no gather pass at all (the gather exists
@@ -1048,16 +1070,441 @@ at one row per expert there is nothing to amortize and the pads cost.
 send `down` to the grouped GEMM and keep `gate_up` on the blocked GEMV; that
 is two kernels for one FFN, and it is worth 1.7x on the half that stays.
 
-**Still open**: `down`'s per-output-row cost, now with a second measurement
-pointing at it (§1.8's open cell, and this section's finding 3). The probe both
-suggest is the same one: give a workgroup several *output* rows rather than
-several activation rows — the `ROWS` knob the non-grouped kernel already has,
-which `GROUPED` currently forbids.
+**Still open — since closed by §1.10**: `down`'s per-output-row cost, with a
+second measurement pointing at it (§1.8's open cell, and this section's finding
+3). The probe both suggest is the same one: give a workgroup several *output*
+rows rather than several activation rows — the `ROWS` knob the non-grouped
+kernel already has, which `GROUPED` currently forbids. §1.10 ran it, in the two
+forms that subtract, and finding 3's reading was right: the cost is fixed per
+output row and lives inside the wave. It also demoted this section's own knob —
+an N block beats the M block at every batch on `down` and needs no routing
+input to choose.
 
 **Effort**: low (done — one `-D`, a table-builder change and four binaries).
 **Value**: high at batch, zero at a single stream: 1.39-1.66x at 256 sequences,
 1.07-1.17x at 64, and it is what lets one kernel serve both the latency and
 the throughput end of decode.
+
+### 1.10 An N block for the grouped GEMV — **DONE** ✅, **the down projection's deficit is a fixed cost per output row, and removing it closes §1.8's last open cell**
+**Hypothesis** (§1.8's one open cell, seconded by §1.9 finding 6, and the item
+that stood at the top of this file's Next list): the `down` projection reads
+**198 GB/s** of distinct weight bytes where `gate_up` reads **235**, for
+identical bytes per expert (845 KB either way). What differs is the aspect
+ratio — down's matrix is 2560 rows of 640 where gate_up's is 640 rows of 2560
+— so down launches 4x the workgroups and issues 4x the output writes. §1.8
+already killed the obvious explanation: at VEC=4 down's 640-nibble row is 20
+lane-steps for a 64-lane wave, but the wave32 arms, where the same row is 20
+steps over 32 lanes, measure within 1%. §1.9 finding 3 then priced down's pad
+slot at **2.1x** gate_up's where its rows are 4x as many and its reduction a
+quarter as long — an ordering the dot products get backwards and a *fixed
+per-output-row cost* gets right. Two candidates left: the grid, or what a wave
+does once per output row.
+
+**Change**: two arms that divide the workgroup count identically and differ in
+everything else, so that subtracting them isolates the answer.
+
+- **`ROWS=n`** — the knob the non-grouped kernel already had and `GROUPED`
+  used to `#error` on. `n` subgroups per workgroup, one output row each. The
+  wave count, the loads, the `subgroupAdd`s and the 4-byte stores are all
+  exactly what they were; **only the number of workgroups changes.**
+- **`NROWS=n`** — new. One subgroup takes `n` *consecutive weight rows* of one
+  expert against one activation row. The wave count falls with the workgroup
+  count, the activation `uvec4`s are hoisted out of the dot macro and shared
+  `n` ways, the `n` results merge into a single wide store under one
+  `subgroupElect`, and each active lane carries `n` rows of dots against one
+  unchanged per-wave fixed cost. It does **not** fill idle lanes: the load loop
+  is still `j = LANE; j < loadsPerRow; j += LANES`, so at down's K=640 lanes
+  20-63 sit out all `n` rows exactly as they sat out the one.
+
+`NROWS` is the transpose of §1.9's `MROWS` (several *activation* rows against
+one weight row) and is written out separately rather than sharing a body with
+it, so every existing binary stayed `cmp`-identical; the two do not combine in
+one build, since they are the two directions of one question. Six builds at
+VEC=4, the width that wins the unblocked arm at both shapes. `N` must divide
+the block — the `rowBase >= pc.M` guard covers a partial workgroup, not a
+partial block inside a wave — which 640 and 2560 both do. Same routing, same
+five batches, same bank as §1.8/§1.9. `shaders/gemv_w4a8.comp`,
+`shaders/shaders.go`, `bench/ops_moe_gemv.go`, `results/moe.csv`.
+
+**Finding 1: it is not the grid. It is what a wave does once per output row.**
+At the cell §1.8 reported the gap in — t=16, DRAM-resident, 1.15 routed rows
+per expert — in distinct weight bytes per expert over the time (GB/s of the
+236 GB/s bus):
+
+| arm | workgroups/pair | waves | gate_up | down | down/gate_up |
+|---|---|---|---|---|---|
+| plain | 2560 (down) | 2560 | **235** | **196** | 0.83 |
+| `ROWS=4` (workgroups/4, waves unchanged) | 640 | 2560 | 235 | 202 | 0.86 |
+| `NROWS=4` (workgroups/4 **and** waves/4) | 640 | 640 | 231 | **230** | **0.98** |
+
+Dividing the workgroup count by 2, 4 or 8 and changing nothing else is worth
+**1.02-1.03x** on down and **1.00x** on gate_up. Dividing it by the same
+factors *with* the wave count is worth **1.17x** on down, and takes it to 98%
+of gate_up's rate. So the workgroup count — the first of §1.8's two remaining
+candidates — is roughly a tenth of the gap, and the rest is a cost a wave pays
+once per output row: one `subgroupAdd`, one store, one activation row, all
+independent of K and all paid by down four times as often against a quarter of
+gate_up's loads.
+
+**Finding 2: the whole grid, and where each arm stops paying.** Speedup against
+the same VEC unblocked (`moe_gemv_v4`), both runs of this session agreeing to
+within the noise of the 12-20 µs t=1 cells:
+
+| layer | batch | rows/expert | `ROWS=2` | 4 | 8 | `NROWS=2` | 4 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| gate_up | 1 | 1.00 | 0.96x | 0.94x | 0.96x | 0.99x | 0.97x | 0.76x |
+| gate_up | 4 | 1.00 | 1.02x | 1.00x | 0.94x | 1.06x | **1.12x** | 0.87x |
+| gate_up | 16 | 1.15 | 1.00x | 1.00x | 0.93x | 1.00x | 0.98x | 0.83x |
+| gate_up | 64 | 1.72 | 1.01x | 1.00x | 0.90x | 1.06x | 1.06x | 0.89x |
+| gate_up | 256 | 5.05 | 1.01x | 1.00x | 0.95x | 1.22x | **1.38x** | 1.14x |
+| down | 1 | 1.00 | 1.34x | 1.34x | 1.27x | **1.69x** | 1.60x | 1.42x |
+| down | 4 | 1.00 | 1.08x | 1.07x | 1.07x | 1.23x | 1.33x | **1.43x** |
+| down | 16 | 1.15 | 1.02x | 1.03x | 1.03x | 1.11x | **1.17x** | 1.16x |
+| down | 64 | 1.72 | 1.08x | 1.09x | 1.08x | 1.19x | 1.34x | **1.39x** |
+| down | 256 | 5.05 | 1.24x | 1.24x | 1.18x | 1.47x | 1.76x | **1.94x** |
+
+`ROWS` is flat in `n` wherever it does anything, which is what a per-workgroup
+cost looks like once the first division has removed it; `NROWS` is monotone in
+`n` on down and turns over at `n=8` on gate_up. The two cells where `ROWS`
+*does* pay on down — t=1 (1.34x) and t=256 (1.24x) — are the two where DRAM is
+not the binding constraint (8 MB fits the MALL; at 5.05 rows per expert §1.9's
+request pressure binds), so the grid cost is real but normally hidden behind
+the bus.
+
+**Finding 3: the fit prices the per-output-row cost, and it is 20% of down and
+0% of gate_up.** `NROWS=n` divides the number of waves while leaving each
+wave's per-row work alone, so if a wave's time is `a` fixed plus `b` per row,
+total time should be `T(n) = A/n + B`. Fitting `A` and `B` from `n=1,2` only
+and predicting `n=4`:
+
+| layer | batch | `A` (the per-`n` term) | as % of `T(1)` | `n=4` predicted | `n=4` measured |
+|---|---|---|---|---|---|
+| gate_up | 16 | -0.002 ms | **-0.4%** | 0.499 ms | 0.507 ms |
+| down | 16 | 0.118 ms | **19.8%** | 0.508 ms | 0.508 ms |
+| down | 64 | 0.641 ms | 31.8% | 1.537 ms | 1.501 ms |
+
+Same routing, same duplication, same distinct bytes, same binary family: at
+t=16 gate_up has **no** measurable per-output-row cost and down has a fifth of
+its time in one. Read `A` as *the* per-output-row cost only at t=16, which is
+the DRAM-resident batch with the least duplication; the t=64 row is in the
+table to show the fit holds, but a share of its `A` is finding 5's request
+term, which grows with the batch (at t=256 gate_up's `A` is 36% of `T(1)`
+despite gate_up having no per-row deficit at all). That is the answer to §1.8's open cell stated as a number.
+The model breaks at `n=8` and only upward (gate_up t=16: 0.499 predicted,
+0.598 measured) — eight accumulators, eight scale streams and an eight-float
+store per wave is past the register knee, which is why the best block is 4 at
+gate_up and 4-8 at down rather than the largest built.
+
+**Finding 4: lane occupancy is falsified a second time, from the opposite
+direction.** §1.8 tested it by halving the wave (20 steps over 32 lanes instead
+of 64: within 1%). The complementary test is already in the same sweep and it
+is `VEC=1`, which puts **80 loads over 64 lanes** at down — full occupancy, the
+only cell in the grid that has it — and is **1.05x slower** than VEC=4
+(0.628 ms against 0.596 at t=16). Meanwhile `NROWS=4`, which leaves those 44
+lanes as idle as it found them, is 1.17x faster. Filling the lanes costs; the
+thing worth removing is the per-wave fixed cost, and the two are independent.
+
+**Finding 5: at a serving batch both blocks pay for §1.9's reason rather than
+this one, and `XREQ` is the column that says so.** At t=256 gate_up gains
+1.38x from `NROWS=4` despite having no per-output-row deficit at all, and what
+moves is activation *requests*: 1447 → 499 GB/s asked for, against 2-9 GB/s
+DRAM actually supplies. That is §1.9 finding 2's cache pressure reached from
+the other axis — `MROWS` shares one weight row across several tokens, `NROWS`
+shares one activation row across several weight rows, and at five rows per
+expert the MALL serving the re-reads is what sets the time either way. So the
+N block is two levers in one binary: a per-output-row lever that only down
+needs, and a request lever that both layers need at batch.
+
+**Finding 6: the N block beats the M block on `down` at every batch, and ties
+it on `gate_up`.** Best of each, in ms:
+
+| layer | batch | plain | best `MROWS` | best `NROWS` | N/M |
+|---|---|---|---|---|---|
+| gate_up | 1 | 0.012 | 0.017 (m2) | 0.012 (n2) | 1.42x |
+| gate_up | 4 | 0.085 | 0.086 (m2) | **0.076** (n4) | 1.13x |
+| gate_up | 16 | 0.497 | **0.491** (m2) | 0.498 (n2) | 0.99x |
+| gate_up | 64 | 1.440 | **1.349** (m2) | 1.360 (n4) | 0.99x |
+| gate_up | 256 | 2.899 | **2.075** (m8) | 2.103 (n4) | 0.99x |
+| down | 1 | 0.021 | 0.019 (m2) | **0.012** (n2) | 1.58x |
+| down | 4 | 0.118 | 0.124 (m2) | **0.083** (n8) | 1.49x |
+| down | 16 | 0.596 | 0.590 (m2) | **0.508** (n4) | 1.16x |
+| down | 64 | 2.018 | 1.739 (m2) | **1.447** (n8) | 1.20x |
+| down | 256 | 5.848 | 3.512 (m4) | **3.021** (n8) | 1.16x |
+
+And it has two properties the M block does not. It takes **nothing from
+routing** — `N` is a model constant where rows per expert is a runtime
+distribution — and it **never pads**, where a short expert group does. §1.9's
+"the block has to be read off the routing rather than compiled in" applies to
+the M axis only.
+
+**Finding 7: what it is worth, and the crossover moves once more.** The
+single-stream decode budget (per *distinct* expert, at the least-duplicated
+DRAM-resident batch, which is the number a real step pays because its 10
+experts have not been touched for 47 layers):
+
+| | gate+up / expert | down / expert | one block | x48 layers | FFN-only tok/s | % of the 5.00 ms bus floor |
+|---|---|---|---|---|---|---|
+| §1.8's grouped GEMV | 7.2 us | 4.2 us | 0.114 ms | 5.47 ms | 183 | 91% |
+| §1.9, with the M block | 7.1 us | 4.2 us | 0.113 ms | 5.43 ms | 184 | 92% |
+| with the N block on `down` | 7.1 us | **3.7 us** | **0.107 ms** | **5.15 ms** | **194** | **97%** |
+
+Unlike the M block, this one *is* a latency lever: it pays at one row per
+expert, because a fixed per-output-row cost does not care how many tokens
+routing supplied. Against the Q4 grouped GEMM the `down` ratios all move with
+it — 1.51x at t=16 (was 1.31x), 1.38x at t=64 (was 1.16x) and 0.90x at t=256
+(was 0.77x), so the projection that §1.9 sent to the GEMM at five rows per
+expert is now within 10% of it there and ahead of it everywhere below.
+
+**What this changes for the engine**: give the grouped decode GEMV an N block
+sized so one wave's loads at least cover its lanes —
+`NROWS >= 8*VEC*WAVE/K`, which is 4 at down's K=640 and 1 at gate_up's
+K=2560 — and prefer it to the M block, which it beats at every batch on the
+projection that needs either. The two sizing rules are now the same rule read
+along the two axes of the weight matrix: **§1.7 sizes the load width so one
+lane-step covers a weight row; §1.10 sizes the row block so one wave-step
+covers the lanes.** At a serving batch, add §1.9's second reason on top: past
+~5 rows per expert both blocks are buying request relief rather than either of
+the things they were built for, and `NROWS=4` on gate_up is worth 1.38x for
+that reason alone.
+
+**Still open, and all of it cheap:**
+- **The (VEC, NROWS) grid.** This swept `NROWS` at VEC=4 only. The two move the
+  same quantity from opposite ends — loads per lane per row, and rows per wave
+  — and finding 4 says they do not simply trade, so the corner is worth one
+  sweep.
+- **wave32 with an N block.** wave32 halves the idle lanes and `NROWS` covers
+  the fixed cost; §1.7 says the wave size alone does nothing once C is held
+  fixed, but that was measured with one row per wave.
+- **`NROWS` x `MROWS` in one build**, currently an `#error`. At t=256 both pay
+  for finding 5's reason, so the corner is unmeasured and is exactly where a
+  serving batch sits.
+- **Filling the lanes properly**, which none of this does: disjoint lane slices
+  per output row, reduced with `subgroupClusteredAdd`. Finding 4 has lowered
+  the expected gain to near zero, which is itself the reason to run it — it is
+  the only arm that would say whether the idle lanes ever mattered.
+
+**Effort**: low (done — one `#define`, a grid divisor and six binaries).
+**Value**: high, and on the latency end this time: **1.17-1.94x on `down`** at
+its best block at every batch, the single-stream MoE FFN from 92% to **97% of
+its bus floor**, and §1.8's last open cell closed.
+
+### 1.11 The corner: `MROWS` x `NROWS` in one wave — **DONE** ✅, **they compose, and decode's throughput end reaches the bus**
+**Hypothesis** (the item that stood at the top of this file's Next list):
+§1.9 and §1.10 each measured one block on its own, and at a serving batch both
+turned out to pay for the *same* thing — the MALL serving requests that are
+re-reads (§1.9 finding 2, §1.10 finding 5). Two levers on one resource can
+**compose** (the re-read counts multiply), **saturate** (the first one applied
+takes the MALL off the critical path and the second buys only its own
+overhead) or **compete** (a cell is an accumulator plus a partial, and the
+corner's register cost is the product). None of the three is derivable from the
+single-axis rows, and the corner is where 256 sequences in flight actually sit:
+at t=256 the two blocks are within 1% of each other on `gate_up` and 1.16x
+apart on `down`.
+
+**Change**: a third `main` in `gemv_w4a8.comp`, taken when `MROWS > 1 &&
+NROWS > 1` — the combination the file used to `#error` on. A workgroup is a
+group of `MROWS` table slots naming one expert (§1.9's grid) and a subgroup is
+`NROWS` consecutive weight rows of that expert (§1.10's), so a wave holds
+`MROWS*NROWS` cells, every weight load it issues is dotted `MROWS` times and
+every activation load `NROWS` times. It is both hoists at once: the dot macro
+takes a weight `uvec4` *and* an activation pair already in registers, where
+§1.9's loads the activations and §1.10's loads the weights. Five builds at
+VEC=4 — m2n2, m4n2, m8n2, m2n4, m4n4 — plus the two probes §1.10 left beside
+it: the **(VEC, NROWS) grid** (VEC 1/8/16 at NROWS=4, against §1.10's VEC=4
+sweep) and **wave32 with an N block**. Same routing, same five batches, same
+bank as §1.8-§1.10; every pre-existing `.spv` is byte-identical after
+`go generate`. `shaders/gemv_w4a8.comp`, `shaders/shaders.go`,
+`bench/ops_moe_gemv.go`, `results/moe.csv`.
+
+**Finding 1: they compose, and the corner is the kernel to dispatch at a
+serving batch.** Speedup against the same-width unblocked kernel
+(`moe_gemv_v4`), all at VEC=4 and wave64, with `c` the corner's speedup
+divided by the *product* of the speedups of its own two axes **at its own two
+widths** — 1.0 would be exact composition:
+
+| layer | batch | rows/expert | best M-only | best N-only | best corner | `c` at that cell |
+|---|---|---|---|---|---|---|
+| gate_up | 1 | 1.00 | 0.92x (m2) | 0.99x (n2) | 0.95x (m2n2) | 1.05 |
+| gate_up | 4 | 1.00 | 0.96x (m2) | **1.10x** (n4) | 1.07x (m2n4) | 1.01 |
+| gate_up | 16 | 1.15 | **1.01x** (m2) | 1.00x (n2) | 1.01x (m4n2) | 1.02 |
+| gate_up | 64 | 1.72 | 1.07x (m4) | 1.06x (n2) | **1.08x** (m4n2) | 0.95 |
+| gate_up | 256 | 5.05 | 1.39x (m8) | 1.37x (n4) | **1.54x** (m4n4) | 0.87 |
+| down | 1 | 1.00 | 0.98x (m2) | **1.54x** (n2) | 1.29x (m2n2) | 0.85 |
+| down | 4 | 1.00 | 0.93x (m2) | **1.37x** (n8) | 1.15x (m2n4) | 0.93 |
+| down | 16 | 1.15 | 1.01x (m2) | 1.18x (n4) | **1.18x** (m2n4) | 0.99 |
+| down | 64 | 1.72 | 1.17x (m2) | **1.40x** (n8) | 1.41x (m2n4) | 0.89 |
+| down | 256 | 5.05 | 1.65x (m4) | 1.93x (n8) | **2.12x** (m4n4) | 0.73 |
+
+So it is composition, not saturation and not competition: `c` stays between
+0.73 and 1.05 at every cell, and at t=256 the corner beats each of its own
+axes by **1.19x and 1.27x on `down`** (2.763 ms against `n4`'s 3.313 and
+`m4`'s 3.555) and **1.12x and 1.19x on `gate_up`** (1.880 against 2.107 and
+2.242).
+
+Against the *best single-axis build in the whole sweep* — any width, either
+wave — the margin is smaller and concentrated where it matters:
+
+| batch | 1 | 4 | 16 | 64 | 256 |
+|---|---|---|---|---|---|
+| gate_up | 0.86x | 0.97x | 0.99x | 1.01x | **1.10x** |
+| down | 0.84x | 0.83x | 1.01x | 1.00x | **1.10x** |
+
+At 256 sequences in flight the corner is **1.10x the best anything else in
+this file can do** at both shapes (and 1.54x / 2.11x the unblocked kernel); at
+16-64 it ties the best single-axis build within 1%, which is what a cell
+already at the bus looks like; and below that, where the M block is a real
+loss, the corner loses with it and the N block alone is what an engine should
+dispatch.
+
+**Finding 2: what stops the composition is the bus, and only one cell of the
+decode path is still short of it.** Distinct weight bytes per touched expert
+over the time, against the 236 GB/s DRAM bus, at the best build of each family
+(VEC=4, wave64):
+
+| layer | batch | unblocked | §1.9's best M | §1.10's best N | best corner |
+|---|---|---|---|---|---|
+| gate_up | 16 | 235 (100%) | 238 (101%) | 235 (100%) | 236 (100%) |
+| gate_up | 64 | 219 (93%) | 235 (100%) | 232 (98%) | **237 (100%)** |
+| gate_up | 256 | 148 (63%) | 206 (87%) | 203 (86%) | **228 (96%)** |
+| down | 16 | 196 (83%) | 198 (84%) | 230 (97%) | **231 (98%)** |
+| down | 64 | 156 (66%) | 183 (77%) | 219 (93%) | **219 (93%)** |
+| down | 256 | 73 (31%) | 120 (51%) | 141 (60%) | **155 (66%)** |
+
+The gate_up projection — two thirds of a MoE block's weights — is now at
+**96% of the bus at 256 sequences in flight**, where §1.9's best was 87% and
+the unblocked kernel 63%, and that is why `c` falls to 0.87 there: the second
+lever runs into the wall the first one nearly reached. `down` at t=256 is the
+**one cell of the decode path still below the bus** at 66%, and the reason is
+visible in the table it comes from: `m4n4` runs 829 groups of 4 slots against
+2560 real pairs, so **756 of its 3316 slots (23%) are pads**. Priced at
+finding 3's slot cost, the pads are ~0.22 ms of its 2.76, and the rest of the
+deficit is §1.10's per-output-row cost paid over four times as many rows.
+
+**Finding 3: the N block makes the M block's pad slots nearly free on
+`gate_up`, and does not on `down`.** This is the mechanism behind `c > 1` at
+one row per expert, and it is measured the way §1.9 finding 3 measured the pad:
+at t=4 every expert has exactly one pair, so a blocked build reads *identical*
+weights and differs only in slots. Fitting `T = groups*w + slots*s` with the
+group count held at 40:
+
+| layer | `NROWS` | group `w` | slot `s` | `w/s` |
+|---|---|---|---|---|
+| gate_up | 1 | 1.95 us | 0.167 us | 11.7:1 |
+| gate_up | 2 | 1.96 us | 0.068 us | 28.5:1 |
+| gate_up | 4 | 1.88 us | **0.042 us** | **44.8:1** |
+| down | 1 | 2.51 us | 0.346 us | 7.3:1 |
+| down | 2 | 2.13 us | 0.299 us | 7.1:1 |
+| down | 4 | 1.86 us | 0.288 us | 6.5:1 |
+
+A pad slot costs a per-*wave* part (its activation row, its share of the
+launch) and a per-*output-row* part (a `subgroupAdd` and a store per row), and
+`NROWS` divides only the first. gate_up's slot is 640 output rows and its pad
+cost falls **4.0x** — almost exactly `NROWS` — so the per-wave part was nearly
+all of it; down's slot is 2560 output rows and its pad cost falls **1.2x**,
+because §1.10's fixed per-output-row cost is what a down pad is mostly made of.
+§1.9's engine rule inherits the split: block when it removes one group per
+`w/s` pads, which with an N block is **~45 pads on gate_up** (it was 10.5) and
+**~6.5 on down** (it was 6.5). That is the arithmetic behind gate_up tolerating
+`MROWS=8` at t=256 while down's best is 4.
+
+**Finding 4: the (VEC, NROWS) grid — the row block partly substitutes for the
+load width.** `NROWS=4` against the same width unblocked:
+
+| layer | batch | VEC=1 | VEC=4 | VEC=8 | VEC=16 |
+|---|---|---|---|---|---|
+| gate_up | 64 | 1.08x | 1.06x | 1.05x | 1.03x |
+| gate_up | 256 | **1.67x** | 1.37x | 1.38x | 1.21x |
+| down | 64 | 1.36x | 1.34x | 1.32x | 1.23x |
+| down | 256 | 1.78x | 1.77x | 1.55x | 1.21x |
+
+The block is worth most at the *narrowest* width, and at gate_up's t=256 cell
+`v1_n4` (2.059 ms) is the **fastest build in the whole single-axis grid**,
+ahead of `v4_n4` (2.107) — a cell §1.7's width rule calls the worst possible
+choice (a VEC=1 lane-step covers 256 B of a 1280 B row). The two knobs move the
+same quantity from opposite ends, as §1.10 finding 4 suspected: VEC buys bytes
+per lane-step, `NROWS` buys rows per wave, and what the memory system responds
+to is bytes in flight per wave, which is their product. VEC=16 is the one width
+the block cannot rescue — at down it is 5 loads over 64 lanes before the block
+and 5 after.
+
+**Finding 5: wave32 with an N block pays in exactly one cell, and §1.7's rule
+still explains the rest.** `v4_n4_w32` against `v4_n4`: **1.065x at down
+t=256** (3.111 ms against 3.313, the best wave32 cell in the file), a wash at
+t=16 and t=64, and **0.77x at gate_up t=256**. The split is coverage, not the
+wave: at down a 32-lane VEC=4 step still covers the whole 320 B row (512 B) and
+halves the idle lanes from 44 to 12, while at gate_up it covers 512 B of a
+1280 B row and §1.7's rule prices the difference. So the wave size is still not
+an independent lever — but at the one shape where coverage survives halving it,
+having four rows per wave to amortize turns §1.7's "identical to 0.05%" into a
+6% win.
+
+**Finding 6: registers were the risk that did not materialise.** From the RADV
+ISA (`RADV_DEBUG=asm`), highest VGPR touched and scratch operations:
+
+| build | max VGPR | scratch |
+|---|---|---|
+| `v4` (plain) | 47 | 0 |
+| `v4_n4`, `v4_m4` | 47 | 0 |
+| `v4_m2_n4` | 59 | 0 |
+| `v4_m4_n4` | 83 | 0 |
+| `v4_m8_n2` | 107 | 0 |
+
+Sixteen cells' worth of accumulators, partials and live operands cost 83 of the
+256 VGPRs a wave64 kernel may hold, and **nothing spills anywhere in the
+family** — which is why the third branch of the hypothesis (competition) does
+not appear in the timings, and why `MROWS=8` x `NROWS=4` is worth building next
+rather than being ruled out.
+
+**Finding 7: what it is worth.** The MoE FFN per token of the batch, over 48
+layers, against the Q4 grouped GEMM on the same routing:
+
+| best kernel of each family | 16 seq | 64 seq | 256 seq |
+|---|---|---|---|
+| no block (§1.8) | 210 tok/s | 274 | 459 |
+| the M block alone (§1.9) | 212 | 303 | 692 |
+| the N block alone (§1.10) | 221 | 321 | 746 |
+| **both (this item)** | **223** | **326** | **818** |
+| the Q4 grouped GEMM (§2.2/§3.5) | 120 | 185 | 545 |
+
+At 256 sequences the FFN is **1.50x** the GEMM where §1.9 measured 1.27x, and
+the per-projection crossover §1.9 opened closes: `down` at 5.05 rows per expert
+goes from **0.77x** the GEMM (§1.9) to 0.90x (§1.10) to **0.98x** — parity, at
+the batch where a 16-row tile is at its most efficient — while `gate_up` goes
+from 1.70x to **1.88x**. Single-stream decode is untouched, as it must be: the
+M axis is a loss at one row per expert, so the latency budget stays §1.10's
+**5.14 ms over 48 layers, 195 tok/s, 97% of the 5.00 ms bus floor**.
+
+**What this changes for the engine**: dispatch the decode GEMV with *both*
+blocks, sized by two independent rules that are now both arithmetic.
+`NROWS = max(1, 8*VEC*WAVE/K)` comes from the model (4 at down's K=640, 1-2 at
+gate_up's 2560) and is safe at every batch; `MROWS` comes from the routing
+histogram (≈ the mean rows per expert, erring low) and is a loss below ~1.7
+rows. Finding 3 amends the second: *with* an N block, a projection with few
+output rows per slot — gate_up — can err **high**, because its pads have got
+4x cheaper, which is why `MROWS=8` is its best block at t=256 and 4 is down's.
+One kernel family, two compile-time widths, and the pair to build at is
+(4, 4) if only one corner build is kept.
+
+**Still open, and all cheap:**
+- **`MROWS=8` x `NROWS=4`**, the one corner of the grid not built, now that
+  finding 6 says the registers are there for it. gate_up's best M is 8 and its
+  best corner is (4, 4); the cell between them is unmeasured.
+- **`down` at t=256, the last cell under the bus** (66%). Finding 2 prices a
+  quarter of the gap as pad slots, which a *runtime*-sized block removes — the
+  engine rule above already says to size `MROWS` off the routing, and the
+  measurement of that is a table built per dispatch rather than per sweep.
+- **A corner at `NROWS=8`** on down, where the single axis' best block is 8 at
+  t=64 and t=256.
+- **Filling the lanes properly** — disjoint lane slices per output row reduced
+  with `subgroupClusteredAdd` — which finding 4 makes more interesting than
+  §1.10 left it: if what the memory system responds to is bytes in flight per
+  wave, the lane map is the third way to buy them.
+
+**Effort**: low (done — one `main`, five binaries, four probe binaries).
+**Value**: high at batch and nil below it: **1.10x over the best single-blocked
+build** (1.12-1.27x over its own axes) at 256 sequences, `gate_up` to **96% of
+the DRAM bus**, the FFN to **818 tok/s**, and the GEMM crossover §1.9 opened on
+`down` closed — against ties at 16-64 tokens and losses below.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
@@ -3015,21 +3462,67 @@ and split it by projection: `down`'s t=64 tie is now a 1.16x win, but at 5.05
 rows a 16-row tile covers an expert in one pass where an `MROWS=4` block needs
 1.62, so `down` goes to the GEMM there and `gate_up` stays 1.70x ahead of it.
 
+**§1.10 is done**, the item that stood at the top of this list, and it closes
+the last cell §1.8 left open. `down` read 198 GB/s per distinct expert against
+`gate_up`'s 235 for identical bytes, and the two candidates were the grid and
+what a wave does per output row. Two arms that divide the workgroup count
+identically settle it: dividing it *alone* (`ROWS`, same waves, same loads,
+same stores) is worth **1.02x**, and dividing it *with the wave count*
+(`NROWS`, several of an expert's weight rows per subgroup against one
+activation row) is worth **1.17x** and takes down to **98% of gate_up's rate**.
+A fit of `T = A/n + B` prices the difference: **19.8% of down's time is fixed
+per output row and -0.4% of gate_up's is** — one `subgroupAdd`, one store and
+one activation row, paid four times as often against a quarter of the loads.
+Three things that were not in the plan. Lane occupancy is falsified a second
+time and from the opposite direction — the one build in the grid that *fills*
+down's lanes (VEC=1, 80 loads over 64) is **1.05x slower**, while the block
+that leaves them idle is 1.17x faster. The N block **beats §1.9's M block at
+every batch on down** (1.16-1.58x) while needing nothing from routing and
+padding nothing, so the M axis is now the secondary knob. And unlike the M
+block it is a **latency** lever: the single-stream MoE FFN goes from 5.43 ms
+to **5.15 ms over 48 layers, 194 tok/s, 97% of its 5.00 ms bus floor**.
+
+**§1.11 is done**, the item that stood at the top of this list, and the two
+blocks **compose**: a wave carrying `MROWS` activation rows *and* `NROWS`
+weight rows is worth **1.12x over each of its own axes on `gate_up` and 1.19x
+on `down`** at 256 sequences in flight — 1.10x over the best single-blocked
+build of any width, 1.54-2.11x over the unblocked kernel — and it is the
+kernel to dispatch at a serving batch. What
+that buys is the thing the decode path had left: `gate_up` now reads **96% of
+the DRAM bus at a serving batch** (§1.9's best was 87%, the unblocked kernel
+63%) and the FFN reaches **818 tok/s against the Q4 GEMM's 545**, closing the
+per-projection crossover §1.9 opened — `down` at 5.05 rows per expert goes from
+0.77x the GEMM to **0.98x**. Three things that were not in the plan: an N block
+makes the M block's pad slots **4x cheaper on `gate_up`** and barely cheaper on
+`down` (a pad costs a per-wave part, which `NROWS` divides, plus a
+per-output-row part, which it does not — and down's slot is 2560 rows against
+gate_up's 640), so the two engine rules interact and the M block may be sized
+*high* where its rows are few; the row block **partly substitutes for the load
+width**, with `VEC=1` + `NROWS=4` the fastest single-axis build at gate_up's
+t=256 cell where §1.7's rule calls that width the worst possible; and the
+corner never spills — 83 VGPRs at (4, 4) against the plain kernel's 47 — so
+the register-competition branch of the hypothesis did not happen. The two
+probes beside it also ran: wave32 + N block pays **1.065x at down's t=256** and
+nowhere else, with §1.7's coverage rule explaining the rest.
+
 **Next:**
-- **Explain the down projection's 198 GB/s against gate_up's 235**, for
-  identical bytes per expert. It launches 4x the workgroups, each a quarter as
-  long, and issues 4x the output writes. §1.8 killed the obvious explanation:
-  at VEC=4 its 640-nibble row is 20 lane-steps for a 64-lane wave, but the
-  wave32 arms — 20 steps over 32 lanes — measure within 1%. Candidates left are
-  the workgroup count and the write pattern; the probe is a build that gives
-  one workgroup several output rows. **§1.9 has narrowed it by half**: its pad
-  slots price one more output row at constant weight traffic, and down's slot
-  costs 2.1x gate_up's where its rows are 4x as many and its reduction a
-  quarter as long — an ordering the dot products get backwards and a fixed
-  per-output-row cost (one `subgroupAdd`, one store) gets right. The probe is
-  now the same one from both directions: the `ROWS` knob the non-grouped
-  kernel already has, which `GROUPED` forbids, and which would amortize that
-  fixed cost over several rows instead of several tokens.
+- **`down` at 256 sequences is the last cell of the decode path under the
+  bus** (66% of it, where every other cell is at 93-100%). §1.11 finding 2
+  prices about a quarter of the gap as **pad slots** — its best build spends
+  23% of its slots on padding — and the fix is the one the engine rule already
+  implies: size `MROWS` from the routing histogram per dispatch instead of
+  compiling one width in. That needs a table built per dispatch, which the
+  bench builds already; what is missing is measuring the *selection*, not
+  another binary. The rest of the gap is §1.10's per-output-row cost paid over
+  4x the rows, which points at the lane-slice kernel below.
+- **The two corner cells not built**: `MROWS=8` x `NROWS=4`, now that the
+  register measurement says there is room, and `NROWS=8` against an M block on
+  `down`, where 8 is the best single-axis block at t=64 and t=256.
+- **Filling the lanes properly** — disjoint lane slices per output row, reduced
+  with `subgroupClusteredAdd`. §1.10 finding 4 lowered the expected gain to
+  near zero and §1.11 finding 4 raised it again from the other side: if what
+  the memory system responds to is bytes in flight per wave, the lane map is
+  the third way to buy them, and it is the only one untried.
 - **§2.2's own two leftovers, both cheap and both attribution rather than
   gain.** The scale plane's layout — 1.24x with no mechanism attached,
   between two binaries that are instruction-for-instruction identical, which
@@ -3198,4 +3691,11 @@ separates its throughput end from its latency end: `MROWS` pairs of one expert
 per workgroup is 1.66x at 256 sequences and 0.39x at one, because what it
 takes off is not the bus but the cache serving four-fifths of a batched
 kernel's requests, and the block has to be read off the routing rather than
-compiled in once.**
+compiled in once. The other axis of the same block is what finally explains
+the one cell that had stood open since decode was first measured honestly:
+`down` reads less of the bus than `gate_up` for identical bytes not because of
+its grid and not because of its idle lanes — the build that fills them is
+slower — but because a fifth of its time is a fixed cost paid once per output
+row, and giving one wave four of them (`NROWS >= 8*VEC*WAVE/K`, the load-width
+rule read along the other axis of the matrix) takes it to 98% of gate_up's
+rate and a decode token's MoE FFN to 97% of its bus floor.**

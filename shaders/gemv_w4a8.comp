@@ -90,6 +90,18 @@
 // kept as the control that showed that. Requires REQUIRE_FULL_SUBGROUPS,
 // which the host sets whenever it pins a size, so every subgroup here is full
 // and takes the `row >= pc.M` branch together.
+//
+// It has since been given a second job, which is why GROUPED no longer
+// forbids it. IDEAS §1.8 finding 9 left one cell of the decode path open — the
+// down projection reads 198 GB/s where gate_up reads 235, for identical bytes
+// per expert — and §1.9 finding 6 narrowed the candidates to two: down
+// launches 4x the workgroups (its matrix is 2560 rows of 640 against 640 rows
+// of 2560) and issues 4x the output writes. ROWS separates them. It divides
+// the workgroup count by ROWS and changes *nothing* else: the same number of
+// subgroups each sweep the same row with the same loads, the same subgroupAdd
+// and the same one-dword store. If the gap is what a workgroup costs to
+// launch, this closes it; if it is what an output row costs inside the wave,
+// this moves nothing and NROWS below is the arm that can.
 #ifndef ROWS
 #define ROWS 1
 #endif
@@ -122,9 +134,6 @@
 //     is told to.
 #ifndef GROUPED
 #define GROUPED 0
-#endif
-#if GROUPED && ROWS > 1
-#error "GROUPED addresses one row per workgroup; ROWS > 1 is the non-grouped control"
 #endif
 
 // MROWS is the grouped arm's **M block**, and it is the thing IDEAS §1.8
@@ -159,6 +168,67 @@
 #if MROWS > 1 && !GROUPED
 #error "MROWS is the grouped arm's M block and needs GROUPED=1"
 #endif
+
+// NROWS is the grouped arm's **N block**, and it is the other direction of the
+// probe ROWS opens above. MROWS gives one workgroup several *activation* rows
+// against one weight row; NROWS gives one *subgroup* several consecutive
+// weight rows of one expert against one activation row.
+//
+// What that changes, against the one-row-per-wave kernel, is four things at
+// once, and they are four things a short row makes expensive:
+//
+//   - the activation row is loaded once per NROWS output rows instead of once
+//     each (the same bytes come off DRAM either way — every workgroup is
+//     re-reading one token's K bytes out of cache — but the *requests* fall by
+//     NROWS, and §1.9 finding 2 is the measurement that says a grouped GEMV's
+//     request count is not free);
+//   - the NROWS output values a wave produces are consecutive floats written
+//     by one elected lane, so they merge into a single wide store where the
+//     unblocked kernel issues one 4-byte store per wave;
+//   - the wave count falls with the workgroup count, where ROWS holds it
+//     fixed — which is what lets the two arms be subtracted;
+//   - and each *active* lane gets NROWS times the work while the wave's fixed
+//     cost stays where it was. Note what this does not do: the `j` loop is
+//     still `j = LANE; j < loadsPerRow; j += LANES`, so at down's K=640 —
+//     20 loads for a 64-lane wave — lanes 20-63 sit out every one of the
+//     NROWS rows, exactly as they sat out the one. Filling them would need a
+//     different lane-to-row map (disjoint lane slices per row, reduced with
+//     subgroupClusteredAdd), which is a separate kernel. What NROWS changes is
+//     the ratio of a wave's fixed cost to its useful work, and down — whose
+//     wave does a quarter of the loads gate_up's does for the same one
+//     subgroupAdd and one store — is where that ratio is worst.
+//
+// Legal values are 1, 2, 4 and 8. NROWS > 1 requires GROUPED (there is no
+// table of output rows without it). The host must divide the grid's x extent
+// by ROWS*NROWS, and N must be a multiple of NROWS — the `rowBase >= pc.M`
+// guard covers a partial *workgroup*, not a partial block inside a wave.
+//
+// **MROWS and NROWS now combine**, which is the arm at the bottom of this
+// file. They were built one at a time on purpose — a build that moved both
+// would have answered neither question — and having answered them separately
+// (§1.9: the M block is a throughput lever, 1.39-1.66x at 256 sequences and
+// 0.39x at one; §1.10: the N block is a latency lever, 1.11-1.94x on down at
+// every batch) the open cell was the corner where a serving batch actually
+// sits. The two arms turned out to pay for the *same* reason — §1.9 finding 2
+// and §1.10 finding 6 both land on the MALL serving re-read requests — so
+// whether they compose, saturate or compete was not derivable from either.
+// §1.11 measured it: they compose, and at 256 sequences in flight the fastest
+// build at both expert shapes has both blocks on.
+//
+// One cell of the product is out of range rather than untested: the combined
+// arm is written for NROWS <= 4, because NROWS=8 is already past the register
+// knee on its own (§1.10 finding 7) and an 8-row block carrying MROWS slots
+// would hold 8*MROWS accumulators.
+#ifndef NROWS
+#define NROWS 1
+#endif
+#if NROWS > 1 && !GROUPED
+#error "NROWS reads its output rows through the table and needs GROUPED=1"
+#endif
+#if NROWS > 4 && MROWS > 1
+#error "the M x N corner is built at NROWS <= 4; 8 rows per wave is past the register knee"
+#endif
+
 layout(local_size_x = (WAVE * ROWS)) in;
 
 // Which lane of which row this invocation is. Macros rather than locals
@@ -227,7 +297,7 @@ layout(push_constant) uniform PC {
         acc = dotPacked4x8AccSatEXT(int(xb.w), (pk.w >> 4u) & 0x0F0F0F0Fu, acc); \
     }
 
-#if MROWS > 1
+#if MROWS > 1 && NROWS == 1
 // The M-blocked step, split where W4A8_GROUP is not. W4A8_GROUP loads the
 // weights *and* the activations it dots them with, which is right when one
 // load serves one output; here one load serves MROWS of them, so the load is
@@ -399,12 +469,445 @@ void main() {
 
     M_ROWS(M_WRITE)
 }
+#elif NROWS > 1 && MROWS == 1
+// The N-blocked step, hoisted the other way round from MROWS'. W4A8_GROUP
+// loads a weight uvec4 *and* the two activation uvec4s it is dotted with,
+// which is right when one load serves one output row; here one activation
+// load serves NROWS weight rows, so the activations are hoisted into
+// N_LOAD_X and W4A8_XY does one row's eight dotPacked4x8AccSatEXT against
+// operands already in registers.
+//
+// This is the transpose of MROWS' W4A8_ROW and is written out separately
+// rather than sharing a body with it, so that adding this arm left every
+// MROWS binary byte-identical. Both are unrolled per VEC rather than looped
+// over WVEC4S for the reason in W4A8_GROUP's comment: a rolled group loop has
+// to index its operands dynamically and spills them to scratch.
+#if VEC >= 4
+#define W4A8_XY(PK, XA, XB, ACC)                                               \
+    {                                                                          \
+        ACC = dotPacked4x8AccSatEXT(int((XA).x), (PK).x & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XA).y), ((PK).x >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XA).z), (PK).y & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XA).w), ((PK).y >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XB).x), (PK).z & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XB).y), ((PK).z >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XB).z), (PK).w & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XB).w), ((PK).w >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+// Where this pair's activation row starts for step j, and one weight row's
+// stride, both in the units their buffer is declared with.
+#define N_XBASE (arow * (pc.lda >> 4u) + XVEC4S * j)
+#define N_WSTRIDE (pc.ldw >> 5u)
+#define N_WSTEP WVEC4S
+#else
+#define W4A8_XY(PK, XA, XB, ACC)                                               \
+    {                                                                          \
+        ACC = dotPacked4x8AccSatEXT(int(XA), (PK) & 0x0F0F0F0Fu, ACC);         \
+        ACC = dotPacked4x8AccSatEXT(int(XB), ((PK) >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+#define N_XBASE (arow * (pc.lda >> 2u) + 2u * j)
+#define N_WSTRIDE (pc.ldw >> 3u)
+#define N_WSTEP 1u
+#endif
+
+#if VEC == 16
+#define N_LOAD_X                                                               \
+    uvec4 xa0 = x[xbase];       uvec4 xb0 = x[xbase + 1u];                     \
+    uvec4 xa1 = x[xbase + 2u];  uvec4 xb1 = x[xbase + 3u];                     \
+    uvec4 xa2 = x[xbase + 4u];  uvec4 xb2 = x[xbase + 5u];                     \
+    uvec4 xa3 = x[xbase + 6u];  uvec4 xb3 = x[xbase + 7u];
+#define N_DOTS(WB, ACC)                                                        \
+    W4A8_XY(w[(WB)], xa0, xb0, ACC)                                            \
+    W4A8_XY(w[(WB) + 1u], xa1, xb1, ACC)                                       \
+    W4A8_XY(w[(WB) + 2u], xa2, xb2, ACC)                                       \
+    W4A8_XY(w[(WB) + 3u], xa3, xb3, ACC)
+#elif VEC == 8
+#define N_LOAD_X                                                               \
+    uvec4 xa0 = x[xbase];       uvec4 xb0 = x[xbase + 1u];                     \
+    uvec4 xa1 = x[xbase + 2u];  uvec4 xb1 = x[xbase + 3u];
+#define N_DOTS(WB, ACC)                                                        \
+    W4A8_XY(w[(WB)], xa0, xb0, ACC)                                            \
+    W4A8_XY(w[(WB) + 1u], xa1, xb1, ACC)
+#elif VEC == 4
+#define N_LOAD_X uvec4 xa0 = x[xbase]; uvec4 xb0 = x[xbase + 1u];
+#define N_DOTS(WB, ACC) W4A8_XY(w[(WB)], xa0, xb0, ACC)
+#else
+#define N_LOAD_X uint xa0 = x[xbase]; uint xb0 = x[xbase + 1u];
+#define N_DOTS(WB, ACC) W4A8_XY(w[(WB)], xa0, xb0, ACC)
+#endif
+
+// The five places an output row appears, the same shape as MROWS' four: each
+// takes its index in the block and the names its state lives under, so one
+// N_ROWS(SITE) line instantiates every row and adding a width is one N_ROWn.
+// N_STEP reads `j`, `xbase` and `blockIdx` from the loop it sits in, N_BIAS
+// reads `b` and `xs`, and N_WRITE reads `orow` and `rowBase`.
+//
+// The write is split from the reduction so that every store lands in one
+// unbroken block under a single subgroupElect(): the addresses are then NROWS
+// consecutive floats from one lane, which is the whole point of the arm.
+#define N_SLOT(I, WB, SB, PART, TOT)                                           \
+    uint WB = (wrow + (I)) * N_WSTRIDE;                                        \
+    uint SB = (wrow + (I)) * (pc.ldw >> pc.logBlock);                          \
+    float PART = 0.0;
+#define N_STEP(I, WB, SB, PART, TOT)                                           \
+    {                                                                          \
+        int acc = 0;                                                           \
+        N_DOTS((WB) + N_WSTEP * j, acc)                                        \
+        PART += float(acc) * float(wScales[(SB) + blockIdx]);                  \
+    }
+#define N_BIAS(I, WB, SB, PART, TOT)                                           \
+    PART -= xs * float(wScales[(SB) + b]);
+#define N_TOTAL(I, WB, SB, PART, TOT)                                          \
+    float TOT = subgroupAdd(PART);
+#define N_WRITE(I, WB, SB, PART, TOT)                                          \
+    y[orow * pc.M + rowBase + (I)] = TOT * pc.xScale;
+
+#define N_ROW0(SITE) SITE(0u, nwb0, nsb0, npart0, ntot0)
+#define N_ROW1(SITE) SITE(1u, nwb1, nsb1, npart1, ntot1)
+#if NROWS >= 4
+#define N_ROW2(SITE) SITE(2u, nwb2, nsb2, npart2, ntot2)
+#define N_ROW3(SITE) SITE(3u, nwb3, nsb3, npart3, ntot3)
+#else
+#define N_ROW2(SITE)
+#define N_ROW3(SITE)
+#endif
+#if NROWS >= 8
+#define N_ROW4(SITE) SITE(4u, nwb4, nsb4, npart4, ntot4)
+#define N_ROW5(SITE) SITE(5u, nwb5, nsb5, npart5, ntot5)
+#define N_ROW6(SITE) SITE(6u, nwb6, nsb6, npart6, ntot6)
+#define N_ROW7(SITE) SITE(7u, nwb7, nsb7, npart7, ntot7)
+#else
+#define N_ROW4(SITE)
+#define N_ROW5(SITE)
+#define N_ROW6(SITE)
+#define N_ROW7(SITE)
+#endif
+#define N_ROWS(SITE)                                                           \
+    N_ROW0(SITE) N_ROW1(SITE) N_ROW2(SITE) N_ROW3(SITE)                        \
+    N_ROW4(SITE) N_ROW5(SITE) N_ROW6(SITE) N_ROW7(SITE)
+
+void main() {
+    // One subgroup is NROWS consecutive weight rows of one expert against one
+    // activation row, so a workgroup covers ROWS * NROWS output rows and the
+    // grid's x extent is pc.M divided by that. N is a multiple of NROWS at
+    // every shape this runs (640 and 2560), so only the workgroup can be
+    // partial and the guard below is the only bounds check needed.
+    uvec4 grp = groups[pc.groupBase + gl_WorkGroupID.y];
+#if ROWS > 1
+    uint rowBase = (gl_WorkGroupID.x * uint(ROWS) + gl_SubgroupID) * uint(NROWS);
+#else
+    uint rowBase = gl_WorkGroupID.x * uint(NROWS);
+#endif
+    if (rowBase >= pc.M) {
+        return;
+    }
+    uint wrow = grp.x + rowBase;   // first of this wave's rows in the bank
+    uint arow = grp.y;
+    uint orow = grp.z;
+    uint loadsPerRow = pc.N / WEIGHTS_PER_LOAD;
+    uint blocksPerRow = pc.N >> pc.logBlock;
+    uint sumBase = arow * blocksPerRow;
+    N_ROWS(N_SLOT)
+
+    for (uint j = LANE; j < loadsPerRow; j += LANES) {
+        uint xbase = N_XBASE;
+        N_LOAD_X
+        uint blockIdx = (j * WEIGHTS_PER_LOAD) >> pc.logBlock;
+        N_ROWS(N_STEP)
+    }
+
+    // The +8 bias, per row: the block sum is the pair's and is shared across
+    // the block, the weight scale is each row's own.
+    for (uint b = LANE; b < blocksPerRow; b += LANES) {
+        float xs = 8.0 * float(xBlockSums[sumBase + b]);
+        N_ROWS(N_BIAS)
+    }
+
+    N_ROWS(N_TOTAL)
+    if (subgroupElect()) {
+        N_ROWS(N_WRITE)
+    }
+}
+#elif MROWS > 1 && NROWS > 1
+// The corner, and the last shape of the decode GEMV left unbuilt: MROWS
+// activation rows *and* NROWS weight rows in one wave. A workgroup is a group
+// of MROWS table slots naming one expert (the M arm's grid), and a subgroup is
+// NROWS consecutive weight rows of that expert (the N arm's grid), so one wave
+// holds MROWS*NROWS output values and every weight load it issues is dotted
+// MROWS times while every activation load is dotted NROWS times.
+//
+// Why it is worth its own arm rather than being read off the two. Both blocks
+// were measured alone and both pay, at a serving batch, for the same reason —
+// §1.9 finding 2 (the M block's speedup is MALL request traffic, not DRAM
+// traffic) and §1.10 finding 6 (the N block's XREQ column falls 2.9x at t=256
+// on a projection with no per-output-row deficit at all). Two levers on one
+// resource can compose, saturate or compete, and none of the three is
+// derivable from the single-axis rows:
+//
+//   - they *compose* if the re-read counts multiply, which is what the request
+//     arithmetic says on its own: a group of MROWS slots over NROWS-row waves
+//     issues weight requests /MROWS and activation requests /NROWS;
+//   - they *saturate* if the MALL stops being what binds once either block is
+//     applied, in which case the second axis buys its own overhead and nothing
+//     else;
+//   - they *compete* for registers, which is the concrete risk here: a cell is
+//     an accumulator and a partial, and the operands live in registers for the
+//     whole step (MROWS*XVEC4S activation uvec4s and NROWS*WVEC4S weight ones).
+//     At VEC=4, MROWS=4, NROWS=4 that is 16 cells over 12 live uvec4s.
+//
+// The two fixed costs behave differently across the corner, which is the other
+// half of the reading. A *pad* slot (§1.9 finding 3) costs one activation row
+// and NROWS output rows now rather than one, so the M block's cost side scales
+// with the N block. The per-output-row cost §1.10 priced at 19.8% of down's
+// time is paid once per cell either way, but the subgroupAdds and stores of
+// one wave's MROWS*NROWS cells all issue together.
+//
+// Structurally this is both hoists at once: W4A8_MNXY takes a weight uvec4 and
+// an activation pair that are both already in registers, where the M arm's
+// W4A8_ROW loads the activations and the N arm's W4A8_XY loads the weights. It
+// is written out separately from either, so that adding this arm left every
+// single-axis binary byte-identical.
+//
+// **Measured (IDEAS §1.11): they compose.** At 256 sequences in flight the
+// corner is 1.12x the better single axis on gate_up and 1.19x on down, 1.54x
+// and 2.12x the unblocked kernel, and it takes gate_up to 96% of the DRAM bus
+// — the second lever keeps paying until the bus stops it. Competition for
+// registers, the third possibility above, does not appear: (4, 4) holds 83 of
+// a wave64 kernel's 256 VGPRs and nothing in the family spills to scratch. The
+// one asymmetry is the pad: a pad slot costs a per-wave part, which NROWS
+// divides, plus a per-output-row part, which it does not, so an N block makes
+// gate_up's pads 4x cheaper (640 output rows per slot) and down's 1.2x (2560).
+#if VEC >= 4
+#define W4A8_MNXY(PK, XA, XB, ACC)                                             \
+    {                                                                          \
+        ACC = dotPacked4x8AccSatEXT(int((XA).x), (PK).x & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XA).y), ((PK).x >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XA).z), (PK).y & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XA).w), ((PK).y >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XB).x), (PK).z & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XB).y), ((PK).z >> 4u) & 0x0F0F0F0Fu, ACC); \
+        ACC = dotPacked4x8AccSatEXT(int((XB).z), (PK).w & 0x0F0F0F0Fu, ACC);   \
+        ACC = dotPacked4x8AccSatEXT(int((XB).w), ((PK).w >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+#define MN_WSTRIDE (pc.ldw >> 5u)
+#define MN_XSTRIDE (pc.lda >> 4u)
+#define MN_WSTEP WVEC4S
+#define MN_XSTEP XVEC4S
+#else
+#define W4A8_MNXY(PK, XA, XB, ACC)                                             \
+    {                                                                          \
+        ACC = dotPacked4x8AccSatEXT(int(XA), (PK) & 0x0F0F0F0Fu, ACC);         \
+        ACC = dotPacked4x8AccSatEXT(int(XB), ((PK) >> 4u) & 0x0F0F0F0Fu, ACC); \
+    }
+#define MN_WSTRIDE (pc.ldw >> 3u)
+#define MN_XSTRIDE (pc.lda >> 2u)
+#define MN_WSTEP 1u
+#define MN_XSTEP 2u
+#endif
+
+// A cell's state, and a row's and a slot's, live under names built by pasting
+// the index on — the one place in this file that does, because a cell is
+// indexed by two numbers and the single-axis arms' "one name per site
+// argument" does not extend to a product without writing out MROWS*NROWS
+// argument lists. Nothing is indexed dynamically, which is the property that
+// matters (see W4A8_GROUP's comment on scratch spills); these are still plain
+// locals, named mnpart0u_1u rather than mnpart[0][1].
+#define MN_WB(R) mnwb##R
+#define MN_SB(R) mnsb##R
+#define MN_SC(R) mnsc##R
+#define MN_WS(R) mnws##R
+#define MN_XB(S) mnxb##S
+#define MN_SUM(S) mnsum##S
+#define MN_OROW(S) mnorow##S
+#define MN_XS(S) mnxs##S
+#define MN_PART(R, S) mnpart##R##_##S
+#define MN_TOT(R, S) mntot##R##_##S
+
+// The loads of one step, and the dots of one cell against them. Unrolled per
+// VEC rather than looped over WVEC4S for the reason in W4A8_GROUP's comment.
+#if VEC == 16
+#define MN_LOAD_W(R, S)                                                        \
+    uvec4 mnw0##R = w[MN_WB(R) + MN_WSTEP * j];                                \
+    uvec4 mnw1##R = w[MN_WB(R) + MN_WSTEP * j + 1u];                           \
+    uvec4 mnw2##R = w[MN_WB(R) + MN_WSTEP * j + 2u];                           \
+    uvec4 mnw3##R = w[MN_WB(R) + MN_WSTEP * j + 3u];
+#define MN_LOAD_X(R, S)                                                        \
+    uvec4 mnxa0##S = x[MN_XB(S) + MN_XSTEP * j];                               \
+    uvec4 mnxb0##S = x[MN_XB(S) + MN_XSTEP * j + 1u];                          \
+    uvec4 mnxa1##S = x[MN_XB(S) + MN_XSTEP * j + 2u];                          \
+    uvec4 mnxb1##S = x[MN_XB(S) + MN_XSTEP * j + 3u];                          \
+    uvec4 mnxa2##S = x[MN_XB(S) + MN_XSTEP * j + 4u];                          \
+    uvec4 mnxb2##S = x[MN_XB(S) + MN_XSTEP * j + 5u];                          \
+    uvec4 mnxa3##S = x[MN_XB(S) + MN_XSTEP * j + 6u];                          \
+    uvec4 mnxb3##S = x[MN_XB(S) + MN_XSTEP * j + 7u];
+#define MN_DOTS(R, S, ACC)                                                     \
+    W4A8_MNXY(mnw0##R, mnxa0##S, mnxb0##S, ACC)                                \
+    W4A8_MNXY(mnw1##R, mnxa1##S, mnxb1##S, ACC)                                \
+    W4A8_MNXY(mnw2##R, mnxa2##S, mnxb2##S, ACC)                                \
+    W4A8_MNXY(mnw3##R, mnxa3##S, mnxb3##S, ACC)
+#elif VEC == 8
+#define MN_LOAD_W(R, S)                                                        \
+    uvec4 mnw0##R = w[MN_WB(R) + MN_WSTEP * j];                                \
+    uvec4 mnw1##R = w[MN_WB(R) + MN_WSTEP * j + 1u];
+#define MN_LOAD_X(R, S)                                                        \
+    uvec4 mnxa0##S = x[MN_XB(S) + MN_XSTEP * j];                               \
+    uvec4 mnxb0##S = x[MN_XB(S) + MN_XSTEP * j + 1u];                          \
+    uvec4 mnxa1##S = x[MN_XB(S) + MN_XSTEP * j + 2u];                          \
+    uvec4 mnxb1##S = x[MN_XB(S) + MN_XSTEP * j + 3u];
+#define MN_DOTS(R, S, ACC)                                                     \
+    W4A8_MNXY(mnw0##R, mnxa0##S, mnxb0##S, ACC)                                \
+    W4A8_MNXY(mnw1##R, mnxa1##S, mnxb1##S, ACC)
+#elif VEC == 4
+#define MN_LOAD_W(R, S) uvec4 mnw0##R = w[MN_WB(R) + MN_WSTEP * j];
+#define MN_LOAD_X(R, S)                                                        \
+    uvec4 mnxa0##S = x[MN_XB(S) + MN_XSTEP * j];                               \
+    uvec4 mnxb0##S = x[MN_XB(S) + MN_XSTEP * j + 1u];
+#define MN_DOTS(R, S, ACC) W4A8_MNXY(mnw0##R, mnxa0##S, mnxb0##S, ACC)
+#else
+#define MN_LOAD_W(R, S) uint mnw0##R = w[MN_WB(R) + MN_WSTEP * j];
+#define MN_LOAD_X(R, S)                                                        \
+    uint mnxa0##S = x[MN_XB(S) + MN_XSTEP * j];                                \
+    uint mnxb0##S = x[MN_XB(S) + MN_XSTEP * j + 1u];
+#define MN_DOTS(R, S, ACC) W4A8_MNXY(mnw0##R, mnxa0##S, mnxb0##S, ACC)
+#endif
+
+// The sites. Every one takes (R, S) — a row's sites ignore S and a slot's
+// ignore R — so that one set of names serves the three instantiators below.
+#define MN_ROW_STATE(R, S)                                                     \
+    uint MN_WB(R) = (wrow + (R)) * MN_WSTRIDE;                                 \
+    uint MN_SB(R) = (wrow + (R)) * (pc.ldw >> pc.logBlock);
+#define MN_SLOT_STATE(R, S)                                                    \
+    uint MN_XB(S) = groups[slot + (S)].y * MN_XSTRIDE;                         \
+    uint MN_SUM(S) = groups[slot + (S)].y * blocksPerRow;                      \
+    uint MN_OROW(S) = groups[slot + (S)].z;
+#define MN_CELL_STATE(R, S) float MN_PART(R, S) = 0.0;
+// One scale per weight row per step: the slots share the row, so they share
+// its scale, exactly as the M arm's single `sc` is shared by its slots.
+#define MN_SCALE(R, S) float MN_SC(R) = float(wScales[MN_SB(R) + blockIdx]);
+#define MN_STEP(R, S)                                                          \
+    {                                                                          \
+        int acc = 0;                                                           \
+        MN_DOTS(R, S, acc)                                                     \
+        MN_PART(R, S) += float(acc) * MN_SC(R);                                \
+    }
+// The +8 bias factorises the way the dot does: the weight scale is the row's,
+// the block sum is the slot's, and the cell is their product.
+#define MN_ROW_BIAS(R, S) float MN_WS(R) = 8.0 * float(wScales[MN_SB(R) + b]);
+#define MN_SLOT_BIAS(R, S) float MN_XS(S) = float(xBlockSums[MN_SUM(S) + b]);
+#define MN_BIAS(R, S) MN_PART(R, S) -= MN_WS(R) * MN_XS(S);
+#define MN_TOTAL(R, S) float MN_TOT(R, S) = subgroupAdd(MN_PART(R, S));
+#define MN_WRITE(R, S) y[MN_OROW(S) * pc.M + rowBase + (R)] = MN_TOT(R, S) * pc.xScale;
+
+// The three instantiators. MN_RL(S, SITE) is one slot's row list, and
+// everything else is built from it: MN_ROWS runs it once with a slot index the
+// row sites ignore, MN_CELLS runs it once per slot, and MN_SLOTS is the
+// slot list on its own. Cells are emitted slot-outermost so that the NROWS
+// stores of one slot — which are consecutive floats of one output row, the
+// point of the N block — stay adjacent inside the elected lane's block.
+#define MN_RL0(S, SITE) SITE(0u, S)
+#define MN_RL1(S, SITE) SITE(1u, S)
+#if NROWS >= 4
+#define MN_RL2(S, SITE) SITE(2u, S)
+#define MN_RL3(S, SITE) SITE(3u, S)
+#else
+#define MN_RL2(S, SITE)
+#define MN_RL3(S, SITE)
+#endif
+#define MN_RL(S, SITE) MN_RL0(S, SITE) MN_RL1(S, SITE) MN_RL2(S, SITE) MN_RL3(S, SITE)
+
+#define MN_SL0(SITE) SITE(0u, 0u)
+#define MN_SL1(SITE) SITE(0u, 1u)
+#define MN_CL0(SITE) MN_RL(0u, SITE)
+#define MN_CL1(SITE) MN_RL(1u, SITE)
+#if MROWS >= 4
+#define MN_SL2(SITE) SITE(0u, 2u)
+#define MN_SL3(SITE) SITE(0u, 3u)
+#define MN_CL2(SITE) MN_RL(2u, SITE)
+#define MN_CL3(SITE) MN_RL(3u, SITE)
+#else
+#define MN_SL2(SITE)
+#define MN_SL3(SITE)
+#define MN_CL2(SITE)
+#define MN_CL3(SITE)
+#endif
+#if MROWS >= 8
+#define MN_SL4(SITE) SITE(0u, 4u)
+#define MN_SL5(SITE) SITE(0u, 5u)
+#define MN_SL6(SITE) SITE(0u, 6u)
+#define MN_SL7(SITE) SITE(0u, 7u)
+#define MN_CL4(SITE) MN_RL(4u, SITE)
+#define MN_CL5(SITE) MN_RL(5u, SITE)
+#define MN_CL6(SITE) MN_RL(6u, SITE)
+#define MN_CL7(SITE) MN_RL(7u, SITE)
+#else
+#define MN_SL4(SITE)
+#define MN_SL5(SITE)
+#define MN_SL6(SITE)
+#define MN_SL7(SITE)
+#define MN_CL4(SITE)
+#define MN_CL5(SITE)
+#define MN_CL6(SITE)
+#define MN_CL7(SITE)
+#endif
+#define MN_ROWS(SITE) MN_RL(0u, SITE)
+#define MN_SLOTS(SITE)                                                         \
+    MN_SL0(SITE) MN_SL1(SITE) MN_SL2(SITE) MN_SL3(SITE)                        \
+    MN_SL4(SITE) MN_SL5(SITE) MN_SL6(SITE) MN_SL7(SITE)
+#define MN_CELLS(SITE)                                                         \
+    MN_CL0(SITE) MN_CL1(SITE) MN_CL2(SITE) MN_CL3(SITE)                        \
+    MN_CL4(SITE) MN_CL5(SITE) MN_CL6(SITE) MN_CL7(SITE)
+
+void main() {
+    // The two grids at once: y indexes a group of MROWS slots naming one
+    // expert, x indexes a block of NROWS of that expert's output rows, so the
+    // host divides the x extent by ROWS*NROWS and makes the y extent the group
+    // count. Every slot of a group names the same expert — the host guarantees
+    // it — so the bank row comes from the first slot.
+    uint slot = pc.groupBase + gl_WorkGroupID.y * uint(MROWS);
+#if ROWS > 1
+    uint rowBase = (gl_WorkGroupID.x * uint(ROWS) + gl_SubgroupID) * uint(NROWS);
+#else
+    uint rowBase = gl_WorkGroupID.x * uint(NROWS);
+#endif
+    if (rowBase >= pc.M) {
+        return;
+    }
+    uint wrow = groups[slot].x + rowBase;   // first of this wave's rows in the bank
+    uint loadsPerRow = pc.N / WEIGHTS_PER_LOAD;
+    uint blocksPerRow = pc.N >> pc.logBlock;
+    MN_ROWS(MN_ROW_STATE)
+    MN_SLOTS(MN_SLOT_STATE)
+    MN_CELLS(MN_CELL_STATE)
+
+    for (uint j = LANE; j < loadsPerRow; j += LANES) {
+        MN_SLOTS(MN_LOAD_X)
+        MN_ROWS(MN_LOAD_W)
+        uint blockIdx = (j * WEIGHTS_PER_LOAD) >> pc.logBlock;
+        MN_ROWS(MN_SCALE)
+        MN_CELLS(MN_STEP)
+    }
+
+    for (uint b = LANE; b < blocksPerRow; b += LANES) {
+        MN_ROWS(MN_ROW_BIAS)
+        MN_SLOTS(MN_SLOT_BIAS)
+        MN_CELLS(MN_BIAS)
+    }
+
+    MN_CELLS(MN_TOTAL)
+    if (subgroupElect()) {
+        MN_CELLS(MN_WRITE)
+    }
+}
 #else
 
 void main() {
 #if GROUPED
     uvec4 grp = groups[pc.groupBase + gl_WorkGroupID.y];
+#if ROWS > 1
+    uint row = gl_WorkGroupID.x * uint(ROWS) + gl_SubgroupID;
+#else
     uint row = gl_WorkGroupID.x;   // output row inside this expert's matrix
+#endif
     uint wrow = grp.x + row;       // its row in the [E*N, ldw] bank
     uint arow = grp.y;             // the token row this pair reads
     uint orow = grp.z;             // the pair's row in y

@@ -337,6 +337,116 @@ var GEMVW4A8GroupedVec4M8 []byte
 //go:embed gemv_w4a8_g_v8_m2.spv
 var GEMVW4A8GroupedVec8M2 []byte
 
+// The output-row blocks (IDEAS §1.8 finding 9, the one open cell of the decode
+// path: the down projection reads 198 GB/s where gate_up reads 235 for
+// identical bytes per expert, with 4x the workgroups and 4x the output
+// writes). Two arms that divide the workgroup count the same way and differ in
+// everything else:
+//
+//   -DROWS=n  puts n subgroups in a workgroup, one output row each. The wave
+//             count, the loads, the reductions and the stores are all exactly
+//             what they were; only the number of workgroups changes.
+//   -DNROWS=n gives one subgroup n consecutive weight rows against one
+//             activation row, so the wave count falls with the workgroup
+//             count, the activation loads are shared n ways, the n results
+//             merge into one wide store, and each active lane carries n rows'
+//             dots against one fixed per-wave cost. (It does not fill down's
+//             44 idle lanes: the load loop is still strided by the wave size,
+//             so the same 20 lanes do n times the work.)
+//
+// Subtracting them is the experiment. Both are built at VEC=4, the width that
+// won the unblocked arm at both expert shapes (§1.8 finding 7: the spread
+// across widths is 3-5% here).
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DROWS=2 -o gemv_w4a8_g_v4_r2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DROWS=4 -o gemv_w4a8_g_v4_r4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DROWS=8 -o gemv_w4a8_g_v4_r8.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DNROWS=2 -o gemv_w4a8_g_v4_n2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DNROWS=4 -o gemv_w4a8_g_v4_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DNROWS=8 -o gemv_w4a8_g_v4_n8.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g_v4_r2.spv
+var GEMVW4A8GroupedVec4Rows2 []byte
+
+//go:embed gemv_w4a8_g_v4_r4.spv
+var GEMVW4A8GroupedVec4Rows4 []byte
+
+//go:embed gemv_w4a8_g_v4_r8.spv
+var GEMVW4A8GroupedVec4Rows8 []byte
+
+//go:embed gemv_w4a8_g_v4_n2.spv
+var GEMVW4A8GroupedVec4N2 []byte
+
+//go:embed gemv_w4a8_g_v4_n4.spv
+var GEMVW4A8GroupedVec4N4 []byte
+
+//go:embed gemv_w4a8_g_v4_n8.spv
+var GEMVW4A8GroupedVec4N8 []byte
+
+// The (VEC, NROWS) grid and the wave32 arm — the two probes IDEAS §1.10 left
+// beside the corner below. It swept the row block at VEC=4 only, and its
+// finding 4 says the two do not simply trade: the one build in the whole grid
+// whose lanes are fully occupied (VEC=1 at down's K=640, 80 loads over 64
+// lanes) is 1.05x *slower* than VEC=4, while NROWS=4 leaves 44 lanes idle and
+// is 1.17x faster. So the row block is swept across the width here, at the
+// width that reaches the bus (4), the one that fills the lanes (1) and the two
+// that empty them further (8, 16). The wave32 build is the other half: §1.7
+// only ever measured the wave size with one row per wave, and a 32-lane wave
+// has half the idle lanes to amortize the same fixed cost over.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=1 -DNROWS=4 -o gemv_w4a8_g_v1_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=8 -DNROWS=4 -o gemv_w4a8_g_v8_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=16 -DNROWS=4 -o gemv_w4a8_g_v16_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DNROWS=4 -DWAVE=32 -o gemv_w4a8_g_v4_n4_w32.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g_v1_n4.spv
+var GEMVW4A8GroupedVec1N4 []byte
+
+//go:embed gemv_w4a8_g_v8_n4.spv
+var GEMVW4A8GroupedVec8N4 []byte
+
+//go:embed gemv_w4a8_g_v16_n4.spv
+var GEMVW4A8GroupedVec16N4 []byte
+
+//go:embed gemv_w4a8_g_v4_n4_w32.spv
+var GEMVW4A8GroupedVec4N4W32 []byte
+
+// The corner: both blocks in one build (-DMROWS=m -DNROWS=n). The M block is a
+// throughput lever (1.39-1.66x at 256 sequences in flight, 0.39x at one) and
+// the N block a latency one (1.11-1.94x on down at every batch), and at a
+// serving batch they were measured to pay for the same thing — the MALL
+// serving re-read requests — so the cell where 256 sequences actually sit is
+// the one neither single-axis sweep reaches.
+//
+// The widths are the ones the two engine rules name at t=256. §1.9's rule for
+// M is "the block nearest the mean rows per expert, erring low", which is 4-8
+// at 5.05 rows; §1.10's rule for N is NROWS >= 8*VEC*WAVE/K, which is 4 at
+// down's K=640 and 1 at gate_up's K=2560. Both shapes run every build, so the
+// rules are being tested and not just applied. NROWS=8 is not built against an
+// M block: it is past the register knee on its own, and a cell is an
+// accumulator plus a partial, so the corner's register cost is the product.
+
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=2 -DNROWS=2 -o gemv_w4a8_g_v4_m2_n2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=4 -DNROWS=2 -o gemv_w4a8_g_v4_m4_n2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=8 -DNROWS=2 -o gemv_w4a8_g_v4_m8_n2.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=2 -DNROWS=4 -o gemv_w4a8_g_v4_m2_n4.spv gemv_w4a8.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DVEC=4 -DMROWS=4 -DNROWS=4 -o gemv_w4a8_g_v4_m4_n4.spv gemv_w4a8.comp
+
+//go:embed gemv_w4a8_g_v4_m2_n2.spv
+var GEMVW4A8GroupedVec4M2N2 []byte
+
+//go:embed gemv_w4a8_g_v4_m4_n2.spv
+var GEMVW4A8GroupedVec4M4N2 []byte
+
+//go:embed gemv_w4a8_g_v4_m8_n2.spv
+var GEMVW4A8GroupedVec4M8N2 []byte
+
+//go:embed gemv_w4a8_g_v4_m2_n4.spv
+var GEMVW4A8GroupedVec4M2N4 []byte
+
+//go:embed gemv_w4a8_g_v4_m4_n4.spv
+var GEMVW4A8GroupedVec4M4N4 []byte
+
 //go:generate glslc --target-env=vulkan1.2 -O -o gemv_subgroup_f32.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_F16 -o gemv_subgroup_f16.spv gemv_subgroup.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DPRECISION_Q8 -o gemv_subgroup_q8.spv gemv_subgroup.comp
