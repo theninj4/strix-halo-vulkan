@@ -10,26 +10,23 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-14, later)**: **parakeet transcribes on the GPU, exactly.**
-The 24 conformer layers went from 2.45 s to **13.8 ms** on the device for an
-11 s clip — 178x — with the transcript and the whole decode trace unchanged.
-S1–S6 are done. What that exposes is everything that is *not* the layers: the
-subsampling stack on the host is now 92 ms, and the TDT decode loop is 205 ms,
-so the clip that took 2.68 s takes 332 ms and **the encoder is no longer the
-problem**. Kokoro is untouched.
+**Status (2026-09-14, later still)**: **the speech-to-text vertical is
+finished.** S8 moved the transducer tail onto the device — 208 ms to 4.8 ms —
+so an 11 s clip goes from 2.68 s on the CPU to **43 ms**, at **257x real
+time**, with the transcript and all 46 emissions unchanged. S1–S8 are done.
+The whole model is resident: what crosses the bus per clip is the mel
+spectrogram in and two floats per emitted token out. Kokoro is next.
 
     testdata/jfk.wav: 11.000 s at 16000 Hz
-    gpu: 24 layers, 1154 MB of weights, 26 MB of arenas, plan reg32x32_bt16_w32
-    1101 mel frames (1100 valid) -> 138 encoder frames (138 valid)
+    gpu: 24 layers, 1162 MB of encoder weights + 24 MB of decoder weights
 
-    stage             time  share       (CPU, S5)
-    front end         20ms   5.9%        20ms
-    encoder          103ms  31.1%       2454ms   <- 92ms of it is CPU subsampling
-    projector          2ms   0.5%          2ms
-    decode           205ms  62.5%        207ms
-    total            332ms               2.68s
+    stage         time  share      (S7)     (S6)    (CPU, S5)
+    front end     21ms   48.0%     25ms     21ms       20ms
+    encoder       17ms   39.8%     20ms    106ms     2454ms
+    decode         5ms   12.2%    209ms    206ms      209ms
+    total         43ms             255ms    331ms      2.68s
 
-    33.1x real time, 4.1x before
+    257x real time, 43x at S7, 33x at S6, 4.1x on the CPU
 
 ## Where the work stands
 
@@ -40,11 +37,12 @@ problem**. Kokoro is untouched.
 | S3 | Mel front end in Go, against S2's mel | **done** — 3.1e-4 absolute |
 | S4 | Encoder, CPU reference, layer by layer | **done** — 1.7e-4 relative |
 | S5 | Prediction net + joint + TDT greedy decode; **first transcript** | **done** — exact string |
-| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | **done** — 178x, exact transcript, [write-up](research/s6-parakeet-encoder.md) |
-| S7 | The subsampling stack on Vulkan | **next** — 92 ms, 87% of the encoder's wall clock |
-| S8 | The projector, the joint and the TDT loop on Vulkan | 205 ms, 62% of the pipeline |
-| S9 | Long clips: chunking, or full attention at T=3000 | undecided, see below |
-| T1 | `reference/convert_kokoro.py` + `reference/dump_kokoro.py` | |
+| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | **done** — 178x, [write-up](research/s6-parakeet-encoder.md) |
+| S7 | The subsampling stack on Vulkan | **done** — 95x, [write-up](research/s7-parakeet-subsampling.md) |
+| S8 | The projector, the prediction net, the joint and the TDT loop | **done** — 43x, 257x real time, [write-up](research/s8-parakeet-decode.md) |
+| S9 | Long clips: chunking, or full attention at T=3000 | open, see below |
+| S10 | The front end on the device, or a faster one on the host | open — **48% of the pipeline** |
+| T1 | `reference/convert_kokoro.py` + `reference/dump_kokoro.py` | **next** |
 | T2 | Phoneme encoder + ALBERT + predictor, CPU, against T1 | |
 | T3 | iSTFTNet decoder, CPU; **first waveform** | |
 | T4 | Vulkan port; `cmd/tts` | |
@@ -60,102 +58,101 @@ but not yet used; it is kokoro's.
 
 **`parakeet/`** — the model on the CPU (`frontend.go`, `subsampling.go`,
 `encoder.go`, `decoder.go`, `decode.go`, `tokenizer.go`, `load.go`) and on the
-device (`gpu.go`, `gpugraph.go`): a `GPUEncoder` that stages all 24 layers as
-1.15 GB of fp16 into one bank and runs a clip as 960 dispatches over four
-shared arenas. `Encoder.Apply` and `GPUEncoder.ApplyMel` have the same
-signature, so a caller switches path by switching which one it calls.
+device:
 
-**`shaders/parakeet_*`** — the seven kernels the GEMM ladder did not have: the
-LayerNorm (with a mean *and* an affine, two builds), silu, the scalar-weighted
-residual, the GLU, the depthwise convolution with its folded BatchNorm, the
-narrowing pass that adds `bias_v`, and the relative-position shift. Plus two
-builds of shaders that already existed: the fragment pack with `bias_u` folded
-in, and the score kernel with the position term as an additive bias
-(`REL_BIAS`).
+  - `gpu.go`, `gpugraph.go`, `gpusub.go` — a `GPUEncoder` holding 1.16 GB of
+    fp16 and running a clip as **946 dispatches** over six shared arenas: ten
+    for the subsampling convolutions, 936 for the 24 conformer layers.
+    `Encoder.Apply` and `GPUEncoder.ApplyMel` have the same signature, and
+    `HostSubsampling` puts the convolutions back on the CPU.
+  - `gpudecode.go` — a `GPUDecoder` holding 24 MB of fp16 over its own four
+    buffers, running the projector once per clip and **eleven dispatches per
+    emission**. `Attach` lets it read the encoder's residual stream in place,
+    so the hidden states never cross the bus.
 
-**`cmd/asr`** — a WAV in, a transcript and a stage profile out. `-gpu` moves
-the layers to the device, `-profile` times every dispatch, `-v` prints the
+**`shaders/parakeet_*`** — fifteen kernels. Seven from S6 (the LayerNorm with
+a mean and an affine, silu, the scalar-weighted residual, the GLU, the
+depthwise convolution over time with its folded BatchNorm, the `bias_v`
+narrowing, the relative-position shift), four from S7 (the stride-2
+convolution over a single-channel input, the depthwise form of it, the
+bias-and-mask epilogue, the flatten) and four from S8 (the LSTM's concatenated
+A operand, the LSTM cell, the joint's addition and rectification, the two
+argmaxes). Plus two builds of shaders that already existed: the fragment pack
+with `bias_u` folded in, and the score kernel with the position term as an
+additive bias (`REL_BIAS`).
+
+**`cmd/asr`** — a WAV in, a transcript and a stage profile out. `-gpu` runs
+the whole model on the device; `-hostsub` and `-hostdec` put the convolutions
+and the transducer tail back on the CPU, which is what the S7 and S8
+measurements are against; `-profile` times every dispatch; `-v` prints the
 per-emission trace.
 
 **`reference/dump_parakeet.py`** — the oracle, which walks the whole model
 rather than its ends and checks itself in four places.
 
-## S6, in one page
+## S8, in one page
 
-The full write-up is [`research/s6-parakeet-encoder.md`](research/s6-parakeet-encoder.md).
-The four things worth carrying forward:
+The full write-up is [`research/s8-parakeet-decode.md`](research/s8-parakeet-decode.md).
+Three things worth carrying forward:
 
-**The score kernel's tail handling encoded an assumption about the size of a
-score.** The flash kernel masks pad keys out of `P` but takes the row max
-before that mask, which is safe when a real score is a q·k product of
-RMS-normalised vectors and never far from a pad key's 0. With the position
-bias the real scores are tens of log2 units wide, so on any row whose scores
-are all negative a key that does not exist set the scale and the whole
-softmax underflowed fp16's smallest subnormal. One `break`, under `REL_BIAS`;
-a factor of 100 in the error.
+**The first latency-bound stage in the engine.** Greedy transducer decoding is
+sequential by construction — step n+1's input is step n's output — so there is
+no batch and no tile to pick. 1.1 GFLOP took 208 ms because each of 46
+emissions was a round trip between a host holding the decision and a device
+holding the model. The whole design is about what crosses the bus: the model,
+the state and the logits stay resident, and what moves is 2.5 KB of embedding
+in and **two floats out** per token.
 
-**Two alignments, not one.** The GEMM's M is padded to the plan's tile (160 at
-138 frames) and the attention geometry to the key block (192). Using one
-number for both padded a clip to 256 and cost 1.28x.
+**M = 1 needs no new kernel, and the ladder proves it.** The four projections
+run on the existing GEMM rungs with M padded from 1 up to the tile, because a
+GEMM reads its B operand once whatever M is. `BM = 32` ties `BM = 16`
+**exactly**, twice, reproducibly — double the arithmetic for the same time —
+which is the direct statement that the tail is bandwidth-bound at M = 1 and
+that a dedicated GEMV would win back something nobody is paying for.
 
-**wave32 wins on a whole model.** Every wave32 rung beats its wave64 twin at
-every clip length measured — 1.28x at 138 frames on the identical tile — and
-the DiT's own winning tile is 1.83x off the pace, because 86 of its 128 rows
-would be padding. §6.2 and stage 3c measured that on one kernel each; this is
-the same lever on 960 dispatches.
+**24 MB of weights against a 32 MiB MALL.** The LSTM and joint GEMMs measure
+449 and 702 GB/s, both *above* this part's DRAM bus and below §5.1b's 930-965
+GB/s cache ceiling: the loop re-reads the entire model out of the last-level
+cache, 46 times. This is the first place in the engine where §0.4's 32 MiB is
+a design constraint that was **met** rather than a cliff that was fallen off —
+and it says exactly what would break it: a bigger prediction network, or a
+second hypothesis in a beam.
 
-**A transcript is not a kernel test.** Two of the four negative controls
-change the encoder output by 33% and 3.9% and leave the words alone. The
-transcript says the port is right; the per-stage tensors say a kernel is, and
-they need the rms-of-the-difference measure rather than max-abs-against-rms,
-because fp16 puts the latter at 2-3% on tensors that are correct.
+## What is left, in order of what it would buy
 
-## S7 and S8: what is left, and in what order
+**S10 — the front end is 48% of the pipeline.** 21 ms of a few thousand
+512-point FFTs in float64 on the host, which has been untouched since S3
+because it was 0.8% of the clip. Two directions and they are not exclusive: a
+float32 radix-4 on the host, or the STFT and the mel filterbank as two
+dispatches. The filterbank is a `[T, 257] x [257, 128]` GEMM, which is the
+ladder's own shape; the FFT is not, and is the interesting half.
 
-The profile above is the whole argument, and it inverts the one that ordered
-S6:
+**The submit and the fence are 38% of an emission.** 40 µs of the 105 µs the
+decode loop spends per token is the round trip, not the work. Two things would
+remove it — a **persistent kernel** with the loop's control flow on the device
+(which is also what `api/transcription.go`'s `transcript.text.delta` would
+want), and **speculating on blanks**, since during a run of blanks the
+prediction state does not change and the joints for consecutive frames are
+independent, i.e. one GEMM at M = 16 for the price of the M = 1 one. This clip
+has only 8 blanks in 46 emissions; a clip with silence in it has many more.
 
-**S7, the subsampling stack — 92 ms, and it is 2.8 GFLOP.** That is 30
-GFLOP/s, on a part that has just done 177 GFLOP in 13.8 ms. It is three
-kernels the ladder does not have — a stride-2 `conv2d` over a *single-channel*
-input, the depthwise form of it, and a pointwise 256→256 that is a GEMM over
-positions — plus the `[T, 4096] x [4096, 1024]` linear, which is already a
-GEMM and is half the stack's arithmetic. Stage 8's implicit-GEMM conv
-(`research/stage-8-vae-conv.md`) is stride 1 and channel-tiled; the layout
-question there (a patch fragment is contiguous only if the channel axis is the
-tiled one) is the same question here with a 1-channel input, where it has a
-different answer.
+**S9 — long clips.** Full attention over the clip means a chunk boundary
+changes every frame's hidden state, so chunking belongs in the design rather
+than after it. The ladder's 1024-frame row (111 ms against 59 at 768) is the
+quadratic term arriving: at 82 s the position projection is 2T-1 = 2047 rows
+and the score matrices are 1024x1024 per head. It would also bound the
+subsampling arena, whose largest tensor is `[4T, 64, 256]` fp32 — 36 MB at 138
+frames and 268 MB at 1024. Narrowing that to fp16 halves it *and* halves the
+two kernels that are 80% of the subsampling stack, both bandwidth-bound; it
+has not been done because the whole stack is 1 ms.
 
-**S8, the decode loop — 205 ms, 62% of the pipeline.** The TDT greedy loop is
-one LSTM step and one 8198-wide joint per emission, 46 of them for this clip.
-The joint's `[8198, 640]` head measures 1.6 TFLOP/s as a GEMV — 6.5 µs a step,
-0.3 ms for the whole clip — so this is not an arithmetic problem: it is 46
-round trips between the host and a model that lives on the device. The
-projector goes with it, and then nothing crosses the bus per clip but the
-logits.
+**Smaller, and measured.** `UploadMel` is 1 ms, almost all of it computing
+2T-1 rows of sinusoidal position embeddings in float64 on the host — they
+depend on nothing but T and could be cached. The encoder's eight per-head
+position-score GEMMs are the same shape at different offsets, which is §3.5's
+grouped GEMM.
 
-Together those two are 297 ms of the 332, so the clip should land near 35 ms —
-**310x real time**, against 33x now and 4.1x on the CPU.
-
-## Open, and to settle by measurement
-
-- **What does streaming mean here?** `api/transcription.go` already defines
-  `transcript.text.delta`. The TDT loop is naturally incremental — it emits at
-  a frame and jumps forward — but the encoder is not: full attention over the
-  clip means a chunk boundary changes every frame's hidden state. Chunking
-  belongs in the design rather than after it. The ladder's 1024-frame row
-  (111 ms, against 59 ms at 768) is the first sign of the quadratic term
-  arriving: at 82 s of audio the position projection is 2T-1 = 2047 rows and
-  the score matrices are 1024x1024 per head.
-- **Is the position term worth hoisting?** `rel_k` is 5.4% of the encoder and
-  the eight per-head score GEMMs another 5.2%, and both are recomputed every
-  layer because the weight is per layer. Nothing can be hoisted, but the eight
-  dispatches could be one: they are the same shape with a different offset,
-  which is §3.5's grouped GEMM.
-- **Is kokoro's voice pack indexed by `len(phonemes)`?** Unchanged: 510 rows,
-  and the reference will say.
-
-## Kokoro — unchanged, and next after the parakeet pipeline closes
+## Kokoro — next, and unchanged
 
 `models/Kokoro-82M/`, 82 M params, a StyleTTS2 derivative in a PyTorch pickle
 (`kokoro-v1_0.pth`, 327 MB F32), five modules: `bert` (ALBERT, 12 layers x
@@ -174,5 +171,11 @@ of the parameters), and a **length regulator** that makes the output length
 data-dependent, which no stage of z-image or parakeet was. G2P stays last and
 outside the model: **the first vertical takes phonemes, not text**.
 
+Two findings transfer directly. S7's: the vocoder is 1-D convolutions over
+`[T, C]`, and holding them channel-last is what makes the pointwise ones GEMMs
+and the depthwise ones coalesced. S8's: 82 M params is 164 MB in fp16, five
+times the MALL, so unlike the transducer tail it will be on the DRAM law and
+the budget is bytes per sample.
+
 `audio/` already has the inverse FFT the vocoder's iSTFT needs, tested by a
-round trip.
+round trip — and S10 would give it a device FFT to share.

@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The transducer's joint, minus its head: one encoder frame added to one
+// prediction state, rectified, and narrowed into the head's fp16 A operand
+// (SPEECH.md S8).
+//
+// This is the whole of what "joint" means in an RNN-T: the two towers meet by
+// *addition* in a shared 640-wide space, and everything after it is one
+// projection to 8198 logits. The frame is chosen by the host -- the TDT
+// cursor jumps by the predicted duration rather than by one frame, so which
+// row of the projected encoder output this reads is a decision made on the
+// host between submits, and arrives as an offset already multiplied out.
+//
+// The prediction projector's bias is folded in here rather than run as a pass
+// of its own over the same 640 floats, the way the two subsampling epilogues
+// fold theirs (parakeet_sub_bias.comp).
+//
+//   pc.inOff   fp32 encoder frame, pc.dim wide, already at its row
+//   pc.aux0    fp32 prediction state, pc.dim wide
+//   pc.wOff    fp32 bias added to the prediction state, or NO_W
+//   pc.outOff  fp16 A operand, row stride pc.lda
+//   pc.tokens  rows to write; row 0 is the vector and the rest are zeros
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint i = gl_LocalInvocationID.x; i < pc.dim; i += 256u) {
+        float v = 0.0;
+        if (r == 0u) {
+            v = act[pc.inOff + i] + act[pc.aux0 + i];
+            if (pc.wOff != NO_W) {
+                v += wbuf[pc.wOff + i];
+            }
+            v = max(v, 0.0);
+        }
+        hact[dst + i] = float16_t(v);
+    }
+}

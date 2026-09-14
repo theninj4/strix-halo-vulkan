@@ -1,0 +1,83 @@
+#version 450
+// The first convolution of the subsampling stack: 1 -> 256 channels, a 3x3
+// kernel at stride 2 with symmetric zero padding, over the log-mel
+// spectrogram (SPEECH.md S7).
+//
+// It is the only convolution in the engine whose input has *one* channel, and
+// that is what decides the layout. Stage 8's implicit-GEMM convolution
+// (research/stage-8-vae-conv.md) tiles the channel axis and packs a patch
+// into a fragment, which is worth doing when the reduction is over 512
+// channels; here the reduction is over nine scalars and the 256 output
+// channels share every one of them. So this is not a GEMM at all: one lane
+// per output channel, nine weights hoisted into registers, and the nine mel
+// samples read as wave-uniform scalars.
+//
+// The output layout is the stack's, and it is the transpose of the CPU
+// reference's: [T, F, C] with the *channel* fastest, not PyTorch's [C, T, F].
+// Three things follow from that and they are the reason for it --
+//
+//   the depthwise convolution's 256 lanes then walk 256 contiguous floats per
+//     tap instead of striding a plane apart (parakeet_sub_dw.comp),
+//   the pointwise 1x1 convolutions become plain [P, 256] x [256, 256] GEMMs
+//     over positions, with no packing pass at all, and
+//   the flatten into the linear's [T, 4096] rows is a contiguous copy, once
+//     the linear's weight columns are permuted to match (parakeet/gpusub.go).
+//
+//   pc.inOff   fp32 mel [kStride, span], row stride pc.span
+//   pc.outOff  fp32 [tokens, heads, dim]
+//   pc.wOff    the filters as [9, dim] fp32, tap-major -- the transpose of
+//              the checkpoint's [dim, 1, 3, 3], so that one tap's 256
+//              channels are contiguous
+//   pc.aux0    the bias, [dim]
+//   pc.aux1    valid output rows; every row at or past it is written as zero,
+//              which is the masking the reference does after each convolution
+//   pc.tokens  output time rows, pc.heads output frequency bins
+//   pc.span    input frequency bins, pc.kStride input time rows
+
+#include "dit_common.glsl"
+
+#ifndef FPER
+#define FPER 8          // output frequency bins per workgroup
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    int ot = int(gl_WorkGroupID.x);
+    if (uint(ot) >= pc.tokens) {
+        return;
+    }
+    int of0 = int(gl_WorkGroupID.y) * FPER;
+    int fin = int(pc.span), tin = int(pc.kStride), fout = int(pc.heads);
+    bool live = uint(ot) < pc.aux1;
+
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float w[9];
+        for (int k = 0; k < 9; k++) {
+            w[k] = wbuf[pc.wOff + uint(k) * pc.dim + c];
+        }
+        float bias = wbuf[pc.aux0 + c];
+        for (int j = 0; j < FPER; j++) {
+            int of = of0 + j;
+            if (of >= fout) {
+                break;
+            }
+            float sum = bias;
+            for (int kt = 0; kt < 3; kt++) {
+                int it = 2 * ot + kt - 1;
+                if (it < 0 || it >= tin) {
+                    continue;
+                }
+                uint row = pc.inOff + uint(it) * uint(fin);
+                for (int kf = 0; kf < 3; kf++) {
+                    int iff = 2 * of + kf - 1;
+                    if (iff < 0 || iff >= fin) {
+                        continue;
+                    }
+                    sum += w[kt * 3 + kf] * act[row + uint(iff)];
+                }
+            }
+            act[pc.outOff + (uint(ot) * uint(fout) + uint(of)) * pc.dim + c] = live ? sum : 0.0;
+        }
+    }
+}

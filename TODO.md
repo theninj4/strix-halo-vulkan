@@ -41,7 +41,9 @@ trusting: the family is now **896 rows in ~9 minutes**, having grown three
 more GEMV builds and eight mixed-width dispatch plans since.)
 
 **`SPEECH.md`** is the current work: the parakeet (speech-to-text) and
-kokoro (text-to-speech) verticals. **`PIPELINE.md`** is the z-image-turbo
+kokoro (text-to-speech) verticals. **Parakeet is finished** (S1-S8): 43 ms for
+an 11 s clip, 257x real time, whole model resident. What is open is the front
+end, which is now half the pipeline, and then kokoro. **`PIPELINE.md`** is the z-image-turbo
 slice, **parked** at 14.26 s an image with its resume points stated at the
 top. Both are rewritten each session rather than appended to, and the
 current one is the file to read first.
@@ -813,6 +815,153 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-14 (sixteenth) — stage S8: the transducer tail on Vulkan
+
+**Result: the decode loop goes from 208 ms to 4.8 ms — 43x — and an 11 s clip
+goes from 255 ms to 43 ms, at 257x real time.** The whole speech-to-text
+vertical is on the device: `go run ./cmd/asr -gpu testdata/jfk.wav` prints the
+same words, at the same frames, with the same durations, in 43 ms against
+2.68 s on the CPU at S5. The full write-up is
+[`research/s8-parakeet-decode.md`](research/s8-parakeet-decode.md); `SPEECH.md`
+is rewritten around what is left, which is that **the front end is now 48% of
+the pipeline** and kokoro is next.
+
+**Built:**
+
+- **`shaders/parakeet_lstm_in.comp`** — one step's A operand, with the input
+  vector and the carried hidden state laid end to end, so a step is one
+  `[4H, 2H]` product against `[W_ih | W_hh]` rather than two `[4H, H]`
+  products summed.
+- **`shaders/parakeet_lstm_gate.comp`** — the cell, with PyTorch's gate order
+  and a tanh written out rather than called (the built-in may evaluate
+  `(e^2x - 1)/(e^2x + 1)`, which overflows).
+- **`shaders/parakeet_joint_sum.comp`** and **`shaders/parakeet_argmax.comp`**
+  — the two towers added and rectified into the head's A operand, and the two
+  independent argmaxes, with the prediction projector's and the head's biases
+  folded into them.
+- **`parakeet/gpudecode.go`** — a `GPUDecoder` over its own four buffers, in
+  the roles `dit_common.glsl` already names, so `dit_gemm.comp` and the two
+  reused epilogue shaders run unchanged over a completely separate arena.
+  `Attach` gives it one more pipeline whose activation binding is the
+  *encoder's* buffer, so the hidden states never cross the bus.
+- **`parakeet/gpudecode_test.go`** — the prediction network through two steps,
+  the joint at the lattice's first cell, the loop over the reference's own
+  encoder output, the whole vertical, the ladder and the per-dispatch timing.
+- **`GPUEncoder.RunMel`** — `ApplyMel` without the read-back, which is what the
+  resident path needs.
+
+**Three things worth carrying forward:**
+
+1. **The first latency-bound stage in the engine, and it needed no kernel.**
+   The four projections run at M = 1 on the existing GEMM rungs with M padded
+   to the tile, because a GEMM reads its B operand once whatever M is. The
+   ladder says it outright: **`BM = 32` ties `BM = 16` exactly, twice,
+   reproducibly** — double the arithmetic for the same time. A dedicated GEMV
+   would win back something nobody is paying for. (The wave64 rungs still lose
+   at 1.08-2.02x, which is §6.2 on a fourth set of shapes.)
+2. **24 MB of weights against a 32 MiB MALL.** The LSTM and joint GEMMs
+   measure 449 and 702 GB/s — *above* this part's DRAM bus and below §5.1b's
+   930-965 GB/s cache ceiling — because the loop re-reads the entire tail out
+   of the last-level cache 46 times. This is the first place in the engine
+   where §0.4's 32 MiB is a budget that was **met** rather than a cliff that
+   was fallen off, and it names its own scaling limit: a bigger prediction
+   network, or a second beam hypothesis, drops the whole loop to the DRAM law.
+3. **The read-back between two stages is worth a pipeline to avoid.** Moving
+   `[138, 1024]` from the encoder's arena to the decoder's through the host is
+   552 KB and **2.4 ms** — device-local host-visible memory reads at 0.2 GB/s
+   (stage 3c's finding, unchanged at three orders of magnitude less data), so
+   it would have been half again what the whole decode loop costs. One extra
+   descriptor set removes it. The binding layout is a contract about *roles*,
+   not about which buffers, which is what makes that a three-line change.
+
+**And the thing that looked like a bug and was not.** Both biases are folded
+into passes that already read the vector — the prediction projector's into
+`joint_sum`, the head's into `argmax` — so the arena holds `W·x` where the
+reference holds `W·x + b`. For the head that is a **4.8% relative** difference,
+because most of that bias is around -6.3: exactly the size of a real error, on
+a tensor whose argmax was already correct. The tests add the bias back with a
+comment.
+
+**Where the remaining time is.** 40 µs of the 105 µs per emission is the submit
+and the fence, not the work; `gemm pred.proj` moves a thirteenth of the joint's
+bytes and takes half its time because `[640, 640]` at BN = 64 is ten workgroups
+on a 40-CU part. Both are dispatch floors. Removing them means a persistent
+kernel or speculating on blank runs, and neither is worth doing while the
+**front end is 21 ms of the 43**.
+
+### Session 2026-09-14 (fifteenth) — stage S7: the subsampling stack on Vulkan
+
+**Result: the five convolutions and the linear in front of the encoder go
+from 92 ms on the host to 0.97 ms on the device — 95x, 2.9 TFLOP/s — so the
+whole encoder is 20 ms of wall clock for an 11 s clip against 2.68 s on the
+CPU, and the clip is 255 ms against 331.** 43.2x real time, from 33.2x. Same
+transcript, same 46 emissions, same frames and durations. The full write-up is
+[`research/s7-parakeet-subsampling.md`](research/s7-parakeet-subsampling.md);
+`SPEECH.md` is rewritten around what is left, which is **the TDT decode loop
+at 82% of the pipeline**.
+
+**Built:**
+
+- **`shaders/parakeet_sub_conv0.comp`** — the dense 1 → 256 convolution at
+  stride 2 over the single-channel mel. One lane per output channel, nine
+  weights hoisted from a `[9, C]` tap-major bank, and the nine mel samples read
+  as wave-uniform scalars shared by all 256 lanes. No fragment, no reduction.
+- **`shaders/parakeet_sub_dw.comp`** — the depthwise 3x3 at stride 2, with the
+  input ReLU, the bias and the masking fused, writing the next GEMM's fp16 A
+  operand directly.
+- **`shaders/parakeet_sub_bias.comp`** and
+  **`shaders/parakeet_sub_flatten_f16.comp`** — the epilogue `dit_gemm.comp`
+  has nowhere to put (bias, `scale_input`, masking) and the flatten into the
+  linear's A operand.
+- **`parakeet/gpusub.go`** — the geometry, the weight staging, the ten-dispatch
+  graph, `SubPlan`/`DefaultSubPlan`, and `GPUEncoder.UploadMel`/`ProfileMel`.
+  `ApplyMel` now runs the whole encoder as one 946-dispatch sequence;
+  `HostSubsampling` puts the convolutions back on the CPU, which is what the
+  measurement is against.
+- **`parakeet/gpusub_test.go`** — the stagewise walk against `sub_0`, `sub_2`,
+  `sub_3`, `sub_5`, `sub_6` and `subsampled`; the end-to-end trace; two
+  negative controls; the GEMM ladder; the dispatch profile.
+
+**Three things worth carrying forward:**
+
+1. **The port was a layout, not a kernel.** Three quarters of the stack's 2.8
+   GFLOP was already on the GEMM ladder and only PyTorch's `[C, T, F]` was
+   hiding it. Held channel-last as `[T, F, C]`: the depthwise convolution's 256
+   lanes walk 256 contiguous floats per tap, the 1x1 convolutions are
+   `[8832, 256] x [256, 256]` GEMMs with **no packing pass at all**, and the
+   flatten is a 5 µs row copy — once the linear's `[1024, 4096]` weight has its
+   columns permuted, which happens once at upload. §2.8's argument about the B
+   layout, in a different costume: a retiling that would cost an activation a
+   pass per clip costs a weight nothing per clip.
+2. **Stage 8's question with the opposite answer.**
+   `research/stage-8-vae-conv.md` decided a convolution's fragment by tiling
+   the channel axis, over 512 channels. Here the input has **one** channel, so
+   there is nothing to tile and all 256 output channels of a position want the
+   same nine scalars — and the kernel that wins builds no fragment. What
+   decided it was the channel count of the *input*, which is not a knob either
+   write-up would have thought to name.
+3. **wave32 on a third set of shapes, and the wide tile losing the shape it
+   was built for.** Every wave32 rung beats every wave64 rung on both of the
+   stack's GEMM shapes. `wg128x256` was the expected winner at 8832 rows and is
+   1.24x off there and 2.80x off on the linear: N = 256 is only four of its
+   tiles wide, so it reads 256 K-deep rows of B to serve 128 rows of A.
+   `DefaultSubPlan` is `reg32x32_bt16_w32` — the same tile `DefaultGEMMPlan`
+   is, for the third set of dimensions running.
+
+**And one that is S6's, for the third time.** The `subNoMask` control moves the
+encoder output by 3.1e-2 relative — 14x the intact run's drift — and leaves the
+transcript alone. Three of this model's six negative controls now do that. The
+transcript says the port is right; it is not sensitive enough to say a kernel
+is, and the per-stage tensors with the rms-of-the-difference measure are.
+
+**Left on the table, deliberately.** 80% of the remaining stack is the two
+kernels that are 0.21 GFLOP of its 2.82, and both are bandwidth: the dense
+convolution writes 36 MB (`[551, 64, 256]` fp32) at 75 GB/s and the first
+depthwise reads it back. Narrowing that intermediate to fp16 halves both *and*
+halves the largest arena in the encoder — which matters at 1024 frames, where
+it is 268 MB. It has not been done because the whole stack is 0.4% of the
+pipeline; it belongs with S9's chunking, which would bound the tensor instead.
 
 ### Session 2026-09-14 (fourteenth) — stage S6: the parakeet encoder on Vulkan
 

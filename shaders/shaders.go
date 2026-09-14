@@ -1529,6 +1529,68 @@ var ParakeetRelShiftSlice []byte
 //go:embed parakeet_pack_bias.spv
 var ParakeetPackBias []byte
 
+// SPEECH.md S7, the subsampling stack. Four kernels and three GEMMs replace
+// the 92 ms the host was spending on 2.8 GFLOP -- 30 GFLOP/s, on a part that
+// had just done 177 GFLOP in 13.8 ms.
+//
+// What the ladder did not have is a stride-2 conv2d over a *single-channel*
+// input and the depthwise form of it. What it did have, once the feature map
+// is held channel-last, is everything else: the two 1x1 convolutions are
+// [P, 256] x [256, 256] GEMMs over positions and the linear is the same
+// [T, 4096] x [4096, 1024] it always was. The layout is the whole design and
+// it is argued in parakeet_sub_conv0.comp.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_sub_conv0.spv parakeet_sub_conv0.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_sub_dw.spv parakeet_sub_dw.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_sub_bias.spv parakeet_sub_bias.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_sub_flatten_f16.spv parakeet_sub_flatten_f16.comp
+
+//go:embed parakeet_sub_conv0.spv
+var ParakeetSubConv0 []byte
+
+//go:embed parakeet_sub_dw.spv
+var ParakeetSubDW []byte
+
+//go:embed parakeet_sub_bias.spv
+var ParakeetSubBias []byte
+
+//go:embed parakeet_sub_flatten_f16.spv
+var ParakeetSubFlattenF16 []byte
+
+// SPEECH.md S8, the transducer tail: the encoder projector, the prediction
+// network, the joint and the TDT greedy loop.
+//
+// This is the first thing in the engine that is *latency* bound rather than
+// throughput bound. Greedy decoding is sequential by construction -- the
+// prediction network advances on the token it just emitted -- so the whole
+// tail runs at M = 1, once per emitted symbol, and what it costs is round
+// trips and weight streaming rather than arithmetic: 24 MFLOP per emission
+// against 18 MB of weights read to do it.
+//
+// So there is no new GEMM here. The four projections (both LSTM layers, the
+// prediction projector and the 8198-wide head) run on the same dit_gemm.comp
+// rungs everything else does, with M padded from 1 up to the narrowest tile
+// in the ladder -- which costs arithmetic the part has spare and no bandwidth
+// at all, since a GEMM reads its weight once whatever M is. What the four
+// kernels below add is the state machine around them.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_lstm_in.spv parakeet_lstm_in.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_lstm_gate.spv parakeet_lstm_gate.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_joint_sum.spv parakeet_joint_sum.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_argmax.spv parakeet_argmax.comp
+
+//go:embed parakeet_lstm_in.spv
+var ParakeetLSTMIn []byte
+
+//go:embed parakeet_lstm_gate.spv
+var ParakeetLSTMGate []byte
+
+//go:embed parakeet_joint_sum.spv
+var ParakeetJointSum []byte
+
+//go:embed parakeet_argmax.spv
+var ParakeetArgmax []byte
+
 // The score kernel with the position bias compiled in, at the two wave sizes.
 // Same ladder position as everywhere else -- QT=1, KTIL=4 -- since stage 3c's
 // table says the geometry is decided by the register file and the wave size

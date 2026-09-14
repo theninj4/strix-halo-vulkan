@@ -1,0 +1,90 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The depthwise half of a `dw_striding` pair: a 3x3 kernel at stride 2 with
+// symmetric zero padding, one filter per channel, over a [T, F, C] feature
+// map (SPEECH.md S7).
+//
+// There is no reduction over channels, so channel c of output position (t, f)
+// is a nine-tap dot product against channel c alone -- 9 multiply-adds where
+// the pointwise convolution that follows does 256. What it costs is the
+// access pattern, and the channel-last layout is what makes that free: a
+// workgroup's 256 lanes read 256 contiguous floats per tap, so each of the
+// nine taps is one fully covered 1 KB request. The same kernel in the
+// reference's [C, T, F] layout would have each lane a whole plane away from
+// its neighbour.
+//
+// Three things are fused into the one pass over the tensor, because each of
+// them would otherwise be a pass of its own over a tensor the pointwise
+// convolution is about to stream anyway:
+//
+//   the ReLU on the *input*. Both depthwise convolutions in the stack follow
+//     one (the ModuleList is conv, relu, dw, pw, relu, dw, pw, relu), and the
+//     reference dumps its tensors before the activation, so the ReLU belongs
+//     to the reader rather than to the writer.
+//   the bias, since the GEMM this feeds has nowhere to put one, and
+//   the masking: output rows at or past the valid length are written as zero,
+//     which is what stops the padding at the end of a clip from reaching the
+//     encoder.
+//
+// The output is the next GEMM's A operand: fp16, row stride pc.lda (§2.3),
+// row index t*F + f, i.e. the feature map read as [T*F, C] positions.
+//
+//   pc.inOff   fp32 [kStride, span, dim], the previous stage's output
+//   pc.outOff  fp16 A operand, row stride pc.lda
+//   pc.wOff    the filters as [9, dim] fp32, tap-major
+//   pc.aux0    the bias, [dim]
+//   pc.aux1    valid output time rows
+//   pc.tokens  output time rows, pc.heads output frequency bins
+//   pc.span    input frequency bins, pc.kStride input time rows
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#ifndef FPER
+#define FPER 8          // output frequency bins per workgroup
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    int ot = int(gl_WorkGroupID.x);
+    if (uint(ot) >= pc.tokens) {
+        return;
+    }
+    int of0 = int(gl_WorkGroupID.y) * FPER;
+    int fin = int(pc.span), tin = int(pc.kStride), fout = int(pc.heads);
+    bool live = uint(ot) < pc.aux1;
+
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float w[9];
+        for (int k = 0; k < 9; k++) {
+            w[k] = wbuf[pc.wOff + uint(k) * pc.dim + c];
+        }
+        float bias = wbuf[pc.aux0 + c];
+        for (int j = 0; j < FPER; j++) {
+            int of = of0 + j;
+            if (of >= fout) {
+                break;
+            }
+            float sum = bias;
+            for (int kt = 0; kt < 3; kt++) {
+                int it = 2 * ot + kt - 1;
+                if (it < 0 || it >= tin) {
+                    continue;
+                }
+                for (int kf = 0; kf < 3; kf++) {
+                    int iff = 2 * of + kf - 1;
+                    if (iff < 0 || iff >= fin) {
+                        continue;
+                    }
+                    float v = act[pc.inOff + (uint(it) * uint(fin) + uint(iff)) * pc.dim + c];
+                    sum += w[kt * 3 + kf] * max(v, 0.0);
+                }
+            }
+            uint p = uint(ot) * uint(fout) + uint(of);
+            hact[pc.outOff + p * pc.lda + c] = float16_t(live ? sum : 0.0);
+        }
+    }
+}

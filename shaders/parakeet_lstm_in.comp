@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// One LSTM step's A operand: the input vector and the carried hidden state
+// laid end to end as a single 2*H-wide fp16 row (SPEECH.md S8).
+//
+// PyTorch computes a step's gates as `W_ih x + b_ih + W_hh h + b_hh`, two
+// matrix-vector products into the same 4H accumulator. Concatenating the two
+// operands makes it **one** product against a `[4H, 2H]` weight that is
+// `[W_ih | W_hh]` stacked along the reduction axis -- half the dispatches,
+// half the intermediates, and a reduction twice as deep, which at M = 1 is
+// the direction that helps. The concatenation is done once at upload
+// (parakeet/gpudecode.go's lstmWeight) and this pass is what feeds it.
+//
+// Rows past the first are written as zeros. The GEMM has no bounds check and
+// covers whole tiles, so a tile's other 15 or 31 rows multiply *something*;
+// making that something zero costs one pass over 40 KB and means the arena
+// never carries a stale fp16 denormal into a dispatch that is on the critical
+// path of every emitted token.
+//
+//   pc.inOff   fp32 x, pc.dim wide -- the token embedding for layer 0, the
+//              layer below's hidden state for the rest
+//   pc.aux0    fp32 h, pc.dim wide, this layer's carried state
+//   pc.outOff  fp16 A operand, row stride pc.lda, 2*pc.dim wide
+//   pc.tokens  rows to write, i.e. the GEMM's tile height
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint dst = pc.outOff + r * pc.lda;
+    uint width = 2u * pc.dim;
+    for (uint i = gl_LocalInvocationID.x; i < width; i += 256u) {
+        float v = 0.0;
+        if (r == 0u) {
+            v = i < pc.dim ? act[pc.inOff + i] : act[pc.aux0 + i - pc.dim];
+        }
+        hact[dst + i] = float16_t(v);
+    }
+}

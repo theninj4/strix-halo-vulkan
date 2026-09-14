@@ -65,6 +65,12 @@ type pushConstants struct {
 	LDA, LDB            uint32
 }
 
+// pushConstantSize is the block's size, which every pipeline in this package
+// declares -- including the transducer tail's, over a completely separate set
+// of buffers. One size across every pipeline is what lets
+// vk.DispatchMultiTimed record a mixed sequence into one command buffer.
+var pushConstantSize = int(unsafe.Sizeof(pushConstants{}))
+
 func (p pushConstants) bytes() []byte {
 	out := make([]byte, unsafe.Sizeof(p))
 	*(*pushConstants)(unsafe.Pointer(&out[0])) = p
@@ -260,6 +266,15 @@ type controls struct {
 	// noBiasU drops the content bias from q's pack, which is half of what
 	// makes this attention Transformer-XL's rather than a plain one.
 	noBiasU bool
+	// subNoMask leaves the frames past the valid length in every stage of the
+	// subsampling stack, so the padding at the end of the clip walks forward
+	// through three stride-2 convolutions into the encoder's last frames.
+	subNoMask bool
+	// subFlatOrder stages the subsampling linear's weight without the column
+	// permutation the channel-last feature map needs, i.e. reads the flatten
+	// with the frequency axis slower instead of the channel axis. It is the
+	// stage's sharpest failure mode because its output is an ordinary tensor.
+	subFlatOrder bool
 }
 
 // layerWeights is where one layer's weights sit in the arenas.
@@ -280,13 +295,27 @@ type GPUEncoder struct {
 	dev *vk.Device
 	cfg EncoderConfig
 
-	// The subsampling stack stays on the host. It is 2.8 GFLOP of the
-	// encoder's 180 and it runs once per clip -- so it is a correctness
-	// problem rather than a performance one, and it is the one operator here
-	// the GEMM ladder has no kernel for: a stride-2 conv2d over a
-	// single-channel input, and the depthwise form of it (SPEECH.md, S6).
+	// The subsampling stack, which S7 moved onto the device
+	// (parakeet/gpusub.go). The host implementation is kept -- it is the CPU
+	// reference the stage is validated against, and HostSubsampling selects
+	// it, which is what makes the two comparable in one process.
 	sub        *Subsampling
 	scaleInput bool
+
+	// HostSubsampling runs the five convolutions and the linear on the CPU,
+	// as S6 did. It is the ladder's control and it is 7x the whole rest of
+	// the encoder, so it is off.
+	HostSubsampling bool
+	subChans        int
+	maxGeom         subGeom // the longest clip the arenas were sized for
+	geom            subGeom // the clip in the arenas
+	subPlan         SubPlan
+	subW            subWeights
+	subPending      bool
+	sMel, sV0       uint32
+	sV1, sV2        uint32
+	hS1, hS2, hFlat uint32
+	ldaSub, ldaFlat int
 
 	wbuf *vk.Buffer // fp32 weights
 	abuf *vk.Buffer // fp32 activations
@@ -413,6 +442,16 @@ func newGPUEncoder(dev *vk.Device, enc *Encoder, maxFrames int, plan GEMMPlan, c
 	if g.headDim != headDim {
 		return nil, fmt.Errorf("parakeet: head dim %d, but the kernels are built for %d", g.headDim, headDim)
 	}
+	// The subsampling stack's extents follow from the encoder frame count: a
+	// stride-2 convolution with kernel 3 and padding 1 takes n to ceil(n/2),
+	// so a clip of at most maxFrames encoder frames is at most 8*maxFrames
+	// mel frames and the three intermediate tensors are at most 4, 2 and 1
+	// times maxFrames deep.
+	g.subChans = cfg.SubsamplingChannels
+	g.maxGeom = subGeometry(8*maxFrames, cfg.NumMelBins, 8*maxFrames)
+	if err := g.checkSubsampling(enc.Subsampling); err != nil {
+		return nil, err
+	}
 	g.ldaDim = g.dim + gemmPad
 	g.ldaFFN = g.ffn + gemmPad
 	g.rowsPad = roundUp(maxFrames, arenaAlign)
@@ -437,6 +476,10 @@ func newGPUEncoder(dev *vk.Device, enc *Encoder, maxFrames int, plan GEMMPlan, c
 		return nil, err
 	}
 	g.AutoPlan = explicit == nil
+	if err := g.SetSubPlan(DefaultSubPlan()); err != nil {
+		g.Destroy()
+		return nil, err
+	}
 
 	if err := g.layoutWeights(len(enc.Layers)); err != nil {
 		g.Destroy()
@@ -483,15 +526,19 @@ func canWMMA(dev *vk.Device) (bool, error) {
 }
 
 // canPin reports whether a pipeline on this device may require a wave size.
-func (g *GPUEncoder) canPin(wave uint32) (bool, error) {
+func (g *GPUEncoder) canPin(wave uint32) (bool, error) { return canPinWave(g.dev, wave) }
+
+// canPinWave is canPin for a caller that holds only the device, which the
+// transducer tail does (parakeet/gpudecode.go).
+func canPinWave(dev *vk.Device, wave uint32) (bool, error) {
 	if wave == 0 {
 		return true, nil
 	}
-	feat := g.dev.Features()
+	feat := dev.Features()
 	if !feat.SubgroupSizeControl {
 		return false, nil
 	}
-	sgs, err := g.dev.Physical().SubgroupSizeControl()
+	sgs, err := dev.Physical().SubgroupSizeControl()
 	if err != nil {
 		return false, fmt.Errorf("parakeet: subgroup size control: %w", err)
 	}
@@ -609,13 +656,16 @@ func (g *GPUEncoder) layoutWeights(layers int) error {
 	if int(off16) != total16 || int(off32) != total32 {
 		return fmt.Errorf("parakeet: weight layout came to %d/%d, planned %d/%d", off16, off32, total16, total32)
 	}
+	// The subsampling stack is not per layer, so it claims what is left of
+	// both arenas after the 24 layers have been laid out.
+	off32, off16 = g.layoutSub(off32, off16)
 
 	var err error
-	if g.wbuf, err = g.dev.NewBuffer(total32 * 4); err != nil {
+	if g.wbuf, err = g.dev.NewBuffer(int(off32) * 4); err != nil {
 		return fmt.Errorf("parakeet: fp32 weight arena: %w", err)
 	}
-	if g.bank, err = g.dev.NewBuffer(total16 * 2); err != nil {
-		return fmt.Errorf("parakeet: fp16 weight bank (%d MB): %w", (total16*2)>>20, err)
+	if g.bank, err = g.dev.NewBuffer(int(off16) * 2); err != nil {
+		return fmt.Errorf("parakeet: fp16 weight bank (%d MB): %w", (int(off16)*2)>>20, err)
 	}
 	return nil
 }
@@ -646,7 +696,6 @@ func (g *GPUEncoder) allocActivations() error {
 	g.aRelK = take32(g.nPad * dim)
 	g.aBD = take32(g.heads * rows * g.nPad)
 	g.aBias = take32(g.heads * rows * rows)
-	g.actElems = int(off32)
 
 	var off16 uint32
 	take16 := func(n int) uint32 { o := off16; off16 += uint32(n); return o }
@@ -660,7 +709,11 @@ func (g *GPUEncoder) allocActivations() error {
 	// is rows*dim however the tiles are cut.
 	g.hQ, g.hK, g.hV = take16(rows*dim), take16(rows*dim), take16(rows*dim)
 	g.hCtx = take16(rows * g.ldaDim)
-	g.hElems = int(off16)
+
+	// The subsampling stack's five intermediates, claimed after the layers'
+	// so that a graph without them is byte for byte the graph S6 ran.
+	off32, off16 = g.allocSub(off32, off16)
+	g.actElems, g.hElems = int(off32), int(off16)
 
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
@@ -702,6 +755,10 @@ func (g *GPUEncoder) build() error {
 		{"relshift", shift},
 		{"pack", shaders.DiTPackF16},
 		{"packbias", shaders.ParakeetPackBias},
+		{"subconv0", shaders.ParakeetSubConv0},
+		{"subdw", shaders.ParakeetSubDW},
+		{"subbias", shaders.ParakeetSubBias},
+		{"subflatten", shaders.ParakeetSubFlattenF16},
 	} {
 		if err := g.pipeline(s.name, s.spirv, spec); err != nil {
 			return err
@@ -743,6 +800,14 @@ func (g *GPUEncoder) build() error {
 		// wave64 tile, which every device that reaches here can run.
 		if err := g.SetPlan(UniformGEMMPlan(GEMMReg32x64)); err != nil {
 			return err
+		}
+	}
+	for _, r := range subProjOrder {
+		if _, ok := g.kernels[g.subPlan[r]]; !ok {
+			if err := g.SetSubPlan(UniformSubPlan(GEMMReg32x64)); err != nil {
+				return err
+			}
+			break
 		}
 	}
 
@@ -829,7 +894,7 @@ func (g *GPUEncoder) stageWeights(enc *Encoder) error {
 			g.bank.WriteUint16At(int(w.bOff[r]), dst)
 		}
 	}
-	return nil
+	return g.stageSub(enc.Subsampling)
 }
 
 // layerProj is the matrix a projection names inside a layer.
@@ -940,26 +1005,93 @@ func (g *GPUEncoder) Apply(x *Mat, valid int) (*Mat, error) {
 	return g.Read(g.aX, g.dim), nil
 }
 
-// ApplyMel is Apply from the front end's output: it runs the subsampling
-// stack on the host, scales as Encoder.forward does, and then the layers on
-// the device. Its signature is Encoder.Apply's, so a caller switches between
-// the two by switching which one it calls.
+// ApplyMel is the whole encoder from the front end's output: the subsampling
+// stack and the 24 layers, in one dispatch sequence, with nothing crossing
+// the bus but the mel spectrogram in and the hidden states out. Its signature
+// is Encoder.Apply's, so a caller switches between the two by switching which
+// one it calls.
+//
+// HostSubsampling runs the convolutions on the CPU instead, which is what S6
+// did and what the stage is measured against.
 func (g *GPUEncoder) ApplyMel(mel *Mat, validMel int) (*Mat, int, error) {
-	x, valid, err := g.sub.Apply(mel, validMel)
-	if err != nil {
-		return nil, 0, err
-	}
-	if g.scaleInput {
-		s := float32(math.Sqrt(float64(g.dim)))
-		for i := range x.Data {
-			x.Data[i] *= s
+	if g.HostSubsampling {
+		x, valid, err := g.sub.Apply(mel, validMel)
+		if err != nil {
+			return nil, 0, err
 		}
+		if g.scaleInput {
+			s := float32(math.Sqrt(float64(g.dim)))
+			for i := range x.Data {
+				x.Data[i] *= s
+			}
+		}
+		h, err := g.Apply(x, valid)
+		if err != nil {
+			return nil, 0, err
+		}
+		return h, valid, nil
 	}
-	h, err := g.Apply(x, valid)
-	if err != nil {
+	if err := g.UploadMel(mel, validMel); err != nil {
 		return nil, 0, err
 	}
-	return h, valid, nil
+	if err := g.Run(); err != nil {
+		return nil, 0, err
+	}
+	return g.Read(g.aX, g.dim), g.valid, nil
+}
+
+// RunMel is ApplyMel without the read-back: it leaves the hidden states in the
+// residual stream and returns only how many frames are valid.
+//
+// It is what the resident pipeline uses (GPUDecoder.Attach). Reading [T, 1024]
+// back out of the arena is 2.4 ms at 552 KB -- device-local host-visible
+// memory reads at 0.2 GB/s on this part -- which is half again what the whole
+// decode loop costs, and nothing on the device needs it back.
+func (g *GPUEncoder) RunMel(mel *Mat, validMel int) (int, error) {
+	if err := g.UploadMel(mel, validMel); err != nil {
+		return 0, err
+	}
+	if err := g.Run(); err != nil {
+		return 0, err
+	}
+	return g.valid, nil
+}
+
+// UploadMel writes the clip's log-mel spectrogram into the arena and settles
+// the run's geometry from it -- the encoder frame count, which the caller no
+// longer computes, the plan, and the position embeddings.
+//
+// It leaves the subsampling stack pending rather than dispatching it, so that
+// Run and Profile see one graph: the stack's ten dispatches in front of the
+// 960 the layers are.
+func (g *GPUEncoder) UploadMel(mel *Mat, validMel int) error {
+	if mel.Cols != g.maxGeom.melBins {
+		return fmt.Errorf("parakeet: the mel spectrogram is %s, want [rows %d]", mel, g.maxGeom.melBins)
+	}
+	if mel.Rows <= 0 || mel.Rows > g.maxGeom.melRows {
+		return fmt.Errorf("parakeet: %d mel frames; the encoder was built for at most %d", mel.Rows, g.maxGeom.melRows)
+	}
+	if validMel < 0 || validMel > mel.Rows {
+		return fmt.Errorf("parakeet: %d valid frames of %d", validMel, mel.Rows)
+	}
+	geom := subGeometry(mel.Rows, mel.Cols, validMel)
+	if geom.t[2] > g.frames {
+		return fmt.Errorf("parakeet: %d mel frames are %d encoder frames; the encoder was built for at most %d",
+			mel.Rows, geom.t[2], g.frames)
+	}
+	g.geom = geom
+	g.rows, g.valid = geom.t[2], geom.v[2]
+	if g.AutoPlan {
+		auto := g.AutoPlan
+		if err := g.SetPlan(PlanFor(g.rows)); err != nil {
+			return err
+		}
+		g.AutoPlan = auto
+	}
+	g.setExtents()
+	g.abuf.WriteFloat32At(int(g.sMel), mel.Data)
+	g.subPending = true
+	return g.writePositions()
 }
 
 // Upload writes the run's input into the residual stream and computes the
@@ -976,6 +1108,7 @@ func (g *GPUEncoder) Upload(x *Mat, valid int) error {
 		return fmt.Errorf("parakeet: %d valid frames of %d", valid, x.Rows)
 	}
 	g.rows, g.valid = x.Rows, valid
+	g.subPending = false
 	if g.AutoPlan {
 		auto := g.AutoPlan
 		if err := g.SetPlan(PlanFor(x.Rows)); err != nil {
@@ -1026,6 +1159,13 @@ func (g *GPUEncoder) writePositions() error {
 // stack spent waiting for the host.
 func (g *GPUEncoder) Run() error {
 	var d []vk.MultiDispatch
+	if g.subPending {
+		sub, _, err := g.subGraph()
+		if err != nil {
+			return err
+		}
+		d = append(d, sub...)
+	}
 	for i := range g.w {
 		layer, _, err := g.layerGraph(i)
 		if err != nil {
@@ -1044,28 +1184,57 @@ type Stage struct {
 	GPU   time.Duration
 }
 
-// Profile runs the same graph one dispatch at a time and times each on the
-// GPU. Wall clock around Apply is not a measurement of the encoder: it also
-// carries the host write of x and the read-back of the result.
+// Profile runs the layer stack one dispatch at a time and times each on the
+// GPU, from the subsampled input. Wall clock around Apply is not a
+// measurement of the encoder: it also carries the host write of x and the
+// read-back of the result.
 func (g *GPUEncoder) Profile(x *Mat, valid int) ([]Stage, *Mat, error) {
 	if err := g.Upload(x, valid); err != nil {
 		return nil, nil, err
 	}
-	var stages []Stage
+	return g.profileLayers(nil)
+}
+
+// ProfileMel is Profile over the whole encoder, subsampling stack included.
+// The stack's dispatches are reported at layer -1, which is what distinguishes
+// them from the 24 layers' in a caller that totals by kind.
+func (g *GPUEncoder) ProfileMel(mel *Mat, validMel int) ([]Stage, *Mat, error) {
+	if err := g.UploadMel(mel, validMel); err != nil {
+		return nil, nil, err
+	}
+	d, kinds, err := g.subGraph()
+	if err != nil {
+		return nil, nil, err
+	}
+	stages, err := g.timeEach(nil, -1, d, kinds)
+	if err != nil {
+		return stages, nil, err
+	}
+	return g.profileLayers(stages)
+}
+
+func (g *GPUEncoder) profileLayers(stages []Stage) ([]Stage, *Mat, error) {
 	for l := range g.w {
 		d, kinds, err := g.layerGraph(l)
 		if err != nil {
 			return nil, nil, err
 		}
-		for i := range d {
-			dur, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true)
-			if err != nil {
-				return stages, nil, fmt.Errorf("parakeet: layer %d dispatch %d (%s): %w", l, i, kinds[i], err)
-			}
-			stages = append(stages, Stage{Index: len(stages), Layer: l, Kind: kinds[i], GPU: dur})
+		if stages, err = g.timeEach(stages, l, d, kinds); err != nil {
+			return stages, nil, err
 		}
 	}
 	return stages, g.Read(g.aX, g.dim), nil
+}
+
+func (g *GPUEncoder) timeEach(stages []Stage, layer int, d []vk.MultiDispatch, kinds []string) ([]Stage, error) {
+	for i := range d {
+		dur, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true)
+		if err != nil {
+			return stages, fmt.Errorf("parakeet: layer %d dispatch %d (%s): %w", layer, i, kinds[i], err)
+		}
+		stages = append(stages, Stage{Index: len(stages), Layer: layer, Kind: kinds[i], GPU: dur})
+	}
+	return stages, nil
 }
 
 // Labels lists one layer's dispatches in order, which is both what Profile

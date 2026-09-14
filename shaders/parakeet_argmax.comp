@@ -1,0 +1,81 @@
+#version 450
+// The TDT decision: two argmaxes over one logit vector, and the head's bias
+// added on the way past (SPEECH.md S8).
+//
+// The joint's head is [8198, 640] and its output is not one distribution but
+// two laid end to end: 8193 token logits with the blank at 8192, then five
+// duration logits for [0, 1, 2, 3, 4]. That layout *is* the token-and-duration
+// transducer -- emit a token, then advance the encoder cursor by the predicted
+// duration instead of by one frame -- and the two argmaxes are independent.
+//
+// Both indices go back to the host as floats, which is exact: the vocabulary
+// is 8193 and float32 is exact on every integer below 2^24. What the host
+// does with them is the one rule that joins the two -- a blank asking for a
+// zero-frame jump is forced to one, or the loop would not terminate -- and it
+// stays there because it is control flow and not arithmetic.
+//
+// The tie-break is the *lowest* index, at every level of the reduction, which
+// is what a serial `for i := 1; ...; if x[i] > x[best]` loop does. It matters:
+// a transducer emits a lot of blanks, and the logits at a silent frame are
+// close enough together that a different tie-break is a different transcript.
+//
+// The bias is folded in rather than run as a pass over 8198 floats first,
+// which on a loop that runs once per emission is a dispatch saved per token.
+//
+//   pc.inOff   fp32 logits, pc.dim token logits then pc.aux0 duration logits
+//   pc.wOff    fp32 bias over the same layout, or NO_W
+//   pc.outOff  fp32 [2]: the token index, then the duration index
+//   pc.dim     the vocabulary size, pc.aux0 the number of durations
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float sv[256];
+shared uint si[256];
+
+float logit(uint i) {
+    float v = act[pc.inOff + i];
+    if (pc.wOff != NO_W) {
+        v += wbuf[pc.wOff + i];
+    }
+    return v;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    float bv = -1.0 / 0.0;
+    uint bi = pc.dim;
+    for (uint i = lid; i < pc.dim; i += 256u) {
+        float v = logit(i);
+        if (v > bv || (v == bv && i < bi)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    sv[lid] = bv;
+    si[lid] = bi;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (lid < s) {
+            if (sv[lid + s] > sv[lid] || (sv[lid + s] == sv[lid] && si[lid + s] < si[lid])) {
+                sv[lid] = sv[lid + s];
+                si[lid] = si[lid + s];
+            }
+        }
+        barrier();
+    }
+    if (lid == 0u) {
+        act[pc.outOff] = float(si[0]);
+        float db = -1.0 / 0.0;
+        uint di = 0u;
+        for (uint k = 0u; k < pc.aux0; k++) {
+            float v = logit(pc.dim + k);
+            if (v > db) {
+                db = v;
+                di = k;
+            }
+        }
+        act[pc.outOff + 1u] = float(di);
+    }
+}

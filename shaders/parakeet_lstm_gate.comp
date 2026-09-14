@@ -1,0 +1,51 @@
+#version 450
+// The LSTM cell: four gates out of one 4H-wide product, and the carried state
+// updated in place (SPEECH.md S8).
+//
+// The gate order is PyTorch's, which is the order the weights are stacked in
+// and not a convention this code is free to choose: input, forget, cell,
+// output, down the rows of both weight matrices. Getting it wrong produces a
+// state that decays plausibly rather than an error.
+//
+// The two bias vectors are already one. PyTorch keeps `bias_ih` and `bias_hh`
+// apart even though only their sum can matter at inference -- a CuDNN
+// compatibility artefact -- so they are summed at load (parakeet/load.go) and
+// this pass reads a single vector.
+//
+// tanh is written out rather than called. The built-in is free to evaluate
+// (e^2x - 1)/(e^2x + 1), which overflows for a gate pre-activation of 90 or
+// so; folding the sign and using exp(-2|x|) is bounded everywhere and costs
+// the same exponential.
+//
+//   pc.inOff   fp32 gates [4*dim], row 0 of the GEMM's output
+//   pc.wOff    fp32 bias  [4*dim], bias_ih + bias_hh
+//   pc.outOff  fp32 h [dim], updated in place
+//   pc.aux0    fp32 c [dim], updated in place
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+float stable_tanh(float x) {
+    float e = exp(-2.0 * abs(x));
+    float t = (1.0 - e) / (1.0 + e);
+    return x < 0.0 ? -t : t;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint h = pc.dim;
+    if (i >= h) {
+        return;
+    }
+    float gi = act[pc.inOff + i] + wbuf[pc.wOff + i];
+    float gf = act[pc.inOff + h + i] + wbuf[pc.wOff + h + i];
+    float gc = act[pc.inOff + 2u * h + i] + wbuf[pc.wOff + 2u * h + i];
+    float go = act[pc.inOff + 3u * h + i] + wbuf[pc.wOff + 3u * h + i];
+
+    float c = sigmoid(gf) * act[pc.aux0 + i] + sigmoid(gi) * stable_tanh(gc);
+    act[pc.aux0 + i] = c;
+    act[pc.outOff + i] = sigmoid(go) * stable_tanh(c);
+}

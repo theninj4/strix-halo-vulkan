@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The join between the subsampling stack and the encoder: ReLU the last
+// pointwise convolution's output, flatten each time frame's 16 frequency bins
+// x 256 channels into one 4096-wide row, and narrow it into the fp16 arena as
+// the subsampling linear's A operand (SPEECH.md S7).
+//
+// The flatten is the point. PyTorch's module does `h.transpose(1, 2).reshape`
+// on a [C, T, F] tensor, which makes the feature index c*F + f -- channel
+// slower. This stack holds the tensor as [T, F, C], where the feature index
+// is f*C + c, so the same reshape here is a *contiguous copy*: one time
+// frame's 4096 numbers already sit next to each other, in the wrong order
+// only if the weight expects the other one.
+//
+// So the permutation is done once, on the weight, at upload
+// (parakeet/gpusub.go's subLinearWeight), and this pass moves nothing. A
+// transpose per clip would be a fifth pass over the tensor; a permutation of
+// a [1024, 4096] weight is free after the first run. Getting it backwards
+// produces a plausible tensor and a wrong transcript, which is what the
+// subFlatOrder negative control checks.
+//
+//   pc.inOff   fp32 [tokens, dim], dim = F*C
+//   pc.outOff  fp16 A operand, row stride pc.lda (§2.3)
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        hact[dst + c] = float16_t(max(act[src + c], 0.0));
+    }
+}

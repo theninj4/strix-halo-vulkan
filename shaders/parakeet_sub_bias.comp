@@ -1,0 +1,53 @@
+#version 450
+// The pointwise convolutions' epilogue: add the per-channel bias the GEMM has
+// nowhere to put, scale, and mask the positions past the clip's valid length
+// (SPEECH.md S7).
+//
+// Three of the subsampling stack's five GEMM-shaped operators carry a bias --
+// both 1x1 convolutions and the linear -- and dit_gemm.comp takes none, by
+// design: every projection in the conformer itself is bias-free, and giving
+// the shared kernel an epilogue for the three that are not would put a branch
+// in the inner loop of 960 dispatches to save three passes over small
+// tensors. So the bias is a pass, and it is the pass that also does the
+// masking, since it already writes every element.
+//
+// The scale is the encoder's `scale_input`: sqrt(hidden_size), which the
+// reference applies to the linear's output before the first layer sees it.
+// Folding it here saves a third pass over [T, 1024].
+//
+// Positions are rows of a [P, dim] view of the feature map, so masking by
+// time means masking every position at or past valid*F -- which is what the
+// caller passes, since this kernel does not know the frequency axis is there.
+//
+//   pc.inOff   fp32 [tokens, dim]
+//   pc.outOff  fp32 [tokens, dim]; may alias pc.inOff, since every lane
+//              writes the element it read
+//   pc.wOff    the bias, [dim], or NO_W
+//   pc.scale   a multiplier applied after the bias
+//   pc.aux1    live positions; the rest are written as zero
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    float s = uintBitsToFloat(pc.scale);
+    bool live = r < pc.aux1;
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.dim;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = 0.0;
+        if (live) {
+            v = act[src + c];
+            if (pc.wOff != NO_W) {
+                v += wbuf[pc.wOff + c];
+            }
+            v *= s;
+        }
+        act[dst + c] = v;
+    }
+}
