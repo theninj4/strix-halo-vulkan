@@ -1,5 +1,13 @@
 # PIPELINE — the z-image-turbo vertical slice
 
+> **PARKED 2026-09-14, and this file is the record of where.** The current
+> work is [`SPEECH.md`](SPEECH.md) — the parakeet and kokoro verticals — and
+> this slice resumes after them. Nothing below is stale: it is the state the
+> pipeline is in, and the three items under "Where the image budget stands"
+> are where to pick it up. The short version: an image is **14.26 s**, the DiT
+> is **94%** of it, and the only thing left worth more than a percent is the
+> **quarter of the WMMA ceiling the seven projections do not reach — 2.6 s**.
+
 > **This file is rewritten, not appended.** It states where the pipeline is
 > *now* and what happens next. History belongs in `TODO.md` (session
 > handoffs) and `research/` (closed findings); if a paragraph here is about

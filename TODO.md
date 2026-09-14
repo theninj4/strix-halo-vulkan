@@ -40,9 +40,11 @@ banks are ever live together. (The wall-clock figures this file has carried for
 trusting: the family is now **896 rows in ~9 minutes**, having grown three
 more GEMV builds and eight mixed-width dispatch plans since.)
 
-**`PIPELINE.md`** is the current work: the z-image-turbo vertical slice,
-its stage list and the model's real dimensions. It is rewritten each
-session rather than appended to, so it is the one file to read first.
+**`SPEECH.md`** is the current work: the parakeet (speech-to-text) and
+kokoro (text-to-speech) verticals. **`PIPELINE.md`** is the z-image-turbo
+slice, **parked** at 14.26 s an image with its resume points stated at the
+top. Both are rewritten each session rather than appended to, and the
+current one is the file to read first.
 
 Three documents carry the older analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
@@ -811,6 +813,61 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-14 (twelfth) — z-image parked, and the two speech verticals surveyed
+
+**No code.** The z-image slice is parked at **14.26 s an image** and the next
+work is the two audio models in `GOALS.md`. `SPEECH.md` is the plan and is now
+the file to read first; `PIPELINE.md` keeps the z-image state with its resume
+points at the top.
+
+**Why park here.** What is left in z-image is one deep problem — the last
+quarter of the WMMA ceiling on seven GEMMs, 2.6 s an image — and it will keep.
+Parakeet and Kokoro are 0.63 B and 0.08 B against 6.2 B, they reuse most of
+the engine, and each closes a whole capability rather than a percent.
+
+**What the survey found.** Both checkpoints are already on disk and were read
+rather than assumed (`SPEECH.md` has the inventories):
+
+1. **Parakeet ships as HF `transformers`, not NeMo.** `config.json` says
+   `ParakeetForTDT`, there is a `model.safetensors`, and the `.venv`'s
+   `transformers 5.17.0` has `ParakeetForTDT`/`ParakeetProcessor`. **The oracle
+   exists today with no conversion work** — the same position stage 5 was in
+   with Qwen3, and the `.nemo` and `.gguf` beside it are not needed.
+2. **`safetensors` cannot open it**, and for one reason: 24 of its 723 tensors
+   are BatchNorm `num_batches_tracked`, scalar **I64**, which inference never
+   reads. That is the first concrete task and the note states the decision to
+   make.
+3. **Its joint head is 8198 wide, not 8193** — 8193 token logits (blank at
+   8192) followed by **5 duration logits**, which `generation_config.json`
+   confirms by suppressing 8193-8197 from the token argmax. That is the whole
+   of TDT in one tensor shape.
+4. **Its tokenizer is Metaspace BPE, not byte-level**, so `zimage/tokenizer`
+   does not transfer — but ASR only ever *decodes*, which is a vocab lookup
+   and a `▁ -> space` rule. Encoding is not needed at all.
+5. **Kokoro is a pickle**, five submodules, and two thirds of its 82 M
+   parameters are the iSTFTNet vocoder. Its ALBERT is 25 tensors for 12 layers
+   because the layers share weights. Its voices are `[510, 1, 256]`, one style
+   vector per phoneme-sequence length.
+6. **G2P is kokoro's real dependency and it is not a kernel.** The
+   recommendation in the note is to make the first vertical take **phonemes,
+   not text**, so the whole network is validatable on day one and G2P becomes
+   a separable stage that can start as an `espeak-ng` shell-out.
+
+**The recommendation: parakeet first**, though it is 8x larger. Its oracle
+needs no conversion, its encoder is 90% shapes the GEMM ladder already wins at
+the head dimension the attention kernel is compiled for, it has exactly one
+open kernel question (Conformer relative-position attention, which
+`dit_attention_wmma.comp` does not compute), and **its correctness bound is an
+exact string** — the cheapest oracle this project has had.
+
+**The interesting engineering question**, flagged in the note rather than
+answered: every kernel here was tuned at M=4096 with 12.5 GB resident, and
+neither of these models is a residency problem — parakeet is 1.25 GB at fp16
+and a 30 s clip is **375 encoder frames**. That puts it near stage 5c's 235
+flop/byte crossover, where the text encoder found that **the winning tile
+moves with the sequence length**. These two will test that finding rather than
+inherit it.
 
 ### Session 2026-09-14 (eleventh) — stage 10: the two layout passes become epilogues
 
