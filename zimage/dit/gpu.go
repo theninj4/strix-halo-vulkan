@@ -60,6 +60,13 @@ type wmmaVariant struct {
 	qt    int    // query tiles per wave (16 rows each)
 	ktil  int    // key tiles per block
 	wave  uint32 // pinned subgroup size; 0 takes the driver's default (64 here)
+	// of16 is the same build with -DOUT_F16=1: the context written straight
+	// into the fp16 arena as the output projection's A operand instead of
+	// fp32 into the activation arena (stage 10). Nil on every variant that
+	// has no such build, and then GPUStack.FuseLayout keeps the narrowing
+	// pass. It is not a ladder rung -- same tiling, same speed on everything
+	// but the epilogue -- so it hangs off the variant rather than being one.
+	of16 []byte
 }
 
 // rows is how many query rows one workgroup covers.
@@ -94,7 +101,8 @@ var wmmaVariants = []wmmaVariant{
 	{name: "wmma_qt2_kt2", spirv: shaders.DiTAttentionWMMAQT2KT2, qt: 2, ktil: 2},
 	{name: "wmma_qt2_kt8", spirv: shaders.DiTAttentionWMMAQT2KT8, qt: 2, ktil: 8},
 	{name: "wmma_qt1_kt8", spirv: shaders.DiTAttentionWMMAQT1KT8, qt: 1, ktil: 8},
-	{name: "wmma_qt1_kt4_w32", spirv: shaders.DiTAttentionWMMAQT1KT4W32, qt: 1, ktil: 4, wave: 32},
+	{name: "wmma_qt1_kt4_w32", spirv: shaders.DiTAttentionWMMAQT1KT4W32, qt: 1, ktil: 4, wave: 32,
+		of16: shaders.DiTAttentionWMMAQT1KT4W32OutF16},
 	{name: "wmma_qt2_kt4_w32", spirv: shaders.DiTAttentionWMMAQT2KT4W32, qt: 2, ktil: 4, wave: 32},
 	{name: "wmma_qt1_kt2_w32", spirv: shaders.DiTAttentionWMMAQT1KT2W32, qt: 1, ktil: 2, wave: 32},
 	{name: "wmma_qt1_kt8_w32", spirv: shaders.DiTAttentionWMMAQT1KT8W32, qt: 1, ktil: 8, wave: 32},

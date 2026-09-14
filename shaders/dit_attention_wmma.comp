@@ -94,7 +94,13 @@
 // dit_pack_f16.comp says why that is the difference between 1.56x and an order
 // of magnitude. The same buffer may not be aliased at two element types in one
 // shader, so this is its own binding.
+// Written as well as read when OUT_F16 puts the context in it; `readonly`
+// otherwise, so every existing build's SPIR-V is unchanged.
+#if OUT_F16
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+#else
 layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
+#endif
 
 #ifndef QT
 #define QT 2        // query tiles per wave; sets arithmetic intensity, 16*QT
@@ -129,6 +135,30 @@ layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
 #endif
 #ifndef GQA
 #define GQA 0
+#endif
+// OUT_F16 writes the context straight into the fp16 arena as the output
+// projection's A operand -- pc.outOff, row stride pc.lda -- instead of fp32
+// into the activation arena (PIPELINE.md stage 10). It removes the narrowing
+// pass that used to read the whole [tokens, dim] context back and write it
+// again, which at 4096 tokens is a 63 MB read and a 31 MB write per block per
+// step and is the only thing that pass did.
+//
+// It changes no arithmetic, and it removes a rounding. The divide by the
+// softmax denominator already happened in fp32 registers; the old path then
+// rounded that to fp32 in memory and a second dispatch rounded *that* to
+// fp16, so where the fp32 result landed exactly between two halves,
+// round-to-even broke a tie the fp32 rounding had manufactured. This path
+// hands the store the unrounded product. 84 halves in 1.2 M come out
+// differently and every one of them is such a tie, which is what
+// zimage/dit's TestGPUBlockFusedLayout asserts.
+//
+// And it is *simpler* than the fp32 path, not more complex, because the
+// per-row reciprocal is the same row-constant-matrix trick the online rescale
+// already uses: `O * Cinv` is a component-wise multiply between two
+// accumulators, so the output tiles go to memory as tiles and the fp32 path's
+// staging loop -- 16 bytes per lane through LDS -- disappears with them.
+#ifndef OUT_F16
+#define OUT_F16 0
 #endif
 
 #define TILE 16
@@ -381,6 +411,32 @@ void main() {
     }
     barrier();
 
+#if OUT_F16
+    // 1/rowSum as a matrix whose every row is constant, exactly as bcorr is
+    // built for the online rescale -- and in the same scratch, which the key
+    // loop has finished with.
+    for (uint i = lane; i < BM; i += WAVE) {
+        uint qi = i / TILE, r = i % TILE;
+        float inv = 1.0 / rowSum[i];
+        for (uint c = 0u; c < TILE; ++c) {
+            bcorr[qi * (TILE * TILE) + r * TILE + c] = inv;
+        }
+    }
+    barrier();
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        ACC cinv;
+        coopMatLoad(cinv, bcorr, qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
+        // The rows past the sequence are written too rather than branched
+        // around: they are the A operand's pad rows, whose products the
+        // output projection computes and nothing reads, and skipping them
+        // would cost the store its tile.
+        [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+            coopMatStore(ACCH(o[qq][j] * cinv), hact,
+                pc.outOff + (q0 + qq * TILE) * pc.lda + head * HEAD_DIM + j * TILE,
+                pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#else
     [[unroll]] for (uint j = 0u; j < HDT; ++j) {
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
             coopMatStore(o[qq][j], stage, qq * (TILE * TILE), TILE,
@@ -407,4 +463,5 @@ void main() {
         }
         barrier();
     }
+#endif
 }

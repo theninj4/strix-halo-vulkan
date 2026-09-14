@@ -113,6 +113,33 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 #ifndef C_F16
 #define C_F16 0
 #endif
+// Fragment-tile C (PIPELINE.md stage 10). The one consumer in the block that
+// does not read a GEMM's output as a matrix at all is attention: `v` goes
+// straight from the projection into dit_pack_f16.comp's mode 1 -- fp16, per
+// head, each 16x16 tile transposed -- and nothing ever looks at the fp32 C in
+// between. That pack is a full round trip of the tensor (a 4096x3840 read and
+// write per block per step) to move bytes the accumulators already hold in
+// the right registers.
+//
+// So C_PACK stores them there directly. The accumulator tile the wave holds
+// *is* one of the pack's output tiles, because both are 16x16 and both are
+// cut on the same boundaries: a 16-column slice of C lies inside one head as
+// long as headDim is a multiple of 16, which it is (128). Writing it
+// transposed is then not a transpose at all but a store layout -- column
+// major with stride 16 puts element (token, component) at d*16 + m, which is
+// exactly what mode 1 writes -- so this costs nothing beyond the fp16 narrow
+// the pack was doing anyway.
+//
+// The destination geometry is the pack's, not the GEMM's: head planes of
+// pc.aux1 padded tokens, tiles ordered component-fastest within a token tile.
+// pc.gemmN is unused here; the store addresses tiles.
+//
+// Range: v is a projection output like any other and is narrowed to fp16 by
+// the pack either way, so this changes nothing about what fits -- unlike
+// C_F16, which moved a tensor that used to stay fp32.
+#ifndef C_PACK
+#define C_PACK 0
+#endif
 
 #define TILE 16
 #define BM (WAVES_M * WM * TILE)
@@ -218,6 +245,19 @@ void main() {
 
     [[unroll]] for (uint i = 0u; i < WM; i++) {
         [[unroll]] for (uint j = 0u; j < WN; j++) {
+#if C_PACK
+            // Tile (token tile, component tile) of one head, as
+            // dit_pack_f16.comp mode 1 lays it out.
+            uint m0 = wm0 + i * TILE, n0 = wn0 + j * TILE;
+            uint head = n0 / pc.headDim;
+            uint ct = (n0 - head * pc.headDim) / TILE;
+            uint hdt = pc.headDim / TILE;
+            uint at = pc.outOff +
+                (head * (pc.aux1 / TILE) + m0 / TILE) * (hdt * TILE * TILE) + ct * (TILE * TILE);
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> t =
+                coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(acc[i][j]);
+            coopMatStore(t, hact, at, TILE, gl_CooperativeMatrixLayoutColumnMajor);
+#else
             uint at = pc.outOff + (wm0 + i * TILE) * pc.gemmN + wn0 + j * TILE;
 #if C_F16
             coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> h =
@@ -225,6 +265,7 @@ void main() {
             coopMatStore(h, hact, at, pc.gemmN, gl_CooperativeMatrixLayoutRowMajor);
 #else
             coopMatStore(acc[i][j], act, at, pc.gemmN, gl_CooperativeMatrixLayoutRowMajor);
+#endif
 #endif
         }
     }

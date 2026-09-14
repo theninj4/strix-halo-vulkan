@@ -54,6 +54,8 @@ func main() {
 	caption := flag.Int("caption", 128, "caption tokens")
 	reps := flag.Int("reps", 3, "timed repetitions; the best is reported")
 	verbose := flag.Bool("v", false, "print every dispatch of the first block of each phase")
+	unfusedLayout := flag.Bool("unfused-layout", false,
+		"keep `pack v` and `narrow ctx` as their own dispatches, which is stage 9's graph")
 	flag.Parse()
 
 	cfg, err := dit.LoadConfig(*dir)
@@ -99,6 +101,7 @@ func main() {
 	g, err := dit.NewGPUStack(dev, set, cfg, rope, unified, nil)
 	must(err)
 	defer g.Destroy()
+	g.FuseLayout = !*unfusedLayout
 	load := time.Since(start)
 
 	banks, byBlock := g.Banks()

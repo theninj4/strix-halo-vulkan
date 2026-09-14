@@ -42,6 +42,7 @@ func main() {
 	height := flag.Int("height", 0, "image height; 0 is square")
 	steps := flag.Int("steps", 8, "denoising steps; Z-Image-Turbo's NFE is 8")
 	cpuHead := flag.Bool("cpuhead", false, "run the patch embedder and the final layer on the host, which is stage 9's slow path")
+	unfusedLayout := flag.Bool("unfused-layout", false, "keep the block's two pure-layout dispatches, which is stage 10's slow path")
 	seed := flag.Int64("seed", 1, "seed for the initial latent")
 	maxPrompt := flag.Int("maxprompt", 512, "longest prompt the text encoder is built for")
 	latentFile := flag.String("latents", "", "read the initial latent from this file instead of the RNG")
@@ -80,7 +81,8 @@ func main() {
 	t0 := time.Now()
 	p, err := pipeline.New(dev, pipeline.Options{
 		Model: *model, Width: *width, Height: *height, Steps: *steps, MaxPrompt: *maxPrompt,
-		CPUHead: *cpuHead,
+		CPUHead:       *cpuHead,
+		UnfusedLayout: *unfusedLayout,
 	})
 	must(err)
 	defer p.Destroy()

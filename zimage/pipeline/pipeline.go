@@ -29,6 +29,11 @@ type Options struct {
 	// because the measurement that justifies stage 9 is the difference
 	// between the two on the same image.
 	CPUHead bool
+	// UnfusedLayout keeps the two pure-layout dispatches stage 10 removed --
+	// `pack v` and `narrow ctx` -- as their own passes. Same reason as
+	// CPUHead: the slow path is what the fast one is measured against, and
+	// the measurement is the difference between the two on the same image.
+	UnfusedLayout bool
 }
 
 // Defaults fills in what was left zero.
@@ -227,6 +232,7 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	// of weights and four pipelines -- and it needs the stack to exist first,
 	// because the residual stream it writes and reads is the stack's arena.
 	p.ctl.cpuHead = opt.CPUHead
+	p.stack.FuseLayout = !opt.UnfusedLayout
 	if p.gpuHead, err = dit.NewGPUHead(p.stack, p.head); err != nil {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: transformer head: %w", err)

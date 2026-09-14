@@ -7,24 +7,25 @@
 > few more with each stage that closes, and loses them when a stage's detail
 > moves to `research/`.
 
-**Status**: **the target is met and everything outside the DiT is done.**
-`go run ./cmd/zimage -prompt "..."` writes a 1024x1024 PNG in **14.5 s** —
+**Status**: **the target is met, and the block has no layout work left in it.**
+`go run ./cmd/zimage -prompt "..."` writes a 1024x1024 PNG in **14.3 s** —
 tokenizer, text encoder, 34 DiT blocks over eight denoising steps, VAE, PNG —
-and reproduces diffusers' fp32 CPU pipeline to **1.6e-2** of the decoded image.
-Two runs agree to 14.49 s and 14.54 s. Every weight is resident: 7.17 GB of
+and reproduces diffusers' fp32 CPU pipeline to **2.2e-2** of the decoded image.
+Two runs agree to 14.18 s and 14.34 s. Every weight is resident: 7.17 GB of
 text encoder, 12.54 GB of transformer, 0.30 GB of VAE and 4.90 GB of
 activations, 21.9 s to load, and then images cost only their own time.
 
-Stage 8 put conv3x3 — 85% of the VAE decode at 3.0-3.2 TFLOP/s — onto the
-matrix cores as an implicit GEMM: **3.02 s to 244 ms at 41-42 TFLOP/s**, the
-decode from 3.62 s to **805 ms in an image**, and the largest dispatch in the
-pipeline from 404 ms to 30 ms. Stage 9 then took the last host arithmetic out
-of the denoising loop, the patch embedder and the final layer: **59 ms of CPU
-a step to 5-10**.
+Stage 9 took the last host arithmetic out of the denoising loop, the patch
+embedder and the final layer: **59 ms of CPU a step to 5-10**. Stage 10 then
+removed the two dispatches in the block that moved no information — `pack v`
+and `narrow ctx`, each of them a tensor read back and written out in the shape
+the next kernel wanted — by making them the *store instruction* of the kernel
+above: **18 dispatches a block to 16**, 53.17 ms to **51.80**, an image 14.49 s
+to **14.26**.
 
-So the whole of what is left is the DiT. It is **94% of an image**, 72% GEMM,
-already at 73-76% of the WMMA ceiling, and nothing outside it is worth a
-percent.
+So the whole of what is left is the DiT's arithmetic. The DiT is **94% of an
+image**, and inside a block it is 74% GEMM at 73-76% of the WMMA ceiling, 14%
+attention and 12% elementwise. Nothing outside it is worth a percent.
 
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 
@@ -83,6 +84,7 @@ whole pipeline is resident in 128 GB unified memory at once.
 | 7 | VAE mid block on WMMA | **done** | attention **94x**, projections **449x**; decode 5.65 s → **3.62 s**, image → **17.8 s**; §7 |
 | 8 | conv2d on WMMA | **done** | implicit GEMM, **12.4x**; decode 3.62 s → **876 ms**, image → **15.0 s**; §8 |
 | 9 | Head and tail on the device | **done** | host per step **59 ms → 5-10 ms**, image → **14.5 s**; §9 |
+| 10 | The layout passes as epilogues | **done** | 18 dispatches → **16**, image → **14.26 s**; §10 |
 
 Each stage gets a CPU implementation in Go first: it separates "do I understand
 the architecture" from "is the shader right", and once it matches diffusers it
@@ -180,24 +182,26 @@ measurement harness is still there — `cmd/ditstack`, `cmd/vaebench`,
 `cmd/textenc -gpu` — and each stage's research note has the sweep behind it.
 
 **The DiT** (`go run ./cmd/ditstack -image 4096 -caption 128`, GPU timestamps,
-best of three, runs agreeing to 0.997-1.008):
+best of three, two runs agreeing to 51.78 and 51.82 ms a layer block):
 
 | phase | blocks | tokens | per block | total |
 |---|---|---|---|---|
-| `noise_refiner` | 2 | 4096 | 49.27 ms | 98.6 ms |
-| `context_refiner` | 2 | 128 | 2.60 ms | 5.2 ms |
-| `layers` | 30 | 4224 | 49.81 ms | 1.49 s |
-| **one step** | 34 | | | **1.60 s** |
+| `noise_refiner` | 2 | 4096 | 49.4 ms | 98.8 ms |
+| `context_refiner` | 2 | 128 | 2.57 ms | 5.1 ms |
+| `layers` | 30 | 4224 | **51.80 ms** | 1.55 s |
+| **one step** | 34 | | | **1.66 s** |
 
-A block is 72% GEMM, 14% attention, 14% elementwise, and one kernel
+A block is 16 dispatches: **74% GEMM** (37.97 ms), 14% attention (7.19 ms) and
+12% elementwise (5.93 ms across eight passes). One kernel
 (`wg128x256_bt16_swz8`) wins all three of its shapes at **40.6-42.0 TFLOP/s**,
-73-76% of the ceiling. Per block by length: 5.2 ms at 320 tokens, 11.7 ms at
-1024, 49.3 ms at 4096. Residency is 12.54 GB in three fp16 banks of 4.25, 4.25
+73-76% of the ceiling. Residency is 12.54 GB in three fp16 banks of 4.25, 4.25
 and 3.54 GB holding 12, 12 and 10 blocks, plus a 0.51 GB fp32 arena and 1.29 GB
 of activations, against an 83.79 GiB device-local host-visible heap.
 
-In the pipeline a step is **1.76 s**, not 1.60: 58 ms of CPU head and tail and
-~100 ms of the residual stream crossing the bus. Both go away together.
+The layers phase measures 1.56 s of wall clock against 1.55 s of dispatches,
+and in the pipeline a step is 1.67-1.70 s against the same 1.66 — 10 ms of
+host and 9 of bus, and the ~50 ms remainder is the one thing in this budget
+still unaccounted for (stage 9 ruled out submit batching for it).
 
 **The VAE** (`go run ./cmd/vaebench`), every convolution and the mid block on
 the matrix cores, wall clock including a read-back:
@@ -213,41 +217,35 @@ The wall column includes a read-back that the *pipeline* does not pay — 12.58
 MB at the 0.18 GB/s a 3.5 GB program gets, 71 ms — which is why a decode costs
 805 ms inside an image and 876 on its own (stage 9).
 
-The profile has changed shape rather than order. There is **no arithmetic left
-in this decoder**: conv3x3 is 244 ms at 41-42 TFLOP/s (30%), and the next four
-items are all bandwidth-bound elementwise passes — group norm 244 ms (30%),
-the conv pack 160 ms (20%), SiLU 61 ms and the adds 40 ms, **63% together** —
-running back to back over the same tensors:
-
-    groupnorm -> silu -> pack -> conv -> groupnorm -> silu -> pack -> conv
-
-So what this decoder wants next is not a kernel but **fusion**: a SiLU whose
-only consumer is a convolution could write the blocked fp16 form *instead of*
-its fp32 output, removing a gigabyte of write and a gigabyte of read. That is
-~200 ms of 805, and 1.3% of an image.
+There is **no arithmetic left in this decoder**: conv3x3 is 244 ms at 41-42
+TFLOP/s (30%) and the next four items are bandwidth-bound elementwise passes
+running back to back over the same tensors — group norm 244 ms, the conv pack
+160, SiLU 61, the adds 40, **63% together**. So what it wants next is not a
+kernel but **fusion**, the same shape of change as stage 10: a SiLU whose only
+consumer is a convolution could write the blocked fp16 form *instead of* its
+fp32 output. ~200 ms of 805, and 1.4% of an image.
 
 **The text encoder** (`go run ./cmd/textenc -gpu`), 35 layers, 7.07 GB of fp16
-weights in two banks: **57.1 ms** at 24 tokens, 71.4 at 128, 170 at 512, where
-the CPU is 2.08 s and 9.17 s. One run walks the roofline — the weights are
-read once whatever T is, so GB/s of weight falling (124, 99, 42) *is* GFLOP/s
-rising (3.0, 12.7, 21.2 T). It is 0.4% of an image; the detail is in
+weights in two banks: **57.1 ms** at 24 tokens, 71.4 at 128, 170 at 512,
+against 2.08 s and 9.17 s on the CPU. One run walks the roofline — the weights
+are read once whatever T is, so GB/s of weight falling (124, 99, 42) *is*
+GFLOP/s rising (3.0, 12.7, 21.2 T). 0.4% of an image; detail in
 [`research/stage-5-text-encoder.md`](research/stage-5-text-encoder.md).
 
 ## Where the image budget stands
 
-`go run ./cmd/zimage -width 1024`, wall clock, two runs agreeing to 14.49 s
-and 14.54 s.
+`go run ./cmd/zimage -width 1024`, wall clock, two runs agreeing to 14.18 s
+and 14.34 s.
 
 | | per image, 1024², 8 steps | share |
 |---|---|---|
-| denoising | **13.63 s** | 94.0% |
-| — of which the 34 blocks | 13.5 s | 93.3% |
-| — of which the host | 0.06 s | 0.4% |
-| — of which the bus | 0.07 s | 0.5% |
-| VAE decode | **0.80 s** | 5.5% |
-| text encoder, 17 tokens | 0.06 s | 0.4% |
-| caption refiners, once per image | 0.007 s | 0.05% |
-| **total** | **14.51 s** | |
+| denoising | **13.37 s** | 93.8% |
+| — of which the 34 blocks | 13.3 s | 93.1% |
+| — of which the host | 0.08 s | 0.6% |
+| VAE decode | **0.81 s** | 5.7% |
+| text encoder, 19 tokens | 0.06 s | 0.4% |
+| caption refiners, once per image | 0.006 s | 0.04% |
+| **total** | **14.26 s** | |
 
 Loading is 21.9 s and happens once: 7.17 GB of text encoder, 12.54 GB of
 transformer, 0.30 GB of VAE weights, 4.90 GB of activation arenas.
@@ -258,24 +256,49 @@ together, and no item in it is worth more than 1.3%. There is no boundary work
 left: the host does a patchify and an unpatchify on a megabyte, and the bus
 carries 1 MB each way per step.
 
-So the next item has to come out of the block itself, and the two candidates
-are both inside it:
+And inside the block there is no *layout* left either — stage 10 took the last
+of it. Everything remaining is arithmetic or the traffic arithmetic needs:
 
-- **~1.0 s an image of pure layout** — `pack v` and `narrow ctx`, which are
-  there only to put an operand in the shape the next kernel wants. A GEMM and
-  the attention kernel could each absorb one in an epilogue. This is the
-  largest single item left, at 7%.
-- **attention at 38 TFLOP/s**, now *behind* the GEMMs it used to lead
-  (40.6-42.0). Worth ~2% if it caught up.
+- **The seven projections, 9.9 s an image (69%), at 73-76% of the WMMA
+  ceiling.** The quarter they do not reach is 2.6 s, which is an order of
+  magnitude more than everything else in this list together. It is also the
+  hardest: stage 4 already applied the fragment-tiled weight (§2.8), the
+  banded grid (§2.4) and the hoisted K-slab (§2.7), and the ablation behind
+  `results/gemm_wmma.csv` is 1.25x behind what the pipeline already does.
+- **Attention at 38 TFLOP/s**, 1.9 s an image, against the GEMMs' 40.6-42.0.
+  Worth ~0.2 s if it caught up. Stage 10 halved its store and removed its LDS
+  staging and neither moved it, which agrees with stage 3c that the register
+  file is what binds it.
+- **The eight elementwise passes, 5.93 ms a block and 1.6 s an image.** Each
+  reads the residual stream and writes it; `swiglu` (1.45 ms) and the two
+  gated residuals (0.89, 0.85) are half. Unlike stage 10's two they compute
+  something, so what they want is fusion into a neighbour — and the neighbour
+  is usually a GEMM, which is where §2.6 and stage 10 both ended.
 
-Below those: the VAE's elementwise fusions are ~200 ms (1.3%) and the text
+Below those: the VAE's elementwise fusions are ~200 ms (1.4%) and the text
 encoder's remaining 1.9x is worth less than a percent.
+
+**One correction worth carrying**, because it sat at the top of this list for
+four sessions: the layout item was priced here at "~1.0 s an image" and was
+**~0.29 s**. The measurement it came from (stage 4) said 1.0 **ms a block**
+and the unit was lost in transcription. A number quoted between documents
+should carry the dimension it was measured in.
 
 ## What each stage found
 
 One file per stage in `research/`, indexed in `research/README.md`. The ones
 that are load-bearing for what is left:
 
+- **[Stage 10, the layout epilogues](research/stage-10-layout-epilogues.md)**
+  — the two dispatches in the block that moved no information, absorbed into
+  the store of the kernel above: **18 a block to 16**, an image 14.49 s to
+  14.26. Possible at all because in both cases the data was already in the
+  right registers in the right 16x16 shape, so a transposed fragment tile is
+  a *column-major `coopMatStore` of stride 16* and not a transpose. Two other
+  things fell out: the item had been mispriced 3.4x by a units slip
+  (`1.0 ms a block` quoted as `1.0 s an image`), and the old path was doing a
+  **double rounding** — which is why 84 halves in 1.2 M of the context differ
+  and why every one of them is an exact fp16 tie.
 - **[Stage 2, the VAE](research/stage-2-vae-decoder.md)** — two hard device
   limits that still bind: 4.29 GB per storage buffer, and a reset watchdog
   that kills a multi-second command buffer. Its absmax survey (497 through the
@@ -290,31 +313,25 @@ that are load-bearing for what is left:
   swizzle is worth 1.84x on a tiled weight and 1.16x on a row-major one, the
   hoisted K-slab becomes a *loss* on a tiled weight, and once all of it is
   applied the three shapes that disagreed on a kernel stop disagreeing.
-- **[Stage 5, the text encoder](research/stage-5-text-encoder.md)** — the
-  pipeline runs **35 of 36 layers** and un-normalised output; right padding to
-  512 is measurably a no-op; **2.08 s to 57 ms**. The encoder sits on the
-  **memory-bound** half of the roofline, so unlike the DiT its winning kernel
-  *moves with the prompt length* and re-planning per run is free. Three
-  conventions invert between it and the DiT — NeoX RoPE, causal attention,
-  grouped heads — and Qwen3's massive activations break an RMS-normalised
-  error bound.
-- **[Stage 6, the pipeline](research/stage-6-pipeline.md)** — `prompt → PNG`,
-  **19.8 s**, matching diffusers to 2.5e-2 of the image. Every bug this stage
-  had was in the *composition* and invisible to each component's own oracle:
-  SwiGLU's product **overflows fp16 on a real prompt and never on a random
-  one** (and the fix is free, because its consumer is an RMS norm), a new push
-  constant on a shared shader silently zeroed the text encoder's
-  feed-forward, and a dispatches-per-submit cap is a proxy for a time cap that
-  stops being a good one when the dispatches differ 100x. Also: the context
-  refiners take neither the timestep nor the latents, so **two of the three
-  phases run once per image rather than once per step**.
-- **[Stage 7, the VAE mid block](research/stage-7-vae-mid-block.md)** — the
-  first target a profiler picked: attention **1.43 s → 15.1 ms** and the four
-  projections **503 ms → 1.12 ms**. A 512-wide head is a register budget, so
-  the *workgroup* owns it rather than the wave. And the finding: this block's
-  softmax is so saturated that a kernel **dropping three quarters of every dot
-  product decodes the same image**, so it is validated on its own inputs
-  rather than through the picture.
+- **[Stage 5, the text encoder](research/stage-5-text-encoder.md)** — **2.08 s
+  to 57 ms**, and the encoder sits on the **memory-bound** half of the
+  roofline, so unlike the DiT its winning kernel *moves with the prompt
+  length* and re-planning per run is free. Three conventions invert between it
+  and the DiT — NeoX RoPE, causal attention, grouped heads — and Qwen3's
+  massive activations break an RMS-normalised error bound.
+- **[Stage 6, the pipeline](research/stage-6-pipeline.md)** — every bug this
+  stage had was in the *composition* and invisible to each component's own
+  oracle: SwiGLU's product **overflows fp16 on a real prompt and never on a
+  random one**, a new push constant on a shared shader silently zeroed the
+  text encoder's feed-forward, and a dispatches-per-submit cap is a proxy for
+  a time cap that stops being one when the dispatches differ 100x. Also: the
+  context refiners take neither the timestep nor the latents, so **two of the
+  three phases run once per image rather than once per step**.
+- **[Stage 7, the VAE mid block](research/stage-7-vae-mid-block.md)** —
+  attention **1.43 s → 15.1 ms**, the four projections **503 ms → 1.12 ms**.
+  The finding that outlives the stage: this block's softmax is so saturated
+  that a kernel **dropping three quarters of every dot product decodes the
+  same image**, so no end-to-end tolerance can validate it.
 - **[Stage 9, the head and tail](research/stage-9-head-and-tail.md)** — the
   host's share of a step **59 ms → 5-10 ms**. A bias and a *pad token* become
   extra columns of K, so `y = Wx + b` and `y = x_pad_token` come out of one
@@ -324,17 +341,11 @@ that are load-bearing for what is left:
   20.5 GB pipeline reads the same arena **83x faster**, which is why the 0.8 s
   an image this stage was partly priced on was never there (`cmd/bus`).
 - **[Stage 8, conv2d](research/stage-8-vae-conv.md)** — the last operator in
-  the VAE, **3.02 s → 244 ms** at 41-42 TFLOP/s, and the only one whose
-  implicit GEMM had to be written rather than dispatched to an existing
-  kernel. The finding is the layout: a patch fragment is contiguous only if
-  the **channel** axis is the tiled one, because tiling the pixel axis — what
-  every other operand in this engine does — makes the `dw = ±1` window
-  straddle two tiles. A one-pixel zero border then puts the convolution's
-  padding *in the data*, so nine taps are nine adds. Also: **BM is the knob**
-  (it sets how many times the activation is streamed) where BN barely moves;
-  §2.7's K-slab hoist does **nothing** once both operands are fully covered;
-  and a bump allocator that never returned a freed block to the bump pointer
-  was costing 394 MB.
+  the VAE, **3.02 s → 244 ms** at 41-42 TFLOP/s. The finding is the layout: a
+  patch fragment is contiguous only if the **channel** axis is the tiled one,
+  because tiling the pixel axis — what every other operand in this engine does
+  — makes the `dw = ±1` window straddle two tiles. Also: §2.7's K-slab hoist
+  does **nothing** once both operands are fully covered.
 - **[Stage 4c, the stack](research/stage-4c-dit-stack.md)** — splitting a
   12.0 GB weight arena across storage buffers costs **one pipeline per bank
   and nothing per dispatch**; six banks are bit-identical to one.

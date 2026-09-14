@@ -812,6 +812,103 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-14 (eleventh) — stage 10: the two layout passes become epilogues
+
+**Result: a DiT block is 16 dispatches, not 18.** `pack v` and `narrow ctx`
+moved no information — each read a tensor and wrote the same numbers in the
+shape the next kernel wanted — and both are now the *store instruction* of the
+kernel that produced the tensor. A block goes **53.17 ms → 51.80 ms** at 4224
+tokens, a step **1.70 s → 1.66 s**, an image **14.49 s → 14.26 s** (two runs,
+14.18 and 14.34). Written up in
+[`research/stage-10-layout-epilogues.md`](research/stage-10-layout-epilogues.md).
+
+Both figures are the same binary: `go run ./cmd/ditstack -unfused-layout` and
+`go run ./cmd/zimage -unfused-layout` keep stage 9's graph, which is the oracle
+the new one is compared against.
+
+**Built:**
+
+- `shaders/dit_gemm.comp -DC_PACK=1` — the projection stores its accumulator
+  tiles straight into `dit_pack_f16.comp`'s mode-1 layout: fp16, per head, each
+  16x16 tile transposed. Eleven lines of index arithmetic and a different
+  `coopMatStore`, because the transpose is not a transpose — column-major with
+  stride 16 *is* mode 1.
+- `shaders/dit_attention_wmma.comp -DOUT_F16=1` — the kernel writes the output
+  projection's fp16 A operand instead of an fp32 context. It came out
+  **shorter** than the path it replaces: the per-row `1/rowSum` becomes a
+  row-constant matrix (the same trick §3.3 already uses for the online
+  rescale), so `O * Cinv` and one `coopMatStore` replace the fp32 epilogue's
+  LDS staging loop.
+- `GPUStack.FuseLayout` (default on) and the `cpackFor` / `wmmaVariant.of16`
+  companion tables, alongside the existing `cf16For`. Both kernels are
+  compiled and both pipelines built, so the switch is live on the graph — which
+  is what lets one test run the two paths back to back over the same arenas.
+- `-unfused-layout` on `cmd/ditstack` and `cmd/zimage`;
+  `Options.UnfusedLayout` on the pipeline; `TestGPUBlockFusedLayout`.
+
+**Four things worth carrying forward:**
+
+1. **The item was mispriced by a factor of a thousand, and the fix is
+   arithmetic.** `PIPELINE.md` and four handoffs here carried this as "~1.0 s
+   an image of pure layout" and made it the largest thing left at 7%. It is
+   **~0.29 s** and 2%. Stage 4 measured it correctly — "together ~1.0 **ms**"
+   a block — and the unit was lost the first time the number was quoted
+   somewhere else. Nothing re-derived it for four sessions, because 1.0 s an
+   image is entirely plausible for a thing that costs 1.0 ms in a block run
+   272 times. **A number quoted between documents should carry the dimension
+   it was measured in.**
+2. **The saving is the bandwidth arithmetic, exactly.** The two passes moved
+   252 MB a block a step at 4096 tokens — 68 GB an image — which at 236 GB/s
+   is 0.29 s. That is what they measured (0.64 + 0.43 ms a block) and what
+   removing them returned. Nothing here was a cache effect or a launch cost.
+3. **The old path was doing a double rounding.** `v` comes out bit-identical
+   over 1.47 M halves, but 84 halves in 1.23 M of the context differ by one
+   ulp — and **every one of them is an exact fp16 tie in the fp32 context**.
+   The old path rounded `o/rowSum` to fp32, stored it, and narrowed that to
+   fp16; where the fp32 result landed exactly between two halves,
+   round-to-even broke a tie the fp32 rounding had manufactured. The fused
+   path hands the store the unrounded product. Established by experiment:
+   adding an fp32 store of the same product to the fused kernel — forcing the
+   intermediate to exist — makes all 84 differences disappear, and the two
+   builds' fp32 contexts are bit-identical, so it is not upstream. The fused
+   path is the *more* correctly rounded of the two.
+4. **Attention's store was never on its critical path.** Stage 10 halved its
+   output bytes and deleted its LDS staging loop, and it measures 7.21 → 7.19
+   ms — nothing. A second measurement agreeing with stage 3c that the register
+   file is what binds that kernel, and the reason its remaining 1.1x is not a
+   memory problem.
+
+**How it was measured:** `go run ./cmd/ditstack -v -reps 3` and
+`go run ./cmd/zimage -reps 2`, each with and without `-unfused-layout`, two
+runs of each arm. Layer blocks agree to 51.78/51.82 fused and 52.82/53.52
+unfused; images to 14.18/14.34 and 14.43/14.55.
+
+**Correctness:** `TestGPUBlockFusedLayout` asserts bit-identity for the packed
+`v` plane and, for the context, that *every* differing half is an fp16 tie —
+which is a stronger statement than a tolerance, since anything that was not a
+rounding difference would fail it. The block's output moves 9.9e-4 of its RMS
+(stage 4b's own fusions: 1.6e-3). End to end against diffusers at 256² the
+pipeline goes **0.0158 → 0.0215** against a 3e-2 bound: a chaotic trajectory
+landing elsewhere, not an accuracy loss — but it does eat a third of the
+remaining margin, which is worth knowing before the next thing perturbs an
+operand.
+
+**Next.** There is no layout left in the block. What remains is arithmetic and
+the traffic it needs: the seven projections are **9.9 s an image, 69% of
+everything, at 73-76% of the WMMA ceiling** — the quarter they do not reach is
+2.6 s and is an order of magnitude more than every other item together;
+attention is 1.9 s at 38 TFLOP/s against the GEMMs' 40.6-42.0, worth ~0.2 s;
+and the eight elementwise passes are 1.6 s, each reading the residual stream
+and writing it, wanting fusion into a neighbour rather than deletion.
+`PIPELINE.md` has the budget.
+
+Housekeeping, carried on: `PIPELINE.md` is **351 lines** against its own
+~200-line budget. This session added a stage (+36) and paid back 25 by moving
+the VAE stages' detail into `research/`, which is the right direction and not
+far enough. The two sections with the most duplication left are "What the
+kernels already give us" and "What each stage found", both of which restate
+`research/README.md`.
+
 ### Session 2026-09-14 (tenth) — stage 9: the head and tail on the device
 
 **Result: no model arithmetic runs on the host inside the denoising loop any

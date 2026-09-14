@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"testing"
+
+	"strix-halo-vulkan/safetensors"
 )
 
 // fp16GEMMRelTol is the bound the whole-block graph is held to. It is a
@@ -73,6 +75,10 @@ func TestGPUBlockAgainstDiffusers(t *testing.T) {
 	// they stop materialising. TestGPUBlockFusedMatchesUnfused is what ties
 	// the fused path back to this walk.
 	g.Fused = false
+	// And stage 10's epilogues, for the same reason: with them on, `v` and
+	// `attn_ctx` are never written as fp32 at all. TestGPUBlockFusedLayout is
+	// what ties that path back here.
+	g.FuseLayout = false
 	t.Logf("plan: %v", g.Plan())
 	t.Logf("arenas: %d MB activations, %d MB weights, %d dispatches",
 		g.ActivationBytes()>>20, g.WeightBytes()>>20, len(g.Labels()))
@@ -176,6 +182,9 @@ func TestGPUBlockFusedMatchesUnfused(t *testing.T) {
 	// preserving, so it is held out here and measured on its own in
 	// TestGPUBlockFP16FFN.
 	g.FP16FFN = false
+	// Stage 10's epilogues are a different fusion with its own test, and one
+	// of the two tensors compared below is the fp32 context they remove.
+	g.FuseLayout = false
 
 	// Both paths up to a label, then the tensor that label produced.
 	at := func(label string, read func() *Mat) (*Mat, *Mat) {
@@ -212,6 +221,171 @@ func TestGPUBlockFusedMatchesUnfused(t *testing.T) {
 	t.Logf("%d dispatches fused against %d unfused", len(g.Labels()), nUnfused)
 	compareTol(t, "block out", fused, unfused, fuseTol)
 	compareTol(t, "fused vs diffusers", fused, loadRef(t, f.m, "out"), fp16GEMMRelTol)
+}
+
+// TestGPUBlockFusedLayout is stage 10's check, and it asks a sharper question
+// than a tolerance: both epilogues move a store, not an arithmetic operation,
+// so the only differences allowed are the ones that follow from *where the
+// rounding happens*.
+//
+// v comes out **bit-identical**. `pack v` read v's fp32 C and wrote the same
+// numbers as fp16 fragment tiles; the projection now stores those tiles out of
+// the accumulators the fp32 C came from, and 1.5 M halves agree exactly.
+//
+// The context does not, and the 84 halves in 1.2 M that differ are the
+// interesting half of this test. They are **every one of them an exact fp16
+// tie in the fp32 context**, which is the signature of a double rounding that
+// the fused path does not perform: the unfused one rounds o/rowsum to fp32,
+// stores it, and a second dispatch rounds that to fp16, and where the fp32
+// result lands exactly between two halves, round-to-even breaks a tie that the
+// fp32 rounding manufactured. The fused path hands the fp16 store the
+// unrounded product -- the compiler contracts the multiply and the narrow into
+// one mixed-precision instruction -- so it never sees the tie and is the
+// correctly rounded answer of the two.
+//
+// That was measured, not assumed. Adding an fp32 store of the same product to
+// the fused kernel -- which forces the intermediate to be materialised --
+// makes all 84 differences disappear.
+//
+// Both are compared where their own output is still visible, the packed v
+// plane and the fp16 A operand, rather than only through the block's output:
+// stage 4b's rule, and the reason that test found what it found.
+func TestGPUBlockFusedLayout(t *testing.T) {
+	f := loadFixture(t)
+	defer f.close()
+	dev, done := newTestDevice(t)
+	defer done()
+
+	x := loadRef(t, f.m, "x")
+	adaln := loadRef(t, f.m, "adaln_input")
+
+	g, err := NewGPUBlock(dev, f.blk, f.rope, f.m.Seq, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+
+	// Both paths up to the dispatch that produces the tensor -- which is not
+	// the same dispatch on the two paths, since removing one is the point.
+	// The *fused* graph is the one under test, so the unfused one is read
+	// first and is the reference.
+	at := func(fusedLabel, unfusedLabel string, read func() []float32) (fused, unfused []float32) {
+		t.Helper()
+		g.FuseLayout = false
+		if err := g.RunTo(x, adaln.Data, unfusedLabel); err != nil {
+			t.Fatal(err)
+		}
+		unfused = read()
+		g.FuseLayout = true
+		if err := g.RunTo(x, adaln.Data, fusedLabel); err != nil {
+			t.Fatal(err)
+		}
+		return read(), unfused
+	}
+	differing := func(got, want []float32) []int {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Fatalf("%d elements against %d", len(got), len(want))
+		}
+		var at []int
+		for i := range got {
+			if got[i] != want[i] {
+				at = append(at, i)
+			}
+		}
+		return at
+	}
+
+	// v, as attention reads it: the whole packed plane, every head, including
+	// the token rows past the sequence -- zero on both paths, the pack because
+	// it zeroes them and the projection because the A operand's pad rows are
+	// zero.
+	v, vRef := at("gemm v", "pack v", func() []float32 {
+		return g.ReadF16Flat(g.TensorHV(), g.PlaneElems())
+	})
+	if bad := differing(v, vRef); len(bad) != 0 {
+		t.Errorf("packed v: %d of %d halves differ, first at %d: %g against %g",
+			len(bad), len(v), bad[0], v[bad[0]], vRef[bad[0]])
+	} else {
+		t.Logf("packed v: %d halves, bit-identical", len(v))
+	}
+
+	// The context, as the output projection reads it, and the fp32 tensor the
+	// unfused path narrowed to get there -- which is what says the differences
+	// are ties and not an error.
+	g.FuseLayout = false
+	if err := g.RunTo(x, adaln.Data, "narrow ctx"); err != nil {
+		t.Fatal(err)
+	}
+	ctx32 := g.Read(g.TensorCtx(), g.Dim())
+	readCtx := func() []float32 { return g.ReadF16(g.TensorHCtx(), g.Dim(), g.LDA()).Data }
+	ctx, ctxRef := at("attention", "narrow ctx", readCtx)
+	bad := differing(ctx, ctxRef)
+	ties := 0
+	for _, i := range bad {
+		if fp16Tie(ctx32.Data[i]) {
+			ties++
+		} else if i == bad[0] {
+			t.Errorf("fp16 context at %d: fused %g against %g, and the fp32 value %g is not an fp16 tie",
+				i, ctx[i], ctxRef[i], ctx32.Data[i])
+		}
+	}
+	if ties != len(bad) {
+		t.Errorf("fp16 context: %d of %d halves differ and only %d of those are fp16 ties; "+
+			"anything else is not a rounding difference", len(bad), len(ctx), ties)
+	}
+	if share := float64(len(bad)) / float64(len(ctx)); share > 1e-4 {
+		t.Errorf("fp16 context: %d of %d halves differ (%.2g), which is more than double rounding accounts for",
+			len(bad), len(ctx), share)
+	} else {
+		t.Logf("fp16 context: %d of %d halves differ (%.2g), all of them exact fp16 ties in the fp32 context",
+			len(bad), len(ctx), share)
+	}
+
+	// And the block, end to end. One ulp on 7e-5 of the context is two fp16
+	// GEMMs away from the output, so this is a tolerance rather than a count.
+	g.FuseLayout = false
+	unfused, err := g.Apply(x, adaln.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nUnfused := len(g.Labels())
+	g.FuseLayout = true
+	fused, err := g.Apply(x, adaln.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(g.Labels()); n != nUnfused-2 {
+		t.Errorf("%d dispatches fused against %d unfused; the two layout passes should be gone", n, nUnfused)
+	} else {
+		t.Logf("%d dispatches fused against %d unfused", n, nUnfused)
+	}
+	compareTol(t, "block out", fused, unfused, fuseLayoutTol)
+	compareTol(t, "fused vs diffusers", fused, loadRef(t, f.m, "out"), fp16GEMMRelTol)
+}
+
+// fuseLayoutTol is what the layout fusion moves the block's output by: one
+// fp16 ulp on 7e-5 of the attention context, carried through the output
+// projection and the feed forward. Measured at 9.9e-4 of the output's RMS --
+// the same order as stage 4b's own fusions (5e-3) and 80x inside the block's
+// comparison against diffusers, which is where it belongs, since 84 halves of
+// an operand is a smaller perturbation than narrowing the operand was.
+const fuseLayoutTol = 3e-3
+
+// fp16Tie says whether an fp32 value lies exactly halfway between two
+// neighbouring fp16 values -- the one case where rounding to fp32 before
+// rounding to fp16 can give a different half from rounding once.
+func fp16Tie(v float32) bool {
+	h16 := safetensors.F32ToF16(v)
+	h := safetensors.F16ToF32(h16)
+	if h == v {
+		return false
+	}
+	o16 := h16 - 1
+	if math.Abs(float64(v)) > math.Abs(float64(h)) {
+		o16 = h16 + 1
+	}
+	return float64(v) == (float64(h)+float64(safetensors.F16ToF32(o16)))/2
 }
 
 // TestGPUBlockFP16FFN measures what §2.6's narrowing costs, rather than

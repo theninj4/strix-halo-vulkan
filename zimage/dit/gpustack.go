@@ -86,6 +86,30 @@ type GPUStack struct {
 	// 65504, while w2's output reaches 6e5 and stays fp32.
 	FP16FFN bool
 
+	// FuseLayout removes the block's two pure-layout dispatches by making the
+	// kernel that produces each tensor store it in the shape its consumer
+	// wants (PIPELINE.md stage 10).
+	//
+	// `pack v` and `narrow ctx` computed nothing. The first read v's fp32 C
+	// and wrote the same numbers back as fp16 fragment tiles; the second read
+	// the fp32 context and wrote the same numbers back as the output
+	// projection's fp16 A operand. Both are now epilogues -- dit_gemm.comp's
+	// C_PACK and dit_attention_wmma.comp's OUT_F16 -- and the round trips they
+	// cost are gone: at 4096 tokens, 94 MB of traffic per block per step for v
+	// and the same again for the context.
+	//
+	// Neither changes an arithmetic operation, and the context epilogue
+	// removes a rounding: v comes out bit-identical, while 84 halves in 1.2 M
+	// of the context differ by one ulp because the old path rounded to fp32
+	// and then to fp16 and this one rounds once. Every one of those 84 is an
+	// exact fp16 tie, which is what TestGPUBlockFusedLayout asserts.
+	//
+	// Off is the graph stages 4-9 ran, and is also what the stagewise
+	// validation needs: with the epilogues on, `v` and `attn_ctx` are never
+	// materialised as fp32, and those are two of the tensors the diffusers
+	// dump is walked against.
+	FuseLayout bool
+
 	// FFScale is the constant the SwiGLU output is multiplied by before it is
 	// stored as w2's fp16 A operand, and it is a range fix rather than a
 	// precision one.
@@ -113,6 +137,9 @@ type GPUStack struct {
 	// cf16 is the fp16-C build of the FFN's projections, empty when the
 	// planned kernel has no companion; see cf16For.
 	cf16 GEMMKernel
+	// cpack is the fragment-tile-C build of the v projection, empty when the
+	// planned kernel has no companion; see cpackFor.
+	cpack GEMMKernel
 
 	dim, ffn       int
 	heads, headDim int
@@ -269,6 +296,21 @@ var gemmVariants = []gemmVariant{
 var cf16For = map[GEMMKernel]gemmVariant{
 	GEMMWG128x256TiledSWZ8: {
 		name: "wg128x256_bt16_swz8_cf16", spirv: shaders.DiTGEMMWG128x256TiledSWZ8CF16,
+		bm: 128, bn: 256, waves: 4, layout: 2,
+	},
+}
+
+// cpackFor names the fragment-tile-C companion build of a kernel, for the one
+// projection whose consumer does not read a matrix at all: v, which attention
+// reads as 16x16 tiles, per head, each transposed (dit_pack_f16.comp mode 1).
+// Same argument as cf16For and the same shape of table -- a property of the
+// *consumer*, so it is reached through a companion and not through a plan --
+// and the same restriction: only the default kernel has one, because a build
+// with a different tile geometry would need its own, and nothing else in the
+// block wants a packed C.
+var cpackFor = map[GEMMKernel]gemmVariant{
+	GEMMWG128x256TiledSWZ8: {
+		name: "wg128x256_bt16_swz8_cpack", spirv: shaders.DiTGEMMWG128x256TiledSWZ8CPack,
 		bm: 128, bn: 256, waves: 4, layout: 2,
 	},
 }
@@ -434,16 +476,17 @@ func newStack(dev *vk.Device, set *safetensors.Set, cfg *Config, specs []blockSp
 		return nil, fmt.Errorf("dit: this device has no 16x16x16 fp16 cooperative matrix; the block graph needs one")
 	}
 	g := &GPUStack{
-		dev:     dev,
-		ctl:     ctl,
-		pipes:   make(map[string]*vk.ComputePipeline),
-		kernels: make(map[GEMMKernel]gemmVariant),
-		plan:    plan,
-		tokens:  tokens,
-		rows:    tokens,
-		Fused:   true,
-		FP16FFN: true,
-		FFScale: defaultFFScale,
+		dev:        dev,
+		ctl:        ctl,
+		pipes:      make(map[string]*vk.ComputePipeline),
+		kernels:    make(map[GEMMKernel]gemmVariant),
+		plan:       plan,
+		tokens:     tokens,
+		rows:       tokens,
+		Fused:      true,
+		FP16FFN:    true,
+		FuseLayout: true,
+		FFScale:    defaultFFScale,
 	}
 	// The shapes come from the first block, which is also what proves the
 	// checkpoint is the model the config describes.
@@ -913,6 +956,16 @@ func (g *GPUStack) build() error {
 	}); err != nil {
 		return err
 	}
+	// Its fp16-context companion, where the chosen variant has one. Both are
+	// built, because FuseLayout is a switch on a live graph and the unfused
+	// arm is the oracle the fused one is checked against.
+	if g.attn.of16 != nil {
+		if err := g.pipeline("attention16", g.attn.of16, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: g.attn.wave,
+		}); err != nil {
+			return err
+		}
+	}
 
 	// The GEMM builds the plan names, plus the fp16-C companion if the FFN's
 	// projections are on a kernel that has one (same geometry, same weight
@@ -936,6 +989,10 @@ func (g *GPUStack) build() error {
 	if c, ok := cf16For[g.plan[ProjW1]]; ok && g.plan[ProjW3] == g.plan[ProjW1] {
 		g.kernels[c.name] = c
 		g.cf16 = c.name
+	}
+	if c, ok := cpackFor[g.plan[ProjV]]; ok {
+		g.kernels[c.name] = c
+		g.cpack = c.name
 	}
 	// One set per bank. The buffer a GEMM reads its weight out of is in the
 	// pipeline's descriptor set, not in its push constants, so a second bank
@@ -1244,6 +1301,32 @@ func (g *GPUStack) TensorAttn() uint32  { return g.aAttn }
 func (g *GPUStack) TensorFF() uint32    { return g.aFF }
 func (g *GPUStack) TensorGate() uint32  { return g.aGate }
 
+// TensorHV is v's fragment-tile plane in the fp16 arena and TensorHCtx the
+// output projection's fp16 A operand. They are what stage 10's epilogues
+// write in place of the fp32 tensors above, so they are the points the fused
+// and unfused graphs are compared at.
+func (g *GPUStack) TensorHV() uint32   { return g.hV }
+func (g *GPUStack) TensorHCtx() uint32 { return g.hCtx }
+
+// PlaneElems is how many halves one of the packed q/k/v tensors holds -- all
+// heads, every token tile the arena was built for. It is the extent
+// ReadF16Flat needs to read one back, since a tiled plane has no row stride to
+// hand ReadF16.
+func (g *GPUStack) PlaneElems() int { return g.heads * g.tokPad * g.headDim }
+
+// ReadF16Flat copies n halves out of the fp16 activation arena exactly as
+// they lie, widening them. ReadF16 covers the operands that are [rows, lda];
+// this covers the ones whose layout is 16x16 fragment tiles, where there is
+// no row stride to state.
+func (g *GPUStack) ReadF16Flat(off uint32, n int) []float32 {
+	raw := g.hbuf.ReadUint16At(int(off), n)
+	out := make([]float32, n)
+	for i, h := range raw {
+		out[i] = safetensors.F16ToF32(h)
+	}
+	return out
+}
+
 // TensorA is the fp16 A operand the projections read, and LDA its row
 // stride: it holds the modulated block input, then the modulated FFN input.
 func (g *GPUStack) TensorA() uint32 { return g.hA }
@@ -1419,8 +1502,11 @@ func (g *GPUStack) blockGraph(i int) ([]vk.MultiDispatch, []string, error) {
 		add("scale", kind, uint32(g.rows), 1, pc)
 	}
 	// One projection: C[tokPad, n] = A[tokPad, k] * B[n, k]. kernel overrides
-	// the plan's choice, which is how the FFN reaches the fp16-C companion.
-	gemm := func(r Proj, kernel GEMMKernel, aOff, cOff uint32, n, k, lda int) error {
+	// the plan's choice, which is how the FFN reaches the fp16-C companion and
+	// v the fragment-tile one; packed says the store is the latter, whose
+	// destination geometry is per-head planes of g.tokPad tokens rather than a
+	// row stride.
+	gemmTo := func(r Proj, kernel GEMMKernel, aOff, cOff uint32, n, k, lda int, packed bool) error {
 		if kernel == "" {
 			kernel = g.plan[r]
 		}
@@ -1439,11 +1525,19 @@ func (g *GPUStack) blockGraph(i int) ([]vk.MultiDispatch, []string, error) {
 		pc.InOff, pc.OutOff, pc.BOff = aOff, cOff, w.bOff[r]
 		pc.GemmM, pc.GemmN, pc.GemmK = uint32(tokPad), uint32(n), uint32(k)
 		pc.LDA, pc.LDB = uint32(lda), uint32(bLD(n, k, v.layout))
+		if packed {
+			// The plane stride the packed tiles are addressed by, as in
+			// qkPack below: the arena's token count, not the run's.
+			pc.Aux1 = uint32(g.tokPad)
+		}
 		d = append(d, vk.MultiDispatch{
 			Pipeline: pipe, GroupsX: uint32(n / v.bn), GroupsY: uint32(tokPad / v.bm), PushConstants: pc.bytes(),
 		})
 		kinds = append(kinds, "gemm "+string(r))
 		return nil
+	}
+	gemm := func(r Proj, kernel GEMMKernel, aOff, cOff uint32, n, k, lda int) error {
+		return gemmTo(r, kernel, aOff, cOff, n, k, lda, false)
 	}
 	// The gated residual: x += gate * y.
 	gate := func(kind string, y, gateOff uint32) {
@@ -1518,11 +1612,22 @@ func (g *GPUStack) blockGraph(i int) ([]vk.MultiDispatch, []string, error) {
 		norm("rmsnorm x", g.aX, g.aH, w.norm1)
 		narrow("attn in", g.aH, g.hA, g.dim, g.ldaDim, scaleMSA, w.modulated)
 	}
+	// v's destination is the fragment-tile arena when the projection can
+	// write it there itself (stage 10), and the fp32 C the pack reads
+	// otherwise. q and k are not the same case: their fragments carry a norm
+	// and a rotation between the GEMM and the pack, so something has to read
+	// them back whatever the store does.
+	vOut, vKernel, vPacked := g.aV, GEMMKernel(""), false
+	if g.FuseLayout && g.cpack != "" {
+		vOut, vKernel, vPacked = g.hV, g.cpack, true
+	}
 	for _, s := range []struct {
-		r   Proj
-		out uint32
-	}{{ProjQ, g.aQ}, {ProjK, g.aK}, {ProjV, g.aV}} {
-		if err := gemm(s.r, "", g.hA, s.out, g.dim, g.dim, g.ldaDim); err != nil {
+		r      Proj
+		kernel GEMMKernel
+		out    uint32
+		packed bool
+	}{{ProjQ, "", g.aQ, false}, {ProjK, "", g.aK, false}, {ProjV, vKernel, vOut, vPacked}} {
+		if err := gemmTo(s.r, s.kernel, g.hA, s.out, g.dim, g.dim, g.ldaDim, s.packed); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -1563,19 +1668,33 @@ func (g *GPUStack) blockGraph(i int) ([]vk.MultiDispatch, []string, error) {
 		}
 	}
 	// v is transposed into its tiles (mode 1) and has no norm or rotation, so
-	// it is the plain pack in both paths.
-	pcV := base
-	pcV.InOff, pcV.OutOff = g.aV, g.hV
-	pcV.Aux0, pcV.Aux1 = 1, uint32(g.tokPad)
-	pcV.Scale = math.Float32bits(1)
-	add("pack", "pack v", groups(tokPad, coopMatTile), uint32(g.heads), pcV)
+	// it is the plain pack -- unless the projection already wrote it there.
+	if !vPacked {
+		pcV := base
+		pcV.InOff, pcV.OutOff = g.aV, g.hV
+		pcV.Aux0, pcV.Aux1 = 1, uint32(g.tokPad)
+		pcV.Scale = math.Float32bits(1)
+		add("pack", "pack v", groups(tokPad, coopMatTile), uint32(g.heads), pcV)
+	}
+	// The context goes straight out as the output projection's fp16 A operand
+	// where the kernel has that epilogue, and as fp32 followed by a narrowing
+	// pass where it does not.
+	attnPipe, ctxPacked := "attention", false
+	if g.FuseLayout && g.attn.of16 != nil {
+		attnPipe, ctxPacked = "attention16", true
+	}
 	pcAttn := base
 	pcAttn.InOff, pcAttn.OutOff = g.hQ, g.aCtx
 	pcAttn.KOff, pcAttn.VOff = g.hK, g.hV
 	pcAttn.Aux1 = uint32(g.tokPad)
-	add("attention", "attention", groups(g.rows, g.attn.rows()), uint32(g.heads), pcAttn)
+	if ctxPacked {
+		pcAttn.OutOff, pcAttn.LDA = g.hCtx, uint32(g.ldaDim)
+	}
+	add(attnPipe, "attention", groups(g.rows, g.attn.rows()), uint32(g.heads), pcAttn)
 
-	narrow("narrow ctx", g.aCtx, g.hCtx, g.dim, g.ldaDim, 0, false)
+	if !ctxPacked {
+		narrow("narrow ctx", g.aCtx, g.hCtx, g.dim, g.ldaDim, 0, false)
+	}
 	if err := gemm(ProjO, "", g.hCtx, g.aAttn, g.dim, g.dim, g.ldaDim); err != nil {
 		return nil, nil, err
 	}

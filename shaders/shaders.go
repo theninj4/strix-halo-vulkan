@@ -1175,8 +1175,19 @@ var DiTAttentionFlash []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -DWAVE=32 -o dit_attn_wmma_qt1_kt2_w32.spv dit_attention_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -DWAVE=32 -o dit_attn_wmma_qt1_kt8_w32.spv dit_attention_wmma.comp
 
+// The fp16-context build of the winning variant (PIPELINE.md stage 10). Same
+// tiling, same wave size; the epilogue writes the output projection's A
+// operand directly instead of an fp32 context a second dispatch then narrows.
+// Like the fp16-C GEMM it is a companion rather than a ladder rung: nothing
+// sweeps it, GPUStack reaches it through a table.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -o dit_attn_wmma_qt1_kt4_w32_of16.spv dit_attention_wmma.comp
+
 //go:embed dit_pack_f16.spv
 var DiTPackF16 []byte
+
+//go:embed dit_attn_wmma_qt1_kt4_w32_of16.spv
+var DiTAttentionWMMAQT1KT4W32OutF16 []byte
 
 //go:embed dit_attn_wmma_qt1_kt4.spv
 var DiTAttentionWMMAQT1KT4 []byte
@@ -1333,8 +1344,16 @@ var DiTGEMMWG128x256TiledSWZ16 []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=8 -DC_F16=1 -o dit_gemm_wg128x256_bt16_swz8_cf16.spv dit_gemm.comp
 
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=8 -DC_PACK=1 -o dit_gemm_wg128x256_bt16_swz8_cpack.spv dit_gemm.comp
+
 //go:embed dit_gemm_wg128x256_bt16_swz8_cf16.spv
 var DiTGEMMWG128x256TiledSWZ8CF16 []byte
+
+// The fragment-tile-C companion (PIPELINE.md stage 10), for the one
+// projection whose consumer reads fragment tiles: v, feeding attention.
+
+//go:embed dit_gemm_wg128x256_bt16_swz8_cpack.spv
+var DiTGEMMWG128x256TiledSWZ8CPack []byte
 
 //go:embed dit_gemm_reg64_hka4.spv
 var DiTGEMMReg64HKA4 []byte
