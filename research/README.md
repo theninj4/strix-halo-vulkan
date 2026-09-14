@@ -45,6 +45,16 @@ that `grep -rl '§2\.3' .` and `ls research/2.3*` find the same thing.
 than files of their own — they are 10-38 lines each. `§0.1` (the measured
 MMA ceiling) is the most-cited of them, at 20 references.
 
+### Pipeline stage findings
+
+These come from building the z-image slice (PIPELINE.md) rather than from a
+numbered experiment, so they carry names instead of section numbers:
+
+| Stage | Findings |
+|---|---|
+| [Stage 2](stage-2-vae-decoder.md) | VAE decoder — fp16 overflow, the conv intensity lesson, two device limits |
+| [Stage 3](stage-3-dit-attention.md) | DiT attention — why it needs WMMA, and the two hazards a port hits |
+
 ### Closed, but small enough to have stayed in the backlog
 
 `§4.1` (per-dispatch cost: ~300 ns, worry falsified) and `§3.7` (the

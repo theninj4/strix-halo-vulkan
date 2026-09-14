@@ -1,0 +1,163 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// Flash-attention-style multi-head attention: one workgroup handles QB query
+// rows of one head, streaming keys in tiles with an online softmax.
+//
+// This is IDEAS §3.3. The structure is dictated by three measurements, taken
+// in this order, and the last one is the only one that mattered:
+//
+//  1. One query row per workgroup (dit_attention.comp) measured 463 GFLOP/s
+//     at 4096 tokens -- 0.8% of this part's matrix ceiling, and about four
+//     minutes of attention per image over 34 blocks and 8 steps.
+//  2. Giving QB queries a shared key tile in LDS was worth 1.09x. The reuse
+//     was real but 16 KB of LDS took occupancy from six workgroups per CU to
+//     two, and the latency hiding lost paid for it. Staging was removed.
+//  3. The actual limit was arithmetic intensity, exactly as IDEAS §2.1 found
+//     for the GEMM and as the VAE's conv2d found again: with one thread per
+//     (query, key) pair the score loop does ONE multiply-add per 4-byte
+//     global load. Giving each thread one key and *all* QB queries makes the
+//     same load feed QB accumulators held in registers.
+//
+// So: thread t owns key `base + t` and carries QB score accumulators. The
+// softmax reductions are then across the workgroup rather than within a
+// query's slice of it, which is what the subgroup arithmetic is for -- it
+// keeps the shared footprint at a few hundred bytes instead of the 8 KB a
+// tree over 256 threads would need, and LDS is the budget that decides
+// occupancy here.
+//
+// Keys arrive transposed (dit_transpose_k.comp) so consecutive threads read
+// consecutive tokens; §5.1b's coverage law makes that worth 20x rather than
+// a rounding error. The running max is folded in before every exponential,
+// which the VAE's 1.16e7 scores and this block's 5.99e5 feed-forward output
+// make a requirement rather than a precaution.
+
+#include "dit_common.glsl"
+
+const uint QB = 8u;    // query rows per workgroup
+const uint KT = 256u;  // keys per tile: one per thread
+const uint HD = 128u;  // head dim; Z-Image is 3840/30
+const uint WG = 256u;
+
+layout(local_size_x = 256) in;
+
+shared float shQ[QB * HD];
+shared float shW[QB * KT];
+shared float shCtx[QB * HD];
+shared float shPart[QB * 16];   // per-subgroup partials, 16 is the worst case
+shared float shM[QB];
+shared float shL[QB];
+shared float shCorr[QB];
+
+void main() {
+    uint head = gl_WorkGroupID.y;
+    uint q0 = gl_WorkGroupID.x * QB;
+    uint t = gl_LocalInvocationID.x;
+    uint n = pc.tokens;
+    uint D = pc.headDim;
+    float scale = uintBitsToFloat(pc.scale);
+    if (q0 >= n || head >= pc.heads) {
+        return;
+    }
+
+    uint waves = gl_NumSubgroups;
+    uint wave = gl_SubgroupID;
+
+    for (uint i = t; i < QB * D; i += WG) {
+        uint qi = i / D, d = i % D;
+        uint row = q0 + qi;
+        shQ[i] = (row < n) ? act[pc.inOff + row * pc.dim + head * D + d] : 0.0;
+        shCtx[i] = 0.0;
+    }
+    if (t < QB) {
+        shM[t] = -1.0 / 0.0;
+        shL[t] = 0.0;
+    }
+    barrier();
+
+    uint kHead = pc.kOff + head * D * pc.kStride;
+
+    for (uint base = 0u; base < n; base += KT) {
+        uint cnt = min(KT, n - base);
+        uint kk = t;
+        bool live = kk < cnt;
+
+        // One key per thread, QB accumulators in registers: the loaded key
+        // component is used QB times instead of once.
+        float sc[QB];
+        for (uint q = 0u; q < QB; ++q) {
+            sc[q] = 0.0;
+        }
+        if (live) {
+            for (uint d = 0u; d < D; ++d) {
+                float kv = act[kHead + d * pc.kStride + base + kk];
+                for (uint q = 0u; q < QB; ++q) {
+                    sc[q] += shQ[q * D + d] * kv;
+                }
+            }
+        }
+        for (uint q = 0u; q < QB; ++q) {
+            sc[q] = live ? sc[q] * scale : -1.0 / 0.0;
+        }
+
+        // Per-query max over the whole workgroup, via subgroup reductions
+        // plus a short pass over the per-wave partials.
+        for (uint q = 0u; q < QB; ++q) {
+            float m = subgroupMax(sc[q]);
+            if (subgroupElect()) {
+                shPart[q * 16u + wave] = m;
+            }
+        }
+        barrier();
+        if (t < QB) {
+            float m = -1.0 / 0.0;
+            for (uint w = 0u; w < waves; ++w) {
+                m = max(m, shPart[t * 16u + w]);
+            }
+            float newMax = max(shM[t], m);
+            shCorr[t] = (shM[t] == -1.0 / 0.0) ? 0.0 : exp(shM[t] - newMax);
+            shM[t] = newMax;
+        }
+        barrier();
+
+        for (uint q = 0u; q < QB; ++q) {
+            float w = exp(sc[q] - shM[q]);
+            shW[q * KT + kk] = w;
+            float sum = subgroupAdd(w);
+            if (subgroupElect()) {
+                shPart[q * 16u + wave] = sum;
+            }
+        }
+        barrier();
+        if (t < QB) {
+            float s = 0.0;
+            for (uint w = 0u; w < waves; ++w) {
+                s += shPart[t * 16u + w];
+            }
+            shL[t] = shL[t] * shCorr[t] + s;
+        }
+        barrier();
+
+        // Rescale and accumulate. Thread t owns component d = t % D and the
+        // QB/2 queries starting at 2*(t/D), so one V load feeds several
+        // accumulators here too.
+        uint d = t % D;
+        uint qBase = (t / D) * (QB / 2u);
+        for (uint j = 0u; j < cnt; ++j) {
+            float vv = act[pc.vOff + (base + j) * pc.dim + head * D + d];
+            for (uint u = 0u; u < QB / 2u; ++u) {
+                uint q = qBase + u;
+                float acc = (j == 0u) ? shCtx[q * D + d] * shCorr[q] : shCtx[q * D + d];
+                shCtx[q * D + d] = acc + shW[q * KT + j] * vv;
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = t; i < QB * D; i += WG) {
+        uint qq = i / D, d = i % D;
+        uint row = q0 + qq;
+        if (row < n) {
+            act[pc.outOff + row * pc.dim + head * D + d] = shCtx[i] / shL[qq];
+        }
+    }
+}

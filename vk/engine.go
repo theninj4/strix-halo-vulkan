@@ -336,6 +336,13 @@ func (b *Buffer) ReadFloat32(n int) []float32 {
 	return out
 }
 
+// WriteFloat32At copies src into the buffer's mapped memory at an element
+// offset, so several tensors can share one arena.
+func (b *Buffer) WriteFloat32At(off int, src []float32) {
+	dst := unsafe.Slice((*float32)(b.mapped), off+len(src))
+	copy(dst[off:], src)
+}
+
 // ReadFloat32At reads n float32s starting at an element offset. Reading a
 // whole buffer to recover a tensor near its end is the difference between
 // copying a few megabytes and copying gigabytes, which for the VAE decoder's

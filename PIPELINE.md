@@ -5,8 +5,10 @@
 > handoffs) and `research/` (closed findings); if a paragraph here is about
 > the past, it is in the wrong file. Keep it under ~150 lines.
 
-**Status**: stages 1 and 2 done. The VAE decoder runs on Vulkan at
-1024x1024 in **5.6 s**, matching diffusers to 2.4e-5.
+**Status**: stages 1 and 2 done; stage 3 correct but not yet fast. The VAE
+decoder runs on Vulkan at 1024x1024 in **5.6 s**. The DiT block and its
+attention match diffusers on CPU and GPU, but attention runs at 2.1% of
+fp32 peak and needs the WMMA path before the DiT is viable.
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 **Accept for now**: ~20-30 s/image. Correctness first, then profile.
 
@@ -61,8 +63,10 @@ whole pipeline is resident in 128 GB unified memory at once.
 | 1 | Checkpoint loader | **done** | `safetensors/`, `cmd/inspect` |
 | 2a | VAE decoder, CPU reference | **done** | `zimage/vae/`, validated stagewise against diffusers |
 | 2b | VAE decoder, Vulkan | **done** | 10 shaders, 119 dispatches, 1024² in 5.6 s |
-| 3 | Attention | next | IDEAS §3.3; 4096 tokens, 30 heads, 3D RoPE, qk_norm |
-| 4 | DiT graph | | 34 blocks over kernels already near ceiling, + adaLN, + SwiGLU |
+| 3a | DiT block, CPU reference | **done** | `zimage/dit/`, validated stagewise incl. RoPE and qk-norm |
+| 3b | Attention, Vulkan | **correct**, slow | 4 shaders; 707 GFLOP/s, needs WMMA (see below) |
+| 3c | Attention on WMMA | next | IDEAS §3.3's own recommendation; ~10x needed |
+| 4 | DiT graph | | 34 blocks, + adaLN, + SwiGLU, + the projections as WMMA GEMMs |
 | 5 | Text encoder + tokenizer | | Qwen3-4B, GQA; BPE from `tokenizer/` |
 | 6 | Scheduler + driver | | FlowMatchEuler, 8 steps; PNG out |
 
@@ -126,6 +130,31 @@ onto the WMMA path, which halves the arena and should move conv3x3 well past
 its current 3.3 TFLOP/s — but it is a separate change with its own
 validation, because doing it at the same time as the correctness port would
 leave any discrepancy with two possible causes.
+
+## What each stage found
+
+Closed findings live in `research/`, not here:
+
+- **[Stage 2 — the VAE decoder](research/stage-2-vae-decoder.md)**: fp16
+  cannot hold this model's intermediates (scores 1.16e7 against a 65504
+  limit), register-blocking beat every other conv fix 6.1x, §5.1b's coverage
+  law predicted a 20x attention bug exactly, and two hard device limits —
+  4.29 GB per storage buffer and a driver watchdog that kills a 5.5 s
+  command buffer.
+- **[Stage 3 — the DiT block](research/stage-3-dit-attention.md)**:
+  attention is two GEMMs and the scalar path tops out an order of magnitude
+  short (2.67 FLOP/byte where ~28 is needed), so §3.3's WMMA instruction is
+  now measured advice. Plus the two hazards a port hits: RoPE pairs
+  *adjacent* components, and the q/k norms are *per head*.
+
+## Measured baseline to beat — DiT attention
+
+| tokens | image | wall | GFLOP/s |
+|---|---|---|---|
+| 320 | — | 26 ms | 92 |
+| 1024 | 256² | 97 ms | 250 |
+| 2048 | — | 232 ms | 416 |
+| 4096 | **1024²** | **546 ms** | **707** |
 
 ## Measured baseline to beat — DiT
 

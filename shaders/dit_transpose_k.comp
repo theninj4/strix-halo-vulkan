@@ -1,0 +1,29 @@
+#version 450
+// Transpose keys from [tokens, heads*headDim] into per-head
+// [heads][headDim][kStride], where kStride is the token count padded so the
+// destination rows do not alias DRAM channels.
+//
+// This is not an optimisation, it is the difference between a working kernel
+// and a 20x slower one. In the natural layout the score loop has thread j
+// read key token j at a fixed component, so consecutive threads land
+// heads*headDim*4 = 15360 B apart; IDEAS §5.1b's coverage law,
+// min(1, C/gcd(stride, 4096)), gives 4/1024 -- under half a percent of the
+// bus. The identical mistake in the VAE's mid-block attention measured 50
+// GFLOP/s and transposing it was worth 20x.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint total = pc.tokens * pc.heads * pc.headDim;
+    if (idx >= total) {
+        return;
+    }
+    uint d = idx % pc.headDim;
+    uint h = (idx / pc.headDim) % pc.heads;
+    uint token = idx / (pc.headDim * pc.heads);
+    act[pc.outOff + (h * pc.headDim + d) * pc.kStride + token] =
+        act[pc.inOff + token * pc.dim + h * pc.headDim + d];
+}

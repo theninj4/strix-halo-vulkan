@@ -1,0 +1,36 @@
+#version 450
+// Z-Image's 3-D rotary embedding, applied in place to every head.
+//
+// The pairing is (2j, 2j+1): adjacent components form one complex number.
+// The other convention in common use pairs j with j+headDim/2, and it
+// produces a plausible-looking tensor that is wrong everywhere -- measured
+// at 12.6 against a 2e-4 bound. The cos/sin table is precomputed on the host
+// from the token ids, so this kernel is only the rotation.
+//
+// pc.inOff is the tensor, pc.wOff the [tokens, headDim/2] cos table with sin
+// following it at pc.aux0.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint pairs = pc.headDim / 2u;
+    uint total = pc.tokens * pc.heads * pairs;
+    if (idx >= total) {
+        return;
+    }
+    uint j = idx % pairs;
+    uint h = (idx / pairs) % pc.heads;
+    uint token = idx / (pairs * pc.heads);
+
+    float c = wbuf[pc.wOff + token * pairs + j];
+    float s = wbuf[pc.aux0 + token * pairs + j];
+
+    uint base = pc.inOff + token * pc.dim + h * pc.headDim + 2u * j;
+    float re = act[base];
+    float im = act[base + 1u];
+    act[base] = re * c - im * s;
+    act[base + 1u] = re * s + im * c;
+}

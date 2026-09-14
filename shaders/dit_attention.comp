@@ -1,0 +1,123 @@
+#version 450
+// Multi-head softmax attention over the whole sequence.
+//
+// One workgroup per (head, query token). Keys are read from the transposed
+// layout dit_transpose_k.comp produces, so consecutive threads read
+// consecutive tokens at one component. Two passes over the keys, never
+// materialising a score row: the same structure the VAE decoder's attention
+// uses, and for the same reason -- the row max has to come out before any
+// exponential, and recomputing the dot products costs less than storing or
+// rescaling 4096 scores per query.
+//
+// Scores accumulate in fp32 regardless of what the operands are stored as.
+// That is a measured requirement rather than caution: the VAE's scores reach
+// 1.16e7 against fp16's 65504, and this block's feed-forward output reaches
+// 5.99e5.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float shQ[128];      // one head's query vector
+shared float shW[256];      // one chunk of exponentiated weights
+shared float shCtx[128];    // running context
+shared float shRed[256];
+
+float reduceMax(float v) {
+    uint t = gl_LocalInvocationID.x;
+    shRed[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            shRed[t] = max(shRed[t], shRed[t + s]);
+        }
+        barrier();
+    }
+    float r = shRed[0];
+    barrier();
+    return r;
+}
+
+float reduceSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    shRed[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            shRed[t] += shRed[t + s];
+        }
+        barrier();
+    }
+    float r = shRed[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint head = gl_WorkGroupID.y;
+    uint row = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint D = pc.headDim;
+    uint n = pc.tokens;
+    float scale = uintBitsToFloat(pc.scale);
+    if (row >= n || head >= pc.heads) {
+        return;
+    }
+
+    uint qBase = pc.inOff + row * pc.dim + head * D;
+    for (uint d = t; d < D; d += 256u) {
+        shQ[d] = act[qBase + d];
+        shCtx[d] = 0.0;
+    }
+    barrier();
+
+    uint kHead = pc.kOff + head * D * pc.kStride;
+
+    // Pass 1: the row maximum.
+    float localMax = -1.0 / 0.0;
+    for (uint base = 0u; base < n; base += 256u) {
+        uint j = base + t;
+        if (j < n) {
+            float s = 0.0;
+            for (uint d = 0u; d < D; ++d) {
+                s += shQ[d] * act[kHead + d * pc.kStride + j];
+            }
+            localMax = max(localMax, s * scale);
+        }
+    }
+    float rowMax = reduceMax(localMax);
+
+    // Pass 2: exponentiate against it and accumulate.
+    float denom = 0.0;
+    for (uint base = 0u; base < n; base += 256u) {
+        uint j = base + t;
+        float w = 0.0;
+        if (j < n) {
+            float s = 0.0;
+            for (uint d = 0u; d < D; ++d) {
+                s += shQ[d] * act[kHead + d * pc.kStride + j];
+            }
+            w = exp(s * scale - rowMax);
+        }
+        shW[t] = w;
+        denom += w;
+        barrier();
+
+        // Each thread owns a disjoint set of output components, so the
+        // accumulation over the chunk's keys needs no atomics.
+        uint cnt = min(256u, n - base);
+        for (uint d = t; d < D; d += 256u) {
+            float acc = shCtx[d];
+            for (uint jj = 0u; jj < cnt; ++jj) {
+                acc += shW[jj] * act[pc.vOff + (base + jj) * pc.dim + head * D + d];
+            }
+            shCtx[d] = acc;
+        }
+        barrier();
+    }
+
+    float total = reduceSum(denom);
+    for (uint d = t; d < D; d += 256u) {
+        act[pc.outOff + row * pc.dim + head * D + d] = shCtx[d] / total;
+    }
+}

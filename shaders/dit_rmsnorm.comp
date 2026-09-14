@@ -1,0 +1,55 @@
+#version 450
+// RMS norm over each span of pc.span components within a row, scaled by a
+// learned weight of that width.
+//
+// One workgroup per (token, span). The span is the whole row for the block's
+// four norms and one head for the q/k norms -- the same kernel, because the
+// only thing that differs is how many spans a row holds. Getting that wrong
+// is a real hazard: normalising q over the full 3840 instead of per 128-wide
+// head is a plausible port bug that changes the output by 2.4x.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float partial[256];
+
+float reduceSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    partial[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            partial[t] += partial[t + s];
+        }
+        barrier();
+    }
+    float r = partial[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint spans = pc.dim / pc.span;
+    uint token = gl_WorkGroupID.x / spans;
+    uint span = gl_WorkGroupID.x % spans;
+    uint t = gl_LocalInvocationID.x;
+    if (token >= pc.tokens) {
+        return;
+    }
+    uint base = token * pc.dim + span * pc.span;
+
+    // Each thread sums its own stride-256 slice before the tree reduction,
+    // so a 3840-wide sum is a tree over partials rather than a serial chain.
+    float s = 0.0;
+    for (uint i = t; i < pc.span; i += 256u) {
+        float v = act[pc.inOff + base + i];
+        s += v * v;
+    }
+    float meanSq = reduceSum(s) / float(pc.span);
+    float inv = inversesqrt(meanSq + uintBitsToFloat(pc.eps));
+
+    for (uint i = t; i < pc.span; i += 256u) {
+        act[pc.outOff + base + i] = act[pc.inOff + base + i] * inv * wbuf[pc.wOff + i];
+    }
+}

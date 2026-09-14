@@ -983,3 +983,28 @@ var VAEAttention []byte
 
 //go:embed vae_transpose.spv
 var VAETranspose []byte
+
+// Z-Image DiT (PIPELINE.md stage 3). Same two-arena binding convention as
+// the VAE shaders, defined in dit_common.glsl. fp32; the CPU implementation
+// in zimage/dit is the oracle.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_rmsnorm.spv dit_rmsnorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_rope.spv dit_rope.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_transpose_k.spv dit_transpose_k.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_attention.spv dit_attention.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_attention_flash.spv dit_attention_flash.comp
+
+//go:embed dit_rmsnorm.spv
+var DiTRMSNorm []byte
+
+//go:embed dit_rope.spv
+var DiTRoPE []byte
+
+//go:embed dit_transpose_k.spv
+var DiTTransposeK []byte
+
+//go:embed dit_attention.spv
+var DiTAttention []byte
+
+//go:embed dit_attention_flash.spv
+var DiTAttentionFlash []byte
