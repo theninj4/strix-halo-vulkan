@@ -30,9 +30,15 @@ import (
 	"syscall"
 )
 
-// DType is a safetensors dtype string. Only the float types the GOALS.md
-// models actually use are handled; the rest are rejected at open time rather
-// than at first use, so a bad checkpoint fails loudly and early.
+// DType is a safetensors dtype string. The float types the GOALS.md models
+// compute in are handled end to end; I64 is carried but not convertible,
+// because parakeet-tdt-0.6b-v3 stores each BatchNorm's scalar
+// `num_batches_tracked` as one — 24 of its 723 tensors — and inference never
+// reads them. Rejecting the file over those would be wrong, and skipping them
+// at open would make cmd/inspect lie about what is in it, so they load like
+// any other tensor and the float accessors refuse them at use. Every other
+// dtype is still rejected at open time rather than at first use, so a bad
+// checkpoint fails loudly and early.
 type DType string
 
 const (
@@ -40,12 +46,23 @@ const (
 	F32  DType = "F32"
 	F16  DType = "F16"
 	BF16 DType = "BF16"
+	I64  DType = "I64"
 )
+
+// IsFloat reports whether a dtype carries a value the F16 and F32 accessors
+// can convert.
+func (d DType) IsFloat() bool {
+	switch d {
+	case F64, F32, F16, BF16:
+		return true
+	}
+	return false
+}
 
 // Size is the width of one element in bytes.
 func (d DType) Size() int {
 	switch d {
-	case F64:
+	case F64, I64:
 		return 8
 	case F32:
 		return 4

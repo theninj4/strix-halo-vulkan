@@ -18,8 +18,10 @@ package bench
 //   - qwen3.8-flash-next is huggingface.co/Qwen/Qwen3.8-Flash-Next
 //     config.json "text_config" (48 layers, 12 of them full attention on a
 //     full_attention_interval of 4, 512-expert MoE with 10 active).
-//   - parakeet-tdt-0.6b-v3 is nvidia/parakeet-tdt-0.6b-v3 config.json
-//     (24-layer conformer encoder, d=1024, ffn=4096, 8x subsampling).
+//   - parakeet-tdt-0.6b-v3 is models/parakeet-tdt-0.6b-v3, read from the
+//     safetensors headers rather than the config (24-layer conformer
+//     encoder, d=1024, ffn=4096, 8x subsampling in a separable dw_striding
+//     stack) and checked against the working implementation in parakeet/.
 //   - kokoro-82m is hexgrad/Kokoro-82M config.json (the PL-BERT block is
 //     the only attention stack; the rest is convolutional or recurrent).
 //   - qwen3-embedding-0.6b is Qwen/Qwen3-Embedding-0.6B config.json.
@@ -49,7 +51,10 @@ type modelShape struct {
 //	                    512 experts at top-10 — the shape nothing in the
 //	                    square sweep resembles.
 //	parakeet            384 frames is ~30 s of audio: 100 frames/s at 10 ms
-//	                    hop, subsampling_factor 8, so 12.5 frames/s.
+//	                    hop, subsampling_factor 8, so 12.5 frames/s — and
+//	                    measured, 11.000 s is 138 frames, 12.55/s. 138 is
+//	                    also a row here, being the length the CPU reference
+//	                    and every test in parakeet/ run at.
 //	kokoro              128 phonemes is a sentence; 512 is the PL-BERT
 //	                    max_position_embeddings, i.e. the longest it takes.
 //	z-image-turbo       4096 latent tokens is a 1024x1024 image: 128x128
@@ -97,20 +102,35 @@ var modelShapes = []modelShape{
 	{model: "qwen3.8-flash-next", layer: "moe.shared_down", M: 2048, N: 2560, K: 640, count: 48},
 
 	// ---- parakeet-tdt-0.6b-v3: conformer encoder over ~30 s of audio ------
+	// Corrected against the checkpoint and against the working CPU
+	// implementation (SPEECH.md S4): 11.000 s of audio measures 138 encoder
+	// frames, i.e. 12.55 frames/s, so 384 is 30.6 s. The rel_k row and the
+	// subsampling linear were missing entirely, and the projector runs once
+	// over every frame rather than once per emitted token.
 	{model: "parakeet-tdt-0.6b", layer: "enc.qkv", M: 384, N: 1024, K: 1024, count: 72},
 	{model: "parakeet-tdt-0.6b", layer: "enc.o", M: 384, N: 1024, K: 1024, count: 24},
+	{model: "parakeet-tdt-0.6b", layer: "enc.rel_k", M: 767, N: 1024, K: 1024, count: 24, note: "2M-1 relative offsets, one per layer"},
 	{model: "parakeet-tdt-0.6b", layer: "enc.ff.up", M: 384, N: 4096, K: 1024, count: 48, note: "two half-FFN modules per layer"},
 	{model: "parakeet-tdt-0.6b", layer: "enc.ff.down", M: 384, N: 1024, K: 4096, count: 48},
 	{model: "parakeet-tdt-0.6b", layer: "enc.conv.pw1", M: 384, N: 2048, K: 1024, count: 24, note: "gated pointwise"},
 	{model: "parakeet-tdt-0.6b", layer: "enc.conv.pw2", M: 384, N: 1024, K: 1024, count: 24},
+	{model: "parakeet-tdt-0.6b", layer: "sub.linear", M: 384, N: 1024, K: 4096, count: 1, note: "256 channels x 16 mel bins"},
+	{model: "parakeet-tdt-0.6b", layer: "enc.projector", M: 384, N: 640, K: 1024, count: 1, note: "every frame, once"},
 	// The same encoder at ~82 s, to see how the shapes scale with M alone.
 	{model: "parakeet-tdt-0.6b", layer: "enc.ff.up", M: 1024, N: 4096, K: 1024, count: 48},
 	{model: "parakeet-tdt-0.6b", layer: "enc.ff.down", M: 1024, N: 1024, K: 4096, count: 48},
+	// And at 11 s, the fixture the CPU reference is validated on: M=138 is
+	// where the encoder is measured to be memory-bound, one flop per byte of
+	// weight per frame against this device's 235 crossover.
+	{model: "parakeet-tdt-0.6b", layer: "enc.ff.up", M: 138, N: 4096, K: 1024, count: 48},
+	{model: "parakeet-tdt-0.6b", layer: "enc.ff.down", M: 138, N: 1024, K: 4096, count: 48},
+	{model: "parakeet-tdt-0.6b", layer: "enc.qkv", M: 138, N: 1024, K: 1024, count: 72},
 	// The TDT decoder runs one step per emitted token: a 2-layer LSTM of
 	// hidden 640 (four gates, so 2560 out) and a joint network whose output
-	// is the 8193-token vocabulary plus the five duration classes.
+	// is the 8193-token vocabulary plus the five duration classes. The
+	// fixture emits 46 times over 138 frames, so this path runs a third as
+	// often as the frame count suggests.
 	{model: "parakeet-tdt-0.6b", layer: "dec.lstm", M: 1, N: 2560, K: 640, count: 4, note: "4 gates x 640; ih and hh"},
-	{model: "parakeet-tdt-0.6b", layer: "joint.enc", M: 1, N: 640, K: 1024, count: 1},
 	{model: "parakeet-tdt-0.6b", layer: "joint.out", M: 1, N: 8198, K: 640, count: 1, note: "8193 vocab + 5 durations"},
 
 	// ---- kokoro-82m: the PL-BERT stack is the only attention block -------

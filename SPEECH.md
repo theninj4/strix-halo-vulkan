@@ -10,234 +10,270 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status**: nothing built. Both checkpoints are on disk and both were
-surveyed on 2026-09-14 — the inventories below are read off the files, not off
-a paper.
+**Status (2026-09-14)**: **parakeet transcribes on the CPU, exactly.**
+`go run ./cmd/asr testdata/jfk.wav` turns 11 s of audio into the reference's
+transcript, emission for emission, in 2.68 s — 4.1x real time before a single
+shader is written. S1–S5 are done and S6 (the Vulkan port) is next. Kokoro is
+untouched.
 
-## Why these two, and why now
+    testdata/jfk.wav: 11.000 s at 16000 Hz
+    1101 mel frames (1100 valid) -> 138 encoder frames (138 valid)
 
-The z-image slice is done in every sense that matters to a *vertical*: it
-turns a prompt into a PNG in 14.26 s and everything left in it is the last
-quarter of the WMMA ceiling on seven GEMMs. That is a deep problem and it will
-still be there. These two are shallow ones — 0.63 B and 0.08 B against
-6.2 B — and each closes a whole capability rather than a percent.
+    stage             time  share
+    front end         20ms   0.7%
+    encoder         2.454s  91.5%
+    projector          2ms   0.1%
+    decode           207ms   7.7%
 
-They are also a different *regime*, which is the interesting part. Every
-kernel this repo has tuned was chosen at M=4096 with 12.5 GB resident. Parakeet
-at fp16 is 1.25 GB and a 30 s clip is **375 encoder frames**; Kokoro is 164 MB
-and a sentence is a few hundred phonemes. Neither is a residency problem and
-neither sits where the DiT sits on the roofline. Stage 5c already found what
-that does — the winning GEMM tile *moves with the sequence length* and
-re-planning per run is free — and these two will test that finding rather than
-inherit it.
+    And so, my fellow Americans, ask not what your country can do for you,
+    ask what you can do for your country.
 
-## What we already have
-
-The engine is most of both models. Taking it seriously is the point of doing
-these next:
-
-| They need | We have | Fits? |
-|---|---|---|
-| GEMM, N/K of 1024, 4096, 640 | `dit_gemm.comp`, 11 rungs + stage 5c's narrow-M rungs | yes, and the narrow-M rungs are aimed exactly at this T |
-| Bidirectional MHA, 8 heads x **128** | `dit_attention_wmma.comp`; `wmmaHeadDim` is 128 | geometry yes, **positional scheme no** — see below |
-| LayerNorm (mean subtracted) | `dit_final_norm.comp` | yes |
-| conv2d 3x3 as implicit GEMM | `vae_conv_wmma.comp` (stage 8) | **stride 1 only**; parakeet subsamples at stride 2 |
-| Checkpoint loading | `safetensors/`, `cmd/inspect` | parakeet yes but for one dtype; kokoro **no**, it is a pickle |
-| A validated-against-the-library method | `reference/dump_*.py`, `RunTo`, negative controls | yes, and it is the reason to keep the order below |
-| An HTTP surface | `api/speech.go`, `api/transcription.go` | request/response types only, no server |
-
-## Parakeet-TDT 0.6B v3 — as the checkpoint describes it
-
-`models/parakeet-tdt-0.6b-v3/`, 723 tensors, **0.627 B params, F32**. It ships
-as **HF `transformers`**, not as NeMo: `config.json` says `ParakeetForTDT`,
-there is a `model.safetensors`, and `transformers 5.17.0` in `.venv` has
-`ParakeetForTDT`, `ParakeetProcessor` and `ParakeetFeatureExtractor`. **So the
-oracle exists today with no conversion work** — the same position stage 5 was
-in with Qwen3, and the `.nemo` and `.gguf` files beside it are not needed.
-
-**Front end** (`processor_config.json`): 16 kHz mono, preemphasis 0.97,
-`n_fft` 512, `win_length` 400, `hop_length` 160, **128 mel bins**. 30 s of
-audio is 3000 frames.
-
-**Encoder**, FastConformer, 24 layers, d=1024, 8 heads x 128, FFN 4096, SiLU:
-
-| | |
-|---|---|
-| Subsampling | 3 x conv2d 3x3 **stride 2**, 1 -> 256 -> 256 -> 256 channels, then `linear [1024, 4096]`. 4096 is 256 channels x 16 surviving mel bins; the factor is **8** in both time and frequency |
-| Per layer | macaron FF1 (x0.5) -> rel-pos MHA -> conv module -> FF2 -> `norm_out`. Five LayerNorms a layer, all with bias |
-| Attention | `q/k/v/o_proj [1024,1024]`, **no bias**, plus `relative_k_proj [1024,1024]` and `bias_u`/`bias_v` `[8,128]` |
-| Conv module | `pointwise_conv1 [2048,1024,1]` (GLU) -> `depthwise_conv [1024,1,9]` -> **BatchNorm** -> SiLU -> `pointwise_conv2 [1024,1024,1]` |
-| Projection | `encoder_projector [640, 1024]` |
-
-**Prediction network**: `embedding [8193, 640]`, a **2-layer LSTM** (640
-hidden, `weight_ih/hh [2560, 640]`), `decoder_projector [640, 640]`.
-
-**Joint**: `joint.head [8198, 640]`. 8198 is 8193 token logits (blank at
-**8192**) followed by **5 duration logits** for durations `[0,1,2,3,4]` —
-which `generation_config.json` confirms by suppressing 8193-8197 from the
-token argmax. That is the whole of TDT: emit a token, then jump the encoder
-cursor by the predicted duration instead of by one.
-
-**Tokenizer**: `tokenizer.json`, **BPE with a Metaspace pre-tokenizer**
-(SentencePiece-style), 8192 pieces plus control tokens —
-`<|startoftranscript|>`, `<|pnc|>`/`<|nopnc|>`, `<|itn|>`/`<|noitn|>`,
-`<|timestamp|>`/`<|notimestamp|>`. Note this is **not** byte-level BPE, so
-`zimage/tokenizer` does not transfer — but ASR only ever **decodes**, and
-decoding is a vocab lookup and a `▁ -> space` rule. Encoding is not needed at
-all.
-
-## Kokoro-82M — as the checkpoint describes it
-
-`models/Kokoro-82M/`, **82 M params**, a StyleTTS2 derivative. Five modules in
-one `kokoro-v1_0.pth` **PyTorch pickle** (327 MB F32), so unlike parakeet it
-needs a conversion pass before `safetensors/` can see it:
-
-| module | tensors | params | what it is |
-|---|---|---|---|
-| `bert` | 25 | 6.29 M | ALBERT, 12 layers x 768, 12 heads, FFN 2048 — 25 tensors because the layers **share weights** |
-| `bert_encoder` | 2 | 0.39 M | one linear, 768 -> 512 |
-| `text_encoder` | 24 | 5.61 M | phoneme embedding, a conv stack (kernel 5), an LSTM |
-| `predictor` | 122 | 16.19 M | duration (`max_dur` 50) + F0/N prosody, AdaIN-conditioned |
-| `decoder` | 375 | **53.28 M** | the iSTFTNet vocoder — two thirds of the model |
-
-From `config.json`: `n_token` 178 with the **IPA vocabulary inline** (114
-symbols), `style_dim` 128, `hidden_dim` 512, `n_mels` 80. The vocoder is
-`upsample_rates [10, 6]`, `upsample_kernel_sizes [20, 12]`, resblocks
-`(3,7,11) x dilations (1,3,5)`, `upsample_initial_channel` 512, and a final
-**iSTFT** at `n_fft` 20 / `hop` 5. Output is **24 kHz**.
-
-**Voices**: `voices/*.pt`, 54 of them, each a `[510, 1, 256]` fp32 tensor —
-one style vector per phoneme-sequence length, 256 wide, which the model splits
-128/128 between the predictor and the decoder. Confirm the indexing rule
-(`len(phonemes)`) against the reference rather than assuming it.
-
-**G2P is the real dependency and it is not a kernel.** Kokoro takes IPA
-phonemes; `misaki` (plus `espeak-ng` for some languages) is what turns text
-into them, and porting that to Go is a language problem, not an inference one.
-**So the first vertical should take phonemes, not text** — the whole network
-is then validatable against the reference on day one, and G2P becomes a
-separate, separable stage that can start as a shell-out to `espeak-ng`.
-
-## What is genuinely new
-
-Shared by both, and **all of it belongs on the host first**. A 30 s clip is
-3000 512-point FFTs; a sentence of speech is a few hundred phonemes. Stage 4's
-rule applies — build the thing that runs, let the profiler choose what moves
-to the GPU:
-
-- **WAV in and out**, 16-bit PCM. Small, and needed by every test.
-- **FFT both ways**: forward STFT for parakeet's mel front end, **inverse**
-  STFT for kokoro's vocoder. One radix-2 implementation covers both.
-- **LSTM.** Both models have one and both are small (640 and 512 hidden).
-  Sequential by nature, so it is a latency problem rather than a throughput
-  one, and parakeet's runs once per *emitted token* rather than per frame.
-
-Parakeet only:
-
-- **Relative-position attention.** `bias_u`, `bias_v` and `relative_k_proj`
-  are Transformer-XL style rel-pos as Conformer uses it —
-  `(q+u)·k^T + (q+v)·rel_k^T` with a shift — and that is **not** what
-  `dit_attention_wmma.comp` computes. This is the one real kernel question in
-  STT, and it is worth answering on the CPU reference first so that the shape
-  of the change is known before a shader is written.
-- **stride-2 conv2d**, over a 1-channel input. The stage-8 implicit GEMM is
-  stride 1; whether stride 2 is a push constant or a different patch gather is
-  the first thing to find out.
-- **Depthwise 1-D conv (k=9), GLU, BatchNorm.** BatchNorm at inference is an
-  affine, so **fold it into the pointwise convolution at load** and it costs
-  nothing at run time. `running_mean`/`running_var` are in the checkpoint.
-- **The TDT greedy loop** on the host: `joint(enc[t], dec[u])`, argmax over
-  8193, emit, advance `u`, advance `t` by the duration argmax, cap at
-  `max_symbols_per_step` 10.
-
-Kokoro only:
-
-- **A pickle-to-safetensors conversion** (`reference/convert_kokoro.py`), five
-  submodules, once.
-- **1-D transposed convolution** and the AdaIN-conditioned resblock stack —
-  a new operator family, and two thirds of the model's parameters.
-- **The length regulator**: expand phoneme states by predicted integer
-  durations. Trivial arithmetic, but it makes the output length data-dependent,
-  which no stage of z-image was.
-
-## Order, and the recommendation
-
-**Do parakeet first.** Not because it is smaller — it is 8x larger — but
-because everything it needs to be *validated* already exists:
-
-1. Its weights are safetensors and `transformers 5.17.0` can run it today, so
-   the oracle is a `reference/dump_parakeet.py` away. Kokoro needs a
-   conversion script before a single number can be compared.
-2. Its encoder is 90% shapes the GEMM ladder already wins, at the head
-   dimension the attention kernel is compiled for.
-3. Its correctness bound is **an exact string**. Every stage of z-image needed
-   an argument about what tolerance means; a transcript is right or it is not.
-   That is the cheapest oracle this project has had.
-4. It has exactly **one** open kernel question (rel-pos attention). Kokoro has
-   three independent new things — conversion, G2P, a vocoder operator family —
-   and its output is a waveform, which needs a perceptual argument the repo
-   has no precedent for.
-
-Then kokoro, phonemes-first, with G2P last.
-
-## Stages
-
-Same shape as `PIPELINE.md`'s: a CPU implementation in Go first, validated
-against the library dump, then the Vulkan port debugged against it.
+## Where the work stands
 
 | # | Stage | State |
 |---|---|---|
-| S1 | `safetensors` reads the parakeet checkpoint; WAV reader | |
-| S2 | `reference/dump_parakeet.py` — mel, 24 layer outputs, joint, decode trace | |
-| S3 | Mel front end in Go, against S2's mel | |
-| S4 | Encoder, CPU reference, layer by layer | |
-| S5 | Prediction net + joint + TDT greedy decode; **first transcript** | |
-| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | |
-| S7 | `cmd/asr`, profile, then optimise | |
+| S1 | `safetensors` reads the parakeet checkpoint; WAV reader | **done** — `DType` gained `I64`, `audio.DecodeWAV` |
+| S2 | `reference/dump_parakeet.py` — mel, layer outputs, joint, decode trace | **done** — 59 tensors, four self-checks in the manifest |
+| S3 | Mel front end in Go, against S2's mel | **done** — 3.1e-4 absolute on unit-variance features |
+| S4 | Encoder, CPU reference, layer by layer | **done** — 1.7e-4 relative at the encoder output |
+| S5 | Prediction net + joint + TDT greedy decode; **first transcript** | **done** — exact string, identical trace |
+| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | next |
+| S7 | `cmd/asr`, profile, then optimise | CPU half done (the table above) |
 | T1 | `reference/convert_kokoro.py` + `reference/dump_kokoro.py` | |
 | T2 | Phoneme encoder + ALBERT + predictor, CPU, against T1 | |
 | T3 | iSTFTNet decoder, CPU; **first waveform** | |
 | T4 | Vulkan port; `cmd/tts` | |
 | T5 | G2P — `espeak-ng` shell-out, then a port if it is worth one | |
 
-## First concrete steps
+## What was built
 
-1. **`safetensors` cannot open the parakeet checkpoint.** `go run ./cmd/inspect
-   models/parakeet-tdt-0.6b-v3` fails with
+**`audio/`** — the host-side signal processing both verticals need. WAV in and
+out (16-bit PCM only, on purpose), a radix-2 FFT in float64, a centred STFT
+that reproduces `torch.stft(center=True, pad_mode="constant")`, and a Slaney
+mel filterbank that reproduces `librosa.filters.mel` to a float32 ulp. The
+inverse FFT is written and tested but not yet used; it is kokoro's.
 
-       tensor "encoder.layers.16.conv.norm.num_batches_tracked" has unsupported dtype "I64"
+**`parakeet/`** — the model. `frontend.go` (preemphasis → STFT → mel → log →
+per-utterance normalisation), `subsampling.go` (the strided conv stack),
+`encoder.go` (24 FastConformer layers, including the relative-position
+attention), `decoder.go` (the LSTM prediction network and the joint),
+`decode.go` (the TDT greedy loop), `tokenizer.go` (decode only), `load.go`.
 
-   24 of the 723 tensors are BatchNorm's `num_batches_tracked`, scalar I64, and
-   **inference never reads them**. The decision to make is whether `DType` gains
-   an `I64` case (and the float accessors reject it) or whether `Open` skips
-   non-float tensors. The first is smaller and keeps `cmd/inspect` honest about
-   what is in the file.
-2. **The reference env needs audio.** `uv pip install --python .venv/bin/python
-   soundfile librosa` — there is no `pip` in `.venv`. `torch 2.14.0+cpu` and
-   `transformers 5.17.0` are already there.
-3. **Pick the fixture clip** and commit it: a few seconds of 16 kHz speech with
-   a known transcript, small enough to live in the repo, used by every test
-   from S2 onward. The samples in `models/Kokoro-82M/samples/*.wav` are 24 kHz
-   Kokoro output and would make a pleasing but circular fixture — use real
-   speech.
+**`cmd/asr`** — a WAV in, a transcript and a stage profile out, `-v` for the
+per-emission trace with timestamps.
 
-## Open questions, to settle by measurement
+**`reference/dump_parakeet.py`** — the oracle. It walks the whole model rather
+than its ends, and it checks itself in four places, all recorded in the
+manifest: the by-hand encoder stack reproduces `encoder()` exactly
+(`stack_gap` 0), the BatchNorm fold is an affine to 1.5e-5, the hand-written
+TDT loop emits what `model.generate` does, and the transcript is the clip's
+known one.
 
-- **Does the encoder use limited-context attention?** NeMo's FastConformer
-  usually does (`att_context_size`), and `config.json` shows only
-  `max_position_embeddings: 5000` with no window. What `transformers` actually
-  runs is what matters, and it changes both the kernel and the cost at 3000
-  frames.
-- **Does fp16 hold?** The repo's recurring lesson (stages 2, 6): survey absmax
-  through the encoder on a real clip before committing. A conformer's conv
-  module and a 4096-wide FFN are the places to look.
-- **Where is the roofline crossover for this T?** At 375 frames the encoder's
-  GEMMs sit near stage 5c's 235 flop/byte crossover, and a 5 s clip (63
-  frames) is well below it. If the winning tile moves with clip length the way
-  the text encoder's moved with prompt length, `qwen.PlanFor` is the precedent.
-- **Is kokoro's voice pack indexed by `len(phonemes)`?** 510 rows, and the
-  reference will say.
+**`testdata/jfk.wav`** — the fixture, 11.000 s of 16 kHz mono speech, public
+domain. Its decode is pinned against CPython's `wave` by a sha256 in
+`audio/wav_test.go`, so a change to the decoder cannot silently move every
+downstream comparison.
+
+## What the checkpoint said that the paper reading did not
+
+Four corrections to this file's own inventory, all of them found by running
+the thing rather than by reading about it:
+
+- **The subsampling is separable, not three plain convolutions.** It is
+  NeMo's `dw_striding`: `conv2d(1→256, stride 2)` and then *twice*
+  `depthwise(256, stride 2) + pointwise(256→256)`, five weight tensors at
+  ModuleList indices 0, 2, 3, 5, 6 with ReLUs in the gaps. The collapsed
+  shape table read `[256, 1, 3, 3]` five times and hid the grouping.
+- **A clip is 8x shorter in frames than it is in mel frames, and the two
+  length formulas disagree by one.** 176000 samples → 1101 mel frames of
+  which **1100** are valid → **138** encoder frames, all valid. The tensor
+  grows by `1 + n/hop` and the valid count by `n/hop`; the trailing frame is
+  zeroed, excluded from the normalisation statistics, and absorbed by the
+  subsampling.
+- **The attention is full, not windowed.** `config.json` names no
+  `att_context_size` and the mask transformers builds is padding only — a
+  rectangle, not a band. At 138 frames that is nothing; at 3000 frames (30 s)
+  it is a 3000x3000 score matrix per head, and it is the reason a long clip is
+  a different problem from a short one.
+- **The blank's embedding row is zeros.** So the first prediction step cannot
+  be validated through its input at all — only through the LSTM state it
+  leaves behind, which is what `TestPredictionMatchesReference` does.
+
+## The one real kernel question, answered on the CPU
+
+Relative-position attention is two score matrices summed, not one:
+
+    (q + bias_u)·k^T          content, over key positions
+    (q + bias_v)·rel_k^T      position, over *relative* offsets
+
+`rel_k` projects a sinusoidal embedding of every offset from +(T-1) to -(T-1),
+so the position term is `[T, 2T-1]` and has to be folded onto the `[T, T]`
+grid. transformers does that with `_rel_shift` — a left pad, a reinterpret of
+the flat buffer, a dropped row — and the closed form, checked exactly against
+the reference for all eight heads, is
+
+    shifted[i][j] = raw[i][T-1-i+j]
+
+i.e. **column j of row i holds the score for relative offset i-j**, read
+straight off a diagonal. A shader does not need the pad-and-reinterpret dance;
+it needs that index. `TestRelShiftIsNotASlice` pins it against the mistake it
+is most often confused with — taking the middle T columns — which agrees with
+it on exactly one row.
+
+The position term also costs something worth knowing: `relative_k_proj` is a
+`[2T-1, 1024] x [1024, 1024]` GEMM per layer, which at T=138 is *twice* the
+work of the q projection and at T=3000 is 43x it. It is the same matrix for
+every layer's input but a different weight per layer, so it cannot be hoisted
+— but it is independent of the activations, so it can be computed once per
+layer ahead of the attention rather than inside it.
+
+## Accuracy, and what the bounds are worth
+
+Every stage is compared against the dump with a *relative* bound, because the
+stages' rms spans 0.02 to 400 and an absolute one would mean nothing across
+them. The measured drift, worst case per stage:
+
+| stage | drift | against |
+|---|---|---|
+| mel filterbank | 3.7e-9 | a peak of 0.042 (one float32 ulp) |
+| power spectrum | 1.1e-5 relative | bins within six decades of the peak |
+| log mel | 3.0e-4 | rms 10.1 |
+| normalised mel | 3.1e-4 | rms 1.0 |
+| subsampled | 1.7e-2 | rms 373 (4.5e-5 relative) |
+| layer 0 out | 4.3e-4 | rms 10.0 (4.2e-5 relative) |
+| encoder out | 3.4e-6 | rms 0.021 (1.7e-4 relative) |
+| joint logits | 4.6e-5 | rms 36.6 |
+| transcript | **exact** | 46 emissions, identical frames and durations |
+
+Two of those bounds are set by the *reference* being the imprecise side rather
+than this code: the power spectrum, where float32 loses three digits between
+the loudest bins and those six decades down, and the position embeddings,
+where torch holds the angle in float32 and one ulp at an offset of 137 frames
+is already 1e-5. Both are computed in float64 here and rounded once.
+
+Every bound has a negative control beside it — `TestFrontEndDetectsErrors` and
+`TestEncoderDetectsErrors` — that breaks the thing the bound is supposed to
+protect (the window convention, the preemphasis, the mel scale, the content
+bias, the BatchNorm fold, the GLU halves, the sin/cos interleave) and requires
+each to miss by at least 10x the bound. They miss by 119x to 6411x.
+
+## S6: what the Vulkan port is walking into
+
+The encoder is 91.5% of the CPU time and ~180 GFLOP (89 G multiply-adds) for
+eleven seconds of audio. Per layer, at T=138:
+
+| op | shape | G MAC | share |
+|---|---|---|---|
+| feed forward 1 and 2 | `[T,1024]x[1024,4096]` and back, x2 | 2.32 | 63% |
+| q/k/v/o projections | `[T,1024]x[1024,1024]` x4 | 0.58 | 16% |
+| `relative_k_proj` | `[2T-1,1024]x[1024,1024]` | 0.29 | 8% |
+| conv pointwise 1 and 2 | `[T,1024]x[1024,2048]`, `[T,1024]x[1024,1024]` | 0.43 | 12% |
+| attention scores and context | `[8,T,T]` | 0.08 | 2% |
+
+which is **the GEMM ladder this repository already has**, at a narrow M — and
+the ladder was re-measured at these exact shapes this session (`bench`'s
+`shapes` family; the parakeet rows in `bench/modelshapes.go` were corrected
+against the checkpoint first, since they were missing `relative_k_proj` and
+the subsampling linear and had the projector running per emitted token rather
+than once per frame):
+
+| shape | M=138 (11 s) | M=384 (30 s) | M=767 (rel_k) | M=1024 |
+|---|---|---|---|---|
+| `[M,1024]x[1024,1024]` | **23.1** | 32.2 | 34.0 | — |
+| `[M,1024]x[1024,4096]` | **29.2** | 31.7 | — | 30.2 |
+| `[M,4096]x[4096,1024]` | **27.4** | 33.2 | — | 26.4 |
+
+TFLOP/s of *useful* work, i.e. charged for the tile padding. The winner at
+every one of those is the same rung — `wmma_reg32_bt_hkab4_w32_padab128`, the
+**wave32 narrow-M** build — and it wins by nearly 2x over the wave64 rungs at
+M=138 (23.1 against 12.7). At M=1024 `reg64_bt_hka4` takes the lead back. So
+stage 5c's finding holds here and the plan is the same shape as
+`qwen.PlanFor`: pick the rung from the clip length.
+
+The padding is the other thing M=138 pays: BM=32 rounds it to 160 (86%
+useful), BM=64 to 192 (72%), and the DiT's 128x256 tile to 256 (54%, and
+10.6 TFLOP/s — half of what the narrow rung gets). "Use the kernel we already
+have" would cost a factor of two here.
+
+**The target that follows.** 177 GFLOP at the measured ~26 TFLOP/s is 6.8 ms,
+and the bandwidth floor — 1.25 GB of fp16 weights read once — is 5.3 ms at
+236 GB/s. So an 11 s clip should encode in **~7 ms**, against 2.45 s on the
+CPU: a 350x speedup, and ~1500x real time. The decode loop is already
+negligible and gets more so — the joint's `[8198, 640]` head measures 1.6
+TFLOP/s as a GEMV, i.e. 6.5 µs a step, 0.3 ms for the fixture's 46 steps.
+
+Three things the ladder does not have:
+
+1. **stride-2 conv2d over a 1-channel input**, plus the depthwise form of it.
+   The stage-8 implicit GEMM is stride 1. This is 2.8 GFLOP of the 180 and it
+   runs once, so it is a correctness problem rather than a performance one.
+2. **The rel-shift index above**, inside the score kernel.
+3. **LayerNorm with a mean**, five per layer. `dit_final_norm.comp` has it.
+
+And one thing to decide rather than port: **M moves with the clip**. 11 s is
+T=138 and 30 s is T=375, against a DiT tuned at M=4096 — stage 5c's finding
+(the winning tile moves with the sequence length, and re-planning per run is
+free) is the precedent, and `qwen.PlanFor` is the shape of the answer.
+
+**fp16 headroom, surveyed and then tested:** the largest activation anywhere
+on the path is **7284** (the subsampling's output and the residual after the
+first feed forward, layer 0) against fp16's 65504, and the largest weight is
+45.3 — a factor of 9 of headroom, but fp16's resolution at 7000 is 4, so the
+residual stream was the tensor to watch rather than the overflow. Narrowing
+every operand on the CPU reference and asking for the transcript settles it:
+**the words and the whole decode trace are unchanged**, at a cost of 4.3%
+relative drift at the encoder output against fp32's 0.017%. The transducer has
+that much margin; a tensor-level bound does not.
+
+## Open, and to settle by measurement
+
+- ~~**Does fp16 hold through 24 layers?**~~ **Answered: yes, and by the only
+  bound that counts.** `Model.SetF16` narrows every matrix-core operand —
+  weights in place, activations on the way into each projection, accumulation
+  and norms and residuals left in float32, which is the shape the port will
+  have — and the transcript is unchanged *and the decode trace is identical*,
+  step for step (`TestF16SurvivesTheTranscript`). What it costs is real
+  though: the encoder output drifts **4.3% relative** against the reference
+  where fp32 drifts 0.017%, growing layer by layer (0.7% at layer 0, 1.4% at
+  layer 12). **So S6 cannot be validated by a tight tensor bound.** Its bound
+  is the transcript, with per-stage tensors used to locate a fault rather than
+  to certify its absence.
+- ~~**Where is the roofline crossover for this T?**~~ **Answered
+  arithmetically and then measured.** A projection's intensity counting only
+  weight traffic is `2M/bytes-per-weight`, so at fp16 it is exactly M flop per
+  byte against this device's 235 crossover (`research/3.4-model-shapes.md`):
+  the encoder is **memory-bound below 235 frames — 18.7 s of audio — and
+  compute-bound above it**. At Q4 the crossover moves to 59 frames (4.7 s).
+  The measured rates above are the confirmation: at M=138 the best rung
+  reaches 29.2 TFLOP/s on `[138,1024]x[1024,4096]`, which is 90% of that
+  shape's *bandwidth* ceiling (32.6 TFLOP/s) and 53% of the matrix rate.
+  This inverts the DiT's situation, where every shape was compute-bound.
 - **What does streaming mean here?** `api/transcription.go` already defines
-  `transcript.text.delta`. Nothing below needs to be streaming to be correct,
-  but the TDT loop is naturally incremental and the choice of chunking belongs
-  in the design rather than after it.
+  `transcript.text.delta`. The TDT loop is naturally incremental — it emits at
+  a frame and jumps forward — but the encoder is not: full attention over the
+  clip means a chunk boundary changes every frame's hidden state. Chunking
+  belongs in the design rather than after it.
+- **Is kokoro's voice pack indexed by `len(phonemes)`?** Unchanged from last
+  session: 510 rows, and the reference will say.
+
+## Kokoro — unchanged, and next after S6
+
+`models/Kokoro-82M/`, 82 M params, a StyleTTS2 derivative in a PyTorch pickle
+(`kokoro-v1_0.pth`, 327 MB F32), five modules: `bert` (ALBERT, 12 layers x
+768, weights shared), `bert_encoder`, `text_encoder`, `predictor` (duration +
+F0/N prosody, AdaIN-conditioned), `decoder` (the iSTFTNet vocoder, 53 M of the
+82 M). `config.json`: `n_token` 178 with the IPA vocabulary inline,
+`style_dim` 128, `hidden_dim` 512, `n_mels` 80, `upsample_rates [10, 6]`,
+resblocks `(3,7,11) x (1,3,5)`, final iSTFT at `n_fft` 20 / `hop` 5, 24 kHz
+out. `voices/*.pt`, 54 of them, each `[510, 1, 256]` split 128/128 between the
+predictor and the decoder.
+
+Three things it needs that parakeet did not: a **pickle-to-safetensors
+conversion** before a single number can be compared, **1-D transposed
+convolution** and the AdaIN resblock stack (a new operator family, two thirds
+of the parameters), and a **length regulator** that makes the output length
+data-dependent, which no stage of z-image or parakeet was. G2P stays last and
+outside the model: **the first vertical takes phonemes, not text**.
+
+`audio/` already has the inverse FFT the vocoder's iSTFT needs, tested by a
+round trip.

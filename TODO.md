@@ -814,6 +814,125 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-14 (thirteenth) — stages S1-S5: parakeet transcribes on the CPU
+
+**Result: `go run ./cmd/asr testdata/jfk.wav` prints the right words.** 11 s of
+audio in, the reference's transcript out — *exactly*, emission for emission —
+in 2.68 s of CPU, which is 4.1x real time before a single shader exists. The
+whole STT vertical up to the Vulkan port is done: `SPEECH.md` S1 through S5,
+rewritten with the results and with S6's target shapes.
+
+**Built:**
+
+- **`audio/`** — WAV in and out (16-bit PCM only, deliberately), a radix-2 FFT
+  in float64, a centred STFT that reproduces `torch.stft(center=True,
+  pad_mode="constant")`, and a Slaney mel filterbank that reproduces
+  `librosa.filters.mel` to a float32 ulp. The inverse transform is written and
+  round-trip tested but unused: it is kokoro's iSTFT.
+- **`parakeet/`** — the model in Go: the front end, the `dw_striding`
+  subsampling stack, 24 FastConformer layers with relative-position attention,
+  the LSTM prediction network, the joint, the TDT greedy loop and a
+  decode-only Metaspace tokenizer.
+- **`cmd/asr`** — WAV in, transcript and stage profile out; `-v` gives the
+  per-emission trace with timestamps, which is how the alignment was eyeballed
+  ("▁And" at 0.24 s, "▁country" at 10.2 s).
+- **`reference/dump_parakeet.py`** — 59 tensors and a manifest, walking the
+  whole model rather than its ends, with four self-checks in it.
+- **`testdata/jfk.wav`** — the fixture, 11.000 s, public domain, its decode
+  pinned by a sha256 against CPython's `wave`.
+- **`safetensors`** gained **I64**, carried but not convertible, so
+  `cmd/inspect` can open the checkpoint and still report the 24 BatchNorm
+  `num_batches_tracked` scalars honestly rather than skipping them.
+
+**Five things the checkpoint said that the survey had not:**
+
+1. **The subsampling is separable.** NeMo's `dw_striding`: `conv2d(1→256,
+   stride 2)` then *twice* `depthwise(256, stride 2) + pointwise(256→256)`.
+   The collapsed shape table showed `[256, 1, 3, 3]` five times and hid the
+   grouping.
+2. **The attention is full, not windowed.** No `att_context_size`, and the
+   mask transformers builds is padding only. At 138 frames that is free; at
+   3000 (30 s) it is a 3000x3000 score matrix per head, and it is why a long
+   clip is a different problem.
+3. **A clip's two length formulas disagree by one.** 176000 samples → 1101 mel
+   frames of which 1100 are valid → 138 encoder frames, all valid. The
+   trailing frame is zeroed, excluded from the normalisation statistics, and
+   absorbed by the subsampling.
+4. **The blank's embedding row is zeros**, so the first prediction step can
+   only be validated through the LSTM state it leaves behind.
+5. **`bias_ih` and `bias_hh` are both stored** for every LSTM layer although
+   only their sum can matter at inference — a CuDNN artefact, summed once at
+   load.
+
+**The one open kernel question, answered before a shader was written.**
+Conformer relative-position attention is two score matrices summed —
+`(q+bias_u)·k^T` over key positions and `(q+bias_v)·rel_k^T` over *relative*
+offsets — and transformers folds the `[T, 2T-1]` second one onto the `[T, T]`
+grid with `_rel_shift`, a left pad and a reinterpret of the flat buffer. The
+closed form, checked exactly (max abs 0) against the reference for all eight
+heads, is
+
+    shifted[i][j] = raw[i][T-1-i+j]
+
+i.e. column j of row i is the score for relative offset i-j, read off a
+diagonal. The shader needs that index, not the pad-and-reinterpret. There is a
+test pinning it against the mistake it is usually confused with — the middle-T
+slice — which agrees on exactly one row.
+
+**Every bound has a negative control.** The stage comparisons are relative
+(the stages' rms spans 0.02 to 400), and each bound is paired with mutations
+that have to miss it by at least 10x: the window convention, the preemphasis,
+the mel scale, the filterbank normalisation, the content bias, the BatchNorm
+fold, the GLU halves, and the sin/cos interleave against RoPE's half-split.
+They miss by 119x to 6411x. The end of the chain needs no tolerance argument
+at all — the transcript is a string, and it is the right one.
+
+**Two places the *reference* is the imprecise side**, both computed in float64
+here and rounded once: the power spectrum, where float32 loses three digits
+between the loudest bins and those six decades down, and the position
+embeddings, where torch holds the angle in float32 and one ulp at an offset of
+137 frames is already 1e-5.
+
+**The profile, which is S6's brief.** The encoder is 91.5% of the time and
+~180 GFLOP (89 G multiply-adds) for eleven seconds; the front end is 0.7% and
+the decode 7.7%. Per layer the work is 63% feed forward, 16% q/k/v/o, 12%
+convolution pointwise, 8% `relative_k_proj` and 2% attention proper — the GEMM
+ladder this repository already has, at **M = 138**. Three things it does not
+have: stride-2 conv2d over a 1-channel input (2.8 GFLOP, runs once, a
+correctness problem rather than a performance one), the rel-shift index inside
+the score kernel, and LayerNorm with a mean (which `dit_final_norm.comp` has).
+
+**The ladder was re-measured at these shapes** rather than assumed, after the
+parakeet rows in `bench/modelshapes.go` were corrected against the checkpoint
+— they were missing `relative_k_proj` (8% of the layer, and an M of 2T-1) and
+the subsampling linear, and had the projector running per emitted token when
+it runs once per frame. The winner at M=138, 384 and 767 is the same rung,
+**`wmma_reg32_bt_hkab4_w32_padab128`, the wave32 narrow-M build**, and at
+M=138 it beats the wave64 rungs by nearly 2x (23.1 against 12.7 TFLOP/s) and
+the DiT's 128x256 tile by 2.3x (10.6), most of that being tile padding: 138
+rounds to 160 rows at BM=32 and to 256 at BM=128. At M=1024 `reg64_bt_hka4`
+takes the lead back, so `qwen.PlanFor`'s shape — pick the rung from the
+sequence length — is the plan here too.
+
+A projection's intensity counting weight traffic alone is `2M/bytes`, i.e.
+**exactly M flop/byte at fp16**, so against the 235 crossover the encoder is
+memory-bound below 235 frames (18.7 s of audio) and compute-bound above it —
+the inverse of the DiT, every shape of which was compute-bound. The measured
+29.2 TFLOP/s at M=138 on `[138,1024]x[1024,4096]` is 90% of that shape's
+bandwidth ceiling and 53% of the matrix rate, which is the same story from the
+other side. **The target for S6**: 177 GFLOP at ~26 TFLOP/s is 6.8 ms and the
+1.25 GB of fp16 weights are 5.3 ms at 236 GB/s, so an 11 s clip should encode
+in ~7 ms against 2.45 s on the CPU — 350x, and ~1500x real time.
+
+**fp16 was tested, not assumed.** `Model.SetF16` narrows every matrix-core
+operand on the CPU reference — weights in place, activations into each
+projection, norms and residuals left alone — and **the transcript and the
+whole decode trace are unchanged**. The cost is 4.3% relative drift at the
+encoder output against fp32's 0.017%, accumulating layer by layer (0.7% at
+layer 0, 1.4% at layer 12). The consequence for S6 is a validation strategy
+rather than a tolerance: **the bound is the transcript**, and per-stage
+tensors locate a fault rather than certify its absence.
+
 ### Session 2026-09-14 (twelfth) — z-image parked, and the two speech verticals surveyed
 
 **No code.** The z-image slice is parked at **14.26 s an image** and the next
