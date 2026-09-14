@@ -22,6 +22,11 @@ type pushConstants struct {
 	Groups           uint32
 	ResOff           uint32
 	Aux0, Aux1, Aux2 uint32
+	// The GEMM block, at the same byte offsets as zimage/dit's, because the
+	// mid block's projections run on shaders/dit_gemm.comp unmodified. See
+	// vae_common.glsl.
+	GemmB, GemmM, GemmN, GemmK uint32
+	LDA, LDB                   uint32
 }
 
 const noBias = 0xffffffff
@@ -146,15 +151,36 @@ type GPUDecoder struct {
 	cpu  *Decoder
 	wbuf *vk.Buffer
 	abuf *vk.Buffer
+	// The fp16 pair, allocated only on the matrix-core path (stage 7): the
+	// activation arena the mid block's operands are packed into, and the four
+	// projection weights in their fragment-tile layout.
+	hbuf   *vk.Buffer
+	w16buf *vk.Buffer
 
 	pipes map[string]*vk.ComputePipeline
 	mods  []*vk.ShaderModule
 
 	weights *gpuWeights
+	w16     map[string]uint32
 	arena   arena
+	harena  arena
+
+	// attn and gemm are the mid block's kernels. A zero attn.spirv means the
+	// fp32 path of stage 2b, which is both the fallback on a device without
+	// matrix cores and the oracle the fp16 path is measured against.
+	attn attnVariant
+	gemm gemmVariant
 
 	// dispatches accumulates the recorded graph so a decode is one submit.
 	dispatches []vk.MultiDispatch
+}
+
+// Options selects the mid block's kernels. The zero value is the default
+// ladder winner on a device that has matrix cores and stage 2b's fp32 path on
+// one that does not.
+type Options struct {
+	Attn AttnKernel
+	GEMM GEMMKernel
 }
 
 // shaderSet is every pipeline the decoder graph uses.
@@ -171,15 +197,35 @@ var shaderSet = map[string][]byte{
 	"transpose":  shaders.VAETranspose,
 }
 
-// NewGPUDecoder uploads a loaded decoder's weights and builds its pipelines.
-// latentH/latentW size the activation arena, which is allocated once for the
-// largest tensor the graph will hold.
+// wmmaShaderSet is the rest of the mid block's pipelines, built only when the
+// device has matrix cores. The attention kernel and the GEMM are not here:
+// one has a wave size to pin and the other is chosen from a ladder.
+var wmmaShaderSet = map[string][]byte{
+	"narrow": shaders.VAENarrowF16,
+	"pack":   shaders.VAEPackF16,
+	"packt":  shaders.VAEPackF16T,
+}
+
+// NewGPUDecoder uploads a loaded decoder's weights and builds its pipelines
+// with the default kernels. latentH/latentW size the activation arena, which
+// is allocated once for the largest tensor the graph will hold.
 func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDecoder, error) {
+	return NewGPUDecoderOpts(dev, cpu, latentH, latentW, Options{})
+}
+
+// NewGPUDecoderOpts is NewGPUDecoder with the mid block's kernels named,
+// which is what the ladder in cmd/vaebench sweeps and what the negative
+// controls in the tests select.
+func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt Options) (*GPUDecoder, error) {
 	g := &GPUDecoder{
 		dev:     dev,
 		cpu:     cpu,
 		pipes:   make(map[string]*vk.ComputePipeline),
 		weights: &gpuWeights{off: make(map[string]uint32)},
+		w16:     make(map[string]uint32),
+	}
+	if err := g.chooseKernels(opt); err != nil {
+		return nil, err
 	}
 
 	g.flattenWeights()
@@ -192,8 +238,17 @@ func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDeco
 	}
 	g.wbuf.WriteFloat32(g.weights.data)
 
-	// Measure the arena by recording the graph once with a throwaway plan.
-	need, err := g.planSize(latentH, latentW)
+	if g.wmma() {
+		w16 := g.stageProjections(cpu.Mid.Attn)
+		if g.w16buf, err = dev.NewBuffer(len(w16) * 2); err != nil {
+			g.Destroy()
+			return nil, fmt.Errorf("vae: fp16 weight buffer (%d MB): %w", (len(w16)*2)>>20, err)
+		}
+		g.w16buf.WriteUint16At(0, w16)
+	}
+
+	// Measure both arenas by recording the graph once with a throwaway plan.
+	need, hneed, err := g.planSize(latentH, latentW)
 	if err != nil {
 		g.Destroy()
 		return nil, err
@@ -202,25 +257,121 @@ func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDeco
 		g.Destroy()
 		return nil, fmt.Errorf("vae: activation buffer (%d MB): %w", (int(need)*4)>>20, err)
 	}
+	// The fp16 arena is allocated even when it is empty, because it is bound
+	// to every pipeline: one descriptor layout across the graph is what lets
+	// vk.DispatchMultiTimed record it into a single command buffer.
+	if g.hbuf, err = dev.NewBuffer(max(int(hneed), 64) * 2); err != nil {
+		g.Destroy()
+		return nil, fmt.Errorf("vae: fp16 activation buffer (%d MB): %w", (int(hneed)*2)>>20, err)
+	}
+	// Zeroed once. Both passes that write it cover their own pad rows, so
+	// this is hygiene rather than an invariant -- but an operand arena that
+	// has never held anything cannot turn a stale bit pattern into an
+	// infinity, and one infinity in a row of A makes that whole row of the
+	// GEMM's output a NaN (stage 6).
+	g.hbuf.WriteFloat32(make([]float32, g.hbuf.Size()/4))
+	if g.w16buf == nil {
+		if g.w16buf, err = dev.NewBuffer(64); err != nil {
+			g.Destroy()
+			return nil, fmt.Errorf("vae: fp16 weight placeholder: %w", err)
+		}
+	}
 
+	set := map[string][]byte{}
 	for name, spirv := range shaderSet {
-		mod, err := dev.NewShaderModule(spirv)
-		if err != nil {
-			g.Destroy()
-			return nil, fmt.Errorf("vae: shader %s: %w", name, err)
+		set[name] = spirv
+	}
+	if g.wmma() {
+		for name, spirv := range wmmaShaderSet {
+			set[name] = spirv
 		}
-		g.mods = append(g.mods, mod)
-		pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-			Buffers:          []*vk.Buffer{g.wbuf, g.abuf},
-			PushConstantSize: uint32(unsafe.Sizeof(pushConstants{})),
-		})
-		if err != nil {
+	}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.w16buf}
+	pcSize := uint32(unsafe.Sizeof(pushConstants{}))
+	for name, spirv := range set {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
 			g.Destroy()
-			return nil, fmt.Errorf("vae: pipeline %s: %w", name, err)
+			return nil, err
 		}
-		g.pipes[name] = pipe
+	}
+	if g.wmma() {
+		// Both matrix-core kernels map gl_SubgroupID onto a wave grid, so
+		// their wave size is pinned rather than assumed: at the wrong size a
+		// workgroup holds the wrong number of waves and half of them write
+		// outside the tile.
+		if err := g.pipeline("attn_wmma", g.attn.spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: g.attn.wave,
+		}); err != nil {
+			g.Destroy()
+			return nil, err
+		}
+		spec := vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}
+		if g.gemm.waves > 1 {
+			spec.RequiredSubgroupSize = 64
+		}
+		if err := g.pipeline("gemm", g.gemm.spirv, spec); err != nil {
+			g.Destroy()
+			return nil, err
+		}
 	}
 	return g, nil
+}
+
+// chooseKernels resolves Options against what the device can actually do.
+func (g *GPUDecoder) chooseKernels(opt Options) error {
+	if opt.Attn == AttnScalar {
+		return nil
+	}
+	if !hasMatrixCores(g.dev) {
+		if opt.Attn != "" {
+			return fmt.Errorf("vae: attention kernel %q needs fp16, cooperative matrices and subgroup size control", opt.Attn)
+		}
+		return nil
+	}
+	attn := opt.Attn
+	if attn == "" {
+		attn = DefaultAttnKernel
+	}
+	v, ok := attnVariantFor(attn)
+	if !ok {
+		return fmt.Errorf("vae: no attention kernel %q (have %v)", attn, AttnKernels())
+	}
+	gk := opt.GEMM
+	if gk == "" {
+		gk = DefaultGEMMKernel
+	}
+	gv, ok := gemmVariantFor(gk)
+	if !ok {
+		return fmt.Errorf("vae: no GEMM kernel %q (have %v)", gk, GEMMKernels())
+	}
+	g.attn, g.gemm = v, gv
+	return nil
+}
+
+// wmma reports whether the mid block runs on the matrix cores.
+func (g *GPUDecoder) wmma() bool { return g.attn.spirv != nil }
+
+// Kernels names the mid block's two kernels, for a benchmark's output.
+func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel) {
+	if !g.wmma() {
+		return AttnScalar, ""
+	}
+	return g.attn.name, g.gemm.name
+}
+
+// pipeline builds one pipeline and records its module for destruction.
+func (g *GPUDecoder) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {
+	mod, err := g.dev.NewShaderModule(spirv)
+	if err != nil {
+		return fmt.Errorf("vae: shader %s: %w", name, err)
+	}
+	g.mods = append(g.mods, mod)
+	pipe, err := g.dev.NewPipeline(mod, spec)
+	if err != nil {
+		return fmt.Errorf("vae: pipeline %s: %w", name, err)
+	}
+	g.pipes[name] = pipe
+	return nil
 }
 
 // Destroy releases every Vulkan object.
@@ -236,6 +387,12 @@ func (g *GPUDecoder) Destroy() {
 	}
 	if g.wbuf != nil {
 		g.wbuf.Destroy()
+	}
+	if g.hbuf != nil {
+		g.hbuf.Destroy()
+	}
+	if g.w16buf != nil {
+		g.w16buf.Destroy()
 	}
 }
 
@@ -301,6 +458,7 @@ func (t tensor) elems() int { return t.C * t.H * t.W }
 type builder struct {
 	g     *GPUDecoder
 	ar    *arena
+	har   *arena
 	out   []vk.MultiDispatch
 	kinds []string
 	flops []float64
@@ -522,9 +680,13 @@ func (b *builder) attention(name string, a *Attention, x tensor) tensor {
 	})
 
 	res := tensor{off: b.ar.alloc(x.elems()), C: x.C, H: x.H, W: x.W}
+	// The bias is in the projection above on this path, so the fused add has
+	// none of its own -- there is no push-constant value that means "not set"
+	// (stage 6), so it is said explicitly.
 	b.add("to_nchw", groups(x.elems(), 256), pushConstants{
 		InOff: outRows.off, OutOff: res.off, ResOff: x.off,
 		C: uint32(x.C), H: uint32(x.H), W: uint32(x.W),
+		Aux0: noBias,
 	})
 	b.release(h, seq, q, k, kT, v, ctx, outRows, x)
 	return res
@@ -548,7 +710,11 @@ func (b *builder) build(latentH, latentW int) tensor {
 	x := tensor{off: b.ar.alloc(d.ConvIn.InC * latentH * latentW), C: d.ConvIn.InC, H: latentH, W: latentW}
 	h := b.conv("conv_in", d.ConvIn, x)
 	h = b.resnet("mid.r1", d.Mid.Resnet1, h)
-	h = b.attention("mid.attn", d.Mid.Attn, h)
+	if b.g.wmma() {
+		h = b.attentionWMMA("mid.attn", d.Mid.Attn, h)
+	} else {
+		h = b.attention("mid.attn", d.Mid.Attn, h)
+	}
 	h = b.resnet("mid.r2", d.Mid.Resnet2, h)
 	for i, up := range d.UpBlocks {
 		for j, r := range up.Resnets {
@@ -566,17 +732,17 @@ func (b *builder) build(latentH, latentW int) tensor {
 }
 
 // planSize records the graph with no pipelines bound, purely to find how
-// large the activation arena has to be.
-func (g *GPUDecoder) planSize(latentH, latentW int) (uint32, error) {
+// large each of the two activation arenas has to be.
+func (g *GPUDecoder) planSize(latentH, latentW int) (uint32, uint32, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{g: g, ar: &arena{}}
+	b := &builder{g: g, ar: &arena{}, har: &arena{}}
 	b.build(latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
-		return 0, b.err
+		return 0, 0, b.err
 	}
-	return b.ar.high, nil
+	return b.ar.high, b.har.high, nil
 }
 
 // Apply decodes a latent on the GPU. The whole graph -- 100-odd dispatches
@@ -591,10 +757,15 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 	}
 
 	g.arena.reset()
-	b := &builder{g: g, ar: &g.arena}
+	g.harena.reset()
+	b := &builder{g: g, ar: &g.arena, har: &g.harena}
 	out := b.build(latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err
+	}
+	if int(b.har.high)*2 > g.hbuf.Size() {
+		return nil, fmt.Errorf("vae: graph needs %d MB of fp16 activations, arena is %d MB",
+			(int(b.har.high)*2)>>20, g.hbuf.Size()>>20)
 	}
 	if int(b.ar.high)*4 > g.abuf.Size() {
 		return nil, fmt.Errorf("vae: graph needs %d MB of activations, arena is %d MB",
@@ -612,13 +783,15 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 	// keeps each submit short while still amortising the per-submit fence
 	// wait over a useful number of dispatches.
 	//
-	// The batch is 4 and not 8 because the graph is not flat: at a 1024x1024
-	// image the mid-block attention is **1.5 s in one dispatch** (16384 rows
-	// of 512, 27% of the decode), so a batch of eight around it is over the
-	// watchdog on its own. That size only shows up at the full image -- 8 is
-	// fine at 512x512, which is the largest thing stage 2 measured -- so this
-	// is a limit the pipeline found rather than the decoder. 4 and 2 are the
-	// same wall clock to within 1%, so the halving costs nothing.
+	// The batch is 4 and not 8 because the graph is not flat. It was the
+	// mid-block attention that forced it -- 1.5 s in one dispatch at a
+	// 1024x1024 image, which put a batch of eight over the watchdog on its
+	// own -- and stage 7 has since made that dispatch 15 ms, leaving a 404 ms
+	// convolution as the largest thing in the graph. So the cap is no longer
+	// load-bearing at this size, and it stays where it is because it is free:
+	// 8 measures 3.62 s against 4's 3.64, and 4 against 2 was the same 1%
+	// before that. The fence wait per submit is not what this decode is made
+	// of.
 	//
 	// Ordering and correctness are unaffected: DispatchMultiTimed blocks
 	// until its batch completes, so a batch boundary is a stronger barrier
@@ -640,7 +813,7 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 func (g *GPUDecoder) Dispatches(latentH, latentW int) (int, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{g: g, ar: &arena{}}
+	b := &builder{g: g, ar: &arena{}, har: &arena{}}
 	b.build(latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
@@ -668,7 +841,8 @@ type Stage struct {
 // which stage to fix.
 func (g *GPUDecoder) Profile(latent *Tensor) ([]Stage, error) {
 	g.arena.reset()
-	b := &builder{g: g, ar: &g.arena}
+	g.harena.reset()
+	b := &builder{g: g, ar: &g.arena, har: &g.harena}
 	out := b.build(latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err

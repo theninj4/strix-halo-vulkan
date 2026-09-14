@@ -58,7 +58,15 @@ func main() {
 	}
 	qf, err := phys.ComputeQueueFamily()
 	must(err)
-	dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{})
+	// The mid block's matrix-core path (stage 7) needs all three; without
+	// them NewGPUDecoder falls back to stage 2b's fp32 kernels.
+	feat, err := phys.SupportedFeatures()
+	must(err)
+	dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{
+		Float16:             feat.Float16,
+		CoopMatrix:          feat.CoopMatrix,
+		SubgroupSizeControl: feat.SubgroupSizeControl,
+	})
 	must(err)
 	defer dev.Destroy()
 

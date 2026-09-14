@@ -7,14 +7,20 @@
 > few more with each stage that closes, and loses them when a stage's detail
 > moves to `research/`.
 
-**Status**: **the target is met.** `go run ./cmd/zimage -prompt "..."` writes a
-1024x1024 PNG in **19.8 s** — tokenizer, text encoder, 34 DiT blocks over eight
-denoising steps, VAE, PNG — and reproduces diffusers' fp32 CPU pipeline to
-**2.5e-2** of the decoded image. Two runs agree to 19.79 s and 19.79 s. Every
-weight is resident: 7.17 GB of text encoder, 12.54 GB of transformer and
-4.56 GB of activations, 21.6 s to load, and then images cost only their own
-time. What is next is **optimisation with a profiler in front of it**, and the
-profile says where: the VAE is 28.6% of the image and has had no pass at all.
+**Status**: **the target is met and the first optimisation pass has landed.**
+`go run ./cmd/zimage -prompt "..."` writes a 1024x1024 PNG in **17.8 s** —
+tokenizer, text encoder, 34 DiT blocks over eight denoising steps, VAE, PNG —
+and reproduces diffusers' fp32 CPU pipeline to **2.5e-2** of the decoded image.
+Two runs agree to 17.84 s and 17.79 s. Every weight is resident: 7.17 GB of
+text encoder, 12.54 GB of transformer and 4.56 GB of activations, 21.6 s to
+load, and then images cost only their own time.
+
+Stage 7 took the profiler's top two items in the VAE — the mid block's
+attention and its four projections — onto the matrix cores: **1.43 s to 15.1 ms
+and 503 ms to 1.12 ms**, the decode from 5.65 s to **3.62 s**. What the
+profiler says now is that the VAE is **85% one convolution kernel**, 3.02 s at
+3.0-3.2 TFLOP/s, and that everything else in this pipeline is either at 70-76%
+of a ceiling or under 1% of an image.
 
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 
@@ -70,6 +76,7 @@ whole pipeline is resident in 128 GB unified memory at once.
 | 5b | Text encoder, CPU reference | **done** | `zimage/qwen`, 35 of 36 layers, **2.08 s**; `cmd/textenc` |
 | 5c | Text encoder, Vulkan | **done** | 21 dispatches/layer, 2 banks, **57 ms**; the winning tile moves with T |
 | 6 | Scheduler + driver | **done** | `zimage/pipeline`, `cmd/zimage`; **19.8 s per image**, 2.5e-2 against diffusers |
+| 7 | VAE mid block on WMMA | **done** | attention **94x**, projections **449x**; decode 5.65 s → **3.62 s**, image → **17.8 s**; §7 |
 
 Each stage gets a CPU implementation in Go first: it separates "do I understand
 the architecture" from "is the shader right", and once it matches diffusers it
@@ -181,25 +188,26 @@ of activations, against an 83.79 GiB device-local host-visible heap.
 In the pipeline a step is **1.76 s**, not 1.60: 58 ms of CPU head and tail and
 ~100 ms of the residual stream crossing the bus. Both go away together.
 
-**The VAE** (`go run ./cmd/vaebench`), everything fp32, wall clock including a
-read-back:
+**The VAE** (`go run ./cmd/vaebench`), fp32 except the mid block, wall clock
+including a read-back:
 
-| latent | image | activations | wall |
-|---|---|---|---|
-| 16² | 128² | 49 MB | 49 ms |
-| 32² | 256² | 197 MB | 217 ms |
-| 64² | 512² | 789 MB | 1.02 s |
-| 128² | **1024²** | 3.16 GB | **5.59 s** |
+| latent | image | activations | wall | before stage 7 |
+|---|---|---|---|---|
+| 16² | 128² | 49 MB | 47 ms | 49 ms |
+| 32² | 256² | 195 MB | 192 ms | 217 ms |
+| 64² | 512² | 780 MB | 856 ms | 1.02 s |
+| 128² | **1024²** | 3.12 GB | **3.62 s** | 5.59 s |
 
-The lever is fp16 onto the WMMA path, which halves the arena and should move
-conv3x3 past its 3.0-3.2 TFLOP/s. Stage 2 found fp16 cannot hold *these*
-intermediates (1.16e7 against 65504), so it needs a per-tensor range check and
-not a blanket narrowing — and stage 6's SwiGLU scale is the other shape that
-fix can take, wherever the consumer is scale-invariant. The profile is **not
-flat**: at a 128² latent the mid-block attention is **1.51 s in one dispatch,
-27% of the decode**, which is both the optimisation target and the reason
-`dispatchesPerSubmit` is 4 rather than 8 (a batch of eight around it trips the
-driver's reset watchdog).
+The profile is now **one kernel**: conv3x3 is **85% of the decode**, 3.02 s at
+3.0-3.2 TFLOP/s against a 55.5 TFLOP/s fp16 ceiling, over 40-odd dispatches of
+which the largest is 404 ms. Everything else together is 15%, and the mid
+block — the whole of stage 7's 2 s — is 0.5%.
+
+The lever left is the same one, now aimed at the only operator that has it:
+conv's implicit GEMM onto fp16 and the matrix cores. Stage 2's constraint still
+holds — fp16 cannot hold *these* intermediates (1.16e7 against 65504) — but
+stage 7 measured the shape of the answer: conv's *inputs* peak at 497 while its
+accumulators need fp32, which is what the matrix cores do natively.
 
 **The text encoder** (`go run ./cmd/textenc -gpu`), 35 layers, 7.07 GB of fp16
 weights in two banks, best of three, two runs agreeing to 1.004:
@@ -218,32 +226,34 @@ which the pipeline pays once per image rather than once per step.
 
 ## Where the image budget stands
 
-`go run ./cmd/zimage -width 1024`, wall clock, two runs agreeing to 19.79 s
-and 19.79 s.
+`go run ./cmd/zimage -width 1024`, wall clock, two runs agreeing to 17.84 s
+and 17.79 s.
 
 | | per image, 1024², 8 steps | share |
 |---|---|---|
-| denoising | **14.05 s** | 71.0% |
-| — of which the 34 blocks | 13.6 s | 68.7% |
-| — of which the CPU head and tail | 0.47 s | 2.4% |
-| — of which the stream across the bus | ~0.8 s | 4.0% |
-| VAE decode | **5.65 s** | 28.6% |
-| text encoder, 17 tokens | 0.06 s | 0.3% |
-| caption refiners, once per image | 0.006 s | 0.03% |
-| **total** | **19.79 s** | |
+| denoising | **14.13 s** | 79.3% |
+| — of which the 34 blocks | 13.6 s | 76.4% |
+| — of which the CPU head and tail | 0.44 s | 2.5% |
+| — of which the stream across the bus | ~0.8 s | 4.5% |
+| VAE decode | **3.60 s** | 20.2% |
+| text encoder, 17 tokens | 0.06 s | 0.4% |
+| caption refiners, once per image | 0.007 s | 0.04% |
+| **total** | **17.82 s** | |
 
 Loading is 21.6 s and happens once: 7.17 GB of text encoder, 12.54 GB of
 transformer, 4.56 GB of activation arenas.
 
 Two items are left and they are very different sizes.
 
-**The VAE, 28.6% of the image, with no optimisation pass at all.** fp32
-throughout, conv3x3 at 3.0-3.2 TFLOP/s against a 55.5 TFLOP/s fp16 ceiling,
-and one attention dispatch that is 27% of the decode on its own. This is the
-whole of the remaining headroom worth the name.
+**conv3x3, 3.02 s, 17% of the image and 85% of the VAE.** 3.0-3.2 TFLOP/s
+against a 55.5 TFLOP/s fp16 ceiling, and unlike everything else in this
+pipeline it is not a GEMM with the wrong kernel in front of it — its implicit
+GEMM has never been written. This is the whole of the remaining headroom worth
+the name, and `research/stage-7-vae-mid-block.md` ends on what stands in its
+way.
 
-**The head and tail onto the device, 1.3 s, 6.4%.** They are the same item:
-`x_embedder` and the final layer run on the CPU (0.47 s), and because they do,
+**The head and tail onto the device, 1.24 s, 7.0%.** They are the same item:
+`x_embedder` and the final layer run on the CPU (0.44 s), and because they do,
 the [4128, 3840] residual stream crosses the bus twice a step (~0.8 s) where
 the [4096, 64] latent is 1 MB. Two GEMMs at shapes the existing kernel already
 covers — K=64 and N=64 — plus a LayerNorm.
@@ -263,7 +273,7 @@ that are load-bearing for what is left:
 - **[Stage 2, the VAE](research/stage-2-vae-decoder.md)** — fp16 cannot hold
   this model's VAE intermediates (1.16e7 against 65504); register blocking beat
   every other conv fix 6.1x; two hard device limits, 4.29 GB per storage buffer
-  and a watchdog that kills a 5.5 s command buffer.
+  and a reset watchdog that kills a multi-second command buffer.
 - **[Stage 3, attention](research/stage-3-dit-attention.md)** — 70% of the WMMA
   ceiling, but only once every operand is stored as fragment tiles. Three
   hazards a port hits: RoPE pairs *adjacent* components, the q/k norms are *per
@@ -291,6 +301,16 @@ that are load-bearing for what is left:
   stops being a good one when the dispatches differ 100x. Also: the context
   refiners take neither the timestep nor the latents, so **two of the three
   phases run once per image rather than once per step**.
+- **[Stage 7, the VAE mid block](research/stage-7-vae-mid-block.md)** — the
+  first target a profiler picked: attention **1.43 s → 15.1 ms** (36.4
+  TFLOP/s) and the four projections **503 ms → 1.12 ms**. The head is 512 wide,
+  four times the DiT's, so stage 3c's kernel spills 170 VGPRs at it and the
+  *workgroup* has to own the head instead of the wave — the two matmuls then
+  split along the same axis in opposite senses. wave32 is 1.56x at identical
+  tiling, again. And the finding: this block's softmax is so saturated that a
+  kernel **dropping three quarters of every dot product decodes the same
+  image**, so it is validated on its own inputs rather than through the
+  picture.
 - **[Stage 4c, the stack](research/stage-4c-dit-stack.md)** — splitting a
   12.0 GB weight arena across storage buffers costs **one pipeline per bank
   and nothing per dispatch**, because the buffer is in the descriptor set. Six

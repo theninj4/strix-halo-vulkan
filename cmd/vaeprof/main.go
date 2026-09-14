@@ -16,6 +16,8 @@ func main() {
 	log.SetFlags(0)
 	size := flag.Int("size", 32, "latent size")
 	topN := flag.Int("top", 12, "slowest dispatches to list")
+	attn := flag.String("attn", "", "mid-block attention kernel (\"scalar\" for stage 2b's fp32 path)")
+	gemm := flag.String("gemm", "", "mid-block projection kernel")
 	flag.Parse()
 	inst, _ := vk.NewInstance("prof")
 	defer inst.Destroy()
@@ -27,7 +29,17 @@ func main() {
 		}
 	}
 	qf, _ := phys.ComputeQueueFamily()
-	dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{})
+	// The mid block's matrix-core path (stage 7) needs all three; without
+	// them NewGPUDecoder falls back to stage 2b's fp32 kernels.
+	feat, err := phys.SupportedFeatures()
+	if err != nil {
+		log.Fatal(err)
+	}
+	dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{
+		Float16:             feat.Float16,
+		CoopMatrix:          feat.CoopMatrix,
+		SubgroupSizeControl: feat.SubgroupSizeControl,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -38,7 +50,9 @@ func main() {
 		log.Fatal(err)
 	}
 	n := *size
-	g, err := vae.NewGPUDecoder(dev, cpu, n, n)
+	g, err := vae.NewGPUDecoderOpts(dev, cpu, n, n, vae.Options{
+		Attn: vae.AttnKernel(*attn), GEMM: vae.GEMMKernel(*gemm),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -70,7 +84,9 @@ func main() {
 		}
 		byKind[k] += s.GPU
 	}
-	fmt.Printf("latent %dx%d -> image %dx%d, %d dispatches, GPU total %s\n\n", n, n, n*8, n*8, len(st), total.Round(time.Millisecond))
+	ak, gk := g.Kernels()
+	fmt.Printf("latent %dx%d -> image %dx%d, %d dispatches, GPU total %s (attn %s, gemm %s)\n\n",
+		n, n, n*8, n*8, len(st), total.Round(time.Millisecond), ak, gk)
 
 	type kv struct {
 		k string

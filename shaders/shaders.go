@@ -937,11 +937,11 @@ var SoftmaxSubgroup []byte
 //go:embed softmax_subgroup_w32.spv
 var SoftmaxSubgroupW32 []byte
 
-// VAE decoder (PIPELINE.md stage 2b). Every one of these declares the same
-// two bindings and the same 64-byte push-constant block, defined in
-// vae_common.glsl, so a whole decode can be recorded into one command buffer
-// by vk.DispatchMultiTimed. All fp32: this is the correctness port, with
-// zimage/vae's CPU implementation as its oracle.
+// VAE decoder (PIPELINE.md stage 2b). Every one of these is built over the
+// same four bindings and declares the same 88-byte push-constant block,
+// defined in vae_common.glsl, so a whole decode can be recorded into one
+// command buffer by vk.DispatchMultiTimed. All fp32: this is the correctness
+// port, with zimage/vae's CPU implementation as its oracle.
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_conv2d.spv vae_conv2d.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_groupnorm.spv vae_groupnorm.comp
@@ -983,6 +983,73 @@ var VAEAttention []byte
 
 //go:embed vae_transpose.spv
 var VAETranspose []byte
+
+// The mid block on the matrix cores (PIPELINE.md stage 7). The scalar
+// attention above is 26% of a 1024x1024 decode in one dispatch and its four
+// projections another 10% at 62 GFLOP/s, so both move to fp16 operands and
+// cooperative-matrix multiplies. The pack is what makes a fragment load
+// cover its 512 bytes (§5.1b); TRANSPOSE=1 is the v operand, whose matmul
+// reduces over the row rather than the component.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_narrow_f16.spv vae_narrow_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_pack_f16.spv vae_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTRANSPOSE=1 -o vae_pack_f16_t.spv vae_pack_f16.comp
+
+//go:embed vae_narrow_f16.spv
+var VAENarrowF16 []byte
+
+//go:embed vae_pack_f16.spv
+var VAEPackF16 []byte
+
+//go:embed vae_pack_f16_t.spv
+var VAEPackF16T []byte
+
+// The attention ladder. QT query tiles per workgroup and KTIL keys tiles per
+// block are the two knobs stage 3c's ablation ended on; what is new here is
+// that the workgroup, not the wave, owns the head, so WAVES is fixed at 4 by
+// the 512-wide head and only the arms that keep the register file under 256
+// are built -- QT=2 with KTIL=4 spills 44 VGPRs into 11 KB of scratch, and so
+// does KTIL=8 at wave32, where an accumulator tile costs 8 registers a lane
+// rather than 4. The wave32 arms are §6.2's, and they win.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o vae_attn_wmma_qt1_kt2.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o vae_attn_wmma_qt1_kt4.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -o vae_attn_wmma_qt1_kt8.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=2 -o vae_attn_wmma_qt2_kt2.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -DWAVE=32 -o vae_attn_wmma_qt1_kt2_w32.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -o vae_attn_wmma_qt1_kt4_w32.spv vae_attention_wmma.comp
+
+//go:embed vae_attn_wmma_qt1_kt2.spv
+var VAEAttentionWMMAQT1KT2 []byte
+
+//go:embed vae_attn_wmma_qt1_kt4.spv
+var VAEAttentionWMMAQT1KT4 []byte
+
+//go:embed vae_attn_wmma_qt1_kt8.spv
+var VAEAttentionWMMAQT1KT8 []byte
+
+//go:embed vae_attn_wmma_qt2_kt2.spv
+var VAEAttentionWMMAQT2KT2 []byte
+
+//go:embed vae_attn_wmma_qt1_kt2_w32.spv
+var VAEAttentionWMMAQT1KT2W32 []byte
+
+//go:embed vae_attn_wmma_qt1_kt4_w32.spv
+var VAEAttentionWMMAQT1KT4W32 []byte
+
+// The two negative controls (zimage/vae/gpu_test.go). NO_CROSS_WAVE drops
+// the three partial score matrices this kernel's structure exists to sum;
+// NO_RESCALE drops the online-softmax correction. Built and dispatchable,
+// deliberately out of the ladder.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DNO_CROSS_WAVE=1 -o vae_attn_wmma_nocross.spv vae_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DNO_RESCALE=1 -o vae_attn_wmma_norescale.spv vae_attention_wmma.comp
+
+//go:embed vae_attn_wmma_nocross.spv
+var VAEAttentionWMMANoCrossWave []byte
+
+//go:embed vae_attn_wmma_norescale.spv
+var VAEAttentionWMMANoRescale []byte
 
 // Z-Image DiT (PIPELINE.md stage 3). Same two-arena binding convention as
 // the VAE shaders, defined in dit_common.glsl. fp32; the CPU implementation

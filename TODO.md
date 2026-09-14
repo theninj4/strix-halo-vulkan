@@ -603,6 +603,106 @@ The DiT's own levers are spent (72% GEMM at 73-76% of the WMMA ceiling) and the
 text encoder is 0.3% of an image. `GOALS.md`'s other four models have not been
 started, and the HTTP API has not either.
 
+### Session 2026-09-14 (eighth) — stage 7: the VAE mid block on the matrix cores
+
+**Result: the first optimisation pass chosen by a profiler.** The decode's
+second- and third-largest costs were the mid block's attention (**1.42 s in one
+dispatch, 26%**) and its four projections (**503 ms at 62 GFLOP/s**), both
+still stage 2b's fp32 correctness kernels. On fp16 operands and
+`coopMatMulAdd` they are **15.1 ms** (36.4 TFLOP/s) and **1.12 ms**
+(30.6 TFLOP/s) — 94x and 449x. The decode is 5.65 s → **3.62 s** and an image
+19.79 s → **17.82 s**. Written up in
+[`research/stage-7-vae-mid-block.md`](research/stage-7-vae-mid-block.md).
+
+| | before | after |
+|---|---|---|
+| mid-block attention, 16384 rows x 512 | 1.429 s | **15.1 ms** |
+| the four 512x512 projections | 503 ms | **1.12 ms** |
+| VAE decode, 1024², GPU total | 5.53 s | **3.56 s** |
+| VAE decode, wall | 5.65 s | **3.62 s** |
+| an image, 1024², 8 steps | 19.79 s | **17.82 s** |
+
+**Built:**
+
+- `shaders/vae_attention_wmma.comp` — flash attention where the **workgroup**
+  owns the head rather than the wave. Seven builds over QT/KTIL/WAVE plus two
+  negative controls.
+- `shaders/vae_pack_f16.comp` (two builds, natural and transposed tiles) and
+  `shaders/vae_narrow_f16.comp` — the fp16 operands, with the projections'
+  biases folded into the pack.
+- `zimage/vae/gpu_wmma.go` — the kernel ladders, the fragment-tile weight
+  staging, and the mid block's graph. `Options`/`NewGPUDecoderOpts`,
+  `AttnKernels()`, `GEMMKernels()`.
+- `vae_common.glsl`'s push-constant block grew the six GEMM fields at
+  `dit_common.glsl`'s byte offsets, and `vae_rows_to_nchw_add.comp` an optional
+  bias. The VAE's pipelines are now built over four buffers.
+- `cmd/vaebench -ladder` sweeps both kernels on GPU timestamps;
+  `cmd/vaeprof -attn/-gemm` profiles a chosen pair. Both commands (and the
+  package's tests) now ask for fp16, cooperative matrices and subgroup-size
+  control, and fall back to stage 2b's fp32 path without them.
+
+**Four things worth carrying forward:**
+
+1. **A head dimension is a register budget, and 4x the DiT's does not fit.**
+   `dit_attention_wmma.comp` keeps `HEAD_DIM/16` output accumulators per query
+   tile — 8 at the DiT's 128, **32** at the VAE's 512 — and built at 512 it
+   asks for **424 VGPRs against a 256-register file, spilling 170 into 30 KB of
+   scratch**. `RADV_DEBUG=shaderstats` said so before a line of host code was
+   written. The fix is to give the head to the workgroup: four waves, each
+   owning an eighth of the component axis, which splits `S = Q.K^T` (a
+   *reduction* over that axis, so the partials are summed in LDS) and
+   `O += P.V` (*indexed* by it, so each wave owns its own output tiles) in
+   opposite directions. 192 VGPRs, no spill, 24 KB of LDS.
+2. **This attention cannot be validated end to end, and that is a property of
+   the model.** Stage 2 found the mid block's softmax is a hard one-hot whose
+   argmax is set by `||k_j||`. Stage 7 hit the consequence: the
+   `NO_CROSS_WAVE` control — which **throws away three quarters of every dot
+   product** — decodes the reference image to **8.2e-4**, *inside* the
+   tolerance the correct kernel meets, while `NO_RESCALE` lands 634x outside
+   it. A kernel whose Q/K addressing ignored the wave index would have passed
+   every image test in the package. So the kernel is tested on its own, on
+   unit-normal rows where the distribution is soft, and there the same control
+   is **833x** out. `TestGPUWMMAControls` now asserts *both* directions, so
+   that if the image ever becomes score-sensitive the test says to promote the
+   control rather than widen a bound.
+3. **Reusing a tuned kernel is cheaper than forking it, and the price is a
+   push-constant convention.** The projections run on `dit_gemm.comp`
+   *unmodified*; what that cost was making `vae_common.glsl`'s block the same
+   88 bytes as `dit_common.glsl`'s with the six GEMM fields at the same
+   offsets (`inOff` and `outOff` already coincided). The alternative was
+   forking a kernel that carries §2.1, §2.3, §2.4 and §2.7 behind it. Its
+   missing bias went into the two passes that were already reading those
+   tensors — the pack and the residual add — for no extra dispatch.
+4. **wave32, a fourth time.** 15.1 ms against 23.6 at identical tiling,
+   **1.56x**, and here it is the only thing separating the ladder's winner from
+   its middle. §2.7's hoisted K-slab also flips sign: a *win* of 4% on these
+   projections where stage 4a measured it a loss on the DiT's `ff.w13`.
+
+**How it was measured:** `go run ./cmd/vaebench -ladder -size 128` (GPU
+timestamps, best of three, every build), run twice and agreeing to 1.003 on the
+winner; `go run ./cmd/vaeprof -size 128` for the decode's profile;
+`go run ./cmd/vaebench -sizes 16,32,64,128` and `go run ./cmd/zimage -reps 2`
+for wall clock (17.84 s and 17.79 s). Register and LDS figures per build come
+from `RADV_DEBUG=shaderstats,nocache go run ./cmd/probe`.
+
+**Correctness:** `go test ./zimage/vae` gains five tests — the fp16 path
+against diffusers over every build (8.2e-4), against the fp32 path on the same
+device (8.2e-4), at a latent whose row count is not a multiple of the key block
+(1.7e-4), the two image-level controls, and the kernel test above (2.0e-3 with
+the controls at 833x and 2718x). The fp32 tests are unchanged and now name
+`Attn: AttnScalar` explicitly. `go test ./zimage/pipeline` still measures
+0.0252 against diffusers at 256², i.e. the mid block's fp16 does not show up in
+the end-to-end number at all.
+
+**Next — conv3x3, which is now 85% of the decode** (3.02 s at 3.0-3.2 TFLOP/s,
+40-odd dispatches, the largest 404 ms) and 17% of an image. Unlike everything
+else optimised so far it is not a GEMM with the wrong kernel in front of it:
+its implicit GEMM has never been written. Stage 2's overflow constraint is
+what stands in the way and stage 7 measured the shape of the answer — conv's
+inputs peak at 497 while its accumulators need fp32, which is what the matrix
+cores do natively. After that the only item left in the image is the DiT's CPU
+head and tail (1.24 s, 7.0%).
+
 ### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the

@@ -1,8 +1,15 @@
 #version 450
 // (H*W, C) -> (C, H, W), adding the attention block's residual on the way
-// back. Fused because the alternative is a second full pass over the tensor
-// for an elementwise add, and IDEAS §3.2's point is that these passes are
-// pure bandwidth and the only win is not doing them.
+// back, and the output projection's bias with it. Fused because the
+// alternative is a second full pass over the tensor for an elementwise add,
+// and IDEAS §3.2's point is that these passes are pure bandwidth and the only
+// win is not doing them.
+//
+// The bias is here because the matrix-core path's projection has none:
+// shaders/dit_gemm.comp is reused unmodified and writes A*B, so the VAE's
+// four biases live in the passes that were already reading those tensors --
+// three in vae_pack_f16.comp and this one. pc.aux0 is NO_BIAS on the fp32
+// path, where the projection adds its own.
 
 #include "vae_common.glsl"
 
@@ -16,5 +23,9 @@ void main() {
     }
     uint p = idx % hw;
     uint c = idx / hw;
-    act[pc.outOff + idx] = act[pc.inOff + p * pc.C + c] + act[pc.resOff + idx];
+    float v = act[pc.inOff + p * pc.C + c] + act[pc.resOff + idx];
+    if (pc.aux0 != NO_BIAS) {
+        v += wbuf[pc.aux0 + c];
+    }
+    act[pc.outOff + idx] = v;
 }
