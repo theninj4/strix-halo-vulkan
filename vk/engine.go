@@ -256,6 +256,7 @@ type Device struct {
 	phys        *PhysicalDevice
 	queue       C.VkQueue
 	queueFamily uint32
+	features    DeviceFeatures
 }
 
 // NewDevice creates a logical device on phys with a single queue drawn from
@@ -268,8 +269,18 @@ func NewDevice(phys *PhysicalDevice, queueFamily uint32, features DeviceFeatures
 		C.shim_create_device(phys.handle, C.uint32_t(queueFamily), &req, &handle, &queue)); err != nil {
 		return nil, err
 	}
-	return &Device{handle: handle, phys: phys, queue: queue, queueFamily: queueFamily}, nil
+	return &Device{handle: handle, phys: phys, queue: queue, queueFamily: queueFamily, features: features}, nil
 }
+
+// Physical returns the physical device this logical device was created on, so
+// a caller holding only the Device can still ask what the hardware reports —
+// cooperative-matrix shapes, for instance.
+func (d *Device) Physical() *PhysicalDevice { return d.phys }
+
+// Features returns the optional features this device was *created* with,
+// which is what a shader may actually use: a feature the hardware supports
+// but NewDevice was not asked for is not enabled.
+func (d *Device) Features() DeviceFeatures { return d.features }
 
 // Destroy releases the device.
 func (d *Device) Destroy() {

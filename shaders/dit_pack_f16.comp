@@ -1,0 +1,97 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Pack one fp32 [tokens, heads*headDim] activation into the fp16 fragment-tile
+// layout dit_attention_wmma.comp's cooperative-matrix loads want.
+//
+// The layout is the whole point of this shader, and it is IDEAS §5.1b's
+// coverage law applied to a `coopMatLoad`. A 16x16 fp16 fragment holds 32 bytes
+// of each of the 16 rows it touches, so reading one out of a matrix stored with
+// any natural row stride puts 16 chunks of 32 B, one stride apart, in a single
+// instruction: the contiguous run in flight is 32 B against a gcd of 256 or
+// more, i.e. an eighth of the bus or less. That is exactly the regime the GEMM
+// ablation measured 2-4x in (shaders/gemm_wmma.comp's HOIST_A/HOIST_B), and
+// measured here first: with q, k and v in their natural per-head layouts the
+// WMMA attention kernel reached 1.56x the scalar one instead of the order of
+// magnitude the matrix cores are worth, and every tile geometry tied, which is
+// the signature of a kernel bound by neither its registers nor its MMA issue.
+//
+// So the fragments are stored *as fragments*. Tile (t, c) of a head -- token
+// rows 16t..16t+15, component columns 16c..16c+15 -- is one contiguous 512 B
+// block, and `coopMatLoad(..., stride 16)` reads it with full coverage and no
+// hoisting, no LDS staging and no extra registers in the kernel that consumes
+// it. Consecutive c are adjacent blocks, which is the order the kernel walks.
+//
+// Two modes, because the two GEMMs of attention reduce over different axes and
+// the hardware operand layout is K-contiguous for both operands:
+//
+//   mode 0 stores (token, component) at m*16 + k. That serves q as the A
+//     operand of q.k^T, read row-major, *and* k as its B operand, read
+//     column-major -- the reduction axis is the component for both, so one
+//     layout does for both.
+//   mode 1 stores (token, component) at hd*16 + m, i.e. each tile transposed.
+//     That serves v as the B operand of p.v, whose reduction axis is the token.
+//
+// Which is the same trick dit_transpose_k.comp plays for the scalar kernel,
+// moved to the other operand and down to tile granularity.
+//
+// The transpose goes through LDS so that both sides of it are coalesced: one
+// workgroup owns 16 tokens of one head, reads them as 16 contiguous rows of
+// headDim floats, and writes HDT contiguous 512 B tiles. Neither the read nor
+// the write is the 32-byte-run pattern this file exists to avoid.
+//
+// Scale folds into the pack: q carries 1/sqrt(headDim) * log2(e) so the
+// kernel's softmax can use exp2 instead of exp, which on this ISA is one
+// instruction instead of a multiply and one.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define TILE 16
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HDT (HEAD_DIM / TILE)
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+// 16 tokens x headDim of the head this workgroup owns.
+shared float rows[TILE * HEAD_DIM];
+
+void main() {
+    uint tt = gl_WorkGroupID.x;          // token tile
+    uint head = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint tok0 = tt * TILE;
+
+    // Coalesced in: consecutive lanes read consecutive components of one
+    // token, so a 128-lane run covers that token's whole head slice. Tokens
+    // past the sequence are zeroed rather than skipped -- the kernel reads the
+    // padding, and a pad key has to score something finite.
+    for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
+        uint m = i / HEAD_DIM, d = i % HEAD_DIM;
+        uint token = tok0 + m;
+        rows[i] = (token < pc.tokens)
+            ? act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] * uintBitsToFloat(pc.scale)
+            : 0.0;
+    }
+    barrier();
+
+    // Coalesced out: consecutive lanes write consecutive halves of one tile.
+    uint base = pc.outOff + (head * pc.aux1 / TILE + tt) * (HDT * TILE * TILE);
+    for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
+        uint c = o / (TILE * TILE);      // component tile
+        uint rem = o % (TILE * TILE);
+        uint m, d;
+        if (pc.aux0 == 0u) {
+            m = rem / TILE;             // (token, component)
+            d = c * TILE + rem % TILE;
+        } else {
+            m = rem % TILE;             // transposed: (component, token)
+            d = c * TILE + rem / TILE;
+        }
+        hact[base + o] = float16_t(rows[m * HEAD_DIM + d]);
+    }
+}

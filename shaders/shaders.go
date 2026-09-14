@@ -1008,3 +1008,73 @@ var DiTAttention []byte
 
 //go:embed dit_attention_flash.spv
 var DiTAttentionFlash []byte
+
+// Attention on the matrix cores (PIPELINE.md stage 3c, IDEAS §3.3). The
+// ladder varies the two knobs that decided the GEMM ablation and nothing
+// else: QT, the query tiles one wave accumulates, which is the whole of the
+// kernel's arithmetic intensity at 16*QT FLOP/byte; and KTIL, the key tiles
+// per block, which moves the softmax bookkeeping and the live score
+// accumulators without moving intensity at all. Both size register and
+// `shared` arrays, so they are -D and not specialization constants, exactly as
+// in gemm_wmma.comp.
+//
+// The wave32 arms are IDEAS §6.2 applied here: the register file is per lane,
+// so the same accumulator grid costs twice the VGPRs at wave32, and the GEMM
+// found the crossover at M=1024 -- which the DiT straddles, 320 tokens for the
+// caption stream and 4096 for a 1024x1024 latent. A variant built with -DWAVE
+// must be paired with RequiredSubgroupSize on the host or the workgroup is no
+// longer one wave and the LDS scratch is shared by two.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_pack_f16.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o dit_attn_wmma_qt1_kt4.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -o dit_attn_wmma_qt1_kt8.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=2 -o dit_attn_wmma_qt2_kt2.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o dit_attn_wmma_qt2_kt4.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=8 -o dit_attn_wmma_qt2_kt8.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=4 -DKTIL=4 -o dit_attn_wmma_qt4_kt4.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DNO_TAIL_MASK=1 -o dit_attn_wmma_qt2_kt4_nomask.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -o dit_attn_wmma_qt1_kt4_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DWAVE=32 -o dit_attn_wmma_qt2_kt4_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -DWAVE=32 -o dit_attn_wmma_qt1_kt2_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -DWAVE=32 -o dit_attn_wmma_qt1_kt8_w32.spv dit_attention_wmma.comp
+
+//go:embed dit_pack_f16.spv
+var DiTPackF16 []byte
+
+//go:embed dit_attn_wmma_qt1_kt4.spv
+var DiTAttentionWMMAQT1KT4 []byte
+
+//go:embed dit_attn_wmma_qt1_kt8.spv
+var DiTAttentionWMMAQT1KT8 []byte
+
+//go:embed dit_attn_wmma_qt2_kt2.spv
+var DiTAttentionWMMAQT2KT2 []byte
+
+//go:embed dit_attn_wmma_qt2_kt4.spv
+var DiTAttentionWMMAQT2KT4 []byte
+
+//go:embed dit_attn_wmma_qt2_kt8.spv
+var DiTAttentionWMMAQT2KT8 []byte
+
+//go:embed dit_attn_wmma_qt4_kt4.spv
+var DiTAttentionWMMAQT4KT4 []byte
+
+// The negative control: qt2_kt4 with the tail mask compiled out, and nothing
+// else changed. zimage/dit/gpu_test.go asserts it fails at a sequence length
+// that is not a multiple of the key block, which is what makes the masked
+// kernel's agreement evidence rather than coincidence.
+
+//go:embed dit_attn_wmma_qt2_kt4_nomask.spv
+var DiTAttentionWMMAQT2KT4NoMask []byte
+
+//go:embed dit_attn_wmma_qt1_kt4_w32.spv
+var DiTAttentionWMMAQT1KT4W32 []byte
+
+//go:embed dit_attn_wmma_qt2_kt4_w32.spv
+var DiTAttentionWMMAQT2KT4W32 []byte
+
+//go:embed dit_attn_wmma_qt1_kt2_w32.spv
+var DiTAttentionWMMAQT1KT2W32 []byte
+
+//go:embed dit_attn_wmma_qt1_kt8_w32.spv
+var DiTAttentionWMMAQT1KT8W32 []byte

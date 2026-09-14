@@ -1,0 +1,355 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Flash attention built out of cooperative-matrix (WMMA) multiplies, one wave
+// per workgroup: PIPELINE.md stage 3c, and the instruction IDEAS §3.3 has
+// carried since before any of it was measured.
+//
+// Why this file exists. dit_attention_flash.comp is correct and tops out at
+// 707 GFLOP/s at 4096 tokens -- 2.1% of fp32 peak -- after three successive
+// structural fixes bought 1.53x in total. The third fix is the one that says
+// no fourth will help: with the queries register-blocked it runs at 2.67
+// FLOP/byte where ~28 is needed to saturate the MALL, and closing that by
+// register blocking alone needs a query block of 32-64 *scalar* accumulators
+// per thread. The scalar-FMA path is an order of magnitude short and the
+// matrix cores are the only way up: WMMA fp16 measures 55.5 TFLOP/s on this
+// part against 22.9 for packed fp32 FMA, and the best GEMM reaches 70% of it.
+//
+// So attention is treated as what it is -- two GEMMs with a softmax wedged
+// between them -- and both are issued as `coopMatMulAdd`:
+//
+//     S = Q.K^T      [BM, headDim] x [headDim, BN]
+//     O += P.V       [BM, BN]      x [BN, headDim]
+//
+// The knobs are the same two that decided the GEMM ablation (§2.1, §2.7):
+//
+//   QT  query tiles per wave. This alone sets arithmetic intensity, at
+//       16*QT FLOP/byte: per key block the wave reads KTIL*HDT fragments of
+//       K and HDT*KTIL of V and issues 2*QT*KTIL*HDT multiplies, so KTIL
+//       cancels out of the ratio entirely and only QT moves it.
+//   KTIL key tiles per block. Does not change intensity; it changes how often
+//       the softmax bookkeeping runs and how many score accumulators are
+//       live. Both are the register budget, which is what §2.7 ended on.
+//
+// And the answer, which is not the GEMM's: **intensity is inert here**. QT=1,
+// 2 and 4 span 16 to 64 FLOP/byte and land within 1.06x of each other, because
+// every query block of a head streams that head's whole K and V and the caches
+// already supply that reuse -- there is no DRAM traffic for register blocking
+// to buy back, the same reason LDS staging lost in §2.1. What decides the
+// ladder is the register file (every spilling variant loses, monotonically in
+// how much) and the wave size (a clean 1.40x at identical tiling, §6.2's third
+// arm). The winner is QT=1, KTIL=4 at wave32: 240 of 256 VGPRs, nothing
+// spilled, 5 KB of LDS, 6.64 ms at 4096 tokens against the scalar kernel's 202.
+//
+// Q's fragments are loaded once, before the key loop, and kept in registers
+// for the whole sequence -- QT*HDT of them, 2 VGPRs each on wave64, which is
+// cheap next to the QT*HDT accumulators they feed.
+//
+// The three things that make a WMMA flash kernel awkward, and what this does:
+//
+//  1. **An accumulator cannot be used as a multiply operand.** GL_KHR
+//     cooperative_matrix allows conversions only between matrices of the same
+//     Use, so P, which arrives in an accumulator, has to go through memory to
+//     come back as an A operand. That round trip is the one unavoidable LDS
+//     cost here, and it is also where the tail masking and the fp16 narrowing
+//     happen, so it earns its place.
+//  2. **Element access exists but carries no row index.** `m[i]` is legal and
+//     `exp2` over it is how the softmax's exponential is applied in registers,
+//     but which (row, column) element i is depends on the implementation, so
+//     no row-wise reduction can be done that way. The row max is therefore
+//     taken from a 16x16 fp32 staging tile in LDS -- one tile, reused, rather
+//     than the whole [BM, BN] score block, which keeps LDS at ~4-8 KB and the
+//     occupancy the flash kernel lost to a 16 KB key tile.
+//  3. **The online-softmax rescale is per row, and a per-row scale is not a
+//     scalar.** But component-wise arithmetic between two same-typed matrices
+//     *is* supported, so the correction becomes a matrix whose every row is
+//     constant -- built in LDS once per key block and applied as
+//     `O = O * Ccorr`. No round trip for O, which is the big accumulator.
+//
+// The row sums come out of the same trick from the other side: appending a
+// column of ones to V makes `P . ones` a matrix whose every column is the row
+// sum of P, so the softmax denominator accumulates in an accumulator
+// alongside O, gets the same `* Ccorr` rescale, and never touches LDS until
+// the epilogue. It costs QT*KTIL of the 2*QT*KTIL*HDT multiplies per block --
+// 6% at headDim 128 -- and removes a reduction pass over every score.
+//
+// Numerics. fp16 holds the operands and fp32 every accumulator, which is the
+// only combination this device's matrix cores implement. The scores are the
+// exposure: they are the one place the VAE's 1.16e7 intermediates (stage 2)
+// have an analogue here, so the running max is folded in before every
+// exponential, exactly as the scalar kernels do. P itself is bounded by 1 by
+// construction, so narrowing it to fp16 costs 5e-4 of relative error and
+// cannot overflow. The tolerance this path is held to is measured, not
+// assumed -- see zimage/dit/gpu_test.go.
+
+#include "dit_common.glsl"
+
+// fp16 activation arena. Every operand is stored as 16x16 fragment tiles, 512
+// contiguous bytes each, so one coopMatLoad is one fully covered read --
+// dit_pack_f16.comp says why that is the difference between 1.56x and an order
+// of magnitude. The same buffer may not be aliased at two element types in one
+// shader, so this is its own binding.
+layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
+
+#ifndef QT
+#define QT 2        // query tiles per wave; sets arithmetic intensity, 16*QT
+#endif
+#ifndef KTIL
+#define KTIL 4      // key tiles per block
+#endif
+#ifndef WAVE
+#define WAVE 64     // threads per workgroup == one wave; host must pin this
+#endif
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+
+#define TILE 16
+#define HDT (HEAD_DIM / TILE)
+#define BM (QT * TILE)
+#define BN (KTIL * TILE)
+
+layout(local_size_x = WAVE) in;
+
+#define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ACCH coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+// One 16x16 fp32 tile per query tile, and the wave's only general scratch:
+// it stages the score tiles for the row max, then the row-constant max
+// matrix, then the output tiles in the epilogue. Reused rather than
+// duplicated because LDS is what decides occupancy here -- the scalar flash
+// kernel lost 3x the resident workgroups to a 16 KB key tile and got 1.09x
+// back for it.
+shared float stage[QT * TILE * TILE];
+// P, fp16, as the A operand of P.V -- row-major, leading dimension BN.
+shared float16_t pbuf[BM * BN];
+// The row-constant correction matrix that rescales O and the row sums. Its
+// counterpart, the row-constant running max, goes in `stage`.
+shared float bcorr[QT * TILE * TILE];
+shared float rowMax[BM];    // running max per query row, across key blocks
+shared float blkMax[BM];    // this key block's max per query row
+shared float rowSum[BM];    // softmax denominator, read out in the epilogue
+
+void main() {
+    uint head = gl_WorkGroupID.y;
+    uint q0 = gl_WorkGroupID.x * BM;
+    uint n = pc.tokens;
+    uint lane = gl_LocalInvocationID.x;
+    if (q0 >= n || head >= pc.heads) {
+        return;
+    }
+
+    // Per-head planes, addressed in tiles: tile (t, c) -- token rows 16t..,
+    // component columns 16c.. -- lives at (t*HDT + c) * 256 halves. q, k and v
+    // share the geometry and differ only in what one tile holds, which is the
+    // transpose dit_pack_f16.comp applies to v.
+    uint plane = head * (pc.aux1 / TILE) * (HDT * TILE * TILE);
+    uint qBase = pc.inOff + plane + (q0 / TILE) * (HDT * TILE * TILE);
+    uint kBase = pc.kOff + plane;
+    uint vBase = pc.vOff + plane;
+
+    // Q stays in registers for the whole sequence.
+    FRAG_A fragQ[QT][HDT];
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
+            coopMatLoad(fragQ[qq][kt], hact, qBase + (qq * HDT + kt) * (TILE * TILE),
+                TILE, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+
+    ACC o[QT][HDT];
+    ACC lsum[QT];
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+            o[qq][j] = ACC(0.0);
+        }
+        lsum[qq] = ACC(0.0);
+    }
+    for (uint i = lane; i < BM; i += WAVE) {
+        rowMax[i] = -1.0 / 0.0;
+    }
+    barrier();
+
+    const FRAG_B ones = FRAG_B(float16_t(1.0));
+
+    for (uint base = 0u; base < n; base += BN) {
+        uint cnt = min(BN, n - base);
+
+        // ---- S = Q.K^T. K is the B operand and already K-contiguous, so it
+        // is read straight out of the packed layout, no staging.
+        ACC s[QT][KTIL];
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                s[qq][kk] = ACC(0.0);
+            }
+        }
+        [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
+            FRAG_B fragK[KTIL];
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                coopMatLoad(fragK[kk], hact, kBase + ((base / TILE + kk) * HDT + kt) * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                    s[qq][kk] = coopMatMulAdd(fragQ[qq][kt], fragK[kk], s[qq][kk]);
+                }
+            }
+        }
+
+        // ---- Row max of this block. The scores are already scaled by
+        // 1/sqrt(headDim)*log2(e) (folded into q by the pack), so everything
+        // below is in log2 units and the exponential is exp2.
+        for (uint i = lane; i < BM; i += WAVE) {
+            blkMax[i] = -1.0 / 0.0;
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+            [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+                coopMatStore(s[qq][kk], stage, qq * (TILE * TILE), TILE,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+            barrier();
+            for (uint i = lane; i < BM; i += WAVE) {
+                uint qi = i / TILE, r = i % TILE;
+                float mx = blkMax[i];
+                for (uint c = 0u; c < TILE; ++c) {
+                    mx = max(mx, stage[qi * (TILE * TILE) + r * TILE + c]);
+                }
+                blkMax[i] = mx;
+            }
+            barrier();
+        }
+
+        // ---- Fold the block into the running max and build the two
+        // row-constant matrices. exp2(-inf - m) is 0, which is exactly the
+        // right correction for the first block, so there is no special case.
+        for (uint i = lane; i < BM; i += WAVE) {
+            uint qi = i / TILE, r = i % TILE;
+            float mo = rowMax[i];
+            float mn = max(mo, blkMax[i]);
+            rowMax[i] = mn;
+            float corr = exp2(mo - mn);
+            for (uint c = 0u; c < TILE; ++c) {
+                stage[qi * (TILE * TILE) + r * TILE + c] = mn;
+                bcorr[qi * (TILE * TILE) + r * TILE + c] = corr;
+            }
+        }
+        barrier();
+
+        // ---- P = exp2(S - max), narrowed to fp16 on its way to LDS, and the
+        // running output rescaled by the same correction.
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            ACC mrow, ccorr;
+            coopMatLoad(mrow, stage, qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(ccorr, bcorr, qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                ACC p = s[qq][kk] - mrow;
+                [[unroll]] for (uint e = 0u; e < p.length(); ++e) {
+                    p[e] = exp2(p[e]);
+                }
+                coopMatStore(ACCH(p), pbuf, (qq * TILE) * BN + kk * TILE, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+                o[qq][j] = o[qq][j] * ccorr;
+            }
+            lsum[qq] = lsum[qq] * ccorr;
+        }
+        barrier();
+
+        // ---- Mask the tail. The packed k plane is zero past the sequence, so
+        // a pad key scores 0 and its weight is exp2(-max), not zero; zeroing
+        // the columns here fixes both O and the row sums, since both are fed
+        // from pbuf.
+        //
+        // NO_TAIL_MASK builds the negative control this is tested with
+        // (zimage/dit/gpu_test.go): without it a sequence whose length is not a
+        // multiple of BN divides every row by a denominator that counts
+        // BN - cnt keys that do not exist. Nothing else differs.
+#if !NO_TAIL_MASK
+        if (cnt < BN) {
+            for (uint i = lane; i < BM * BN; i += WAVE) {
+                if ((i & (BN - 1u)) >= cnt) {
+                    pbuf[i] = float16_t(0.0);
+                }
+            }
+            barrier();
+        }
+#endif
+
+        // ---- O += P.V, and the row sums out of the same fragments.
+        FRAG_A fragP[QT][KTIL];
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                coopMatLoad(fragP[qq][kk], pbuf, (qq * TILE) * BN + kk * TILE, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+        [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+            FRAG_B fragV[KTIL];
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                coopMatLoad(fragV[kk], hact, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                    o[qq][j] = coopMatMulAdd(fragP[qq][kk], fragV[kk], o[qq][j]);
+                }
+            }
+        }
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                lsum[qq] = coopMatMulAdd(fragP[qq][kk], ones, lsum[qq]);
+            }
+        }
+        barrier();
+    }
+
+    // ---- Epilogue: every column of lsum holds the row sum, so column 0 is
+    // read out and the output tiles are scaled by its reciprocal on the way
+    // to global memory.
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        coopMatStore(lsum[qq], stage, qq * (TILE * TILE), TILE,
+            gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint i = lane; i < BM; i += WAVE) {
+        uint qi = i / TILE, r = i % TILE;
+        rowSum[i] = stage[qi * (TILE * TILE) + r * TILE];
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            coopMatStore(o[qq][j], stage, qq * (TILE * TILE), TILE,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        // Four lanes per row, four contiguous floats each: 16 bytes per lane
+        // and 64 contiguous bytes per quad. A head's slice of one output row
+        // is only headDim*4 = 512 B wide however it is written, so this is a
+        // write the coverage law (§5.1b) can only partly satisfy -- it lands
+        // in the MALL and the neighbouring j tiles complete the cache lines.
+        for (uint i = lane; i < BM * 4u; i += WAVE) {
+            uint row = i / 4u, part = i % 4u;
+            if (q0 + row >= n) {
+                continue;
+            }
+            uint qi = row / TILE, r = row % TILE;
+            float inv = 1.0 / rowSum[row];
+            uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
+            uint dst = pc.outOff + (q0 + row) * pc.dim + head * HEAD_DIM + j * TILE + part * 4u;
+            [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                act[dst + c] = stage[src + c] * inv;
+            }
+        }
+        barrier();
+    }
+}

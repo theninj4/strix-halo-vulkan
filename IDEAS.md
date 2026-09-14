@@ -182,7 +182,7 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
-| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **39.0 TFLOP/s** (`wmma_reg64_bt_hka4_padab128`) | **70%** |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **39.0 TFLOP/s** (`wmma_reg64_bt_hka4_padab128`); 38.8 for attention (§3.3) | **70%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
 † **[measured] §5.1b** Both bandwidth rows are *conditional on the access
@@ -536,18 +536,37 @@ a single elementwise kernel taking both operands. Elementwise already hits
 bandwidth and the only win is *not doing them*.
 **Effort**: low. **Value**: medium-high.
 
-### 3.3 Attention is completely absent from the suite — add it
-**Gap**: there is no attention kernel at all. For decode at long context,
-attention over the KV cache is the *dominant* memory consumer, more than
-the weights. For prefill it's a big chunk of the FLOPs.
-**Change**: benchmark (a) naive multi-dispatch attention — QKᵀ GEMM,
-softmax, PV GEMM — versus (b) a fused flash-attention-style kernel with
-online softmax keeping the K-tile in LDS and using coopmat for both
-matmuls. Sweep sequence length 128…8192, plus GQA group sizes.
-**Expected**: the standard flash-attention result is a large win, and it's
-amplified here because the standalone `softmax` kernel measures a poor
-**104 GB/s** — the fused version never materialises the score matrix at all.
-**Effort**: high. **Value**: very high — it's a whole missing pillar.
+### 3.3 Attention is completely absent from the suite — **DONE** ✅, **30.4x**, and the layout mattered more than the tiling
+
+**Written up in
+[`research/stage-3-dit-attention.md`](research/stage-3-dit-attention.md)**,
+because it was built as pipeline stage 3 against Z-Image's real attention
+rather than as a benchmark family. Both matmuls on `coopMatMulAdd`, online
+softmax, fp16 operands and fp32 accumulators: **38.8 TFLOP/s, 70% of the WMMA
+ceiling**, against the scalar flash kernel's 1.28 — one block at 4096 tokens
+from 202 ms to **6.64 ms**.
+
+Three results worth carrying forward, none of them the one this item
+predicted:
+
+- **Arithmetic intensity is inert here.** 16, 32 and 64 FLOP/byte land within
+  1.06x. The caches already supply the cross-block reuse of k and v, so there
+  is no DRAM traffic for register blocking to buy back — the same reason LDS
+  staging lost in §2.1.
+- **Store WMMA operands as 16x16 fragment tiles.** A fragment load holds 32 B
+  of each of 16 rows, so any natural row stride puts §5.1b's coverage at
+  32/gcd. Packing each operand as contiguous 512 B tiles was the difference
+  between 1.56x and 30x, and it needs no registers, no LDS and no hoisting —
+  it strictly dominates §2.7's HOIST lever and every future WMMA kernel should
+  start here.
+- **The register file and the wave size decide it**, as §2.7 said they would:
+  every variant that spills loses monotonically in how much, and wave32 is a
+  clean 1.40x at identical tiling (§6.2's third arm).
+
+The LDS-keyed hypothesis above was wrong in both directions: the score matrix
+never goes to LDS (the k tile is read straight from the fragment-tile layout),
+but P *has* to, because `GL_KHR_cooperative_matrix` forbids using an
+accumulator as a multiply operand.
 
 ### 3.4 Benchmark the *real* shapes from the target models — **DONE** ✅, **and it moved two answers**
 
@@ -721,6 +740,13 @@ every item above gets cheaper to evaluate once we can read the ISA.
 ### 6.2 wave32 vs wave64 — **DONE** ✅, and it split three ways
 
 **Written up in [`research/6.2-wave32-vs-wave64.md`](research/6.2-wave32-vs-wave64.md).** Wave size as a per-pipeline knob, and it split three ways: the best GEMM **spills** at wave32 and loses 25%, the fragment-dominated AI-16 grid gains 1.9-2.1x, and W4A8 decode reads 96% of the bus. Also closed §3.7 — the reduction kernels' 3.3x gap is lane count, not `subgroupAdd`.
+
+**[measured] §3.3's attention kernel is a fourth point, and it behaves like the
+second one**: 1.40x at wave32 (9.30 → 6.64 ms at 4096 tokens) at identical
+tiling, because it is fragment-load dominated and has the registers to spare
+where the GEMM's best kernel did not — 240 of 256 with nothing spilled, against
+its wave64 sibling's 192. Every geometry that *does* spill at wave32 loses,
+which is the same cliff from the other side.
 
 ### 6.3 Occupancy tuning via workgroup size and LDS budget
 Once §6.1 gives VGPR counts, sweep workgroup sizes (64/128/256/512) and
@@ -1061,11 +1087,11 @@ number, and at t=256 a group is worth **1.0-2.7 pad slots** on both.
   **§1.4 GEMV access pattern** and the one ISA question §6.1 has left
   (`v_pk_fma_f16`).
 
-**Then (the missing pillars):** §3.3 attention/flash-attention and §3.1-3.2
-fusion (justified by DRAM round-trips, not launch overhead). §3.3 in
-particular now has a working register-blocked WMMA kernel to build its two
-matmuls out of, and §3.6 (gated DeltaNet) is the last primitive in
-qwen3.8-flash-next that nothing here covers. §3.4 and §3.5 are done.
+**Then (the missing pillars):** §3.1-3.2 fusion (justified by DRAM
+round-trips, not launch overhead), and §3.6 (gated DeltaNet), the last
+primitive in qwen3.8-flash-next that nothing here covers. §3.3, §3.4 and §3.5
+are done — and §3.3 came back with a lever that applies to all of them: store
+every WMMA operand as 16x16 fragment tiles.
 
 **Dropped or downgraded by measurement:** §2.2's Q4 unpack (no 2x int8
 matrix rate, and no LDS tile to make cheaper), **wave32 as a register-headroom

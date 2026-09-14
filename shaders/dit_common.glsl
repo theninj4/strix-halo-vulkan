@@ -5,8 +5,10 @@
 // as an offset, and one push-constant size across every pipeline so
 // vk.DispatchMultiTimed can record a graph into one command buffer.
 //
-// fp32 throughout. Stage 3 is a correctness port with zimage/dit's CPU
-// implementation as its oracle.
+// fp32 throughout for the scalar kernels, whose correctness port had
+// zimage/dit's CPU implementation as its oracle. The matrix-core kernels add a
+// third binding -- the fp16 fragment-tile arena of dit_pack_f16.comp -- which
+// the shaders that do not use it simply leave undeclared.
 
 layout(binding = 0) readonly buffer Weights { float wbuf[]; };
 layout(binding = 1) buffer Act { float act[]; };
@@ -25,8 +27,8 @@ layout(push_constant) uniform PC {
     uint kStride;   // attention: padded token stride of the transposed keys
     uint eps;       // float bits
     uint scale;     // float bits
-    uint aux0;
-    uint aux1;
+    uint aux0;      // rope: sin table; pack: 0 natural / 1 transposed tiles
+    uint aux1;      // WMMA path: padded token count, i.e. the per-head plane
     uint aux2;
 } pc;
 

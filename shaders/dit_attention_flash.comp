@@ -3,12 +3,17 @@
 // Flash-attention-style multi-head attention: one workgroup handles QB query
 // rows of one head, streaming keys in tiles with an online softmax.
 //
-// This is IDEAS §3.3. The structure is dictated by three measurements, taken
-// in this order, and the last one is the only one that mattered:
+// This was IDEAS §3.3's first attempt; dit_attention_wmma.comp is the one that
+// closed it, at 30.4x this kernel, and this one is kept as an fp32 oracle for
+// it. The structure below is dictated by three measurements, taken in this
+// order, and the last one is the only one that mattered:
 //
-//  1. One query row per workgroup (dit_attention.comp) measured 463 GFLOP/s
-//     at 4096 tokens -- 0.8% of this part's matrix ceiling, and about four
-//     minutes of attention per image over 34 blocks and 8 steps.
+//  1. One query row per workgroup (dit_attention.comp) measured 0.52 TFLOP/s
+//     at 4096 tokens -- 0.9% of this part's matrix ceiling, and 136 s of
+//     attention per image over 34 blocks and 8 steps. (All the figures in this
+//     file are GPU-timed and count attention's real 4*n*n*dim flops; the
+//     wall-clock, 6*n*n*dim ones it carried before were both slower and
+//     flattering, for reasons research/stage-3-dit-attention.md sets out.)
 //  2. Giving QB queries a shared key tile in LDS was worth 1.09x. The reuse
 //     was real but 16 KB of LDS took occupancy from six workgroups per CU to
 //     two, and the latency hiding lost paid for it. Staging was removed.
@@ -17,6 +22,12 @@
 //     (query, key) pair the score loop does ONE multiply-add per 4-byte
 //     global load. Giving each thread one key and *all* QB queries makes the
 //     same load feed QB accumulators held in registers.
+//
+// The fourth measurement is the one that ended the line: at 2.67 FLOP/byte
+// where ~28 is needed, the scalar-FMA path is an order of magnitude short of
+// the matrix cores whatever the query block, and the matrix cores turned out to
+// need a different operand *layout* rather than a different loop (see
+// dit_pack_f16.comp). This kernel tops out at 1.28 TFLOP/s against 38.8.
 //
 // So: thread t owns key `base + t` and carries QB score accumulators. The
 // softmax reductions are then across the workgroup rather than within a

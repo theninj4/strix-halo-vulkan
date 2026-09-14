@@ -64,7 +64,7 @@ real dimensions and the stage list live in **[`PIPELINE.md`](PIPELINE.md)**,
 which is *rewritten* each session rather than appended to. Session handoffs
 still accumulate below.
 
-**Done this session:** `safetensors/` (mmap checkpoint reader, F32/F16/BF16,
+**Session 2026-09-13 (the pivot):** `safetensors/` (mmap checkpoint reader, F32/F16/BF16,
 sharded and single-file) and `cmd/inspect`. Verified against 10,574 golden
 narrowing cases from CPython's `struct 'e'`, an exhaustive 65,536-pattern
 fp16 round trip, and a value-for-value cross-check of real tensors against
@@ -77,7 +77,74 @@ immediately corrected the hand-transcribed shape table — the DiT has **34
 attention blocks, not 30**, and `adaLN_modulation` was not modelled at all.
 See `PIPELINE.md` for the full inventory.
 
-### This session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
+### Session 2026-09-14 — stage 3c: attention on the matrix cores
+
+**Result: 38.8 TFLOP/s, 70% of this part's WMMA ceiling, 30.4x the kernel it
+replaces.** One DiT block's attention at 4096 tokens went from 202 ms to
+**6.64 ms** of GPU time; the whole attention stack including the fp16 pack and
+the q/k norms and RoPE is 8.5 ms, i.e. 2.3 s per image over 34 blocks and 8
+steps against 55 s before. Written up in
+[`research/stage-3-dit-attention.md`](research/stage-3-dit-attention.md); IDEAS
+§3.3 is closed.
+
+**Built:**
+
+- `shaders/dit_attention_wmma.comp` — flash attention with both matmuls on
+  `coopMatMulAdd`, one wave per workgroup, fp16 operands, fp32 accumulators,
+  online softmax. Ten variants over two knobs (`QT` query tiles per wave,
+  `KTIL` key tiles per block) plus two pinned-wave32 arms, and an eleventh
+  built with `-DNO_TAIL_MASK` as a negative control.
+- `shaders/dit_pack_f16.comp` — packs an fp32 activation into **16x16 fragment
+  tiles**, which is the finding of the session (below).
+- `zimage/dit/gpu.go` — `Kernel` replaces the old `Flash bool`, the ladder is a
+  variant table as in `bench/ops_gemm_wmma.go`, and `Profile` times each
+  dispatch on the GPU the way `vae.GPUDecoder.Profile` does.
+- `vk.Device.Physical()` and `.Features()`, so a package holding only a
+  `*Device` can ask whether fp16/coopmat were actually enabled.
+
+**Three things that were not expected, in order of how much they cost to
+find:**
+
+1. **The wall clock was measuring the read-back, not the kernel.** All ten
+   variants measured 347 ms and looked identical. Reading 63 MB back out of the
+   device-local host-visible arena runs at **0.2 GB/s** (writes: 11.5), so 344
+   ms of that 347 was one `ReadFloat32At`. On GPU timestamps the variants span
+   6.6 to 19.3 ms. Anything measured with a read-back in it is measuring the
+   read-back — including, mildly, the VAE's 5.6 s.
+2. **The operand layout, not the tiling.** With q, k and v in natural per-head
+   layouts the kernel got 1.56x and *every geometry tied*. A 16x16 fp16
+   fragment load holds 32 B of each of 16 rows, so any natural row stride puts
+   §5.1b's coverage at 32/gcd. Storing each operand as contiguous 512 B
+   fragment tiles took it to 30x, with no registers, no LDS and no hoisting —
+   it strictly dominates §2.7's HOIST lever and belongs in every WMMA kernel.
+3. **Arithmetic intensity is inert here.** 16, 32 and 64 FLOP/byte land within
+   1.06x; the caches already supply the reuse. The register file and the wave
+   size decide it instead: every spilling variant loses monotonically in how
+   much it spills, and wave32 is a clean 1.40x at identical tiling.
+
+**How it was measured:** `go run ./cmd/ditbench` (tokens 320/1024/2048/4096,
+every kernel, best of three, GPU timestamps), twice. Rows at >=1024 tokens
+agree to median 1.000, p10-p90 0.874-1.018; at 4096 alone, 0.991-1.007. The
+320-token rows swing up to 4x between runs — the dispatch is ~130 µs and the
+clock has not ramped — so do not quote them. Register and LDS figures per
+variant come from `RADV_DEBUG=shaderstats,nocache` with one pipeline created
+per process; without `nocache` a second run is a cache hit and prints nothing.
+
+**Tolerances:** the fp16 path measures 6.7e-3 of the tensor's RMS against the
+diffusers reference where the fp32 kernels measure 1.1e-5, and is bounded at
+1.5e-2. That is what fp16's 4.9e-4 quantum predicts once the RMS
+normalisation is accounted for, all ten variants agree to the last digit of it,
+and the three negative controls land 27x, 283x and 569x above the bound.
+
+**Next — stage 4, the DiT graph.** Attention is 4% of the image budget now and
+the linear layers are ~14.6 s of the ~22 s total, so that is where the work is.
+Two things this session leaves for it: (1) the projections should write the
+fragment-tile layout directly, which deletes the 1.8 ms/block pack; (2)
+`results/shapes.csv` says `dit.ff.w13` is half a step's time at 23.4 TFLOP/s
+and that §2.7's crown kernel *loses* 1.66x on it to an older tile — worth
+knowing whether the fragment-tile layout is what that kernel was missing.
+
+### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the
 decode path under the bus — size `MROWS` from the routing histogram per
@@ -170,7 +237,7 @@ order, so they agree to 1e-4) before it is timed.
 **How to re-run:** `go generate ./...` then `go run ./cmd/bench moe` (the
 family ignores `-sizes`/`-blocks`). 896 rows in **~9 minutes**.
 
-### Previous session: IDEAS §1.11 — both blocks in one wave, and decode's throughput end reaches the bus
+### Phase 1, previous session: IDEAS §1.11 — both blocks in one wave, and decode's throughput end reaches the bus
 
 The handoff's item 1 was "close the decode GEMV's last corner: `NROWS` x
 `MROWS` in one build", with two smaller probes beside it. All three are done.

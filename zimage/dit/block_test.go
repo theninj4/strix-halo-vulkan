@@ -97,16 +97,25 @@ func deviation(got, want *Mat) (maxAbs, rms, rel float64, worst int) {
 // dominated by the values nearest zero.
 func compare(t *testing.T, name string, got, want *Mat) {
 	t.Helper()
+	compareTol(t, name, got, want, relTol)
+}
+
+// compareTol is compare against an explicit bound, for the paths that do not
+// carry fp32's drift: the matrix-core kernels narrow their operands to fp16
+// and are held to their own measured figure (fp16RelTol in gpu_test.go).
+func compareTol(t *testing.T, name string, got, want *Mat, tol float64) float64 {
+	t.Helper()
 	if got.Rows != want.Rows || got.Cols != want.Cols {
 		t.Fatalf("%s: shape %s, want %s", name, got, want)
 	}
 	maxAbs, rms, rel, worst := deviation(got, want)
-	if rel > relTol {
+	if rel > tol {
 		t.Errorf("%s %s: max abs %.6g (at %d: got %g want %g), rms %.6g, rel %.3g > %.0e",
-			name, got, maxAbs, worst, got.Data[worst], want.Data[worst], rms, rel, relTol)
-		return
+			name, got, maxAbs, worst, got.Data[worst], want.Data[worst], rms, rel, tol)
+		return rel
 	}
 	t.Logf("%-18s %-14s max abs %.3g  rms %.4g  rel %.2g", name, got.String(), maxAbs, rms, rel)
+	return rel
 }
 
 // ropeFromRef rebuilds the rotary table from the dumped ids, so the table is
