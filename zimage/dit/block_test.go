@@ -253,6 +253,102 @@ func TestBlockAgainstDiffusers(t *testing.T) {
 	compare(t, "out", out, loadRef(t, m, "out"))
 }
 
+// TestFFNIntermediatesFitFP16 is the range check §2.6's fp16 store depends
+// on, and it is here rather than in the GPU tests because it is a property of
+// the model, not of a kernel.
+//
+// Stage 2 found this model's VAE could not hold its intermediates in fp16 at
+// all -- 1.16e7 against a 65504 limit -- so "fp16 is the fast path" is a claim
+// that has to be checked per tensor. The FFN's gate and up projections are the
+// two the block narrows: they are what SwiGLU multiplies, and it narrows their
+// product anyway. Their peaks leave two orders of magnitude of headroom. w2's
+// output is checked too and does *not*: at 6e5 it would overflow, which is why
+// only two of the three FFN projections have an fp16-C build.
+func TestFFNIntermediatesFitFP16(t *testing.T) {
+	if _, err := os.Stat(transformer); err != nil {
+		t.Skipf("no transformer checkpoint at %s", transformer)
+	}
+	m := loadManifest(t)
+	cfg, err := LoadConfig(transformer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, err := safetensors.OpenSet(transformer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	blk, err := LoadBlock(set, "layers.0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The FFN's input as the block forms it: ffn_norm1 scaled by 1 + mod.
+	mod, err := blk.AdaLN.Apply(&Mat{Rows: 1, Cols: blk.AdaLN.In, Data: loadRef(t, m, "adaln_input").Data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scaleMLP := make([]float32, blk.Dim)
+	for i := range scaleMLP {
+		scaleMLP[i] = 1 + mod.Data[2*blk.Dim+i]
+	}
+	h := loadRef(t, m, "ffn_norm1").Clone()
+	scaleRows(h, scaleMLP)
+
+	const fp16Max = 65504.0
+	peak := func(x *Mat) float64 {
+		var mx float64
+		for _, v := range x.Data {
+			if a := math.Abs(float64(v)); a > mx {
+				mx = a
+			}
+		}
+		return mx
+	}
+	for _, c := range []struct {
+		name     string
+		lin      *Linear
+		narrowed bool
+	}{
+		{"feed_forward.w1 (gate)", blk.FFN.W1, true},
+		{"feed_forward.w3 (up)", blk.FFN.W3, true},
+		{"feed_forward.w2 (down)", blk.FFN.W2, false},
+	} {
+		in := h
+		if !c.narrowed {
+			// w2 reads SwiGLU's output, not the block input.
+			gate, err := blk.FFN.W1.Apply(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			up, err := blk.FFN.W3.Apply(h)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parallelFor(gate.Rows, func(r int) {
+				g, u := gate.Row(r), up.Row(r)
+				for i, v := range g {
+					g[i] = v / (1 + float32(math.Exp(float64(-v)))) * u[i]
+				}
+			})
+			in = gate
+		}
+		out, err := c.lin.Apply(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mx := peak(out)
+		t.Logf("%-24s peak |v| %.4g, %.0fx under fp16's %.0f", c.name, mx, fp16Max/mx, fp16Max)
+		if c.narrowed && mx > fp16Max/8 {
+			t.Errorf("%s peaks at %.4g, too close to fp16's %.0f to narrow", c.name, mx, fp16Max)
+		}
+		if !c.narrowed && mx < fp16Max {
+			t.Errorf("%s peaks at %.4g, which fp16 would hold -- the comment saying it would not is stale",
+				c.name, mx)
+		}
+	}
+}
+
 // TestValidationDetectsErrors is the negative control. The four
 // perturbations are the mistakes this block actually invites: RoPE's two
 // pairing conventions look equally plausible, the q/k norms are per head

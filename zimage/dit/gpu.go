@@ -18,6 +18,13 @@ type pushConstants struct {
 	KOff, VOff, KStride uint32
 	Eps, Scale          uint32
 	Aux0, Aux1, Aux2    uint32
+	// The GEMM block, used only by dit_gemm.comp. Every pipeline in a graph
+	// shares one push-constant size (vk.DispatchMultiTimed records them into
+	// one command buffer), so these ride along on every dispatch whether or
+	// not it reads them.
+	BOff                uint32
+	GemmM, GemmN, GemmK uint32
+	LDA, LDB            uint32
 }
 
 func (p pushConstants) bytes() []byte {
@@ -271,32 +278,45 @@ func (g *GPUAttention) pipeline(name string, spirv []byte, spec vk.PipelineSpec)
 	return nil
 }
 
+// canWMMA reports whether this device can run the matrix-core kernels at all:
+// fp16 storage and arithmetic, cooperative matrices, and the 16x16x16
+// fp16/fp32 shape every one of them has compiled in. A device reporting some
+// other shape would run these shaders *wrong* rather than slowly, so the
+// answer is "no" rather than "try it"; the scalar kernels still work, and the
+// GEMM-bearing graph refuses to build instead.
+func canWMMA(dev *vk.Device) (bool, error) {
+	feat := dev.Features()
+	if !feat.Float16 || !feat.CoopMatrix {
+		return false, nil
+	}
+	shapes, err := dev.Physical().CooperativeMatrixShapes()
+	if err != nil {
+		return false, fmt.Errorf("dit: cooperative-matrix shapes: %w", err)
+	}
+	for _, sh := range shapes {
+		if sh.Scope == vk.ScopeSubgroup && sh.M == coopMatTile && sh.N == coopMatTile && sh.K == coopMatTile &&
+			sh.AType == vk.ComponentFloat16 && sh.BType == vk.ComponentFloat16 &&
+			sh.CType == vk.ComponentFloat32 && sh.ResultType == vk.ComponentFloat32 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // buildWMMA allocates the fp16 arena and builds the matrix-core ladder, or
 // does nothing at all if this device cannot run it. Not being able to is not
 // an error: the scalar kernels still work, and a device that reports a
 // cooperative-matrix shape other than 16x16x16 fp16/fp32 would run these
 // shaders wrong rather than slowly, so it is skipped rather than trusted.
 func (g *GPUAttention) buildWMMA() error {
-	feat := g.dev.Features()
-	if !feat.Float16 || !feat.CoopMatrix {
-		return nil
-	}
-	shapes, err := g.dev.Physical().CooperativeMatrixShapes()
+	ok, err := canWMMA(g.dev)
 	if err != nil {
-		return fmt.Errorf("dit: cooperative-matrix shapes: %w", err)
-	}
-	ok := false
-	for _, sh := range shapes {
-		if sh.Scope == vk.ScopeSubgroup && sh.M == coopMatTile && sh.N == coopMatTile && sh.K == coopMatTile &&
-			sh.AType == vk.ComponentFloat16 && sh.BType == vk.ComponentFloat16 &&
-			sh.CType == vk.ComponentFloat32 && sh.ResultType == vk.ComponentFloat32 {
-			ok = true
-			break
-		}
+		return err
 	}
 	if !ok {
 		return nil
 	}
+	feat := g.dev.Features()
 	// HEAD_DIM is compiled into the shader, as the accumulator grid it sizes
 	// has to be known to the front end. Z-Image is 3840/30 = 128 everywhere.
 	if g.headDim != wmmaHeadDim {

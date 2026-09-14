@@ -182,7 +182,7 @@ tops out at **2900 MHz** per `pp_dpm_sclk`; LPDDR5X-8000 on a 256-bit bus):
 | Vector FP32 FMA | **22.9 TFLOP/s** | 198 | 2.76 TFLOP/s (`tiled,fp16`) | ~12% |
 | Packed fp16 FMA | **25.3 TFLOP/s** | 218 | — (no kernel uses it) | — |
 | `dotPacked4x8` int8 | **54.0 TOP/s** | 465 | 2.2 TOP/s (`naive,w8a8`) | **~4%** ❌ |
-| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **39.0 TFLOP/s** (`wmma_reg64_bt_hka4_padab128`); 38.8 for attention (§3.3) | **70%** |
+| WMMA fp16→fp32 | **55.5 TFLOP/s** | 479 | **42.0 TFLOP/s** (the DiT's projections: a fragment-tiled weight §2.8 + a swizzled grid §2.4); 39.0 in the suite (`wmma_reg64_bt_hka4_padab128`), 38.8 for attention (§3.3) | **76%** |
 | WMMA int8→int32 | **55.7 TOP/s** | 480 | 4.7 TOP/s (`coopmat,q8`) | **~8%** ❌ |
 
 † **[measured] §5.1b** Both bandwidth rows are *conditional on the access
@@ -465,33 +465,9 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 
 **Written up in [`research/2.3-channel-aliasing.md`](research/2.3-channel-aliasing.md).** The "better instruction stream is 2.8x slower" contradiction was **DRAM channel aliasing**: a power-of-two leading dimension puts all 16 addresses of a K-strided fragment load in one channel. Padding each stride 256 B off a multiple of 4 KB is worth up to 1.35x and took the suite to 28.4 TFLOP/s.
 
-### 2.4 Workgroup swizzle / tile reordering for MALL locality
-**Hypothesis**: linear `gl_WorkGroupID` ordering walks C row-by-row, so
-concurrently-resident workgroups share A rows but stream all of B — poor
-reuse in the 32MB MALL. Grouped/Morton ("super-tile") ordering makes the
-in-flight set of workgroups a square block of C, maximising shared A and B.
-**Change**: remap `gl_WorkGroupID.x/y` through a swizzle in-shader (group
-tiles into e.g. 8×8 super-tiles); pure index arithmetic, no structural
-change.
-**Expected**: 10-30% on large N, more once §2.1 makes tiles bigger. A
-standard, well-documented GEMM win.
-**[measured] §2.1 promotes this, and §2.3 sharpens what it would be
-testing.** §2.1's best kernel sat at ~760 of the 805 GB/s the MALL delivers
-at AI 16 and 32, which read as *literally* MALL-bandwidth-bound; §2.3 then
-raised the same kernels past that figure (742-887 GB/s implied at AI 32) by
-de-aliasing their strides, so part of that traffic must be served by the
-L1s and "pinned at the MALL" is no longer the right description. What
-survives is the shape of the argument: the AI-32 kernels are still within
-~10% of a bandwidth ceiling at *some* level, a swizzle is still the only
-remaining change that reduces cross-tile traffic without touching the tile
-shape or the register budget, and §2.1's finding that neither LDS staging
-nor multi-wave workgroups help still means every bit of cross-tile reuse
-this kernel gets comes from a cache it does not manage. Note that the
-AI-85 variant is *not* bandwidth-bound anywhere (306 GB/s implied), so a
-swizzle should help the AI-32 kernels and do nothing for that one — which
-is itself the cleanest way to tell whether the swizzle is doing what it
-claims.
-**Effort**: low. **Value**: high (upgraded).
+### 2.4 Workgroup swizzle / tile reordering for MALL locality — **DONE** ✅, **1.84x** on the shape that needed it
+
+**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md).** Walking the grid in bands of 8 columns instead of row by row takes `dit.ff.w13` from 24.2 to **41.1 TFLOP/s** and the whole DiT block from 64.0 to 49.3 ms. The mechanism was worked out before the code was written and the arithmetic predicted the measurement to within 10%: `w13` and `w2` have *identical* tile-level traffic (3.52 GB at M=4096) and reached 264 and 439 GB/s against it, because `gl_WorkGroupID.x` is the fastest axis and `w13`'s grid is 40 columns wide against `w2`'s 15 — so `w2` keeps four grid rows in flight and amortises each B slab four ways, and `w13` keeps 1.6. Three things this item did not predict: **the optimum band is interior** (2/4/8/16 give 36.0/39.2/41.1/38.3 — narrow bands do not amortise B, wide ones push A past the MALL); **it is worth far more against a fragment-tiled weight than a row-major one** (1.84x against 1.16x), so ordering and layout are not separable levers; and with it every shape in the model converges on **one** kernel at 73-76% of the WMMA ceiling, where before they disagreed.
 
 ### 2.5 Split-K for skinny shapes
 **Hypothesis**: real transformer GEMMs aren't square. When M·N is small
@@ -504,20 +480,19 @@ combine via a second reduce dispatch (or `atomicAdd` on fp32 C).
 **Measure**: needs §3.4's realistic shape sweep to know which shapes matter.
 **Effort**: medium. **Value**: medium, shape-dependent.
 
-### 2.6 fp16 output, and fuse epilogue work
-**Hypothesis**: every GEMM writes `float c[]` (fp32), doubling store
-traffic versus the fp16 the next layer wants, and every fused op (bias,
-activation, residual add, the next layer's quantize) is a separate
-full-round-trip dispatch through DRAM.
-**Change**: an fp16-output variant, plus an epilogue hook in the GEMM
-kernel (bias + activation + optional int8-quantize of the result).
-**Expected**: ~M·N·2 bytes saved per GEMM, and one whole DRAM round-trip
-per fused op eliminated — at 236 GB/s that's directly measurable.
-**Effort**: low-medium. **Value**: medium-high.
+### 2.6 fp16 output, and fuse epilogue work — **DONE for the DiT** ✅, **0.85 ms/block**, and the fusions are worth more
+
+**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md).** Both halves were priced on a real graph rather than a benchmark. **The fp16 C**: the FFN's gate and up projections write fp16 and SwiGLU reads it, halving 320 MB of traffic per block — 2.19 ms to 1.37, and the block's error against diffusers goes 1.7e-2 to 1.8e-2. It is offered per *consumer* and per *tensor*, not as a kernel option: `dit.ff.w2`'s output reaches 6e5 against fp16's 65504 while `w1`'s and `w3`'s peak at 250 and 508, so two of the three projections have the build and the third does not (stage 2's overflow lesson, checked by `TestFFNIntermediatesFitFP16`). **The epilogue/elementwise fusions**: 12.2 ms of a DiT block is norms, narrowings, the rotary embedding and the gated residuals, and fusing each norm into its consumer takes that to 6.7 — the biggest piece being the q/k norm + RoPE + fragment pack in one kernel (3.66 → 1.40 ms), which is possible because all four steps share one natural unit, a head of one token. The fusions are arithmetic-preserving (the fp16 A operand is bit-identical); the fp16 C is not, and is measured separately for it.
+
+**Still open**: the same treatment for the *projections that feed attention* — `gemm v` writing fragment tiles in its epilogue and the attention kernel writing its own fp16 A operand, together another ~1.0 ms/block — and any of this in the benchmark kernel, which still has an fp32-only store.
 
 ### 2.7 Hoist the K-slab's fragment loads — **DONE** ✅, **2.1x**, and it closed §2.3's residue
 
 **Written up in [`research/2.7-kslab-hoist.md`](research/2.7-kslab-hoist.md).** Issuing a whole K-slab's fragment loads before its first MMA — same bytes, same instructions, same intensity, only the scheduling — is worth **2.1x** and takes the best GEMM to **38990 GFLOP/s, 70% of the WMMA ceiling**. Depth is not the variable; concurrency is.
+
+### 2.8 Store the *weight* as 16x16 fragment tiles — **DONE** ✅, **1.46x**, but not universal
+
+**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md)**, because it was measured on the DiT's own projections rather than as a benchmark family. §3.3 ended on "store every WMMA operand as fragment tiles" and called it a strict improvement on §2.7's hoist; a weight is the case where the retiling is *free*, since it is packed once at upload and read every step. Holding the kernel fixed and changing only the weight's arrangement, it is worth **1.46x on `dit.qkv`/`dit.o` (28.0 → 41.0 TFLOP/s, 74% of the ceiling — past §2.7's 70%)** and **1.43x on `dit.ff.w2`**, and it **loses 5% on `dit.ff.w13`**. Against the fastest natural-layout kernel of any geometry the three are 1.16x, 1.43x and 0.95x; against `results/shapes.csv`, 1.25x, 1.47x and 1.04x. **§2.4 has since changed the picture on the third shape and on the whole claim**: with the grid swizzled, the tiled weight wins `ff.w13` too (41.1 against the row-major layout's 28.0), and the swizzle is itself worth 1.84x against a tiled weight and only 1.16x against a row-major one. Layout and launch order are one lever measured in two places, not two. So "strictly dominates" is withdrawn: it is a shape-dependent lever, and it interacts with §2.7 — with a tiled B, *removing* the hoisted K-slab is worth 1.3-1.5x on `w13`.
 
 ## 3. Kernel fusion and the ops the suite doesn't cover yet
 
@@ -556,9 +531,12 @@ predicted:
 - **Store WMMA operands as 16x16 fragment tiles.** A fragment load holds 32 B
   of each of 16 rows, so any natural row stride puts §5.1b's coverage at
   32/gcd. Packing each operand as contiguous 512 B tiles was the difference
-  between 1.56x and 30x, and it needs no registers, no LDS and no hoisting —
-  it strictly dominates §2.7's HOIST lever and every future WMMA kernel should
-  start here.
+  between 1.56x and 30x, and it needs no registers, no LDS and no hoisting, so
+  every WMMA kernel should start here. **This item also claimed it strictly
+  dominates §2.7's HOIST lever, and §2.8 has since withdrawn that**: on a
+  GEMM's weight the tiling is 1.46x on two of the DiT's three shapes and a 5%
+  loss on the third, and on that third one it is *removing* the hoist that is
+  worth 1.3-1.5x. It is a shape-dependent lever like every other one here.
 - **The register file and the wave size decide it**, as §2.7 said they would:
   every variant that spills loses monotonically in how much, and wave32 is a
   clean 1.40x at identical tiling (§6.2's third arm).

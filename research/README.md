@@ -41,6 +41,11 @@ that `grep -rl '§2\.3' .` and `ls research/2.3*` find the same thing.
 | [§5.1b](5.1b-mall-cliff-and-stride.md) | The MALL cliff and the stride probe | The coverage law `min(1, C/gcd(stride, 4096))`; rotation is **4 KB** |
 | [§6.2](6.2-wave32-vs-wave64.md) | wave32 vs wave64 | Splits three ways; decode **96% of the bus**, the best GEMM **spills** |
 
+§2.4 (the workgroup swizzle), §2.6 (fp16 output and epilogue fusion) and §2.8
+(a weight stored as fragment tiles) were all measured as part of stage 4 and
+are written up in [`stage-4-dit-graph.md`](stage-4-dit-graph.md) rather than
+in files of their own.
+
 `§0.1`-`§0.5` are subsections *inside* `0-measurement-validity.md` rather
 than files of their own — they are 10-38 lines each. `§0.1` (the measured
 MMA ceiling) is the most-cited of them, at 20 references.
@@ -54,6 +59,7 @@ numbered experiment, so they carry names instead of section numbers:
 |---|---|
 | [Stage 2](stage-2-vae-decoder.md) | VAE decoder — fp16 overflow, the conv intensity lesson, two device limits |
 | [Stage 3](stage-3-dit-attention.md) | DiT attention — why it needs WMMA, and the two hazards a port hits |
+| [Stage 4](stage-4-dit-graph.md) | The DiT block as a graph — **49.3 ms/block, 13.4 s/image**; a tiled weight (§2.8), a swizzled grid (§2.4) and a fused tail (§2.6) compound to **1.83x**, and all three are about order rather than arithmetic |
 
 ### Closed, but small enough to have stayed in the backlog
 

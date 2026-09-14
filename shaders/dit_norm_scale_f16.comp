@@ -1,0 +1,60 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// A block input, end to end: RMS norm over the whole row, the adaLN scale,
+// and the narrowing into the fp16 arena as a GEMM A operand.
+//
+// dit_rmsnorm.comp followed by dit_scale_f16.comp is the same arithmetic in
+// two dispatches and 1.5x the traffic -- the fp32 intermediate is written and
+// read back for nothing -- so this is one pass: read 63 MB, write 31 MB.
+//
+// The scale is `1 + mod`, already formed by dit_adaln.comp, and it lives in
+// the *activation* arena because it is computed per step, which is why its
+// offset is pc.aux0 and not pc.wOff. pc.aux2 = 0 drops it, which is the
+// attention context's path into the output projection.
+//
+// The destination stride is pc.lda, not pc.dim: A's rows are K + 128 halves
+// apart so that a K-strided fragment load does not put all 16 of its
+// addresses in one DRAM channel (§2.3).
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#define WG 256
+layout(local_size_x = WG) in;
+
+shared float partial[WG];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+
+    float s = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        float v = act[src + c];
+        s += v * v;
+    }
+    partial[t] = s;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(partial[0] / float(pc.dim) + uintBitsToFloat(pc.eps));
+
+    for (uint c = t; c < pc.dim; c += WG) {
+        float v = act[src + c] * inv * wbuf[pc.wOff + c];
+        if (pc.aux2 != 0u) {
+            v *= act[pc.aux0 + c];
+        }
+        hact[dst + c] = float16_t(v);
+    }
+}

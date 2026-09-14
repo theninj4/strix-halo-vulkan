@@ -1078,3 +1078,124 @@ var DiTAttentionWMMAQT1KT2W32 []byte
 
 //go:embed dit_attn_wmma_qt1_kt8_w32.spv
 var DiTAttentionWMMAQT1KT8W32 []byte
+
+// PIPELINE.md stage 4, the DiT graph: the rest of the block, so that a whole
+// transformer layer is a dispatch sequence rather than a kernel with host
+// code around it. Four of the five are elementwise passes that exist to keep
+// the GEMMs fed -- the modulation vector, the two narrowings into the fp16
+// arena, the gated residual -- and the fifth is the GEMM itself.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_adaln.spv dit_adaln.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_scale_f16.spv dit_scale_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_swiglu_f16.spv dit_swiglu_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DIN_F16=1 -o dit_swiglu_f16_in16.spv dit_swiglu_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_gate_add.spv dit_gate_add.comp
+
+// The fused tail (PIPELINE.md stage 4b). Stage 4a's graph kept every norm as
+// its own dispatch so that each one is a tensor the diffusers dump can be
+// compared against; once that has been done, the fp32 intermediate between a
+// norm and its consumer is a DRAM round trip bought for nothing. These three
+// are the same arithmetic in one pass each, and `GPUBlock` keeps both paths so
+// the fused output is checked against the unfused one rather than only
+// against the reference.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_norm_scale_f16.spv dit_norm_scale_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_norm_gate_add.spv dit_norm_gate_add.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_qk_pack.spv dit_qk_pack.comp
+
+//go:embed dit_norm_scale_f16.spv
+var DiTNormScaleF16 []byte
+
+//go:embed dit_norm_gate_add.spv
+var DiTNormGateAdd []byte
+
+//go:embed dit_qk_pack.spv
+var DiTQKPack []byte
+
+//go:embed dit_adaln.spv
+var DiTAdaLN []byte
+
+//go:embed dit_scale_f16.spv
+var DiTScaleF16 []byte
+
+//go:embed dit_swiglu_f16.spv
+var DiTSwiGLUF16 []byte
+
+//go:embed dit_swiglu_f16_in16.spv
+var DiTSwiGLUF16In16 []byte
+
+//go:embed dit_gate_add.spv
+var DiTGateAdd []byte
+
+// The projection GEMM's ladder. Two knobs, both read off results/shapes.csv
+// rather than swept blind:
+//
+//   - the tile geometry, where the model's three shapes disagreed: the
+//     single-wave 64x64 register-blocked tile with a hoisted K-slab (§2.7)
+//     wins dit.qkv and dit.ff.w2 at M=4096, and the four-wave 128x256 tile
+//     wins dit.ff.w13 by 1.66x.
+//   - the B layout, which is the new question. A weight is uploaded once, so
+//     storing it as 16x16 fragment tiles costs nothing per step and buys the
+//     coverage (§5.1b) that stage 3c measured 30x of on attention's
+//     activations. Each geometry is built against the layout it won with and
+//     against the tiled one, which is the comparison.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=0 -o dit_gemm_reg64_hka4.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg64_hka4_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -o dit_gemm_reg64_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=1 -o dit_gemm_wg128x256.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -o dit_gemm_wg128x256_bt16.spv dit_gemm.comp
+
+// The swizzle arms (IDEAS §2.4). Same kernel, same layouts, only the mapping
+// from gl_WorkGroupID to a tile of C: bands of SWZ columns walked top to
+// bottom instead of the grid's own row-major order.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=1 -DSWZ=4 -o dit_gemm_wg128x256_swz4.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=1 -DSWZ=8 -o dit_gemm_wg128x256_swz8.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=2 -o dit_gemm_wg128x256_bt16_swz2.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=4 -o dit_gemm_wg128x256_bt16_swz4.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=8 -o dit_gemm_wg128x256_bt16_swz8.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=16 -o dit_gemm_wg128x256_bt16_swz16.spv dit_gemm.comp
+
+//go:embed dit_gemm_wg128x256_swz4.spv
+var DiTGEMMWG128x256SWZ4 []byte
+
+//go:embed dit_gemm_wg128x256_swz8.spv
+var DiTGEMMWG128x256SWZ8 []byte
+
+//go:embed dit_gemm_wg128x256_bt16_swz2.spv
+var DiTGEMMWG128x256TiledSWZ2 []byte
+
+//go:embed dit_gemm_wg128x256_bt16_swz4.spv
+var DiTGEMMWG128x256TiledSWZ4 []byte
+
+//go:embed dit_gemm_wg128x256_bt16_swz8.spv
+var DiTGEMMWG128x256TiledSWZ8 []byte
+
+//go:embed dit_gemm_wg128x256_bt16_swz16.spv
+var DiTGEMMWG128x256TiledSWZ16 []byte
+
+// The fp16-C companion of the default kernel (§2.6). Not a ladder rung: it is
+// only correct where the consumer reads fp16 and the values fit, which in this
+// block is the FFN's gate and up projections and nothing else, so GPUBlock
+// reaches it through a companion table rather than through a plan.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=8 -DC_F16=1 -o dit_gemm_wg128x256_bt16_swz8_cf16.spv dit_gemm.comp
+
+//go:embed dit_gemm_wg128x256_bt16_swz8_cf16.spv
+var DiTGEMMWG128x256TiledSWZ8CF16 []byte
+
+//go:embed dit_gemm_reg64_hka4.spv
+var DiTGEMMReg64HKA4 []byte
+
+//go:embed dit_gemm_reg64_hka4_bt16.spv
+var DiTGEMMReg64HKA4Tiled []byte
+
+//go:embed dit_gemm_reg64_bt16.spv
+var DiTGEMMReg64Tiled []byte
+
+//go:embed dit_gemm_wg128x256.spv
+var DiTGEMMWG128x256 []byte
+
+//go:embed dit_gemm_wg128x256_bt16.spv
+var DiTGEMMWG128x256Tiled []byte

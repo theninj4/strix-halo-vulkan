@@ -144,6 +144,149 @@ fragment-tile layout directly, which deletes the 1.8 ms/block pack; (2)
 and that §2.7's crown kernel *loses* 1.66x on it to an older tile — worth
 knowing whether the fragment-tile layout is what that kernel was missing.
 
+### Session 2026-09-14 (later) — stage 4a: the DiT block as a graph
+
+**Result: a whole DiT block runs on the GPU in 65.6 ms at 4096 tokens** — 26
+dispatches, every matrix operation on the matrix cores, validated stage by
+stage against diffusers. **17.8 s per image** for the transformer and 23.4 s
+with the VAE, inside the 20-30 s stage 4 set out to accept. Written up in
+[`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md); IDEAS §2.8 is
+new and closed, §2.4 and §2.6 gained the measurements that justify them.
+
+**Built:**
+
+- `shaders/dit_gemm.comp` — the projection GEMM. §2.7's winning arm on the
+  DiT's binding and push-constant layout, with **three B layouts** as a
+  build-time knob (`[N, K+pad]` column-major, `[K, N+pad]` row-major, 16x16
+  fragment tiles) and five builds over two tilings.
+- Four elementwise shaders: `dit_adaln.comp` (the modulation projection and
+  its four chunks), `dit_scale_f16.comp`, `dit_swiglu_f16.comp`,
+  `dit_gate_add.comp`.
+- `zimage/dit/gpublock.go` — `GPUBlock`: four arenas (fp32/fp16 x
+  weights/activations), a `GEMMPlan` that picks a kernel *per projection* and
+  stages each weight in the layout that kernel reads, and `RunTo`, which runs
+  the graph's prefix up to a labelled dispatch so a 26-dispatch graph can still
+  be validated stagewise.
+- `cmd/ditblock` — times the block dispatch by dispatch and sweeps the ladder
+  over the model's three shapes.
+- `dit_common.glsl`'s push-constant block gained six GEMM fields (88 bytes of
+  the device's 256); `vk.Buffer` gained `WriteUint16At`/`ReadUint16At`;
+  `safetensors` exported `F32ToF16`/`F16ToF32`.
+
+**Three things that were not expected:**
+
+1. **`results/shapes.csv`'s crown kernel is the slowest of five in situ.**
+   `wmma_reg64_bt_hka4_padab128` — §2.7's winner, 39.0 TFLOP/s in the suite —
+   gives 24.5 s/image against the new default plan's 17.8. The table was not
+   wrong; it was measured before the weight could be stored as fragment tiles,
+   and that changes which geometry wins on two of the three shapes.
+2. **A fragment-tiled weight is 1.46x, and stage 3c's "strictly dominates" is
+   withdrawn.** Same kernel, only the weight's arrangement changed: 28.0 →
+   41.0 TFLOP/s on `dit.qkv`/`o` (**74% of the WMMA ceiling**, past §2.7's
+   70%), 28.3 → 40.5 on `dit.ff.w2`, and **23.0 against 24.3 on
+   `dit.ff.w13` — a 5% loss**. It also interacts with §2.7: with a tiled B,
+   *removing* the hoisted K-slab is worth 1.3-1.5x on `w13`.
+3. **18% of a block does no arithmetic.** 12.1 ms of the 65.6 is the
+   elementwise tail — norms, narrowings, the rotary embedding, the fragment
+   pack, SwiGLU, the two gated residuals — 3.3 s per image. The fusions are
+   priced in `research/stage-4-dit-graph.md`; `swiglu` alone is already at 193
+   GB/s of the 236 GB/s bus and needs §2.6's fp16 C rather than a fusion.
+
+**How it was measured:** `go run ./cmd/ditblock -tokens 320,1024,4096`, best of
+three per configuration, GPU timestamps per dispatch, run twice. The runs agree
+to **0.994-1.006** on every block total and to 1-2% on every per-shape cell;
+the two cells outside that (`reg64_bt16` on `ff.w13`, `reg64_hka4_bt16` on
+`ff.w2`) are losing cells and change no choice.
+
+**Tolerances:** the whole-block path measures 1.7e-2 of the tensor's RMS
+against the diffusers reference and is bounded at 8e-2 — looser than stage
+3c's 1.5e-2 because all seven projections now narrow *both* operands rather
+than only attention's. Two intermediate stages report 3.1e-2 and 3.7e-2, and
+that is the RMS normalisation rather than the arithmetic: the worst element of
+`attention_norm2` is 1.9e-3 of itself, about four fp16 quanta, on a tensor
+whose RMS is twenty times below its largest elements. Three negative controls
+land at **1160x, 2828x and 15828x** the bound, and all five GEMM builds — three
+weight layouts, two tilings — agree to every digit logged.
+
+**Next — stage 4b, then 4c.** In order of what the profile says: (1) `ff.w13`
+is 27 ms of the block's 47 ms of GEMM at 24.3 TFLOP/s where its neighbours
+reach 41, it *degrades with M* (27.3 at 1024 tokens, 23.0 at 4096), and its
+weight is 157 MB against a 32 MB MALL — which is §2.4's workgroup swizzle, and
+worth **2.9 s per image**; (2) the elementwise fusions, worth ~1.0 s; (3)
+§2.6's fp16 C, which halves both `w13`'s write and `swiglu`'s read. Then stage
+4c, 34 blocks, whose only new problem is that 12.3 GB of fp16 weights do not
+fit one 4.29 GB storage buffer.
+
+### Session 2026-09-14 (later still) — stage 4b: three levers, none of them arithmetic
+
+**Result: the DiT block goes 65.6 ms -> 49.3 ms at 4096 tokens, and the image
+budget 17.8 s -> 13.4 s** (19.0 s with the VAE). The block's three GEMM shapes
+now sit at **42.0, 41.1 and 40.6 TFLOP/s — 73-76% of the WMMA ceiling — on a
+single kernel**, where stage 4a needed a per-shape plan and its worst shape was
+at 24.2. Written up alongside 4a in
+[`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md); IDEAS **§2.4
+and §2.6 are closed**, and §2.8 is amended.
+
+**Built:**
+
+- `SWZ` in `shaders/dit_gemm.comp` (§2.4): bands of SWZ columns walked top to
+  bottom instead of the grid's row-major order. Seven builds over two B
+  layouts and SWZ = 2, 4, 8, 16.
+- `C_F16` in the same kernel and `IN_F16` in `dit_swiglu_f16.comp` (§2.6),
+  reached through a companion table rather than the kernel ladder — it is a
+  property of the consumer, not the tiling.
+- `dit_norm_scale_f16.comp`, `dit_norm_gate_add.comp`, `dit_qk_pack.comp`:
+  seven dispatches become three. `GPUBlock.Fused` and `.FP16FFN` keep both
+  paths, and the graph is 18 dispatches fused against 26.
+- `TestGPUBlockFusedMatchesUnfused`, `TestGPUBlockFP16FFN`,
+  `TestFFNIntermediatesFitFP16`.
+
+**What it found:**
+
+1. **`ff.w13` was resisting the launch order, not the layout** — 24.2 -> 41.1
+   TFLOP/s, **1.84x**, the largest number in the stage. The mechanism was
+   derived before the code was written and predicted the measurement to within
+   10%: `w13` and `w2` have *identical* tile-level traffic (3.52 GB) and
+   reached 264 and 439 GB/s against it, because `gl_WorkGroupID.x` is the
+   fastest axis and `w13`'s grid is 40 columns wide against `w2`'s 15 — so
+   `w2` keeps four grid rows in flight and amortises each B slab four ways,
+   `w13` keeps 1.6.
+2. **The optimum band is interior**: 2/4/8/16 give 36.0/39.2/**41.1**/38.3.
+   Narrow bands do not amortise B; wide ones push A past the 32 MB MALL.
+3. **Ordering and layout are one lever, not two.** The swizzle is worth 1.84x
+   against a fragment-tiled weight and only 1.16x against a row-major one, and
+   the tiled weight *lost* on `w13` until the swizzle was there. Neither is
+   worth its full value alone, which is why the ladder is a cross product.
+4. **Per-shape kernel plans were a symptom.** With both applied, one kernel
+   wins all three shapes; `DefaultGEMMPlan` is uniform again.
+5. **The elementwise tail fuses cleanly and the biggest piece is q/k**: 12.2 ms
+   -> 6.7, of which `rmsnorm q/k + rope + pack` 3.66 -> 1.40. That one works
+   because all four steps share a natural unit — a head of one token — so the
+   intermediate never leaves LDS.
+6. **An fp16 C is worth 0.85 ms and 6% of the block's error**, and it is a
+   per-tensor question: `w1`/`w3` peak at 250 and 508 against fp16's 65504,
+   `w2` at 6e5.
+
+**How it was measured:** `go run ./cmd/ditblock -tokens 320,1024,4096`, best of
+three, GPU timestamps per dispatch, run twice — agreeing to **0.998-1.020** on
+every block total and 1-3% per shape.
+
+**Correctness:** the eleven GEMM builds all agree to every digit logged. The
+fusions are checked against the unfused graph at the last point their own
+output is visible: the fp16 A operand is **bit-identical**, the attention
+context differs by 5.1e-4, the block by 1.6e-3 (bound 5e-3). The fp16 C is
+measured rather than asserted free — the block's error against diffusers goes
+1.7e-2 to 1.8e-2.
+
+**Next — stage 4c, and then the VAE.** 4c is 34 blocks, whose only new problem
+is that 12.3 GB of fp16 weights do not fit one 4.29 GB storage buffer. After
+that the DiT is 72% GEMM at 73-76% of the ceiling and the next-largest item in
+the image is the **VAE's 5.6 s**, which is 30% of the total and has had no
+optimisation pass at all. Two smaller things are left inside the block:
+`pack v` and `narrow ctx` are 1.0 s per image of pure layout that a GEMM and
+the attention kernel could do in their epilogues, and attention's 38 TFLOP/s
+is now *behind* the GEMMs it used to lead.
+
 ### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the

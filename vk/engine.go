@@ -365,6 +365,24 @@ func (b *Buffer) ReadFloat32At(off, n int) []float32 {
 	return out
 }
 
+// WriteUint16At copies src into the buffer's mapped memory at a uint16
+// element offset. fp16 is the matrix cores' only operand type, so a weight
+// arena is filled through this rather than WriteFloat32At; the caller does
+// the narrowing, because the layout it writes into is usually a transpose or
+// a retiling of the tensor it came from.
+func (b *Buffer) WriteUint16At(off int, src []uint16) {
+	dst := unsafe.Slice((*uint16)(b.mapped), off+len(src))
+	copy(dst[off:], src)
+}
+
+// ReadUint16At reads n uint16s starting at a uint16 element offset.
+func (b *Buffer) ReadUint16At(off, n int) []uint16 {
+	src := unsafe.Slice((*uint16)(b.mapped), off+n)
+	out := make([]uint16, n)
+	copy(out, src[off:])
+	return out
+}
+
 // ReadUint32 reads n uint32s back out of the buffer's mapped memory.
 func (b *Buffer) ReadUint32(n int) []uint32 {
 	src := unsafe.Slice((*uint32)(b.mapped), n)

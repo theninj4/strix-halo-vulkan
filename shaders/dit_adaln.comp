@@ -1,0 +1,49 @@
+#version 450
+// adaLN modulation: mod = W t + b, where t is the timestep embedding (256
+// wide) and mod is 4*dim, then the four chunks are turned into the vectors
+// the block actually multiplies by.
+//
+// The chunks are scale_msa, gate_msa, scale_mlp, gate_mlp in that order; the
+// scales are offset by one and the gates pass through tanh, so a freshly
+// trained block starts as the identity. The checkpoint does not label them,
+// which is why zimage/dit's CPU reference has a negative control for getting
+// the order wrong, and why the transform lives here rather than being left to
+// the four consumers.
+//
+// One workgroup per output row: 256 threads read one row of W with perfectly
+// coalesced 1 KB, multiply it by the embedding held in the same 256 lanes,
+// and tree-reduce. The whole projection is 15360x256 = 3.9 MFLOP and 15.7 MB
+// per block -- nothing, but it is 3.9 MFLOP that would otherwise be a host
+// round trip in the middle of a graph.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float partial[256];
+
+void main() {
+    uint j = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (j >= pc.gemmN) {
+        return;
+    }
+
+    float s = 0.0;
+    for (uint i = t; i < pc.gemmK; i += 256u) {
+        s += wbuf[pc.wOff + j * pc.gemmK + i] * act[pc.inOff + i];
+    }
+    partial[t] = s;
+    barrier();
+    for (uint step = 128u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        float v = partial[0] + wbuf[pc.aux0 + j];
+        uint chunk = j / pc.dim;
+        act[pc.outOff + j] = (chunk == 1u || chunk == 3u) ? tanh(v) : 1.0 + v;
+    }
+}

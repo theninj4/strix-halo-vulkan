@@ -30,6 +30,20 @@ layout(push_constant) uniform PC {
     uint aux0;      // rope: sin table; pack: 0 natural / 1 transposed tiles
     uint aux1;      // WMMA path: padded token count, i.e. the per-head plane
     uint aux2;
+    // The GEMM block (dit_gemm.comp). C = A*B with A the activations in the
+    // fp16 arena at inOff, B the weights in the fp16 weight arena at bOff and
+    // C fp32 in the activation arena at outOff, so the three offsets a
+    // projection needs are already here and only its extents and strides are
+    // not. Kept as their own fields rather than folded onto `dim`/`span`
+    // because a GEMM's four numbers are M, N, K and a leading dimension per
+    // operand, and reusing an unrelated name for one of them is how a graph
+    // with seven projections in it gets silently wrong.
+    uint bOff;      // GEMM: B, in the fp16 weight arena
+    uint gemmM;     // GEMM: rows of A and C, padded up to the tile
+    uint gemmN;     // GEMM: columns of B and C; also C's row stride
+    uint gemmK;     // GEMM: the reduction extent
+    uint lda;       // GEMM: A's row stride in halves, K + pad (IDEAS §2.3)
+    uint ldb;       // GEMM: B's row stride in halves; unused when B is tiled
 } pc;
 
 const uint NO_W = 0xffffffffu;

@@ -44,10 +44,10 @@ func TestF32ToF16Golden(t *testing.T) {
 			t.Fatal(err)
 		}
 		in := math.Float32frombits(uint32(inBits))
-		got := f32ToF16(in)
+		got := F32ToF16(in)
 		if got != uint16(wantBits) {
 			if bad < 10 {
-				t.Errorf("f32ToF16(%v /*%08x*/) = %04x, want %04x", in, inBits, got, wantBits)
+				t.Errorf("F32ToF16(%v /*%08x*/) = %04x, want %04x", in, inBits, got, wantBits)
 			}
 			bad++
 		}
@@ -75,9 +75,9 @@ func TestF16RoundTrip(t *testing.T) {
 		if exp == 0x1f && mant != 0 {
 			continue // NaN: payload is not preserved by design
 		}
-		got := f32ToF16(f16ToF32(h))
+		got := F32ToF16(F16ToF32(h))
 		if got != h {
-			t.Fatalf("round trip of %04x gave %04x (via %v)", h, got, f16ToF32(h))
+			t.Fatalf("round trip of %04x gave %04x (via %v)", h, got, F16ToF32(h))
 		}
 	}
 }
@@ -102,12 +102,12 @@ func TestF16ToF32KnownValues(t *testing.T) {
 		{0xfc00, float32(math.Inf(-1))},
 	}
 	for _, c := range cases {
-		got := f16ToF32(c.h)
+		got := F16ToF32(c.h)
 		if got != c.want {
-			t.Errorf("f16ToF32(%04x) = %v, want %v", c.h, got, c.want)
+			t.Errorf("F16ToF32(%04x) = %v, want %v", c.h, got, c.want)
 		}
 		if math.Signbit(float64(got)) != math.Signbit(float64(c.want)) {
-			t.Errorf("f16ToF32(%04x) sign mismatch: %v vs %v", c.h, got, c.want)
+			t.Errorf("F16ToF32(%04x) sign mismatch: %v vs %v", c.h, got, c.want)
 		}
 	}
 }
@@ -201,8 +201,8 @@ func TestOpenRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, v := range f32vals {
-		if f16ToF32(gotF16[i]) != v {
-			t.Errorf("a.f32[%d] via fp16 = %v, want %v", i, f16ToF32(gotF16[i]), v)
+		if F16ToF32(gotF16[i]) != v {
+			t.Errorf("a.f32[%d] via fp16 = %v, want %v", i, F16ToF32(gotF16[i]), v)
 		}
 	}
 

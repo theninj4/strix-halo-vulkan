@@ -1,0 +1,30 @@
+#version 450
+// The gated residual: x += gate * y, with gate a row vector broadcast down
+// the sequence.
+//
+// Both of the block's residuals have this shape -- attention's and the feed
+// forward's -- and in both the gate comes from adaLN (dit_adaln.comp) and so
+// lives in the activation arena rather than the weight arena, which is why
+// its offset is pc.aux0 and not pc.wOff.
+//
+// x is updated in place: the residual stream is one tensor for the whole
+// block, which is what lets stage 4 run 34 of these back to back without a
+// copy between them.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    // One workgroup per row rather than a flat grid: the gate is indexed by
+    // the column, and a flat grid would pay an integer division by a width
+    // that is not a power of two (3840) on every element (IDEAS §1.2).
+    uint base = r * pc.dim;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        act[pc.outOff + base + c] += act[pc.aux0 + c] * act[pc.inOff + base + c];
+    }
+}

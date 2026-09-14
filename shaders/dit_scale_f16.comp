@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Narrow an fp32 activation into the fp16 arena as a GEMM A operand,
+// optionally scaling each column by a row vector first.
+//
+// Two uses, one shader: the modulated attention and FFN inputs, which are
+// rmsnorm(x) * (1 + scale_*) and want the scale (pc.aux2 = 1), and the
+// attention context on its way into the output projection, which wants only
+// the narrowing (pc.aux2 = 0).
+//
+// The destination stride is pc.lda, not pc.dim: A's rows are K + 128 halves
+// apart so that a K-strided fragment load does not put all 16 of its
+// addresses in one DRAM channel (§2.3). The pad columns are never read -- the
+// reduction stops at K -- so they are left as they were allocated.
+//
+// One workgroup per token row, which makes both sides contiguous: 256 lanes
+// walk the row in order.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = act[src + c];
+        if (pc.aux2 != 0u) {
+            v *= act[pc.aux0 + c];
+        }
+        hact[dst + c] = float16_t(v);
+    }
+}

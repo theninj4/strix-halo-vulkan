@@ -1,0 +1,126 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+// The whole of what happens to q and k between their projection and
+// attention, in one pass: the per-head RMS norm, the 3-D rotary embedding,
+// the softmax scale, and the narrowing into dit_pack_f16.comp's fragment-tile
+// layout.
+//
+// Unfused, that is three dispatches and 346 MB of traffic per operand at 4096
+// tokens (read 63, write 63, read 63, write 63, read 63, write 31) for 63 MB
+// of input and 31 MB of output. None of them does arithmetic worth the name
+// and all three are at the bus, so the fusion is worth what the round trips
+// cost -- measured at 1.83 ms -> 0.55 ms per operand
+// (research/stage-4-dit-graph.md).
+//
+// It is possible at all because the three steps have the same natural unit as
+// the pack already does: a **head of one token**. The RMS norm is per head
+// (128 wide, not 3840 -- normalising over the full width is a plausible port
+// bug that changes the output by 2.4x), the rotation pairs components 2j and
+// 2j+1 within a head, and a fragment tile column is a slice of one head. So a
+// workgroup that owns 16 tokens of one head owns everything all three steps
+// need, and the intermediate never leaves LDS.
+//
+// The unfused kernels stay: they are three separately validated stages, and
+// GPUBlock keeps a path through them so the fused output can be checked
+// against the thing it replaces rather than only against the reference.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#define TILE 16
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HDT (HEAD_DIM / TILE)
+#define PAIRS (HEAD_DIM / 2)
+#define WG 256
+#define LANES (WG / TILE)   // lanes cooperating on one token's head
+
+layout(local_size_x = WG) in;
+
+shared float rows[TILE * HEAD_DIM];
+shared float partial[WG];
+shared float inv[TILE];
+
+void main() {
+    uint tt = gl_WorkGroupID.x;          // token tile
+    uint head = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint tok0 = tt * TILE;
+
+    // Coalesced in: consecutive lanes read consecutive components of one
+    // token. Tokens past the sequence are zeroed rather than skipped -- the
+    // attention kernel reads the padding and a pad key has to score
+    // something finite.
+    for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
+        uint m = i / HEAD_DIM, d = i % HEAD_DIM;
+        uint token = tok0 + m;
+        rows[i] = (token < pc.tokens)
+            ? act[pc.inOff + token * pc.dim + head * HEAD_DIM + d]
+            : 0.0;
+    }
+    barrier();
+
+    // The per-head RMS: LANES lanes per token row, each summing HEAD_DIM/LANES
+    // components at stride LANES, then a tree over the lanes. Consecutive
+    // lanes touch consecutive LDS addresses, so the stride costs no bank
+    // conflicts.
+    uint m = tid / LANES, lane = tid % LANES;
+    float s = 0.0;
+    for (uint d = lane; d < HEAD_DIM; d += LANES) {
+        float v = rows[m * HEAD_DIM + d];
+        s += v * v;
+    }
+    partial[tid] = s;
+    barrier();
+    [[unroll]] for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            partial[tid] += partial[tid + step];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        // A pad row is all zeros; giving it inv = 0 keeps the zeros zero
+        // instead of propagating the 1/sqrt(eps) a real norm would produce.
+        inv[m] = (tok0 + m < pc.tokens)
+            ? inversesqrt(partial[tid] / float(HEAD_DIM) + uintBitsToFloat(pc.eps))
+            : 0.0;
+    }
+    barrier();
+
+    // Norm weight, rotation and scale, in place in LDS. One thread owns
+    // TILE*PAIRS/WG complex pairs; both divisors are compile-time powers of
+    // two. The rotation is (2j, 2j+1) -- see dit_rope.comp for why that
+    // matters -- and the cos/sin tables are indexed by the token alone, since
+    // every head shares them.
+    for (uint p = tid; p < TILE * PAIRS; p += WG) {
+        uint r = p / PAIRS, j = p % PAIRS;
+        uint token = tok0 + r;
+        uint base = r * HEAD_DIM + 2u * j;
+        float re = rows[base] * inv[r] * wbuf[pc.aux2 + 2u * j];
+        float im = rows[base + 1u] * inv[r] * wbuf[pc.aux2 + 2u * j + 1u];
+        float c = 0.0, sn = 0.0;
+        if (token < pc.tokens) {
+            c = wbuf[pc.wOff + token * PAIRS + j];
+            sn = wbuf[pc.aux0 + token * PAIRS + j];
+        }
+        float sc = uintBitsToFloat(pc.scale);
+        rows[base] = (re * c - im * sn) * sc;
+        rows[base + 1u] = (re * sn + im * c) * sc;
+    }
+    barrier();
+
+    // Coalesced out: consecutive lanes write consecutive halves of one 512 B
+    // fragment tile. Tile (t, c) of a head holds token rows 16t.. and
+    // component columns 16c.., element (token, component) at m*16 + k, which
+    // is what a row-major fragment load of stride 16 reads.
+    uint outBase = pc.outOff + (head * pc.aux1 / TILE + tt) * (HDT * TILE * TILE);
+    for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
+        uint c = o / (TILE * TILE);
+        uint rem = o % (TILE * TILE);
+        hact[outBase + o] = float16_t(rows[(rem / TILE) * HEAD_DIM + c * TILE + rem % TILE]);
+    }
+}

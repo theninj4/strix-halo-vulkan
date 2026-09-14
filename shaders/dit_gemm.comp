@@ -1,0 +1,231 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// C = A * B for the DiT's seven projections: fp16 activations out of the
+// fp16 arena, fp16 weights out of the weight arena, fp32 accumulators, fp32
+// C back into the activation arena.
+//
+// This is gemm_wmma.comp's winning arm ported onto the DiT's binding and
+// push-constant layout (dit_common.glsl), not a new kernel: same 16x16x16
+// cooperative-matrix tiles, same WM x WN register-blocked accumulator grid
+// (§2.1), same hoisted K-slab (§2.7), same padded leading dimensions (§2.3).
+// What the benchmark kernel carries and this one does not is the machinery
+// that made it an *ablation* -- the LDS arms that lost, the tile table of the
+// grouped mode, its own four-buffer binding layout -- and what this one has
+// and that one does not is the B layout the block actually wants, below.
+// The two are kept apart deliberately: results/gemm_wmma.csv is a measured
+// artifact of a kernel that should not move under it, and the epilogue
+// fusions stage 4 will want (a fragment-tile C for the projections that feed
+// attention) have no meaning in a benchmark.
+//
+// Three B layouts, selected at build time, because the model's three shapes
+// did not agree on one in results/shapes.csv and the third is new:
+//
+//   B_LAYOUT 0  [N, ldb], K-contiguous, read with a column-major fragment
+//     load. This is how a PyTorch `Linear` weight already sits in memory and
+//     what §2.3/§2.7 ended on: the crown kernel at M=4096 on dit.qkv and
+//     dit.ff.w2, 32.9 and 27.5 TFLOP/s.
+//   B_LAYOUT 1  [K, ldb], N-contiguous, read with a row-major fragment load,
+//     i.e. the weight stored transposed. Slower on two of the model's three
+//     shapes and 1.66x *faster* on dit.ff.w13 (23.4 against 14.1), which is
+//     the disagreement stage 4 inherited.
+//   B_LAYOUT 2  16x16 fragment tiles: tile (nt, kt) is 512 contiguous bytes
+//     holding element (k, n) at n*16 + k, tiles ordered kt-fastest. Stage 3c
+//     found this worth 30x on attention, where a fragment load out of any
+//     natural row stride covers 32 B of each of 16 rows and §5.1b prices it
+//     at 32/gcd of the bus. The same argument applies to every B fragment
+//     here -- and unlike attention, whose operands are activations that have
+//     to be packed every step, a weight is packed once at upload and the
+//     layout is free thereafter.
+//
+// The A operand is the same K-contiguous [M, lda] in all three: it is an
+// activation, so tiling it would cost a pass per step, and HOIST_A already
+// buys its coverage back. Whether that trade is the right one is exactly what
+// the B_LAYOUT=2 rungs measure.
+//
+// No bounds checks, as in gemm_wmma.comp: M is padded up to BM by the host
+// (the fp16 arena is allocated and zeroed for the padded token count), and
+// every N and K in this model is a multiple of 256. The pad rows of C are
+// written with the products of zeros and ignored.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
+
+#ifndef WM
+#define WM 4        // accumulator tiles per wave, M direction
+#endif
+#ifndef WN
+#define WN 4        // accumulator tiles per wave, N direction
+#endif
+#ifndef WAVES_M
+#define WAVES_M 1   // waves per workgroup, M direction
+#endif
+#ifndef WAVES_N
+#define WAVES_N 1   // waves per workgroup, N direction
+#endif
+#ifndef BK_TILES
+#define BK_TILES 1  // K-slab depth, in 16-wide cooperative-matrix steps
+#endif
+#ifndef HOIST_A
+#define HOIST_A 0   // issue the whole slab's A loads before the first MMA
+#endif
+#ifndef B_LAYOUT
+#define B_LAYOUT 0
+#endif
+#ifndef WAVE
+#define WAVE 64     // threads per wave; the host must pin this when it is 32
+#endif
+// Workgroup swizzle (IDEAS §2.4). Zero keeps the launch order the grid
+// implies -- gl_WorkGroupID.x, the N direction, fastest -- which makes the
+// set of workgroups resident at one moment a *row* of C: one A slab shared by
+// gridX of them, and the whole of B streamed past. That is fine while B fits
+// in the 32 MB MALL and ruinous when it does not, and it is why this model's
+// three GEMM shapes reach 264 and 439 GB/s of effective bandwidth off
+// identical tile-level traffic (research/stage-4-dit-graph.md).
+//
+// SWZ > 0 groups the grid into bands of SWZ columns and walks each band
+// top to bottom, so the resident set becomes a tall block instead: SWZ
+// B slabs against gridY A slabs. The last band is narrower when SWZ does not
+// divide gridX, which the `cols` term handles -- every band before it is full,
+// so a band's first linear id is still band*SWZ*gridY.
+#ifndef SWZ
+#define SWZ 0
+#endif
+// fp16 C (IDEAS §2.6). The accumulators stay fp32 -- this is the *store* --
+// and it exists for the one consumer in the block that reads a GEMM's output
+// elementwise and immediately narrows it anyway: SwiGLU, whose two inputs are
+// 160 MB of fp32 each at 4096 tokens. Writing them as fp16 halves both that
+// write and the read that follows.
+//
+// It is not safe everywhere and is not offered everywhere: dit.ff.w2's output
+// reaches 6e5 against fp16's 65504 limit, which is stage 2's overflow lesson
+// again, while w1's and w3's peak at 250 and 508 -- 129x to 262x of headroom
+// (zimage/dit's TestFFNIntermediatesFitFP16). The destination stride is
+// pc.gemmN, since nothing reads this operand with a fragment load.
+#ifndef C_F16
+#define C_F16 0
+#endif
+
+#define TILE 16
+#define BM (WAVES_M * WM * TILE)
+#define BN (WAVES_N * WN * TILE)
+#define BK (BK_TILES * TILE)
+#define NTHREADS (WAVES_M * WAVES_N * WAVE)
+
+layout(local_size_x = NTHREADS) in;
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+// A: [M, lda], K-contiguous, row-major fragment load.
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda + (k0) + (kt) * TILE, \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+
+#if B_LAYOUT == 0
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, pc.bOff + (wn0 + (j) * TILE) * pc.ldb + (k0) + (kt) * TILE, \
+        pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
+#elif B_LAYOUT == 1
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, pc.bOff + ((k0) + (kt) * TILE) * pc.ldb + wn0 + (j) * TILE, \
+        pc.ldb, gl_CooperativeMatrixLayoutRowMajor);
+#else
+// Tile (nt, kt) is one contiguous 512 B block, kt fastest, holding element
+// (k, n) at n*TILE + k -- which is what a column-major load of stride TILE
+// reads. pc.ldb is unused; the tile row is pc.gemmK / TILE tiles long.
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, pc.bOff +                                            \
+        (((wn0 + (j) * TILE) / TILE) * (pc.gemmK / TILE) + ((k0) + (kt) * TILE) / TILE) * (TILE * TILE), \
+        TILE, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
+
+// One K-slab: WM A-fragments and WN B-fragments per K-tile, then WM*WN MMAs
+// against them. With HOIST_A the slab's A loads all issue before the first
+// MMA, so the wave has BK_TILES*32 bytes of each A row outstanding at once
+// instead of 32 (§5.1b mechanism 3, §2.7).
+#if HOIST_A
+#define MMA_BLOCK(k0) {                                                        \
+    FRAG_A_T fragA[BK_TILES][WM];                                              \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(fragA[kt][i], i, k0, kt) } \
+    }                                                                          \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        FRAG_B_T fragB[WN];                                                    \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(fragB[j], j, k0, kt) } \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(fragA[kt][i], fragB[j], acc[i][j]);  \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+#else
+#define MMA_BLOCK(k0) {                                                        \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        FRAG_A_T fragA[WM];                                                    \
+        FRAG_B_T fragB[WN];                                                    \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(fragA[i], i, k0, kt) } \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(fragB[j], j, k0, kt) } \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);      \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+#endif
+
+void main() {
+    uint waveM = gl_SubgroupID / WAVES_N;
+    uint waveN = gl_SubgroupID % WAVES_N;
+
+    uint tileX = gl_WorkGroupID.x;
+    uint tileY = gl_WorkGroupID.y;
+#if SWZ > 0
+    uint gridX = pc.gemmN / BN;
+    uint gridY = pc.gemmM / BM;
+    uint linear = tileY * gridX + tileX;
+    uint perBand = uint(SWZ) * gridY;
+    uint band = linear / perBand;
+    uint inBand = linear - band * perBand;
+    uint cols = min(uint(SWZ), gridX - band * uint(SWZ));
+    tileX = band * uint(SWZ) + inBand % cols;
+    tileY = inBand / cols;
+#endif
+
+    uint wm0 = tileY * BM + waveM * (WM * TILE);
+    uint wn0 = tileX * BN + waveN * (WN * TILE);
+
+    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+        MMA_BLOCK(k0)
+    }
+
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            uint at = pc.outOff + (wm0 + i * TILE) * pc.gemmN + wn0 + j * TILE;
+#if C_F16
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> h =
+                coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(acc[i][j]);
+            coopMatStore(h, hact, at, pc.gemmN, gl_CooperativeMatrixLayoutRowMajor);
+#else
+            coopMatStore(acc[i][j], act, at, pc.gemmN, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+    }
+}

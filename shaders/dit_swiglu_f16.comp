@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// SwiGLU's elementwise middle: h = silu(w1 x) * (w3 x), narrowed into the
+// fp16 arena as the A operand of w2.
+//
+// The two halves arrive as separate GEMM outputs (pc.inOff the gate, pc.kOff
+// the up projection), both [tokens, 10240] fp32, and this is the only pass
+// that touches them -- 336 MB read and 84 MB written at 4096 tokens, which is
+// why it narrows on the way out rather than in a second pass.
+//
+// silu is x * sigmoid(x), computed in fp32 before the narrowing: the gate is
+// unbounded, and the product is what has to survive fp16, not the sigmoid.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+// IN_F16 reads the two halves out of the fp16 arena instead, which is what
+// dit_gemm.comp's C_F16 build writes: the same 4096x10240 tensors at half the
+// bytes. Their peaks are 250 and 508 against fp16's 65504, so the narrowing
+// costs precision and not range (IDEAS §2.6).
+#ifndef IN_F16
+#define IN_F16 0
+#endif
+#if IN_F16
+#define GATE(i) float(hact[gate + (i)])
+#define UP(i)   float(hact[up + (i)])
+#else
+#define GATE(i) act[gate + (i)]
+#define UP(i)   act[up + (i)]
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint gate = pc.inOff + r * pc.dim;
+    uint up = pc.kOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float g = GATE(c);
+        hact[dst + c] = float16_t(g / (1.0 + exp(-g)) * UP(c));
+    }
+}

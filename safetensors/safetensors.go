@@ -326,15 +326,15 @@ func (t *Tensor) F16(dst []uint16) ([]uint16, error) {
 	case BF16:
 		for i := 0; i < n; i++ {
 			bits := uint32(binary.LittleEndian.Uint16(t.Data[i*2:])) << 16
-			dst = append(dst, f32ToF16(math.Float32frombits(bits)))
+			dst = append(dst, F32ToF16(math.Float32frombits(bits)))
 		}
 	case F32:
 		for i := 0; i < n; i++ {
-			dst = append(dst, f32ToF16(math.Float32frombits(binary.LittleEndian.Uint32(t.Data[i*4:]))))
+			dst = append(dst, F32ToF16(math.Float32frombits(binary.LittleEndian.Uint32(t.Data[i*4:]))))
 		}
 	case F64:
 		for i := 0; i < n; i++ {
-			dst = append(dst, f32ToF16(float32(math.Float64frombits(binary.LittleEndian.Uint64(t.Data[i*8:])))))
+			dst = append(dst, F32ToF16(float32(math.Float64frombits(binary.LittleEndian.Uint64(t.Data[i*8:])))))
 		}
 	default:
 		return nil, fmt.Errorf("safetensors: tensor %q: cannot convert dtype %q to fp16", t.Name, t.DType)
@@ -359,7 +359,7 @@ func (t *Tensor) F32(dst []float32) ([]float32, error) {
 		}
 	case F16:
 		for i := 0; i < n; i++ {
-			dst = append(dst, f16ToF32(binary.LittleEndian.Uint16(t.Data[i*2:])))
+			dst = append(dst, F16ToF32(binary.LittleEndian.Uint16(t.Data[i*2:])))
 		}
 	case F64:
 		for i := 0; i < n; i++ {
@@ -371,9 +371,14 @@ func (t *Tensor) F32(dst []float32) ([]float32, error) {
 	return dst, nil
 }
 
-// f32ToF16 rounds a float32 to IEEE binary16, half-to-even, with overflow
+// F32ToF16 rounds a float32 to IEEE binary16, half-to-even, with overflow
 // going to infinity and subnormals preserved.
-func f32ToF16(f float32) uint16 {
+//
+// Exported because the narrowing is not only a loading concern: zimage/dit
+// stages the DiT's weights into the device's fp16 arena in a layout the
+// matrix cores want, which is a transpose or a retiling of what is on disk
+// rather than a straight copy, so it cannot go through Tensor.F16.
+func F32ToF16(f float32) uint16 {
 	b := math.Float32bits(f)
 	sign := uint16((b >> 16) & 0x8000)
 	exp := int32((b>>23)&0xff) - 127
@@ -416,8 +421,11 @@ func f32ToF16(f float32) uint16 {
 	}
 }
 
-// f16ToF32 widens IEEE binary16 to float32.
-func f16ToF32(h uint16) float32 {
+// F16ToF32 widens IEEE binary16 to float32. Exported alongside F32ToF16 for
+// the same reason: an fp16 arena written by a Go-side packer is read back by
+// Go-side validation, and the pair is already checked here against all 65,536
+// bit patterns.
+func F16ToF32(h uint16) float32 {
 	sign := uint32(h&0x8000) << 16
 	exp := uint32(h>>10) & 0x1f
 	mant := uint32(h & 0x3ff)
