@@ -449,9 +449,12 @@ func (g *GPUAttention) Apply(q, k, v *Mat, normAndRope bool) (*Mat, error) {
 	return g.result(), nil
 }
 
-// Stage is one dispatch's identity and cost, as returned by Profile.
+// Stage is one dispatch's identity and cost, as returned by Profile. Block is
+// which block of a GPUStack it belongs to, and is zero for the attention
+// stack's own profile, which has no blocks.
 type Stage struct {
 	Index int
+	Block int
 	Kind  string
 	GPU   time.Duration
 }

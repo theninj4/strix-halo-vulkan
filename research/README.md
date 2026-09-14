@@ -60,6 +60,7 @@ numbered experiment, so they carry names instead of section numbers:
 | [Stage 2](stage-2-vae-decoder.md) | VAE decoder — fp16 overflow, the conv intensity lesson, two device limits |
 | [Stage 3](stage-3-dit-attention.md) | DiT attention — why it needs WMMA, and the two hazards a port hits |
 | [Stage 4](stage-4-dit-graph.md) | The DiT block as a graph — **49.3 ms/block, 13.4 s/image**; a tiled weight (§2.8), a swizzled grid (§2.4) and a fused tail (§2.6) compound to **1.83x**, and all three are about order rather than arithmetic |
+| [Stage 4c](stage-4c-dit-stack.md) | The whole DiT resident — **12.54 GB in three storage buffers, 12.8 s/image**; splitting the weight arena costs one pipeline per bank and nothing per dispatch, and six banks are bit-identical to one |
 
 ### Closed, but small enough to have stayed in the backlog
 

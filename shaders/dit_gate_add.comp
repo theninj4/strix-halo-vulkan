@@ -10,6 +10,10 @@
 // x is updated in place: the residual stream is one tensor for the whole
 // block, which is what lets stage 4 run 34 of these back to back without a
 // copy between them.
+//
+// pc.aux2 = 0 drops the gate, which is the context refiner's path: two of the
+// DiT's 34 blocks are built with modulation=False and add their branch output
+// to the residual ungated (stage 4c).
 
 #include "dit_common.glsl"
 
@@ -25,6 +29,10 @@ void main() {
     // that is not a power of two (3840) on every element (IDEAS §1.2).
     uint base = r * pc.dim;
     for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
-        act[pc.outOff + base + c] += act[pc.aux0 + c] * act[pc.inOff + base + c];
+        float v = act[pc.inOff + base + c];
+        if (pc.aux2 != 0u) {
+            v *= act[pc.aux0 + c];
+        }
+        act[pc.outOff + base + c] += v;
     }
 }

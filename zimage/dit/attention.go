@@ -142,32 +142,41 @@ type Block struct {
 	Dim                  int
 }
 
-// Apply runs the block. x is [tokens, dim]; adaln is the timestep embedding.
+// Apply runs the block. x is [tokens, dim]; adaln is the timestep embedding,
+// and is ignored by a block with no adaLN projection.
+//
+// A block without modulation -- the two context refiners, which diffusers
+// builds with modulation=False -- is this block with its four modulation
+// vectors absent rather than a different module: no scale on either branch
+// input and both residuals ungated.
 func (b *Block) Apply(x *Mat, adaln []float32, rope *RoPE) (*Mat, error) {
 	if x.Cols != b.Dim {
 		return nil, fmt.Errorf("dit: block takes %d features, got %s", b.Dim, x)
 	}
-	modIn := &Mat{Rows: 1, Cols: len(adaln), Data: adaln}
-	modMat, err := b.AdaLN.Apply(modIn)
-	if err != nil {
-		return nil, err
-	}
-	mod := modMat.Data
-	if len(mod) != 4*b.Dim {
-		return nil, fmt.Errorf("dit: adaLN produced %d values, want %d", len(mod), 4*b.Dim)
-	}
-	// The four chunks are scale_msa, gate_msa, scale_mlp, gate_mlp, in that
-	// order. The scales are offset by one and the gates pass through tanh,
-	// so a freshly trained block starts as the identity.
-	scaleMSA := make([]float32, b.Dim)
-	gateMSA := make([]float32, b.Dim)
-	scaleMLP := make([]float32, b.Dim)
-	gateMLP := make([]float32, b.Dim)
-	for i := 0; i < b.Dim; i++ {
-		scaleMSA[i] = 1 + mod[i]
-		gateMSA[i] = float32(math.Tanh(float64(mod[b.Dim+i])))
-		scaleMLP[i] = 1 + mod[2*b.Dim+i]
-		gateMLP[i] = float32(math.Tanh(float64(mod[3*b.Dim+i])))
+	var scaleMSA, gateMSA, scaleMLP, gateMLP []float32
+	if b.AdaLN != nil {
+		modIn := &Mat{Rows: 1, Cols: len(adaln), Data: adaln}
+		modMat, err := b.AdaLN.Apply(modIn)
+		if err != nil {
+			return nil, err
+		}
+		mod := modMat.Data
+		if len(mod) != 4*b.Dim {
+			return nil, fmt.Errorf("dit: adaLN produced %d values, want %d", len(mod), 4*b.Dim)
+		}
+		// The four chunks are scale_msa, gate_msa, scale_mlp, gate_mlp, in
+		// that order. The scales are offset by one and the gates pass through
+		// tanh, so a freshly trained block starts as the identity.
+		scaleMSA = make([]float32, b.Dim)
+		gateMSA = make([]float32, b.Dim)
+		scaleMLP = make([]float32, b.Dim)
+		gateMLP = make([]float32, b.Dim)
+		for i := 0; i < b.Dim; i++ {
+			scaleMSA[i] = 1 + mod[i]
+			gateMSA[i] = float32(math.Tanh(float64(mod[b.Dim+i])))
+			scaleMLP[i] = 1 + mod[2*b.Dim+i]
+			gateMLP[i] = float32(math.Tanh(float64(mod[3*b.Dim+i])))
+		}
 	}
 
 	h := x.Clone()
@@ -202,8 +211,12 @@ func (b *Block) Apply(x *Mat, adaln []float32, rope *RoPE) (*Mat, error) {
 	return out, nil
 }
 
-// scaleRows multiplies every row elementwise by s.
+// scaleRows multiplies every row elementwise by s; a nil s is the unmodulated
+// block's missing scale, which is the identity rather than zero.
 func scaleRows(x *Mat, s []float32) {
+	if s == nil {
+		return
+	}
 	parallelFor(x.Rows, func(r int) {
 		row := x.Row(r)
 		for i := range row {
@@ -212,10 +225,17 @@ func scaleRows(x *Mat, s []float32) {
 	})
 }
 
-// gateAddRows computes dst += gate * src, elementwise per row.
+// gateAddRows computes dst += gate * src, elementwise per row. A nil gate is
+// the unmodulated block's ungated residual.
 func gateAddRows(dst, src *Mat, gate []float32) {
 	parallelFor(dst.Rows, func(r int) {
 		d, s := dst.Row(r), src.Row(r)
+		if gate == nil {
+			for i := range d {
+				d[i] += s[i]
+			}
+			return
+		}
 		for i := range d {
 			d[i] += gate[i] * s[i]
 		}

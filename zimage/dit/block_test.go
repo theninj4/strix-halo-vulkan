@@ -16,21 +16,32 @@ import (
 // the attention internals. Regenerate with:
 //
 //	.venv/bin/python reference/dump_dit_block.py --seq 320 --caption 64
+//
+// refStackDir is stage 4c's counterpart, a sequence of blocks each with its
+// own weights:
+//
+//	.venv/bin/python reference/dump_dit_stack.py --seq 320 --caption 64
 const (
 	refDir      = "../../reference/out/dit"
+	refStackDir = "../../reference/out/ditstack"
 	transformer = "../../models/Z-Image-Turbo/transformer"
 )
 
 type manifest struct {
-	Seq       int     `json:"seq"`
-	Caption   int     `json:"caption"`
-	Dim       int     `json:"dim"`
-	Heads     int     `json:"heads"`
-	HeadDim   int     `json:"head_dim"`
-	AxesDims  [3]int  `json:"axes_dims"`
-	AxesLens  [3]int  `json:"axes_lens"`
-	RopeTheta float64 `json:"rope_theta"`
-	NormEps   float64 `json:"norm_eps"`
+	// dir is where the .bin files are, so that a tensor can be read with the
+	// manifest alone and two dumps can be open at once.
+	dir string
+
+	Seq       int      `json:"seq"`
+	Blocks    []string `json:"blocks"`
+	Caption   int      `json:"caption"`
+	Dim       int      `json:"dim"`
+	Heads     int      `json:"heads"`
+	HeadDim   int      `json:"head_dim"`
+	AxesDims  [3]int   `json:"axes_dims"`
+	AxesLens  [3]int   `json:"axes_lens"`
+	RopeTheta float64  `json:"rope_theta"`
+	NormEps   float64  `json:"norm_eps"`
 	Tensors   map[string]struct {
 		Shape []int   `json:"shape"`
 		Count int     `json:"count"`
@@ -38,16 +49,17 @@ type manifest struct {
 	} `json:"tensors"`
 }
 
-func loadManifest(t *testing.T) *manifest {
+func loadManifest(t *testing.T, dir string) *manifest {
 	t.Helper()
-	buf, err := os.ReadFile(filepath.Join(refDir, "manifest.json"))
+	buf, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
-		t.Skipf("no reference dump (%v); run reference/dump_dit_block.py", err)
+		t.Skipf("no reference dump in %s (%v); run reference/dump_dit_block.py", dir, err)
 	}
 	var m manifest
 	if err := json.Unmarshal(buf, &m); err != nil {
 		t.Fatal(err)
 	}
+	m.dir = dir
 	return &m
 }
 
@@ -58,7 +70,7 @@ func loadRef(t *testing.T, m *manifest, name string) *Mat {
 	if !ok {
 		t.Fatalf("reference has no tensor %q", name)
 	}
-	raw, err := os.ReadFile(filepath.Join(refDir, name+".bin"))
+	raw, err := os.ReadFile(filepath.Join(m.dir, name+".bin"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +152,7 @@ func ropeFromRef(t *testing.T, m *manifest) *RoPE {
 // a wrong frequency schedule produces a block output that is wrong
 // everywhere with no clue as to why.
 func TestRoPETable(t *testing.T) {
-	m := loadManifest(t)
+	m := loadManifest(t, refDir)
 	rope := ropeFromRef(t, m)
 	cos := loadRef(t, m, "freqs_cos")
 	sin := loadRef(t, m, "freqs_sin")
@@ -153,7 +165,7 @@ func TestBlockAgainstDiffusers(t *testing.T) {
 	if _, err := os.Stat(transformer); err != nil {
 		t.Skipf("no transformer checkpoint at %s", transformer)
 	}
-	m := loadManifest(t)
+	m := loadManifest(t, refDir)
 	cfg, err := LoadConfig(transformer)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +280,7 @@ func TestFFNIntermediatesFitFP16(t *testing.T) {
 	if _, err := os.Stat(transformer); err != nil {
 		t.Skipf("no transformer checkpoint at %s", transformer)
 	}
-	m := loadManifest(t)
+	m := loadManifest(t, refDir)
 	cfg, err := LoadConfig(transformer)
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +370,7 @@ func TestValidationDetectsErrors(t *testing.T) {
 	if _, err := os.Stat(transformer); err != nil {
 		t.Skipf("no transformer checkpoint at %s", transformer)
 	}
-	m := loadManifest(t)
+	m := loadManifest(t, refDir)
 	cfg, err := LoadConfig(transformer)
 	if err != nil {
 		t.Fatal(err)

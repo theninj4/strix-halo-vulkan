@@ -9,7 +9,10 @@
 //
 // pc.inOff is the branch output, pc.outOff the residual stream (updated in
 // place), pc.wOff the norm's learned weight in the weight arena, and pc.aux0
-// the gate in the *activation* arena, since adaLN forms it per step.
+// the gate in the *activation* arena, since adaLN forms it per step. pc.aux2 =
+// 0 drops the gate, which is the context refiner's path: two of the DiT's 34
+// blocks are built with modulation=False and add their branch output to the
+// residual ungated (stage 4c).
 
 #include "dit_common.glsl"
 
@@ -43,6 +46,10 @@ void main() {
     float inv = inversesqrt(partial[0] / float(pc.dim) + uintBitsToFloat(pc.eps));
 
     for (uint c = t; c < pc.dim; c += WG) {
-        act[dst + c] += act[pc.aux0 + c] * (act[src + c] * inv * wbuf[pc.wOff + c]);
+        float v = act[src + c] * inv * wbuf[pc.wOff + c];
+        if (pc.aux2 != 0u) {
+            v *= act[pc.aux0 + c];
+        }
+        act[dst + c] += v;
     }
 }

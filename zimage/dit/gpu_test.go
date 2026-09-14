@@ -108,7 +108,7 @@ func loadFixture(t *testing.T) fixture {
 	if _, err := os.Stat(transformer); err != nil {
 		t.Skipf("no transformer checkpoint at %s", transformer)
 	}
-	m := loadManifest(t)
+	m := loadManifest(t, refDir)
 	cfg, err := LoadConfig(transformer)
 	if err != nil {
 		t.Fatal(err)

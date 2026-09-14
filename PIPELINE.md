@@ -7,13 +7,14 @@
 > few more with each stage that closes, and loses them when a stage's detail
 > moves to `research/`.
 
-**Status**: stages 1, 2, 3 and 4a-4b done. A whole DiT block runs on the GPU
-— 18 dispatches, every matrix operation on the matrix cores — in **49.3 ms at
-4096 tokens**, validated stage by stage against diffusers. That is **13.4 s
-per image** for the transformer and **19.0 s** with the VAE, under the 20-30 s
-this stage set out to accept. The three GEMM shapes are at 73-76% of the WMMA
-ceiling on one kernel. Next is stage 4c: 34 blocks, whose only new problem is
-that 12.3 GB of fp16 weights do not fit one storage buffer.
+**Status**: stages 1, 2, 3 and 4 done. **The whole DiT runs on the GPU** — all
+34 blocks resident, 12.54 GB of weights across three storage buffers because
+one addresses 4.29 GB here — at **1.60 s per denoising step, 12.8 s per
+image** at 1024x1024, validated against diffusers. With the VAE that is
+**18.4 s**, under the 20-30 s stage 4 set out to accept. A block inside the
+stack costs the same 49.3 ms it cost alone, and a run with the weights in six
+banks is bit-identical to one with them in a single buffer. Next is stage 5,
+the text encoder.
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 
 ## Why this exists
@@ -45,6 +46,7 @@ hand and has gaps that change the arithmetic:
 | VAE | Flux `AutoencoderKL`: `block_out_channels [128,256,512,512]`, 2 layers/block, GroupNorm(32), SiLU, mid-block attention, 8x upsample, scale 0.3611, shift 0.1159 |
 | Text encoder | Qwen3-4B: 36 layers, hidden 2560, FFN 9728, GQA 32q/8kv, head_dim 128, vocab 151936 |
 | Scheduler | `FlowMatchEulerDiscrete`, shift 3.0, 1000 train timesteps, 8 NFE |
+| Topology | **three phases, three lengths**: noise refiners over the image tokens, context refiners over the caption, then the 30 layers over the two concatenated. The context refiners are `modulation=False` — no adaLN, no scale, ungated residuals |
 
 Sizes: transformer 6.155 B **F32** on disk (24.62 GB); text encoder 4.022 B
 and VAE 0.084 B, both **BF16**. As fp16 the three total **20.5 GB**, so the
@@ -62,9 +64,9 @@ whole pipeline is resident in 128 GB unified memory at once.
 | 3c | Attention on WMMA | **done** | 38.8 TFLOP/s = 70% of ceiling, 30.4x |
 | 4a | The block as a graph | **done** | `GPUBlock`, 26 dispatches, 65.6 ms; §2.8 |
 | 4b | Fuse the tail, fix `ff.w13` | **done** | 18 dispatches, **49.3 ms**; §2.4, §2.6 |
-| 4c | 34 blocks | next | weight streaming: 12.3 GB of fp16 against a 4.29 GB buffer limit |
-| 5 | Text encoder + tokenizer | | Qwen3-4B, GQA; BPE from `tokenizer/` |
-| 6 | Scheduler + driver | | FlowMatchEuler, 8 steps; PNG out |
+| 4c | 34 blocks | **done** | `GPUStack`, 3 weight banks, **1.60 s/step**, 12.8 s/image |
+| 5 | Text encoder + tokenizer | next | Qwen3-4B, GQA; BPE from `tokenizer/` |
+| 6 | Scheduler + driver | | FlowMatchEuler, 8 steps; the three phases, PNG out |
 
 Each stage gets a CPU implementation in Go first: it separates "do I understand
 the architecture" from "is the shader right", and once it matches diffusers it
@@ -120,20 +122,35 @@ Measured on this device (`research/`), and load-bearing for every stage:
   host-visible arena run at **0.2 GB/s** (writes: 11.5), so any wall-clock
   figure that includes a read-back is measuring the read-back.
 
-## Measured baseline to beat — the DiT block
+## Measured baseline to beat — the DiT
 
-`go run ./cmd/ditblock`, GPU timestamps per dispatch, best of three, two runs
-agreeing to 0.994-1.006. Per image is 34 blocks x 8 steps.
+`go run ./cmd/ditstack -image 4096 -caption 128`, GPU timestamps per dispatch,
+best of three, runs agreeing to 0.997-1.008. Wall clock is +0.4% over the sum,
+so 77 fence waits per step are not a cost.
 
-| tokens | image | block | GEMMs | attention | elementwise | per image |
-|---|---|---|---|---|---|---|
-| 320 | — | 5.2 ms | 4.7 | 0.06 | 0.5 | 1.4 s |
-| 1024 | 256² | 11.7 ms | 9.8 | 0.45 | 1.4 | 3.2 s |
-| 4096 | **1024²** | **49.3 ms** | **35.7** | **6.7** | **6.8** | **13.4 s** |
+| phase | blocks | tokens | per block | total |
+|---|---|---|---|---|
+| `noise_refiner` | 2 | 4096 | 49.27 ms | 98.6 ms |
+| `context_refiner` | 2 | 128 | 2.60 ms | 5.2 ms |
+| `layers` | 30 | 4224 | 49.81 ms | 1.49 s |
+| **one step** | 34 | | | **1.60 s** |
+| **one image**, 8 steps | | | | **12.8 s** |
 
-TFLOP/s by shape at 4096, on the one kernel that wins all three
-(`wg128x256_bt16_swz8`): `qkv`/`o` **42.0**, `ff.w13` **41.1**, `ff.w2`
-**40.6** — 73-76% of the 55.5 TFLOP/s ceiling.
+A block is 72% GEMM, 14% attention, 14% elementwise. TFLOP/s by shape at 4096,
+on the one kernel that wins all three (`wg128x256_bt16_swz8`): `qkv`/`o`
+**42.0**, `ff.w13` **41.1**, `ff.w2` **40.6** — 73-76% of the 55.5 TFLOP/s
+ceiling. Per-block times by length, from `cmd/ditblock`:
+
+| tokens | image | block | GEMMs | attention | elementwise |
+|---|---|---|---|---|---|
+| 320 | — | 5.2 ms | 4.7 | 0.06 | 0.5 |
+| 1024 | 256² | 11.7 ms | 9.8 | 0.45 | 1.4 |
+| 4096 | **1024²** | **49.3 ms** | **35.7** | **6.7** | **6.8** |
+
+Residency: 12.54 GB of weights (three fp16 banks of 4.25, 4.25 and 3.54 GB,
+holding 12, 12 and 10 blocks, plus a 0.51 GB fp32 arena) and 1.29 GB of
+activations, against an 83.79 GiB device-local host-visible heap. 15.1 s to
+load.
 
 ## Measured baseline to beat — VAE
 
@@ -155,18 +172,23 @@ stage 4b used on the FFN, not a blanket narrowing.
 
 | | per image, 1024², 8 steps |
 |---|---|
-| DiT, measured end to end | **17.8 s** |
-| — of which projections | 12.8 s |
-| — of which attention | 1.8 s |
-| — of which elementwise | 3.3 s |
+| DiT, measured end to end | **12.8 s** |
+| — of which projections | 9.3 s |
+| — of which attention | 1.7 s |
+| — of which elementwise | 1.8 s |
 | VAE decode, measured | 5.6 s |
-| **total** | **23.4 s** |
+| **total** | **18.4 s** |
 
-Stage 4b's levers, priced: fusing the norms into their consumers and the
-q/k-norm + RoPE + pack chain into one kernel is ~1.0 s; an fp16 C out of
-`w1`/`w3` (§2.6) halves both that GEMM's write and `swiglu`'s read; and
-`ff.w13` at 24.3 TFLOP/s against its neighbours' 41 is worth **2.9 s** on its
-own if §2.4's swizzle closes it.
+The DiT's levers are spent: it is 72% GEMM at 73-76% of the WMMA ceiling. What
+is left inside it is ~1.0 s of pure layout (`pack v` and `narrow ctx`, which a
+GEMM and the attention kernel could do in their epilogues) and attention's
+38 TFLOP/s, now *behind* the GEMMs it used to lead.
+
+**The VAE is now 30% of the image and has had no optimisation pass at all.**
+The lever is fp16 onto the WMMA path, which halves the arena and should move
+conv3x3 past its 3.3 TFLOP/s. Stage 2 found fp16 cannot hold *these*
+intermediates (1.16e7 against 65504), so it needs the per-tensor range check
+stage 4b used on the FFN, not a blanket narrowing.
 
 ## What each stage found
 
@@ -186,3 +208,8 @@ that are load-bearing for what is left:
   swizzle is worth 1.84x on a tiled weight and 1.16x on a row-major one, the
   hoisted K-slab becomes a *loss* on a tiled weight, and once all of it is
   applied the three shapes that disagreed on a kernel stop disagreeing.
+- **[Stage 4c, the stack](research/stage-4c-dit-stack.md)** — splitting a
+  12.0 GB weight arena across storage buffers costs **one pipeline per bank
+  and nothing per dispatch**, because the buffer is in the descriptor set. Six
+  banks are bit-identical to one. The fp32 CPU chain (4.2e-4) is what makes
+  the fp16 chain's compounded 1.8e-1 readable as rounding rather than wiring.

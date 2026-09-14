@@ -276,9 +276,12 @@ policy.
 The block is now 72% GEMM, 14% attention, 14% elementwise, and the GEMMs are
 at 73-76% of the ceiling. In order of what is left:
 
-- **34 blocks (stage 4c).** 12.3 GB of fp16 weights against a 4.29 GB limit
-  per storage buffer, so the arena has to be split and the plan has to name
-  which buffer a projection reads from. Nothing about the kernels changes.
+- ~~**34 blocks (stage 4c).**~~ **Done**, and it came out as predicted:
+  the arena is split into three banks and a block names the one it reads from,
+  with nothing about the kernels changed. The only thing the prediction missed
+  is that a bank is a *pipeline* rather than a push constant. See
+  [`stage-4c-dit-stack.md`](stage-4c-dit-stack.md) — 12.54 GB resident,
+  49.27 ms a block inside the stack against 49.3 alone.
 - **The projections writing fragment tiles directly.** `pack v` (0.59 ms) is
   pure layout and `gemm v` could do it in its epilogue; `narrow ctx` (0.41 ms)
   is the same for attention's output. Together ~1.0 ms, and unlike the q/k

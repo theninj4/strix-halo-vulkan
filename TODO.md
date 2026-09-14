@@ -287,6 +287,81 @@ optimisation pass at all. Two smaller things are left inside the block:
 the attention kernel could do in their epilogues, and attention's 38 TFLOP/s
 is now *behind* the GEMMs it used to lead.
 
+### Session 2026-09-14 (fourth) — stage 4c: the whole DiT resident, in three storage buffers
+
+**Result: all 34 blocks live on the device at once — 12.54 GB of weights — and
+one denoising step is 1.60 s, which is 12.8 s per image** at 1024x1024 and 8
+steps (18.4 s with the VAE). A block inside the stack costs **49.27 ms at 4096
+tokens**, the same 49.3 ms stage 4b measured for one block alone, and a run
+with the weights in six banks is **bit-identical** to the same run with them in
+one. Written up in
+[`research/stage-4c-dit-stack.md`](research/stage-4c-dit-stack.md).
+
+**Built:**
+
+- `zimage/dit/gpustack.go` (the old `gpublock.go`, renamed): `GPUStack`, N
+  blocks over shared pipelines and shared activation arenas, with the fp16
+  projection weights split into **banks** — one storage buffer addresses 4.29
+  GB here and the DiT's weights are 12.0 GB, so the 34 blocks come out 12, 12,
+  10. A block is a row of offsets plus a bank index. `GPUBlock` is now this
+  type with one block in it (`gpublock.go`), so every stage-4b test applies
+  unchanged.
+- `Apply(x, adaln, sel)`, `Run(sel)` (no upload, no read-back), `Profile`,
+  `SetRoPE`, `Banks()`, and a run length that may be **shorter** than the one
+  the arenas were built for.
+- The unmodulated block, which is two of the 34: `pc.aux2 = 0` added to
+  `dit_gate_add.comp` and `dit_norm_gate_add.comp` (every other `.spv` is
+  byte-identical after `go generate`), the same flag on the CPU `Block.Apply`,
+  and the `adaln` dispatch not issued at all — 17 dispatches, not 18.
+- `reference/dump_dit_stack.py`, `cmd/ditstack`, `zimage/dit/gpustack_test.go`
+  (five tests: against diffusers per block and chained, against the CPU chain,
+  banks-agree, the bank plan without a device, and three controls).
+
+**What it found:**
+
+1. **Splitting the weight arena is free per dispatch and costs one pipeline
+   per bank.** The buffer a GEMM reads is in its *descriptor set*, not its push
+   constants, so a bank is a pipeline — six instead of two for the real stack.
+   Nothing in the dispatch path changes, because `vk.DispatchMultiTimed`
+   already binds each dispatch's own set (IDEAS §1.12 built it for that).
+2. **The transformer runs three phases at three lengths**, which stage 4b's
+   "34 x 8 x 49.3 ms" quietly assumed away: noise refiners over the image
+   tokens, context refiners over the caption (2.60 ms a block, 19x cheaper),
+   the 30 layers over the two concatenated — so 30 of 34 run at 4224, not
+   4096. The two nearly cancel: 12.8 s measured against 13.4 s projected.
+3. **The fp32 CPU chain is what makes the fp16 chain's error readable.** Six
+   chained blocks drift to 1.8e-1 of the tensor's RMS, over twice a single
+   block's bound, and nothing about that figure alone says rounding rather than
+   wiring. The identical chain in fp32 lands at 4.2e-4 — worst element 1.6e-5
+   of itself — and each block run on the *reference's* input is inside the
+   single-block bound. Both halves were needed.
+4. **Sizing a weight for a layout it is never read in cost 0.35 GB.** The
+   single-block code sized every weight for the largest of the three B layouts
+   so the `wrongBLayout` control could not run off the end; across 34 blocks
+   that is 2.9% of the arena, so it is now conditional on the control.
+5. **Wall clock is +0.3-0.4% over the sum of the dispatch timings.** 612
+   dispatches in batches of eight is 77 fence waits against 1.6 s of GPU work.
+6. **A block is sub-linear in tokens between 4096 and 4224** — 49.27 to 49.81
+   ms, +1.1% for +3.1% of GEMM rows and +6.4% of attention. Unexplained; the
+   candidate is §5.1b and the fact that 4096 is the one power of two in the
+   model. One cell, 2.6%, so nothing is concluded from it yet.
+
+**How it was measured:** `go run ./cmd/ditstack -image 4096 -caption 128`, best
+of three, GPU timestamps per dispatch, run twice plus a third with `-v`. The
+runs agree to **0.997-1.008** on every cell.
+
+**Correctness:** five tests, three controls at **263x, 351x and 496x** the
+bound, and the bank split checked to be exactly identical rather than within a
+tolerance. Loading is 15.1 s for 24.6 GB of fp32 narrowed and packed into 12.0
+GB of fp16 (packing parallelised over output rows, 1.56x), peak host memory one
+block.
+
+**Next — stage 5, the text encoder**, and the VAE. The DiT's levers are spent:
+it is 72% GEMM at 73-76% of the WMMA ceiling, and the next-largest item in the
+image is the **VAE's 5.6 s**, 30% of the total, with no optimisation pass at
+all. Inside the DiT what is left is ~1.0 s of pure layout (`pack v`, `narrow
+ctx`) and attention's 38 TFLOP/s, now behind the GEMMs.
+
 ### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the
