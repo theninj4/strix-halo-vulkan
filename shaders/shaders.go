@@ -1051,6 +1051,76 @@ var VAEAttentionWMMANoCrossWave []byte
 //go:embed vae_attn_wmma_norescale.spv
 var VAEAttentionWMMANoRescale []byte
 
+// conv2d on the matrix cores (PIPELINE.md stage 8). Stage 7's profiler left
+// conv3x3 at 85% of a 1024x1024 decode, 3.0-3.2 TFLOP/s against a 55.5
+// TFLOP/s ceiling, and it is the one operator in this pipeline whose implicit
+// GEMM had never been written. The pack is what makes that GEMM's B operand
+// a 512 B contiguous fragment load at an *unaligned* pixel offset, which is
+// what a +-1 tap shift needs; vae_pack_conv.comp is the argument.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_pack_conv.spv vae_pack_conv.comp
+
+//go:embed vae_pack_conv.spv
+var VAEPackConv []byte
+
+// The conv ladder. BM x BN is the workgroup's output tile -- output channels
+// by pixels -- and the two knobs that matter are different ones from the
+// DiT's: BM sets how many times the activation is streamed (once per
+// ceil(OC/BM)), BN how much of the filter slab a workgroup amortises. The
+// wave32 arms are §6.2's, which has won four times.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -o vae_conv_wmma_64x64.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=2 -o vae_conv_wmma_64x64_k2.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_N=2 -o vae_conv_wmma_64x128.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -o vae_conv_wmma_128x64.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -o vae_conv_wmma_128x128.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=4 -o vae_conv_wmma_256x64.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVE=32 -o vae_conv_wmma_64x64_w32.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVE=32 -o vae_conv_wmma_128x64_w32.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DWAVE=32 -o vae_conv_wmma_128x128_w32.spv vae_conv_wmma.comp
+
+//go:embed vae_conv_wmma_64x64.spv
+var VAEConvWMMA64x64 []byte
+
+//go:embed vae_conv_wmma_64x64_k2.spv
+var VAEConvWMMA64x64K2 []byte
+
+//go:embed vae_conv_wmma_64x128.spv
+var VAEConvWMMA64x128 []byte
+
+//go:embed vae_conv_wmma_128x64.spv
+var VAEConvWMMA128x64 []byte
+
+//go:embed vae_conv_wmma_128x128.spv
+var VAEConvWMMA128x128 []byte
+
+//go:embed vae_conv_wmma_256x64.spv
+var VAEConvWMMA256x64 []byte
+
+//go:embed vae_conv_wmma_64x64_w32.spv
+var VAEConvWMMA64x64W32 []byte
+
+//go:embed vae_conv_wmma_128x64_w32.spv
+var VAEConvWMMA128x64W32 []byte
+
+//go:embed vae_conv_wmma_128x128_w32.spv
+var VAEConvWMMA128x128W32 []byte
+
+// The conv path's two negative controls (zimage/vae/gpu_conv_test.go).
+// NO_TAP_SHIFT drops the horizontal tap offset, which is the one thing the
+// blocked layout exists to make free; PAD_CLAMP replicates the edge pixel
+// instead of zeroing the border, which is the padding bug a conv port
+// actually has. Built and dispatchable, deliberately out of the ladder.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DNO_TAP_SHIFT=1 -o vae_conv_wmma_notapshift.spv vae_conv_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DPAD_CLAMP=1 -o vae_pack_conv_clamp.spv vae_pack_conv.comp
+
+//go:embed vae_conv_wmma_notapshift.spv
+var VAEConvWMMANoTapShift []byte
+
+//go:embed vae_pack_conv_clamp.spv
+var VAEPackConvClamp []byte
+
 // Z-Image DiT (PIPELINE.md stage 3). Same two-arena binding convention as
 // the VAE shaders, defined in dit_common.glsl. fp32; the CPU implementation
 // in zimage/dit is the oracle.
@@ -1172,6 +1242,20 @@ var DiTAttentionWMMAQT1KT8W32 []byte
 
 //go:embed dit_norm_scale_f16.spv
 var DiTNormScaleF16 []byte
+
+// The transformer's tail (PIPELINE.md stage 9). A LayerNorm -- the mean is
+// subtracted, which nothing else in this model does -- times the final
+// layer's adaLN scale, narrowed into the fp16 arena as a GEMM A operand. The
+// NO_MEAN build is the control: it is an RMS norm, which is the mistake.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_final_norm.spv dit_final_norm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNO_MEAN=1 -o dit_final_norm_nomean.spv dit_final_norm.comp
+
+//go:embed dit_final_norm.spv
+var DiTFinalNorm []byte
+
+//go:embed dit_final_norm_nomean.spv
+var DiTFinalNormNoMean []byte
 
 //go:embed dit_norm_gate_add.spv
 var DiTNormGateAdd []byte

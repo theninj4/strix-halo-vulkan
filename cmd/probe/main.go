@@ -41,9 +41,9 @@ const strixHaloDeviceID = 0x1586
 const probeBindings = 8
 
 // probePushConstants is likewise bound-above the push-constant block of any
-// shader here (the largest is gemm_wmma.comp's 20 bytes). A layout range
-// smaller than the block the shader declares is invalid, so err large.
-const probePushConstants = 64
+// shader here (the largest is the VAE's 88 bytes, vae_common.glsl). A layout
+// range smaller than the block the shader declares is invalid, so err large.
+const probePushConstants = 128
 
 func main() {
 	if len(os.Args) != 2 && len(os.Args) != 3 {

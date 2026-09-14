@@ -89,9 +89,19 @@ type Conv2D struct {
 	Bias      []float32 // [OutC], may be nil
 }
 
+// convTap, when set, is called with every convolution's input before it runs.
+// It is how TestConvInputsFitFP16 measures the headroom the matrix-core
+// convolution depends on -- stage 2's "absmax 497 through the whole decoder"
+// as an assertion rather than as a memory -- without keeping a second copy
+// of the decoder's graph in the test. Nothing in the library sets it.
+var convTap func(c *Conv2D, x *Tensor)
+
 // Apply runs the convolution. Output is [N, OutC, H, W] for the 3x3 pad-1 and
 // 1x1 pad-0 cases this decoder uses, both of which preserve spatial size.
 func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
+	if convTap != nil {
+		convTap(c, x)
+	}
 	if x.C != c.InC {
 		return nil, fmt.Errorf("vae: conv expects %d input channels, got %d", c.InC, x.C)
 	}

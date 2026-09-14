@@ -75,7 +75,7 @@ func TestGPUDecoderAgainstDiffusers(t *testing.T) {
 	}
 	latent := loadRef(t, m, "latent")
 
-	gpu, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar})
+	gpu, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar, Conv: ConvScalar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestGPUMatchesCPU(t *testing.T) {
 	}
 	latent := loadRef(t, m, "latent")
 
-	gpu, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar})
+	gpu, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar, Conv: ConvScalar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestGPUWMMAAgainstDiffusers(t *testing.T) {
 
 	for _, k := range []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT1KT8, AttnQT2KT2, AttnQT1KT4W32} {
 		t.Run(string(k), func(t *testing.T) {
-			gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{Attn: k})
+			gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{Attn: k, Conv: ConvScalar})
 			defer gpu.Destroy()
 			got, err := gpu.Apply(latent)
 			if err != nil {
@@ -218,7 +218,7 @@ func TestGPUWMMAMatchesScalar(t *testing.T) {
 	}
 	latent := loadRef(t, m, "latent")
 
-	scalar, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar})
+	scalar, err := NewGPUDecoderOpts(dev, cpu, latent.H, latent.W, Options{Attn: AttnScalar, Conv: ConvScalar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestGPUWMMAMatchesScalar(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{})
+	gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{Conv: ConvScalar})
 	defer gpu.Destroy()
 	got, err := gpu.Apply(latent)
 	if err != nil {
@@ -279,7 +279,7 @@ func TestGPUWMMAControls(t *testing.T) {
 		{AttnNoCrossWave, false},
 	} {
 		t.Run(string(c.kernel), func(t *testing.T) {
-			gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{Attn: c.kernel})
+			gpu := newWMMADecoder(t, dev, cpu, latent.H, latent.W, Options{Attn: c.kernel, Conv: ConvScalar})
 			defer gpu.Destroy()
 			got, err := gpu.Apply(latent)
 			if err != nil {
@@ -320,7 +320,7 @@ func TestGPUWMMATailMask(t *testing.T) {
 		latent.Data[i] = float32(math.Sin(float64(i)*0.37)) * 2
 	}
 
-	scalar, err := NewGPUDecoderOpts(dev, cpu, n, n, Options{Attn: AttnScalar})
+	scalar, err := NewGPUDecoderOpts(dev, cpu, n, n, Options{Attn: AttnScalar, Conv: ConvScalar})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestGPUWMMATailMask(t *testing.T) {
 
 	for _, k := range []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT1KT8, AttnQT2KT2, AttnQT1KT4W32} {
 		t.Run(string(k), func(t *testing.T) {
-			gpu := newWMMADecoder(t, dev, cpu, n, n, Options{Attn: k})
+			gpu := newWMMADecoder(t, dev, cpu, n, n, Options{Attn: k, Conv: ConvScalar})
 			defer gpu.Destroy()
 			got, err := gpu.Apply(latent)
 			if err != nil {
@@ -492,7 +492,7 @@ func TestGPUWMMAAttentionKernel(t *testing.T) {
 	const kernelTol = 3e-3
 	for _, kern := range []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT1KT8, AttnQT2KT2, AttnQT1KT4W32} {
 		t.Run(string(kern), func(t *testing.T) {
-			g := newWMMADecoder(t, dev, cpu, 16, 16, Options{Attn: kern})
+			g := newWMMADecoder(t, dev, cpu, 16, 16, Options{Attn: kern, Conv: ConvScalar})
 			defer g.Destroy()
 			got := runAttention(t, g, rows, dim, q, k, v, scale)
 			rel := flooredDeviation(&Tensor{N: 1, C: 1, H: rows, W: dim, Data: got}, wantT)
@@ -506,7 +506,7 @@ func TestGPUWMMAAttentionKernel(t *testing.T) {
 
 	for _, kern := range []AttnKernel{AttnNoCrossWave, AttnNoRescale} {
 		t.Run(string(kern), func(t *testing.T) {
-			g := newWMMADecoder(t, dev, cpu, 16, 16, Options{Attn: kern})
+			g := newWMMADecoder(t, dev, cpu, 16, 16, Options{Attn: kern, Conv: ConvScalar})
 			defer g.Destroy()
 			got := runAttention(t, g, rows, dim, q, k, v, scale)
 			rel := flooredDeviation(&Tensor{N: 1, C: 1, H: rows, W: dim, Data: got}, wantT)

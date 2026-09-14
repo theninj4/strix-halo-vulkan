@@ -703,6 +703,202 @@ inputs peak at 497 while its accumulators need fp32, which is what the matrix
 cores do natively. After that the only item left in the image is the DiT's CPU
 head and tail (1.24 s, 7.0%).
 
+### Session 2026-09-14 (ninth) — stage 8: conv2d on the matrix cores
+
+**Result: the VAE is done.** conv3x3 was 85% of the decode at 3.0-3.2 TFLOP/s
+and is now **244 ms at 41-42 TFLOP/s**; the decode is 3.62 s → **876 ms** and
+an image **17.82 s → 15.00 s**. The largest dispatch in the whole pipeline
+went from 404 ms to 30.3 ms. Written up in
+[`research/stage-8-vae-conv.md`](research/stage-8-vae-conv.md).
+
+| | before | after |
+|---|---|---|
+| `conv3x3 512->512 @512x512` | 404.2 ms, 3060 GFLOP/s | **30.3 ms, 40841** |
+| all conv3x3 | 3.017 s | **244 ms** |
+| all conv1x1 | 153 ms | **12 ms** |
+| VAE decode, GPU total | 3.557 s | **801 ms** |
+| VAE decode, wall | 3.62 s | **876 ms** |
+| an image, 1024², 8 steps | 17.82 s | **15.00 s** |
+
+(The 876 ms is `cmd/vaebench`'s, and stage 9 found 71 ms of it is a read-back
+the pipeline does not pay -- 12.58 MB at the 0.18 GB/s a small program gets.
+In an image the decode is **805 ms**.)
+
+**Built:**
+
+- `shaders/vae_conv_wmma.comp` — conv as an implicit GEMM, `C[OC, HW] =
+  A[OC, taps*C] * B[taps*C, HW]`, with B addressed rather than materialised
+  (im2col at 1024² would be 4.7 GB). Nine builds over BM/BN/BK/WAVE, plus a
+  negative control.
+- `shaders/vae_pack_conv.comp` — the blocked fp16 layout
+  `[ceil(C/16)][H+2][W+2][16]`, plus a second build as the padding control.
+- `zimage/vae/gpu_conv.go` — the ladder, the filter packing, the expanded
+  biases, `ConvKernel`/`ConvKernels()`, and the conv half of the graph.
+- `Options` grew `Conv`, and `chooseKernels` now resolves the mid block and
+  the convolutions **independently**, so a test can narrow one and not the
+  other. Every stage-7 test says `Conv: ConvScalar` explicitly.
+- `zimage/vae/gpu_conv_test.go` — six tests: the fp16 headroom on real
+  activations and on the filters, every build against the scalar path, the
+  whole fp16 decoder against diffusers, a 96x96 image, and the two controls.
+- `cmd/vaebench -convladder`, `-conv`; `cmd/vaeprof -conv`; the fp16 arena in
+  both outputs; `Pipeline.Residency` grew a VAE column; `cmd/probe`'s
+  push-constant range grew to 128 bytes (the VAE block is 88 and did not fit).
+
+**Five things worth carrying forward:**
+
+1. **Which axis you tile is decided by the access pattern, not by the
+   operand.** Every WMMA kernel in this engine stores its operands as 16x16
+   fragment tiles, and for conv that is *wrong on the pixel axis*: a tiled
+   pixel axis makes the `dw = ±1` tap window straddle two tiles, which a
+   fragment load cannot express. Tiling the **channel** axis instead —
+   16 channels contiguous per pixel — makes a patch fragment 512 contiguous
+   bytes **at any pixel offset**, which is a column-major load of stride 16.
+   That one choice is the stage.
+2. **Put the padding in the data.** A one-pixel zero border on the packed
+   layout means every address the kernel forms is a real address holding
+   either an activation or a zero, so nine taps are nine adds — no masking, no
+   branch, no K-axis bounds check. It costs 0.4% of the tensor at 1024².
+3. **§2.7 is a fix for an under-covered load, not a general lever.** The
+   K-slab knob measured 1.00x here, because both operands are already fully
+   covered 512 B reads and there is nothing left for more outstanding bytes to
+   fix. Stage 3c got the same answer for the same reason.
+4. **A test at a deliberately awkward size earns its keep.** The kernel clamps
+   every pixel address into its own channel plane so nothing can leave the
+   buffer; the clamp lands on the bottom border row, which is zeros —
+   *provided the padded row is at least 16 pixels wide*. At the 12x12 latent
+   `TestGPUConvOddSize` decodes it is 14, so the clamp reached back into the
+   last real row and the last output row got two columns of the wrong pixels.
+   Every build failed identically at the same element, which is what said the
+   bug was in the shared addressing. The fix is `max(W+2, 16)`. Neither the
+   1024² image nor the 16x16 reference latent can have this bug.
+5. **A bump allocator has to give blocks back to the bump pointer.**
+   `arena.release` only ever pushed onto the free list, so a sequence of
+   allocate-free-allocate in *increasing* size — which is exactly what the
+   packed activations are, 17 MB then 68 then 270 then 539 — stranded every
+   block behind the next. The fp16 arena was the sum (933 MB) instead of the
+   largest (539 MB). Four lines; the fp32 arena gained 168 MB too, which
+   matters against the 4.29 GB storage-buffer limit.
+
+**How it was measured:** `go run ./cmd/vaebench -convladder -size 128` (GPU
+timestamps, best of two then best of three, the runs agreeing to 1.005 on the
+winner); `go run ./cmd/vaeprof -size 128` with and without `-conv scalar` for
+the distribution; `go run ./cmd/vaebench -sizes 16,32,64,128` and
+`go run ./cmd/zimage -reps 2` for wall clock (15.00 s and 15.04 s). Register
+and LDS figures from `RADV_DEBUG=shaderstats,nocache go run ./cmd/probe`:
+144 VGPRs at wave64, 192 at wave32, no spills, 1-4 KB of LDS.
+
+**Correctness:** `go test ./zimage/vae` gains six tests. The fp16 convolutions
+land **8.2e-3** from the fp32 graph — a chain of 40-odd of them, where stage
+7's 8.2e-4 was one block — and the whole fp16 decoder lands **3.3e-3** from
+diffusers; the bound is a max over elements, so the two are not additive and
+the second is legitimately smaller. `go test ./zimage/pipeline` still measures
+**0.0252** against diffusers at 256², i.e. none of this shows up end to end.
+Both controls fire at **312x** and **271x** — and `pad_clamp`, which touches
+only the image's frame, is the opposite of stage 7's result: a decoder's
+border is not information-bottlenecked the way its mid-block softmax is.
+
+**Next.** The VAE is 5.4% of an image and has no arithmetic left in it: its
+largest kernel is now a **group norm**, and four bandwidth-bound elementwise
+passes (groupnorm, pack, silu, add) are 63% of the decode. They run back to
+back over the same gigabyte, so what it wants is **fusion** — specifically a
+SiLU whose only consumer is a convolution writing the blocked fp16 form
+instead of its fp32 output, worth ~200 ms of 876. But that is 1.3% of an
+image. The item that is actually next is **the DiT's CPU head and tail**
+(1.24 s, 8.3%): two GEMMs at shapes the existing kernel already covers plus a
+LayerNorm, which also stops the [4128, 3840] residual stream crossing the bus
+twice a step. `PIPELINE.md` has both.
+
+Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
+and the next stage that closes should pay some of that back by moving closed
+detail into `research/`.
+
+### Session 2026-09-14 (tenth) — stage 9: the head and tail on the device
+
+**Result: no model arithmetic runs on the host inside the denoising loop any
+more.** The patch embedder and the final layer moved onto the matrix cores:
+the host's share of a step went **59 ms → 5-10 ms**, a step 1.75 s →
+**1.70 s**, an image **14.89 s → 14.49 s** (two runs, 14.49 and 14.54).
+Written up in
+[`research/stage-9-head-and-tail.md`](research/stage-9-head-and-tail.md).
+
+Both figures are the same binary: `go run ./cmd/zimage -cpuhead` keeps stage
+6's host path, which is the oracle the device path is compared against.
+
+**Built:**
+
+- `shaders/dit_final_norm.comp` — LayerNorm (the mean *is* subtracted, which
+  nothing else in this model does), the final layer's adaLN scale, and the
+  narrowing into the fp16 arena, in one pass. Plus a `NO_MEAN` control.
+- `zimage/dit/gpuhead.go` — `GPUHead`: two GEMMs on `dit_gemm.comp` rungs the
+  block never uses, the block's own `dit_adaln.comp` for the final layer's
+  modulation, and 5 MB of its own weights. It borrows the *stack's* two
+  activation arenas, because the embedder writes the residual stream and the
+  tail reads it: same tensor, therefore same buffer.
+- `GPUStack` grew three activation slots and `writeAdaLN`, which puts the
+  timestep embedding in the arena in both the forms the model wants — as it
+  is for every block, and through a SiLU for the final layer. That asymmetry
+  is diffusers'.
+- `Options.CPUHead` and `cmd/zimage -cpuhead`; `zimage/dit/gpuhead_test.go`
+  (four tests) and `TestPipelineHeadOnDevice`.
+- **`cmd/bus`** — a probe for what a host read and write of a mapped buffer
+  cost, and how that changes with how much has already been allocated. It is
+  the tool that found the item below.
+
+**Four things worth carrying forward:**
+
+1. **A bias -- and a *pad token* -- can be a column of K.** `dit_gemm.comp`
+   has no bias and stage 7's rule (put it in a pass already reading the
+   tensor) has nowhere to go at the head, because the embedder's consumer is
+   the block graph. So A gets a column holding 1 for a real token against a B
+   row holding the bias, and **a second column holding 1 for a *padded* token**
+   against a B row holding the learned `x_pad_token`. `y = Wx + b` and
+   `y = x_pad_token` then come out of the same GEMM with no branch, no second
+   dispatch and no host write of the padding. K goes 64 → 128, which the
+   64-wide slab was rounding up to anyway.
+2. **The engine's read-back number was wrong for the pipeline, by 83x.**
+   `vk.NewBuffer` falls back from the device-local host-visible heap to the
+   plain host-visible one when the first cannot serve a request, and on this
+   device that heap's budget is about **8 GB** against the 83.79 GiB it
+   reports. Below it a host read is 0.18 GB/s; above it, 15. The pipeline has
+   20.5 GB of weights resident, so its 63 MB read-back costs **6.5 ms, not
+   344**. Two things in the repo's own numbers fall out of it: `cmd/vaebench`
+   reports a 1024² decode at 876 ms where the pipeline reports 805, and the
+   71 ms difference is exactly 12.58 MB at 0.18 GB/s; and the **0.8 s an image
+   of "residual stream crossing the bus" never existed** -- it was the
+   remainder of a subtraction, not a measurement.
+3. **A bound inherited from a looser path is a control that has stopped
+   controlling.** Taking the block's `fp16RelTol` (1.5e-2) for the head would
+   have left `NO_MEAN` -- an RMS norm where the model has a LayerNorm -- only
+   **3x** outside it. Set from their own measurements the two bounds are 6e-3
+   and 2e-3, and the control is 22x out. Its host twin in `head_test.go` is
+   the same 4.4e-2 at 219x, against an fp32 bound.
+4. **What is not the missing 100 ms.** A step is 1.70 s of wall against the
+   stack's 1.60 s of GPU timestamps. It is not the host (5-10 ms), not the bus
+   (9 ms), and **not submit batching**: `perSubmit` 8 → 18 (one submit per
+   block) → 64 measures 1.69 and 1.68 against 1.70, inside the noise. Left
+   open rather than guessed at, which is what the last item was for.
+
+**How it was measured:** `go run ./cmd/zimage -reps 2` with and without
+`-cpuhead`; `go run ./cmd/bus -buffer 1200 -chunk 63 -pre N` for the heap
+threshold, bisected to between 6 and 7 GB.
+
+**Correctness:** the embedder lands **3.4e-3** from diffusers' `x_prepared`
+and the tail **8.6e-4** from its `final`, each against a bound set from its
+own measurement; the padded-stream case is checked against the host path at a
+token count that needs padding, which is the only test the pad-token column
+has. `TestPipelineHeadOnDevice` runs a whole image both ways (latent 0.0135,
+image 0.0187), and the pipeline's end-to-end number against diffusers moved
+0.0252 → **0.0158** -- which is a chaotic trajectory landing differently, not
+an accuracy claim.
+
+**Next.** The image is **94% the DiT** and nothing outside it is worth a
+percent. Inside the block: ~1.0 s an image of pure layout (`pack v` and
+`narrow ctx`, both of which exist only to put an operand in the next kernel's
+shape -- a GEMM and the attention kernel could each absorb one in an
+epilogue), and attention at 38 TFLOP/s against the GEMMs' 40.6-42.0. Below
+those, the VAE's elementwise fusion is ~200 ms (1.3%). `PIPELINE.md` has the
+budget.
+
 ### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the

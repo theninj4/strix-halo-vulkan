@@ -148,6 +148,61 @@ func TestPipelineAgainstDiffusers(t *testing.T) {
 	t.Logf("image %dx%d: relative L2 %.3g, max abs %.3g", img.W, img.H, e, maxAbs(img.Data, want))
 }
 
+// TestPipelineHeadOnDevice is stage 9's "keep the slow path" check: the same
+// image generated with the patch embedder and the final layer on the device
+// and on the host, from the same starting latent.
+//
+// It is the only test that exercises the device head *in the composition* --
+// with the real caption behind the image, the padded rows in the stream, and
+// eight steps of feedback through the scheduler. Each half is separately
+// held to diffusers (TestPipelineAgainstDiffusers here, TestGPUHead* in
+// zimage/dit); what this adds is that moving the boundary did not move the
+// picture.
+//
+// The bound is the image bound rather than the step bound, because a
+// denoising trajectory amplifies: what the head's fp16 operands cost at step
+// one is 1e-4, and by step eight the two runs have taken slightly different
+// paths through the same basin.
+func TestPipelineHeadOnDevice(t *testing.T) {
+	m := loadManifest(t, runDir)
+	if m.Size == 0 {
+		t.Skipf("%s is not a dump_zimage_run.py manifest", runDir)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+
+	p, err := New(dev, Options{Model: modelDir, Width: m.Size, Height: m.Size, Steps: m.Steps})
+	if err != nil {
+		t.Skipf("cannot build the pipeline (%v)", err)
+	}
+	defer p.Destroy()
+	if p.gpuHead == nil {
+		t.Skip("this pipeline has no device head")
+	}
+	init := loadRef(t, m, "latents_init")
+
+	run := func(cpu bool) ([]float32, []float32) {
+		p.ctl = controls{cpuHead: cpu}
+		latents := append([]float32(nil), init...)
+		img, _, err := p.GenerateFrom(m.Prompt, latents, nil)
+		p.ctl = controls{}
+		if err != nil {
+			t.Fatalf("cpuHead=%v: %v", cpu, err)
+		}
+		return latents, img.Data
+	}
+	hostLatent, hostImage := run(true)
+	devLatent, devImage := run(false)
+
+	const tol = 3e-2
+	le, ie := relL2(devLatent, hostLatent), relL2(devImage, hostImage)
+	if le > tol || ie > tol {
+		t.Errorf("device head vs host head: latent %.3g, image %.3g > %.0e", le, ie, tol)
+		return
+	}
+	t.Logf("device head vs host head: latent %.3g, image %.3g", le, ie)
+}
+
 // TestPipelineDetectsErrors is the negative control. Each case breaks one
 // thing the composition gets to decide and asserts the break is caught: the
 // direction the schedule integrates in, whether the context refiners ran at

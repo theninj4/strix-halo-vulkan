@@ -23,6 +23,12 @@ type Options struct {
 	Height    int
 	Steps     int
 	MaxPrompt int // the longest prompt the text encoder is built for
+	// CPUHead runs the patch embedder and the final layer on the host, which
+	// is what stage 6 did. It is the slow path kept beside the device one
+	// (PIPELINE.md's rule), and it is a flag rather than a test-only control
+	// because the measurement that justifies stage 9 is the difference
+	// between the two on the same image.
+	CPUHead bool
 }
 
 // Defaults fills in what was left zero.
@@ -63,6 +69,10 @@ type Pipeline struct {
 	cfg   *dit.Config
 	head  *dit.Head
 	stack *dit.GPUStack
+	// gpuHead is the patch embedder and the final layer on the device (stage
+	// 9). nil is the host path of stage 6, which is what it is measured
+	// against and what runs if the shapes do not suit the kernels.
+	gpuHead *dit.GPUHead
 
 	dec *vae.GPUDecoder
 
@@ -75,7 +85,7 @@ type Pipeline struct {
 	// config's counts.
 	noiseRefiner, contextRefiner, layers []int
 
-	// ctl is empty in every real use; see controls.
+	// ctl is empty in every real use except for Options.CPUHead; see controls.
 	ctl controls
 
 	latentH, latentW int
@@ -116,6 +126,10 @@ type controls struct {
 	// 1, which is the off-by-one the checkpoint invites: nothing downstream
 	// of a rotary table can tell that every caption token moved one place.
 	capPosFromZero bool
+	// cpuHead runs the patch embedder and the final layer on the host, which
+	// is what stage 6 did and what stage 9's device path is compared against.
+	// Not a breakage -- it is the slow path, kept (PIPELINE.md's rule).
+	cpuHead bool
 }
 
 // Step is what a progress callback is told after each denoising step.
@@ -209,6 +223,14 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: transformer: %w", err)
 	}
+	// The head on the device. It is a small object beside the stack -- 5 MB
+	// of weights and four pipelines -- and it needs the stack to exist first,
+	// because the residual stream it writes and reads is the stack's arena.
+	p.ctl.cpuHead = opt.CPUHead
+	if p.gpuHead, err = dit.NewGPUHead(p.stack, p.head); err != nil {
+		p.Destroy()
+		return nil, fmt.Errorf("pipeline: transformer head: %w", err)
+	}
 	nr := p.cfg.NRefiner
 	p.noiseRefiner = seq(0, nr)
 	p.contextRefiner = seq(nr, 2*nr)
@@ -233,13 +255,17 @@ func (p *Pipeline) Destroy() {
 	if p.dec != nil {
 		p.dec.Destroy()
 	}
+	// Before the stack: the head's pipelines are bound to the stack's arenas.
+	if p.gpuHead != nil {
+		p.gpuHead.Destroy()
+	}
 	if p.stack != nil {
 		p.stack.Destroy()
 	}
 	if p.enc != nil {
 		p.enc.Destroy()
 	}
-	p.dec, p.stack, p.enc = nil, nil, nil
+	p.dec, p.stack, p.enc, p.gpuHead = nil, nil, nil, nil
 }
 
 // Scheduler is the noise schedule the pipeline walks.
@@ -366,9 +392,11 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		if err != nil {
 			return nil, nil, err
 		}
-		x, err := p.head.EmbedImage(patches)
-		if err != nil {
-			return nil, nil, err
+		var x *dit.Mat
+		if p.gpuHead == nil || p.ctl.cpuHead {
+			if x, err = p.head.EmbedImage(patches); err != nil {
+				return nil, nil, err
+			}
 		}
 		d.Head = time.Since(t0)
 
@@ -379,7 +407,15 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		// Phase one: the noise refiners over the image stream alone. The
 		// unified rotary table's first rows are the image's, so the same
 		// table serves both this phase and the layers.
-		if err := p.stack.Upload(x, 0, p.imgTotal); err != nil {
+		//
+		// On the device path the embedder *is* the upload: the [4096, 64]
+		// patches go up as fp16 and the [4096, 3840] stream is written by a
+		// GEMM that never leaves the device.
+		if x != nil {
+			if err := p.stack.Upload(x, 0, p.imgTotal); err != nil {
+				return nil, nil, err
+			}
+		} else if err := p.gpuHead.Embed(patches, p.imgTotal); err != nil {
 			return nil, nil, err
 		}
 		if err := p.stack.Run(p.noiseRefiner); err != nil {
@@ -397,16 +433,26 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		if err := p.stack.Run(p.layers); err != nil {
 			return nil, nil, fmt.Errorf("pipeline: step %d layers: %w", step, err)
 		}
-		stream := p.stack.Read(p.stack.TensorX(), p.cfg.Dim)
 		d.Blocks = time.Since(blocks)
 
 		t0 = time.Now()
 		// Only the image tokens reach the final layer; the caption's rows are
-		// produced and discarded, as they are in diffusers' unpatchify.
-		image := &dit.Mat{Rows: p.imgTokens, Cols: stream.Cols, Data: stream.Data[:p.imgTokens*stream.Cols]}
-		final, err := p.head.Final(image, adaln)
-		if err != nil {
-			return nil, nil, err
+		// produced and discarded, as they are in diffusers' unpatchify. On the
+		// device path the tail runs over the padded image stream, because the
+		// GEMM's tile divides that and not the token count, and the extra
+		// rows are dropped here rather than not computed.
+		var final *dit.Mat
+		if p.gpuHead == nil || p.ctl.cpuHead {
+			stream := p.stack.Read(p.stack.TensorX(), p.cfg.Dim)
+			image := &dit.Mat{Rows: p.imgTokens, Cols: stream.Cols, Data: stream.Data[:p.imgTokens*stream.Cols]}
+			if final, err = p.head.Final(image, adaln); err != nil {
+				return nil, nil, err
+			}
+		} else {
+			if final, err = p.gpuHead.Final(p.imgTotal); err != nil {
+				return nil, nil, err
+			}
+			final = &dit.Mat{Rows: p.imgTokens, Cols: final.Cols, Data: final.Data[:p.imgTokens*final.Cols]}
 		}
 		out, err := p.head.Unpatchify(final, p.latentH, p.latentW)
 		if err != nil {
@@ -446,11 +492,17 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 	return img, tm, nil
 }
 
-// Residency reports what the pipeline holds on the device, by stage.
-func (p *Pipeline) Residency() (encoder, transformer, activations int) {
+// Residency reports what the pipeline holds on the device, by stage. The VAE
+// is its own column because stage 8 gave it two arenas of each kind: the
+// convolutions read fp16 fragment-tile copies of the filters and a blocked
+// fp16 copy of each input, beside the fp32 originals the scalar kernels and
+// the rest of the graph still use.
+func (p *Pipeline) Residency() (encoder, transformer, vae, activations int) {
+	vaeW32, vaeW16 := p.dec.WeightBytes()
 	return p.enc.WeightBytes() + p.enc.ActivationBytes(),
 		p.stack.WeightBytes(),
-		p.stack.ActivationBytes() + p.dec.ActivationBytes()
+		vaeW32 + vaeW16,
+		p.stack.ActivationBytes() + p.dec.ActivationBytes() + p.dec.F16ActivationBytes()
 }
 
 func seq(lo, hi int) []int {

@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The transformer's tail, up to its projection: a LayerNorm without affine,
+// the final layer's adaLN scale, and the narrowing into the fp16 arena as a
+// GEMM A operand -- one pass over the residual stream instead of three.
+//
+// This is dit_norm_scale_f16.comp's shape with the one difference that makes
+// it a different shader: **the mean is subtracted**. Every other norm in this
+// model is an RMS norm, and diffusers' final layer is a LayerNorm with
+// elementwise_affine=False and its own epsilon (1e-6, not the config's 1e-5).
+// zimage/dit's head.go lists that as one of the four things that produce a
+// plausible tensor when they are wrong, so it is a separate kernel rather
+// than a flag on a kernel whose name says RMS.
+//
+// Two reduction passes rather than one, i.e. the mean and then the variance
+// about it, which is what the CPU reference does. The single-pass identity
+// `E[x^2] - mean^2` reads the row once less and cancels catastrophically when
+// the mean approaches the RMS; this tensor is a residual stream after 34
+// blocks and there is no reason to assume it does not.
+//
+// pc.inOff is the fp32 stream, pc.outOff the fp16 destination, pc.aux0 the
+// scale vector `1 + adaLN(SiLU(t))` in the activation arena (as in
+// dit_norm_scale_f16.comp, it is per step and so lives with the activations
+// rather than the weights), pc.eps the epsilon's bit pattern and pc.lda the
+// destination row stride (§2.3).
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+// The negative control (zimage/dit/gpuhead_test.go): normalise without
+// subtracting the mean, i.e. do what every *other* norm in this model does.
+// It is the bug this shader exists to not have.
+#ifndef NO_MEAN
+#define NO_MEAN 0
+#endif
+
+#define WG 256
+layout(local_size_x = WG) in;
+
+shared float partial[WG];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    float n = float(pc.dim);
+
+    float s = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        s += act[src + c];
+    }
+    partial[t] = s;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+#if NO_MEAN
+    float mean = 0.0;
+#else
+    float mean = partial[0] / n;
+#endif
+    barrier();
+
+    float v2 = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        float d = act[src + c] - mean;
+        v2 += d * d;
+    }
+    partial[t] = v2;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(partial[0] / n + uintBitsToFloat(pc.eps));
+
+    for (uint c = t; c < pc.dim; c += WG) {
+        hact[dst + c] = float16_t((act[src + c] - mean) * inv * act[pc.aux0 + c]);
+    }
+}

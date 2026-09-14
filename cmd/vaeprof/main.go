@@ -18,6 +18,7 @@ func main() {
 	topN := flag.Int("top", 12, "slowest dispatches to list")
 	attn := flag.String("attn", "", "mid-block attention kernel (\"scalar\" for stage 2b's fp32 path)")
 	gemm := flag.String("gemm", "", "mid-block projection kernel")
+	conv := flag.String("conv", "", "convolution kernel (\"scalar\" for stage 2b's fp32 path)")
 	flag.Parse()
 	inst, _ := vk.NewInstance("prof")
 	defer inst.Destroy()
@@ -52,6 +53,7 @@ func main() {
 	n := *size
 	g, err := vae.NewGPUDecoderOpts(dev, cpu, n, n, vae.Options{
 		Attn: vae.AttnKernel(*attn), GEMM: vae.GEMMKernel(*gemm),
+		Conv: vae.ConvKernel(*conv),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -84,9 +86,9 @@ func main() {
 		}
 		byKind[k] += s.GPU
 	}
-	ak, gk := g.Kernels()
-	fmt.Printf("latent %dx%d -> image %dx%d, %d dispatches, GPU total %s (attn %s, gemm %s)\n\n",
-		n, n, n*8, n*8, len(st), total.Round(time.Millisecond), ak, gk)
+	ak, gk, ck := g.Kernels()
+	fmt.Printf("latent %dx%d -> image %dx%d, %d dispatches, GPU total %s (attn %s, gemm %s, conv %s)\n\n",
+		n, n, n*8, n*8, len(st), total.Round(time.Millisecond), ak, gk, ck)
 
 	type kv struct {
 		k string

@@ -142,6 +142,16 @@ type GPUStack struct {
 	hA, hQ, hK, hV, hCtx, hFFN uint32
 	hGate, hUp                 uint32
 	hElems                     int
+
+	// The head's slots (stage 9, gpuhead.go). They are in the stack's arenas
+	// rather than in the head's own, because the patch embedder writes the
+	// residual stream and the final layer reads it: the two are the same
+	// tensor, so they have to be the same buffer, and a Vulkan binding is one
+	// buffer. patchDim is zero on a config that does not describe a patch,
+	// which is what the block tests build, and then none of this is allocated.
+	patchDim                  int
+	aAdaSiLU, aFinalMod, aOut uint32
+	hPatch, hPatchLDA         uint32
 }
 
 // blockWeights is where one block's weights sit in the arenas. Everything a
@@ -456,6 +466,12 @@ func newStack(dev *vk.Device, set *safetensors.Set, cfg *Config, specs []blockSp
 	// count is padded to 128 -- which is also what the attention kernel's key
 	// blocks want, so one number serves both.
 	g.tokPad = (tokens + wmmaTokenAlign - 1) &^ (wmmaTokenAlign - 1)
+	// cfg is nil when a caller supplies its own block (NewGPUBlock does), and
+	// then there is no patch to size the head's slots from -- which is right:
+	// a single block has no head.
+	if cfg != nil && len(cfg.PatchSize) > 0 && cfg.InChan > 0 {
+		g.patchDim = cfg.PatchSize[0] * cfg.PatchSize[0] * cfg.InChan
+	}
 	g.ldaDim = g.dim + gemmPad
 	g.ldaFFN = g.ffn + gemmPad
 
@@ -787,6 +803,15 @@ func (g *GPUStack) allocActivations() error {
 	g.aFF = alloc(rows * g.dim)
 	g.aMod = alloc(4 * g.dim)
 	g.aAdaIn = alloc(g.adaIn)
+	if g.patchDim > 0 {
+		// The final layer's adaLN reads SiLU(t) where every block's reads t
+		// itself -- diffusers applies the non-linearity in the final layer
+		// and not in the blocks -- so the two forms are both resident and
+		// SetAdaLN writes both.
+		g.aAdaSiLU = alloc(g.adaIn)
+		g.aFinalMod = alloc(g.dim)
+		g.aOut = alloc(rows * g.patchDim)
+	}
 
 	halloc := func(n int) uint32 {
 		off := uint32(g.hElems)
@@ -802,6 +827,13 @@ func (g *GPUStack) allocActivations() error {
 	g.hFFN = halloc(rows * g.ldaFFN)
 	g.hGate = halloc(rows * g.ffn)
 	g.hUp = halloc(rows * g.ffn)
+	if g.patchDim > 0 {
+		// The patch embedder's A operand: the patchified latent, its bias
+		// column and its pad-token column, narrowed. headEmbedK is the padded
+		// reduction extent and gemmPad the §2.3 stride pad.
+		g.hPatchLDA = uint32(headEmbedK(g.patchDim) + gemmPad)
+		g.hPatch = halloc(rows * int(g.hPatchLDA))
+	}
 
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
@@ -1028,10 +1060,18 @@ func (g *GPUStack) Apply(x *Mat, adaln []float32, sel []int) (*Mat, error) {
 // blocks over whatever the residual stream already holds and leaves the
 // result there.
 //
-// It is what a denoising step is made of. A read-back out of this arena runs
-// at 0.2 GB/s, so Apply's 63 MB result costs 315 ms at 4096 tokens -- a fifth
-// of the step -- and the pipeline wants it once per image, not once per
-// phase.
+// It is what a denoising step is made of. Apply's read-back is separate from
+// it because the pipeline wants the result once per image rather than once
+// per phase -- and, since stage 9, because it does not want it at all: the
+// tail runs on the device (gpuhead.go) and what crosses the bus per step is
+// the [tokens, 64] latent rather than the [tokens, 3840] stream.
+//
+// How much that read-back costs depends on something outside this file. A
+// harness that has allocated little gets the device-local host-visible heap,
+// where a host read runs at 0.18 GB/s and 63 MB is 344 ms (stage 3c); the
+// pipeline, with 20.5 GB of weights resident, is past that heap's ~8 GB
+// budget and reads the same arena at 15 GB/s, where 63 MB is 6.5 ms. See
+// cmd/bus and research/stage-9-head-and-tail.md.
 func (g *GPUStack) Run(sel []int) error {
 	sel, err := g.selection(sel)
 	if err != nil {
@@ -1265,9 +1305,25 @@ func (g *GPUStack) upload(x *Mat, adaln []float32) error {
 	g.rows = x.Rows
 	g.abuf.WriteFloat32At(int(g.aX), x.Data)
 	if g.adaIn > 0 {
-		g.abuf.WriteFloat32At(int(g.aAdaIn), adaln)
+		g.writeAdaLN(adaln)
 	}
 	return nil
+}
+
+// writeAdaLN puts the timestep embedding in the arena in both the forms the
+// model asks for: as it is, which is what every block's adaLN projects, and
+// through a SiLU, which is what the final layer's does (head.go's Final).
+// The asymmetry is diffusers' and is worth one extra kilobyte per step rather
+// than a shader that has to know which caller it has.
+func (g *GPUStack) writeAdaLN(v []float32) {
+	g.abuf.WriteFloat32At(int(g.aAdaIn), v)
+	if g.patchDim > 0 {
+		act := make([]float32, len(v))
+		for i, x := range v {
+			act[i] = x / (1 + float32(math.Exp(float64(-x))))
+		}
+		g.abuf.WriteFloat32At(int(g.aAdaSiLU), act)
+	}
 }
 
 // Upload writes x into the residual stream starting at row `at`, and makes the
@@ -1301,7 +1357,7 @@ func (g *GPUStack) SetAdaLN(v []float32) error {
 	if len(v) != g.adaIn {
 		return fmt.Errorf("dit: adaln is %d wide, want %d", len(v), g.adaIn)
 	}
-	g.abuf.WriteFloat32At(int(g.aAdaIn), v)
+	g.writeAdaLN(v)
 	return nil
 }
 

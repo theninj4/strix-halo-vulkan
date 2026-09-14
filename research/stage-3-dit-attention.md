@@ -32,6 +32,15 @@ than about a kernel:
   however, a property every future harness will have, and stage 6's PNG path
   will need a host-cached staging buffer rather than a direct read.
 
+  **Refined by stage 9** ([`stage-9-head-and-tail.md`](stage-9-head-and-tail.md)):
+  it is a property of the harness in a stricter sense than this paragraph
+  knew. `vk.NewBuffer` falls back from the device-local host-visible heap to
+  the plain host-visible one when the first cannot serve the request, and on
+  this device that happens at about **8 GB of total allocation** — so a
+  benchmark reads at 0.18 GB/s and the pipeline, which has 20.5 GB of weights
+  resident, reads the *same arena* at 15 GB/s. The 63 MB read this paragraph
+  prices at 344 ms costs the pipeline **6.5 ms**. Measured with `cmd/bus`.
+
 ## Stage 3b — the scalar kernels, and why they could not get there
 
 Kept because the simple one is the oracle the matrix-core kernels are checked

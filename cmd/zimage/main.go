@@ -41,6 +41,7 @@ func main() {
 	width := flag.Int("width", 1024, "image width in pixels, a multiple of 16")
 	height := flag.Int("height", 0, "image height; 0 is square")
 	steps := flag.Int("steps", 8, "denoising steps; Z-Image-Turbo's NFE is 8")
+	cpuHead := flag.Bool("cpuhead", false, "run the patch embedder and the final layer on the host, which is stage 9's slow path")
 	seed := flag.Int64("seed", 1, "seed for the initial latent")
 	maxPrompt := flag.Int("maxprompt", 512, "longest prompt the text encoder is built for")
 	latentFile := flag.String("latents", "", "read the initial latent from this file instead of the RNG")
@@ -79,15 +80,16 @@ func main() {
 	t0 := time.Now()
 	p, err := pipeline.New(dev, pipeline.Options{
 		Model: *model, Width: *width, Height: *height, Steps: *steps, MaxPrompt: *maxPrompt,
+		CPUHead: *cpuHead,
 	})
 	must(err)
 	defer p.Destroy()
 	load := time.Since(t0)
 
-	enc, tr, act := p.Residency()
+	enc, tr, vaeW, act := p.Residency()
 	c, lh, lw := p.Latent()
-	fmt.Printf("loaded in %s: %.2f GB text encoder + %.2f GB transformer + %.2f GB activations, latent [%d %d %d]\n",
-		ms(load), float64(enc)/1e9, float64(tr)/1e9, float64(act)/1e9, c, lh, lw)
+	fmt.Printf("loaded in %s: %.2f GB text encoder + %.2f GB transformer + %.2f GB VAE + %.2f GB activations, latent [%d %d %d]\n",
+		ms(load), float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9, c, lh, lw)
 	fmt.Printf("sigmas: %s\n\n", sigmas(p))
 
 	for rep := 0; rep < *reps; rep++ {

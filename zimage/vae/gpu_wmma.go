@@ -207,8 +207,7 @@ func packTiledB(dst []uint16, w []float32, n, k int) {
 // stageProjections packs the mid block's four projection weights into the
 // fp16 weight arena. Nothing else in the decoder is narrowed: these are the
 // only tensors a matrix-core kernel reads.
-func (g *GPUDecoder) stageProjections(a *Attention) []uint16 {
-	var data []uint16
+func (g *GPUDecoder) stageProjections(data []uint16, a *Attention) []uint16 {
 	put := func(name string, l *Linear) {
 		off := uint32(len(data))
 		data = append(data, make([]uint16, l.Out*l.In)...)

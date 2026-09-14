@@ -28,6 +28,8 @@ func main() {
 	dir := flag.String("vae", "models/Z-Image-Turbo/vae", "VAE checkpoint directory")
 	sizes := flag.String("sizes", "16,32,64", "comma-separated latent sizes")
 	ladder := flag.Bool("ladder", false, "sweep the mid block's kernels at -size instead of timing decodes")
+	convladder := flag.Bool("convladder", false, "sweep the convolution kernels at -size instead of timing decodes")
+	conv := flag.String("conv", "", "convolution kernel (\"scalar\" for stage 2b's fp32 path)")
 	size := flag.Int("size", 128, "latent size for -ladder")
 	reps := flag.Int("reps", 3, "runs per configuration; the best is reported")
 	attn := flag.String("attn", "", "mid-block attention kernel")
@@ -67,8 +69,12 @@ func main() {
 		runLadder(dev, cpu, *size, *reps)
 		return
 	}
+	if *convladder {
+		runConvLadder(dev, cpu, *size, *reps)
+		return
+	}
 
-	fmt.Printf("%-8s %-12s %10s %12s %12s\n", "LATENT", "IMAGE", "DISPATCH", "ACT MB", "WALL")
+	fmt.Printf("%-8s %-12s %10s %12s %12s %12s\n", "LATENT", "IMAGE", "DISPATCH", "ACT MB", "F16 MB", "WALL")
 	for _, tok := range strings.Split(*sizes, ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(tok))
 		if err != nil {
@@ -76,6 +82,7 @@ func main() {
 		}
 		g, err := vae.NewGPUDecoderOpts(dev, cpu, n, n, vae.Options{
 			Attn: vae.AttnKernel(*attn), GEMM: vae.GEMMKernel(*gemm),
+			Conv: vae.ConvKernel(*conv),
 		})
 		if err != nil {
 			fmt.Printf("%-8d failed: %v\n", n, err)
@@ -104,9 +111,10 @@ func main() {
 				best = d
 			}
 		}
-		fmt.Printf("%-8d %-12s %10d %12.1f %12s\n",
+		fmt.Printf("%-8d %-12s %10d %12.1f %12.1f %12s\n",
 			n, fmt.Sprintf("%dx%d", n*8, n*8), nd,
-			float64(g.ActivationBytes())/1e6, best.Round(time.Millisecond))
+			float64(g.ActivationBytes())/1e6, float64(g.F16ActivationBytes())/1e6,
+			best.Round(time.Millisecond))
 		g.Destroy()
 	}
 }
@@ -162,17 +170,75 @@ func runLadder(dev *vk.Device, cpu *vae.Decoder, n, reps int) {
 				gemm, gemmF = m, mf
 			}
 		}
-		ak, gk := g.Kernels()
+		ak, gk, _ := g.Kernels()
 		fmt.Printf("%-22s %-22s %12s %12.1f %12s %12.1f\n", ak, gk,
 			attn.Round(time.Microsecond), attnF/attn.Seconds()/1e12,
 			gemm.Round(time.Microsecond), gemmF/gemm.Seconds()/1e12)
 	}
 
 	for _, k := range vae.AttnKernels() {
-		run(vae.Options{Attn: k})
+		run(vae.Options{Attn: k, Conv: vae.ConvScalar})
 	}
 	fmt.Println()
 	for _, k := range vae.GEMMKernels() {
-		run(vae.Options{GEMM: k})
+		run(vae.Options{GEMM: k, Conv: vae.ConvScalar})
+	}
+}
+
+// runConvLadder times every build of the convolution kernel (stage 8) on its
+// own dispatches. The convolutions are 40-odd dispatches rather than one, so
+// what is reported is their sum -- and beside it the pack pass the fp16 path
+// adds, because a layout that made the kernel faster than the pass it needs
+// is the only way this trade goes wrong.
+func runConvLadder(dev *vk.Device, cpu *vae.Decoder, n, reps int) {
+	latent := vae.NewTensor(1, 16, n, n)
+	rng := rand.New(rand.NewSource(1))
+	for i := range latent.Data {
+		latent.Data[i] = float32(rng.NormFloat64())
+	}
+
+	fmt.Printf("latent %dx%d -> image %dx%d, best of %d\n\n", n, n, n*8, n*8, reps)
+	fmt.Printf("%-16s %12s %12s %12s %12s %12s\n", "CONV", "CONV", "TFLOP/s", "PACK", "CONV+PACK", "DECODE")
+
+	for _, k := range vae.ConvKernels() {
+		func() {
+			g, err := vae.NewGPUDecoderOpts(dev, cpu, n, n, vae.Options{Conv: k})
+			if err != nil {
+				fmt.Printf("%-16s failed: %v\n", k, err)
+				return
+			}
+			defer g.Destroy()
+			var conv, pack, all time.Duration
+			var convF float64
+			for i := 0; i < reps; i++ {
+				st, err := g.Profile(latent)
+				must(err)
+				var c, p, a time.Duration
+				var cf float64
+				for _, s := range st {
+					a += s.GPU
+					switch {
+					case strings.HasPrefix(s.Kind, "conv"):
+						c += s.GPU
+						cf += s.Flops
+					case strings.HasPrefix(s.Kind, "packconv"):
+						p += s.GPU
+					}
+				}
+				if i == 0 || c < conv {
+					conv, convF = c, cf
+				}
+				if i == 0 || p < pack {
+					pack = p
+				}
+				if i == 0 || a < all {
+					all = a
+				}
+			}
+			fmt.Printf("%-16s %12s %12.1f %12s %12s %12s\n", k,
+				conv.Round(time.Microsecond), convF/conv.Seconds()/1e12,
+				pack.Round(time.Microsecond), (conv + pack).Round(time.Microsecond),
+				all.Round(time.Millisecond))
+		}()
 	}
 }

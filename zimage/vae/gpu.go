@@ -124,6 +124,29 @@ func (a *arena) release(off uint32, elems int) {
 		}
 	}
 	a.free = append(a.free, blk)
+
+	// Anything that now ends at the bump pointer goes back to the bump
+	// pointer, rather than staying on the free list where only a request of
+	// its own size or smaller could ever use it. Those few lines are worth
+	// having: stage 8's packed activations are allocated and freed one at a
+	// time in *increasing* size, so without this each is stranded behind the
+	// next and the fp16 arena is the sum of all of them (933 MB at
+	// 1024x1024) rather than the largest (539 MB). The fp32 arena gains 168
+	// MB from the same change.
+	for {
+		i := -1
+		for j, b := range a.free {
+			if b.off+b.size == a.next {
+				i = j
+				break
+			}
+		}
+		if i < 0 {
+			return
+		}
+		a.next = a.free[i].off
+		a.free = append(a.free[:i], a.free[i+1:]...)
+	}
 }
 
 func (a *arena) reset() {
@@ -165,11 +188,20 @@ type GPUDecoder struct {
 	arena   arena
 	harena  arena
 
-	// attn and gemm are the mid block's kernels. A zero attn.spirv means the
-	// fp32 path of stage 2b, which is both the fallback on a device without
-	// matrix cores and the oracle the fp16 path is measured against.
+	// attn and gemm are the mid block's kernels, conv every convolution's.
+	// A zero spirv means the fp32 path of stage 2b, which is both the
+	// fallback on a device without matrix cores and the oracle the fp16 path
+	// is measured against. The two are chosen independently: the mid block
+	// and the convolutions are different kernels on different tensors, and a
+	// test that wants one narrowing and not the other has to be able to ask.
 	attn attnVariant
 	gemm gemmVariant
+	conv convVariant
+
+	// convs is every convolution in the graph, in the order flattenWeights
+	// walked them. Both fp16 stagings read it, so the names a dispatch looks
+	// up cannot drift from the names the arena was built with.
+	convs []convRef
 
 	// dispatches accumulates the recorded graph so a decode is one submit.
 	dispatches []vk.MultiDispatch
@@ -181,6 +213,13 @@ type GPUDecoder struct {
 type Options struct {
 	Attn AttnKernel
 	GEMM GEMMKernel
+	Conv ConvKernel
+}
+
+// convRef is one convolution and the name its weights were flattened under.
+type convRef struct {
+	name string
+	conv *Conv2D
 }
 
 // shaderSet is every pipeline the decoder graph uses.
@@ -238,8 +277,14 @@ func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt O
 	}
 	g.wbuf.WriteFloat32(g.weights.data)
 
-	if g.wmma() {
-		w16 := g.stageProjections(cpu.Mid.Attn)
+	if g.f16() {
+		var w16 []uint16
+		if g.wmma() {
+			w16 = g.stageProjections(w16, cpu.Mid.Attn)
+		}
+		if g.convCores() {
+			w16 = g.stageConvWeights(w16)
+		}
 		if g.w16buf, err = dev.NewBuffer(len(w16) * 2); err != nil {
 			g.Destroy()
 			return nil, fmt.Errorf("vae: fp16 weight buffer (%d MB): %w", (len(w16)*2)>>20, err)
@@ -286,6 +331,11 @@ func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt O
 			set[name] = spirv
 		}
 	}
+	if g.convCores() {
+		// The packing pass belongs to the chosen build, because one of the
+		// controls is a wrong pack rather than a wrong kernel (gpu_conv.go).
+		set["pack_conv"] = g.conv.packSpirv()
+	}
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.w16buf}
 	pcSize := uint32(unsafe.Sizeof(pushConstants{}))
 	for name, spirv := range set {
@@ -314,49 +364,90 @@ func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt O
 			return nil, err
 		}
 	}
+	if g.convCores() {
+		// Pinned at both sizes, not only at 32: the kernel derives its wave's
+		// tile from gl_SubgroupID against a compile-time wave grid, so a
+		// workgroup holding a different number of waves than the build assumes
+		// writes outside its tile at either size.
+		if err := g.pipeline("conv_wmma", g.conv.spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: g.conv.wave,
+		}); err != nil {
+			g.Destroy()
+			return nil, err
+		}
+	}
 	return g, nil
 }
 
 // chooseKernels resolves Options against what the device can actually do.
+// The mid block and the convolutions are resolved separately, so that a
+// caller can narrow one and not the other -- which is what the tests that
+// hold each path to the one it replaced need.
 func (g *GPUDecoder) chooseKernels(opt Options) error {
-	if opt.Attn == AttnScalar {
-		return nil
-	}
 	if !hasMatrixCores(g.dev) {
-		if opt.Attn != "" {
+		if opt.Attn != "" && opt.Attn != AttnScalar {
 			return fmt.Errorf("vae: attention kernel %q needs fp16, cooperative matrices and subgroup size control", opt.Attn)
+		}
+		if opt.Conv != "" && opt.Conv != ConvScalar {
+			return fmt.Errorf("vae: conv kernel %q needs fp16, cooperative matrices and subgroup size control", opt.Conv)
 		}
 		return nil
 	}
-	attn := opt.Attn
-	if attn == "" {
-		attn = DefaultAttnKernel
+	if opt.Attn != AttnScalar {
+		attn := opt.Attn
+		if attn == "" {
+			attn = DefaultAttnKernel
+		}
+		v, ok := attnVariantFor(attn)
+		if !ok {
+			return fmt.Errorf("vae: no attention kernel %q (have %v)", attn, AttnKernels())
+		}
+		gk := opt.GEMM
+		if gk == "" {
+			gk = DefaultGEMMKernel
+		}
+		gv, ok := gemmVariantFor(gk)
+		if !ok {
+			return fmt.Errorf("vae: no GEMM kernel %q (have %v)", gk, GEMMKernels())
+		}
+		g.attn, g.gemm = v, gv
 	}
-	v, ok := attnVariantFor(attn)
-	if !ok {
-		return fmt.Errorf("vae: no attention kernel %q (have %v)", attn, AttnKernels())
+	if opt.Conv != ConvScalar {
+		ck := opt.Conv
+		if ck == "" {
+			ck = DefaultConvKernel
+		}
+		cv, ok := convVariantFor(ck)
+		if !ok {
+			return fmt.Errorf("vae: no conv kernel %q (have %v)", ck, ConvKernels())
+		}
+		g.conv = cv
 	}
-	gk := opt.GEMM
-	if gk == "" {
-		gk = DefaultGEMMKernel
-	}
-	gv, ok := gemmVariantFor(gk)
-	if !ok {
-		return fmt.Errorf("vae: no GEMM kernel %q (have %v)", gk, GEMMKernels())
-	}
-	g.attn, g.gemm = v, gv
 	return nil
 }
 
 // wmma reports whether the mid block runs on the matrix cores.
 func (g *GPUDecoder) wmma() bool { return g.attn.spirv != nil }
 
-// Kernels names the mid block's two kernels, for a benchmark's output.
-func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel) {
-	if !g.wmma() {
-		return AttnScalar, ""
+// convCores reports whether the convolutions do.
+func (g *GPUDecoder) convCores() bool { return g.conv.spirv != nil }
+
+// f16 reports whether anything in the graph needs the two fp16 arenas. They
+// are bound to every pipeline either way -- one descriptor layout across the
+// graph is what lets a decode be recorded into one command buffer -- but on
+// the fully scalar path they are placeholders.
+func (g *GPUDecoder) f16() bool { return g.wmma() || g.convCores() }
+
+// Kernels names the graph's three chosen kernels, for a benchmark's output.
+func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel, ConvKernel) {
+	attn, gemm, conv := AttnScalar, GEMMKernel(""), ConvScalar
+	if g.wmma() {
+		attn, gemm = g.attn.name, g.gemm.name
 	}
-	return g.attn.name, g.gemm.name
+	if g.convCores() {
+		conv = g.conv.name
+	}
+	return attn, gemm, conv
 }
 
 // pipeline builds one pipeline and records its module for destruction.
@@ -400,11 +491,13 @@ func (g *GPUDecoder) Destroy() {
 // order the graph reads them.
 func (g *GPUDecoder) flattenWeights() {
 	w := g.weights
+	g.convs = nil
 	conv := func(name string, c *Conv2D) {
 		w.put(name+".weight", c.Weight)
 		if c.Bias != nil {
 			w.put(name+".bias", c.Bias)
 		}
+		g.convs = append(g.convs, convRef{name, c})
 	}
 	norm := func(name string, n *GroupNorm) {
 		w.put(name+".weight", n.Weight)
@@ -444,6 +537,18 @@ func (g *GPUDecoder) flattenWeights() {
 	}
 	norm("conv_norm_out", g.cpu.ConvNormOut)
 	conv("conv_out", g.cpu.ConvOut)
+
+	// The matrix-core convolution starts its accumulators from the bias
+	// rather than adding it (gpu_conv.go), which wants each one repeated
+	// across a 16-wide row. A second pass, so that the arena's layout is
+	// unchanged when the convolutions run scalar.
+	if g.convCores() {
+		for _, cr := range g.convs {
+			if cr.conv.Bias != nil {
+				w.put(cr.name+".bias16", expandBias(cr.conv.Bias, cr.conv.OutC))
+			}
+		}
+	}
 }
 
 // tensor is a shape plus its offset in the activation arena.
@@ -527,15 +632,14 @@ func (b *builder) bOff(name string) uint32 {
 	return noBias
 }
 
-// conv appends a convolution producing a fresh tensor.
+// conv appends a convolution producing a fresh tensor. Both shapes this
+// decoder uses -- 3x3 pad 1 and the 1x1 pad 0 shortcuts -- preserve H and W.
 func (b *builder) conv(name string, c *Conv2D, x tensor) tensor {
-	out := tensor{off: b.ar.alloc(c.OutC * x.H * x.W), C: c.OutC, H: x.H, W: x.W}
-	if c.Pad == 0 && c.KH == 1 {
-		// 1x1 with no padding also preserves H and W.
-		out.H, out.W = x.H, x.W
+	if b.g.convCores() {
+		return b.convCores(name, c, x)
 	}
-	b.label(fmt.Sprintf("conv%dx%d %d->%d @%dx%d", c.KH, c.KW, x.C, c.OutC, x.H, x.W),
-		2*float64(c.OutC)*float64(out.H)*float64(out.W)*float64(x.C)*float64(c.KH)*float64(c.KW))
+	out := tensor{off: b.ar.alloc(c.OutC * x.H * x.W), C: c.OutC, H: x.H, W: x.W}
+	b.label(convLabel(c, x), convFlops(c, x))
 	// The grid's y axis is output-channel *blocks*: the shader's OC_BLOCK
 	// accumulators per thread are what give the kernel its arithmetic
 	// intensity, so the channel count is divided by that here.
@@ -822,8 +926,21 @@ func (g *GPUDecoder) Dispatches(latentH, latentW int) (int, error) {
 	return len(b.out), nil
 }
 
-// ActivationBytes is the size of the activation arena.
+// ActivationBytes is the size of the fp32 activation arena.
 func (g *GPUDecoder) ActivationBytes() int { return g.abuf.Size() }
+
+// F16ActivationBytes is the size of the fp16 one, which stage 8 turned from
+// the mid block's scratch into the second-largest allocation in the decoder:
+// the blocked copy of a convolution's input is half the tensor's own size,
+// and at 1024x1024 the largest of them is 539 MB.
+func (g *GPUDecoder) F16ActivationBytes() int { return g.hbuf.Size() }
+
+// WeightBytes is the two weight arenas: the fp32 originals every scalar
+// kernel still reads, and the fp16 fragment-tile copies the matrix-core
+// kernels do.
+func (g *GPUDecoder) WeightBytes() (fp32, fp16 int) {
+	return g.wbuf.Size(), g.w16buf.Size()
+}
 
 // Stage is one dispatch's identity and cost, as returned by Profile.
 type Stage struct {
