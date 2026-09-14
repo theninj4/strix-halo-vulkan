@@ -1,0 +1,32 @@
+#version 450
+// The conformer's residual: x += scale * y.
+//
+// dit_gate_add.comp's shape with a scalar where that one has a row vector:
+// the DiT's gate comes from adaLN and is per channel, and the conformer's is
+// the macaron half-step -- 0.5 around each of the two feed forwards, 1 around
+// attention and the convolution -- which is a constant of the architecture
+// rather than anything computed per step. So it rides in pc.scale and there
+// is no vector to read.
+//
+// x is updated in place, which is what lets 24 layers run back to back with
+// no copy between them.
+//
+//   pc.inOff  the branch output, row stride pc.dim
+//   pc.outOff the residual stream, same stride
+//   pc.scale  the half-step weight's bit pattern
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint base = r * pc.dim;
+    float s = uintBitsToFloat(pc.scale);
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        act[pc.outOff + base + c] += s * act[pc.inOff + base + c];
+    }
+}

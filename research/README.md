@@ -68,6 +68,15 @@ numbered experiment, so they carry names instead of section numbers:
 | [Stage 9](stage-9-head-and-tail.md) | The transformer's head and tail on the device — the host's share of a step **59 ms to 5-10 ms**, an image **14.89 s to 14.49 s**. A bias and a *pad token* are extra columns of K, so `y = Wx + b` and `y = x_pad_token` come out of one biasless GEMM with no branch and no host write. And the correction: the engine's "a host read-back runs at 0.2 GB/s" is true only below about **8 GB of allocation**, where `vk.NewBuffer` still gets the device-local heap — the 20.5 GB pipeline reads the same arena **83x faster**, so the 0.8 s an image this stage was partly priced on was never there |
 | [Stage 10](stage-10-layout-epilogues.md) | The block's two layout passes as epilogues — 18 dispatches to **16**, a block **53.17 ms to 51.80**, an image **14.49 s to 14.26 s**. `pack v` and `narrow ctx` moved no information and are now the store instruction of the kernel above them, which is possible because in both cases the data was already in the right registers in the right 16x16 shape. Two other things came out of it: the item had been on the backlog for four sessions priced at **1.0 s an image when the measurement behind it said 1.0 ms a block** — a units slip, 3.4x the real figure — and the old path was doing a **double rounding** that the fused one does not, which is why 84 halves in 1.2 M differ and why every one of them is an exact fp16 tie |
 
+### Speech vertical findings
+
+From building the two audio verticals (SPEECH.md), so they carry stage names
+rather than section numbers.
+
+| Stage | Findings |
+|---|---|
+| [S6](s6-parakeet-encoder.md) | The parakeet encoder on Vulkan — the 24 conformer layers **2.45 s to 13.8 ms**, 12.9 TFLOP/s, transcript and decode trace unchanged. Transformer-XL's position term is an **additive bias on the score tiles**, one coopmat load and one add. The bug: the flash kernel takes its row max *before* the tail mask, which encoded an assumption that a real score is near a pad key's 0 — with a position bias it is not, and a key that does not exist set the scale until the softmax underflowed fp16; one `break`, 100x. Padding the clip to one alignment instead of two cost 1.28x, **wave32 beats wave64 on every rung at every clip length**, and two of the four negative controls change the encoder output by 33% and 3.9% while leaving the transcript alone |
+
 ### Closed, but small enough to have stayed in the backlog
 
 `§4.1` (per-dispatch cost: ~300 ns, worry falsified) and `§3.7` (the

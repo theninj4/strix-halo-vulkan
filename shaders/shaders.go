@@ -1457,3 +1457,117 @@ var QwenAttentionQT1KT4NoCausal []byte
 
 //go:embed qwen_rope.spv
 var QwenRoPE []byte
+
+// SPEECH.md S6, the parakeet encoder. The FastConformer is the same GEMM
+// ladder the DiT and the text encoder run -- two feed forwards, four
+// projections, two pointwise convolutions and the relative-position
+// projection, all [T, 1024] against [1024, N] -- so what this section adds is
+// the five things the ladder does not have, and one geometry it does.
+//
+//   - **A LayerNorm with a mean and an affine** (parakeet_layernorm.comp).
+//     Five per layer, and the only norm the model has.
+//   - **The Transformer-XL score bias**: the position term, its shift
+//     (parakeet_relshift.comp) and the additive bias that folds it into the
+//     score kernel (dit_attention_wmma.comp's REL_BIAS build).
+//   - **The convolution branch**: a GLU over the channel axis
+//     (parakeet_glu.comp) and a depthwise convolution over time with the
+//     folded BatchNorm and silu (parakeet_dwconv_f16.comp).
+//   - **silu on its own** (parakeet_silu_f16.comp), which is the conformer's
+//     feed forward where the DiT's is gated.
+//   - **A scalar-weighted residual** (parakeet_residual.comp): the macaron
+//     half-step is 0.5, not a per-channel gate.
+//
+// and the geometry is the **wave32 narrow-M GEMM**. An 11 s clip is 138
+// frames, where results/shapes.csv measures the 32x32 wave32 tile at 23.1
+// TFLOP/s against 12.7 for the wave64 rungs that win at M=1024 -- nearly 2x,
+// on the same weights, for the same reason the attention kernel took 1.40x
+// from the same lever (§6.2). dit_gemm.comp already takes -DWAVE, so these
+// are builds and not a kernel.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_layernorm.spv parakeet_layernorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOUT_F16=1 -o parakeet_layernorm_f16.spv parakeet_layernorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOUT_F16=1 -DNO_MEAN=1 -o parakeet_layernorm_f16_nomean.spv parakeet_layernorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_silu_f16.spv parakeet_silu_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_residual.spv parakeet_residual.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_glu.spv parakeet_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_dwconv_f16.spv parakeet_dwconv_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_narrow_f16.spv parakeet_narrow_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o parakeet_relshift.spv parakeet_relshift.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSHIFT_SLICE=1 -o parakeet_relshift_slice.spv parakeet_relshift.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBIAS=1 -o parakeet_pack_bias.spv dit_pack_f16.comp
+
+//go:embed parakeet_layernorm.spv
+var ParakeetLayerNorm []byte
+
+//go:embed parakeet_layernorm_f16.spv
+var ParakeetLayerNormF16 []byte
+
+//go:embed parakeet_layernorm_f16_nomean.spv
+var ParakeetLayerNormF16NoMean []byte
+
+//go:embed parakeet_silu_f16.spv
+var ParakeetSiLUF16 []byte
+
+//go:embed parakeet_residual.spv
+var ParakeetResidual []byte
+
+//go:embed parakeet_glu.spv
+var ParakeetGLU []byte
+
+//go:embed parakeet_dwconv_f16.spv
+var ParakeetDWConvF16 []byte
+
+//go:embed parakeet_narrow_f16.spv
+var ParakeetNarrowF16 []byte
+
+//go:embed parakeet_relshift.spv
+var ParakeetRelShift []byte
+
+//go:embed parakeet_relshift_slice.spv
+var ParakeetRelShiftSlice []byte
+
+//go:embed parakeet_pack_bias.spv
+var ParakeetPackBias []byte
+
+// The score kernel with the position bias compiled in, at the two wave sizes.
+// Same ladder position as everywhere else -- QT=1, KTIL=4 -- since stage 3c's
+// table says the geometry is decided by the register file and the wave size
+// and not by the sequence, and an 11 s clip's 138 frames make attention 2% of
+// the encoder's arithmetic either way.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DREL_BIAS=1 -DOUT_F16=1 -DWAVE=32 -o parakeet_attn_wmma_qt1_kt4_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DREL_BIAS=1 -DOUT_F16=1 -o parakeet_attn_wmma_qt1_kt4.spv dit_attention_wmma.comp
+
+//go:embed parakeet_attn_wmma_qt1_kt4_w32.spv
+var ParakeetAttentionQT1KT4W32 []byte
+
+//go:embed parakeet_attn_wmma_qt1_kt4.spv
+var ParakeetAttentionQT1KT4 []byte
+
+// The wave32 rungs of the projection GEMM, at the two narrow tiles
+// results/shapes.csv puts at the top for a clip-length M.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DWAVE=32 -o dit_gemm_reg32x32_bt16_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DWAVE=32 -o dit_gemm_reg32x64_bt16_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DWAVE=32 -o dit_gemm_reg16x64_bt16_w32.spv dit_gemm.comp
+
+//go:embed dit_gemm_reg32x32_bt16_w32.spv
+var DiTGEMMReg32x32TiledW32 []byte
+
+//go:embed dit_gemm_reg32x64_bt16_w32.spv
+var DiTGEMMReg32x64TiledW32 []byte
+
+//go:embed dit_gemm_reg16x64_bt16_w32.spv
+var DiTGEMMReg16x64TiledW32 []byte
+
+// The position term's own GEMM is the one in the encoder whose B operand is
+// an activation rather than a weight -- rel_k, [2T-1, 1024], different every
+// clip -- so it cannot be staged as fragment tiles and reads the natural
+// [N, ldb] layout instead. That is B_LAYOUT=0, i.e. dit_gemm_reg64_hka4.spv,
+// which the DiT already builds; what is new is a narrow-M rung of it, since
+// this GEMM's M is the clip length like every other here.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=0 -o dit_gemm_reg32x64_hka4.spv dit_gemm.comp
+
+//go:embed dit_gemm_reg32x64_hka4.spv
+var DiTGEMMReg32x64HKA4 []byte

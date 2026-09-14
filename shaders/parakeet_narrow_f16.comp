@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Narrow an fp32 activation into the fp16 arena as a GEMM operand, adding a
+// per-column bias on the way and zeroing the rows past the tensor.
+//
+// dit_scale_f16.comp is the same pass with a per-column *multiply*; the two
+// differ in the arithmetic they fold, and both exist because the alternative
+// is a second pass over the tensor. The two uses here are attention's:
+//
+//   q + bias_v, as the A operand of the position term's per-head GEMM. The
+//     Transformer-XL attention this model uses adds a learned vector to the
+//     query before each of its two score matrices -- bias_u for the content
+//     term and bias_v for the position term -- and the content one folds into
+//     the fragment pack instead (dit_pack_f16.comp's BIAS build), because
+//     that pass is already reading q.
+//   relative_k_proj's output, as the B operand of the same GEMM, where the
+//     bias is NO_W and what matters is the zeroing: N is padded up to the
+//     kernel's tile and the GEMM has no bounds check, so the rows past the
+//     2T-1 relative offsets have to hold zeros rather than whatever the last
+//     longer clip left there.
+//
+//   pc.inOff  fp32 source, row stride pc.dim
+//   pc.outOff fp16 destination, row stride pc.lda (§2.3)
+//   pc.wOff   the bias vector in the fp32 weight arena, or NO_W for none
+//   pc.tokens rows to convert; pc.aux1 rows to write, the rest zeroed
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.aux1) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    bool live = r < pc.tokens;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = 0.0;
+        if (live) {
+            v = act[src + c];
+            if (pc.wOff != NO_W) {
+                v += wbuf[pc.wOff + c];
+            }
+        }
+        hact[dst + c] = float16_t(v);
+    }
+}

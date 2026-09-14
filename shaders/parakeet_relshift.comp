@@ -1,0 +1,73 @@
+#version 450
+// Transformer-XL's relative-position shift, as an index rather than as a
+// buffer reinterpretation, and the scale that makes the score kernel's
+// exponential base 2.
+//
+// The position term of this attention is computed over *relative offsets*:
+// (q + bias_v) . rel_k^T is [T, 2T-1], one column per offset from +(T-1) down
+// to -(T-1), and it has to be folded onto the [T, T] query/key grid the
+// content term lives on. transformers does that with `_rel_shift` -- a left
+// pad by one, a reinterpretation of the flat buffer as [2T, T], a dropped row
+// -- which is three operations that exist to move data a shader can simply
+// address:
+//
+//     shifted[i][j] = raw[i][T - 1 - i + j]
+//
+// i.e. column j of row i holds the score for relative offset i-j, read
+// straight off a diagonal. parakeet/encoder.go keeps the literal pad-and-view
+// version, because that is the one that can be checked line by line against
+// the Python; this is the closed form it was proved equal to, and
+// TestRelShiftIsNotASlice pins both against the thing they are most often
+// confused with -- taking the middle T columns, which agrees on exactly one
+// row.
+//
+// The output is the additive bias the score kernel reads, so it carries the
+// softmax scale here: the content term gets 1/sqrt(headDim)*log2(e) folded
+// into q by the fragment pack, and the two are summed *before* the softmax, so
+// the position term has to arrive already carrying the same factor.
+//
+//   pc.inOff  the [heads][rows, aux0] raw position scores, fp32
+//   pc.outOff the [heads][aux1, aux1] bias planes, fp32
+//   pc.tokens the key count: columns past it are zeroed, since a masked key
+//             must not contribute a bias to a row's maximum either
+//   pc.kStride the query row count T, which is what the offset is measured from
+//   pc.aux0   the raw matrix's row stride, pc.aux1 the bias plane's
+//   pc.scale  1/sqrt(headDim) * log2(e)
+
+#include "dit_common.glsl"
+
+// The negative control (parakeet/gpu_test.go): the centre slice, i.e. the
+// same 2T-1 wide matrix read down its middle T columns instead of down the
+// diagonal. It is the wrong answer that looks most like the right one.
+#ifndef SHIFT_SLICE
+#define SHIFT_SLICE 0
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint i = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (i >= pc.aux1) {
+        return;
+    }
+    uint t = pc.kStride;
+    uint p = 2u * t - 1u;
+    uint src = pc.inOff + head * pc.aux1 * pc.aux0 + i * pc.aux0;
+    uint dst = pc.outOff + head * pc.aux1 * pc.aux1 + i * pc.aux1;
+    float s = uintBitsToFloat(pc.scale);
+    for (uint j = gl_LocalInvocationID.x; j < pc.aux1; j += 256u) {
+        float v = 0.0;
+        if (i < t && j < pc.tokens) {
+#if SHIFT_SLICE
+            uint off = (t - 1u) / 2u + j;
+#else
+            uint off = t - 1u - i + j;
+#endif
+            if (off < p) {
+                v = act[src + off] * s;
+            }
+        }
+        act[dst + j] = v;
+    }
+}

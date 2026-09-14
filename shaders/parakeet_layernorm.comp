@@ -1,0 +1,111 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The conformer's normalisation: a LayerNorm with a weight *and a bias*, over
+// a whole row of features.
+//
+// It is a third norm kernel rather than a flag on one of the two the DiT has,
+// and the reason is what the three differ in. dit_rmsnorm.comp has no mean
+// and no bias; dit_final_norm.comp subtracts the mean but has no affine at
+// all (diffusers builds it with elementwise_affine=False). Parakeet's encoder
+// has five of these per layer and *every* norm in it is this one -- there is
+// no RMS norm in the model anywhere -- so the affine is not optional and the
+// mean is not optional, and a kernel whose name says RMS would be the wrong
+// thing to reach for.
+//
+// Two reduction passes, the mean and then the variance about it, as
+// dit_final_norm.comp does and for the same reason: the single-pass
+// E[x^2] - mean^2 identity cancels when the mean approaches the RMS, and this
+// tensor is a residual stream 24 layers deep. The population variance (over N,
+// not N-1) is torch.nn.LayerNorm's convention -- and *not* the convention the
+// front end's per-utterance normalisation uses, eight lines away in the
+// Python (parakeet/model.go).
+//
+//   pc.inOff   fp32 source, row stride pc.dim
+//   pc.outOff  destination: fp32 at stride pc.dim, or fp16 at stride pc.lda
+//   pc.wOff    the weight vector, pc.aux0 the bias, both fp32 in the weight arena
+//   pc.eps     epsilon's bit pattern (1e-5, torch's nn.LayerNorm default)
+//
+// OUT_F16 writes the result straight into the fp16 arena as a GEMM A operand
+// (§2.3's padded stride), which is what four of the five norms in a layer
+// feed. The fifth -- norm_out -- writes the residual stream back in place as
+// fp32, so it takes the other build. Fusing the narrowing into the norm is
+// dit_norm_scale_f16.comp's lesson: the alternative is a [T, 1024] fp32
+// intermediate written and read back for nothing.
+
+#include "dit_common.glsl"
+
+#ifndef OUT_F16
+#define OUT_F16 0
+#endif
+#if OUT_F16
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+#endif
+
+// The negative control (parakeet/gpu_test.go): normalise without subtracting
+// the mean, i.e. do what every norm in the *other* two models does. It is the
+// mistake this kernel exists to not make, and it produces a perfectly
+// plausible tensor.
+#ifndef NO_MEAN
+#define NO_MEAN 0
+#endif
+
+#define WG 256
+layout(local_size_x = WG) in;
+
+shared float partial[WG];
+
+float reduce(float v, uint t) {
+    partial[t] = v;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    return partial[0];
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    float n = float(pc.dim);
+
+    float s = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        s += act[src + c];
+    }
+#if NO_MEAN
+    float mean = 0.0;
+    reduce(s, t);
+#else
+    float mean = reduce(s, t) / n;
+#endif
+    barrier();
+
+    float v2 = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        float d = act[src + c] - mean;
+        v2 += d * d;
+    }
+    float inv = inversesqrt(reduce(v2, t) / n + uintBitsToFloat(pc.eps));
+
+#if OUT_F16
+    uint dst = pc.outOff + r * pc.lda;
+#else
+    uint dst = pc.outOff + r * pc.dim;
+#endif
+    for (uint c = t; c < pc.dim; c += WG) {
+        float v = (act[src + c] - mean) * inv * wbuf[pc.wOff + c] + wbuf[pc.aux0 + c];
+#if OUT_F16
+        hact[dst + c] = float16_t(v);
+#else
+        act[dst + c] = v;
+#endif
+    }
+}

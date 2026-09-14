@@ -1,0 +1,35 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The feed forward's activation: h = silu(x), narrowed into the fp16 arena as
+// the second linear's A operand.
+//
+// This is dit_swiglu_f16.comp with one input instead of two -- the conformer's
+// feed forward is a plain widening linear, silu and narrowing linear, not a
+// gated one -- and without the headroom scale that file needs. It can be
+// without it: the DiT's SwiGLU multiplies two unbounded tensors and overflows
+// fp16 on a real prompt, while this narrows silu(x) itself, whose largest
+// value anywhere on the parakeet encoder's path is 1.2e3 against fp16's 65504
+// (SPEECH.md's fp16 survey).
+//
+//   pc.inOff  fp32 source, row stride pc.dim
+//   pc.outOff fp16 destination, row stride pc.lda (§2.3)
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = act[src + c];
+        hact[dst + c] = float16_t(v / (1.0 + exp(-v)));
+    }
+}

@@ -814,6 +814,84 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-14 (fourteenth) — stage S6: the parakeet encoder on Vulkan
+
+**Result: the 24 conformer layers run on the device in 13.8 ms for an 11 s
+clip, against 2.45 s on the CPU — 178x — and `go run ./cmd/asr -gpu
+testdata/jfk.wav` prints the same words, at the same frames, with the same
+durations.** 177 GFLOP at 12.9 TFLOP/s of useful work. The full write-up is
+[`research/s6-parakeet-encoder.md`](research/s6-parakeet-encoder.md);
+`SPEECH.md` is rewritten around what the measurement exposed, which is that
+**the encoder is no longer the problem**: the subsampling stack, still on the
+host, is 92 ms and the TDT decode loop is 205 ms of a 332 ms clip.
+
+**Built:**
+
+- **`parakeet/gpu.go` + `parakeet/gpugraph.go`** — a `GPUEncoder` on
+  `zimage/qwen`'s shape: four shared arenas, all 24 layers staged as 1.15 GB
+  of fp16 fragment tiles in one bank, a clip as 960 dispatches in four command
+  buffers. `Apply`, `ApplyMel` (front end's output in, so it is a drop-in for
+  `Encoder.Apply`), `Profile`, `RunTo`, `SetPlan`.
+- **Seven new shaders** (`shaders/parakeet_*`): the LayerNorm with a mean
+  *and* an affine (two builds, plus the no-mean control), silu, the
+  scalar-weighted residual, the channel-axis GLU, the depthwise convolution
+  with its folded BatchNorm and silu in one pass, the narrowing pass that adds
+  `bias_v`, and the relative-position shift (plus its centre-slice control).
+- **Three new builds of shaders that existed**: the fragment pack with
+  `bias_u` folded in, and the score kernel with `REL_BIAS` at both wave sizes.
+  `dit_pack_f16.comp`'s existing binary is byte-identical afterwards;
+  `dit_attention_wmma.comp`'s are identical modulo SSA ids, and
+  `zimage/dit` and `zimage/qwen` both still pass.
+- **Four wave32 GEMM rungs** (`dit_gemm_reg{32x32,32x64,16x64}_bt16_w32`,
+  `dit_gemm_reg32x64_hka4`). `dit_gemm.comp` already took `-DWAVE`, so these
+  are builds and not a kernel.
+- **`cmd/asr -gpu -profile`**, and `parakeet/gpu_test.go`: the layer-0 stage
+  walk, the 24-layer stack, the transcript, four negative controls and a
+  ladder that times the whole encoder once per rung at four clip lengths.
+
+**The four things worth remembering:**
+
+1. **A kernel's tail handling encoded an assumption about the size of a
+   score.** `dit_attention_wmma.comp` masks pad keys out of `P` but takes the
+   row max *before* that mask — safe for two models, because a real score is a
+   q·k product of RMS-normalised vectors and a pad key scores 0. parakeet's
+   position bias makes real scores tens of log2 units wide, so on every row
+   whose scores are all negative a key that does not exist set the scale and
+   `exp2(real - 0)` underflowed **fp16's smallest subnormal**, taking the
+   softmax denominator to zero. One `break` under `REL_BIAS`: 2.2e-2 → 2.2e-4.
+2. **Two alignments, not one.** The GEMM's M is padded to the plan's tile and
+   the attention geometry to the key block. One number for both padded a
+   138-frame clip to 256 rows and cost **1.28x** of the whole encoder.
+3. **wave32 wins on a whole model, not just on a kernel.** Every wave32 rung
+   beats its wave64 twin at every clip length from 138 to 1024 frames — 1.28x
+   at 138 on the identical tile — and the DiT's own winner is 1.83x off the
+   pace there. §6.2 and stage 3c each measured this on one kernel; this is 960
+   dispatches of it.
+4. **The transcript validates the port and cannot validate a kernel.** Two of
+   the four negative controls (no mean in the norms, padding left in the
+   depthwise window) move the encoder output by 3.9% and 33% and leave the
+   words alone. The per-stage bound had to change measure too: max-abs against
+   rms reads 2-3% on tensors that are correct under fp16, because the largest
+   element of these tensors is 30x their rms, so `deviation` grew an `ErrRMS`
+   and the GPU stages bound the rms of the difference (worst stage 9.5e-4,
+   encoder output 2.1e-3).
+
+**What is next, and the order is the profile's:**
+
+1. **S7 — the subsampling stack.** 92 ms on the host for 2.8 GFLOP, i.e. 30
+   GFLOP/s next to the 12.9 TFLOP/s the layers reach. Three kernels the ladder
+   lacks (stride-2 `conv2d` over a single-channel input, its depthwise form, a
+   pointwise 256→256) plus a `[T, 4096] x [4096, 1024]` linear that is already
+   a GEMM and is half the stack's arithmetic. Stage 8's implicit-GEMM conv is
+   stride 1 and channel-tiled; the same layout question has a different answer
+   at one input channel.
+2. **S8 — the projector, the joint and the TDT loop.** 205 ms, 62% of the
+   pipeline, and not an arithmetic problem: the joint's `[8198, 640]` head is
+   6.5 µs a step as a GEMV, so this is 46 host round trips to a model that
+   lives on the device.
+3. Together those are 297 ms of the 332, so the clip should land near 35 ms —
+   **310x real time**, against 33x now.
+
 ### Session 2026-09-14 (thirteenth) — stages S1-S5: parakeet transcribes on the CPU
 
 **Result: `go run ./cmd/asr testdata/jfk.wav` prints the right words.** 11 s of

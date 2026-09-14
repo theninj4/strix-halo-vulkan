@@ -53,6 +53,21 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define HEAD_DIM 128
 #endif
 #define HDT (HEAD_DIM / TILE)
+// A per-head bias vector added to every token before the scale, which is what
+// parakeet's Transformer-XL attention wants of q: it adds a learned bias_u to
+// the query before the content score (parakeet/encoder.go), and this pass is
+// already reading q element by element, so folding it in costs nothing and
+// saves a round trip of the tensor. The vector is [heads*headDim] fp32 in the
+// weight arena at pc.wOff, and BIAS=0 -- every existing build -- does not read
+// it.
+#ifndef BIAS
+#define BIAS 0
+#endif
+#if BIAS
+#define QBIAS(head, d) + wbuf[pc.wOff + (head) * HEAD_DIM + (d)]
+#else
+#define QBIAS(head, d)
+#endif
 #define WG 256
 
 layout(local_size_x = WG) in;
@@ -74,7 +89,8 @@ void main() {
         uint m = i / HEAD_DIM, d = i % HEAD_DIM;
         uint token = tok0 + m;
         rows[i] = (token < pc.tokens)
-            ? act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] * uintBitsToFloat(pc.scale)
+            ? (act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] QBIAS(head, d))
+                * uintBitsToFloat(pc.scale)
             : 0.0;
     }
     barrier();

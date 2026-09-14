@@ -125,8 +125,19 @@ func loadRef(t *testing.T, m *manifest, name string) ([]float32, tensorMeta) {
 type deviation struct {
 	MaxAbs float64
 	RMS    float64 // of the reference, for scale
+	ErrRMS float64 // of the difference, which is the measure fp16 needs
 	At     int
 }
+
+// Rel is the deviation as a fraction of the tensor's own scale, in the rms
+// sense: the measure to bound a *narrowed* path by.
+//
+// MaxAbs/RMS is the right measure for the CPU reference, where an error is a
+// bug in one element and the rest of the tensor is exact. It is the wrong one
+// for fp16 operands, where every element carries a relative error of its own
+// magnitude: the largest element of these tensors is 5-30x their rms, so its
+// rounding alone puts MaxAbs/RMS in the percent range with nothing wrong.
+func (d deviation) Rel() float64 { return d.ErrRMS / d.RMS }
 
 func compare(t *testing.T, got, want []float32) deviation {
 	t.Helper()
@@ -134,14 +145,16 @@ func compare(t *testing.T, got, want []float32) deviation {
 		t.Fatalf("length %d, reference has %d", len(got), len(want))
 	}
 	var d deviation
-	var sq float64
+	var sq, errSq float64
 	for i := range got {
 		diff := math.Abs(float64(got[i]) - float64(want[i]))
 		if diff > d.MaxAbs {
 			d.MaxAbs, d.At = diff, i
 		}
+		errSq += diff * diff
 		sq += float64(want[i]) * float64(want[i])
 	}
 	d.RMS = math.Sqrt(sq / float64(len(want)))
+	d.ErrRMS = math.Sqrt(errSq / float64(len(want)))
 	return d
 }

@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The convolution branch's middle: a depthwise convolution over time, the
+// folded BatchNorm, silu, and the narrowing into the fp16 arena as the second
+// pointwise convolution's A operand -- one pass over the tensor.
+//
+// This is the one operator in the encoder that is not a GEMM and not
+// elementwise. It is depthwise, so there is no reduction over channels at
+// all: channel c of frame i is a 9-tap dot product down the time axis of
+// channel c alone, which is 9 multiply-adds per element against the 1024 a
+// pointwise convolution does. What it costs is the access pattern -- nine
+// reads a row stride apart -- and what makes that affordable is that the row
+// stride is only 4 KB and a workgroup's 256 lanes walk a row contiguously, so
+// each of the nine taps is a fully covered read of the same 256 channels.
+//
+// The BatchNorm is already folded into a per-channel affine at load
+// (parakeet/load.go): at inference it is (x - mean)/sqrt(var + eps)*w + b,
+// which depends on nothing but the channel, so there is no batch statistic
+// here and no running mean to read.
+//
+//   pc.inOff  fp32 [tokens, dim], the GLU output, already zeroed past the clip
+//   pc.outOff fp16 destination, row stride pc.lda (§2.3)
+//   pc.wOff   the depthwise filters, [dim, span] fp32, one per channel
+//   pc.span   the kernel width (9), centred: pad = (span-1)/2
+//   pc.aux0   the folded BatchNorm scale, pc.aux1 its shift
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    int r = int(gl_WorkGroupID.x);
+    if (uint(r) >= pc.tokens) {
+        return;
+    }
+    int pad = int(pc.span - 1u) / 2;
+    uint dst = pc.outOff + uint(r) * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float sum = 0.0;
+        for (int k = 0; k < int(pc.span); k++) {
+            int s = r + k - pad;
+            if (s < 0 || s >= int(pc.tokens)) {
+                continue;
+            }
+            sum += wbuf[pc.wOff + c * pc.span + uint(k)] * act[pc.inOff + uint(s) * pc.dim + c];
+        }
+        float v = sum * wbuf[pc.aux0 + c] + wbuf[pc.aux1 + c];
+        hact[dst + c] = float16_t(v / (1.0 + exp(-v)));
+    }
+}

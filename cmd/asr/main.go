@@ -1,15 +1,20 @@
 // Command asr transcribes a WAV file with parakeet-tdt-0.6b-v3: audio in,
-// text out, on the CPU reference (SPEECH.md stages S3-S5).
+// text out, on the CPU reference (SPEECH.md stages S3-S5) or on Vulkan (S6).
 //
-// It is also the profile the Vulkan port is aimed at. The stage timings it
-// prints are the whole argument for what moves to the GPU first: the front
-// end is a few thousand 512-point FFTs and the decode loop is one 8198-wide
-// projection per emitted token, while the encoder is ~180 GFLOP for eleven
-// seconds of audio, all of it in shapes the engine's GEMM ladder already
-// covers.
+// The stage timings it prints are what decided the order of the port: the
+// front end is a few thousand 512-point FFTs and the decode loop is one
+// 8198-wide projection per emitted token, while the encoder is ~180 GFLOP for
+// eleven seconds of audio -- 91.5% of the CPU time -- all of it in shapes the
+// engine's GEMM ladder already covers.
+//
+// -gpu moves the 24 conformer layers onto the device and leaves the front
+// end, the subsampling stack, the projector and the TDT loop on the host, so
+// the "encoder" row it prints then covers the CPU subsampling *and* the GPU
+// layers, which is what a caller actually waits for.
 //
 //	go run ./cmd/asr testdata/jfk.wav
-//	go run ./cmd/asr -v -reps 3 testdata/jfk.wav
+//	go run ./cmd/asr -gpu -reps 3 testdata/jfk.wav
+//	go run ./cmd/asr -gpu -profile testdata/jfk.wav
 package main
 
 import (
@@ -21,6 +26,7 @@ import (
 
 	"strix-halo-vulkan/audio"
 	"strix-halo-vulkan/parakeet"
+	"strix-halo-vulkan/vk"
 )
 
 func main() {
@@ -28,6 +34,8 @@ func main() {
 	model := flag.String("model", "models/parakeet-tdt-0.6b-v3", "checkpoint directory")
 	reps := flag.Int("reps", 1, "timed repetitions; the best of each stage is reported")
 	verbose := flag.Bool("v", false, "print the decode trace, one line per emission")
+	gpu := flag.Bool("gpu", false, "run the conformer layers on Vulkan")
+	profile := flag.Bool("profile", false, "with -gpu, time every dispatch on the device and print the total per kind")
 	flag.Parse()
 	if flag.NArg() != 1 {
 		fmt.Fprintf(os.Stderr, "usage: %s [-model dir] [-v] <file.wav>\n", os.Args[0])
@@ -43,6 +51,28 @@ func main() {
 	must(err)
 	fmt.Printf("loaded %s in %v\n\n", *model, time.Since(start).Round(time.Millisecond))
 
+	// The encoder the run uses: the CPU reference, or the Vulkan one with the
+	// same signature (parakeet.GPUEncoder.ApplyMel).
+	encode := m.Encoder.Apply
+	if *gpu {
+		dev, release := openDevice()
+		defer release()
+		// Sized for this clip: one front-end pass up front says how many
+		// encoder frames it becomes. The arenas are a few MB either way; what
+		// the length decides is the GEMM tile, and PlanFor picks that per run.
+		feats, err := m.FrontEnd.Features(clip)
+		must(err)
+		g, err := parakeet.NewGPUEncoder(dev, m.Encoder, m.Encoder.Subsampling.ValidLength(feats.Frames), nil)
+		must(err)
+		defer g.Destroy()
+		fmt.Printf("gpu: %d layers, %d MB of weights, %d MB of arenas, plan %s\n\n",
+			g.Layers(), g.WeightBytes()>>20, g.ActivationBytes()>>20, g.Plan()[parakeet.ProjQ])
+		encode = g.ApplyMel
+		if *profile {
+			defer func() { printProfile(g) }()
+		}
+	}
+
 	var best struct{ front, encode, project, decode time.Duration }
 	var out *parakeet.Transcript
 	for i := 0; i < *reps; i++ {
@@ -52,7 +82,7 @@ func main() {
 		t1 := time.Now()
 
 		mel := &parakeet.Mat{Rows: feats.Frames, Cols: feats.Mels, Data: feats.Data}
-		hidden, valid, err := m.Encoder.Apply(mel, feats.Valid)
+		hidden, valid, err := encode(mel, feats.Valid)
 		must(err)
 		t2 := time.Now()
 
@@ -107,6 +137,66 @@ func main() {
 		}
 	}
 	fmt.Printf("\n%s\n", out.Text)
+}
+
+// openDevice picks the compute device the rest of this repository picks: the
+// integrated Strix Halo part when it is there, the first one otherwise.
+func openDevice() (*vk.Device, func()) {
+	inst, err := vk.NewInstance("asr")
+	must(err)
+	devices, err := inst.PhysicalDevices()
+	must(err)
+	if len(devices) == 0 {
+		log.Fatal("no Vulkan devices")
+	}
+	phys := &devices[0]
+	for i := range devices {
+		if devices[i].DeviceID == 0x1586 {
+			phys = &devices[i]
+			break
+		}
+	}
+	qf, err := phys.ComputeQueueFamily()
+	must(err)
+	sgs, err := phys.SubgroupSizeControl()
+	must(err)
+	dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{
+		Float16: true, CoopMatrix: true, SubgroupSizeControl: sgs.Supported,
+	})
+	must(err)
+	fmt.Printf("device: %s\n", phys.Name)
+	return dev, func() { dev.Destroy(); inst.Destroy() }
+}
+
+// printProfile times the graph one dispatch at a time and totals it by kind.
+// Wall clock around the encoder is not a measurement of it: that also carries
+// the host's subsampling, the upload and the read-back.
+func printProfile(g *parakeet.GPUEncoder) {
+	stages, _, err := g.Profile(g.Read(g.TensorX(), g.Dim()), g.Valid())
+	must(err)
+	type total struct {
+		n int
+		d time.Duration
+	}
+	byKind := map[string]total{}
+	var sum time.Duration
+	for _, s := range stages {
+		e := byKind[s.Kind]
+		e.n, e.d = e.n+1, e.d+s.GPU
+		byKind[s.Kind] = e
+		sum += s.GPU
+	}
+	fmt.Printf("\n%d dispatches, %v on the device, %.0f GFLOP, %.1f TFLOP/s\n",
+		len(stages), sum.Round(time.Microsecond), g.FLOPs(g.Rows())/1e9,
+		g.FLOPs(g.Rows())/sum.Seconds()/1e12)
+	for _, k := range g.Labels() {
+		e, ok := byKind[k]
+		if !ok {
+			continue
+		}
+		delete(byKind, k)
+		fmt.Printf("  %-18s %3d  %8v  %4.1f%%\n", k, e.n, e.d.Round(time.Microsecond), 100*float64(e.d)/float64(sum))
+	}
 }
 
 func must(err error) {

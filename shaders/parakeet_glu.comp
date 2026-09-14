@@ -1,0 +1,43 @@
+#version 450
+// The convolution branch's gate: the first pointwise convolution's [T, 2C]
+// output halved into [T, C] by a GLU, and the padding frames zeroed.
+//
+// The gating axis is the *channel* axis. In PyTorch this is `glu(dim=1)` on a
+// [B, 2C, T] tensor, which is the same axis this row-major [T, 2C] layout
+// calls the column -- so the first C columns are gated by a sigmoid of the
+// last C, and getting that backwards produces a plausible tensor rather than
+// an error.
+//
+// The zeroing is not tidiness. Frames past the clip's valid length are zeroed
+// *before* the depthwise convolution so that padding cannot walk backwards
+// into real frames through the 9-wide kernel; without it the last four valid
+// frames of a padded clip see whatever the pad rows hold. It lives here rather
+// than in the convolution because this is the pass that already writes every
+// element of the tensor.
+//
+//   pc.inOff  fp32 [tokens, 2*dim], row stride 2*pc.dim
+//   pc.outOff fp32 [tokens, dim]
+//   pc.aux1   the valid frame count; rows at or past it are written as zero
+//   pc.aux2   the negative control: 1 skips the zeroing
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * 2u * pc.dim;
+    uint dst = pc.outOff + r * pc.dim;
+    bool pad = r >= pc.aux1 && pc.aux2 == 0u;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = 0.0;
+        if (!pad) {
+            float g = act[src + pc.dim + c];
+            v = act[src + c] / (1.0 + exp(-g));
+        }
+        act[dst + c] = v;
+    }
+}
