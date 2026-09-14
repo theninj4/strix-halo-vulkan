@@ -11,6 +11,14 @@
 //
 // silu is x * sigmoid(x), computed in fp32 before the narrowing: the gate is
 // unbounded, and the product is what has to survive fp16, not the sigmoid.
+//
+// And it does not, unscaled. On a real prompt the two halves peak around 276
+// and 256, whose product is 7.1e4 against fp16's 65504, so a handful of
+// elements in a few million overflow to infinity -- and one infinity in a row
+// of the A operand makes that whole row of w2's output a NaN. pc.scale is the
+// headroom: the only consumer of this tensor is w2, whose output is consumed
+// by an RMS norm, and an RMS norm is invariant to a positive scale on its
+// input. So this is scaled down here and nothing downstream is told.
 
 #include "dit_common.glsl"
 
@@ -41,8 +49,9 @@ void main() {
     uint gate = pc.inOff + r * pc.dim;
     uint up = pc.kOff + r * pc.dim;
     uint dst = pc.outOff + r * pc.lda;
+    float s = uintBitsToFloat(pc.scale);
     for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
         float g = GATE(c);
-        hact[dst + c] = float16_t(g / (1.0 + exp(-g)) * UP(c));
+        hact[dst + c] = float16_t(g / (1.0 + exp(-g)) * UP(c) * s);
     }
 }

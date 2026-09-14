@@ -362,6 +362,247 @@ image is the **VAE's 5.6 s**, 30% of the total, with no optimisation pass at
 all. Inside the DiT what is left is ~1.0 s of pure layout (`pack v`, `narrow
 ctx`) and attention's 38 TFLOP/s, now behind the GEMMs.
 
+### Session 2026-09-14 (fifth) — stage 5a/5b: the tokenizer and the text encoder on the CPU
+
+**Result: a prompt now becomes the tensor the DiT's `cap_embedder` consumes.**
+The tokenizer reproduces HF's fast Qwen2 tokenizer **id for id on all 20
+corpus cases**, raw and through the chat template; the encoder matches
+transformers to **8e-6** over the 35 layers Z-Image actually runs. `go run
+./cmd/textenc` is the slice end to end: **2.08 s** for a 24-token prompt,
+9.17 s for a 105-token one, against a **30 ms** GPU floor. Written up in
+[`research/stage-5-text-encoder.md`](research/stage-5-text-encoder.md).
+
+**Built:**
+
+- `zimage/tokenizer` (`tokenizer.go`, `split.go`) — byte-level BPE read out
+  of `tokenizer.json` (vocab, merges, added tokens), the pre-tokenizer
+  hand-rolled because Go's RE2 has no lookahead, and the chat template as the
+  one hand-transcribed thing in the package.
+- `zimage/qwen` (`model.go`, `load.go`) — Qwen3-4B as an encoder: NeoX RoPE,
+  per-head q/k norms, causal GQA (32q/8kv), SwiGLU, and a `Trace` that names
+  every intermediate so a test can walk the graph.
+- `reference/dump_tokenizer.py`, `reference/dump_qwen.py` — the two oracles.
+  The qwen dump also *settles* two assumptions rather than asserting them
+  (below). This is the first stage whose reference is `transformers` rather
+  than `diffusers`; it was installed into `.venv` this session.
+- `cmd/textenc` — prompt in, hidden state and the regime arithmetic out.
+
+**Four things worth carrying forward:**
+
+1. **The pipeline runs 35 of the 36 layers, and the output is un-normalised.**
+   `hidden_states[-2]` is layer 34's output: no last layer, no final norm, no
+   lm_head. transformers v5 collects hidden states with a hook on the decoder
+   layer rather than v4's list, so the index could have shifted — the dump
+   runs 35 layers by hand and measures the difference at **exactly 0**.
+2. **The pipeline's padding to 512 is a measured no-op.** Right padding under
+   causal attention cannot reach a real token; the dump compares the padded
+   run masked back down against an unpadded one and gets **exactly 0**, so
+   `Forward` runs at the prompt's own length — 21x less work at 24 tokens.
+3. **Qwen3's massive activations break an RMS-normalised error bound.** The
+   absmax is **109-238x** the RMS on these hidden states, so an fp32
+   summation-order difference on one outlier reads as 7.5e-4 of the tensor
+   and 9.4e-6 of the element it sits on. `hidden_2` failed the 2e-4 bound
+   every other stage passed. The denominator needs a per-element floor,
+   `max(|want|, rms)`; with it every stage lands at 2e-6 to 2e-5 and the four
+   negative controls still fail by 6500x-160000x. Third pipeline stage, third
+   answer to "normalise by what" — it is a property of the model.
+4. **A negative control is only as good as the corpus.** Breaking the merge
+   table is caught by 19 of the tokenizer's 20 cases and breaking the byte
+   alphabet by 19; breaking special-token handling is caught by **one** — the
+   single case with `<|im_end|>` written out in it, and the chat template
+   rides entirely on that mechanism.
+
+**How it was measured:** `go run ./cmd/textenc -reps 2` at two prompt lengths;
+the forward pass is pure CPU fp32 over 32 cores and the two lengths agree on
+the rate to 1%. Correctness is `go test ./zimage/tokenizer ./zimage/qwen`:
+20 cases x 2 (raw and templated), a round trip, the NFC gap pinned as a gap,
+14 stages of layer 0, four hidden states of the full stack, and two prompts
+end to end.
+
+**Next — stage 5c, and it is not stage 4 again.** The DiT is compute-bound at
+16384 flop/byte; this model runs the same kind of layer at `T` flop/byte,
+which for a prompt is 8-512 against the same 235 crossover. At T=24 the DiT's
+winning `wg128x256` tile would fill 24 of its 128 rows. The kernel question is
+§1.7/§1.9's (GEMV, and where an M block turns over between M=1 and M=256), the
+weights are 7.06 GB of fp16 — two banks at this device's 4.29 GB limit, stage
+4c's machinery unchanged — and unlike the DiT this model *is* worth
+quantizing, because here 4-bit weights buy time as well as footprint.
+
+### Session 2026-09-14 (sixth) — stage 5c: the text encoder on the GPU
+
+**Result: 2.08 s to 57 ms, 36x**, which takes the text encoder from 11% of
+the image to **0.3%** and the whole pipeline to **18.5 s**. 35 layers,
+7.07 GB of fp16 weights in two storage buffers, 21 dispatches per layer,
+matching transformers to **7.9e-4**. Correct on its first run against the
+reference dump, stage by stage. Written up in
+[`research/stage-5-text-encoder.md`](research/stage-5-text-encoder.md).
+
+**Built:**
+
+- `zimage/qwen/gpu.go` — `GPUEncoder` over the DiT's four-arena binding
+  layout and push-constant block, with stage 4c's bank machinery unchanged.
+  `SetPlan`/`PlanFor`/`AutoPlan` re-plan per run.
+- `shaders/qwen_rope.comp` — NeoX rotary, its own file rather than a flag on
+  `dit_rope.comp`: which convention a model wants is a property of the
+  checkpoint, and a build flag would let a graph pick the wrong one silently.
+- `CAUSAL` and `GQA` on `dit_attention_wmma.comp`, plus five narrow-M rungs
+  of `dit_gemm.comp`. The DiT's own builds come out instruction for
+  instruction identical (checked with `spirv-dis`, ids normalised).
+- `zimage/qwen/load.go` gains `LoadLayer`/`LoadEmbedding`, so the GPU path
+  stages one layer at a time — 404 MB of host memory, not 14.1 GB.
+- `cmd/textenc -gpu [-ladder] [-tokens ...] [-v]`.
+
+**Four things worth carrying forward:**
+
+1. **The winning kernel moves with the prompt length, and that is new.** In
+   the DiT, once the weight was fragment-tiled and the grid swizzled, one
+   kernel won all three shapes. Here seven rungs over the *same* weights
+   cannot agree, because T is not a shape the kernel sees — it is the
+   arithmetic intensity itself. 16-row and 32-row tiles win at 16-64 tokens,
+   a 64-row tile at 128, and the DiT's own 128x256 at 256+. Taking the DiT's
+   default at a 24-token prompt costs **1.24x**; taking the narrowest at 512
+   costs **1.92x**. Re-planning is free — every rung reads the same staged
+   weight — so `AutoPlan` applies the measured table per run and `SetPlan`
+   makes the ladder one 7 GB load instead of seven.
+2. **The run walks the roofline in one sweep.** 24 to 512 tokens: 2979 to
+   21227 GFLOP/s while the weight bandwidth falls 124 to 42 GB/s. Same
+   weights, read once, under 21x the work. It is the clearest measurement of
+   §3.4's crossover the project has: below it the GB/s column is what moves,
+   above it the GFLOP/s column.
+3. **Two bandwidth hypotheses falsified, cheaply.** At 24 tokens the best
+   rung streams a never-reused weight at 124 GB/s of a 236 GB/s bus. Wider
+   in N (eight B fragments per K step) and deeper in K (an eight-tile slab)
+   both came out **slower**, 1.08x and 1.10x, so it is not per-wave request
+   count. What the profile does show is a *size* effect: 49.8 MB dispatches
+   reach 157 GB/s and 5.2 MB ones reach 64. The lever that follows is
+   concatenating q/k/v into one [6144, 2560] weight — one dispatch instead of
+   three, priced at 5.6% of the run.
+4. **A causal mask has to be applied twice.** Once when the row max is taken
+   and once on P. Masking only P leaves `exp2(real - future_max)`
+   underflowing to zero in fp16 whenever a masked score beats every real one
+   by more than ~24 in log2 units, and the kernel then divides by a row sum
+   of zero. This is why the row-max scan breaks at the diagonal.
+
+**How it was measured:** `go run ./cmd/textenc -gpu`, best of three, twice —
+the two runs agree to 1.004 at 24 tokens and 1.000 at 128. GPU timestamps per
+dispatch for the breakdown; wall clock also carries the host gather and the
+read-back, which at 128 tokens is 6.5 ms of 71.
+
+**Correctness:** five tests — one layer walked stage by stage against the
+reference dump (14 stages, worst 4.1e-3), all 35 layers end to end for two
+prompts (7.9e-4), every ladder rung agreeing to the last bit, four banks
+bit-identical to one, and five negative controls at **430x to 135000x** the
+bound.
+
+**Next — stage 6, the scheduler and the driver.** The three pieces all run;
+what does not exist is the thing that runs them in order: FlowMatchEuler over
+8 steps, the transformer's three phases, `cap_embedder` fed from the encoder's
+output *on the device* rather than through a read-back, and a PNG at the end.
+The optimisation backlog is in the research note and none of it is on the
+critical path — the VAE's 5.6 s is 30% of the image and has had no pass at
+all, and it is the only large item left.
+
+### Session 2026-09-14 (seventh) — stage 6: the pipeline
+
+**Result: `prompt → PNG`.** `go run ./cmd/zimage -prompt "a red fox sitting in
+fresh snow, photograph"` writes a 1024x1024 image in **19.8 s** and reproduces
+diffusers' fp32 CPU pipeline to **2.5e-2** of the decoded image. Two runs agree
+to 19.79 s and 19.79 s. Written up in
+[`research/stage-6-pipeline.md`](research/stage-6-pipeline.md).
+
+| stage | wall | share |
+|---|---|---|
+| text encoder (17 tokens, tokenizer included) | 62 ms | 0.3% |
+| caption refiners, **once per image** | 6 ms | 0.03% |
+| denoising, 8 x 1.76 s over 4128 tokens | 14.05 s | 71.0% |
+| VAE decode | 5.65 s | 28.6% |
+| **total** | **19.79 s** | |
+
+**Built:**
+
+- `zimage/dit/head.go` — everything the transformer does around its blocks:
+  `t_embedder`, `x_embedder`, `cap_embedder`, the two learned pad tokens, the
+  final layer, patchify/unpatchify and the 3-D position ids. 130 MB of small
+  linear layers and almost entirely convention.
+- `zimage/pipeline` — `FlowMatchEuler` (the schedule, the conditioning value
+  and the Euler step) and `Pipeline`, which holds every stage resident and
+  runs them in order. `Generate`/`GenerateFrom`, a `Step` progress callback
+  carrying the latents, and `Timings`.
+- `cmd/zimage` — prompt in, PNG out, with the per-stage wall clock.
+- `GPUStack.Upload(x, at, rows)` / `SetAdaLN` / `Rows` — what the three phases
+  need and `Apply` could not express: write a tensor at a row offset and state
+  the run's length, so the caption's 32 rows sit behind the image's 4096 in one
+  arena with no copy.
+- `GPUStack.FFScale` and a scale on `shaders/dit_swiglu_f16.comp`.
+- `reference/dump_zimage.py` (the head, with the transformer built at
+  `n_layers=0`), `reference/dump_zimage_run.py` (the whole pipeline in fp32 on
+  the CPU at 256x256) and `reference/dump_zimage_step.py` (one forward pass
+  with hooks on each phase boundary).
+
+**Four things worth carrying forward:**
+
+1. **SwiGLU overflows fp16 on a real prompt and never on a random one.** The
+   gate and up projections peak at 276 and 256, their product is 7.1e4 against
+   65504, and **one infinity in a row of an A operand makes that whole row of
+   the GEMM's output a NaN** — so the latent was entirely NaN by step 2 and the
+   image was black. On stage 4b's *random* fixture the unscaled peak is already
+   5.12e4, 78% of the range: the margin was 28% and a real prompt spends it.
+   The fix is free because it never has to be undone — w2's output is read by
+   an RMS norm and by nothing else, and an RMS norm is invariant to a positive
+   scale on its input, so `FFScale` = 1/16 lives in one shader and no consumer
+   is told. `TestGPUBlockFFScale` holds that invariance to 8e-7.
+2. **A new push constant on a shared shader is a landmine, because there is no
+   default that means "not set".** Adding the scale zeroed `zimage/qwen`'s
+   feed-forward, which builds the same shader and left `pc.scale` at 0. The
+   encoder did not produce zeros: it produced a tensor with a plausible RMS
+   and shape, missing only its massive activations — absmax **56.8 where the
+   reference has 13753** — and the image was colourful noise. Qwen's scale has
+   to be 1, because its SwiGLU output feeds a GEMM whose output feeds a
+   *residual add* rather than a norm.
+3. **Validate the composition, at a small size.** Every component's oracle
+   passed while the pipeline made a black image. The whole diffusers pipeline
+   in fp32 on the CPU at 256x256 is 3.2 s a step — eight steps and the VAE in
+   half a minute — because the composition does not know how big the image is.
+   It found all three of this stage's bugs in one sitting. The bound it uses is
+   **relative L2**, not max-over-RMS: a denoising trajectory is chaotic, so one
+   element of the last latent can be far out while the image is the same image.
+   The measured per-step sequence is 1.4e-4 rising to 2.1e-2, i.e. the fp16
+   chain entering at 1.4e-4 and the feedback multiplying it by ~1.6 a step.
+4. **A dispatches-per-submit cap is a proxy for a time cap, and stops being a
+   good one when the dispatches differ 100x.** The VAE's 8 was fine at every
+   size stage 2 measured and returns `VK_ERROR_DEVICE_LOST` at 1024x1024,
+   because one dispatch — the mid-block attention over 16384 rows — is **1.51 s
+   on its own, 27% of the decode**. It is now 4, which is the same wall clock
+   as 2 to within 1%.
+
+**How it was measured:** `go run ./cmd/zimage -width 1024 -reps 2`, wall clock,
+two process runs. `go run ./cmd/vaeprof -size 128` for the decode's profile.
+
+**Correctness:** `go test ./zimage/pipeline` is the stage's own — eight steps
+beside diffusers' from the same initial latent (per-step relative L2 1.4e-4 to
+2.1e-2, image 2.5e-2) and three negative controls at 27x-56x the bound. Note
+the third, **caption positions from 0 instead of 1, lands at only 2-3x**: the
+off-by-one the checkpoint invites is the one the tests barely catch, which is
+the argument for keeping the end-to-end bound as tight as the measurement
+allows. `go test ./zimage/dit` gains the head's seven tests (four controls at
+219x-48474x) and `TestGPUBlockFFScale`.
+
+**Next — optimisation, with the profiler in front of it.** Two items:
+
+- **The VAE is 28.6% of the image and has had no pass at all.** fp32
+  throughout, conv3x3 at 3.0-3.2 TFLOP/s against a 55.5 ceiling, one attention
+  dispatch at 27% of the decode. This is the whole of the remaining headroom
+  worth the name.
+- **The head and tail onto the device, 1.3 s, 6.4%.** One item, not two: the
+  CPU head and tail cost 0.47 s, and *because* they are on the CPU the
+  [4128, 3840] residual stream crosses the bus twice a step (~0.8 s) where the
+  [4096, 64] latent is 1 MB. Two GEMMs at shapes the kernel already covers
+  (K=64, N=64) plus a LayerNorm.
+
+The DiT's own levers are spent (72% GEMM at 73-76% of the WMMA ceiling) and the
+text encoder is 0.3% of an image. `GOALS.md`'s other four models have not been
+started, and the HTTP API has not either.
+
 ### Phase 1's last session: IDEAS §1.12 — the M block read off the routing histogram, and an expert belongs to one dispatch
 
 The handoff's item 1 was "`down` at 256 sequences is the last cell of the
@@ -2064,7 +2305,13 @@ footprint (M=32768, N=4096), which is the regime real decode runs in:
    (required since the instance targets Vulkan 1.2, where it is not yet
    core). Fixed.
 
-## Next steps (pick up here)
+## Phase 1's backlog, still open
+
+> This is the microbenchmark phase's list, left as it stood when phase 2
+> began. **It is not what to pick up next** — the newest session entry above
+> carries that, and `PIPELINE.md` carries the plan. Nothing here is on the
+> pipeline's critical path; it is where to look when a profile points at one
+> of these kernels.
 
 `IDEAS.md` has the full backlog with its "Suggested order of attack"
 updated for what §0, §1.1, §2.1, §2.2, §2.3, §5.1b, §5.1b's traversal

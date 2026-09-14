@@ -1199,3 +1199,91 @@ var DiTGEMMWG128x256 []byte
 
 //go:embed dit_gemm_wg128x256_bt16.spv
 var DiTGEMMWG128x256Tiled []byte
+
+// PIPELINE.md stage 5c, the text encoder. Three things it needs and the DiT
+// did not, all of them builds of shaders the DiT already has:
+//
+//   - **Narrow-M rungs of the projection GEMM.** The DiT runs at M=4096 and
+//     its winning tile is 128 rows deep; a prompt is 8-512 tokens, so that
+//     tile would fill 24 of its 128 rows at a short prompt *and* leave the
+//     whole q projection to 16 workgroups, on a part with 40 CUs. These are
+//     the same kernel at 16 and 32 rows, where the grid is deep enough to
+//     fill the machine. All are against the fragment-tiled weight (§2.8),
+//     which is free on a weight and is what makes a fragment load covered.
+//   - **A causal, grouped-query build of the attention kernel.** Two
+//     compile-time flags on dit_attention_wmma.comp, so the DiT's own builds
+//     take neither: their SPIR-V comes out instruction for instruction the
+//     same afterwards, with only the SSA ids shifted by the two dead
+//     assignments in the `#else` arms (checked with `spirv-dis` and the ids
+//     normalised).
+//   - **NeoX rotary**, which is its own file (qwen_rope.comp) because the
+//     convention is a property of the checkpoint and not a knob.
+//
+// The GEMM keeps its `dit_` prefix because it is the DiT's kernel; what the
+// encoder adds is geometry, not a shader.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg16x64_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=16 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg16x256_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg32x64_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=8 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg32x128_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=8 -DWAVES_N=2 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_wg16x256_bt16.spv dit_gemm.comp
+
+//go:embed dit_gemm_reg16x64_bt16.spv
+var DiTGEMMReg16x64Tiled []byte
+
+//go:embed dit_gemm_reg16x256_bt16.spv
+var DiTGEMMReg16x256Tiled []byte
+
+//go:embed dit_gemm_reg32x64_bt16.spv
+var DiTGEMMReg32x64Tiled []byte
+
+//go:embed dit_gemm_reg32x128_bt16.spv
+var DiTGEMMReg32x128Tiled []byte
+
+//go:embed dit_gemm_wg16x256_bt16.spv
+var DiTGEMMWG16x256Tiled []byte
+
+// Two more rungs, aimed at the one thing the first sweep left unexplained:
+// at 24 tokens the best rung reaches 124 GB/s of a 236 GB/s bus while doing
+// nothing but streaming a weight it never reuses, which is the signature of
+// too few loads in flight rather than of a tile being the wrong shape. Both
+// of these buy outstanding requests per wave without changing the tile's
+// memory traffic -- wider in N (eight B fragments per K step instead of
+// four) and deeper in K (an eight-tile slab instead of four).
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=8 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg16x128_bt16.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=4 -DBK_TILES=8 -DHOIST_A=1 -DB_LAYOUT=2 -o dit_gemm_reg16x64_bt16_k8.spv dit_gemm.comp
+
+//go:embed dit_gemm_reg16x128_bt16.spv
+var DiTGEMMReg16x128Tiled []byte
+
+//go:embed dit_gemm_reg16x64_bt16_k8.spv
+var DiTGEMMReg16x64TiledK8 []byte
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DCAUSAL=1 -DGQA=1 -o qwen_attn_wmma_qt1_kt4.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DCAUSAL=1 -DGQA=1 -o qwen_attn_wmma_qt2_kt4.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DCAUSAL=1 -DGQA=1 -o qwen_attn_wmma_qt1_kt4_w32.spv dit_attention_wmma.comp
+
+//go:embed qwen_attn_wmma_qt1_kt4.spv
+var QwenAttentionQT1KT4 []byte
+
+//go:embed qwen_attn_wmma_qt2_kt4.spv
+var QwenAttentionQT2KT4 []byte
+
+//go:embed qwen_attn_wmma_qt1_kt4_w32.spv
+var QwenAttentionQT1KT4W32 []byte
+
+// The same kernel with the causal mask compiled out, i.e. every token seeing
+// the whole prompt. Built and dispatchable but deliberately left out of the
+// ladder: its only caller is the negative control in zimage/qwen/gpu_test.go,
+// which is the counterpart of dit_attn_wmma_qt2_kt4_nomask.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DGQA=1 -o qwen_attn_wmma_qt1_kt4_nocausal.spv dit_attention_wmma.comp
+
+//go:embed qwen_attn_wmma_qt1_kt4_nocausal.spv
+var QwenAttentionQT1KT4NoCausal []byte
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qwen_rope.spv qwen_rope.comp
+
+//go:embed qwen_rope.spv
+var QwenRoPE []byte

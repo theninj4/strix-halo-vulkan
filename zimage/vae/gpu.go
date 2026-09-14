@@ -27,8 +27,8 @@ type pushConstants struct {
 const noBias = 0xffffffff
 
 // dispatchesPerSubmit caps how much work goes into one command buffer. See
-// Apply for why it is not simply "all of it".
-const dispatchesPerSubmit = 8
+// Apply for why it is not simply "all of it", and why 8 is not safe either.
+const dispatchesPerSubmit = 4
 
 func (p pushConstants) bytes() []byte {
 	out := make([]byte, unsafe.Sizeof(p))
@@ -611,6 +611,14 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 	// -- the same 119 dispatches submitted separately all complete. Batching
 	// keeps each submit short while still amortising the per-submit fence
 	// wait over a useful number of dispatches.
+	//
+	// The batch is 4 and not 8 because the graph is not flat: at a 1024x1024
+	// image the mid-block attention is **1.5 s in one dispatch** (16384 rows
+	// of 512, 27% of the decode), so a batch of eight around it is over the
+	// watchdog on its own. That size only shows up at the full image -- 8 is
+	// fine at 512x512, which is the largest thing stage 2 measured -- so this
+	// is a limit the pipeline found rather than the decoder. 4 and 2 are the
+	// same wall clock to within 1%, so the halving costs nothing.
 	//
 	// Ordering and correctness are unaffected: DispatchMultiTimed blocks
 	// until its batch completes, so a batch boundary is a stronger barrier

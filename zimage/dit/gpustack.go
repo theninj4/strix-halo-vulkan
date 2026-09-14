@@ -86,6 +86,27 @@ type GPUStack struct {
 	// 65504, while w2's output reaches 6e5 and stays fp32.
 	FP16FFN bool
 
+	// FFScale is the constant the SwiGLU output is multiplied by before it is
+	// stored as w2's fp16 A operand, and it is a range fix rather than a
+	// precision one.
+	//
+	// The gate and up projections peak around 276 and 256 on a real prompt,
+	// so their product reaches 7.1e4 against fp16's 65504 and a few elements
+	// in a few million overflow to infinity. One infinity anywhere in a row
+	// of an A operand makes that whole row of the GEMM's output a NaN, and
+	// the NaN is then in the residual stream, so a denoising loop turns the
+	// image black two steps later. Random inputs never reach it -- stage 4b
+	// measured the two halves at 250 and 508 and did not multiply them -- and
+	// it is the first thing a real prompt does.
+	//
+	// It costs nothing to undo because it never has to be undone: w2's output
+	// is read by an RMS norm and by nothing else, and an RMS norm is invariant
+	// to a positive scale on its input. So the scale lives in one shader and
+	// no consumer knows about it. 1/16 is a power of two -- exact in the
+	// exponent, no mantissa lost -- and leaves 15x of headroom over the
+	// measured peak.
+	FFScale float64
+
 	attn    wmmaVariant
 	plan    GEMMPlan
 	kernels map[GEMMKernel]gemmVariant
@@ -290,6 +311,9 @@ func GEMMKernels() []GEMMKernel {
 // channel. 128 halves is 256 B, the value the ablation peaked at.
 const gemmPad = 128
 
+// defaultFFScale is GPUStack.FFScale's value; see the field.
+const defaultFFScale = 1.0 / 16
+
 // blockControls are the deliberate breakages the negative control switches
 // on. They live here rather than in the test because what they break is the
 // *graph* -- which modulation vector a dispatch is handed, whether a dispatch
@@ -409,6 +433,7 @@ func newStack(dev *vk.Device, set *safetensors.Set, cfg *Config, specs []blockSp
 		rows:    tokens,
 		Fused:   true,
 		FP16FFN: true,
+		FFScale: defaultFFScale,
 	}
 	// The shapes come from the first block, which is also what proves the
 	// checkpoint is the model the config describes.
@@ -1184,6 +1209,13 @@ func (g *GPUStack) TensorGate() uint32  { return g.aGate }
 func (g *GPUStack) TensorA() uint32 { return g.hA }
 func (g *GPUStack) LDA() int        { return g.ldaDim }
 
+// TensorHFFN is w2's fp16 A operand -- the SwiGLU output -- and LDAFFN its row
+// stride. It is the one intermediate whose *range* has to be watched rather
+// than its precision, which is what FFScale is for and what
+// TestGPUBlockFFScale reads it to measure.
+func (g *GPUStack) TensorHFFN() uint32 { return g.hFFN }
+func (g *GPUStack) LDAFFN() int        { return g.ldaFFN }
+
 // Mod reads the four modulation vectors back, already transformed: scale_msa,
 // gate_msa, scale_mlp, gate_mlp, concatenated.
 func (g *GPUStack) Mod() []float32 { return g.abuf.ReadFloat32At(int(g.aMod), 4*g.dim) }
@@ -1237,6 +1269,44 @@ func (g *GPUStack) upload(x *Mat, adaln []float32) error {
 	}
 	return nil
 }
+
+// Upload writes x into the residual stream starting at row `at`, and makes the
+// run `rows` long.
+//
+// It is what the pipeline's three phases need and Apply cannot express: the
+// caption stream is refined once per image at the front of the arena, and
+// then written back *behind* the image stream every step, because the layers
+// run over the two concatenated. Nothing copies -- the concatenation is the
+// arena's own layout -- and the rows past `at+x.Rows` keep whatever they held,
+// which is why `rows` is stated rather than inferred.
+func (g *GPUStack) Upload(x *Mat, at, rows int) error {
+	if x.Cols != g.dim {
+		return fmt.Errorf("dit: x is %s, want [rows %d]", x, g.dim)
+	}
+	if at < 0 || x.Rows <= 0 || at+x.Rows > rows {
+		return fmt.Errorf("dit: %s written at row %d does not fit in a %d-row run", x, at, rows)
+	}
+	if rows > g.tokens {
+		return fmt.Errorf("dit: a %d-row run; the stack was built for at most %d", rows, g.tokens)
+	}
+	g.rows = rows
+	g.abuf.WriteFloat32At(int(g.aX)+at*g.dim, x.Data)
+	return nil
+}
+
+// SetAdaLN writes the timestep embedding every modulated block projects its
+// own modulation from. It changes once per denoising step and nothing else in
+// the arena does, which is why it is separate from the stream.
+func (g *GPUStack) SetAdaLN(v []float32) error {
+	if len(v) != g.adaIn {
+		return fmt.Errorf("dit: adaln is %d wide, want %d", len(v), g.adaIn)
+	}
+	g.abuf.WriteFloat32At(int(g.aAdaIn), v)
+	return nil
+}
+
+// Rows is the length of the run the arena currently holds.
+func (g *GPUStack) Rows() int { return g.rows }
 
 // blockGraph builds one block's dispatch sequence, with a label per dispatch.
 // Apply, Profile and RunTo share it so that what the profiler times is what
@@ -1490,6 +1560,7 @@ func (g *GPUStack) blockGraph(i int) ([]vk.MultiDispatch, []string, error) {
 	pcGLU.InOff, pcGLU.KOff, pcGLU.OutOff = gateOut, upOut, g.hFFN
 	pcGLU.Dim = uint32(g.ffn)
 	pcGLU.LDA = uint32(g.ldaFFN)
+	pcGLU.Scale = math.Float32bits(float32(g.FFScale))
 	add(gluPipe, "swiglu", uint32(g.rows), 1, pcGLU)
 	if err := gemm(ProjW2, "", g.hFFN, g.aFF, g.dim, g.ffn, g.ldaFFN); err != nil {
 		return nil, nil, err

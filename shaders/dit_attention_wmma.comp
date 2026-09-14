@@ -108,6 +108,28 @@ layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
 #ifndef HEAD_DIM
 #define HEAD_DIM 128
 #endif
+// The text encoder's two differences (PIPELINE.md stage 5c). Both are
+// compile-time so the DiT's own builds are unchanged, and both are inert in
+// them: Z-Image's attention is bidirectional with one kv head per query head,
+// Qwen3's is causal with four query heads per kv head.
+//
+//   CAUSAL  a query attends to its own position and earlier. The key loop
+//           stops at the diagonal block, and inside that block the mask is
+//           applied *twice*: once when the row max is taken, so that a future
+//           key cannot set the scale every real key is then measured against,
+//           and once on P, which is what actually removes it from the output
+//           and from the row sum. The first is not optional -- masking only P
+//           would leave exp2(real - future_max) underflowing to zero in fp16
+//           whenever the gap exceeds ~24 in log2 units.
+//   GQA     grouped query attention: pc.aux2 query heads share one kv head,
+//           so k and v are addressed by head/pc.aux2 while q is addressed by
+//           head. The packed kv planes then hold kv_heads planes, not heads.
+#ifndef CAUSAL
+#define CAUSAL 0
+#endif
+#ifndef GQA
+#define GQA 0
+#endif
 
 #define TILE 16
 #define HDT (HEAD_DIM / TILE)
@@ -151,9 +173,14 @@ void main() {
     // share the geometry and differ only in what one tile holds, which is the
     // transpose dit_pack_f16.comp applies to v.
     uint plane = head * (pc.aux1 / TILE) * (HDT * TILE * TILE);
+#if GQA
+    uint kvPlane = (head / max(pc.aux2, 1u)) * (pc.aux1 / TILE) * (HDT * TILE * TILE);
+#else
+    uint kvPlane = plane;
+#endif
     uint qBase = pc.inOff + plane + (q0 / TILE) * (HDT * TILE * TILE);
-    uint kBase = pc.kOff + plane;
-    uint vBase = pc.vOff + plane;
+    uint kBase = pc.kOff + kvPlane;
+    uint vBase = pc.vOff + kvPlane;
 
     // Q stays in registers for the whole sequence.
     FRAG_A fragQ[QT][HDT];
@@ -179,7 +206,15 @@ void main() {
 
     const FRAG_B ones = FRAG_B(float16_t(1.0));
 
-    for (uint base = 0u; base < n; base += BN) {
+#if CAUSAL
+    // Nothing past this query block's last row can be attended to, so the
+    // blocks beyond it are not read at all -- which at BM = BN is half the
+    // key traffic of the bidirectional kernel, averaged over the grid.
+    uint last = min(n, q0 + BM);
+#else
+    uint last = n;
+#endif
+    for (uint base = 0u; base < last; base += BN) {
         uint cnt = min(BN, n - base);
 
         // ---- S = Q.K^T. K is the B operand and already K-contiguous, so it
@@ -220,6 +255,11 @@ void main() {
                 uint qi = i / TILE, r = i % TILE;
                 float mx = blkMax[i];
                 for (uint c = 0u; c < TILE; ++c) {
+#if CAUSAL
+                    if (base + kk * TILE + c > q0 + i) {
+                        break;      // and every c after it, the row is done
+                    }
+#endif
                     mx = max(mx, stage[qi * (TILE * TILE) + r * TILE + c]);
                 }
                 blkMax[i] = mx;
@@ -274,6 +314,20 @@ void main() {
         // multiple of BN divides every row by a denominator that counts
         // BN - cnt keys that do not exist. Nothing else differs.
 #if !NO_TAIL_MASK
+#if CAUSAL
+        // The diagonal block needs the causal mask as well as the tail one,
+        // and only the diagonal block does: every earlier block is entirely
+        // in the past of every row here.
+        if (cnt < BN || base + BN > q0) {
+            for (uint i = lane; i < BM * BN; i += WAVE) {
+                uint col = i & (BN - 1u);
+                if (col >= cnt || base + col > q0 + i / BN) {
+                    pbuf[i] = float16_t(0.0);
+                }
+            }
+            barrier();
+        }
+#else
         if (cnt < BN) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 if ((i & (BN - 1u)) >= cnt) {
@@ -282,6 +336,7 @@ void main() {
             }
             barrier();
         }
+#endif
 #endif
 
         // ---- O += P.V, and the row sums out of the same fragments.

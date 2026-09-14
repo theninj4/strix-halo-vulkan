@@ -1,6 +1,7 @@
 package dit
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -118,7 +119,14 @@ func TestGPUBlockAgainstDiffusers(t *testing.T) {
 	// Feed forward. "rmsnorm ffn" is the first thing downstream of the msa
 	// residual, so it is also the check that the gated add landed.
 	stage("rmsnorm ffn", "ffn_norm1", f32(g.TensorNorm1, dim), fp16GEMMRelTol)
-	stage("gemm w2", "feed_forward", f32(g.TensorFF, dim), fp16GEMMRelTol)
+	// w2's output is the one tensor in the graph that is not on the model's
+	// own scale: the SwiGLU pass divides by GPUStack.FFScale so that the
+	// product fits fp16, and nothing downstream undoes it because the next
+	// thing that happens to it is an RMS norm. Here the reference is on the
+	// model's scale, so the comparison undoes it -- and the stage after this
+	// one, "rmsnorm ff", is then where the claim that the scale is invisible
+	// is actually checked, since it is compared unscaled.
+	stage("gemm w2", "feed_forward", scaled(f32(g.TensorFF, dim), 1/g.FFScale), fp16GEMMRelTol)
 	stage("rmsnorm ff", "ffn_norm2", f32(g.TensorFF, dim), fp16GEMMRelTol)
 
 	// And the block itself, through Apply rather than RunTo, so that what is
@@ -368,5 +376,90 @@ func TestGPUBlockDetectsErrors(t *testing.T) {
 			continue
 		}
 		t.Logf("%-34s rel %.3g = %.0fx the bound (rms %.4g)", c.name, rel, rel/fp16GEMMRelTol, rms)
+	}
+}
+
+// TestGPUBlockFFScale checks the SwiGLU headroom, which is the one thing in
+// the graph that changes a tensor's value on purpose.
+//
+// The claim it rests on is that w2's output is read by an RMS norm and by
+// nothing else, so a positive scale on the SwiGLU output cannot reach the
+// block's output. That is exactly the kind of claim that is true when it is
+// written and false three commits later, and it is load-bearing: without the
+// scale a real prompt overflows fp16 in a few elements of a few million, one
+// infinity makes a whole row of w2's output a NaN, and eight denoising steps
+// later the image is black.
+//
+// So: the scale moves the intermediate by the factor it says and does not move
+// the block's output. Three decades of it, because what would break the
+// invariance is the norm's epsilon, and that can only matter once the scale is
+// small enough for a row's mean square to approach it -- at 1/256 the mean
+// square is 65536x smaller and the bound still holds by four orders.
+//
+// The test also reports the headroom the default buys on this fixture, which
+// is the number the default was chosen against.
+func TestGPUBlockFFScale(t *testing.T) {
+	f := loadFixture(t)
+	defer f.close()
+	dev, done := newTestDevice(t)
+	defer done()
+
+	x := loadRef(t, f.m, "x")
+	adaln := loadRef(t, f.m, "adaln_input")
+
+	g, err := NewGPUBlock(dev, f.blk, f.rope, f.m.Seq, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+
+	// swiglu is w2's fp16 A operand, which is what the scale is protecting.
+	swiglu := func() *Mat { return g.ReadF16(g.TensorHFFN(), g.FFN(), g.LDAFFN()) }
+	run := func(scale float64) (ff, out *Mat, peak float64) {
+		t.Helper()
+		g.FFScale = scale
+		if err := g.RunTo(x, adaln.Data, "gemm w2"); err != nil {
+			t.Fatal(err)
+		}
+		ff = g.Read(g.TensorFF(), g.Dim())
+		for _, v := range swiglu().Data {
+			peak = math.Max(peak, math.Abs(float64(v)))
+		}
+		out, err = g.Apply(x, adaln.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ff, out, peak
+	}
+	defer func() { g.FFScale = defaultFFScale }()
+
+	baseFF, baseOut, peak := run(1)
+	t.Logf("SwiGLU peak unscaled %.4g, at the default 1/%g %.4g -- %.0fx under fp16's 65504",
+		peak, 1/defaultFFScale, peak*defaultFFScale, 65504/(peak*defaultFFScale))
+
+	// 1e-3 is where the fp16 rounding of a rescaled operand lands; the
+	// reference comparison's own bound is 8e-2, so this is two orders tighter
+	// than the level at which the scale could hide.
+	const scaleTol = 1e-3
+	for _, s := range []float64{1.0 / 4, defaultFFScale, 1.0 / 256} {
+		ff, out, _ := run(s)
+		want := baseFF.Clone()
+		for i := range want.Data {
+			want.Data[i] *= float32(s)
+		}
+		compareTol(t, fmt.Sprintf("feed_forward x%g", s), ff, want, scaleTol)
+		compareTol(t, fmt.Sprintf("out x%g", s), out, baseOut, scaleTol)
+	}
+}
+
+// scaled multiplies a read tensor by a constant, for the one stage whose
+// device tensor is deliberately not on the model's scale.
+func scaled(read func() *Mat, by float64) func() *Mat {
+	return func() *Mat {
+		m := read()
+		for i := range m.Data {
+			m.Data[i] *= float32(by)
+		}
+		return m
 	}
 }

@@ -61,6 +61,8 @@ numbered experiment, so they carry names instead of section numbers:
 | [Stage 3](stage-3-dit-attention.md) | DiT attention — why it needs WMMA, and the two hazards a port hits |
 | [Stage 4](stage-4-dit-graph.md) | The DiT block as a graph — **49.3 ms/block, 13.4 s/image**; a tiled weight (§2.8), a swizzled grid (§2.4) and a fused tail (§2.6) compound to **1.83x**, and all three are about order rather than arithmetic |
 | [Stage 4c](stage-4c-dit-stack.md) | The whole DiT resident — **12.54 GB in three storage buffers, 12.8 s/image**; splitting the weight arena costs one pipeline per bank and nothing per dispatch, and six banks are bit-identical to one |
+| [Stage 5](stage-5-text-encoder.md) | The tokenizer and the text encoder — **35 of 36 layers, 2.08 s on the CPU to 57 ms on the GPU**; the model is **memory-bound at T flop/byte against a 235 crossover**, so unlike the DiT **the winning kernel moves with the prompt length** (1.24x for getting it wrong); Qwen3's massive activations break an RMS-normalised error bound |
+| [Stage 6](stage-6-pipeline.md) | The scheduler and the driver — **prompt to PNG, 1024x1024 in 19.8 s**, matching diffusers' fp32 CPU pipeline to 2.5e-2 of the image; every bug this stage had was in the *composition* and invisible to each component's own oracle — SwiGLU **overflows fp16 on a real prompt and never on a random one**, a shared shader's new push constant silently zeroed the text encoder, and the VAE's watchdog cap is a proxy for time on a graph whose dispatches differ 100x |
 
 ### Closed, but small enough to have stayed in the backlog
 

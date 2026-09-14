@@ -32,16 +32,28 @@ type manifest struct {
 	// manifest alone and two dumps can be open at once.
 	dir string
 
-	Seq       int      `json:"seq"`
-	Blocks    []string `json:"blocks"`
-	Caption   int      `json:"caption"`
-	Dim       int      `json:"dim"`
-	Heads     int      `json:"heads"`
-	HeadDim   int      `json:"head_dim"`
-	AxesDims  [3]int   `json:"axes_dims"`
-	AxesLens  [3]int   `json:"axes_lens"`
-	RopeTheta float64  `json:"rope_theta"`
-	NormEps   float64  `json:"norm_eps"`
+	Seq     int      `json:"seq"`
+	Blocks  []string `json:"blocks"`
+	Caption int      `json:"caption"`
+	Dim     int      `json:"dim"`
+
+	// Stage 6's dump (reference/out/zimage) describes a latent rather than a
+	// token count, so it carries these instead of Seq.
+	Latent    int     `json:"latent"`
+	InChan    int     `json:"in_channels"`
+	PatchSize int     `json:"patch_size"`
+	ImgTokens int     `json:"img_tokens"`
+	CapFeat   int     `json:"cap_feat_dim"`
+	Steps     int     `json:"steps"`
+	T         float64 `json:"t"`
+	TScale    float64 `json:"t_scale"`
+
+	Heads     int     `json:"heads"`
+	HeadDim   int     `json:"head_dim"`
+	AxesDims  [3]int  `json:"axes_dims"`
+	AxesLens  [3]int  `json:"axes_lens"`
+	RopeTheta float64 `json:"rope_theta"`
+	NormEps   float64 `json:"norm_eps"`
 	Tensors   map[string]struct {
 		Shape []int   `json:"shape"`
 		Count int     `json:"count"`

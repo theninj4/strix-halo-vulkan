@@ -7,14 +7,15 @@
 > few more with each stage that closes, and loses them when a stage's detail
 > moves to `research/`.
 
-**Status**: stages 1, 2, 3 and 4 done. **The whole DiT runs on the GPU** — all
-34 blocks resident, 12.54 GB of weights across three storage buffers because
-one addresses 4.29 GB here — at **1.60 s per denoising step, 12.8 s per
-image** at 1024x1024, validated against diffusers. With the VAE that is
-**18.4 s**, under the 20-30 s stage 4 set out to accept. A block inside the
-stack costs the same 49.3 ms it cost alone, and a run with the weights in six
-banks is bit-identical to one with them in a single buffer. Next is stage 5,
-the text encoder.
+**Status**: **the target is met.** `go run ./cmd/zimage -prompt "..."` writes a
+1024x1024 PNG in **19.8 s** — tokenizer, text encoder, 34 DiT blocks over eight
+denoising steps, VAE, PNG — and reproduces diffusers' fp32 CPU pipeline to
+**2.5e-2** of the decoded image. Two runs agree to 19.79 s and 19.79 s. Every
+weight is resident: 7.17 GB of text encoder, 12.54 GB of transformer and
+4.56 GB of activations, 21.6 s to load, and then images cost only their own
+time. What is next is **optimisation with a profiler in front of it**, and the
+profile says where: the VAE is 28.6% of the image and has had no pass at all.
+
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
 
 ## Why this exists
@@ -65,8 +66,10 @@ whole pipeline is resident in 128 GB unified memory at once.
 | 4a | The block as a graph | **done** | `GPUBlock`, 26 dispatches, 65.6 ms; §2.8 |
 | 4b | Fuse the tail, fix `ff.w13` | **done** | 18 dispatches, **49.3 ms**; §2.4, §2.6 |
 | 4c | 34 blocks | **done** | `GPUStack`, 3 weight banks, **1.60 s/step**, 12.8 s/image |
-| 5 | Text encoder + tokenizer | next | Qwen3-4B, GQA; BPE from `tokenizer/` |
-| 6 | Scheduler + driver | | FlowMatchEuler, 8 steps; the three phases, PNG out |
+| 5a | Tokenizer | **done** | `zimage/tokenizer`, byte-level BPE, 20 cases id for id |
+| 5b | Text encoder, CPU reference | **done** | `zimage/qwen`, 35 of 36 layers, **2.08 s**; `cmd/textenc` |
+| 5c | Text encoder, Vulkan | **done** | 21 dispatches/layer, 2 banks, **57 ms**; the winning tile moves with T |
+| 6 | Scheduler + driver | **done** | `zimage/pipeline`, `cmd/zimage`; **19.8 s per image**, 2.5e-2 against diffusers |
 
 Each stage gets a CPU implementation in Go first: it separates "do I understand
 the architecture" from "is the shader right", and once it matches diffusers it
@@ -74,14 +77,19 @@ is the oracle the GPU port is debugged against.
 
 ## The rule for every stage
 
-Validate against the **diffusers reference**, not against a shape table.
+Validate against the **library reference**, not against a shape table.
 `reference/dump_vae.py` and `reference/dump_dit_block.py` are the pattern: run
 a fixed input through diffusers in fp32 on CPU, dump **every submodule's
-output**, and walk the graph stage by stage against it. `GPUBlock.RunTo` is
+output**, and walk the graph stage by stage against it. Stage 5's oracle is
+`transformers` rather than `diffusers` (`reference/dump_qwen.py`,
+`reference/dump_tokenizer.py`) — same pattern, and it does one thing more:
+where the port relies on an assumption about the library (which hidden state
+`[-2]` is, whether padding changes an answer) the dump *measures* the
+assumption and the test reads the number. `GPUBlock.RunTo` is
 what makes that possible on an 18-dispatch graph whose intermediates are
 overwritten before it ends: it re-runs the prefix up to a labelled dispatch.
 
-Three rules around that, each of which has caught something:
+Five rules around that, each of which has caught something:
 
 - **A negative control per test**, deliberately breaking the implementation
   and asserting the break is caught. Without one the test proves only that it
@@ -94,7 +102,24 @@ Three rules around that, each of which has caught something:
 - **Normalise the error by the tensor's RMS**, not per element — but know what
   that costs: two of stage 4a's stages report 3e-2 where their worst element
   is 2e-3 of itself, because an RMS norm's output inherits the learned
-  weight's dynamic range.
+  weight's dynamic range. Stage 5 is where that bill came due: Qwen3's
+  massive activations put the absmax **109-238x** above the RMS, so the RMS
+  alone fails a stage whose worst element is off by 9e-6 of itself. The
+  denominator needs a floor — `max(|want|, rms)` per element — and **which
+  denominator is right is a property of the model**, so look before
+  inheriting one. Stage 6 needs a third answer: a denoising trajectory is
+  chaotic, so it is bounded in **relative L2** over the whole tensor.
+- **Validate the composition too, and do it at a small size.** Every stage's
+  own oracle passed while the pipeline made a black image, because what was
+  wrong was between them. `reference/dump_zimage_run.py` runs the whole
+  diffusers pipeline in fp32 on the CPU at **256x256** — 3.2 s a step, the
+  full eight steps and the VAE in half a minute — because the composition
+  does not know how big the image is. It is the cheapest test in the project
+  and it found three bugs in one sitting.
+- **A real prompt is not a random tensor.** Two of stage 6's three bugs only
+  appear on real inputs: SwiGLU's product overflows fp16 at 7.1e4 where the
+  random fixture peaks at 5.1e4, and the VAE's watchdog cap only fails at the
+  full image. Random-input validation is necessary and it is not sufficient.
 
 ## What the kernels already give us
 
@@ -114,6 +139,14 @@ Measured on this device (`research/`), and load-bearing for every stage:
   instead of a row that streams all of B past one A slab: **1.84x** on the one
   shape wide enough to suffer, and only 1.16x without the tiling. They are one
   lever measured in two places.
+- **Both halves of the roofline are in this pipeline, and they want opposite
+  kernels.** The DiT is compute-bound at 16384 flop/byte; the text encoder
+  runs the same kind of layer at `T` flop/byte, which for a prompt is 8-512
+  against the same 235 crossover. Measured: the encoder's winning tile is 16
+  or 32 rows at 24 tokens, 64 at 128, and the DiT's own 128x256 at 256+ —
+  1.24x for taking the DiT's default at a short prompt, 1.92x for taking the
+  narrowest at a long one. Re-planning per run is free (`qwen.PlanFor`),
+  because every rung reads the same staged weight.
 - **Kernel choice is per shape only while something else is wrong.** The DiT's
   three shapes disagreed until both of the above were applied; then one kernel
   won all three. `results/shapes.csv`'s pick measures 23.5 s/image against
@@ -122,11 +155,14 @@ Measured on this device (`research/`), and load-bearing for every stage:
   host-visible arena run at **0.2 GB/s** (writes: 11.5), so any wall-clock
   figure that includes a read-back is measuring the read-back.
 
-## Measured baseline to beat — the DiT
+## Measured baselines, per stage
 
-`go run ./cmd/ditstack -image 4096 -caption 128`, GPU timestamps per dispatch,
-best of three, runs agreeing to 0.997-1.008. Wall clock is +0.4% over the sum,
-so 77 fence waits per step are not a cost.
+The stage-level figures the budget above is made of. Each stage's own
+measurement harness is still there — `cmd/ditstack`, `cmd/vaebench`,
+`cmd/textenc -gpu` — and each stage's research note has the sweep behind it.
+
+**The DiT** (`go run ./cmd/ditstack -image 4096 -caption 128`, GPU timestamps,
+best of three, runs agreeing to 0.997-1.008):
 
 | phase | blocks | tokens | per block | total |
 |---|---|---|---|---|
@@ -134,65 +170,94 @@ so 77 fence waits per step are not a cost.
 | `context_refiner` | 2 | 128 | 2.60 ms | 5.2 ms |
 | `layers` | 30 | 4224 | 49.81 ms | 1.49 s |
 | **one step** | 34 | | | **1.60 s** |
-| **one image**, 8 steps | | | | **12.8 s** |
 
-A block is 72% GEMM, 14% attention, 14% elementwise. TFLOP/s by shape at 4096,
-on the one kernel that wins all three (`wg128x256_bt16_swz8`): `qkv`/`o`
-**42.0**, `ff.w13` **41.1**, `ff.w2` **40.6** — 73-76% of the 55.5 TFLOP/s
-ceiling. Per-block times by length, from `cmd/ditblock`:
+A block is 72% GEMM, 14% attention, 14% elementwise, and one kernel
+(`wg128x256_bt16_swz8`) wins all three of its shapes at **40.6-42.0 TFLOP/s**,
+73-76% of the ceiling. Per block by length: 5.2 ms at 320 tokens, 11.7 ms at
+1024, 49.3 ms at 4096. Residency is 12.54 GB in three fp16 banks of 4.25, 4.25
+and 3.54 GB holding 12, 12 and 10 blocks, plus a 0.51 GB fp32 arena and 1.29 GB
+of activations, against an 83.79 GiB device-local host-visible heap.
 
-| tokens | image | block | GEMMs | attention | elementwise |
-|---|---|---|---|---|---|
-| 320 | — | 5.2 ms | 4.7 | 0.06 | 0.5 |
-| 1024 | 256² | 11.7 ms | 9.8 | 0.45 | 1.4 |
-| 4096 | **1024²** | **49.3 ms** | **35.7** | **6.7** | **6.8** |
+In the pipeline a step is **1.76 s**, not 1.60: 58 ms of CPU head and tail and
+~100 ms of the residual stream crossing the bus. Both go away together.
 
-Residency: 12.54 GB of weights (three fp16 banks of 4.25, 4.25 and 3.54 GB,
-holding 12, 12 and 10 blocks, plus a 0.51 GB fp32 arena) and 1.29 GB of
-activations, against an 83.79 GiB device-local host-visible heap. 15.1 s to
-load.
-
-## Measured baseline to beat — VAE
+**The VAE** (`go run ./cmd/vaebench`), everything fp32, wall clock including a
+read-back:
 
 | latent | image | activations | wall |
 |---|---|---|---|
 | 16² | 128² | 49 MB | 49 ms |
 | 32² | 256² | 197 MB | 217 ms |
 | 64² | 512² | 789 MB | 1.02 s |
-| 128² | **1024²** | 3.16 GB | **5.6 s** |
+| 128² | **1024²** | 3.16 GB | **5.59 s** |
 
-Everything is fp32 and that wall clock includes a read-back. At 30% of the
-image it is now the second-largest item and has had no optimisation pass; the
-lever is fp16 onto the WMMA path, which halves the arena and should move
-conv3x3 past its 3.3 TFLOP/s. Stage 2 found fp16 cannot hold *these*
-intermediates (1.16e7 against 65504), so it needs the per-tensor range check
-stage 4b used on the FFN, not a blanket narrowing.
+The lever is fp16 onto the WMMA path, which halves the arena and should move
+conv3x3 past its 3.0-3.2 TFLOP/s. Stage 2 found fp16 cannot hold *these*
+intermediates (1.16e7 against 65504), so it needs a per-tensor range check and
+not a blanket narrowing — and stage 6's SwiGLU scale is the other shape that
+fix can take, wherever the consumer is scale-invariant. The profile is **not
+flat**: at a 128² latent the mid-block attention is **1.51 s in one dispatch,
+27% of the decode**, which is both the optimisation target and the reason
+`dispatchesPerSubmit` is 4 rather than 8 (a batch of eight around it trips the
+driver's reset watchdog).
+
+**The text encoder** (`go run ./cmd/textenc -gpu`), 35 layers, 7.07 GB of fp16
+weights in two banks, best of three, two runs agreeing to 1.004:
+
+| tokens | GPU wall | GFLOP/s | GB/s of weight | CPU fp32 |
+|---|---|---|---|---|
+| 24 | **57.1 ms** | 2979 | 124 (53% of the bus) | 2.08 s |
+| 128 | **71.4 ms** | 12670 | 99 (42%) | 9.17 s at 105 |
+| 512 | 170 ms | 21227 | 42 (18%) | — |
+
+One run walks the roofline: the weights are read once whatever T is, so the
+GB/s column falling *is* the GFLOP/s column rising. At 24 tokens the profile is
+96% GEMM and 0.4% attention, so the causal grouped-query kernel was worth
+making correct and is not worth tuning. Wall clock includes the read-back,
+which the pipeline pays once per image rather than once per step.
 
 ## Where the image budget stands
 
-| | per image, 1024², 8 steps |
-|---|---|
-| DiT, measured end to end | **12.8 s** |
-| — of which projections | 9.3 s |
-| — of which attention | 1.7 s |
-| — of which elementwise | 1.8 s |
-| VAE decode, measured | 5.6 s |
-| **total** | **18.4 s** |
+`go run ./cmd/zimage -width 1024`, wall clock, two runs agreeing to 19.79 s
+and 19.79 s.
 
-The DiT's levers are spent: it is 72% GEMM at 73-76% of the WMMA ceiling. What
-is left inside it is ~1.0 s of pure layout (`pack v` and `narrow ctx`, which a
-GEMM and the attention kernel could do in their epilogues) and attention's
-38 TFLOP/s, now *behind* the GEMMs it used to lead.
+| | per image, 1024², 8 steps | share |
+|---|---|---|
+| denoising | **14.05 s** | 71.0% |
+| — of which the 34 blocks | 13.6 s | 68.7% |
+| — of which the CPU head and tail | 0.47 s | 2.4% |
+| — of which the stream across the bus | ~0.8 s | 4.0% |
+| VAE decode | **5.65 s** | 28.6% |
+| text encoder, 17 tokens | 0.06 s | 0.3% |
+| caption refiners, once per image | 0.006 s | 0.03% |
+| **total** | **19.79 s** | |
 
-**The VAE is now 30% of the image and has had no optimisation pass at all.**
-The lever is fp16 onto the WMMA path, which halves the arena and should move
-conv3x3 past its 3.3 TFLOP/s. Stage 2 found fp16 cannot hold *these*
-intermediates (1.16e7 against 65504), so it needs the per-tensor range check
-stage 4b used on the FFN, not a blanket narrowing.
+Loading is 21.6 s and happens once: 7.17 GB of text encoder, 12.54 GB of
+transformer, 4.56 GB of activation arenas.
+
+Two items are left and they are very different sizes.
+
+**The VAE, 28.6% of the image, with no optimisation pass at all.** fp32
+throughout, conv3x3 at 3.0-3.2 TFLOP/s against a 55.5 TFLOP/s fp16 ceiling,
+and one attention dispatch that is 27% of the decode on its own. This is the
+whole of the remaining headroom worth the name.
+
+**The head and tail onto the device, 1.3 s, 6.4%.** They are the same item:
+`x_embedder` and the final layer run on the CPU (0.47 s), and because they do,
+the [4128, 3840] residual stream crosses the bus twice a step (~0.8 s) where
+the [4096, 64] latent is 1 MB. Two GEMMs at shapes the existing kernel already
+covers — K=64 and N=64 — plus a LayerNorm.
+
+The DiT's own levers are spent: 72% GEMM at 73-76% of the WMMA ceiling, and
+what is left inside it is ~1.0 s of pure layout (`pack v` and `narrow ctx`,
+which a GEMM and the attention kernel could do in their epilogues) and
+attention's 38 TFLOP/s, now *behind* the GEMMs it used to lead. The text
+encoder is 0.3% of an image and the 1.9x still between it and the memory bus
+is worth less than a percent.
 
 ## What each stage found
 
-One file per stage in `research/`, indexed in `research/README.md`. The three
+One file per stage in `research/`, indexed in `research/README.md`. The ones
 that are load-bearing for what is left:
 
 - **[Stage 2, the VAE](research/stage-2-vae-decoder.md)** — fp16 cannot hold
@@ -208,6 +273,24 @@ that are load-bearing for what is left:
   swizzle is worth 1.84x on a tiled weight and 1.16x on a row-major one, the
   hoisted K-slab becomes a *loss* on a tiled weight, and once all of it is
   applied the three shapes that disagreed on a kernel stop disagreeing.
+- **[Stage 5, the text encoder](research/stage-5-text-encoder.md)** — the
+  pipeline runs **35 of 36 layers** and un-normalised output; right padding to
+  512 is measurably a no-op; **2.08 s to 57 ms**. The encoder sits on the
+  **memory-bound** half of the roofline, so unlike the DiT its winning kernel
+  *moves with the prompt length* and re-planning per run is free. Three
+  conventions invert between it and the DiT — NeoX RoPE, causal attention,
+  grouped heads — and Qwen3's massive activations break an RMS-normalised
+  error bound.
+- **[Stage 6, the pipeline](research/stage-6-pipeline.md)** — `prompt → PNG`,
+  **19.8 s**, matching diffusers to 2.5e-2 of the image. Every bug this stage
+  had was in the *composition* and invisible to each component's own oracle:
+  SwiGLU's product **overflows fp16 on a real prompt and never on a random
+  one** (and the fix is free, because its consumer is an RMS norm), a new push
+  constant on a shared shader silently zeroed the text encoder's
+  feed-forward, and a dispatches-per-submit cap is a proxy for a time cap that
+  stops being a good one when the dispatches differ 100x. Also: the context
+  refiners take neither the timestep nor the latents, so **two of the three
+  phases run once per image rather than once per step**.
 - **[Stage 4c, the stack](research/stage-4c-dit-stack.md)** — splitting a
   12.0 GB weight arena across storage buffers costs **one pipeline per bank
   and nothing per dispatch**, because the buffer is in the descriptor set. Six

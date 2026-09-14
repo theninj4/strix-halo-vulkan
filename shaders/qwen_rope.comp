@@ -1,0 +1,41 @@
+#version 450
+// Qwen3's rotary embedding, applied in place to every head.
+//
+// The pairing is NeoX's: component j moves against component j + headDim/2,
+// the two halves of the head rotating against each other. dit_rope.comp is
+// the same rotation with the *other* convention -- adjacent components, 2j
+// with 2j+1 -- and the two produce equally plausible tensors, so this is its
+// own file rather than a flag: which one a model wants is a property of the
+// checkpoint, and a build flag on one shader would let a graph pick the wrong
+// one without saying so. zimage/qwen's negative control measures the
+// difference at 6.7 against a 2e-4 bound.
+//
+// transformers builds cos and sin as cat(freqs, freqs) over the full head
+// width, which is the same half table twice; the host stores the half, so the
+// table here is [tokens, headDim/2] cos at pc.wOff with sin following at
+// pc.aux0 -- the same layout dit_rope.comp reads.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint halfDim = pc.headDim / 2u;
+    uint total = pc.tokens * pc.heads * halfDim;
+    if (idx >= total) {
+        return;
+    }
+    uint j = idx % halfDim;
+    uint h = (idx / halfDim) % pc.heads;
+    uint token = idx / (halfDim * pc.heads);
+
+    float c = wbuf[pc.wOff + token * halfDim + j];
+    float s = wbuf[pc.aux0 + token * halfDim + j];
+
+    uint base = pc.inOff + token * pc.dim + h * pc.headDim + j;
+    float lo = act[base];
+    float hi = act[base + halfDim];
+    act[base] = lo * c - hi * s;
+    act[base + halfDim] = hi * c + lo * s;
+}
