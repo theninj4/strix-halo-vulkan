@@ -48,6 +48,8 @@ func main() {
 	coldFootprintsFlag := flag.String("coldfootprints", intsToFlag(def.ColdFootprints), "comma-separated weight footprints in MB (fp16-equivalent) for the DRAM-resident gemv_cold sweep; entries well above the ~32MB last-level cache are the ones that measure real decode")
 	coldN := flag.Int("coldn", def.ColdN, "reduction length N for the gemv_cold sweep; its row count M is derived from each footprint")
 	bankGiB := flag.Int("bankgib", def.BankGiB, "total weight bank to allocate for the bank family, in GiB; allocation stops early and the sweep shortens if the device will not give this much")
+	bankHeadroomGiB := flag.Int("bankheadroom", 0, "if non-zero, cap in GiB for the bank family's capacity probe, which allocates (without writing) until the driver refuses, to find what the two overlapping heaps really give; off by default because it allocates until it fails")
+	bankHeadroomType := flag.Int("bankheadroomtype", -1, "memory type index for the capacity probe (-1 = whatever vk.NewBuffer prefers); only one type can be probed per process, see RunBankHeadroom")
 	bankReadMiB := flag.Int("bankreadmib", def.BankReadMiB, "bytes read per timed step in the bank family, in MiB; held constant while the bank grows, so GB/s isolates the working set")
 	warmClock := flag.Duration("warmclock", 3*time.Second, "maximum ALU-heavy warmup before each timed measurement; stops as soon as the GPU reaches its top advertised clock, so a hot GPU costs one short burst (0 disables)")
 	clockSample := flag.Duration("clocksample", time.Millisecond, "sampling period for the sclk/power counters recorded with each measurement")
@@ -98,6 +100,10 @@ func main() {
 	p.ColdN = *coldN
 	p.BankGiB = *bankGiB
 	p.BankReadMiB = *bankReadMiB
+	p.BankHeadroomGiB = *bankHeadroomGiB
+	if *bankHeadroomType >= 0 {
+		p.BankHeadroomType = uint32(*bankHeadroomType)
+	}
 	p.Warmup = uint32(*warmup)
 	p.Iters = uint32(*iters)
 	p.CUs = *cus

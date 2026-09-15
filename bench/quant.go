@@ -212,6 +212,77 @@ func quantizeQ4(data []float32, rows, cols, block int) (packed []uint8, scales [
 	return packed, scales
 }
 
+// quantizeQ4Asym is the asymmetric (zero-point) 4-bit scheme IDEAS §7 asks to
+// price against the symmetric one: a block keeps both its scale and its
+// minimum, so the 16 codes span [min, max] instead of a range centred on zero.
+// Two fp16 values per block instead of one, i.e. 4 + 32/block bits per weight
+// against 4 + 16/block — which is the whole question, because at equal bits a
+// symmetric scheme can afford half the block size.
+//
+// It is nearly free in the *kernel* as well as on paper: §1.1's W4A8 GEMV
+// already computes a per-block sum of the activations to cancel the packed
+// nibbles' +8 bias, and `sum (q-z)x = sum q*x - z*sum x` reuses exactly that
+// term with z in place of 8. The GEMM path is the one that would have to
+// carry it out to the fp32 epilogue (§2.2 finding 9).
+func quantizeQ4Asym(data []float32, rows, cols, block int) (packed []uint8, scales, mins []uint16) {
+	blocksPerRow := cols / block
+	packed = make([]uint8, len(data)/2)
+	scales = make([]uint16, rows*blocksPerRow)
+	mins = make([]uint16, rows*blocksPerRow)
+	for r := 0; r < rows; r++ {
+		for bi := 0; bi < blocksPerRow; bi++ {
+			start := r*cols + bi*block
+			lo, hi := data[start], data[start]
+			for i := 1; i < block; i++ {
+				v := data[start+i]
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			scale := (hi - lo) / 15.0
+			if scale == 0 {
+				scale = 1.0
+			}
+			// Both stored as fp16 and read back before use, so the reference
+			// this produces is what a kernel would actually compute.
+			scaleBits := float32ToFloat16(scale)
+			minBits := float32ToFloat16(lo)
+			scales[r*blocksPerRow+bi] = scaleBits
+			mins[r*blocksPerRow+bi] = minBits
+			scaleF := float16ToFloat32(scaleBits)
+			minF := float16ToFloat32(minBits)
+			for i := 0; i < block; i += 2 {
+				idx0, idx1 := start+i, start+i+1
+				q0 := clampInt(int(math.Round(float64((data[idx0]-minF)/scaleF))), 0, 15)
+				q1 := clampInt(int(math.Round(float64((data[idx1]-minF)/scaleF))), 0, 15)
+				packed[idx0/2] = uint8(q0) | uint8(q1<<4)
+			}
+		}
+	}
+	return packed, scales, mins
+}
+
+// dequantizeQ4Asym is the inverse of quantizeQ4Asym.
+func dequantizeQ4Asym(packed []uint8, scales, mins []uint16, rows, cols, block int) []float32 {
+	blocksPerRow := cols / block
+	out := make([]float32, rows*cols)
+	for r := 0; r < rows; r++ {
+		for bi := 0; bi < blocksPerRow; bi++ {
+			scale := float16ToFloat32(scales[r*blocksPerRow+bi])
+			min := float16ToFloat32(mins[r*blocksPerRow+bi])
+			start := r*cols + bi*block
+			for i := 0; i < block; i++ {
+				idx := start + i
+				out[idx] = float32(int(q4NibbleAt(packed, idx)))*scale + min
+			}
+		}
+	}
+	return out
+}
+
 // dequantizeQ4 is the exact inverse of quantizeQ4's shader-side reader.
 func dequantizeQ4(packed []uint8, scales []uint16, rows, cols, block int) []float32 {
 	blocksPerRow := cols / block

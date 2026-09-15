@@ -82,6 +82,13 @@ GB/s, mean of two runs, `rand` (the MoE-decode pattern):
 sizes. Across all 144 cells of both runs the mean is 235.5 GB/s and the range
 is 225.5–237.4.
 
+**And at 80 GiB.** A later single run with `-bankgib 80` — 23 buffers, 85.9 GB,
+every page written — reads **237 GB/s at every prefix from 1 to 80 GiB,
+`rand/seq` 1.00x**. That is past UD-Q4_K_XL's 82.52 GB resident core, so the
+largest bank this vertical would ever hold has now been measured live rather
+than extrapolated. It is one run rather than two, but it agrees cell for cell
+with the two-run 64 GiB sweep above over their common prefixes.
+
 Two reference points make that number readable:
 
 - §0.4's contiguous copy benchmark measures the DRAM ceiling at **236 GB/s**.
@@ -143,15 +150,13 @@ cells are seconds.
 
 **Does not close:**
 
-- **Heap 0.** Everything here is heap 1, the 83.79 GiB `DEVICE_LOCAL` heap —
-  `vk.NewBuffer` prefers `DEVICE_LOCAL|HOST_VISIBLE` and got it for all 19
-  allocations. Whether the host-visible-only heap reads as fast is **L0b**
-  (§5.1), still unrun, and it is what decides whether anything above ~4.5
-  bits/weight is possible at all.
-- **The other 20 GB.** The sweep stops at 64 GiB because that is what a bank of
-  our own needs. UD-Q4_K_XL's resident core is 82.5 GB, which is 96% of the
-  heap; the last few GiB before an allocator gives up are not measured here and
-  may behave differently for reasons that have nothing to do with bandwidth.
+- ~~**Heap 0.**~~ Answered by **L0b**, [§5.1](5.1-memory-types.md): all eight
+  buffer-compatible memory types read within 0.57% of each other, heap 0 and
+  heap 1 alike. There is no faster heap and no slower one.
+- ~~**The other 20 GB.**~~ Closed by the 80 GiB run above and by
+  [§5.1](5.1-memory-types.md), which found the 83.79 GiB heap figure is not a
+  limit at all (105.0 GiB reserved). What is genuinely unmeasured now is only
+  the band between 80 GiB touched and 105 GiB reserved.
 - **Concurrent pressure.** One process, nothing else on the GPU. A serving
   engine holding 64 GB while the host also holds a KV cache and a 28.8 GB
   mmap'd n-gram table is a different memory-pressure regime.

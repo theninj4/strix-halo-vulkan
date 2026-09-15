@@ -863,6 +863,15 @@ var GEMMWMMAMoEReg16x64BTHKAB4W32 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DLDS_PAD=0 -o gemm_wmma_q4_moe_reg64_ldspad0.spv gemm_wmma_q4.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DDOUBLE_BUFFER=1 -o gemm_wmma_q4_moe_reg64_db.spv gemm_wmma_q4.comp
 
+// LLM.md L0c: the scale plane's layout, the mechanism test §2.2 finding 4
+// asked for. Two layouts that make one staging step's BN scales contiguous
+// (k-major, and tile-blocked), each at both scale-block sizes, so the 1.24x
+// QBLOCK=128 win can be read against the layout that should remove it.
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DSCALE_LAYOUT=1 -o gemm_wmma_q4_moe_reg64_smk.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DSCALE_LAYOUT=1 -DQBLOCK=128 -o gemm_wmma_q4_moe_reg64_smk_qb128.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DSCALE_LAYOUT=2 -o gemm_wmma_q4_moe_reg64_smt.spv gemm_wmma_q4.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DGROUPED=1 -DBK_TILES=4 -DHOIST_A=1 -DWM=4 -DWN=4 -DSCALE_LAYOUT=2 -DQBLOCK=128 -o gemm_wmma_q4_moe_reg64_smt_qb128.spv gemm_wmma_q4.comp
+
 //go:embed gemm_wmma_q4_moe_reg64.spv
 var GEMMWMMAQ4MoEReg64 []byte
 
@@ -886,6 +895,18 @@ var GEMMWMMAQ4MoEReg64LDSPad0 []byte
 
 //go:embed gemm_wmma_q4_moe_reg64_db.spv
 var GEMMWMMAQ4MoEReg64DB []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_smk.spv
+var GEMMWMMAQ4MoEReg64SMK []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_smk_qb128.spv
+var GEMMWMMAQ4MoEReg64SMKQB128 []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_smt.spv
+var GEMMWMMAQ4MoEReg64SMT []byte
+
+//go:embed gemm_wmma_q4_moe_reg64_smt_qb128.spv
+var GEMMWMMAQ4MoEReg64SMTQB128 []byte
 
 // The gather and combine passes the grouped GEMM cannot do for itself
 // (IDEAS §3.5). TOPK is baked in because it sizes the combine's unrolled

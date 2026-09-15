@@ -380,6 +380,11 @@ func (l *Layer) Forward(x *Mat, rope *RoPE, tr Trace, prefix string) (*Mat, erro
 	for i := range gate.Data {
 		gate.Data[i] = silu(gate.Data[i]) * up.Data[i]
 	}
+	// down_proj's input, and the one activation in the block with a really
+	// wide dynamic range — stage 6 found SwiGLU overflowing fp16 here on a
+	// real prompt and never on a random one. LLM.md L0d needs it by name,
+	// because the format decision turns on what int8 does to exactly this.
+	tr.put(prefix+"swiglu", gate)
 	mlp, err := l.Down.Apply(gate)
 	if err != nil {
 		return nil, err

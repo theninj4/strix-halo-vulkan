@@ -374,6 +374,88 @@ VkResult shim_create_storage_buffer(VkDevice device, VkPhysicalDevice phys, VkDe
     return VK_SUCCESS;
 }
 
+VkResult shim_create_storage_buffer_of_type(VkDevice device, VkDeviceSize size, uint32_t memType,
+                                             VkBuffer *out_buffer, VkDeviceMemory *out_memory, void **out_mapped) {
+    VkBufferCreateInfo bufInfo = {0};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = size;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkResult r = vkCreateBuffer(device, &bufInfo, NULL, out_buffer);
+    if (r != VK_SUCCESS) {
+        return r;
+    }
+
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(device, *out_buffer, &reqs);
+    if (!(reqs.memoryTypeBits & (1u << memType))) {
+        vkDestroyBuffer(device, *out_buffer, NULL);
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkMemoryAllocateInfo allocInfo = {0};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = reqs.size;
+    allocInfo.memoryTypeIndex = memType;
+
+    r = vkAllocateMemory(device, &allocInfo, NULL, out_memory);
+    if (r != VK_SUCCESS) {
+        vkDestroyBuffer(device, *out_buffer, NULL);
+        return r;
+    }
+    r = vkBindBufferMemory(device, *out_buffer, *out_memory, 0);
+    if (r != VK_SUCCESS) {
+        vkFreeMemory(device, *out_memory, NULL);
+        vkDestroyBuffer(device, *out_buffer, NULL);
+        return r;
+    }
+
+    // A type without HOST_VISIBLE cannot be mapped; the caller gets NULL and
+    // must fill the buffer some other way (or not at all, for a read probe).
+    *out_mapped = NULL;
+    r = vkMapMemory(device, *out_memory, 0, VK_WHOLE_SIZE, 0, out_mapped);
+    if (r != VK_SUCCESS) {
+        *out_mapped = NULL;
+    }
+    return VK_SUCCESS;
+}
+
+VkResult shim_memory_types(VkDevice device, VkPhysicalDevice phys, ShimMemoryType *out, uint32_t max, uint32_t *count) {
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(phys, &props);
+    *count = props.memoryTypeCount;
+
+    // "Can this type back a storage buffer?" is a property of a buffer, not
+    // of the device, so ask a throwaway one. Any size works; the bits do not
+    // depend on it.
+    uint32_t bufferBits = 0;
+    VkBufferCreateInfo bufInfo = {0};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = 4096;
+    bufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer probe;
+    if (vkCreateBuffer(device, &bufInfo, NULL, &probe) == VK_SUCCESS) {
+        VkMemoryRequirements reqs;
+        vkGetBufferMemoryRequirements(device, probe, &reqs);
+        bufferBits = reqs.memoryTypeBits;
+        vkDestroyBuffer(device, probe, NULL);
+    }
+
+    uint32_t n = props.memoryTypeCount < max ? props.memoryTypeCount : max;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t h = props.memoryTypes[i].heapIndex;
+        out[i].index = i;
+        out[i].heapIndex = h;
+        out[i].propertyFlags = props.memoryTypes[i].propertyFlags;
+        out[i].heapSize = props.memoryHeaps[h].size;
+        out[i].heapFlags = props.memoryHeaps[h].flags;
+        out[i].bufferCompatible = (bufferBits & (1u << i)) ? 1 : 0;
+    }
+    return VK_SUCCESS;
+}
+
 void shim_destroy_buffer(VkDevice device, VkBuffer buffer, VkDeviceMemory memory) {
     vkUnmapMemory(device, memory);
     vkFreeMemory(device, memory, NULL);

@@ -937,6 +937,7 @@ func PrintMoESummary(w io.Writer, results []Result, p Params) {
 	printMoEOccupancy(w, results)
 	printMoEStrideGrid(w, results)
 	printMoEQ4Grid(w, results)
+	printMoEQ4ScaleLayout(w, results)
 	printMoEQ4StrideGrid(w, results)
 	printMoERoute(w, results)
 	printMoELayerBudget(w, results)

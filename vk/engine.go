@@ -12,6 +12,7 @@ import "C"
 
 import (
 	"fmt"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -311,6 +312,106 @@ type Buffer struct {
 	mapped unsafe.Pointer
 	size   int
 }
+
+// Memory property bits, as reported per memory type. Named here rather than
+// imported from cgo so a caller can test them without the C types.
+const (
+	MemoryDeviceLocal    = 0x0001
+	MemoryHostVisible    = 0x0002
+	MemoryHostCoherent   = 0x0004
+	MemoryHostCached     = 0x0008
+	MemoryDeviceCoherent = 0x0040 // VK_AMD_device_coherent_memory
+	MemoryDeviceUncached = 0x0080 // VK_AMD_device_coherent_memory
+)
+
+// MemoryType is one entry of the device's memory-type table, with the heap it
+// draws from. This device exposes eleven of them across two heaps that overlap
+// the same physical RAM, and which one a weight bank lands in decides both how
+// large it may be (heap 1 stops at 83.79 GiB) and, possibly, how fast it
+// reads — IDEAS §5.1, LLM.md L0b.
+type MemoryType struct {
+	Index            uint32
+	HeapIndex        uint32
+	Flags            uint32
+	HeapSize         uint64
+	BufferCompatible bool // can back a plain storage buffer
+}
+
+// Has reports whether every bit in want is set.
+func (m MemoryType) Has(want uint32) bool { return m.Flags&want == want }
+
+// String renders the property bits the way vulkaninfo names them, shortened.
+func (m MemoryType) String() string {
+	names := []struct {
+		bit  uint32
+		name string
+	}{
+		{MemoryDeviceLocal, "DEVICE_LOCAL"},
+		{MemoryHostVisible, "HOST_VISIBLE"},
+		{MemoryHostCoherent, "HOST_COHERENT"},
+		{MemoryHostCached, "HOST_CACHED"},
+		{MemoryDeviceCoherent, "DEVICE_COHERENT"},
+		{MemoryDeviceUncached, "DEVICE_UNCACHED"},
+	}
+	var parts []string
+	for _, n := range names {
+		if m.Flags&n.bit != 0 {
+			parts = append(parts, n.name)
+		}
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, "|")
+}
+
+// MemoryTypes returns the device's memory-type table.
+func (d *Device) MemoryTypes() ([]MemoryType, error) {
+	const max = 32
+	raw := make([]C.ShimMemoryType, max)
+	var count C.uint32_t
+	if err := check("vkGetPhysicalDeviceMemoryProperties",
+		C.shim_memory_types(d.handle, d.phys.handle, &raw[0], C.uint32_t(max), &count)); err != nil {
+		return nil, err
+	}
+	n := int(count)
+	if n > max {
+		n = max
+	}
+	out := make([]MemoryType, n)
+	for i := 0; i < n; i++ {
+		out[i] = MemoryType{
+			Index:            uint32(raw[i].index),
+			HeapIndex:        uint32(raw[i].heapIndex),
+			Flags:            uint32(raw[i].propertyFlags),
+			HeapSize:         uint64(raw[i].heapSize),
+			BufferCompatible: raw[i].bufferCompatible != 0,
+		}
+	}
+	return out, nil
+}
+
+// NewBufferOfType allocates a storage buffer from a named memory type rather
+// than from the one NewBuffer prefers. A type without HOST_VISIBLE cannot be
+// mapped, so MappedPointer and every Write/Read method on the result are
+// unusable — such a buffer is only good for a kernel that reads whatever the
+// allocation happened to contain, which is exactly what the bandwidth probes
+// want.
+func (d *Device) NewBufferOfType(size int, memType uint32) (*Buffer, error) {
+	var handle C.VkBuffer
+	var memory C.VkDeviceMemory
+	var mapped unsafe.Pointer
+	if err := check("vkCreateBuffer/vkAllocateMemory",
+		C.shim_create_storage_buffer_of_type(d.handle, C.VkDeviceSize(size), C.uint32_t(memType),
+			&handle, &memory, &mapped)); err != nil {
+		return nil, err
+	}
+	return &Buffer{dev: d, handle: handle, memory: memory, mapped: mapped, size: size}, nil
+}
+
+// Mapped reports whether the buffer's memory could be mapped, which is false
+// only for a NewBufferOfType on a type without HOST_VISIBLE.
+func (b *Buffer) Mapped() bool { return b.mapped != nil }
 
 // NewBuffer allocates a buffer of size bytes usable as a storage buffer in a
 // compute shader, left mapped.

@@ -21,8 +21,10 @@ type Params struct {
 	ColdFootprints []int // weight footprints in MB (gemv_cold)
 	ColdN          int   // reduction length (gemv_cold)
 
-	BankGiB     int // total weight bank to allocate, in GiB (bank)
-	BankReadMiB int // bytes read per timed step, in MiB (bank)
+	BankGiB          int    // total weight bank to allocate, in GiB (bank)
+	BankReadMiB      int    // bytes read per timed step, in MiB (bank)
+	BankHeadroomGiB  int    // cap for the allocate-until-refused capacity probe, in GiB; 0 disables
+	BankHeadroomType uint32 // which memory type that probe allocates from
 
 	StridePads       []int // row padding in bytes (stride)
 	StrideFootprints []int // touched footprints in MB (stride)
@@ -55,6 +57,7 @@ func DefaultParams() Params {
 		// 63-cell sweep is seconds of timed work.
 		BankGiB:          64,
 		BankReadMiB:      1024,
+		BankHeadroomType: bankDefaultType,
 		StridePads:       StridePadsBytes,
 		StrideFootprints: StrideFootprintsMB,
 		StrideRowBytes:   StrideRowBytesList,

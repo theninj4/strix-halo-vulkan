@@ -457,7 +457,7 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 
 **Written up in [`research/2.1-register-blocking.md`](research/2.1-register-blocking.md).** Register-blocking the accumulators raised arithmetic intensity from 8 to 32 FLOP/byte: **25.2 TFLOP/s, 6.0x**, 8% to 45% of the matrix cores. LDS staging and multi-wave workgroups both turned out to be **unnecessary** — the 32 MiB MALL already supplies that reuse.
 
-### 2.2 Q4 weights into the coopmat path — **DONE** ✅, **2.10x a MoE block**
+### 2.2 Q4 weights into the coopmat path — **DONE** ✅, **2.10x a MoE block** (and its scale-plane leftover closed by **L0c**, a further **1.17x**)
 
 **Written up in [`research/2.2-q4-coopmat.md`](research/2.2-q4-coopmat.md).** Q4 weights through the coopmat path: **2.10x a whole MoE block**, a prompt chunk's 48 of them from 1.35 s to 0.64 s. The operand must round-trip through LDS (no extension exposes a fragment's lane layout), and that LDS tile's rows must be padded off the 32-bank rotation for 1.68-1.83x.
 
@@ -639,7 +639,12 @@ gains on small shapes where a single GEMM can't fill the GPU.
 
 ## 5. APU-specific memory experiments (this is the unusual part of the chip)
 
-### 5.1 Which memory type is fastest for GPU-read-only weights?
+### 5.1 Which memory type is fastest for GPU-read-only weights? — **DONE** ✅, **none of them**, and the heap sizes are fiction
+
+**Written up in [`research/5.1-memory-types.md`](research/5.1-memory-types.md)** (LLM.md L0b). All eight types that can back a storage buffer read at **236.0-237.4 GB/s**, a 0.57% spread across 32 cells — heap 0 / heap 1 is **1.0004**, and `HOST_CACHED` and `DEVICE_UNCACHED` are worth nothing either way. The property bits describe how the *host* sees the pages; a GPU read never goes through the CPU's cache hierarchy, so on a unified-memory part there is nothing for them to change. Second, negative, and larger: **the reported heap sizes are not limits** — type 3 reserved **105.0 GiB** against a heap advertised as 83.79, and type 2 **101.5 GiB** against 41.89, neither refused by the driver. The ceiling is physical RAM. Two side findings: this reconciles `cmd/bus`'s "the first heap runs out at about 8 GB" (that is the 8 GiB *visible VRAM* carveout, a host-read phenomenon the GPU does not notice), and **freed GPU memory returns to the driver's TTM pool rather than to `MemAvailable`**, so a second capacity probe in the same process reads zero.
+
+The original text follows.
+
 **Hypothesis**: the allocator currently prefers `DEVICE_LOCAL|HOST_VISIBLE`
 (memory type 3/4 here) for its unified-memory convenience, but on an APU
 that choice usually means host-coherent/uncached-write-combine pages, which
@@ -658,6 +663,11 @@ run the 64MB copy from each.
 weights, with a staging upload at load time — which is a small change to
 the weight loader for a possibly free few-percent on everything.
 **Effort**: low. **Value**: high (bandwidth is the binding constraint).
+**[measured] There is no ranking and there is no few percent.** The
+expectation was imported from discrete parts, where `DEVICE_LOCAL` means VRAM
+across a PCIe bus. Delivered as a negative that removes a knob from the
+engine — and, incidentally, as the capacity result that let LLM.md drop a
+wrong argument.
 
 ### 5.1b The MALL cliff, and the strided-bandwidth probe — **probe DONE** ✅
 
@@ -765,27 +775,55 @@ degraded number, not the benchmark number.
 
 ---
 
-## 7. Accuracy work that has to happen before any of this ships
+## 7. Accuracy work that has to happen before any of this ships — **first three items DONE** ✅
+
+**Written up in [`research/l0d-quant-error.md`](research/l0d-quant-error.md)**
+(LLM.md L0d). Real weights and real activations from a Qwen3-4B forward pass,
+14 projections, float64 reference. Four results: **W4A8 costs 1.13x the error
+of W4A16**, so the 3x throughput cliff is bought cheaply; **the activations are
+the floor above ~5 bits/weight** — int8-per-token alone contributes 2.87e-2
+where an 8-bit weight contributes 3.4e-3, so W8A8 is 99% activation error and
+lands within 1.2x of W5A8 for twice the bytes; **asymmetric Q4 is worth 5% at
+equal bits, not the 2x predicted below**; and a **defect** — `quantizeQ8`'s
+fp16 block scale goes subnormal whenever a block's maximum is under 7.75e-3,
+which is worth 14x on one real tensor in fourteen, inverts the block-size
+ordering, and is fixed by flooring the scale at fp16's smallest normal. Q4 is
+immune (its scale is 18x larger). The last item, real perplexity, still needs
+the model.
 
 Perf work is choosing between formats whose *accuracy* is unmeasured — the
 `TODO.md` working conclusion already flags this. None of these are perf
 experiments, but they gate the format decision:
 
-- **Per-format error metrics**: for each of Q8/Q4/W8A8/W4A8 and each block
-  size, measure RMS and max relative error of a full layer's output against
-  an fp32 reference — the harness already builds CPU references, so this is
-  mostly bookkeeping. This gives an accuracy-vs-GFLOP/s Pareto front
-  instead of a speed ranking.
-- **Asymmetric (zero-point) vs symmetric Q4**: the current scheme is
-  symmetric `[-8,7]` (`gemm_coopmat_q4.comp:43`). Asymmetric costs one more
-  value per block and a correction term but typically halves the error;
-  worth measuring both cost and benefit.
-- **Activation outliers**: W8A8's weak point is per-tensor/per-row dynamic
-  activation quantization in the presence of outlier channels. Measure how
-  bad it is on real activations before committing to W8A8 for decode.
+- ~~**Per-format error metrics**~~ **DONE.** The front exists, and the surprise
+  in it is that the 4-bit and 8-bit families are 14x apart with nothing in
+  between, so the choice is not a smooth trade. "Mostly bookkeeping" was wrong
+  in one way worth recording: it needed *real* activations, and building the
+  float64 reference turned up a quantizer bug the speed-ranked suite could
+  never have seen.
+- ~~**Asymmetric (zero-point) vs symmetric Q4**~~ **DONE, and "typically halves
+  the error" is falsified here: it is worth 1.043-1.053x** at equal bits per
+  weight (q4asym/64 against q4sym/32, and q4asym/128 against q4sym/64). It is
+  free at decode — §1.1's W4A8 GEMV already computes the per-block activation
+  sum the zero-point correction needs — and costs an epilogue term in the GEMM
+  path (§2.2 finding 9). 5% is probably not worth that.
+- ~~**Activation outliers**~~ **DONE, and they are severe but survivable.**
+  Channel spread reaches 99.5 at layer 0's `down_proj` input and **4172** at
+  layer 1's, with kurtosis 87 187 against a Gaussian 3 — and int8 *per token*
+  still costs only 1.3-1.6x there and 1.0-1.1x everywhere else. Per **tensor**
+  is 1.97x worse on the activation error alone, so the per-row scale is what
+  makes it work, and it is free in the RMSNorm epilogue (§3.1). The one
+  projection that stays awkward is `down`, whose input is the SwiGLU output and
+  has no norm in front of it.
 - **Real perplexity**: ultimately the only test that matters. Needs a
   model loaded, so it comes after the engine exists — but it should be the
   acceptance criterion for the format choice, not benchmark GFLOP/s.
+  **Still open**, and L0d sharpened why: everything above is one projection's
+  output error, which is not a hidden state's error and says nothing about how
+  48 layers compose. It is LLM.md's L9.
+- **New, from L0d: floor `quantizeQ8`'s block scale at fp16's smallest
+  normal.** Two lines, but it changes the CPU reference every W8A8 correctness
+  check is built from, so it wants its own change with those re-run.
 
 ---
 

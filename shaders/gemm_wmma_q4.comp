@@ -119,6 +119,37 @@
 #if (QBLOCK < 32) || ((QBLOCK & (QBLOCK - 1)) != 0)
 #error "QBLOCK must be a power of two >= 32 (one uvec4 of nibbles must lie in one block)"
 #endif
+// How the fp16 scale plane is laid out — LLM.md **L0c**, and the mechanism
+// test IDEAS §2.2 finding 4 asked for and did not run.
+//
+// That finding is the largest unexplained number left in the Q4 path:
+// QBLOCK=128 beats QBLOCK=32 by **1.24x** between two binaries that
+// `RADV_DEBUG=shaderstats` prices identically — same 252 VGPRs, same 5064
+// bytes of code, same 802 instructions, same 513 VALU, same 100 VMEM. The only
+// difference in the source is the shift in the scale index, and the nominal
+// traffic difference is 4.4% of the bank. Something other than bytes is being
+// paid for, and §1.8's grouped GEMV — which reads its scales exactly the way
+// it reads its weights — costs only 1.045-1.116x on the same axis, which
+// points at how this kernel *stages* them rather than at the traffic.
+//
+// The candidate is where the loads land. One staging step reads BN rows of the
+// scale plane at one k-block. At layout 0 those BN scales are `ldb/QBLOCK`
+// halves apart — 160 B for gate_up at QBLOCK=32 — so each 2-byte scale is
+// alone in its own cache line and one step is a BN-address gather, which is
+// §5.1b's worst request shape. Layouts 1 and 2 make the same BN scales
+// contiguous, so the step becomes two 64-byte lines:
+//
+//   0  row-major    [rows][ldb/QBLOCK]                  what §2.2 measured
+//   1  k-major      [ldb/QBLOCK][snrows]                a transpose, tile-agnostic
+//   2  tile-blocked [rows/BN][ldb/QBLOCK][BN]           one N-tile's whole K sweep contiguous
+//
+// Layout 1 is the one a real engine would want: it is a property of the
+// weights alone, so the tile geometry can change without repacking. Layout 2
+// is the maximum-locality bound, and costs a repack if BN ever changes. If 1
+// reaches 2 there is nothing to trade.
+#ifndef SCALE_LAYOUT
+#define SCALE_LAYOUT 0
+#endif
 // Grouped / MoE mode, identical in meaning to gemm_wmma.comp's: the tile
 // origin is read out of a table instead of derived from gl_WorkGroupID, so
 // one dispatch covers every expert's tiles with each expert's weights at a
@@ -155,7 +186,13 @@ layout(push_constant) uniform PC {
     uint M;
     uint N;
     uint K;
-    uint block;   // unused: the quantization block is QBLOCK, a compile-time -D
+    // Leading dimension of the scale plane at SCALE_LAYOUT=1: the number of
+    // B rows it was packed for, which is the whole bank's row count and not
+    // this tile's. Unused by the other layouts. (This slot used to be
+    // `block`, which was dead — the quantization block is QBLOCK, a
+    // compile-time -D, because the scale index is then a shift rather than
+    // IDEAS §1.2's runtime integer division.)
+    uint snrows;
     // B's row stride in *elements* (nibbles), not bytes and not halves. Must
     // be a multiple of QBLOCK, which at QBLOCK=32 also makes every row
     // 16-byte aligned and every uvec4 load in range. Separate from K for the
@@ -232,6 +269,21 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
     }                                                                          \
 }
 
+// Where row n's scale for reduction index k lives. Every divisor here is a
+// compile-time power of two, so none of these is a runtime integer division
+// (IDEAS §1.2) — which is what makes the three layouts comparable at all: the
+// instruction counts stay equal and only the addresses move.
+#if SCALE_LAYOUT == 0
+#define SCALE_IDX(n, k) ((n) * (pc.ldb / QBLOCK) + (k) / QBLOCK)
+#elif SCALE_LAYOUT == 1
+#define SCALE_IDX(n, k) (((k) / QBLOCK) * pc.snrows + (n))
+#elif SCALE_LAYOUT == 2
+#define SCALE_IDX(n, k) ((((n) / BN) * (pc.ldb / QBLOCK) + (k) / QBLOCK) * BN   \
+                         + ((n) & (BN - 1u)))
+#else
+#error "SCALE_LAYOUT must be 0 (row-major), 1 (k-major) or 2 (tile-blocked)"
+#endif
+
 // Global -> registers for the Q4 slab starting at reduction index kk. Kept
 // separate from STORE_STAGE so that with DOUBLE_BUFFER the compiler sinks the
 // s_waitcnt past the MMAs issued in between; without it the two are adjacent
@@ -242,8 +294,7 @@ shared float16_t ldsB[LDS_PLANES * LDS_B_PLANE];
         if (i < B_CHUNKS) {                                                    \
             uint elem = (n0 + B_ROW(i)) * pc.ldb + (kk) + B_COL(i);            \
             stageB[s] = bq[elem >> 5u];                                        \
-            stageS[s] = scales[(n0 + B_ROW(i)) * (pc.ldb / QBLOCK)             \
-                               + ((kk) + B_COL(i)) / QBLOCK];                  \
+            stageS[s] = scales[SCALE_IDX(n0 + B_ROW(i), (kk) + B_COL(i))];     \
         }                                                                      \
     }                                                                          \
 }

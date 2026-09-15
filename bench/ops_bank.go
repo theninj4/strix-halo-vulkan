@@ -81,7 +81,11 @@ var BankSlabBytesList = []int{819200, 1638400, 4 << 20}
 // under anything interesting up to the whole device-local heap's worth: the
 // UD-Q4_K_XL resident core is 82.5 GB and a bank of our own would be ~67 GB,
 // so 64 GiB (68.7 GB) is the size the answer actually has to hold at.
-var BankPrefixesGiB = []int{1, 2, 4, 8, 16, 32, 48, 64}
+// 80 GiB (85.9 GB) is only reached by an explicit -bankgib 80: it covers
+// UD-Q4_K_XL's 82.52 GB resident core with margin, and unlike L0b's capacity
+// probe every page of it is written, so it measures residency rather than
+// reservation.
+var BankPrefixesGiB = []int{1, 2, 4, 8, 16, 32, 48, 64, 80}
 
 // bankOrders are the three slab selections, in the order they are reported.
 var bankOrders = []string{"seq", "spread", "rand"}
@@ -128,7 +132,7 @@ func RunBank(dev *vk.Device, phys *vk.PhysicalDevice, p Params, out io.Writer) (
 	}
 	defer dst.Destroy()
 
-	bufs, err := allocBank(dev, mod, dst, p.BankGiB<<30, maxSlabs, out)
+	bufs, err := allocBank(dev, mod, dst, p.BankGiB<<30, maxSlabs, bankDefaultType, out)
 	for _, b := range bufs {
 		defer b.release()
 	}
@@ -184,7 +188,231 @@ func RunBank(dev *vk.Device, phys *vk.PhysicalDevice, p Params, out io.Writer) (
 			}
 		}
 	}
+
+	// L0b (§5.1) runs after the range sweep so that it inherits the same
+	// verified kernel and the same dst buffer, and so that the range result
+	// is already in hand when the memory types are compared against it.
+	typeResults, err := runBankMemTypes(dev, mod, dst, p, maxSlabs, out)
+	if err != nil {
+		return results, err
+	}
+	results = append(results, typeResults...)
+
+	if p.BankHeadroomGiB > 0 {
+		// Off by default: it allocates until the driver refuses, which is
+		// not something to do to a workstation without being asked.
+		if err := RunBankHeadroom(dev, p.BankHeadroomType, p.BankHeadroomGiB, out); err != nil {
+			return results, err
+		}
+	}
 	return results, nil
+}
+
+// bankMemTypeGiB is how much of each memory type the L0b arm allocates. It has
+// to clear two thresholds to mean anything: the 32 MiB MALL, or the probe
+// would measure cache, and the ~8 GB at which `cmd/bus` found host reads of
+// the preferred type change character — the point where this part's real
+// 8 GiB visible-VRAM carveout runs out and something else starts backing the
+// allocation. 12 GiB clears both.
+const bankMemTypeGiB = 12
+
+// bankMemTypePrefixesGiB are measured within each type: one comfortably
+// inside the carveout and one well past it. If the carveout boundary matters
+// to a *GPU* read the way it matters to a host read, it shows up as these two
+// disagreeing.
+var bankMemTypePrefixesGiB = []int{1, 12}
+
+// runBankMemTypes is LLM.md **L0b** and IDEAS **§5.1**, never run until now.
+//
+// Every number in the range sweep above came from whatever vk.NewBuffer
+// prefers, which is memory type 3 — DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT,
+// heap 1, and heap 1 stops at 83.79 GiB. UD-Q4_K_XL's resident core is
+// 82.52 GB, which is 96% of that, so whether the *other* heap reads as fast
+// decides whether a model larger than heap 1 can be served at all — and
+// therefore whether anything wider than ~4.25 bits/weight is on the table.
+//
+// §5.1 asked the more general question ("which memory type is fastest for
+// GPU-read-only weights?") and predicted the answer would be worth a few
+// percent on everything. This arm answers both at once: it walks every type
+// that can back a storage buffer, allocates the same bank from each and runs
+// the same gather over it.
+func runBankMemTypes(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, p Params, maxSlabs int, out io.Writer) ([]Result, error) {
+	types, err := dev.MemoryTypes()
+	if err != nil {
+		return nil, fmt.Errorf("bank: memory types: %w", err)
+	}
+	fmt.Fprintf(out, "\nbank/L0b: %d memory types\n", len(types))
+	for _, t := range types {
+		fmt.Fprintf(out, "  type %2d  heap %d  %5.1f GiB  buffer=%v  %s\n",
+			t.Index, t.HeapIndex, float64(t.HeapSize)/(1<<30), t.BufferCompatible, t)
+	}
+
+	const slabBytes = 1638400 // the model's gate_up expert slab at 4 bits
+	parts, ok := bankParts(slabBytes)
+	if !ok {
+		return nil, fmt.Errorf("bank: slab %d B has no legal part count", slabBytes)
+	}
+	chunksPerPart := slabBytes / 16 / parts
+	readBytes := p.BankReadMiB << 20
+	slabCount := readBytes / slabBytes
+
+	var results []Result
+	for _, t := range types {
+		if !t.BufferCompatible {
+			continue
+		}
+		rs, err := bankOneMemType(dev, mod, dst, t, maxSlabs, slabBytes, parts, chunksPerPart, slabCount, readBytes, p, out)
+		if err != nil {
+			return results, err
+		}
+		results = append(results, rs...)
+	}
+	return results, nil
+}
+
+func bankOneMemType(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, t vk.MemoryType,
+	maxSlabs, slabBytes, parts, chunksPerPart, slabCount, readBytes int, p Params, out io.Writer) ([]Result, error) {
+
+	bufs, err := allocBank(dev, mod, dst, bankMemTypeGiB<<30, maxSlabs, t.Index, out)
+	defer func() {
+		for _, b := range bufs {
+			b.release()
+		}
+	}()
+	if err != nil || len(bufs) == 0 {
+		fmt.Fprintf(out, "bank/L0b: type %d gave nothing\n", t.Index)
+		return nil, nil //nolint:nilerr // an unusable type is a result, not a failure
+	}
+	allocated := bufs[len(bufs)-1].off + bufs[len(bufs)-1].size
+	mapped := bufs[0].src.Mapped()
+
+	var results []Result
+	for _, gib := range bankMemTypePrefixesGiB {
+		prefix := gib << 30
+		if prefix > allocated {
+			continue
+		}
+		slots := bankSlots(bufs, prefix, slabBytes)
+		if slots.total < slabCount {
+			continue
+		}
+		dispatches := loadSlabTables(bufs, selectSlabs(slots, slabCount, "rand"), slabBytes, chunksPerPart, parts)
+		ns, clocks, err := TimeDispatchMulti(dispatches, 1, p.Warmup, p.Iters, false)
+		if err != nil {
+			return results, fmt.Errorf("bank memtype=%d prefix=%dGiB: %w", t.Index, gib, err)
+		}
+		results = append(results, Result{
+			Op: "bank", Variant: "memtype", Size: gib,
+			Detail: fmt.Sprintf("type=%d;heap=%d;gotGiB=%.0f;mapped=%v;flags=%s",
+				t.Index, t.HeapIndex, float64(allocated)/(1<<30), mapped, t),
+			NsPerIter: ns,
+			GBPS:      float64(readBytes) / (ns / 1e9) / 1e9,
+			Clocks:    clocks,
+		})
+	}
+	return results, nil
+}
+
+// bankHeadroomFloorGiB is how much host memory the headroom probe refuses to
+// go below. It is allocating without writing, so the pages should stay
+// uncommitted and nothing should be at risk — but "should" is doing work in
+// that sentence on a driver that hands out GTT, and this runs on the
+// developer's own workstation. The probe stops rather than finds out.
+const bankHeadroomFloorGiB = 12
+
+// RunBankHeadroom answers the capacity half of L0b, which is a different
+// question from the bandwidth half above: **how much will the device actually
+// hand out?**
+//
+// It matters because the numbers are close and the reported ones turn out to
+// be fiction. RADV reports heap 1 (device-local) at 83.79 GiB and heap 0 at
+// 41.89 GiB on a machine with 117.7 GiB of GTT. UD-Q4_K_XL's resident core is
+// 82.52 GB = 76.9 GiB, which is 92% of heap 1, and a 262 k KV cache is another
+// 6.4 GB on top — so whether "83.79 GiB" is a wall decides whether the stock
+// quant can be served at all, and whether anything wider than ~4.25 bits is
+// worth considering.
+//
+// **One probe per process, deliberately.** Freeing a Vulkan allocation returns
+// its pages to the driver's TTM pool rather than to the kernel's free list:
+// after this probe releases 63 GiB, `MemAvailable` stays where it was and
+// `mem_info_gtt_used` drops to ~90 MB. So a second probe in the same process
+// sees a machine that looks full and is not, and reports zero. Measuring two
+// memory types means two runs.
+//
+// Allocation only — no page is written. That measures what the driver will
+// reserve, which is an upper bound on what the machine will hold; the largest
+// bank this suite has actually *touched* is the 64 GiB of the range sweep.
+func RunBankHeadroom(dev *vk.Device, memType uint32, capGiB int, out io.Writer) error {
+	types, err := dev.MemoryTypes()
+	if err != nil {
+		return err
+	}
+	if memType == bankDefaultType {
+		for _, t := range types {
+			if t.BufferCompatible && t.Has(vk.MemoryDeviceLocal|vk.MemoryHostVisible|vk.MemoryHostCoherent) {
+				memType = t.Index
+				break
+			}
+		}
+	}
+	if int(memType) >= len(types) || !types[memType].BufferCompatible {
+		return fmt.Errorf("bank: memory type %d cannot back a storage buffer", memType)
+	}
+	t := types[memType]
+
+	var bufs []*vk.Buffer
+	defer func() {
+		for _, b := range bufs {
+			b.Destroy()
+		}
+	}()
+	got, why := fillWith(dev, memType, capGiB<<30, &bufs)
+
+	fmt.Fprintf(out, "\nL0b capacity — how much will the device actually reserve?\n")
+	fmt.Fprintf(out, "  allocation only, nothing written; cap %d GiB, host-memory floor %d GiB\n",
+		capGiB, bankHeadroomFloorGiB)
+	fmt.Fprintf(out, "  type %d (heap %d, reported %.1f GiB): **%.1f GiB** — %s\n",
+		t.Index, t.HeapIndex, float64(t.HeapSize)/(1<<30), float64(got)/(1<<30), why)
+	fmt.Fprintf(out, "  run again with -bankheadroomtype to measure another type; "+
+		"a second probe in this process would read zero (see the doc comment)\n")
+	return nil
+}
+
+// fillWith appends bankBufferBytes allocations of memType to bufs until the
+// driver refuses, the cap is hit, or host memory runs low.
+func fillWith(dev *vk.Device, memType uint32, capBytes int, bufs *[]*vk.Buffer) (int, string) {
+	got := 0
+	for got < capBytes {
+		if avail := memAvailableGiB(); avail > 0 && avail < bankHeadroomFloorGiB {
+			return got, fmt.Sprintf("stopped at the floor, %.1f GiB of host memory left", avail)
+		}
+		b, err := dev.NewBufferOfType(bankBufferBytes, memType)
+		if err != nil {
+			return got, "the driver refused"
+		}
+		*bufs = append(*bufs, b)
+		got += bankBufferBytes
+	}
+	return got, "hit the cap"
+}
+
+// memAvailableGiB reads MemAvailable, so the probe can stop before it starts
+// costing the machine rather than after.
+func memAvailableGiB() float64 {
+	f, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(f), "\n") {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		var kb float64
+		if _, err := fmt.Sscanf(line, "MemAvailable: %f kB", &kb); err == nil {
+			return kb / (1 << 20)
+		}
+	}
+	return 0
 }
 
 // bankMaxParts bounds the workgroups-per-slab search, and so the dst buffer.
@@ -206,11 +434,20 @@ func bankParts(slabBytes int) (int, bool) {
 	return 0, false
 }
 
+// bankDefaultType means "whatever vk.NewBuffer prefers", which on this device
+// is always memory type 3 (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT).
+const bankDefaultType = ^uint32(0)
+
 // allocBank allocates as much of want as the device will give, in
 // bankBufferBytes pieces, dirties every page of it and builds one pipeline
 // per piece. A partial bank is not an error: running out is itself
 // information, and the sweep simply stops at what was obtained.
-func allocBank(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, want, maxSlabs int, out io.Writer) ([]bankBuf, error) {
+//
+// memType is bankDefaultType for the preferred type or an explicit index for
+// the L0b arm. An explicit type that is not host-visible comes back unmapped,
+// and its pages are left however the driver supplied them — noted in the
+// report, because an untouched allocation is the one way this probe can lie.
+func allocBank(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, want, maxSlabs int, memType uint32, out io.Writer) ([]bankBuf, error) {
 	var bufs []bankBuf
 	for off := 0; off < want; {
 		size := bankBufferBytes
@@ -221,13 +458,24 @@ func allocBank(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, want, maxSl
 		if size == 0 {
 			break
 		}
-		src, err := dev.NewBuffer(size)
+		var src *vk.Buffer
+		var err error
+		if memType == bankDefaultType {
+			src, err = dev.NewBuffer(size)
+		} else {
+			src, err = dev.NewBufferOfType(size, memType)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "bank: allocation stopped at %.1f GiB: %v\n",
 				float64(off)/(1<<30), err)
 			break
 		}
-		touchPages(src)
+		if src.Mapped() {
+			touchPages(src)
+		}
+		// The slab table is always a default-type buffer: it has to be
+		// writable from the host, and it is 32 KB, so where it lives cannot
+		// affect a measurement that reads gigabytes.
 		slabs, err := dev.NewBuffer(maxSlabs * 4)
 		if err != nil {
 			src.Destroy()
@@ -244,9 +492,7 @@ func allocBank(dev *vk.Device, mod *vk.ShaderModule, dst *vk.Buffer, want, maxSl
 		}
 		bufs = append(bufs, bankBuf{src: src, slabs: slabs, pipe: pipe, off: off, size: size})
 		off += size
-		fmt.Fprintf(out, "\rbank: allocating %.1f GiB", float64(off)/(1<<30))
 	}
-	fmt.Fprintln(out)
 	return bufs, nil
 }
 
@@ -494,6 +740,51 @@ func PrintBankSummary(w io.Writer, results []Result, p Params) {
 		}
 		tw.Flush()
 	}
+	PrintBankMemTypeSummary(w, results, p)
+}
+
+// PrintBankMemTypeSummary prints L0b: one row per memory type that can back a
+// storage buffer, at two prefixes. §5.1 predicted a ranking worth a few
+// percent; the column to read is whether there is any spread at all.
+func PrintBankMemTypeSummary(w io.Writer, results []Result, p Params) {
+	var rows []Result
+	for _, r := range results {
+		if r.Op == "bank" && r.Variant == "memtype" {
+			rows = append(rows, r)
+		}
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nL0b / §5.1 — does the memory type matter for a GPU read?\n")
+	fmt.Fprintf(w, "%d MiB read per step from a %d GiB bank of each type, GB/s\n",
+		p.BankReadMiB, bankMemTypeGiB)
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprint(tw, "  type\theap\tgot GiB")
+	for _, g := range bankMemTypePrefixesGiB {
+		fmt.Fprintf(tw, "\t%d GiB", g)
+	}
+	fmt.Fprint(tw, "\tflags\n")
+	seen := map[string]bool{}
+	for _, r := range rows {
+		f := detailField(r.Detail, "type")
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
+		fmt.Fprintf(tw, "  %s\t%s\t%s", f, detailField(r.Detail, "heap"), detailField(r.Detail, "gotGiB"))
+		for _, g := range bankMemTypePrefixesGiB {
+			v := "-"
+			for _, q := range rows {
+				if detailField(q.Detail, "type") == f && q.Size == g {
+					v = fmt.Sprintf("%.0f", q.GBPS)
+				}
+			}
+			fmt.Fprintf(tw, "\t%s", v)
+		}
+		fmt.Fprintf(tw, "\t%s\n", detailField(r.Detail, "flags"))
+	}
+	tw.Flush()
 }
 
 func filterOp(results []Result, op string) []Result {

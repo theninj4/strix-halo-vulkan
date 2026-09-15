@@ -10,12 +10,13 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: scoped; L0a done, and it came back clean.** The checkpoint is not
-downloaded. What exists is the arithmetic below — all of it from the real
-`config.json` and from the **actual tensor tables of
-`unsloth/…-UD-Q4_K_XL`**, read out of 35 MB of HTTP range requests rather
-than 111 GB of download (`reference/gguf_inventory.py`) — plus the one
-measurement that arithmetic was resting on:
+**Status: scoped; L0 complete — L0a, L0b, L0c and L0d all done.** The checkpoint is not downloaded. What
+exists is the arithmetic below — all of it from the real `config.json` and
+from the **actual tensor tables of `unsloth/…-UD-Q4_K_XL`**, read out of
+35 MB of HTTP range requests rather than 111 GB of download
+(`reference/gguf_inventory.py`) — plus the two measurements it was resting on.
+Both came back negative, which is the useful kind: they removed constraints
+rather than adding them.
 
 > **L0a: the DRAM bus does not care how big the weight bank is.** 236.4 GB/s
 > reading a **64 GiB** bank at random against 237.1 GB/s reading a 1 GiB one,
@@ -23,7 +24,46 @@ measurement that arithmetic was resting on:
 > sizes. That *is* §0.4's 236 GB/s ceiling, not merely near it — no TLB cliff,
 > no page-table cost, no penalty for scattering. So decode stays linear in
 > bits/weight at the size a 180 B model needs, which is what every number
-> below depends on. [Write-up](research/l0a-bank-range.md) · `results/bank.csv`
+> below depends on. [Write-up](research/l0a-bank-range.md)
+>
+> **L0a again, at 80 GiB.** `-bankgib 80`: 23 buffers, 85.9 GB, every page
+> written, **237 GB/s at every prefix** — past UD-Q4_K_XL's 82.52 GB resident
+> core, so the largest bank this vertical would hold is now measured live.
+>
+> **L0b: neither does the memory type, and the heap sizes are fiction.** All
+> eight types that can back a storage buffer read **236.0-237.4 GB/s** — 0.57%
+> across 32 cells, heap 0 / heap 1 = **1.0004**. And the advertised heap sizes
+> are not limits: type 3 reserved **105.0 GiB** against a heap RADV calls
+> 83.79, type 2 **101.5 GiB** against 41.89, neither refused by the driver.
+> **The ceiling is physical RAM.** [Write-up](research/5.1-memory-types.md) ·
+> `results/bank.csv`
+
+> **L0c: §2.2's unexplained 1.24x was locality in the scale plane, and it is
+> gone.** One staging step reads 64 rows of the fp16 scale plane, and laid out
+> `[rows][ldb/QBLOCK]` those scales are a row stride apart — 160 B on
+> `gate_up` — so each 2-byte scale arrives alone in its cache line. A k-major
+> plane makes them contiguous and takes `gate_up` at QBLOCK=32 from **4.71 ms
+> to 3.72, 1.27x**, past row-major QBLOCK=128's 3.79. **The fine scale block
+> accuracy wants now costs 1.0% instead of 14.2%.**
+> [Write-up](research/l0c-scale-plane.md) · `results/moe.csv`
+
+> **L0d: W4A8 is safe, and above ~5 bits/weight the activations are the
+> floor.** Real weights and real activations from a Qwen3-4B forward pass, 14
+> projections, float64 reference. int8-per-token activations cost **1.13x** the
+> error of fp16 ones, so the 3x cliff between W4A8 and W4A16 is bought
+> cheaply — but int8 activations *alone* contribute 2.87e-2 where an 8-bit
+> weight contributes 3.4e-3, so **W8A8 is 99% activation error** and lands
+> within 1.2x of W5A8 for twice the bytes and half the tok/s. Asymmetric Q4 is
+> worth 5% at equal bits, not the 2x §7 predicted. And a bug fell out:
+> `quantizeQ8`'s fp16 block scale goes subnormal under maxAbs 7.75e-3, worth
+> **14x** on one real tensor in fourteen — Q4 is immune.
+> [Write-up](research/l0d-quant-error.md)
+
+> **What L0b changed.** This file previously ruled Q5 and Q6 out because they
+> did not fit the 83.79 GiB device-local heap. **That argument was wrong** and
+> is withdrawn. They are ruled out now on *throughput* — Q5 costs 20% of tok/s
+> and Q6 33% — which is the better argument anyway, because it is the one that
+> would still hold on a machine with more memory.
 
 ---
 
@@ -38,11 +78,13 @@ accuracy criterion (`llama-perplexity` — §7's "real perplexity", free) and a
 performance baseline (`llama-bench`) all at once. **This vertical does not need
 a Python reference dump**, which is what S1 and T1 spent their first session on.
 
-**2. UD-Q4_K_XL fits, but only once the n-gram table is taken off the GPU.**
-It is 111.32 GB against a 89.97 GB device-local heap. But 28.80 GB of it is
-`per_layer_token_embd` — a 320 M-row hash table that is *gathered*, 16 rows of
-160 values per token, **1.41 KB**. Leave it mmap'd on the host and the resident
-core is **82.52 GB, inside the heap with 7.4 GB to spare**.
+**2. A quarter of UD-Q4_K_XL is a lookup table that should never touch the
+GPU.** Of its 111.32 GB, **28.80 GB** is `per_layer_token_embd` — a 320 M-row
+hash table read 16 rows of 160 values at a time, **1.41 KB per token**. Leave
+it mmap'd on the host and the resident core is **82.52 GB**. L0b since
+established that 111.32 GB would *fit* if we insisted, so this is no longer a
+necessity — it is 26% of the machine's memory bought for 0.02% of its
+bandwidth, which is reason enough.
 
 **3. The stock quant is tuned for accuracy-per-byte, not for tok/s on a
 bandwidth-bound APU, and it costs 1.7x.** Unsloth put every dense tensor at
@@ -73,7 +115,14 @@ same GPU.
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
 ~4.25 bits on everything streamed, fp16 routers, the n-gram table left as
-IQ4_NL on disk. Target ~67 tok/s against phase 1's ~38. Source it either by
+IQ4_NL on disk, and — L0c — **fp16 scales per 32 nibbles in a k-major plane**.
+The two-level scale this file used to recommend (int8 per 32 under an fp16
+per-256 super-scale) was half an accuracy argument and half a way to dodge
+§2.2's 1.24x tax on fine scale blocks; L0c removed the tax, so the fine block
+is essentially free at prefill and the extra machinery buys nothing there.
+What survives of the int8-sub-scale argument is **bytes** — fp16-per-32 is
+11.1% of the bank against 3.0% at per-128, and at *decode* bytes are the clock
+— so it is a question for L0d, not a decision already taken. Target ~67 tok/s against phase 1's ~38. Source it either by
 transcoding the GGUF (cheap, double-quantises) or from the 360 GB bf16
 (clean — and **unsloth publish their imatrix**, `imatrix_unsloth.gguf`, 580 MB,
 so the calibration is free).
@@ -92,8 +141,11 @@ completely. Both dwarf the difference between 4 and 5 bits.
 | DRAM bandwidth | **236 GB/s** peak; **242 GB/s** best real decode GEMV | §0, §1.7 |
 | MALL | 32 MiB, 805 GB/s copy / 965 read | §0.4, §5.1b |
 | WMMA fp16 | 55.5 TFLOP/s; best real kernel 39.0 (70%) | §0.1, §2.7 |
-| Vulkan heap 1 (`DEVICE_LOCAL`) | **83.79 GiB = 89.97 GB** | `vulkaninfo`, this session |
-| Vulkan heap 0 (host-visible) | 41.89 GiB, same physical RAM | `vulkaninfo` |
+| Vulkan heap 1 (`DEVICE_LOCAL`) | advertised 83.79 GiB — **not a limit**: 105.0 GiB reserved | §5.1 |
+| Vulkan heap 0 (host-visible) | advertised 41.89 GiB — 101.5 GiB reserved | §5.1 |
+| memory type, for a GPU read | **irrelevant**, all 8 within 0.57% | §5.1 |
+| the real capacity ceiling | **physical RAM**, 117.7 GiB, less the OS | §5.1 |
+| visible VRAM carveout | 8 GiB — a *host*-read boundary only | `cmd/bus`, §5.1 |
 | `maxBufferSize` / `maxMemoryAllocationSize` | **4 GiB − 4 B** | `vulkaninfo` |
 | `maxDescriptorSetStorageBuffers` | 8 388 606 | `vulkaninfo` |
 | GTT / system RAM | 117.7 GiB (`amdgpu.gttsize=126976` already set) | `/proc/cmdline` |
@@ -182,9 +234,12 @@ at `top_k = 2048` however long the context is:
 | 131 072 | 3.22 GB | 0.20 | 113 MB |
 | 262 144 | 6.44 GB | 0.40 | 113 MB |
 
-Which is also the second reason phase 2 matters: at 82.52 GB resident there are
-7.4 GB of heap left, so **UD-Q4_K_XL as shipped cannot hold full context**. At
-67 GB there are 23 GB and it can.
+Before L0b this section ended by saying UD-Q4_K_XL could not hold full context
+because 82.52 GB left only 7.4 GB of an 89.97 GB heap. **That was wrong** — the
+heap figure is advisory and 105 GiB is reservable — so 82.52 GB of weights plus
+6.8 GB of KV is comfortable, and even keeping the n-gram table resident
+(111.32 GB total) is within reach. Capacity has stopped being the binding
+constraint on this model at any format below Q8. Bandwidth is the whole story.
 
 ### Prefill behaves differently from decode
 
@@ -259,23 +314,48 @@ bound by the dequant path and by the 40-rows-per-expert tile (§3.4 finding 3:
       **85 W against ALU work's 118-142**, so speculation and batching have
       ~50 W of package budget to spend.
       [Write-up](research/l0a-bank-range.md).
-- [ ] **L0b** *Is heap 0 as fast as heap 1 for GPU reads?* §5.1, never run, and
-      **now the next thing to run**: L0a measured heap 1 only (`vk.NewBuffer`
-      prefers `DEVICE_LOCAL|HOST_VISIBLE` and got it for all 19 allocations),
-      and that heap stops at 89.97 GB. If the host-visible heap reads at the
-      same rate, UD-Q4_K_XL's 82.5 GB core gets room for a long-context KV
-      cache and Q5-class formats come back on the table; if it does not,
-      ~4.25 bits is the only format there is. The `bank` family is the
-      instrument — it needs a memory-type knob and one more arm. A day.
-- [ ] **L0c** *The blocked scale plane.* §2.2's open item (QBLOCK=128 is 1.24x
-      QBLOCK=32 from two instruction-identical binaries, cause unattributed).
-      It is simultaneously the fix for that and the feasibility test for the
-      block-32 granularity phase 2 wants. Two days.
-- [ ] **L0d** *Per-format error metrics* (§7) on `Qwen3-Embedding-0.6B`, which
-      is already in `models/` — RMS and max relative error per format per block
-      size, plus the activation-outlier measurement that decides **W4A8 vs
-      W4A16**. That one is a 3x cliff (§1.1 measured the float-unpack Q4 GEMV
-      at 74 GB/s, 31% of the bus) sitting behind a question nobody has asked.
+- [x] **L0b** *Is heap 0 as fast as heap 1 for GPU reads?* **Done — no type
+      or heap is faster than any other, and the heap sizes turned out not to
+      be limits.** §5.1, never run before. New `vk.Device.MemoryTypes()` /
+      `NewBufferOfType()` over two shim entry points, and two more arms on the
+      `bank` family. All eight buffer-compatible types read **236.0-237.4
+      GB/s** (0.57% spread, heap0/heap1 = 1.0004); `HOST_CACHED` and
+      `DEVICE_UNCACHED` are worth nothing either way, because the property
+      bits describe how the *host* sees the pages and a GPU read never goes
+      through the CPU's caches. The capacity probe then reserved **105.0 GiB
+      from a heap advertised as 83.79** and 101.5 from one advertised as
+      41.89, stopped only by its own host-memory floor. Two side findings: the
+      8 GiB carveout behind `cmd/bus`'s "the first heap runs out at 8 GB" is a
+      host-read boundary the GPU does not notice, and **freed GPU memory
+      returns to the driver's TTM pool, not to `MemAvailable`**, so a capacity
+      probe gets one memory type per process.
+      [Write-up](research/5.1-memory-types.md).
+- [x] **L0c** *The blocked scale plane.* **Done, and unlike L0a and L0b it is
+      a positive: 1.27x, and it changes the format.** `SCALE_LAYOUT` on
+      `gemm_wmma_q4.comp` with a matching host packer, three layouts x two
+      scale-block sizes at §2.2's winning geometry. k-major qb32 beats
+      row-major qb128 on `gate_up` (3.72 vs 3.79 ms), so **block-32
+      granularity costs 1.0% of the two matmuls instead of 14.2%**. The
+      mechanism is the plane's row stride and the two layers are the control:
+      identical nominal scale overhead (11.1% of the bank), strides of 160 B
+      and 40 B, recoveries of 1.27x and 1.02x. Tile-blocking beyond k-major is
+      worth 0.1%, so the layout stays a property of the weights rather than of
+      the tile geometry — which matters, because layout 2 would mean repacking
+      60 GB whenever `BN` changed. Best cell is **1.169x** over what §2.2
+      shipped. [Write-up](research/l0c-scale-plane.md).
+- [x] **L0d** *Per-format error metrics* (§7). **Done, and it settles the
+      format.** New `cmd/quanterr` + `bench/quanterr.go`: 14 real projections
+      from a Qwen3-4B forward pass against a float64 reference, weight
+      reconstruction error carried separately from output error. Not
+      `Qwen3-Embedding-0.6B` as this entry originally said — Z-Image's Qwen3-4B
+      text encoder is hidden **2560**, the target's own width, where the
+      embedding model is 1024. **W4A8 costs 1.13x W4A16** (worst site 1.6x, on
+      `down`); **the activation error is the floor above ~5 bits**; asymmetric
+      is worth 5% at equal bits; per-token activation scales beat per-tensor by
+      1.97x and are free. Outliers are severe — channel spread 4172 and
+      kurtosis 87 187 at layer 1's `down` — and survivable with a per-row
+      scale. Found a defect in `quantizeQ8` on the way (see below).
+      [Write-up](research/l0d-quant-error.md).
 
 ### L1 — get the checkpoint, and a baseline
 
@@ -368,19 +448,42 @@ bound by the dequant path and by the 40-rows-per-expert tile (§3.4 finding 3:
 | # | decision | why |
 |---|---|---|
 | D1 | **Consume UD-Q4_K_XL first, don't quantise from bf16.** | 114 GB instead of 360, an imatrix-calibrated checkpoint, and a bit-exact oracle. Phase order: run it, profile it, then optimise (`TODO.md`). |
-| D2 | **The n-gram table lives off-heap, mmap'd.** | 28.80 GB of capacity for 1.41 KB/token of bandwidth. Putting it on the GPU costs a third of the heap for nothing. |
-| D3 | **Target ~4.25 bits on everything *streamed*, not just the experts.** | 76% of decode bytes are dense. Bits spent there cost ~nothing in memory and everything in tok/s. |
+| D2 | **The n-gram table lives off-heap, mmap'd.** | 28.80 GB of capacity for 1.41 KB/token of bandwidth — 26% of the machine for 0.02% of its bus. L0b showed it would *fit* on the GPU; that does not make it worth a quarter of the memory. |
+| D3 | **Target ~4.25 bits on everything *streamed*, not just the experts.** | 76% of decode bytes are dense. Bits spent there cost ~nothing in memory and everything in tok/s. L0d adds the accuracy half: above ~5 bits the int8 activations are the floor anyway, so the bits would not buy what they appear to. |
 | D4 | **Do not go below 4 bits on the experts.** | They are 24% of the traffic; Q3 buys ~11% for a real accuracy hit. |
+| D6 | **W4A8, with per-token activation scales.** | L0d: int8-per-token costs **1.13x** the error of fp16 activations, against a 3x throughput cliff (§1.1's float-unpack Q4 GEMV reaches 31% of the bus). Per-*tensor* is 1.97x worse on the activation error and per-token is free in the RMSNorm epilogue (§3.1). |
+| D7 | **Symmetric Q4, not asymmetric.** | L0d: 1.043-1.053x at equal bits per weight, where §7 predicted 2x. Free at decode (§1.1's block sum already exists) but an extra fp32-epilogue term in the GEMM path (§2.2 finding 9). Revisit only if L9's perplexity asks for it. |
+| D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill, so accuracy gets the granularity it wants for nothing. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — which is the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and it gives correctness, accuracy and a baseline from one binary. |
 
 ## Open questions
 
-- ~~**L0a's answer.**~~ Settled: flat to 64 GiB. What is left of it is the
-  last 20 GB — UD-Q4_K_XL's 82.5 GB core is 96% of the heap, and the sweep
-  stopped at 64 GiB because that is what a bank of *our own* needs. How the
-  allocator behaves at 96% occupancy is not a bandwidth question, but it is
-  still a question.
-- **W4A8 vs W4A16** — a 3x cliff behind an unmeasured accuracy question (L0d).
+- ~~**L0a's answer.**~~ ~~**L0b's.**~~ Both settled, both negative, and the
+  residency gap between them is closed to 80 GiB: `-bankgib 80` holds **23
+  buffers, 85.9 GB, every page written, 237 GB/s at random**, past
+  UD-Q4_K_XL's 82.52 GB core. What remains taken on trust is only the band
+  between 80 GiB touched and 105 GiB reserved.
+- **Does 111.32 GB — the whole GGUF, n-gram table included — hold live?** It
+  is reservable and 80 GiB of it is demonstrably residable. If the whole thing
+  is, D2 becomes purely an efficiency choice and the host-side PLE gather can
+  be deferred past L2, which would simplify the first working version.
+- ~~**W4A8 vs W4A16**~~ Settled by L0d: 1.13x mean, 1.6x worst. Take W4A8.
+  What is left of it is `down_proj` specifically, whose SwiGLU input has no
+  norm in front of it and carries the outliers. Finer activation groups on
+  that one input, or a rotation, are the unmeasured mitigations; running it at
+  W4A16 is not one, because 13% of the decode budget at 31% of the bus is
+  +26% of decode time.
+- **Fix `quantizeQ8`'s subnormal scale** — two lines (floor it at fp16's
+  smallest normal), but it changes the CPU reference every W8A8 correctness
+  check is built from, so it wants its own change with those re-run. Not
+  urgent for a Q4 engine; it becomes urgent if phase 2 ever transcodes
+  UD-Q4_K_XL's Q8_0 dense tensors through it.
+- **Does the scale plane's layout matter at *decode* too?** L0c is all GEMM.
+  §1.8 measured the grouped GEMV paying 1.045-1.116x on the same axis and put
+  it down to bytes alone — that kernel reads its scales the way it reads its
+  weights, so it should not care about the plane — but it has not been tried
+  with a k-major plane, and decode is where scale bytes are charged against
+  the bus.
 - **How much of the Q8_0 dense allocation is actually needed?** Unsloth chose
   it with an imatrix and 45 calibration chunks. D3 assumes ~4.25 bits is
   enough; L1's perplexity plus L8's is the only honest test.

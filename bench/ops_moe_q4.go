@@ -68,6 +68,10 @@ type moeQ4Variant struct {
 	// only so the summary can name what a row varied.
 	ldsPad    int
 	doubleBuf bool
+	// scaleLayout is gemm_wmma_q4.comp's SCALE_LAYOUT: 0 row-major,
+	// 1 k-major, 2 tile-blocked. LLM.md L0c. The host has to pack the plane
+	// the same way, which is the only reason this is not purely a -D.
+	scaleLayout int
 	// padElems is B's row padding in *elements* (nibbles), used when
 	// gcdTarget is zero. Zero means the bank as it comes.
 	padElems int
@@ -142,6 +146,15 @@ var moeQ4Variants = []moeQ4Variant{
 	{name: "moe_q4_reg64_qb128", spirv: shaders.GEMMWMMAQ4MoEReg64QB128, bm: 64, bn: 64, bk: 64, qblock: 128, ldsPad: 8},
 	{name: "moe_q4_reg64_ldspad0", spirv: shaders.GEMMWMMAQ4MoEReg64LDSPad0, bm: 64, bn: 64, bk: 64, qblock: 32, ldsPad: 0},
 	{name: "moe_q4_reg64_db", spirv: shaders.GEMMWMMAQ4MoEReg64DB, bm: 64, bn: 64, bk: 64, qblock: 32, ldsPad: 8, doubleBuf: true},
+
+	// LLM.md L0c — the scale plane's layout, against both scale-block sizes.
+	// `moe_q4_reg64` and `moe_q4_reg64_qb128` above are the row-major pair
+	// these subtract from, so the table reads as a 3x2: three layouts, two
+	// values of QBLOCK, everything else held at §2.2's winning geometry.
+	{name: "moe_q4_reg64_smk", spirv: shaders.GEMMWMMAQ4MoEReg64SMK, bm: 64, bn: 64, bk: 64, qblock: 32, ldsPad: 8, scaleLayout: 1},
+	{name: "moe_q4_reg64_smk_qb128", spirv: shaders.GEMMWMMAQ4MoEReg64SMKQB128, bm: 64, bn: 64, bk: 64, qblock: 128, ldsPad: 8, scaleLayout: 1},
+	{name: "moe_q4_reg64_smt", spirv: shaders.GEMMWMMAQ4MoEReg64SMT, bm: 64, bn: 64, bk: 64, qblock: 32, ldsPad: 8, scaleLayout: 2},
+	{name: "moe_q4_reg64_smt_qb128", spirv: shaders.GEMMWMMAQ4MoEReg64SMTQB128, bm: 64, bn: 64, bk: 64, qblock: 128, ldsPad: 8, scaleLayout: 2},
 
 	// The stride arm, grouped-only at the real prefill batch.
 	{name: "moe_q4_reg64_gcd16", spirv: shaders.GEMMWMMAQ4MoEReg64, bm: 64, bn: 64, bk: 64, qblock: 32, ldsPad: 8, gcdTarget: 16, strideArm: true},
@@ -264,7 +277,7 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 
 			base := moeQ4Result(s, v, r, lay, tiles, ldb)
 
-			pc := moePushConstants(s.N, s.K, ldb, v.lda(s.K), 0)
+			pc := moeQ4PushConstants(s.N, s.K, moeExperts*s.N, ldb, v.lda(s.K), 0)
 			ns, clocks, err := TimeDispatch(pipe, uint32(tiles.total()), 1, 1, warmup, iters, pc)
 			if err != nil {
 				return nil, fmt.Errorf("moe q4 %s %s grouped t=%d: %w", s.layer, v.name, t, err)
@@ -282,7 +295,7 @@ func runMoEShapeQ4(dev *vk.Device, s moeShape, variants []moeQ4Variant, routings
 					continue
 				}
 				groups = append(groups, tiles.counts[e])
-				pcs = append(pcs, moePushConstants(s.N, s.K, ldb, v.lda(s.K), int(tiles.base[e])))
+				pcs = append(pcs, moeQ4PushConstants(s.N, s.K, moeExperts*s.N, ldb, v.lda(s.K), int(tiles.base[e])))
 			}
 			ns, clocks, err = TimeDispatchSequence(pipe, groups, 1, 1, warmup, iters, pcs)
 			if err != nil {
@@ -420,7 +433,10 @@ func verifyMoEGroupedQ4(dev *vk.Device, mod *vk.ShaderModule, v moeQ4Variant) er
 
 	aBuf.WriteBytes(float32SliceToFloat16Bytes(padRows(aData, lay.total, K, lda)))
 	bBuf.WriteBytes(padPackedQ4Rows(packed, experts*N, K, ldb))
-	scalesBuf.WriteBytes(padScaleRows(scales, experts*N, K/v.qblock, ldb/v.qblock))
+	// Packed over the plane's *allocated* height, not just the three experts
+	// that carry data, so the k-major layout's stride is the one the kernel
+	// is told about.
+	scalesBuf.WriteBytes(packScalePlane(scales, experts*N, moeExperts*N, K/v.qblock, ldb/v.qblock, v.scaleLayout, v.bn))
 	tileBuf.WriteBytes(uint32SliceToBytes(tiles.table))
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
@@ -433,7 +449,7 @@ func verifyMoEGroupedQ4(dev *vk.Device, mod *vk.ShaderModule, v moeQ4Variant) er
 	}
 	defer pipe.Destroy()
 
-	pc := moePushConstants(N, K, ldb, lda, 0)
+	pc := moeQ4PushConstants(N, K, moeExperts*N, ldb, lda, 0)
 	if _, err := pipe.DispatchTimed(uint32(tiles.total()), 1, 1, 1, pc); err != nil {
 		return err
 	}
@@ -464,6 +480,49 @@ func padPackedQ4Rows(packed []uint8, rows, cols, ldElems int) []byte {
 
 // padScaleRows does the same for the fp16 scale plane, whose row is one entry
 // per quantization block and whose stride follows B's.
+// moeQ4PushConstants is moePushConstants with the slot the fp16 kernel leaves
+// dead carrying the scale plane's leading dimension, which SCALE_LAYOUT=1
+// needs and the other two ignore.
+func moeQ4PushConstants(N, K, snrows, ldb, lda, tileBase int) []byte {
+	pc := newPC().U32(0).U32(uint32(N)).U32(uint32(K)).U32(uint32(snrows)).
+		U32(uint32(ldb)).U32(uint32(lda)).U32(uint32(tileBase)).Bytes()
+	if len(pc) != moePushConstantSize {
+		panic(fmt.Sprintf("moe q4 push constants: built %d bytes, layout declares %d",
+			len(pc), moePushConstantSize))
+	}
+	return pc
+}
+
+// packScalePlane writes the fp16 scale plane in one of gemm_wmma_q4.comp's
+// three SCALE_LAYOUTs (LLM.md L0c). srcRows rows carry data; the plane is
+// planeRows tall, because the k-major layout's stride is the whole bank's
+// height and the kernel is told that number, not the populated one.
+//
+// The three expressions here must stay the mirror image of the shader's
+// SCALE_IDX. That is what the correctness check is for: a layout that the two
+// sides disagree about produces wrong numbers, not slow ones.
+func packScalePlane(scales []uint16, srcRows, planeRows, blocksPerRow, ldBlocks, layout, bn int) []byte {
+	if planeRows < srcRows {
+		planeRows = srcRows
+	}
+	out := make([]byte, planeRows*ldBlocks*2)
+	for r := 0; r < srcRows; r++ {
+		for b := 0; b < blocksPerRow; b++ {
+			var i int
+			switch layout {
+			case 1:
+				i = b*planeRows + r
+			case 2:
+				i = ((r/bn)*ldBlocks+b)*bn + r%bn
+			default:
+				i = r*ldBlocks + b
+			}
+			binary.LittleEndian.PutUint16(out[i*2:], scales[r*blocksPerRow+b])
+		}
+	}
+	return out
+}
+
 func padScaleRows(scales []uint16, rows, blocksPerRow, ldBlocks int) []byte {
 	out := make([]byte, rows*ldBlocks*2)
 	for r := 0; r < rows; r++ {
@@ -551,6 +610,67 @@ func printMoEQ4Grid(w io.Writer, results []Result) {
 		"  EXEC is the padded tiles' own FLOP rate against the %.1f TFLOP/s of matrix cores, and which of\n"+
 		"  those two is near its ceiling is what says whether Q4 has moved this shape off the memory system\n",
 		dramPeakGBPS, wmmaPeakTFLOPS)
+}
+
+// printMoEQ4ScaleLayout is LLM.md **L0c**: the scale plane's layout against
+// the scale block size, three by two, everything else held at §2.2's winning
+// geometry.
+//
+// The number this exists to explain is §2.2 finding 4 — QBLOCK=128 beats
+// QBLOCK=32 by 1.24x between instruction-identical binaries — and the reading
+// is one comparison: **k-major at QBLOCK=32 against row-major at QBLOCK=128**.
+// If they meet, the 1.24x was locality, a finer scale block is free once the
+// plane is laid out for the staging step, and phase 2 can have block-32
+// accuracy at block-128 speed. If they do not, the cause is still open and a
+// finer block still costs.
+func printMoEQ4ScaleLayout(w io.Writer, results []Result) {
+	const tokens = "2048"
+	names := map[int]string{0: "row-major", 1: "k-major", 2: "tile-blocked"}
+	// [layout][qblock][layer] -> ms
+	ms := map[[3]string]float64{}
+	var layers []string
+	for _, r := range results {
+		if r.WeightFormat != "q4" || detailField(r.Detail, "mode") != mode1 ||
+			detailField(r.Detail, "tokens") != tokens {
+			continue
+		}
+		v, ok := lookupMoEQ4Variant(r.Variant)
+		if !ok || v.strideArm || v.bn != 64 || v.bm != 64 || v.ldsPad != 8 || v.doubleBuf {
+			continue
+		}
+		layer := detailField(r.Detail, "layer")
+		ms[[3]string{strconv.Itoa(v.scaleLayout), strconv.Itoa(v.qblock), layer}] = r.NsPerIter / 1e6
+		if !containsString(layers, layer) {
+			layers = append(layers, layer)
+		}
+	}
+	if len(layers) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nL0c — the scale plane's layout (%s tokens, 64x64x64 tile, LDS_PAD=8)\n", tokens)
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprint(tw, "SCALE LAYOUT")
+	for _, l := range layers {
+		fmt.Fprintf(tw, "\t%s qb32\t%s qb128\t%s qb32 gain", l, l, l)
+	}
+	fmt.Fprintln(tw)
+	for _, lay := range []int{0, 1, 2} {
+		fmt.Fprintf(tw, "%s", names[lay])
+		for _, l := range layers {
+			a := ms[[3]string{strconv.Itoa(lay), "32", l}]
+			b := ms[[3]string{strconv.Itoa(lay), "128", l}]
+			base := ms[[3]string{"0", "32", l}]
+			gain := "-"
+			if a > 0 && base > 0 {
+				gain = fmt.Sprintf("%.2fx", base/a)
+			}
+			fmt.Fprintf(tw, "\t%.2f\t%.2f\t%s", a, b, gain)
+		}
+		fmt.Fprintln(tw)
+	}
+	tw.Flush()
+	fmt.Fprint(w, "  ms per dispatch; \"qb32 gain\" is against row-major qb32, the configuration §2.2 measured.\n"+
+		"  The comparison that settles it is k-major qb32 against row-major qb128.\n")
 }
 
 // printMoEQ4StrideGrid is §5.1b's rule applied to a 4-bit row, which is half

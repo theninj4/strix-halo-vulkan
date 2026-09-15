@@ -119,7 +119,33 @@ VkResult shim_device_wait_idle(VkDevice device);
 // HOST_VISIBLE|HOST_COHERENT if no such memory type exists.
 VkResult shim_create_storage_buffer(VkDevice device, VkPhysicalDevice phys, VkDeviceSize size,
                                      VkBuffer *out_buffer, VkDeviceMemory *out_memory, void **out_mapped);
+
+// The same, from a *named* memory type rather than the preferred one. This is
+// IDEAS §5.1 / LLM.md L0b: the default above always lands in heap 1, which
+// stops at 83.79 GiB on this part, and whether the other heaps read as fast
+// decides whether a model larger than that can be served at all. Fails with
+// VK_ERROR_FORMAT_NOT_SUPPORTED if the type cannot back this buffer, and
+// leaves out_mapped NULL for a type that is not host-visible.
+VkResult shim_create_storage_buffer_of_type(VkDevice device, VkDeviceSize size, uint32_t memType,
+                                             VkBuffer *out_buffer, VkDeviceMemory *out_memory, void **out_mapped);
 void shim_destroy_buffer(VkDevice device, VkBuffer buffer, VkDeviceMemory memory);
+
+// One entry of VkPhysicalDeviceMemoryProperties, flattened so cgo sees only
+// scalars. `bufferBits` is set when this type can back a plain storage buffer,
+// which is the only kind this program allocates.
+typedef struct {
+    uint32_t index;
+    uint32_t heapIndex;
+    uint32_t propertyFlags;
+    uint64_t heapSize;
+    uint32_t heapFlags;
+    uint32_t bufferCompatible;
+} ShimMemoryType;
+
+// Fills up to max entries and returns how many exist. Needs a device as well
+// as the physical device because "can back a storage buffer" comes from
+// vkGetBufferMemoryRequirements, which is a device call.
+VkResult shim_memory_types(VkDevice device, VkPhysicalDevice phys, ShimMemoryType *out, uint32_t max, uint32_t *count);
 
 VkResult shim_create_shader_module(VkDevice device, const void *code, size_t size, VkShaderModule *out);
 void shim_destroy_shader_module(VkDevice device, VkShaderModule module);
