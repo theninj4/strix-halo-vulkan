@@ -106,39 +106,76 @@ func ReadDump(path string) (*Dump, error) {
 	payload := b[p : p+nbytes]
 
 	n := int(d.NE[0] * d.NE[1] * d.NE[2] * d.NE[3])
+	tsz, ok := dumpTypeSize[d.GType]
+	if !ok {
+		return nil, fmt.Errorf("%s: unhandled ggml type %d", path, d.GType)
+	}
+	// eval_dump.c copies ggml_nbytes(t) bytes from the tensor's own pointer,
+	// so a *view* comes out as the region of its parent it spans rather than
+	// as the tensor it denotes — 253 952 bytes for a [128, 16, 7] view whose
+	// values are 57 344. Nine of the trace's tensors are like that and all
+	// nine are this layer's q/k/v column ranges of the fused projection. The
+	// strides are in the header, so the gather is exact; reading the payload
+	// flat is what would be wrong.
+	at := func(i int) int { return i * tsz }
+	if !d.contiguous(tsz) {
+		at = func(i int) int {
+			off := uint64(0)
+			for ax := 0; ax < 4; ax++ {
+				if d.NE[ax] > 0 {
+					off += uint64(int64(i)%d.NE[ax]) * d.NB[ax]
+					i /= int(d.NE[ax])
+				}
+			}
+			return int(off)
+		}
+	}
+	if o := at(n - 1); n > 0 && o+tsz > len(payload) {
+		return nil, fmt.Errorf("%s: payload is %d bytes, the strides reach %d", path, len(payload), o+tsz)
+	}
 	d.Vals = make([]float32, n)
 	switch d.GType {
 	case 0: // f32
-		if len(payload) < 4*n {
-			return nil, fmt.Errorf("%s: f32 payload short", path)
-		}
 		for i := range d.Vals {
-			d.Vals[i] = math.Float32frombits(le.Uint32(payload[4*i:]))
+			d.Vals[i] = math.Float32frombits(le.Uint32(payload[at(i):]))
 		}
 	case 1: // f16
 		for i := range d.Vals {
-			d.Vals[i] = f16(le.Uint16(payload[2*i:]))
+			d.Vals[i] = f16(le.Uint16(payload[at(i):]))
 		}
 	case 30: // bf16
 		for i := range d.Vals {
-			d.Vals[i] = math.Float32frombits(uint32(le.Uint16(payload[2*i:])) << 16)
+			d.Vals[i] = math.Float32frombits(uint32(le.Uint16(payload[at(i):])) << 16)
 		}
 	case 26: // i32 — the QSA indexer's top-k is a list of cell indices
-		if len(payload) < 4*n {
-			return nil, fmt.Errorf("%s: i32 payload short", path)
-		}
 		d.Ints = make([]int32, n)
 		for i := range d.Ints {
-			d.Ints[i] = int32(le.Uint32(payload[4*i:]))
+			d.Ints[i] = int32(le.Uint32(payload[at(i):]))
 			d.Vals[i] = float32(d.Ints[i])
 		}
-	default:
-		return nil, fmt.Errorf("%s: unhandled ggml type %d", path, d.GType)
 	}
 	if base := filepath.Base(path); len(base) > 5 && base[4] == '_' {
 		fmt.Sscanf(base[:4], "%d", &d.Seq)
 	}
 	return d, nil
+}
+
+// dumpTypeSize is the byte width of every ggml type the trace carries.
+var dumpTypeSize = map[uint32]int{0: 4, 1: 2, 26: 4, 30: 2}
+
+// contiguous reports whether the payload can be read as a flat array — which
+// is true of every dumped tensor that is not a strided view.
+func (d *Dump) contiguous(tsz int) bool {
+	stride := uint64(tsz)
+	for ax := 0; ax < 4; ax++ {
+		if d.NB[ax] != stride {
+			return false
+		}
+		if d.NE[ax] > 0 {
+			stride *= uint64(d.NE[ax])
+		}
+	}
+	return true
 }
 
 func f16(u uint16) float32 {

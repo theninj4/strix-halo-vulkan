@@ -129,6 +129,62 @@ attention with the selection is **bit-identical** to running it without.
 that is L4's job rather than a gap here: at 4k context the width binds, the
 order starts to matter, and a new dump is needed.
 
+## Addendum (L3) — vLLM settles what the selection *is*, without a 4k dump
+
+A second implementation of this architecture turned up during L3
+(`../vllm`, `vllm/models/qwen4_exp/`), and it answers the question above by
+construction rather than by measurement. Its selection is **block-granular**:
+
+	BLOCK_TOPK    = token_topk // compress_ratio        = 2048/4 = 512 blocks
+	OUTPUT_WIDTH  = BLOCK_TOPK*ratio + ratio - 1        = 2051
+	tail_start    = ((query_position + 1) // ratio) * ratio
+	selected      = top-512 blocks by score, each expanded to its `ratio` cells
+	              ++ the causal tail, cells tail_start .. query_position
+
+llama.cpp reaches the same set from the other end: it biases the tail block by
+1e9, expands the *block* scores to cells, and takes the top `top_k + ratio - 1`
+**cells**. That only agrees because all `ratio` cells of a block carry one
+score and the width is exactly `512*ratio + (ratio-1)`.
+
+**Which is the finding L4 needs**: the selection returns **whole blocks in
+score order**, and a cell-level top-k that splits a block on a tie is wrong
+even though it would pass every test that can be written at 7 tokens. It also
+retires the worry that closed this section — llama.cpp's `TOP_K` being "a
+selection and not a sort" is harmless *precisely because* blocks stay whole,
+so the tie order inside a block is unobservable by construction rather than by
+luck.
+
+Five things it confirms outright, each of which was read out of llama.cpp
+alone until now:
+
+| | vLLM | this file |
+|---|---|---|
+| pooling | `accumulator / COMPRESS_RATIO` | mean over `ratio` raw keys |
+| which blocks exist | `end_position >= COMPRESS_RATIO - 1` | complete blocks only |
+| a block's rope position | `end_position - COMPRESS_RATIO + 1` | its first cell |
+| order of operations | pool → `gemma_rmsnorm` → rope → cache | pool → norm → rope |
+| the score | `tl.sum(tl.maximum(scores, 0.0), axis=2)` | rectified per head, summed, unscaled |
+
+And `tail_start = ((query_position + 1) // ratio) * ratio` is the same formula
+character for character as this file's `tailStart`.
+
+Two differences that are not disagreements. vLLM's **indexer norms are
+`GemmaRMSNorm`** — `x * (1 + w)` — where this file applies a plain RMS norm to
+the GGUF's gamma; llama.cpp's converter does `data_torch + 1` on
+`.indexer.q_layernorm.weight`, `.indexer.k_layernorm.weight` and the three
+`.ple.norm_*` tensors, so the fold is in the checkpoint and both sides compute
+the same thing. That also retro-confirms **L2d**'s PLE norms. And vLLM's
+compressed key cache is **fp8 e4m3** where llama.cpp's is fp16 (L2e-2) — a
+cache-precision choice on either side rather than model semantics, though it
+does say the indexer tolerates fp8 there, which is a lever phase 2 has and
+probably never needs at 1.5% of a prefill graph.
+
+One last corroboration, of L2f rather than of this file: HF stores the
+indexer's query and key as **one** `index_qk_proj`, which llama.cpp's
+converter splits into two tensors — and which L2f then fuses back into its
+`[13952, 2560]` projection. The fusion was derived from the shapes; it turns
+out to be the checkpoint's own layout.
+
 ## How to reproduce
 
     go test ./llm/ -v -run 'TestAttn|TestRoPE'

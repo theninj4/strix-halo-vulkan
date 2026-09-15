@@ -348,3 +348,63 @@ func (m *Model) AttnWeights(layer int) (AttnWeights, error) {
 	}
 	return w, nil
 }
+
+// DeltaNetConfig returns a linear-attention layer's shape. ok is false for
+// the 12 full-attention layers, which have no `ssm_*` tensors at all — the
+// mirror of AttnConfig, and between them the two cover all 48.
+//
+// The three head counts come from keys whose names are ggml's Mamba
+// vocabulary rather than this architecture's: `time_step_rank` is the value
+// head count, `group_count` the key head count, and `state_size` the width of
+// a head on both sides. Reading them is not optional — the 16/48 split is
+// what the whole layer is shaped around.
+func (m *Model) DeltaNetConfig(layer int) (DeltaNetConfig, bool, error) {
+	arch := m.Set.Arch()
+	if !m.Set.Has(fmt.Sprintf("blk.%d.attn_qkv.weight", layer)) {
+		return DeltaNetConfig{}, false, nil
+	}
+	get := func(k string) int { v, _ := m.Set.Uint(arch + ".ssm." + k); return int(v) }
+	c := DeltaNetConfig{
+		NEmbd:   m.Config.NEmbd,
+		HeadDim: get("state_size"),
+		NHeadK:  get("group_count"),
+		NHeadV:  get("time_step_rank"),
+		Conv:    get("conv_kernel"),
+		Inner:   get("inner_size"),
+		Eps:     m.Config.RMSEps,
+	}
+	switch {
+	case c.HeadDim == 0 || c.NHeadK == 0 || c.NHeadV == 0 || c.Conv == 0:
+		return c, true, fmt.Errorf("llm: layer %d states %d key heads and %d value heads of %d, conv %d",
+			layer, c.NHeadK, c.NHeadV, c.HeadDim, c.Conv)
+	case c.NHeadV*c.HeadDim != c.Inner:
+		return c, true, fmt.Errorf("llm: %d value heads of %d do not make ssm.inner_size %d",
+			c.NHeadV, c.HeadDim, c.Inner)
+	case c.NHeadV%c.NHeadK != 0:
+		return c, true, fmt.Errorf("llm: %d value heads do not divide into %d key heads",
+			c.NHeadV, c.NHeadK)
+	}
+	return c, true, nil
+}
+
+// DeltaNetWeights loads one linear-attention layer's tensors.
+func (m *Model) DeltaNetWeights(layer int) (DeltaNetWeights, error) {
+	p := fmt.Sprintf("blk.%d.", layer)
+	var w DeltaNetWeights
+	for _, t := range []struct {
+		name string
+		dst  *[]float32
+	}{
+		{"attn_qkv.weight", &w.QKV}, {"attn_gate.weight", &w.Z}, {"ssm_out.weight", &w.Out},
+		{"ssm_alpha.weight", &w.Alpha}, {"ssm_beta.weight", &w.Beta},
+		{"ssm_conv1d.weight", &w.Conv1d}, {"ssm_norm.weight", &w.Norm},
+		{"ssm_a", &w.A}, {"ssm_dt.bias", &w.DTBias},
+	} {
+		v, err := m.F32(p + t.name)
+		if err != nil {
+			return w, err
+		}
+		*t.dst = v
+	}
+	return w, nil
+}
