@@ -28,12 +28,16 @@ import (
 // a ggml [features, tokens] tensor reads back as tokens-major rows of
 // features — the layout the rest of this package uses.
 type Dump struct {
-	Name  string
-	Op    string
-	Seq   int // graph order, from the filename
-	NE    [4]int64
-	NB    [4]uint64
-	Vals  []float32
+	Name string
+	Op   string
+	Seq  int // graph order, from the filename
+	NE   [4]int64
+	NB   [4]uint64
+	Vals []float32
+	// Ints is the payload of an integer tensor, which is what the QSA
+	// indexer's top-k selection is. Vals carries the same values widened, so
+	// a shape check does not have to know which kind it is.
+	Ints  []int32
 	GType uint32
 }
 
@@ -118,6 +122,15 @@ func ReadDump(path string) (*Dump, error) {
 	case 30: // bf16
 		for i := range d.Vals {
 			d.Vals[i] = math.Float32frombits(uint32(le.Uint16(payload[2*i:])) << 16)
+		}
+	case 26: // i32 — the QSA indexer's top-k is a list of cell indices
+		if len(payload) < 4*n {
+			return nil, fmt.Errorf("%s: i32 payload short", path)
+		}
+		d.Ints = make([]int32, n)
+		for i := range d.Ints {
+			d.Ints[i] = int32(le.Uint32(payload[4*i:]))
+			d.Vals[i] = float32(d.Ints[i])
 		}
 	default:
 		return nil, fmt.Errorf("%s: unhandled ggml type %d", path, d.GType)

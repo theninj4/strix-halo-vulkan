@@ -10,15 +10,17 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1, L2a, L2b, L2c and L2d complete.** The checkpoint is
+**Status: L0, L1, L2a, L2b, L2c, L2d and L2e complete.** The checkpoint is
 downloaded, llama.cpp runs it, the Go side reads it, the prefill mystery is
 solved, **the hyper-connection block runs on the GPU in four dispatches where
 the reference has sixteen** — 4.24x on the lines it replaces, 14.9% of
-llama.cpp's whole prefill graph — and **the PLE n-gram block runs beside it**,
-its trigram hash over a 320 M-row table bit-exact against the reference. 114 GB
-in 18 minutes; `models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL`
-shards and the 2.79 GB MTP head. **Next: one full-attention layer with mrope
-and the QSA indexer beside it, which is what L2's gate asks for.**
+llama.cpp's whole prefill graph — **the PLE n-gram block runs beside it** with
+its trigram hash bit-exact, and **L2e has the full-attention layer and the QSA
+indexer matching tensor for tensor**, four stages composing to 9.7e-06 rms.
+114 GB in 18 minutes; `models/Qwen3.8-Flash-Next-GGUF/` holds the four
+`UD-Q4_K_XL` shards and the 2.79 GB MTP head. **Next: the GPU port of L2e's
+layer, then L3's DeltaNet — the last architectural piece with no reference at
+all.**
 
 ## The number to beat
 
@@ -253,6 +255,44 @@ vertical, and the one L2a put at the front of the queue.
 > bytes; §5.1b's traversal penalty in a kernel written without thinking about
 > it.
 
+## What L2e established — the attention layer, and two more oracle numerics
+
+`llm/attn.go`: the fused query/gate projection, interleaved M-RoPE, the QSA
+indexer and causal GQA, checked against layer 3 of the dump.
+[Write-up](research/l2e-attention.md)
+
+> **L2e-1: it matches, and the chain composes.** The indexer's pooled keys to
+> 1.7e-07 rms, its score to **3.5e-07 relative**, the fused query/gate split to
+> 1.2e-06, the attention output to 2.4e-04. And from `l_last-2` through our
+> mixer, our indexer, our attention and our combine, **`hc_combine-3` agrees
+> to 9.75e-06 rms** — four stages, none of the intermediates llama.cpp's.
+>
+> **L2e-2: the indexer's key cache is fp16, worth 2072x.** The keys are
+> rounded to halves *between* being projected and being pooled, which is why
+> `indexer_k_raw` is exact and `indexer_k_pooled` three lines later was
+> 3.49e-04 until it was modelled. `llama_memory_hybrid_idx` passes the
+> context's `type_k` straight through.
+>
+> **L2e-3: a matmul between two F32 tensors is an fp16 matmul, worth 69x.**
+> The indexer's score is F32 x F32 and the reference computes it on the fp16
+> matrix cores: 3.52e-03 rms in f32, **the same 3.52e-03 in float64**, and
+> 5.11e-05 with both operands rounded to halves. **So the fp16 kernels L2c and
+> L2d run are not giving up anything the reference keeps** — they are the same
+> arithmetic.
+>
+> **L2e-4: the block structure is the cache's, not the prompt's.** Seven tokens
+> in a 256-cell cache (flash attention pads it) make **one** real block of 4;
+> the other 63 pool cell 0 four times because `blk_cells` is zero-filled, and
+> the unpooled tail goes to a spare block carrying a 1e9 "always visible"
+> marker — finite, so it can never meet a -inf and make a NaN.
+>
+> **L2e-5: and the selection cannot be tested yet.** `top_k + ratio - 1` is
+> 2051 against 256 cells, so it names every cell; running the attention with
+> it is bit-identical to running it without. llama.cpp's `TOP_K` is also a
+> *selection and not a sort* — it returns the identity permutation where the
+> scores are not monotone — which is unobservable at this width. **L4's 4k
+> context is where both become testable.**
+
 ---
 
 ## The three findings that set the direction
@@ -466,6 +506,7 @@ below Q8. Bandwidth is the whole story.
 | `llm/gpu.go` | **L2c: the block on the device.** Four arenas, the fused `[336, 10240]` down/inject weight, the up projection's row permutation, an M ladder per projection with a measured `PlanFor` schedule, and a sweep profiler that reads every staged mixer so the weights are as cold as a real graph's. |
 | `shaders/llm_gemm.comp` | **L2c/L2d: the vertical's GEMM**, one kernel and one epilogue per mode — MODE 0 down+inject+silu, MODE 1 up+sigmoid+collapse, MODE 2 plain — because in this architecture the epilogue is where the time goes. |
 | `shaders/llm_hc_*.comp`, `llm_ple_*.comp` | **L2c/L2d: the blocks.** `llm_hc_norm` (grouped RMSNorm → fp16 A operand), `llm_hc_combine`, `llm_ple_gate` (both norms, the signed-sqrt gate, the broadcast and the conv norm in one pass) and `llm_ple_conv` (four dilated taps, the SiLU and the residual add), over `llm_common.glsl`'s binding contract. |
+| `llm/attn.go` | **L2e: the full-attention layer.** The fused query/gate projection, interleaved M-RoPE, the QSA indexer's pool/score/select with the reference's own cache block structure, and causal GQA — with the fp16 KV cache and the fp16 F32-matmul the reference turns out to use. |
 | `llm/ple.go`, `llm/gpu_ple.go` | **L2d: the n-gram block.** The trigram hash and the host-side gather out of the mmap'd 28.80 GB table (D2), the CPU block, and the three-dispatch device path. |
 | `zimage/qwen/` | a working Qwen3 transformer on the GPU in Go — RMSNorm, RoPE, GQA, SwiGLU, four shared arenas. The skeleton for L2. |
 | `shaders/gemv_w4a8.comp` | decode GEMV at **99-103% of the bus** (§1.1, §1.7), plus 25 grouped / M-blocked / N-blocked MoE builds (§1.8-§1.12). |
@@ -562,11 +603,21 @@ below Q8. Bandwidth is the whole story.
       (**7.7e-08 rms**) and on the device in three dispatches against about
       thirty. Layer 1's mixer, the one L2c could not compare, now matches too.
       [Write-up](research/l2d-ple.md) · `results/l2d_ple.csv`
-- [ ] One full-attention layer with mrope, and the QSA indexer beside it
-      (`indexer_*-3` are in the trace).
+- [x] **L2e — one full-attention layer with mrope, and the QSA indexer beside
+      it.** The CPU reference: the fused query/gate projection, IMRoPE (which
+      is **NeoX on text**, asserted rather than assumed), the block-pooled
+      indexer and causal GQA. Every dumped tensor of layer 3 matches, and the
+      four-stage chain from `l_last-2` lands at **9.75e-06 rms**. Two more
+      oracle numerics fell out. [Write-up](research/l2e-attention.md)
+- [ ] The GPU port of that layer. Three of the four pieces exist in some form
+      (`qwen_attn_wmma_*` at headDim 128 against this model's 256,
+      `qwen_rope.comp`, `llm_gemm.comp`'s plain arm); the indexer's
+      pool-score-select has no kernel anywhere.
 - [ ] Gate: layer 3's output matches the reference. **Not "to fp16
       tolerance"** — L2b-3: an rms bound under `llm.RefQ8`, since the
-      reference is computing in int8 and the error is heavy-tailed.
+      reference is computing in int8 and the error is heavy-tailed. **Half of
+      it is met**: `hc_combine-3`, the residual after the attention half, is
+      at 9.75e-06 rms. `l_last-3` needs the MoE half, which is L5.
 
 ### L3 — Gated DeltaNet  *(the big one)*
 
@@ -688,6 +739,16 @@ below Q8. Bandwidth is the whole story.
 - **The recurrent state.** L2d's convolution reaches 9 tokens back and L3's
   DeltaNet has both a conv and an fp32 state; both are zeros at position zero
   and neither exists at decode. It is one piece of work for L7, not two.
+- **What else is the backend computing in fp16?** L2e found an F32 x F32
+  matmul on the fp16 matrix cores. That is good news for our kernels — it
+  means they concede nothing — but nothing else in this vertical has been
+  audited for it, and it changes what a tolerance against the dump *means*
+  wherever it applies.
+- **Why is `attn_pregate` 1.03e-04 where everything around it is 1e-06?** Its
+  inputs are all modelled and rounding the query to fp16 moves it by 3%. What
+  is left is the flash-attention kernel's own accumulation order, which the
+  dump enables by default. Bounded, not explained — the same category as
+  L2b's three residual mixers.
 - **Where does llama.cpp's missing 1.5 s at `-ub 2048` go?** The GPU graph is
   4.556 s and the wall clock 6.083 s, against ≤7% host time at `-ub 512`. It
   does not scale with graph count. Not ours to fix, but it means the honest

@@ -284,3 +284,67 @@ func (m *Model) PLEGather(rows []int32, nHeads, headDim int) ([]float32, error) 
 	}
 	return out, nil
 }
+
+// AttnConfig returns a full-attention layer's shape. ok is false for the
+// linear-attention layers, which are 36 of the 48 and have no attention
+// tensors at all.
+//
+// The compress ratio is per layer and comes from an array rather than a
+// scalar: `attention.compress_ratios` is 48 entries and only the
+// full-attention ones are non-zero, so the layer index is not optional.
+func (m *Model) AttnConfig(layer int) (AttnConfig, bool, error) {
+	arch := m.Set.Arch()
+	if !m.Set.Has(fmt.Sprintf("blk.%d.attn_q.weight", layer)) {
+		return AttnConfig{}, false, nil
+	}
+	c := m.Config
+	get := func(k string) int { v, _ := m.Set.Uint(arch + "." + k); return int(v) }
+	a := AttnConfig{
+		NEmbd: c.NEmbd, NHead: c.NHead, NHeadKV: c.NHeadKV,
+		HeadDim:  get("attention.key_length"),
+		RopeDims: c.RopeDims,
+		RopeBase: c.RopeBase,
+		Eps:      c.RMSEps,
+		IdxHeads: get("attention.indexer.head_count"),
+		IdxDim:   get("attention.indexer.key_length"),
+		TopK:     get("attention.indexer.top_k"),
+	}
+	if v, ok := m.Set.Ints(arch + ".rope.dimension_sections"); ok {
+		for i := 0; i < len(a.Sections) && i < len(v); i++ {
+			a.Sections[i] = int(v[i])
+		}
+	}
+	if v, ok := m.Set.Ints(arch + ".attention.compress_ratios"); ok {
+		if layer < len(v) {
+			a.Ratio = int(v[layer])
+		}
+	}
+	if a.HeadDim == 0 || a.NHead == 0 || a.NHeadKV == 0 {
+		return a, true, fmt.Errorf("llm: layer %d states %d heads of %d over %d kv heads",
+			layer, a.NHead, a.HeadDim, a.NHeadKV)
+	}
+	return a, true, nil
+}
+
+// AttnWeights loads one full-attention layer's tensors, the indexer's
+// included.
+func (m *Model) AttnWeights(layer int) (AttnWeights, error) {
+	p := fmt.Sprintf("blk.%d.", layer)
+	var w AttnWeights
+	for _, t := range []struct {
+		name string
+		dst  *[]float32
+	}{
+		{"attn_q", &w.Q}, {"attn_k", &w.K}, {"attn_v", &w.V}, {"attn_output", &w.O},
+		{"attn_q_norm", &w.QNorm}, {"attn_k_norm", &w.KNorm},
+		{"indexer.q_proj", &w.IdxQ}, {"indexer.k_proj", &w.IdxK},
+		{"indexer.q_norm", &w.IdxQNorm}, {"indexer.k_norm", &w.IdxKNorm},
+	} {
+		v, err := m.F32(p + t.name + ".weight")
+		if err != nil {
+			return w, err
+		}
+		*t.dst = v
+	}
+	return w, nil
+}

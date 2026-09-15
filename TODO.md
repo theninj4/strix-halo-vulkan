@@ -58,8 +58,8 @@ is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
 stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
 image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
-(text-generation) vertical and is **the current work**: L0, L1, L2a, L2b, L2c
-and L2d are closed. The checkpoint is downloaded (114 GB in 18 minutes,
+(text-generation) vertical and is **the current work**: L0, L1, L2a-L2e are
+closed. The checkpoint is downloaded (114 GB in 18 minutes,
 `models/Qwen3.8-Flash-Next-GGUF/`), llama.cpp runs it, and **the number to beat
 is `pp2048 391.42` / `tg128 25.15` tok/s** — decode at 65.8% of the bus, and
 prefill 5x below what this repo's own microbenchmarks had been added up into.
@@ -80,15 +80,19 @@ more output columns and consuming the 21 MB gate inside the up projection's
 epilogue, so neither tensor is ever written. **L2d added the PLE n-gram
 block** beside it — the host-side trigram hash over the 320 M-row table is
 **bit-exact** against the reference and the block matches to 7.7e-08 rms, in
-three dispatches against about thirty. The Go
+three dispatches against about thirty. **L2e then built the full-attention
+layer and the QSA indexer** — every dumped tensor of layer 3 matches, four
+stages compose to 9.75e-06 rms, and two more oracle numerics fell out: the
+indexer's key cache is fp16 (2072x) and **an F32 x F32 matmul runs on the fp16
+matrix cores** (69x), which means the fp16 kernels this vertical already ships
+concede nothing the reference keeps. The Go
 side reads the
 checkpoint: `gguf/` (1224/1224 tensors against the Python inventory), five
 dequant paths bit-exact against ggml, and a tokenizer exact against
 `llama-tokenize`. The plan behind it is unchanged — run the stock quant first
 (llama.cpp is the oracle), then re-quantise, because **76% of the bytes read
 per token are dense** and the stock Q8_0 dense allocation costs 1.7x on a
-bus-bound machine. Task list L0–L9; **L2 continues with one full-attention layer and the QSA
-indexer**. All three files are rewritten each
+bus-bound machine. Task list L0–L9; **L2 continues with the GPU port of that layer**. All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -859,6 +863,73 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (thirty-fifth) — stage L2e: the attention layer, and two more things the oracle does
+
+**Result: layer 3 — the first of the 12 full-attention layers — runs in Go and
+matches llama.cpp tensor for tensor, QSA indexer included, and the chain
+composes: from the previous layer's output through our mixer, our indexer, our
+attention and our combine, `hc_combine-3` agrees to 9.75e-06 rms.**
+[Write-up](research/l2e-attention.md) · `llm/attn.go`
+
+**1. Every dumped tensor of the layer.** The indexer's pooled keys 1.69e-07
+rms, its score 5.11e-05 on values to 145.8 (**3.5e-07 relative**), the fused
+query/gate split 1.19e-06, `attn_output-3` 2.43e-04. The per-cell score's
+mask — 1764 of its 1792 entries are -inf — agrees exactly, and its 28 finite
+cells to 3.2e-04.
+
+**2. The indexer's key cache is fp16, and modelling it is worth 2072x.** The
+keys are rounded to halves *between* being projected and being pooled, which
+is why `indexer_k_raw` was exact while `indexer_k_pooled` three lines later
+sat at 3.49e-04. `llama_memory_hybrid_idx` passes the context's `type_k`
+straight through to the indexer cache.
+
+**3. A matmul between two F32 tensors is an fp16 matmul, and modelling it is
+worth 69x.** The indexer's score is `ggml_mul_mat` over two F32 tensors the
+callback hands us directly: 3.52e-03 rms in f32, **the same 3.52e-03 in
+float64** — so not our precision — and 5.11e-05 with both operands rounded to
+halves. This is the third distinct thing this oracle does that its graph does
+not say, after L2b's int8 activations and the cache above, and it is the most
+useful of the three: **the fp16 kernels L2c and L2d already run concede
+nothing the reference keeps.**
+
+**4. Interleaved M-RoPE is NeoX on text, asserted rather than assumed.**
+Sections [11, 11, 10, 0] over n_rot 64 of 256 dims, and llama.cpp puts the
+token position in the t, h and w slots with zero in e — which no sector of
+[11, 11, 10] ever selects. `TestRoPEMultiIsNeoXOnText` checks it bit-for-bit,
+so the day an image batch makes it false the test says so instead of a tensor
+failing three stages downstream. A second test pins the other half: **64 dims
+rotate and 192 are copied**.
+
+**5. The indexer's block structure is the cache's, not the prompt's.** Seven
+tokens in a 256-cell cache — flash attention pads the cell count — make
+**one** real block of four; the other 63 pool cell 0 four times because
+`blk_cells` is zero-filled, and the unpooled tail goes to a spare block
+carrying a **1e9** "always visible" marker, finite so that it can never meet a
+-inf and make a NaN. None of that is inferable from the graph; it comes out of
+`set_input_qsa`.
+
+**6. And the selection cannot be validated at this length.** `top_k + ratio -
+1` is 2051 against 256 cells, so it names every cell — running the attention
+with the selection is bit-identical to running it without, which the test
+asserts. llama.cpp's `TOP_K` is also **a selection and not a sort**: at token
+4, cells 4-6 carry the 1e9 marker and cells 0-3 carry 117.7, and
+`indexer_top_k` comes back as the identity permutation. Unobservable at this
+width. **L4's 4k context is where both become testable, and it needs a new
+dump.**
+
+**Bounded, not explained:** `attn_pregate` sits at 1.03e-04 rms on values to
+3.44 where everything either side of it is 1e-06. Its inputs are all modelled
+and rounding the query to fp16 as well moves it 3%; what is left is the
+flash-attention kernel's own accumulation order, which the dump enables by
+default and which is not reproducible from outside it.
+
+**Left for the next step:** the GPU port. Three of its four pieces exist in
+some form — `shaders/qwen_attn_wmma_*` is causal GQA on the matrix cores at
+headDim 128 against this model's 256, `qwen_rope.comp` is the NeoX rotary, and
+`llm_gemm.comp`'s plain arm is the projections — and what has no kernel
+anywhere in this repo is the indexer's pool-score-select, which is small,
+oddly shaped and 1.5% of a graph.
 
 ### Session 2026-09-15 (thirty-fourth) — stage L2d: the n-gram block, and a hash with no tolerance
 
