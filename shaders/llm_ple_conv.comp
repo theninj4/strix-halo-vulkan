@@ -1,0 +1,56 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The PLE block's tail: a depthwise causal convolution over the token axis,
+// its SiLU, and the residual add — one dispatch for what llama.cpp spends
+// four shifted MULs, three ADDs, a SILU and two more ADDs on.
+//
+//	out[c, t] = silu( sum_k w[c][k] * normed[c, t - (K-1-k)*dil] )
+//	res[t][c] += gated[t][c] + out[c, t]
+//
+// The convolution is depthwise over all 10240 channels with K = 4 taps
+// **dilated by the n-gram size**, so it reaches 0, 3, 6 and 9 tokens back —
+// which makes it the second recurrent thing in this model after DeltaNet.
+// This kernel is prefill from position zero, so anything before the first
+// token is zero; at decode those positions come from a 9-token history that
+// llama.cpp keeps in a row of its recurrent cache, and L7 is where that
+// history has to exist.
+//
+// One thread is one channel of one token. The taps are a gather along the
+// token axis with a stride of dil*wide floats, so consecutive threads always
+// read consecutive addresses — the dilation costs nothing here, unlike in the
+// reference, where each tap is a separate transposed copy of the whole tensor.
+
+#include "llm_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    // The channel block is the *fast* grid axis and the token the slow one, so
+    // the workgroups resident at one moment cover one token's whole 40 KB row
+    // rather than one channel block of forty different tokens. Same work, same
+    // bytes: it is which addresses are outstanding together that changes, and
+    // it is worth 1.9x here (research/l2d-ple.md).
+    uint t = gl_WorkGroupID.y;
+    uint c = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint wide = pc.hc * pc.nEmbd;
+    if (t >= pc.tokens || c >= wide) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.kern; k++) {
+        uint back = (pc.kern - 1u - k) * pc.dil;
+        if (back > t) {
+            continue;
+        }
+        sum += wbuf[pc.convOff + c * pc.kern + k] * act[pc.normOff + (t - back) * wide + c];
+    }
+    float o = sum / (1.0 + exp(-sum));
+    if (pc.convOutOff != NO_W) {
+        act[pc.convOutOff + t * wide + c] = o;
+    }
+    act[pc.resOff + t * wide + c] += act[pc.gatedOff + t * wide + c] + o;
+}

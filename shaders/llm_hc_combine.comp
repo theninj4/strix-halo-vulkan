@@ -1,0 +1,42 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// build_hc_combine: scatter one block's output back into every stream of the
+// wide residual, each with its own learned weight.
+//
+//   res[t][c] += out[t] * 2*sigmoid(inject[t][c] / hc)
+//
+// The 2*sigmoid centres the weights on 1, so an inject of zero is a plain
+// residual add — which is how the block initialises to a no-op.
+//
+// llama.cpp spends a SCALE, a SIGMOID, a REPEAT, a MUL and an ADD on this,
+// four of which move the 10240-wide fp32 residual; here the scatter weight is
+// one scalar read per workgroup and the residual is read and written once.
+// One workgroup is one (token, stream), which is what makes the weight
+// workgroup-uniform.
+
+#include "llm_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint n = pc.nEmbd;
+    // The inject row stride is the down projection's tile, not hc: the fused
+    // [lowRank + hc, wide] weight puts the scatter weights in one 16-wide
+    // tile and the kernel stores it whole.
+    uint inj = pc.injOff + t * (pc.gemmN - pc.lowRank) + c;
+    float w = 2.0 * (1.0 / (1.0 + exp(-act[inj] / float(pc.hc))));
+
+    uint dst = pc.resOff + (t * pc.hc + c) * n;
+    uint src = pc.outOff + t * n;
+    for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
+        act[dst + i] += act[src + i] * w;
+    }
+}

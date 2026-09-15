@@ -116,22 +116,7 @@ func HCMix(c HCConfig, w HCWeights, res []float32, nTok int) (mixed, inject, xn,
 		src := res[t*wide : (t+1)*wide]
 		dst := xn[t*wide : (t+1)*wide]
 
-		// Grouped RMSNorm: ggml_rms_norm reduces over ne[0] alone, which is
-		// one stream of one token — HC independent norms, not one over the
-		// whole 10240.
-		for ch := 0; ch < c.HC; ch++ {
-			x := src[ch*c.NEmbd : (ch+1)*c.NEmbd]
-			var ss float64
-			for _, v := range x {
-				ss += float64(v) * float64(v)
-			}
-			scale := float32(1 / math.Sqrt(ss/float64(c.NEmbd)+float64(c.Eps)))
-			g := w.Norm[ch*c.NEmbd : (ch+1)*c.NEmbd]
-			o := dst[ch*c.NEmbd : (ch+1)*c.NEmbd]
-			for i, v := range x {
-				o[i] = v * scale * g[i]
-			}
-		}
+		groupedRMSNorm(dst, src, w.Norm, c.NEmbd, c.HC, c.Eps)
 
 		// The low-rank gate. The 1/hc before the SiLU is llama.cpp's, and it
 		// is not a norm: it is folded into the down projection's output.
@@ -163,6 +148,35 @@ func HCMix(c HCConfig, w HCWeights, res []float32, nTok int) (mixed, inject, xn,
 		}
 	}
 	return mixed, inject, xn, gate
+}
+
+// groupedRMSNorm is the norm this architecture uses wherever it touches the
+// wide residual: hc independent norms of nEmbd values, each scaled by its own
+// slice of a [nEmbd, hc] gamma.
+//
+// It is the detail a transcription gets wrong and the oracle catches
+// (research/l2b-hyper-connections.md): `ggml_rms_norm` reduces over ne[0]
+// alone, and every tensor here is [nEmbd, hc, T] — so it is *not* one norm
+// over the concatenated 10240. Both the hyper-connection block and the PLE
+// block (three times) are built on it.
+//
+// The sum is accumulated in float64 because the reference's is done by a
+// backend kernel whose order is not ours, and a f32 sum over 2560 squares is
+// the one place that shows.
+func groupedRMSNorm(dst, src, gamma []float32, nEmbd, hc int, eps float32) {
+	for ch := 0; ch < hc; ch++ {
+		x := src[ch*nEmbd : (ch+1)*nEmbd]
+		var ss float64
+		for _, v := range x {
+			ss += float64(v) * float64(v)
+		}
+		scale := float32(1 / math.Sqrt(ss/float64(nEmbd)+float64(eps)))
+		g := gamma[ch*nEmbd : (ch+1)*nEmbd]
+		o := dst[ch*nEmbd : (ch+1)*nEmbd]
+		for i, v := range x {
+			o[i] = v * scale * g[i]
+		}
+	}
 }
 
 // HCCombine is llama.cpp's build_hc_combine: scatter one block's output back
@@ -220,8 +234,12 @@ const actQuantBlock = 32
 // act returns the activation a matmul against a Q8_0 weight actually sees.
 // Under Exact that is x itself; under RefQ8 it is x put through a symmetric
 // int8 grid in blocks of 32, written into buf.
-func (c HCConfig) act(x, buf []float32) []float32 {
-	if c.Act != RefQ8 {
+func (c HCConfig) act(x, buf []float32) []float32 { return quantAct(x, buf, c.Act) }
+
+// quantAct is that, as a function of the mode alone, because every block in
+// this model that multiplies a Q8_0 weight sees the same arithmetic.
+func quantAct(x, buf []float32, mode Numerics) []float32 {
+	if mode != RefQ8 {
 		return x
 	}
 	for b := 0; b < len(x); b += actQuantBlock {

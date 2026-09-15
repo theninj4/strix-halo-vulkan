@@ -8,6 +8,13 @@
 //	go run ./cmd/llm -tokenize 'hello world'
 //	go run ./cmd/llm -model … -tokenize-file prompt.txt -ids-only
 //
+// At L2 it also drives the first kernel of the vertical, the fused
+// hyper-connection block, against the per-op attribution of llama.cpp's own
+// prefill graph that L2a produced (hc.go):
+//
+//	go run ./cmd/llm -hc
+//	go run ./cmd/llm -hc -tokens 512 -ladder -csv results/l2c_hc.csv
+//
 // The acceptance criterion for the tokenizer is llama.cpp's own, so the
 // output format is llama-tokenize's:
 //
@@ -34,7 +41,36 @@ func main() {
 	file := flag.String("tokenize-file", "", "tokenize the contents of this file")
 	idsOnly := flag.Bool("ids-only", false, "print ids alone, one line, space separated")
 	chat := flag.Bool("chat", false, "wrap the text in the chat template first")
+	hc := flag.Bool("hc", false, "benchmark the fused hyper-connection block")
+	ple := flag.Bool("ple", false, "benchmark the PLE n-gram block")
+	tokens := flag.String("tokens", "64,128,256,512,1024,2048", "token counts for -hc")
+	mixers := flag.Int("mixers", 8, "how many real mixers to stage for -hc; the sweep needs more than the 32 MiB MALL")
+	iters := flag.Int("iters", 20, "repetitions per timed dispatch for -hc")
+	ladder := flag.Bool("ladder", false, "run every kernel rung for -hc")
+	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
+
+	if *ple {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *hc {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := hcBench(*model, toks, *mixers, *iters, *ladder, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if *text == "" && *file == "" {
 		fmt.Fprintf(os.Stderr, "usage: %s [-model dir] -tokenize <text> | -tokenize-file <path>\n", os.Args[0])

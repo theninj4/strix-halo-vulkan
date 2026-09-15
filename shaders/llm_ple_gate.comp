@@ -1,0 +1,119 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The PLE block's gate, and everything between the projections and the
+// convolution: LLM.md L2's n-gram module, which runs once, at layer 1.
+//
+//	key    = grouped_norm(W_key * emb)          [nEmbd] per stream
+//	query  = grouped_norm(res)                  [nEmbd] per stream
+//	s      = sum_i(key*query) / sqrt(nEmbd)
+//	gate   = sigmoid(sgn(s) * sqrt(clamp(|s|, 1e-6, inf)))
+//	gated  = value * gate                       the one value vector, per stream
+//	normed = grouped_norm(gated)                the convolution's input
+//
+// One workgroup is one (token, stream), which is what makes every reduction
+// here workgroup-local: three of them in sequence over 2560 values — the key's
+// sum of squares and the query's together, then the dot product of the two
+// normalised vectors, then the gated value's. The *stream* is the fast grid
+// axis, so the workgroups resident together cover one token's whole 40 KB row
+// instead of one stream of four different tokens; same bytes, 1.14-1.26x
+// (research/l2d-ple.md), and the same traversal effect §5.1b measured. llama.cpp spends two RMS_NORMs,
+// two MULs, a SUM_ROWS, a SCALE, an ABS, a CLAMP, a SQRT, an SGN, a MUL, a
+// SIGMOID, a REPEAT, a MUL and a third RMS_NORM_MUL on the same thing.
+//
+// The signed square root is the unusual step and it is not a normalisation: a
+// dot product of two 2560-wide normalised vectors is too wide for a sigmoid to
+// resolve, and sqrt compresses it while sgn keeps the sign it would otherwise
+// lose. ggml_sgn(0) is 0, so a zero score gates at exactly 0.5 — which is why
+// the clamp's floor never reaches the sign.
+
+#include "llm_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float partA[256];
+shared float partB[256];
+
+// reduce2 sums two per-thread values across the workgroup and leaves both in
+// partA[0] and partB[0].
+void reduce2(uint tid, float a, float b) {
+    partA[tid] = a;
+    partB[tid] = b;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partA[tid] += partA[tid + stride];
+            partB[tid] += partB[tid + stride];
+        }
+        barrier();
+    }
+}
+
+void main() {
+    uint ch = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint n = pc.nEmbd;
+    uint wide = pc.hc * n;
+    uint tid = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(pc.eps);
+
+    // The fused projection wrote key over the wide stream and value after it,
+    // one row of pc.gemmN per token.
+    uint keyOff = pc.kvOff + t * pc.gemmN + ch * n;
+    uint valOff = pc.kvOff + t * pc.gemmN + wide;
+    uint resOff = pc.resOff + t * wide + ch * n;
+    uint gk = pc.gammaOff + ch * n;
+    uint gq = pc.gammaQOff + ch * n;
+    uint gc = pc.gammaCOff + ch * n;
+
+    float sk = 0.0, sq = 0.0;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        float k = act[keyOff + i];
+        float q = act[resOff + i];
+        sk += k * k;
+        sq += q * q;
+    }
+    reduce2(tid, sk, sq);
+    float scaleK = 1.0 / sqrt(partA[0] / float(n) + eps);
+    float scaleQ = 1.0 / sqrt(partB[0] / float(n) + eps);
+    barrier();
+
+    float dot = 0.0;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        dot += (act[keyOff + i] * scaleK * wbuf[gk + i]) *
+               (act[resOff + i] * scaleQ * wbuf[gq + i]);
+    }
+    reduce2(tid, dot, 0.0);
+    float s = partA[0] * inversesqrt(float(n));
+    float mag = sqrt(max(abs(s), 1e-6));
+    float g = 1.0 / (1.0 + exp(-(s > 0.0 ? mag : (s < 0.0 ? -mag : 0.0))));
+    barrier();
+
+    if (tid == 0u) {
+        act[pc.gateOff + t * pc.hc + ch] = g;
+    }
+
+    // The gated value, and its own sum of squares for the norm that follows.
+    // It is computed rather than derived from the value's: rms(value*g) is
+    // |g|*rms(value) exactly in real arithmetic, and this is the tensor the
+    // reference normalises.
+    uint gated = pc.gatedOff + t * wide + ch * n;
+    float ss = 0.0;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        float v = act[valOff + i] * g;
+        act[gated + i] = v;
+        ss += v * v;
+    }
+    reduce2(tid, ss, 0.0);
+    float scaleG = 1.0 / sqrt(partA[0] / float(n) + eps);
+
+    uint normed = pc.normOff + t * wide + ch * n;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        act[normed + i] = act[gated + i] * scaleG * wbuf[gc + i];
+    }
+}

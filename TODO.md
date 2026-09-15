@@ -58,8 +58,8 @@ is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
 stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
 image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
-(text-generation) vertical and is **the current work**: L0, L1, L2a and L2b
-are closed. The checkpoint is downloaded (114 GB in 18 minutes,
+(text-generation) vertical and is **the current work**: L0, L1, L2a, L2b, L2c
+and L2d are closed. The checkpoint is downloaded (114 GB in 18 minutes,
 `models/Qwen3.8-Flash-Next-GGUF/`), llama.cpp runs it, and **the number to beat
 is `pp2048 391.42` / `tg128 25.15` tok/s** — decode at 65.8% of the bus, and
 prefill 5x below what this repo's own microbenchmarks had been added up into.
@@ -72,14 +72,23 @@ hyper-connection mixer and combine, in `llm/`, matching llama.cpp's own
 activations to **6.2e-08 rms** in four of the seven mixers of the four dumped
 layers — and found that **the oracle is not exact**: llama.cpp's Vulkan
 backend evaluates a Q8_0 matmul over int8 activations, which is worth **233x**
-on the gate and retires L2's "fp16 tolerance" acceptance criterion. The Go
+on the gate and retires L2's "fp16 tolerance" acceptance criterion. **L2c then
+put that block on the device**: four dispatches where the reference has
+sixteen, **226.6 ms of its 512-token graph against 53.4 — 4.24x, and 14.9% of
+the whole prefill graph** — by fusing `inject` onto the down projection as four
+more output columns and consuming the 21 MB gate inside the up projection's
+epilogue, so neither tensor is ever written. **L2d added the PLE n-gram
+block** beside it — the host-side trigram hash over the 320 M-row table is
+**bit-exact** against the reference and the block matches to 7.7e-08 rms, in
+three dispatches against about thirty. The Go
 side reads the
 checkpoint: `gguf/` (1224/1224 tensors against the Python inventory), five
 dequant paths bit-exact against ggml, and a tokenizer exact against
 `llama-tokenize`. The plan behind it is unchanged — run the stock quant first
 (llama.cpp is the oracle), then re-quantise, because **76% of the bytes read
 per token are dense** and the stock Q8_0 dense allocation costs 1.7x on a
-bus-bound machine. Task list L0–L9; **L2, the dense skeleton, is next**. All three files are rewritten each
+bus-bound machine. Task list L0–L9; **L2 continues with one full-attention layer and the QSA
+indexer**. All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -850,6 +859,145 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (thirty-fourth) — stage L2d: the n-gram block, and a hash with no tolerance
+
+**Result: the PLE block — the reason a quarter of this checkpoint is a lookup
+table — runs, and its trigram hash reproduces llama.cpp's gather bit-exactly:
+sixteen rows of a 320 001 536-row table per token, chosen by a 64-bit mix of
+the token and its two predecessors.** [Write-up](research/l2d-ple.md) ·
+`llm/ple.go`, `llm/gpu_ple.go`, `shaders/llm_ple_*`, `results/l2d_ple.csv`
+
+**1. Bit-exact is the only tolerance a hash has.** `ple_embd` matches to **0
+ulp**, because a wrong index does not return a wrong-ish row — it returns a
+real embedding belonging to another n-gram. The sixteen near-prime
+vocabularies tile the table exactly and a test checks that they do. The block
+on top matches llama.cpp to **7.7e-08 rms** on `ple_gate-1`, 2.1e-09 on
+`gated` and 1.3e-08 on `conv_out`, under L2b's `RefQ8` numerics.
+
+**2. It closes L2c's one open comparison.** Layer 1's attn mixer reads a
+residual this block has written into, so it was the one mixer of the eight
+that could not be checked against the trace. Fed through the block it lands
+where the other seven do — 2.4e-04 on `hc_norm`, 2.9e-03 on the gate — which
+is the end-to-end check that the two stages compose.
+
+**3. Three dispatches against about thirty, and it is 0.19% of a graph.** The
+key and value projections read the same gathered embedding, so they are one
+fused `[12800, 2560]` matrix — the same argument that put `inject` on the
+hyper-connection block's down projection. Everything between them and the
+convolution is one workgroup per (token, stream); the dilated depthwise
+convolution carries its SiLU and the residual add. On the lines that can be
+named we are **0.88x — slower** (2234 us against 1974), and the projections
+alone are **1.06x while reading twice the weight bytes**. It runs **once**, at
+layer 1, so none of that matters: it was built to be correct and to be on the
+device, because the alternative is a 21 MB round trip of the residual to the
+host in the middle of the stack.
+
+**4. Two levers, both free, and one of them is a repeat lesson.** The fused
+projection's B is **65.5 MB, twice the MALL**, so it is read M/BM times — BM
+32 → 128 is **3.3x** at 2048 tokens for identical arithmetic. And swapping
+which grid axis is fast, so the resident workgroups cover one token's 40 KB
+row instead of one channel block of forty tokens, is **2.9-4.0x** on the
+convolution and 1.14-1.26x on the gate. Same work, same bytes, same
+instruction count: §5.1b's cross-wave traversal penalty, in a kernel written
+without thinking about it. **Nothing else in this vertical has been checked
+for it.**
+
+**Two controls, for the two ways this block is silently wrong.** Losing the
+convolution's dilation (taps at 1, 2, 3 back instead of 3, 6, 9) is **1.2e5x**
+worse and reversing the tap order — convolution against correlation — is
+**8.5e5x**; both produce a tensor of the right shape and magnitude, which is
+why llama.cpp's own comment says `ggml_conv_1d_dw` is unreliable and spells
+the operation out.
+
+**One API edge worth remembering:** `gguf.Dequantize` **appends**, so a reused
+scratch row has to be passed as `buf[:0]`. Handed a full-length buffer it
+returns the *first* row every time — 112 identical rows, all plausible, no
+error. That was the whole of the gather bug.
+
+**How it was measured:** `go run ./cmd/llm -ple -csv results/l2d_ple.csv`, GPU
+timestamps, 20 repetitions a dispatch. Two runs agree to 1.2% on every
+dispatch of 100 us or more and 1.4% on the block totals; the worst cell is
+6.5% on a 23 us dispatch.
+
+**Left undone, deliberately:** the convolution's **decode history** — four taps
+reaching 9 tokens back need a per-sequence history that llama.cpp keeps in its
+recurrent cache, and everything here is prefill from position zero. L3's
+DeltaNet needs the same machinery for its own conv and its fp32 state, so it
+is one piece of work rather than two. **L2's next item is one full-attention
+layer with mrope and the QSA indexer beside it.**
+
+### Session 2026-09-15 (thirty-third) — stage L2c: the block on the GPU, four dispatches against sixteen
+
+**Result: the hyper-connection block — the thing L2a costed at over half of
+llama.cpp's prefill graph — runs on the device in four dispatches, and the
+lines of the reference's graph it replaces go from 226.6 ms to 53.4 ms.
+4.24x, and 14.9% of the whole 1164.7 ms prefill graph removed by one block.**
+[Write-up](research/l2c-hc-kernel.md) · `shaders/llm_hc_*`, `llm/gpu.go`,
+`results/l2c_hc.csv`
+
+**1. Four dispatches where the reference has sixteen.** Per 512-token graph,
+against the lines that are nameably this block: the grouped norm 16.7 →
+**5.3 ms**, `down` + `inject` 163.3 → **24.7**, `up` 30.7 → **16.8**, the
+combine's `REPEAT` 15.9 → **6.6**. The rest of the block's glue — the gamma
+multiply, the gate's sigmoid, the `xn*gate` multiply, the collapse's adds, the
+combine's four elementwise passes — is inside `MUL`/`ADD`/`SIGMOID`/
+`MULTI_ADD` lines the whole model shares, and is **absent from our graph
+rather than faster in it**, so 4.24x is the conservative reading. If nothing
+else changed, llama.cpp's 391.4 tok/s at `-ub 512` would become **~460**.
+
+**2. Two tensors never exist, and that is the whole finding.** `inject` — L2a's
+worst single line, a `[10240, 4]` F32 matmul at 31.8 GFLOP/s for 10.3% of
+prefill — is four more output columns on a fused `[336, 10240]` weight, and
+320 is 20 fragment tiles so the split is a compare per tile. And the
+`[10240, T]` gate, 21 MB a mixer at 512 tokens (the whole MALL), is consumed
+inside the up projection's epilogue: sigmoid on the accumulators, then the
+4-branch collapse against `xn` through LDS, writing the 2560-wide `mixed`
+instead. That needs the four streams of a feature in one workgroup, which is a
+**weight permutation** rather than a loop.
+
+**3. It is 38x nearer the f32 model than the oracle it is checked against.**
+All eight mixers of layers 0-3, each driven from llama.cpp's own residual,
+agree with L2b's CPU reference to **1e-04 rms** — `maxRel` on `hc_norm` is
+4.9e-04, which *is* fp16's step. Against llama.cpp the residual is 2.3e-03 to
+6.5e-03, and that is **L2b's own figure for the CPU reference**: the reference
+is the side computing in int8. `TestHCGPUIsNearerTheModelThanTheReference`
+makes it a checked claim rather than a remark.
+
+**4. The MALL cliff is ours too.** Between 512 and 1024 tokens the norm goes
+**575 → 167 GB/s** and the combine **695 → 170** — above the DRAM bus on the
+near side, below it on the far — because the fp32 residual is 21.0 MB at
+T=512 and 41.9 MB at T=1024 against a 32 MiB MALL. Per token the block is
+cheapest at 512 and 1.5x more expensive at 2048. L2a inferred "keep the
+residual in fp16" from llama.cpp's profile; this measures it on our own
+kernel. **Not taken**: the residual accumulates across 97 combines, so
+narrowing it is an accuracy decision for L6 and L8, not for a kernel.
+
+**Two controls, because both of the new ideas produce plausible tensors when
+wrong.** `TestHCGPUUnpermutedUpIsWrong` stages the up projection in the
+checkpoint's own row order while the kernel goes on reading the permuted one —
+not a crash, not a NaN, a `mixed` built from the wrong four columns, 0.36 rms
+out. And every rung of both M ladders is **bit-identical** to every other at a
+7-token prompt, which is what checks the padding where a BM of 64 covers nine
+times the tokens that exist.
+
+**How it was measured:** `go run ./cmd/llm -hc -ladder`, GPU timestamps swept
+across **every staged mixer** rather than repeating one — a mixer is 13.4 MB of
+fp16 weights, which fits the MALL, so a loop over one dispatch would measure a
+kernel reading L3 where the graph it models reads 97 cold ones. Two full ladder
+runs agree to 1.4% on the mean cell and 0.6% on the block totals at the
+scheduled pair; the dispersion is on dispatches under 20 us and on the `up_m1`
+rung, where it reaches 30%. The kernel ladder gave a measured `PlanFor`
+schedule (`down_m1/up_m4` to 96 tokens, `down_m1/up_m2` to 384,
+`down_m2/up_m2` above), never more than 1.04x off the per-length winner.
+
+**Still on the table for this block, and deliberately not done:** it reads
+**fp16** weights, dequantised from Q8_0 at upload — 13.4 MB a mixer against
+7.1 — and the down projection is weight-read-bound, so a Q8_0 path is the
+obvious next lever and is what phase 2's W4A8 bank will want here anyway. The
+`up` rung is at 19.4 TFLOP/s against the 34-40 `shapes.csv` holds on similar
+shapes, with none of §2.7's hoist or §2.4's swizzle tried. **L2's next item is
+the PLE gather and the n-gram block**, not more tuning here.
 
 ### Session 2026-09-15 (thirty-second) — stage L2b: the block runs, and the oracle is not exact
 

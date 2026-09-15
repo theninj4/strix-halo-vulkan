@@ -150,3 +150,137 @@ func (m *Model) HCWeights(layer int, side string) (HCWeights, error) {
 
 // Close unmaps the shards.
 func (m *Model) Close() error { return m.Set.Close() }
+
+// PLEConfig reads the per-layer-embedding block's shape and its hash
+// constants out of the checkpoint's `qwen4exp.ple.*` keys. ok is false when
+// the checkpoint has no PLE module at all, which is how llama.cpp treats the
+// key group: absent means every field stays zero.
+//
+// The constants are not optional detail. `layer_multipliers`,
+// `head_offsets` and `head_vocab_sizes` *are* the hash — sixteen near-prime
+// vocabularies around 20 000 0xx over disjoint ranges of a 320 M-row table —
+// so a transcription of them would be a silent wrong answer, and they are
+// read rather than written down.
+func (m *Model) PLEConfig() (PLEConfig, bool, error) {
+	arch := m.Set.Arch()
+	layers, ok := m.Set.Ints(arch + ".ple.layers")
+	if !ok || len(layers) == 0 {
+		return PLEConfig{}, false, nil
+	}
+	c := PLEConfig{
+		NEmbd: m.Config.NEmbd,
+		HC:    m.Config.HC,
+		Eps:   m.Config.RMSEps,
+	}
+	for _, l := range layers {
+		c.Layers = append(c.Layers, int(l))
+	}
+	get := func(k string) (int, error) {
+		v, ok := m.Set.Uint(arch + ".ple." + k)
+		if !ok {
+			return 0, fmt.Errorf("llm: the checkpoint has a PLE module but no %s.ple.%s", arch, k)
+		}
+		return int(v), nil
+	}
+	var err error
+	if c.NGram, err = get("ngram_size"); err != nil {
+		return c, true, err
+	}
+	if c.PerGram, err = get("heads_per_ngram"); err != nil {
+		return c, true, err
+	}
+	if c.Conv, err = get("conv_kernel"); err != nil {
+		return c, true, err
+	}
+	eos, err := get("eos_token_id")
+	if err != nil {
+		return c, true, err
+	}
+	c.EOS = int32(eos)
+	if v, ok := m.Set.Uint(arch + ".ple.image_token_id"); ok {
+		c.Image = int32(v)
+	}
+	dim, ok := m.Set.Uint(arch + ".embedding_length_per_layer_input")
+	if !ok {
+		return c, true, fmt.Errorf("llm: the checkpoint states no %s.embedding_length_per_layer_input", arch)
+	}
+	c.HeadDim = int(dim)
+	c.NHeads = (c.NGram - 1) * c.PerGram
+
+	if c.Mult, ok = m.Set.Uints(arch + ".ple.layer_multipliers"); !ok || len(c.Mult) != c.NGram {
+		return c, true, fmt.Errorf("llm: %s.ple.layer_multipliers is %d values, want %d", arch, len(c.Mult), c.NGram)
+	}
+	for _, k := range []string{"head_offsets", "head_vocab_sizes"} {
+		v, ok := m.Set.Uints(arch + ".ple." + k)
+		if !ok || len(v) != c.NHeads {
+			return c, true, fmt.Errorf("llm: %s.ple.%s is %d values, want %d", arch, k, len(v), c.NHeads)
+		}
+		u := make([]uint32, len(v))
+		for i, x := range v {
+			u[i] = uint32(x)
+		}
+		if k == "head_offsets" {
+			c.Offsets = u
+		} else {
+			c.Vocabs = u
+		}
+	}
+	if c.NHeads*c.HeadDim != c.NEmbd {
+		return c, true, fmt.Errorf("llm: %d PLE heads of %d do not make n_embd %d, which the key and value projections assume",
+			c.NHeads, c.HeadDim, c.NEmbd)
+	}
+	return c, true, nil
+}
+
+// PLEWeights loads the n-gram block's tensors for a layer.
+func (m *Model) PLEWeights(layer int) (PLEWeights, error) {
+	p := fmt.Sprintf("blk.%d.ple_", layer)
+	var w PLEWeights
+	for _, t := range []struct {
+		name string
+		dst  *[]float32
+	}{
+		{"key", &w.Key}, {"value", &w.Value},
+		{"norm_key", &w.NormKey}, {"norm_query", &w.NormQuery}, {"norm_conv", &w.NormConv},
+		{"conv1d", &w.Conv1d},
+	} {
+		v, err := m.F32(p + t.name + ".weight")
+		if err != nil {
+			return w, err
+		}
+		*t.dst = v
+	}
+	return w, nil
+}
+
+// PLEGather reads the rows PLERows named, as [T][NHeads*HeadDim].
+//
+// This is D2 in one function: `per_layer_token_embd` is 28.80 GB of IQ4_NL —
+// a quarter of the whole checkpoint — and a token reads 16 rows of 160
+// values out of it, 1.41 KB. It stays in the mapping and is never staged
+// anywhere, which is also what llama.cpp does (`TENSOR_READ_LAZY`).
+func (m *Model) PLEGather(rows []int32, nHeads, headDim int) ([]float32, error) {
+	t, err := m.Set.Get("per_layer_token_embd.weight")
+	if err != nil {
+		return nil, err
+	}
+	if int(t.Dims[0]) != headDim {
+		return nil, fmt.Errorf("llm: per_layer_token_embd rows are %d wide, want %d", t.Dims[0], headDim)
+	}
+	out := make([]float32, len(rows)*headDim)
+	// gguf.Dequantize appends, so the scratch row is handed over empty and
+	// kept only for its capacity.
+	buf := make([]float32, 0, headDim)
+	for i, r := range rows {
+		if int64(r) < 0 || int64(r) >= t.Dims[1] {
+			return nil, fmt.Errorf("llm: PLE row %d (head %d of token %d) is outside the table's %d rows",
+				r, i%nHeads, i/nHeads, t.Dims[1])
+		}
+		v, err := t.DequantizeRow(int64(r), buf[:0])
+		if err != nil {
+			return nil, err
+		}
+		copy(out[i*headDim:], v)
+	}
+	return out, nil
+}

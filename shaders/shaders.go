@@ -1892,3 +1892,95 @@ var KokoroBertAttn []byte
 
 //go:embed kokoro_gelu.spv
 var KokoroGELU []byte
+
+// The hyper-connection block (LLM.md L2), qwen3.8-flash-next's replacement
+// for the residual stream — and, by L2a's per-op attribution of llama.cpp's
+// own graph, over half of its prefill: 30.6% elementwise glue, 12.2% tiny-N
+// F32 matmul and ~7% for the low-rank pair, against 1.6% for the gated
+// DeltaNet that three quarters of the layers are made of.
+//
+// Four dispatches where the reference has about sixteen. The norm writes the
+// fp16 A operand both matmuls read; the down projection carries `inject`'s
+// four output columns (the reference's worst single line, 10.3% of prefill at
+// 31.8 GFLOP/s) and applies silu on the accumulator; the up projection's
+// epilogue is the sigmoid and the 4-branch collapse, so the [10240, T] gate —
+// 21 MB at 512 tokens, the whole MALL — is never written; and the combine is
+// one pass over the residual instead of five.
+//
+// Both GEMM rungs are M-blocked ladders over the same shader. The down
+// projection's N is 336 = 21 tiles, so its BN is 48 (WN=3) and the ladder
+// moves BM alone; the up projection's collapse needs the four streams of a
+// feature in one workgroup, so its BN is 64 (WN=4) and the host permutes the
+// weight's rows to match.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_norm.spv llm_hc_norm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_combine.spv llm_hc_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -o llm_hc_down_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -o llm_hc_down_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -o llm_hc_down_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -o llm_hc_up_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -o llm_hc_up_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -o llm_hc_up_m4.spv llm_gemm.comp
+
+// The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
+// a prefill graph — its key projection is one dispatch of the 37 that share
+// that shape — so none of this is tuned; what it has to be is on the device,
+// because the alternative is a 21 MB round trip of the residual to the host in
+// the middle of the stack.
+//
+// Three dispatches against llama.cpp's ~25: the key and value projections are
+// one fused [hc*nEmbd + nEmbd, nEmbd] weight on the plain arm of llm_gemm,
+// everything between the projections and the convolution is one workgroup per
+// (token, stream), and the dilated depthwise convolution carries its SiLU and
+// the residual add.
+
+// The key/value projection's tile is chosen against the *weight*, not the
+// activation: its fused B is 65.5 MB of fp16, twice the 32 MiB MALL, so a
+// workgroup that carries BM token rows reads all of it M/BM times. At 512
+// tokens BM=32 is 1.05 GB of weight traffic and BM=128 is 262 MB. That is the
+// whole shape of this dispatch, and the ladder exists to show it.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -o llm_ple_kv_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -o llm_ple_kv_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -o llm_ple_kv_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_gate.spv llm_ple_gate.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_conv.spv llm_ple_conv.comp
+
+//go:embed llm_hc_norm.spv
+var LLMHCNorm []byte
+
+//go:embed llm_hc_combine.spv
+var LLMHCCombine []byte
+
+//go:embed llm_hc_down_m1.spv
+var LLMHCDownM1 []byte
+
+//go:embed llm_hc_down_m2.spv
+var LLMHCDownM2 []byte
+
+//go:embed llm_hc_down_m4.spv
+var LLMHCDownM4 []byte
+
+//go:embed llm_hc_up_m1.spv
+var LLMHCUpM1 []byte
+
+//go:embed llm_hc_up_m2.spv
+var LLMHCUpM2 []byte
+
+//go:embed llm_hc_up_m4.spv
+var LLMHCUpM4 []byte
+
+//go:embed llm_ple_kv_m2.spv
+var LLMPLEKVM2 []byte
+
+//go:embed llm_ple_kv_m4.spv
+var LLMPLEKVM4 []byte
+
+//go:embed llm_ple_kv_m8.spv
+var LLMPLEKVM8 []byte
+
+//go:embed llm_ple_gate.spv
+var LLMPLEGate []byte
+
+//go:embed llm_ple_conv.spv
+var LLMPLEConv []byte

@@ -1,0 +1,62 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Grouped RMSNorm over the hyper-connection residual: LLM.md L2's first
+// dispatch, and the only one that reads the wide fp32 stream.
+//
+//   xn[t][c] = res[t][c] / rms(res[t][c]) * gamma[c]      per (token, stream)
+//
+// The grouping is the detail a transcription gets wrong and the oracle
+// catches (research/l2b-hyper-connections.md): `ggml_rms_norm` reduces over
+// ne[0] alone, and the tensor is [nEmbd, hc, T] — so there are hc independent
+// norms of 2560 per token, not one over the concatenated 10240. One
+// workgroup is one (token, stream), which makes that structural rather than
+// a divide.
+//
+// It writes fp16 straight into the GEMM's A layout — [T][lda] with stream c
+// at column c*nEmbd — so the narrow, the gamma multiply and the staging that
+// llama.cpp spends RMS_NORM + MUL + CONT on are one pass at the bus. Both
+// matmuls of the block then read this one tensor, which is what makes the
+// down/inject fusion possible at all.
+
+#include "llm_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float partials[256];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint n = pc.nEmbd;
+    uint src = pc.resOff + (t * pc.hc + c) * n;
+    uint dst = pc.xnOff + t * pc.lda + c * n;
+    uint g = pc.gammaOff + c * n;
+    uint tid = gl_LocalInvocationID.x;
+
+    float sumSq = 0.0;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        float v = act[src + i];
+        sumSq += v * v;
+    }
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        barrier();
+    }
+
+    // 1/sqrt rather than inversesqrt: ggml computes 1.0f/sqrtf(mean + eps)
+    // and this tensor is compared against its output.
+    float scale = 1.0 / sqrt(partials[0] / float(n) + uintBitsToFloat(pc.eps));
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        hact[dst + i] = float16_t(act[src + i] * scale * wbuf[g + i]);
+    }
+}

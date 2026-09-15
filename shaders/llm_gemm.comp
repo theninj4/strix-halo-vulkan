@@ -1,0 +1,225 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The vertical's GEMM: one cooperative-matrix kernel, one epilogue per mode,
+// because in this architecture the epilogue is where the time goes. LLM.md L2a
+// put the hyper-connection block at over half of llama.cpp's prefill graph —
+// 30.6% elementwise glue + 12.2% tiny-N F32 matmul + ~7% for its low-rank
+// pair — and almost none of that is arithmetic.
+//
+//   MODE 0   [lowRank + hc, wide] * xn  ->  silu(lo/hc) fp16, and inject fp32
+//   MODE 1   [wide, lowRank] * lo       ->  sigmoid, collapsed into mixed
+//   MODE 2   [n, k] * a                 ->  C fp32, no epilogue at all
+//
+// MODE 2 is the plain one, and it exists for the PLE block's key and value
+// projections — which read the same gathered n-gram embedding, so the host
+// packs them as one [hc*nEmbd + nEmbd, nEmbd] weight for the same reason
+// MODE 0 carries inject.
+//
+// MODE 0 is the fusion L2a costed. `w_inject` is a [10240, 4] F32 matrix
+// applied to the *same* xn that `w_down` reads, and llama.cpp runs it as its
+// own MUL_MAT: 95 dispatches a graph at 31.8 GFLOP/s, 0.06% of peak and
+// **10.3% of prefill** for 15.6 MB of weights. Here it is four more output
+// columns on a matrix that already has 320 — the host packs them as one
+// [336, 10240] weight — so the tile whose columns start at lowRank is inject
+// and every other tile is the gate's low-rank input. 320 is 20 tiles, so that
+// split is on a tile boundary and costs a compare per tile, not a branch per
+// element.
+//
+// MODE 1 is the one that keeps a tensor off DRAM. The gate is [10240, T] —
+// 20.97 MB at 512 tokens, i.e. the whole MALL (L2a finding 5) — and nothing
+// downstream ever wants it: it is consumed immediately by
+// mixed[t][i] = mean_c(xn[t][c][i] * gate[t][c][i]). So the sigmoid and the
+// 4-branch collapse run on the accumulators, and the kernel writes the 2560
+// wide `mixed` instead of the 10240-wide gate. That needs the four streams of
+// one feature to be in the same workgroup, which is a *layout*: the host
+// permutes the up projection's output rows to (feature block, stream,
+// feature) so a 64-column block is 16 features x 4 streams. See packUpB in
+// llm/gpu.go.
+//
+// Everything else is the shape zimage/dit's GEMM ended on and this file does
+// not re-litigate: 16x16x16 cooperative-matrix tiles, a WM x WN register
+// accumulator grid, fp16 operands with fp32 accumulators, §2.3's padded
+// leading dimension on the A operand, and B in the §2.8 fragment tiling
+// (tile (nt, kt) is 256 contiguous halves holding element (k, n) at
+// (n%16)*16 + k%16, kt fastest). It is a separate shader rather than another
+// -D arm of dit_gemm.comp because both epilogues read a *second* activation
+// tensor and one of them writes a narrower C than the GEMM computes — which
+// is not an epilogue that file has a slot for, and it is the whole point of
+// this one.
+//
+// No bounds checks, as everywhere else in this ladder: the host pads M up to
+// BM and the arenas are zeroed once, so the pad rows carry the products of
+// zeros and their outputs are ignored.
+
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0
+#endif
+#ifndef WM
+#define WM 4        // accumulator tiles, M direction
+#endif
+#ifndef WN
+#define WN 4        // accumulator tiles, N direction; MODE 1 needs a multiple of 4
+#endif
+#ifndef BK_TILES
+#define BK_TILES 2  // K-slab depth, in 16-wide cooperative-matrix steps
+#endif
+// The stream count is compiled in rather than read from pc.hc: MODE 1's
+// collapse is a reduction over it *and* the weight permutation that puts the
+// streams of one feature in one workgroup is cut on it, so a mismatch would
+// be a wrong answer and not a slow one. The host checks the checkpoint says 4.
+#ifndef HC_STREAMS
+#define HC_STREAMS 4
+#endif
+
+#define TILE 16
+#define BM (WM * TILE)
+#define BN (WN * TILE)
+#define BK (BK_TILES * TILE)
+#define WAVE 64
+
+layout(local_size_x = WAVE) in;
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+#define ACC_T coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ACC16_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+
+#if MODE == 1
+#define A_BUF_OFF pc.loOff
+#define A_LDA pc.ldaLo
+// The gate tiles go through LDS on the way to the collapse. Storing the
+// accumulator and reading it back with ordinary indexing is what lets the
+// collapse pair a gate element with its xn element without depending on how
+// the implementation maps matrix elements to lanes -- which the cooperative
+// matrix extension does not define. It is 16 KB and one barrier.
+shared float gateLDS[BM * BN];
+#else
+// MODE 0 and MODE 2 both read the fp16 A operand at xnOff: the hyper-
+// connection block's normalised residual, and the PLE block's gathered
+// embedding.
+#define A_BUF_OFF pc.xnOff
+#define A_LDA pc.lda
+#endif
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    uint wn0 = gl_WorkGroupID.x * BN;
+    uint wm0 = gl_WorkGroupID.y * BM;
+
+    ACC_T acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = ACC_T(0.0);
+        }
+    }
+
+    uint ktiles = pc.gemmK / TILE;
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+        [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
+            FRAG_A_T fragA[WM];
+            FRAG_B_T fragB[WN];
+            [[unroll]] for (uint i = 0u; i < WM; i++) {
+                coopMatLoad(fragA[i], hact, A_BUF_OFF + (wm0 + i * TILE) * A_LDA + k0 + kt * TILE,
+                    A_LDA, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < WN; j++) {
+                coopMatLoad(fragB[j], w16, pc.bOff +
+                    (((wn0 + j * TILE) / TILE) * ktiles + (k0 + kt * TILE) / TILE) * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < WM; i++) {
+                [[unroll]] for (uint j = 0u; j < WN; j++) {
+                    acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);
+                }
+            }
+        }
+    }
+
+#if MODE == 0
+    // Down and inject in one store pass. The gate's branch gets silu(x/hc)
+    // applied on the accumulator and is narrowed into the fp16 arena as the
+    // next matmul's A operand; inject's single tile is written fp32, because
+    // it is read by the combine as a scalar per stream and never by a
+    // fragment load.
+    float invHC = 1.0 / float(pc.hc);
+    uint injStride = pc.gemmN - pc.lowRank;
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            uint n0 = wn0 + j * TILE;
+            uint m0 = wm0 + i * TILE;
+            if (n0 < pc.lowRank) {
+                ACC16_T lo;
+                [[unroll]] for (uint e = 0u; e < acc[i][j].length(); e++) {
+                    float v = float(acc[i][j][e]) * invHC;
+                    lo[e] = float16_t(v * sigmoidf(v));
+                }
+                coopMatStore(lo, hact, pc.loOff + m0 * pc.ldaLo + n0, pc.ldaLo,
+                    gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+                coopMatStore(acc[i][j], act, pc.injOff + m0 * injStride + (n0 - pc.lowRank),
+                    injStride, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+#elif MODE == 2
+    // No epilogue: C straight out, fp32, row stride gemmN.
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            coopMatStore(acc[i][j], act,
+                pc.outOff + (wm0 + i * TILE) * pc.gemmN + wn0 + j * TILE, pc.gemmN,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#else
+    // The gate, then the collapse, with the 10240-wide tensor never leaving
+    // the workgroup.
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            ACC_T g;
+            [[unroll]] for (uint e = 0u; e < acc[i][j].length(); e++) {
+                g[e] = sigmoidf(float(acc[i][j][e]));
+            }
+            coopMatStore(g, gateLDS, (i * TILE) * BN + j * TILE, BN,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+    barrier();
+
+    // Column n of this block is (feature block, stream, feature) by the host's
+    // permutation, so the four streams of one feature are 16 columns apart
+    // inside the same 64-column group. One output is a dot product of length
+    // hc over a gate row in LDS and an xn row in the fp16 arena.
+    uint blocks = BN / (TILE * HC_STREAMS);  // feature blocks this workgroup covers
+    uint outs = BM * blocks * TILE;
+    float invHC = 1.0 / float(pc.hc);
+    uint wide = pc.hc * pc.nEmbd;
+    for (uint p = gl_LocalInvocationID.x; p < outs; p += WAVE) {
+        uint r = p % TILE;                   // feature inside its block; fastest, so
+        uint fb = (p / TILE) % blocks;       // consecutive lanes read consecutive halves
+        uint m = p / (TILE * blocks);
+        uint t = wm0 + m;
+        uint feat = (wn0 / (TILE * HC_STREAMS) + fb) * TILE + r;
+        uint gbase = m * BN + fb * (TILE * HC_STREAMS) + r;
+        uint xbase = pc.xnOff + t * pc.lda + feat;
+        float sum = 0.0;
+        [[unroll]] for (uint c = 0u; c < HC_STREAMS; c++) {
+            float gv = gateLDS[gbase + c * TILE];
+            sum += gv * float(hact[xbase + c * pc.nEmbd]);
+            if (pc.gateOff != NO_W) {
+                act[pc.gateOff + t * wide + c * pc.nEmbd + feat] = gv;
+            }
+        }
+        act[pc.outOff + t * pc.nEmbd + feat] = sum * invHC;
+    }
+#endif
+}
