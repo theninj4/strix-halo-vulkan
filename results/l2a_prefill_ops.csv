@@ -1,0 +1,195 @@
+phase,ubatch,category,op,dispatches,us_per_dispatch,us_total,pct_of_graph,gflops
+prefill,512,moe_experts,"MUL_MAT_ID q4_K m=640 n=10 k=2560 n_expert=512 batch=512",92,3834.050,352733.0,28.914,4375.0
+prefill,512,moe_experts,"MUL_MAT_ID q5_1 m=2560 n=10 k=640 n_expert=512 batch=512",43,3314.190,142510.0,11.682,5058.3
+prefill,512,matmul_f32,"MUL_MAT f32 m=4 n=512 k=10240",95,1318.220,125231.0,10.265,31.8
+prefill,512,glue,"MUL",479,173.761,83231.6,6.823,0.0
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=10240 n=512 k=2560",37,1346.820,49832.4,4.085,19927.1
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=320 n=512 k=10240",95,400.585,38055.6,3.119,8375.9
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=6144 n=512 k=2560",36,971.606,34977.8,2.867,16573.6
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=2560 n=512 k=6144",48,713.244,34235.7,2.806,22579.7
+prefill,512,glue,"CONCAT",37,880.568,32581.0,2.671,0.0
+prefill,512,glue,"MULTI_ADD ADD",170,186.230,31659.1,2.595,0.0
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=10240 n=512 k=320",95,323.431,30726.0,2.519,10358.3
+prefill,512,glue,"ADD",231,109.628,25324.2,2.076,0.0
+prefill,512,attention_qsa,"FLASH_ATTN_EXT dst(256,24,512,1),  q(256,512,24,1),  k(256,2048,2,1),  v(256,2048,2,1),  m(2048,512,1,1)",12,2098.360,25180.3,2.064,12280.9
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=12288 n=512 k=2560",12,1698.700,20384.4,1.671,18959.1
+prefill,512,norms,"RMS_NORM(2560,4,512,1)",98,170.485,16707.5,1.370,0.0
+prefill,512,moe_experts,"MUL_MAT_ID q8_0 m=2560 n=10 k=640 n_expert=512 batch=512",4,4098.690,16394.7,1.344,4090.1
+prefill,512,glue,"REPEAT",98,162.534,15928.3,1.306,0.0
+prefill,512,deltanet,"GATED_DELTA_NET",36,438.416,15783.0,1.294,0.0
+prefill,512,glue,"SIGMOID",326,41.505,13530.9,1.109,0.0
+prefill,512,moe_experts,"MUL_MAT_ID q5_K m=640 n=10 k=2560 n_expert=512 batch=512",2,6292.190,12584.4,1.032,2665.8
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=640 n=512 k=2560",94,130.848,12299.7,1.008,12819.4
+prefill,512,matmul_f32,"MUL_MAT f32 m=1 n=512 k=2560",47,192.768,9060.1,0.743,13.6
+prefill,512,norms,"RMS_NORM_MUL RMS_NORM(128,48,512,1)",36,238.462,8584.6,0.704,0.0
+prefill,512,matmul_f32,"MUL_MAT f32 m=48 n=512 k=2560",72,108.903,7841.0,0.643,1155.2
+prefill,512,glue,"CONT",251,29.537,7413.8,0.608,0.0
+prefill,512,glue,"GLU",96,73.036,7011.5,0.575,0.0
+prefill,512,deltanet,"SSM_CONV_SILU SSM_CONV",36,188.477,6785.2,0.556,0.0
+prefill,512,matmul_f32,"MUL_MAT f32 m=512 n=512 k=2560",47,129.887,6104.7,0.500,10331.3
+prefill,512,deltanet,"L2_NORM",72,63.173,4548.5,0.373,0.0
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=2560 n=512 k=640",47,88.068,4139.2,0.339,19035.4
+prefill,512,matmul_dense,"MUL_MAT bf16 m=512 n=512 k=2560",12,290.935,3491.2,0.286,4612.4
+prefill,512,matmul_dense,"MUL_MAT_VEC q8_0 m=248320 n=1 k=2560",1,2933.570,2933.6,0.240,433.3
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=512 n=512 k=2560",24,115.834,2780.0,0.228,11584.8
+prefill,512,glue,"SCALE",399,6.719,2680.9,0.220,0.0
+prefill,512,attention_qsa,"TOP_K K=2048 (2048,512,1,1)",12,182.880,2194.6,0.180,0.0
+prefill,512,norms,"RMS_NORM_MUL RMS_NORM(256,24,512,1)",12,169.481,2033.8,0.167,0.0
+prefill,512,routing_gather,"GET_ROWS",135,14.557,1965.3,0.161,0.0
+prefill,512,routing_gather,"ARGSORT",47,37.770,1775.2,0.146,0.0
+prefill,512,matmul_dense,"MUL_MAT bf16 m=128 n=512 k=2560",12,127.969,1535.6,0.126,2621.6
+prefill,512,rope,"ROPE",48,23.641,1134.8,0.093,0.0
+prefill,512,glue,"CPY",85,12.222,1038.9,0.085,0.0
+prefill,512,routing_gather,"SET_ROWS",48,19.485,935.3,0.077,0.0
+prefill,512,glue,"SILU",98,6.423,629.5,0.052,0.0
+prefill,512,matmul_f32,"MUL_MAT f32 m=512 n=2048 k=128",12,38.359,460.3,0.038,6970.6
+prefill,512,routing_gather,"TOPK_MOE_EARLY_SOFTMAX_NORM SOFT_MAX",48,7.892,378.8,0.031,0.0
+prefill,512,matmul_dense,"MUL_MAT q8_0 m=2560 n=512 k=2560",1,359.282,359.3,0.029,18675.0
+prefill,512,norms,"RMS_NORM_MUL RMS_NORM(128,4,512,1)",12,22.742,272.9,0.022,0.0
+prefill,512,glue,"RELU",12,22.452,269.4,0.022,0.0
+prefill,512,routing_gather,"FILL",24,10.804,259.3,0.021,0.0
+prefill,512,norms,"SUM_ROWS",48,5.192,249.2,0.020,0.0
+prefill,512,attention_qsa,"TOPK_QSA GET_ROWS",12,17.225,206.7,0.017,0.0
+prefill,512,norms,"RMS_NORM_MUL RMS_NORM(256,2,512,1)",12,13.605,163.3,0.013,0.0
+prefill,512,moe_experts,"MUL_MAT_ID_VEC q4_K m=640 n=10 k=2560 n_expert=512",2,70.293,140.6,0.012,466.1
+prefill,512,glue,"CLAMP",48,2.394,115.0,0.009,0.0
+prefill,512,glue,"DIV",47,2.397,112.7,0.009,0.0
+prefill,512,moe_experts,"MUL_MAT_ID_MUL MUL_MAT_ID_VEC q8_0 m=2560 n=10 k=640 n_expert=512",1,102.554,102.6,0.008,319.3
+prefill,512,deltanet,"SOFTPLUS",36,2.455,88.4,0.007,0.0
+prefill,512,norms,"RMS_NORM_MUL RMS_NORM(128,512,1,1)",12,7.066,84.8,0.007,0.0
+prefill,512,matmul_dense,"MUL_MAT_VEC q8_0 m=320 n=1 k=10240",2,21.861,43.7,0.004,299.8
+prefill,512,matmul_dense,"MUL_MAT_VEC q8_0 m=10240 n=1 k=320",2,20.258,40.5,0.003,323.0
+prefill,512,matmul_f32,"MUL_MAT_VEC f32 m=512 n=1 k=2560",1,37.671,37.7,0.003,69.6
+prefill,512,matmul_dense,"MUL_MAT_VEC q8_0 m=640 n=1 k=2560",2,10.339,20.7,0.002,316.9
+prefill,512,matmul_dense,"MUL_MAT_VEC q8_0 m=2560 n=1 k=640",1,10.099,10.1,0.001,324.2
+prefill,512,norms,"RMS_NORM(2560,4,1,1)",2,3.646,7.3,0.001,0.0
+prefill,512,matmul_f32,"MUL_MAT_VEC f32 m=4 n=1 k=10240",1,6.091,6.1,0.000,13.4
+prefill,512,matmul_f32,"MUL_MAT_VEC f32 m=1 n=1 k=2560",1,3.406,3.4,0.000,1.5
+prefill,512,glue,"SQRT",1,2.564,2.6,0.000,0.0
+prefill,512,glue,"SGN",1,2.404,2.4,0.000,0.0
+prefill,512,glue,"ABS",1,2.364,2.4,0.000,0.0
+decode,1,moe_experts,"MUL_MAT_ID_VEC q4_K m=640 n=10 k=2560 n_expert=512",94,57.835,5436.6,13.166,566.5
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=10240 n=1 k=2560",37,124.919,4622.0,11.193,419.6
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=2560 n=1 k=6144",48,78.867,3785.7,9.168,398.8
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=248320 n=1 k=2560",1,2934.220,2934.2,7.106,433.2
+decode,1,moe_experts,"MUL_MAT_ID_MUL MUL_MAT_ID_VEC q5_1 m=2560 n=10 k=640 n_expert=512",43,66.448,2857.3,6.920,492.7
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=6144 n=1 k=2560",36,75.741,2726.7,6.603,415.2
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=12288 n=1 k=2560",12,149.747,1797.0,4.352,420.1
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=320 n=1 k=10240",97,17.623,1709.5,4.140,371.8
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=10240 n=1 k=320",97,17.558,1703.2,4.125,372.7
+decode,1,matmul_f32,"MUL_MAT_VEC f32 m=512 n=1 k=2560",48,30.449,1461.6,3.540,86.1
+decode,1,glue,"MUL",432,2.508,1083.5,2.624,0.0
+decode,1,glue,"SCALE",399,2.444,975.5,2.362,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=640 n=1 k=2560",96,9.701,931.3,2.255,337.7
+decode,1,routing_gather,"GET_ROWS",100,8.140,814.1,1.972,0.0
+decode,1,glue,"SIGMOID",326,2.434,793.6,1.922,0.0
+decode,1,glue,"CONT",251,2.326,584.1,1.414,0.0
+decode,1,glue,"ADD",231,2.479,572.8,1.387,0.0
+decode,1,matmul_f32,"MUL_MAT_VEC f32 m=4 n=1 k=10240",96,5.613,538.9,1.305,14.6
+decode,1,glue,"CPY",85,5.732,487.2,1.180,0.0
+decode,1,glue,"MULTI_ADD ADD",170,2.746,466.9,1.131,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=2560 n=1 k=640",48,9.629,462.2,1.119,340.0
+decode,1,moe_experts,"MUL_MAT_ID_MUL MUL_MAT_ID_VEC q8_0 m=2560 n=10 k=640 n_expert=512",5,84.391,422.0,1.022,388.0
+decode,1,deltanet,"GATED_DELTA_NET",36,10.895,392.2,0.950,0.0
+decode,1,norms,"RMS_NORM(2560,4,1,1)",100,3.208,320.8,0.777,0.0
+decode,1,matmul_f32,"MUL_MAT_VEC f32 m=48 n=1 k=2560",72,4.193,301.9,0.731,58.6
+decode,1,glue,"GLU",96,2.734,262.6,0.636,0.0
+decode,1,glue,"SILU",98,2.479,243.0,0.588,0.0
+decode,1,glue,"REPEAT",98,2.472,242.3,0.587,0.0
+decode,1,routing_gather,"TOPK_MOE_EARLY_SOFTMAX_NORM SOFT_MAX",48,4.860,233.3,0.565,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=512 n=1 k=2560",24,7.942,190.6,0.462,330.0
+decode,1,norms,"RMS_NORM_MUL RMS_NORM(128,48,1,1)",36,4.812,173.2,0.420,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC bf16 m=512 n=1 k=2560",12,13.815,165.8,0.402,189.7
+decode,1,attention_qsa,"FLASH_ATTN_EXT dst(256,24,1,1),  q(256,1,24,1),  k(256,256,2,1),  v(256,256,2,1),  m(256,1,1,1)",12,13.401,160.8,0.389,469.5
+decode,1,glue,"CONCAT",37,4.184,154.8,0.375,0.0
+decode,1,deltanet,"L2_NORM",72,2.137,153.9,0.373,0.0
+decode,1,moe_experts,"MUL_MAT_ID_VEC q5_K m=640 n=10 k=2560 n_expert=512",2,70.794,141.6,0.343,462.8
+decode,1,deltanet,"SSM_CONV_SILU SSM_CONV",36,3.599,129.6,0.314,0.0
+decode,1,matmul_f32,"MUL_MAT_VEC f32 m=1 n=1 k=2560",48,2.577,123.7,0.300,2.0
+decode,1,rope,"ROPE",48,2.545,122.2,0.296,0.0
+decode,1,routing_gather,"SET_ROWS",48,2.237,107.4,0.260,0.0
+decode,1,deltanet,"SOFTPLUS",36,2.508,90.3,0.219,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC bf16 m=128 n=1 k=2560",12,5.509,66.1,0.160,118.9
+decode,1,norms,"RMS_NORM_MUL RMS_NORM(256,24,1,1)",12,4.958,59.5,0.144,0.0
+decode,1,routing_gather,"FILL",24,2.432,58.4,0.141,0.0
+decode,1,matmul_dense,"MUL_MAT_VEC q8_0 m=2560 n=1 k=2560",1,32.902,32.9,0.080,398.3
+decode,1,norms,"RMS_NORM_MUL RMS_NORM(128,4,1,1)",12,2.614,31.4,0.076,0.0
+decode,1,norms,"RMS_NORM_MUL RMS_NORM(256,2,1,1)",12,2.557,30.7,0.074,0.0
+decode,1,norms,"RMS_NORM_MUL RMS_NORM(128,64,1,1)",12,2.544,30.5,0.074,0.0
+decode,1,matmul_f32,"MUL_MAT_VEC f32 m=64 n=4 k=128",12,2.514,30.2,0.073,26.0
+decode,1,attention_qsa,"TOP_K K=256 (256,1,1,1)",12,2.437,29.2,0.071,0.0
+decode,1,glue,"RELU",12,2.424,29.1,0.070,0.0
+decode,1,norms,"SUM_ROWS",1,8.456,8.5,0.020,0.0
+decode,1,glue,"SGN",1,2.604,2.6,0.006,0.0
+decode,1,glue,"SQRT",1,2.444,2.4,0.006,0.0
+decode,1,glue,"CLAMP",1,2.404,2.4,0.006,0.0
+decode,1,glue,"ABS",1,2.284,2.3,0.006,0.0
+prefill,2048,moe_experts,"MUL_MAT_ID q4_K m=640 n=10 k=2560 n_expert=512 batch=2048",92,11623.500,1069360.0,23.455,5772.4
+prefill,2048,moe_experts,"MUL_MAT_ID q5_1 m=2560 n=10 k=640 n_expert=512 batch=2048",43,11054.600,475347.0,10.426,6065.9
+prefill,2048,glue,"CONCAT",37,12842.400,475167.0,10.422,0.0
+prefill,2048,glue,"MUL",479,856.385,410209.0,8.998,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=2560 n=2048 k=6144",48,4021.710,193042.0,4.234,16017.9
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=10240 n=2048 k=2560",37,5188.090,191959.0,4.210,20692.3
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=320 n=2048 k=10240",95,1950.360,185284.0,4.064,6881.4
+prefill,2048,matmul_f32,"MUL_MAT f32 m=4 n=2048 k=10240",95,1734.360,164764.0,3.614,96.7
+prefill,2048,glue,"ADD",231,597.331,137984.0,3.027,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=10240 n=2048 k=320",95,1437.250,136539.0,2.995,9323.9
+prefill,2048,glue,"MULTI_ADD ADD",170,706.865,120167.0,2.636,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=6144 n=2048 k=2560",36,3307.360,119065.0,2.612,19475.3
+prefill,2048,glue,"SIGMOID",326,286.372,93357.3,2.048,0.0
+prefill,2048,norms,"RMS_NORM(2560,4,2048,1)",98,859.603,84241.1,1.848,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=12288 n=2048 k=2560",12,6314.360,75772.3,1.662,20401.7
+prefill,2048,deltanet,"GATED_DELTA_NET",36,2057.510,74070.4,1.625,0.0
+prefill,2048,glue,"REPEAT",98,647.877,63492.0,1.393,0.0
+prefill,2048,attention_qsa,"FLASH_ATTN_EXT dst(256,24,2048,1),  q(256,2048,24,1),  k(256,2048,2,1),  v(256,2048,2,1),  m(2048,2048,1,1)",12,4821.670,57860.0,1.269,21378.3
+prefill,2048,moe_experts,"MUL_MAT_ID q8_0 m=2560 n=10 k=640 n_expert=512 batch=2048",4,12207.200,48828.6,1.071,5493.2
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=640 n=2048 k=2560",94,489.299,45994.2,1.009,13712.6
+prefill,2048,glue,"CONT",251,166.543,41802.4,0.917,0.0
+prefill,2048,norms,"RMS_NORM_MUL RMS_NORM(128,48,2048,1)",36,953.166,34314.0,0.753,0.0
+prefill,2048,glue,"GLU",96,347.109,33322.5,0.731,0.0
+prefill,2048,moe_experts,"MUL_MAT_ID q5_K m=640 n=10 k=2560 n_expert=512 batch=2048",2,16192.000,32384.0,0.710,4143.8
+prefill,2048,deltanet,"SSM_CONV_SILU SSM_CONV",36,887.584,31953.1,0.701,0.0
+prefill,2048,deltanet,"L2_NORM",72,263.294,18957.2,0.416,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=2560 n=2048 k=640",47,320.896,15082.2,0.331,20896.6
+prefill,2048,matmul_f32,"MUL_MAT f32 m=512 n=2048 k=2560",47,316.453,14873.3,0.326,16961.9
+prefill,2048,glue,"SCALE",472,30.604,14445.2,0.317,0.0
+prefill,2048,matmul_f32,"MUL_MAT f32 m=48 n=2048 k=2560",72,198.347,14281.0,0.313,2537.1
+prefill,2048,matmul_f32,"MUL_MAT f32 m=1 n=2048 k=2560",47,234.973,11043.8,0.242,44.6
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=512 n=2048 k=2560",24,368.992,8855.8,0.194,14546.8
+prefill,2048,matmul_dense,"MUL_MAT bf16 m=512 n=2048 k=2560",12,681.972,8183.7,0.180,7870.8
+prefill,2048,norms,"RMS_NORM_MUL RMS_NORM(256,24,2048,1)",12,670.066,8040.8,0.176,0.0
+prefill,2048,attention_qsa,"TOP_K K=2048 (2048,2048,1,1)",12,642.967,7715.6,0.169,0.0
+prefill,2048,rope,"ROPE",48,127.763,6132.7,0.135,0.0
+prefill,2048,routing_gather,"ARGSORT",47,128.300,6030.1,0.132,0.0
+prefill,2048,routing_gather,"GET_ROWS",135,29.902,4036.9,0.089,0.0
+prefill,2048,matmul_dense,"MUL_MAT bf16 m=128 n=2048 k=2560",12,316.517,3798.2,0.083,4239.6
+prefill,2048,routing_gather,"SET_ROWS",48,61.237,2939.4,0.064,0.0
+prefill,2048,matmul_dense,"MUL_MAT_VEC q8_0 m=248320 n=1 k=2560",1,2926.720,2926.7,0.064,434.3
+prefill,2048,glue,"SILU",98,23.717,2324.3,0.051,0.0
+prefill,2048,matmul_f32,"MUL_MAT f32 m=512 n=8192 k=128",12,182.135,2185.6,0.048,5872.3
+prefill,2048,glue,"CPY",85,25.372,2156.7,0.047,0.0
+prefill,2048,matmul_dense,"MUL_MAT q8_0 m=2560 n=2048 k=2560",1,1298.030,1298.0,0.028,20676.2
+prefill,2048,routing_gather,"TOPK_MOE_EARLY_SOFTMAX_NORM SOFT_MAX",48,25.290,1213.9,0.027,0.0
+prefill,2048,attention_qsa,"TOPK_QSA GET_ROWS",12,97.571,1170.9,0.026,0.0
+prefill,2048,routing_gather,"FILL",24,43.968,1055.2,0.023,0.0
+prefill,2048,glue,"RELU",12,79.938,959.3,0.021,0.0
+prefill,2048,norms,"RMS_NORM_MUL RMS_NORM(128,4,2048,1)",12,72.243,866.9,0.019,0.0
+prefill,2048,norms,"RMS_NORM_MUL RMS_NORM(256,2,2048,1)",12,61.606,739.3,0.016,0.0
+prefill,2048,norms,"SUM_ROWS",48,14.256,684.3,0.015,0.0
+prefill,2048,deltanet,"SOFTPLUS",36,5.229,188.3,0.004,0.0
+prefill,2048,glue,"CLAMP",48,2.526,121.3,0.003,0.0
+prefill,2048,glue,"DIV",47,2.534,119.1,0.003,0.0
+prefill,2048,moe_experts,"MUL_MAT_ID_VEC q4_K m=640 n=10 k=2560 n_expert=512",2,56.868,113.7,0.002,576.1
+prefill,2048,norms,"RMS_NORM_MUL RMS_NORM(128,512,1,1)",12,6.912,83.0,0.002,0.0
+prefill,2048,moe_experts,"MUL_MAT_ID_MUL MUL_MAT_ID_VEC q8_0 m=2560 n=10 k=640 n_expert=512",1,80.392,80.4,0.002,407.3
+prefill,2048,matmul_dense,"MUL_MAT_VEC q8_0 m=320 n=1 k=10240",2,17.533,35.1,0.001,373.8
+prefill,2048,matmul_dense,"MUL_MAT_VEC q8_0 m=10240 n=1 k=320",2,16.851,33.7,0.001,388.3
+prefill,2048,matmul_f32,"MUL_MAT_VEC f32 m=512 n=1 k=2560",1,26.851,26.9,0.001,97.6
+prefill,2048,matmul_dense,"MUL_MAT_VEC q8_0 m=640 n=1 k=2560",2,10.018,20.0,0.000,327.0
+prefill,2048,matmul_dense,"MUL_MAT_VEC q8_0 m=2560 n=1 k=640",1,9.818,9.8,0.000,333.5
+prefill,2048,norms,"RMS_NORM(2560,4,1,1)",2,3.446,6.9,0.000,0.0
+prefill,2048,matmul_f32,"MUL_MAT_VEC f32 m=4 n=1 k=10240",1,6.412,6.4,0.000,12.8
+prefill,2048,matmul_f32,"MUL_MAT_VEC f32 m=1 n=1 k=2560",1,2.725,2.7,0.000,1.9
+prefill,2048,glue,"ABS",1,2.404,2.4,0.000,0.0
+prefill,2048,glue,"SGN",1,2.404,2.4,0.000,0.0
+prefill,2048,glue,"SQRT",1,2.404,2.4,0.000,0.0

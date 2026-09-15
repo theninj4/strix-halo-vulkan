@@ -10,10 +10,12 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0 and L1 complete. The checkpoint is downloaded, llama.cpp runs it,
-and the Go side reads it.** 114 GB in 18 minutes;
-`models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL` shards and the
-2.79 GB MTP head. **L2 — the dense skeleton — is next.**
+**Status: L0, L1, L2a and L2b complete.** The checkpoint is downloaded,
+llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
+**the first block of the model runs and matches the reference**. 114 GB in 18
+minutes; `models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL` shards
+and the 2.79 GB MTP head. **Next: the fused Vulkan kernel for the block L2b
+just wrote the CPU reference for, then the PLE gather and attention.**
 
 ## The number to beat
 
@@ -23,7 +25,7 @@ shipped, `-ngl -1`, mmap on, two repetitions, nothing else on the GPU:
 | test | tok/s | against |
 |---|---:|---|
 | pp512 | 313.62 ± 1.74 | |
-| **pp2048** | **388.60 ± 1.89** | the ~2000 this file predicted — **5x out** |
+| **pp2048** | **388.60 ± 1.89** | L2a re-measures **391.42 ± 1.13** at its best ubatch, and attributes the 5x |
 | pp8192 | 392.95 ± 1.04 | prefill plateaus, it does not scale with the chunk |
 | tg32 | 25.12 ± 0.03 | |
 | **tg128** | **25.15 ± 0.02** | **65.8%** of the 242 GB/s bus |
@@ -39,14 +41,10 @@ chunking. [Write-up](research/l1-baseline.md)
 llama.cpp's 25.15 — decode leaves a third of the bus unused in the reference
 implementation. Phase 2's ~67 is then **2.7x the reference**, not 1.8x.
 
-And **prefill is the surprise**. §3.4 and §2.2 were added up into "~2000 tok/s
-at a 2048 chunk"; the reference gets 388.60 and does not improve with a bigger
-chunk. Either this architecture has a great deal of prefill that is not matmul
-— 36 DeltaNet layers, the QSA indexer, 194 hyper-connection projections a
-token — or llama.cpp's Vulkan path leaves 5x on the table. Which one it is
-decides whether L6 is an afternoon or a fortnight, and **it is the first thing
-L2 should find out**, because both candidates are measurable before the whole
-model runs.
+**L2a has since re-measured the prefill row**: `-ub 512` is llama.cpp's best
+ubatch and it does **391.42 ± 1.13**, 0.7% from L1's separate 388.60 ± 1.89.
+256/1024/2048 give 347.71 / 380.91 / 336.72 — bigger is *worse*, for a reason
+finding 5 below explains.
 
 ## What L0 established
 
@@ -80,6 +78,94 @@ model runs.
 > equal bits, not 2x. And a bug fell out: `quantizeQ8`'s fp16 block scale goes
 > subnormal under maxAbs 7.75e-3, worth **14x** on one real tensor in fourteen.
 > [Write-up](research/l0d-quant-error.md)
+
+## What L2a established — the 5x, attributed
+
+`GGML_VK_PERF_LOGGER=1` puts a timestamp query around every dispatch in
+llama.cpp's Vulkan graph. Both of L1's candidates are **wrong**, and the
+answer is better than either. [Write-up](research/l2a-prefill-attribution.md)
+· `results/l2a_prefill_ops.csv`
+
+> **L2a-1: the architecture is innocent.** `GATED_DELTA_NET` is **1.6%** of a
+> prefill graph — 36 dispatches, 74.1 ms of 4556. The whole DeltaNet core is
+> 2.7%, full attention plus the QSA indexer and its top-2048 selection 1.5%.
+> **The candidate "this architecture has a great deal of prefill that is not
+> matmul" accounts for 4.5% and cannot explain a 5x.** Nor is it host
+> overhead: **93% of the un-instrumented wall clock is GPU kernel time**.
+>
+> **L2a-2: it is the hyper-connection block, and half of that is free.**
+> Per graph: MoE experts **35.7%**, dense matmul **26.2%**, elementwise glue
+> **30.6%** (2453 dispatches), tiny-N F32 matmul **12.2%** at `-ub 512`. The
+> worst single line is `MUL_MAT f32 m=4 n=512 k=10240` — `hc_*_inject`, a
+> `[10240, 4]` F32 projection run 95 times a graph — at **31.8 GFLOP/s, 0.06%
+> of peak, 10.3% of prefill**. It reads the same `xn` that `hc.down` reads, so
+> it is four more output columns on a matrix that already has 320: **fusing it
+> deletes a tenth of prefill.** `CONCAT` is the other scandal, at 48 GB/s
+> falling to **13 GB/s** as the ubatch grows.
+>
+> **L2a-3: against our own measured kernels the chunk is 2.25-2.53x.**
+> `results/shapes.csv`'s best variant per shape beats llama.cpp by **5.08x at
+> `hc.down`** (N=320), 2.96x at `moe.shared` (N=640), 2.15x at `attn.o`, and
+> only 1.11-1.15x on the two widest-N shapes — **we win exactly where N is
+> small.** §2.2's already-built Q4 grouped MoE block is **642 ms against 1626,
+> 2.53x**. Total: **711 tok/s with the glue as it stands, ~1150 with three
+> quarters of it fused into epilogues.** So **L6 is an afternoon, and ~1150
+> — not ~2000 — is what it should be scoped against.**
+>
+> **L2a-4: `-ub 512` is a MALL-sized optimum, so do not raise it.** 256 / 512
+> / 1024 / 2048 give 347.71 / **391.42** / 380.91 / 336.72. Per token the MoE
+> does get cheaper with a bigger ubatch (0.78x) — but the glue gets **1.57x**
+> more expensive, because the `[10240, T]` **F32** residual is 20.97 MB at
+> T=512, **just inside the 32 MiB MALL**, and 83.9 MB at T=2048. `MUL` falls
+> from 362 GB/s to 294, `CONCAT` from 48 to 13. **Keep the residual fp16 and
+> fuse the traffic away rather than cache it.**
+>
+> **L2a-5: decode's gap is dispatches, not GEMV.** llama.cpp's decode matmuls
+> are already at **198-230 GB/s** (`lm_head` 675 MB in 2.93 ms = 230). The
+> 6.334 GB a token needs 26.2 ms and it spends 41.3; the missing 15.1 ms is
+> **2896 dispatches that read no weights, costing 8.9 ms — 22% of the step**,
+> an order of magnitude past L1's 0.62 ms estimate for the same graph.
+> **L7 is won by not dispatching 3837 kernels, not by a better GEMV.**
+
+## What L2b established — the block runs, and the oracle is not exact
+
+`llm/` is the vertical's package: a `Config` read from the checkpoint, the
+hyper-connection block, and `reference/eval_dump.c`, which writes **whole**
+tensors of a real llama.cpp pass where `llama-eval-callback` prints three per
+axis. [Write-up](research/l2b-hyper-connections.md) · `reference/out/llm/`
+
+> **L2b-1: the block matches, and four of its seven mixers match to f32
+> round-off.** `token_embd`'s gather and `hc_init` are **bit-exact**; the
+> combine is 1e-09 rms; the F32-weighted `hc_norm` and `hc_inject` are 1e-07
+> and **3e-06 relative** on values to \|71.7\|; and `hc_gate` — through two
+> Q8_0 matmuls, a SiLU and a sigmoid — is **6.2e-08 rms in four of the seven
+> mixers of the four dumped layers**. Nothing wrong about the formula, the
+> weight indexing or the layout survives that.
+>
+> **L2b-2: llama.cpp evaluates a Q8_0 matmul over int8 activations, and
+> modelling it is worth 233x.** `quantize_q8_1.comp`: blocks of 32, `d =
+> amax/127`, `round(x * 1/d)` **with the f32 reciprocal**, and the scale
+> *stored* fp16. `hc_gate-0` goes from **3.143e-03 rms to 1.347e-05**.
+> Rounding the activations, the weights or both to fp16 changes **nothing**
+> (3.14e-03), so this is not a precision effect — it is a different
+> arithmetic. Quantising with an already-fp16 scale, the obvious misreading,
+> is 35x worse than the real thing.
+>
+> **L2b-3: so L2's gate changes.** "Matches `llama-eval-callback` to fp16
+> tolerance" is unreachable *and* meaningless downstream of a Q8_0 matmul.
+> The criterion is an **rms bound under the reference's own numerics**
+> (`llm.Numerics`, `Exact` vs `RefQ8`), and maxAbs is a logged diagnostic
+> rather than a bound, because an int8 grid makes the error heavy-tailed:
+> one flipped rounding among `lo`'s 320 values moves all 10240 gate outputs.
+> Three of the seven mixers keep 6e-06 to 3.4e-04 rms for that reason,
+> bounded but not explained.
+>
+> **L2b-4: and D6 is cheaper than it looked.** The baseline **PPL 4.0340**
+> was measured with **W8A8 already running on the dense tensors**. L0d priced
+> int8-per-token activations at 1.13x fp16's error and called W8A8 "99%
+> activation error"; that is not a projection about our bank, it is what the
+> reference implementation does. **D3 and D6 give up no activation axis the
+> reference keeps**, and L8's perplexity comparison is like-for-like on it.
 
 ---
 
@@ -126,7 +212,10 @@ dense weight is read every time.
 L1: the reader, the five dequant paths and the tokenizer all exist and are
 checked against llama.cpp.** What is left is the model itself — L2 to L7.
 Correctness is checked tensor-for-tensor against `llama-eval-callback`; the
-acceptance criterion is *it generates the same text as llama.cpp*.
+acceptance criterion is *it generates the same text as llama.cpp*. **L2a sizes
+it**: ~1150 tok/s prefill against 391.4, and 38.2 tok/s decode against 25.15,
+both reachable with kernels that already exist plus the epilogue fusion the
+hyper-connection block needs.
 
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
@@ -286,6 +375,8 @@ below Q8. Bandwidth is the whole story.
 | `cmd/gguf` | inventory, quant mix, decode budget, `-check` against `tensors.json`. |
 | `cmd/llm` | the vertical's driver. `-tokenize` today; generation at L7. |
 | `zimage/tokenizer/` | **L1: `FromVocab`** builds the BPE from GGUF metadata, and `split()` now carries both Qwen pre-tokenizers. 213/213 against `llama-tokenize`. |
+| `llm/` | **L2b: the vertical's package.** `Config` from the checkpoint's own metadata, on-demand dequantisation, the `token_embd` gather (bit-exact), and the hyper-connection block — `HCInit`, `HCMix`, `HCCombine` — with a `Numerics` switch between the exact model and the reference's int8 arithmetic. |
+| `reference/eval_dump.c` | **L2b: the oracle.** Whole tensors of a real llama.cpp pass, where `llama-eval-callback` prints three per axis and a sum. `llm/evaldump.go` reads them back as a `Trace`. |
 | `zimage/qwen/` | a working Qwen3 transformer on the GPU in Go — RMSNorm, RoPE, GQA, SwiGLU, four shared arenas. The skeleton for L2. |
 | `shaders/gemv_w4a8.comp` | decode GEMV at **99-103% of the bus** (§1.1, §1.7), plus 25 grouped / M-blocked / N-blocked MoE builds (§1.8-§1.12). |
 | `shaders/gemm_wmma_q4.comp` | Q4 prefill GEMM, **2.10x fp16** on a MoE block (§2.2), with L0c's k-major scale plane. |
@@ -297,14 +388,19 @@ below Q8. Bandwidth is the whole story.
 
 ## What has to be built
 
-1. **Gated DeltaNet — 36 of the 48 layers.** §3.6, unbuilt, "effort: high".
+1. **Hyper-connections** — 4-branch gated residual at width 10240, every layer,
+   and 194 low-rank projections a token. **L2a promoted this to first**: it is
+   over half of llama.cpp's prefill graph once its glue and its `inject`
+   projection are counted, and almost all of that is one fused kernel.
+   **L2b has built the CPU half**; the kernel is what is left.
+2. **Gated DeltaNet — 36 of the 48 layers.** §3.6, unbuilt, "effort: high".
    Chunked linear attention, fp32 recurrent state, depthwise conv1d k=4 over
    10240 channels, `A_log`/`dt_bias` gating, sigmoid output gate. The largest
-   new kernel in the project's history, and three quarters of the model.
-2. **QSA sparse attention** — indexer, top-2048 selection, gathered attention.
-   Not in `IDEAS.md` at all; it needs a new section.
-3. **Hyper-connections** — 4-branch gated residual at width 10240, every layer,
-   and 194 low-rank projections a token.
+   new kernel in the project's history, and three quarters of the model — but
+   **L2a prices the reference's at 2.7% of prefill**, so the risk here is
+   getting it right, not making it fast.
+3. **QSA sparse attention** — indexer, top-2048 selection, gathered attention.
+   Not in `IDEAS.md` at all; it needs a new section. 1.5% of prefill.
 4. **PLE n-gram** — trigram hashing into 16 heads over a 320 M-row mmap'd
    table, `layer_multipliers`, conv1d k=4, key/value projections.
 5. **KV cache**, mrope (interleaved, sections [11,11,10], 64 of 256 dims), and
@@ -350,12 +446,31 @@ below Q8. Bandwidth is the whole story.
 
 ### L2 — the dense skeleton
 
-- [ ] **First, settle the prefill question above**: price one full-attention
-      layer and one DeltaNet layer against §2.2's kernels before building the
-      stack, so the 5x is attributed before it is designed around.
-- [ ] Embeddings, PLE gather (host, mmap'd), hyper-connection mix/combine,
-      RMSNorm, one full-attention layer with mrope.
-- [ ] Gate: layer 3's output matches `llama-eval-callback` to fp16 tolerance.
+- [x] **L2a — settle the prefill question.** Done by per-op attribution of
+      llama.cpp's own graph rather than by pricing one layer: **DeltaNet is
+      1.6%, attention+QSA 1.5%, and the 5x is MoE (35.7%), dense matmul
+      (26.2%), glue (30.6%) and tiny-N F32 (12.2%)**. Against our own kernels
+      the chunk is 2.25-2.53x, so **the target is ~1150 tok/s, not ~2000**.
+      [Write-up](research/l2a-prefill-attribution.md) · `results/l2a_prefill_ops.csv`
+- [x] **L2b — the hyper-connection block, CPU reference.** `llm/`: the block,
+      a `Config` read from the checkpoint, and **`reference/eval_dump.c`**, a
+      whole-tensor oracle (143 tensors, 35.7 MB, all of layers 0-3 — enough
+      for L2, L3 *and* L4 from one model load). Every mixer and combine of the
+      four dumped layers matches; four of seven gates to **6.2e-08 rms**. And
+      it found what the oracle is really computing — see L2b-2 above.
+      [Write-up](research/l2b-hyper-connections.md)
+- [ ] **The fused hyper-connection kernel** — L2a-2's specification, now with
+      an oracle: grouped RMSNorm over `[2560, 4, T]`, the low-rank gate, the
+      4-branch collapse, and `hc.down` **with `inject`'s 4 columns fused onto
+      it**. One kernel where llama.cpp has ~10 and 22% of its prefill.
+- [ ] PLE gather (host, mmap'd) and the n-gram block — layer 1 only, and the
+      one thing between `hc_init` and a whole layer stack. The trace has
+      `ple_embd`, `ple_gate`, `ple_gated_value` and `ple_conv_out-1`.
+- [ ] One full-attention layer with mrope, and the QSA indexer beside it
+      (`indexer_*-3` are in the trace).
+- [ ] Gate: layer 3's output matches the reference. **Not "to fp16
+      tolerance"** — L2b-3: an rms bound under `llm.RefQ8`, since the
+      reference is computing in int8 and the error is heavy-tailed.
 
 ### L3 — Gated DeltaNet  *(the big one)*
 
@@ -418,6 +533,15 @@ below Q8. Bandwidth is the whole story.
     $L/build/bin/llama-eval-callback -m $M -p 'hello' -n 1   # per-tensor dumps
     $L/build/bin/llama-perplexity -m $M -f models/wikitext-2-raw/wiki.test.raw -c 2048 -b 2048
 
+    # L2a's tool: a timestamp query around every dispatch in the Vulkan graph.
+    # Costs 4-7% and prints one per-op-shape table per graph compute.
+    GGML_VK_PERF_LOGGER=1 $L/build/bin/llama-bench -m $M -p 2048 -n 16 -r 1 -ub 512
+
+    # L2b's tool: whole intermediate tensors of a real pass, to reference/out/llm.
+    # See research/l2b-hyper-connections.md for the build line and the filter.
+    /tmp/eval_dump -m $M -o reference/out/llm -c 64 -p '…' -n '<regex>'
+    go test ./llm/ -v                        # the block against that trace
+
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh
 
@@ -436,18 +560,28 @@ below Q8. Bandwidth is the whole story.
 
 ## Open questions
 
-- **Why is prefill 393 and not ~2000?** The largest open number in this file,
-  and it is new. Candidates: the 36 DeltaNet layers and the QSA indexer are
-  not matmuls and were never in the estimate; the 194 hyper-connection
-  projections a token are narrow (320 wide) and were missing from the shape
-  table entirely; or llama.cpp's Vulkan path is simply well short of this
-  machine. Measurable at L2 with one layer of each kind, before the stack
-  exists.
+- ~~**Why is prefill 393 and not ~2000?**~~ **Answered by L2a**: neither
+  candidate. It is the hyper-connection block's glue and its `[10240, 4]` F32
+  `inject` projection, plus a MoE kernel 2.53x off ours. See L2a above.
+- **How much of the 30.6% glue actually fuses?** L2a's ~1150 tok/s assumes
+  three quarters of it disappears into matmul epilogues; unfused it is 711.
+  That spread is the widest uncertainty left in the prefill estimate, and
+  §10's layout/epilogue work is where the answer comes from.
+- **Where does llama.cpp's missing 1.5 s at `-ub 2048` go?** The GPU graph is
+  4.556 s and the wall clock 6.083 s, against ≤7% host time at `-ub 512`. It
+  does not scale with graph count. Not ours to fix, but it means the honest
+  baseline is the `-ub 512` one.
 - **Does 111.32 GB — the whole GGUF, n-gram table included — hold live?** 80
   GiB is demonstrably residable (L0a) and 105 GiB reservable (L0b); L1 ran at
   77 GiB with 39 GiB of page cache beside it. If the whole thing fits, D2
   becomes an efficiency choice rather than a necessity and the host-side PLE
   gather can be deferred past L2.
+- **Why do three of the seven hyper-connection mixers keep a residual?** Four
+  reproduce llama.cpp's gate to 6.2e-08 rms under `RefQ8`; `blk.0.hc_attn` and
+  `blk.2.hc_attn` sit at ~2e-05 and `blk.3.hc_ffn` at 3.4e-04, with identical
+  code, identical Q8_0 weight types and an `hc_norm` input agreeing to 8e-08.
+  An int8 grid amplifying a last-bit accumulation difference fits, but a count
+  of near-boundary `lo` values does not track it. Bounded, not explained.
 - **What is `down_proj`'s activation error really costing?** L0d settled W4A8
   at 1.13x mean, 1.6x worst, and the worst site is `down`, whose SwiGLU input
   has no norm in front of it. Finer activation groups on that one input, or a
@@ -464,8 +598,10 @@ below Q8. Bandwidth is the whole story.
   honest test.
 - **`§3.4 finding 4` says prefill is "98% memory-bound by weight bytes";
   §2.2's direct measurement of a Q4 block says 2.2x above its memory floor.**
-  They disagree, and L1's 393 tok/s says the model-level estimate built on
-  either is 5x optimistic. Reconcile before sizing prefill.
+  L2a settles which is nearer: at 2048 tokens the expert bank is 64 GB, a
+  **273 ms** floor, and §2.2's kernel takes 642 — so **2.4x above the bus**,
+  and §3.4's "98% memory-bound" is the one to retire. The model-level estimate
+  built on it was 5x optimistic; L2a's bottom-up 1768 ms replaces it.
 - **Batch and speculation.** At batch 4 the dense 76% amortises completely.
   Worth knowing whether the API will ever serve more than one stream before
   optimising the batch-1 path to death.
