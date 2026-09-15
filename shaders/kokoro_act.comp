@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// Apply an AdaIN affine, optionally a Snake, and narrow into the fp16 arena
+// the convolution's A operand is read from — one pass over the tensor for
+// what the reference does in three.
+//
+// The destination is a *bordered* arena: pc.lda-wide rows with `border` zero
+// rows before and after the signal, so the convolution's zero padding is in
+// the data and its taps are branchless (dit_gemm.comp's A_CONV). This pass
+// only ever writes rows [0, T), so the border it was allocated with survives.
+//
+// SNAKE adds the generator's activation, x + sin(ax)^2/a with a learned `a`
+// per channel. It is fused here rather than being a pass of its own because
+// the alternative is a second full round trip of a [15601, 128] tensor for
+// two instructions of arithmetic.
+//
+//   pc.inOff   [T, C] fp32 input
+//   pc.outOff  fp16 destination, row stride pc.lda
+//   pc.wOff    [C] alpha, when SNAKE
+//   pc.aux0    [2C] scale then shift, in the fp32 arena
+//   pc.aux2    log2(C)
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef SNAKE
+#define SNAKE 0
+#endif
+// LEAKY replaces the AdaIN affine with a leaky rectifier, which is what a
+// generator stage does to its input before the upsampler. Same pass, same
+// narrow, same bordered destination — the only difference is where the two
+// per-channel numbers come from, and here there are none.
+#ifndef LEAKY
+#define LEAKY 0
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint t = idx >> pc.aux2;
+    uint c = idx & (pc.dim - 1u);
+#if LEAKY
+    float v = act[pc.inOff + idx];
+    if (v < 0.0) {
+        v *= uintBitsToFloat(pc.scale);
+    }
+#else
+    float v = act[pc.inOff + idx] * act[pc.aux0 + c] + act[pc.aux0 + pc.dim + c];
+#endif
+#if SNAKE
+    float a = wbuf[pc.wOff + c];
+    float s = sin(a * v);
+    v += s * s / a;
+#endif
+    hact[pc.outOff + t * pc.lda + c] = float16_t(v);
+}

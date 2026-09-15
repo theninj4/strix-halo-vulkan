@@ -1,0 +1,44 @@
+#version 450
+
+// Reduce kokoro_stats.comp's partials into the per-channel affine an AdaIN
+// applies, folding the style vector's gamma and beta into it.
+//
+// The whole of AdaIN is then two numbers per channel — a scale and a shift —
+// and applying it is one fused elementwise pass (kokoro_act.comp). The style
+// affine costs nothing per frame because it *is* per channel: `fc` is a
+// [2C, 128] projection of one vector for the whole utterance, so the host
+// computes gamma and beta once at upload and this pass never sees the style.
+//
+//   pc.inOff   [chunks, 2C] partials
+//   pc.outOff  [2C] scale then shift
+//   pc.wOff    [2C] gamma then beta, precomputed per utterance
+//   pc.tokens  T, the divisor
+//   pc.dim     C
+//   pc.aux0    chunks
+//   pc.eps     float bits
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint C = pc.dim;
+    float n = float(pc.tokens);
+    for (uint c = gl_LocalInvocationID.x; c < C; c += 256u) {
+        float s = 0.0, q = 0.0;
+        for (uint k = 0u; k < pc.aux0; k++) {
+            s += act[pc.inOff + k * 2u * C + c];
+            q += act[pc.inOff + k * 2u * C + C + c];
+        }
+        float mean = s / n;
+        // E[x^2] - E[x]^2 rather than a second centred pass. The activations
+        // here are post-convolution and mean-free to within their own scale,
+        // so the cancellation is mild; TestGPUAdaIN bounds it against the
+        // two-pass CPU reference rather than assuming it.
+        float variance = max(q / n - mean * mean, 0.0);
+        float inv = inversesqrt(variance + uintBitsToFloat(pc.eps));
+        float scale = (1.0 + wbuf[pc.wOff + c]) * inv;
+        act[pc.outOff + c] = scale;
+        act[pc.outOff + C + c] = wbuf[pc.wOff + C + c] - mean * scale;
+    }
+}

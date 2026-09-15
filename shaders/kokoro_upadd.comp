@@ -1,0 +1,51 @@
+#version 450
+
+// The epilogue of a generator upsampling stage: add the bias, fold in the
+// reflection pad, and add the excitation — three things the reference does in
+// three passes over a [15601, 128] tensor, in one.
+//
+// The upsampler is a GEMM whose N is `stride * channels`, so its output read
+// as [(T+1)*stride, channels] is already the upsampled signal — offset by
+// half a stride, because `padding` is stride/2 and torch's transposed
+// convolution drops those rows. pc.inOff carries that offset, so nothing here
+// knows about it.
+//
+// PAD is `nn.ReflectionPad1d((1, 0))`, which the last stage needs to reconcile
+// two frame counts that are otherwise one apart. It is an index map rather
+// than a copy: output row 0 reads row 1 and row j reads row j-1.
+//
+//   pc.inOff   the upsampler's output, already offset by stride/2
+//   pc.outOff  [T, C] destination
+//   pc.wOff    [C] bias, or NO_W
+//   pc.aux0    the excitation, [T, C], or NO_W
+//   pc.aux2    log2(C)
+
+#include "dit_common.glsl"
+
+#ifndef PAD
+#define PAD 0
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint t = idx >> pc.aux2;
+    uint c = idx & (pc.dim - 1u);
+#if PAD
+    uint src = t == 0u ? 1u : t - 1u;
+#else
+    uint src = t;
+#endif
+    float v = act[pc.inOff + (src << pc.aux2) + c];
+    if (pc.wOff != NO_W) {
+        v += wbuf[pc.wOff + c];
+    }
+    if (pc.aux0 != NO_W) {
+        v += act[pc.aux0 + idx];
+    }
+    act[pc.outOff + idx] = v;
+}

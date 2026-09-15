@@ -1,0 +1,65 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Per-channel sum and sum of squares over a chunk of frames, for the AdaIN
+// that precedes every convolution in kokoro's vocoder (SPEECH.md T4).
+//
+// AdaIN normalises each *channel* over time — an instance norm, not a layer
+// norm — so the reduction runs down a column of a channel-last [T, C]
+// activation, which is the awkward direction. It is done anyway: holding the
+// tensor channel-last is what makes the convolutions GEMMs (S7), and a
+// reduction is one pass while a transpose would be two.
+//
+// The access is still coalesced, because the workgroup is laid out across
+// *channels* rather than along the column: 256 threads cover 256/C row groups
+// of C consecutive channels, so one wave's addresses are one contiguous run
+// of a row. The column direction is the loop, not the lane index.
+//
+// One workgroup per chunk of frames; the partials are reduced by
+// kokoro_affine.comp, which is what makes this parallel over a 15601-frame
+// tensor instead of one workgroup per channel.
+//
+//   pc.inOff   [T, C] fp32 activations
+//   pc.outOff  [chunks, 2C] fp32 partials: sums then sums of squares
+//   pc.tokens  T
+//   pc.dim     C, a power of two
+//   pc.aux0    frames per chunk
+//   pc.aux2    log2(C)
+
+#include "dit_common.glsl"
+
+#define NTHREADS 256
+layout(local_size_x = NTHREADS) in;
+
+shared float ssum[NTHREADS];
+shared float ssq[NTHREADS];
+
+void main() {
+    uint C = pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+    uint c = tid & (C - 1u);
+    uint rg = tid >> pc.aux2;
+    uint groups = uint(NTHREADS) >> pc.aux2;
+
+    uint t0 = gl_WorkGroupID.x * pc.aux0;
+    uint t1 = min(t0 + pc.aux0, pc.tokens);
+
+    float s = 0.0, q = 0.0;
+    for (uint t = t0 + rg; t < t1; t += groups) {
+        float v = act[pc.inOff + t * C + c];
+        s += v;
+        q += v * v;
+    }
+    ssum[tid] = s;
+    ssq[tid] = q;
+    barrier();
+    if (rg == 0u) {
+        for (uint g = 1u; g < groups; g++) {
+            s += ssum[(g << pc.aux2) + c];
+            q += ssq[(g << pc.aux2) + c];
+        }
+        act[pc.outOff + gl_WorkGroupID.x * 2u * C + c] = s;
+        act[pc.outOff + gl_WorkGroupID.x * 2u * C + C + c] = q;
+    }
+}

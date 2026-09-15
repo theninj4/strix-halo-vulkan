@@ -8,14 +8,15 @@ import (
 // FFT is a radix-2 complex discrete Fourier transform of a fixed size, with
 // its twiddle factors and bit-reversal permutation computed once.
 //
-// Both verticals need one: parakeet's front end is 512-point forward
-// transforms at one per 10 ms of audio, and kokoro's vocoder ends in a
-// 20-point inverse transform per output hop. Neither is anywhere near a
-// bottleneck — a 30 s clip is 3000 forward transforms, microseconds of work
-// against an encoder that is billions of flops a frame — so this is the plain
-// iterative Cooley-Tukey rather than anything clever, in float64 so that the
-// transform is not the thing limiting how closely the Go front end tracks
-// torch.stft.
+// Parakeet's front end is 512-point forward transforms at one per 10 ms of
+// audio, which is nowhere near a bottleneck — a 30 s clip is 3000 of them,
+// microseconds of work against an encoder that is billions of flops a frame —
+// so this is the plain iterative Cooley-Tukey rather than anything clever, in
+// float64 so that the transform is not the thing limiting how closely the Go
+// front end tracks torch.stft.
+//
+// Kokoro's vocoder needs a **20-point** transform, which is not a power of two
+// and is not this: see DFT.
 type FFT struct {
 	n       int
 	rev     []int32      // bit-reversal permutation

@@ -816,6 +816,466 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-15 (twenty-first) — stage T4b: the upsamplers, and a stage that does not come back
+
+**Result: the vocoder goes from 487 ms to 244 ms and an utterance from 686 ms
+to 446 ms — 7.28x real time, from 0.90x on the CPU three sessions ago.** The
+two transposed convolutions (192 ms on the host) and the two readbacks they
+forced are gone: a generator stage is now **one upload of its input, one of
+the excitation projection, and one download of its output**, with the
+rectifier, the excitation's own residual block, the upsampling, the bias, the
+reflection pad and the three averaged blocks in between.
+
+**The transposed convolution is one GEMM, and the trick is the output width.**
+Both upsamplers have `kernel = 2*stride` and `padding = stride/2`, so every
+output frame is reached by exactly two taps and which two is decided by the
+residue of the frame index:
+
+    output frame q*s + r - s/2  =  sum_i x[q-1, i]*W[i, n, r+s] + x[q, i]*W[i, n, r]
+
+The obvious reading of that is s separate GEMMs writing a strided subset of
+the rows, which would need a store stride the kernel does not have. The other
+reading is **one** GEMM whose N is `s*C_out`: column `r*C_out + n` of a
+`[T+1, s*C_out]` result *is* output frame `q*s + r`, so reading the same bytes
+as `[(T+1)*s, C_out]` is already the upsampled signal — offset by `stride/2`,
+which is a pointer. No strided store, no residue loop, no second kernel, and
+the A operand is the existing `A_CONV` addressing at two taps with the arena's
+zero border supplying `x[-1]` and `x[T]`. `TestTransposedConvDecomposition`
+pins the identity on the CPU with no Vulkan in sight.
+
+**The reflection pad is an index map, not a copy.** `nn.ReflectionPad1d((1,0))`
+exists to reconcile two frame counts that are otherwise one apart, and doing it
+as a pass would move 8 MB for one row. Folded into the epilogue that was
+already adding the bias and the excitation, it is `src = t == 0 ? 1 : t - 1`.
+Bias, pad and excitation add: one pass over the tensor for what the reference
+does in three.
+
+**Built:** `kokoro_upadd.comp` (+`-DPAD=1`), a `-DLEAKY=1` build of
+`kokoro_act.comp`, `NewGPUStage`/`RunStage`/`packUpB` in `kokoro/gpu.go`, and
+`TestTransposedConvDecomposition`. The generator's CPU path is untouched and
+still the reference; `graph` gained a running-value parameter so the
+excitation's block can run in its own arena rather than through the one the
+three generator blocks share.
+
+**Accuracy** is unchanged: the two stages land at 2.2e-4 and 1.9e-4 relative
+against the CPU path and the waveform at 7.1e-4, against a 3e-3 bound.
+
+**Where the vocoder's 244 ms now goes**, and the answer is a surprise:
+
+    decoder (4 AdaIN blocks)   132 ms   54%
+    stage 1 (incl. 38 ms down)  45 ms   18%
+    conv_post + iSTFT           22 ms    9%
+    stage 0 (incl. 13 ms down)  17 ms    7%
+    excitation + its STFT       15 ms    6%
+    noise projections            9 ms    4%
+
+**The decoder is 8.8 GFLOP — 5.5% of the vocoder's arithmetic and 54% of its
+time.** T3's by-difference estimate put it at 29 ms; measured directly it is
+132. That makes it the next item by a factor of three, and it is *not* a
+kernel problem: `AdainResBlk1d` is the same shape of block, and the only
+reason it is still on the host is that its channel counts are **514, 1090,
+1024 and 512** — and 514 and 1090 are not powers of two, so `A_CONV`'s shift
+and mask do not apply. A second build with a real integer division (the index
+is wave-uniform, so it is scalar work) is the whole of what it needs.
+
+**Next is T4c**, in this order:
+
+1. **The decoder's four `AdainResBlk1d`s and its `encode`** — an `A_CONV=2`
+   build for non-power-of-two channels, plus the three things the generator's
+   block does not have: a leaky rectifier instead of a Snake, a `1/sqrt(2)` on
+   the sum, and a shortcut path (`conv1x1`, and a depthwise transposed
+   convolution on the one block that upsamples). 132 ms.
+2. **`conv_post` and the iSTFT** (22 ms). `conv_post`'s N is **22**, which is
+   not a multiple of the 16-wide tile — pad it to 32 with zero weight columns
+   and let the epilogue read 22.
+3. **The last download** (38 ms). Once the tail is on the device, what comes
+   back is 78000 samples — 312 KB instead of 8 MB.
+
+After that the vocoder is ~40 ms and the phoneme side's 205 ms of recurrences
+is the whole cost, which is S8's problem again.
+### Session 2026-09-15 (twentieth) — stage T4a: the vocoder's residual blocks on Vulkan
+
+**Result: the eight AdaIN residual blocks go from 2669 ms on the CPU to 6.93 ms
+on the device — 385x, at 22.4 TFLOP/s.** The vocoder is 2942 → **487 ms** and a
+3.25 s utterance 3626 → **686 ms**, 4.74x real time, with
+`go run ./cmd/tts -gpu` producing a waveform 65 dB from the CPU path's.
+The blocks are 97% of the vocoder's arithmetic; what is left on the host is 3%
+of it and now most of the time.
+
+**The kernel question, and it turned out to be a layout question again.**
+Every convolution in a generator residual block is a k-tap filter over a
+channel-last `[T, C]` activation — k of 3, 7 or 11, dilations of 1, 3 and 5,
+C of 128 or 256. Written out, that is the GEMM
+`C[t, o] = sum_{j,c} A[t, j*C+c] * B[o, j*C+c]` with `A[t, j*C+c] =
+x[t + j*d - p, c]`, i.e. the ordinary A address **plus `j*(d*lda)`** — and
+because C is a power of two, j and c are a shift and a mask of the K index.
+One 16-wide fragment therefore lies entirely inside one tap. So `A_CONV=1` is
+twelve lines in `dit_gemm.comp`: the im2col is an *addressing rule*, not a
+pass, and a dilated convolution costs exactly one dispatch and no packing.
+
+The padding is in the data, as stage 8's conv2d did it one dimension up: the
+fp16 arena carries a 32-frame zero border at each end and `inOff` points at
+row `border - p`, so an out-of-range tap reads a zero that was already there
+and the kernel has no branch in it. Every existing build of `dit_gemm.comp` is
+byte-for-byte unchanged (checked against the committed SPIR-V).
+
+**Built:** `shaders/kokoro_conv_*.spv` (four rungs of `dit_gemm.comp` with
+`A_CONV=1`), `kokoro_stats/affine/act/residual/copy.comp`, `kokoro/gpu.go`
+(`GPUBlocks`, `Model.AttachGPU`), `cmd/tts -gpu`, and four tests.
+
+**Six findings:**
+
+1. **The readback is the pipeline now, and it is 140x asymmetric.** Writing
+   into a `DEVICE_LOCAL|HOST_VISIBLE` buffer runs at **29 GB/s**; reading the
+   same buffer back runs at **210 MB/s**. An 8 MB `[15601, 128]` stage output
+   takes 0.3 ms to upload, **38 ms to download**, and 0.8-1.3 ms to compute a
+   whole residual block over. Of the vocoder's remaining 487 ms, about 100 is
+   four such downloads. This is the number that decides T4b: the answer is not
+   a faster kernel, it is to stop coming back to the host — the same
+   conclusion S8 reached about the transducer loop, arrived at from the
+   opposite direction (there the round trip was latency, here it is a
+   write-combined read).
+
+2. **The convolutions are 65% of a block on the device and the AdaIN is 28%.**
+   On the CPU the convolutions were essentially all of it. `norm1`+`norm2` are
+   1.97 ms of the 6.93 and the residual add another 0.48 — bandwidth-bound
+   passes over fp32 `[15601, 128]` tensors. Stage 8's VAE decoder ended in the
+   same place ("63% of the decode is four bandwidth-bound elementwise passes"),
+   and the same two levers apply: narrow the activations to fp16, and fuse the
+   residual into the second convolution's epilogue.
+
+3. **`conv1`'s bias does not exist.** Its output goes straight into an AdaIN,
+   which subtracts the per-channel mean over time — adding a per-channel
+   constant moves that mean by exactly itself and leaves the variance alone, so
+   it cancels identically. Measured on the CPU: dropping all three of a block's
+   `convs1` biases changes the output by **2.7e-7** relative, against **0.031**
+   for the same experiment on `convs2`, whose output reaches the residual add.
+   So it is not staged at all.
+
+4. **The style conditioning costs nothing per frame, because it is not per
+   frame.** Each AdaIN's `fc` is a `[2C, 128]` projection of *one* vector for
+   the whole utterance, so the host computes gamma and beta once at
+   `SetStyle` and what reaches the graph is two numbers per channel. 48 of the
+   70 `fc` layers leave the dispatch graph entirely.
+
+5. **AdaIN reduces down a column and is still coalesced.** The normalisation is
+   over *time* per channel — the awkward direction for a channel-last tensor —
+   but the workgroup is laid out across *channels*, 256 threads covering
+   `256/C` row groups, so a wave's addresses are one contiguous run of a row
+   and the column direction is the loop. Two dispatches (partials over 64
+   frame chunks, then the per-channel affine) rather than one workgroup per
+   channel, and applying it, the Snake and the fp16 narrow are one fused pass.
+
+6. **The ladder's winner is `reg32x64_w32` at both rates**, by 1.10-1.28x over
+   the rest. The shape is new to this repository — M of 2600 or 15601 against
+   N of 128 or 256, where the DiT's projections are M=4096 by N=3840 and
+   parakeet's M=138 by N=1024 — and wave32 wins again, which is §6.2 holding
+   on a fourth set of shapes.
+
+**Accuracy**: the eight blocks land between **1.2e-5 and 2.2e-4** relative
+against the CPU reference, the two generator stages at 2.0e-4 and 1.7e-4, and
+the waveform at 5.7e-4 — against a 3e-3 bound. An AdaIN renormalises after
+every convolution, so fp16 error does not compound down the stack the way it
+does through a plain residual tower.
+
+**Where the vocoder's 487 ms now goes**: the two transposed-convolution
+upsamplers **192 ms** on the host, the readbacks ~100 ms, the decoder's four
+AdaIN blocks 29 ms, `conv_post` 11 ms, the iSTFT 12 ms, the excitation and its
+STFT 15 ms, the noise projections 9 ms, the eight residual blocks **7 ms**.
+
+**Next is T4b**: the rest of the generator on the device — the two `ups`
+(which are the largest single item left *and* would remove two of the four
+downloads), `conv_post`, and the noise projections — so that a stage's output
+never crosses the bus. Then the decoder's AdaIN blocks, which are the same
+`AdainResBlk1d` the predictor uses and want a second `A_CONV` rung at C = 512
+and 1024. The iSTFT and the excitation are 27 ms and can stay on the host
+until they are not.
+### Session 2026-09-15 (nineteenth) — stage T3: the iSTFTNet vocoder, and the first waveform
+
+**Result: `go run ./cmd/tts` synthesises speech.** Phonemes in, a 24 kHz WAV
+out, no PyTorch anywhere on the path. The decoder matches the T1 dump to
+**1.2e-6** and the generator — given the reference's own excitation
+spectrogram — to **1.3e-5 (98 dB)**, which is float noise. 3.63 s for a 3.25 s
+utterance on the CPU, 0.90x real time, of which the vocoder is **94%**.
+
+**Built:**
+
+- `audio/dft.go` — an arbitrary-size direct DFT and a `transformer` interface,
+  because **n_fft is 20** and the existing radix-2 FFT cannot take it. At 20
+  points the direct form is 220 complex multiplies and a Bluestein would be
+  slower and would have to be tested.
+- `audio/istft.go` — `ISTFT`, weighted overlap-add with the window-square
+  envelope divided back out, reproducing `torch.istft(center=True)`.
+- `audio/spectrogram.go` — `STFT.MagnitudePhase`, and a `Pad` field:
+  `torch.stft`'s **default is reflection**, which kokoro never names and
+  parakeet explicitly overrides to zeros.
+- `kokoro/vocoder.go` — `Snake`, `SnakeResBlock` (upstream `AdaINResBlock1`),
+  `HarmonicSource`, `Generator`, `Vocoder`.
+- `cmd/tts` — `-phonemes`, `-voice`, `-speed`, `-noise`, `-list`, `-o`.
+- Tests: `kokoro/vocoder_test.go` (5) and `audio/istft_test.go` (4).
+
+**Four findings, three of them about what cannot be reproduced and why:**
+
+1. **The vocoder is compute-bound, and T2's guess that it would be
+   bandwidth-bound was wrong.** It is **160 GFLOP for 3.25 s of audio — 49
+   GFLOP per second of speech** — against 53 M parameters read once, an
+   arithmetic intensity in the hundreds of FLOP per byte. 97% of it is the
+   eight `SnakeResBlock`s, and every convolution in them is `[T, C] x [C, C]`
+   per tap at C = 128 or 256 — one kernel family, and the ladder's own shape.
+   The CPU reference gets 55 GFLOP/s; §2.1's WMMA path measures 38-42 TFLOP/s,
+   so T4's target for the whole vocoder is **single-digit milliseconds**.
+   (The earlier reasoning — "164 MB of fp16 weights against a 32 MiB MALL" —
+   was about the model, not about the vocoder, which re-reads 53 M parameters
+   once while doing 80 G MACs.)
+
+2. **The excitation's phase accumulator is the worst-conditioned quantity in
+   either vertical.** Upstream integrates the phase in radians and *then*
+   multiplies by 300, so three seconds in, the accumulator holds **1.3e5
+   radians, where one float32 ulp is 0.016 radians** — a 1% error in the sine.
+   The reference is float32, so the dumped excitation is only accurate to
+   about that, and a float64 port is *more* accurate and therefore differs.
+   This package keeps the phase in **cycles** and wraps to [0, 1) before the
+   sine, so nothing is ever large. **fp16 cannot represent 1.3e5 at all**, and
+   at 6e4 its ulp is 64 radians: a naive T4 port of the upstream ordering to
+   half precision produces noise instead of a harmonic series.
+
+3. **The excitation's phase *spectrogram* is undefined over a quarter of its
+   bins**, and the network consumes it as ordinary numbers. With the noise off
+   (T1's deterministic path) an unvoiced region's excitation is a constant —
+   tanh of the mixer's bias — and a constant's windowed spectrum is exactly
+   zero outside the three bins a Hann window occupies. `atan2(0, 0)` is
+   whatever the rounding says. Measured: **47704 of 171611 phases disagree**
+   with the reference; 46957 of those still disagree modulo 2*pi and the
+   loudest of them sits at magnitude 4.4e-5, **3593x below the spectrum's
+   rms**; the other 747 are pure ±pi branch flips, the loudest at 13x below.
+   So every disagreement is a phase of nothing — but it is **18.2 dB** of
+   difference in the output waveform, because the network was never trained to
+   ignore those channels. This is a property of the zero-noise oracle, not of
+   the model.
+
+   That number is why the vocoder is checked three ways:
+   from the F0 curve (18.2 dB), from the reference's excitation (18.7 dB, so
+   the phase accumulator is worth almost nothing), and from the reference's
+   excitation *spectrogram* (**98.0 dB**, which is the port's own error). The
+   middle run is what made it clear the accumulator was a red herring.
+
+4. **`rand_ini` is dead code.** `SineGen` draws a random initial phase per
+   harmonic and adds it to sample 0 of the phase curve — which is then
+   decimated 300:1 with a half-sample offset, so output frame 0 reads input
+   samples 149 and 150 and sample 0 is never read. Verified against the
+   reference: setting it to 0, 0.37 or 0.99 changes **nothing**, bit for bit.
+   So the only randomness that matters is the additive Gaussian noise, which
+   `HarmonicSource.Noise` now provides — off by default, since off is the only
+   reproducible configuration, and `-noise 1` is what an utterance meant to be
+   listened to wants.
+
+**Two bugs worth remembering:**
+
+- **`leakyReLUInPlace` inside the generator corrupted its own trace.** The
+  activation is applied to a value the caller still holds — the previous
+  stage's output — where the encoders' activations are applied to a fresh
+  convolution result. It presented as `dec_decode_3` and both `gen_up_*` being
+  80% wrong while everything before them was exact, which is a signature worth
+  recognising: a stage that is wrong *and* whose input was right, with the
+  wrongness appearing only after a later stage ran.
+- **`SamplesPerFrame` was 300 and should have been 600** — caught by
+  `TestConfig` in T2, which multiplies it by the frame count and compares
+  against the reference's actual sample count rather than checking it against
+  itself.
+
+**Where the vocoder's 2.9 s goes**: the generator is 2897 ms of it, the four
+decoder AdaIN blocks 29 ms, the source module 6 ms and the two transforms
+19 ms. Inside the generator: the three `resblocks` at 15601 frames are 1173 ms,
+the two `noise_res` blocks 802 ms, the three `resblocks` at 2600 frames
+694 ms. Nothing else is above 5%.
+
+**Next is T4**: the Vulkan port. `kokoro/` is 2340 lines of CPU reference over
+11 files, with 18 tests of its own and 4 new ones in `audio/`, and
+`cmd/tts -noise 1` sounds like the model.
+### Session 2026-09-15 (eighteenth) — stage T2: the phoneme side of kokoro on the CPU
+
+**Result: `kokoro.Model.Prosody` goes from a phoneme string to durations, an
+expanded feature stream and the F0/energy curves, matching the T1 dump to
+**5e-7 relative** at every one of its twenty checkpoints — and predicting all
+50 durations *exactly*, which is the only one of those numbers that has to be
+exact.** 200 ms on the CPU for a 3.25 s utterance. The vocoder (T3) is what is
+left before there is a waveform.
+
+**Built — `kokoro/`, 9 files:**
+
+- `config.go` — config.json, plus the three AlbertConfig defaults it omits,
+  plus `Phonemes` (the vocabulary lookup, which returns what it *dropped*
+  rather than swallowing it, because the style pack is indexed by phoneme
+  count and the model by token count).
+- `model.go` — `Mat` ([frames, channels]), `Linear`, `Embedding`, `LayerNorm`,
+  `InstanceNormInPlace`, `GELUNew`, `LeakyReLU`, `parallelFor`.
+- `conv.go` — `Conv1D` (stride/pad/dilation/groups) and `ConvTranspose1D`,
+  plus `UpsampleNearest`.
+- `lstm.go` — the bidirectional single-layer `LSTM`, which is the only shape
+  of recurrence in the model and appears six times.
+- `albert.go` — the 12-layer shared-weight-group phoneme encoder.
+- `textencoder.go` — the shallow path: embedding, three 5-tap convolutions,
+  one LSTM.
+- `adain.go` — `AdaIN1d`, `AdaLayerNorm`, `AdainResBlk1d`.
+- `predictor.go` — `DurationEncoder`, `Durations`, `Expand`, `Prosody`.
+- `load.go`, `infer.go` — the loader over the converted mapping, and the chain.
+
+**Five things worth carrying forward:**
+
+1. **`parallelFor`'s hand-off was 50% of the runtime.** The version copied
+   from `parakeet/` pushes one index per worker through a buffered channel.
+   That is fine for a feed-forward stack that fans out a few dozen times a
+   clip; it is not fine for a recurrence, which fans out once per *timestep* —
+   about a thousand times over an utterance, each time over 2048 LSTM gates.
+   Claiming contiguous chunks instead took the duration encoder from **145 ms
+   to 32 ms**, the prosody stack from 130 to 64 and the text encoder from 49
+   to 15, with the whole chain going **420 ms → 200 ms**. Note the threshold
+   that looks obviously right here — skip the fan-out for small n — is
+   actively wrong: the short loops in this model are short in *indices*, not
+   in work (twelve attention heads over a whole utterance), and adding one put
+   ALBERT back up by 20%. `parakeet/` has the same `parallelFor` and the same
+   opportunity in `gpudecode`'s CPU fallback; not touched this session.
+
+2. **Where the time goes, and it is not where the arithmetic is.** ALBERT
+   89 ms / 43%, the duration side 38 ms, the prosody side 64 ms, the text
+   encoder 16 ms. ALBERT is ~3.3 G MACs of the roughly 5.5 G on the path, so
+   it is the *efficient* stage; the recurrences are 60% of the remainder on a
+   fraction of the work, because each of their 50 or 130 steps is a GEMV at
+   M = 1 that cannot start until the last one finished. That is S8's finding
+   arriving from a different direction, and it is what T4 has to be designed
+   around: **the phoneme side of kokoro is latency-bound, the vocoder side
+   will be bandwidth-bound.**
+
+3. **`SamplesPerFrame` is 600, and the factor nobody would guess is a 2.**
+   The chain is a doubling inside the decoder's *last AdainResBlk1d*, then the
+   generator's 10 and 6, then the iSTFT hop of 5. Only the last three are in
+   `config.json`; the first happens in a residual block that is not named
+   "upsample" anywhere. `Config.SamplesPerFrame()` carries it, and
+   `TestConfig` checks the product against the reference's actual sample
+   count, which is how the missing 2 was found.
+
+4. **The durations have to be exact, and they are.** The head emits 50 logits
+   per token and the duration is the *sum of their sigmoids* — a soft count of
+   how many of 50 ticks are on, not an argmax and not a regression — then
+   rounded and clamped to at least 1. The raw sums agree to 1.1e-7 relative,
+   which leaves a rounding margin of about six orders of magnitude; all 50
+   integers match and so does the 130-frame total.
+
+5. **The length regulator is a gather and now demonstrably is one.** `Expand`
+   reproduces the reference's `[50, 130]` one-hot matmul **bit for bit**
+   (max abs 0), so the two `[512, 50] x [50, 130]` GEMMs torch spends on it
+   are confirmed dead. `TestLengthRegulator` also walks the dumped alignment
+   matrix to check the two statements agree about which token owns which
+   frame.
+
+**Tests.** `kokoro/` has 11 tests. Nine compare against `reference/out/kokoro/`
+and skip cleanly when it is absent; two do not need it at all —
+`TestConv1D`/`TestConvTranspose1D` check the rewrites against the definitions
+over shapes the dump does not reach (dilation 3 and 5, dense transposed
+convolutions at stride 10 and 6, which are T3's), and `ConvTranspose1D` is
+checked *gather against scatter*, since `Apply` is written as the former and
+the operator is usually stated as the latter. `TestInstanceNormIsNotLayerNorm`
+pins the axis AdaIN normalises over, because the two are the same operation
+transposed and picking the wrong one still gives plausible numbers of the
+right shape.
+
+**Layout.** Everything is `[frames, channels]`, the transpose of PyTorch's
+conv1d activation — S7's finding carried over, since channel-last is what
+makes the pointwise convolutions GEMMs and the depthwise ones coalesced. The
+dump is in torch's layout, so `refMat(..., channelFirst)` transposes in the
+test rather than the model.
+
+**Next is T3**: the iSTFTNet vocoder on the CPU, and the first waveform. Four
+operators it needs that `kokoro/` now has (`Conv1D` with dilation,
+`ConvTranspose1D` dense, `AdaIN1d`, the nearest-neighbour upsample), three it
+does not: **Snake1D** (`x + sin(ax)²/a`, the generator's activation),
+the **harmonic source** (an F0 curve integrated to a phase and turned into
+nine sinusoids — deterministic only if the excitation noise is zeroed, see T1)
+and the **iSTFT** overlap-add at `n_fft` 20 / hop 5, which `audio/` has the
+inverse FFT for but not the overlap-add.
+
+### Session 2026-09-15 (seventeenth) — stage T1: kokoro converted, and its oracle
+
+**Result: Kokoro-82M is a safetensors mapping the Go side can open, and
+`reference/out/kokoro/` holds a 63-tensor walk of a full `text → wav` run
+whose by-hand chain reproduces `KModel.forward_with_tokens` exactly (gap 0).**
+This is T1 of `SPEECH.md`; nothing has been ported yet. Two scripts:
+
+**`reference/convert_kokoro.py`** — the pickle (`kokoro-v1_0.pth`, five
+`state_dict`s, every key prefixed `module.` from a `DataParallel`) becomes
+`models/Kokoro-82M/model.safetensors` (459 tensors, 81.731 M params, 327 MB
+fp32) plus `models/Kokoro-82M/voices.safetensors` (54 voices, `[510, 256]`
+each, under `voice.<name>`). Both land in the same directory on purpose:
+`safetensors.OpenSet` globs `*.safetensors`, so one open gives Go the model
+*and* the voices — verified, 513 tensors, 88.78 M, 355 MB, with three tensor
+sums cross-checked against Python.
+
+**`reference/dump_kokoro.py`** — the oracle, driven from a fixed phoneme
+string (`misaki`'s output for "The quick brown fox…", recorded verbatim in the
+manifest so the dump reproduces without misaki, spacy or espeak). 50 tokens →
+130 alignment frames → 78000 samples = 3.250 s of 24 kHz.
+
+**Three things it settled, none of which were in `config.json`:**
+
+1. **The vocoder is stochastic.** `SineGen` draws the eight harmonics' initial
+   phases from `torch.rand` and adds Gaussian noise to the excitation, so two
+   runs of `KModel` on the same input differ — there is no seed to match in Go
+   and no tolerance that survives it. The dump therefore runs with every
+   random draw replaced by zeros (deterministic; this is what the Go port is
+   checked against) and writes a second seeded run beside it. The noise is
+   **worth 13.8 dB**: 0.00956 rms against 0.0469 rms of signal. That is loud
+   enough that the Go port needs its own excitation noise to sound right, so
+   it is an explicit input to the vocoder, not a residual to chase.
+
+2. **The AdaIN `InstanceNorm1d` affine is identity.** All 70 of them are built
+   `affine=True` (an upstream ONNX workaround) but the checkpoint has no
+   weights for them, and `KModel` loads `strict=False` and logs at *debug* —
+   so a genuinely missing tensor would have loaded as noise in silence. The
+   key sets are diffed both ways: 140 of the model's 688 tensors are uncovered
+   and every one is an identity affine or a `num_batches_tracked`. AdaIN is
+   `(1 + gamma) * instance_norm(x) + beta`, with no learned scale under the
+   gamma, and the normalisation is over **time**, per channel.
+
+3. **`weight_norm` folds, and the fold is checked.** 89 convolutions are
+   stored as `weight_g`/`weight_v`; folding once at conversion agrees with
+   `torch.nn.utils.remove_weight_norm` to **1.19e-7**, and accounts for the
+   32 K parameters the safetensors has fewer than the pickle. Same shape of
+   check as parakeet's BatchNorm fold, and for the same reason.
+
+**Self-checks in the manifest**, all against the live modules: by-hand ALBERT
+layer 2.9e-6 and the 12-layer stack 0; duration encoder 0; one
+`AdainResBlk1d` by hand 7.2e-7 and `F0Ntrain` 0; text encoder 0; source module,
+generator, decoder and the whole chain against `forward_with_tokens` all **0**,
+durations identical.
+
+**Numbers worth carrying into T2-T4:**
+
+- **One alignment frame is exactly 600 samples = 25 ms.** `pred_dur` sums to
+  130 here, 2x through the predictor's upsampling block to 260 F0/N frames,
+  2x again in `decode.3` to 260 decoder frames, then 10x and 6x through the
+  generator to 15600 STFT frames and a hop of 5 to 78000 samples. An
+  off-by-one anywhere in that chain desynchronises everything after it.
+- **The length regulator is a gather, not a matmul.** torch builds an
+  `[N, L]` one-hot and does `d @ aln`; frame *f* simply reads token
+  `indices[f]`. Two `[512, 50] x [50, 130]` GEMMs saved, and the only
+  data-dependent output length in the engine so far.
+- **fp16 survey**: largest activation **314** (the F0 curve, in Hz), largest
+  weight **12.2**. Nothing on the path is near 65504. The two places to watch
+  are the generator's `exp()` on the spectrogram half of `conv_post` (argument
+  max 3.0 here) and the instance-norm variances.
+- **ALBERT's `layer_norm_eps` is 1e-12**, not the 1e-5 every other LayerNorm
+  in the repo uses, and its FFN activation is `gelu_new`. 12 layers share one
+  weight group, so the encoder is 768x12 of *the same* 3.5 M parameters.
+- **CPU cost, for scale**: `KModel` synthesises this clip in 0.23 s — 14x real
+  time before any of it is on the device.
+
+**Not done:** `espeak-ng` is not installed on this machine, which T5 (G2P)
+will want; `misaki` and `en_core_web_sm` now are, in `.venv`. The dump's
+phoneme string is hardcoded precisely so T2-T4 do not depend on any of that.
+
+**Next is T2**: the phoneme encoder, ALBERT and the predictor on the CPU in
+Go, against `reference/out/kokoro/`.
+
 ### Session 2026-09-14 (sixteenth) — stage S8: the transducer tail on Vulkan
 
 **Result: the decode loop goes from 208 ms to 4.8 ms — 43x — and an 11 s clip

@@ -1,0 +1,45 @@
+#version 450
+
+// x += conv + bias, in fp32, which closes one iteration of a generator
+// residual block.
+//
+// The bias is here and not after the first convolution of a pair because the
+// first one's is immediately followed by an AdaIN, which subtracts the
+// per-channel mean over time: adding a per-channel constant moves that mean by
+// exactly the constant and leaves the variance alone, so it cancels
+// identically. Only the bias of a convolution whose output reaches a residual
+// add survives, which is every `conv2` and no `conv1`.
+//
+// COPY replaces the accumulate with a plain store, which is what the
+// generator's three parallel blocks need: each of them starts from the same
+// input, so the stage's input is held once and copied into the running value
+// before each one rather than uploaded three times.
+//
+//   pc.inOff   [T, C] fp32 convolution output
+//   pc.outOff  [T, C] fp32 running value, updated in place
+//   pc.wOff    [C] bias, or NO_W
+//   pc.dim     C, a power of two
+
+#include "dit_common.glsl"
+
+#ifndef COPY
+#define COPY 0
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    float v = act[pc.inOff + idx];
+    if (pc.wOff != NO_W) {
+        v += wbuf[pc.wOff + (idx & (pc.dim - 1u))];
+    }
+#if COPY
+    act[pc.outOff + idx] = v;
+#else
+    act[pc.outOff + idx] += v;
+#endif
+}

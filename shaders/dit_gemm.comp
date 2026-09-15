@@ -80,6 +80,30 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 #ifndef B_LAYOUT
 #define B_LAYOUT 0
 #endif
+// A_CONV (SPEECH.md T4): the A operand is an *implicit* im2col of a
+// channel-last [T, C] activation, so a dilated 1-D convolution runs on this
+// kernel with no packing pass and no accumulate flag.
+//
+// A k-tap convolution over channel-last data is the GEMM
+// C[t, o] = sum_{j,c} A[t, j*C + c] * B[o, j*C + c] with A[t, j*C+c] =
+// x[t + j*d - p, c]. Writing K = j*C + c, that element lives at
+// (t + j*d - p)*lda + c -- so the A address is the ordinary one plus
+// j*(d*lda), and j and c are a shift and a mask of the K index because C is
+// 128 or 256 here. One 16-wide fragment therefore lies entirely inside one
+// tap (C is a multiple of 16), which is what makes this a *layout* rather
+// than a gather.
+//
+// The padding is in the data, not in a branch: the host allocates the
+// activation arena with a zero border of `pad` rows at each end and points
+// pc.inOff at row (border - p), the same trick stage 8's conv2d used for its
+// nine taps. Out-of-range taps then read zeros that were already there.
+//
+//   pc.aux0  C, the input channel count (a power of two)
+//   pc.aux1  d*lda, the row stride between consecutive taps
+//   pc.aux2  log2(C)
+#ifndef A_CONV
+#define A_CONV 0
+#endif
 #ifndef WAVE
 #define WAVE 64     // threads per wave; the host must pin this when it is 32
 #endif
@@ -152,10 +176,21 @@ layout(local_size_x = NTHREADS) in;
 #define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
 #define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
 
+#if A_CONV
+// A: the implicit im2col above. kk is wave-uniform, so the shift and the mask
+// are two scalar instructions ahead of a load that is otherwise identical to
+// the plain one.
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda                  \
+        + (((k0) + (kt) * TILE) >> pc.aux2) * pc.aux1                              \
+        + (((k0) + (kt) * TILE) & (pc.aux0 - 1u)),                                 \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+#else
 // A: [M, lda], K-contiguous, row-major fragment load.
 #define LOAD_FRAG_A(dst, i, k0, kt)                                            \
     coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda + (k0) + (kt) * TILE, \
         pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+#endif
 
 #if B_LAYOUT == 0
 #define LOAD_FRAG_B(dst, j, k0, kt)                                            \

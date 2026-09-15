@@ -1633,3 +1633,76 @@ var DiTGEMMReg16x64TiledW32 []byte
 
 //go:embed dit_gemm_reg32x64_hka4.spv
 var DiTGEMMReg32x64HKA4 []byte
+
+// Kokoro's vocoder (SPEECH.md T4). The generator is eight AdaIN residual
+// blocks and 97% of the vocoder's 160 GFLOP, and every convolution in them is
+// a k-tap filter over a channel-last [T, C] activation at C = 128 or 256 with
+// a dilation of 1, 3 or 5. A_CONV=1 makes those the same GEMM as everything
+// else: the im2col is an addressing rule on the A operand and the padding is
+// a zero border in the arena, so a convolution costs one dispatch and no
+// packing pass. See dit_gemm.comp's A_CONV block.
+//
+// Four rungs, the same ladder shape the parakeet encoder sweeps, because the
+// vocoder's M is 2600 or 15601 and its N is 128 or 256 -- a much taller and
+// narrower shape than anything measured so far.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=1 -DWAVE=32 -o kokoro_conv_reg32x32_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=1 -DWAVE=32 -o kokoro_conv_reg32x64_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -DA_CONV=1 -o kokoro_conv_reg64.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=8 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=1 -o kokoro_conv_reg32x128.spv dit_gemm.comp
+
+//go:embed kokoro_conv_reg32x32_w32.spv
+var KokoroConvReg32x32W32 []byte
+
+//go:embed kokoro_conv_reg32x64_w32.spv
+var KokoroConvReg32x64W32 []byte
+
+//go:embed kokoro_conv_reg64.spv
+var KokoroConvReg64 []byte
+
+//go:embed kokoro_conv_reg32x128.spv
+var KokoroConvReg32x128 []byte
+
+// The AdaIN residual block's scalar passes. AdaIN normalises each channel
+// over *time*, so its reduction runs down a column of a channel-last tensor —
+// two dispatches (partials, then the per-channel affine) rather than one,
+// which is what makes it parallel over a 15601-frame tensor. Applying it,
+// the Snake activation and the narrow into the convolution's fp16 arena are
+// then one fused pass.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_stats.spv kokoro_stats.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_affine.spv kokoro_affine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_act.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSNAKE=1 -o kokoro_act_snake.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLEAKY=1 -o kokoro_act_leaky.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_upadd.spv kokoro_upadd.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DPAD=1 -o kokoro_upadd_pad.spv kokoro_upadd.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_residual.spv kokoro_residual.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCOPY=1 -o kokoro_copy.spv kokoro_residual.comp
+
+//go:embed kokoro_stats.spv
+var KokoroStats []byte
+
+//go:embed kokoro_affine.spv
+var KokoroAffine []byte
+
+//go:embed kokoro_act.spv
+var KokoroAct []byte
+
+//go:embed kokoro_act_snake.spv
+var KokoroActSnake []byte
+
+//go:embed kokoro_act_leaky.spv
+var KokoroActLeaky []byte
+
+//go:embed kokoro_upadd.spv
+var KokoroUpAdd []byte
+
+//go:embed kokoro_upadd_pad.spv
+var KokoroUpAddPad []byte
+
+//go:embed kokoro_residual.spv
+var KokoroResidual []byte
+
+//go:embed kokoro_copy.spv
+var KokoroCopy []byte
