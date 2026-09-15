@@ -58,14 +58,18 @@ is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
 stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
 image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
-(text-generation) vertical, **scoped 2026-09-15, nothing built**: it carries
-the real tensor inventory of `unsloth/…-UD-Q4_K_XL` (1224 tensors, 111.32 GB,
-5.03 bits/weight), read out of 35 MB of HTTP range requests by
-`reference/gguf_inventory.py` rather than a download, and the two-phase plan
-that follows from it — run the stock quant first (llama.cpp is built here,
-supports `qwen4exp`, and is the oracle), then re-quantise, because **76% of the
-bytes read per token are dense** and the stock Q8_0 dense allocation costs 1.7x
-on a bus-bound machine. Task list L0–L9. All three files are rewritten each
+(text-generation) vertical and is **the current work**: L0 and L1 are closed.
+The checkpoint is downloaded (114 GB in 18 minutes,
+`models/Qwen3.8-Flash-Next-GGUF/`), llama.cpp runs it, and **the number to beat
+is `pp2048 388.60` / `tg128 25.15` tok/s** — decode at 65.8% of the bus, and
+prefill **5x below** what this repo's own microbenchmarks had been added up
+into, which is now the vertical's largest open question. The Go side reads the
+checkpoint: `gguf/` (1224/1224 tensors against the Python inventory), five
+dequant paths bit-exact against ggml, and a tokenizer exact against
+`llama-tokenize`. The plan behind it is unchanged — run the stock quant first
+(llama.cpp is the oracle), then re-quantise, because **76% of the bytes read
+per token are dense** and the stock Q8_0 dense allocation costs 1.7x on a
+bus-bound machine. Task list L0–L9; **L2, the dense skeleton, is next**. All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -836,6 +840,120 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (thirtieth) — stage L1: the checkpoint, the reader, and the number to beat
+
+**Result: `Qwen3.8-Flash-Next-UD-Q4_K_XL` is downloaded and running, and the bar
+is `pp2048 388.60 ± 1.89` / `tg128 25.15 ± 0.02` tok/s.** 114 GB in 18 minutes;
+llama.cpp's Vulkan build loads it, holds **77 GiB resident** and generates
+coherent text at 24.66 tok/s. On the Go side L1 built the container half of
+phase 1: a GGUF reader checked **tensor-for-tensor against the Python
+inventory (1224/1224, 0 disagreements)**, five dequant paths **bit-exact
+against ggml's own `to_float`**, a tokenizer **exact on 213 of 213 tokens
+against `llama-tokenize`**, and `bench/modelshapes.go` rewritten from the real
+tensor table. [Write-up](research/l1-baseline.md) · `LLM.md` rewritten.
+
+**Two of this file's own numbers turned out to be wrong, and the second one
+matters more than anything L1 built.**
+
+**1. Prefill is 393 tok/s, not ~2000.** `LLM.md` had added §3.4 and §2.2 up
+into "~2000 tok/s prefill at a 2048 chunk". The reference implementation gets
+**388.60 at 2048 and 392.95 at 8192** — it plateaus, so a bigger chunk is not
+the missing piece. Either this architecture has a great deal of prefill that is
+not matmul (36 DeltaNet layers, the QSA indexer, and **194 hyper-connection
+projections a token** that the shape table did not model at all), or llama.cpp's
+Vulkan path leaves 5x on the table here. Both are measurable at L2 with one
+layer of each kind, before any of the stack exists, and which one it is decides
+how L6 is sized. It is now the largest open number in `LLM.md`.
+
+**2. Decode reaches 65.8% of the bus, so the 38.2 tok/s ceiling stands but the
+reference does not reach it.** 25.15 tok/s over 6.334 GB/token is 159 GB/s
+against §1.7's 242. Phase 1's job is therefore 38.2 rather than "beat
+llama.cpp", and phase 2's ~67 is **2.7x the reference** rather than 1.8x.
+
+**`bench/modelshapes.go` was wrong in four rows and missing four families.**
+Reading the checkpoint rather than a config.json did the same thing here that
+it did for the DiT at stage 1: `attn.q` is **12288** and not 6144 (the
+projection carries a gate beside the query), K and V are two separate 512-wide
+matrices rather than one fused 512, the DeltaNet layers have a **single fused
+10240-wide** input projection rather than a 2048/6144 pair, and there were no
+rows at all for the hyper-connections, the QSA indexer or the PLE block. The
+corrected table reads **6.665 B weights a token against the checkpoint's own
+6.671 B** — 0.09% apart, where the old one read 5.779 B, **13.4% short**, and
+was missing **220 matmuls a token**. `shapes` re-run over it (313 rows) prices
+a decode step at 3.33 GB and 73 tok/s at 4 bits before attention, with the
+**2081 dispatches costing 0.62 ms — 5%** (§4.1). That last figure is new and
+is a phase-2 constraint: 194 of the 220 missing matmuls are hyper-connection
+projections, 320 wide, unavoidable, and a ~67 tok/s decode step only has ~15
+ms in it.
+
+**What was built**
+
+| piece | checked against |
+|---|---|
+| `gguf/gguf.go` — mmap'd reader, the value grammar, `general.alignment`, the split convention, openable from any shard | `cmd/gguf -check tensors.json`: **1224/1224, 0 disagreements** |
+| `gguf/dequant.go` — Q4_K, Q5_K, Q5_1, Q8_0, IQ4_NL, F32, F16, BF16 | `reference/dequant_ref.c` through `ggml_get_type_traits(t)->to_float`: **bit-exact**, ulp for ulp |
+| `cmd/gguf` — the Python inventory's Go counterpart | reproduces `LLM.md`'s table exactly, in **47 ms** |
+| `zimage/tokenizer.FromVocab` + `cmd/llm -tokenize` | `llama-tokenize --ids`: **213/213** |
+| `bench/modelshapes.go` | the checkpoint's own per-token parameter count, 0.09% |
+
+**Three things worth keeping from how it was checked.**
+
+*The dequant oracle is a C program, not a Python one.* The five formats are
+transcriptions of `ggml-quants.c`, so a test that restated them would check the
+transcription against itself and a numpy reimplementation would only move the
+question. `reference/dequant_ref.c` links the already-built `libggml-base.so`
+and calls **the same function** every llama.cpp CPU path calls, over bytes the
+Go test generates; the comparison is bit-exact rather than within a tolerance.
+Both files are committed (`gguf/testdata/dequant_{in,ref}.bin`, 15 KB), so the
+test needs no toolchain — only regenerating them does. The one constraint on
+the generated input is that **every fp16 scale field is forced to an ordinary
+magnitude**: a random 16-bit pattern is Inf or NaN one time in 32, and a NaN
+scale makes a strict comparison meaningless. Everything a layout error would
+show up in — nibbles, sign bits, the packed 6-bit K-quant scales, the
+fifth-bit planes — stays fully random.
+
+*The tokenizer needed a second pre-tokenizer.* `tokenizer.ggml.pre` is
+`qwen35`, and llama.cpp's `QWEN35` differs from `QWEN2` in exactly one
+character class, twice: `[\p{L}\p{M}]+` where qwen2 has `\p{L}+`, and `\p{M}`
+excluded from the symbol class as well. A combining mark joins the letters
+before it instead of being taken as a symbol, so `e` + U+0301 is **one** piece
+under qwen35 and two under qwen2. `split()` now takes a `marks` flag and the
+corpus carries a decomposed "é", a bare combining acute and a Devanagari
+cluster beside the ordinary English, the CJK, the ZWJ emoji and the chat and
+multimodal specials.
+
+*`split.tensors.count` is worth checking.* A download that stops after three
+of four shards still opens, and every tensor in it still parses — nothing but
+the split keys notices. `OpenSet` verifies consecutive `split.no`, an agreed
+`split.count` and the promised tensor total, and it resolves the set from
+**any** shard rather than only the first.
+
+**Two open questions closed.**
+
+*Does llama.cpp keep 82 GB device-local, or is it mmap-and-page?* **Resident**:
+`free` shows 77 GiB steady during a run against the inventory's 76.86 GiB core.
+
+*And it already does D2.* `src/models/qwen4exp.cpp` creates
+`per_layer_token_embd` with `TENSOR_READ_LAZY` — *"read rows on demand instead
+of loading whole tensor; requires mmap"*. The 28.80 GB n-gram table is gathered
+from the mapping host-side, exactly as D2 proposes, so D2 is the reference
+behaviour rather than a deviation and the baseline is like-for-like.
+
+**Housekeeping.** Shard 1 of a split GGUF is 11 MB and holds **no tensors at
+all** — it is the metadata shard, 67 keys including the 248 320-entry
+vocabulary, the merge table and the chat template, which is why
+`reference/gguf_inventory.py` only ever needed 35 MB of range requests. The
+fetch script (`reference/fetch_llm_checkpoint.sh`) is resumable and
+checks each file's size against the HF API's before moving on; re-running it
+after a full download is a no-op. And a bash trap worth remembering: `local a=$1
+b=$(f "$a")` does **not** work — `local` expands all its arguments before
+performing any assignment, so `$a` is unset under `set -u`. The first version
+of the fetch script failed 50 times in one second because of it.
+
+**Next is L2**, and the first item is not construction: price one
+full-attention layer and one DeltaNet layer against §2.2's kernels, so the 5x
+prefill gap is attributed before anything is designed around it.
 
 ### Session 2026-09-15 (twenty-ninth) — stage T6d: the phoneme side resident, and one place fp16 could not go
 

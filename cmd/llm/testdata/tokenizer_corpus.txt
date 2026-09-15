@@ -1,0 +1,11 @@
+The quick brown fox jumps over 3 lazy dogs; it's 2026, isn't it?
+Numbers: 0 7 42 1024 3.14159 -17 1e9 0x1F 1,000,000
+Whitespace:   three spaces, a tab	and a newline.
+
+Combining marks: é vs é, äöü, ́ alone, Devanagari क्ष, Thai กำ.
+CJK: 量子計算機は難しい。中文分词测试。한국어 텍스트.
+Emoji: 👩🏽‍🚀 🇬🇧 ✅ — and an em dash, ellipsis…
+Code: for (int i = 0; i < n; ++i) { y[i] += a*x[i]; }  // SAXPY
+Chat: <|im_start|>user
+Describe <|vision_start|><|image_pad|><|vision_end|> please.<|im_end|>
+<|im_start|>assistant

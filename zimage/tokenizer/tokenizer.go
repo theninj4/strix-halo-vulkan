@@ -41,6 +41,9 @@ type Tokenizer struct {
 
 	byteToRune [256]rune
 	runeToByte map[rune]byte
+
+	// marks selects the qwen35 pre-tokenizer over the qwen2 one; see split().
+	marks bool
 }
 
 type tokenizerJSON struct {
@@ -213,7 +216,7 @@ func (t *Tokenizer) nextSpecial(text string) (int, string) {
 // encodeOrdinary runs the pre-tokenizer, the byte-level mapping and BPE.
 func (t *Tokenizer) encodeOrdinary(text string) ([]int32, error) {
 	var ids []int32
-	for _, piece := range split(text) {
+	for _, piece := range split(text, t.marks) {
 		var mapped strings.Builder
 		for i := 0; i < len(piece); i++ {
 			mapped.WriteRune(t.byteToRune[piece[i]])

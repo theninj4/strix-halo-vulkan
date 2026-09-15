@@ -15,9 +15,14 @@ package bench
 //     feed-forward width taken from the safetensors headers themselves
 //     (layers.0.feed_forward.w1.weight is [10240, 3840]) because the
 //     transformer config does not state it.
-//   - qwen3.8-flash-next is huggingface.co/Qwen/Qwen3.8-Flash-Next
-//     config.json "text_config" (48 layers, 12 of them full attention on a
-//     full_attention_interval of 4, 512-expert MoE with 10 active).
+//   - qwen3.8-flash-next is read from the checkpoint itself,
+//     models/Qwen3.8-Flash-Next-GGUF/…UD-Q4_K_XL-00001-of-00004.gguf, via
+//     `go run ./cmd/gguf -tensors`: 1224 tensors, 48 layers of which 12 are
+//     full attention on a full_attention_interval of 4, a 512-expert MoE
+//     with 10 active, and a 10240-wide hyper-connected residual. The rows
+//     below were corrected against it at L1 (LLM.md); the config.json
+//     transcription they replaced had four of them wrong and four families
+//     missing.
 //   - parakeet-tdt-0.6b-v3 is models/parakeet-tdt-0.6b-v3, read from the
 //     safetensors headers rather than the config (24-layer conformer
 //     encoder, d=1024, ffn=4096, 8x subsampling in a separable dw_striding
@@ -64,19 +69,47 @@ type modelShape struct {
 //	qwen3-embedding     512 and 2048 are typical document chunks.
 var modelShapes = []modelShape{
 	// ---- qwen3.8-flash-next, decode (the tok/s path) ----------------------
+	// Corrected at L1 against the real tensor table of UD-Q4_K_XL
+	// (`go run ./cmd/gguf -tensors …`), not against config.json. What the
+	// earlier transcription got wrong: `attn.q` is 12288 and not 6144 (the
+	// projection carries a gate beside the query), K and V are two separate
+	// 512-wide matrices rather than one fused 512, the DeltaNet layers have
+	// a single fused 10240-wide input projection and a 6144-wide gate rather
+	// than a 2048/6144 pair, and the hyper-connections, the PLE block and
+	// the QSA indexer were missing altogether — 200 matmuls a token between
+	// them. A GGUF states a weight as [in, out], so each row below is
+	// N = ne[1], K = ne[0].
+	//
 	// 12 full-attention layers: 24 query heads and 2 KV heads of head_dim
-	// 256, so the query projection is 8x the width of either KV projection.
-	{model: "qwen3.8-flash-next", layer: "attn.q", M: 1, N: 6144, K: 2560, count: 12},
-	{model: "qwen3.8-flash-next", layer: "attn.kv", M: 1, N: 512, K: 2560, count: 24, note: "2 KV heads x 256"},
+	// 256. The residual stream is 10240 wide (4 hyper-connection branches of
+	// 2560), but every projection reads and writes 2560.
+	{model: "qwen3.8-flash-next", layer: "attn.q", M: 1, N: 12288, K: 2560, count: 12, note: "query+gate, 24 heads x 256 x 2"},
+	{model: "qwen3.8-flash-next", layer: "attn.k", M: 1, N: 512, K: 2560, count: 12, note: "2 KV heads x 256"},
+	{model: "qwen3.8-flash-next", layer: "attn.v", M: 1, N: 512, K: 2560, count: 12},
 	{model: "qwen3.8-flash-next", layer: "attn.o", M: 1, N: 2560, K: 6144, count: 12},
-	// 36 gated-DeltaNet layers: q and k are 16 heads x 128, v and its output
-	// gate are 48 heads x 128.
-	{model: "qwen3.8-flash-next", layer: "la.qk", M: 1, N: 2048, K: 2560, count: 72},
-	{model: "qwen3.8-flash-next", layer: "la.vz", M: 1, N: 6144, K: 2560, count: 72},
-	{model: "qwen3.8-flash-next", layer: "la.o", M: 1, N: 2560, K: 6144, count: 36},
+	// The QSA indexer that picks the top 2048 keys: 4 heads x 128, one KV
+	// head. Tiny, BF16 in the checkpoint, and it runs every token.
+	{model: "qwen3.8-flash-next", layer: "qsa.q", M: 1, N: 512, K: 2560, count: 12, note: "indexer, 4 heads x 128"},
+	{model: "qwen3.8-flash-next", layer: "qsa.k", M: 1, N: 128, K: 2560, count: 12, note: "indexer, 1 KV head"},
+	// 36 gated-DeltaNet layers: one fused input projection at 10240 (q, k, v
+	// and the dt/beta terms), a 6144 output gate, and a 6144 -> 2560 exit.
+	// alpha and beta are F32 and rank 48.
+	{model: "qwen3.8-flash-next", layer: "la.qkv", M: 1, N: 10240, K: 2560, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.gate", M: 1, N: 6144, K: 2560, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.out", M: 1, N: 2560, K: 6144, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.ab", M: 1, N: 48, K: 2560, count: 72, note: "ssm alpha and beta, F32"},
+	// Hyper-connections, two per layer (one before attention, one before the
+	// MoE) plus one at the output: a low-rank 320 squeeze of the 10240-wide
+	// residual and its expansion back. 194 matmuls a token, and 1.4 GB.
+	{model: "qwen3.8-flash-next", layer: "hc.down", M: 1, N: 320, K: 10240, count: 97},
+	{model: "qwen3.8-flash-next", layer: "hc.up", M: 1, N: 10240, K: 320, count: 97},
+	// The PLE block, layer 1 only: a key projection at 10240 and a value
+	// projection at 2560, over the 320M-row n-gram table's gathered rows.
+	{model: "qwen3.8-flash-next", layer: "ple.key", M: 1, N: 10240, K: 2560, count: 1},
+	{model: "qwen3.8-flash-next", layer: "ple.value", M: 1, N: 2560, K: 2560, count: 1},
 	// MoE, every layer: a 512-way router, ten active experts of width 640,
 	// and one shared expert always on.
-	{model: "qwen3.8-flash-next", layer: "moe.router", M: 1, N: 512, K: 2560, count: 48},
+	{model: "qwen3.8-flash-next", layer: "moe.router", M: 1, N: 512, K: 2560, count: 48, note: "F32 in the checkpoint"},
 	{model: "qwen3.8-flash-next", layer: "moe.gate_up", M: 1, N: 640, K: 2560, count: 960, note: "10 of 512 experts x gate+up"},
 	{model: "qwen3.8-flash-next", layer: "moe.down", M: 1, N: 2560, K: 640, count: 480, note: "10 of 512 experts"},
 	{model: "qwen3.8-flash-next", layer: "moe.shared", M: 1, N: 640, K: 2560, count: 96},
@@ -85,12 +118,20 @@ var modelShapes = []modelShape{
 	{model: "qwen3.8-flash-next", layer: "lm_head", M: 1, N: 248320, K: 2560, count: 1, note: "vocab 248320"},
 
 	// ---- qwen3.8-flash-next, prefill at 2048 tokens ----------------------
-	{model: "qwen3.8-flash-next", layer: "attn.q", M: 2048, N: 6144, K: 2560, count: 12},
-	{model: "qwen3.8-flash-next", layer: "attn.kv", M: 2048, N: 512, K: 2560, count: 24},
+	{model: "qwen3.8-flash-next", layer: "attn.q", M: 2048, N: 12288, K: 2560, count: 12},
+	{model: "qwen3.8-flash-next", layer: "attn.k", M: 2048, N: 512, K: 2560, count: 12},
+	{model: "qwen3.8-flash-next", layer: "attn.v", M: 2048, N: 512, K: 2560, count: 12},
 	{model: "qwen3.8-flash-next", layer: "attn.o", M: 2048, N: 2560, K: 6144, count: 12},
-	{model: "qwen3.8-flash-next", layer: "la.qk", M: 2048, N: 2048, K: 2560, count: 72},
-	{model: "qwen3.8-flash-next", layer: "la.vz", M: 2048, N: 6144, K: 2560, count: 72},
-	{model: "qwen3.8-flash-next", layer: "la.o", M: 2048, N: 2560, K: 6144, count: 36},
+	{model: "qwen3.8-flash-next", layer: "qsa.q", M: 2048, N: 512, K: 2560, count: 12},
+	{model: "qwen3.8-flash-next", layer: "qsa.k", M: 2048, N: 128, K: 2560, count: 12},
+	{model: "qwen3.8-flash-next", layer: "la.qkv", M: 2048, N: 10240, K: 2560, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.gate", M: 2048, N: 6144, K: 2560, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.out", M: 2048, N: 2560, K: 6144, count: 36},
+	{model: "qwen3.8-flash-next", layer: "la.ab", M: 2048, N: 48, K: 2560, count: 72},
+	{model: "qwen3.8-flash-next", layer: "hc.down", M: 2048, N: 320, K: 10240, count: 97},
+	{model: "qwen3.8-flash-next", layer: "hc.up", M: 2048, N: 10240, K: 320, count: 97},
+	{model: "qwen3.8-flash-next", layer: "ple.key", M: 2048, N: 10240, K: 2560, count: 1},
+	{model: "qwen3.8-flash-next", layer: "ple.value", M: 2048, N: 2560, K: 2560, count: 1},
 	{model: "qwen3.8-flash-next", layer: "moe.router", M: 2048, N: 512, K: 2560, count: 48},
 	// The shape the square sweep has no analogue for: 2048 tokens spread
 	// over 512 experts is 40 rows each, and every expert in the bank is
