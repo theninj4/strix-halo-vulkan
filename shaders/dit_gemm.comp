@@ -101,6 +101,24 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 //   pc.aux0  C, the input channel count (a power of two)
 //   pc.aux1  d*lda, the row stride between consecutive taps
 //   pc.aux2  log2(C)
+//
+// A_CONV=2 is the same convolution over a channel count that is *not* a power
+// of two, which is what kokoro's decoder is made of: 514, 1090, 1024 and 512
+// (SPEECH.md T4c). Two things change and neither is a divide in the inner
+// loop.
+//
+// The host pads the row stride up to a multiple of BK with zero columns, so a
+// 16-wide fragment still lies entirely inside one tap and the K loop's step
+// never straddles a tap boundary. Then the tap index and the column offset are
+// *carried* across the loop instead of being recomputed: k0 advances by BK
+// every iteration, so the column offset advances by BK and rolls over into the
+// next tap exactly when it reaches pc.aux0. A compare and a subtract, where a
+// literal reading of K/C and K%C would put an integer division -- which RDNA
+// has no scalar instruction for -- inside the hottest loop in the engine.
+//
+//   pc.aux0  the padded channel count, a multiple of BK; also pc.lda
+//   pc.aux1  d*lda
+//   pc.aux2  unused
 #ifndef A_CONV
 #define A_CONV 0
 #endif
@@ -176,7 +194,14 @@ layout(local_size_x = NTHREADS) in;
 #define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
 #define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
 
-#if A_CONV
+#if A_CONV == 2
+// A: the implicit im2col, with the tap index carried by the K loop rather than
+// divided out. aTap and aCol are declared and advanced in main().
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda                  \
+        + aTap + aCol + (kt) * TILE,                                               \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+#elif A_CONV
 // A: the implicit im2col above. kk is wave-uniform, so the shift and the mask
 // are two scalar instructions ahead of a load that is otherwise identical to
 // the plain one.
@@ -274,8 +299,21 @@ void main() {
         }
     }
 
+#if A_CONV == 2
+    // The tap's row offset and the column inside it, carried across the loop.
+    // pc.aux0 is a multiple of BK, so the rollover is exact and a whole slab
+    // is always inside one tap.
+    uint aTap = 0u, aCol = 0u;
+#endif
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
         MMA_BLOCK(k0)
+#if A_CONV == 2
+        aCol += BK;
+        if (aCol >= pc.aux0) {
+            aCol -= pc.aux0;
+            aTap += pc.aux1;
+        }
+#endif
     }
 
     [[unroll]] for (uint i = 0u; i < WM; i++) {

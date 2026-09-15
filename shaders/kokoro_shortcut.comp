@@ -1,0 +1,47 @@
+#version 450
+
+// The epilogue of one of the decoder's AdaIN residual blocks: add the second
+// convolution's bias, add the shortcut, scale by 1/sqrt(2), and write into the
+// *wider* row the next block reads (SPEECH.md T4c).
+//
+// The 1/sqrt(2) is not a detail. StyleTTS2's block is a variance-preserving
+// average of its two branches rather than the plain residual add the
+// generator's blocks use, and leaving it out makes the output grow by sqrt(2)
+// a block — 4x over the four the decoder stacks.
+//
+// The destination stride is the point of the kernel. Every decode block is
+// handed its own output *concatenated* with the phoneme residual and the two
+// curves, and those 66 side channels are the same for all four blocks — so
+// they are written once at upload into columns [dim, lda) of a [T, lda]
+// arena, and each block's epilogue writes its 1024 columns beside them.
+// The concatenation upstream does per block costs nothing here because it is
+// a row stride.
+//
+// The grid is 2-D — a band of 256 channels by one frame — so the index
+// decomposition is free at any channel count, which matters because the
+// decoder's are 514, 1090, 1024 and 512.
+//
+//   pc.inOff   [T, dim] fp32, the second convolution's output
+//   pc.aux0    [T, dim] fp32, the shortcut's
+//   pc.outOff  [T, lda] fp32 destination
+//   pc.wOff    [dim] bias, or NO_W
+//   pc.dim     the block's output channel count
+//   pc.lda     the destination row stride
+//   pc.scale   the scale applied to the sum
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.dim) {
+        return;
+    }
+    uint t = gl_WorkGroupID.y;
+    float v = act[pc.inOff + t * pc.dim + c] + act[pc.aux0 + t * pc.dim + c];
+    if (pc.wOff != NO_W) {
+        v += wbuf[pc.wOff + c];
+    }
+    act[pc.outOff + t * pc.lda + c] = v * uintBitsToFloat(pc.scale);
+}

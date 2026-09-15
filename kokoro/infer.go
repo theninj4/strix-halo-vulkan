@@ -3,6 +3,7 @@ package kokoro
 import (
 	"fmt"
 	"math/rand"
+	"time"
 )
 
 // Prosody is everything the vocoder needs and nothing it does not: the
@@ -17,6 +18,26 @@ type Prosody struct {
 	F0        []float32 // [2*Frames]
 	Energy    []float32 // [2*Frames]
 	RawDur    []float32 // the durations before rounding, for diagnostics
+
+	// Where the time went. The phoneme side is 85% of an utterance and 60% of
+	// *it* is recurrences, so the split that matters is ALBERT against the six
+	// bidirectional LSTMs (SPEECH.md T6).
+	Times ProsodyTimes
+}
+
+// ProsodyTimes is the phoneme side, stage by stage.
+type ProsodyTimes struct {
+	BERT        time.Duration // 12 ALBERT layers over the tokens
+	DurEncoder  time.Duration // three LSTM/AdaLayerNorm pairs
+	Durations   time.Duration // one LSTM and the duration head
+	Prosody     time.Duration // the shared LSTM and the F0/N stacks
+	TextEncoder time.Duration // an embedding, three convolutions and one LSTM
+	Expand      time.Duration // the length regulator, twice
+}
+
+// Total is the whole phoneme side.
+func (t ProsodyTimes) Total() time.Duration {
+	return t.BERT + t.DurEncoder + t.Durations + t.Prosody + t.TextEncoder + t.Expand
 }
 
 // Samples is how long the waveform will be, which is fixed the moment the
@@ -47,41 +68,78 @@ func (m *Model) Prosody(ids []int, style []float32, speed float32) (*Prosody, er
 		return nil, fmt.Errorf("kokoro: predictor style is %d wide, want %d",
 			len(style), m.Config.StyleDim)
 	}
-	hiddens, err := m.BERT.Apply(ids)
+	var times ProsodyTimes
+	t0 := time.Now()
+	var last *Mat
+	if m.BERTGPU != nil {
+		// The embedding stack stays on the host: a table lookup, two adds and
+		// a 128->768 projection over fifty rows is not worth a dispatch.
+		_, hidden, err := m.BERT.Embed(ids)
+		if err != nil {
+			return nil, err
+		}
+		if last, err = m.BERTGPU.Apply(hidden); err != nil {
+			return nil, err
+		}
+	} else {
+		hiddens, err := m.BERT.Apply(ids)
+		if err != nil {
+			return nil, err
+		}
+		last = hiddens[len(hiddens)-1]
+	}
+	dEn, err := m.BERTEncoder.Apply(last)
 	if err != nil {
 		return nil, err
 	}
-	dEn, err := m.BERTEncoder.Apply(hiddens[len(hiddens)-1])
-	if err != nil {
-		return nil, err
-	}
+	times.BERT = time.Since(t0)
+
+	t0 = time.Now()
 	encoded, err := m.Predictor.TextEncoder.Apply(dEn, style)
 	if err != nil {
 		return nil, err
 	}
+	times.DurEncoder = time.Since(t0)
+
+	t0 = time.Now()
 	durations, raw, err := m.Predictor.Durations(encoded, speed)
 	if err != nil {
 		return nil, err
 	}
+	times.Durations = time.Since(t0)
+
+	t0 = time.Now()
 	en, err := Expand(encoded, durations)
 	if err != nil {
 		return nil, err
 	}
+	times.Expand = time.Since(t0)
+
+	t0 = time.Now()
 	f0, energy, err := m.Predictor.Prosody(en, style)
 	if err != nil {
 		return nil, err
 	}
+	times.Prosody = time.Since(t0)
+
+	t0 = time.Now()
 	tEn, err := m.TextEncoder.Apply(ids)
 	if err != nil {
 		return nil, err
 	}
+	times.TextEncoder = time.Since(t0)
+
+	t0 = time.Now()
 	asr, err := Expand(tEn, durations)
 	if err != nil {
 		return nil, err
 	}
+	times.Expand += time.Since(t0)
+
 	return &Prosody{
 		Tokens: ids, Durations: durations, Frames: en.Rows,
 		ASR: asr, Encoded: en, F0: f0, Energy: energy, RawDur: raw,
+		Times: times,
 	}, nil
 }
 

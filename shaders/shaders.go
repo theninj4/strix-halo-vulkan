@@ -1674,7 +1674,7 @@ var KokoroConvReg32x128 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_affine.spv kokoro_affine.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_act.spv kokoro_act.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DSNAKE=1 -o kokoro_act_snake.spv kokoro_act.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLEAKY=1 -o kokoro_act_leaky.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLEAKY=1 -DNO_AFFINE=1 -o kokoro_act_leaky.spv kokoro_act.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_upadd.spv kokoro_upadd.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DPAD=1 -o kokoro_upadd_pad.spv kokoro_upadd.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_residual.spv kokoro_residual.comp
@@ -1706,3 +1706,102 @@ var KokoroResidual []byte
 
 //go:embed kokoro_copy.spv
 var KokoroCopy []byte
+
+// The decoder — upstream's `Decoder`, the four AdaIN residual blocks between
+// the length regulator and the generator (SPEECH.md T4c). It is 54% of the
+// vocoder's time on 5.5% of its arithmetic, and the only reason it was still
+// on the host is its channel counts: 514, 1090, 1024 and 512, two of which
+// are not powers of two, so A_CONV=1's shift and mask do not apply.
+//
+// A_CONV=2 is the same convolution with the tap index carried across the K
+// loop instead of divided out, over a row stride the host pads to a multiple
+// of BK. Four rungs again, because the shape is the opposite of the
+// generator's — M of 130 or 260 against N of 512 or 1024, where the generator
+// is M in the thousands by N of 128.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=2 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=2 -DWAVE=32 -o kokoro_dconv_reg32x32_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=2 -DWAVE=32 -o kokoro_dconv_reg32x64_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -DA_CONV=2 -o kokoro_dconv_reg64.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=8 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DA_CONV=2 -o kokoro_dconv_reg32x128.spv dit_gemm.comp
+
+//go:embed kokoro_dconv_reg32x32_w32.spv
+var KokoroDConvReg32x32W32 []byte
+
+//go:embed kokoro_dconv_reg32x64_w32.spv
+var KokoroDConvReg32x64W32 []byte
+
+//go:embed kokoro_dconv_reg64.spv
+var KokoroDConvReg64 []byte
+
+//go:embed kokoro_dconv_reg32x128.spv
+var KokoroDConvReg32x128 []byte
+
+// The decoder's scalar passes. NPOT swaps the shift-and-mask index
+// decomposition for a 2-D grid, which costs nothing and works at any channel
+// count; the three activation builds are the three places a [T, C] fp32
+// tensor is narrowed into a convolution's A operand — after a normalisation,
+// before a shortcut, and before the one shortcut that upsamples.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -o kokoro_dstats.spv kokoro_stats.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DLEAKY=1 -o kokoro_dact.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -o kokoro_dnarrow.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -DREPEAT=1 -o kokoro_dnarrow_rep.spv kokoro_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_shortcut.spv kokoro_shortcut.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_pool.spv kokoro_pool.comp
+
+//go:embed kokoro_dstats.spv
+var KokoroDStats []byte
+
+//go:embed kokoro_dact.spv
+var KokoroDAct []byte
+
+//go:embed kokoro_dnarrow.spv
+var KokoroDNarrow []byte
+
+//go:embed kokoro_dnarrow_rep.spv
+var KokoroDNarrowRepeat []byte
+
+//go:embed kokoro_shortcut.spv
+var KokoroShortcut []byte
+
+//go:embed kokoro_pool.spv
+var KokoroPool []byte
+
+// The vocoder's tail: `conv_post`, the two nonlinearities, and the inverse
+// transform (SPEECH.md T4c). Moving these onto the device is worth more than
+// the arithmetic in them — 78000 samples come back where 8 MB of [15601, 128]
+// used to, and a device-local host-visible buffer reads at 210 MB/s.
+//
+// conv_post's N is 22, which is not a multiple of the 16-wide fragment tile;
+// the host pads it to 32 with zero weight columns and the epilogue reads the
+// 22 that mean anything.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_post.spv kokoro_post.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_istft.spv kokoro_istft.comp
+
+//go:embed kokoro_post.spv
+var KokoroPost []byte
+
+//go:embed kokoro_istft.spv
+var KokoroISTFT []byte
+
+// PL-BERT, the phoneme encoder (SPEECH.md T6). Twelve layers sharing one
+// weight group, 768 wide over fifty tokens — 6.7 GFLOP that the CPU
+// reference takes 104 ms over, which is 47% of the phoneme side and 40% of a
+// whole utterance.
+//
+// Almost all of it runs on kernels that already exist: the projections and
+// the feed-forward are `dit_gemm.comp`'s narrow-M rungs, the post-norms are
+// parakeet's LayerNorm (a mean *and* an affine, which is what this model's
+// 1e-12 norm needs), and the residual adds are parakeet's. What is new is the
+// attention, which at 7.7 MFLOP a layer is not worth a matrix-core kernel,
+// and the feed-forward's activation.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_bert_attn.spv kokoro_bert_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -DGELU=1 -o kokoro_gelu.spv kokoro_act.comp
+
+//go:embed kokoro_bert_attn.spv
+var KokoroBertAttn []byte
+
+//go:embed kokoro_gelu.spv
+var KokoroGELU []byte

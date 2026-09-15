@@ -113,7 +113,37 @@ type upWeights struct {
 	bias        uint32
 	pad         bool // the last stage's reflection pad
 	ldaIn       int
+	scale       float32          // folded into the weights, not the bias
 	conv        *ConvTranspose1D // dropped after staging
+}
+
+// tailWeights is the vocoder's tail — `conv_post`, its two nonlinearities and
+// the inverse transform — staged on the last upsampling stage.
+//
+// It is here rather than in an object of its own because it reads the stage's
+// own running value and the pipelines are bound to the stage's four arenas.
+// What it buys is the readback: with the tail on the device a stage returns
+// 78000 samples, 312 KB, where the [15601, 128] activation it used to return
+// is 8 MB — and that buffer reads back at 210 MB/s.
+//
+// Two scalars are folded into the weights rather than applied as passes. The
+// generator averages its three residual blocks, and a leaky rectifier is
+// positively homogeneous, so dividing `conv_post`'s *weights* by three (and
+// not its bias) is the same function as dividing the activation by three
+// first. And conv_post's N is 22, which is not a multiple of the 16-wide
+// fragment tile, so it is padded to 32 with zero weight columns.
+type tailWeights struct {
+	nfft, hop, bins int
+	frames, samples int
+	n               int // conv_post's output width, padded to a tile
+	taps, pad       int
+	bank            uint32 // the padded, scaled conv_post weights
+	bias            uint32 // [2*bins]
+	tw              uint32 // cos, sin, window, window squared
+	aPost, aRI      uint32
+	aWav            uint32
+	conv            *Conv1D // dropped after staging
+	window          []float64
 }
 
 // blockWeights is one SnakeResBlock's staged offsets, three iterations deep.
@@ -151,6 +181,13 @@ type GPUBlocks struct {
 
 	// The upsampler that feeds the blocks, when this set owns one.
 	up *upWeights
+	// The tail, when this is the last stage.
+	tail *tailWeights
+	// The arena this stage's fp32 space came from, when it is shared. With
+	// one set, aXin is the previous object's output and nothing is uploaded
+	// or downloaded between them.
+	shared   *sharedArena
+	resident bool
 
 	wbuf, abuf, hbuf, bank *vk.Buffer
 	mods                   []*vk.ShaderModule
@@ -167,13 +204,58 @@ type GPUBlocks struct {
 	actElems, hElems  int
 }
 
+// sharedArena is one fp32 buffer handed out to the decoder and to both
+// generator stages, so that one object's output *is* the next one's input.
+//
+// The alternative is what T4a and T4b left: each object owns its arena, and a
+// stage's result comes back to the host only to be written straight into the
+// next one. Measured on this machine that is 2.3 ms for the decoder's
+// [260, 512] and 14.4 ms for stage 0's [2600, 256] — 17 ms of a 54 ms
+// vocoder, for two tensors that never needed to leave the device. A
+// device-local host-visible buffer writes at 29 GB/s and reads at 176-219,
+// which is the same 140x asymmetry T4a found; the answer is the same, one
+// level up.
+//
+// Reservation is two-phase because the offsets have to be known before the
+// buffer can be sized: every object lays itself out against a running total,
+// and Commit allocates once at the end.
+type sharedArena struct {
+	dev  *vk.Device
+	buf  *vk.Buffer
+	next uint32
+}
+
+// reserve hands out n fp32 elements and returns their offset.
+func (a *sharedArena) reserve(n int) uint32 {
+	o := a.next
+	a.next += uint32(n)
+	return o
+}
+
+// commit allocates the one buffer every reservation points into.
+func (a *sharedArena) commit() error {
+	buf, err := a.dev.NewBuffer(int(a.next) * 4)
+	if err != nil {
+		return fmt.Errorf("kokoro: shared fp32 arena of %d MB: %w", a.next*4>>20, err)
+	}
+	a.buf = buf
+	return nil
+}
+
+func (a *sharedArena) destroy() {
+	if a.buf != nil {
+		a.buf.Destroy()
+		a.buf = nil
+	}
+}
+
 func roundUp(n, m int) int { return (n + m - 1) / m * m }
 
 func groups(n, per int) uint32 { return uint32((n + per - 1) / per) }
 
 // NewGPUBlocks stages a set of residual blocks, all of the same shape.
 func NewGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel ConvKernel) (*GPUBlocks, error) {
-	return newGPUBlocks(dev, blocks, frames, kernel, nil, false)
+	return newGPUBlocks(dev, blocks, frames, kernel, nil, nil, nil)
 }
 
 // NewGPUStage stages a whole generator upsampling stage: the transposed
@@ -185,6 +267,35 @@ func NewGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel Co
 // reflection pad and the excitation add all happen between them.
 func NewGPUStage(dev *vk.Device, blocks []*SnakeResBlock, up *ConvTranspose1D, inFrames, frames int,
 	pad bool, kernel ConvKernel) (*GPUBlocks, error) {
+	return newGPUStage(dev, blocks, up, inFrames, frames, pad, kernel, nil, nil)
+}
+
+// NewGPUStageWithTail is NewGPUStage for the *last* stage, with `conv_post`
+// and the inverse transform attached — so the whole vocoder ends on the
+// device and what comes back is the waveform.
+func NewGPUStageWithTail(dev *vk.Device, blocks []*SnakeResBlock, up *ConvTranspose1D, inFrames, frames int,
+	pad bool, kernel ConvKernel, g *Generator, sa *sharedArena) (*GPUBlocks, error) {
+	if g.ISTFT == nil || g.ConvPost == nil {
+		return nil, fmt.Errorf("kokoro: the generator has no tail to stage")
+	}
+	if !g.ISTFT.Center {
+		return nil, fmt.Errorf("kokoro: this path assumes a centred inverse transform")
+	}
+	bins := g.ISTFT.Bins()
+	if g.ConvPost.Out != 2*bins {
+		return nil, fmt.Errorf("kokoro: conv_post is %d wide against %d bins", g.ConvPost.Out, bins)
+	}
+	return newGPUStage(dev, blocks, up, inFrames, frames, pad, kernel, &tailWeights{
+		nfft: g.ISTFT.NFFT, hop: g.ISTFT.Hop, bins: bins,
+		frames: frames, samples: g.ISTFT.Samples(frames),
+		n:    roundUp(g.ConvPost.Out, coopMatTile*2),
+		taps: g.ConvPost.Kernel, pad: g.ConvPost.Pad,
+		conv: g.ConvPost, window: g.ISTFT.Window(),
+	}, sa)
+}
+
+func newGPUStage(dev *vk.Device, blocks []*SnakeResBlock, up *ConvTranspose1D, inFrames, frames int,
+	pad bool, kernel ConvKernel, tail *tailWeights, sa *sharedArena) (*GPUBlocks, error) {
 	if up.Kernel != 2*up.Stride || up.Pad != up.Stride/2 {
 		return nil, fmt.Errorf("kokoro: upsampler k=%d s=%d p=%d, this path needs k=2s and p=s/2",
 			up.Kernel, up.Stride, up.Pad)
@@ -192,11 +303,11 @@ func NewGPUStage(dev *vk.Device, blocks []*SnakeResBlock, up *ConvTranspose1D, i
 	return newGPUBlocks(dev, blocks, frames, kernel, &upWeights{
 		inCh: up.In, outCh: up.Out, stride: up.Stride, inFrames: inFrames, pad: pad, ldaIn: up.In,
 		conv: up,
-	}, true)
+	}, tail, sa)
 }
 
 func newGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel ConvKernel,
-	up *upWeights, _ bool) (*GPUBlocks, error) {
+	up *upWeights, tail *tailWeights, sa *sharedArena) (*GPUBlocks, error) {
 	if len(blocks) == 0 {
 		return nil, fmt.Errorf("kokoro: no blocks")
 	}
@@ -206,7 +317,7 @@ func newGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel Co
 	}
 	g := &GPUBlocks{
 		dev: dev, frames: frames, framesPad: roundUp(frames, framePad),
-		channels: c, lda: c, kernel: kernel, up: up,
+		channels: c, lda: c, kernel: kernel, up: up, tail: tail, shared: sa,
 		pipes: map[string]*vk.ComputePipeline{},
 		convs: map[ConvKernel]*vk.ComputePipeline{},
 	}
@@ -219,15 +330,28 @@ func newGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel Co
 		g.Destroy()
 		return nil, err
 	}
-	if err := g.build(); err != nil {
-		g.Destroy()
-		return nil, err
+	if g.shared != nil {
+		// The buffer does not exist yet: the caller reserves every object's
+		// space, commits once, and then calls finish.
+		return g, nil
 	}
-	if err := g.stage(blocks); err != nil {
+	if err := g.finish(blocks); err != nil {
 		g.Destroy()
 		return nil, err
 	}
 	return g, nil
+}
+
+// finish builds the pipelines and writes the weights, which cannot happen
+// until every arena exists.
+func (g *GPUBlocks) finish(blocks []*SnakeResBlock) error {
+	if g.shared != nil {
+		g.abuf = g.shared.buf
+	}
+	if err := g.build(); err != nil {
+		return err
+	}
+	return g.stage(blocks)
 }
 
 // Frames is the geometry this set was built for.
@@ -252,8 +376,11 @@ func (g *GPUBlocks) SetKernel(k ConvKernel) error {
 
 func (g *GPUBlocks) alloc(blocks []*SnakeResBlock) error {
 	c := g.channels
-	var off32 uint32
-	take32 := func(n int) uint32 { o := off32; off32 += uint32(n); return o }
+	var base, off32 uint32
+	if g.shared != nil {
+		base = g.shared.next
+	}
+	take32 := func(n int) uint32 { o := base + off32; off32 += uint32(n); return o }
 	// The stage's input is held once and copied into the running value before
 	// each block, because the generator runs three blocks over the *same*
 	// input and averages them. Uploading it three times would cost more than
@@ -272,6 +399,13 @@ func (g *GPUBlocks) alloc(blocks []*SnakeResBlock) error {
 		// The upsampler writes (T_in+1) rows of stride*C, which read as
 		// [(T_in+1)*stride, C] is the signal offset by stride/2.
 		g.aUp = take32(roundUp(g.up.inFrames+1, framePad) * g.up.stride * c)
+	}
+	if t := g.tail; t != nil {
+		// conv_post writes roundUp(frames, BM) rows of the padded width; the
+		// rectangular spectrum and the waveform are exact.
+		t.aPost = take32(g.framesPad * t.n)
+		t.aRI = take32(t.frames * 2 * t.bins)
+		t.aWav = take32(t.samples)
 	}
 	g.actElems = int(off32)
 
@@ -295,10 +429,15 @@ func (g *GPUBlocks) alloc(blocks []*SnakeResBlock) error {
 	if g.up != nil {
 		offW += uint32(g.up.outCh)
 	}
+	if t := g.tail; t != nil {
+		offW += uint32(2*t.bins + 2*t.nfft*t.bins + 2*t.nfft)
+	}
 	g.wNext = 0
 
 	var err error
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.shared != nil {
+		g.shared.reserve(g.actElems)
+	} else if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("kokoro: fp32 arena: %w", err)
 	}
 	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
@@ -317,6 +456,9 @@ func (g *GPUBlocks) alloc(blocks []*SnakeResBlock) error {
 	}
 	if g.up != nil {
 		halves += g.up.stride * g.up.outCh * 2 * g.up.inCh
+	}
+	if t := g.tail; t != nil {
+		halves += t.n * t.taps * c
 	}
 	g.bank, err = g.dev.NewBuffer(halves * 2)
 	if err != nil {
@@ -341,6 +483,8 @@ func (g *GPUBlocks) build() error {
 		{"leaky", shaders.KokoroActLeaky},
 		{"upadd", shaders.KokoroUpAdd},
 		{"upaddpad", shaders.KokoroUpAddPad},
+		{"post", shaders.KokoroPost},
+		{"istft", shaders.KokoroISTFT},
 	} {
 		if err := g.pipeline(s.name, s.spirv, spec); err != nil {
 			return err
@@ -453,9 +597,56 @@ func (g *GPUBlocks) stage(blocks []*SnakeResBlock) error {
 		u := g.up
 		u.bias = takeW(u.conv.Bias)
 		u.bOff = bankOff
-		packUpB(bank[bankOff:], u.conv.Weight, u.inCh, u.outCh, u.stride)
+		w := u.conv.Weight
+		if u.scale != 0 {
+			// The previous stage left its blocks summed rather than averaged,
+			// and the rectifier in front of this upsampler is positively
+			// homogeneous, so the division lives here. The bias is not
+			// scaled: it is added after the projection, not before it.
+			w = make([]float32, len(u.conv.Weight))
+			for i, v := range u.conv.Weight {
+				w[i] = v * u.scale
+			}
+		}
+		packUpB(bank[bankOff:], w, u.inCh, u.outCh, u.stride)
 		bankOff += uint32(u.stride * u.outCh * 2 * u.inCh)
 		u.conv = nil
+	}
+	if t := g.tail; t != nil {
+		// The generator averages three residual blocks and the rectifier in
+		// front of conv_post is positively homogeneous, so the division by
+		// three lives in these weights. The bias is not divided: it is added
+		// after the projection, not before it.
+		inv := float32(1) / float32(len(blocks)-1)
+		w := make([]float32, len(t.conv.Weight))
+		for i, v := range t.conv.Weight {
+			w[i] = v * inv
+		}
+		bias := make([]float32, t.conv.Out)
+		if t.conv.Bias != nil {
+			copy(bias, t.conv.Bias)
+		}
+		t.bias = takeW(bias)
+
+		// The twiddles and the window: [nfft, bins] of each, then the window
+		// and its square. They depend on nothing but the geometry.
+		tw := make([]float32, 2*t.nfft*t.bins+2*t.nfft)
+		for n := 0; n < t.nfft; n++ {
+			for b := 0; b < t.bins; b++ {
+				th := 2 * math.Pi * float64(b*n) / float64(t.nfft)
+				tw[n*t.bins+b] = float32(math.Cos(th))
+				tw[t.nfft*t.bins+n*t.bins+b] = float32(math.Sin(th))
+			}
+			wn := float32(t.window[n])
+			tw[2*t.nfft*t.bins+n] = wn
+			tw[2*t.nfft*t.bins+t.nfft+n] = wn * wn
+		}
+		t.tw = takeW(tw)
+
+		t.bank = bankOff
+		packConvBPad(bank[bankOff:], w, t.conv.Out, g.channels, g.channels, t.taps)
+		bankOff += uint32(t.n * t.taps * g.channels)
+		t.conv, t.window = nil, nil
 	}
 	g.bank.WriteUint16At(0, bank)
 	g.wbuf.WriteFloat32At(0, w32)
@@ -469,19 +660,7 @@ func (g *GPUBlocks) stage(blocks []*SnakeResBlock) error {
 // fragment tiles B_LAYOUT=2 reads, with the K index being tap*In + in — which
 // is the order dit_gemm.comp's A_CONV walks the activation in.
 func packConvB(dst []uint16, w []float32, out, in, taps int) {
-	k := taps * in
-	kt := k / coopMatTile
-	parallelFor(out, func(o int) {
-		base := (o / coopMatTile) * kt * coopMatTile * coopMatTile
-		lane := (o % coopMatTile) * coopMatTile
-		for i := 0; i < in; i++ {
-			for j := 0; j < taps; j++ {
-				kk := j*in + i
-				dst[base+(kk/coopMatTile)*coopMatTile*coopMatTile+lane+kk%coopMatTile] =
-					safetensors.F32ToF16(w[(o*in+i)*taps+j])
-			}
-		}
-	})
+	packConvBPad(dst, w, out, in, in, taps)
 }
 
 // SetStyle computes every AdaIN's gamma and beta for one utterance.
@@ -736,7 +915,11 @@ func (g *GPUBlocks) Destroy() {
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank} {
+	bufs := []*vk.Buffer{g.wbuf, g.hbuf, g.bank}
+	if g.shared == nil {
+		bufs = append(bufs, g.abuf)
+	}
+	for _, b := range bufs {
 		if b != nil {
 			b.Destroy()
 		}
@@ -755,6 +938,31 @@ func (g *GPUBlocks) Destroy() {
 func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle []float32, kernel ConvKernel) error {
 	g := m.Vocoder.Generator
 	m.DetachGPU()
+
+	// One fp32 arena for all three objects, laid out before any of them is
+	// built: the decoder's output *is* stage 0's input and stage 0's is
+	// stage 1's, so the two tensors between them — 0.5 MB and 2.5 MB — never
+	// cross the bus. See sharedArena.
+	sa := &sharedArena{dev: dev}
+
+	// PL-BERT, which is 47% of the phoneme side and shares one weight group
+	// across its twelve layers, so it is staged once for any utterance rather
+	// than sized per clip like everything below.
+	bert, err := NewGPUAlbert(dev, m.BERT, m.BERT.Config.MaxPositionEmbed)
+	if err != nil {
+		return fmt.Errorf("kokoro: staging PL-BERT: %w", err)
+	}
+	m.BERTGPU = bert
+
+	// The decoder first, because it is what decides the generator's input:
+	// its last block doubles the frame count, which is where the 2*frames
+	// below comes from (SPEECH.md T4c).
+	dec, err2 := newGPUDecoder(dev, m.Vocoder, frames, DefaultDecoderKernel, sa)
+	if err = err2; err != nil {
+		return fmt.Errorf("kokoro: staging the decoder: %w", err)
+	}
+	m.Vocoder.GPU = dec
+
 	n := 2 * frames
 	for i := range g.Ups {
 		in := n
@@ -767,17 +975,61 @@ func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle []float32, kernel
 			g.ResBlocks[i*g.NumKernels], g.ResBlocks[i*g.NumKernels+1], g.ResBlocks[i*g.NumKernels+2],
 			g.NoiseRes[i],
 		}
-		gb, err := NewGPUStage(dev, blocks, g.Ups[i], in, n, pad, kernel)
+		var gb *GPUBlocks
+		var err error
+		if i == len(g.Ups)-1 {
+			gb, err = NewGPUStageWithTail(dev, blocks, g.Ups[i], in, n, pad, kernel, g, sa)
+		} else {
+			gb, err = newGPUStage(dev, blocks, g.Ups[i], in, n, pad, kernel, nil, sa)
+		}
 		if err != nil {
 			m.DetachGPU()
 			return fmt.Errorf("kokoro: staging generator stage %d: %w", i, err)
 		}
+		g.GPU = append(g.GPU, gb)
+	}
+
+	// The aliasing, which is the whole point of the shared arena. Each of
+	// these pairs is the same [T, C] region under two names, so an object's
+	// UploadInput has nothing to do.
+	//
+	// A stage leaves its three residual blocks *summed*, not averaged, so the
+	// consumer carries the 1/NumKernels. It can, because every consumer is
+	// linear or positively homogeneous: the next stage's upsampler takes it
+	// into its weights (below, not its bias, which is added afterwards) and
+	// the tail takes it into conv_post's.
+	g.GPU[0].aXin, g.GPU[0].resident = dec.aOut, true
+	for i := 1; i < len(g.GPU); i++ {
+		g.GPU[i].aXin, g.GPU[i].resident = g.GPU[i-1].aSum, true
+		g.GPU[i].up.scale = 1 / float32(g.NumKernels)
+	}
+
+	if err := sa.commit(); err != nil {
+		m.DetachGPU()
+		return err
+	}
+	m.Vocoder.arena = sa
+	if err := dec.finish(); err != nil {
+		m.DetachGPU()
+		return fmt.Errorf("kokoro: staging the decoder: %w", err)
+	}
+	if err := dec.SetStyle(decStyle); err != nil {
+		m.DetachGPU()
+		return err
+	}
+	for i, gb := range g.GPU {
+		blocks := []*SnakeResBlock{
+			g.ResBlocks[i*g.NumKernels], g.ResBlocks[i*g.NumKernels+1], g.ResBlocks[i*g.NumKernels+2],
+			g.NoiseRes[i],
+		}
+		if err := gb.finish(blocks); err != nil {
+			m.DetachGPU()
+			return fmt.Errorf("kokoro: staging generator stage %d: %w", i, err)
+		}
 		if err := gb.SetStyle(decStyle); err != nil {
-			gb.Destroy()
 			m.DetachGPU()
 			return err
 		}
-		g.GPU = append(g.GPU, gb)
 	}
 	return nil
 }
@@ -789,6 +1041,18 @@ func (m *Model) DetachGPU() {
 		gb.Destroy()
 	}
 	g.GPU = nil
+	if m.Vocoder.GPU != nil {
+		m.Vocoder.GPU.Destroy()
+		m.Vocoder.GPU = nil
+	}
+	if m.Vocoder.arena != nil {
+		m.Vocoder.arena.destroy()
+		m.Vocoder.arena = nil
+	}
+	if m.BERTGPU != nil {
+		m.BERTGPU.Destroy()
+		m.BERTGPU = nil
+	}
 }
 
 // packUpB lays a ConvTranspose1d weight out as the one GEMM described on
@@ -889,10 +1153,13 @@ func (g *GPUBlocks) upGraph() ([]vk.MultiDispatch, []string, error) {
 	return d, []string{"leaky", "upsample", "upadd"}, nil
 }
 
-// RunStage runs a whole upsampling stage over the uploaded input and
-// excitation: the noise block, the upsampler, and the average of the three
-// residual blocks. One submit, one download.
-func (g *GPUBlocks) RunStage() (*Mat, error) {
+// stageDispatches is a whole upsampling stage: the noise block, the
+// upsampler, and the three residual blocks summed into g.aSum.
+//
+// The sum is left undivided. Whatever consumes it — the host, or the tail —
+// carries the 1/NumKernels, because every consumer is either linear or
+// positively homogeneous and so can absorb it into a weight.
+func (g *GPUBlocks) stageDispatches() ([]vk.MultiDispatch, error) {
 	if g.up == nil {
 		return nil, fmt.Errorf("kokoro: this block set has no upsampler")
 	}
@@ -920,6 +1187,16 @@ func (g *GPUBlocks) RunStage() (*Mat, error) {
 			d = append(d, g.elementwise("residual", g.aX, g.aSum, noW))
 		}
 	}
+	return d, nil
+}
+
+// RunStage runs a whole upsampling stage over the uploaded input and
+// excitation. One submit, one download.
+func (g *GPUBlocks) RunStage() (*Mat, error) {
+	d, err := g.stageDispatches()
+	if err != nil {
+		return nil, err
+	}
 	if err := submit(d); err != nil {
 		return nil, err
 	}
@@ -930,4 +1207,118 @@ func (g *GPUBlocks) RunStage() (*Mat, error) {
 		out.Data[i] *= inv
 	}
 	return out, nil
+}
+
+// HasTail reports whether this stage carries conv_post and the inverse
+// transform.
+func (g *GPUBlocks) HasTail() bool { return g.tail != nil }
+
+// Resident reports whether this stage's input and output are already in the
+// arena its neighbours read — so there is nothing to upload and nothing to
+// bring back.
+func (g *GPUBlocks) Resident() bool { return g.shared != nil }
+
+// RunStageResident runs the stage and leaves its result where the next one
+// will read it. The sum is left undivided; see stageDispatches.
+func (g *GPUBlocks) RunStageResident() error {
+	d, err := g.stageDispatches()
+	if err != nil {
+		return err
+	}
+	return submit(d)
+}
+
+// Samples is how many the tail produces.
+func (g *GPUBlocks) Samples() int {
+	if g.tail == nil {
+		return 0
+	}
+	return g.tail.samples
+}
+
+// RunStageWave runs the stage and its tail, and returns the waveform.
+//
+// This is the whole point of staging the tail: what comes back is 78000
+// samples, 312 KB, where the stage's own [15601, 128] output is 8 MB — and
+// the arena it would come out of reads at 210 MB/s, so the download was
+// 38 ms of a 117 ms vocoder.
+func (g *GPUBlocks) RunStageWave() ([]float32, error) {
+	if g.tail == nil {
+		return nil, fmt.Errorf("kokoro: this stage has no tail")
+	}
+	d, err := g.stageDispatches()
+	if err != nil {
+		return nil, err
+	}
+	t, _, err := g.tailGraph()
+	if err != nil {
+		return nil, err
+	}
+	if err := submit(append(d, t...)); err != nil {
+		return nil, err
+	}
+	return g.abuf.ReadFloat32At(int(g.tail.aWav), g.tail.samples), nil
+}
+
+// tailRung is the widest rung of the ladder whose tile divides conv_post's
+// padded output width, which is 32 — so the 64- and 128-wide rungs the
+// residual blocks run on cannot be used here.
+func (g *GPUBlocks) tailRung() (convVariant, bool) {
+	var best convVariant
+	var found bool
+	for _, v := range convVariants {
+		if _, ok := g.convs[v.name]; !ok || g.tail.n%v.bn != 0 {
+			continue
+		}
+		if !found || v.bn > best.bn {
+			best, found = v, true
+		}
+	}
+	return best, found
+}
+
+// tailGraph is the four dispatches that turn the stage's running sum into
+// samples: the rectifier and the narrow, conv_post, the epilogue that makes a
+// rectangular spectrum of it, and the inverse transform.
+func (g *GPUBlocks) tailGraph() ([]vk.MultiDispatch, []string, error) {
+	t := g.tail
+	v, ok := g.tailRung()
+	if !ok {
+		return nil, nil, fmt.Errorf("kokoro: no rung tiles %d output columns", t.n)
+	}
+	c := uint32(g.channels)
+	logC := uint32(math.Log2(float64(g.channels)))
+	m := roundUp(g.frames, v.bm)
+
+	pcLeaky := pushConstants{
+		Tokens: uint32(g.frames), Dim: c, Aux2: logC,
+		InOff: g.aSum, OutOff: g.hA, LDA: uint32(g.lda),
+		Scale: math.Float32bits(0.01), // F.leaky_relu's default slope
+	}
+	pcConv := pushConstants{
+		InOff: g.hA - uint32(t.pad*g.lda), OutOff: t.aPost, BOff: t.bank,
+		GemmM: uint32(m), GemmN: uint32(t.n), GemmK: uint32(t.taps * g.channels),
+		LDA:  uint32(g.lda),
+		Aux0: c, Aux1: c, Aux2: logC,
+	}
+	pcPost := pushConstants{
+		InOff: t.aPost, OutOff: t.aRI, WOff: t.bias,
+		Dim: uint32(t.bins), LDA: uint32(t.n), Aux0: uint32(t.nfft),
+	}
+	pcISTFT := pushConstants{
+		InOff: t.aRI, OutOff: t.aWav, WOff: t.tw,
+		Tokens: uint32(t.samples), Dim: uint32(t.bins),
+		Aux0: uint32(t.nfft), Aux1: uint32(t.hop), Aux2: uint32(t.frames),
+	}
+	d := []vk.MultiDispatch{
+		{Pipeline: g.pipes["leaky"], GroupsX: groups(g.frames*g.channels, 256), GroupsY: 1,
+			PushConstants: pcLeaky.bytes()},
+		{Pipeline: g.convs[v.name], GroupsX: uint32(t.n / v.bn), GroupsY: uint32(m / v.bm),
+			PushConstants: pcConv.bytes()},
+		{Pipeline: g.pipes["post"], GroupsX: groups(t.bins, 256), GroupsY: uint32(t.frames),
+			PushConstants: pcPost.bytes()},
+		{Pipeline: g.pipes["istft"], GroupsX: groups(t.samples, 256), GroupsY: 1,
+			PushConstants: pcISTFT.bytes()},
+	}
+	return d, []string{"leaky", "conv_post", "post", "istft"}, nil
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"time"
 
 	"strix-halo-vulkan/audio"
 )
@@ -269,15 +270,25 @@ type GeneratorTrace struct {
 	Stages           []*Mat
 	Post             *Mat
 	Spec, Phase      []float64
+
+	// Where the time went. The split is the one the port is optimised
+	// against: the decoder, the two upsampling stages, and the tail — the
+	// excitation, conv_post and the inverse transform.
+	Excitation, Stage, Tail time.Duration
 }
 
 // Apply runs the vocoder over the decoder's [T, 512] output, conditioned on
 // the style vector and driven by the F0 curve at twice the alignment rate.
 func (g *Generator) Apply(x *Mat, style, f0 []float32) ([]float32, *GeneratorTrace, error) {
+	t0 := time.Now()
 	source, f0Up, uv, sines := g.Source.Apply(f0)
-	return g.applyHarmonic(x, style, g.Harmonic(source), &GeneratorTrace{
+	har := g.Harmonic(source)
+	src := time.Since(t0)
+	out, tr, err := g.applyHarmonic(x, style, har, &GeneratorTrace{
 		F0Up: f0Up, UV: uv, Source: source, Sines: sines,
 	})
+	tr.Excitation = src
+	return out, tr, err
 }
 
 // ApplyWithSource runs the vocoder on an excitation the caller supplies
@@ -334,6 +345,7 @@ func (g *Generator) applyHarmonic(x *Mat, style []float32, har *Mat, tr *Generat
 	tr.Harmonic = har
 
 	var err error
+	t0 := time.Now()
 	for i := range g.Ups {
 		dev := g.device(i)
 		src, err := g.NoiseConvs[i].Apply(har)
@@ -348,8 +360,29 @@ func (g *Generator) applyHarmonic(x *Mat, style []float32, har *Mat, tr *Generat
 			if err := dev.UploadNoise(src); err != nil {
 				return nil, tr, err
 			}
-			if err := dev.UploadInput(x); err != nil {
-				return nil, tr, err
+			if !dev.resident {
+				if err := dev.UploadInput(x); err != nil {
+					return nil, tr, err
+				}
+			}
+			if dev.HasTail() {
+				// The last stage keeps going: conv_post, the two
+				// nonlinearities and the inverse transform are on the device
+				// too, so what comes back is the waveform rather than a
+				// [15601, 128] activation.
+				tr.Stage = time.Since(t0)
+				t0 = time.Now()
+				out, err := dev.RunStageWave()
+				tr.Tail = time.Since(t0)
+				return out, tr, err
+			}
+			if dev.Resident() {
+				// The next stage reads this one's output in place.
+				if err := dev.RunStageResident(); err != nil {
+					return nil, tr, err
+				}
+				x = nil
+				continue
 			}
 			if x, err = dev.RunStage(); err != nil {
 				return nil, tr, err
@@ -394,6 +427,10 @@ func (g *Generator) applyHarmonic(x *Mat, style []float32, har *Mat, tr *Generat
 		x = sum
 		tr.Stages = append(tr.Stages, x)
 	}
+
+	tr.Stage = time.Since(t0)
+	t0 = time.Now()
+	defer func() { tr.Tail += time.Since(t0) }()
 
 	x = leakyReLU(x, 0.01) // F.leaky_relu's default slope, not the 0.1 above
 	post, err := g.ConvPost.Apply(x)
@@ -465,6 +502,14 @@ type Vocoder struct {
 	Decode        []*AdainResBlk1d
 	ASRRes        *Conv1D
 	Generator     *Generator
+
+	// GPU, when set, runs the five AdaIN blocks on the device. It is nil by
+	// default: the CPU path is the reference and stays the reference.
+	GPU *GPUDecoder
+
+	// arena is the one fp32 buffer the decoder and both generator stages
+	// share, owned here because no one of them owns it.
+	arena *sharedArena
 }
 
 // VocoderTrace is the decoder's intermediates, for the same reason
@@ -474,6 +519,9 @@ type VocoderTrace struct {
 	Encode        *Mat
 	Decode        []*Mat
 	Generator     *GeneratorTrace
+
+	// Decoder is the five AdaIN blocks, on whichever path ran them.
+	Decoder time.Duration
 }
 
 // Apply runs the whole vocoder: [T, 512] of expanded phonemes and two
@@ -496,19 +544,45 @@ func (v *Vocoder) Apply(asr *Mat, f0, energy, style []float32) ([]float32, *Voco
 	}
 	tr.F0, tr.N = f0c, nc
 
-	x, err := Concat(asr, f0c, nc)
-	if err != nil {
-		return nil, tr, err
+	tDec := time.Now()
+	var x *Mat
+	if v.GPU == nil {
+		if x, err = Concat(asr, f0c, nc); err != nil {
+			return nil, tr, err
+		}
+		if x, err = v.Encode.Apply(x, style); err != nil {
+			return nil, tr, err
+		}
+		tr.Encode = x
 	}
-	if x, err = v.Encode.Apply(x, style); err != nil {
-		return nil, tr, err
-	}
-	tr.Encode = x
 	asrRes, err := v.ASRRes.Apply(asr)
 	if err != nil {
 		return nil, tr, err
 	}
 	tr.ASRRes = asrRes
+
+	if v.GPU != nil {
+		// Every block, one submit. The concatenation upstream does four times
+		// is a row stride on the device, so the side channels go up once and
+		// nothing between `encode` and the generator crosses the bus.
+		if v.GPU.Resident() {
+			// The generator's first stage reads the decoder's output in
+			// place, so there is nothing to bring back.
+			if err = v.GPU.Run(asr, f0c, nc, asrRes); err != nil {
+				return nil, tr, err
+			}
+			x = nil
+		} else if x, err = v.GPU.Apply(asr, f0c, nc, asrRes); err != nil {
+			return nil, tr, err
+		}
+		tr.Decoder = time.Since(tDec)
+		if x != nil {
+			tr.Decode = append(tr.Decode, x)
+		}
+		out, gtr, err := v.Generator.Apply(x, style, f0)
+		tr.Generator = gtr
+		return out, tr, err
+	}
 
 	for i, block := range v.Decode {
 		// Every block is handed the phoneme residual and both curves again.
@@ -526,6 +600,7 @@ func (v *Vocoder) Apply(asr *Mat, f0, energy, style []float32) ([]float32, *Voco
 			return nil, tr, fmt.Errorf("kokoro: decode block %d upsamples and is not last", i)
 		}
 	}
+	tr.Decoder = time.Since(tDec)
 	out, gtr, err := v.Generator.Apply(x, style, f0)
 	tr.Generator = gtr
 	return out, tr, err

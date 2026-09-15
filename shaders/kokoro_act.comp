@@ -3,9 +3,9 @@
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-// Apply an AdaIN affine, optionally a Snake, and narrow into the fp16 arena
-// the convolution's A operand is read from — one pass over the tensor for
-// what the reference does in three.
+// Apply an AdaIN affine, optionally an activation, and narrow into the fp16
+// arena the convolution's A operand is read from — one pass over the tensor
+// for what the reference does in three.
 //
 // The destination is a *bordered* arena: pc.lda-wide rows with `border` zero
 // rows before and after the signal, so the convolution's zero padding is in
@@ -13,15 +13,42 @@
 // only ever writes rows [0, T), so the border it was allocated with survives.
 //
 // SNAKE adds the generator's activation, x + sin(ax)^2/a with a learned `a`
-// per channel. It is fused here rather than being a pass of its own because
-// the alternative is a second full round trip of a [15601, 128] tensor for
-// two instructions of arithmetic.
+// per channel. LEAKY adds a leaky rectifier of slope pc.scale, which is what
+// every rectifier in the vocoder is. Either is fused here rather than being a
+// pass of its own because the alternative is a second full round trip of a
+// [15601, 128] tensor for two instructions of arithmetic.
 //
-//   pc.inOff   [T, C] fp32 input
+// The four knobs compose, and the builds that exist are the combinations the
+// two halves of the vocoder ask for:
+//
+//   (nothing)             the generator's AdaIN + narrow
+//   SNAKE                 the generator's residual block
+//   NO_AFFINE + LEAKY     a stage's input, rectified on its way to the
+//                         upsampler — there are no AdaIN coefficients there
+//   LEAKY                 the decoder's AdaIN block, which rectifies *after*
+//                         its normalisation rather than instead of it
+//   NO_AFFINE             a plain narrow, which is what the decoder's
+//                         shortcut path needs: it reads the block's input,
+//                         not its normalisation
+//   NO_AFFINE + REPEAT    the same with a nearest-neighbour 2x upsample
+//                         folded in, which is the shortcut of the one
+//                         decoder block that doubles its frames
+//   NO_AFFINE + GELU      PL-BERT's feed-forward activation and the narrow
+//                         into the second projection's A operand
+//
+// NPOT drops the power-of-two channel count: the index decomposition becomes
+// a 2-D grid (channel bands by frame) instead of a shift and a mask of a
+// linear id, so nothing here divides. The decoder's widths are 514, 1090,
+// 1024 and 512 and only two of those are powers of two, and a 2-D grid is
+// exactly as coalesced.
+//
+//   pc.inOff   [T, C] fp32 input, row stride pc.aux1 when NPOT
 //   pc.outOff  fp16 destination, row stride pc.lda
 //   pc.wOff    [C] alpha, when SNAKE
 //   pc.aux0    [2C] scale then shift, in the fp32 arena
-//   pc.aux2    log2(C)
+//   pc.aux1    the input's row stride, when NPOT
+//   pc.aux2    log2(C), unless NPOT
+//   pc.scale   the leaky rectifier's slope, when LEAKY
 
 #include "dit_common.glsl"
 
@@ -30,35 +57,66 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #ifndef SNAKE
 #define SNAKE 0
 #endif
-// LEAKY replaces the AdaIN affine with a leaky rectifier, which is what a
-// generator stage does to its input before the upsampler. Same pass, same
-// narrow, same bordered destination — the only difference is where the two
-// per-channel numbers come from, and here there are none.
 #ifndef LEAKY
 #define LEAKY 0
+#endif
+#ifndef NO_AFFINE
+#define NO_AFFINE 0
+#endif
+#ifndef REPEAT
+#define REPEAT 0
+#endif
+#ifndef NPOT
+#define NPOT 0
+#endif
+// GELU is huggingface's `gelu_new`, the tanh approximation, which is what
+// PL-BERT's feed-forward uses (SPEECH.md T6). It is here rather than in a
+// kernel of its own for the same reason SNAKE is: the alternative is a second
+// round trip of a [T, 2048] tensor for six instructions of arithmetic.
+#ifndef GELU
+#define GELU 0
 #endif
 
 layout(local_size_x = 256) in;
 
 void main() {
+#if NPOT
+    uint c = gl_GlobalInvocationID.x;
+    uint t = gl_WorkGroupID.y;
+    if (c >= pc.dim) {
+        return;
+    }
+    uint lds = pc.aux1;
+#else
     uint idx = gl_GlobalInvocationID.x;
     if (idx >= pc.tokens * pc.dim) {
         return;
     }
     uint t = idx >> pc.aux2;
     uint c = idx & (pc.dim - 1u);
+    uint lds = pc.dim;
+#endif
+#if REPEAT
+    // nn.Upsample(scale_factor=2, mode="nearest") on the way in.
+    float v = act[pc.inOff + (t >> 1u) * lds + c];
+#else
+    float v = act[pc.inOff + t * lds + c];
+#endif
+#if !NO_AFFINE
+    v = v * act[pc.aux0 + c] + act[pc.aux0 + pc.dim + c];
+#endif
 #if LEAKY
-    float v = act[pc.inOff + idx];
     if (v < 0.0) {
         v *= uintBitsToFloat(pc.scale);
     }
-#else
-    float v = act[pc.inOff + idx] * act[pc.aux0 + c] + act[pc.aux0 + pc.dim + c];
 #endif
 #if SNAKE
     float a = wbuf[pc.wOff + c];
     float s = sin(a * v);
     v += s * s / a;
+#endif
+#if GELU
+    v = 0.5 * v * (1.0 + tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
 #endif
     hact[pc.outOff + t * pc.lda + c] = float16_t(v);
 }

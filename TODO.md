@@ -41,12 +41,22 @@ trusting: the family is now **896 rows in ~9 minutes**, having grown three
 more GEMV builds and eight mixed-width dispatch plans since.)
 
 **`SPEECH.md`** is the current work: the parakeet (speech-to-text) and
-kokoro (text-to-speech) verticals. **Parakeet is finished** (S1-S8): 43 ms for
-an 11 s clip, 257x real time, whole model resident. What is open is the front
-end, which is now half the pipeline, and then kokoro. **`PIPELINE.md`** is the z-image-turbo
-slice, **parked** at 14.26 s an image with its resume points stated at the
-top. Both are rewritten each session rather than appended to, and the
-current one is the file to read first.
+kokoro (text-to-speech) verticals. **Both models now run on the device.**
+Parakeet is finished (S1-S8): 43 ms for an 11 s clip, 257x real time, whole
+model resident, with the host-side front end now half the pipeline. Kokoro's
+vocoder is finished (T1-T4c): 38 ms against 3626 on the CPU, 12.90x real time
+for a whole utterance, and **85% of that utterance is now the phoneme side's
+six bidirectional LSTMs**. Grapheme-to-phoneme is underway: T5a measured that
+**91% of running English is a dictionary lookup** and that a part-of-speech
+tagger is worth 1.74% of tokens, and T5b ported that 91% into `g2p/`. What is
+**T5 is finished** — `go run ./cmd/tts -gpu -text 'Hello there.'` speaks with
+no Python on the path, and reproduces misaki character for character on a
+corpus in which every branch of its English G2P fires. T6a put PL-BERT on the
+device (104 ms to 4), taking an utterance to **20.9x real time**. What is open
+is the F0/N stacks (T6b) and the six bidirectional LSTMs (T6c). **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
+image with its resume points stated at the top. Both are rewritten each
+session rather than appended to, and the current one is the file to read
+first.
 
 Three documents carry the older analysis: **`IDEAS.md`** is the prioritised
 experiment backlog (~30 items, each with hypothesis / change / expected
@@ -815,6 +825,410 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (twenty-sixth) — stage T6a: PL-BERT on Vulkan, and a plan the profile corrected
+
+**Result: ALBERT goes from 104 ms to 4 ms — 46.6x — and an utterance from
+260 ms to 156 ms, 12.51x real time to 20.88x. None of the fifty durations
+changes.**
+
+    stage          gpu    (T4c)   cpu (T3)
+    bert            4ms    104ms     104ms   12 ALBERT layers, 46.6x
+    dur encoder    24ms     24ms      24ms
+    durations       8ms      8ms       8ms
+    prosody        66ms     66ms      66ms
+    text encoder   15ms     15ms      15ms
+    phoneme side  116ms    222ms     222ms   74% of the utterance
+    vocoder        40ms     38ms    3626ms
+    total         156ms    260ms    3848ms   20.88x real time
+
+**The plan for this stage was wrong and the profile said so.** `SPEECH.md` had
+carried "60% of the phoneme side is recurrences" since T2. Adding a six-stage
+timer to `Prosody` put **ALBERT at 104 ms of 222** — 47% of the phoneme side —
+against 6.7 GFLOP, which is a transformer this repository has had kernels for
+since stage 3. The recurrences are 78 ms and the F0/N AdaIN stacks another 33,
+so the order of attack was exactly backwards. **The first commit of a stage
+should be the instrument, not the kernel.**
+
+**Built:**
+
+- `kokoro/gpubert.go` — `GPUAlbert`, fifteen dispatches a layer over four
+  arenas, twelve layers of one shared weight group, sized for the model's
+  512-token limit so it is staged once for any utterance rather than per clip.
+- `shaders/kokoro_bert_attn.comp` — one workgroup per (head, query), scores in
+  shared memory.
+- `-DGELU=1` on `kokoro_act.comp`, which is huggingface's `gelu_new` fused into
+  the narrow that was happening anyway.
+- Six-stage timing on `Prosody`, printed by `cmd/tts`.
+- `kokoro/gpubert_test.go` — four tests: layer by layer against the CPU, the
+  whole encoder, the dispatch profile, and the durations.
+
+**Four things worth carrying forward:**
+
+1. **A bias is an extra column of K**, stage 9's trick on its second outing.
+   The fp16 A operand's row stride is padded anyway for §2.3, so column
+   `width` of every row holds a 1 and the packed B holds the bias at that K
+   index — `y = Wx + b` out of a biasless GEMM, six projections a layer,
+   twelve layers, no epilogue and no dispatch. The pad is **64 rather than one
+   tile**, because dit_gemm.comp's K loop steps by BK and a padded K has to
+   stay a multiple of it.
+2. **Almost nothing new was needed.** The projections and the feed-forward are
+   `dit_gemm.comp`'s narrow-M rung — M is the token count, fifty, the same
+   regime the decoder's ladder picked a 32-wide tile for — the post-norms are
+   *parakeet's* LayerNorm (a mean **and** an affine, which is exactly what a
+   1e-12 post-norm needs and what neither DiT norm has), and the residual adds
+   are parakeet's too. Two kernels are new in a 6.7 GFLOP port.
+3. **Do not reach for the matrix cores by reflex.** The attention is scalar on
+   purpose: twelve heads over fifty tokens at a head width of 64 is 7.7 MFLOP
+   a layer, 0.1% of the 558 the layer does. A WMMA kernel would spend most of
+   its tiles on padding — fifty tokens is four 16-wide tiles with fourteen
+   rows of nothing — and cost a pack pass per operand to save a tenth of a
+   millisecond over the whole stack.
+4. **Test the integers, not the tensor.** ALBERT's output drifts 2.1e-3 over
+   twelve layers, which means nothing on its own; what matters is whether that
+   flips a *duration*, because the durations are a rounded sum of sigmoids and
+   one changed frame shifts everything after it. Zero of fifty change, with a
+   largest unrounded drift of 0.005 frames. And the corollary: comparing the
+   two paths' **waveforms** gives 17.8 dB, which is not a regression — the F0
+   curve moves by 2.2e-4 and drives a phase accumulator that reaches 1.3e5
+   radians (T3), so tens of radians of phase decorrelate the samples while the
+   alignment, the spectrum and the sound are identical.
+
+**Tolerances.** Per layer against the CPU reference, bounded at 6e-3: 3.5e-4
+after one layer and 2.1e-3 after twelve, so the post-norms hold the fp16 error
+rather than letting it compound. Durations compared as integers.
+
+**Left on the table, with its number attached.** T6b is the F0/N stacks, ~33 ms
+of the prosody predictor's 66 — six `AdainResBlk1d` at 512 and 256 channels,
+*the same block `GPUDecoder` already runs*, one of them with the same depthwise
+pool; what differs is the plumbing, not the kernels. T6c is the recurrences,
+~78 ms across six bidirectional LSTMs, which is S8's problem in a different
+model.
+
+### Session 2026-09-15 (twenty-fifth) — stage T5d: the espeak fallback, the homograph tagger, and T5 closed
+
+**Result: the designed corpus is exact, 24 of 24 sentences and 100% of
+phoneme words; on 400 sentences nobody chose, 92.4% of phoneme words agree.**
+T5 is closed and written up in
+[`research/t5-kokoro-g2p.md`](research/t5-kokoro-g2p.md).
+
+    the word path         204 corpus tokens, phonemes and rating     0 wrong
+    num2words             10115 integers x 3 spellings, 11 decimals  0 wrong
+    get_number            1760 cases over 45 digit strings           0 wrong
+    subtokenize           67 word shapes                             0 wrong
+    the espeak fallback   39 words, raw and rewritten                0 wrong
+    the homograph tagger  1962 occurrences against spacy            88.4%  (baseline 83.8%)
+    end to end, designed  24 sentences                          24 exact, 100% of words
+    end to end, unseen    400 sentences of this repo's prose    68.8%, 92.4% of words
+
+**Built:**
+
+- `g2p/espeak.go` — a **cgo + `dlopen`** binding to libespeak-ng. The plan
+  said "shell out"; there is no `espeak-ng` binary on this machine, only the
+  shared library bundled inside misaki's wheel. dlopen also means `go build`
+  works with no espeak present and a caller that gets an error simply has no
+  fallback, which is how the engine behaved before this session.
+- `g2p/fallback.go` — misaki's 25-rule rewrite of espeak's IPA into kokoro's
+  alphabet, separate from the binding so it is testable on any machine.
+- `g2p/homograph.go` — twelve rules over one word either side, and
+  `Lexicon.retag`, the second tokenizer pass that applies them only to the 671
+  entries the dictionary pronounces two ways.
+- `reference/dump_g2p.py` gains three tables: `espeak.txt` (raw espeak,
+  phonemizer's output and misaki's, so a disagreement says which of the three
+  layers moved), `homographs.txt` (1962 real occurrences with spacy's tag and
+  the neighbouring words) and `wild.txt` (400 sentences of this repository's
+  prose with misaki's phonemes).
+- `cmd/tts -text` now opens the fallback when it can.
+
+**Four things worth carrying forward:**
+
+1. **Measure the rule; do not reason about it.** The homograph rules scored
+   **79.2% against a no-tagger baseline of 83.8%** on the first attempt —
+   *worse than doing nothing* — and all of the damage was `that`, which is 445
+   of 1962 occurrences. Five candidate rules were then measured against the
+   table, and the winner (DT when a boundary or a function word is on the
+   left, 83.1%) beat the syntactically obvious refinement ("a determiner
+   cannot be followed by a verb", 74.6%) by 8.5 points, because "that is" is
+   overwhelmingly a determiner in running prose.
+2. **A rule that helps one word is not a rule until it is measured on the
+   others.** "A content word in front means a tensed verb" takes `read` from
+   63 to 70 of 104 — and applied generally makes "a memory fragment" the verb,
+   and `fragment` alone is 79 occurrences. Restricted to the four entries
+   carrying a VBD key it is a clean gain; unrestricted it is a loss.
+3. **The right metric is the pronunciation, not the tag.** Two tags that
+   select the same dictionary entry are equally right, and most do — which is
+   why the no-tagger baseline is 83.8% and not something low, and why an
+   accuracy figure against spacy would have been the wrong number to chase.
+4. **Dump every layer of a stacked oracle.** The fallback is espeak, then
+   phonemizer (a tie character and punctuation preservation), then misaki's
+   rewrite. Recording all three columns meant the binding and the rewrite
+   could be tested separately, and the rewrite runs on a machine with no
+   espeak at all.
+
+**Tolerances.** String equality on every component and on the designed corpus.
+The unseen-prose measurement carries floors (65% of sentences, 90% of words)
+set below what was measured, so a regression fails and corpus drift does not.
+
+**Left on the table, with its number attached.** The tagger's 11.6%; the
+tokenizer's disagreements with spacy on fragments (in at least one of which
+misaki reads `vs.` as `vˈiz` and this port says `vˈɜɹsəs`, which is not a
+difference worth fixing); and `Model.Style` indexing the voice pack by the
+**character** count of the phoneme string, so a G2P emitting a different
+number of characters picks a different voice row.
+
+### Session 2026-09-15 (twenty-fourth) — stage T5c: numbers, the tokenizer, and text in
+
+**Result: `go run ./cmd/tts -gpu -text 'In 2024 the team shipped 1,024
+kernels and spent $3.5 million, up 12%.'` speaks, and the phonemes it makes
+are character for character what misaki makes.** Four of T5c's five pieces are
+exact against their own dumped oracle; the fifth is the tokenizer, which
+stands in for spacy and is measured rather than assumed.
+
+    num2words        10115 integers x cardinal/ordinal/year, 11 decimals   0 wrong
+    get_number       1760 cases: 45 digit strings x 4 currencies x head x flags   0 wrong
+    subtokenize      67 word shapes   0 wrong
+    the word path    204 tokens, phonemes and rating   0 wrong   (T5b)
+    end to end       18 of 24 corpus sentences, 93.6% of phoneme words
+
+**All six sentences that differ, differ for one of the two reasons T5d
+names**: three need a homograph tagger (`read`, `record`, `present`, `object`,
+`live`) and three need an espeak fallback (`10:30`, `Kraftwerk`, four invented
+words). Nothing else is wrong, which is what makes the 18/24 a *statement*
+rather than a score.
+
+**Built:**
+
+- `g2p/number.go` — `num2words`' English: the cardinal join rules, the ordinal
+  rewrite of the last word, the year form and the digit-by-digit decimal.
+- `g2p/getnumber.go` — misaki's eight-branch `get_number`, the currency pairs
+  and `IsNumber`.
+- `g2p/subtoken.go` — the nine-alternative subtoken regex as a scanner, since
+  two of its alternatives are lookaheads RE2 cannot express.
+- `g2p/tokenize.go` — the tokenizer, `Retokenize`, the progressive-merge loop,
+  `resolve_tokens`' stress demotion, and `Phonemize`.
+- `reference/dump_g2p.py` grows three tables — `numbers.txt`,
+  `number_cases.txt`, `subtokens.txt` — and records `get_number` per token in
+  isolation the way T5b recorded `get_word`.
+- `cmd/tts -text`, which phonemizes and then speaks, warning about any token
+  the dictionary could not answer for.
+
+**Five things worth carrying forward:**
+
+1. **Dump the cross product, not the corpus.** The corpus reaches 21 number
+   tokens; `get_number` has eight branches keyed on digit count, a leading
+   zero, a decimal point, is_head and currency. 45 digit strings against every
+   combination of the other three is 1760 cases and costs nothing, and it is
+   the difference between "the tests pass" and "the function is right".
+2. **A table catches what reading does not.** The subtoken port looked correct
+   and split `3.50` into `3.5` and `0`: the regex `(?:\d?[,.]?\d)+` matches the
+   last digit of a run with *both* its optional parts empty, which a
+   hand-written loop does not do unless it tries the alternatives in the
+   engine's order. Three words in the table failed; nothing else would have
+   found it.
+3. **Only the tokenizer knows which hyphen is punctuation.** `well-known`
+   subtokenizes to `well | - | known`, and that hyphen is inside a word while
+   the period after `dog` is beside one — the same character class, opposite
+   treatment. Marking it at tokenization time is the fix; guessing later
+   splits the run and loses both the whole-word lookup and the stress rule.
+4. **Ask the dictionary whether a period belongs to the word.** It carries
+   `Dr.` as an entry, so `l.gold[chunk]` answers the abbreviation question
+   without a list to maintain. `U.S.A.` is the one pattern left over.
+5. **A currency symbol reaches forwards.** It is spent on the *last* CD token
+   of the run that follows, so `$3.5 million` is millions of dollars — which
+   only works if the scale words are tagged CD, as spacy tags them.
+
+**Tolerances.** String equality everywhere below the tokenizer. Above it, the
+measurement is reported and only the sentences that use nothing but the
+dictionary are asserted exact, because the tagger is knowingly an
+approximation and pretending otherwise would make the test lie.
+
+**Left on the table, deliberately.** T5d: a cgo binding to the libespeak-ng
+bundled in `espeakng_loader` plus misaki's 25-rule rewrite of its IPA, and a
+homograph tagger for the 69 words the survey named. The number to beat there
+is not spacy's accuracy but how often a most-frequent-tag table disagrees with
+it on those 69 words — which the existing survey can measure before anything
+is built.
+
+### Session 2026-09-15 (twenty-third) — stages T5a/T5b: the G2P oracle, and the 91% that is a dictionary
+
+**Result: `g2p.Lexicon` reproduces misaki's `get_word` on 204 of 204 tokens of
+the reference corpus, phonemes and confidence rating both — and the survey
+that decided what to build says a part-of-speech tagger is worth 1.74% of
+running-text tokens, so spacy stays out of the engine.**
+
+`cmd/tts` takes phonemes, not text, and that is the one thing between the
+text-to-speech vertical and an HTTP endpoint. The oracle has to be misaki,
+because that is what kokoro was trained on — but misaki runs spacy, and
+porting a neural tagger would have been larger than everything else in
+`SPEECH.md`. So T5a is a measurement before a line of Go: **how much of misaki
+is an algorithm and how much is a table.**
+
+    path                     tokens       share
+    gold dictionary           44229      81.64%
+    silver dictionary          3745       6.91%
+    the three suffix rules     1456       2.69%
+    resolved                              91.24%
+    unresolved                 4744       8.76%
+
+over 54174 tokens of this repository's own prose — real running English, and a
+hard case because a tenth of it is acronyms, so those are floors.
+
+**Built:**
+
+- `reference/convert_misaki.py` — exports `us_gold`, `us_silver` and the two
+  British dictionaries out of the misaki wheel as plain text, 183 k US entries
+  in 4.6 MB, checking the round trip entry by entry and refusing to run if a
+  key or value could be mistaken for a separator.
+- `reference/dump_g2p.py` — a 24-sentence corpus, each sentence labelled with
+  the branch it exercises, dumped token by token with its tag, its context and
+  **what `Lexicon.get_word` alone made of it**, plus the coverage survey. Two
+  self-checks: every sentence's tokens rejoin to its whole-string output
+  (0 of 24 disagree), and every phoneme produced is inside kokoro's own
+  vocabulary (0 outside).
+- `g2p/stress.go` — `applyStress` and `restress`, the vowel/consonant sets,
+  `Context` and the reverse walk that produces it.
+- `g2p/lexicon.go` — both dictionaries, `grow_dictionary`, `IsKnown`,
+  `lookup`, the proper-noun spelling path, the three suffix rules, the
+  function-word special cases and `Word`.
+- `g2p/lexicon_test.go` — six tests against the dump: the word path, the
+  rating, the context walk, the stress rules, the spelling path, and the
+  survey re-stated so the numbers are in test output rather than only in a
+  document.
+
+**Four things worth carrying forward:**
+
+1. **The tagger is worth 1.74%, and half of what looks like tagging is not.**
+   790 of 90201 gold entries are tag-conditioned; 671 actually differ by tag.
+   But misaki's `'None'` key is selected by `ctx.future_vowel is None` — by
+   whether a vowel follows, not by any tag — and that accounts for another
+   1.83% of tokens on its own. `that`, `this`, `by`, `has`, `be`, `would` and
+   `there` are stressed at the end of a phrase and unstressed in the middle.
+   What a tagger is really for is a short homograph list: `read`, `fragment`,
+   `inside`, `arithmetic` and the noun/verb `-ate` pairs, 69 distinct words in
+   54 k tokens.
+2. **A tag mapping to `null` is not `DEFAULT`.** 67 gold entries have one, and
+   it means *this* part of speech has no pronunciation, so the lookup falls
+   through to spelling the word out. The line format encodes it as an empty
+   value for exactly that reason, since a real pronunciation is never empty.
+3. **A stress mark is inserted, not prepended.** Promoting an unmarked `strɪŋ`
+   gives `strˈɪŋ`, because a mark sits immediately before its vowel; misaki
+   does it by giving the mark the fractional index `j - 0.5` and re-sorting,
+   which also makes it impossible for two marks to cross.
+4. **Measure the oracle's own decomposition, not just its output.** The dump
+   records `get_word` in isolation *and* replays the context each token saw —
+   misaki does not keep it, so the replay walks the finished tokens backwards
+   the way the main loop does. That turned an all-or-nothing port into a pure
+   function with 204 test cases, and caught the one thing a naive dump got
+   wrong: with an empty context, `will` comes out `wˈɪl` and it should be
+   `wɪl`.
+
+**Tolerances.** Exactness, not a tolerance: this is string equality on all 204
+word-path tokens and all 204 ratings. The other 88 tokens of the corpus are
+punctuation, numbers or the tokenizer's business and are counted, not
+asserted on. The dictionaries load in **63 ms** for 365 k grown entries.
+
+**Left on the table, deliberately.** T5c is the tokenizer (spacy's splitting,
+not its tagging — misaki subtokenizes hyphenated and case-mixed words and
+tries progressively shorter merges) and `num2words`. T5d is the espeak
+fallback, which turns out not to be a shell-out at all: there is no
+`espeak-ng` binary here, only the shared library bundled in `espeakng_loader`,
+so it is a cgo binding plus misaki's 25-rule rewrite of espeak's IPA into
+kokoro's alphabet.
+
+### Session 2026-09-15 (twenty-second) — stage T4c: the decoder, the tail, and the last readback
+
+**Result: the vocoder goes from 244 ms to 38 ms and an utterance from 7.28x
+real time to 12.90x. The decoder alone goes from 132 ms to 0.74 ms of GPU
+time, and nothing between its first block and the waveform crosses the bus.**
+The whole write-up, T4a and T4b folded in with it, is now
+[`research/t4-kokoro-vocoder.md`](research/t4-kokoro-vocoder.md).
+
+    stage          gpu    (T4b)    cpu (T3)
+    phoneme side  214ms    205ms      207ms   85% of the utterance
+    decoder         3ms    132ms      132ms
+    generator      13ms     62ms     3160ms
+    excitation     14ms     24ms       24ms   float64 on the host, staying there
+    tail            8ms     22ms       22ms
+    vocoder        38ms    244ms     3626ms
+    total         252ms    446ms     3833ms   12.90x real time
+
+**Built:**
+
+- `shaders/dit_gemm.comp` gains **`A_CONV=2`**, the dilated-convolution
+  addressing over a channel count that is not a power of two.
+- `kokoro/gpudec.go` — `GPUDecoder`, the five AdaIN blocks (514, 1090, 1024
+  and 512 channels) as 43 dispatches over four arenas, with the per-block
+  `torch.cat` as a row stride.
+- `kokoro/gpu.go` gains `tailWeights` — `conv_post`, the two nonlinearities
+  and the inverse transform on the last generator stage — and `sharedArena`,
+  one fp32 buffer laid out across the decoder and both stages before any of
+  them is built.
+- Six shaders: `kokoro_shortcut`, `kokoro_pool`, `kokoro_post`,
+  `kokoro_istft`, plus NPOT builds of `kokoro_stats` and three more
+  activation builds of `kokoro_act` (which was restructured so AFFINE, LEAKY,
+  SNAKE, REPEAT and NPOT compose instead of being mutually exclusive).
+- `audio.ISTFT.Window()`, so the device port builds the same overlap-add from
+  the same numbers rather than re-deriving the padding rule.
+- `cmd/tts` now prints the five-stage split above, which is what made each of
+  these decisions checkable.
+- `kokoro/gpudec_test.go` — five tests: per block against the dump, the
+  chain, the ladder, the dispatch profile, and the whole vocoder against both
+  the CPU path and the dump.
+
+**Four things worth carrying forward:**
+
+1. **An integer division in a K loop can usually be carried instead.** The
+   literal port of `A_CONV` to a non-power-of-two C is `K/C` and `K%C`, and
+   RDNA has no scalar integer divide, so that is ~10 VALU instructions inside
+   the hottest loop in the engine. Padding the row stride to a multiple of BK
+   makes a slab never straddle a tap, and then the tap offset and the column
+   inside it advance by a compare and a subtract per iteration. The inner
+   loop costs exactly what `A_CONV=1`'s does. Pad to **BK, not to a power of
+   two**: 1090 → 1152 is 5.7% more arithmetic, 1090 → 2048 is 88%.
+2. **A scalar between two objects belongs in a weight.** Three of them turned
+   up in one session — the generator's `1/NumKernels`, `conv1`'s bias (which
+   the following AdaIN removes identically), and the same `1/NumKernels`
+   again for the tail — and none cost a pass, because every consumer is
+   linear or positively homogeneous. The exception proves it: the `pool`'s
+   bias is *not* dropped, because it enters before a convolution whose zero
+   padding makes its contribution differ on the two boundary frames.
+3. **The readback was most of what remained, twice.** 38 ms for one
+   `[15601, 128]` and 14.4 for a `[2600, 256]`, at 154-219 MB/s against
+   29 GB/s of write. The tail removed the first; the shared arena removed the
+   second and a third. Measure a handoff before pricing a kernel — this is
+   the same lesson stage 3c, T4a and S8 each learned from a different
+   direction, and the fourth time it cost nothing to spot because
+   `cmd/tts`'s stage split was in place first.
+4. **An inverse transform wants to be a gather.** The reference scatters —
+   invert a frame, window it, accumulate — which at n_fft 20 and hop 5 means
+   four frames land on every sample. One thread per output *sample*, reading
+   the four frames that cover it and evaluating only the point of each
+   transform that reaches it, is one dispatch with no atomics and 44 FMAs.
+   S10's forward FFT can mirror it.
+
+**How it was measured.** `go run ./cmd/tts -gpu -reps 3`, the best of three,
+twice; the per-dispatch figures are GPU timestamps from
+`TestGPUDecoderProfile` (best of four). The ladder is `TestGPUDecoderLadder`,
+wall clock over the whole decoder, best of five after a warm submit —
+`reg32x32_w32` at 0.79 ms against `reg32x64_w32`'s 0.91, `reg32x128`'s 1.28
+and `reg64`'s 1.43. That is a *different* winner from the generator's, which
+is the point of running the ladder again: M of 130-260 by N of 512-1024
+cannot feed a 64-wide tile the way M in the thousands by N of 128 does.
+§6.2's wave32 result holds for a fifth set of shapes.
+
+**Tolerances.** Each decode block is within 3.0-3.4e-4 relative of the dump
+(bounded at 6e-3, looser than the generator's 3e-3 because K is 3456 rather
+than 384-2816). The whole vocoder is 59.1 dB from the CPU path — and **18.2
+dB from the reference dump, which is what the CPU path measures to three
+digits**. That last equality is the real check: 18.2 dB is T3's floor, set by
+the reference's own undefined excitation phases, so a tail that were wrong
+would move it and nothing could hide that.
+
+**Left on the table, deliberately.** The excitation is 14 ms of float64 on
+the host and stays there — its phase accumulator reaches 1.3e5 radians and
+fp16 cannot represent it. And the vocoder is no longer the problem: the
+phoneme side is 214 ms of a 252 ms utterance, 60% of it six bidirectional
+LSTMs at M = 1. That is S8's problem again and is T6.
 
 ### Session 2026-09-15 (twenty-first) — stage T4b: the upsamplers, and a stage that does not come back
 

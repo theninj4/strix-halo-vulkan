@@ -1,0 +1,62 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The `pool` of the one decoder block that doubles its frame count: a
+// *depthwise* transposed convolution, one tap group per channel, stride 2,
+// kernel 3, padding 1, output padding 1 — the one combination that takes T
+// frames to exactly 2T (SPEECH.md T4c).
+//
+// Depthwise means it is not a GEMM and does not want to be: each output
+// channel reads only its own input channel, so the arithmetic is three
+// multiplies a frame against a [T, C] tensor's worth of traffic. It is a
+// scalar pass, and because the stride is 2 the residue decides which taps
+// reach a frame at all:
+//
+//   j even   j = 2t + 1 - k  =>  k = 1,     one tap, from frame j/2
+//   j odd                        k = 0, 2,  two taps, from (j+1)/2 and (j-1)/2
+//
+// There is no bounds check because there is a border: frame T of the source
+// is a zero row the arena was allocated with, so the last output frame's
+// missing tap reads a zero that was already there — dit_gemm.comp's A_CONV
+// trick, one kernel over.
+//
+// The bias is applied here rather than dropped. The AdaIN that follows the
+// convolution this feeds would remove a per-channel constant exactly, which
+// is why `conv1`'s bias is not staged at all — but this one enters *before* a
+// convolution whose zero padding makes its contribution differ on the two
+// boundary frames, so it is not quite a constant and is kept.
+//
+//   pc.inOff   fp16 [T, lda] source, bordered
+//   pc.outOff  fp16 [2T, lda] destination, bordered
+//   pc.wOff    [C, 3] fp32 weights, tap fastest
+//   pc.bOff    [C] fp32 bias, or NO_W
+//   pc.dim     C
+//   pc.lda     the row stride of both
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    if (c >= pc.dim) {
+        return;
+    }
+    uint j = gl_WorkGroupID.y;
+    float v = 0.0;
+    if (pc.bOff != NO_W) {
+        v = wbuf[pc.bOff + c];
+    }
+    uint w = pc.wOff + c * 3u;
+    if ((j & 1u) == 0u) {
+        v += wbuf[w + 1u] * float(hact[pc.inOff + (j >> 1u) * pc.lda + c]);
+    } else {
+        v += wbuf[w] * float(hact[pc.inOff + ((j + 1u) >> 1u) * pc.lda + c]);
+        v += wbuf[w + 2u] * float(hact[pc.inOff + ((j - 1u) >> 1u) * pc.lda + c]);
+    }
+    hact[pc.outOff + j * pc.lda + c] = float16_t(v);
+}

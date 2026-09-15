@@ -1,17 +1,21 @@
 // Command tts synthesises speech with Kokoro-82M: phonemes in, a WAV out, on
 // the CPU reference (SPEECH.md stages T2-T3).
 //
-// It takes **phonemes, not text**. Grapheme-to-phoneme is stage T5 and lives
-// outside the model on purpose: the checkpoint's vocabulary is 178 IPA
+// It takes phonemes by default, and **text** with -text. Grapheme-to-phoneme
+// lives outside the model on purpose: the checkpoint's vocabulary is 178 IPA
 // symbols, and every language it supports needs a different front end to
 // reach them. `reference/dump_kokoro.py` records the phonemes misaki produces
-// for its test sentence, and -phonemes defaults to those.
+// for its test sentence, and -phonemes defaults to those; -text runs `g2p`,
+// which needs the lexicon `reference/convert_misaki.py` writes and, for words
+// outside it, libespeak-ng — without which those words are dropped with a
+// warning (SPEECH.md T5).
 //
 // The stage timings it prints are what T4 has to work with: ALBERT and the
 // recurrences are a fifth of a second between them and the vocoder is the
 // rest, which is the split between a latency-bound problem and a
 // bandwidth-bound one.
 //
+//	go run ./cmd/tts -gpu -text 'Hello there.' -o out.wav
 //	go run ./cmd/tts -gpu -o out.wav
 //	go run ./cmd/tts -voice bm_george -noise 1 -o out.wav
 //	go run ./cmd/tts -phonemes 'hɛlˈO wˈɜɹld.' -o out.wav
@@ -28,6 +32,7 @@ import (
 	"time"
 
 	"strix-halo-vulkan/audio"
+	"strix-halo-vulkan/g2p"
 	"strix-halo-vulkan/kokoro"
 	"strix-halo-vulkan/vk"
 )
@@ -40,6 +45,8 @@ func main() {
 	log.SetFlags(0)
 	dir := flag.String("model", "models/Kokoro-82M", "converted checkpoint directory")
 	phonemes := flag.String("phonemes", defaultPhonemes, "IPA phonemes to speak")
+	text := flag.String("text", "", "English text to speak; needs the lexicon in -lexicon (SPEECH.md T5)")
+	lexdir := flag.String("lexicon", "models/misaki", "misaki lexicon directory, from reference/convert_misaki.py")
 	voice := flag.String("voice", "af_heart", "voice pack name")
 	speed := flag.Float64("speed", 1, "duration divisor; >1 is faster and shorter")
 	noise := flag.Int64("noise", 0, "seed for the excitation noise; 0 leaves it off, which is what the reference dump used")
@@ -67,6 +74,27 @@ func main() {
 	}
 	if *noise != 0 {
 		model.SetExcitationNoise(*noise)
+	}
+
+	if *text != "" {
+		lex, err := g2p.Load(*lexdir, false)
+		if err != nil {
+			log.Fatalf("%v\n(run reference/convert_misaki.py to write it)", err)
+		}
+		if e, err := g2p.Open(false); err == nil {
+			defer e.Close()
+			lex.Fallback = e
+		} else {
+			fmt.Fprintf(os.Stderr, "warning: no espeak fallback (%v); "+
+				"words outside the dictionary will be dropped\n", err)
+		}
+		ps, unknown := lex.Phonemize(*text)
+		if unknown > 0 {
+			fmt.Fprintf(os.Stderr,
+				"warning: %d token(s) could not be pronounced and were dropped\n", unknown)
+		}
+		fmt.Printf("%q\n  -> %q\n\n", *text, ps)
+		*phonemes = ps
 	}
 
 	ids, dropped := model.Config.Phonemes(*phonemes)
@@ -103,7 +131,10 @@ func main() {
 
 	var prosody *kokoro.Prosody
 	var wav []float32
-	best := struct{ prosody, vocoder, total time.Duration }{}
+	best := struct {
+		prosody, vocoder, total          time.Duration
+		decoder, excitation, stage, tail time.Duration
+	}{}
 	for r := 0; r < *reps; r++ {
 		t := time.Now()
 		p, err := model.Prosody(ids, predStyle, float32(*speed))
@@ -112,13 +143,15 @@ func main() {
 		}
 		tp := time.Since(t)
 		t = time.Now()
-		samples, _, err := model.Vocoder.Apply(p.ASR, p.F0, p.Energy, decStyle)
+		samples, tr, err := model.Vocoder.Apply(p.ASR, p.F0, p.Energy, decStyle)
 		if err != nil {
 			log.Fatal(err)
 		}
 		tv := time.Since(t)
 		if r == 0 || tp+tv < best.total {
 			best.prosody, best.vocoder, best.total = tp, tv, tp+tv
+			best.decoder, best.excitation = tr.Decoder, tr.Generator.Excitation
+			best.stage, best.tail = tr.Generator.Stage, tr.Generator.Tail
 		}
 		prosody, wav = p, samples
 	}
@@ -127,10 +160,21 @@ func main() {
 	fmt.Printf("%q\n", *phonemes)
 	fmt.Printf("%s: %d phonemes -> %d tokens -> %d frames -> %d samples = %.3f s at %d Hz\n",
 		*voice, runes-dropped, len(ids), prosody.Frames, len(wav), seconds, model.Config.SamplingRate)
-	fmt.Printf("\n    stage      time\n")
-	fmt.Printf("    prosody  %6.0fms\n", ms(best.prosody))
-	fmt.Printf("    vocoder  %6.0fms\n", ms(best.vocoder))
-	fmt.Printf("    total    %6.0fms   %.2fx real time (load %.0fms)\n",
+	pt := prosody.Times
+	fmt.Printf("\n    stage         time\n")
+	fmt.Printf("    bert        %6.0fms\n", ms(pt.BERT))
+	fmt.Printf("    dur enc     %6.0fms\n", ms(pt.DurEncoder))
+	fmt.Printf("    durations   %6.0fms\n", ms(pt.Durations))
+	fmt.Printf("    prosody     %6.0fms\n", ms(pt.Prosody))
+	fmt.Printf("    text enc    %6.0fms\n", ms(pt.TextEncoder))
+	fmt.Printf("    expand      %6.0fms\n", ms(pt.Expand))
+	fmt.Printf("    phonemes    %6.0fms\n", ms(best.prosody))
+	fmt.Printf("    decoder     %6.0fms\n", ms(best.decoder))
+	fmt.Printf("    generator   %6.0fms\n", ms(best.stage))
+	fmt.Printf("    excitation  %6.0fms\n", ms(best.excitation))
+	fmt.Printf("    tail        %6.0fms\n", ms(best.tail))
+	fmt.Printf("    vocoder     %6.0fms\n", ms(best.vocoder))
+	fmt.Printf("    total       %6.0fms   %.2fx real time (load %.0fms)\n",
 		ms(best.total), seconds/best.total.Seconds(), ms(load))
 
 	if *out != "" {

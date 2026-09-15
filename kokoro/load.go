@@ -19,6 +19,10 @@ type Model struct {
 	Predictor   *Predictor
 	Vocoder     *Vocoder
 
+	// BERTGPU, when set, runs the twelve ALBERT layers on the device. It is
+	// nil by default: the CPU path is the reference and stays the reference.
+	BERTGPU *GPUAlbert
+
 	Voices              map[string][]float32 // [510*256] each, by name
 	voiceRows, voiceDim int
 }

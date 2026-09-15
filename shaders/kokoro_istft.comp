@@ -1,0 +1,84 @@
+#version 450
+
+// The inverse short-time Fourier transform, one thread per output *sample*
+// (SPEECH.md T4c).
+//
+// Written as a gather rather than as a transform followed by an overlap-add,
+// which is what makes it one dispatch with no atomics and no second pass. The
+// reference inverts each frame, windows it and accumulates it into a shared
+// buffer — a scatter, and a contended one, because at n_fft = 20 and hop = 5
+// four consecutive frames land on every sample. Turned around, sample i reads
+// the four frames that cover it and evaluates only the one point of each
+// frame's transform that reaches it:
+//
+//   x_t[n] = sum_b Re'[t,b] cos(2*pi*b*n/N) - Im'[t,b] sin(2*pi*b*n/N)
+//
+// with Re' and Im' already carrying the Hermitian factor of two and the 1/N
+// (kokoro_post.comp). So the twiddles are a [N, bins] table of 220 entries
+// that depends on nothing but the geometry, and the whole kernel is 44
+// multiply-adds and a divide.
+//
+// That divide is the transform. The analysis window has already been applied
+// once and the synthesis applies it again, so what makes the round trip exact
+// is dividing by the sum of the *squared* windows at each sample rather than
+// by their sum — accumulated in the same loop, since it has the same support.
+// Samples the window squares do not cover are left at zero rather than
+// divided by something near zero, which is torch's NOLA condition.
+//
+// This is a 20-point transform, and 20 is not a power of two — which is why
+// audio/ has a direct DFT at all. At this size a table beats any factoring.
+//
+//   pc.inOff   [frames, 2*bins] fp32, Re then Im
+//   pc.outOff  [samples] fp32
+//   pc.wOff    [N*bins] cos, [N*bins] sin, [N] window, [N] window squared
+//   pc.tokens  samples
+//   pc.dim     bins
+//   pc.aux0    n_fft
+//   pc.aux1    hop
+//   pc.aux2    frames
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens) {
+        return;
+    }
+    int nfft = int(pc.aux0);
+    int hop = int(pc.aux1);
+    int bins = int(pc.dim);
+    int frames = int(pc.aux2);
+
+    // center=True trims n_fft/2 from each end, so output sample i is index
+    // i + n_fft/2 of the untrimmed overlap-add.
+    int f = int(idx) + nfft / 2;
+    // Frame t covers indices [t*hop, t*hop + n_fft), so t runs over
+    // ceil((f - n_fft + 1)/hop) .. floor(f/hop), clamped to the run. The
+    // ceiling is written the usual way; where it would be negative the clamp
+    // takes over, so truncation toward zero costs nothing.
+    int tlo = max(0, (f - nfft + hop) / hop);
+    int thi = min(frames - 1, f / hop);
+
+    uint twCos = pc.wOff;
+    uint twSin = twCos + uint(nfft * bins);
+    uint win = twSin + uint(nfft * bins);
+    uint winSq = win + uint(nfft);
+
+    float acc = 0.0, env = 0.0;
+    for (int t = tlo; t <= thi; t++) {
+        int n = f - t * hop;
+        uint r = pc.inOff + uint(t * 2 * bins);
+        uint c0 = twCos + uint(n * bins);
+        uint s0 = twSin + uint(n * bins);
+        float s = 0.0;
+        for (int b = 0; b < bins; b++) {
+            s += act[r + uint(b)] * wbuf[c0 + uint(b)] -
+                act[r + uint(bins + b)] * wbuf[s0 + uint(b)];
+        }
+        acc += s * wbuf[win + uint(n)];
+        env += wbuf[winSq + uint(n)];
+    }
+    act[pc.outOff + idx] = env > 1e-11 ? acc / env : 0.0;
+}

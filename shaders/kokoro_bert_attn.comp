@@ -1,0 +1,111 @@
+#version 450
+
+// PL-BERT's self-attention, which is the one kernel in this model that is not
+// a GEMM or an elementwise pass (SPEECH.md T6).
+//
+// It is deliberately scalar rather than a matrix-core flash kernel, and the
+// arithmetic says why: twelve heads over fifty tokens at a head width of 64 is
+// **7.7 MFLOP a layer**, 0.1% of the 558 MFLOP the projections and the
+// feed-forward do. A WMMA attention would spend most of its tiles on padding —
+// a 50-token sequence is four 16-wide tiles with 14 rows of nothing — and
+// would cost a pack pass per operand to save a tenth of a millisecond over the
+// whole stack.
+//
+// One workgroup per (head, query). The scores for that query live in shared
+// memory, which bounds the sequence at MAX_TOKENS; the model's own limit is
+// `max_position_embeddings`, 512, and that is what this is sized for.
+//
+// Attention is full and unmasked: the model runs a single utterance with no
+// padding, so there is nothing to mask and the [T, T] score matrix is dense.
+//
+//   pc.inOff   Q, [T, dim] fp32
+//   pc.kOff    K, same
+//   pc.vOff    V, same
+//   pc.outOff  the context, same
+//   pc.tokens  T
+//   pc.dim     heads * headDim
+//   pc.heads, pc.headDim
+//   pc.scale   1/sqrt(headDim), as bits
+
+#include "dit_common.glsl"
+
+#define WG 256
+#define MAX_TOKENS 512
+
+layout(local_size_x = WG) in;
+
+shared float scores[MAX_TOKENS];
+shared float partial[WG];
+
+float reduceAdd(float v, uint t) {
+	partial[t] = v;
+	barrier();
+	for (uint step = WG / 2u; step > 0u; step >>= 1) {
+		if (t < step) {
+			partial[t] += partial[t + step];
+		}
+		barrier();
+	}
+	return partial[0];
+}
+
+float reduceMax(float v, uint t) {
+	partial[t] = v;
+	barrier();
+	for (uint step = WG / 2u; step > 0u; step >>= 1) {
+		if (t < step) {
+			partial[t] = max(partial[t], partial[t + step]);
+		}
+		barrier();
+	}
+	return partial[0];
+}
+
+void main() {
+	uint h = gl_WorkGroupID.x;
+	uint i = gl_WorkGroupID.y;
+	uint t = gl_LocalInvocationID.x;
+	uint T = min(pc.tokens, uint(MAX_TOKENS));
+	if (i >= T) {
+		return;
+	}
+	uint hd = pc.headDim;
+	uint off = h * hd;
+	uint qb = pc.inOff + i * pc.dim + off;
+	float sc = uintBitsToFloat(pc.scale);
+
+	float m = -1e30;
+	for (uint j = t; j < T; j += WG) {
+		uint kb = pc.kOff + j * pc.dim + off;
+		float d = 0.0;
+		for (uint c = 0u; c < hd; c++) {
+			d += act[qb + c] * act[kb + c];
+		}
+		d *= sc;
+		scores[j] = d;
+		m = max(m, d);
+	}
+	m = reduceMax(m, t);
+	barrier();
+
+	float s = 0.0;
+	for (uint j = t; j < T; j += WG) {
+		float e = exp(scores[j] - m);
+		scores[j] = e;
+		s += e;
+	}
+	s = reduceAdd(s, t);
+	barrier();
+
+	// The weighted sum, one channel per thread. headDim is 64 here, so three
+	// quarters of the workgroup idle — which is the right trade at this size:
+	// a layout that kept them busy would need a transpose the tensor does not
+	// otherwise want.
+	if (t < hd) {
+		float acc = 0.0;
+		for (uint j = 0u; j < T; j++) {
+			acc += scores[j] * act[pc.vOff + j * pc.dim + off + t];
+		}
+		act[pc.outOff + i * pc.dim + off + t] = acc / s;
+	}
+}

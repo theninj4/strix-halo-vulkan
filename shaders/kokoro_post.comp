@@ -1,0 +1,46 @@
+#version 450
+
+// `conv_post`'s epilogue: the bias, the two nonlinearities, and the Hermitian
+// bookkeeping the inverse transform would otherwise repeat once per output
+// sample (SPEECH.md T4c).
+//
+// The head does not predict a complex spectrum. It predicts a log magnitude
+// and something it takes the sine of — so the magnitude is positive by
+// construction and the phase is in [-1, 1] rather than wrapped, neither of
+// which an unconstrained real/imaginary pair would give. This pass is where
+// that becomes a rectangular (Re, Im) the overlap-add can accumulate with
+// nothing but multiplies and adds.
+//
+// Two constants are folded in here because they are per bin and the consumer
+// is per sample. 1/n_fft is the inverse transform's normalisation. The factor
+// of two on bins 1..n/2-1 is the Hermitian mirror: the full spectrum's bin
+// n-b is the conjugate of bin b, and the pair contributes
+// 2*(Re cos - Im sin) to a real signal, while DC and Nyquist appear once.
+// Folding both means kokoro_istft.comp has no transcendental in it at all,
+// and it evaluates 20 samples for every frame this pass evaluates once.
+//
+//   pc.inOff   [T, lda] fp32 conv_post output, N padded up to a tile
+//   pc.outOff  [T, 2*bins] fp32, Re then Im
+//   pc.wOff    [2*bins] conv_post's bias
+//   pc.dim     bins
+//   pc.lda     the input's row stride
+//   pc.aux0    n_fft
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.dim) {
+        return;
+    }
+    uint t = gl_WorkGroupID.y;
+    uint r = pc.inOff + t * pc.lda;
+    float m = exp(act[r + b] + wbuf[pc.wOff + b]);
+    float p = sin(act[r + pc.dim + b] + wbuf[pc.wOff + pc.dim + b]);
+    float k = (b == 0u || b + 1u == pc.dim) ? 1.0 : 2.0;
+    k /= float(pc.aux0);
+    act[pc.outOff + t * 2u * pc.dim + b] = k * m * cos(p);
+    act[pc.outOff + t * 2u * pc.dim + pc.dim + b] = k * m * sin(p);
+}

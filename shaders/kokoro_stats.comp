@@ -20,17 +20,50 @@
 // kokoro_affine.comp, which is what makes this parallel over a 15601-frame
 // tensor instead of one workgroup per channel.
 //
+// NPOT is the same reduction over a channel count that is neither a power of
+// two nor smaller than a workgroup -- kokoro's decoder normalises over 514,
+// 1090, 1024 and 512 channels (SPEECH.md T4c). There the layout above has
+// nothing to arrange: one workgroup of 256 threads is 256 *consecutive*
+// channels of one row already, which is as coalesced as the generator's
+// packing and needs no shared memory and no reduction at the end. The grid
+// gains a second dimension, one band of 256 channels per y.
+//
 //   pc.inOff   [T, C] fp32 activations
 //   pc.outOff  [chunks, 2C] fp32 partials: sums then sums of squares
 //   pc.tokens  T
-//   pc.dim     C, a power of two
+//   pc.dim     C, a power of two unless NPOT
 //   pc.aux0    frames per chunk
-//   pc.aux2    log2(C)
+//   pc.aux2    log2(C), unused when NPOT
 
 #include "dit_common.glsl"
 
+#ifndef NPOT
+#define NPOT 0
+#endif
+
 #define NTHREADS 256
 layout(local_size_x = NTHREADS) in;
+
+#if NPOT
+void main() {
+    uint C = pc.dim;
+    uint c = gl_WorkGroupID.y * NTHREADS + gl_LocalInvocationID.x;
+    if (c >= C) {
+        return;
+    }
+    uint t0 = gl_WorkGroupID.x * pc.aux0;
+    uint t1 = min(t0 + pc.aux0, pc.tokens);
+
+    float s = 0.0, q = 0.0;
+    for (uint t = t0; t < t1; t++) {
+        float v = act[pc.inOff + t * C + c];
+        s += v;
+        q += v * v;
+    }
+    act[pc.outOff + gl_WorkGroupID.x * 2u * C + c] = s;
+    act[pc.outOff + gl_WorkGroupID.x * 2u * C + C + c] = q;
+}
+#else
 
 shared float ssum[NTHREADS];
 shared float ssq[NTHREADS];
@@ -63,3 +96,4 @@ void main() {
         act[pc.outOff + gl_WorkGroupID.x * 2u * C + C + c] = q;
     }
 }
+#endif

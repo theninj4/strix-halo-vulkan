@@ -47,6 +47,16 @@ func NewISTFT(nFFT, hop int, window []float64, center bool) (*ISTFT, error) {
 // Bins is the number of non-redundant frequency bins the input carries.
 func (s *ISTFT) Bins() int { return s.NFFT/2 + 1 }
 
+// Window is the zero-padded analysis window, which is also the synthesis
+// window and the thing the envelope is the square of. It is returned so that
+// a device port can build the same overlap-add from the same numbers rather
+// than reconstructing the padding rule.
+func (s *ISTFT) Window() []float64 {
+	out := make([]float64, len(s.window))
+	copy(out, s.window)
+	return out
+}
+
 // Samples is how many samples a run of frames produces.
 func (s *ISTFT) Samples(frames int) int {
 	if frames <= 0 {
