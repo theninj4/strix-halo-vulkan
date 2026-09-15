@@ -67,6 +67,22 @@ type push struct {
 	KVOff, GatedOff, NormOff        uint32
 	ConvOff, ConvOutOff             uint32
 	GammaQOff, GammaCOff, Kern, Dil uint32
+
+	// The full-attention layer and the QSA indexer (gpu_attn.go). Named one
+	// field per tensor rather than folded onto the spares above, for the
+	// reason llm_common.glsl gives: this block has four norm gammas and five
+	// activation tensors that exist nowhere else in the vertical, and reading
+	// the indexer's key norm through a field called GammaOff is a class of
+	// wrong no tolerance catches. 51 uints is 204 bytes against the device's
+	// 256.
+	QKVOff, QOff, KOff, VOff, CtxOff  uint32
+	IdxKOff, IdxQOff                  uint32
+	ScoreOff, CellOff, RopeOff        uint32
+	GammaKOff, GammaIQOff, GammaIKOff uint32
+	Heads, KVHeads, HeadDim           uint32
+	NKV, Plane, LDCtx                 uint32
+	IdxHeads, IdxDim, Ratio, RotDims  uint32
+	AttnScale                         uint32
 }
 
 func (p push) bytes() []byte {

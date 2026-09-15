@@ -1940,9 +1940,14 @@ var KokoroGELU []byte
 // tokens BM=32 is 1.05 GB of weight traffic and BM=128 is 262 MB. That is the
 // whole shape of this dispatch, and the ladder exists to show it.
 
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -o llm_ple_kv_m2.spv llm_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -o llm_ple_kv_m4.spv llm_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -o llm_ple_kv_m8.spv llm_gemm.comp
+// MODE=2 is llm_gemm.comp with no epilogue at all, and it is the vertical's
+// ordinary projection kernel rather than this block's: the PLE key/value pair
+// was its first caller, the full-attention layer's fused QKV and its output
+// projection are the next two. The rungs differ only in BM.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -o llm_gemm_plain_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -o llm_gemm_plain_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -o llm_gemm_plain_m8.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_gate.spv llm_ple_gate.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_conv.spv llm_ple_conv.comp
 
@@ -1970,17 +1975,64 @@ var LLMHCUpM2 []byte
 //go:embed llm_hc_up_m4.spv
 var LLMHCUpM4 []byte
 
-//go:embed llm_ple_kv_m2.spv
-var LLMPLEKVM2 []byte
+//go:embed llm_gemm_plain_m2.spv
+var LLMGEMMPlainM2 []byte
 
-//go:embed llm_ple_kv_m4.spv
-var LLMPLEKVM4 []byte
+//go:embed llm_gemm_plain_m4.spv
+var LLMGEMMPlainM4 []byte
 
-//go:embed llm_ple_kv_m8.spv
-var LLMPLEKVM8 []byte
+//go:embed llm_gemm_plain_m8.spv
+var LLMGEMMPlainM8 []byte
 
 //go:embed llm_ple_gate.spv
 var LLMPLEGate []byte
 
 //go:embed llm_ple_conv.spv
 var LLMPLEConv []byte
+
+// The full-attention layer and the QSA indexer (LLM.md L2f): 12 of the 48
+// layers, and 5.64% of llama.cpp's prefill graph in 19 dispatches a layer.
+//
+// Five dispatches replace them, and the saving is all in what never gets
+// written. One fused projection produces the query, its gate, the key, the
+// value and both of the indexer's operands, because all six read the same
+// normalised residual — the same argument that put `inject` on the hyper-
+// connection block's down projection (L2a) and the value on the PLE block's
+// key. One staging pass does the per-head norm, the interleaved M-RoPE and the
+// fragment tiling for all three of q, k and v. The indexer's pool, norm and
+// rotate are one kernel over two addressings, and its score, bias, expansion
+// and mask are another. And the output gate — a SIGMOID, a MUL and a CONT in
+// the reference, over a [T, 6144] tensor — is folded into the attention
+// kernel's epilogue, which already holds the output tile for the softmax
+// divide.
+//
+// HEAD_DIM is 256 here against every other attention kernel in the repo at
+// 128, which doubles both the query fragments and the output accumulators a
+// wave holds across the key loop. That is why the ladder starts at QT=1: the
+// register file is what decides it (§2.7, §6.2), not arithmetic intensity,
+// which the DiT's ablation found inert.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_pack.spv llm_attn_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_idx.spv llm_attn_idx.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_score.spv llm_attn_score.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
+
+//go:embed llm_attn_pack.spv
+var LLMAttnPack []byte
+
+//go:embed llm_attn_idx.spv
+var LLMAttnIdx []byte
+
+//go:embed llm_attn_score.spv
+var LLMAttnScore []byte
+
+//go:embed llm_attn_qt1_kt2.spv
+var LLMAttnQT1KT2 []byte
+
+//go:embed llm_attn_qt1_kt4.spv
+var LLMAttnQT1KT4 []byte
+
+//go:embed llm_attn_qt2_kt4.spv
+var LLMAttnQT2KT4 []byte

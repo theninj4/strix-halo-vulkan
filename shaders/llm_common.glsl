@@ -69,6 +69,42 @@ layout(push_constant) uniform PC {
     uint gammaCOff;  // f32 conv norm, over the gated value
     uint kern;       // conv taps
     uint dil;        // conv dilation, which is the n-gram size
+
+    // The full-attention layer and the QSA indexer (llm_attn_pack.comp,
+    // llm_attn_idx.comp, llm_attn_score.comp, llm_attn_wmma.comp). Twelve of
+    // the 48 layers, and the only ones with a KV cache.
+    //
+    // Every tensor here is named for what it is rather than folded onto a
+    // spare field, for the reason the header gives: this block has four
+    // separate norm gammas and five activation tensors that exist nowhere
+    // else in the vertical, and a graph that reads the indexer's key norm
+    // through a field called `gammaOff` is wrong in a way no tolerance
+    // catches. 51 uints is 204 bytes against the device's 256.
+    uint qkvOff;     // f32 [T][gemmN]: the one fused projection's output --
+                     // query, gate, key, value, indexer query, indexer key
+    uint qOff;       // fp16 packed query planes, fragment tiles
+    uint kOff;       // fp16 packed key planes, same tiling as the query
+    uint vOff;       // fp16 packed value planes, each tile transposed
+    uint ctxOff;     // fp16 gated context: the output projection's A operand
+    uint idxKOff;    // fp16 [nBlocks][idxDim], pooled, normed and rotated
+    uint idxQOff;    // fp16 [T][idxHeads][idxDim]
+    uint scoreOff;   // f32 [T][nBlocks], the rectified per-block score
+    uint cellOff;    // f32 [T][nKV], biased, expanded and causally masked
+    uint ropeOff;    // f32 rotary table: [nKV][rot/2] cos, then the same sins
+    uint gammaKOff;  // f32 [headDim], the key's per-head norm
+    uint gammaIQOff; // f32 [idxDim], the indexer query's
+    uint gammaIKOff; // f32 [idxDim], the indexer key's
+    uint heads;      // query heads
+    uint kvHeads;    // key/value heads; heads/kvHeads share one cache head
+    uint headDim;
+    uint nKV;        // cache cells -- the reference's padded count, not T
+    uint plane;      // padded token rows per packed head plane
+    uint ldCtx;      // the context's row stride in halves, gateWidth + pad
+    uint idxHeads;
+    uint idxDim;
+    uint ratio;      // compress_ratio: cells pooled into one indexer block
+    uint rotDims;    // n_rot -- 64 of the 256 head dims rotate
+    uint attnScale;  // float bits: 1/sqrt(headDim) * log2(e), folded into q
 } pc;
 
 const uint NO_W = 0xffffffffu;

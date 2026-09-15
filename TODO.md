@@ -58,8 +58,8 @@ is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
 stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
 image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
-(text-generation) vertical and is **the current work**: L0, L1, L2a-L2e are
-closed. The checkpoint is downloaded (114 GB in 18 minutes,
+(text-generation) vertical and is **the current work**: L0, L1 and the whole of
+L2 (L2a-L2f) are closed. The checkpoint is downloaded (114 GB in 18 minutes,
 `models/Qwen3.8-Flash-Next-GGUF/`), llama.cpp runs it, and **the number to beat
 is `pp2048 391.42` / `tg128 25.15` tok/s** — decode at 65.8% of the bus, and
 prefill 5x below what this repo's own microbenchmarks had been added up into.
@@ -85,14 +85,24 @@ layer and the QSA indexer** — every dumped tensor of layer 3 matches, four
 stages compose to 9.75e-06 rms, and two more oracle numerics fell out: the
 indexer's key cache is fp16 (2072x) and **an F32 x F32 matmul runs on the fp16
 matrix cores** (69x), which means the fp16 kernels this vertical already ships
-concede nothing the reference keeps. The Go
+concede nothing the reference keeps. **L2f then put that layer on the device**:
+six dispatches where the reference has nineteen, **66.3 ms of its 512-token
+graph against 27.6 — 2.40x, or 1.60x once llama.cpp's flash kernel is repriced
+at equal work** — by fusing six of its matrices into one `[13952, 2560]`
+projection, the two norms, the two ropes and the fragment tiling into one pass,
+and the output gate into the attention epilogue. It also found the same kernel
+wanting **opposite BM schedules on two weights that differ only in falling
+either side of the 32 MiB MALL**. Two of the three dense blocks are now on the
+device, and between them they take **25.1% of llama.cpp's prefill graph down to
+7.0%**. The Go
 side reads the
 checkpoint: `gguf/` (1224/1224 tensors against the Python inventory), five
 dequant paths bit-exact against ggml, and a tokenizer exact against
 `llama-tokenize`. The plan behind it is unchanged — run the stock quant first
 (llama.cpp is the oracle), then re-quantise, because **76% of the bytes read
 per token are dense** and the stock Q8_0 dense allocation costs 1.7x on a
-bus-bound machine. Task list L0–L9; **L2 continues with the GPU port of that layer**. All three files are rewritten each
+bus-bound machine. Task list L0–L9; **L3, the gated DeltaNet, is next — three quarters of the
+layers and the only piece with no reference implementation to check against**. All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -863,6 +873,70 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (thirty-sixth) — stage L2f: the attention layer on the device, six dispatches against nineteen
+
+**Result: the full-attention layer runs on the GPU in six dispatches where
+llama.cpp's graph spends nineteen, and 66.3 ms of its 512-token prefill graph
+becomes 27.6 — 2.40x, or 1.60x once the one row that is not like for like is
+repriced.** Every tensor agrees: the fused projection's six column ranges to
+1.7e-04 rms, the indexer's pooled key to 3.1e-04, its score to **3.8e-07
+relative**, the cell mask exactly, and the layer's output to **5.9e-05 against
+the f32 model — 19.3x nearer it than llama.cpp is**.
+[Write-up](research/l2f-attention-gpu.md) · `results/l2f_attn.csv` ·
+`LLM.md` rewritten.
+
+**1. Six of the reference's matrices are one.** The query, its gate, the key,
+the value and both indexer projections read the same normalised residual, so
+they are one `[13952, 2560]` weight and one matmul — L2a's argument for
+`inject` and L2d's for the PLE value, at the largest scale in the model. The
+per-head norm, the interleaved M-RoPE and the fragment tiling for q, k and v
+are then one dispatch over a (token tile, plane) grid, because all three are
+column ranges of that output ending in the same layout.
+
+**2. The output gate folds into the attention epilogue.** `attn_q` is
+[2560, 12288] — each head's 256 query dims followed by 256 gate dims — and the
+epilogue already holds the output tile in LDS for the softmax divide, so the
+gate costs one read of the projection's own fp32 row. A `SIGMOID`, a `MUL`, a
+`CONT` and a `[512, 6144]` round trip through DRAM, deleted.
+`TestAttnGPUGateIsFused` is the control, because the ungated output is a
+plausible tensor of the right shape.
+
+**3. One row is not like for like, and saying so needs a number.** llama.cpp's
+flash kernel issues the whole [512, 2048] rectangle its cache defines — ggml's
+own FLOP count says so — where ours walks the causal triangle of a 512-token
+prefill. On rate the two kernels are **18.9 TFLOP/s against 12.3, 1.54x**, and
+repricing that row makes the layer 1.60x rather than 2.40x. The selection
+llama.cpp also runs (TOP_K and its GET_ROWS, 2.4 ms) is left out of the
+comparison entirely, and so is every elementwise line this block shares.
+
+**4. The same kernel wants opposite BM schedules on two weights.** The fused
+projection's B is 71.4 MB, 2.2x the MALL, so it is read M/BM times and the
+widest row block wins everywhere above 64 tokens, by 3.2x at 2048. The output
+projection's B is 31.5 MB and **fits**, and there reuse buys nothing while
+occupancy does: at 64 tokens BM=128 is the worst rung by 2.1x, at 512 BM=64
+wins, and only at 1024 does BM=128 win back. Same kernel, same arithmetic,
+inverted schedule, decided by which side of one cache the weight falls on.
+Nothing else in the repo has been checked against that boundary.
+
+**5. And the attention ladder ends one rung narrower than every other here.**
+qt1_kt2 170 us, qt1_kt4 223, qt2_kt4 241, monotonic in how much a wave holds
+live. §3.3's conclusion is unchanged — intensity is inert, the register file
+decides — headDim 256 against the DiT's 128 just makes it decide sooner.
+
+**Reproducibility.** Two separate runs of the same plans — the auto-schedule
+sweep and the winning rows of the 27-plan ladder, in different processes —
+agree on the per-layer total to **1.008x median** (1.003-1.012x) over the five
+lengths from 128 to 2048. A 1.01x gap between two rungs is inside that; the
+1.32-3.2x spreads the schedules are cut on are not.
+
+**What is open.** The *selection*: `top_k + ratio - 1` is 2051 against a
+256-cell cache, so the indexer names every cell and the sparse path is
+bit-identical to the dense one; the gather has no kernel and no test until
+there is a 4k dump, which is L4. The indexer's score is the one line we lose
+on (0.8 ms against 0.7), a scalar kernel at 4.1 TFLOP/s and an obvious
+cooperative-matrix rewrite worth 0.07% of a graph. And the rotary table wants a
+row per cache cell, which is right for prefill and 67 MB at full context.
 
 ### Session 2026-09-15 (thirty-fifth) — stage L2e: the attention layer, and two more things the oracle does
 

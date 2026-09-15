@@ -1,0 +1,191 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The full-attention layer's staging pass: per-head RMS norm, the interleaved
+// M-RoPE and the fragment tiling the WMMA kernel loads, for the query, the key
+// and the value, in **one dispatch**.
+//
+// llama.cpp spends RMS_NORM_MUL(256,24,T) + RMS_NORM_MUL(256,2,T) + two ROPEs
+// + the CPYs into the cache on the same thing, five lines of its graph. Here
+// they are one, because all three tensors are column ranges of the same fused
+// projection (llm_attn_qkv, the plain arm of llm_gemm.comp) and all three end
+// in the same layout — so the grid is simply "one (token tile, plane)" and the
+// plane index says which of the three this workgroup is.
+//
+//	plane < heads                   query head p        norm, rope, scale
+//	plane < heads + kvHeads         key head p-heads    norm, rope
+//	otherwise                       value head          neither
+//
+// The query's *gate* is the other half of each of its heads and is not touched
+// here at all: it is consumed by the attention kernel's epilogue straight out
+// of the fp32 projection output, which is the fusion that removes llama.cpp's
+// SIGMOID + MUL + CONT.
+//
+// Three details are the reference's rather than a choice, and each is a thing
+// a transcription gets wrong without producing anything obviously broken:
+//
+//  1. **The norm is per head, over headDim, with one gamma shared by every
+//     head** — `build_norm` on a [headDim, nHead, T] tensor reduces over ne[0]
+//     alone, exactly as the hyper-connection block's grouped norm does over
+//     its streams. Reducing over the 6144-wide row would be plausible and
+//     wrong.
+//  2. **The rotary turns 64 of the 256 head dims and copies 192.** n_rot is
+//     not the head dim here. Reading it as one is the mistake
+//     `TestRoPEMultiRotatesOnlyNRot` exists for.
+//  3. **The pairing is NeoX**: dim i against i + n_rot/2, not i against i+1.
+//
+// The angles come from a host-built table rather than a `pow` per lane. The
+// CPU reference walks `theta *= base^(-2/rot)` in float64 and llama.cpp
+// evaluates `powf` in float32; neither is reproducible from a float32 `pow`
+// here, and at a long context the absolute angle error is what would show. The
+// table is [nKV][rot/2] cosines followed by the same sines, fp32, and a block
+// position indexes it exactly as a token position does — which is what lets
+// the indexer's pooled keys (llm_attn_idx.comp) share it.
+//
+// The tiling is dit_pack_f16.comp's and the argument for it is §5.1b's: a
+// 16x16 fp16 fragment read out of a naturally strided matrix puts sixteen
+// 32-byte runs in one instruction, an eighth of the bus, and storing the
+// fragments *as fragments* is the difference between 1.56x and the order of
+// magnitude the matrix cores are worth. Tile (t, c) of a head — token rows
+// 16t.., component columns 16c.. — is 512 contiguous bytes. The query and the
+// key share one mode, because the reduction axis of q.k^T is the component for
+// both operands; the value is stored transposed, because the reduction axis of
+// p.v is the token.
+//
+// The softmax scale folds into the query here, 1/sqrt(headDim) * log2(e), so
+// the attention kernel's exponential is `exp2` and not `exp`.
+
+#include "llm_common.glsl"
+
+#define TILE 16
+#ifndef HEAD_DIM
+#define HEAD_DIM 256
+#endif
+#define HDT (HEAD_DIM / TILE)
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+// 16 tokens x headDim of the one head this workgroup owns: the norm's
+// reduction, the rotary and the transpose all happen in here, so the tensor
+// crosses DRAM once each way however many passes the arithmetic takes.
+shared float rows[TILE * HEAD_DIM];
+// Sixteen partial sums per token row, one per lane group.
+shared float part[TILE * TILE];
+
+void main() {
+    uint tt = gl_WorkGroupID.x;      // token tile
+    uint p = gl_WorkGroupID.y;       // which plane: query, key or value head
+    uint tid = gl_LocalInvocationID.x;
+    uint tok0 = tt * TILE;
+
+    uint qWidth = pc.heads * 2u * pc.headDim;
+    uint kvWidth = pc.kvHeads * pc.headDim;
+
+    uint head, srcCol, gamma, outOff;
+    bool rot;
+    uint mode;                       // 0 natural tiles, 1 transposed
+    float scale = 1.0;
+    if (p < pc.heads) {
+        head = p;
+        srcCol = head * 2u * pc.headDim;   // the query half of this head
+        gamma = pc.gammaOff;
+        outOff = pc.qOff;
+        rot = true;
+        mode = 0u;
+        scale = uintBitsToFloat(pc.attnScale);
+    } else if (p < pc.heads + pc.kvHeads) {
+        head = p - pc.heads;
+        srcCol = qWidth + head * pc.headDim;
+        gamma = pc.gammaKOff;
+        outOff = pc.kOff;
+        rot = true;
+        mode = 0u;
+    } else {
+        head = p - pc.heads - pc.kvHeads;
+        srcCol = qWidth + kvWidth + head * pc.headDim;
+        gamma = NO_W;
+        outOff = pc.vOff;
+        rot = false;
+        mode = 1u;
+    }
+
+    // Coalesced in: consecutive lanes read consecutive components of one
+    // token. Rows past the prompt are zeroed rather than skipped — the
+    // attention kernel reads the whole plane, and a key that does not exist
+    // has to score something finite.
+    for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
+        uint m = i / HEAD_DIM, d = i % HEAD_DIM;
+        uint token = tok0 + m;
+        rows[i] = (token < pc.tokens)
+            ? act[pc.qkvOff + token * pc.gemmN + srcCol + d]
+            : 0.0;
+    }
+    barrier();
+
+    if (gamma != NO_W) {
+        // Sixteen lanes per token row, each summing HEAD_DIM/16 squares.
+        uint m = tid / TILE, lane = tid % TILE;
+        float s = 0.0;
+        for (uint d = lane; d < HEAD_DIM; d += TILE) {
+            float v = rows[m * HEAD_DIM + d];
+            s += v * v;
+        }
+        part[tid] = s;
+        barrier();
+        for (uint stride = TILE / 2u; stride > 0u; stride >>= 1u) {
+            if (lane < stride) {
+                part[tid] += part[tid + stride];
+            }
+            barrier();
+        }
+        // 1.0/sqrt rather than inversesqrt: ggml computes 1.0f/sqrtf(mean+eps)
+        // and these tensors are compared against its output.
+        float inv = 1.0 / sqrt(part[m * TILE] / float(HEAD_DIM) + uintBitsToFloat(pc.eps));
+        for (uint d = lane; d < HEAD_DIM; d += TILE) {
+            rows[m * HEAD_DIM + d] *= inv * wbuf[gamma + d];
+        }
+        barrier();
+    }
+
+    if (rot) {
+        // NeoX pairing over the first n_rot dims, angles from the table. The
+        // 192 dims past n_rot are already in place and are not read.
+        uint rotHalf = pc.rotDims / 2u;
+        uint pairs = TILE * rotHalf;
+        uint sinTab = pc.ropeOff + pc.nKV * rotHalf;
+        for (uint i = tid; i < pairs; i += WG) {
+            uint m = i / rotHalf, j = i % rotHalf;
+            uint pos = tok0 + m;
+            if (pos >= pc.nKV) {
+                continue;            // a pad row: its rotation is unobservable
+            }
+            float c = wbuf[pc.ropeOff + pos * rotHalf + j];
+            float s = wbuf[sinTab + pos * rotHalf + j];
+            uint b = m * HEAD_DIM + j;
+            float lo = rows[b], hi = rows[b + rotHalf];
+            rows[b] = lo * c - hi * s;
+            rows[b + rotHalf] = lo * s + hi * c;
+        }
+        barrier();
+    }
+
+    // Coalesced out: consecutive lanes write consecutive halves of one tile.
+    uint base = outOff + (head * (pc.plane / TILE) + tt) * (HDT * TILE * TILE);
+    for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
+        uint c = o / (TILE * TILE);
+        uint rem = o % (TILE * TILE);
+        uint m, d;
+        if (mode == 0u) {
+            m = rem / TILE;              // (token, component)
+            d = c * TILE + rem % TILE;
+        } else {
+            m = rem % TILE;              // transposed: (component, token)
+            d = c * TILE + rem / TILE;
+        }
+        hact[base + o] = float16_t(rows[m * HEAD_DIM + d] * scale);
+    }
+}

@@ -1,0 +1,115 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The QSA indexer's score, its bias, its expansion to cells and the causal
+// mask — one dispatch, one workgroup per token, for llama.cpp's MUL_MAT f32 +
+// RELU + SUM_ROWS + the adds and the mask around them.
+//
+// The scorer is not attention and the difference is the rectifier. Each of the
+// four heads dots its 128-wide query against a block's pooled key and the
+// **positive** parts are summed: a head that disagrees contributes nothing
+// rather than cancelling a head that agrees, which is DeepSeek's lightning
+// indexer and is why there is no softmax anywhere in here.
+//
+// **Both operands are F32 tensors and the reference still evaluates this in
+// fp16** (research/l2e-attention.md): computing it in f32 gives 3.52e-03 rms
+// against llama.cpp, computing it in *float64* gives the same 3.52e-03 — so it
+// is not precision on our side — and rounding both operands to halves gives
+// 5.11e-05. The backend is putting an f32 matmul on the fp16 matrix cores. Our
+// operands arrive as halves from llm_attn_idx.comp, so this kernel is that
+// arithmetic rather than a model of it, and the fp16 the whole vertical
+// computes in concedes nothing the reference keeps.
+//
+// The bias is the part that cannot be inferred from the graph.
+//
+//	a block past the last whole one      -inf, it does not exist
+//	a block at or after this token's
+//	  incomplete tail                    1e9, "always visible"
+//	the spare block that collects every
+//	  unpooled cell                      1e9
+//	anything else                        0
+//
+// 1e9 and not an infinity, so that it can never meet the mask's -inf and make
+// a NaN. And the expansion to cells routes every cell past the last whole
+// block to that one spare block, which is what makes the incomplete tail
+// visible without giving it a score.
+//
+// What this kernel does **not** do is the selection. `top_k + ratio - 1` is
+// 2051 against a 256-cell cache, so it names every cell and is bit-identical
+// to not selecting at all — and llama.cpp's own TOP_K turns out to be a
+// selection and not a sort, returning the identity permutation here. Neither
+// the width nor the order is observable until the context is longer than
+// top_k, so the selection is L4's, with a dump to check it against; the
+// attention kernel beside this one runs dense causal, which at this width is
+// the same computation.
+
+#include "llm_common.glsl"
+
+#ifndef IDX_DIM
+#define IDX_DIM 128
+#endif
+#ifndef IDX_HEADS
+#define IDX_HEADS 4
+#endif
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+// This token's queries, read once and then hit by every block.
+shared float16_t qs[IDX_HEADS * IDX_DIM];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
+    uint nBid = pc.tokens / pc.ratio;
+    uint deadBid = (nBid >= nBlocks) ? nBlocks - 1u : nBid;
+
+    for (uint i = tid; i < IDX_HEADS * IDX_DIM; i += WG) {
+        qs[i] = hact[pc.idxQOff + t * IDX_HEADS * IDX_DIM + i];
+    }
+    barrier();
+
+    for (uint b = tid; b < nBlocks; b += WG) {
+        uint kb = pc.idxKOff + b * IDX_DIM;
+        float s = 0.0;
+        [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
+            float d = 0.0;
+            for (uint j = 0u; j < IDX_DIM; j++) {
+                d += float(qs[h * IDX_DIM + j]) * float(hact[kb + j]);
+            }
+            s += max(d, 0.0);
+        }
+        act[pc.scoreOff + t * nBlocks + b] = s;
+    }
+    memoryBarrierBuffer();
+    barrier();
+
+    // The tail is every cell at or after the last whole block this token can
+    // see; `(t+1)/ratio*ratio` is where it starts.
+    uint tailStart = (t + 1u) / pc.ratio * pc.ratio;
+    for (uint j = tid; j < pc.nKV; j += WG) {
+        float v;
+        if (j > t || j >= pc.tokens) {
+            v = -1.0 / 0.0;              // the causal mask, and every empty cell
+        } else {
+            uint blk = (j < nBid * pc.ratio) ? j / pc.ratio : deadBid;
+            float bias;
+            if (blk >= nBid) {
+                bias = (blk == deadBid && nBid < nBlocks) ? 1e9 : -1.0 / 0.0;
+            } else if (blk * pc.ratio >= tailStart) {
+                bias = 1e9;
+            } else {
+                bias = 0.0;
+            }
+            v = act[pc.scoreOff + t * nBlocks + blk] + bias;
+        }
+        act[pc.cellOff + t * pc.nKV + j] = v;
+    }
+}

@@ -1,0 +1,887 @@
+package llm
+
+// The full-attention layer on the device: LLM.md L2f, and the GPU half of the
+// reference L2e built in attn.go.
+//
+// Twelve of the 48 layers are this one. L2a priced the nameable lines of them
+// at **5.64% of llama.cpp's 512-token prefill graph in 228 dispatches** — 19 a
+// layer — spread over five projections, four RMS norms, four ropes, the flash
+// attention, the top-k and the gate:
+//
+//	MUL_MAT q8_0 m=12288 k=2560   12   20384 us   query and gate
+//	MUL_MAT q8_0 m=512   k=2560   24    2780      key, value
+//	MUL_MAT bf16 m=512   k=2560   12    3491      indexer query
+//	MUL_MAT bf16 m=128   k=2560   12    1536      indexer key
+//	MUL_MAT q8_0 m=2560  k=6144   12    8559      output (12 of that line's 48)
+//	RMS_NORM_MUL (256,24) (256,2) 24    2197      query, key
+//	RMS_NORM_MUL (128,4)  (128,T) 24     358      indexer query, indexer key
+//	ROPE                          48    1135      all four of them
+//	MUL_MAT f32 m=512 n=2048 k=128 12     460      the indexer score
+//	RELU                          12     269      its rectifier
+//	FLASH_ATTN_EXT                12   25180
+//	TOP_K, TOPK_QSA GET_ROWS      24    2401
+//
+// Five dispatches replace those nineteen, and every one of the fusions is the
+// same argument L2a made for `inject` and L2d for the PLE block's value: two
+// matmuls that read the same activation are one matmul with more columns.
+//
+//	qkv    xn -> query, gate, key, value, indexer query, indexer key
+//	pack   per-head norm + IMRoPE + the fragment tiling, for q, k and v
+//	idx    the indexer's pooled key and its query: pool, norm, rope, fp16
+//	score  the rectified block score, its bias, the cells and the mask
+//	attn   causal GQA on the matrix cores, with the output gate in its epilogue
+//	out    the output projection                     (the plain GEMM again)
+//
+// Two tensors never exist, which is where the time goes. The **gate** is
+// [T, 6144] — llama.cpp materialises sigmoid(gate), multiplies, and copies the
+// product to make it contiguous, three lines and two round trips — and here it
+// is one read inside the attention kernel's epilogue, which already holds the
+// output tile for the softmax divide. And the **fused projection's six
+// outputs** are one [13952, 2560] weight instead of five matrices, which at
+// 512 tokens turns five dispatches reading 71 MB between them into one
+// dispatch reading 71 MB once.
+//
+// What is *not* here is the selection. `top_k + ratio - 1` is 2051 against a
+// 256-cell cache, so the indexer names every cell and the sparse path is
+// bit-identical to the dense causal one (research/l2e-attention.md); the score
+// is computed and checked, and L4 is where it starts to bite.
+
+import (
+	"fmt"
+	"math"
+	"time"
+	"unsafe"
+
+	"strix-halo-vulkan/safetensors"
+	"strix-halo-vulkan/shaders"
+	"strix-halo-vulkan/vk"
+)
+
+// attnBN is the compiled column block of the plain GEMM arm, which both
+// projections here run on.
+const attnBN = 64
+
+// AttnKernel names one build of shaders/llm_attn_wmma.comp, by its tile.
+type AttnKernel string
+
+const (
+	AttnQT1KT2 AttnKernel = "qt1_kt2"
+	AttnQT1KT4 AttnKernel = "qt1_kt4"
+	AttnQT2KT4 AttnKernel = "qt2_kt4"
+)
+
+type attnVariant struct {
+	name       AttnKernel
+	spirv      []byte
+	qt, ktil   int
+	rows, keys int
+}
+
+var attnVariants = []attnVariant{
+	{AttnQT1KT2, shaders.LLMAttnQT1KT2, 1, 2, 16, 32},
+	{AttnQT1KT4, shaders.LLMAttnQT1KT4, 1, 4, 16, 64},
+	{AttnQT2KT4, shaders.LLMAttnQT2KT4, 2, 4, 32, 64},
+}
+
+// AttnKernels lists the rungs, narrowest first.
+func AttnKernels() []AttnKernel { return []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT2KT4} }
+
+// DefaultAttnKernel is the measured winner, and the ladder turned over from
+// where every other attention kernel in this repo sits.
+//
+// At 512 tokens, per layer: qt1_kt2 **167 us**, qt1_kt4 219, qt2_kt4 241 —
+// 19.3, 14.7 and 13.3 TFLOP/s, monotonic in how much a wave holds live. Both
+// of the DiT's and the text encoder's ladders end at qt1_kt4 or wider; this
+// one ends one rung narrower because headDim is 256 and not 128, so a wave
+// already carries 16 query fragments and 16 output accumulators across the key
+// loop before KTIL adds a score accumulator per key tile. Arithmetic intensity
+// is inert here exactly as §3.3 found it — the register file decides, and at
+// this head dim it decides sooner.
+func DefaultAttnKernel() AttnKernel { return AttnQT1KT2 }
+
+func attnVariantFor(k AttnKernel) (attnVariant, bool) {
+	for _, v := range attnVariants {
+		if v.name == k {
+			return v, true
+		}
+	}
+	return attnVariant{}, false
+}
+
+// GEMMKernel names one build of the plain arm of llm_gemm.comp, by its row
+// block. Both of this layer's projections read a B far larger than the MALL —
+// the fused QKV weight is 71.4 MB and the output projection 31.5 — so the rung
+// is chosen against the weight, exactly as the PLE block's is: a workgroup
+// carrying BM token rows reads all of B M/BM times.
+type GEMMKernel string
+
+const (
+	GEMMM2 GEMMKernel = "gemm_m2"
+	GEMMM4 GEMMKernel = "gemm_m4"
+	GEMMM8 GEMMKernel = "gemm_m8"
+)
+
+type gemmVariant struct {
+	name  GEMMKernel
+	spirv []byte
+	bm    int
+}
+
+var gemmVariants = []gemmVariant{
+	{GEMMM2, shaders.LLMGEMMPlainM2, 32},
+	{GEMMM4, shaders.LLMGEMMPlainM4, 64},
+	{GEMMM8, shaders.LLMGEMMPlainM8, 128},
+}
+
+// GEMMKernels lists the rungs, narrowest first.
+func GEMMKernels() []GEMMKernel { return []GEMMKernel{GEMMM2, GEMMM4, GEMMM8} }
+
+// GEMMKernelFor is the rung for the *fused projection*, whose B is 71.4 MB —
+// 2.2x the MALL — so it is chosen against the weight exactly as L2d's is: a
+// workgroup carrying BM token rows reads all of B M/BM times, and that is the
+// whole shape of this dispatch. Measured, us per layer, BM 32 / 64 / 128:
+//
+//	T =   64    497 /  413 /  452      64 rows do not fill a BM of 128
+//	T =  128    917 /  529 /  452
+//	T =  512   3118 / 2003 / 1520
+//	T = 2048  19060 / 9570 / 6027      a 3.2x spread on identical arithmetic
+func GEMMKernelFor(tokens int) GEMMKernel {
+	if tokens <= 64 {
+		return GEMMM4
+	}
+	return GEMMM8
+}
+
+// OutGEMMKernelFor is the rung for the *output projection*, and it is a
+// different one at every length — which is the point of having two.
+//
+// Its B is 31.5 MB, just **inside** the 32 MiB MALL where the fused
+// projection's is 2.2x past it, and the two ladders separate on exactly that.
+// Measured, us per layer, BM 32 / 64 / 128:
+//
+//	T =   64    138 /  170 /  286      the widest rung is 2.1x the narrowest
+//	T =  128    194 /  205 /  285
+//	T =  256    265 /  306 /  316
+//	T =  512    507 /  458 /  519      the middle rung, and only here
+//	T = 1024   1035 /  965 /  858
+//	T = 2048   2142 / 1807 / 1623      now the widest, 1.32x the narrowest
+//
+// So the schedule inverts across the sweep: at 64 tokens BM=128 is the worst
+// rung by 2.1x and at 2048 it is the best by 1.32x, on the same kernel and the
+// same arithmetic. While B fits the MALL, reading it fewer times buys nothing
+// and the occupancy a narrow row block leaves is the whole story; once M is
+// large enough that the *activation* traffic dominates, the wide rung wins
+// back. The fused projection never has the first regime because its B never
+// fits, which is why one schedule could not serve both.
+func OutGEMMKernelFor(tokens int) GEMMKernel {
+	switch {
+	case tokens <= 256:
+		return GEMMM2
+	case tokens <= 512:
+		return GEMMM4
+	default:
+		return GEMMM8
+	}
+}
+
+func gemmVariantFor(k GEMMKernel) (gemmVariant, bool) {
+	for _, v := range gemmVariants {
+		if v.name == k {
+			return v, true
+		}
+	}
+	return gemmVariant{}, false
+}
+
+// attnLayerWeights is where one layer's staged weights sit.
+type attnLayerWeights struct {
+	qkv, out         uint32 // fp16 bank
+	gQ, gK, gIQ, gIK uint32 // fp32 arena: the four norm gammas
+}
+
+// AttnGPU runs full-attention layers on the device. It holds however many
+// layers it was staged with — at L2f that is the one the trace covers, at L6
+// it will be all twelve — plus one set of activation arenas sized for the
+// longest prompt.
+type AttnGPU struct {
+	dev *vk.Device
+	cfg AttnConfig
+
+	wbuf, abuf, hbuf, bank *vk.Buffer
+	pipes                  map[string]*vk.ComputePipeline
+	mods                   []*vk.ShaderModule
+
+	layers []attnLayerWeights
+
+	attn          AttnKernel
+	gemm, outGemm GEMMKernel
+	// autoPlan re-chooses both GEMM rungs per run. SetPlan turns it off,
+	// because a caller that named a rung meant it.
+	autoPlan bool
+
+	tokens, arenaRows, rows int
+	nKV                     int
+	lda, ldCtx              int
+
+	// fp32 weight arena: four gammas a layer, then the rotary table.
+	wElems int
+	wRope  uint32
+
+	// fp32 activations.
+	aQKV, aScore, aCell, aOut uint32
+	actElems                  int
+	// fp16 activations.
+	hXn, hQ, hK, hV, hCtx, hIdxK, hIdxQ uint32
+	hElems                              int
+}
+
+// qkvN is the fused projection's output width: the query and its gate, the key,
+// the value and both of the indexer's operands, padded up to the GEMM's column
+// block. Six of llama.cpp's matrices, one of ours.
+func (g *AttnGPU) qkvN() int {
+	c := g.cfg
+	n := c.QWidth() + 2*c.KVWidth() + c.IdxHeads*c.IdxDim + c.IdxDim
+	return roundUpInt(n, attnBN)
+}
+
+// The column each of the fused projection's six outputs starts at. The shaders
+// derive the same numbers from heads, kvHeads, headDim and the indexer's two,
+// so these are the host's half of that contract and the tests check them.
+func (g *AttnGPU) colK() int  { return g.cfg.QWidth() }
+func (g *AttnGPU) colV() int  { return g.colK() + g.cfg.KVWidth() }
+func (g *AttnGPU) colIQ() int { return g.colV() + g.cfg.KVWidth() }
+func (g *AttnGPU) colIK() int { return g.colIQ() + g.cfg.IdxHeads*g.cfg.IdxDim }
+
+// NBlocks is the indexer's block count: the cache's cell count over the
+// compress ratio, which at 7 tokens in a 256-cell cache is 64 — one real block
+// and 63 that do not exist.
+func (g *AttnGPU) NBlocks() int { return (g.nKV + g.cfg.Ratio - 1) / g.cfg.Ratio }
+
+// NewAttnGPU stages layers onto the device and builds every pipeline.
+//
+// maxTokens is the longest prompt the arenas are built for and nKV the cache's
+// cell count, which is the reference's padded number rather than the prompt's:
+// the indexer's block grid, its bias and the rotary table are all cut against
+// it (research/l2e-attention.md).
+func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights) (*AttnGPU, error) {
+	if maxTokens <= 0 || nKV < maxTokens {
+		return nil, fmt.Errorf("llm: %d tokens in a %d-cell cache", maxTokens, nKV)
+	}
+	if len(layers) == 0 {
+		return nil, fmt.Errorf("llm: no attention layers to stage")
+	}
+	if cfg.HeadDim != 256 {
+		return nil, fmt.Errorf("llm: the attention kernel is built for headDim 256, this checkpoint says %d", cfg.HeadDim)
+	}
+	if cfg.IdxDim != 128 || cfg.IdxHeads != 4 {
+		return nil, fmt.Errorf("llm: the indexer kernels are built for 4 heads of 128, this checkpoint says %d of %d",
+			cfg.IdxHeads, cfg.IdxDim)
+	}
+	if cfg.Ratio <= 0 {
+		return nil, fmt.Errorf("llm: layer has compress ratio %d, so it is not a full-attention layer", cfg.Ratio)
+	}
+	if cfg.NHead%cfg.NHeadKV != 0 {
+		return nil, fmt.Errorf("llm: %d query heads do not group over %d kv heads", cfg.NHead, cfg.NHeadKV)
+	}
+	ok, err := canWMMA(dev)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
+	}
+	g := &AttnGPU{
+		dev: dev, cfg: cfg,
+		pipes:    make(map[string]*vk.ComputePipeline),
+		tokens:   maxTokens,
+		rows:     maxTokens,
+		nKV:      nKV,
+		lda:      cfg.NEmbd + gemmPad,
+		ldCtx:    cfg.GateWidth() + gemmPad,
+		attn:     DefaultAttnKernel(),
+		gemm:     GEMMKernelFor(maxTokens),
+		outGemm:  OutGEMMKernelFor(maxTokens),
+		autoPlan: true,
+	}
+	// The plane is padded up to the widest tile any rung covers, because the
+	// attention kernel reads whole key blocks and the pack writes whole token
+	// tiles; both would otherwise read whatever a previous, longer run left.
+	align := coopMatTile
+	for _, v := range attnVariants {
+		align = maxInt(align, maxInt(v.rows, v.keys))
+	}
+	for _, v := range gemmVariants {
+		align = maxInt(align, v.bm)
+	}
+	g.arenaRows = roundUpInt(maxTokens, align)
+
+	if err := g.alloc(len(layers)); err != nil {
+		g.Destroy()
+		return nil, err
+	}
+	if err := g.build(); err != nil {
+		g.Destroy()
+		return nil, err
+	}
+	if err := g.stage(layers); err != nil {
+		g.Destroy()
+		return nil, err
+	}
+	return g, nil
+}
+
+// alloc lays out the four arenas. Nothing is read here — every size follows
+// from the config — so the layout can be checked before a weight is touched.
+func (g *AttnGPU) alloc(nLayers int) error {
+	c := g.cfg
+	rows := g.arenaRows
+	rotHalf := c.RopeDims / 2
+
+	// fp32 weights: four gammas a layer, then one rotary table for all of them.
+	perLayer := 2*c.HeadDim + 2*c.IdxDim
+	g.wElems = nLayers*perLayer + 2*g.nKV*rotHalf
+	g.wRope = uint32(nLayers * perLayer)
+	var err error
+	if g.wbuf, err = g.dev.NewBuffer(g.wElems * 4); err != nil {
+		return fmt.Errorf("llm: attention fp32 weight arena: %w", err)
+	}
+
+	alloc := func(n int) uint32 {
+		off := uint32(g.actElems)
+		g.actElems += (n + 63) &^ 63
+		return off
+	}
+	g.aQKV = alloc(rows * g.qkvN())
+	g.aScore = alloc(rows * g.NBlocks())
+	g.aCell = alloc(rows * g.nKV)
+	// The output gets its own arena rather than being written back over the
+	// projection's. It is 5 MB at 512 tokens against the 27 the fused
+	// projection holds, and aliasing them would cost the layer's own inputs —
+	// which at L6 the residual add still wants — to save that.
+	g.aOut = alloc(rows * c.NEmbd)
+	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
+	}
+
+	halloc := func(n int) uint32 {
+		off := uint32(g.hElems)
+		g.hElems += (n + 63) &^ 63
+		return off
+	}
+	plane := rows * c.HeadDim
+	g.hXn = halloc(rows * g.lda)
+	g.hQ = halloc(c.NHead * plane)
+	g.hK = halloc(c.NHeadKV * plane)
+	g.hV = halloc(c.NHeadKV * plane)
+	g.hCtx = halloc(rows * g.ldCtx)
+	g.hIdxK = halloc(g.NBlocks() * c.IdxDim)
+	g.hIdxQ = halloc(rows * c.IdxHeads * c.IdxDim)
+	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
+	}
+	// Zeroed once: every A operand's pad columns and every short run's pad
+	// rows come from here, and none of these kernels bounds-check.
+	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
+	g.abuf.WriteFloat32(make([]float32, g.actElems))
+
+	perBank := g.qkvN()*c.NEmbd + c.NEmbd*c.GateWidth()
+	if g.bank, err = g.dev.NewBuffer(nLayers * perBank * 2); err != nil {
+		return fmt.Errorf("llm: attention fp16 weight bank (%d MB): %w", (nLayers*perBank*2)>>20, err)
+	}
+	g.layers = make([]attnLayerWeights, nLayers)
+	for i := range g.layers {
+		base := uint32(i * perLayer)
+		g.layers[i] = attnLayerWeights{
+			qkv: uint32(i * perBank),
+			out: uint32(i*perBank + g.qkvN()*c.NEmbd),
+			gQ:  base,
+			gK:  base + uint32(c.HeadDim),
+			gIQ: base + uint32(2*c.HeadDim),
+			gIK: base + uint32(2*c.HeadDim+c.IdxDim),
+		}
+	}
+	return nil
+}
+
+func (g *AttnGPU) build() error {
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}
+	pcSize := uint32(unsafe.Sizeof(push{}))
+	for name, spirv := range map[string][]byte{
+		"pack":  shaders.LLMAttnPack,
+		"idx":   shaders.LLMAttnIdx,
+		"score": shaders.LLMAttnScore,
+	} {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
+			return err
+		}
+	}
+	feat := g.dev.Features()
+	sgs, err := g.dev.Physical().SubgroupSizeControl()
+	if err != nil {
+		return fmt.Errorf("llm: subgroup size control: %w", err)
+	}
+	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
+		return fmt.Errorf("llm: the attention and GEMM rungs need a pinned 64-wide subgroup")
+	}
+	for _, v := range attnVariants {
+		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
+	}
+	for _, v := range gemmVariants {
+		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (g *AttnGPU) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {
+	mod, err := g.dev.NewShaderModule(spirv)
+	if err != nil {
+		return fmt.Errorf("llm: shader attn.%s: %w", name, err)
+	}
+	g.mods = append(g.mods, mod)
+	pipe, err := g.dev.NewPipeline(mod, spec)
+	if err != nil {
+		return fmt.Errorf("llm: pipeline attn.%s: %w", name, err)
+	}
+	g.pipes[name] = pipe
+	return nil
+}
+
+// stage packs each layer's weights and builds the rotary table.
+//
+// The fused projection is the six matrices laid end to end as output rows of
+// one [qkvN, nEmbd] matrix, in the order the shaders derive: query and gate
+// interleaved per head (which is the checkpoint's own order), then key, value,
+// indexer query, indexer key. The pad rows the column block adds are left
+// zero, and their outputs are never read.
+func (g *AttnGPU) stage(layers []AttnWeights) error {
+	c := g.cfg
+	for i, w := range layers {
+		for _, t := range []struct {
+			name string
+			off  uint32
+			src  []float32
+			want int
+		}{
+			{"attn_q_norm", g.layers[i].gQ, w.QNorm, c.HeadDim},
+			{"attn_k_norm", g.layers[i].gK, w.KNorm, c.HeadDim},
+			{"indexer.q_norm", g.layers[i].gIQ, w.IdxQNorm, c.IdxDim},
+			{"indexer.k_norm", g.layers[i].gIK, w.IdxKNorm, c.IdxDim},
+		} {
+			if len(t.src) != t.want {
+				return fmt.Errorf("llm: layer %d %s is %d values, want %d", i, t.name, len(t.src), t.want)
+			}
+			g.wbuf.WriteFloat32At(int(t.off), t.src)
+		}
+
+		for _, t := range []struct {
+			name string
+			src  []float32
+			n    int
+		}{
+			{"attn_q", w.Q, c.QWidth()},
+			{"attn_k", w.K, c.KVWidth()},
+			{"attn_v", w.V, c.KVWidth()},
+			{"indexer.q_proj", w.IdxQ, c.IdxHeads * c.IdxDim},
+			{"indexer.k_proj", w.IdxK, c.IdxDim},
+		} {
+			if len(t.src) != t.n*c.NEmbd {
+				return fmt.Errorf("llm: layer %d %s is %d values, want %d", i, t.name, len(t.src), t.n*c.NEmbd)
+			}
+		}
+		if len(w.O) != c.NEmbd*c.GateWidth() {
+			return fmt.Errorf("llm: layer %d attn_output is %d values, want %d", i, len(w.O), c.NEmbd*c.GateWidth())
+		}
+
+		qkv := make([]uint16, g.qkvN()*c.NEmbd)
+		tileB(qkv, w.Q, c.QWidth(), c.NEmbd, func(r int) int { return r })
+		base := g.colK()
+		tileB(qkv, w.K, c.KVWidth(), c.NEmbd, func(r int) int { return base + r })
+		baseV := g.colV()
+		tileB(qkv, w.V, c.KVWidth(), c.NEmbd, func(r int) int { return baseV + r })
+		baseIQ := g.colIQ()
+		tileB(qkv, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return baseIQ + r })
+		baseIK := g.colIK()
+		tileB(qkv, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return baseIK + r })
+		g.bank.WriteUint16At(int(g.layers[i].qkv), qkv)
+
+		out := make([]uint16, c.NEmbd*c.GateWidth())
+		tileB(out, w.O, c.NEmbd, c.GateWidth(), func(r int) int { return r })
+		g.bank.WriteUint16At(int(g.layers[i].out), out)
+	}
+	g.wbuf.WriteFloat32At(int(g.wRope), ropeTable(g.cfg, g.nKV))
+	return nil
+}
+
+// ropeTable is the rotary's cosines for every cache position followed by its
+// sines: [nKV][rot/2] then [nKV][rot/2].
+//
+// The angles are built here, in float64, rather than from a `pow` per lane,
+// for the reason the shader's header gives — the CPU reference walks
+// `theta *= base^(-2/rot)` in float64 and a float32 `pow` does not reproduce
+// it, which at a long context is an absolute angle error and not a relative
+// one. Position is the only input, so one table serves the query, the key and
+// the indexer's pooled blocks, whose position is the first cell they cover.
+//
+// It is the interleaved M-RoPE's angle and not plain NeoX's as a matter of
+// derivation rather than of coincidence: this calls the same RoPEMulti the CPU
+// reference does, on a basis vector, and reads the rotation back off it. On a
+// text batch the two agree bit for bit (`TestRoPEMultiIsNeoXOnText`), and the
+// day an image batch makes them differ this table follows without an edit.
+func ropeTable(c AttnConfig, nKV int) []float32 {
+	rotHalf := c.RopeDims / 2
+	out := make([]float32, 2*nKV*rotHalf)
+	// A unit vector in dim i and zero in dim i+rotHalf rotates to
+	// (cos, sin), so one pass over a [1][rot] probe per position reads the
+	// whole row of angles off the reference implementation itself.
+	probe := make([]float32, c.RopeDims)
+	for pos := 0; pos < nKV; pos++ {
+		for i := range probe {
+			probe[i] = 0
+		}
+		for i := 0; i < rotHalf; i++ {
+			probe[i] = 1
+		}
+		RoPEMulti(c, probe, []int32{int32(pos)}, 1, c.RopeDims, 1)
+		for i := 0; i < rotHalf; i++ {
+			out[pos*rotHalf+i] = probe[i]                     // cos
+			out[nKV*rotHalf+pos*rotHalf+i] = probe[i+rotHalf] // sin
+		}
+	}
+	return out
+}
+
+// SetPlan chooses the three rungs: the attention tile, and one row block for
+// each of the two projections. Every rung is built and they all read the same
+// staged weight, so this moves a pipeline and restages nothing.
+func (g *AttnGPU) SetPlan(attn AttnKernel, gemm, outGemm GEMMKernel) error {
+	if _, ok := attnVariantFor(attn); !ok {
+		return fmt.Errorf("llm: no attention kernel %q (have %v)", attn, AttnKernels())
+	}
+	for _, k := range []GEMMKernel{gemm, outGemm} {
+		if _, ok := gemmVariantFor(k); !ok {
+			return fmt.Errorf("llm: no GEMM kernel %q (have %v)", k, GEMMKernels())
+		}
+	}
+	g.attn, g.gemm, g.outGemm = attn, gemm, outGemm
+	g.autoPlan = false
+	return nil
+}
+
+// Plan reports the rungs in use.
+func (g *AttnGPU) Plan() (AttnKernel, GEMMKernel, GEMMKernel) {
+	return g.attn, g.gemm, g.outGemm
+}
+
+// Layers is how many layers are staged, Tokens the longest prompt the arenas
+// were built for and NKV the cache's cell count.
+func (g *AttnGPU) Layers() int { return len(g.layers) }
+func (g *AttnGPU) Tokens() int { return g.tokens }
+func (g *AttnGPU) NKV() int    { return g.nKV }
+
+// WeightBytes is what the staged layers cost on the device and
+// ActivationBytes what the shared arenas cost.
+func (g *AttnGPU) WeightBytes() int     { return g.wbuf.Size() + g.bank.Size() }
+func (g *AttnGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
+
+// Upload writes the layer's input: the hyper-connection block's output
+// `hc_mixed`, [T][nEmbd], narrowed into the fused projection's A layout.
+func (g *AttnGPU) Upload(xn []float32, nTok int) error {
+	c := g.cfg
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	if len(xn) != nTok*c.NEmbd {
+		return fmt.Errorf("llm: input is %d values, want %d", len(xn), nTok*c.NEmbd)
+	}
+	g.rows = nTok
+	if g.autoPlan {
+		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+	}
+	row := make([]uint16, c.NEmbd)
+	for t := 0; t < nTok; t++ {
+		for i, v := range xn[t*c.NEmbd : (t+1)*c.NEmbd] {
+			row[i] = safetensors.F32ToF16(v)
+		}
+		g.hbuf.WriteUint16At(int(g.hXn)+t*g.lda, row)
+	}
+	return nil
+}
+
+// graph builds one layer's dispatch sequence, with a label per dispatch, and
+// is shared by Run and Profile so that what the profiler times is what a run
+// executes.
+func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
+	if layer < 0 || layer >= len(g.layers) {
+		return nil, nil, fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
+	}
+	c := g.cfg
+	w := g.layers[layer]
+	av, _ := attnVariantFor(g.attn)
+	gv, _ := gemmVariantFor(g.gemm)
+	ov, _ := gemmVariantFor(g.outGemm)
+	// The packed planes are padded to the widest tile, so a short run never
+	// reads what a longer one left behind.
+	plane := roundUpInt(g.rows, maxInt(av.rows, av.keys))
+
+	base := push{
+		Tokens: uint32(g.rows), NEmbd: uint32(c.NEmbd),
+		LDA: uint32(g.lda), Eps: math.Float32bits(c.Eps),
+		QKVOff: g.aQKV, QOff: g.hQ, KOff: g.hK, VOff: g.hV, CtxOff: g.hCtx,
+		IdxKOff: g.hIdxK, IdxQOff: g.hIdxQ,
+		ScoreOff: g.aScore, CellOff: g.aCell, RopeOff: g.wRope,
+		GammaOff: w.gQ, GammaKOff: w.gK, GammaIQOff: w.gIQ, GammaIKOff: w.gIK,
+		Heads: uint32(c.NHead), KVHeads: uint32(c.NHeadKV), HeadDim: uint32(c.HeadDim),
+		NKV: uint32(g.nKV), Plane: uint32(plane), LDCtx: uint32(g.ldCtx),
+		IdxHeads: uint32(c.IdxHeads), IdxDim: uint32(c.IdxDim),
+		Ratio: uint32(c.Ratio), RotDims: uint32(c.RopeDims),
+		AttnScale: math.Float32bits(float32(math.Log2(math.E) / math.Sqrt(float64(c.HeadDim)))),
+		GemmN:     uint32(g.qkvN()),
+	}
+
+	var d []vk.MultiDispatch
+	var kinds []string
+	add := func(pipe, kind string, gx, gy uint32, pc push) {
+		d = append(d, vk.MultiDispatch{Pipeline: g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
+		kinds = append(kinds, kind)
+	}
+
+	// 1. The one fused projection: six of llama.cpp's matrices, one matmul.
+	qkv := base
+	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
+	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
+	add(string(g.gemm), "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+
+	// 2. Norm, rotary and the fragment tiling for q, k and v together.
+	add("pack", "pack", uint32(plane/coopMatTile), uint32(c.NHead+2*c.NHeadKV), base)
+
+	// 3. The indexer's two operands: one pooled key per block, one query per
+	//    (token, head).
+	units := maxInt(g.NBlocks(), g.rows)
+	add("idx", "idx", uint32(units), uint32(1+c.IdxHeads), base)
+
+	// 4. Its score, the bias, the cells and the causal mask.
+	add("score", "score", uint32(g.rows), 1, base)
+
+	// 5. Causal GQA with the output gate in the epilogue.
+	add(string(g.attn), "attn", uint32(roundUpInt(g.rows, av.rows)/av.rows), uint32(c.NHead), base)
+
+	// 6. The output projection, off the gated context.
+	out := base
+	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
+	out.OutOff, out.BOff = g.aOut, w.out
+	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.GateWidth())
+	add(string(g.outGemm), "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	return d, kinds, nil
+}
+
+// Run executes one layer over whatever Upload left in the arenas.
+func (g *AttnGPU) Run(layer int) error {
+	d, kinds, err := g.graph(layer)
+	if err != nil {
+		return err
+	}
+	for i := range d {
+		if _, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true); err != nil {
+			return fmt.Errorf("llm: attention dispatch %d (%s): %w", i, kinds[i], err)
+		}
+	}
+	return nil
+}
+
+// Profile times each dispatch on the GPU over iters back-to-back repetitions.
+// Wall clock around a run is not a measurement of the layer: it carries the
+// upload and the read-back, and this arena reads at 0.2 GB/s.
+//
+// Every dispatch here is idempotent — each reads arenas an earlier one wrote
+// and writes one no earlier one reads — so a profile leaves the same tensors a
+// Run does. It is still Run that the correctness tests drive, so that what
+// they check is the sequence and not a repetition of it.
+func (g *AttnGPU) Profile(layer, iters int) ([]Stage, error) {
+	if iters <= 0 {
+		iters = 1
+	}
+	d, kinds, err := g.graph(layer)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Stage, 0, len(d))
+	for i := range d {
+		dur, err := vk.DispatchMultiTimed(d[i:i+1], 1, uint32(iters), true)
+		if err != nil {
+			return out, fmt.Errorf("llm: attention dispatch %d (%s): %w", i, kinds[i], err)
+		}
+		out = append(out, Stage{Kind: kinds[i], GPU: dur / time.Duration(iters)})
+	}
+	return out, nil
+}
+
+// ProfileSweep times each kind of dispatch across every staged layer, and is
+// the number to quote rather than Profile's.
+//
+// The difference is the cache — the same argument HCGPU.ProfileSweep makes,
+// from the other side. One layer's *weights* are 103 MB and cannot sit in the
+// 32 MiB MALL however often a dispatch is repeated, so those reads are already
+// cold; it is the activations that a repetition would keep warm and a real
+// graph running twelve different layers would not.
+func (g *AttnGPU) ProfileSweep(iters int) ([]Stage, error) {
+	if iters <= 0 {
+		iters = 1
+	}
+	_, kinds, err := g.graph(0)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Stage, 0, len(kinds))
+	for k := range kinds {
+		var total time.Duration
+		for l := range g.layers {
+			d, _, err := g.graph(l)
+			if err != nil {
+				return nil, err
+			}
+			dur, err := vk.DispatchMultiTimed(d[k:k+1], 1, uint32(iters), true)
+			if err != nil {
+				return out, fmt.Errorf("llm: %s sweep, layer %d: %w", kinds[k], l, err)
+			}
+			total += dur
+		}
+		out = append(out, Stage{Kind: kinds[k], GPU: total / time.Duration(len(g.layers)*iters)})
+	}
+	return out, nil
+}
+
+// The tensors a run leaves behind, in the layout attn.go's CPU reference uses.
+
+// Out is the layer's output, `attn_output`, [T][nEmbd].
+func (g *AttnGPU) Out() []float32 {
+	return g.abuf.ReadFloat32At(int(g.aOut), g.rows*g.cfg.NEmbd)
+}
+
+// QKV is the fused projection's whole output row, [T][qkvN]. Column returns
+// one of its six tensors by the column it starts at, which is how a
+// disagreement gets located in a projection instead of in what consumed it.
+func (g *AttnGPU) QKV() []float32 {
+	return g.abuf.ReadFloat32At(int(g.aQKV), g.rows*g.qkvN())
+}
+
+// Column slices one output of the fused projection out of its row: the key at
+// ColK, the indexer's raw key at ColIK, and so on.
+func (g *AttnGPU) Column(col, width int) []float32 {
+	raw := g.QKV()
+	out := make([]float32, g.rows*width)
+	for t := 0; t < g.rows; t++ {
+		copy(out[t*width:(t+1)*width], raw[t*g.qkvN()+col:])
+	}
+	return out
+}
+
+// ColK, ColV, ColIQ and ColIK are where the fused projection's later tensors
+// start. The shaders derive the same numbers from the head counts, so these
+// are the host's half of that contract.
+func (g *AttnGPU) ColK() int  { return g.colK() }
+func (g *AttnGPU) ColV() int  { return g.colV() }
+func (g *AttnGPU) ColIQ() int { return g.colIQ() }
+func (g *AttnGPU) ColIK() int { return g.colIK() }
+
+// Score is the indexer's rectified per-block score, [T][nBlocks].
+func (g *AttnGPU) Score() []float32 {
+	return g.abuf.ReadFloat32At(int(g.aScore), g.rows*g.NBlocks())
+}
+
+// Cells is the same score biased, expanded over the cache and causally
+// masked, [T][nKV] — `indexer_score_tokens`, infinities and all.
+func (g *AttnGPU) Cells() []float32 {
+	return g.abuf.ReadFloat32At(int(g.aCell), g.rows*g.nKV)
+}
+
+// IdxK is the pooled, normed and rotated indexer key, [nBlocks][idxDim],
+// widened out of the fp16 arena.
+func (g *AttnGPU) IdxK() []float32 {
+	return g.readF16(g.hIdxK, g.NBlocks()*g.cfg.IdxDim)
+}
+
+// IdxQ is the indexer's query, [T][idxHeads][idxDim].
+func (g *AttnGPU) IdxQ() []float32 {
+	return g.readF16(g.hIdxQ, g.rows*g.cfg.IdxHeads*g.cfg.IdxDim)
+}
+
+// Context is the gated attention output, [T][nHead*headDim] — `attn_gated`,
+// read out of the output projection's A layout, whose row stride is not the
+// width.
+func (g *AttnGPU) Context() []float32 {
+	width := g.cfg.GateWidth()
+	raw := g.hbuf.ReadUint16At(int(g.hCtx), (g.rows-1)*g.ldCtx+width)
+	out := make([]float32, g.rows*width)
+	for t := 0; t < g.rows; t++ {
+		for i, h := range raw[t*g.ldCtx : t*g.ldCtx+width] {
+			out[t*width+i] = safetensors.F16ToF32(h)
+		}
+	}
+	return out
+}
+
+// Q and K are the packed query and key planes, un-tiled back into the CPU
+// reference's [T][heads][headDim]. They exist so that a disagreement in the
+// attention output can be located in the norm or the rotary instead of being
+// attributed to the kernel that consumed them.
+func (g *AttnGPU) Q() []float32 { return g.unpack(g.hQ, g.cfg.NHead, false) }
+func (g *AttnGPU) K() []float32 { return g.unpack(g.hK, g.cfg.NHeadKV, false) }
+
+// V is the same, out of the transposed tiling the value is stored in.
+func (g *AttnGPU) V() []float32 { return g.unpack(g.hV, g.cfg.NHeadKV, true) }
+
+func (g *AttnGPU) unpack(off uint32, heads int, transposed bool) []float32 {
+	const tile = coopMatTile
+	c := g.cfg
+	av, _ := attnVariantFor(g.attn)
+	plane := roundUpInt(g.rows, maxInt(av.rows, av.keys))
+	hdt := c.HeadDim / tile
+	raw := g.hbuf.ReadUint16At(int(off), heads*plane*c.HeadDim)
+	out := make([]float32, g.rows*heads*c.HeadDim)
+	for h := 0; h < heads; h++ {
+		for t := 0; t < g.rows; t++ {
+			for d := 0; d < c.HeadDim; d++ {
+				idx := (h*(plane/tile)+t/tile)*(hdt*tile*tile) + (d/tile)*(tile*tile)
+				if transposed {
+					idx += (d%tile)*tile + t%tile
+				} else {
+					idx += (t%tile)*tile + d%tile
+				}
+				out[(t*heads+h)*c.HeadDim+d] = safetensors.F16ToF32(raw[idx])
+			}
+		}
+	}
+	return out
+}
+
+func (g *AttnGPU) readF16(off uint32, n int) []float32 {
+	raw := g.hbuf.ReadUint16At(int(off), n)
+	out := make([]float32, n)
+	for i, h := range raw {
+		out[i] = safetensors.F16ToF32(h)
+	}
+	return out
+}
+
+// Destroy releases every Vulkan object.
+func (g *AttnGPU) Destroy() {
+	for _, p := range g.pipes {
+		p.Destroy()
+	}
+	for _, m := range g.mods {
+		m.Destroy()
+	}
+	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.bank} {
+		if b != nil {
+			b.Destroy()
+		}
+	}
+}

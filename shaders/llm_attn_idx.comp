@@ -1,0 +1,115 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The QSA indexer's two operands: the block-pooled key and the query, both
+// normed, both rotated, both narrowed to fp16 — one dispatch for what
+// llama.cpp spends a pool, two RMS_NORM_MULs, two ROPEs and a CPY on.
+//
+// The grid is (unit, kind): kind 0 is one pooled key per **block**, kind k>0
+// is indexer query head k-1 of one **token**. Both are a 128-wide row that
+// gets the same three operations, so they are one kernel with two addressings
+// rather than two kernels; 128 lanes, one component each, and the norm's
+// reduction is the workgroup.
+//
+// What has to be reproduced rather than invented is the block structure, and
+// it is the *cache's* and not the prompt's (research/l2e-attention.md). A
+// block is `ratio` consecutive cell positions and it exists only if all of
+// them are occupied, so 7 tokens in a 256-cell cache make one real block of 4
+// and 63 that do not exist — and because llama.cpp's `blk_cells` is
+// zero-filled, each of those pools cell 0 `ratio` times. That is why
+// `indexer_k_pooled` rows 1..63 are all exactly token 0's raw key, and it is a
+// check rather than a curiosity: it is one of the two things that pinned down
+// the numeric below.
+//
+// **The key cache is fp16, and modelling it is worth 2072x.**
+// `llama_memory_hybrid_idx` passes the context's `type_k` straight through, so
+// the keys are rounded to halves *between* being projected and being pooled —
+// `indexer_k_raw` is exact and `indexer_k_pooled` three lines later is not,
+// unless the round trip is there. Here it costs one `float16_t()` on the way
+// out of the fused projection's fp32 output, so this kernel is bit-for-bit the
+// arithmetic the reference does rather than an approximation of it.
+//
+// The rotary is the same table llm_attn_pack.comp reads, indexed by the
+// block's *first cell position* — which is why a block that does not exist,
+// whose position is 0, is also unrotated.
+
+#include "llm_common.glsl"
+
+#ifndef IDX_DIM
+#define IDX_DIM 128
+#endif
+
+layout(local_size_x = IDX_DIM) in;
+
+shared float part[IDX_DIM];
+shared float val[IDX_DIM];
+
+void main() {
+    uint unit = gl_WorkGroupID.x;
+    uint kind = gl_WorkGroupID.y;
+    uint i = gl_LocalInvocationID.x;
+
+    uint qWidth = pc.heads * 2u * pc.headDim;
+    uint kvWidth = pc.kvHeads * pc.headDim;
+    uint idxQCol = qWidth + 2u * kvWidth;
+    uint idxKCol = idxQCol + pc.idxHeads * pc.idxDim;
+
+    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
+    uint nBid = pc.tokens / pc.ratio;   // whole blocks only
+
+    uint gamma, dst, pos;
+    if (kind == 0u) {
+        if (unit >= nBlocks) {
+            return;
+        }
+        // Pool `ratio` cached keys. The cache is fp16, so the rounding is on
+        // the way in and the mean is taken over halves.
+        float sum = 0.0;
+        for (uint s = 0u; s < pc.ratio; s++) {
+            uint cell = (unit < nBid) ? unit * pc.ratio + s : 0u;
+            sum += float(float16_t(act[pc.qkvOff + cell * pc.gemmN + idxKCol + i]));
+        }
+        val[i] = sum / float(pc.ratio);
+        gamma = pc.gammaIKOff;
+        dst = pc.idxKOff + unit * pc.idxDim;
+        pos = (unit < nBid) ? unit * pc.ratio : 0u;
+    } else {
+        if (unit >= pc.tokens) {
+            return;
+        }
+        uint head = kind - 1u;
+        val[i] = act[pc.qkvOff + unit * pc.gemmN + idxQCol + head * pc.idxDim + i];
+        gamma = pc.gammaIQOff;
+        dst = pc.idxQOff + (unit * pc.idxHeads + head) * pc.idxDim;
+        pos = unit;
+    }
+
+    part[i] = val[i] * val[i];
+    barrier();
+    for (uint stride = IDX_DIM / 2u; stride > 0u; stride >>= 1u) {
+        if (i < stride) {
+            part[i] += part[i + stride];
+        }
+        barrier();
+    }
+    float v = val[i] * (1.0 / sqrt(part[0] / float(IDX_DIM) + uintBitsToFloat(pc.eps)))
+        * wbuf[gamma + i];
+    barrier();
+    val[i] = v;
+    barrier();
+
+    // NeoX rotary over the first n_rot of the 128 dims; the rest are copied.
+    uint rotHalf = pc.rotDims / 2u;
+    if (i < rotHalf && pos < pc.nKV) {
+        float c = wbuf[pc.ropeOff + pos * rotHalf + i];
+        float s = wbuf[pc.ropeOff + pc.nKV * rotHalf + pos * rotHalf + i];
+        float lo = val[i], hi = val[i + rotHalf];
+        val[i] = lo * c - hi * s;
+        val[i + rotHalf] = lo * s + hi * c;
+    }
+    barrier();
+
+    hact[dst + i] = float16_t(val[i]);
+}

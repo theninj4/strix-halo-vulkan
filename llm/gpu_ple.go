@@ -57,9 +57,9 @@ type pleVariant struct {
 }
 
 var pleVariants = []pleVariant{
-	{PLEKVM2, shaders.LLMPLEKVM2, 32},
-	{PLEKVM4, shaders.LLMPLEKVM4, 64},
-	{PLEKVM8, shaders.LLMPLEKVM8, 128},
+	{PLEKVM2, shaders.LLMGEMMPlainM2, 32},
+	{PLEKVM4, shaders.LLMGEMMPlainM4, 64},
+	{PLEKVM8, shaders.LLMGEMMPlainM8, 128},
 }
 
 // PLEKernels lists the rungs, narrowest first.
