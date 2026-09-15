@@ -20,6 +20,16 @@ var Double []byte
 //go:embed copy.spv
 var Copy []byte
 
+// Weight-bank gather probe (LLM.md L0a): a fixed number of bytes read as
+// slabs drawn from a bank of tens of gigabytes, to find out whether the DRAM
+// bus survives a working set 20x larger than anything else here measures.
+// Nothing about the arithmetic matters; the address range does.
+
+//go:generate glslc --target-env=vulkan1.2 -O -o bank_gather.spv bank_gather.comp
+
+//go:embed bank_gather.spv
+var BankGather []byte
+
 // Strided read bandwidth (IDEAS §5.1b): the same fixed set of bytes read
 // with the rows spaced an arbitrary stride apart, in five request shapes.
 // LANES_PER_ROW is how many consecutive 16-byte chunks of one row go to
@@ -1748,6 +1758,7 @@ var KokoroDConvReg32x128 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -DREPEAT=1 -o kokoro_dnarrow_rep.spv kokoro_act.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_shortcut.spv kokoro_shortcut.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_pool.spv kokoro_pool.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_proj.spv kokoro_proj.comp
 
 //go:embed kokoro_dstats.spv
 var KokoroDStats []byte
@@ -1766,6 +1777,61 @@ var KokoroShortcut []byte
 
 //go:embed kokoro_pool.spv
 var KokoroPool []byte
+
+// The prosody predictor's two 1-wide projections (SPEECH.md T6b). N = 1 is
+// the one output shape the ladder cannot express, a fragment tile being 16
+// columns wide, so it is a scalar reduction instead — one workgroup a frame.
+
+//go:embed kokoro_proj.spv
+var KokoroProj []byte
+
+// The six bidirectional LSTMs of kokoro's phoneme side (SPEECH.md T6c), which
+// after T6a and T6b are 96% of it. One dispatch a timestep, both directions,
+// with the input projections lifted out of the loop and done once as a GEMM —
+// so what is left in the sequential part is `W_hh`, [H, 4H], half a megabyte
+// that stays MALL-resident for every step.
+
+// Two knobs, and they are not equally important. CELLS is how many cells a
+// workgroup owns — 256/CELLS bands a direction, so 2*256/CELLS workgroups on
+// a step — and UNROLL is how many taps of the reduction one thread has in
+// flight.
+//
+// A step is 0.5 MB of weights against 0.26 MFLOP, which looks like a
+// bandwidth problem and is not: spreading it from two workgroups to sixteen
+// moved it by nothing at all, and deepening the unroll from 4 to 32 moved it
+// from 12.0 microseconds to 3.7 (TestGPULSTMLadder). What the kernel is short
+// of is *outstanding loads*, and a recurrence has only 4H threads to issue
+// them from. The `u4` build is kept so that finding stays measurable.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCELLS=64 -DUNROLL=4 -o kokoro_lstm_c64u4.spv kokoro_lstm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCELLS=128 -DUNROLL=32 -o kokoro_lstm_c128.spv kokoro_lstm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCELLS=64 -DUNROLL=32 -o kokoro_lstm_c64.spv kokoro_lstm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCELLS=32 -DUNROLL=32 -o kokoro_lstm_c32.spv kokoro_lstm.comp
+
+// The rest of the phoneme side (SPEECH.md T6d): the length regulator as a
+// gather, and the leaky rectifier that feeds the text encoder's convolutions
+// — an NPOT build of the narrow every other stage already uses.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_gather.spv kokoro_gather.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -DLEAKY=1 -o kokoro_dleaky.spv kokoro_act.comp
+
+//go:embed kokoro_gather.spv
+var KokoroGather []byte
+
+//go:embed kokoro_dleaky.spv
+var KokoroDLeaky []byte
+
+//go:embed kokoro_lstm_c64u4.spv
+var KokoroLSTMC64U4 []byte
+
+//go:embed kokoro_lstm_c128.spv
+var KokoroLSTMC128 []byte
+
+//go:embed kokoro_lstm_c64.spv
+var KokoroLSTMC64 []byte
+
+//go:embed kokoro_lstm_c32.spv
+var KokoroLSTMC32 []byte
 
 // The vocoder's tail: `conv_post`, the two nonlinearities, and the inverse
 // transform (SPEECH.md T4c). Moving these onto the device is worth more than

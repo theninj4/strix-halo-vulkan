@@ -10,15 +10,16 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-15, T6a)**: **both verticals are on the device, text-to-speech
-takes text, and an utterance is 20.9x real time.**
+**Status (2026-09-15, T6d)**: **both verticals are on the device, text-to-speech
+takes text, and an utterance is 74.2x real time.**
 Speech-to-text transcribes an 11 s clip in 43 ms, 257x real time, whole model
-resident, S1–S8 done. **Text-to-speech is 12.9x real time** and its vocoder is
-38 ms: T4c put the decoder, `conv_post` and the inverse transform on Vulkan
-and removed every readback between them, so `go run ./cmd/tts -gpu -o out.wav`
-is one upload of the excitation and one download of the waveform. What is left
-in the vocoder is 14 ms of float64 signal processing that belongs on the host.
-**The phoneme side is now 85% of an utterance.**
+resident, S1–S8 done. **Text-to-speech is 44 ms for 3.25 s of audio.** T6 is
+finished: ALBERT 104 ms to 4 (T6a), the F0/N AdaIN stacks 40 to 1 (T6b), the
+six bidirectional LSTMs 73 to 6 (T6c) and the chain between them 17 to 8
+(T6d) — so **the phoneme side went from 222 ms to 8 and is now 18% of an
+utterance, over 1.96 ms of GPU time**. The other 82% is the vocoder, whose
+36 ms T4c already cut from 3626, and whose largest remaining piece is **14 ms
+of float64 phase accumulation on the host** that T3 put there on purpose.
 
 `go run ./cmd/tts -gpu -text 'Hello there.'` speaks, with no Python on the
 path. T5 opened with a measurement instead of code — **91% of running-text
@@ -32,25 +33,32 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
     "In 2024 the team shipped 1,024 kernels and spent $3.5 million, up 12%."
     -> ɪn twˈɛnti twˈɛnti fˈɔɹ ðə tˈim ʃˈɪpt wˈʌn θˈWzᵊnd twˈɛnti fˈɔɹ
        kˈɜɹnᵊlz ænd spˈɛnt θɹˈi pYnt fˈIv mˈɪljᵊn dˈɑləɹz, ˌʌp twˈɛlv pəɹsˈɛnt.
-    character for character what misaki gives, and 12.6x real time to speak
+    character for character what misaki gives
 
-    text to speech, T6a (kokoro)
+    text to speech, T6d (kokoro)
     "The quick brown fox jumps over the lazy dog." (af_heart)
     48 phonemes -> 50 tokens -> 130 frames -> 78000 samples = 3.250 s
 
-    stage          gpu    (T4c)   cpu (T3)
-    bert            4ms    104ms     104ms   12 ALBERT layers, 46.6x
-    dur encoder    24ms     24ms      24ms   three bidirectional LSTMs
-    durations       8ms      8ms       8ms   one more, and the head
-    prosody        66ms     66ms      66ms   one more, and the F0/N stacks
-    text encoder   15ms     15ms      15ms   three convolutions and one LSTM
-    phoneme side  116ms    222ms     222ms   74% of the utterance
-    decoder         2ms      3ms     132ms
-    generator      13ms     13ms    3160ms
-    excitation     16ms     15ms      24ms   float64 on the host, staying there
+    stage          gpu    (T6c)   cpu (T3)
+    bert            4ms      4ms     104ms   12 ALBERT layers, 46.6x
+    dur encoder     3ms      3ms      24ms   + the whole text encoder
+    durations       0ms      1ms       8ms   the head, on the host, in fp32
+    prosody         1ms      2ms      66ms   gather, shared, both AdaIN stacks
+    text encoder    0ms      8ms      15ms   now only a readback
+    phoneme side    8ms     17ms     222ms   18% of the utterance
+    decoder         1ms      1ms     132ms
+    generator      12ms     12ms    3160ms
+    excitation     14ms     15ms      24ms   float64 on the host, see T7
     tail            8ms      8ms      22ms
-    vocoder        40ms     38ms    3626ms
-    total         156ms    260ms    3848ms   20.88x real time, from 12.51x
+    vocoder        36ms     36ms    3626ms   82% of the utterance
+    total          44ms     53ms    3848ms   74.20x real time, from 61.44x
+
+    the phoneme side on the device, by family   1.957 ms of GPU time
+      six recurrences, steps only  1.478ms  76%   shared alone is 0.508
+      F0/N AdaIN stacks            0.204ms  10%
+      input projections            0.072ms   4%   six GEMMs, out of the loops
+      text encoder convolutions    0.076ms   4%
+      everything else              0.127ms   6%   norms, narrows, the gather
 
     speech to text, S8 (parakeet, Vulkan)
     testdata/jfk.wav: 11.000 s at 16000 Hz
@@ -89,8 +97,10 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T5c | `num2words`, `get_number`, the subtokenizer, the tokenizer and the merge loop | **done** — each exact; `-text` speaks |
 | T5d | The espeak fallback and the homograph tagger | **done** — 39 words exact, tagger 88.4% against spacy; corpus 24/24 |
 | T6a | PL-BERT on Vulkan | **done** — 104 ms to 4 ms, 46.6x, no duration changes |
-| T6b | The F0/N AdaIN stacks, ~33 ms of the prosody predictor's 66 | **next**, see below |
-| T6c | The six bidirectional LSTMs, ~78 ms — S8's problem again | open |
+| T6b | The F0/N AdaIN stacks, 40 ms of the prosody predictor's 67 | **done** — 40 ms to 1 ms, one new shader |
+| T6c | The six bidirectional LSTMs, 73 ms — 96% of the phoneme side | **done** — 73 ms to 6 ms, durations unchanged |
+| T6d | The chain between them: readbacks, the regulator, the text encoder | **done** — 17 ms to 8 ms, two submits and two readbacks |
+| T7 | The excitation: float64 phase accumulation on the host | **next** — the largest single stage in the model, 14 ms |
 
 ## What exists
 
@@ -145,8 +155,15 @@ vocabulary lookup), `model.go`, `conv.go`, `lstm.go`, `albert.go`,
 `infer.go` (`Prosody`, `Synthesize`, `Speak`). 18 tests — sixteen against the
 dump, two against the definitions over shapes the dump does not reach.
 
-On the device, two objects and **one shared fp32 arena**:
+On the device, `blockSet` and four objects built on or beside it, over
+**one shared fp32 arena**:
 
+  - `adainset.go` — `blockSet`, the part of StyleTTS2 that is the same
+    wherever it appears: `AdainResBlk1d` staged on the device. The padded row
+    stride, the bordered fp16 operand, the two-phase AdaIN reduction, the
+    weight bank, the style projection and the eleven-dispatch graph. It owns
+    no input and no output; **two objects embed it** and supply only where a
+    block's input comes from and where its output goes.
   - `gpu.go` — `GPUBlocks` is one generator upsampling stage: its transposed
     convolution, its three Snake residual blocks and the excitation's, staged
     as fp16 fragment tiles. The last one also carries the **tail**
@@ -154,15 +171,40 @@ On the device, two objects and **one shared fp32 arena**:
     transform, so `RunStageWave` returns 78000 samples rather than an 8 MB
     activation.
   - `gpudec.go` — `GPUDecoder` is the five AdaIN blocks, 31 M parameters of
-    fp16 over channel counts of 514, 1090, 1024 and 512.
+    fp16 over channel counts of 514, 1090, 1024 and 512. Its plumbing is the
+    **concatenation as a row stride**: 66 side channels written once, and each
+    block's epilogue writing its 1024 beside them.
+  - `gpuprosody.go` — `GPUProsody` is the predictor's F0 and energy stacks:
+    the same block again, six of them at 512 and 256 channels in two parallel
+    stacks off one input, and the two 1-wide projections that make them
+    curves. **62 dispatches in one submit**, 0.39 ms on the device. Four of the
+    six keep their channel count and so have no shortcut convolution at all —
+    their epilogue reads the block's input where it already lies.
   - `gpubert.go` — `GPUAlbert` is PL-BERT: one shared weight group, fifteen
     dispatches a layer, arenas sized for the model's 512-token limit so it is
     staged once for any utterance. Its biases are columns of K.
-  - `sharedArena` — one fp32 buffer laid out across all three before any of
-    them is built, so `stage0.aXin` *is* `decoder.aOut` and `stage1.aXin` is
-    `stage0.aSum`. `Model.AttachGPU` does the layout, the commit and the
-    aliasing; `Resident()` is how `Vocoder.Apply` knows there is nothing to
-    upload.
+  - `sharedArena` — one fp32 buffer laid out across the decoder and both
+    generator stages before any of them is built, so `stage0.aXin` *is*
+    `decoder.aOut` and `stage1.aXin` is `stage0.aSum`. `Model.AttachGPU` does
+    the layout, the commit and the aliasing; `Resident()` is how
+    `Vocoder.Apply` knows there is nothing to upload. `GPUProsody` keeps an
+    arena of its own: its output is two curves the host convolves on the way
+    into the vocoder, so nothing of its would stay on the device anyway.
+
+**`kokoro/gpulstm.go` and `shaders/kokoro_lstm.comp`** — `GPULSTM`, one
+bidirectional recurrence on the device: a narrow, the input projection as one
+GEMM over both directions, and **one dispatch a timestep** covering both.
+`SetTail` is what turns the style concatenation into part of the operand.
+Four builds of the step kernel over two knobs, of which only one matters — see
+T6c below.
+
+**`kokoro/gpuphonemes.go`** — `GPUPhonemes`, the whole phoneme side over one
+shared arena: the duration encoder's three LSTM/AdaLayerNorm pairs, the
+recurrence before the duration head, the text encoder's three convolutions and
+its own recurrence, the length regulator, `shared`, and the F0/N stacks.
+**Two submits and two readbacks**, and the only thing in it that is not an
+offset is `kokoro_gather.comp`. The duration head is deliberately *not* here —
+see T6d.
 
 **`shaders/kokoro_*`** — the generator's eight kernels (four builds of
 `dit_gemm.comp` with `A_CONV=1`, the AdaIN reduction's two halves, the fused
@@ -170,7 +212,10 @@ affine/Snake/narrow and its leaky build, the residual add and its copy
 variant, the upsampler's epilogue with and without the reflection pad) and
 T4c's eight: four `A_CONV=2` rungs, an NPOT reduction, three more activation
 builds, the shortcut epilogue, the depthwise `pool`, `conv_post`'s epilogue
-and the inverse transform.
+and the inverse transform. T6a added the attention and a `gelu_new` build;
+T6b added exactly one, `kokoro_proj.comp` — a 256-to-**1** convolution, which
+is the one output shape the ladder cannot express because a fragment tile is
+16 columns wide.
 
 **`g2p/`** — English text to kokoro's phonemes, in seven files.
 `stress.go` (the stress rewrite rules, the vowel and consonant sets, `Context`
@@ -193,7 +238,9 @@ integers, `get_number` over a 1760-case cross product, and the subtoken regex
 over 67 word shapes — and the coverage survey above.
 
 **`cmd/tts`** — phonemes in, a WAV out, with the stage profile above.
-`-gpu` runs the decoder, the generator and the tail on Vulkan, `-voice` picks
+`-gpu` runs the whole model on Vulkan except the embeddings, the duration
+head and the excitation, each of which is on the host for a reason given in
+T6d and T7; `-voice` picks
 one of 54, `-speed` divides the durations, `-noise <seed>` switches the
 excitation noise on (off is the reproducible configuration; on is what an
 utterance meant to be listened to wants), `-list` prints the voices.
@@ -348,14 +395,21 @@ not a rule until it is measured on the others: "a content word in front means a
 tensed verb" is worth seven occurrences of `read` and would wreck `fragment`,
 so it is restricted to the entries that carry a VBD key.
 
-## T6 — the phoneme side
+## T6 — the phoneme side, finished
 
-**The plan for this stage was wrong, and the profile said so.** `SPEECH.md` had
-carried "60% of the phoneme side is recurrences" since T2. Timing the six
-stages put **ALBERT at 104 ms of 222** — 47% of the phoneme side and 40% of a
-whole utterance — against 6.7 GFLOP of arithmetic, which is a transformer this
-repository has had kernels for since stage 3. The recurrences are 78 ms and the
-F0/N AdaIN stacks another 33, so the order of attack was exactly backwards.
+**Three stages, 222 ms to 17, and the profile decided the order of all three
+of them.** `SPEECH.md` had carried "60% of the phoneme side is recurrences" since
+T2. Timing the six stages put **ALBERT at 104 ms of 222** — 47% of the phoneme
+side and 40% of a whole utterance — against 6.7 GFLOP of arithmetic, which is a
+transformer this repository has had kernels for since stage 3. Then T6b split
+`Prosody`'s remaining 67 ms and found **40 ms of AdaIN stacks** where this file
+had written 33. Both corrections were three lines of `time.Now()`. **The first
+commit of a stage should be the instrument, not the kernel** — and the
+instrument has to be one level finer than the plan, because a stage's number
+inferred by subtraction is not a measurement. T6c is the case where the
+instrument agreed with the plan — 73 ms of 76 in the recurrences, exactly where
+T2 had said — and it is worth noticing that this was only knowable the same
+way.
 
 **T6a put PL-BERT on Vulkan: 104 ms to 4 ms, 46.6x**, 0.204 ms of GPU time a
 layer. Nothing about the model's behaviour moved: **none of the fifty durations
@@ -389,19 +443,110 @@ Three things worth keeping:
     four 16-wide tiles with fourteen rows of nothing — and cost a pack pass
     per operand to save a tenth of a millisecond over the whole stack.
 
-**T6b is the F0/N stacks**, ~33 ms of the prosody predictor's 66. They are six
-`AdainResBlk1d` at 512 and 256 channels over 130 and 260 frames — *the same
-block `GPUDecoder` already runs*, one of them with the same depthwise `pool`.
-What is different is the plumbing rather than the kernels: no side channels, no
-concatenation, and two parallel stacks off one shared input.
+**T6b took the F0/N stacks from 40 ms to 1**, and the instrument moved the
+number before the kernel did: `SPEECH.md` had carried "~33 ms" for them,
+inferred by subtraction, and splitting `Prosody` measured 24 ms of recurrence
+against **40 ms of stacks** — a third of the whole phoneme side. They are six
+`AdainResBlk1d` at 512 and 256 channels over 130 and 260 frames, which is *the
+same block `GPUDecoder` already runs*, so the stage was a refactor and some
+plumbing: `blockSet` lifted out of `gpudec.go` (which shrank from 729 lines to
+322, with its numbers unmoved), `GPUProsody` wrapped around it, and **one new
+shader in the whole stage**.
 
-**T6c is the recurrences**, ~78 ms across six bidirectional LSTMs — three in
-the duration encoder, one before the duration head, `shared`, and the text
-encoder's. Each step is a GEMV at M = 1 and cannot start until the last one
-finished, so this is S8's problem in a different model, and S8's answer
-applies: a resident state, the loop's control flow on the device, and the
-submit and the fence out of the inner step. The shared arena and the two-phase
-layout T4c built are what it would extend.
+Three things from it are worth keeping:
+
+  - **The third kind of shortcut is no shortcut.** Four of the six blocks keep
+    their channel count, so upstream builds them with `conv1x1 = None`. On the
+    device that is not a case to implement but three dispatches and an fp16
+    sub-arena that do not happen — the epilogue reads the block's input where
+    it already lies. It cost one thing: the epilogue had assumed its second
+    operand carried the block's own row stride, which is true only when the
+    block made it.
+  - **A 1-wide output is a kernel, not a rung.** The projections are
+    [260, 256] x [256, 1]. Every rung writes a 16-wide cooperative-matrix
+    fragment, so the narrowest GEMM available is 16 columns of which 15 would
+    be zero weight, *plus* a narrow into fp16 for an operand already in fp32.
+    Reuse is the default and the fragment tile is a hard floor.
+  - **The projection is on the device for the boundary, not the arithmetic.**
+    It is 0.7% of the stacks' GPU time. What it buys is that the last block's
+    [260, 256] activation never comes back: this device reads host-visible
+    memory at 210 MB/s, so that tensor is 1.3 ms a curve against 1 KB and 5 µs
+    for the curve itself.
+
+**T6c took the six recurrences from 73 ms to 6**, and this time the plan was
+right: the instrument measured **73 ms of a 76 ms phoneme side** in the six
+LSTMs, 96%, with everything else on that side — ALBERT, the stacks, the
+convolutions, the length regulator — sharing 3 ms between them.
+
+**One algebraic move does most of it.** Torch's step is
+`W_ih x_t + W_hh h_{t-1} + b`, and the first term depends on nothing the loop
+produces. `P = X W_ih^T + b` is therefore computed for the whole sequence up
+front, as **one GEMM with both directions' weights concatenated along N**, and
+the loop keeps only `W_hh h`. The per-step B operand goes from 1.8 MB to 0.5 —
+small enough to stay MALL-resident for every step of every LSTM in the model —
+and the pass that would otherwise assemble `[x_t | h_{t-1}]` as an fp16 operand
+stops existing.
+
+**The recurrence is a static graph, and that is the difference from S8.** A
+transducer decides what to do next from what it just emitted, so its loop
+costs a host round trip a step. Nothing is decided here: the sequence length is
+known before the first dispatch, so the whole thing is T+2 dispatches in one
+command buffer with no fence in the middle, and one dispatch a step covers
+both directions.
+
+Three things from it are worth keeping anywhere else in this engine:
+
+  - **The knob was not the one being turned.** A step is 0.5 MB of weights
+    against 0.26 MFLOP — 500 bytes a FLOP — so it reads as a bandwidth problem,
+    and the obvious fix was to spread it over more CUs. Two workgroups, eight,
+    sixteen: **12.1 microseconds either way**. What it was short of was
+    outstanding loads, and deepening the unroll from 4 taps to 32 took it to
+    **3.7**. A recurrence has only 4H threads to issue from, so depth per
+    thread is the only parallelism left.
+  - **Measure the step on the critical path.** The same dispatch 130 times
+    with barriers is 11.9 microseconds; without them it is 0.53, because they
+    overlap and hit the same hot megabyte. The second number is a throughput
+    figure for work that cannot be run in parallel, and it is not the step.
+  - **One field beat four signatures.** `LSTM.GPU` hangs off the recurrence,
+    not off the four objects that own one, because all four reach it through
+    `Apply`.
+
+**T6d closed it**: the whole phoneme side is one arena, two submits and two
+readbacks, 8 ms of wall clock over **1.96 ms of GPU time**. T6c's recurrences
+had been 6 ms of wall clock over 1.4 of GPU — the rest six readbacks and six
+submits, because each one returned its output so the host could do the three
+lines between it and the next. This was those three lines, and it needed one
+new kernel: a gather.
+
+Four things from it are worth keeping anywhere else in this engine:
+
+  - **fp16 has exactly one place it cannot go in this model.** The duration
+    head was on the device first — one narrow, one GEMM, 13 KB back instead of
+    102 — and a duration moved by **0.29 of a frame**, where T6a's whole
+    ALBERT port moved the largest of fifty by 0.005. Its logits have an rms of
+    27, so a thousandth of relative error is two hundredths of a logit; a
+    duration is the *sum of fifty sigmoids* of them, the terms near zero have
+    a derivative of a quarter, and the total is then **rounded**. The head
+    went back to the host in fp32 and the drift returned to 0.006. **A dot
+    product whose output is rounded is not the same kind of tensor as one
+    whose output is added** — and this is the model's only one.
+  - **A constant input channel is part of the operand, not part of the data.**
+    Five of the six recurrences take `[h | style]`, the same 128 numbers in
+    every row of every utterance. `GPULSTM.SetTail` writes them once into the
+    fp16 A operand, in columns `lstmPad` had already reserved, so torch's
+    `Concat(h, s)` becomes nothing at all. Stage 9's bias trick is the special
+    case where the constant is 1. It also **removed a kernel before it was
+    written**: with the style out of the data, every normalisation runs over a
+    512-wide row, which is the shape parakeet's LayerNorm already reads — so
+    AdaLayerNorm is that kernel with `(1+gamma)` and `beta` computed on the
+    host once an utterance, exactly as every AdaIN in the vocoder is.
+  - **Read back the shorter tensor.** `t_en` can be expanded here and returned
+    as [L, 512], or returned as [T, 512] and expanded on the host. The
+    expansion is a gather either way; 102 KB is cheaper to read than 266. At
+    210 MB/s the *direction* of a gather is a bandwidth decision.
+  - **Two independent paths are one submit.** The text encoder depends on
+    nothing the duration path produces, so its convolutions and its recurrence
+    ride in the same command buffer and cost only their own dispatches.
 
 The `parallelFor` lesson from T2 is worth repeating before anyone profiles it:
 pushing one index per worker through a channel costs more than the work when a
@@ -451,3 +596,32 @@ has not been done because the whole stack is 1 ms.
 depend on nothing but T and could be cached. The encoder's eight per-head
 position-score GEMMs are the same shape at different offsets, which is §3.5's
 grouped GEMM.
+
+## T7 — the excitation, and what is actually left
+
+With T6 closed the vocoder is **82% of an utterance** again, and the largest
+single stage in the whole model is the **excitation at 14 ms** — 32% of a
+44 ms utterance, and nearly twice the whole phoneme side.
+
+It is on the host on purpose and T3 explains why: upstream integrates the
+excitation's phase in radians and multiplies by 300, so three seconds holds
+**1.3e5 radians, where one float32 ulp is 0.016** and fp16 cannot represent the
+number at all. But that is an argument about *upstream's* formulation.
+`HarmonicSource` already keeps the phase in cycles and wraps before the sine,
+so nothing it computes is ever large — which is why it is more accurate than
+the dump rather than less. The open question is therefore not "can the
+reference's accumulator move to the device" but **"is the wrapped form
+float32-safe, and if so what does it cost there"**, and it is a measurement
+rather than an argument: 78000 samples times eight harmonics of
+`sin(2*pi*frac(phi))`, with the F0 curve upsampled 300:1 and a uv mask, is an
+embarrassingly parallel kernel if the wrap is exact.
+
+Beside it: **the generator is 12 ms and the tail 8**, which T4 left measured
+and which are the only parts of this model that were ever arithmetic-bound.
+
+And what is left on the phoneme side is 6 ms of the 8, none of it arithmetic:
+ALBERT's [T, 768] readback and its host-side embedding stack, the two
+readbacks T6d could not remove, and four submits. Closing any of it means
+moving the *vocoder's* input boundary — `asr` currently goes host-side into
+`GPUDecoder.Upload` — which is one change, not four, and is the thing to do
+after T7 rather than before it.

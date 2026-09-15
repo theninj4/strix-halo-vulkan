@@ -935,7 +935,7 @@ func (g *GPUBlocks) Destroy() {
 // takes the alignment frame count the prosody predicted and derives the rest —
 // the same chain TestSTFTGeometry pins: 2L frames into the generator, then the
 // upsampling rates, then a reflection pad on the last stage.
-func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle []float32, kernel ConvKernel) error {
+func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle, predStyle []float32, kernel ConvKernel) error {
 	g := m.Vocoder.Generator
 	m.DetachGPU()
 
@@ -953,6 +953,23 @@ func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle []float32, kernel
 		return fmt.Errorf("kokoro: staging PL-BERT: %w", err)
 	}
 	m.BERTGPU = bert
+
+	// The rest of the phoneme side, on an arena of its own: the duration
+	// encoder, the duration head, the length regulator, the text encoder and
+	// the F0/N stacks, with every recurrence chained through the tensor
+	// before it (SPEECH.md T6c, T6d). Two things come back from it — the
+	// duration logits and the text encoder's output — and both are host
+	// decisions rather than readbacks that could be removed.
+	ph, err := NewGPUPhonemes(dev, m, frames)
+	if err != nil {
+		m.DetachGPU()
+		return fmt.Errorf("kokoro: staging the phoneme side: %w", err)
+	}
+	m.PhonemesGPU = ph
+	if err := ph.SetStyle(predStyle); err != nil {
+		m.DetachGPU()
+		return err
+	}
 
 	// The decoder first, because it is what decides the generator's input:
 	// its last block doubles the frame count, which is where the 2*frames
@@ -1053,6 +1070,18 @@ func (m *Model) DetachGPU() {
 		m.BERTGPU.Destroy()
 		m.BERTGPU = nil
 	}
+	if m.PhonemesGPU != nil {
+		m.PhonemesGPU.Destroy()
+		m.PhonemesGPU = nil
+	}
+}
+
+// recurrences is every bidirectional LSTM in the model, in the order an
+// utterance runs them.
+func (m *Model) recurrences() []*LSTM {
+	p := m.Predictor
+	out := append([]*LSTM{}, p.TextEncoder.LSTMs...)
+	return append(out, p.LSTM, p.Shared, m.TextEncoder.LSTM)
 }
 
 // packUpB lays a ConvTranspose1d weight out as the one GEMM described on

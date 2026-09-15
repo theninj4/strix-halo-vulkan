@@ -1,0 +1,164 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// One timestep of a bidirectional LSTM, both directions, in one dispatch
+// (SPEECH.md T6c).
+//
+// # Why the recurrent half is all that is left here
+//
+// PyTorch computes a step as `W_ih x_t + W_hh h_{t-1} + b`. The first term
+// does not depend on the state, so the whole sequence's worth of it is **one
+// GEMM** — `[T, In] x [In, 8H]` with both directions' weights concatenated
+// along N — done once before the loop starts, on the matrix cores, at the
+// ladder's own shape. What is left for the sequential part is the second
+// term, and that is the entire point of the split: `W_hh` is [H, 4H], half a
+// megabyte in fp16, against `[W_ih | W_hh]`'s 1.8 — so the per-step B operand
+// shrinks 3.5x and stays inside the MALL for every step of every LSTM in the
+// model (research/5.1b: 805-965 GB/s resident against 236 from DRAM).
+//
+// # One dispatch a step, not three
+//
+// S8's transducer loop is `lstm_in`, a GEMM and `lstm_gate` per step, because
+// its control flow is data-dependent and the host decides between them. Here
+// nothing is decided: the sequence length is known before the first dispatch,
+// so the whole recurrence is a static graph and the only cost per step is the
+// dispatch itself. Three of those would be three barriers on the critical
+// path of a chain 330 steps long, so the gates and the cell are fused into
+// one.
+//
+// # The grid, and why it is not one workgroup
+//
+// A step is 0.5 MB of weights and 0.26 MFLOP of arithmetic — 500 bytes a
+// FLOP, so it is a memory problem whatever else it looks like. The first
+// version gave one workgroup to each direction and measured **14.3
+// microseconds a step**, which is 36 GB/s: not the MALL's 805 and not even
+// one CU's share of L2, but the latency of 1024 dependent loads per thread
+// with eight waves to hide it.
+//
+// So the grid is (bands, directions) and a workgroup owns CELLS cells rather
+// than all H of them: one thread to one **(cell, gate)** pair, a quarter of
+// the loads each, and eight workgroups on eight CUs instead of two. The cell
+// update then needs the four gates of a cell back in one place, which is the
+// only barrier in the kernel.
+//
+// **The carried state has to be double-buffered for this.** With one
+// workgroup a direction, a thread could overwrite `h[i]` once its own copy
+// was in shared memory; with four, band 0 can finish and write `h[0..63]`
+// before band 1 has read it, and there is no way to order two workgroups of
+// one dispatch. So h alternates between two halves of the state region and
+// `pc.aux2` says which is live. The cell state needs no such thing: cell i
+// belongs to exactly one band for the whole sequence.
+//
+// `W_hh` is stored **k-major**, [H, 4H] rather than torch's [4H, H], so at
+// reduction index k a wave's 32 threads read 32 consecutive halves. The
+// transpose happens once at staging; the alternative is a 512-byte stride
+// between neighbouring lanes on every one of 256 iterations.
+//
+// The two directions are one dispatch over `gl_WorkGroupID.y`. They are
+// independent — forward reads token s, reverse reads T-1-s — and every offset
+// that distinguishes them is a fixed stride from the other, so one set of
+// push constants covers both.
+//
+//   pc.inOff   [T, lda] fp32, the input projections; direction d at column
+//              d*4H, gates in torch's order: input, forget, cell, output
+//   pc.lda     that row stride, 2*4H
+//   pc.outOff  [T, ldb] fp32 output; direction d's h at column d*H
+//   pc.ldb     that row stride, 2H
+//   pc.aux0    fp32 state, 3H a direction: h, h again, then c
+//   pc.aux1    the step index s, which is *not* the token index
+//   pc.aux2    which half of the state h is live in, 0 or 1
+//   pc.bOff    fp16 [2][H, 4H] k-major recurrent weights
+//   pc.tokens  T
+//   pc.dim     H, the hidden width per direction; a multiple of CELLS, at
+//              most NTHREADS
+
+#include "dit_common.glsl"
+
+layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
+
+// CELLS is how many cells one workgroup owns, and therefore NTHREADS/4 of
+// them: four gates a cell, one thread each.
+#ifndef CELLS
+#define CELLS 64
+#endif
+// UNROLL is how many taps of the reduction a thread has in flight. The step
+// is latency-bound rather than bandwidth-bound — see the grid note above —
+// so this is the knob that matters and it is swept, not guessed.
+#ifndef UNROLL
+#define UNROLL 4
+#endif
+#define NTHREADS (CELLS * 4)
+
+layout(local_size_x = NTHREADS) in;
+
+// The carried state, read once at the top so the reduction never touches
+// global memory for it, and the gate partials on the way back out.
+shared float sh[256];
+shared float gsum[NTHREADS];
+
+float sigmoid(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+// tanh written out rather than called, for S8's reason: the built-in is free
+// to evaluate (e^2x - 1)/(e^2x + 1), which overflows for a gate
+// pre-activation of 90 or so, where folding the sign and using exp(-2|x|) is
+// bounded everywhere and costs the same exponential.
+float stable_tanh(float x) {
+    float e = exp(-2.0 * abs(x));
+    float t = (1.0 - e) / (1.0 + e);
+    return x < 0.0 ? -t : t;
+}
+
+void main() {
+    uint d = gl_WorkGroupID.y;
+    uint H = pc.dim;
+    uint tid = gl_LocalInvocationID.x;
+    uint gate = tid / uint(CELLS);
+    uint lc = tid % uint(CELLS);
+    uint cell = gl_WorkGroupID.x * uint(CELLS) + lc;
+
+    uint t = (d == 0u) ? pc.aux1 : (pc.tokens - 1u - pc.aux1);
+    uint st = pc.aux0 + d * 3u * H;
+    uint hIn = st + pc.aux2 * H;
+    uint hOut = st + (1u - pc.aux2) * H;
+    uint cOff = st + 2u * H;
+
+    for (uint k = tid; k < H; k += uint(NTHREADS)) {
+        sh[k] = act[hIn + k];
+    }
+    barrier();
+
+    // One dot product: this gate of this cell against the whole state.
+    float sum = act[pc.inOff + t * pc.lda + d * 4u * H + gate * H + cell];
+    uint b = pc.bOff + d * H * 4u * H + gate * H + cell;
+    uint row = 4u * H;
+    for (uint k = 0u; k < H; k += uint(UNROLL)) {
+        float v[UNROLL];
+        for (int u = 0; u < UNROLL; u++) {
+            v[u] = float(w16[b + uint(u) * row]);
+        }
+        for (int u = 0; u < UNROLL; u++) {
+            sum += sh[k + uint(u)] * v[u];
+        }
+        b += uint(UNROLL) * row;
+    }
+    gsum[tid] = sum;
+    barrier();
+
+    // The four gates of one cell are now CELLS apart in shared memory, and
+    // the first CELLS threads own one cell each.
+    if (tid >= uint(CELLS)) {
+        return;
+    }
+    float gi = gsum[lc];
+    float gf = gsum[uint(CELLS) + lc];
+    float gg = gsum[2u * uint(CELLS) + lc];
+    float go = gsum[3u * uint(CELLS) + lc];
+
+    float c = sigmoid(gf) * act[cOff + cell] + sigmoid(gi) * stable_tanh(gg);
+    act[cOff + cell] = c;
+    float h = sigmoid(go) * stable_tanh(c);
+    act[hOut + cell] = h;
+    act[pc.outOff + t * pc.ldb + d * H + cell] = h;
+}

@@ -1,6 +1,9 @@
 package kokoro
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // TextEncoder is the second, shallower path from the phonemes: an embedding,
 // three 5-tap convolutions with a layer norm and a leaky ReLU, and one
@@ -21,7 +24,7 @@ type TextEncoder struct {
 }
 
 // Apply runs the encoder over a token sequence and returns [T, Channels].
-func (t *TextEncoder) Apply(ids []int) (*Mat, error) {
+func (t *TextEncoder) Apply(ids []int, times *ProsodyTimes) (*Mat, error) {
 	x, err := t.Embedding.Rows(ids)
 	if err != nil {
 		return nil, err
@@ -35,5 +38,10 @@ func (t *TextEncoder) Apply(ids []int) (*Mat, error) {
 		}
 		leakyReLUInPlace(x, 0.2)
 	}
-	return t.LSTM.Apply(x)
+	t0 := time.Now()
+	out, err := t.LSTM.Apply(x)
+	if times != nil {
+		times.Recurrence += time.Since(t0)
+	}
+	return out, err
 }

@@ -121,7 +121,7 @@ func main() {
 			log.Fatal(err)
 		}
 		defer cleanup()
-		if err := model.AttachGPU(dev, p.Frames, decStyle, kokoro.DefaultConvKernel); err != nil {
+		if err := model.AttachGPU(dev, p.Frames, decStyle, predStyle, kokoro.DefaultConvKernel); err != nil {
 			log.Fatal(err)
 		}
 		defer model.DetachGPU()
@@ -166,8 +166,15 @@ func main() {
 	fmt.Printf("    dur enc     %6.0fms\n", ms(pt.DurEncoder))
 	fmt.Printf("    durations   %6.0fms\n", ms(pt.Durations))
 	fmt.Printf("    prosody     %6.0fms\n", ms(pt.Prosody))
+	fmt.Printf("      shared    %6.0fms\n", ms(pt.Shared))
+	fmt.Printf("      f0/n      %6.0fms\n", ms(pt.Stacks))
 	fmt.Printf("    text enc    %6.0fms\n", ms(pt.TextEncoder))
 	fmt.Printf("    expand      %6.0fms\n", ms(pt.Expand))
+	// Only on the host path: on the device the recurrences are inside the
+	// two submits above and a zero here would read as a broken timer.
+	if pt.Recurrence > 0 {
+		fmt.Printf("    recurrence  %6.0fms\n", ms(pt.Recurrence))
+	}
 	fmt.Printf("    phonemes    %6.0fms\n", ms(best.prosody))
 	fmt.Printf("    decoder     %6.0fms\n", ms(best.decoder))
 	fmt.Printf("    generator   %6.0fms\n", ms(best.stage))

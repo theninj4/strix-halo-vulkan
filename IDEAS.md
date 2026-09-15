@@ -663,7 +663,7 @@ the weight loader for a possibly free few-percent on everything.
 
 **Written up in [`research/5.1b-mall-cliff-and-stride.md`](research/5.1b-mall-cliff-and-stride.md).** The probe that measured the memory system directly, and the one item that found something nobody was looking for. The interleave rotation is **4 KB**, not 2 KB, and the achievable fraction of peak is `min(1, C/gcd(stride, 4096))` where C is the contiguous run the requests in flight hold in a row — worth 4x, and up to 8x on a tensor with no padding at all.
 
-### 5.2 Heap topology, carveout size and page size
+### 5.2 Heap topology, carveout size and page size — **DONE** ✅ (heap 1), **and there is nothing to lay out for**
 
 Heap 1 reports 83.8 GiB device-local on a machine with 117 GiB of usable
 RAM (and heap 0 another 41.9 GiB) — the two heaps overlap the same physical
@@ -673,7 +673,25 @@ Experiment: measure bandwidth for buffers small enough to fit a
 conventionally-sized carveout vs much larger, and check whether page-size
 effects appear. Also test whether huge/2MB pages are in play. Informs how
 to lay out a multi-GB model.
-**Effort**: medium. **Value**: medium, potentially high for big models.
+
+**[measured] Written up in
+[`research/l0a-bank-range.md`](research/l0a-bank-range.md)** (LLM.md L0a).
+A fixed 1 GiB read drawn from a bank swept 1 → 64 GiB, in three selection
+orders, at qwen3.8-flash-next's two real 4-bit expert slab sizes: **flat at
+236-237 GB/s everywhere, and random selection costs exactly nothing**
+(`rand/seq` 1.00x in all 48 cells at the real slab sizes). That is §0.4's
+236 GB/s *contiguous* ceiling reached by a **gather over 64 GiB**, so carveout
+size, page size and the ~19 separate 4 GiB allocations a big bank needs are
+all invisible in achieved bandwidth. The answer to "informs how to lay out a
+multi-GB model" is that it does not: lay it out however is convenient. Stage
+4c found the matching result from the other direction on the DiT (six weight
+banks bit-identical to one). **Still open is heap 0** — every allocation above
+was `DEVICE_LOCAL|HOST_VISIBLE`, i.e. heap 1, which stops at 83.79 GiB. That
+is §5.1, still unrun, and it is now the item that decides whether a model
+larger than that heap can be served at all.
+**Effort**: was medium; the probe was half a day. **Value**: delivered as a
+negative, which is the useful kind here — it removed a class of worry from the
+LLM vertical before any of it was built.
 
 ### 5.3 Image/texture loads vs storage-buffer loads
 On AMD, sampler/image reads go through a different path (and on some parts

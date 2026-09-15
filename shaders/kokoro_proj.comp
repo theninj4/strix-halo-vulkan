@@ -1,0 +1,54 @@
+#version 450
+
+// The prosody predictor's `F0_proj` and `N_proj`: a 1x1 convolution from 256
+// channels to *one*, which is what turns the last AdaIN block's activation
+// into a curve (SPEECH.md T6b).
+//
+// It is a kernel of its own because N = 1 is the one shape the convolution
+// ladder cannot express. Every rung of dit_gemm.comp writes a 16-wide
+// cooperative-matrix fragment, so the narrowest output it can produce is 16
+// columns of which 15 would be zero weight — and reaching it would cost a
+// narrow into the fp16 arena first, for 66560 multiplies.
+//
+// One workgroup per frame, 256 threads down the channel axis, so a wave's
+// addresses are one contiguous run of a row and the reduction is in shared
+// memory. The loop is there for a channel count wider than a workgroup; here
+// it runs exactly once.
+//
+//   pc.inOff   [T, lda] fp32 activations
+//   pc.outOff  [T] fp32 destination, one value a frame
+//   pc.wOff    [dim] fp32 weights
+//   pc.bOff    [1] fp32 bias, or NO_W
+//   pc.dim     the input channel count
+//   pc.lda     the input's row stride
+
+#include "dit_common.glsl"
+
+#define NTHREADS 256
+layout(local_size_x = NTHREADS) in;
+
+shared float red[NTHREADS];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    float s = 0.0;
+    for (uint c = tid; c < pc.dim; c += NTHREADS) {
+        s += act[pc.inOff + t * pc.lda + c] * wbuf[pc.wOff + c];
+    }
+    red[tid] = s;
+    barrier();
+    for (uint half_ = NTHREADS / 2u; half_ > 0u; half_ >>= 1u) {
+        if (tid < half_) {
+            red[tid] += red[tid + half_];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        float v = red[0];
+        if (pc.bOff != NO_W) {
+            v += wbuf[pc.bOff];
+        }
+        act[pc.outOff + t] = v;
+    }
+}

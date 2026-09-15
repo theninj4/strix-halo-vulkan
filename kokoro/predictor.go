@@ -2,7 +2,7 @@ package kokoro
 
 import (
 	"fmt"
-	"math"
+	"time"
 )
 
 // DurationEncoder is the prosody predictor's text side: three bidirectional
@@ -24,15 +24,19 @@ type DurationEncoder struct {
 // Apply runs the encoder over a [T, Channels] activation and returns
 // [T, Channels+StyleDim] — the style is still attached on the way out, which
 // is what the duration head and the length regulator both consume.
-func (d *DurationEncoder) Apply(x *Mat, style []float32) (*Mat, error) {
+func (d *DurationEncoder) Apply(x *Mat, style []float32, times *ProsodyTimes) (*Mat, error) {
 	s := Broadcast(style, x.Rows)
 	h, err := Concat(x, s)
 	if err != nil {
 		return nil, err
 	}
 	for i := range d.LSTMs {
+		t0 := time.Now()
 		if h, err = d.LSTMs[i].Apply(h); err != nil {
 			return nil, fmt.Errorf("kokoro: duration lstm %d: %w", i, err)
+		}
+		if times != nil {
+			times.Recurrence += time.Since(t0)
 		}
 		if err = d.Norms[i].Apply(h, style); err != nil {
 			return nil, fmt.Errorf("kokoro: duration norm %d: %w", i, err)
@@ -73,29 +77,20 @@ type Predictor struct {
 //
 // Speed divides the duration before rounding, which is why it is a parameter
 // here rather than a resampling of the output.
-func (p *Predictor) Durations(d *Mat, speed float32) ([]int, []float32, error) {
+func (p *Predictor) Durations(d *Mat, speed float32, times *ProsodyTimes) ([]int, []float32, error) {
+	t0 := time.Now()
 	x, err := p.LSTM.Apply(d)
 	if err != nil {
 		return nil, nil, err
+	}
+	if times != nil {
+		times.Recurrence += time.Since(t0)
 	}
 	logits, err := p.DurationHead.Apply(x)
 	if err != nil {
 		return nil, nil, err
 	}
-	raw := make([]float32, logits.Rows)
-	out := make([]int, logits.Rows)
-	for t := 0; t < logits.Rows; t++ {
-		var sum float32
-		for _, v := range logits.Row(t) {
-			sum += sigmoid(v)
-		}
-		raw[t] = sum / speed
-		n := int(math.Round(float64(raw[t])))
-		if n < 1 {
-			n = 1
-		}
-		out[t] = n
-	}
+	out, raw := durationsFrom(logits, speed)
 	return out, raw, nil
 }
 
@@ -134,11 +129,26 @@ func Expand(x *Mat, durations []int) (*Mat, error) {
 // convolution on the way in. The round trip is not an accident: the doubling
 // happens inside an AdaIN block where it can be learned, and the halving
 // happens in a plain convolution where it cannot.
-func (p *Predictor) Prosody(en *Mat, style []float32) (f0, energy []float32, err error) {
+// The `times` pointer is the instrument T6a's lesson asks for and may be
+// nil: the recurrence and the stacks are two different problems — one is
+// latency-bound at M = 1, the other is six convolution blocks — and the split
+// between them decides which is worth a kernel.
+func (p *Predictor) Prosody(en *Mat, style []float32, times *ProsodyTimes) (f0, energy []float32, err error) {
+	t0 := time.Now()
 	shared, err := p.Shared.Apply(en)
 	if err != nil {
 		return nil, nil, err
 	}
+	if times != nil {
+		times.Shared += time.Since(t0)
+		times.Recurrence += time.Since(t0)
+	}
+	t0 = time.Now()
+	defer func() {
+		if times != nil {
+			times.Stacks += time.Since(t0)
+		}
+	}()
 	run := func(blocks []*AdainResBlk1d, proj *Conv1D) ([]float32, error) {
 		h, err := shared, error(nil)
 		for i, b := range blocks {

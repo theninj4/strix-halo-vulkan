@@ -1,0 +1,38 @@
+#version 450
+
+// The length regulator: frame f is a copy of token `index[f]` (SPEECH.md T6d).
+//
+// Upstream writes this as an `[N, L]` one-hot matrix and a matmul, which is
+// two `[512, 50] x [50, 130]` GEMMs that do not need to exist. It is a gather,
+// and on the device it is the *only* thing that has to happen between the
+// durations being decided and the recurrence after them — so putting it here
+// rather than on the host is what keeps the duration encoder's output from
+// making a round trip it would otherwise make purely to be reordered.
+//
+// The indices arrive as floats in the activation arena rather than as a
+// separate integer buffer. A frame count fits exactly in an fp32 mantissa
+// several thousand times over, the binding layout has four buffers and none
+// of them is an integer one, and a host write of 130 floats costs 4
+// microseconds at the 29 GB/s this device writes host-visible memory at.
+//
+//   pc.inOff   [T, lda] fp32 source
+//   pc.lda     the source row stride
+//   pc.outOff  [L, ldb] fp32 destination
+//   pc.ldb     the destination row stride
+//   pc.aux0    [L] fp32 indices, in the activation arena
+//   pc.dim     how many channels to copy
+//   pc.tokens  L, the number of output frames
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint f = gl_WorkGroupID.y;
+    if (c >= pc.dim || f >= pc.tokens) {
+        return;
+    }
+    uint src = uint(act[pc.aux0 + f]);
+    act[pc.outOff + f * pc.ldb + c] = act[pc.inOff + src * pc.lda + c];
+}

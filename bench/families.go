@@ -21,6 +21,9 @@ type Params struct {
 	ColdFootprints []int // weight footprints in MB (gemv_cold)
 	ColdN          int   // reduction length (gemv_cold)
 
+	BankGiB     int // total weight bank to allocate, in GiB (bank)
+	BankReadMiB int // bytes read per timed step, in MiB (bank)
+
 	StridePads       []int // row padding in bytes (stride)
 	StrideFootprints []int // touched footprints in MB (stride)
 	StrideRowBytes   []int // bytes touched per row (stride)
@@ -42,9 +45,16 @@ func DefaultParams() Params {
 		// cache-to-DRAM cliff can be located rather than merely straddled.
 		BWSizes: []int{262144, 524288, 1048576, 2097152, 3145728, 4194304,
 			6291456, 8388608, 12582912, 16777216, 33554432, 67108864},
-		Blocks:           []int{32, 64, 128},
-		ColdFootprints:   []int{16, 64, 256},
-		ColdN:            4096,
+		Blocks:         []int{32, 64, 128},
+		ColdFootprints: []int{16, 64, 256},
+		ColdN:          4096,
+		// 64 GiB is 68.7 GB: the size a bank of our own would be (~67 GB),
+		// and close enough to UD-Q4_K_XL's 82.5 GB resident core to say
+		// whether the answer holds there. 1 GiB read per step is ~4.5 ms at
+		// the bus, which is long enough to measure and short enough that a
+		// 63-cell sweep is seconds of timed work.
+		BankGiB:          64,
+		BankReadMiB:      1024,
 		StridePads:       StridePadsBytes,
 		StrideFootprints: StrideFootprintsMB,
 		StrideRowBytes:   StrideRowBytesList,
@@ -154,6 +164,14 @@ var families = []Family{
 			return RunMoE(dev, phys, p.Warmup, p.Iters)
 		},
 		Summary: func(w io.Writer, results []Result, p Params) { PrintMoESummary(w, results, p) },
+	},
+	{
+		Name: "bank",
+		Desc: "LLM.md L0a: fixed bytes read from a weight bank of growing size, to see whether the bus survives a 64 GiB working set",
+		Run: func(dev *vk.Device, phys *vk.PhysicalDevice, p Params) ([]Result, error) {
+			return RunBank(dev, phys, p, os.Stderr)
+		},
+		Summary: func(w io.Writer, results []Result, p Params) { PrintBankSummary(w, results, p) },
 	},
 	{
 		Name: "reduce",

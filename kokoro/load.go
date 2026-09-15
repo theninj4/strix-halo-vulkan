@@ -23,6 +23,13 @@ type Model struct {
 	// nil by default: the CPU path is the reference and stays the reference.
 	BERTGPU *GPUAlbert
 
+	// PhonemesGPU, when set, runs the whole phoneme side on the device: both
+	// encoders, every recurrence, the duration head, the length regulator and
+	// the F0/N stacks. Like BERTGPU it is nil by default, and it is sized for
+	// one utterance's frame count, which is why AttachGPU takes the
+	// durations' answer.
+	PhonemesGPU *GPUPhonemes
+
 	Voices              map[string][]float32 // [510*256] each, by name
 	voiceRows, voiceDim int
 }

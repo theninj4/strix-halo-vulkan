@@ -21,8 +21,15 @@
 // decomposition is free at any channel count, which matters because the
 // decoder's are 514, 1090, 1024 and 512.
 //
+// The shortcut has a row stride of its own because it is not always a tensor
+// of this block's making. A block that changes its channel count convolves
+// its input into a [T, dim] scratch; a block that does not is the identity on
+// it, and then the shortcut *is* the block's input, read where it already
+// lies at whatever stride its producer wrote it with (SPEECH.md T6b).
+//
 //   pc.inOff   [T, dim] fp32, the second convolution's output
-//   pc.aux0    [T, dim] fp32, the shortcut's
+//   pc.aux0    [T, aux1] fp32, the shortcut's
+//   pc.aux1    the shortcut's row stride
 //   pc.outOff  [T, lda] fp32 destination
 //   pc.wOff    [dim] bias, or NO_W
 //   pc.dim     the block's output channel count
@@ -39,7 +46,7 @@ void main() {
         return;
     }
     uint t = gl_WorkGroupID.y;
-    float v = act[pc.inOff + t * pc.dim + c] + act[pc.aux0 + t * pc.dim + c];
+    float v = act[pc.inOff + t * pc.dim + c] + act[pc.aux0 + t * pc.aux1 + c];
     if (pc.wOff != NO_W) {
         v += wbuf[pc.wOff + c];
     }

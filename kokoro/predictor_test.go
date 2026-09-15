@@ -38,7 +38,7 @@ func TestDurationEncoder(t *testing.T) {
 		check(t, m, fmt.Sprintf("dur_norm_%d", i), h, true, 1e-5)
 	}
 
-	d, err := de.Apply(dEn, style)
+	d, err := de.Apply(dEn, style, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +67,7 @@ func TestDurations(t *testing.T) {
 	}
 	check(t, m, "dur_logits", logits, false, 1e-5)
 
-	durations, raw, err := model.Predictor.Durations(d, m.Speed)
+	durations, raw, err := model.Predictor.Durations(d, m.Speed, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func TestProsody(t *testing.T) {
 		}
 	}
 
-	f0, energy, err := model.Predictor.Prosody(en, style)
+	f0, energy, err := model.Predictor.Prosody(en, style, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

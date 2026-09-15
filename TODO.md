@@ -44,17 +44,28 @@ more GEMV builds and eight mixed-width dispatch plans since.)
 kokoro (text-to-speech) verticals. **Both models now run on the device.**
 Parakeet is finished (S1-S8): 43 ms for an 11 s clip, 257x real time, whole
 model resident, with the host-side front end now half the pipeline. Kokoro's
-vocoder is finished (T1-T4c): 38 ms against 3626 on the CPU, 12.90x real time
-for a whole utterance, and **85% of that utterance is now the phoneme side's
-six bidirectional LSTMs**. Grapheme-to-phoneme is underway: T5a measured that
+vocoder is finished (T1-T4c): 36 ms against 3626 on the CPU, and with T6
+closed it is **82% of an utterance** again. Grapheme-to-phoneme is underway: T5a measured that
 **91% of running English is a dictionary lookup** and that a part-of-speech
 tagger is worth 1.74% of tokens, and T5b ported that 91% into `g2p/`. What is
 **T5 is finished** — `go run ./cmd/tts -gpu -text 'Hello there.'` speaks with
 no Python on the path, and reproduces misaki character for character on a
 corpus in which every branch of its English G2P fires. T6a put PL-BERT on the
-device (104 ms to 4), taking an utterance to **20.9x real time**. What is open
-is the F0/N stacks (T6b) and the six bidirectional LSTMs (T6c). **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
-image with its resume points stated at the top. Both are rewritten each
+device (104 ms to 4), T6b the F0/N AdaIN stacks (40 ms to 1), T6c the six
+bidirectional LSTMs (73 ms to 6) and T6d the chain between them (17 ms to 8),
+taking an utterance to **74.2x real time**. **T6 is finished: the phoneme side
+is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
+is the vocoder again, whose host-side excitation is now the largest single
+stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
+image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
+(text-generation) vertical, **scoped 2026-09-15, nothing built**: it carries
+the real tensor inventory of `unsloth/…-UD-Q4_K_XL` (1224 tensors, 111.32 GB,
+5.03 bits/weight), read out of 35 MB of HTTP range requests by
+`reference/gguf_inventory.py` rather than a download, and the two-phase plan
+that follows from it — run the stock quant first (llama.cpp is built here,
+supports `qwen4exp`, and is the oracle), then re-quantise, because **76% of the
+bytes read per token are dense** and the stock Q8_0 dense allocation costs 1.7x
+on a bus-bound machine. Task list L0–L9. All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -825,6 +836,316 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-15 (twenty-ninth) — stage T6d: the phoneme side resident, and one place fp16 could not go
+
+**Result: the phoneme side goes from 17 ms to 8 — and an utterance from 53 ms
+to 44, 61.4x real time to 74.2x. Fifty of fifty durations are still
+unchanged. The whole of it is 1.96 ms of GPU time.**
+
+    stage          gpu    (T6c)   cpu (T3)
+    bert            4ms      4ms     104ms
+    dur encoder     3ms      3ms      24ms   + the whole text encoder
+    durations       0ms      1ms       8ms   the head, on the host, in fp32
+    prosody         1ms      2ms      66ms   gather, shared, both AdaIN stacks
+    text encoder    0ms      8ms      15ms   now just a readback
+    phoneme side    8ms     17ms     222ms   18% of the utterance
+    vocoder        36ms     36ms    3626ms   82% of the utterance
+    total          44ms     53ms    3848ms   74.20x real time, from 61.44x
+
+**T6c's number said what to do.** Six recurrences at 6 ms of wall clock over
+**1.4 ms of GPU time**: the other 4.6 was six readbacks and six submits,
+because each one returned its output so the host could do the three lines
+between it and the next. This stage is those three lines. Almost nothing in
+it is arithmetic — it is a chain of offsets — and the **only new kernel is a
+gather**.
+
+**Built:**
+
+- `kokoro/gpuphonemes.go` — `GPUPhonemes`: both encoders, every recurrence,
+  the length regulator and the F0/N stacks over one shared arena. **Two
+  submits and two readbacks** for what was eight and seven.
+- `shaders/kokoro_gather.comp` — the length regulator.
+- `GPULSTM.SetTail` and `SetNarrowLeaky`; `GPUProsody` on a shared arena with
+  an `Attach`.
+- `Model.prosodyGPU`, which replaces `LSTM.GPU` — the T6c hook is gone.
+- `kokoro/gpuphonemes_test.go` — the chain link by link, the profile, and the
+  durations.
+
+**Four things worth carrying forward:**
+
+1. **fp16 has exactly one place it cannot go in this model, and this stage
+   found it.** The duration head was on the device first: one narrow, one
+   GEMM, 13 KB back instead of 102. A duration moved — not by rounding noise
+   but by **0.29 of a frame**, where T6a's entire ALBERT port moved the
+   largest of fifty by 0.005. The head's logits have an rms of **27**, so a
+   thousandth of fp16 relative error is two hundredths of a logit; a duration
+   is the *sum of fifty sigmoids* of them, the terms near zero have a
+   derivative of a quarter, and the total is then **rounded**. Every frame
+   boundary in the utterance is placed by that rounding. The head went back to
+   the host, in fp32, on the same code the CPU reference runs — and the
+   largest drift returned to 0.006 frames. **A dot product whose output is
+   rounded is not the same kind of tensor as one whose output is added.**
+2. **A constant input channel is part of the operand, not part of the data.**
+   Five of the six recurrences take `[h | style]`, and the style half is the
+   same 128 numbers in every row of every utterance. `SetTail` writes them
+   once into the fp16 A operand, in the columns `lstmPad` had already reserved
+   — so torch's `Concat(h, s)`, a [T, 640] allocation and a copy per timestep,
+   becomes nothing at all. Stage 9's bias trick is the special case where the
+   constant is 1. It also shortened the chain: with the style out of the data,
+   every normalisation runs over a 512-wide row, which is the shape parakeet's
+   LayerNorm kernel already reads — so **AdaLayerNorm needed no kernel**,
+   being `(1+gamma)*norm(x) + beta` with the affine computed on the host once
+   per utterance exactly as every AdaIN in the vocoder already is.
+3. **Read back the shorter tensor.** The text encoder's output could be
+   expanded on the device and returned as [L, 512], or returned as [T, 512]
+   and expanded on the host. The expansion is a gather either way, and 102 KB
+   is cheaper to read than 266. At 210 MB/s the direction of a gather is a
+   bandwidth decision.
+4. **Two independent paths are one submit.** The text encoder depends on
+   nothing the duration path produces, so its convolutions and its recurrence
+   ride in the same command buffer and cost only their own dispatches. The
+   printed `dur enc` covers both; `text enc` is now only the readback.
+
+**Tolerances.** Link by link against the host, bounded at 3e-3: the duration
+encoder 2.0e-4, the head's input 1.6e-4, the text encoder 1.2e-4. Curves
+against the dump 5.3e-5 and 3.9e-5. End to end, **fifty of fifty durations
+unchanged**, F0 2.4e-4, energy 1.3e-4, the expanded phoneme features 1.2e-4.
+The waveform's rms moves from 1537.1 to 1537.3.
+
+**Where the 1.96 ms of GPU time goes.** The six recurrences' steps are
+**1.48 ms, 76% of it** — `shared` alone is 0.51, being 130 steps to the
+others' 50 — the F0/N stacks are 0.2, the text encoder's three convolutions
+are 0.076, and nothing else reaches a twentieth of a millisecond. The phoneme
+side measures 8 ms of wall clock against that 1.96, and the difference is
+ALBERT's readback, the two that are left here, and four submits.
+
+**Left on the table.** The phoneme side is now **18% of an utterance** and the
+vocoder is 82%, which is where T4 left it. The largest single stage in the
+whole model is the **excitation at 14 ms**, 32% of an utterance: float64 phase
+accumulation on the host that T3 put there because upstream's accumulator
+reaches 1.3e5 radians. `HarmonicSource` already keeps the phase in cycles and
+wraps before the sine, so the question is whether the *wrapped* form is
+float32-safe — a measurement, not an argument. The generator is 12 ms and the
+tail 8, and those are the only parts of this model that were ever
+arithmetic-bound.
+
+### Session 2026-09-15 (twenty-eighth) — stage T6c: the six recurrences, and a knob that was not the one being turned
+
+**Result: the six bidirectional LSTMs go from 73 ms to 6 — and an utterance
+from 116 ms to 53, 28.1x real time to 61.4x. Fifty of fifty durations are
+unchanged and both prosody curves agree with the host to 3e-5.**
+
+    stage          gpu    (T6b)   cpu (T3)
+    bert            4ms      4ms     104ms
+    dur encoder     3ms     28ms      24ms   three bidirectional LSTMs
+    durations       1ms      9ms       8ms   one more, and the head
+    prosody         2ms     26ms      66ms   shared LSTM 2ms, F0/N stacks 1ms
+    text encoder    8ms     15ms      15ms   three convolutions and one LSTM
+    phoneme side   17ms     75ms     222ms   32% of the utterance
+    vocoder        36ms     40ms    3626ms
+    total          53ms    116ms    3848ms   61.44x real time, from 28.07x
+
+    of which the recurrences    6ms     73ms     73ms   12.3x
+
+**The instrument was right this time, and said so before anything was
+written.** T6a and T6b had each found the plan wrong by measuring; here the
+same three lines of `time.Now()` — threaded through the four stages that own a
+recurrence — put **73 ms of a 76 ms phoneme side** in the six LSTMs. 96%.
+Everything else on that side, ALBERT and the AdaIN stacks and the
+convolutions and the length regulator together, was 3 ms.
+
+**One algebraic move does most of the work.** Torch's step is
+`W_ih x_t + W_hh h_{t-1} + b`, and the first term depends on nothing the loop
+produces. So `P = X W_ih^T + b` is computed for the whole sequence up front as
+**one GEMM with both directions' weights concatenated along N**, and the loop
+is left with `W_hh h`. That takes the per-step B operand from
+`[4H, In+H]` at 1.8 MB to `[H, 4H]` at 0.5, removes the per-step pass that
+would otherwise assemble `[x_t | h_{t-1}]` as an fp16 operand, and leaves the
+sequential part small enough to stay MALL-resident for every step of every
+LSTM in the model.
+
+**Built:**
+
+- `shaders/kokoro_lstm.comp` — one timestep, both directions, one dispatch.
+  Four builds over two knobs.
+- `kokoro/gpulstm.go` — `GPULSTM`: a narrow, the input projection, and T
+  dispatches, all in one command buffer.
+- `LSTM.GPU`, one field, which is how all six call sites changed at once.
+- `ProsodyTimes.Recurrence`, printed by `cmd/tts`.
+- `kokoro/gpulstm_test.go` — five tests: `shared` against the dump, all six
+  against the CPU, the two-knob ladder, the dispatch profile, and the
+  durations.
+
+**Five things worth carrying forward:**
+
+1. **The knob was not the one being turned.** A step is 0.5 MB of weights
+   against 0.26 MFLOP — 500 bytes a FLOP — so it reads as a bandwidth problem,
+   and the first optimisation was the obvious one: spread it from two
+   workgroups to eight so fewer bytes go through each CU. **It changed
+   nothing**, 12.1 microseconds either way, and sixteen workgroups changed
+   nothing either. What the kernel was short of was *outstanding loads*.
+   Deepening the unroll from 4 taps to 32 took it from **12.0 microseconds a
+   step to 3.7**; past 32 the register pressure takes it back. A recurrence
+   has only 4H threads to issue loads from, so depth per thread is the only
+   parallelism left — and the `u4` build is kept so the finding stays
+   measurable.
+2. **Measure the step on the critical path, not alone.** 130 *different* step
+   dispatches with barriers cost 11.9 microseconds each; the same 130 with
+   barriers off cost 0.53, because they all overlap and hit the same hot
+   megabyte. Neither number is the step: the first includes what a serialised
+   dispatch costs, the second is a throughput figure for work that cannot be
+   thrown at the machine in parallel. A trivial dispatch serialised the same
+   way is 1.27 microseconds, which is the floor this stage is 3x above.
+3. **A static graph is not a decode loop.** S8 spends three dispatches and a
+   host round trip a step because a transducer decides what to do next from
+   what it just emitted. Nothing is decided here — the sequence length is
+   known before the first dispatch — so the whole recurrence is T+2 dispatches
+   in one command buffer, with no fence in the middle. That difference is
+   worth more than any kernel in the stage.
+4. **The state has to be double-buffered the moment there is more than one
+   workgroup.** Band 0 can write `h[0..63]` before band 1 has read it, and two
+   workgroups of one dispatch cannot be ordered. The cell state needs no such
+   thing: cell i belongs to one band for the whole sequence. This was found by
+   reasoning rather than by a wrong answer, which is the good case and is not
+   the usual one.
+5. **One field beat four signatures.** `LSTM.GPU` hangs off the recurrence
+   rather than off the four objects that own one, because all four reach it
+   through `Apply`. T6b's instrument had needed a `*ProsodyTimes` threaded
+   through three of those signatures; the device path needed none.
+
+**Tolerances.** `shared` against the dump and against the CPU, bounded at
+3e-3: 1.02e-4 both ways. All six against the CPU over the sequences they
+actually see: 1.0e-4 to 3.8e-4. End to end, **fifty of fifty durations
+unchanged**, F0 3.7e-5, energy 2.2e-5, the expanded phoneme features 1.1e-4.
+
+**The ladder.** Over 130 frames: `lstm_c64_u4` 12.0 microseconds a step,
+`c128` 4.5, `c64` **3.7**, `c32` 3.8. Bands are worth 0.8 of those 8.3
+microseconds and the unroll is worth 7.5.
+
+**Left on the table, with its number attached.** The six recurrences are
+6 ms of wall clock over **1.4 ms of GPU time**: the other 3.7 ms is six
+readbacks, 776 KB at the 210 MB/s this device reads host-visible memory at,
+and 0.2 ms of submits. Removing it is T4c's problem one model over — the
+duration encoder's three LSTMs are chained through an AdaLayerNorm that is
+*parakeet's LayerNorm kernel with a host-computed style affine*, so no new
+shader is needed, and the length regulator is a gather. Worth ~4 ms of 53.
+The text encoder's three convolutions are another 7 ms on the host and run on
+kernels this package already has.
+
+**But the vocoder is 68% of an utterance again**, and the largest single stage
+in the whole model is now the **excitation at 15 ms** — float64 phase
+accumulation on the host that T3 put there on purpose, because the
+accumulator reaches 1.3e5 radians where an fp32 ulp is 0.016 and fp16 cannot
+represent the number at all. That is the next thing to look at, and the answer
+is unlikely to be "move it": `HarmonicSource` already keeps the phase in
+cycles and wraps before the sine, so the question is whether the *wrapped*
+formulation has a float32 or a device form, not whether the reference's does.
+
+### Session 2026-09-15 (twenty-seventh) — stage T6b: the F0/N stacks, and a block that was already written
+
+**Result: the prosody predictor's two AdaIN stacks go from 40 ms to 1 ms — and
+an utterance from 156 ms to 116 ms, 20.9x real time to 28.1x. The durations
+are unchanged and both curves agree with the reference dump to 2.4e-5.**
+
+    stage          gpu    (T6a)   cpu (T3)
+    bert            4ms      4ms     104ms
+    dur encoder    28ms     28ms      24ms
+    durations       9ms      9ms       8ms
+    prosody        26ms     67ms      66ms   shared LSTM 24ms, F0/N stacks 1ms
+    text encoder   15ms     16ms      15ms
+    phoneme side   75ms    116ms     222ms   65% of the utterance
+    vocoder        40ms     39ms    3626ms
+    total         116ms    156ms    3848ms   28.07x real time, from 20.88x
+
+**The instrument came first again, and again it moved the number.**
+`SPEECH.md` had carried "~33 ms" for these stacks since T6a, inferred by
+subtraction. Splitting `Prosody`'s 64 ms into the shared recurrence and the
+stacks measured **24 ms and 40 ms** — the stacks are a third of the whole
+phoneme side, not a quarter of the predictor. Three lines of `time.Now()`
+before any kernel, and the stage is worth a quarter more than it looked.
+
+**Almost all of the work was deleting the assumption that this needed new
+code.** These six blocks are `AdainResBlk1d` — the same type `GPUDecoder` has
+run since T4c, on the same eleven-dispatch graph, the same A_CONV=2 rungs, the
+same bordered fp16 arena and the same two-phase AdaIN reduction. So the stage
+is a **refactor plus plumbing**: `kokoro/adainset.go` lifts `decBlock`, the
+weight layout, the staging, the style projection and the dispatch graph out of
+`gpudec.go` into a `blockSet` both objects embed, and `kokoro/gpuprosody.go`
+is the 300 lines that say where a block's input comes from and where its
+output goes. **One new shader in the whole stage**, and it is nine lines of
+arithmetic.
+
+**Built:**
+
+- `kokoro/adainset.go` — `blockSet`: the block machinery neither object owns.
+  `GPUDecoder` shrank from 729 lines to 322 and its numbers did not move
+  (59.1 dB against the CPU path, 18.2 dB against the dump, both unchanged).
+- `kokoro/gpuprosody.go` — `GPUProsody`, six blocks and two projections over
+  one fp32 arena, **62 dispatches in one submit**.
+- `shaders/kokoro_proj.comp` — `F0_proj` and `N_proj`, 256 channels to one.
+- `decBlock.noSC`, and a row stride of its own for `kokoro_shortcut.comp`.
+- The `Shared`/`Stacks` split on `ProsodyTimes`, printed by `cmd/tts`.
+- `kokoro/gpuprosody_test.go` — five tests: block by block against the dump,
+  both curves against the dump *and* the CPU, the ladder, the dispatch
+  profile, and the durations.
+
+**Four things worth carrying forward:**
+
+1. **The third shape of shortcut is no shortcut.** Four of these six blocks
+   keep their channel count, so upstream builds them with `conv1x1 = None` and
+   the shortcut is the block's input unchanged. On the device that is not a
+   special case to implement but **three dispatches and an fp16 sub-arena that
+   do not happen**: the epilogue reads the input where it already lies. It
+   needed one thing — the epilogue had assumed its second operand had the
+   block's own row stride, which is only true when the block made it.
+2. **A 1-wide output is a kernel, not a rung.** The two projections are
+   [260, 256] x [256, 1]. Every rung writes a 16-wide cooperative-matrix
+   fragment, so the narrowest GEMM on offer is 16 columns of which 15 would be
+   zero weight — *plus* a narrow into the fp16 arena for an operand that is
+   already in fp32. A workgroup-per-frame scalar reduction is 0.0015 ms and
+   exact. **Reuse is the default, but the fragment tile is a hard floor**, and
+   T6a's "do not reach for the matrix cores by reflex" cuts both ways.
+3. **The readback is the reason the projection is on the device at all.**
+   It is 0.7% of the stacks' GPU time and could trivially have stayed on the
+   host — except that the host would then need the last block's [260, 256]
+   activation, and this device reads host-visible memory at 210 MB/s (T4a).
+   That is 1.3 ms a curve, against 1 KB and 5 µs for the curve itself. The
+   arithmetic did not move to the device; the **boundary** did.
+4. **`GroupsY` defaults to zero, and a zero grid is legal.** The projection
+   dispatched nothing and failed silently — every block correct to 1e-4, both
+   curves exactly 0.0. Everything else in this package writes a 2-D grid, so
+   this is the first 1-D dispatch in `kokoro/` and the first to hit it. Worth
+   a look the next time a result is *identically* zero rather than wrong.
+
+**Tolerances.** Every block against the dump, bounded at 6e-3 (the decoder's,
+the same block): 3.4e-5 to 8.9e-5, six of six. Both curves against the dump
+and against the CPU path: 2.4e-5 either way. Durations compared as integers,
+fifty of fifty unchanged, so the alignment and everything downstream of it are
+identical.
+
+**The ladder, measured rather than assumed.** These convolutions are M of 130
+or 260 by N of 512 and 256 at K = 3*512 and 3*256 — a third of the decoder's K
+— so the rung was re-swept: `conv_reg32x32_w32` 0.35 ms, `32x64_w32` 0.38,
+`32x128` 0.54, `reg64` 0.57. The decoder's winner wins again, and wave32 leads
+on a fifth geometry (§6.2).
+
+**Where the 0.39 ms of GPU time goes.** conv1 36%, conv2 18%, conv1x1 4% —
+58% in the matrix cores — and **32% in the AdaIN reduction**, of which the
+`affine` pass alone is 13% for a [2C] reduction over eight chunks that is one
+workgroup and pure launch latency. The stacks measure 1 ms of wall clock
+against 0.39 ms on the device, so **the other 0.6 ms is the submit and the
+fence**, which is S8's finding in a third place and is not worth chasing at
+1 ms.
+
+**Left on the table, with its number attached.** T6c is the recurrences and is
+now **76 ms of a 116 ms utterance**: the duration encoder's three bidirectional
+LSTMs (28 ms, with its AdaLayerNorms), the duration head's one (9), `shared`
+(24) and the text encoder's (15, with its three convolutions). Six of them,
+each a GEMV at M = 1 that cannot start until the last one finished — S8's
+problem in a different model, and S8's answer applies. The phoneme side is
+**65% of an utterance and the four recurrence-bound stages are 94% of it**;
+everything else on it, ALBERT and the stacks together, is 5 ms.
 
 ### Session 2026-09-15 (twenty-sixth) — stage T6a: PL-BERT on Vulkan, and a plan the profile corrected
 

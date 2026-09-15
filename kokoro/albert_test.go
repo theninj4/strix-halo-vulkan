@@ -149,7 +149,7 @@ func TestTextEncoder(t *testing.T) {
 		check(t, m, "te_cnn_"+string(rune('0'+i)), x, true, 1e-5)
 	}
 
-	out, err := model.TextEncoder.Apply(m.InputIDs)
+	out, err := model.TextEncoder.Apply(m.InputIDs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

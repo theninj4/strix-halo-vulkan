@@ -2,6 +2,7 @@ package kokoro
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"time"
 )
@@ -10,14 +11,18 @@ import (
 // expanded phoneme features, the two curves that condition them, and the
 // alignment that produced all three.
 type Prosody struct {
-	Tokens    []int     // the input ids, boundary tokens included
-	Durations []int     // one frame count per token, summing to Frames
-	Frames    int       // alignment frames, 25 ms each
-	ASR       *Mat      // [Frames, 512], the text encoder expanded
-	Encoded   *Mat      // [Frames, 640], the duration encoder expanded
-	F0        []float32 // [2*Frames]
-	Energy    []float32 // [2*Frames]
-	RawDur    []float32 // the durations before rounding, for diagnostics
+	Tokens    []int // the input ids, boundary tokens included
+	Durations []int // one frame count per token, summing to Frames
+	Frames    int   // alignment frames, 25 ms each
+	ASR       *Mat  // [Frames, 512], the text encoder expanded
+	// Encoded is [Frames, 640], the duration encoder expanded. It is a
+	// diagnostic: nothing downstream reads it, and on the device path it is
+	// **nil**, because there the length regulator is a gather that happens
+	// between two dispatches and the tensor never leaves the arena.
+	Encoded *Mat
+	F0      []float32 // [2*Frames]
+	Energy  []float32 // [2*Frames]
+	RawDur  []float32 // the durations before rounding, for diagnostics
 
 	// Where the time went. The phoneme side is 85% of an utterance and 60% of
 	// *it* is recurrences, so the split that matters is ALBERT against the six
@@ -27,10 +32,18 @@ type Prosody struct {
 
 // ProsodyTimes is the phoneme side, stage by stage.
 type ProsodyTimes struct {
-	BERT        time.Duration // 12 ALBERT layers over the tokens
-	DurEncoder  time.Duration // three LSTM/AdaLayerNorm pairs
-	Durations   time.Duration // one LSTM and the duration head
-	Prosody     time.Duration // the shared LSTM and the F0/N stacks
+	BERT       time.Duration // 12 ALBERT layers over the tokens
+	DurEncoder time.Duration // three LSTM/AdaLayerNorm pairs
+	Durations  time.Duration // one LSTM and the duration head
+	Prosody    time.Duration // the shared LSTM and the F0/N stacks
+	Shared     time.Duration // of Prosody: the recurrence across the regulator
+	Stacks     time.Duration // of Prosody: the six F0/N AdaIN blocks
+	// Recurrence is the six bidirectional LSTMs, summed across whichever of
+	// the stages above contain them: three in DurEncoder, one in Durations,
+	// Shared, and one in TextEncoder. It cuts across the stage split rather
+	// than partitioning it, because what T6c can move is the recurrences and
+	// not the stages (SPEECH.md T6c).
+	Recurrence  time.Duration
 	TextEncoder time.Duration // an embedding, three convolutions and one LSTM
 	Expand      time.Duration // the length regulator, twice
 }
@@ -68,6 +81,9 @@ func (m *Model) Prosody(ids []int, style []float32, speed float32) (*Prosody, er
 		return nil, fmt.Errorf("kokoro: predictor style is %d wide, want %d",
 			len(style), m.Config.StyleDim)
 	}
+	if m.PhonemesGPU != nil {
+		return m.prosodyGPU(ids, style, speed)
+	}
 	var times ProsodyTimes
 	t0 := time.Now()
 	var last *Mat
@@ -95,14 +111,14 @@ func (m *Model) Prosody(ids []int, style []float32, speed float32) (*Prosody, er
 	times.BERT = time.Since(t0)
 
 	t0 = time.Now()
-	encoded, err := m.Predictor.TextEncoder.Apply(dEn, style)
+	encoded, err := m.Predictor.TextEncoder.Apply(dEn, style, &times)
 	if err != nil {
 		return nil, err
 	}
 	times.DurEncoder = time.Since(t0)
 
 	t0 = time.Now()
-	durations, raw, err := m.Predictor.Durations(encoded, speed)
+	durations, raw, err := m.Predictor.Durations(encoded, speed, &times)
 	if err != nil {
 		return nil, err
 	}
@@ -116,14 +132,14 @@ func (m *Model) Prosody(ids []int, style []float32, speed float32) (*Prosody, er
 	times.Expand = time.Since(t0)
 
 	t0 = time.Now()
-	f0, energy, err := m.Predictor.Prosody(en, style)
-	if err != nil {
+	var f0, energy []float32
+	if f0, energy, err = m.Predictor.Prosody(en, style, &times); err != nil {
 		return nil, err
 	}
 	times.Prosody = time.Since(t0)
 
 	t0 = time.Now()
-	tEn, err := m.TextEncoder.Apply(ids)
+	tEn, err := m.TextEncoder.Apply(ids, &times)
 	if err != nil {
 		return nil, err
 	}
@@ -188,4 +204,122 @@ func (m *Model) Speak(phonemes, voice string, speed float32) ([]float32, *Prosod
 		return nil, nil, err
 	}
 	return m.Synthesize(ids, dec, pred, speed)
+}
+
+// prosodyGPU is Model.Prosody with the phoneme side on the device.
+//
+// It is a separate function rather than a set of branches because almost
+// nothing survives the move: the length regulator, the concatenations, the
+// three normalisations and the convolutions are all offsets in an arena now,
+// and what is left on the host is the two decisions and the two table
+// lookups that feed them.
+//
+// The host still does four things, and each of them is here for a reason:
+//
+//   - **the embeddings**, PL-BERT's and the text encoder's, because a gather
+//     of fifty rows out of a table is not worth a dispatch and putting the
+//     table on the device would cost 21 MB to save a copy;
+//   - **`bert_encoder`**, one 768->512 projection over fifty rows, for the
+//     same reason;
+//   - **the duration head and its rounding**, which is the decision every
+//     frame boundary downstream is placed by, and which fp16 cannot make;
+//   - **expanding `t_en`**, because the vocoder still takes its input from
+//     the host, and [T, 512] is cheaper to read back than [L, 512].
+func (m *Model) prosodyGPU(ids []int, style []float32, speed float32) (*Prosody, error) {
+	g := m.PhonemesGPU
+	var times ProsodyTimes
+
+	t0 := time.Now()
+	_, hidden, err := m.BERT.Embed(ids)
+	if err != nil {
+		return nil, err
+	}
+	last, err := m.BERTGPU.Apply(hidden)
+	if err != nil {
+		return nil, err
+	}
+	dEn, err := m.BERTEncoder.Apply(last)
+	if err != nil {
+		return nil, err
+	}
+	times.BERT = time.Since(t0)
+
+	t0 = time.Now()
+	emb, err := m.TextEncoder.Embedding.Rows(ids)
+	if err != nil {
+		return nil, err
+	}
+	// One submit: the duration encoder, the recurrence before the head, and
+	// the whole text encoder, which depends on nothing the first two produce.
+	x, err := g.Encode(dEn, emb)
+	if err != nil {
+		return nil, err
+	}
+	times.DurEncoder = time.Since(t0)
+
+	// The head stays on the host, in fp32, on the same code the CPU reference
+	// runs: its logits have an rms of 27 and a duration is a *rounded* sum of
+	// fifty sigmoids of them, so a thousandth of fp16 relative error is a
+	// third of a frame. See GPUPhonemes.
+	t0 = time.Now()
+	logits, err := m.Predictor.DurationHead.Apply(x)
+	if err != nil {
+		return nil, err
+	}
+	durations, raw := durationsFrom(logits, speed)
+	times.Durations = time.Since(t0)
+
+	t0 = time.Now()
+	f0, energy, err := g.Prosody(durations)
+	if err != nil {
+		return nil, err
+	}
+	times.Prosody = time.Since(t0)
+	times.Stacks = times.Prosody
+
+	t0 = time.Now()
+	tEn := g.TextEncoded()
+	times.TextEncoder = time.Since(t0)
+
+	t0 = time.Now()
+	asr, err := Expand(tEn, durations)
+	if err != nil {
+		return nil, err
+	}
+	times.Expand = time.Since(t0)
+
+	frames := 0
+	for _, d := range durations {
+		frames += d
+	}
+	// Encoded is the duration encoder's expanded output, which on this path
+	// never leaves the device: it is a diagnostic the CPU reference fills in
+	// and nothing downstream reads.
+	return &Prosody{
+		Tokens: ids, Durations: durations, Frames: frames,
+		ASR: asr, F0: f0, Energy: energy, RawDur: raw,
+		Times: times,
+	}, nil
+}
+
+// durationsFrom is the rounding, which is the same arithmetic wherever the
+// logits came from: a duration is the *sum* of fifty sigmoids — a soft count
+// of how many of fifty ticks are on — divided by the speed, rounded, and
+// clamped to at least one frame so no token can vanish.
+func durationsFrom(logits *Mat, speed float32) ([]int, []float32) {
+	raw := make([]float32, logits.Rows)
+	out := make([]int, logits.Rows)
+	for t := 0; t < logits.Rows; t++ {
+		var sum float32
+		for _, v := range logits.Row(t) {
+			sum += sigmoid(v)
+		}
+		raw[t] = sum / speed
+		n := int(math.Round(float64(raw[t])))
+		if n < 1 {
+			n = 1
+		}
+		out[t] = n
+	}
+	return out, raw
 }

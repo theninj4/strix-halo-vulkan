@@ -68,6 +68,14 @@ numbered experiment, so they carry names instead of section numbers:
 | [Stage 9](stage-9-head-and-tail.md) | The transformer's head and tail on the device — the host's share of a step **59 ms to 5-10 ms**, an image **14.89 s to 14.49 s**. A bias and a *pad token* are extra columns of K, so `y = Wx + b` and `y = x_pad_token` come out of one biasless GEMM with no branch and no host write. And the correction: the engine's "a host read-back runs at 0.2 GB/s" is true only below about **8 GB of allocation**, where `vk.NewBuffer` still gets the device-local heap — the 20.5 GB pipeline reads the same arena **83x faster**, so the 0.8 s an image this stage was partly priced on was never there |
 | [Stage 10](stage-10-layout-epilogues.md) | The block's two layout passes as epilogues — 18 dispatches to **16**, a block **53.17 ms to 51.80**, an image **14.49 s to 14.26 s**. `pack v` and `narrow ctx` moved no information and are now the store instruction of the kernel above them, which is possible because in both cases the data was already in the right registers in the right 16x16 shape. Two other things came out of it: the item had been on the backlog for four sessions priced at **1.0 s an image when the measurement behind it said 1.0 ms a block** — a units slip, 3.4x the real figure — and the old path was doing a **double rounding** that the fused one does not, which is why 84 halves in 1.2 M differ and why every one of them is an exact fp16 tie |
 
+### LLM vertical findings
+
+From building the qwen3.8-flash-next vertical (LLM.md).
+
+| Stage | Findings |
+|---|---|
+| [L0a](l0a-bank-range.md) | Does the DRAM bus survive a 64 GiB weight bank? — **flat**: 236.4 GB/s reading 64 GiB at random against 237.1 reading 1 GiB, `rand/seq` 1.00x in every cell at both of the model's real expert slab sizes, which *is* §0.4's 236 GB/s ceiling rather than merely near it. No TLB cliff, no page-table cost, no penalty for scattering — so decode stays linear in bits/weight at the size a 180 B model needs, and **§5.2 is answered in the negative**: there is nothing to lay a big bank out *for*, and the 4 GiB allocation cap's ~19 buffers cost nothing. Two side results: the 4 MiB control slab's 1.7% deficit is workgroup tail, not memory, and a purely bandwidth-bound read draws **85 W against ALU work's 118-142**, so there is ~50 W of package budget for speculation and batching to spend |
+
 ### Speech vertical findings
 
 From building the two audio verticals (SPEECH.md), so they carry stage names

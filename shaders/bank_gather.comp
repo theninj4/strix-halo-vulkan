@@ -1,0 +1,90 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+// Weight-bank gather probe — LLM.md L0a.
+//
+// The question is narrow and nothing in this suite answers it: **does the
+// DRAM bus still deliver 240 GB/s when the addresses being read are drawn
+// from a working set of tens of gigabytes?**
+//
+// Every bandwidth figure this repo quotes was measured over a small range.
+// `bandwidth` (copy.comp) tops out at a 512 MB footprint, `gemv_cold`'s
+// largest DRAM-resident case reads **64 MB** of 4-bit weights per dispatch,
+// and `moe`'s expert banks reach 4 GB. A qwen3.8-flash-next decode step
+// reads ~3 GB — but scattered as ~500 expert slabs drawn from a **64-82 GB**
+// resident bank, which is 20x the largest range ever measured here and a
+// page-table footprint nothing has probed. If the TLB cannot cover it, every
+// tok/s figure in LLM.md is wrong, and it is wrong before a single layer of
+// the model has been written.
+//
+// So this kernel deliberately does *no* arithmetic worth the name. It reads
+// slabs of the bank with the same 128-bit `buffer_load_b128` that
+// gemv_w4a8.comp's inner loop issues (IDEAS §1.1 note 3), sums them so the
+// loads cannot be eliminated, and writes one dword per workgroup. What it
+// measures is the memory system, not a kernel — which is the right
+// instrument, because the kernel it stands in for is already at 99-103% of
+// the bus (§1.7) and has nothing left to give.
+//
+// The geometry is (slab, part):
+//
+//   * `gl_WorkGroupID.y` selects a slab, whose base is a table lookup. The
+//     table is what makes the access pattern a *gather*: the host fills it
+//     with slab bases drawn contiguously, evenly spread, or at random from
+//     the bank, so that the bytes read and the instruction count are
+//     identical across the three and only the addresses differ.
+//   * `gl_WorkGroupID.x` splits one slab across several workgroups, because
+//     a real expert slab is 0.8-1.6 MB and one workgroup per slab would
+//     leave the grid too small to saturate 40 CUs.
+//
+// Inside a part the traversal is plainly contiguous: consecutive lanes take
+// consecutive 16-byte chunks, so one step of the loop covers
+// `WG * 16` = 4 KB in one run. That is deliberate — §5.1b's coverage law
+// (`min(1, C/gcd(stride, 4096))`) is satisfied by construction, so anything
+// this probe measures is about the *range*, not about the request shape.
+// The shape question already has its own kernel, strided_read.comp.
+
+#ifndef WG
+#define WG 256
+#endif
+
+layout(local_size_x = WG) in;
+
+layout(std430, binding = 0) readonly buffer Src { uvec4 src[]; };
+// Base of each slab, in 16-byte chunks, relative to this buffer. One table
+// per bank buffer: a bank is many buffers because this device caps a single
+// allocation at 4 GiB - 4 (maxMemoryAllocationSize), so 64 GB is ~19 of them.
+layout(std430, binding = 1) readonly buffer Slabs { uint slabChunk[]; };
+layout(std430, binding = 2) writeonly buffer Dst { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    uint chunksPerPart; // 16-byte chunks one workgroup reads; a multiple of WG
+    uint parts;         // workgroups per slab, i.e. gl_NumWorkGroups.x
+    uint dstBase;       // where this buffer's dispatch writes, so the banks' outputs do not collide
+} pc;
+
+shared uint part[16];
+
+void main() {
+    uint base = slabChunk[gl_WorkGroupID.y] + gl_WorkGroupID.x * pc.chunksPerPart;
+
+    uint acc = 0u;
+    for (uint i = gl_LocalInvocationID.x; i < pc.chunksPerPart; i += uint(WG)) {
+        uvec4 v = src[base + i];
+        acc += v.x + v.y + v.z + v.w;
+    }
+
+    uint total = subgroupAdd(acc);
+    if (subgroupElect()) {
+        part[gl_SubgroupID] = total;
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        uint s = 0u;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) {
+            s += part[i];
+        }
+        dst[pc.dstBase + gl_WorkGroupID.y * pc.parts + gl_WorkGroupID.x] = s;
+    }
+}

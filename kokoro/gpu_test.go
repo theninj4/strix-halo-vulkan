@@ -294,7 +294,7 @@ func TestGPUVocoder(t *testing.T) {
 	defer done()
 	m := loadManifest(t)
 	model := loadModel(t)
-	decStyle, _, err := model.Style(m.Voice, len([]rune(m.Phonemes)))
+	decStyle, predStyle, err := model.Style(m.Voice, len([]rune(m.Phonemes)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +308,7 @@ func TestGPUVocoder(t *testing.T) {
 	}
 	cpu := time.Since(t0)
 
-	if err := model.AttachGPU(dev, m.LengthRegulator.Frames, decStyle, DefaultConvKernel); err != nil {
+	if err := model.AttachGPU(dev, m.LengthRegulator.Frames, decStyle, predStyle, DefaultConvKernel); err != nil {
 		t.Fatal(err)
 	}
 	defer model.DetachGPU()
