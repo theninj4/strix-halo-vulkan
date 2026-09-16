@@ -634,7 +634,10 @@ func (g *AttnGPU) NKV() int    { return g.nKV }
 
 // WeightBytes is what the staged layers cost on the device and
 // ActivationBytes what the shared arenas cost.
-func (g *AttnGPU) WeightBytes() int     { return g.wbuf.Size() + g.bank.Size() }
+func (g *AttnGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+
+// Buffers is how many device allocations the layer holds (L6a).
+func (g *AttnGPU) Buffers() int         { return 4 }
 func (g *AttnGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 
 // Upload writes the layer's input: the hyper-connection block's output

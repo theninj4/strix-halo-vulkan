@@ -60,7 +60,7 @@ shared uint shTotal;
 void main() {
     uint tid = gl_LocalInvocationID.x;
     uint nE = pc.gemmK;          // the expert count
-    uint used = pc.moeUsed;
+    uint used = MOE_USED;
     uint slots = used + 1u;
     uint pairs = pc.tokens * used;
     uint bm = pc.gemmM;          // the row block this tile list is cut to

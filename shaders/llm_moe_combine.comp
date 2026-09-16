@@ -36,10 +36,10 @@ void main() {
     if (t >= pc.tokens) {
         return;
     }
-    uint slots = pc.moeUsed + 1u;
+    uint slots = MOE_USED + 1u;
     // The inverse permutation sits behind the weights and the top-k, all
     // three indexed by the same (token, slot).
-    uint invPerm = pc.moeWeightOff + pc.tokens * slots + pc.tokens * pc.moeUsed;
+    uint invPerm = pc.moeWeightOff + pc.tokens * slots + pc.tokens * MOE_USED;
     uint dst = pc.outOff + t * pc.nEmbd;
     for (uint j = gl_LocalInvocationID.x; j < pc.nEmbd; j += WG) {
         float s = 0.0;

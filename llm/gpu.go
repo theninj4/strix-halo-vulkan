@@ -577,7 +577,10 @@ func (g *HCGPU) Tokens() int { return g.tokens }
 
 // WeightBytes is what the staged mixers cost on the device and
 // ActivationBytes what the shared arenas cost.
-func (g *HCGPU) WeightBytes() int     { return g.wbuf.Size() + g.bank.Size() }
+func (g *HCGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+
+// Buffers is how many device allocations the block holds (L6a).
+func (g *HCGPU) Buffers() int         { return 4 }
 func (g *HCGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 
 // Upload writes the wide residual for a run: [T][hc*nEmbd], which is ggml's

@@ -225,20 +225,38 @@ var moeSPIRV = map[string][]byte{
 // quantised bank, addressed by byte offset because a Q8_0 block is 34 bytes.
 type moeLayerWeights struct {
 	router                        uint32 // fp16 bank, halves
+	bank                          int    // which of qbufs holds the six below
 	gate, up, down                uint32 // quantised bank, bytes
 	shGate, shUp, shDown          uint32
 	gateFmt, upFmt, downFmt       moeFmt
 	shGateFmt, shUpFmt, shDownFmt moeFmt
 }
 
+// moeMaxBanks is how many buffers binding 5 (and binding 6, the same buffers
+// read as `uvec4`) holds, and it is the checkpoint's layer count: **a layer's
+// quantised bank is a buffer of its own**.
+//
+// It is not a tidiness choice. `maxStorageBufferRange` on this device is
+// 4 GiB - 4 and one layer's three routed banks plus its shared expert's are
+// 1.61 GB, so two layers is the most one buffer could hold and 48 of them is
+// 77 GB — the arena-with-an-offset arrangement every other block here uses
+// cannot express residency (LLM.md L6a). The count is compiled into
+// llm_moe_gemm.comp as NBANK, so it is a constant on both sides and
+// TestMoEGPUBankArray is what holds them together; a stage of fewer layers
+// pads the array with a placeholder, which no dispatch ever names.
+const moeMaxBanks = 48
+
 // MoEGPU runs the MoE block on the device.
 type MoEGPU struct {
 	dev *vk.Device
 	cfg MoEConfig
 
-	wbuf, abuf, hbuf, bank, qbuf *vk.Buffer
-	pipes                        map[string]*vk.ComputePipeline
-	mods                         []*vk.ShaderModule
+	wbuf, abuf, hbuf, bank *vk.Buffer
+	// One quantised bank a layer, bound as one array of moeMaxBanks
+	// descriptors. Beyond len(layers) they are the placeholder.
+	qbufs []*vk.Buffer
+	pipes map[string]*vk.ComputePipeline
+	mods  []*vk.ShaderModule
 
 	layers []moeLayerWeights
 
@@ -263,6 +281,22 @@ type MoEGPU struct {
 	qBytes int
 }
 
+// bankSet is the array binding 5 and binding 6 are written from: the staged
+// layers' buffers, then the placeholder as many times as it takes to fill
+// moeMaxBanks. Every descriptor of an array has to be written whether or not
+// a shader ever indexes it.
+func (g *MoEGPU) bankSet() []*vk.Buffer {
+	set := make([]*vk.Buffer, moeMaxBanks)
+	for i := range set {
+		if i < len(g.qbufs) {
+			set[i] = g.qbufs[i]
+		} else {
+			set[i] = g.wbuf
+		}
+	}
+	return set
+}
+
 // routerN is the fused router's output width: the 512 experts, the shared
 // expert's gate as a 513th column, and the pad up to the plain GEMM's column
 // block.
@@ -284,6 +318,10 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 	// wider checkpoint would be answered wrongly rather than slowly.
 	if cfg.NExpert > 512 {
 		return nil, fmt.Errorf("llm: the route and permutation kernels are built for at most 512 experts, this checkpoint says %d", cfg.NExpert)
+	}
+	if len(layers) > moeMaxBanks {
+		return nil, fmt.Errorf("llm: %d layers to stage, and binding 5 is an array of %d — rebuild llm_moe_gemm.comp with -DNBANK=%d",
+			len(layers), moeMaxBanks, len(layers))
 	}
 	if cfg.NExpertUsed > 16 {
 		return nil, fmt.Errorf("llm: the route kernel is built for at most 16 experts a token, this checkpoint says %d", cfg.NExpertUsed)
@@ -422,10 +460,17 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	// The quantised bank: the checkpoint's own bytes, laid end to end. Every
 	// tensor here is a whole number of four-byte words, which is what lets
 	// the shader read it as uints.
+	//
+	// **One buffer a layer**, because 48 of them are 77 GB and a storage
+	// buffer on this device is at most 4 GiB - 4 (L6a). So `off` restarts at
+	// every layer and the offsets a dispatch carries are inside that layer's
+	// own buffer, which the bank index names.
 	g.layers = make([]moeLayerWeights, len(layers))
-	off := 0
+	total := 0
 	for i, w := range layers {
 		g.layers[i].router = uint32(i * perRouter)
+		g.layers[i].bank = i
+		off := 0
 		for _, t := range []struct {
 			dst  *uint32
 			fmt  *moeFmt
@@ -456,29 +501,38 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 			*t.fmt = f
 			off += roundUpInt(len(t.ten.Data), 16)
 		}
+		buf, err := g.dev.NewBuffer(off)
+		if err != nil {
+			return fmt.Errorf("llm: moe quantised bank, layer %d (%d MB): %w", i, off>>20, err)
+		}
+		g.qbufs = append(g.qbufs, buf)
+		total += off
 	}
-	g.qBytes = off
-	if g.qbuf, err = g.dev.NewBuffer(off); err != nil {
-		return fmt.Errorf("llm: moe quantised bank (%d MB): %w", off>>20, err)
-	}
+	g.qBytes = total
 	return nil
 }
 
 func (g *MoEGPU) build() error {
-	// Seven buffers against the rest of the vertical's five: the quantised
-	// bank at binding 5, and the same buffer again at binding 6 as sixteen-
+	// Seven bindings against the rest of the vertical's five: the quantised
+	// bank at binding 5, and the same buffers again at binding 6 as sixteen-
 	// byte words, because the unpack issues half as many loads through it.
 	// Only this block's shaders declare either, and the router's plain GEMM
 	// arm declares neither — a descriptor set may have bindings its shader
 	// never names, which is what lets one sequence mix them.
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf, g.qbuf, g.qbuf}
+	//
+	// The last two bindings are **arrays** of moeMaxBanks descriptors, one a
+	// layer, so the seven bindings are 5 + 2*48 = 101 buffers (L6a).
+	banks := g.bankSet()
+	bufs := append([]*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}, banks...)
+	bufs = append(bufs, banks...)
+	counts := []uint32{1, 1, 1, 1, 1, moeMaxBanks, moeMaxBanks}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"route":   shaders.LLMMoERoute,
 		"perm":    shaders.LLMMoEPerm,
 		"combine": shaders.LLMMoECombine,
 	} {
-		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, Counts: counts, PushConstantSize: pcSize}); err != nil {
 			return err
 		}
 	}
@@ -490,7 +544,7 @@ func (g *MoEGPU) build() error {
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < moeWave {
 		return fmt.Errorf("llm: the grouped GEMM needs a pinned %d-wide subgroup", moeWave)
 	}
-	spec := vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: moeWave}
+	spec := vk.PipelineSpec{Buffers: bufs, Counts: counts, PushConstantSize: pcSize, RequiredSubgroupSize: moeWave}
 	if sgs.MaxComputeWorkgroupSubgroups < 4 {
 		return fmt.Errorf("llm: the widest rung needs four %d-wide subgroups a workgroup, this device allows %d",
 			moeWave, sgs.MaxComputeWorkgroupSubgroups)
@@ -552,7 +606,7 @@ func (g *MoEGPU) stage(layers []MoEWeights) error {
 			{g.layers[i].shUp, w.UpShexpT},
 			{g.layers[i].shDown, w.DownShexpT},
 		} {
-			g.qbuf.WriteBytesAt(int(t.off), t.ten.Data)
+			g.qbufs[g.layers[i].bank].WriteBytesAt(int(t.off), t.ten.Data)
 		}
 	}
 	return nil
@@ -585,8 +639,18 @@ func (g *MoEGPU) Tokens() int { return g.rows }
 // WeightBytes is what a run reads at most: the quantised bank plus the fp16
 // router. What it reads in fact is smaller and depends on the prompt, because
 // L5a-4's routing touches about half the experts at a 512-token ubatch.
-func (g *MoEGPU) WeightBytes() int     { return g.qbuf.Size() + g.bank.Size() }
+func (g *MoEGPU) WeightBytes() int {
+	n := g.bank.Size()
+	for _, b := range g.qbufs {
+		n += b.Size()
+	}
+	return n
+}
 func (g *MoEGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
+
+// Buffers is how many device allocations the block holds: the four every
+// block here has, and one quantised bank a layer (L6a).
+func (g *MoEGPU) Buffers() int { return 4 + len(g.qbufs) }
 
 // Upload narrows the block's input into the fp16 arena and writes the shared
 // expert's own permutation and schedule, which are the identity over the
@@ -695,7 +759,11 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		Tokens: uint32(g.rows), NEmbd: uint32(c.NEmbd),
 		LDA: uint32(g.lda), LDCtx: uint32(g.ldCtx),
 		XnOff: g.hXn, QKVOff: g.aLogits, OutOff: g.aOut, GatedOff: g.aGated,
-		MoEWeightOff: g.aWeights, MoEUsed: uint32(c.NExpertUsed),
+		MoEWeightOff: g.aWeights,
+		// The used count in the low sixteen bits and the layer's bank index
+		// in the high, because the push block is full at 64 uints and the
+		// GEMM needs to know which buffer of the array it reads (L6a).
+		MoEUsed: uint32(c.NExpertUsed) | uint32(w.bank)<<16,
 		GateOff: noW,
 	}
 
@@ -1015,12 +1083,12 @@ func (g *MoEGPU) Destroy() {
 		m.Destroy()
 	}
 	g.mods = nil
-	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.qbuf} {
+	for _, b := range append([]*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}, g.qbufs...) {
 		if b != nil {
 			b.Destroy()
 		}
 	}
-	g.wbuf, g.abuf, g.hbuf, g.bank, g.qbuf = nil, nil, nil, nil, nil
+	g.wbuf, g.abuf, g.hbuf, g.bank, g.qbufs = nil, nil, nil, nil, nil
 }
 
 // Schedule reports what a rung's tile list costs: how many (expert, row

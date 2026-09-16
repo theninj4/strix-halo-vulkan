@@ -10,8 +10,9 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1 and the whole of L2, L3, L4 and L5 complete — every block of
-this model now runs on the GPU.** The checkpoint is downloaded, llama.cpp runs
+**Status: L0, L1, the whole of L2, L3, L4 and L5, and now L6a — every block of
+this model runs on the GPU, and all 48 layers of all of them are resident at
+once.** The checkpoint is downloaded, llama.cpp runs
 it, the Go side reads it, the prefill mystery is solved, and there is a kernel
 for every layer and every sub-layer: the hyper-connection block in four
 dispatches where the reference has sixteen (4.24x, 14.9% of llama.cpp's whole
@@ -43,8 +44,21 @@ all 4096 tokens and the top-10-of-512 selection the reference's set for set
 *and order for order*. Along the way the router turned out to be **bit-exact**
 against llama.cpp on all 2 097 152 logits, and so did `shared_expert_gate` —
 which corrects L5a-1: fusing that gate onto the router's matrix is not a
-deviation but a reproduction. **Next: L6, all 48 layers resident and logits
-against llama.cpp.**
+deviation but a reproduction.
+
+**L6a has since put the whole model on the device: 84.20 GB of weights and
+0.87 GB of arenas in 68 buffers, staged in 33 seconds, with 41 GB of this
+machine left over.** That needed one structural change and it was not in a
+kernel. Every block here lays its weights out as one arena with a per-layer
+offset, `maxStorageBufferRange` on this device is **4 GiB - 4**, and a
+layer's expert bank is 1.61 GB — so binding 5 became an **array of buffers,
+one a layer**, indexed by a push constant that had to ride in the top sixteen
+bits of an existing field because the block was already 64 uints against a
+256-byte limit. **Residency turns out to be free in the bank's size**: 2, 4,
+12, 24 and 48 banks span 10.4 to 84.2 GB resident and 11062-11242 us for the
+same block, a 1.6% spread with no trend, which is L0a holding at the size the
+model actually is. **Next: L6b, the graph that runs the five blocks in order,
+and logits against llama.cpp.**
 
 ## The number to beat
 
@@ -854,6 +868,69 @@ dispatches, the plain GEMM arm once and four kernels of this block's own.
 > raise the ubatch" is a statement about the glue, not about this.
 
 
+## What L6a established — the whole model resident, and a bank that is an array
+
+`cmd/llm/resident.go`, `llm/gpu_moe.go`, `vk/shim.c`,
+`shaders/llm_common.glsl`: 84.20 GB in 68 buffers, and binding 5 as an array.
+[Write-up](research/l6a-residency.md) · `results/l6a_resident.csv`
+
+> **L6a-1: 84.20 GB of weights and 0.87 GB of arenas in 68 buffers, staged in
+> 33 seconds, with 41 GB of the machine left over.** 97 hyper-connection
+> mixers (1.31 GB), the PLE block (0.07), 36 DeltaNet layers (4.18), 12
+> attention layers (1.24) and 48 expert banks (77.41). Against the
+> checkpoint's 82.52 GB resident core it is **1.04x** once the 0.68 GB
+> embedding and the 0.68 GB lm head — which nothing stages yet — come off the
+> reference figure; the **+3.04 GB** is the dense half staged as *halves*,
+> 6.79 GB of fp16 against the 3.67 GB of Q8_0 and F32 those tensors ship as,
+> 1.85x. The 28.80 GB n-gram table is still mmap'd (D2) and 41 GB of
+> MemAvailable is left for its working set. **The DeltaNet bank is the near
+> miss**: 36 fused projections in **4.18 GB in one buffer**, 2.7% under this
+> device's cap.
+>
+> **L6a-2: the expert bank is an array of buffers, one a layer, because the
+> arena-with-an-offset arrangement cannot express this model.**
+> `maxStorageBufferRange` here is **4 GiB - 4** and a layer's bank is 1.61 GB,
+> which is also the most a `uint32` byte offset addresses — the same wall
+> twice. So binding 5 and binding 6 became `qb[NBANK]` and `qb4[NBANK]`,
+> indexed by a **dynamically uniform** push constant, which is core Vulkan and
+> not descriptor indexing: one dispatch is one layer. Three consequences.
+> `shim_create_compute_pipeline` gained a per-binding `descriptorCount`, so
+> seven bindings are 5 + 48 + 48 = **101 buffers** and `counts == NULL` is
+> byte for byte the old path. NBANK is **compiled in at 48** — a spec constant
+> cannot portably size a descriptor array and the SPIR-V is pre-compiled — so
+> a short stage pads the array with the block's 256-byte placeholder. And the
+> layer index rides in the **top sixteen bits of `moeUsed`**, because the push
+> block is 64 uints against this device's whole 256-byte range and L5b's own
+> comment on it reads *"Five fields, and the block is out of room"*.
+>
+> **L6a-3: the index is load-bearing, and the control says so by 203x.** Every
+> other test here stages layer 3 alone, where the bank index is zero and an
+> ignored index is indistinguishable from a read one. `TestMoEGPUBankArray`
+> stages layers 0-3 and asks for the last: **8.133e-05 rms** against
+> llama.cpp, against **1.652e-02** — 203x — for the same run with the index
+> forced to zero. Layer 0's experts against layer 3's routing is a perfectly
+> plausible tensor of the right shape and magnitude, which is why the control
+> is in the test and not in a comment.
+>
+> **L6a-4: residency is free in the bank's size.** 2, 4, 12, 24 and 48 banks —
+> **10.4 to 84.2 GB resident** — run layer 3's block in **11134, 11062, 11162,
+> 11067 and 11242 us**: an eightfold range of bytes, a 1.6% spread, no trend.
+> That is L0a (*"the DRAM bus does not care how big the weight bank is"*)
+> holding at 68 live buffers and the size the model actually is, rather than
+> at a probe's 23. What is left is a **flat ~2.5% step** against L5b's
+> isolated 10824.7 us that appears as soon as the other four blocks are staged
+> and does not grow with the bank — not the count and not the indirection,
+> both constant across that column. At a ~1% noise band it is written down
+> rather than chased: L6b runs all five blocks in one graph anyway.
+>
+> **L6a-5: staging order is worth 8 GB.** The expert bank is `memcpy` out of
+> the mmap'd checkpoint at about 2.6 GB/s and needs no host floats at all; the
+> dense half is **dequantised to f32 on the host** first, and the 36 DeltaNet
+> layers are **8.35 GB of transient floats at once**. So the dense blocks go
+> first, each block's floats are returned to the OS before the next asks, and
+> the 77 GB goes last — the peak is the resident model rather than the
+> resident model plus a dequantisation.
+
 ---
 
 ## The three findings that set the direction
@@ -918,9 +995,12 @@ sizes it**: ~1150 tok/s prefill against 391.4, and 38.2 tok/s decode against
 25.15, both reachable with kernels that already exist plus the epilogue fusion
 the hyper-connection block needs. **L2c, L2f, L3b, L4b and L5b between them
 have taken 1015.5 ms of llama.cpp's 1164.7 ms prefill graph down to 714.8 —
-87.2% of it replaced by 61.4%, a 25.8% saving on the whole graph.** What is
-left is L6: the graph that runs them in order, and an arena plan that holds
-82.52 GB.
+87.2% of it replaced by 61.4%, a 25.8% saving on the whole graph.** **L6a has
+the arena plan**: 84.20 GB in 68 buffers, all 48 layers of all five blocks
+resident at once, with residency measured to cost nothing that scales with the
+bank. What is left is **L6b** — the graph that runs them in order over one set
+of arenas, the embedding gather and the lm head — and its gate, logits against
+llama.cpp.
 
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
@@ -1091,7 +1171,9 @@ below Q8. Bandwidth is the whole story.
 | `shaders/llm_attn_select.comp` | **L4b: the QSA selection.** One workgroup a token, the row's keys cached in LDS, llama.cpp's four radix passes with its serial bucket walk replaced by a subgroup suffix sum, and a **per-cell bitmask** out instead of an index list — which deletes the reference's `GET_ROWS`. Dispatched only where `top_k + ratio - 1` is fewer cells than the cache holds; `SetSparse` forces it either way, which is how it is priced and how the dense control runs. |
 | `shaders/llm_attn_*.comp` | **L2f: the layer's four kernels.** `llm_attn_pack` (per-head norm + interleaved M-RoPE + the fragment tiling for q, k and v in one grid), `llm_attn_idx` (the indexer's pooled key and query over two addressings), `llm_attn_score` (the rectified score, its bias, the cells and the causal mask) and `llm_attn_wmma` (causal GQA at headDim 256, **with the output gate in its epilogue**, and **L4b's bitmask staged a key block at a time** beside the causal mask). |
 | `llm/moe.go` | **L5a: the MoE block.** `MoEConfig` from the checkpoint, the F32 router with fp16 operands and an f32 accumulator, the softmax/argsort/top-10/clamp/normalise chain, an `ExpertBank` that dequantises one expert's [640, 2560] matrix on demand out of a 77 GB tensor nothing can hold as floats, the routed half walked **by expert** rather than by token, and the shared expert with its one-column gate on the f32 vector path. |
-| `llm/gpu_moe.go` | **L5b: the MoE block on the device, in nine dispatches.** The fused `[nExpert+1, nEmbd]` router with the shared expert's gate as its 513th column, a **quantised** bank staged byte for byte out of the checkpoint (1.57 GB a layer, against 5.03 as halves), a seventh binding that is the same bank read as `uvec4`, the permuted row space with the shared expert's group at its front, the measured `MoEPlanFor` schedule and a sweep profiler. |
+| `cmd/llm -resident` | **L6a: the whole model on the device.** Stages every mixer, every layer and every expert bank, and prints the plan — bytes, buffers, wall clock — beside the checkpoint's inventory and the machine's memory. `-bank 48,24,12,4,2` restages the bank alone to price residency against itself; `-dense` leaves the 77 GB out. |
+| `vk.PipelineSpec.Counts` | **L6a: a binding may be an array of buffers.** `shim_create_compute_pipeline` takes a per-binding `descriptorCount` and the flat buffer list is their concatenation; `nil` is the one-buffer-per-binding arrangement every other kernel in the repo uses, unchanged. |
+| `llm/gpu_moe.go` | **L5b: the MoE block on the device, in nine dispatches.** The fused `[nExpert+1, nEmbd]` router with the shared expert's gate as its 513th column, a **quantised** bank staged byte for byte out of the checkpoint (1.57 GB a layer, against 5.03 as halves), a seventh binding that is the same bank read as `uvec4`, the permuted row space with the shared expert's group at its front, the measured `MoEPlanFor` schedule and a sweep profiler. **L6a** made the quantised bank one buffer a layer, bound as one array of `moeMaxBanks`, with the layer index in the top sixteen bits of `moeUsed`. |
 | `shaders/llm_moe_gemm.comp` | **L5b: the grouped quantised GEMM.** Two modes — gate/up with `silu(gate)*up` on the accumulators, down in permutation order — crossed with the four formats the bank ships in (Q4_K, Q5_K, Q5_1, Q8_0) and five row-block rungs. Each workgroup unpacks its own BN x BK slab into LDS per K-step, and every store is a whole cooperative-matrix fragment because the permutation pads each expert's rows to the block. |
 | `shaders/llm_moe_{route,perm,combine}.comp` | **L5b: the routing.** `llm_moe_route` is the softmax over 512, ten workgroup argmaxes reproducing `ggml_argsort`'s DESC comparator without materialising the other 502 ranks, the normalised weights and the shared gate's sigmoid — one workgroup a token, `llm_attn_select.comp`'s shape. `llm_moe_perm` is a counting sort, the padded offsets, the sentinel fill, the inverse permutation and the two tile schedules, in one workgroup. `llm_moe_combine` is the eleven contributions weighted and summed in the reference's order. |
 | `llm/deltanet.go` | **L3a: the gated DeltaNet, 36 of the 48 layers.** The fused [2560, 10240] qkv projection, the depthwise causal conv, the L2 norm under either of llama.cpp's two spellings of it (`QKNorm`), the two F32 gate projections and the delta rule itself — with a `DeltaNetState` carrying both the [128, 128, 48] recurrent state *and* the convolution's window, bit-identically across a batch split. |
@@ -1139,11 +1221,14 @@ below Q8. Bandwidth is the whole story.
    is not a thing this machine holds. L5a-4's 26x imbalance is answered by a
    device-built tile *list* rather than a grid, and by padding each expert's
    rows to the block so the epilogue needs no LDS at all (L5b-3).
-6. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
+6. ~~**Residency**~~ — **done at L6a**: 84.20 GB in 68 buffers, and a bank
+   that is an array because a storage buffer here is at most 4 GiB - 4. What
+   is left of the graph is the order, one set of arenas, and the head.
+7. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
    (interleaved, sections [11,11,10], 64 of 256 dims, NeoX on a text batch);
    what is left is the ring buffer, the indexer cache's own incremental
    pooling, and a rotary table that does not want a row per context cell.
-7. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
+8. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
 
 ---
 
@@ -1348,7 +1433,23 @@ below Q8. Bandwidth is the whole story.
 
 ### L6 — the whole stack, prefill only
 
-- [ ] All 48 layers resident, the n-gram table mmap'd, ~100 buffers.
+- [x] **L6a — residency.** All 48 layers of all five blocks on the device at
+      once: **84.20 GB of weights and 0.87 GB of arenas in 68 buffers, staged
+      in 33 s**, the n-gram table still mmap'd, 41 GB of the machine left
+      over. The MoE bank is an **array of buffers, one a layer**, because
+      `maxStorageBufferRange` is 4 GiB - 4 and a layer is 1.61 GB — a
+      per-binding `descriptorCount` in the shim, a block-instance array in the
+      GLSL, NBANK compiled in at 48, and the layer index in the top sixteen
+      bits of `moeUsed` because the push block was full. **Residency is free
+      in the bank's size** (L6a-4). [Write-up](research/l6a-residency.md) ·
+      `results/l6a_resident.csv`
+- [x] Gate: the bank index is load-bearing — layer 3 read from bank 3 is
+      **8.133e-05 rms** against llama.cpp, the same run with the index forced
+      to zero is **203x further away**, and every L5b gate still passes with
+      the array in place.
+- [ ] **L6b — the graph.** The five blocks in llama.cpp's own order over one
+      set of arenas, plus the two tensors nothing stages yet: the embedding
+      gather and the lm head.
 - [ ] Gate: logits match llama.cpp; prefill tok/s against 388.60.
 
 ### L7 — decode
@@ -1400,6 +1501,10 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -moe -model $M -tokens 512,2048              # L5b's block
     go run ./cmd/llm -moe -model $M -tokens 512,2048 -ladder -iters 5 \
         -csv results/l5b_moe_ladder.csv
+    go run ./cmd/llm -resident -model $M                      # L6a: the whole model
+    go run ./cmd/llm -resident -model $M -dense               # the 6.8 GB half alone
+    go run ./cmd/llm -resident -model $M -bank 48,24,12,4,2 \
+        -csv results/l6a_resident.csv                         # residency, priced
 
     # the reference implementation, the oracle, the baseline
     less $L/src/models/qwen4exp.cpp                  # 1279 lines, the whole architecture
@@ -1439,6 +1544,8 @@ below Q8. Bandwidth is the whole story.
     go test ./llm/ -v -run TestMoEGPU        # L5b: the same on the device, the
                                              # permutation, the ladder's
                                              # agreement and the padding control
+    go test ./llm/ -v -run TestMoEGPUBankArray  # L6a: the bank index, and the
+                                             # control that shows it is read
 
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh

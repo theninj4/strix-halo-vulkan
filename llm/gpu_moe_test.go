@@ -443,3 +443,96 @@ func TestMoEGPUPaddingIsInert(t *testing.T) {
 		}
 	}
 }
+
+// TestMoEGPUBankArray is L6a's gate: the quantised bank is an **array** of
+// buffers, one a layer, and the layer index that selects between them rides in
+// the top sixteen bits of a push-constant field.
+//
+// Every other test in this file stages layer 3 alone, where the index is zero
+// and an ignored index would be indistinguishable from a read one. This one
+// stages layers 0 through 3 — 6.4 GB — and asks for the last, so the answer is
+// right only if the dispatch reads bank 3. The control is the same run with
+// the index forced to zero: layer 0's experts against layer 3's activations is
+// a perfectly plausible tensor and nothing but a comparison says otherwise.
+//
+// It is also what holds the two sides of NBANK together. The count is compiled
+// into llm_moe_gemm.comp and declared in Go as moeMaxBanks, and a descriptor
+// array whose length disagrees with the shader's is a pipeline that will not
+// create — so the first assertion here is that 48 is still 48.
+func TestMoEGPUBankArray(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages four expert banks, 6.4 GB")
+	}
+	m, tr := fixtures4k(t)
+	c := m.MoEConfig()
+	if m.Config.NLayer != moeMaxBanks {
+		t.Fatalf("the checkpoint has %d layers and binding 5 is an array of %d; "+
+			"rebuild llm_moe_gemm.comp with -DNBANK=%d", m.Config.NLayer, moeMaxBanks, m.Config.NLayer)
+	}
+	var ws []MoEWeights
+	for l := 0; l <= moeLayer; l++ {
+		w, err := m.MoEWeights(l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ws = append(ws, w)
+	}
+	in, err := tr.Get("hc_mixed-3", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nTok := len(in.Vals) / c.NEmbd
+
+	dev, done := newTestDevice(t)
+	defer done()
+	start := time.Now()
+	g, err := NewMoEGPU(dev, c, nTok, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.Upload(in.Vals, nTok); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("staged %d layers in %v: %.2f GB of bank in %d buffers, %d of them real",
+		g.Layers(), time.Since(start).Round(time.Millisecond),
+		float64(g.WeightBytes())/1e9, g.Buffers(), len(ws))
+
+	want, err := tr.Get("ffn_out-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The real thing: layer 3 is bank 3.
+	if err := g.Run(moeLayer); err != nil {
+		t.Fatal(err)
+	}
+	got, err := compare(g.Out(), want.Vals[:len(g.Out())])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("ffn_out-3 from bank %d: %v", moeLayer, got)
+	if got.rms > 1e-2 {
+		t.Errorf("layer %d against llama.cpp: rms %.3e over 1.0e-02 (%v)", moeLayer, got.rms, got)
+	}
+
+	// The control: the same dispatches with every bank index forced to zero,
+	// which is layer 0's 1.6 GB of experts read with layer 3's routing. It has
+	// to be *much* further away than the real one, or the index is not being
+	// read and the test above proves nothing.
+	saved := g.layers[moeLayer].bank
+	g.layers[moeLayer].bank = 0
+	if err := g.Run(moeLayer); err != nil {
+		t.Fatal(err)
+	}
+	g.layers[moeLayer].bank = saved
+	ctl, err := compare(g.Out(), want.Vals[:len(g.Out())])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("the same run with the bank index forced to 0: %v — %.0fx further away",
+		ctl, ctl.rms/got.rms)
+	if ctl.rms < 10*got.rms {
+		t.Errorf("layer 0's experts are only %.1fx worse than layer 3's; the bank index is not selecting",
+			ctl.rms/got.rms)
+	}
+}

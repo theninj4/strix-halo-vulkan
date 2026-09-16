@@ -46,6 +46,9 @@ func main() {
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
 	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
 	moe := flag.Bool("moe", false, "benchmark the MoE block")
+	resident := flag.Bool("resident", false, "stage every layer of every block on the device and report the plan")
+	dense := flag.Bool("dense", false, "for -resident: leave the 77 GB expert bank out and stage the dense half alone")
+	bank := flag.String("bank", "", "for -resident: stage these many expert banks instead of all 48 — a list, one stage each, to price residency against itself")
 	ctx := flag.Int("ctx", 2048, "cache cells for -attn; llama.cpp's measured graph had 2048")
 	attnLayers := flag.Int("layers", 2, "how many layers to stage for -attn and -dn; for -moe the default is one, because a layer's expert bank is 1.57 GB")
 	sel := flag.String("sel", "auto", "the QSA selection for -attn: auto (only where it bites), on (price it where it is the identity), off (the dense control)")
@@ -63,6 +66,32 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *resident {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		// One arena size, not a sweep: residency is about the weights, so
+		// the arenas are sized for llama.cpp's own best ubatch unless the
+		// caller named a length of their own.
+		maxTok := 512
+		if flagSet("tokens") {
+			for _, t := range toks {
+				maxTok = max(maxTok, t)
+			}
+		}
+		var banks []int
+		if *bank != "" {
+			if banks, err = parseInts(*bank); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if err := residency(*model, maxTok, max(*ctx, maxTok), banks, *dense, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -197,3 +226,16 @@ func run(model, text string, idsOnly bool) error {
 }
 
 func mustStr(set *gguf.Set, key string) string { v, _ := set.Str(key); return v }
+
+// flagSet reports whether the caller named a flag on the command line, as
+// against taking its default. -resident needs it: every other mode sweeps
+// -tokens and it defaults to a list, where residency wants one length.
+func flagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}

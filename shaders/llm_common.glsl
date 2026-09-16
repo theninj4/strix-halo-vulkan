@@ -43,7 +43,16 @@ layout(binding = 4) buffer ActU { uint actu[]; };
 // because a Q8_0 block is 34 bytes and nothing about these formats is
 // four-aligned below the row.
 #ifdef MOE_QBANK
-layout(binding = 5) readonly buffer QBank { uint qbank[]; };
+// **It is an array of buffers, one a layer.** `maxStorageBufferRange` on this
+// device is 4 GiB - 4 and the whole bank is 77 GB (LLM.md L6a), so residency
+// is not a matter of one arena with a per-layer offset: a layer's 1.61 GB is
+// a buffer of its own, all NBANK of them are bound at one binding, and the
+// layer index selects. The index is dynamically uniform — one layer per
+// dispatch — so this is core Vulkan and not descriptor indexing.
+#ifndef NBANK
+#define NBANK 1
+#endif
+layout(binding = 5) readonly buffer QBank { uint w[]; } qb[NBANK];
 // The same buffer again, as sixteen-byte words. A Q4_K super-block is 144
 // bytes and a Q5_K one 176, both multiples of sixteen, so the 32 bytes of
 // nibbles a lane unpacks per K-step are two aligned `uvec4` loads where they
@@ -51,7 +60,12 @@ layout(binding = 5) readonly buffer QBank { uint qbank[]; };
 // bound by how many load instructions its unpack issues, not by the bytes
 // they fetch. Q5_1's 24-byte and Q8_0's 34-byte blocks are not aligned to
 // sixteen and go on reading the `uint` view.
-layout(binding = 6) readonly buffer QBank4 { uvec4 qbank4[]; };
+layout(binding = 6) readonly buffer QBank4 { uvec4 w[]; } qb4[NBANK];
+// The kernel goes on spelling them `qbank` and `qbank4`: which buffer of the
+// array is the same fact for every load a dispatch issues, so it belongs at
+// the declaration rather than at the 30-odd call sites.
+#define qbank  qb[MOE_BANK].w
+#define qbank4 qb4[MOE_BANK].w
 #endif
 
 layout(push_constant) uniform PC {
@@ -198,8 +212,21 @@ layout(push_constant) uniform PC {
                        // and tile bases, then 3 uints per (expert, row block)
     uint moeWeightOff; // f32 [T][used+1]: the normalised routing weights, and
                        // sigmoid(shared_expert_gate) in the last slot
+
     uint moeBOff2;     // the byte offset of a swiglu tile's second matrix, `up`
-    uint moeUsed;      // experts per token; the slot stride is this plus one
+    // Experts per token in the low sixteen bits -- the slot stride is that
+    // plus one -- and the **bank index** in the high sixteen.
+    //
+    // The two ride in one uint because the block above is the last one there
+    // was room for: 64 uints is 256 bytes and that is this device's whole
+    // push-constant range. L6a's array of bank buffers needs a layer index at
+    // every GEMM dispatch and there is no 65th field to put it in, so it goes
+    // where there is room -- the used count is at most sixteen. MOE_USED and
+    // MOE_BANK are how the kernels read them; nothing spells `pc.moeUsed`.
+    uint moeUsed;
 } pc;
+
+#define MOE_USED (pc.moeUsed & 0xffffu)
+#define MOE_BANK (pc.moeUsed >> 16u)
 
 const uint NO_W = 0xffffffffu;

@@ -162,8 +162,14 @@ void shim_destroy_shader_module(VkDevice device, VkShaderModule module);
 // multiple of it; the device must have been created with
 // ShimDeviceFeatures.subgroupSizeControl. Zero keeps the driver's default,
 // byte for byte the same pipeline this shim built before the knob existed.
+// `counts` gives the descriptor count of each of `bindingCount` bindings, and
+// `buffers` is their concatenation — a binding with a count above one is an
+// *array* of storage buffers, which a shader declares as `buffer B {...} b[N]`
+// and indexes with a dynamically uniform expression. NULL is the plain
+// arrangement: one buffer per binding, `bindingCount` ignored.
 VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
                                        const VkBuffer *buffers, uint32_t bufferCount,
+                                       const uint32_t *counts, uint32_t bindingCount,
                                        uint32_t pushConstantSize,
                                        const ShimSpecConstant *specConstants, uint32_t specConstantCount,
                                        uint32_t requiredSubgroupSize,

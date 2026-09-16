@@ -446,7 +446,12 @@ func (g *PLEGPU) kvSlice(col, width int) []float32 {
 
 // WeightBytes is what the block costs on the device and ActivationBytes what
 // its arenas cost.
-func (g *PLEGPU) WeightBytes() int     { return g.wbuf.Size() + g.bank.Size() }
+func (g *PLEGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+
+// Buffers is how many device allocations the block holds. L6a counts them
+// across the whole model: `maxStorageBufferRange` is 4 GiB - 4 here, so the
+// number is a residency fact and not bookkeeping.
+func (g *PLEGPU) Buffers() int         { return 4 }
 func (g *PLEGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 
 // Destroy releases every Vulkan object.

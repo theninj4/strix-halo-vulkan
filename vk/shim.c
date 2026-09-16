@@ -475,32 +475,52 @@ void shim_destroy_shader_module(VkDevice device, VkShaderModule module) {
 }
 
 #define SHIM_MAX_BINDINGS 8
+// A binding may hold an *array* of storage buffers, so the flat buffer list is
+// far longer than the binding list: LLM.md L6a binds the MoE bank one buffer a
+// layer, because `maxStorageBufferRange` is 4 GiB - 4 and the bank is 77.
+#define SHIM_MAX_BUFFERS 256
 #define SHIM_MAX_SPEC_CONSTANTS 32
 
 VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
                                        const VkBuffer *buffers, uint32_t bufferCount,
+                                       const uint32_t *counts, uint32_t bindingCount,
                                        uint32_t pushConstantSize,
                                        const ShimSpecConstant *specConstants, uint32_t specConstantCount,
                                        uint32_t requiredSubgroupSize,
                                        uint32_t queueFamily, ShimComputePipeline *out) {
     memset(out, 0, sizeof(*out));
 
-    if (bufferCount > SHIM_MAX_BINDINGS || specConstantCount > SHIM_MAX_SPEC_CONSTANTS) {
+    // counts == NULL is the plain arrangement every other kernel here uses:
+    // one buffer per binding, in order.
+    if (counts == NULL) {
+        bindingCount = bufferCount;
+    }
+    if (bindingCount > SHIM_MAX_BINDINGS || bufferCount > SHIM_MAX_BUFFERS ||
+        specConstantCount > SHIM_MAX_SPEC_CONSTANTS) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     VkDescriptorSetLayoutBinding bindings[SHIM_MAX_BINDINGS];
-    for (uint32_t i = 0; i < bufferCount; i++) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < bindingCount; i++) {
+        uint32_t n = counts == NULL ? 1 : counts[i];
+        if (n == 0) {
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         memset(&bindings[i], 0, sizeof(bindings[i]));
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[i].descriptorCount = 1;
+        bindings[i].descriptorCount = n;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        total += n;
+    }
+    if (total != bufferCount) {
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo = {0};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = bufferCount;
+    layoutInfo.bindingCount = bindingCount;
     layoutInfo.pBindings = bindings;
 
     VkResult r = vkCreateDescriptorSetLayout(device, &layoutInfo, NULL, &out->setLayout);
@@ -601,24 +621,28 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
         return r;
     }
 
-    VkDescriptorBufferInfo bufInfos[SHIM_MAX_BINDINGS];
+    VkDescriptorBufferInfo bufInfos[SHIM_MAX_BUFFERS];
     VkWriteDescriptorSet writes[SHIM_MAX_BINDINGS];
     for (uint32_t i = 0; i < bufferCount; i++) {
         memset(&bufInfos[i], 0, sizeof(bufInfos[i]));
         bufInfos[i].buffer = buffers[i];
         bufInfos[i].offset = 0;
         bufInfos[i].range = VK_WHOLE_SIZE;
-
+    }
+    uint32_t first = 0;
+    for (uint32_t i = 0; i < bindingCount; i++) {
+        uint32_t n = counts == NULL ? 1 : counts[i];
         memset(&writes[i], 0, sizeof(writes[i]));
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = out->descSet;
         writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
+        writes[i].descriptorCount = n;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufInfos[i];
+        writes[i].pBufferInfo = &bufInfos[first];
+        first += n;
     }
-    if (bufferCount > 0) {
-        vkUpdateDescriptorSets(device, bufferCount, writes, 0, NULL);
+    if (bindingCount > 0) {
+        vkUpdateDescriptorSets(device, bindingCount, writes, 0, NULL);
     }
 
     VkCommandPoolCreateInfo cmdPoolInfo = {0};

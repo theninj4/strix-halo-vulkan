@@ -321,7 +321,7 @@ void main() {
     uint expert = actu[rec];
     uint rowStart = actu[rec + 1u];
     uint n0 = gl_WorkGroupID.x * BN;
-    uint slots = pc.moeUsed + 1u;
+    uint slots = MOE_USED + 1u;
 
     // Expert e's output row n is bank row e*gemmN + n, which is what makes a
     // three-axis GGUF tensor addressable without a stride table.

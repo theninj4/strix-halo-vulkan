@@ -2192,31 +2192,31 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_route.spv llm_moe_route.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_perm.spv llm_moe_perm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_combine.spv llm_moe_combine.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=1 -o llm_moe_up_q4k_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=2 -DWAVES=1 -o llm_moe_up_q4k_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=4 -DWAVES=1 -o llm_moe_up_q4k_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=2 -o llm_moe_up_q4k_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=4 -o llm_moe_up_q4k_w4m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=1 -o llm_moe_up_q5k_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=2 -DWAVES=1 -o llm_moe_up_q5k_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=4 -DWAVES=1 -o llm_moe_up_q5k_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=2 -o llm_moe_up_q5k_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=4 -o llm_moe_up_q5k_w4m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=1 -o llm_moe_up_q80_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=2 -DWAVES=1 -o llm_moe_up_q80_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=4 -DWAVES=1 -o llm_moe_up_q80_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=2 -o llm_moe_up_q80_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=4 -o llm_moe_up_q80_w4m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=1 -o llm_moe_down_q51_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=2 -DWAVES=1 -o llm_moe_down_q51_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=4 -DWAVES=1 -o llm_moe_down_q51_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=2 -o llm_moe_down_q51_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=4 -o llm_moe_down_q51_w4m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=1 -o llm_moe_down_q80_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=2 -DWAVES=1 -o llm_moe_down_q80_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=4 -DWAVES=1 -o llm_moe_down_q80_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=2 -o llm_moe_down_q80_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=4 -o llm_moe_down_q80_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q4k_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q4k_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q5k_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q5k_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q80_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q80_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_q51_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_q51_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q80_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q80_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q80_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_q80_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_q80_w4m1.spv llm_moe_gemm.comp
 
 //go:embed llm_moe_up_q4k_m1.spv
 var LLMMoEUpQ4KM1 []byte

@@ -591,7 +591,18 @@ type SpecConstant struct {
 // buffer per entry in Buffers (bound to bindings 0..len(Buffers)-1), an
 // optional push-constant range, and optional specialization constants.
 type PipelineSpec struct {
-	Buffers          []*Buffer
+	Buffers []*Buffer
+	// Counts, when set, groups Buffers into descriptor *arrays*: binding i
+	// holds Counts[i] consecutive buffers, and the shader declares it as
+	// `buffer B { ... } b[N]` and indexes it with a dynamically uniform
+	// expression. Its sum must be len(Buffers). Nil is the plain
+	// arrangement — one buffer per binding, in order — which is what every
+	// kernel here but one uses.
+	//
+	// It exists because `maxStorageBufferRange` on this device is 4 GiB - 4
+	// and the MoE bank is 77 GB (LLM.md L6a): the bank is one buffer a layer,
+	// bound as one array, and the layer index selects.
+	Counts           []uint32
 	PushConstantSize uint32
 	SpecConstants    []SpecConstant
 	// RequiredSubgroupSize pins the wave size the shader runs at instead of
@@ -624,6 +635,23 @@ func (d *Device) NewPipeline(shader *ShaderModule, spec PipelineSpec) (*ComputeP
 		bufPtr = &bufHandles[0]
 	}
 
+	var countPtr *C.uint32_t
+	var counts []C.uint32_t
+	if len(spec.Counts) > 0 {
+		total := 0
+		for _, n := range spec.Counts {
+			total += int(n)
+		}
+		if total != len(spec.Buffers) {
+			return nil, fmt.Errorf("vk: PipelineSpec.Counts sums to %d, but there are %d buffers", total, len(spec.Buffers))
+		}
+		counts = make([]C.uint32_t, len(spec.Counts))
+		for i, n := range spec.Counts {
+			counts[i] = C.uint32_t(n)
+		}
+		countPtr = &counts[0]
+	}
+
 	var specC []C.ShimSpecConstant
 	if len(spec.SpecConstants) > 0 {
 		specC = make([]C.ShimSpecConstant, len(spec.SpecConstants))
@@ -638,6 +666,7 @@ func (d *Device) NewPipeline(shader *ShaderModule, spec PipelineSpec) (*ComputeP
 
 	if err := check("vkCreateComputePipelines",
 		C.shim_create_compute_pipeline(d.handle, shader.handle, bufPtr, C.uint32_t(len(bufHandles)),
+			countPtr, C.uint32_t(len(spec.Counts)),
 			C.uint32_t(spec.PushConstantSize), specPtr, C.uint32_t(len(specC)),
 			C.uint32_t(spec.RequiredSubgroupSize),
 			C.uint32_t(d.queueFamily), &p.handle)); err != nil {

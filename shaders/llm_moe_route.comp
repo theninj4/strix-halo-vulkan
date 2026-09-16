@@ -59,7 +59,7 @@ void main() {
         return;
     }
     uint nE = pc.gemmK;          // the expert count: the reduction extent here
-    uint used = pc.moeUsed;
+    uint used = MOE_USED;
     uint base = pc.qkvOff + t * pc.gemmN;
     uint sg = tid / 64u;
 

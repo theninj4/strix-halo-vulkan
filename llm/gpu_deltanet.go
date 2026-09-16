@@ -533,7 +533,12 @@ func (g *DeltaNetGPU) Tokens() int { return g.tokens }
 
 // WeightBytes is what the staged layers cost on the device and
 // ActivationBytes what the shared arenas cost.
-func (g *DeltaNetGPU) WeightBytes() int     { return g.wbuf.Size() + g.bank.Size() }
+func (g *DeltaNetGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+
+// Buffers is how many device allocations the layer holds (L6a). All 36
+// layers' fused projections are one bank of 4.18 GB, which clears this
+// device's 4 GiB - 4 by 2.8%.
+func (g *DeltaNetGPU) Buffers() int         { return 4 }
 func (g *DeltaNetGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 
 // Upload writes the layer's input: the hyper-connection block's output
