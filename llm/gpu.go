@@ -88,10 +88,22 @@ type push struct {
 
 	// The gated DeltaNet (gpu_deltanet.go). Six fields, because everything
 	// else the layer needs is already above under the same meaning — see the
-	// note in llm_common.glsl. 57 uints is 228 bytes against the device's
-	// 256, which is what TestAttnGPUPushBlockFits guards.
+	// note in llm_common.glsl.
 	SSMGateOff, SSMBetaOff, SSMStateOff uint32
 	SSMAOff, SSMDTOff, SSMNorm          uint32
+
+	// The MoE block (gpu_moe.go). Five fields, and with them the block is
+	// **full**: 64 uints is 256 bytes, which is this device's whole
+	// push-constant range, and TestAttnGPUPushBlockFits is what guards it.
+	// Everything else the MoE needs is said by a field above that already
+	// means it, and llm_common.glsl carries the mapping — `xnOff` the block
+	// input, `qkvOff` the one fused projection's output (here the router's
+	// 512 logits with the shared expert's gate as a 513th column), `ctxOff`
+	// the fp16 A operand of the output projection (here `silu(gate)*up`),
+	// `gatedOff` "value * gate" (here the down projection's output times its
+	// routing weight) and `outOff` the block's output.
+	MoEPermOff, MoETileOff, MoEWeightOff uint32
+	MoEBOff2, MoEUsed                    uint32
 }
 
 func (p push) bytes() []byte {

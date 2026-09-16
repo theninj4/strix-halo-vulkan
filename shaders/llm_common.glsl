@@ -30,6 +30,29 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 // one command buffer; only llm_attn_select.comp writes it and only
 // llm_attn_wmma.comp reads it.
 layout(binding = 4) buffer ActU { uint actu[]; };
+// The quantised expert bank, read as raw words. **Only the MoE block
+// declares it** (`-DMOE_QBANK`), because every other kernel in this vertical
+// is built over five buffers and a shader that names a binding its descriptor
+// set does not have is a pipeline that will not create.
+//
+// It is `uint` and not `float16_t` for the reason L5b exists: one layer's
+// three expert banks are 2.52 billion weights, 5.03 GB dequantised to halves
+// and 75 GB across the model, so they stay in the checkpoint's own Q4_K, Q5_K,
+// Q5_1 and Q8_0 blocks and the kernel unpacks its own slab per K-step. A
+// tensor is addressed by its **byte** offset here, not its element offset,
+// because a Q8_0 block is 34 bytes and nothing about these formats is
+// four-aligned below the row.
+#ifdef MOE_QBANK
+layout(binding = 5) readonly buffer QBank { uint qbank[]; };
+// The same buffer again, as sixteen-byte words. A Q4_K super-block is 144
+// bytes and a Q5_K one 176, both multiples of sixteen, so the 32 bytes of
+// nibbles a lane unpacks per K-step are two aligned `uvec4` loads where they
+// would otherwise be eight `uint` ones — and this kernel turned out to be
+// bound by how many load instructions its unpack issues, not by the bytes
+// they fetch. Q5_1's 24-byte and Q8_0's 34-byte blocks are not aligned to
+// sixteen and go on reading the `uint` view.
+layout(binding = 6) readonly buffer QBank4 { uvec4 qbank4[]; };
+#endif
 
 layout(push_constant) uniform PC {
     // The wide residual, fp32 in the activation arena: [T][hc*nEmbd], which
@@ -135,6 +158,48 @@ layout(push_constant) uniform PC {
     uint ssmAOff;     // f32 [heads]: ssm_a, already -exp(A_log)
     uint ssmDTOff;    // f32 [heads]: ssm_dt.bias
     uint ssmNorm;     // 1 = ggml_l2_norm's max(|x|, eps), 0 = #28068's rsqrt
+
+    // The MoE block (llm_moe_route.comp, llm_moe_perm.comp,
+    // llm_moe_gemm.comp, llm_moe_combine.comp). Every one of the 48 layers
+    // has one, 97% of the checkpoint's parameters are in them, and L2a put
+    // them at 35.7% of the prefill graph.
+    //
+    // **Five fields, and the block is out of room**: 64 uints is 256 bytes,
+    // which is this device's whole push-constant range. So the rest of what
+    // the MoE needs is said by fields that already mean it, and the mapping
+    // is written down here rather than inferred at four call sites:
+    //
+    //   xnOff/lda     the block's fp16 input, [T][lda] -- the A operand of
+    //                 the router and of every routed gate/up tile
+    //   qkvOff        f32 [T][gemmN]: the one fused projection's output
+    //                 again, which here is the router's 512 logits with the
+    //                 shared expert's one-column gate as a 513th
+    //   ctxOff/ldCtx  fp16 [rows][ffn]: silu(gate)*up, which is exactly what
+    //                 that field already is -- the A operand of the layer's
+    //                 output projection
+    //   gatedOff      f32 [T][used+1][nEmbd]: "value * gate", which here is
+    //                 the down projection's output times its routing weight,
+    //                 one row per (token, slot) and the last slot the shared
+    //                 expert's
+    //   outOff        f32 [T][nEmbd]: ffn_out, the block's output
+    //   bOff          the **byte** offset of a dispatch's first quantised
+    //                 matrix in the bank above -- `gate` for a swiglu tile,
+    //                 `down` for a down tile
+    //   gemmM         the row block the tile list is cut to, which the
+    //                 permutation kernel has to know and every GEMM rung
+    //                 compiles in
+    //   gemmN         the bank's output width per expert, so that expert e's
+    //                 output row n is bank row e*gemmN + n -- and, for the
+    //                 route and permutation kernels, the expert count
+    //   gemmK         the reduction extent, which is also what says how many
+    //                 quantised blocks a row holds
+    uint moePermOff;   // uint: topk[T][used], then the expert-major permutation
+    uint moeTileOff;   // uint: the tile count, the per-expert counts, offsets
+                       // and tile bases, then 3 uints per (expert, row block)
+    uint moeWeightOff; // f32 [T][used+1]: the normalised routing weights, and
+                       // sigmoid(shared_expert_gate) in the last slot
+    uint moeBOff2;     // the byte offset of a swiglu tile's second matrix, `up`
+    uint moeUsed;      // experts per token; the slot stride is this plus one
 } pc;
 
 const uint NO_W = 0xffffffffu;

@@ -874,6 +874,130 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-16 (forty-first) — stage L5b: the MoE block on the device, and every layer of the model now has a kernel
+
+**Result: nine dispatches against the ~845 llama.cpp spends on the same work
+— 567.4 ms of its 512-token prefill graph against 522.3, 1.09x, and 1758.4
+against 1131.6 at ubatch 2048, 1.55x — with `ffn_out` at 8.132e-05 rms over
+all 4096 tokens and the selection the reference's set for set *and order for
+order*.** The last block of the model to get a kernel, and the first whose
+weights never become floats. [Write-up](research/l5b-moe-gpu.md) ·
+`results/l5b_moe.csv`, `results/l5b_moe_ladder.csv` · `LLM.md` rewritten.
+
+**1. The bank stays quantised, because it cannot not.** One layer's three
+routed banks are 2.52 billion weights: **5.03 GB as halves and 241 GB across
+the model**, against 1.57 GB and 75 GB as they ship. So `llm_moe_gemm.comp`
+is the first GEMM in this vertical whose B operand is not a host-dequantised
+fp16 fragment bank — the checkpoint's bytes are memcpy'd onto the device and
+each workgroup unpacks its own BN x BK slab into LDS per K-step, from Q4_K,
+Q5_K, Q5_1 or Q8_0 under a `-DQFMT`. §2.2's argument, for §2.2's reason: a
+cooperative-matrix fragment's lane layout is not exposed, so nibbles cannot be
+unpacked into registers and declared a fragment.
+
+**2. L5a-4's routing is what the schedule is.** 274 of 512 experts at ubatch
+512 with one taking 95% of the tokens means a grid of (experts x row blocks)
+is almost entirely empty, so the tiles are a device-built **list** of
+(expert, row block) records over a static upper bound with an early return —
+372 real against a bound of 1216. And every expert's row range is **padded up
+to the row block**, with the slack named by a sentinel permutation entry
+pointing at a token one past the batch: that is what lets a
+cooperative-matrix store, which covers sixteen rows and cannot be masked, go
+straight to global instead of through an LDS staging buffer. Poisoning the
+sentinel's activation row with 1000 moves `ffn_out` by **exactly zero** at
+every rung, which is the control that padding scheme needs and that no tensor
+comparison provides.
+
+**3. Two optimisations worked and two did not, and the two that did not are
+the finding.** Deleting the LDS epilogue is **1.35x** on the whole block
+(14 785 us to 10 930 at m2/m2) and widening the unpack's loads is **3.1x on
+Q8_0** (`shexp.up` 669 us to 217) — both about instruction count rather than
+about bytes. But **sharing the dequantised slab across two or four waves of
+one workgroup is 1.15-1.24x *against*** at the same row block, even though it
+halves the unpack per row and doubles the waves a CU holds on a kernel running
+at about one wave a SIMD: occupancy is not what this kernel is short of, which
+is the same answer L3b-4 got for the scan's staged operands. And **making the
+K-step cover a whole Q4_K nibble group is 1.16x against**, even though it
+removes a real 2x read amplification — the doubled slab takes MODE 0's LDS
+from 12.8 KB to 23 and the workgroups a CU can hold from five to two, and the
+second read was being served out of cache. A third: the conflict-free LDS pad
+is **5.4x worse** than the four-way-conflicting one, because 16-byte row
+alignment is what the cooperative-matrix LDS load needs and every aligned pad
+has `gcd >= 4` with the bank count.
+
+**4. The router is bit-exact against llama.cpp, and that corrects L5a-1.**
+`ffn_moe_logits-3` is **0 ulp** on all 2 097 152 values where the CPU
+reference is at 3.606e-05 — same operands, same accumulator, and evidently
+the same 16-wide accumulation order. **`shared_expert_gate-3` is bit-exact
+too**, which L5a-1 did not expect: it read the reference as keeping that one
+on the f32 *vector* path "at any prompt length" because it has one output
+column, and inferred that fusing it onto the router's matrix as a 513th
+column would be a deviation to price. `mul_mat_vec_max_cols` counts the
+columns of the **output**, which is the token count, so at any real ubatch a
+[2560, 1] F32 weight is on the fp16 matrix cores like everything else. The
+fusion costs nothing, and it deletes 47 dispatches running at **13.6
+GFLOP/s** — L2a's `inject` scandal in miniature, 9.1 ms a graph.
+
+**5. The permutation's row index is `token * (used + 1) + slot`, and that one
+choice does four things.** The shared expert's row is the last slot, so it is
+one more group of the same grouped GEMM rather than a dense special case; the
+up projection's gathered rows are the down projection's **contiguous** ones;
+the routing weight is indexed by the same number as the row; and a token's
+eleven contributions are contiguous for the combine. The inverse permutation
+is written beside it, because the down projection stores whole fragments in
+permutation order rather than scattering rows — which is what moved the
+routing weights into the combine, where they ride a read that happens once
+anyway.
+
+**6. The ladder moves outward with the chunk.** m2/m2 wins at 512 and m4/m4
+at 2048 (1.03x), because a wider row block amortises the slab over more rows
+and costs padding — 3.90x the real rows at 512 against 1.90x at 2048 for the
+same BM 64. `MoEPlanFor` is that boundary.
+
+**7. Where the next 2.5x is.** `up` runs at 10.8 TFLOP/s and 70 GB/s of bank
+against §2.7's 39 TFLOP/s and L0a's 236 GB/s. Its own byte floor is 2.9 ms
+against 7.2 measured, with the arithmetic able to hide under it, and what
+sits in between is the unpack. Three levers, two of them cheap: a float atomic
+add would delete the combine dispatch and the 58 MB tensor behind it
+(`VK_EXT_shader_atomic_float`, at the cost of a non-deterministic summation
+order); the arithmetic intensity is the *routing's* — 274 experts read 505 MB
+to serve 5120 rows — so the real lever is a bigger ubatch, which is why the
+block is 1.55x at 2048 and 1.09x at 512; and L5a-4's hot expert, chosen by 95%
+of tokens and the same shape as the shared one, is still routed.
+
+**Built:**
+
+- `shaders/llm_moe_gemm.comp` — the grouped quantised GEMM, two modes
+  (gate/up with `silu(gate)*up` on the accumulators, down in permutation
+  order) crossed with four formats and five row-block rungs, 25 builds.
+- `shaders/llm_moe_route.comp` — the softmax over 512, ten workgroup argmaxes
+  reproducing `ggml_argsort`'s DESC comparator without materialising the other
+  502 ranks, the normalised weights and the shared expert's sigmoid gate, one
+  workgroup a token.
+- `shaders/llm_moe_perm.comp` — the counting sort, the padded offsets, the
+  sentinel fill, the inverse permutation and the two tile schedules, in one
+  workgroup.
+- `shaders/llm_moe_combine.comp` — the eleven contributions weighted and
+  summed, in the reference's order.
+- `llm/gpu_moe.go` — the block: five arenas plus a seventh binding that is the
+  quantised bank read as `uvec4`, the fused router matrix with the shared
+  gate as its 513th column, the host-written shared-expert group at the front
+  of the permuted row space, the measured plan and a sweep profiler.
+- `llm/gpu_moe_test.go` — the routing on every token, the permutation and its
+  inverse as exact structural claims, the block at 4 k, the ladder's
+  agreement across eight plans (exact, because only the tiling changes), and
+  the padding-inertness control.
+- `cmd/llm/bench_moe.go` — `-moe`, the ladder, and the comparison against
+  llama.cpp's own graph at both 512 and 2048. It reads `hc_mixed-3` out of the
+  4 k trace rather than synthesising input, because a synthetic activation
+  routes near-uniformly, reads twice the bank and hides the imbalance the
+  schedule exists for.
+- `vk.Buffer.WriteBytesAt`, and `MoEWeights` carrying the shared expert's
+  three tensors as `*gguf.Tensor` beside their dequantised copies.
+
+**Next: L6** — all 48 layers resident, the n-gram table mmap'd, ~100 buffers,
+and logits against llama.cpp. Every block now has a kernel; what L6 adds is
+the graph that runs them in order and the arena plan that holds 82.52 GB.
+
 ### Session 2026-09-16 (fortieth) — stage L5a: the MoE block, and a routing nothing had measured
 
 **Result: all fourteen tensors llama.cpp names inside the FFN half match —

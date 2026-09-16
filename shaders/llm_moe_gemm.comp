@@ -1,0 +1,428 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The grouped expert GEMM: 35.7% of llama.cpp's prefill graph, 97% of this
+// checkpoint's parameters, and the last block of the model without a kernel
+// (LLM.md L5b).
+//
+// **It reads the checkpoint's own quantised blocks.** Every other GEMM in
+// this vertical takes a B operand the host has dequantised to halves and
+// packed into §2.8 fragment tiles. That cannot happen here: one layer's three
+// expert banks are 2.52 billion weights, 5.03 GB at fp16 and 241 GB across
+// the model, against 1.57 GB and 75 GB as they ship. So the bank is staged
+// **verbatim** — Q4_K and Q5_K for gate and up, Q5_1 or Q8_0 for down, Q8_0
+// for the shared expert — and each workgroup unpacks its own BN x BK slab
+// into LDS per K-step, which is §2.2's arrangement for the same reason it
+// gave: a cooperative-matrix fragment's lane layout is not exposed, so
+// nibbles cannot be unpacked into registers and declared a fragment.
+//
+// Two modes, and both of them fuse what llama.cpp spends a dispatch on:
+//
+//   MODE 0   gate and up for one (expert, row block), `silu(gate)*up` on the
+//            accumulators.  The [rows, 640] pair never exists: the reference
+//            writes `ffn_moe_gate` and `ffn_moe_up` and then reads them back
+//            through `ggml_swiglu_split`.
+//   MODE 1   down, times the row's routing weight, scattered to its
+//            (token, slot).  `ffn_moe_weighted` never exists either.
+//
+// **The A operand of MODE 0 is gathered and the A operand of MODE 1 is not**,
+// and that asymmetry is the permutation paying for itself. A routed row is
+// some token's row of the block input, so MODE 0 stages BM scattered rows
+// into LDS; what it writes is indexed by *permutation position*, so MODE 1's
+// rows are contiguous and it loads them straight out of the fp16 arena with
+// no gather at all. The scatter happens once, in MODE 1's epilogue, where it
+// is a store that had to happen anyway.
+//
+// **No tile has a tail, and that is a choice made in the permutation.**
+// L5a-4 measured the routing: 274 of 512 experts touched at a 512-token
+// ubatch and 273 of them with fewer than 19 rows, so most tiles would be
+// mostly padding and the padding must not write over the next expert's rows.
+// A cooperative-matrix store covers sixteen rows at once and cannot be
+// masked, so the obvious answer is to stage the accumulators in LDS and copy
+// them out under a bound — and that answer costs 8-16 KB of LDS on a kernel
+// whose occupancy is already about one wave a SIMD, which is what it is short
+// of. So `llm_moe_perm.comp` rounds every expert's row range up to the
+// schedule's alignment instead and fills the slack with a **sentinel**
+// permutation entry naming a token one past the batch, whose activation row
+// is zero. Every store then goes straight to global, and the only cost is
+// arithmetic on rows nothing reads.
+
+#define MOE_QBANK
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0      // 0 = gate/up + swiglu, 1 = down + weight + scatter
+#endif
+// The quantised format of this build's B. The bank ships as four of them and
+// which one a tensor is, is a fact about the layer: `ffn_down_exps` is Q5_1 on
+// 43 of the 48 layers and Q8_0 on the other five, gate and up are Q4_K except
+// on layer 2 where they are Q5_K, and the shared expert is Q8_0 everywhere.
+#define FMT_Q4_K 0
+#define FMT_Q5_K 1
+#define FMT_Q5_1 2
+#define FMT_Q8_0 3
+#ifndef QFMT
+#define QFMT FMT_Q4_K
+#endif
+#ifndef WM
+#define WM 2        // accumulator tiles a wave holds, M direction
+#endif
+#ifndef WN
+#define WN 4        // accumulator tiles, N direction
+#endif
+// How many waves split a tile's rows between them. They share one
+// dequantised B slab, which is the whole point: unpacking 64 rows of Q4_K per
+// K-step to multiply sixteen rows of A is most of what this kernel does, and
+// a second wave halves that per row while doubling the occupancy of a kernel
+// that runs at about one wave a SIMD.
+#ifndef WAVES
+#define WAVES 1
+#endif
+
+#define TILE 16
+#define BM (WAVES * WM * TILE)
+#define BN (WN * TILE)
+// One K-step is 32 elements by default: exactly one Q5_1 or Q8_0 block, whose
+// scale a lane then reads once for the whole slab.
+//
+// It is a `-D` because Q4_K and Q5_K look as though they want 64. A 64-element
+// group of those formats packs the low nibbles of all 32 bytes first and the
+// high nibbles of the *same* 32 bytes second, so a 32-element step reads the
+// group's bytes, uses half of every one, and then reads them again — an
+// apparent 2x read amplification on 44 GB of the checkpoint, which one step
+// per group removes. **Measured, it is 1.16x slower**: the doubled slab takes
+// MODE 0's LDS from 12.8 KB to 23 and the workgroups a CU can hold from five
+// to two, and the second read of those 32 bytes was being served out of cache
+// anyway. The loop below is written to cover any BK; the ladder runs at 32.
+#ifndef BK
+#define BK 32
+#endif
+#define BK_TILES (BK / TILE)
+#define WAVE 64
+#define LANES (WAVES * WAVE)
+
+layout(local_size_x = LANES) in;
+
+// §2.2's LDS_PAD, which it measured at 1.68-1.83x, and which here is pinned
+// by alignment rather than free to tune. A slab row of BK + 8 halves is 20
+// dwords and `gcd(20, 32)` is 4, so the 64 lanes of the unpack — one column
+// each — land on eight of the 32 banks. Two halves would make the stride 17
+// dwords, coprime with 32 and conflict-free, and it is **5.4x slower**: at 34
+// halves a row starts on a 4-byte boundary and the cooperative-matrix load
+// off LDS loses its wide path. Every pad that keeps rows 16-byte aligned is a
+// multiple of four dwords, so a bank conflict of at least four ways is the
+// price of the fragment load, and eight is as good as it gets.
+#ifndef LDS_PAD
+#define LDS_PAD 8
+#endif
+#define LDS_ROW (BK + LDS_PAD)
+
+#if MODE == 0
+shared float16_t sB0[BN * LDS_ROW];
+shared float16_t sB1[BN * LDS_ROW];
+shared float16_t sA[BM * LDS_ROW];
+#else
+shared float16_t sB0[BN * LDS_ROW];
+#endif
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+#define ACC_T coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ACC16_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+
+// ---- The formats. Each is stated as "bytes a block covers" and "elements a
+// block covers", so a row's byte length is (K / QK) * QB and nothing below
+// has to know which axis it is walking.
+#if QFMT == FMT_Q4_K
+#define QK 256u
+#define QB 144u
+#elif QFMT == FMT_Q5_K
+#define QK 256u
+#define QB 176u
+#elif QFMT == FMT_Q5_1
+#define QK 32u
+#define QB 24u
+#else
+#define QK 32u
+#define QB 34u
+#endif
+
+uint qbyte(uint b) { return (qbank[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
+
+// The block header, in one load. `d` and its companion are the first four
+// bytes of every one of these formats and the block base is four-aligned, so
+// a pair of halves comes out of a single word rather than four byte reads.
+vec2 qhdr(uint blk) { return unpackHalf2x16(qbank[blk >> 2]); }
+
+#if QFMT == FMT_Q4_K || QFMT == FMT_Q5_K
+// ggml's get_scale_min_k4: eight 6-bit scale/min pairs in twelve bytes, which
+// is three words read once for the whole slab. The first four pairs are plain
+// fields; the last four take their low nibble from bytes 8..11 and their top
+// two bits from the spare bits of bytes 0..7.
+uint sbyte(uvec3 s, uint i) {
+    uint w = (i < 4u) ? s.x : ((i < 8u) ? s.y : s.z);
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+void scaleMinK4(uint j, uvec3 s, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = sbyte(s, j) & 63u;
+        mn = sbyte(s, j + 4u) & 63u;
+    } else {
+        uint a = sbyte(s, j + 4u);
+        sc = (a & 0xFu) | ((sbyte(s, j - 4u) >> 6) << 4);
+        mn = (a >> 4) | ((sbyte(s, j) >> 6) << 4);
+    }
+}
+#endif
+
+// dequantSlab writes the BK elements of bank row `row` starting at element
+// `k0` into `dst` at `col * LDS_ROW`. One lane per output column, so the block
+// header is read once for the whole slab.
+#define DEQUANT_SLAB(NAME, DST)                                                                 \
+void NAME(uint bankBase, uint row, uint k0, uint col) {                                         \
+    uint rb = bankBase + row * ((pc.gemmK / QK) * QB);                                          \
+    uint dst = col * LDS_ROW;                                                                   \
+    DEQUANT_BODY(DST)                                                                           \
+}
+
+#if QFMT == FMT_Q4_K
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint k0c = k0 + c;                                                                          \
+    uint within = k0c & 255u;                                                                    \
+    uint g = within >> 6;                                                                       \
+    uint sub = (within >> 5) & 1u;                                                              \
+    uint blk = rb + (k0c >> 8) * 144u;                                                          \
+    uint hw = blk >> 2;                                                                         \
+    vec2 dd = unpackHalf2x16(qbank[hw]);                                                        \
+    uint sc, mn;                                                                                \
+    scaleMinK4(2u * g + sub, uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]), sc, mn);    \
+    float ds = dd.x * float(sc);                                                                \
+    float dm = dd.y * float(mn);                                                                \
+    uint qv = (blk + 16u + g * 32u) >> 4;                                                       \
+    uvec4 lo4 = qbank4[qv];                                                                     \
+    uvec4 hi4 = qbank4[qv + 1u];                                                                \
+    [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                                 \
+        uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            uint nib = (sub == 0u) ? (by & 0xFu) : (by >> 4);                                   \
+            DST[dst + c + t * 4u + b] = float16_t(ds * float(nib) - dm);                        \
+        }                                                                                       \
+    }                                                                                           \
+  }
+#elif QFMT == FMT_Q5_K
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint k0c = k0 + c;                                                                          \
+    uint within = k0c & 255u;                                                                    \
+    uint g = within >> 6;                                                                       \
+    uint sub = (within >> 5) & 1u;                                                              \
+    uint blk = rb + (k0c >> 8) * 176u;                                                          \
+    uint hw = blk >> 2;                                                                         \
+    vec2 dd = unpackHalf2x16(qbank[hw]);                                                        \
+    uint sc, mn;                                                                                \
+    scaleMinK4(2u * g + sub, uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]), sc, mn);    \
+    float ds = dd.x * float(sc);                                                                \
+    float dm = dd.y * float(mn);                                                                \
+    uint hmask = (sub == 0u ? 1u : 2u) << (2u * g);                                             \
+    uint hv = (blk + 16u) >> 4;                                                                 \
+    uvec4 h0 = qbank4[hv];                                                                      \
+    uvec4 h1 = qbank4[hv + 1u];                                                                 \
+    uint qv = (blk + 48u + g * 32u) >> 4;                                                       \
+    uvec4 lo4 = qbank4[qv];                                                                     \
+    uvec4 hi4 = qbank4[qv + 1u];                                                                \
+    [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                                 \
+        uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
+        uint h = (t < 4u) ? h0[t] : h1[t - 4u];                                                 \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            uint nib = (sub == 0u) ? (by & 0xFu) : (by >> 4);                                   \
+            if (((h >> (8u * b)) & hmask) != 0u) {                                              \
+                nib += 16u;                                                                     \
+            }                                                                                   \
+            DST[dst + c + t * 4u + b] = float16_t(ds * float(nib) - dm);                        \
+        }                                                                                       \
+    }                                                                                           \
+  }
+#elif QFMT == FMT_Q5_1
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint blk = rb + ((k0 + c) >> 5) * 24u;                                                            \
+    uint hw = blk >> 2;                                                                         \
+    vec2 dm = unpackHalf2x16(qbank[hw]);                                                        \
+    uint qh = qbank[hw + 1u];                                                                   \
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {                                                 \
+        uint w = qbank[hw + 2u + t];                                                            \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint j = t * 4u + b;                                                                \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            uint lo = (by & 0xFu) | (((qh >> j) & 1u) << 4);                                    \
+            uint hi = (by >> 4) | (((qh >> (j + 16u)) & 1u) << 4);                              \
+            DST[dst + c + j] = float16_t(float(lo) * dm.x + dm.y);                              \
+            DST[dst + c + j + 16u] = float16_t(float(hi) * dm.x + dm.y);                        \
+        }                                                                                       \
+    }                                                                                           \
+  }
+#else
+// Q8_0 alone is not word-aligned below the row: 34 bytes a block puts the
+// int8s at an offset of 2 mod 4 on every other one, so the 32 bytes come out
+// of nine words through a rotating window rather than out of eight.
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint blk = rb + ((k0 + c) >> 5) * 34u;                                                      \
+    uint hw = blk >> 2;                                                                         \
+    vec2 dd = unpackHalf2x16(qbank[hw]);                                                        \
+    float d = ((blk & 2u) == 0u) ? dd.x : dd.y;                                                 \
+    uint base = blk + 2u;                                                                       \
+    uint bw = base >> 2;                                                                        \
+    bool odd = (base & 2u) != 0u;                                                               \
+    uint carry = qbank[bw];                                                                     \
+    [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                                 \
+        uint nxt = qbank[bw + t + 1u];                                                          \
+        uint w = odd ? ((carry >> 16) | (nxt << 16)) : carry;                                   \
+        carry = nxt;                                                                            \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            DST[dst + c + t * 4u + b] = float16_t(float(int(by) - int((by >> 7) << 8)) * d);    \
+        }                                                                                       \
+    }                                                                                           \
+  }
+#endif
+
+DEQUANT_SLAB(dequantB0, sB0)
+#if MODE == 0
+DEQUANT_SLAB(dequantB1, sB1)
+#endif
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    // Which rows of the tile this wave owns. Every cooperative-matrix op
+    // below is subgroup-scoped, so the waves share LDS and nothing else.
+    uint wrow = (tid / WAVE) * (WM * TILE);
+    uint tileIdx = gl_WorkGroupID.y;
+    // Every row block past the schedule's end returns before it reads a
+    // weight. The grid is a static upper bound — ceil(tokens*used/BM) plus
+    // one partial block per expert — because the real count is only known on
+    // the device, and an empty workgroup costs a launch.
+    if (tileIdx >= actu[pc.moeTileOff]) {
+        return;
+    }
+    uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
+    uint expert = actu[rec];
+    uint rowStart = actu[rec + 1u];
+    uint n0 = gl_WorkGroupID.x * BN;
+    uint slots = pc.moeUsed + 1u;
+
+    // Expert e's output row n is bank row e*gemmN + n, which is what makes a
+    // three-axis GGUF tensor addressable without a stride table.
+    uint bankBase = expert * pc.gemmN + n0;
+
+    ACC_T acc0[WM][WN];
+#if MODE == 0
+    ACC_T acc1[WM][WN];
+#endif
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc0[i][j] = ACC_T(0.0);
+#if MODE == 0
+            acc1[i][j] = ACC_T(0.0);
+#endif
+        }
+    }
+
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+#if MODE == 0
+        // The A operand is gathered: BM rows of the block input, named by the
+        // permutation and belonging to BM different tokens.
+        for (uint idx = tid; idx < BM * BK; idx += LANES) {
+            uint r = idx / BK;
+            uint c = idx - r * BK;
+            uint p = actu[pc.moePermOff + rowStart + r];
+            sA[r * LDS_ROW + c] = hact[pc.xnOff + (p / slots) * pc.lda + k0 + c];
+        }
+        // The two matrices are one staging pass, so every lane of every wave
+        // has a row to unpack rather than half of them idling.
+        for (uint r = tid; r < 2u * BN; r += LANES) {
+            if (r < BN) {
+                dequantB0(pc.bOff, bankBase + r, k0, r);
+            } else {
+                dequantB1(pc.moeBOff2, bankBase + r - BN, k0, r - BN);
+            }
+        }
+#else
+        for (uint r = tid; r < BN; r += LANES) {
+            dequantB0(pc.bOff, bankBase + r, k0, r);
+        }
+#endif
+        barrier();
+
+        [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
+            FRAG_A_T fragA[WM];
+            [[unroll]] for (uint i = 0u; i < WM; i++) {
+#if MODE == 0
+                coopMatLoad(fragA[i], sA, (wrow + i * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#else
+                // MODE 1's rows are permutation positions and so contiguous:
+                // no gather, and the overhang past this expert reads the next
+                // one's swiglu rows and is thrown away at the store.
+                coopMatLoad(fragA[i], hact,
+                    pc.ctxOff + (rowStart + wrow + i * TILE) * pc.ldCtx + k0 + kt * TILE, pc.ldCtx,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+            [[unroll]] for (uint j = 0u; j < WN; j++) {
+                FRAG_B_T fragB;
+                coopMatLoad(fragB, sB0, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < WM; i++) {
+                    acc0[i][j] = coopMatMulAdd(fragA[i], fragB, acc0[i][j]);
+                }
+#if MODE == 0
+                coopMatLoad(fragB, sB1, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+                [[unroll]] for (uint i = 0u; i < WM; i++) {
+                    acc1[i][j] = coopMatMulAdd(fragA[i], fragB, acc1[i][j]);
+                }
+#endif
+            }
+        }
+        barrier();
+    }
+
+    // ---- The epilogue. MODE 0 applies `ggml_swiglu_split(gate, up)` =
+    // silu(gate)*up on the accumulators, so the [rows, ffn] pair the
+    // reference materialises never exists; MODE 1 writes the down
+    // projection's rows where they already are, in permutation order, and
+    // leaves the routing weight to the combine — which has to read every one
+    // of these values once anyway, and which is the only place that knows
+    // which (token, slot) a row belongs to without a gather.
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+#if MODE == 0
+            ACC16_T sw;
+            [[unroll]] for (uint e = 0u; e < acc0[i][j].length(); e++) {
+                float g = float(acc0[i][j][e]);
+                sw[e] = float16_t(g * sigmoidf(g) * float(acc1[i][j][e]));
+            }
+            coopMatStore(sw, hact,
+                pc.ctxOff + (rowStart + wrow + i * TILE) * pc.ldCtx + n0 + j * TILE,
+                pc.ldCtx, gl_CooperativeMatrixLayoutRowMajor);
+#else
+            coopMatStore(acc0[i][j], act,
+                pc.gatedOff + (rowStart + wrow + i * TILE) * pc.nEmbd + n0 + j * TILE, pc.nEmbd,
+                gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        }
+    }
+}

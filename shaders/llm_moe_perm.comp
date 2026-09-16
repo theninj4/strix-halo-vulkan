@@ -1,0 +1,195 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The routing permutation and the tile schedule it implies (LLM.md L5b).
+//
+// A counting sort over the 512 experts: histogram, exclusive prefix sum,
+// scatter. It is one workgroup because the whole input is `tokens * used`
+// integers — 5120 at a 512-token ubatch, 40 960 at the 4 k fixture — and 97%
+// of this block's time is in the two GEMMs behind it.
+//
+// **L5a-4 is why the schedule is a list and not a grid.** At a 512-token
+// ubatch only **274 of 512 experts are touched**, one of them takes **484 of
+// the 512 tokens** and the other 273 have fewer than 19: a workgroup per
+// expert has a 26x load imbalance and a grid of (experts x fixed row blocks)
+// is almost entirely empty. So this kernel emits one record per (expert, row
+// block) that has rows — `tileCount` of them — and the GEMM dispatches a
+// static upper bound of `ceil(tokens*used/BM) + nExperts` row blocks, every
+// one past `tileCount` returning before it reads anything.
+//
+// **Each expert's rows are padded up to `pc.gemmN`, and that padding is what
+// buys the GEMM its epilogue.** A cooperative-matrix store covers sixteen
+// rows at once and cannot be masked, so a tile whose expert runs out of rows
+// part-way through would have to stage its accumulators in LDS and copy them
+// out under a bound — which is 8-16 KB of LDS on a kernel whose occupancy is
+// already one wave a SIMD. Rounding every expert's range up instead means a
+// tile's rows are *always* that expert's, the store goes straight out, and
+// the padding rows are named by a **sentinel** permutation entry pointing at
+// a token index one past the batch, whose activation row is zero. The
+// alignment is the wider of the two modes' row blocks, so both tile lists
+// divide it exactly and the two ladders stay independent.
+//
+// Two more things the layout does. The row a permutation entry names is
+// `token * (used + 1) + slot`, not the token — so the slot stride carries the
+// shared expert's row as its last element. And the **inverse** permutation is
+// written beside it, because the down projection's output lands in
+// permutation order and the combine has to find a token's eleven
+// contributions again; the alternative is a scattered store, and a scattered
+// store is the LDS round trip this file exists to avoid.
+//
+// The order of rows *within* an expert is whatever the scatter's atomics
+// give, and nothing depends on it: every row is independent and the combine
+// sums by (token, slot).
+
+#include "llm_common.glsl"
+
+#define WG 256
+#define MAX_EXPERTS 512
+
+layout(local_size_x = WG) in;
+
+shared uint shCnt[MAX_EXPERTS];
+shared uint shWave[WG / 64];
+shared uint shTotal;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint nE = pc.gemmK;          // the expert count
+    uint used = pc.moeUsed;
+    uint slots = used + 1u;
+    uint pairs = pc.tokens * used;
+    uint bm = pc.gemmM;          // the row block this tile list is cut to
+    uint pad = pc.gemmN;         // the row alignment both lists share
+    uint sg = tid / 64u;
+
+    // The shared expert is one group of the same grouped GEMM and it takes
+    // the front of the row space: it runs for every token, so its rows are
+    // the identity and the host writes them. The routed experts start behind
+    // it.
+    uint reserve = ((pc.tokens + pad - 1u) / pad) * pad;
+
+    // The four per-expert arrays the counting sort keeps. They sit behind the
+    // permutation, which the host sizes for the widest rung, so where they
+    // start is the host's to say — `moeBOff2`, which in a GEMM dispatch is
+    // the second quantised matrix and here has no matrix to name.
+    uint book = pc.moeBOff2;
+    uint counts = book;
+    uint offsets = book + nE;
+    uint cursor = book + 2u * nE;
+    uint tileBase = book + 3u * nE;
+    uint topk = pc.moeWeightOff + pc.tokens * slots;
+    uint invPerm = topk + pairs;
+
+    for (uint e = tid; e < nE; e += WG) {
+        actu[counts + e] = 0u;
+    }
+    barrier();
+
+    // ---- The histogram.
+    for (uint p = tid; p < pairs; p += WG) {
+        atomicAdd(actu[counts + actu[topk + p]], 1u);
+    }
+    barrier();
+
+    // ---- Two exclusive prefix sums over the experts, in the same shape: one
+    // over the padded counts, which is where an expert's rows start, and one
+    // over padded/BM, which is where its tile records start. A subgroup scan
+    // per wave, the wave totals carried across, and a carry across the
+    // chunks — because nE is 512 and the workgroup is 256.
+    uint carryRows = reserve;
+    uint carryTiles = 0u;
+    for (uint c0 = 0u; c0 < MAX_EXPERTS; c0 += WG) {
+        uint e = c0 + tid;
+        uint cnt = (e < nE) ? actu[counts + e] : 0u;
+        shCnt[e] = cnt;
+        uint padded = ((cnt + pad - 1u) / pad) * pad;
+        uint nt = padded / bm;
+
+        uint rowTot = subgroupAdd(padded);
+        uint rowEx = subgroupExclusiveAdd(padded);
+        uint tileTot = subgroupAdd(nt);
+        uint tileEx = subgroupExclusiveAdd(nt);
+        if (subgroupElect()) {
+            shWave[sg] = rowTot;
+        }
+        barrier();
+        uint rowBefore = 0u, rowAll = 0u;
+        [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+            rowAll += shWave[w];
+            if (w < sg) {
+                rowBefore += shWave[w];
+            }
+        }
+        barrier();
+        if (subgroupElect()) {
+            shWave[sg] = tileTot;
+        }
+        barrier();
+        uint tileBefore = 0u, tileAll = 0u;
+        [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+            tileAll += shWave[w];
+            if (w < sg) {
+                tileBefore += shWave[w];
+            }
+        }
+        barrier();
+
+        if (e < nE) {
+            uint off = carryRows + rowBefore + rowEx;
+            actu[offsets + e] = off;
+            actu[cursor + e] = off;
+            actu[tileBase + e] = carryTiles + tileBefore + tileEx;
+        }
+        carryRows += rowAll;
+        carryTiles += tileAll;
+    }
+    if (tid == 0u) {
+        actu[pc.moeTileOff] = carryTiles;
+        actu[pc.moeTileOff + 1u] = carryRows;
+        shTotal = carryRows;
+    }
+    barrier();
+
+    // ---- Every routed row starts as the sentinel: a (token, slot) pair one
+    // token past the batch, whose activation row is a zero pad. What the
+    // scatter does not overwrite is padding, and padding has to compute
+    // something finite rather than whatever the arena last held.
+    uint sentinel = pc.tokens * slots;
+    for (uint r = reserve + tid; r < shTotal; r += WG) {
+        actu[pc.moePermOff + r] = sentinel;
+    }
+    barrier();
+
+    // ---- The scatter, and the inverse beside it. `p` is (token, slot)
+    // flattened by `used`; what lands in the permutation is the same pair
+    // flattened by `used + 1`, so the shared expert's slot is already spoken
+    // for.
+    for (uint p = tid; p < pairs; p += WG) {
+        uint e = actu[topk + p];
+        uint idx = atomicAdd(actu[cursor + e], 1u);
+        uint tok = p / used;
+        uint k = p - tok * used;
+        actu[pc.moePermOff + idx] = tok * slots + k;
+        actu[invPerm + tok * slots + k] = idx;
+    }
+
+    // ---- The tile records: expert, first row, and the row block, which is
+    // now always full because the range was padded to it.
+    for (uint e = tid; e < nE; e += WG) {
+        uint cnt = shCnt[e];
+        uint padded = ((cnt + pad - 1u) / pad) * pad;
+        uint off = actu[offsets + e];
+        uint tb = actu[tileBase + e];
+        for (uint mb = 0u; mb * bm < padded; ++mb) {
+            uint rec = pc.moeTileOff + 2u + 3u * (tb + mb);
+            actu[rec] = e;
+            actu[rec + 1u] = off + mb * bm;
+            actu[rec + 2u] = bm;
+        }
+    }
+}

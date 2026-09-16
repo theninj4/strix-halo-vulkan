@@ -122,6 +122,14 @@ type MoEWeights struct {
 	DownShexp  []float32 // [nEmbd][ffnShared]
 
 	Gate, Up, Down *ExpertBank
+
+	// The shared expert again, as the checkpoint's own Q8_0 rows. The GPU
+	// path (gpu_moe.go) stages every weight in this block quantised — the
+	// three routed banks because 5.03 GB a layer cannot be halves, and the
+	// shared expert because it is the same kernel and the same shape, which
+	// is what makes it one more group of the grouped GEMM rather than a
+	// dense special case.
+	GateShexpT, UpShexpT, DownShexpT *gguf.Tensor
 }
 
 // MoEWeights loads one layer's FFN half.
@@ -156,6 +164,18 @@ func (m *Model) MoEWeights(layer int) (MoEWeights, error) {
 			return w, err
 		}
 		if *t.dst, err = newExpertBank(tn); err != nil {
+			return w, err
+		}
+	}
+	for _, t := range []struct {
+		dst  **gguf.Tensor
+		name string
+	}{
+		{&w.GateShexpT, "ffn_gate_shexp"},
+		{&w.UpShexpT, "ffn_up_shexp"},
+		{&w.DownShexpT, "ffn_down_shexp"},
+	} {
+		if *t.dst, err = m.Set.Get(name(t.name)); err != nil {
 			return w, err
 		}
 	}

@@ -2160,3 +2160,144 @@ var LLMDNScanL8P []byte
 
 //go:embed llm_dn_scan_l4p.spv
 var LLMDNScanL4P []byte
+
+// The MoE block — LLM.md L5b — which is 35.7% of llama.cpp's prefill graph,
+// 97% of this checkpoint's parameters and the last block of the model to get
+// a kernel.
+//
+// Four shaders. `llm_moe_route` is the router's tail — the softmax over 512,
+// the ten workgroup argmaxes that reproduce `ggml_argsort`'s DESC comparator
+// without materialising the other 502 ranks, the normalised weights and the
+// shared expert's sigmoid gate — one workgroup a token, which is
+// `llm_attn_select.comp`'s shape. `llm_moe_perm` is a counting sort over the
+// experts and the tile schedule it implies, in one workgroup, because
+// L5a-4's routing is a 26x load imbalance that cannot be covered by a static
+// grid. `llm_moe_combine` sums a token's eleven contributions, which are
+// contiguous by the permutation's own indexing.
+//
+// `llm_moe_gemm` is the block: a grouped cooperative-matrix GEMM that reads
+// the checkpoint's **own quantised blocks** rather than a dequantised bank,
+// because one layer's three expert tensors are 5.03 GB at fp16 and 241 GB
+// across the model against 1.57 and 75 as they ship. It is a cross of two
+// modes (gate/up with `silu(gate)*up` fused onto the accumulators, and down
+// with the routing weight and the scatter fused onto the store) against the
+// four formats the bank ships in (Q4_K and Q5_K for gate/up, Q5_1 or Q8_0
+// for down, Q8_0 for the shared expert), and a row-block ladder over each,
+// because L5a-4's distribution is what decides whether a wide tile is reuse
+// or padding.
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_route.spv llm_moe_route.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_perm.spv llm_moe_perm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_combine.spv llm_moe_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_route.spv llm_moe_route.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_perm.spv llm_moe_perm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_combine.spv llm_moe_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=1 -o llm_moe_up_q4k_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=2 -DWAVES=1 -o llm_moe_up_q4k_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=4 -DWAVES=1 -o llm_moe_up_q4k_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=2 -o llm_moe_up_q4k_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=4 -o llm_moe_up_q4k_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=1 -o llm_moe_up_q5k_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=2 -DWAVES=1 -o llm_moe_up_q5k_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=4 -DWAVES=1 -o llm_moe_up_q5k_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=2 -o llm_moe_up_q5k_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=4 -o llm_moe_up_q5k_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=1 -o llm_moe_up_q80_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=2 -DWAVES=1 -o llm_moe_up_q80_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=4 -DWAVES=1 -o llm_moe_up_q80_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=2 -o llm_moe_up_q80_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=4 -o llm_moe_up_q80_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=1 -o llm_moe_down_q51_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=2 -DWAVES=1 -o llm_moe_down_q51_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=4 -DWAVES=1 -o llm_moe_down_q51_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=2 -o llm_moe_down_q51_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=4 -o llm_moe_down_q51_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=1 -o llm_moe_down_q80_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=2 -DWAVES=1 -o llm_moe_down_q80_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=4 -DWAVES=1 -o llm_moe_down_q80_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=2 -o llm_moe_down_q80_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=4 -o llm_moe_down_q80_w4m1.spv llm_moe_gemm.comp
+
+//go:embed llm_moe_up_q4k_m1.spv
+var LLMMoEUpQ4KM1 []byte
+
+//go:embed llm_moe_up_q4k_m2.spv
+var LLMMoEUpQ4KM2 []byte
+
+//go:embed llm_moe_up_q4k_m4.spv
+var LLMMoEUpQ4KM4 []byte
+
+//go:embed llm_moe_up_q4k_w2m1.spv
+var LLMMoEUpQ4KW2M1 []byte
+
+//go:embed llm_moe_up_q4k_w4m1.spv
+var LLMMoEUpQ4KW4M1 []byte
+
+//go:embed llm_moe_up_q5k_m1.spv
+var LLMMoEUpQ5KM1 []byte
+
+//go:embed llm_moe_up_q5k_m2.spv
+var LLMMoEUpQ5KM2 []byte
+
+//go:embed llm_moe_up_q5k_m4.spv
+var LLMMoEUpQ5KM4 []byte
+
+//go:embed llm_moe_up_q5k_w2m1.spv
+var LLMMoEUpQ5KW2M1 []byte
+
+//go:embed llm_moe_up_q5k_w4m1.spv
+var LLMMoEUpQ5KW4M1 []byte
+
+//go:embed llm_moe_up_q80_m1.spv
+var LLMMoEUpQ80M1 []byte
+
+//go:embed llm_moe_up_q80_m2.spv
+var LLMMoEUpQ80M2 []byte
+
+//go:embed llm_moe_up_q80_m4.spv
+var LLMMoEUpQ80M4 []byte
+
+//go:embed llm_moe_up_q80_w2m1.spv
+var LLMMoEUpQ80W2M1 []byte
+
+//go:embed llm_moe_up_q80_w4m1.spv
+var LLMMoEUpQ80W4M1 []byte
+
+//go:embed llm_moe_down_q51_m1.spv
+var LLMMoEDownQ51M1 []byte
+
+//go:embed llm_moe_down_q51_m2.spv
+var LLMMoEDownQ51M2 []byte
+
+//go:embed llm_moe_down_q51_m4.spv
+var LLMMoEDownQ51M4 []byte
+
+//go:embed llm_moe_down_q51_w2m1.spv
+var LLMMoEDownQ51W2M1 []byte
+
+//go:embed llm_moe_down_q51_w4m1.spv
+var LLMMoEDownQ51W4M1 []byte
+
+//go:embed llm_moe_down_q80_m1.spv
+var LLMMoEDownQ80M1 []byte
+
+//go:embed llm_moe_down_q80_m2.spv
+var LLMMoEDownQ80M2 []byte
+
+//go:embed llm_moe_down_q80_m4.spv
+var LLMMoEDownQ80M4 []byte
+
+//go:embed llm_moe_down_q80_w2m1.spv
+var LLMMoEDownQ80W2M1 []byte
+
+//go:embed llm_moe_down_q80_w4m1.spv
+var LLMMoEDownQ80W4M1 []byte
+
+//go:embed llm_moe_route.spv
+var LLMMoERoute []byte
+
+//go:embed llm_moe_perm.spv
+var LLMMoEPerm []byte
+
+//go:embed llm_moe_combine.spv
+var LLMMoECombine []byte

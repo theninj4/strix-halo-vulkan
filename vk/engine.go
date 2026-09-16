@@ -515,6 +515,16 @@ func (b *Buffer) WriteBytes(src []byte) {
 	copy(dst, src)
 }
 
+// WriteBytesAt copies src into the buffer's mapped memory at a byte offset.
+// A quantised weight bank is staged through this rather than through
+// WriteFloat32At: its blocks are 24, 34, 144 or 176 bytes and nothing about
+// them is a float, so the host copies the checkpoint's own bytes and the
+// shader unpacks them (LLM.md L5b).
+func (b *Buffer) WriteBytesAt(off int, src []byte) {
+	dst := unsafe.Slice((*byte)(b.mapped), off+len(src))
+	copy(dst[off:], src)
+}
+
 // FillRepeating tiles block across the whole buffer, in place. It exists for
 // the multi-gigabyte weight banks IDEAS §3.5 needs: a 512-expert fp16 bank is
 // 1.8 GB, and building a host-side copy of that to hand to WriteBytes costs

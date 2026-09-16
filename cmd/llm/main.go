@@ -45,8 +45,9 @@ func main() {
 	ple := flag.Bool("ple", false, "benchmark the PLE n-gram block")
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
 	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
+	moe := flag.Bool("moe", false, "benchmark the MoE block")
 	ctx := flag.Int("ctx", 2048, "cache cells for -attn; llama.cpp's measured graph had 2048")
-	attnLayers := flag.Int("layers", 2, "how many layers to stage for -attn and -dn")
+	attnLayers := flag.Int("layers", 2, "how many layers to stage for -attn and -dn; for -moe the default is one, because a layer's expert bank is 1.57 GB")
 	sel := flag.String("sel", "auto", "the QSA selection for -attn: auto (only where it bites), on (price it where it is the identity), off (the dense control)")
 	tokens := flag.String("tokens", "64,128,256,512,1024,2048", "token counts for -hc")
 	mixers := flag.Int("mixers", 8, "how many real mixers to stage for -hc; the sweep needs more than the 32 MiB MALL")
@@ -62,6 +63,17 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *moe {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := moeBench(*model, toks, *attnLayers, *iters, *ladder, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return

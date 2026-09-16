@@ -10,41 +10,41 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1, the whole of L2, the whole of L3, the whole of L4 and L5a
-complete.** The checkpoint is downloaded, llama.cpp runs it, the Go side reads
-it, the prefill mystery is solved, and **every layer of this model now runs on
-the GPU**: the hyper-connection block in four dispatches where the reference
-has sixteen (4.24x, 14.9% of llama.cpp's whole prefill graph), the PLE n-gram
-block beside it with its trigram hash bit-exact, the full-attention layer with
-its QSA indexer **and now its selection** in seven dispatches where the
-reference has twenty-eight (L2f and L4b, 2.32x), and — **L3b — the gated
-DeltaNet, three quarters of the layers, in five dispatches where the reference
-has eleven**: 152.8 ms of its 512-token graph becoming 111.5, **1.37x, with
-the recurrence itself at 1.06x**. Between them L2, L3 and L4b have taken
-**448.1 ms of llama.cpp's 1164.7 ms prefill graph down to 192.5** — 38.5% of
-it replaced by 16.5%. 114 GB in 18 minutes;
+**Status: L0, L1 and the whole of L2, L3, L4 and L5 complete — every block of
+this model now runs on the GPU.** The checkpoint is downloaded, llama.cpp runs
+it, the Go side reads it, the prefill mystery is solved, and there is a kernel
+for every layer and every sub-layer: the hyper-connection block in four
+dispatches where the reference has sixteen (4.24x, 14.9% of llama.cpp's whole
+prefill graph), the PLE n-gram block beside it with its trigram hash
+bit-exact, the full-attention layer with its QSA indexer **and** its selection
+in seven dispatches where the reference has twenty-eight (L2f and L4b, 2.32x),
+the gated DeltaNet — three quarters of the layers — in five where the
+reference has eleven (L3b, 1.37x, the recurrence itself at 1.06x), and now
+**L5b: the MoE block, 35.7% of the graph and 97% of the parameters, in nine
+dispatches against about 845**.
+
+**Between them the five blocks have taken 1015.5 ms of llama.cpp's 1164.7 ms
+prefill graph down to 714.8** — 87.2% of it replaced by 61.4%, a 25.8% saving
+on the whole graph. 114 GB in 18 minutes;
 `models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL` shards and the
 2.79 GB MTP head.
 
-**And L4 is done on both sides.** L4a's 4 k dump reproduced the QSA selection
-**set for set** on all 2045 rows where it bites, and found that the arithmetic
-every tolerance in L2 and L3 was measured against is not the arithmetic a real
-ubatch uses: **at 4096 columns every quantised matmul in the graph accumulates
-in fp16**, so the reference is the side losing precision at prefill and the
-tolerance there is 5e-3 rather than 1e-6. **L4b is that selection as a kernel**
-— one dispatch writing a per-cell bitmask where llama.cpp has twenty-four
-writing an index list and converting it back, **2.40 ms of a 512-token graph
-becoming 1.24, and 1.94x** — and it prices the thing the architecture is named
-for: at prefill the selection **costs** the attention kernel 1.21x and saves it
-nothing. The layer's output at 4096 tokens is **9.87e-04 rms** against
-llama.cpp, inside what the same comparison gives at 7 tokens, and the dense
-control is 2.0x further. The same dump carried the whole MoE block, so
-**L5a's fixture existed before L5 started** — and L5a is now done: every one
-of the fourteen tensors of the FFN half matches, the top-10-of-512 selection
-is the reference's **set for set on all 4096 tokens**, and the routing turns
-out to be nothing like balanced — **274 of 512 experts touched at a
-512-token ubatch, one of them taking 95% of the tokens**. **Next: L5b's
-kernel, 35.7% of the graph and the last block without one.**
+**L5b is the first kernel here whose weights never become floats.** One
+layer's three expert banks are 2.52 billion weights — 5.03 GB as halves and
+241 GB across the model, against 1.57 GB and 75 GB as they ship — so the bank
+is staged byte for byte out of the mmap'd checkpoint and each workgroup
+unpacks its own Q4_K/Q5_K/Q5_1/Q8_0 slab into LDS per K-step. The schedule is
+L5a-4's routing made concrete: a device-built *list* of (expert, row block)
+records over a static bound, with every expert's rows padded up to the block
+so a cooperative-matrix store can go straight to global. **567.4 ms of
+llama.cpp's graph becomes 522.3 — 1.09x at its own best ubatch — and 1758.4
+becomes 1131.6 at ubatch 2048, 1.55x**, with `ffn_out` at 8.132e-05 rms over
+all 4096 tokens and the top-10-of-512 selection the reference's set for set
+*and order for order*. Along the way the router turned out to be **bit-exact**
+against llama.cpp on all 2 097 152 logits, and so did `shared_expert_gate` —
+which corrects L5a-1: fusing that gate onto the router's matrix is not a
+deviation but a reproduction. **Next: L6, all 48 layers resident and logits
+against llama.cpp.**
 
 ## The number to beat
 
@@ -704,13 +704,18 @@ against all fourteen tensors llama.cpp names inside the FFN half.
 > router itself is 3.6e-05 rms, and it is L2e-3's numeric rather than
 > L4a-5's: fp16 operands with an **f32** accumulator, because `.f16acc`
 > belongs to the quantised kernels and L4a-5 put `ffn_moe_logits` at 0.0%
-> exact halves.
+> exact halves. *(L5b-5 corrects the other half of this finding: the claim
+> that `shared_expert_gate`'s single output column keeps it on the f32 vector
+> path at any prompt length is wrong — the threshold counts the columns of
+> the output, which is the token count. At a real ubatch it is on the matrix
+> cores like everything else, and the device reproduces it bit-for-bit.)*
 >
 > **L5a-2: the block matches at the tolerance the fp16 accumulator sets.**
 > `ffn_out-3` is **1.378e-04 rms**, with the three routed matmuls at
 > 2.7-2.9e-03 on values of order 1 — the oracle's precision, not ours — and
-> `shared_expert_gate` at **4.152e-05** because one output column keeps it on
-> the f32 vector path at any prompt length.
+> `shared_expert_gate` at **4.152e-05** because it is the one tensor here with
+> no quantised weight in it — not, as this finding first said, because one
+> output column keeps it on the f32 vector path; see L5b-5.
 >
 > **L5a-3: modelling the reference's arithmetic makes the fit *worse* here,
 > by 1.4-1.8x.** `Exact` f32 is 2.217e-03 against llama.cpp where `RefQ8` is
@@ -746,6 +751,107 @@ against all fourteen tensors llama.cpp names inside the FFN half.
 > by zero the data never reaches (the smallest sum on this prompt is 0.0554
 > against the clamp's 6.1e-05), so it is asserted from the graph and measured
 > to be the identity on all 4096 rows.
+
+
+## What L5b established — the block on the device, and two optimisations that were worth nothing
+
+`llm/gpu_moe.go`, `shaders/llm_moe_{gemm,route,perm,combine}.comp`: nine
+dispatches, the plain GEMM arm once and four kernels of this block's own.
+[Write-up](research/l5b-moe-gpu.md) · `results/l5b_moe.csv`,
+`results/l5b_moe_ladder.csv`
+
+> **L5b-1: nine dispatches against about 845, and 567.4 ms becomes 522.3.**
+> Per 512-token graph, against the lines of llama.cpp's own graph that are
+> nameably this block: the router with the shared expert's gate 15.2 →
+> **4.7 ms** (3.22x), the routing's tail 2.6 → **0.7** (3.70x), the gather
+> 2.0 → **1.8**, gate/up with its `GLU` 372.3 → **345.4** (1.08x), down
+> 158.9 → **134.0** (1.19x), the shared expert 16.4 → **13.6** (1.21x), and
+> a **combine the reference does not have at all**, 22.1 ms, counted in full.
+> **1.09x, and 48.7% of the whole graph becoming 44.8%** — a second run gives
+> 522.2 ms, 0.3% apart. At `-ub 2048` the same comparison is **1758.4 ms
+> against 1131.6, 1.55x**, because the MoE is the one block that gets cheaper
+> per token on *both* sides as the chunk grows and the glue that makes 2048 a
+> worse ubatch overall (L2a-4) belongs to other blocks. The `MUL` that
+> applies the ten weights, the `MUL` and `SIGMOID` of the shared gate and the
+> `ADD` that sums the two halves are left out of the comparison entirely —
+> they live in the shared MUL/SIGMOID/ADD lines and are *absent* from our
+> graph rather than faster in it.
+>
+> **L5b-2: the bank never becomes floats, and that is what makes the kernel
+> possible.** Every other GEMM in this vertical takes a B operand the host has
+> dequantised to halves and packed into §2.8 fragment tiles; one layer's three
+> routed banks are 2.52 billion weights — **5.03 GB at fp16 and 241 GB across
+> the model**, against 1.57 and 75 as they ship — so that cannot happen here.
+> The bank is staged byte for byte out of the mmap'd checkpoint and each
+> workgroup unpacks its own BN x BK slab into LDS per K-step, from **Q4_K,
+> Q5_K, Q5_1 or Q8_0** under a `-DQFMT`, which is §2.2's arrangement for
+> §2.2's reason: a cooperative-matrix fragment's lane layout is not exposed,
+> so nibbles cannot be unpacked into registers and declared a fragment.
+>
+> **L5b-3: L5a-4's routing is the schedule, and padding the rows is what buys
+> the epilogue.** 274 of 512 experts at ubatch 512 with one taking 95% of the
+> tokens makes a grid of (experts x row blocks) almost entirely empty, so the
+> tiles are a device-built **list** over a static upper bound with an early
+> return — 372 real records against a bound of 1216. And every expert's range
+> is padded up to the row block, the slack named by a **sentinel** permutation
+> entry pointing at a token one past the batch: that is what lets a
+> cooperative-matrix store, which covers sixteen rows and cannot be masked, go
+> straight to global rather than through an LDS staging buffer. It executes
+> 1.09-3.90x the rows that exist depending on the rung and the chunk, and
+> **poisoning the sentinel's activation row with 1000 moves `ffn_out` by
+> exactly zero** — which is the control that scheme needs and that no tensor
+> comparison provides.
+>
+> **L5b-4: two optimisations worked, two did not, and the two that did not are
+> the finding.** Deleting the LDS epilogue is **1.35x** on the whole block and
+> widening the unpack's loads is **3.1x on Q8_0** — both about instruction
+> count rather than about bytes or arithmetic. But **sharing the dequantised
+> slab across two or four waves of one workgroup is 1.15-1.24x *against***, at
+> the same row block, even though it halves the unpack per row and doubles the
+> waves a CU holds on a kernel running at about one wave a SIMD: occupancy is
+> not what this kernel is short of, which is the answer L3b-4 got for the
+> scan's staged operands. And **making the K-step cover a whole Q4_K nibble
+> group is 1.16x against** even though it removes a real 2x read
+> amplification, because the doubled slab takes MODE 0's LDS from 12.8 KB to
+> 23 and the workgroups a CU holds from five to two. A third: the
+> conflict-free LDS pad is **5.4x worse** than the four-way-conflicting one,
+> because 16-byte row alignment is what the fragment load needs and every
+> aligned pad has `gcd >= 4` with the bank count.
+>
+> **L5b-5: the router is bit-exact, and that corrects L5a-1.**
+> `ffn_moe_logits-3` is **0 ulp** on all 2 097 152 values where L5a's CPU
+> reference is at 3.606e-05 — same operands, same accumulator, and the same
+> 16-wide accumulation order. **`shared_expert_gate-3` is bit-exact too.**
+> L5a-1 read the reference as keeping that one on the f32 *vector* path "at
+> any prompt length" because it has one output column, and inferred that
+> fusing it onto the router's matrix as a 513th column would be a deviation to
+> price, in L3b-2's spirit. `mul_mat_vec_max_cols` counts the columns of the
+> **output**, which is the token count, so at any real ubatch a [2560, 1] F32
+> weight is on the fp16 matrix cores like everything else. The fusion costs
+> nothing and it deletes 47 dispatches running at **13.6 GFLOP/s** — L2a's
+> `inject` scandal in miniature, 9.1 ms a graph.
+>
+> **L5b-6: it matches, and the selection now matches in order too.**
+> `ffn_out-3` is **8.132e-05 rms** against llama.cpp over all 4096 tokens —
+> inside L5a's 1.378e-04 over 48 — with the swiglu at 5.5e-04 on values to
+> 8.8, which is L4a-5's fp16 accumulator and not ours. The selection is the
+> reference's **set for set on all 4096 tokens and 0 of 40 960 slots differ in
+> sequence**, where the CPU reference had two: the tie that separated them is
+> 4.35e-07 apart relative, the CPU's logits differ from the reference's by
+> more than that and the device's do not differ at all. The permutation has a
+> gate of its own with no tolerance in it — a bijection over all 40 960
+> (token, slot) pairs, every row in the range of the expert that chose it, the
+> histogram the selection's bucket for bucket, and the inverse round-tripping
+> on all 45 056 slots.
+>
+> **L5b-7: and the next 2.5x is the unpack, or a bigger ubatch.** `up` runs at
+> **10.8 TFLOP/s and 70 GB/s** of quantised bank against §2.7's 39 TFLOP/s and
+> L0a's 236 GB/s. Its own byte floor is 2.9 ms against 7.2 measured, with the
+> arithmetic able to hide under it. But the arithmetic intensity is the
+> **routing's**, not the kernel's — 274 experts read 505 MB to serve 5120 rows,
+> about 17 rows an expert — so the lever that actually moves is the chunk,
+> which is why the block is 1.09x at 512 and 1.55x at 2048. L2a-4's "do not
+> raise the ubatch" is a statement about the glue, not about this.
 
 
 ---
@@ -804,16 +910,17 @@ dense weight is read every time.
 L1**: the reader, the five dequant paths and the tokenizer all exist and are
 checked against llama.cpp. **L2 has the dense skeleton on the device** — the
 hyper-connection block, the PLE n-gram block and the full-attention layer with
-its indexer — and **L3 has the linear-attention layer**, all checked
-tensor-for-tensor against `llama-eval-callback`. **Every layer of the model now
-has a kernel except the MoE**, and L4 has the selection beside them. The acceptance criterion is *it generates the
-same text as llama.cpp*. **L2a sizes it**: ~1150 tok/s prefill against 391.4,
-and 38.2 tok/s decode against 25.15, both reachable with kernels that already
-exist plus the epilogue fusion the hyper-connection block needs. **L2c, L2f, L3b and
-L4b between them have taken 448.1 ms of llama.cpp's 1164.7 ms prefill graph
-down to 192.5 — 38.5% of it replaced by 16.5%, a 21.9% saving from all three
-dense blocks, the QSA selection and three quarters of the layers**, with the
-MoE's 35.7% still untouched at L5.
+its indexer — **L3 has the linear-attention layer**, **L4 has the QSA
+selection**, and **L5 has the MoE block**, all checked tensor-for-tensor
+against `llama-eval-callback`. **Every block of the model now has a kernel.**
+The acceptance criterion is *it generates the same text as llama.cpp*. **L2a
+sizes it**: ~1150 tok/s prefill against 391.4, and 38.2 tok/s decode against
+25.15, both reachable with kernels that already exist plus the epilogue fusion
+the hyper-connection block needs. **L2c, L2f, L3b, L4b and L5b between them
+have taken 1015.5 ms of llama.cpp's 1164.7 ms prefill graph down to 714.8 —
+87.2% of it replaced by 61.4%, a 25.8% saving on the whole graph.** What is
+left is L6: the graph that runs them in order, and an arena plan that holds
+82.52 GB.
 
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
@@ -984,6 +1091,9 @@ below Q8. Bandwidth is the whole story.
 | `shaders/llm_attn_select.comp` | **L4b: the QSA selection.** One workgroup a token, the row's keys cached in LDS, llama.cpp's four radix passes with its serial bucket walk replaced by a subgroup suffix sum, and a **per-cell bitmask** out instead of an index list — which deletes the reference's `GET_ROWS`. Dispatched only where `top_k + ratio - 1` is fewer cells than the cache holds; `SetSparse` forces it either way, which is how it is priced and how the dense control runs. |
 | `shaders/llm_attn_*.comp` | **L2f: the layer's four kernels.** `llm_attn_pack` (per-head norm + interleaved M-RoPE + the fragment tiling for q, k and v in one grid), `llm_attn_idx` (the indexer's pooled key and query over two addressings), `llm_attn_score` (the rectified score, its bias, the cells and the causal mask) and `llm_attn_wmma` (causal GQA at headDim 256, **with the output gate in its epilogue**, and **L4b's bitmask staged a key block at a time** beside the causal mask). |
 | `llm/moe.go` | **L5a: the MoE block.** `MoEConfig` from the checkpoint, the F32 router with fp16 operands and an f32 accumulator, the softmax/argsort/top-10/clamp/normalise chain, an `ExpertBank` that dequantises one expert's [640, 2560] matrix on demand out of a 77 GB tensor nothing can hold as floats, the routed half walked **by expert** rather than by token, and the shared expert with its one-column gate on the f32 vector path. |
+| `llm/gpu_moe.go` | **L5b: the MoE block on the device, in nine dispatches.** The fused `[nExpert+1, nEmbd]` router with the shared expert's gate as its 513th column, a **quantised** bank staged byte for byte out of the checkpoint (1.57 GB a layer, against 5.03 as halves), a seventh binding that is the same bank read as `uvec4`, the permuted row space with the shared expert's group at its front, the measured `MoEPlanFor` schedule and a sweep profiler. |
+| `shaders/llm_moe_gemm.comp` | **L5b: the grouped quantised GEMM.** Two modes — gate/up with `silu(gate)*up` on the accumulators, down in permutation order — crossed with the four formats the bank ships in (Q4_K, Q5_K, Q5_1, Q8_0) and five row-block rungs. Each workgroup unpacks its own BN x BK slab into LDS per K-step, and every store is a whole cooperative-matrix fragment because the permutation pads each expert's rows to the block. |
+| `shaders/llm_moe_{route,perm,combine}.comp` | **L5b: the routing.** `llm_moe_route` is the softmax over 512, ten workgroup argmaxes reproducing `ggml_argsort`'s DESC comparator without materialising the other 502 ranks, the normalised weights and the shared gate's sigmoid — one workgroup a token, `llm_attn_select.comp`'s shape. `llm_moe_perm` is a counting sort, the padded offsets, the sentinel fill, the inverse permutation and the two tile schedules, in one workgroup. `llm_moe_combine` is the eleven contributions weighted and summed in the reference's order. |
 | `llm/deltanet.go` | **L3a: the gated DeltaNet, 36 of the 48 layers.** The fused [2560, 10240] qkv projection, the depthwise causal conv, the L2 norm under either of llama.cpp's two spellings of it (`QKNorm`), the two F32 gate projections and the delta rule itself — with a `DeltaNetState` carrying both the [128, 128, 48] recurrent state *and* the convolution's window, bit-identically across a batch split. |
 | `llm/gpu_deltanet.go` | **L3b: that layer on the device, in five dispatches.** The fused `[16512, 2560]` projection for four of llama.cpp's matrices — including both F32 gate projections — a recurrent state per staged layer, the convolution's window as `Conv-1` rows of negative token index in front of the projection's own output, and a sweep profiler over every staged layer. |
 | `shaders/llm_dn_*.comp` | **L3b: the layer's three kernels.** `llm_dn_conv` (the depthwise causal convolution, its SiLU, the per-head L2 norm of q and k under either spelling, and the softplus/sigmoid pair, over a (plane, token) grid), `llm_dn_scan` (the delta rule — **a fifteen-rung ladder on LPC and QKREG**, whose ends are 6.3x apart) and `llm_dn_norm` (the gated RMS norm straight into the output matmul's A operand). |
@@ -1021,10 +1131,14 @@ below Q8. Bandwidth is the whole story.
 4. ~~**PLE n-gram**~~ — **done at L2d**: trigram hashing into 16 heads over a
    320 M-row mmap'd table, `layer_multipliers`, conv1d k=4, key/value
    projections, bit-exact and in three dispatches.
-5. **The MoE block** — **L5a has the reference**, all fourteen tensors against
-   the 4k dump, and the routing distribution the kernel has to be scheduled
-   against (L5a-4). What is left is **L5b's kernel**, 35.7% of the graph and
-   the last block without one.
+5. ~~**The MoE block**~~ — **done at L5a and L5b.** The CPU reference matches
+   all fourteen tensors of the FFN half at 4096 tokens, and the kernel runs
+   the block in nine dispatches against about 845 — **1.09x at llama.cpp's
+   own best ubatch and 1.55x at 2048** — over a bank that stays in the
+   checkpoint's own Q4_K, Q5_K, Q5_1 and Q8_0 blocks because 241 GB of halves
+   is not a thing this machine holds. L5a-4's 26x imbalance is answered by a
+   device-built tile *list* rather than a grid, and by padding each expert's
+   rows to the block so the epilogue needs no LDS at all (L5b-3).
 6. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
    (interleaved, sections [11,11,10], 64 of 256 dims, NeoX on a text batch);
    what is left is the ring buffer, the indexer cache's own incremental
@@ -1206,14 +1320,31 @@ below Q8. Bandwidth is the whole story.
       with three negative controls: the expert bank's row order (175x), the
       SwiGLU's two halves (59x) and the `weights_sum` clamp, which is invisible
       in the data and asserted from the graph.
-- [ ] **L5b — the kernel.** Router (F32) with its softmax/top-10/normalise in
-      one workgroup a token, `llm_attn_select.comp`'s shape exactly; the
-      permutation; grouped Q4 WMMA GEMM for prefill (§2.2) against L5a-4's
-      **26x bucket imbalance**; grouped Q4 GEMV for decode (§1.8-§1.12); the
-      weighted combine; and the shared expert, which is the same shape as a
-      routed one and runs for every token.
-- [ ] Gate: one block matches on the device; GB/s reported against L0a, and
-      the 35.7% of llama.cpp's graph against what it becomes.
+- [x] **L5b — the kernel.** Nine dispatches: the router with the shared
+      expert's gate as a 513th column, the softmax/top-10/normalise in one
+      workgroup a token, a counting sort and its two tile schedules, a
+      **grouped GEMM over the checkpoint's own quantised blocks** (Q4_K, Q5_K,
+      Q5_1, Q8_0 — because 241 GB of halves is not a thing this machine
+      holds), and the weighted combine. L5a-4's 26x imbalance is answered by a
+      device-built tile *list* over a static bound, and by padding each
+      expert's rows to the row block so a cooperative-matrix store goes
+      straight to global. **567.4 ms of llama.cpp's 512-token graph becomes
+      522.3 — 1.09x — and 1758.4 becomes 1131.6 at ubatch 2048, 1.55x.**
+      Two optimisations that should have worked did not, and are written down
+      (L5b-4). [Write-up](research/l5b-moe-gpu.md) · `results/l5b_moe.csv`
+- [x] Gate: the block matches on the device at 4096 tokens — **`ffn_out-3` at
+      8.132e-05 rms**, inside L5a's figure over 48 tokens — with the selection
+      the reference's set for set *and order for order*, the permutation
+      checked as an exact bijection, and the padding shown to be inert by
+      poisoning the row it reads. Rates reported against L0a: `up` at 70 GB/s
+      of quantised bank and 10.8 TFLOP/s, `down` at 121 GB/s. 35.7% of
+      llama.cpp's graph in `moe_experts` alone, 48.7% counting everything
+      nameably this block, becomes 44.8%.
+- [ ] **L5c — decode's shape, when L7 needs it.** The grouped Q4 GEMV
+      (§1.8-§1.12) against a one-token routing, where L5a-4's hot expert is
+      the same 0.5 MB of Q4_K 95% of the time and would sit in the MALL if
+      anything kept it there. Not built at L5b, because at prefill the
+      grouped GEMM is the whole block.
 
 ### L6 — the whole stack, prefill only
 
@@ -1266,6 +1397,9 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -dn -model $M -tokens 512                 # L3b's layer
     go run ./cmd/llm -dn -model $M -ladder -csv results/l3b_dn.csv
     go run ./cmd/llm -dn -model $M -tokens 512,2048 -gemm-ladder
+    go run ./cmd/llm -moe -model $M -tokens 512,2048              # L5b's block
+    go run ./cmd/llm -moe -model $M -tokens 512,2048 -ladder -iters 5 \
+        -csv results/l5b_moe_ladder.csv
 
     # the reference implementation, the oracle, the baseline
     less $L/src/models/qwen4exp.cpp                  # 1279 lines, the whole architecture
@@ -1302,6 +1436,9 @@ below Q8. Bandwidth is the whole story.
     go test ./llm/ -v -run 'TestMatMuls|TestF16Acc|TestIndexerProjection|TestHalfPrecision'
     go test ./llm/ -v -run TestMoE           # L5a: the MoE block, its controls,
                                              # and the routing distribution
+    go test ./llm/ -v -run TestMoEGPU        # L5b: the same on the device, the
+                                             # permutation, the ladder's
+                                             # agreement and the padding control
 
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh
@@ -1360,23 +1497,50 @@ below Q8. Bandwidth is the whole story.
   711-to-1159 spread), **L2f for the second** (2.40x, 1.60x at equal attention
   work) **and L3b for the linear layers** (1.37x on the layer, 3.90x on the
   gated norm alone). All three dense blocks are in and all three land inside
-  that spread. What is still open is the MoE's, which is L5 and is 35.7% of
-  the graph on its own.
-- **How does a grouped MoE kernel schedule a 26x bucket imbalance?** L5a-4
-  measured the real distribution and it is not the uniform one §2.2's 642 ms
-  Q4 block was swept at: at ubatch 512 one expert has **484 rows** and 273 of
-  the 274 touched experts have fewer than 19. A workgroup per expert cannot be
-  scheduled statically, the permutation buffer is sized by the tail rather than
-  the mean, and the arithmetic intensity varies **484x** inside one dispatch.
-  Whether §2.2's 2.53x survives that is L5b's first measurement, and it should
-  be re-swept at the measured distribution rather than at a uniform one.
+  that spread. **L5b closes the last of it**: the MoE's own glue — the GLU,
+  the two weight multiplies, the shared gate's sigmoid and the two-half add —
+  is fused into an accumulator, a store and a read that had to happen anyway,
+  and the block is 1.09x at ubatch 512 and 1.55x at 2048. All five blocks are
+  in, and the whole nameable graph is 87.2% replaced by 61.4%.
+- ~~**How does a grouped MoE kernel schedule a 26x bucket imbalance?**~~
+  **Answered at L5b: with a list, not a grid, and by padding.** The tiles are
+  one device-built record per (expert, row block) that has rows, over a static
+  upper bound with an early return — and every expert's range is rounded up to
+  the row block so the epilogue can store whole cooperative-matrix fragments.
+  **§2.2's 2.53x does not survive the real distribution**: it was swept at a
+  uniform split, and at the measured one the block is **1.09x at ubatch 512
+  and 1.55x at 2048**, because 274 experts read 505 MB of bank to serve 5120
+  rows and the arithmetic intensity is the routing's rather than the tile's.
+  The padding it costs is 2.33x the rows at 512 and 1.90x at 2048, and it is
+  nearly free time, because a cold expert's tile is reading 0.9 MB of Q4_K to
+  multiply seventeen rows either way.
+- **Why is the grouped GEMM 2.5x off its own byte floor?** L5b-7: `up` moves
+  686 MB of quantised bank in 7.2 ms, 70 GB/s of a 236 GB/s bus, with 78
+  GFLOP of matrix work that would take 2.0 ms at §2.7's best rate and could
+  hide entirely under the loads. What sits in between is the unpack — 1.22 G
+  weights a dispatch, each a shift, a mask, a convert, an fma and a 16-bit LDS
+  store, issued by the same wave that is waiting on the load. Three things
+  that should have closed it did not (L5b-4): more waves a workgroup, a wider
+  K-step and a conflict-free LDS pad are 1.15-1.24x, 1.16x and **5.4x**
+  against respectively. What has not been tried is issuing the loads a K-step
+  ahead of the unpack that consumes them.
+- **Would a float atomic delete the combine?** L5b's down projection stores
+  whole fragments in permutation order because a scattered store would need an
+  LDS round trip, so a token's eleven contributions are summed by a ninth
+  dispatch — 22.1 ms a graph at ubatch 512 and 66.4 at 2048, reading a 58 MB
+  tensor that exists for no other reason. `VK_EXT_shader_atomic_float` would
+  delete both, at the cost of a summation order that is no longer the
+  reference's — which L5a's tie analysis is the reason to be careful about.
+  The extension is not enabled in `vk.DeviceFeatures` today.
 - **Does the hot expert want to be treated as a second shared expert?** At
   ubatch 512 expert 454 is chosen by 95% of tokens and ranked *first* by 54%.
   It has the same shape as the shared expert, which runs for 100%. Running the
   two together as one dense pair and routing only the other nine would delete
   a gather for half the block's tokens — and would be wrong on the 5% that do
   not select it, so it is a fast path with a correction rather than a
-  simplification. Unmeasured.
+  simplification. **Still unmeasured after L5b**, which treats it as one more
+  group of the grouped GEMM like any other — sixteen tiles of it at ubatch 512
+  against one for each of the other 273.
 - **Should our kernels follow the reference onto an fp16 accumulator — part
   two.** L5a-3 is the sharpest data point yet: at the MoE, modelling the
   reference's arithmetic makes the fit **worse** (0.57-0.73x), because the

@@ -1,0 +1,52 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// `ffn_out` — the ten routed contributions and the shared expert's, weighted
+// and summed (LLM.md L5b).
+//
+// It exists because the down projection cannot accumulate in place: a token's
+// ten experts are ten different tiles of the grouped GEMM, so without a float
+// atomic each writes its own row and something has to add them up.
+//
+// It carries the **routing weights** for a reason that is not about
+// arithmetic. The down projection's rows come out in permutation order, which
+// is what lets it store whole cooperative-matrix fragments straight to global
+// instead of scattering them a row at a time through LDS; but in that order a
+// workgroup does not know which (token, slot) a row is without reading the
+// permutation per row, and the weight would have to be applied per row
+// anyway. Here the weight is a scalar per row of a read that happens once
+// regardless. So `ffn_moe_weighted` is still never a tensor, and the store it
+// would have ridden on stays a fragment store.
+//
+// The order is the reference's: the ten in slot order, then
+// `ffn_shexp_gated`, which is the chain of adds `build_layer_ffn` emits and
+// the order `moe.go`'s CPU reference sums in.
+
+#include "llm_common.glsl"
+
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint slots = pc.moeUsed + 1u;
+    // The inverse permutation sits behind the weights and the top-k, all
+    // three indexed by the same (token, slot).
+    uint invPerm = pc.moeWeightOff + pc.tokens * slots + pc.tokens * pc.moeUsed;
+    uint dst = pc.outOff + t * pc.nEmbd;
+    for (uint j = gl_LocalInvocationID.x; j < pc.nEmbd; j += WG) {
+        float s = 0.0;
+        for (uint k = 0u; k < slots; ++k) {
+            uint row = actu[invPerm + t * slots + k];
+            s += act[pc.gatedOff + row * pc.nEmbd + j] * act[pc.moeWeightOff + t * slots + k];
+        }
+        act[dst + j] = s;
+    }
+}

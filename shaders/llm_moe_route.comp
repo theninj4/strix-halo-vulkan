@@ -1,0 +1,175 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The MoE router's tail: softmax over 512, the top ten, the normalised
+// weights and the shared expert's gate — one workgroup a token, which is
+// `llm_attn_select.comp`'s shape exactly (LLM.md L5b).
+//
+// The matmul itself is not here. `ffn_gate_inp` is [2560, 512] F32 — 0.25 GB
+// read every token for 0.06 B of parameters, L2a's other F32 scandal — and
+// above the 8-column threshold llama.cpp sends it to the fp16 coopmat path
+// like everything else (L3a-5), so it is `llm_gemm.comp`'s plain arm with an
+// f32 accumulator, which is the numeric L5a-1 measured: fp16 operands,
+// `ffn_moe_logits` at **0.0%** exactly-representable halves where every
+// *quantised* matmul is at 100.0%.
+//
+// **The shared expert's gate is a 513th column of that matrix.** It is a
+// [2560, 1] F32 weight applied to the same input — L2a's argument for
+// `inject`, L2d's for the PLE value, L2f-3's for six of the attention
+// layer's matrices and L3b-2's for alpha and beta, at a fifth site. It is
+// also a **deviation from the 7-token dump and not from the reference**, in
+// exactly L3b-2's sense but the other way round: one output column keeps
+// `shared_expert_gate` on the f32 *vector* path at any prompt length
+// (L3a-5), so the reference computes this one in f32 where we compute it on
+// the fp16 matrix cores. Priced rather than hidden — see L5b's write-up.
+//
+// What this kernel does that a sort would not: it takes the ten largest by
+// **ten workgroup argmaxes**, each resolving a tie towards the lower expert
+// index. That is `sort.SliceStable` over `>` — the comparator
+// `ggml_argsort`'s DESC arm uses — reproduced without materialising the
+// other 502 ranks, and L5a-1's fixture says what it has to hit: the
+// reference's selection **set for set on all 4096 tokens**, with the one row
+// whose order differs being a pair 4.35e-07 apart.
+
+#include "llm_common.glsl"
+
+#define WG 256
+#define MAX_EXPERTS 512
+#define MAX_USED 16
+
+layout(local_size_x = WG) in;
+
+// The probabilities, cached for the ten selection passes and overwritten with
+// -1 as each is taken. 2 KB, against re-reading the row ten times.
+shared float probs[MAX_EXPERTS];
+shared float shVal[WG / 64];
+shared uint shIdx[WG / 64];
+shared float shSel[MAX_USED];
+shared uint shSelIdx[MAX_USED];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint nE = pc.gemmK;          // the expert count: the reduction extent here
+    uint used = pc.moeUsed;
+    uint base = pc.qkvOff + t * pc.gemmN;
+    uint sg = tid / 64u;
+
+    // ---- ggml_soft_max over the 512 logits: the max subtracted for range,
+    // then exp and a normalise.
+    float m = -1.0 / 0.0;
+    for (uint i = tid; i < nE; i += WG) {
+        float v = act[base + i];
+        probs[i] = v;
+        m = max(m, v);
+    }
+    m = subgroupMax(m);
+    if (subgroupElect()) {
+        shVal[sg] = m;
+    }
+    barrier();
+    [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+        m = max(m, shVal[w]);
+    }
+    barrier();
+
+    float s = 0.0;
+    for (uint i = tid; i < nE; i += WG) {
+        float e = exp(probs[i] - m);
+        probs[i] = e;
+        s += e;
+    }
+    s = subgroupAdd(s);
+    if (subgroupElect()) {
+        shVal[sg] = s;
+    }
+    barrier();
+    s = 0.0;
+    [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+        s += shVal[w];
+    }
+    float inv = 1.0 / s;
+    for (uint i = tid; i < nE; i += WG) {
+        probs[i] *= inv;
+    }
+    barrier();
+
+    // ---- The top `used`, one workgroup argmax at a time. A taken expert is
+    // marked with -1, which no probability can reach, so the mask costs a
+    // store rather than a second array.
+    for (uint k = 0u; k < used; ++k) {
+        float bv = -1.0;
+        uint bi = 0xFFFFFFFFu;
+        for (uint i = tid; i < nE; i += WG) {
+            float v = probs[i];
+            if (v > bv) {
+                bv = v;
+                bi = i;
+            }
+        }
+        float wv = subgroupMax(bv);
+        // The tie rule is the comparator's: `>` is false between equals, so a
+        // stable sort leaves them in ascending index order and the lowest
+        // index wins.
+        uint wi = subgroupMin(bv == wv ? bi : 0xFFFFFFFFu);
+        if (subgroupElect()) {
+            shVal[sg] = wv;
+            shIdx[sg] = wi;
+        }
+        barrier();
+        float best = shVal[0];
+        uint bestI = shIdx[0];
+        [[unroll]] for (uint w = 1u; w < WG / 64u; ++w) {
+            if (shVal[w] > best || (shVal[w] == best && shIdx[w] < bestI)) {
+                best = shVal[w];
+                bestI = shIdx[w];
+            }
+        }
+        if (tid == 0u) {
+            shSel[k] = best;
+            shSelIdx[k] = bestI;
+        }
+        barrier();
+        if (tid == 0u) {
+            probs[bestI] = -1.0;
+        }
+        barrier();
+    }
+
+    // ---- The ten weights, `norm_w` and the reference's own clamp, then the
+    // shared expert's gate in the last slot. Serial on one lane because
+    // `used` is ten: a reduction over ten values costs more in barriers than
+    // it saves.
+    if (tid == 0u) {
+        float sum = 0.0;
+        [[unroll]] for (uint k = 0u; k < MAX_USED; ++k) {
+            if (k < used) {
+                sum += shSel[k];
+            }
+        }
+        // ggml_clamp(weights_sum, 6.103515625e-5, INFINITY) — the smallest
+        // normal half, the reference's guard against a zero denominator. L5a
+        // measured it to be the identity on all 4096 rows of the 4 k dump
+        // (the smallest sum there is 0.0554) and it is reproduced anyway,
+        // because it is in the graph.
+        sum = max(sum, 6.103515625e-5);
+        uint slots = used + 1u;
+        uint topk = pc.moeWeightOff + pc.tokens * slots;
+        for (uint k = 0u; k < used; ++k) {
+            actu[topk + t * used + k] = shSelIdx[k];
+            act[pc.moeWeightOff + t * slots + k] = shSel[k] / sum;
+        }
+        // The shared expert runs for every token and its weight is the
+        // sigmoid of the fused matrix's 513th column.
+        float g = act[base + nE];
+        act[pc.moeWeightOff + t * slots + used] = 1.0 / (1.0 + exp(-g));
+    }
+}
