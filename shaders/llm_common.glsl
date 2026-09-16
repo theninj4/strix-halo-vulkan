@@ -143,7 +143,7 @@ layout(push_constant) uniform PC {
     uint heads;      // query heads
     uint kvHeads;    // key/value heads; heads/kvHeads share one cache head
     uint headDim;
-    uint nKV;        // cache cells -- the reference's padded count, not T
+    uint nKV;        // cache cells -- the whole context, not this batch
     uint plane;      // padded token rows per packed head plane
     uint ldCtx;      // the context's row stride in halves, gateWidth + pad
     uint idxHeads;
@@ -153,6 +153,44 @@ layout(push_constant) uniform PC {
     uint ratio;      // compress_ratio: cells pooled into one indexer block
     uint rotDims;    // n_rot -- 64 of the 256 head dims rotate
     uint attnScale;  // float bits: 1/sqrt(headDim) * log2(e), folded into q
+
+    // **Continuing a sequence needs three more fields and the block has
+    // none** (L7). 64 uints is 256 bytes and that is this device's whole
+    // push-constant range, so the things a run that follows another knows
+    // that a fresh one does not are said by fields their blocks already do
+    // not use — the same arrangement `moeUsed` documents above, and the same
+    // rule: the mapping lives here, and nothing spells the borrowed field's
+    // own name.
+    //
+    //   lowRank   SEQ_PAST:    tokens of this sequence already behind the
+    //             run. For the attention layer that is cells in the KV cache,
+    //             so token t is cell SEQ_PAST + t at position SEQ_PAST + t;
+    //             for the PLE block it is how far back its convolution may
+    //             reach. Zero is a fresh sequence. Only the hyper-connection
+    //             block uses `lowRank` as itself.
+    //   injOff    SEQ_HIST:    the ring a convolution over the token axis
+    //             reads behind itself, addressed by **position modulo its
+    //             length**: f32 [(kern-1)*dil][hc*nEmbd] for the PLE block,
+    //             f32 [kern-1][gemmN] per layer for the gated DeltaNet.
+    //             `injOff` is the hyper-connection block's scatter weights
+    //             and neither of those blocks has any.
+    //   loOff     SEQ_SRC:     the tensor llm_seq_hist.comp copies those rows
+    //             *out* of, for the one dispatch that writes the ring. It is
+    //             the same field ATTN_IDXRAW is, because the two are never
+    //             in the same push block: one is the attention layer's and
+    //             the other belongs to the two convolutions.
+    //   loOff     ATTN_IDXRAW: fp16 [nKV][idxDim], the indexer's *raw* key
+    //             per cell. It is a cache because a pooled block spans
+    //             `ratio` cells and at decode those arrive in `ratio`
+    //             different batches; llm_attn_pack.comp writes this batch's
+    //             cells and llm_attn_idx.comp pools out of it.
+    //
+    // kOff, vOff and idxKOff are unchanged as fields and changed as tensors:
+    // they now address **one staged layer's** cache rather than a shared
+    // arena, because a cache belongs to the layer that filled it. The key and
+    // value planes are nKV cells rather than `plane` token rows; idxKOff is
+    // the pooled table, and a block that is already complete is never
+    // recomputed.
 
     // The gated DeltaNet (llm_dn_conv.comp, llm_dn_scan.comp,
     // llm_dn_norm.comp). Thirty-six of the 48 layers, and the only ones with
@@ -230,3 +268,10 @@ layout(push_constant) uniform PC {
 #define MOE_BANK (pc.moeUsed >> 16u)
 
 const uint NO_W = 0xffffffffu;
+
+// The four fields a *continuing* run borrows (L7). See the notes in the push
+// block: 64 uints is 256 bytes and there was no room for a 65th.
+#define SEQ_PAST    pc.lowRank
+#define SEQ_HIST    pc.injOff
+#define SEQ_SRC     pc.loOff
+#define ATTN_IDXRAW pc.loOff

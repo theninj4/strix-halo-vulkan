@@ -100,6 +100,15 @@ type Graph struct {
 	maxTok int
 	nKV    int
 
+	// The sequence, which is what L7 added. `past` is how many tokens of it
+	// are already behind the graph — cells in the attention cache, positions
+	// behind the PLE convolution, and tokens folded into every DeltaNet
+	// layer's recurrent state — and `ids` is the whole of it, because the
+	// n-gram gather is a trigram and a continuing run's first token still has
+	// two predecessors.
+	past int
+	ids  []int32
+
 	// Staged is what each block cost to put on the device, in the order they
 	// were staged, for the caller that wants to print a plan.
 	Staged []StagedBlock
@@ -349,17 +358,66 @@ func (g *Graph) MaxTokens() int { return g.maxTok }
 // without one.
 func (g *Graph) Head() *HeadGPU { return g.head }
 
-// Forward runs the whole model over a prompt and returns the logits of its
-// last token, which is the only row llama.cpp computes at prefill.
+// Past is how many tokens of the current sequence are behind the graph, and
+// Ids is that sequence.
+func (g *Graph) Past() int    { return g.past }
+func (g *Graph) Ids() []int32 { return g.ids }
+
+// Reset starts a fresh sequence: the attention cache from cell zero, the PLE
+// convolution from position zero, and every DeltaNet layer's recurrent state
+// and window cleared (L7b).
+//
+// Only the DeltaNet's state is actually written. The other two are *masked*
+// rather than cleared — a cell past the end of the sequence is excluded from
+// every score, a convolution tap before position zero contributes nothing —
+// so clearing them would be work that changes no output.
+func (g *Graph) Reset() error {
+	g.past = 0
+	g.ids = g.ids[:0]
+	if g.attn != nil {
+		g.attn.Reset()
+	}
+	if g.ple != nil {
+		g.ple.Reset()
+	}
+	if g.dn != nil {
+		for l := 0; l < g.nLayer; l++ {
+			if k := g.kinds[l]; !k.attn {
+				if err := g.dn.Reset(k.idx); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Forward runs the whole model over a prompt **as a fresh sequence** and
+// returns the logits of its last token, which is the only row llama.cpp
+// computes at prefill.
 //
 // It also returns `result_norm` — the final mixer's output, the tensor the
 // head reads — because a logit disagreement has exactly two places to be and
 // the caller should not have to run the graph twice to find out which.
 func (g *Graph) Forward(ids []int32) (logits, norm []float32, err error) {
+	if err := g.Reset(); err != nil {
+		return nil, nil, err
+	}
+	return g.Extend(ids)
+}
+
+// Extend runs the model over the next tokens of the sequence the graph is
+// already holding, and returns the last one's logits.
+//
+// It is Forward without the reset, and it is the whole of decode: a prompt is
+// one call with many tokens, a generated token is a call with one. What makes
+// the two the same computation is L7a's cache and L7b's two carried
+// histories, and what asserts it is TestGraphIsAChunkSplit.
+func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	if g.head == nil {
 		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
 	}
-	norm, err = g.Hidden(ids)
+	norm, err = g.HiddenExtend(ids)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -383,10 +441,19 @@ func (g *Graph) Forward(ids []int32) (logits, norm []float32, err error) {
 	return logits, norm, nil
 }
 
-// Hidden runs every layer and the final mixer, and returns `result_norm` for
-// the last token: [nEmbd].
+// Hidden runs every layer and the final mixer over a fresh sequence, and
+// returns `result_norm` for the last token: [nEmbd].
 func (g *Graph) Hidden(ids []int32) ([]float32, error) {
-	if err := g.Prefill(ids); err != nil {
+	if err := g.Reset(); err != nil {
+		return nil, err
+	}
+	return g.HiddenExtend(ids)
+}
+
+// HiddenExtend is Hidden without the reset: the next tokens of the sequence
+// the graph is already holding.
+func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
+	if err := g.Append(ids); err != nil {
 		return nil, err
 	}
 	top := time.Now()
@@ -426,15 +493,16 @@ func (g *Graph) Hidden(ids []int32) ([]float32, error) {
 // other 44 layers need.
 func (g *Graph) Residual() []float32 { return g.hc.Res() }
 
-// Prefill runs every layer over a prompt, leaving the wide residual in the
-// hyper-connection block's arena.
-//
-// A fresh sequence every time: the KV cache is written from cell zero and
-// every DeltaNet layer's recurrent state and shared convolution window are
-// reset. Continuing one is L7's.
-func (g *Graph) Prefill(ids []int32) error { return g.PrefillN(ids, g.nLayer) }
+// Prefill runs every layer over a prompt **as a fresh sequence**, leaving the
+// wide residual in the hyper-connection block's arena.
+func (g *Graph) Prefill(ids []int32) error {
+	if err := g.Reset(); err != nil {
+		return err
+	}
+	return g.Append(ids)
+}
 
-// PrefillN runs the first nLayer layers and stops.
+// PrefillN runs the first nLayer layers of a fresh sequence and stops.
 //
 // It is how the graph is asked a question the trace can answer. The oracle
 // holds `l_last-0` through `l_last-3` and nothing deeper, so "does our error
@@ -442,12 +510,36 @@ func (g *Graph) Prefill(ids []int32) error { return g.PrefillN(ids, g.nLayer) }
 // four numbers — and four numbers are only a trend if the same staged model
 // produces all of them.
 func (g *Graph) PrefillN(ids []int32, nLayer int) error {
+	if err := g.Reset(); err != nil {
+		return err
+	}
+	return g.AppendN(ids, nLayer)
+}
+
+// Append runs every layer over the next tokens of the sequence the graph is
+// holding, and advances it.
+func (g *Graph) Append(ids []int32) error { return g.AppendN(ids, g.nLayer) }
+
+// AppendN runs the first nLayer layers over the next tokens of the sequence.
+//
+// Three things make this a continuation rather than a second prompt, and all
+// three are somewhere else: the attention cache and the indexer's pooled
+// blocks (L7a), the PLE convolution's ring (L7b), and every DeltaNet layer's
+// recurrent state and window, which were already carried across a batch split
+// at L3 and only ever needed the graph to stop clearing them. What is left
+// here is the n-gram gather — a trigram, so the first token of a continuing
+// run still reads two tokens that are not in it, which is why the graph keeps
+// the whole id list and hashes over all of it.
+func (g *Graph) AppendN(ids []int32, nLayer int) error {
 	if nLayer <= 0 || nLayer > g.nLayer {
 		return fmt.Errorf("llm: %d layers, this graph staged %d", nLayer, g.nLayer)
 	}
 	nTok := len(ids)
 	if nTok <= 0 || nTok > g.maxTok {
 		return fmt.Errorf("llm: %d tokens, the arenas are built for %d", nTok, g.maxTok)
+	}
+	if g.past+nTok > g.nKV {
+		return fmt.Errorf("llm: %d tokens at position %d of a %d-cell context", nTok, g.past, g.nKV)
 	}
 
 	top := time.Now()
@@ -462,9 +554,13 @@ func (g *Graph) PrefillN(ids []int32, nLayer int) error {
 	if err != nil {
 		return fmt.Errorf("llm: token_embd: %w", err)
 	}
+	g.ids = append(g.ids, ids...)
 	var pleEmbd []float32
 	if g.hasPLE {
-		pleEmbd, err = g.m.PLEGather(PLERows(g.pleCfg, ids), g.pleCfg.NHeads, g.pleCfg.HeadDim)
+		// Hashed over the whole sequence, gathered for its tail: the trigram
+		// of the first token of this run reaches two tokens behind it.
+		rows := PLERows(g.pleCfg, g.ids)[g.past*g.pleCfg.NHeads:]
+		pleEmbd, err = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
 		if err != nil {
 			return fmt.Errorf("llm: per_layer_token_embd: %w", err)
 		}
@@ -474,17 +570,27 @@ func (g *Graph) PrefillN(ids []int32, nLayer int) error {
 	// The wide residual starts as hc identical copies of the embedding, and
 	// from here it lives in the hyper-connection block's arena: every
 	// combine updates it in place and nothing else in the graph writes it.
+	// It is per *batch* and not per sequence — the stream is a function of
+	// the token, and what carries between runs is the three histories above.
 	// This is the last host *write* of the pass — a write costs 70 GB/s
 	// where a read costs 25 (L6b-4), and the embedding is on the host
 	// anyway.
 	if err := g.hc.UploadInit(embd, nTok); err != nil {
 		return err
 	}
-	for l := 0; l < nLayer; l++ {
-		if k := g.kinds[l]; !k.attn && g.dn != nil {
-			if err := g.dn.Reset(k.idx); err != nil {
-				return err
-			}
+	if g.attn != nil {
+		if err := g.attn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.SetPast(g.past); err != nil {
+			return err
 		}
 	}
 	t0 = since(&g.Stats.Glue, t0)
@@ -553,6 +659,7 @@ func (g *Graph) PrefillN(ids []int32, nLayer int) error {
 		}
 		t0 = since(&g.Stats.HC, t0)
 	}
+	g.past += nTok
 	g.Stats.Total += time.Since(top)
 	g.Stats.Runs++
 	return nil

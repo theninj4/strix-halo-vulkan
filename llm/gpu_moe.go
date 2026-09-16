@@ -846,10 +846,12 @@ func (g *MoEGPU) Run(layer int) error {
 	if err != nil {
 		return err
 	}
-	for i := range d {
-		if _, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: moe dispatch %d (%s): %w", i, kinds[i], err)
-		}
+	// One command buffer for the whole block, not one a dispatch: a submit
+	// and a fence wait is ~150 us here and a decode step is a batch of one,
+	// so what the sequence costs is how many times it is handed over
+	// (LLM.md L7c).
+	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
+		return fmt.Errorf("llm: moe, %d dispatches (%v): %w", len(d), kinds, err)
 	}
 	return nil
 }

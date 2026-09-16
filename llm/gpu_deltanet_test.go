@@ -343,6 +343,9 @@ func TestDeltaNetGPUStateCarries(t *testing.T) {
 	if err := g.Reset(0); err != nil {
 		t.Fatal(err)
 	}
+	if err := g.SetPast(0); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.Upload(in, nTok); err != nil {
 		t.Fatal(err)
 	}
@@ -360,13 +363,21 @@ func TestDeltaNetGPUStateCarries(t *testing.T) {
 	if err := g.Reset(0); err != nil {
 		t.Fatal(err)
 	}
+	if err := g.SetPast(0); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.Upload(in[:split*c.NEmbd], split); err != nil {
 		t.Fatal(err)
 	}
 	if err := g.Run(0); err != nil {
 		t.Fatal(err)
 	}
-	g.Carry()
+	// The window moves on the device now (L7b): the layer's last dispatch
+	// leaves its Conv-1 rows in the layer's own ring, and the only thing the
+	// caller says is where the next run starts.
+	if err := g.SetPast(split); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.Upload(in[split*c.NEmbd:], nTok-split); err != nil {
 		t.Fatal(err)
 	}
@@ -400,6 +411,9 @@ func TestDeltaNetGPUStateCarries(t *testing.T) {
 	if err := g.Reset(0); err != nil {
 		t.Fatal(err)
 	}
+	if err := g.SetPast(0); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.Upload(in[:split*c.NEmbd], split); err != nil {
 		t.Fatal(err)
 	}
@@ -411,6 +425,9 @@ func TestDeltaNetGPUStateCarries(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Conv = make([]float32, len(st.Conv)) // the recurrent state, no window
+	if err := g.SetPast(split); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.SetState(0, st); err != nil {
 		t.Fatal(err)
 	}

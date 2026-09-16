@@ -27,9 +27,19 @@
 // `llama_memory_hybrid_idx` passes the context's `type_k` straight through, so
 // the keys are rounded to halves *between* being projected and being pooled —
 // `indexer_k_raw` is exact and `indexer_k_pooled` three lines later is not,
-// unless the round trip is there. Here it costs one `float16_t()` on the way
-// out of the fused projection's fp32 output, so this kernel is bit-for-bit the
-// arithmetic the reference does rather than an approximation of it.
+// unless the round trip is there. It is llm_attn_pack.comp that does the
+// rounding now, on the way into ATTN_IDXRAW, and this kernel pools halves out
+// of it — the same arithmetic, moved one dispatch earlier because a block
+// spans cells this batch may not contain.
+//
+// **A complete block is never pooled twice** (L7a). Cell contents never
+// change, so block b is final the moment all `ratio` of its cells exist: the
+// host dispatches only the blocks the batch completed, `[past/ratio,
+// (past+T)/ratio)`, and the pooled table at `idxKOff` carries the rest over
+// from the batch that built them. A fresh sequence — `SEQ_PAST == 0` — is
+// the one case that writes the whole table, because the blocks past the last
+// complete one pool cell 0 and have to be filled once before they can be left
+// alone.
 //
 // The rotary is the same table llm_attn_pack.comp reads, indexed by the
 // block's *first cell position* — which is why a block that does not exist,
@@ -46,6 +56,15 @@ layout(local_size_x = IDX_DIM) in;
 shared float part[IDX_DIM];
 shared float val[IDX_DIM];
 
+// blockLo and blockHi are the half-open range of pooled blocks this dispatch
+// rebuilds. The host computes the same two numbers to size the grid, so they
+// are derived here from nothing but the push block.
+uint blockLo() { return (SEQ_PAST == 0u) ? 0u : SEQ_PAST / pc.ratio; }
+uint blockHi() {
+    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
+    return (SEQ_PAST == 0u) ? nBlocks : (SEQ_PAST + pc.tokens) / pc.ratio;
+}
+
 void main() {
     uint unit = gl_WorkGroupID.x;
     uint kind = gl_WorkGroupID.y;
@@ -54,27 +73,27 @@ void main() {
     uint qWidth = pc.heads * 2u * pc.headDim;
     uint kvWidth = pc.kvHeads * pc.headDim;
     uint idxQCol = qWidth + 2u * kvWidth;
-    uint idxKCol = idxQCol + pc.idxHeads * pc.idxDim;
 
-    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
-    uint nBid = pc.tokens / pc.ratio;   // whole blocks only
+    uint past = SEQ_PAST;
+    uint nBid = (past + pc.tokens) / pc.ratio;   // whole blocks only
 
     uint gamma, dst, pos;
     if (kind == 0u) {
-        if (unit >= nBlocks) {
+        uint b = blockLo() + unit;
+        if (b >= blockHi()) {
             return;
         }
-        // Pool `ratio` cached keys. The cache is fp16, so the rounding is on
-        // the way in and the mean is taken over halves.
+        // Pool `ratio` cached keys out of the raw cell cache, which is
+        // already fp16: the mean is taken over halves, as the reference's is.
         float sum = 0.0;
         for (uint s = 0u; s < pc.ratio; s++) {
-            uint cell = (unit < nBid) ? unit * pc.ratio + s : 0u;
-            sum += float(float16_t(act[pc.qkvOff + cell * pc.gemmN + idxKCol + i]));
+            uint cell = (b < nBid) ? b * pc.ratio + s : 0u;
+            sum += float(hact[ATTN_IDXRAW + cell * pc.idxDim + i]);
         }
         val[i] = sum / float(pc.ratio);
         gamma = pc.gammaIKOff;
-        dst = pc.idxKOff + unit * pc.idxDim;
-        pos = (unit < nBid) ? unit * pc.ratio : 0u;
+        dst = pc.idxKOff + b * pc.idxDim;
+        pos = (b < nBid) ? b * pc.ratio : 0u;
     } else {
         if (unit >= pc.tokens) {
             return;
@@ -83,7 +102,7 @@ void main() {
         val[i] = act[pc.qkvOff + unit * pc.gemmN + idxQCol + head * pc.idxDim + i];
         gamma = pc.gammaIQOff;
         dst = pc.idxQOff + (unit * pc.idxHeads + head) * pc.idxDim;
-        pos = unit;
+        pos = past + unit;
     }
 
     part[i] = val[i] * val[i];

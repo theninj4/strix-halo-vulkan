@@ -117,7 +117,15 @@ type PLEGPU struct {
 	wNormKey, wNormQuery, wNormConv, wConv uint32
 	// fp32 activations.
 	aRes, aKV, aGate, aGated, aNorm, aConvOut uint32
-	actElems                                  int
+	// aHist is the convolution's ring: (Conv-1)*NGram rows of the normed
+	// gated value, addressed by **position** modulo its length, and the only
+	// tensor in this block that outlives a run (L7b).
+	aHist    uint32
+	actElems int
+	// past is how many tokens of this sequence are already behind the run,
+	// which is how far back the convolution may reach. Zero is a fresh
+	// sequence, where anything before token 0 is zero.
+	past int
 	// fp16 activations: the gathered n-gram embedding, the GEMM's A operand.
 	hEmb   uint32
 	hElems int
@@ -201,6 +209,10 @@ func (g *PLEGPU) alloc() error {
 	g.aGated = alloc(rows * wide)
 	g.aNorm = alloc(rows * wide)
 	g.aGate = alloc(rows * c.HC)
+	// 9 rows of 10240 floats — 368 KB — against the 168 MB a whole context's
+	// worth of `aNorm` would be, which is the other way to let a tap reach
+	// behind the run.
+	g.aHist = alloc(c.ConvHist() * wide)
 	g.aConvOut = noW
 	if g.convOut {
 		g.aConvOut = alloc(rows * wide)
@@ -238,6 +250,7 @@ func (g *PLEGPU) build() error {
 	for name, spirv := range map[string][]byte{
 		"gate": shaders.LLMPLEGate,
 		"conv": shaders.LLMPLEConv,
+		"hist": shaders.LLMSeqHist,
 	} {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
 			return err
@@ -355,6 +368,10 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 		GammaQOff: g.wNormQuery, GammaCOff: g.wNormConv,
 		Kern: uint32(c.Conv), Dil: uint32(c.NGram),
 		GemmN: uint32(g.kvN()),
+		// SEQ_HIST and SEQ_PAST: two fields this block does not otherwise
+		// use, because the push block is full at 64 uints (llm_common.glsl).
+		InjOff:  g.aHist,
+		LowRank: uint32(g.past),
 	}
 
 	var d []vk.MultiDispatch
@@ -372,17 +389,43 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 
 	add("gate", "gate", uint32(c.HC), uint32(g.rows), base)
 	add("conv", "conv", uint32((wide+255)/256), uint32(g.rows), base)
+	// The ring, for whatever runs next. It is the only dispatch here that a
+	// single-shot prefill does not need, and it is nine rows.
+	hist := base
+	hist.LoOff = g.aNorm // SEQ_SRC
+	hist.GemmM, hist.GemmK = uint32(c.ConvHist()), uint32(wide)
+	add("hist", "hist", uint32((wide+255)/256), uint32(minInt(g.rows, c.ConvHist())), hist)
 	return d, kinds
+}
+
+// Past is how many tokens of this sequence precede the next run, SetPast moves
+// it, and Reset starts a fresh sequence.
+//
+// Nothing is cleared on a reset: the convolution masks every tap that reaches
+// before position zero, so the ring's contents are unreachable rather than
+// merely stale.
+func (g *PLEGPU) Past() int { return g.past }
+func (g *PLEGPU) Reset()    { g.past = 0 }
+
+// SetPast places the next run's first token at position n.
+func (g *PLEGPU) SetPast(n int) error {
+	if n < 0 {
+		return fmt.Errorf("llm: position %d", n)
+	}
+	g.past = n
+	return nil
 }
 
 // Run executes the block over whatever Upload left in the arenas. The
 // residual is updated in place.
 func (g *PLEGPU) Run() error {
 	d, kinds := g.graph()
-	for i := range d {
-		if _, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: ple dispatch %d (%s): %w", i, kinds[i], err)
-		}
+	// One command buffer for the whole block, not one a dispatch: a submit
+	// and a fence wait is ~150 us here and a decode step is a batch of one,
+	// so what the sequence costs is how many times it is handed over
+	// (LLM.md L7c).
+	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
+		return fmt.Errorf("llm: ple, %d dispatches (%v): %w", len(d), kinds, err)
 	}
 	return nil
 }

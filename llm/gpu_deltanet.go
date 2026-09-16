@@ -178,6 +178,7 @@ type dnLayerWeights struct {
 	gamma     uint32 // fp32 arena: ssm_norm, [headDim], shared by all 48 heads
 	a, dtBias uint32 // fp32 arena: [nHeadV] each
 	state     uint32 // fp32 activation arena: [nHeadV][headDim][headDim]
+	win       uint32 // fp32 activation arena: [Conv-1][qkvN], a ring by position
 }
 
 // DeltaNetGPU runs linear-attention layers on the device. It holds however
@@ -210,12 +211,19 @@ type DeltaNetGPU struct {
 	// vectors, per layer.
 	wElems int
 
-	// fp32 activations. aQKV is token **zero** of the fused projection's
-	// output; the convolution's Conv-1 history rows sit in front of it.
-	aQKVBase, aQKV                uint32
+	// fp32 activations. aQKV is the fused projection's output; the
+	// convolution's Conv-1 history rows are a ring **of their own, per
+	// layer**, at aWin (L7b) rather than in front of it, because that arena
+	// is shared by every staged layer and a carried window is not.
+	aQKV                          uint32
+	aWin                          uint32
 	aNorm, aSilu, aOut            uint32
 	aGate, aBeta, aState, aResult uint32
 	actElems                      int
+	// past is how many tokens of this sequence are behind the run, which is
+	// what turns the ring's absolute positions into slots. Zero is a fresh
+	// sequence, where a tap reaching before token zero contributes nothing.
+	past int
 	// fp16 activations.
 	hXn, hCtx uint32
 	hElems    int
@@ -328,15 +336,16 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 		g.actElems += (n + 63) &^ 63
 		return off
 	}
-	// The convolution's history is Conv-1 rows of *negative* token index in
-	// front of the projection's own output, so a tap that reaches before
-	// token zero is an ordinary read at a wrapped offset and a fresh sequence
-	// is those rows zeroed. It is the same 120 KB window the CPU reference
-	// carries beside the [128, 128, 48] state, and a kernel that forgets it
-	// is wrong in a way nothing but a batch-split test sees (L3a-6).
+	// The convolution's history: Conv-1 rows a layer, a ring addressed by
+	// position, which is the same 120 KB window the CPU reference carries
+	// beside the [128, 128, 48] state. A kernel that carries the state and
+	// forgets it is wrong in a way nothing but a batch-split test sees
+	// (L3a-6) — and a *graph* that carries one shared window across 36 layers
+	// is wrong in a way nothing but a chunk-split test sees (L7b-2), which is
+	// why it is per layer here and was not before.
 	hist := c.Conv - 1
-	g.aQKVBase = alloc((rows + hist) * g.qkvN())
-	g.aQKV = g.aQKVBase + uint32(hist*g.qkvN())
+	g.aQKV = alloc(rows * g.qkvN())
+	g.aWin = alloc(nLayers * hist * g.qkvN())
 	g.aNorm = alloc(rows * cw)
 	g.aSilu = alloc(rows * cw)
 	g.aOut = alloc(rows * c.Inner)
@@ -379,6 +388,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 			a:      base + uint32(cw*c.Conv+c.HeadDim),
 			dtBias: base + uint32(cw*c.Conv+c.HeadDim+c.NHeadV),
 			state:  g.aState + uint32(i*c.StateSize()),
+			win:    g.aWin + uint32(i*(c.Conv-1)*g.qkvN()),
 		}
 	}
 	return nil
@@ -390,6 +400,7 @@ func (g *DeltaNetGPU) build() error {
 	for name, spirv := range map[string][]byte{
 		"conv": shaders.LLMDNConv,
 		"norm": shaders.LLMDNNorm,
+		"hist": shaders.LLMSeqHist,
 	} {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
 			return err
@@ -569,16 +580,37 @@ func (g *DeltaNetGPU) Upload(xn []float32, nTok int) error {
 	return nil
 }
 
-// Reset zeroes one layer's recurrent state and the convolution's history,
-// which is what a fresh sequence starts from. The history is shared by every
-// layer in an arena this size, so it is reset with each of them.
+// Past is how many tokens of this sequence are behind the run, SetPast moves
+// it, and Reset clears one layer.
+//
+// The position is the block's, not the layer's: every staged layer runs over
+// the same tokens, so one number serves all of them and the graph sets it
+// once a run.
+func (g *DeltaNetGPU) Past() int { return g.past }
+
+// SetPast places the next run's first token at position n.
+func (g *DeltaNetGPU) SetPast(n int) error {
+	if n < 0 {
+		return fmt.Errorf("llm: position %d", n)
+	}
+	g.past = n
+	return nil
+}
+
+// Reset zeroes one layer's recurrent state and the convolution's window,
+// which is what a fresh sequence starts from.
+//
+// The window would not strictly need clearing — a tap that reaches before
+// position zero contributes nothing whatever the ring holds — but this is
+// 198 KB a layer against a 3.1 MB state, and `State` below is easier to
+// believe when the two agree about what an empty sequence looks like.
 func (g *DeltaNetGPU) Reset(layer int) error {
 	if layer < 0 || layer >= len(g.layers) {
 		return fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
 	c := g.cfg
 	g.abuf.ZeroFloat32At(int(g.layers[layer].state), c.StateSize())
-	g.abuf.ZeroFloat32At(int(g.aQKVBase), (c.Conv-1)*g.qkvN())
+	g.abuf.ZeroFloat32At(int(g.layers[layer].win), (c.Conv-1)*g.qkvN())
 	return nil
 }
 
@@ -599,17 +631,22 @@ func (g *DeltaNetGPU) SetState(layer int, st *DeltaNetState) error {
 	}
 	g.abuf.WriteFloat32At(int(g.layers[layer].state), st.S)
 	// DeltaNetState.Conv is [channel][position] with the token axis fastest,
-	// which is what ggml_ssm_conv slides a window over; the arena is
-	// [position][channel] because it is the projection's own output extended
-	// backwards. Column 0 is the oldest either way.
+	// which is what ggml_ssm_conv slides a window over; the ring is
+	// [position mod hist][channel]. Column 0 is the oldest, and the positions
+	// it stands for are the `hist` before the run Past names — so a caller
+	// seeds the window by setting the position first.
 	hist := c.Conv - 1
 	rows := make([]float32, hist*g.qkvN())
 	for ch := 0; ch < c.ConvWidth(); ch++ {
 		for p := 0; p < hist; p++ {
-			rows[p*g.qkvN()+ch] = st.Conv[ch*hist+p]
+			pos := g.past - hist + p
+			if pos < 0 {
+				continue
+			}
+			rows[(pos%hist)*g.qkvN()+ch] = st.Conv[ch*hist+p]
 		}
 	}
-	g.abuf.WriteFloat32At(int(g.aQKVBase), rows)
+	g.abuf.WriteFloat32At(int(g.layers[layer].win), rows)
 	return nil
 }
 
@@ -625,26 +662,21 @@ func (g *DeltaNetGPU) State(layer int) (*DeltaNetState, error) {
 		S:    g.abuf.ReadFloat32At(int(g.layers[layer].state), c.StateSize()),
 		Conv: make([]float32, c.ConvWidth()*hist),
 	}
-	// The window after a run is the last hist rows of what the convolution
-	// read, which is this batch's tail unless the batch is shorter than it.
-	rows := g.abuf.ReadFloat32At(int(g.aQKVBase), (hist+g.rows)*g.qkvN())
+	// The window after a run is the last hist positions of the sequence so
+	// far — this batch's tail unless the batch is shorter than it, in which
+	// case the ring still holds what an earlier one left.
+	rows := g.abuf.ReadFloat32At(int(g.layers[layer].win), hist*g.qkvN())
+	end := g.past + g.rows
 	for ch := 0; ch < c.ConvWidth(); ch++ {
 		for p := 0; p < hist; p++ {
-			st.Conv[ch*hist+p] = rows[(g.rows+p)*g.qkvN()+ch]
+			pos := end - hist + p
+			if pos < 0 {
+				continue
+			}
+			st.Conv[ch*hist+p] = rows[(pos%hist)*g.qkvN()+ch]
 		}
 	}
 	return st, nil
-}
-
-// Carry advances the convolution's window in place, so that the next Upload
-// and Run continue the sequence. The recurrent state carries by itself — the
-// scan reads and writes the same arena — but the window is Conv-1 rows of the
-// *projection's* output and has to move to the front of it.
-func (g *DeltaNetGPU) Carry() {
-	c := g.cfg
-	hist := c.Conv - 1
-	rows := g.abuf.ReadFloat32At(int(g.aQKV)+(g.rows-hist)*g.qkvN(), hist*g.qkvN())
-	g.abuf.WriteFloat32At(int(g.aQKVBase), rows)
 }
 
 // graph builds one layer's dispatch sequence, with a label per dispatch, and
@@ -674,6 +706,10 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		SSMAOff: w.a, SSMDTOff: w.dtBias, SSMNorm: norm,
 		Heads: uint32(c.NHeadV), KVHeads: uint32(c.NHeadK), HeadDim: uint32(c.HeadDim),
 		GemmN: uint32(g.qkvN()),
+		// SEQ_HIST and SEQ_PAST: two fields this layer does not otherwise
+		// use, because the push block is full at 64 uints (llm_common.glsl).
+		InjOff:  w.win,
+		LowRank: uint32(g.past),
 	}
 	if g.keepSilu {
 		base.ConvOutOff = g.aSilu
@@ -709,6 +745,16 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	out.OutOff, out.BOff = g.aResult, w.out
 	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.Inner)
 	add(string(g.outGemm), "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+
+	// 6. The convolution's window, for whatever runs next: the last Conv-1
+	//    rows of the projection into this layer's ring. Three rows of 16512
+	//    floats — 198 KB — and the only dispatch here a single-shot prefill
+	//    does not need.
+	hist := c.Conv - 1
+	win := base
+	win.LoOff = g.aQKV // SEQ_SRC
+	win.GemmM, win.GemmK = uint32(hist), uint32(g.qkvN())
+	add("hist", "hist", uint32((g.qkvN()+255)/256), uint32(minInt(g.rows, hist)), win)
 	return d, kinds, nil
 }
 
@@ -719,10 +765,12 @@ func (g *DeltaNetGPU) Run(layer int) error {
 	if err != nil {
 		return err
 	}
-	for i := range d {
-		if _, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: deltanet dispatch %d (%s): %w", i, kinds[i], err)
-		}
+	// One command buffer for the whole block, not one a dispatch: a submit
+	// and a fence wait is ~150 us here and a decode step is a batch of one,
+	// so what the sequence costs is how many times it is handed over
+	// (LLM.md L7c).
+	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
+		return fmt.Errorf("llm: deltanet, %d dispatches (%v): %w", len(d), kinds, err)
 	}
 	return nil
 }

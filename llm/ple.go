@@ -43,8 +43,10 @@ import "math"
 // the n-gram size**, so its taps reach 0, 3, 6 and 9 tokens back. That makes
 // it the second recurrent thing in the model after DeltaNet: at decode it
 // needs a 9-token history per sequence, which llama.cpp keeps in a row of the
-// recurrent cache. This file is prefill from position zero, so the history is
-// zeros; L7 is where that stops being true.
+// recurrent cache. On the device that history is `PLEGPU`'s ring (L7b); this
+// file is prefill from position zero, so here it is still zeros — and
+// `PLERows` below already takes the whole id list, so a continuing run needs
+// nothing from it but a slice.
 
 // PLEConfig is the block's shape and its hash constants, all read from the
 // checkpoint's own metadata (`qwen4exp.ple.*`) rather than transcribed.
@@ -73,6 +75,12 @@ type PLEConfig struct {
 // key and value projections read it directly.
 func (c PLEConfig) Wide() int      { return c.HC * c.NEmbd }
 func (c PLEConfig) EmbdWidth() int { return c.NHeads * c.HeadDim }
+
+// ConvHist is how far back the depthwise convolution reaches: (Conv-1)*NGram
+// tokens, 9 for this checkpoint's kernel of 4 dilated by 3. It is the length
+// of the ring a continuing run reads (L7b) and the number of rows a run has to
+// leave behind it.
+func (c PLEConfig) ConvHist() int { return (c.Conv - 1) * c.NGram }
 
 // IsPLE reports whether a layer carries the block. The checkpoint lists one.
 func (c PLEConfig) IsPLE(layer int) bool {

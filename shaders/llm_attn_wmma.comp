@@ -51,6 +51,14 @@
 // cells: at any prompt shorter than `top_k + ratio - 1` the selection names
 // every cell (research/l2e-attention.md), so running it would be the identity
 // and the branch is not an approximation.
+//
+// **The query is a batch, the key and the value are a cache** (L7a). Row i of
+// query block q0 is cell `SEQ_PAST + q0 + i` and the keys run over every cell
+// the cache holds, `SEQ_PAST + tokens` of them, so the two operands no longer
+// share a plane geometry: the query's is `plane` padded token rows, the key's
+// and the value's are nKV cells. Every causal comparison is between a cell and
+// a *position*, and on a fresh sequence SEQ_PAST is zero and all of it is
+// what L2f measured.
 
 #include "llm_common.glsl"
 
@@ -119,17 +127,19 @@ bool selected(uint row, uint col) {
 void main() {
     uint head = gl_WorkGroupID.y;
     uint q0 = gl_WorkGroupID.x * BM;
-    uint n = pc.tokens;
+    uint past = SEQ_PAST;
+    uint n = past + pc.tokens;       // cells in the cache, keys to attend over
     uint lane = gl_LocalInvocationID.x;
-    if (q0 >= n || head >= pc.heads) {
+    if (q0 >= pc.tokens || head >= pc.heads) {
         return;
     }
     bool sparse = pc.selOff != NO_W;
 
-    uint tiles = pc.plane / TILE;
-    uint plane = head * tiles * (HDT * TILE * TILE);
+    uint qTiles = pc.plane / TILE;
+    uint kvTiles = pc.nKV / TILE;
+    uint plane = head * qTiles * (HDT * TILE * TILE);
     uint rep = max(pc.heads / max(pc.kvHeads, 1u), 1u);
-    uint kvPlane = (head / rep) * tiles * (HDT * TILE * TILE);
+    uint kvPlane = (head / rep) * kvTiles * (HDT * TILE * TILE);
     uint qBase = pc.qOff + plane + (q0 / TILE) * (HDT * TILE * TILE);
     uint kBase = pc.kOff + kvPlane;
     uint vBase = pc.vOff + kvPlane;
@@ -158,8 +168,8 @@ void main() {
     const FRAG_B ones = FRAG_B(float16_t(1.0));
 
     // Nothing past this query block's last row can be attended to, so the key
-    // blocks beyond it are never read.
-    uint last = min(n, q0 + BM);
+    // blocks beyond it are never read. Its last row is cell `past + q0 + BM - 1`.
+    uint last = min(n, past + q0 + BM);
     for (uint base = 0u; base < last; base += BN) {
         uint cnt = min(BN, n - base);
 
@@ -203,7 +213,7 @@ void main() {
                 float mx = blkMax[i];
                 for (uint c = 0u; c < TILE; ++c) {
                     uint cell = base + kk * TILE + c;
-                    if (cell > q0 + i) {
+                    if (cell > past + q0 + i) {
                         break;      // and every c after it, the row is done
                     }
                     if (sparse && !selected(i, kk * TILE + c)) {
@@ -257,11 +267,11 @@ void main() {
         // the diagonal block needs it — every earlier block is entirely in the
         // past of every row — but the selection drops cells anywhere, so with
         // it on every block passes through here.
-        if (sparse || cnt < BN || base + BN > q0) {
+        if (sparse || cnt < BN || base + BN > past + q0) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 uint col = i & (BN - 1u);
                 uint row = i / BN;
-                if (col >= cnt || base + col > q0 + row ||
+                if (col >= cnt || base + col > past + q0 + row ||
                     (sparse && !selected(row, col))) {
                     pbuf[i] = float16_t(0.0);
                 }

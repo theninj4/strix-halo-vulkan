@@ -880,6 +880,111 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-16 (forty-fifth) — stage L7: decode, and the model generates llama.cpp's text
+
+**Result: the model generates — in Go, on Vulkan, out of its own GGUF. At
+temperature zero `The capital of France is` produces llama.cpp's completion,
+diverging at exactly one token where the top two logits are 0.161 apart and
+re-converging within a sentence. 7.46 tok/s against the reference's 25.15, and
+prefill is unchanged at 950.3 tok/s, 2.43x.** Three sub-stages:
+[L7a](research/l7a-kv-cache.md) · [L7b](research/l7b-sequence.md) ·
+[L7c](research/l7c-decode.md) · `results/l7c_decode.csv`,
+`results/l7_graph.csv` · `LLM.md` rewritten.
+
+**1. L7a — the KV cache, and it is a chunk split bit for bit.** The query's
+geometry and the key's part company: `plane` padded token rows against **nKV
+cells, one plane a layer**, and every causal comparison becomes a cell against
+a *position*. 2.31 KB a cell a layer, so twelve layers are 27.7 KB a cell — 57
+MB at 2048 cells — with one structural limit, that sharing a buffer with the
+arenas caps it near 148k cells. The **indexer** needed two things a KV cache
+does not suggest: its *raw* key gets a cell cache of its own, written as one
+more plane of the pack kernel's grid, because pooling averages four cells and
+at decode those arrive in four batches; and its *pooled* table is incremental,
+`[past/ratio, (past+T)/ratio)`, one workgroup instead of 1024, with a fresh
+sequence the one case that writes all of it. **Gate: a 4096-token prompt in
+chunks of 512, 64, 7 or one is identical to the last place** — all 10 485 760
+floats, because a chunked run recomputes nothing and a tolerance would pass a
+cache off by a position.
+
+**2. L2e's fp16 round trip had never run on the GPU.** `float(float16_t(x))`
+inline is bit-identical to no cast at all — checksummed over the whole pooled
+tensor at both fixture lengths — while `spirv-dis` shows both `OpFConvert`s
+surviving `spirv-opt`, so it is RADV's NIR folding `f2f32(f2f16(a))` under the
+inexact rule a shader without `NoContraction` permits. **A value that models a
+memory format has to go through memory.** Reading the fp16 cache is the
+faithful choice and is forced anyway; it moves `indexer_k` from 3.058e-04 to
+3.552e-04 against llama.cpp and leaves `attn_output`, `l_last-0..3` and the
+argmax unchanged, because the raw key already arrives at 1.65e-04 from our own
+dequantisation.
+
+**3. L7b — five histories carry, and one of them was shared by 36 layers.**
+The cache and pooled blocks, the PLE convolution's 9-row ring, every DeltaNet
+layer's recurrent state, its 3-row window, and the **n-gram trigram**, which
+is the host's — so the graph keeps the sequence rather than the batch and
+slices `PLERows` at `past`. The DeltaNet's window lived as rows of negative
+token index in front of the fused projection's output, an arena **sized for
+one batch**, and nothing could see it while every pass was a fresh sequence:
+all 36 layers read the zeros the graph had just written. The moment a run
+leaves its tail behind, layer 1 reads layer 0's — `l_last-1` goes from
+2.473e-04 to **3.062e-03, 12x**, with `l_last-0` exact.
+
+**4. Both convolutions now use one 15-line kernel over a ring addressed by
+absolute position**, which is what makes the store a pure write: the only rows
+a run must save are its own and every older slot is already right, so no slot
+is both read and written however short the run is. A shifted window needs the
+opposite, and that is what the host-side `DeltaNetGPU.Carry` was — 198 KB a
+layer through a mapped arena, **and reading in front of the arena for any run
+shorter than the window**, i.e. every decode step. Deleted. **Gate: 512 tokens
+in chunks of 128, of 9, or as 495 then seventeen single ones all return
+`result_norm` identical to the last place**; the control, every token its own
+*sequence*, is 1.785e+00 rms away.
+
+**5. L7c — the text, and the one token it disagrees on.** Greedy is the
+default because the gate is only a check if the sampler is a function of the
+logits alone. At the divergence our top two are `"." 25.362` against
+`" for" 25.201` — 0.161 apart where the tokens either side are decided by 3 to
+10 — which is L6b-3's x1.085-a-layer drift landing where the model is
+indifferent. So the gate reads **llama.cpp's text except where the argmax is a
+near-tie**. The stop condition is **not `eos_token_id`**: this checkpoint's is
+248046 and what it emits to finish is 248044, which the metadata calls
+`bos_token_id`; llama.cpp flags `<|endoftext|>`, `<|im_end|>` and `<|eot_id|>`
+end-of-generation by *name*.
+
+**6. One `madvise` was worth 176x on the n-gram gather.** D2 leaves the 28.80
+GB table mmap'd because a token reads 1.41 KB of it — right about bandwidth,
+silent about latency: sixteen scattered 90-byte reads are sixteen faults and
+the kernel answers each with a 128 KB readahead window, **2 MB of I/O to
+deliver 1.41 KB**. `MADV_RANDOM` on that tensor's pages takes the gather from
+17.6 ms a token to **0.1** at four layers (2.07x on the rate) and from 23.6 to
+8.5 at 48, where 85.47 GB resident leaves no page cache to hold it. Prefill
+gains with it: **950.3 tok/s at 2048**. Submitting a command buffer a block
+rather than a dispatch was another 12% and prices a submit at **31 µs**; ~490
+remain, worth ~11% more.
+
+**7. The ceiling is 25.0 tok/s, not 38.2, because our dense half is fp16.** A
+token reads 8.07 GB of dense weights plus ~1.60 GB of experts = **9.67 GB**,
+where the budget's 6.334 assumed the shipped Q8_0. 9.67 GB at 242 GB/s is 40.0
+ms — and 25.0 tok/s is llama.cpp's *measured* rate, so the reference is at the
+ceiling of the bank it reads rather than leaving a third of the bus unused.
+**We are at 30% of our own ceiling**, and **D3 is worth 3.5x here rather than
+1.7x**.
+
+**8. Where the 134 ms goes: two kernels shaped for prefill.** Hyper-connection
+27.6%, MoE 27.5%, DeltaNet 21.4%, gather 6.3%, attention 6.3%, moves 5.3%,
+head 4.8%. The first two are **6.9x and 5.6x** off their own bytes and the
+rest are 1.2-1.7x. The hyper-connection **down** projection is 237.6 µs of a
+293.5 µs mixer at **29 GB/s** because it writes 336 columns and launches ~21
+workgroups on a 40-CU device, where `up` writes 10240 and launches 640 at 143
+GB/s — at M=1 the parallelism has to come from splitting K (§1.1). The MoE
+pads each expert's rows to its 32-row block, so one token does **32x** the
+arithmetic and the kernel is unpack-bound at 70 GB/s of bank.
+
+**Next: L7d, the decode kernels.** A K-split GEMV for the hyper-connection
+down projection, a row block of one for the MoE, and one command buffer a
+token — together the difference between 7.46 tok/s and something near the 25.0
+this bank allows. Underneath it, L8's re-quantisation is worth 3.5x on the
+ceiling itself and would also let the n-gram table back into the page cache.
+
 ### Session 2026-09-16 (forty-fourth) — stage L6c: the glue on the device, and 2.40x llama.cpp
 
 **Result: prefill is 941.3 tok/s at ubatch 2048 against llama.cpp's

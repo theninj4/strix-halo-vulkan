@@ -32,6 +32,11 @@
 //	  unpooled cell                      1e9
 //	anything else                        0
 //
+// **Everything here counts cells, not tokens** (L7a). Token t of the run is
+// cell SEQ_PAST + t, the cache holds SEQ_PAST + T of them, and the causal
+// mask compares a cell against this token's *position*. On a fresh sequence
+// SEQ_PAST is zero and every line below is what it was.
+//
 // 1e9 and not an infinity, so that it can never meet the mask's -inf and make
 // a NaN. And the expansion to cells routes every cell past the last whole
 // block to that one spare block, which is what makes the incomplete tail
@@ -67,8 +72,10 @@ void main() {
     if (t >= pc.tokens) {
         return;
     }
+    uint pos = SEQ_PAST + t;
+    uint nCells = SEQ_PAST + pc.tokens;
     uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
-    uint nBid = pc.tokens / pc.ratio;
+    uint nBid = nCells / pc.ratio;
     uint deadBid = (nBid >= nBlocks) ? nBlocks - 1u : nBid;
 
     for (uint i = tid; i < IDX_HEADS * IDX_DIM; i += WG) {
@@ -93,10 +100,10 @@ void main() {
 
     // The tail is every cell at or after the last whole block this token can
     // see; `(t+1)/ratio*ratio` is where it starts.
-    uint tailStart = (t + 1u) / pc.ratio * pc.ratio;
+    uint tailStart = (pos + 1u) / pc.ratio * pc.ratio;
     for (uint j = tid; j < pc.nKV; j += WG) {
         float v;
-        if (j > t || j >= pc.tokens) {
+        if (j > pos || j >= nCells) {
             v = -1.0 / 0.0;              // the causal mask, and every empty cell
         } else {
             uint blk = (j < nBid * pc.ratio) ? j / pc.ratio : deadBid;

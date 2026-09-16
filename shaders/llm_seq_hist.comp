@@ -1,0 +1,52 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The one dispatch in this vertical that exists so that a *next* run can
+// happen: it stores a run's last rows into a convolution's ring (LLM.md L7b).
+//
+// Two blocks in this model are convolutions over the token axis, and both are
+// therefore recurrent in a way the hyper-connection stream is not. The PLE
+// block's taps reach 0, 3, 6 and 9 tokens back and the gated DeltaNet's reach
+// 0, 1, 2 and 3, so a run that follows another has to be able to read rows it
+// did not compute. This kernel is what leaves them behind, and it is one
+// kernel for both because the shape is the same: copy the last `hist` rows of
+// a [tokens][width] tensor into a [hist][width] ring.
+//
+// **The ring is addressed by absolute position, not by age, and that is what
+// makes this a pure write.** The rows a run has to leave behind are the last
+// `hist` positions of the sequence so far; any of those that predate the run
+// are already in the slots they belong in, because the run that produced them
+// put them there and nothing has overwritten them since. So this dispatch
+// only ever reads the source and never the ring — there is no slot it both
+// reads and writes however short the run is, which is the case decode spends
+// all of its time in: one token, one row stored, and the other `hist - 1`
+// already right.
+//
+// A shifted window would need the opposite — the old rows read and moved —
+// and at one token a run would be reading `hist - 1` rows to write them back
+// one slot along.
+//
+// The push block says the rest, through fields both blocks leave free for the
+// dispatch that carries them (llm_common.glsl): SEQ_SRC the source, SEQ_HIST
+// the ring, gemmM its length in rows, gemmK the row width in floats.
+
+#include "llm_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint j = gl_WorkGroupID.y;       // which of the run's stored rows
+    uint c = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint hist = max(pc.gemmM, 1u);
+    uint width = pc.gemmK;
+    // The last min(tokens, hist) rows of the run, oldest first.
+    uint keep = min(pc.tokens, hist);
+    if (j >= keep || c >= width) {
+        return;
+    }
+    uint t = pc.tokens - keep + j;
+    uint pos = SEQ_PAST + t;
+    act[SEQ_HIST + (pos % hist) * width + c] = act[SEQ_SRC + t * width + c];
+}

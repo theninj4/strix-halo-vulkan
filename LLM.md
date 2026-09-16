@@ -10,9 +10,9 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: the model runs, and prefill is 2.40x the reference.** L0, L1, the
-whole of L2, L3, L4, L5, L6a, L6b and now **L6c — tokens in, llama.cpp's own
-logits out, with nothing crossing a block boundary through the host.** The checkpoint is downloaded,
+**Status: the model generates, and it generates llama.cpp's text.** L0, L1,
+the whole of L2, L3, L4, L5, L6 and now **L7 — a prompt in, tokens out, one at
+a time, over a cache the last step extended.** The checkpoint is downloaded,
 llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
 there is a kernel for every layer and every sub-layer: the hyper-connection
 block in four dispatches where the reference has sixteen (4.24x, 14.9% of
@@ -22,8 +22,9 @@ its selection in seven dispatches where the reference has twenty-eight (L2f
 and L4b, 2.32x), the gated DeltaNet — three quarters of the layers — in five
 where the reference has eleven (L3b, 1.37x, the recurrence itself at 1.06x),
 the MoE block, 35.7% of the graph and 97% of the parameters, in nine
-dispatches against about 845 (L5b), and now the order that makes them one
-forward pass.
+dispatches against about 845 (L5b), the order that makes them one forward
+pass, and now the three histories that make a second pass a continuation of
+the first.
 
 **Between them the five blocks have taken 1015.5 ms of llama.cpp's 1164.7 ms
 prefill graph down to 714.8** — 87.2% of it replaced by 61.4%, a 25.8% saving
@@ -63,11 +64,32 @@ its own arenas, so an activation crossing a block boundary was read out of one
 mapped arena, narrowed to halves and written into the other, 96 times a pass —
 22.7% of the graph. `shaders/llm_move.comp` is that move as one dispatch, and
 it is **bit-exact**: `l_last` at all six depths and both of the head's tensors
-came back identical to the last place. **Prefill is 941.3 tok/s at ubatch 2048
-against llama.cpp's best-of-any-ubatch 391.42 — 2.40x — and 572.9 at 512
-against its 313.62 for the same prompt, 1.83x.** The moves themselves are 2.0%
-of the pass, so the shared arena L6c was scoped as would buy that and nothing
-else. **96.6% of the graph is now the five blocks. Next: L7, decode.**
+came back identical to the last place. The moves themselves are 2.0% of the
+pass, so the shared arena L6c was scoped as would buy that and nothing else,
+and **96.6% of the graph is the five blocks**.
+
+**L7 is decode, and the gate it clears is the text.** Given
+`The capital of France is` at temperature zero the model produces llama.cpp's
+completion — the same list of capitals, the same `<think>` block, the same
+`Lisbon.` — diverging at **exactly one token**, where our top two logits are
+0.161 apart against the 3 to 10 that decide the tokens either side of it, and
+re-converging within a sentence. Underneath it, two equalities: a 4096-token
+prompt through the attention layer in chunks of 512, 64, 7 or **one** is
+identical to the last place, and the whole graph over 512 tokens in chunks of
+128, of 9, or as 495 then seventeen single ones returns `result_norm`
+identical to the last place. **Prefill is 950.3 tok/s at ubatch 2048 against
+391.42 — 2.43x — and 587.1 at 512 against 313.62, 1.87x.**
+
+**Decode is 7.46 tok/s against llama.cpp's 25.15, and the attribution is two
+kernels rather than a direction.** One `madvise(MADV_RANDOM)` on the n-gram
+table was worth **176x** on the host gather; a command buffer a block rather
+than a submit a dispatch was worth 12%; and the ceiling turns out to be **25.0
+tok/s and not 38.2**, because our dense half is staged as halves and a token
+reads 9.67 GB rather than the checkpoint's 6.334. We are at 30% of our own
+ceiling, and what is between us and it is the hyper-connection **down**
+projection at 29 GB/s (336 output columns, ~21 workgroups) and the MoE's
+32-row padding doing 32x the arithmetic for one token. **Next: L7d, the decode
+kernels.**
 
 ## The number to beat
 
@@ -1076,6 +1098,163 @@ activation that crosses a block boundary, as one dispatch.
 > same reason llama.cpp's pp512 is below its pp2048. That is a decode problem
 > wearing a prefill hat, and it is L7's.
 
+## What L7a established — the KV cache, and a round trip that was dead code
+
+`llm/gpu_attn.go`, `shaders/llm_attn_{pack,idx,score,wmma}.comp`: the
+full-attention layer over a cache that outlives the batch.
+[Write-up](research/l7a-kv-cache.md)
+
+> **L7a-1: the query is a batch and the key is a cache.** They used to be the
+> same object — token `t` was cell `t` — and now the query's geometry is
+> `plane` padded token rows while the key's is **nKV cells, one plane a
+> layer**. Every causal comparison becomes a cell against a *position*, row
+> `i` of query block `q0` being cell `SEQ_PAST + q0 + i`, and the pack
+> scatters by cell because a batch boundary may land inside a fragment tile.
+> The cache is **2.31 KB a cell a layer** — key, value, the indexer's raw key
+> and its pooled block — so twelve layers are 27.7 KB a cell: 57 MB at 2048,
+> 906 MB at 32768, and a single buffer caps it near 148k cells.
+>
+> **L7a-2: the indexer needed two things a KV cache does not suggest.** Its
+> *raw* key gets a cell cache of its own, written as **one more plane of the
+> pack kernel's grid**, because pooling averages `ratio = 4` cells and at
+> decode those arrive in four different batches. And its *pooled* table is
+> incremental: a cell never changes, so a block is final once its four cells
+> exist and a continuing run rebuilds only `[past/ratio, (past+T)/ratio)` —
+> one workgroup instead of 1024 — with a **fresh** sequence the one case that
+> writes all of it, because the blocks past the last complete one pool cell 0
+> four times and must be filled once before they can be left alone.
+>
+> **L7a-3: two push fields, and the block has been full since L5b.** 64 uints
+> is 256 bytes and that is this device's whole range, so `SEQ_PAST` rides
+> `lowRank` and `ATTN_IDXRAW` rides `loOff` under macro names, the same
+> arrangement `moeUsed` has carried the bank index in since L6a. The mapping
+> lives in `llm_common.glsl` and no kernel spells the borrowed field.
+>
+> **L7a-4: `float(float16_t(x))` is dead code on this driver, and L2e's fp16
+> cache had never run on the GPU.** Three builds of the pooling loop,
+> checksummed over the whole pooled tensor at both fixture lengths: reading
+> the fp16 cell cache gives one answer, and the inline cast gives one
+> **bit-identical to no cast at all**. It is not `spirv-opt` — `spirv-dis`
+> finds both `OpFConvert`s in the optimised module — so it is RADV's NIR
+> folding `f2f32(f2f16(a))` under the inexact rule a shader without
+> `NoContraction` permits. **A value that models a memory format has to go
+> through memory.** Reading the cache is what the reference does and is forced
+> anyway; it moves `indexer_k` from 3.058e-04 to 3.552e-04 against llama.cpp
+> and leaves `attn_output`, `l_last-0..3` and the argmax unchanged, because
+> the raw key already arrives at 1.65e-04 from our own dequantisation.
+>
+> **L7a-5: the gate is an equality.** 4096 tokens in chunks of 512, 64, 7 and
+> 4063-then-33-singles: **identical to the last place**, all 10 485 760
+> floats. A chunked run recomputes nothing — the same dispatches read the same
+> values in the same order — so bit-equality is reachable rather than lucky,
+> and a tolerance would have passed a cache off by a position.
+
+---
+
+## What L7b established — five histories, and one shared by 36 layers
+
+`llm/graph.go`, `llm/gpu_ple.go`, `llm/gpu_deltanet.go`,
+`shaders/llm_seq_hist.comp`: the model continuing a sequence.
+[Write-up](research/l7b-sequence.md)
+
+> **L7b-1: five things carry and only one is a KV cache.** The cache and
+> pooled blocks (L7a); the PLE convolution's **9**-row ring; every DeltaNet
+> layer's recurrent state; its **3**-row window; and the **n-gram trigram**,
+> which is the host's — a decode step's gather is a function of three tokens,
+> one of which it has, so `Graph` keeps the sequence rather than the batch and
+> slices `PLERows` at `past`. The wide residual is deliberately *not* carried:
+> it is a function of the token.
+>
+> **L7b-2: the DeltaNet's convolution window was shared by all 36 layers, and
+> nothing could see it.** It lived as `Conv-1` rows of negative token index in
+> front of the fused projection's output — an arena sized for one *batch* —
+> and while every pass was a fresh sequence all 36 layers read the zeros the
+> graph had just written, which is the right answer. The moment a run leaves
+> its tail behind, layer 1 reads layer 0's: `l_last-1` goes from 2.473e-04 to
+> **3.062e-03, 12x**, with `l_last-0` exact. The assumption that stopped
+> holding is worth naming — *the arena in front of the projection's output
+> belongs to whoever ran last*.
+>
+> **L7b-3: one kernel for both rings, addressed by position, so the store is a
+> pure write.** `shaders/llm_seq_hist.comp` is fifteen lines and serves both
+> convolutions. The only rows a run must save are its own; every older slot is
+> already right, because the run that produced it put it there. So no slot is
+> both read and written however short the run is. A *shifted* window needs the
+> opposite and at one token would read `hist-1` rows to move them one slot
+> along — which is what the host-side `DeltaNetGPU.Carry` did, 198 KB a layer
+> through a mapped arena, **and it read in front of the arena for any run
+> shorter than the window**, i.e. every decode step. Deleted.
+>
+> **L7b-4: the gate, and the control that comes free.** 512 tokens in chunks
+> of 128, of 9, or as 495 then seventeen single ones: `result_norm`
+> **identical to the last place** in every case. The control — every token its
+> own *sequence* — is **1.785e+00 rms** on values to 18.5. The one-token
+> schedule is both at once: a chunk of one has nothing of its own to read, so
+> a history that was not carried cannot produce the right answer by accident.
+
+---
+
+## What L7c established — the loop, the text, and where 134 ms goes
+
+`llm/sample.go`, `cmd/llm/generate.go`, `gguf/gguf.go`: generation.
+[Write-up](research/l7c-decode.md) · `results/l7c_decode.csv`
+
+> **L7c-1: it generates llama.cpp's text, and the one disagreement is
+> priced.** At the divergence our top two are `"." 25.362` against
+> `" for" 25.201` — **0.161 apart**, where the tokens either side are decided
+> by 3 to 10 — which is L6b-3's x1.085-a-layer drift landing where the model
+> is indifferent; both continuations say the same thing and the completion
+> re-converges within a sentence. So the gate reads *llama.cpp's text except
+> where the argmax is a near-tie*, which is a claim about two implementations
+> rather than about a checkpoint neither computes exactly.
+>
+> **L7c-2: the stop condition is not `eos_token_id`.** This checkpoint's is
+> **248046** and what the model emits to finish is **248044** — which the
+> metadata calls `bos_token_id` and `padding_token_id`. llama.cpp flags
+> `<|endoftext|>`, `<|im_end|>` and `<|eot_id|>` end-of-generation by *name*
+> as well as by key, and a loop that trusts the key runs past the end of the
+> text and then repeats one token until `-n` is exhausted.
+>
+> **L7c-3: one `madvise` was worth 176x.** D2 leaves the 28.80 GB n-gram table
+> mmap'd because a token reads 1.41 KB of it — right about bandwidth, silent
+> about latency. Sixteen scattered 90-byte reads are sixteen page faults and
+> the kernel answers each with a 128 KB readahead window: **2 MB of I/O to
+> deliver 1.41 KB.** `MADV_RANDOM` on that tensor's pages alone takes the
+> gather from 17.6 ms a token to **0.1** at four layers — 2.07x on the decode
+> rate — and from 23.6 to 8.5 at 48, where 85.47 GB resident leaves no page
+> cache to hold it. Prefill gains too: the ladder goes from L6c's 941.3 to
+> **950.3 tok/s**. `TENSOR_READ_LAZY` is a statement about bytes;
+> `MADV_RANDOM` is the statement about pages that has to go with it.
+>
+> **L7c-4: a command buffer a block, and a submit is 31 us.** Every block was
+> submitting each dispatch with its own fence wait — fine at prefill, the
+> whole cost at decode, where a token is ~1130 of them. One
+> `DispatchMultiTimed` a block takes it to ~490 and the rate from 5.99 to
+> 6.68; the MoE column prices the submit exactly, 432 to 48 for 12.1 ms.
+> Nothing in the shim prevents one command buffer for the **whole token** —
+> it binds each pipeline's own descriptor set — and that is worth ~11% more.
+>
+> **L7c-5: the ceiling is 25.0 tok/s, not 38.2, because our dense half is
+> fp16.** A token reads 8.07 GB of dense weights (1.31 hyper-connection + 4.18
+> DeltaNet + 1.24 attention + 1.27 head + 0.07 PLE) plus ~1.60 GB of experts =
+> **9.67 GB**, against the budget's 6.334 at the shipped Q8_0. 9.67 GB at 242
+> GB/s is 40.0 ms — and **25.0 tok/s is llama.cpp's measured rate**, so the
+> reference is at the ceiling of the bank *it* reads rather than leaving a
+> third of the bus unused. We are at **30% of our own ceiling**, and D3 is
+> worth **3.5x** here rather than 1.7x.
+>
+> **L7c-6: two kernels shaped for prefill are 55% of the step.** Of 134.1 ms:
+> hyper-connection 27.6%, MoE 27.5%, DeltaNet 21.4%, gather 6.3%, attention
+> 6.3%, moves 5.3%, head 4.8%. The first two are **6.9x and 5.6x** off their
+> own bytes where the rest are 1.2-1.7x. The hyper-connection **down**
+> projection is 237.6 us of a 293.5 us mixer at **29 GB/s**, because it writes
+> 336 columns and launches about **21 workgroups** on a 40-CU device, where
+> `up` writes 10240, launches 640 and does 143 GB/s — at M=1 the parallelism
+> has to come from splitting **K**, which is what `gemv_w4a8.comp` does at
+> 99-103% of the bus (§1.1) and no rung of a GEMM ladder can supply. The MoE
+> pads each expert's rows to its 32-row block (L5b-3), so **one token does 32x
+> the arithmetic it needs** and the kernel is unpack-bound at 70 GB/s of bank.
+
 ---
 
 ## The three findings that set the direction
@@ -1149,11 +1328,16 @@ prefill at **941.3 tok/s against 391.42 — 2.40x** — with **96.6% of the pass
 inside the five blocks**, which is 82% of the way to the ~1150 above. What is
 left of prefill is inside the kernels; the next stage is **L7**, decode.
 
-**Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
-repack) at widths chosen for this bus rather than for a generic machine:
-~4.25 bits on everything streamed, fp16 routers, the n-gram table left as
-IQ4_NL on disk, and — L0c — **fp16 scales per 32 nibbles in a k-major plane**.
-Target ~67 tok/s against phase 1's 38.2 ceiling and the reference's 25.15.
+**Phase 2 — our own bank, and L7c made it worth 3.5x rather than 1.7x.** Our
+dense half is staged as **halves**, so a token reads 8.07 GB of it against the
+3.67 the shipped Q8_0 would be: the ceiling for the bank we actually run is
+**25.0 tok/s**, which is llama.cpp's measured rate exactly. **Not expanding
+the dense half is 1.66x before any re-quantisation at all.** Then re-quantise
+to the repo's W4A8 layout (§1.1's repack) at widths chosen for this bus rather
+than for a generic machine: ~4.25 bits on everything streamed, fp16 routers,
+the n-gram table left as IQ4_NL on disk, and — L0c — **fp16 scales per 32
+nibbles in a k-major plane**. Target ~67 tok/s against this bank's 25.0
+ceiling, the checkpoint's 38.2 and the reference's 25.15.
 Source it either by transcoding the GGUF (cheap, double-quantises) or from
 the 360 GB bf16 (clean — and **unsloth publish their imatrix**,
 `imatrix_unsloth.gguf`, 580 MB, so the calibration is free).
@@ -1280,6 +1464,28 @@ backwards on this machine: it costs 2% of memory and **a factor of 1.7 in
 tok/s**. Conversely, going below 4 bits on the *experts* buys very little —
 they are only a quarter of the traffic.
 
+**That table is the checkpoint's, and L7c-5 measured ours.** The dense blocks
+are dequantised on the way to the device and staged as **halves**, which L6a
+priced as capacity (6.79 GB of fp16 against 3.67 of Q8_0) and which at decode
+is bandwidth:
+
+    hyper-connection mixers          1.31 GB
+    gated DeltaNet, 36 layers        4.18 GB
+    full attention, 12 layers        1.24 GB
+    lm head                          1.27 GB
+    PLE projections                  0.07 GB
+                                    --------
+    dense, every token               8.07 GB   83%
+    experts, 11 of 512, 48 layers   ~1.60 GB   17%
+                                    --------
+    per token                        9.67 GB   -> 25.0 tok/s at 242 GB/s
+                                               -> we reach 7.46 (58 GB/s)
+
+So **llama.cpp's 25.15 is the ceiling of the bank it reads**, and the 38.2 in
+the row above is a ceiling neither implementation is aiming at. The first
+1.66x of phase 2 needs no re-quantisation at all — only not expanding the
+dense half on the way to the device.
+
 ### Context is cheap here, which is the good news
 
 12 full-attention layers x 2 KV heads x 256, and QSA caps what a step *reads*
@@ -1305,7 +1511,10 @@ below Q8. Bandwidth is the whole story.
 | `gguf/` | **L1: the GGUF reader.** mmap'd, sharded, the split convention, the value grammar, openable from any shard. 1224/1224 tensors against the Python inventory. |
 | `gguf/dequant.go` | **L1: Q4_K, Q5_K, Q5_1, Q8_0, IQ4_NL, F32, F16, BF16** — bit-exact against ggml's own `to_float` via `reference/dequant_ref.c`. |
 | `cmd/gguf` | inventory, quant mix, decode budget, `-check` against `tensors.json`. |
-| `cmd/llm` | the vertical's driver. `-tokenize` today; generation at L7. |
+| `cmd/llm` | the vertical's driver: `-tokenize`, the five block benchmarks, `-resident`, `-graph`, and **L7c's `-gen`** — prefill, then one token at a time, with both rates and where each went. |
+| `llm/sample.go` | **L7c: the sampler.** `top_k -> top_p -> temp -> dist` with temperature zero short-circuiting into `Argmax`, which is the default because the gate is only a check if the sampler is a function of the logits alone. `TopK` is a quickselect: a 248320-wide sort is 30 ms, most of a decode step. |
+| `gguf.Tensor.AdviseRandom` | **L7c: `MADV_RANDOM` on one tensor's pages.** For the 28.80 GB n-gram table, whose sixteen scattered reads a token drew sixteen 128 KB readahead windows. 176x on the gather; the rest of the shard keeps the readahead staging wants. |
+| `shaders/llm_seq_hist.comp` | **L7b: the ring both convolutions leave behind them.** Fifteen lines for the PLE block's nine normed rows and the DeltaNet's three projection rows, addressed by **position modulo the ring's length** — which is what makes the store a pure write and a one-token run cost one row and no read. |
 | `zimage/tokenizer/` | **L1: `FromVocab`** builds the BPE from GGUF metadata, and `split()` now carries both Qwen pre-tokenizers. 213/213 against `llama-tokenize`. |
 | `llm/` | **L2b: the vertical's package.** `Config` from the checkpoint's own metadata, on-demand dequantisation, the `token_embd` gather (bit-exact), and the hyper-connection block — `HCInit`, `HCMix`, `HCCombine` — with a `Numerics` switch between the exact model and the reference's int8 arithmetic. |
 | `reference/eval_dump.c` | **L2b: the oracle.** Whole tensors of a real llama.cpp pass, where `llama-eval-callback` prints three per axis and a sum. `llm/evaldump.go` reads them back as a `Trace`. **L4a** added `-f` (a prompt from a file) and `-nt` (an exact token count), and pins the build's headers. |
@@ -1314,7 +1523,7 @@ below Q8. Bandwidth is the whole story.
 | `shaders/llm_gemm.comp` | **L2c/L2d/L2f: the vertical's GEMM**, one kernel and one epilogue per mode — MODE 0 down+inject+silu, MODE 1 up+sigmoid+collapse, MODE 2 plain — because in this architecture the epilogue is where the time goes. |
 | `shaders/llm_hc_*.comp`, `llm_ple_*.comp` | **L2c/L2d: the blocks.** `llm_hc_norm` (grouped RMSNorm → fp16 A operand), `llm_hc_combine`, `llm_ple_gate` (both norms, the signed-sqrt gate, the broadcast and the conv norm in one pass) and `llm_ple_conv` (four dilated taps, the SiLU and the residual add), over `llm_common.glsl`'s binding contract. |
 | `llm/attn.go` | **L2e: the full-attention layer.** The fused query/gate projection, interleaved M-RoPE, the QSA indexer's pool/score/select with the reference's own cache block structure, and causal GQA — with the fp16 KV cache and the fp16 F32-matmul the reference turns out to use. **L4a** replaced the selection with a port of the reference's radix select, and made the indexer's two BF16 projections take a bf16 activation above the 8-column threshold. |
-| `llm/gpu_attn.go` | **L2f: that layer on the device, in six dispatches.** The fused `[13952, 2560]` projection for six of llama.cpp's matrices, a host-built rotary table, two BM ladders because the two projections fall on opposite sides of the MALL, and a sweep profiler over every staged layer. |
+| `llm/gpu_attn.go` | **L2f: that layer on the device, in six dispatches.** The fused `[13952, 2560]` projection for six of llama.cpp's matrices, a host-built rotary table, two BM ladders because the two projections fall on opposite sides of the MALL, and a sweep profiler over every staged layer. **L7a gave it a cache**: four planes a layer — key, value, the indexer's raw key per cell and its pooled block — with `SetPast`, an incremental `blockRange`, and the query's plane geometry no longer the key's. |
 | `shaders/llm_attn_select.comp` | **L4b: the QSA selection.** One workgroup a token, the row's keys cached in LDS, llama.cpp's four radix passes with its serial bucket walk replaced by a subgroup suffix sum, and a **per-cell bitmask** out instead of an index list — which deletes the reference's `GET_ROWS`. Dispatched only where `top_k + ratio - 1` is fewer cells than the cache holds; `SetSparse` forces it either way, which is how it is priced and how the dense control runs. |
 | `shaders/llm_attn_*.comp` | **L2f: the layer's four kernels.** `llm_attn_pack` (per-head norm + interleaved M-RoPE + the fragment tiling for q, k and v in one grid), `llm_attn_idx` (the indexer's pooled key and query over two addressings), `llm_attn_score` (the rectified score, its bias, the cells and the causal mask) and `llm_attn_wmma` (causal GQA at headDim 256, **with the output gate in its epilogue**, and **L4b's bitmask staged a key block at a time** beside the causal mask). |
 | `llm/moe.go` | **L5a: the MoE block.** `MoEConfig` from the checkpoint, the F32 router with fp16 operands and an f32 accumulator, the softmax/argsort/top-10/clamp/normalise chain, an `ExpertBank` that dequantises one expert's [640, 2560] matrix on demand out of a 77 GB tensor nothing can hold as floats, the routed half walked **by expert** rather than by token, and the shared expert with its one-column gate on the f32 vector path. |
@@ -1323,7 +1532,7 @@ below Q8. Bandwidth is the whole story.
 | `llm/gpu_moe.go` | **L5b: the MoE block on the device, in nine dispatches.** The fused `[nExpert+1, nEmbd]` router with the shared expert's gate as its 513th column, a **quantised** bank staged byte for byte out of the checkpoint (1.57 GB a layer, against 5.03 as halves), a seventh binding that is the same bank read as `uvec4`, the permuted row space with the shared expert's group at its front, the measured `MoEPlanFor` schedule and a sweep profiler. **L6a** made the quantised bank one buffer a layer, bound as one array of `moeMaxBanks`, with the layer index in the top sixteen bits of `moeUsed`. |
 | `shaders/llm_moe_gemm.comp` | **L5b: the grouped quantised GEMM.** Two modes — gate/up with `silu(gate)*up` on the accumulators, down in permutation order — crossed with the four formats the bank ships in (Q4_K, Q5_K, Q5_1, Q8_0) and five row-block rungs. Each workgroup unpacks its own BN x BK slab into LDS per K-step, and every store is a whole cooperative-matrix fragment because the permutation pads each expert's rows to the block. |
 | `shaders/llm_moe_{route,perm,combine}.comp` | **L5b: the routing.** `llm_moe_route` is the softmax over 512, ten workgroup argmaxes reproducing `ggml_argsort`'s DESC comparator without materialising the other 502 ranks, the normalised weights and the shared gate's sigmoid — one workgroup a token, `llm_attn_select.comp`'s shape. `llm_moe_perm` is a counting sort, the padded offsets, the sentinel fill, the inverse permutation and the two tile schedules, in one workgroup. `llm_moe_combine` is the eleven contributions weighted and summed in the reference's order. |
-| `llm/graph.go` | **L6b: the model.** The five blocks in `llama_model_qwen4exp::graph::graph`'s order over one staged model, `Prefill`/`PrefillN`/`Hidden`/`Forward`, and a `GraphStats` that splits a pass into block and glue. `Layers: N` truncates it to a prefix, which is how the order is checked in 7 GB. |
+| `llm/graph.go` | **L6b: the model.** The five blocks in `llama_model_qwen4exp::graph::graph`'s order over one staged model, and a `GraphStats` that splits a pass into block and glue. `Layers: N` truncates it to a prefix, which is how the order is checked in 7 GB. **L7b made it a sequence**: `Reset`/`Append`/`Extend` beside `Prefill`/`Hidden`/`Forward`, a `past` every block is told once a run, and the whole id list kept because the n-gram hash is a trigram. |
 | `llm/move.go`, `shaders/llm_move.comp` | **L6c: the move between two blocks' arenas.** Three bindings of its own — 1 and 2 the same buffer twice, so an fp32 and an fp16 destination are one pipeline shape — one pipeline per (source, destination) pair, and a `Port` per crossing tensor. Bit-exact against the host narrowing, and **2.0% of the pass** against the 22.7% it replaced. |
 | `vk.Buffer.Zero*` | **L6c: clearing a mapping in place.** `WriteFloat32At(off, make([]float32, n))` is two costs and on a hot path the allocation is the larger: 36 DeltaNet states is 113 MB of Go allocation a prefill, flat in the prompt length (L6c-4). |
 | `llm/gpu_head.go` | **L6b: the lm head.** `output.weight`, [2560, 248320] Q8_0 — 675 MB, 1.27 GB as halves — staged a 4096-row slab at a time straight into the fragment tiling, and run as `llm_gemm.comp`'s MODE 2 on **one row**, because `inp_out_ids` is what the reference computes. The only matmul in the vertical with no epilogue: the final hyper-connection mixer is the output norm. |
@@ -1383,11 +1592,18 @@ below Q8. Bandwidth is the whole story.
    graph in the five blocks**. What is left of prefill is inside the kernels,
    not between them — L5b-7's unpack in the MoE (53.7% of the pass) and
    L3b-5's fused projection in the DeltaNet (20.3%).
-8. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
-   (interleaved, sections [11,11,10], 64 of 256 dims, NeoX on a text batch);
-   what is left is the ring buffer, the indexer cache's own incremental
-   pooling, and a rotary table that does not want a row per context cell.
-9. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
+8. ~~**KV cache** and a decode loop~~ — **done at L7a, L7b and L7c.** The
+   layer runs over nKV cells with the indexer's raw key cached per cell and
+   its pooled table rebuilt only where a block completed; both convolutions
+   read a per-layer ring; the graph keeps the sequence because the n-gram hash
+   is a trigram; and `cmd/llm -gen` generates llama.cpp's text. The rotary
+   table is still a row per context cell — 64 floats a cell, 2 MB at 32768 —
+   which is small enough that it stayed a table.
+
+9. **The decode kernels** (L7d): a K-split GEMV where a 336-column projection
+   launches 21 workgroups, a row block of one where the MoE pads to 32, and
+   one command buffer a token.
+10. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
 
 ---
 
@@ -1635,14 +1851,67 @@ below Q8. Bandwidth is the whole story.
       graph is the blocks; L2a-3's ~1150 projection is 82% reached and the
       rest of it is inside the kernels.
 
-### L7 — decode
+### L7 — decode  *(done)*
 
-- [ ] KV cache, ring buffer, sampling, the generation loop.
-- [ ] Gate: it generates the same text as llama.cpp; tok/s against the 38.2
-      ceiling and against 25.15.
+- [x] **L7a — the KV cache.** The full-attention layer over nKV cells, one
+      plane a layer, with every causal comparison a cell against a *position*.
+      The indexer's **raw** key cached per cell and written as one more plane
+      of the pack kernel's grid (a pooled block spans four cells and at decode
+      those arrive in four batches), and its **pooled** table incremental —
+      `[past/ratio, (past+T)/ratio)`, one workgroup instead of 1024. Two more
+      push fields borrowed, because 64 uints is 256 bytes. And **L2e's fp16
+      round trip had been folded away by the driver since L2e**: a value that
+      models a memory format has to go through memory (L7a-4).
+      [Write-up](research/l7a-kv-cache.md)
+- [x] Gate: a 4096-token prompt in chunks of 512, 64, 7 and one is
+      **identical to the last place** — all 10 485 760 floats — and
+      `TestAttnGPUCacheKeepsPooledBlocks` asserts the incremental range
+      against an independent predicate.
+- [x] **L7b — the sequence.** Five histories carry and one of them was
+      **shared by all 36 DeltaNet layers**, invisible while every pass was a
+      fresh sequence and 12x wrong at `l_last-1` the moment it was not. Both
+      convolutions now read a per-layer ring addressed by absolute position,
+      written by one 15-line kernel, which is what makes the store a pure
+      write and deletes the host-side `Carry` — which was itself wrong for any
+      run shorter than the window. [Write-up](research/l7b-sequence.md)
+- [x] Gate: 512 tokens in chunks of 128, of 9, and as 495 then seventeen
+      single ones give `result_norm` **identical to the last place**; the
+      control, every token its own sequence, is 1.785e+00 rms away.
+- [x] **L7c — the loop.** `llm/sample.go` (greedy by default, because the gate
+      is only a check if the sampler is a function of the logits alone) and
+      `cmd/llm -gen`. The stop condition is **not `eos_token_id`**. One
+      `madvise(MADV_RANDOM)` on the n-gram table is worth **176x** on the host
+      gather; a command buffer a block rather than a submit a dispatch is
+      worth 12% and prices a submit at 31 us.
+      [Write-up](research/l7c-decode.md) · `results/l7c_decode.csv`
+- [x] Gate: **llama.cpp's text**, diverging at one token where our top two
+      logits are 0.161 apart and re-converging within a sentence.
+      **7.46 tok/s against 25.15** — 30% of the 25.0 this bank's own 9.67 GB a
+      token allow (L7c-5) — and prefill unchanged at **950.3 tok/s, 2.43x**.
+
+### L7d — the decode kernels
+
+- [ ] The hyper-connection **down** projection as a K-split GEMV. It is 237.6
+      us of a 293.5 us mixer at **29 GB/s**, because 336 output columns is
+      about 21 workgroups on a 40-CU device; `gemv_w4a8.comp` does 99-103% of
+      the bus at M=1 (§1.1) and no rung of a GEMM ladder can supply the
+      parallelism.
+- [ ] A row block of **one** for the MoE at decode. The permutation pads each
+      expert's rows to 32 (L5b-3), so one token does **32x** the arithmetic
+      and the kernel is unpack-bound at 70 GB/s of bank.
+- [ ] One command buffer a **token** rather than a block. ~490 submits at 31
+      us is ~15 ms of 134; nothing in the shim prevents it — it binds each
+      pipeline's own descriptor set — so this is a graph-level change and not
+      a Vulkan one.
+- [ ] Gate: the same text, and tok/s against this bank's 25.0 ceiling.
 
 ### L8 — phase 2, our own bank
 
+- [ ] **Stop expanding the dense half**, which is 1.66x on the decode ceiling
+      before any re-quantisation: 8.07 GB a token of fp16 against 3.67 of the
+      Q8_0 the checkpoint ships (L7c-5). It would also leave enough page cache
+      for the 28.80 GB n-gram table, which L7c-3 measured at 8.5 ms a token
+      when there is not.
 - [ ] Choose per-tensor widths from L0d and L1's **PPL 4.0340**.
 - [ ] Re-quantise (transcode from the GGUF, or from bf16 with unsloth's
       published imatrix) into the §1.1 W4A8 layout with an L0c scale plane.
@@ -1650,7 +1919,8 @@ below Q8. Bandwidth is the whole story.
       tensor families per linear layer, or `kHeadOfV` is wrong on 32 of 48
       heads in 36 of 48 layers.
 - [ ] Gate: ~67 tok/s, ≤67 GB resident, perplexity within a stated delta of
-      **4.0340** on the same corpus, context and chunking.
+      **4.0340** on the same corpus, context and chunking — and the same text
+      at temperature zero for as long as L7c's is.
 
 ### L9 — phase 3, and shipping
 
@@ -1668,7 +1938,12 @@ below Q8. Bandwidth is the whole story.
     # ours
     go run ./cmd/gguf $M                      # the inventory and the decode budget
     go run ./cmd/gguf -tensors -kv $M         # every tensor, every metadata key
-    go run ./cmd/llm -tokenize 'hello world'  # generation arrives at L7
+    go run ./cmd/llm -tokenize 'hello world'
+    go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is'
+    go run ./cmd/llm -gen -model $M -n 64 -top 3      # the alternatives it beat
+    go run ./cmd/llm -gen -model $M -n 128 -temp 0.7 -top-p 0.8 -seed 1
+    go run ./cmd/llm -gen -model $M -n 16 -layers 4   # the loop, in 7 GB
+    go run ./cmd/llm -gen -model $M -n 64 -csv results/l7c_decode.csv
     go run ./cmd/llm -hc -model $M -tokens 512          # L2c's block, against L2a's table
     go run ./cmd/llm -hc -model $M -ladder -csv results/l2c_hc.csv
     go run ./cmd/llm -ple -model $M -csv results/l2d_ple.csv   # L2d's block
@@ -1699,6 +1974,8 @@ below Q8. Bandwidth is the whole story.
     # the reference implementation, the oracle, the baseline
     less $L/src/models/qwen4exp.cpp                  # 1279 lines, the whole architecture
     $L/build/bin/llama-bench -m $M -p 512,2048 -n 128 -r 2
+    $L/build/bin/llama-completion -m $M -n 128 --temp 0 -no-cnv \
+        -p 'The capital of France is'         # L7c's gate, the other side
     $L/build/bin/llama-eval-callback -m $M -p 'hello' -n 1   # per-tensor dumps
     $L/build/bin/llama-perplexity -m $M -f models/wikitext-2-raw/wiki.test.raw -c 2048 -b 2048
 
@@ -1744,6 +2021,15 @@ below Q8. Bandwidth is the whole story.
                                              # and llama.cpp's own logits
     go test ./llm/ -v -run TestArenaMemoryTypes  # L6b-4: what a mapped arena
                                              # costs the host, by memory type
+    go test ./llm/ -v -run TestAttnGPUCache  # L7a: the layer's cache as a
+                                             # chunk split, bit for bit, and
+                                             # the incremental block range
+    go test ./llm/ -v -run TestGraphIsAChunkSplit
+                                             # L7b: the model as a chunk
+                                             # split, down to one token, and
+                                             # the no-history control
+    go test ./llm/ -v -run 'TestArgmax|TestTopN|TestSampler'
+                                             # L7c: the sampler
     go test ./llm/ -v -run TestMove          # L6c: the arena-to-arena move,
                                              # value for value against the
                                              # host narrowing it replaced
@@ -1768,9 +2054,28 @@ below Q8. Bandwidth is the whole story.
 | D7 | **Symmetric Q4, not asymmetric.** | L0d: 1.043-1.053x at equal bits, where §7 predicted 2x. Revisit only if L9's perplexity asks for it. |
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
+| D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
+| D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
 
+- **Why is the hyper-connection block's `down` projection 8.3x off the bus at
+  one token, and is a K-split GEMV all of it?** L7c-6: 237.6 us a mixer at
+  **29 GB/s**, where the `up` projection beside it reads the same kind of
+  weight at 143. The difference that is visible is the grid — 336 output
+  columns is about 21 workgroups against `up`'s 640 — and §1.1's GEMV is the
+  shape that fixes it. What is not yet checked is whether 21 workgroups
+  explains the whole 8.3x or only the occupancy half of it, and the cheap way
+  to find out is to run the same weight through `gemv_w4a8`'s shape before
+  writing an epilogue for it.
+- **Does the MoE want a row block of one at decode, or a GEMV per expert?**
+  L7c-6: the permutation pads each expert's rows to 32 (L5b-3, which is what
+  let the epilogue skip LDS entirely), so one token does **32x** the
+  arithmetic and the kernel is unpack-bound at 70 GB/s of bank. A row block of
+  one keeps the whole tile machinery and removes the padding; a GEMV per
+  expert removes the cooperative matrices too, and §1.8-§1.12 have 25 grouped
+  builds of exactly that already measured. Which one wins is a question about
+  whether the unpack can feed a GEMV, not about the padding.
 - **L8's bf16 path has to replicate a head permutation, or it is a different
   model.** L3a-3 and vLLM between them: llama.cpp's converter reorders the 48
   V heads from HF's grouped order into tiled order — `in_proj_qkv`'s V rows,
@@ -1790,8 +2095,10 @@ below Q8. Bandwidth is the whole story.
   best measured rate, 1.1-1.6x at an honest one for 64x64x128 tiles with a
   serial triangular solve in the middle, and a *perfect* version saves 1.0% of
   the prefill graph while putting a recurrent state through fp16 operands.
-  **What is still open is the same question at decode**, where a chunk is a
-  token and the whole argument changes; that is L7's.
+  **At decode the question dissolves rather than changing**: a chunk is a
+  token, so a chunked kernel *is* the scan, and L7c measured the DeltaNet at
+  1.7x its own bytes — the closest of the three big blocks to the bus and not
+  where L7d's 4x is.
 - **Why is llama.cpp's own scan shape 6.3x better in its kernel than in
   ours?** L3b-3 ran the reference's decomposition — one state column per
   workgroup, 6144 workgroups, q and k re-read 128 times — and got 2766 us

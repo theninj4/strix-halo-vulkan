@@ -222,6 +222,13 @@ type AttnGPU struct {
 	tokens, arenaRows, rows int
 	nKV                     int
 	lda, ldCtx              int
+	// past is how many cells the cache already holds: token t of the next run
+	// is cell past+t and its position is past+t (L7a). Zero is a fresh
+	// sequence, which is every run before L7 and every test above L4.
+	past int
+	// layer is the one the last graph was built for, so that the read-back
+	// accessors below reach into that layer's cache rather than layer 0's.
+	layer int
 
 	// fp32 weight arena: four gammas a layer, then the rotary table.
 	wElems int
@@ -240,9 +247,18 @@ type AttnGPU struct {
 	// at a length where it does not bite and how the dense control runs at one
 	// where it does.
 	sparse bool
-	// fp16 activations.
-	hXn, hQ, hK, hV, hCtx, hIdxK, hIdxQ uint32
-	hElems                              int
+	// fp16 activations. hXn, hQ, hCtx and hIdxQ are this batch's and are
+	// overwritten by the next one.
+	hXn, hQ, hCtx, hIdxQ uint32
+	// The KV cache, in the same fp16 arena and **one plane per staged
+	// layer**: the key and the value as nKV cells of fragment tiles, the
+	// indexer's raw key per cell, and the pooled key per block (L7a). These
+	// are the only tensors in this vertical that outlive the run that wrote
+	// them, which is why they are strided by layer where everything else is
+	// shared.
+	hK, hV, hIdxRaw, hIdxK             uint32
+	kvStride, idxRawStride, idxKStride int
+	hElems                             int
 }
 
 // qkvN is the fused projection's output width: the query and its gate, the key,
@@ -279,6 +295,40 @@ func (g *AttnGPU) selWords() int { return (g.nKV + 31) / 32 }
 // that says the selection changes the attention output at all.
 func (g *AttnGPU) Sparse() bool     { return g.sparse }
 func (g *AttnGPU) SetSparse(v bool) { g.sparse = v }
+
+// Past is how many cells the cache holds before the next run, SetPast moves
+// it, and Reset starts a fresh sequence.
+//
+// Nothing is cleared: a cell past `past + nTok` is masked out of every score
+// and every softmax, so what a longer previous run left there is unreadable
+// rather than merely unread. What a fresh sequence does need is the whole
+// pooled block table rebuilt, and `blockRange` is where that is said.
+func (g *AttnGPU) Past() int { return g.past }
+func (g *AttnGPU) Reset()    { g.past = 0 }
+
+// SetPast places the next run's first token at cell n.
+func (g *AttnGPU) SetPast(n int) error {
+	if n < 0 || n >= g.nKV {
+		return fmt.Errorf("llm: cell %d of a %d-cell cache", n, g.nKV)
+	}
+	g.past = n
+	return nil
+}
+
+// blockRange is the half-open range of pooled indexer blocks a run rebuilds,
+// and llm_attn_idx.comp derives the same two numbers from the push block.
+//
+// A cell's contents never change, so a block is final as soon as all `ratio`
+// of its cells exist: a continuing run touches only the blocks its own tokens
+// completed. A fresh sequence rebuilds the whole table, because the blocks
+// past the last complete one pool cell 0 `ratio` times and have to be written
+// once before they can be left alone.
+func (g *AttnGPU) blockRange() (int, int) {
+	if g.past == 0 {
+		return 0, g.NBlocks()
+	}
+	return g.past / g.cfg.Ratio, (g.past + g.rows) / g.cfg.Ratio
+}
 
 // NBlocks is the indexer's block count: the cache's cell count over the
 // compress ratio, which at 7 tokens in a 256-cell cache is 64 — one real block
@@ -409,11 +459,26 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	plane := rows * c.HeadDim
 	g.hXn = halloc(rows * g.lda)
 	g.hQ = halloc(c.NHead * plane)
-	g.hK = halloc(c.NHeadKV * plane)
-	g.hV = halloc(c.NHeadKV * plane)
 	g.hCtx = halloc(rows * g.ldCtx)
-	g.hIdxK = halloc(g.NBlocks() * c.IdxDim)
 	g.hIdxQ = halloc(rows * c.IdxHeads * c.IdxDim)
+
+	// The cache, one plane a layer. A query plane is padded token *rows* of
+	// one batch; a key plane is the layer's nKV *cells* and outlives it, so
+	// the two geometries part company here and the shaders are told both.
+	//
+	// It is 2.31 KB a cell a layer — 1 KB of key, 1 KB of value, 256 B of the
+	// indexer's raw key and 64 B of its pooled block — so twelve layers are
+	// 27.7 KB a cell: 57 MB at 2048 cells, 906 MB at 32768. The one structural
+	// limit is that it shares a buffer with the arenas above and
+	// `maxStorageBufferRange` is 4 GiB - 4, which caps this at about 148k
+	// cells; past that the cache wants L6a's array-of-buffers, one a layer.
+	g.kvStride = c.NHeadKV * g.nKV * c.HeadDim
+	g.idxRawStride = g.nKV * c.IdxDim
+	g.idxKStride = g.NBlocks() * c.IdxDim
+	g.hK = halloc(nLayers * g.kvStride)
+	g.hV = halloc(nLayers * g.kvStride)
+	g.hIdxRaw = halloc(nLayers * g.idxRawStride)
+	g.hIdxK = halloc(nLayers * g.idxKStride)
 	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
@@ -667,6 +732,10 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	if layer < 0 || layer >= len(g.layers) {
 		return nil, nil, fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
+	if g.past < 0 || g.past+g.rows > g.nKV {
+		return nil, nil, fmt.Errorf("llm: %d tokens at cell %d of a %d-cell cache", g.rows, g.past, g.nKV)
+	}
+	g.layer = layer
 	c := g.cfg
 	w := g.layers[layer]
 	av, _ := attnVariantFor(g.attn)
@@ -679,8 +748,17 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	base := push{
 		Tokens: uint32(g.rows), NEmbd: uint32(c.NEmbd),
 		LDA: uint32(g.lda), Eps: math.Float32bits(c.Eps),
-		QKVOff: g.aQKV, QOff: g.hQ, KOff: g.hK, VOff: g.hV, CtxOff: g.hCtx,
-		IdxKOff: g.hIdxK, IdxQOff: g.hIdxQ,
+		QKVOff: g.aQKV, QOff: g.hQ, CtxOff: g.hCtx, IdxQOff: g.hIdxQ,
+		// The cache is this layer's, not the block's: four planes, each
+		// strided by the layer that filled it (L7a).
+		KOff:    g.hK + uint32(layer*g.kvStride),
+		VOff:    g.hV + uint32(layer*g.kvStride),
+		IdxKOff: g.hIdxK + uint32(layer*g.idxKStride),
+		// ATTN_IDXRAW and ATTN_PAST: two fields this layer does not otherwise
+		// use, because the push block is full at 64 uints. llm_common.glsl
+		// carries the mapping.
+		LoOff:    g.hIdxRaw + uint32(layer*g.idxRawStride),
+		LowRank:  uint32(g.past),
 		ScoreOff: g.aScore, CellOff: g.aCell, RopeOff: g.wRope,
 		GammaOff: w.gQ, GammaKOff: w.gK, GammaIQOff: w.gIQ, GammaIKOff: w.gIK,
 		Heads: uint32(c.NHead), KVHeads: uint32(c.NHeadKV), HeadDim: uint32(c.HeadDim),
@@ -708,12 +786,16 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
 	add(string(g.gemm), "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
 
-	// 2. Norm, rotary and the fragment tiling for q, k and v together.
-	add("pack", "pack", uint32(plane/coopMatTile), uint32(c.NHead+2*c.NHeadKV), base)
+	// 2. Norm, rotary and the fragment tiling for q, k and v together, plus
+	//    the one plane that is not a head: the indexer's raw key into its own
+	//    cell cache, which the pooling behind this dispatch reads.
+	add("pack", "pack", uint32(plane/coopMatTile), uint32(c.NHead+2*c.NHeadKV+1), base)
 
-	// 3. The indexer's two operands: one pooled key per block, one query per
-	//    (token, head).
-	units := maxInt(g.NBlocks(), g.rows)
+	// 3. The indexer's two operands: one pooled key per **newly completed**
+	//    block, one query per (token, head). A block whose cells all existed
+	//    before this batch is already in the table and is not dispatched.
+	lo, hi := g.blockRange()
+	units := maxInt(hi-lo, g.rows)
 	add("idx", "idx", uint32(units), uint32(1+c.IdxHeads), base)
 
 	// 4. Its score, the bias, the cells and the causal mask.
@@ -746,10 +828,12 @@ func (g *AttnGPU) Run(layer int) error {
 	if err != nil {
 		return err
 	}
-	for i := range d {
-		if _, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: attention dispatch %d (%s): %w", i, kinds[i], err)
-		}
+	// One command buffer for the whole block, not one a dispatch: a submit
+	// and a fence wait is ~150 us here and a decode step is a batch of one,
+	// so what the sequence costs is how many times it is handed over
+	// (LLM.md L7c).
+	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
+		return fmt.Errorf("llm: attention, %d dispatches (%v): %w", len(d), kinds, err)
 	}
 	return nil
 }
@@ -879,10 +963,17 @@ func (g *AttnGPU) Cells() []float32 {
 	return g.abuf.ReadFloat32At(int(g.aCell), g.rows*g.nKV)
 }
 
-// IdxK is the pooled, normed and rotated indexer key, [nBlocks][idxDim],
-// widened out of the fp16 arena.
+// IdxK is the pooled, normed and rotated indexer key of the layer the last
+// run was for, [nBlocks][idxDim], widened out of the fp16 arena.
 func (g *AttnGPU) IdxK() []float32 {
-	return g.readF16(g.hIdxK, g.NBlocks()*g.cfg.IdxDim)
+	return g.readF16(g.hIdxK+uint32(g.layer*g.idxKStride), g.NBlocks()*g.cfg.IdxDim)
+}
+
+// IdxRaw is the indexer's raw key cache, [nKV][idxDim] — the halves the
+// pooling above averages, which is where the reference's fp16 round trip
+// happens.
+func (g *AttnGPU) IdxRaw() []float32 {
+	return g.readF16(g.hIdxRaw+uint32(g.layer*g.idxRawStride), g.nKV*g.cfg.IdxDim)
 }
 
 // IdxQ is the indexer's query, [T][idxHeads][idxDim].
@@ -909,28 +1000,40 @@ func (g *AttnGPU) Context() []float32 {
 // reference's [T][heads][headDim]. They exist so that a disagreement in the
 // attention output can be located in the norm or the rotary instead of being
 // attributed to the kernel that consumed them.
-func (g *AttnGPU) Q() []float32 { return g.unpack(g.hQ, g.cfg.NHead, false) }
-func (g *AttnGPU) K() []float32 { return g.unpack(g.hK, g.cfg.NHeadKV, false) }
+func (g *AttnGPU) Q() []float32 {
+	av, _ := attnVariantFor(g.attn)
+	return g.unpack(g.hQ, g.cfg.NHead, roundUpInt(g.rows, maxInt(av.rows, av.keys)), 0, false)
+}
+
+// K and V are the *cache's* rows for this run's tokens: cells past..past+T of
+// the layer the last run was for, which on a fresh sequence is 0..T and is
+// what every test above L4 compares.
+func (g *AttnGPU) K() []float32 {
+	return g.unpack(g.hK+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
+}
 
 // V is the same, out of the transposed tiling the value is stored in.
-func (g *AttnGPU) V() []float32 { return g.unpack(g.hV, g.cfg.NHeadKV, true) }
+func (g *AttnGPU) V() []float32 {
+	return g.unpack(g.hV+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, true)
+}
 
-func (g *AttnGPU) unpack(off uint32, heads int, transposed bool) []float32 {
+// unpack reads g.rows rows out of a packed plane of `plane` rows, starting at
+// row `first`, and un-tiles them into the CPU reference's [T][heads][headDim].
+func (g *AttnGPU) unpack(off uint32, heads, plane, first int, transposed bool) []float32 {
 	const tile = coopMatTile
 	c := g.cfg
-	av, _ := attnVariantFor(g.attn)
-	plane := roundUpInt(g.rows, maxInt(av.rows, av.keys))
 	hdt := c.HeadDim / tile
 	raw := g.hbuf.ReadUint16At(int(off), heads*plane*c.HeadDim)
 	out := make([]float32, g.rows*heads*c.HeadDim)
 	for h := 0; h < heads; h++ {
 		for t := 0; t < g.rows; t++ {
+			r := first + t
 			for d := 0; d < c.HeadDim; d++ {
-				idx := (h*(plane/tile)+t/tile)*(hdt*tile*tile) + (d/tile)*(tile*tile)
+				idx := (h*(plane/tile)+r/tile)*(hdt*tile*tile) + (d/tile)*(tile*tile)
 				if transposed {
-					idx += (d%tile)*tile + t%tile
+					idx += (d%tile)*tile + r%tile
 				} else {
-					idx += (t%tile)*tile + d%tile
+					idx += (r%tile)*tile + d%tile
 				}
 				out[(t*heads+h)*c.HeadDim+d] = safetensors.F16ToF32(raw[idx])
 			}

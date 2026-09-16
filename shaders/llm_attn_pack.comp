@@ -17,7 +17,24 @@
 //
 //	plane < heads                   query head p        norm, rope, scale
 //	plane < heads + kvHeads         key head p-heads    norm, rope
-//	otherwise                       value head          neither
+//	plane < heads + 2*kvHeads       value head          neither
+//	the one after that              the indexer's raw key, copied
+//
+// **The key and the value go into the cache, the query does not** (L7a). A
+// query plane is `plane` padded token rows of this batch and is read once by
+// the kernel behind this one; a key plane is the layer's own nKV cells and
+// outlives the batch. So the store below scatters by *cell* — token t of the
+// run is cell SEQ_PAST + t — and a batch boundary is allowed to fall in the
+// middle of a 16-row fragment tile, which is why it is an element scatter and
+// not a tile copy. The rotary follows the same position: SEQ_PAST + t, not t.
+//
+// The last plane is the one thing here that is not a head at all. The
+// indexer's key is pooled `ratio` cells at a time and at decode those cells
+// arrive in `ratio` separate batches, so the raw key needs a cache of its own
+// — 128 halves a cell against the key's 512 — and this is the pass that has
+// its fp32 row already addressed. It is a plane of this kernel rather than a
+// dispatch of its own because llm_attn_idx.comp *reads* it, and two dispatches
+// are how that ordering is guaranteed.
 //
 // The query's *gate* is the other half of each of its heads and is not touched
 // here at all: it is consumed by the attention kernel's epilogue straight out
@@ -84,9 +101,30 @@ void main() {
 
     uint qWidth = pc.heads * 2u * pc.headDim;
     uint kvWidth = pc.kvHeads * pc.headDim;
+    uint past = SEQ_PAST;
+
+    // The indexer's raw key cache: a straight fp16 copy of this batch's cells,
+    // no norm and no rotary, both of which llm_attn_idx.comp does after the
+    // pooling. The rounding to halves is the reference's own — the cache it
+    // pools out of is fp16 (research/l2e-attention.md) — so this is where that
+    // round trip happens now rather than inside the pooling loop.
+    if (p == pc.heads + 2u * pc.kvHeads) {
+        uint idxKCol = qWidth + 2u * kvWidth + pc.idxHeads * pc.idxDim;
+        for (uint i = tid; i < TILE * pc.idxDim; i += WG) {
+            uint m = i / pc.idxDim, d = i % pc.idxDim;
+            uint token = tok0 + m;
+            if (token >= pc.tokens) {
+                continue;
+            }
+            hact[ATTN_IDXRAW + (past + token) * pc.idxDim + d] =
+                float16_t(act[pc.qkvOff + token * pc.gemmN + idxKCol + d]);
+        }
+        return;
+    }
 
     uint head, srcCol, gamma, outOff;
     bool rot;
+    bool cached;                     // key and value: cells, not token rows
     uint mode;                       // 0 natural tiles, 1 transposed
     float scale = 1.0;
     if (p < pc.heads) {
@@ -95,6 +133,7 @@ void main() {
         gamma = pc.gammaOff;
         outOff = pc.qOff;
         rot = true;
+        cached = false;
         mode = 0u;
         scale = uintBitsToFloat(pc.attnScale);
     } else if (p < pc.heads + pc.kvHeads) {
@@ -103,6 +142,7 @@ void main() {
         gamma = pc.gammaKOff;
         outOff = pc.kOff;
         rot = true;
+        cached = true;
         mode = 0u;
     } else {
         head = p - pc.heads - pc.kvHeads;
@@ -110,6 +150,7 @@ void main() {
         gamma = NO_W;
         outOff = pc.vOff;
         rot = false;
+        cached = true;
         mode = 1u;
     }
 
@@ -159,7 +200,7 @@ void main() {
         uint sinTab = pc.ropeOff + pc.nKV * rotHalf;
         for (uint i = tid; i < pairs; i += WG) {
             uint m = i / rotHalf, j = i % rotHalf;
-            uint pos = tok0 + m;
+            uint pos = past + tok0 + m;
             if (pos >= pc.nKV) {
                 continue;            // a pad row: its rotation is unobservable
             }
@@ -173,8 +214,14 @@ void main() {
         barrier();
     }
 
-    // Coalesced out: consecutive lanes write consecutive halves of one tile.
+    // Out. The query is a whole tile of this batch's plane and consecutive
+    // lanes write consecutive halves of it. The key and the value are cells of
+    // the layer's cache, and `past` need not be a multiple of the tile, so
+    // each element is placed by its own cell — sixteen-wide runs rather than
+    // one 512-byte one, which for the two kv heads is not where this kernel's
+    // time is.
     uint base = outOff + (head * (pc.plane / TILE) + tt) * (HDT * TILE * TILE);
+    uint cellTiles = pc.nKV / TILE;
     for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
         uint c = o / (TILE * TILE);
         uint rem = o % (TILE * TILE);
@@ -186,6 +233,20 @@ void main() {
             m = rem % TILE;              // transposed: (component, token)
             d = c * TILE + rem / TILE;
         }
-        hact[base + o] = float16_t(rows[m * HEAD_DIM + d] * scale);
+        float v = rows[m * HEAD_DIM + d] * scale;
+        if (!cached) {
+            hact[base + o] = float16_t(v);
+            continue;
+        }
+        uint token = tok0 + m;
+        if (token >= pc.tokens) {
+            continue;                    // a pad row is not a cell
+        }
+        uint cell = past + token;
+        uint dst = outOff + (head * cellTiles + cell / TILE) * (HDT * TILE * TILE)
+            + c * (TILE * TILE)
+            + ((mode == 0u) ? (cell % TILE) * TILE + rem % TILE
+                            : (rem / TILE) * TILE + cell % TILE);
+        hact[dst] = float16_t(v);
     }
 }

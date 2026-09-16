@@ -33,15 +33,20 @@
 // grouped RMS and llm_attn_pack.comp about the per-head one. Reducing over
 // the 2048-wide q range would be plausible and wrong.
 //
-// **The convolution's history is three rows of negative token index.** The
-// host puts the fused projection's output at `qkvOff` with Conv-1 rows of the
-// previous batch's tail *in front of it*, so a tap that reaches before token
-// zero is an ordinary read at a negative offset — `uint` arithmetic wraps to
-// exactly the right address — and a fresh sequence is those rows zeroed. A
-// kernel that carries the [128, 128, 48] recurrent state and forgets this
-// 120 KB window is wrong in a way nothing but a batch-split test sees
-// (research/l3-deltanet.md finding 6), and at decode it would be wrong on
-// every token.
+// **The convolution's history is three rows of a per-layer ring** (L7b). A tap
+// that reaches before this run's first token reads SEQ_HIST at `position
+// modulo kern-1`, and a tap that reaches before *position zero* contributes
+// nothing. A kernel that carries the [128, 128, 48] recurrent state and
+// forgets this 120 KB window is wrong in a way nothing but a batch-split test
+// sees (research/l3-deltanet.md finding 6), and at decode it would be wrong
+// on every token.
+//
+// It is **per layer**, which the arrangement it replaces was not: the window
+// used to be Conv-1 rows of negative token index in front of the projection's
+// own output, and that arena is shared by all 36 layers. Nothing saw it while
+// a pass was a fresh sequence — every layer read zeros there — and it is
+// wrong the moment one layer's tail is left behind for the next run, because
+// the layer after it would read it (L7b-2).
 //
 // **softplus is ggml's, cutoff and all.** `log(1 + exp(x))` evaluated in f32
 // flushes to exactly zero below about -16.6 rather than to exp(x), and the
@@ -102,10 +107,17 @@ void main() {
     // Four taps along the token axis. Consecutive lanes read consecutive
     // channels of one token, so each tap is one coalesced run; the history
     // rows are the same read at a wrapped offset.
+    uint past = SEQ_PAST;
+    uint hist = max(pc.kern - 1u, 1u);
     float sum = 0.0;
     for (uint k = 0u; k < pc.kern; k++) {
         uint back = pc.kern - 1u - k;
-        uint row = pc.qkvOff + uint(int(t) - int(back)) * pc.gemmN;
+        if (back > past + t) {
+            continue;                 // before the sequence started: zero
+        }
+        uint row = (back <= t)
+            ? pc.qkvOff + (t - back) * pc.gemmN
+            : SEQ_HIST + ((past + t - back) % hist) * pc.gemmN;
         sum += wbuf[pc.convOff + c * pc.kern + k] * act[row + c];
     }
     float v = siluf(sum);

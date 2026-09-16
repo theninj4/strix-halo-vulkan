@@ -1990,6 +1990,16 @@ var LLMPLEGate []byte
 //go:embed llm_ple_conv.spv
 var LLMPLEConv []byte
 
+// LLMSeqHist stores a run's last rows into a convolution's ring, so that the
+// next run can reach behind itself (L7b). One kernel for the PLE block and
+// the gated DeltaNet both, because the shape is the same; it is a pure write
+// — the older slots of the ring are already what they should be — which is
+// what lets a one-token decode step cost one row and no read.
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_seq_hist.spv llm_seq_hist.comp
+//go:embed llm_seq_hist.spv
+var LLMSeqHist []byte
+
 // The full-attention layer and the QSA indexer (LLM.md L2f): 12 of the 48
 // layers, and 5.64% of llama.cpp's prefill graph in 19 dispatches a layer.
 //

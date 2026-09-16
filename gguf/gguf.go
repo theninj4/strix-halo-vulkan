@@ -37,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"syscall"
+	"unsafe"
 )
 
 // Magic is the four bytes every GGUF file starts with.
@@ -177,6 +178,33 @@ type Tensor struct {
 	Dims  []int64 // ggml order: Dims[0] is the fastest-varying axis
 	Data  []byte
 	Shard int // index into Set.Files, 0 for a single file
+}
+
+// AdviseRandom tells the kernel that this tensor's pages will be read at
+// random, so that a fault brings in one page rather than a readahead window.
+//
+// It exists for one tensor: `per_layer_token_embd` is 28.80 GB of n-gram
+// lookup table that a token reads **sixteen rows** of, 90 bytes each and
+// nowhere near each other (LLM.md D2). The default readahead turns those
+// sixteen faults into sixteen 128 KB reads — 2 MB to deliver 1.41 KB — which
+// is invisible at prefill, where a batch amortises it, and is a decode step's
+// largest single cost.
+//
+// The range is trimmed to whole pages, because madvise takes an aligned
+// address; the partial pages at either end belong to a neighbouring tensor
+// and their advice is not ours to set.
+func (t *Tensor) AdviseRandom() error {
+	if len(t.Data) == 0 {
+		return nil
+	}
+	page := uintptr(syscall.Getpagesize())
+	base := uintptr(unsafe.Pointer(&t.Data[0]))
+	lo := (base + page - 1) &^ (page - 1)
+	hi := (base + uintptr(len(t.Data))) &^ (page - 1)
+	if hi <= lo {
+		return nil
+	}
+	return syscall.Madvise(t.Data[lo-base:hi-base], syscall.MADV_RANDOM)
 }
 
 // Elems is the number of elements in the tensor.

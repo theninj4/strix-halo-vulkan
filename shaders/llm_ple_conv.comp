@@ -13,10 +13,16 @@
 // The convolution is depthwise over all 10240 channels with K = 4 taps
 // **dilated by the n-gram size**, so it reaches 0, 3, 6 and 9 tokens back —
 // which makes it the second recurrent thing in this model after DeltaNet.
-// This kernel is prefill from position zero, so anything before the first
-// token is zero; at decode those positions come from a 9-token history that
-// llama.cpp keeps in a row of its recurrent cache, and L7 is where that
-// history has to exist.
+//
+// **That history now exists** (L7b). A tap that reaches behind the run reads
+// SEQ_HIST, a ring of `(kern-1)*dil` normed rows addressed by **position
+// modulo its length** — 9 rows of 10240 floats, 368 KB, against the 168 MB a
+// whole context's worth of this tensor would be. A ring and not a shifted
+// window because the update behind this dispatch then never reads a slot it
+// writes: the only positions it has to store are this run's own last nine,
+// and every older slot is already what it should be. Position 0 is still
+// zero, and on a fresh sequence SEQ_PAST is 0 and every tap below is what L2d
+// measured.
 //
 // One thread is one channel of one token. The taps are a gather along the
 // token axis with a stride of dil*wide floats, so consecutive threads always
@@ -40,13 +46,18 @@ void main() {
         return;
     }
 
+    uint past = SEQ_PAST;
+    uint hist = (pc.kern - 1u) * pc.dil;
     float sum = 0.0;
     for (uint k = 0u; k < pc.kern; k++) {
         uint back = (pc.kern - 1u - k) * pc.dil;
-        if (back > t) {
-            continue;
+        if (back > past + t) {
+            continue;                 // before the sequence started: zero
         }
-        sum += wbuf[pc.convOff + c * pc.kern + k] * act[pc.normOff + (t - back) * wide + c];
+        float v = (back <= t)
+            ? act[pc.normOff + (t - back) * wide + c]
+            : act[SEQ_HIST + ((past + t - back) % hist) * wide + c];
+        sum += wbuf[pc.convOff + c * pc.kern + k] * v;
     }
     float o = sum / (1.0 + exp(-sum));
     if (pc.convOutOff != NO_W) {

@@ -57,6 +57,13 @@ func main() {
 	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
 	moe := flag.Bool("moe", false, "benchmark the MoE block")
 	graph := flag.Bool("graph", false, "run the whole model end to end, tokens to logits, and report tok/s")
+	gen := flag.Bool("gen", false, "generate: prefill the prompt, then decode one token at a time")
+	nPredict := flag.Int("n", 64, "for -gen: how many tokens to generate")
+	temp := flag.Float64("temp", 0, "for -gen: sampling temperature; 0 is greedy, which is what a comparison needs")
+	topK := flag.Int("top-k", 0, "for -gen: keep the k highest logits, 0 for all")
+	topP := flag.Float64("top-p", 0, "for -gen: nucleus mass, 0 or 1 for all")
+	seed := flag.Int64("seed", 0, "for -gen: the sampler's seed")
+	showTop := flag.Int("top", 0, "for -gen: print the n highest logits beside each token, on stderr")
 	prompt := flag.String("prompt", graphDefaultPrompt, "the text -graph prefills; repeated to reach -tokens")
 	resident := flag.Bool("resident", false, "stage every layer of every block on the device and report the plan")
 	dense := flag.Bool("dense", false, "for -resident: leave the 77 GB expert bank out and stage the dense half alone")
@@ -78,6 +85,21 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *gen {
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		if err := generate(genOpts{
+			model: *model, prompt: *prompt, n: *nPredict, ctx: *ctx, layers: layers,
+			temp: *temp, topK: *topK, topP: *topP, seed: *seed, chat: *chat, top: *showTop,
+			csv: *csvPath,
+		}); err != nil {
 			log.Fatal(err)
 		}
 		return
