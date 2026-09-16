@@ -88,6 +88,23 @@ func (o GraphOpts) denseQ8() bool { return !o.DenseFP16 && DenseQ8() }
 // is the control, on the precedent of L6b's `LLM_ARENA_UNCACHED`.
 func DenseQ8() bool { return os.Getenv("LLM_DENSE_FP16") != "1" }
 
+// DecodeGEMV is whether the one-token kernels L8d added are in use: the MoE's
+// expert GEMVs and split-K router, and the dense split-K GEMV under the gated
+// DeltaNet's two projections. They are the default; `LLM_DECODE_GEMM=1` puts
+// every one of them back on the cooperative-matrix GEMM that ran before L8d,
+// which is the control the write-up's numbers are measured against — and the
+// only way to run the two side by side over one prompt, since a block chooses
+// its rung from the batch and not from a flag at the call site.
+//
+// The two paths do not compute the same numbers, and the difference is the
+// order of a sum rather than the weights: a cooperative-matrix accumulator
+// adds sixteen k an instruction in an order the extension does not define,
+// where a GEMV lane adds them serially and a split-K reduce adds the slabs
+// afterwards. It is f32 round-off over a 2560-long chain — rms 1.7e-05 on a
+// projection whose scale is 31.5 — and at temperature zero over a hundred
+// tokens it is enough to re-word a sentence. See L8d's gate.
+func DecodeGEMV() bool { return os.Getenv("LLM_DECODE_GEMM") != "1" }
+
 // blockKind says which sublayer a layer's attention half is, and where in its
 // block's staged list it sits.
 type blockKind struct {
@@ -228,7 +245,20 @@ func (g *Graph) flush() error {
 // different association of the same products, and at one token it is the rung
 // the schedule picks. So the exactness claim is now conditional on the
 // schedule, and this is what lets a test say which half it is testing.
+// **L8d widened it.** The one-token kernels that stage replaces — the MoE's
+// expert GEMVs, its split-K router and the split-K GEMV under the DeltaNet's
+// two projections — are not bit-exact against the GEMMs they replace either,
+// and for the same reason: a cooperative-matrix accumulator sums sixteen k an
+// instruction in an order the extension does not define, a GEMV lane sums them
+// serially, and a split-K reduce adds the slabs afterwards. So the pin now
+// covers four blocks rather than one.
 func (g *Graph) PinSchedule(on bool) error {
+	if g.moe != nil {
+		g.moe.PinGemv(on)
+	}
+	if g.dn != nil {
+		g.dn.PinGemv(on)
+	}
 	if !on {
 		g.hc.AutoPlan()
 		return nil

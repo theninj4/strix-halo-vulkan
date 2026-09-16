@@ -1,0 +1,100 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// `ffn_gate_inp` at **one token**: LLM.md L8d.
+//
+// The router is a [513, 2560] fp16 matrix — 512 experts and the shared
+// expert's gate as a 513th column (L5b) — and 2.63 MB is the smallest weight
+// in this block by two orders of magnitude. It was also **27.7% of the block
+// at decode**: 64 us at 41 GB/s, where the two expert GEMVs beside it reach
+// 235 and 345.
+//
+// It is D11 for the fourth time and the same cure L7d applied to the
+// hyper-connection down projection. `llm_gemm.comp` blocks the *output*
+// columns at 64, so 576 padded columns are **nine workgroups** on a 40-CU
+// device, each dragging 288 KB of weight through one wave with fifteen of
+// every sixteen rows of its A fragment padding. At M=1 the parallelism cannot
+// come from N — N is the output, and there are 513 of them. It has to come
+// from K, which is 2560.
+//
+// So this is llm_hc_gemv.comp's split-K over the same §2.8 fragment tiling,
+// with that kernel's arithmetic unchanged and its epilogue removed:
+//
+//   MODE 0  (s, nt) -> partial[s][nt*16 .. nt*16+16)     KSLABS x 36 groups
+//   MODE 1  sum over s -> the logits row
+//
+// A wave is four k-tiles by sixteen columns, a lane owns one column and
+// sixteen consecutive k of it, and the four lanes sharing a column are
+// lane, lane^16, lane^32 — two shuffles and no LDS, because within an n-tile
+// the tiles of consecutive kt are contiguous and a step is 2 KB read straight
+// through.
+//
+// **KSLABS is §5.1b's 4 KB period, D12, and the table is a different one
+// here** because the matrix is a different size: a slab is
+// `(gemmK/16/KSLABS) * 512` bytes, so at 8/10/20/40 slabs it is
+// 10240/8192/4096/2048 — 2.5, 2, 1 and 0.5 times 4 KB — and the rule says the
+// two whole multiples lose. 160 k-tiles must divide into whole four-tile
+// steps, so KSLABS has to divide 40.
+
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0
+#endif
+#ifndef KSLABS
+#define KSLABS 40
+#endif
+
+#define TILE 16
+#define WAVE 64
+
+layout(local_size_x = WAVE) in;
+
+void main() {
+#if MODE == 0
+    uint slab = gl_WorkGroupID.x;                // which stripe of K
+    uint nt = gl_WorkGroupID.y;                  // which 16 output columns
+    uint ktiles = pc.gemmK / TILE;
+    uint perSlab = ktiles / KSLABS;
+    uint kt0 = slab * perSlab;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint col = lane % TILE;                      // the output column this lane owns
+    uint sub = lane / TILE;                      // which of the four tiles of a step
+    uint xbase = pc.xnOff + kt0 * TILE;
+    uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE) + lane * TILE;
+
+    float sum = 0.0;
+    for (uint c = 0u; c < perSlab; c += 4u) {
+        uint w = wbase + c * (TILE * TILE);
+        uint x = xbase + (c + sub) * TILE;
+        [[unroll]] for (uint i = 0u; i < TILE; i++) {
+            sum += float(w16[w + i]) * float(hact[x + i]);
+        }
+    }
+
+    sum += subgroupShuffleXor(sum, 16u);
+    sum += subgroupShuffleXor(sum, 32u);
+    if (sub == 0u) {
+        // The partials ride `gammaOff`, which is what llm_hc_gemv.comp does
+        // with the same tensor and for the same reason: the push block is 64
+        // uints, this device's whole range, and the MoE reads no norm.
+        act[pc.gammaOff + slab * pc.gemmN + nt * TILE + col] = sum;
+    }
+#else
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.gemmN) {
+        return;
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
+        sum += act[pc.gammaOff + s * pc.gemmN + n];
+    }
+    act[pc.outOff + n] = sum;
+#endif
+}

@@ -11,10 +11,11 @@ the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
 **Status: the model generates, it generates llama.cpp's text, and phase 2's
-first half is finished.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
+kernel half is finished.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
-and now L8a and L8b, which between them put every dense weight in the model
-on the width the checkpoint already ships.** The checkpoint is downloaded,
+L8a and L8b, which between them put every dense weight in the model
+on the width the checkpoint already ships, and now L8d, which gives the two
+blocks that dominate a decode step a kernel shaped for one row.** The checkpoint is downloaded,
 llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
 there is a kernel for every layer and every sub-layer: the hyper-connection
 block in four dispatches where the reference has sixteen (4.24x, 14.9% of
@@ -152,16 +153,36 @@ against 14.07, a token is 6.05 GB against a ceiling of 40.0 tok/s, residency
 81.89 GB, prefill unchanged at 1041.1 — and every tensor of the block is
 identical to the fp16 bank's on all fifteen rungs.**
 
-**Next: L8d, and it is a reordering.** Phase 2's plan was two bank stages and
-then the re-quantisation, but L8a and L8b between them moved the attribution:
-two stages of bank work bought 1.24x at decode and left **the MoE at 56 GB/s
-of a 242 GB/s bus, 4.3x off its own bytes and 42% of a token**, where the lm
-head — the same kernel family, the same kind of bank — holds 194 and is 1.25x
-off. **If every block ran at the head's rate a token would be 31 ms rather
-than 68: 32 tok/s, from kernel work alone, with no bank change and so no
-accuracy to argue about.** That is worth more than L8c's ~1.9x on the dense
-half and it is collected first; the re-quantisation follows it, onto a faster
-baseline.
+**L8d took the kernels before the widths, and it is 1.57x on decode with no
+bank change at all.** Phase 2's plan was two bank stages and then the
+re-quantisation; L8a and L8b moved the attribution instead, leaving the MoE at
+56 GB/s of a 242 GB/s bus and 42% of a token where the lm head holds 194 on
+the same kernel family. **Decode is 23.15 tok/s against 14.71, prefill 1049.8
+at ubatch 2048 against 1041.1 and 653.9 at 512 against 643.4 — faster on both
+— and a token is 43.0 ms against 66.7.** The MoE block is 27.6 ms a token to
+**12.05** (2.29x, 58 GB/s of bank to **133**) and the gated DeltaNet 18.9 to
+**11.0** (1.72x, 119 to 205).
+
+Five of the six findings are D11 — *read a dispatch's shape off its grid* —
+and the sixth is D12. **The MoE's tile grid was a static upper bound of 2052
+records where eleven exist**, because `maxRows` lets all 512 experts be padded
+and a one-token batch routes ten rows: 82 080 workgroups to run 11, and the
+reason the first GEMV ladder read as a catastrophe. **`llm_moe_gemv.comp` is
+the expert GEMM at one token** — LPR lanes a column, no LDS slab, no barrier
+in the K loop and no fragment, since §2.2's rule is about a cooperative-matrix
+fragment and a dot product has none — 2.46-6.17x a dispatch and **3.06x on the
+block**. **The router was nine workgroups** and its split-K is 11.8x; **the
+combine was one workgroup**, and its new grid needed the column block on the
+*x* axis, which is 7.8x at decode and 1.35x at prefill where the obvious order
+was 9.2x slower than the single workgroup it replaced. **`llm_gemv.comp` is
+the same finding on the dense projections**: the DeltaNet's layer 454.0 us to
+242.5, with D12 picking k8 for a K of 2560 and k32 for one of 6144. Nothing
+reads a different weight; what changes is the order of a sum, and at
+temperature zero it re-words the `<think>` block at **one token whose top two
+logits are 0.012 apart**.
+
+**Next: L8c, the re-quantisation, onto a baseline that is 1.57x faster than
+the one it was planned against.**
 
 ## The number to beat
 
@@ -1547,6 +1568,102 @@ decode at 14.71 tok/s, the block 2.14x at one token.
 > top ten with the drift unchanged, and `-gen -n 128` is L7c's completion
 > down to `Lisbon.`
 
+## What L8d established — the decode kernels, and five grids said the same thing
+
+`shaders/llm_moe_gemv.comp`, `shaders/llm_moe_router.comp`,
+`shaders/llm_gemv.comp`, `shaders/llm_moe_combine.comp`, `llm/gpu_moe.go`,
+`llm/gpu_deltanet.go`, `llm/bank.go`, `llm/graph.go`: decode at 23.15 tok/s,
+the MoE block 3.06x and the DeltaNet layer 1.87x at one token.
+[Write-up](research/l8d-moe-decode.md) · `results/l8d_decode.csv` ·
+`results/l8d_decode_gemm.csv` · `results/l8d_graph.csv` ·
+`results/l8d_moe.csv` · `results/l8d_dn.csv`
+
+> **L8d-1: the MoE's tile grid was a static bound of 2052 records where eleven
+> exist, and it is a dispatch and not a bookkeeping number.** The grouped GEMM
+> dispatches an upper bound of (expert, row block) records because the real
+> count is built on the device, and the bound was `maxRows/bm` — which lets
+> **every one of the 512 experts** have an alignment of slack, right for the
+> row space and wrong for the tile list. A batch of `rows` tokens routes
+> `rows * used` rows and so pads at most that many experts: **ten**, at one
+> token. At the GEMM's own BN of 64 the down mode was 40 x 2052 = 82 080
+> workgroups to run 11, ~33 us a layer at about 0.5 ns an empty launch. The
+> new bound is exact at one token and 1.74x tighter at 512. **It is also why
+> the first GEMV ladder read as a failure** — the routed down mode at BN=16
+> measured 481 us against the GEMM's 84, of which 330 was empty launches, and
+> at BN=1 it was 3666 us for 5.25 M of them. A kernel whose whole purpose is a
+> narrower column block cannot be measured against a grid bound that
+> multiplies with it.
+>
+> **L8d-2: the combine was one workgroup, and its grid has an axis order worth
+> 9.2x.** `ffn_out` at one token was a single 256-lane workgroup walking 2560
+> columns — 112 KB of reads on a 40-CU device, 22 us at 6 GB/s. Splitting the
+> column axis is one line and is **7.8x**. But the obvious spelling puts the
+> token on x, and Vulkan varies x fastest: consecutive workgroups are then
+> consecutive *tokens* at the same 256-byte slice, and a token's eleven rows
+> are 10 KB apart in a 566 MB arena. At ubatch 2048 that was **815 us to
+> 7505**. With the column block on x the forty workgroups of one token walk
+> its rows end to end: **1104.9 us at 228 GB/s**, 1.35x faster than the single
+> workgroup it replaced, at prefill as well as decode.
+>
+> **L8d-3: the router was nine workgroups, and D12 does not reach it.**
+> `ffn_gate_inp` is [513, 2560] fp16, 2.63 MB — the smallest weight in the
+> block by two orders of magnitude and **27.7% of it at decode**, 64 us at 41
+> GB/s. 576 padded columns at BN=64 is nine workgroups, so the parallelism has
+> to come from K: `llm_moe_router.comp` is L7d's split-K over the same §2.8
+> tiling with no epilogue, **4.4 us plus a 1.0 us reduce, 11.8x**. Its KSLABS
+> ladder is **flat** — 4.6/4.5/4.9/4.3 us at 8/10/20/40 — where the same
+> kernel spans 2.4x on the hyper-connection block, because §5.1b's 4 KB
+> rotation is a DRAM channel effect and 2.63 MB never leaves the MALL. The
+> logits are checked as numbers *and* the top ten as a sequence, since a
+> router's output is discrete: rms 3.4e-05, **0 of 10 slots differ**.
+>
+> **L8d-4: at one token the expert GEMM is the wrong kernel, and a dot product
+> has no fragment.** L5b's slab-into-LDS arrangement is right at prefill,
+> where the unpack is amortised over 16 to 64 rows, and at decode there is
+> **one** row: fifteen sixteenths of every row block is padding and the K-loop
+> is a barrier, a dependent load and a consume with one wave in flight. L7d
+> narrowed BN and got 71 to 93 GB/s and no further. `llm_moe_gemv.comp` drops
+> the slab, the barrier and the cooperative matrix — §2.2's rule is about a
+> *fragment*, and this has none — so a lane unpacks its own dwords into
+> registers and a whole row's loads are in flight at once. Microseconds a
+> layer: routed up 196.5 to **78.1** (94 GB/s to 236), routed down 84.9 to
+> **34.5** (145 to 356), shared up 75.9 to **12.3** (46 to 284), shared down
+> 11.8 to **7.3**; the block **464.5 to 152.0, 3.06x**, and 58 GB/s to 133 end
+> to end. **The lane count inverts between two dispatches of the same kernel**
+> — the routed pair wants LPR=16 and the shared expert LPR=64, because Q4_K
+> packs 320 payload dwords into a 2560-long row and Q8_0 packs 640.
+>
+> **L8d-5: the same finding on the dense projections, and D12 *does* reach
+> them.** `llm_gemv.comp` is the split-K with the hyper-connection epilogue
+> removed, so it serves any `llm_gemm.comp` MODE 2 caller over either bank,
+> tail and all. The gated DeltaNet — 36 of the 48 layers — goes **454.0 us a
+> layer to 242.5**: qkv 316.8 to 199.1 and out 124.3 to 26.7, which is 5.4x on
+> a projection whose grid was 40 workgroups. A slab is
+> `(gemmK/16/KSLABS) * 256` bytes, so **the rung moves with K**: at K = 2560
+> the whole multiples of 4 KB are 1 and 2 slabs (275.8 and 308.9 us against
+> k8's 196.2) and at K = 6144 they are 1, 4 and 8 (32.8, 25.8, 30.7 against
+> k32's 22.0). A ladder measured on one matrix does not carry to another of
+> the same kernel.
+>
+> **L8d-6: nothing reads a different weight, and the text moves at one token
+> anyway.** Every byte is staged as L5b and L8a staged it; what changes is the
+> order of a sum — a cooperative-matrix accumulator adds sixteen k an
+> instruction in an undefined order, a GEMV lane adds them serially, a split-K
+> reduce adds the slabs afterwards. Against the GEMM over one token that is
+> rms 2.5e-06 on the MoE's `ffn_out` (scale 0.032), 1.75e-05 on the DeltaNet's
+> fused projection (31.5) and 3.4e-05 on the router's logits (7.46), and it
+> **does not move with the rung** — every split of the qkv lands within 0.2%
+> of the same number, where a mis-read scale plane would be different at each.
+> `TestGraphLogits` is unchanged (argmax 561, llama.cpp's own top ten, the
+> drift the same x1.085 a layer) and `Graph.PinSchedule` now covers four
+> blocks, so `TestGraphIsAChunkSplit`'s equalities hold to the last place.
+> **At temperature zero the `<think>` block re-words at completion token 47**,
+> where the top two logits are **0.012 apart** against the 3-25 that decide
+> the tokens either side — the same class of thing L7c's own 0.161 divergence
+> from llama.cpp is, an order of magnitude tighter. The capitals list and
+> `Lisbon.` are identical, and `LLM_DECODE_GEMM=1` reproduces L7c's completion
+> exactly.
+
 ---
 
 ## The three findings that set the direction
@@ -1636,12 +1753,15 @@ bit-identical arithmetic (L8a-1), and the token falls from 9.67 GB to 6.61:
 with the hyper-connection block** — the split that had to fall on a column
 block, the GEMV that had to round in fp16, and the collapse scratch that had
 to shrink before the unpack could be amortised: **decode 14.71 tok/s, a token
-6.05 GB, the ceiling 40.0, prefill unchanged**. Nothing in the model computes
-anything different yet — **and the bytes have stopped being the thing to
-fix**, which is why **L8d takes the kernels before the widths**: the MoE is
-4.3x off its own bytes and the DeltaNet 2.0x, against the lm head's 1.25x on
-the same kernel family, so ~2.2x is sitting in three grids and an unpack that
-waits on its own loads. *Then* re-quantise
+6.05 GB, the ceiling 40.0, prefill unchanged**. **Then the bytes stopped being
+the thing to fix, so L8d took the kernels before the widths** — five grids and
+an unpack that waited on its own loads, no bank change and so no accuracy to
+argue about: **decode 23.15 tok/s, the MoE 58 GB/s of bank to 133, the
+DeltaNet 119 to 205, a token 66.7 ms to 43.0, and prefill 1049.8 tok/s at
+ubatch 2048 and 653.9 at 512 — faster on both.** That is **58% of this bank's
+own 40.0 ceiling**, 61% of the checkpoint's 38.2 and 0.92x llama.cpp's
+measured 25.15, and nothing in the model computes anything different yet.
+*Now* re-quantise
 to the repo's W4A8 layout (§1.1's repack) at widths chosen for this bus rather
 than for a generic machine: ~4.25 bits on everything streamed, fp16 routers,
 the n-gram table left as IQ4_NL on disk, and — L0c — **fp16 scales per 32
@@ -2295,7 +2415,35 @@ below Q8. Bandwidth is the whole story.
       each out of a 32 MiB MALL, so the bytes were already hidden and only the
       unpack's ALU is left — and that the m-tile scratch pays for it by making
       the fp16 arm 1.13-1.24x faster as well.
-### L8d — the MoE at decode  *(next)*
+### L8d — the decode kernels  *(done)*
+
+- [x] **Read the grid, then the loads** — and the grid turned out to be five
+      dispatches rather than one. `llm_moe_gemv.comp` is the expert GEMM at
+      one token (2.46-6.17x a dispatch), `llm_moe_router.comp` the router's
+      split-K (11.8x), `llm_moe_combine.comp`'s new grid the combine (7.8x at
+      decode, 1.35x at prefill), `llm_gemv.comp` the gated DeltaNet's two
+      projections (1.87x on the layer) — and under all of them a tile-grid
+      bound that was 2052 records where eleven exist. **Decode 14.71 tok/s to
+      23.15, the MoE block 27.6 ms a token to 12.05 and 58 GB/s of bank to
+      133, the DeltaNet 18.9 to 11.0 and 119 to 205, a token 66.7 ms to 43.0,
+      prefill 1041.1 to 1049.8 at ubatch 2048 and 643.4 to 653.9 at 512.**
+      [Write-up](research/l8d-moe-decode.md) · `results/l8d_decode.csv` ·
+      `results/l8d_decode_gemm.csv` · `results/l8d_graph.csv` ·
+      `results/l8d_moe.csv` · `results/l8d_dn.csv`
+- [x] Gate: **no bank change**, the MoE at **133 GB/s** at one token against
+      the ≥120 asked for, **23.15 tok/s** against ≥18, and prefill *faster* at
+      both ubatches rather than merely no slower — D14's hazard did not fire,
+      because the decode kernels are a different pipeline and not a different
+      rung of the prefill one. The text is where the gate has to be read
+      carefully: the capitals list and `Lisbon.` are identical and
+      `TestGraphLogits` is unchanged, but at temperature zero the `<think>`
+      block **re-words at one token**, whose top two logits are 0.012 apart
+      against the 3-25 either side. Nothing reads a different weight; a
+      cooperative-matrix accumulator and a GEMV lane associate the same
+      products differently. `LLM_DECODE_GEMM=1` is the control and reproduces
+      L7c's completion exactly.
+
+<details><summary>What it was scoped as</summary>
 
 - [ ] **Read the grid, then the loads.** The MoE is **42.1% of a token** and
       moves 1.60 GB in 28.6 ms — **56 GB/s of a 242 GB/s bus, 4.3x off its own
@@ -2333,7 +2481,27 @@ below Q8. Bandwidth is the whole story.
       at ubatch 512 or 2048 — the hazard being D14, since the MoE's weights at
       prefill are read once each and its decode grid is not its prefill grid.
 
-### L8c — the widths that are ours rather than the checkpoint's  *(after L8d)*
+</details>
+
+### L8e — the projections L8d did not reach  *(next, and cheap)*
+
+- [ ] **The full-attention layer is the same finding a fifth time.** It is now
+      the third-largest block at decode — 354.5 ms of a 2478 ms GPU total,
+      **12.9%**, about 126 GB/s — and its two projections are the same
+      `llm_gemm.comp` MODE 2 dispatches the DeltaNet's were. `llm_gemv.comp`
+      is already generic over both banks and both tail cases, so the work is
+      the wiring and a KSLABS ladder per projection (D12: the rung moves with
+      K). Worth ~1.5 tok/s.
+- [ ] **The MoE's shared expert wants a rung of its own**, 13 us a layer: it
+      runs on the routed pair's LPR because they are one field, and the two
+      invert (Q4_K packs 320 payload dwords into a 2560-long row, Q8_0 packs
+      640). Two more fields on the plan, 0.6 ms a token.
+- [ ] **`route` and the two `perm` dispatches are 11.6 us a layer** and all
+      three are one workgroup — L8d-2's fix, on a smaller tensor. 0.56 ms a
+      token, and only worth it if the token gets short enough for it to
+      matter.
+
+### L8c — the widths that are ours rather than the checkpoint's  *(after L8e)*
 
 - [ ] Choose per-tensor widths from L0d and L1's **PPL 4.0340**. Everything
       L8a and L8b stage is still **the checkpoint's arithmetic**: 8.5 bits a
@@ -2385,6 +2553,15 @@ below Q8. Bandwidth is the whole story.
     # how the two are compared against one dump, one trace and one prompt.
     LLM_DENSE_FP16=1 go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is'
     LLM_DENSE_FP16=1 go test ./llm/ -run TestDeltaNetGPU -v
+
+    # L8d's control, on the same precedent. Every one-token kernel L8d added —
+    # the MoE's two expert GEMVs, its split-K router, the dense GEMV under the
+    # DeltaNet's two projections — goes back to the cooperative-matrix GEMM.
+    # It is the only way to run the two over one prompt, because a block picks
+    # its rung from the batch and not from a flag at the call site, and it is
+    # what reproduces L7c's completion token for token.
+    LLM_DECODE_GEMM=1 go run ./cmd/llm -gen -model $M -n 128 -prompt 'The capital of France is'
+    LLM_DECODE_GEMM=1 go run ./cmd/llm -gen -model $M -n 64 -csv results/l8d_decode_gemm.csv
     go run ./cmd/llm -attn -model $M                    # L2f's layer, 64..2048
     go run ./cmd/llm -attn -model $M -tokens 512 -ladder
     go run ./cmd/llm -attn -model $M -ladder -csv results/l2f_attn.csv
@@ -2394,7 +2571,13 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -dn -model $M -tokens 512                 # L3b's layer
     go run ./cmd/llm -dn -model $M -ladder -csv results/l3b_dn.csv
     go run ./cmd/llm -dn -model $M -tokens 512,2048 -gemm-ladder
-    go run ./cmd/llm -moe -model $M -tokens 1 -ladder      # L7d: the narrow-N rungs
+    go run ./cmd/llm -moe -model $M -tokens 1 -ladder      # L7d's narrow-N rungs,
+                                             # L8d's six GEMV rungs for both
+                                             # modes, and the router's ladder
+    go run ./cmd/llm -moe -model $M -tokens 1 -ladder -csv results/l8d_moe.csv
+    go run ./cmd/llm -dn -model $M -tokens 1 -gemm-ladder  # L8d: the dense
+                                             # GEMV's split, per projection,
+                                             # and the GEMM control beside it
     go run ./cmd/llm -moe -model $M -tokens 512,2048              # L5b's block
     go run ./cmd/llm -moe -model $M -tokens 512,2048 -ladder -iters 5 \
         -csv results/l5b_moe_ladder.csv
@@ -2472,6 +2655,15 @@ below Q8. Bandwidth is the whole story.
     go test ./llm/ -v -run TestHCGPUGemv     # L7d: the split-K down
                                              # projection against the GEMM
                                              # rung, and the batch it refuses
+    go test ./llm/ -v -run TestMoEGPUDecode  # L8d: the expert GEMVs against
+                                             # the GEMM and against llama.cpp,
+                                             # the router's ladder as a top-k,
+                                             # and the one-token refusal
+    go test ./llm/ -v -run TestDeltaNetGPUGemvAgrees
+                                             # L8d: the dense GEMV against the
+                                             # GEMM on both projections, the
+                                             # fp16 tail on its own, and the
+                                             # rungs that cannot cut K
     go test ./llm/ -v -run TestHCGPUQ8       # L8b: the block on both banks,
                                              # fifteen rungs, every tensor
                                              # identical to the last bit
@@ -2500,50 +2692,43 @@ below Q8. Bandwidth is the whole story.
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
 | D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
-| D11 | **At one token, read a dispatch's shape off its grid before anything else.** | L7d: three kernels were 23-71 GB/s for one reason — 7, 10 and 100 workgroups on a 40-CU device — and two of them had been attributed to padding and to arithmetic. Fix it by splitting **K** where N is the output (the down projection) or by narrowing **BN** where N is wide enough to cut (the MoE); both keep the staged weight exactly as it is. |
-| D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. |
+| D11 | **At one token, read a dispatch's shape off its grid before anything else — including the part of the grid that does nothing.** | L7d: three kernels were 23-71 GB/s for one reason — 7, 10 and 100 workgroups on a 40-CU device — and two of them had been attributed to padding and to arithmetic. Fix it by splitting **K** where N is the output (the down projection, the router, both dense projections) or by narrowing **BN** where N is wide enough to cut (the MoE, the combine); both keep the staged weight exactly as it is. **L8d found it five more times and added the corollary**: a *static upper bound* on a grid is a dispatch too. The MoE's tile grid was 2052 records where eleven exist, 82 080 workgroups to run 11 at about 0.5 ns each, and it multiplies with every narrowing of BN — so it has to be tightened on the same axis the kernel narrows, or the kernel measures as a catastrophe (481 us against a GEMM's 84, of which 330 was empty launches). |
+| D15 | **At one token a block runs a different *kernel*, not a different rung, and the host refuses it above one token.** | L8d: `llm_moe_gemv.comp`, `llm_moe_router.comp` and `llm_gemv.comp` are the decode pipeline — no LDS slab, no barrier in the K loop, no cooperative matrix — and they are 1.87-3.06x on the two blocks that dominate a step while being *slower* at prefill, where the GEMM's fragment is full. The MoE's GEMV reads one row of a tile, which is every real row a tile has at one token and not at two, so `SetPlan`, `Upload` and `Resize` refuse it rather than drop rows; `Graph.PinSchedule` is what lets a test ask for the prefill kernels at any length. **§2.2's rule survives intact and was over-read**: nibbles cannot be unpacked into a cooperative-matrix *fragment*, and a dot product has no fragment. |
+| D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. **L8d-5 shows it does not carry to another *matrix* either** — k8 wins at K = 2560 and k32 at K = 6144 on one kernel over one bank — and **L8d-3 shows where it stops applying**: the 2.63 MB router never leaves the MALL, so its KSLABS ladder is flat within 0.6 us. A rule about DRAM channels says nothing about a weight that does not reach DRAM. |
 | D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. **L8b holds the rule where it costs something**: `inject` does not begin on a column block, so keeping it in the tail means staging 32 low-rank rows twice, and the answer is to pay the 0.33 MB a mixer rather than to re-quantise four rows early. |
 | D14 | **At prefill the bank is not the kernel; at decode it is.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
 
-- **Answered by L7d, both of them, and the answer was the same one.** The
-  down projection's 8.3x was the grid and nothing else — a split-K GEMV over
-  the same staged weight is **230 GB/s, 95% of the bus** — and the MoE's was
-  the grid too rather than the 32-row padding, because at one token every rung
-  makes exactly ten tiles. What is left of each is below.
-- **Why does the MoE's up mode read 93 GB/s of bank where its down mode reads
-  136 on the same grid?** L7d-3 narrowed BN from 64 to 16 and moved `up` from
-  71 to 93, not to 136, so the grid was part of it and not all of it. The
-  difference that is left is that MODE 0 gathers its A rows into LDS per
-  K-step and MODE 1 does not — and at decode every workgroup gathers the
-  **same** 2560-long row, 400 times. So the question has become whether a
-  **GEMV per expert** can feed itself from the checkpoint's own Q4_K without
-  the LDS round trip §2.2 said was unavoidable for a *fragment*; §1.8-§1.12
-  have 25 grouped builds of that shape measured against a repacked bank, and
-  none against this one. **This is L8d**, and L8b-2 is the reason to expect it
-  to work: the same split over int8 tiles is 326 GB/s against 230.
-- **What is the gated DeltaNet at one token?** L7d-6 left it the largest single
-  block in the step and **L8a-5 halved its bytes without halving its time**:
-  27.1 ms to 18.8 over 4.18 GB to 2.25, so it has gone from 1.56x off its own
-  bytes to **2.02x**, at 120 GB/s of a 242 GB/s bus. The fused projection is
-  329.6 us a layer at one token where the head — the same kernel, the same
-  bank format, 30x the weight — holds 188 GB/s, and the difference is that the
-  head's grid is 3880 workgroups and the DeltaNet's is 258. Nothing has yet
-  profiled the layer with a batch of one in mind the way L2c did the
-  hyper-connection block, and D11 says to read the grid first. **L8d's second
-  half**, after the MoE and by the same method.
+- ~~**Why does the MoE's up mode read 93 GB/s of bank where its down mode reads
+  136 on the same grid?**~~ **Answered at L8d-4, and the premise was wrong in
+  a useful way**: neither number was the kernel's ceiling, because both modes
+  were running a GEMM whose fragment holds one real row. A **GEMV per expert**
+  does feed itself from the checkpoint's own Q4_K without the LDS round trip —
+  §2.2's rule is about a cooperative-matrix *fragment* and a dot product has
+  none — and the two modes go to **236 and 356 GB/s** with the asymmetry gone.
+  What the MODE 0 / MODE 1 gap turns into is a *lane-count* asymmetry between
+  the routed pair and the shared expert, and that one is about format: Q4_K
+  packs 320 payload dwords into a 2560-long row where Q8_0 packs 640, so the
+  wider read wants the wider lane group.
+- ~~**What is the gated DeltaNet at one token?**~~ **Answered at L8d-5: the
+  grid, as D11 said.** The layer is 454.0 us to **242.5**, 119 GB/s to 205 and
+  18.9 ms a token to 11.0, from a split-K GEMV over exactly the weight the
+  GEMM already staged. The output projection was the worse of the two at 40
+  workgroups and is **5.4x**; the fused one at 258 is 1.58x. **What is left is
+  the full-attention layer**, which is now the third-largest block at decode
+  (12.9%, ~126 GB/s) and is the same two dispatches — L8e.
 - ~~**Does the Q8 arm want a split-K rung at one token?**~~ **Answered at
   L8b-2, on the one kernel that already had one: yes, and by 2.34x.** The
   hyper-connection down projection's split-K GEMV over int8 tiles is
   **326 GB/s against the fp16 build's 230** — a lane's sixteen consecutive k
   are four words and one scale, which is if anything simpler than sixteen
   halves — and the arithmetic is identical because the multiply is done in
-  fp16 rather than in f32-then-converted. **So the question moves to the two
-  projections that have no such rung**: the DeltaNet's fused input projection
-  at 258 workgroups and its output at 218, which L8a-5 left at 120-126 GB/s
-  and which are now 28% of a token between them. The split is the same split.
+  fp16 rather than in f32-then-converted. **L8d-5 gave the other projections
+  that rung** — `llm_gemv.comp` is the same kernel with the hyper-connection
+  epilogue removed — and the DeltaNet's two are 1.58x and 5.43x. The attention
+  layer's two are the last pair without it.
 - **What does the unpack cost when the bytes are already cached?** L8b-5 is
   the first measurement in this vertical where a *narrower* bank is **slower**:
   at ubatch 2048 the hyper-connection block's two projections are 1.09-1.15x

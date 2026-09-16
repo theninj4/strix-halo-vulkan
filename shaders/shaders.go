@@ -2153,6 +2153,106 @@ var LLMGEMMQ8M4 []byte
 //go:embed llm_gemm_q8_m8.spv
 var LLMGEMMQ8M8 []byte
 
+// The **decode** projection: llm_gemv.comp, LLM.md L8d. llm_gemm.comp MODE 2
+// at one token is a sixteen-row fragment holding one row, an LDS slab per
+// K-step and a grid of gemmN/64 workgroups; this is the split-K GEMV over the
+// same fragment tiling and the same L8a bank, in two dispatches — or one at
+// KSLABS=1, where MODE 0 stores the row itself. Every rung of both banks is
+// built because D12's 4 KB rotation picks a different one per K.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -o llm_gemv_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -o llm_gemv_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -o llm_gemv_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -o llm_gemv_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -o llm_gemv_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -o llm_gemv_k32.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k32.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=2 -o llm_gemv_sum_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=4 -o llm_gemv_sum_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=8 -o llm_gemv_sum_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=16 -o llm_gemv_sum_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=32 -o llm_gemv_sum_k32.spv llm_gemv.comp
+
+//go:embed llm_gemv_k1.spv
+var LLMGEMVK1 []byte
+
+//go:embed llm_gemv_k2.spv
+var LLMGEMVK2 []byte
+
+//go:embed llm_gemv_k4.spv
+var LLMGEMVK4 []byte
+
+//go:embed llm_gemv_k8.spv
+var LLMGEMVK8 []byte
+
+//go:embed llm_gemv_k16.spv
+var LLMGEMVK16 []byte
+
+//go:embed llm_gemv_k32.spv
+var LLMGEMVK32 []byte
+
+//go:embed llm_gemv_q8_k1.spv
+var LLMGEMVQ8K1 []byte
+
+//go:embed llm_gemv_q8_k2.spv
+var LLMGEMVQ8K2 []byte
+
+//go:embed llm_gemv_q8_k4.spv
+var LLMGEMVQ8K4 []byte
+
+//go:embed llm_gemv_q8_k8.spv
+var LLMGEMVQ8K8 []byte
+
+//go:embed llm_gemv_q8_k16.spv
+var LLMGEMVQ8K16 []byte
+
+//go:embed llm_gemv_q8_k32.spv
+var LLMGEMVQ8K32 []byte
+
+//go:embed llm_gemv_sum_k2.spv
+var LLMGEMVSumK2 []byte
+
+//go:embed llm_gemv_sum_k4.spv
+var LLMGEMVSumK4 []byte
+
+//go:embed llm_gemv_sum_k8.spv
+var LLMGEMVSumK8 []byte
+
+//go:embed llm_gemv_sum_k16.spv
+var LLMGEMVSumK16 []byte
+
+//go:embed llm_gemv_sum_k32.spv
+var LLMGEMVSumK32 []byte
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -o llm_gemv_k20.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k20.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=20 -o llm_gemv_sum_k20.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -o llm_gemv_k40.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k40.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=40 -o llm_gemv_sum_k40.spv llm_gemv.comp
+
+//go:embed llm_gemv_k20.spv
+var LLMGEMVK20 []byte
+
+//go:embed llm_gemv_q8_k20.spv
+var LLMGEMVQ8K20 []byte
+
+//go:embed llm_gemv_sum_k20.spv
+var LLMGEMVSumK20 []byte
+
+//go:embed llm_gemv_k40.spv
+var LLMGEMVK40 []byte
+
+//go:embed llm_gemv_q8_k40.spv
+var LLMGEMVQ8K40 []byte
+
+//go:embed llm_gemv_sum_k40.spv
+var LLMGEMVSumK40 []byte
+
 //go:embed llm_ple_gate.spv
 var LLMPLEGate []byte
 
@@ -2504,6 +2604,183 @@ var LLMMoEDownQ80W2M1 []byte
 
 //go:embed llm_moe_down_q80_w4m1.spv
 var LLMMoEDownQ80W4M1 []byte
+
+// The **decode** kernel of the same grouped GEMM: llm_moe_gemv.comp, LLM.md
+// L8d. Every rung above is a cooperative-matrix GEMM whose workgroup unpacks
+// a BN x BK slab of the checkpoint's own blocks into LDS per K-step and
+// multiplies it by BM rows of A — right at prefill, where the unpack is
+// amortised over sixteen to sixty-four rows, and wrong at one token, where
+// the row block is fifteen sixteenths padding and the loop is a barrier and a
+// dependent load per K-step. These have no LDS slab, no barrier in the K
+// loop and no fragment: LPR lanes share one output column and walk its row of
+// the bank in stride, straight into registers.
+//
+// Two axes. **LPR** is lanes a column, which is the shape of a load — LPR
+// consecutive lanes read LPR consecutive dwords — and it wants to divide the
+// row's payload-dword count: 320 for Q4_K/Q5_K at K = 2560, 640 for Q8_0
+// there, 160 for Q8_0 at 640 and 80 for Q5_1. **WAVES** buys one thing, the A
+// vector staged in LDS once for four waves instead of once for one, and
+// changes no arithmetic. AKMAX is the LDS that stages it: nEmbd for the up
+// mode, the expert width for the down mode.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=16 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=32 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=64 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=16 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=32 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DLPR=64 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q4k_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=16 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=32 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=64 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=16 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=32 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DLPR=64 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q5k_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=16 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=32 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=64 -DWAVES=1 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=16 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=32 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DLPR=64 -DWAVES=4 -DAKMAX=2560 -DNBANK=48 -o llm_moe_gv_up_q80_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=16 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=32 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=64 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=16 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=32 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DLPR=64 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q51_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=16 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=32 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=64 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=16 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=32 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=64 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v64w4.spv llm_moe_gemv.comp
+
+//go:embed llm_moe_gv_up_q4k_v16.spv
+var LLMMoEGVUpQ4KV16 []byte
+
+//go:embed llm_moe_gv_up_q4k_v32.spv
+var LLMMoEGVUpQ4KV32 []byte
+
+//go:embed llm_moe_gv_up_q4k_v64.spv
+var LLMMoEGVUpQ4KV64 []byte
+
+//go:embed llm_moe_gv_up_q4k_v16w4.spv
+var LLMMoEGVUpQ4KV16W4 []byte
+
+//go:embed llm_moe_gv_up_q4k_v32w4.spv
+var LLMMoEGVUpQ4KV32W4 []byte
+
+//go:embed llm_moe_gv_up_q4k_v64w4.spv
+var LLMMoEGVUpQ4KV64W4 []byte
+
+//go:embed llm_moe_gv_up_q5k_v16.spv
+var LLMMoEGVUpQ5KV16 []byte
+
+//go:embed llm_moe_gv_up_q5k_v32.spv
+var LLMMoEGVUpQ5KV32 []byte
+
+//go:embed llm_moe_gv_up_q5k_v64.spv
+var LLMMoEGVUpQ5KV64 []byte
+
+//go:embed llm_moe_gv_up_q5k_v16w4.spv
+var LLMMoEGVUpQ5KV16W4 []byte
+
+//go:embed llm_moe_gv_up_q5k_v32w4.spv
+var LLMMoEGVUpQ5KV32W4 []byte
+
+//go:embed llm_moe_gv_up_q5k_v64w4.spv
+var LLMMoEGVUpQ5KV64W4 []byte
+
+//go:embed llm_moe_gv_up_q80_v16.spv
+var LLMMoEGVUpQ80V16 []byte
+
+//go:embed llm_moe_gv_up_q80_v32.spv
+var LLMMoEGVUpQ80V32 []byte
+
+//go:embed llm_moe_gv_up_q80_v64.spv
+var LLMMoEGVUpQ80V64 []byte
+
+//go:embed llm_moe_gv_up_q80_v16w4.spv
+var LLMMoEGVUpQ80V16W4 []byte
+
+//go:embed llm_moe_gv_up_q80_v32w4.spv
+var LLMMoEGVUpQ80V32W4 []byte
+
+//go:embed llm_moe_gv_up_q80_v64w4.spv
+var LLMMoEGVUpQ80V64W4 []byte
+
+//go:embed llm_moe_gv_down_q51_v16.spv
+var LLMMoEGVDownQ51V16 []byte
+
+//go:embed llm_moe_gv_down_q51_v32.spv
+var LLMMoEGVDownQ51V32 []byte
+
+//go:embed llm_moe_gv_down_q51_v64.spv
+var LLMMoEGVDownQ51V64 []byte
+
+//go:embed llm_moe_gv_down_q51_v16w4.spv
+var LLMMoEGVDownQ51V16W4 []byte
+
+//go:embed llm_moe_gv_down_q51_v32w4.spv
+var LLMMoEGVDownQ51V32W4 []byte
+
+//go:embed llm_moe_gv_down_q51_v64w4.spv
+var LLMMoEGVDownQ51V64W4 []byte
+
+//go:embed llm_moe_gv_down_q80_v16.spv
+var LLMMoEGVDownQ80V16 []byte
+
+//go:embed llm_moe_gv_down_q80_v32.spv
+var LLMMoEGVDownQ80V32 []byte
+
+//go:embed llm_moe_gv_down_q80_v64.spv
+var LLMMoEGVDownQ80V64 []byte
+
+//go:embed llm_moe_gv_down_q80_v16w4.spv
+var LLMMoEGVDownQ80V16W4 []byte
+
+//go:embed llm_moe_gv_down_q80_v32w4.spv
+var LLMMoEGVDownQ80V32W4 []byte
+
+//go:embed llm_moe_gv_down_q80_v64w4.spv
+var LLMMoEGVDownQ80V64W4 []byte
+
+// The **decode** router: llm_moe_router.comp, LLM.md L8d. Split-K over the
+// same fragment tiling `llm_gemm.comp` MODE 2 reads, in two dispatches — the
+// partials and their sum — because at one token 513 output columns are nine
+// workgroups and the parallelism has to come from K. KSLABS has to divide 40
+// (160 k-tiles in whole four-tile steps) and wants to miss D12's 4 KB
+// rotation, so the ladder is 8/10/20/40 and the rule predicts 8 and 40.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -o llm_moe_router_k8.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=8 -o llm_moe_router_k8_r.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=10 -o llm_moe_router_k10.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=10 -o llm_moe_router_k10_r.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -o llm_moe_router_k20.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=20 -o llm_moe_router_k20_r.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -o llm_moe_router_k40.spv llm_moe_router.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=40 -o llm_moe_router_k40_r.spv llm_moe_router.comp
+
+//go:embed llm_moe_router_k8.spv
+var LLMMoERouterK8 []byte
+
+//go:embed llm_moe_router_k8_r.spv
+var LLMMoERouterK8R []byte
+
+//go:embed llm_moe_router_k10.spv
+var LLMMoERouterK10 []byte
+
+//go:embed llm_moe_router_k10_r.spv
+var LLMMoERouterK10R []byte
+
+//go:embed llm_moe_router_k20.spv
+var LLMMoERouterK20 []byte
+
+//go:embed llm_moe_router_k20_r.spv
+var LLMMoERouterK20R []byte
+
+//go:embed llm_moe_router_k40.spv
+var LLMMoERouterK40 []byte
+
+//go:embed llm_moe_router_k40_r.spv
+var LLMMoERouterK40R []byte
 
 //go:embed llm_moe_route.spv
 var LLMMoERoute []byte

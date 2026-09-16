@@ -131,6 +131,12 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 	// over a 10240-long dot product, amplified by L6b-3's x1.085 a layer and
 	// by seventeen steps of recurrence, and **not** the 1.785e+00 the control
 	// below reports for a history that was not carried.
+	//
+	// **L8d made it four kernels rather than one.** The hyper-connection
+	// block's split-K down projection was the only rung in this vertical that
+	// reassociated; it is now joined by the MoE's two expert GEMVs, its
+	// split-K router and the dense GEMV under the DeltaNet's two projections.
+	// The bar does not move, and what it now measures is all of them at once.
 	t.Run("one token at a time, on the decode schedule", func(t *testing.T) {
 		if err := g.PinSchedule(false); err != nil {
 			t.Fatal(err)
@@ -156,7 +162,7 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Logf("result_norm, split-K down projection: %v", r)
+		t.Logf("result_norm, the decode kernels' reassociation: %v", r)
 		if r.rms > 1e-3 {
 			t.Errorf("the decode schedule moves result_norm by %.3e rms, which is more than a "+
 				"reassociated dot product can account for (%v)", r.rms, r)

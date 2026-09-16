@@ -27,26 +27,38 @@
 
 #include "llm_common.glsl"
 
-#define WG 256
+// **The grid is (column block, token) and it was (token)** — D11 again, and
+// the cheapest instance of it in this block (L8d-2). At one token the whole
+// dispatch was *one workgroup*: 2560 columns, eleven rows each, 112 KB of
+// reads on a 40-CU device, 22 us at 6 GB/s. It is one line of arithmetic and
+// no arithmetic changed.
+//
+// **The column block is the x axis and that is not cosmetic.** The obvious
+// spelling puts the token there, and at a 2048-token ubatch it is **9.2x
+// slower than the single workgroup it replaced**: this dispatch reads 230 MB
+// out of a 566 MB arena, consecutive workgroups would then be consecutive
+// *tokens* at the same 256-byte column slice, and the rows of one token's
+// eleven contributions are 10 KB apart. With the column block fastest, the
+// forty workgroups of one token walk its rows end to end and the block
+// streams again — 34 GB/s back to 315 (L8d-2).
+#define WG 64
 
 layout(local_size_x = WG) in;
 
 void main() {
-    uint t = gl_WorkGroupID.x;
-    if (t >= pc.tokens) {
+    uint t = gl_WorkGroupID.y;
+    uint j = gl_WorkGroupID.x * WG + gl_LocalInvocationID.x;
+    if (t >= pc.tokens || j >= pc.nEmbd) {
         return;
     }
     uint slots = MOE_USED + 1u;
     // The inverse permutation sits behind the weights and the top-k, all
     // three indexed by the same (token, slot).
     uint invPerm = pc.moeWeightOff + pc.tokens * slots + pc.tokens * MOE_USED;
-    uint dst = pc.outOff + t * pc.nEmbd;
-    for (uint j = gl_LocalInvocationID.x; j < pc.nEmbd; j += WG) {
-        float s = 0.0;
-        for (uint k = 0u; k < slots; ++k) {
-            uint row = actu[invPerm + t * slots + k];
-            s += act[pc.gatedOff + row * pc.nEmbd + j] * act[pc.moeWeightOff + t * slots + k];
-        }
-        act[dst + j] = s;
+    float s = 0.0;
+    for (uint k = 0u; k < slots; ++k) {
+        uint row = actu[invPerm + t * slots + k];
+        s += act[pc.gatedOff + row * pc.nEmbd + j] * act[pc.moeWeightOff + t * slots + k];
     }
+    act[pc.outOff + t * pc.nEmbd + j] = s;
 }

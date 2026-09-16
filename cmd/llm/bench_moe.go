@@ -167,15 +167,47 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 	}
 	fmt.Println()
 
-	var plans [][2]llm.MoEKernel
-	if ladder {
+	// The ladder. At one token it is a different cross as well as a longer
+	// one: `llm_moe_gemv.comp`'s six rungs are a *second kernel* for the same
+	// two modes (L8d), they may be mixed with the GEMM's because every rung
+	// cuts its tile list to the same sixteen rows, and they are refused above
+	// one token — so the two crosses are walked separately and then the six
+	// mixtures that pair each kernel's best with the other's.
+	type moePlan struct {
+		up, down llm.MoEKernel
+		router   llm.MoERouterKernel
+	}
+	plansFor := func(tok int) []moePlan {
+		if !ladder {
+			return []moePlan{{}}
+		}
+		var p []moePlan
 		for _, u := range llm.MoEUpKernels() {
 			for _, d := range llm.MoEKernels() {
-				plans = append(plans, [2]llm.MoEKernel{u, d})
+				p = append(p, moePlan{u, d, ""})
 			}
 		}
-	} else {
-		plans = [][2]llm.MoEKernel{{}}
+		if tok == 1 {
+			for _, u := range llm.MoEDecodeKernels() {
+				for _, d := range llm.MoEDecodeKernels() {
+					p = append(p, moePlan{u, d, ""})
+				}
+			}
+			for _, u := range llm.MoEDecodeKernels() {
+				p = append(p, moePlan{u, llm.MoEM1, ""})
+			}
+			for _, d := range llm.MoEDecodeKernels() {
+				p = append(p, moePlan{llm.MoEN1M1, d, ""})
+			}
+			// And the router's own ladder, which does not cross the experts'
+			// — it is a different matrix and a different kernel (L8d-3), so
+			// it is walked once against the plan the experts settle on.
+			du, dd := llm.MoEPlanFor(1)
+			for _, r := range append([]llm.MoERouterKernel{llm.MoERouterGEMM}, llm.MoERouterKernels()...) {
+				p = append(p, moePlan{du, dd, r})
+			}
+		}
+		return p
 	}
 
 	var rows [][]string
@@ -186,9 +218,14 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 		if err := g.Upload(x[:tok*cfg.NEmbd], tok); err != nil {
 			return err
 		}
-		for _, p := range plans {
-			if p[0] != "" {
-				if err := g.SetPlan(p[0], p[1]); err != nil {
+		for _, p := range plansFor(tok) {
+			if p.up != "" {
+				if err := g.SetPlan(p.up, p.down); err != nil {
+					return err
+				}
+			}
+			if p.router != "" {
+				if err := g.SetRouter(p.router); err != nil {
 					return err
 				}
 			}
@@ -201,8 +238,8 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 			touched := g.Touched()
 			upTiles, upExec, realRows := g.Schedule(up)
 			dnTiles, dnExec, _ := g.Schedule(down)
-			fmt.Printf("T = %-5d %s/%s (%d and %d waves a workgroup)  %d of %d experts touched, %d rows: %d up tiles (%d rows, %.2fx), %d down tiles (%d rows, %.2fx)\n",
-				tok, up, down, llm.MoEWaves(up), llm.MoEWaves(down), touched, cfg.NExpert, realRows,
+			fmt.Printf("T = %-5d %s/%s/%s (%d and %d waves a workgroup)  %d of %d experts touched, %d rows: %d up tiles (%d rows, %.2fx), %d down tiles (%d rows, %.2fx)\n",
+				tok, up, down, g.Router(), llm.MoEWaves(up), llm.MoEWaves(down), touched, cfg.NExpert, realRows,
 				upTiles, upExec, float64(upExec)/float64(realRows),
 				dnTiles, dnExec, float64(dnExec)/float64(realRows))
 
@@ -225,7 +262,7 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 				}
 				fmt.Println()
 				rows = append(rows, []string{
-					strconv.Itoa(tok), string(up), string(down), strconv.Itoa(touched),
+					strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()), strconv.Itoa(touched),
 					strconv.Itoa(upTiles), strconv.Itoa(upExec), strconv.Itoa(dnTiles), strconv.Itoa(dnExec),
 					s.Kind, fmt.Sprintf("%.3f", us),
 					fmt.Sprintf("%.1f", us*moeLayersPerGraph/1e3),
@@ -236,7 +273,7 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 			fmt.Printf("  %-10s %9.1f us  x%d = %7.1f ms\n", "block", us, moeLayersPerGraph,
 				us*moeLayersPerGraph/1e3)
 			rows = append(rows, []string{
-				strconv.Itoa(tok), string(up), string(down), strconv.Itoa(touched),
+				strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()), strconv.Itoa(touched),
 				strconv.Itoa(upTiles), strconv.Itoa(upExec), strconv.Itoa(dnTiles), strconv.Itoa(dnExec),
 				"block", fmt.Sprintf("%.3f", us),
 				fmt.Sprintf("%.1f", us*moeLayersPerGraph/1e3), "", "",

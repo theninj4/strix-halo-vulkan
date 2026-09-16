@@ -541,3 +541,158 @@ func TestMoEGPUBankArray(t *testing.T) {
 			ctl.rms/got.rms)
 	}
 }
+
+// TestMoEGPUDecode is L8d's gate: llm_moe_gemv.comp against the cooperative-
+// matrix GEMM it replaces at one token, and both against llama.cpp's own
+// `ffn_out-3` for that token.
+//
+// It cannot be the exact comparison TestMoEGPULadderAgrees is, and the reason
+// is arithmetic rather than tolerance. The GEMM's B operand is a fragment, so
+// every unpacked weight is rounded to a half on its way into LDS; the GEMV has
+// no fragment and no LDS, so its weight stays an f32 and the product with the
+// f16 activation is exact. One fewer rounding per weight over a 2560-long dot
+// product is a real difference and it is in the *reference's* direction — so
+// the assertion is that the two kernels agree with each other to a tolerance
+// and that neither is further from llama.cpp than the other: the two kernels
+// differ by fifty times less than either differs from the reference, so the
+// rounding is real and it is below the floor the block already sits on.
+//
+// The one-row rule is what the rest of it tests. A GEMV rung reads the first
+// row of a tile and nothing else, which is every real row a tile has when the
+// batch is one token, because a token's top-k names ten *distinct* experts.
+// The shared expert's group is the same claim on the host's own schedule.
+func TestMoEGPUDecode(t *testing.T) {
+	c, w, in, _, tr := moeFixtures4k(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	// Staged for two so that the negative control at the end has somewhere to
+	// resize to; run at one.
+	g, err := NewMoEGPU(dev, c, 2, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.Upload(in[:c.NEmbd], 1); err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := tr.Get("ffn_out-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := want.Vals[:c.NEmbd]
+
+	// The GEMM, at the rung L7d left the plan on.
+	if err := g.SetPlan(MoEN1M1, MoEM1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(0); err != nil {
+		t.Fatal(err)
+	}
+	gemm := append([]float32(nil), g.Out()...)
+	tiles, _, _, _ := g.Tiles()
+	rg, err := compare(gemm, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%-10s %2d up tiles, against ffn_out-3 token 0: %v", "n1m1/m1", tiles, rg)
+
+	for _, plan := range [][2]MoEKernel{
+		{MoEV64W4, MoEV16W4}, {MoEV16, MoEV16}, {MoEV32, MoEV32}, {MoEV64, MoEV64},
+		{MoEV16W4, MoEV32W4}, {MoEV32W4, MoEV64W4},
+		// Mixed with the GEMM, which is the structural half: the two kernels
+		// cut their tile lists to the same sixteen rows, so a GEMV up mode
+		// feeds a GEMM down mode out of the same permutation.
+		{MoEV64W4, MoEM1}, {MoEN1M1, MoEV16W4},
+	} {
+		name := fmt.Sprintf("%s/%s", plan[0], plan[1])
+		if err := g.SetPlan(plan[0], plan[1]); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		out := g.Out()
+		rk, err := compare(out, gemm)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		rr, err := compare(out, ref)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Logf("%-12s against n1m1/m1: %v\n%-12s against ffn_out-3: %v", name, rk, "", rr)
+		// The two kernels differ by the fp16 rounding of a weight, which on a
+		// 2560-long dot product over |ffn_out| ~ 1 is parts in ten thousand.
+		if rk.rms > 2e-3 {
+			t.Errorf("%s disagrees with the GEMM by rms %.3e (max %.3e at %d)", name, rk.rms, rk.maxAbs, rk.at)
+		}
+		// And it is not further from the reference than the GEMM is, which is
+		// what says the difference is a rounding the GEMM does and not an
+		// error this kernel makes.
+		if rr.rms > rg.rms*1.05 {
+			t.Errorf("%s is %.3e from ffn_out-3 where the GEMM is %.3e", name, rr.rms, rg.rms)
+		}
+	}
+
+	// The router's own ladder, which is a separate kernel over a separate
+	// matrix (L8d-3) and whose output is **discrete**: a logit that is wrong
+	// by a little names a different expert, and the tensor comparisons above
+	// would then be comparing two different mixtures rather than two
+	// arithmetics. So the top-ten is compared as a sequence and not only the
+	// logits as numbers.
+	if err := g.SetPlan(MoEV64W4, MoEV16W4); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetRouter(MoERouterGEMM); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(0); err != nil {
+		t.Fatal(err)
+	}
+	refLogits := append([]float32(nil), g.Logits()...)
+	refTop := append([]int32(nil), g.TopK()...)
+	for _, k := range MoERouterKernels() {
+		if err := g.SetRouter(k); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		r, err := compare(g.Logits(), refLogits)
+		if err != nil {
+			t.Fatalf("router %s: %v", k, err)
+		}
+		top := g.TopK()
+		diff := 0
+		for i := range refTop {
+			if top[i] != refTop[i] {
+				diff++
+			}
+		}
+		t.Logf("router %-4s against the GEMM: %v, %d of %d top-k slots differ", k, r, diff, len(refTop))
+		// A split-K sum is a different association of the same products, so
+		// this is a tolerance and not an equality — but the selection it
+		// feeds is not.
+		if r.rms > 1e-4 {
+			t.Errorf("router %s: logits rms %.3e against the GEMM's (%v)", k, r.rms, r)
+		}
+		if diff != 0 {
+			t.Errorf("router %s names %d different experts", k, diff)
+		}
+	}
+	if err := g.SetRouter(MoERouterFor(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The negative control on the one-row rule: above one token a GEMV rung
+	// would drop rows, so the host has to refuse it rather than run it.
+	if err := g.SetPlan(MoEV16W4, MoEV16W4); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Resize(2); err == nil {
+		t.Error("a GEMV plan was accepted for a two-token batch, where a tile may hold two rows")
+	} else {
+		t.Logf("refused above one token: %v", err)
+	}
+}

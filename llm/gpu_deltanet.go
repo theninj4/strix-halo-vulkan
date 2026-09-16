@@ -66,6 +66,17 @@ import (
 // layer's projections run on. Same kernel as the attention layer's.
 const dnBN = attnBN
 
+// The decode rungs of the two projections, from results/l8d_dn.csv (L8d-4),
+// and they are different numbers for the reason D12 gives. A slab is
+// `(gemmK/16/KSLABS) * 256` bytes on the int8 bank. The fused projection
+// reduces over nEmbd = 2560 — 160 k-tiles, so 1 and 2 slabs are 10 and 5 whole
+// multiples of 4 KB and measure 276 and 309 us against 4, 8, 20 and 40's
+// 240/196/225/207. The output projection reduces over Inner = 6144, 384
+// tiles, where 1, 4 and 8 slabs are whole multiples (32.8, 25.8 and 30.7 us)
+// and 32 is 0.75 of one: **22.0**.
+const dnQKVGemv = GEMVK8
+const dnOutGemv = GEMVK32
+
 // dnWave is the wave the scan is pinned to, and the width every rung's
 // LPC divides.
 const dnWave = 64
@@ -213,6 +224,15 @@ type DeltaNetGPU struct {
 
 	scan          DNKernel
 	gemm, outGemm GEMMKernel
+	// The decode rungs of the same two projections: llm_gemv.comp at one
+	// token, GEMVOff at every other length (L8d-4).
+	qkvGemv, outGemv GEMVKernel
+	// pinGemv holds both projections on llm_gemm.comp whatever the batch, so
+	// that a prompt run in chunks is the prompt run whole to the last place
+	// (Graph.PinSchedule). The GEMV is the second rung in this vertical that
+	// is not bit-exact against its siblings, for L7d's reason: a split sum is
+	// a different association of the same products.
+	pinGemv bool
 	// autoPlan re-chooses both GEMM rungs per run. SetPlan turns it off,
 	// because a caller that named a rung meant it.
 	autoPlan bool
@@ -235,6 +255,7 @@ type DeltaNetGPU struct {
 	aWin                          uint32
 	aNorm, aSilu, aOut            uint32
 	aGate, aBeta, aState, aResult uint32
+	aPart                         uint32
 	actElems                      int
 	// past is how many tokens of this sequence are behind the run, which is
 	// what turns the ring's absolute positions into slots. Zero is a fresh
@@ -384,6 +405,11 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	g.aBeta = alloc(rows * c.NHeadV)
 	g.aState = alloc(nLayers * c.StateSize())
 	g.aResult = alloc(rows * c.NEmbd)
+	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8d-4). The wider
+	// of the two projections is the fused one, so 32 x 16512 x 4 = 2.1 MB —
+	// allocated whichever rung runs, because the arena plan is fixed at
+	// construction and the rung is not.
+	g.aPart = alloc(gemvMaxSlabs * g.qkvN())
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: deltanet fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -493,6 +519,16 @@ func (g *DeltaNetGPU) build() error {
 			}); err != nil {
 				return err
 			}
+		}
+	}
+	// The decode GEMV, every rung of both banks plus the reduce (L8d-4). They
+	// are built whatever the bank is, because the reduce reads neither and
+	// the fp16 partials arm is what a block on the fp16 bank runs.
+	for name, spirv := range gemvSPIRV {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{
+			Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -624,6 +660,61 @@ func (g *DeltaNetGPU) Plan() (DNKernel, GEMMKernel, GEMMKernel) {
 	return g.scan, g.gemm, g.outGemm
 }
 
+// SetGemv chooses the two projections' decode rungs, or GEMVOff to leave them
+// on llm_gemm.comp. It is separate from SetPlan because the GEMV is a
+// different kernel over the same staged weight and its ladder does not cross
+// the GEMM's — and because the two projections do not want the same split:
+// K is 2560 on one and 6144 on the other, so D12's 4 KB rotation lands on
+// different rungs.
+func (g *DeltaNetGPU) SetGemv(qkv, out GEMVKernel) error {
+	for _, t := range []struct {
+		k     GEMVKernel
+		gemmK int
+		what  string
+	}{{qkv, g.cfg.NEmbd, "qkv"}, {out, g.cfg.Inner, "out"}} {
+		if t.k == GEMVOff {
+			continue
+		}
+		if gemvSlabs(t.k) == 0 {
+			return fmt.Errorf("llm: no GEMV kernel %q (have %v)", t.k, GEMVKernels())
+		}
+		if !GEMVFits(t.k, t.gemmK) {
+			return fmt.Errorf("llm: GEMV rung %q does not cut K = %d of %s into whole four-tile steps",
+				t.k, t.gemmK, t.what)
+		}
+	}
+	if (qkv != GEMVOff || out != GEMVOff) && g.rows != 1 {
+		return fmt.Errorf("llm: the GEMV rungs read one token's row; this batch is %d", g.rows)
+	}
+	g.qkvGemv, g.outGemv = qkv, out
+	g.autoPlan = false
+	return nil
+}
+
+// Gemv reports the decode rungs in use.
+func (g *DeltaNetGPU) Gemv() (GEMVKernel, GEMVKernel) { return g.qkvGemv, g.outGemv }
+
+// PinGemv holds the two projections on llm_gemm.comp whatever the batch, and
+// releases them to the measured schedule when off. See Graph.PinSchedule.
+func (g *DeltaNetGPU) PinGemv(on bool) {
+	g.pinGemv = on
+	if on {
+		g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+	} else if g.autoPlan {
+		g.qkvGemv, g.outGemv = DNGemvFor(g.rows)
+	}
+}
+
+// DNGemvFor is the decode plan: llm_gemv.comp at one token and the GEMM at
+// every other length, where its A operand is a full fragment and its grid is
+// no longer `gemmN/64` workgroups for one row.
+func DNGemvFor(tokens int) (GEMVKernel, GEMVKernel) {
+	if tokens != 1 || !DecodeGEMV() {
+		return GEMVOff, GEMVOff
+	}
+	return dnQKVGemv, dnOutGemv
+}
+
 // KeepSilu makes the convolution also write its un-normalised SiLU output,
 // which is `conv_output_silu` and which the fused kernel otherwise never
 // materialises — the same NO_W switch the hyper-connection block's gate has.
@@ -663,6 +754,11 @@ func (g *DeltaNetGPU) Upload(xn []float32, nTok int) error {
 	g.rows = nTok
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+		if g.pinGemv {
+			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+		} else {
+			g.qkvGemv, g.outGemv = DNGemvFor(nTok)
+		}
 	}
 	slab := make([]uint16, nTok*g.lda)
 	narrowRows(slab, xn, nTok, c.NEmbd, g.lda)
@@ -833,6 +929,17 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// already means in MODE 0 — and `gateOff` is where those rows' halves
 		// are, or NO_W for a matrix that is int8 all the way through.
 		qkv.LowRank, qkv.GateOff = uint32(g.qkvQ8Rows()), w.qkvTail
+	}
+	if ks := gemvSlabs(g.qkvGemv); ks > 0 {
+		// The decode kernel: one row, so the parallelism comes from K and not
+		// from a sixteen-row fragment of which fifteen rows are padding
+		// (L8d-4). The partials ride `resOff`, which this block does not use.
+		qkv.ResOff = g.aPart
+		add(gemvPipe(g.qkvGemv, g.q8), "qkv", uint32(ks), uint32(g.qkvN()/16), qkv)
+		if ks > 1 {
+			add(gemvSumPipe(g.qkvGemv), "qkv.sum", uint32(roundUpInt(g.qkvN(), dnWave)/dnWave), 1, qkv)
+		}
+	} else if g.q8 {
 		add(q8Pipe(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
 	} else {
 		add(string(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
@@ -859,7 +966,15 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		outPipe = q8Pipe(g.outGemm)
 		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: ssm_out is Q8_0
 	}
-	add(outPipe, "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	if ks := gemvSlabs(g.outGemv); ks > 0 {
+		out.ResOff = g.aPart
+		add(gemvPipe(g.outGemv, g.q8), "out", uint32(ks), uint32(c.NEmbd/16), out)
+		if ks > 1 {
+			add(gemvSumPipe(g.outGemv), "out.sum", uint32(roundUpInt(c.NEmbd, dnWave)/dnWave), 1, out)
+		}
+	} else {
+		add(outPipe, "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	}
 
 	// 6. The convolution's window, for whatever runs next: the last Conv-1
 	//    rows of the projection into this layer's ring. Three rows of 16512
@@ -1109,6 +1224,11 @@ func (g *DeltaNetGPU) Resize(nTok int) error {
 	g.rows = nTok
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+		if g.pinGemv {
+			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+		} else {
+			g.qkvGemv, g.outGemv = DNGemvFor(nTok)
+		}
 	}
 	if pad := g.arenaRows - nTok; pad > 0 {
 		g.hbuf.ZeroUint16At(int(g.hCtx)+nTok*g.ldCtx, pad*g.ldCtx)

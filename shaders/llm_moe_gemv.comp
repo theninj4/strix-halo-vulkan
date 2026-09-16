@@ -1,0 +1,323 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The grouped expert GEMM **at one token** (LLM.md L8d).
+//
+// `llm_moe_gemm.comp` is the same two modes as a cooperative-matrix GEMM, and
+// at prefill it is the right kernel: a workgroup unpacks a BN x BK slab of the
+// checkpoint's own Q4_K into LDS per K-step and multiplies it by BM rows of A,
+// so the unpack — which is most of what the block does — is amortised over
+// sixteen to sixty-four rows. **At decode there is one row.** Every row block
+// is fifteen sixteenths padding, the slab is unpacked for one real row, and
+// the loop that does it is a barrier, a dependent load and a consume per
+// K-step with one wave in flight per workgroup: 93 GB/s of a 242 GB/s bus on
+// the up mode and 46 on the shared expert's, against the lm head's 194 on the
+// same kind of bank (L7d-3, L8b).
+//
+// So this is the other kernel, and the three things it changes are the three
+// leads L8d names:
+//
+//   **the grid** — a workgroup is LPR lanes per output column and NCOL
+//   columns, so the up mode's grid is (640/NCOL) x tiles rather than
+//   (640/BN) x tiles: hundreds to thousands of workgroups where the GEMM has
+//   ten to four hundred, on a 40-CU device that was short of workgroups and
+//   not of rows (D11);
+//
+//   **the LDS round trip** — there is none. A lane unpacks its own dwords of
+//   the weight straight into registers and multiplies them there. §2.2's rule
+//   that nibbles cannot be unpacked into a cooperative-matrix *fragment*
+//   still holds; it says nothing about a dot product, which has no fragment.
+//   The A vector is the only thing in LDS, staged once for the whole
+//   workgroup rather than once per K-step;
+//
+//   **the loads** — a lane's dwords are independent of each other and of
+//   every barrier, so the whole row's worth of loads is in flight at once
+//   instead of one K-step's being issued and immediately consumed (§2.7).
+//
+// **It is a decode kernel and it says so.** A tile is (expert, row block) and
+// this reads *one* row of it, the first — which is the only real one when the
+// batch is a single token, because the top-k of one token names ten distinct
+// experts with one row each and the permutation puts that row at the tile's
+// base. The host refuses the rung above one token rather than this silently
+// dropping rows.
+//
+// **The arithmetic is not the GEMM's, and the difference is below the floor
+// the block already sits on.** The GEMM stores `float16_t(ds*nib - dm)` into
+// LDS because a fragment is halves; here the unpacked weight stays an f32 and
+// the product with the f16 activation is exact, so a dot product carries one
+// fewer rounding per weight. It cannot be made bit-identical to that path from
+// a register — D10: `float(float16_t(x))` is folded away by RADV, and unlike
+// L8b-2's `float16_t(q) * d` there is no pair of exact halves to multiply
+// here. Measured rather than assumed: the two kernels differ by rms 2.5e-06 on
+// an `ffn_out` whose distance from llama.cpp's own is 4.65e-05, so it is fifty
+// times under the difference the block already has (TestMoEGPUDecode).
+
+#define MOE_QBANK
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0      // 0 = gate/up + swiglu, 1 = down, scattered by position
+#endif
+#define FMT_Q4_K 0
+#define FMT_Q5_K 1
+#define FMT_Q5_1 2
+#define FMT_Q8_0 3
+#ifndef QFMT
+#define QFMT FMT_Q4_K
+#endif
+// Lanes that share one output column. It is the only ladder axis that changes
+// the shape of a load: a column's row of the bank is `nqd` quantised dwords
+// and LPR lanes walk it in stride, so LPR consecutive lanes read LPR
+// consecutive dwords — 4*LPR contiguous bytes an instruction, up to a whole
+// 256-byte pair of cache lines at 64.
+//
+// It has to divide 64 and it wants to divide `nqd`. The four shapes this
+// block runs are Q4_K/Q5_K at K = 2560 (320 dwords), Q8_0 at 2560 (640) and
+// at 640 (160), and Q5_1 at 640 (80) — so 16 divides every one of them, 32
+// all but Q5_1's and 64 only the two at 2560. The loop below covers any
+// remainder; the ladder is what says which rung to stand on.
+#ifndef LPR
+#define LPR 64
+#endif
+// Waves a workgroup, which here buys exactly one thing: the A vector is
+// staged in LDS once per workgroup, so four waves read it a quarter as many
+// times. It changes no arithmetic and no weight traffic.
+#ifndef WAVES
+#define WAVES 1
+#endif
+
+#define WAVE 64
+#define LANES (WAVES * WAVE)
+#define NCOL (LANES / LPR)
+// The longest A this block has: the up mode reduces over nEmbd = 2560 and the
+// down mode over the expert width, 640.
+#ifndef AKMAX
+#define AKMAX 2560
+#endif
+
+layout(local_size_x = LANES) in;
+
+shared float16_t sA[AKMAX];
+
+// ---- The formats, as the GEMM states them: bytes a block covers, elements a
+// block covers, and — the one thing a GEMV needs that a slab unpack does not
+// — how many **dwords of quantised payload** a block holds, because that is
+// the axis the lanes divide.
+#if QFMT == FMT_Q4_K
+#define QK 256u
+#define QB 144u
+#define QSDB 32u
+#elif QFMT == FMT_Q5_K
+#define QK 256u
+#define QB 176u
+#define QSDB 32u
+#elif QFMT == FMT_Q5_1
+#define QK 32u
+#define QB 24u
+#define QSDB 4u
+#else
+#define QK 32u
+#define QB 34u
+#define QSDB 8u
+#endif
+
+#if QFMT == FMT_Q4_K || QFMT == FMT_Q5_K
+// ggml's get_scale_min_k4, unchanged from the GEMM's copy.
+uint sbyte(uvec3 s, uint i) {
+    uint w = (i < 4u) ? s.x : ((i < 8u) ? s.y : s.z);
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+void scaleMinK4(uint j, uvec3 s, out uint sc, out uint mn) {
+    if (j < 4u) {
+        sc = sbyte(s, j) & 63u;
+        mn = sbyte(s, j + 4u) & 63u;
+    } else {
+        uint a = sbyte(s, j + 4u);
+        sc = (a & 0xFu) | ((sbyte(s, j - 4u) >> 6) << 4);
+        mn = (a >> 4) | ((sbyte(s, j) >> 6) << 4);
+    }
+}
+#endif
+
+// dotDword is the whole kernel: the `d`-th quantised dword of the bank row
+// that starts at byte `rb`, unpacked into registers and dotted against the
+// elements of A it covers. Eight elements for every format — four bytes, two
+// nibbles each for the nibble formats and four int8s for Q8_0, which is why
+// Q8_0's row holds twice the dwords for the same K.
+#if QFMT == FMT_Q4_K
+float dotDword(uint rb, uint d) {
+    uint sb = d >> 5;               // which 256-element super-block
+    uint ll = d & 31u;              // which of its 32 payload dwords
+    uint blk = rb + sb * QB;
+    uint hw = blk >> 2;
+    vec2 dd = unpackHalf2x16(qbank[hw]);
+    uvec3 s = uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]);
+    // A dword's four bytes are one 32-element sub-block in their low nibbles
+    // and the next one in their high nibbles, so both of the super-block's
+    // scale pairs for this 64-group are needed and neither is read twice.
+    uint g = ll >> 3;
+    uint sc0, mn0, sc1, mn1;
+    scaleMinK4(2u * g, s, sc0, mn0);
+    scaleMinK4(2u * g + 1u, s, sc1, mn1);
+    float ds0 = dd.x * float(sc0), dm0 = dd.y * float(mn0);
+    float ds1 = dd.x * float(sc1), dm1 = dd.y * float(mn1);
+    uint w = qbank[hw + 4u + ll];
+    uint k0 = sb * QK + g * 64u + (ll & 7u) * 4u;
+    float acc = 0.0;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        uint by = (w >> (8u * b)) & 0xFFu;
+        acc += (ds0 * float(by & 0xFu) - dm0) * float(sA[k0 + b]);
+        acc += (ds1 * float(by >> 4) - dm1) * float(sA[k0 + 32u + b]);
+    }
+    return acc;
+}
+#elif QFMT == FMT_Q5_K
+float dotDword(uint rb, uint d) {
+    uint sb = d >> 5;
+    uint ll = d & 31u;
+    uint blk = rb + sb * QB;
+    uint hw = blk >> 2;
+    vec2 dd = unpackHalf2x16(qbank[hw]);
+    uvec3 s = uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]);
+    uint g = ll >> 3;
+    uint sc0, mn0, sc1, mn1;
+    scaleMinK4(2u * g, s, sc0, mn0);
+    scaleMinK4(2u * g + 1u, s, sc1, mn1);
+    float ds0 = dd.x * float(sc0), dm0 = dd.y * float(mn0);
+    float ds1 = dd.x * float(sc1), dm1 = dd.y * float(mn1);
+    // The fifth bit of element j of the super-block is bit (j >> 5) of
+    // qh[j & 31], and a dword's eight elements share one qh byte per byte of
+    // payload — so one dword of qh covers this lane's four.
+    uint h = qbank[hw + 4u + (ll & 7u)];
+    uint w = qbank[hw + 12u + ll];
+    uint k0 = sb * QK + g * 64u + (ll & 7u) * 4u;
+    float acc = 0.0;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        uint by = (w >> (8u * b)) & 0xFFu;
+        uint hb = (h >> (8u * b)) & 0xFFu;
+        uint lo = (by & 0xFu) | (((hb >> (2u * g)) & 1u) << 4);
+        uint hi = (by >> 4) | (((hb >> (2u * g + 1u)) & 1u) << 4);
+        acc += (ds0 * float(lo) - dm0) * float(sA[k0 + b]);
+        acc += (ds1 * float(hi) - dm1) * float(sA[k0 + 32u + b]);
+    }
+    return acc;
+}
+#elif QFMT == FMT_Q5_1
+float dotDword(uint rb, uint d) {
+    uint m = d >> 2;                // which 32-element block
+    uint qq = d & 3u;               // which of its four payload dwords
+    uint blk = rb + m * QB;
+    uint hw = blk >> 2;
+    vec2 dm = unpackHalf2x16(qbank[hw]);
+    uint qh = qbank[hw + 1u];
+    uint w = qbank[hw + 2u + qq];
+    uint k0 = m * QK;
+    uint j0 = qq * 4u;
+    float acc = 0.0;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        uint j = j0 + b;
+        uint by = (w >> (8u * b)) & 0xFFu;
+        uint lo = (by & 0xFu) | (((qh >> j) & 1u) << 4);
+        uint hi = (by >> 4) | (((qh >> (j + 16u)) & 1u) << 4);
+        acc += (float(lo) * dm.x + dm.y) * float(sA[k0 + j]);
+        acc += (float(hi) * dm.x + dm.y) * float(sA[k0 + j + 16u]);
+    }
+    return acc;
+}
+#else
+// Q8_0's 34-byte block is the one that is not word-aligned below the row: the
+// int8s start at an offset of 2 mod 4 on every other block, so a payload
+// dword comes out of a two-word rotating window.
+float dotDword(uint rb, uint d) {
+    uint m = d >> 3;
+    uint qq = d & 7u;
+    uint blk = rb + m * QB;
+    uint hw = blk >> 2;
+    vec2 dd = unpackHalf2x16(qbank[hw]);
+    float dq = ((blk & 2u) == 0u) ? dd.x : dd.y;
+    uint base = blk + 2u;
+    uint bw = (base >> 2) + qq;
+    uint w = ((base & 2u) != 0u) ? ((qbank[bw] >> 16) | (qbank[bw + 1u] << 16)) : qbank[bw];
+    uint k0 = m * QK + qq * 4u;
+    float acc = 0.0;
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+        uint by = (w >> (8u * b)) & 0xFFu;
+        acc += float(int(by) - int((by >> 7) << 8)) * dq * float(sA[k0 + b]);
+    }
+    return acc;
+}
+#endif
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint tileIdx = gl_WorkGroupID.y;
+    // The grid is the same static upper bound the GEMM's is, and the same
+    // early return: the schedule's real length lives on the device.
+    if (tileIdx >= actu[pc.moeTileOff]) {
+        return;
+    }
+    uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
+    uint expert = actu[rec];
+    uint rowStart = actu[rec + 1u];
+    uint slots = MOE_USED + 1u;
+
+    // The row. MODE 0's is some token's row of the block input, named by the
+    // permutation; MODE 1's is the permutation position itself, which is what
+    // MODE 0 wrote. One row per tile — see the header.
+#if MODE == 0
+    uint p = actu[pc.moePermOff + rowStart];
+    uint aBase = pc.xnOff + (p / slots) * pc.lda;
+#else
+    uint aBase = pc.ctxOff + rowStart * pc.ldCtx;
+#endif
+    for (uint k = tid; k < pc.gemmK; k += LANES) {
+        sA[k] = hact[aBase + k];
+    }
+    barrier();
+
+    uint lane = tid & (LPR - 1u);
+    uint n0 = gl_WorkGroupID.x * NCOL + (tid / LPR);
+    uint rowBytes = (pc.gemmK / QK) * QB;
+    uint bankRow = expert * pc.gemmN + n0;
+    uint rb0 = pc.bOff + bankRow * rowBytes;
+#if MODE == 0
+    uint rb1 = pc.moeBOff2 + bankRow * rowBytes;
+#endif
+
+    uint nqd = (pc.gemmK / QK) * QSDB;
+    float acc0 = 0.0;
+#if MODE == 0
+    float acc1 = 0.0;
+#endif
+    for (uint d = lane; d < nqd; d += LPR) {
+        acc0 += dotDword(rb0, d);
+#if MODE == 0
+        acc1 += dotDword(rb1, d);
+#endif
+    }
+
+    acc0 = subgroupClusteredAdd(acc0, LPR);
+#if MODE == 0
+    acc1 = subgroupClusteredAdd(acc1, LPR);
+#endif
+    if (lane != 0u) {
+        return;
+    }
+#if MODE == 0
+    // `ggml_swiglu_split` on the two sums, so the [rows, 640] pair the
+    // reference materialises never exists here either.
+    hact[pc.ctxOff + rowStart * pc.ldCtx + n0] =
+        float16_t(acc0 * sigmoidf(acc0) * acc1);
+#else
+    act[pc.gatedOff + rowStart * pc.nEmbd + n0] = acc0;
+#endif
+}

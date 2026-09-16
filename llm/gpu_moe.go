@@ -100,27 +100,122 @@ const (
 	// than of rows needs. Up mode only: the down mode's N is 2560.
 	MoEN2M1 MoEKernel = "n2m1" // BM 16, BN 32
 	MoEN1M1 MoEKernel = "n1m1" // BM 16, BN 16
+
+	// And the rungs that are **not the same kernel**: llm_moe_gemv.comp,
+	// L8d. Narrowing BN took the up mode from 71 to 93 GB/s and no further,
+	// because what is left is not the grid — it is that a workgroup unpacks
+	// its slab into LDS per K-step, behind a barrier, to multiply it by one
+	// real row. The GEMV drops the slab, the barrier and the cooperative
+	// matrix: LPR lanes share one output column and walk its row of the bank
+	// in stride, straight into registers, with every load of the row in
+	// flight at once.
+	//
+	// A rung is `v<LPR>` with an optional `w4`, which is four waves a
+	// workgroup sharing the one A vector in LDS. Both modes have all six and
+	// they may be mixed with each other and with the GEMM rungs, because
+	// every one of them cuts its tile list to the same sixteen rows.
+	//
+	// **They read one row of a tile**, which is every real row a tile has
+	// when the batch is one token — ten distinct experts, one row each — and
+	// is not when it is two. The host refuses them above one token.
+	MoEV16   MoEKernel = "v16"   // 16 lanes a column, 4 columns a workgroup
+	MoEV32   MoEKernel = "v32"   // 32 lanes, 2 columns
+	MoEV64   MoEKernel = "v64"   // a whole wave a column
+	MoEV16W4 MoEKernel = "v16w4" // four waves: 16 columns a workgroup
+	MoEV32W4 MoEKernel = "v32w4" // 8 columns
+	MoEV64W4 MoEKernel = "v64w4" // 4 columns
 )
 
-// MoEKernels lists the rungs both modes have, narrowest first.
+// MoEKernels lists the GEMM rungs both modes have, narrowest first.
 func MoEKernels() []MoEKernel {
 	return []MoEKernel{MoEM1, MoEM2, MoEM4, MoEW2M1, MoEW4M1}
 }
 
-// MoEUpKernels lists every rung the up mode can run, which is the list above
-// plus the narrow-N pair.
+// MoEUpKernels lists every GEMM rung the up mode can run, which is the list
+// above plus the narrow-N pair.
 func MoEUpKernels() []MoEKernel {
 	return append(MoEKernels(), MoEN2M1, MoEN1M1)
 }
 
+// MoEDecodeKernels lists the GEMV rungs, which both modes share and which
+// only a one-token batch may stand on.
+func MoEDecodeKernels() []MoEKernel {
+	return []MoEKernel{MoEV16, MoEV32, MoEV64, MoEV16W4, MoEV32W4, MoEV64W4}
+}
+
+// MoERouterKernel names how `ffn_gate_inp` runs. `MoERouterGEMM` is
+// llm_gemm.comp MODE 2 at the `GEMMKernelFor` rung, which is right at prefill
+// and is nine workgroups at one token; the rest are llm_moe_router.comp's
+// split-K, by how many ways it cuts K (L8d-3).
+type MoERouterKernel string
+
+const (
+	MoERouterGEMM MoERouterKernel = "gemm"
+	MoERouterK8   MoERouterKernel = "k8"
+	MoERouterK10  MoERouterKernel = "k10"
+	MoERouterK20  MoERouterKernel = "k20"
+	MoERouterK40  MoERouterKernel = "k40"
+)
+
+// MoERouterKernels lists the split-K rungs. Every one of them divides 40,
+// which is what makes 160 k-tiles a whole number of four-tile steps.
+func MoERouterKernels() []MoERouterKernel {
+	return []MoERouterKernel{MoERouterK8, MoERouterK10, MoERouterK20, MoERouterK40}
+}
+
+// moeRouterSlabs is a rung's split, and zero for the GEMM.
+func moeRouterSlabs(k MoERouterKernel) int {
+	switch k {
+	case MoERouterK8:
+		return 8
+	case MoERouterK10:
+		return 10
+	case MoERouterK20:
+		return 20
+	case MoERouterK40:
+		return 40
+	}
+	return 0
+}
+
+// moeRouterMaxSlabs sizes the partial-sum arena: f32 [KSLABS][routerN], which
+// at the widest rung is 92 KB and is allocated whatever rung runs.
+const moeRouterMaxSlabs = 40
+
+// MoEIsGemv reports whether a rung is llm_moe_gemv.comp rather than
+// llm_moe_gemm.comp. It is what says a plan needs a one-token batch.
+func MoEIsGemv(k MoEKernel) bool {
+	switch k {
+	case MoEV16, MoEV32, MoEV64, MoEV16W4, MoEV32W4, MoEV64W4:
+		return true
+	}
+	return false
+}
+
 // moeBNOf is a rung's column block. It is what the host has to know to shape
 // the grid, and it is compiled into the SPIR-V.
+// A GEMV rung has no column block in the GEMM's sense; what it has is NCOL,
+// the output columns one workgroup owns, which is `waves * 64 / LPR`. It
+// enters the grid at exactly the same place, so the two kinds of rung share
+// this function and `graph` needs no branch.
 func moeBNOf(k MoEKernel) int {
 	switch k {
 	case MoEN1M1:
 		return 16
 	case MoEN2M1:
 		return 32
+	case MoEV16:
+		return 4
+	case MoEV32:
+		return 2
+	case MoEV64:
+		return 1
+	case MoEV16W4:
+		return 16
+	case MoEV32W4:
+		return 8
+	case MoEV64W4:
+		return 4
 	}
 	return moeBN
 }
@@ -134,6 +229,11 @@ func moeBM(k MoEKernel) int {
 	case MoEM4, MoEW4M1:
 		return 64
 	}
+	if MoEIsGemv(k) {
+		// The tile list is the GEMM's narrowest, so a GEMV plan may be mixed
+		// with one and the permutation's alignment does not move.
+		return 16
+	}
 	return 0
 }
 
@@ -143,7 +243,7 @@ func MoEWaves(k MoEKernel) int {
 	switch k {
 	case MoEW2M1:
 		return 2
-	case MoEW4M1:
+	case MoEW4M1, MoEV16W4, MoEV32W4, MoEV64W4:
 		return 4
 	}
 	return 1
@@ -175,9 +275,88 @@ const moeBMMax = 64
 // `m2/m2`'s 100 and the shared expert's 40 against ten, which is **1.28x on
 // the block** (L7d): 612.3 us to 479.9, with the up mode at 93 GB/s of bank
 // against 71 and the shared expert's at 46 against 23.
+// MoERouterFor is the router's rung. The split-K kernel is a **decode** kernel
+// in the same sense the expert GEMVs are — it reads one token's row — so
+// above one token the block goes back to the GEMM, which is the right kernel
+// there anyway: at a 512-token ubatch `ffn_gate_inp` is 512 rows of A and the
+// grid is no longer nine workgroups.
+func MoERouterFor(tokens int) MoERouterKernel {
+	if tokens == 1 && DecodeGEMV() {
+		return MoERouterK40
+	}
+	return MoERouterGEMM
+}
+
+// SetRouter chooses the router's rung, for the ladder. It is separate from
+// SetPlan because the router is a different matrix from the experts and its
+// ladder does not cross theirs.
+func (g *MoEGPU) SetRouter(k MoERouterKernel) error {
+	if k != MoERouterGEMM && moeRouterSlabs(k) == 0 {
+		return fmt.Errorf("llm: no MoE router kernel %q (have %v)", k, append([]MoERouterKernel{MoERouterGEMM}, MoERouterKernels()...))
+	}
+	if k != MoERouterGEMM && g.rows > 1 {
+		return fmt.Errorf("llm: the MoE router rung %q reads one token's row; this batch is %d", k, g.rows)
+	}
+	g.routerGemv = k
+	g.autoPlan = false
+	return nil
+}
+
+// Router reports the rung in use.
+func (g *MoEGPU) Router() MoERouterKernel { return g.routerGemv }
+
+// PinGemv holds the block on llm_moe_gemm.comp and the GEMM router whatever
+// the batch, and releases it to the measured schedule when off. See
+// Graph.PinSchedule.
+func (g *MoEGPU) PinGemv(on bool) {
+	g.pinGemv = on
+	if !g.autoPlan {
+		return
+	}
+	if on {
+		g.up, g.down, g.routerGemv = MoEN1M1, MoEM1, MoERouterGEMM
+		if g.rows > 1 {
+			g.up, g.down = MoEM2, MoEM2
+		}
+	} else {
+		g.up, g.down = MoEPlanFor(g.rows)
+		g.routerGemv = MoERouterFor(g.rows)
+	}
+	g.syncShared()
+}
+
+// moePlan is the schedule for a batch, honouring the pin.
+func (g *MoEGPU) moePlan(nTok int) (MoEKernel, MoEKernel, MoERouterKernel) {
+	if g.pinGemv {
+		if nTok == 1 {
+			return MoEN1M1, MoEM1, MoERouterGEMM
+		}
+		up, down := MoEPlanFor(nTok)
+		return up, down, MoERouterGEMM
+	}
+	up, down := MoEPlanFor(nTok)
+	return up, down, MoERouterFor(nTok)
+}
+
+// moeCheckGemv is the one thing a GEMV plan needs that a GEMM plan does not.
+func moeCheckGemv(up, down MoEKernel, rows int) error {
+	if rows <= 1 {
+		return nil
+	}
+	for _, k := range []MoEKernel{up, down} {
+		if MoEIsGemv(k) {
+			return fmt.Errorf("llm: the MoE GEMV rung %q reads one row of a tile, so it is a one-token kernel; this batch is %d", k, rows)
+		}
+	}
+	return nil
+}
+
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 	switch {
+	case tokens == 1 && DecodeGEMV():
+		return MoEV64W4, MoEV16W4
 	case tokens == 1:
+		// L8d's control: the narrow-BN GEMM rung L7d left the plan on.
 		return MoEN1M1, MoEM1
 	case tokens <= 1024:
 		return MoEM2, MoEM2
@@ -262,6 +441,56 @@ var moeSPIRV = map[string][]byte{
 	"down_q80_m4":   shaders.LLMMoEDownQ80M4,
 	"down_q80_w2m1": shaders.LLMMoEDownQ80W2M1,
 	"down_q80_w4m1": shaders.LLMMoEDownQ80W4M1,
+
+	// The decode rungs, which are a different kernel rather than a different
+	// shape of the same one: llm_moe_gemv.comp, LLM.md L8d. Same two modes,
+	// same four formats, same tile list — no LDS slab, no barrier in the K
+	// loop and no cooperative matrix.
+	"up_q4k_v16":     shaders.LLMMoEGVUpQ4KV16,
+	"up_q4k_v32":     shaders.LLMMoEGVUpQ4KV32,
+	"up_q4k_v64":     shaders.LLMMoEGVUpQ4KV64,
+	"up_q4k_v16w4":   shaders.LLMMoEGVUpQ4KV16W4,
+	"up_q4k_v32w4":   shaders.LLMMoEGVUpQ4KV32W4,
+	"up_q4k_v64w4":   shaders.LLMMoEGVUpQ4KV64W4,
+	"up_q5k_v16":     shaders.LLMMoEGVUpQ5KV16,
+	"up_q5k_v32":     shaders.LLMMoEGVUpQ5KV32,
+	"up_q5k_v64":     shaders.LLMMoEGVUpQ5KV64,
+	"up_q5k_v16w4":   shaders.LLMMoEGVUpQ5KV16W4,
+	"up_q5k_v32w4":   shaders.LLMMoEGVUpQ5KV32W4,
+	"up_q5k_v64w4":   shaders.LLMMoEGVUpQ5KV64W4,
+	"up_q80_v16":     shaders.LLMMoEGVUpQ80V16,
+	"up_q80_v32":     shaders.LLMMoEGVUpQ80V32,
+	"up_q80_v64":     shaders.LLMMoEGVUpQ80V64,
+	"up_q80_v16w4":   shaders.LLMMoEGVUpQ80V16W4,
+	"up_q80_v32w4":   shaders.LLMMoEGVUpQ80V32W4,
+	"up_q80_v64w4":   shaders.LLMMoEGVUpQ80V64W4,
+	"down_q51_v16":   shaders.LLMMoEGVDownQ51V16,
+	"down_q51_v32":   shaders.LLMMoEGVDownQ51V32,
+	"down_q51_v64":   shaders.LLMMoEGVDownQ51V64,
+	"down_q51_v16w4": shaders.LLMMoEGVDownQ51V16W4,
+	"down_q51_v32w4": shaders.LLMMoEGVDownQ51V32W4,
+	"down_q51_v64w4": shaders.LLMMoEGVDownQ51V64W4,
+	"down_q80_v16":   shaders.LLMMoEGVDownQ80V16,
+	"down_q80_v32":   shaders.LLMMoEGVDownQ80V32,
+	"down_q80_v64":   shaders.LLMMoEGVDownQ80V64,
+	"down_q80_v16w4": shaders.LLMMoEGVDownQ80V16W4,
+	"down_q80_v32w4": shaders.LLMMoEGVDownQ80V32W4,
+	"down_q80_v64w4": shaders.LLMMoEGVDownQ80V64W4,
+}
+
+// moeRouterSPIRV is the decode router's two dispatches at each split (L8d-3).
+// It is a table of its own because the router is not a rung of the grouped
+// GEMM: a different matrix, a different kernel and a ladder that does not
+// cross the experts'.
+var moeRouterSPIRV = map[string][]byte{
+	"router_k8":    shaders.LLMMoERouterK8,
+	"router_k8_r":  shaders.LLMMoERouterK8R,
+	"router_k10":   shaders.LLMMoERouterK10,
+	"router_k10_r": shaders.LLMMoERouterK10R,
+	"router_k20":   shaders.LLMMoERouterK20,
+	"router_k20_r": shaders.LLMMoERouterK20R,
+	"router_k40":   shaders.LLMMoERouterK40,
+	"router_k40_r": shaders.LLMMoERouterK40R,
 }
 
 // moeLayerWeights is where one layer's FFN half sits. The router is halves in
@@ -275,6 +504,10 @@ type moeLayerWeights struct {
 	gateFmt, upFmt, downFmt       moeFmt
 	shGateFmt, shUpFmt, shDownFmt moeFmt
 }
+
+// moeCombineWG is llm_moe_combine.comp's workgroup, and the column block its
+// grid is cut to. It is a constant on both sides.
+const moeCombineWG = 64
 
 // moeMaxBanks is how many buffers binding 5 (and binding 6, the same buffers
 // read as `uvec4`) holds, and it is the checkpoint's layer count: **a layer's
@@ -307,9 +540,13 @@ type MoEGPU struct {
 
 	layers []moeLayerWeights
 
-	up, down MoEKernel
-	router   GEMMKernel
-	autoPlan bool
+	up, down   MoEKernel
+	router     GEMMKernel
+	routerGemv MoERouterKernel
+	autoPlan   bool
+	// pinGemv holds the block on llm_moe_gemm.comp and the GEMM router
+	// whatever the batch: see Graph.PinSchedule and DeltaNetGPU.pinGemv.
+	pinGemv bool
 
 	tokens, arenaRows, rows int
 	lda, ldCtx              int
@@ -320,6 +557,7 @@ type MoEGPU struct {
 	aPerm, aBook                    uint32
 	aTilesUp, aTilesDown            uint32
 	aShTilesUp, aShTilesDown        uint32
+	aRouterPart                     uint32
 	actElems                        int
 	// fp16 activation arena.
 	hXn, hSwiglu uint32
@@ -392,10 +630,11 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 		dev: dev, cfg: cfg,
 		pipes:  make(map[string]*vk.ComputePipeline),
 		tokens: maxTokens, rows: maxTokens,
-		lda:      cfg.NEmbd + gemmPad,
-		ldCtx:    cfg.FFNExpert + gemmPad,
-		router:   GEMMKernelFor(maxTokens),
-		autoPlan: true,
+		lda:        cfg.NEmbd + gemmPad,
+		ldCtx:      cfg.FFNExpert + gemmPad,
+		router:     GEMMKernelFor(maxTokens),
+		routerGemv: MoERouterFor(maxTokens),
+		autoPlan:   true,
 	}
 	g.up, g.down = MoEPlanFor(maxTokens)
 	align := moeBMMax
@@ -427,16 +666,36 @@ func (g *MoEGPU) pad() int { return maxInt(moeBM(g.up), moeBM(g.down)) }
 
 // maxRows is the static upper bound on the permuted row space: the shared
 // expert's group at the front, every routed row, and at most one alignment of
-// slack per expert.
+// slack per expert **that has a row**. The last clause is the whole bound at
+// decode: a batch of `rows` tokens names at most `rows * used` experts, so
+// ten of the 512 can be padded and not 512 (L8d-1).
 func (g *MoEGPU) maxRows(rows int) int {
-	return roundUpInt(rows, moeBMMax) + rows*g.cfg.NExpertUsed + g.cfg.NExpert*moeBMMax
+	return roundUpInt(rows, moeBMMax) + rows*g.cfg.NExpertUsed + g.touchable(rows)*moeBMMax
+}
+
+// touchable is how many experts a batch can possibly route to.
+func (g *MoEGPU) touchable(rows int) int {
+	return minInt(g.cfg.NExpert, rows*g.cfg.NExpertUsed)
 }
 
 // maxTiles is the static upper bound on (expert, row block) records at a
-// given rung. The GEMM's grid is this, and everything past the schedule's
-// real length returns before it reads a weight.
+// given rung. **The GEMM's grid is this**, and everything past the schedule's
+// real length returns before it reads a weight — so it is not a bookkeeping
+// number, it is a dispatch: `gemmN/BN` workgroups for every tile it names,
+// and an empty workgroup is about 0.5 ns.
+//
+// **L8d-1: it was `maxRows/bm`, which at one token is 2052 tiles where eleven
+// exist.** `maxRows` allows every one of the 512 experts an alignment of
+// slack, because a 512-token ubatch really can touch 274 of them — but the
+// row space and the *tile list* are not the same bound, and a batch that
+// routes ten rows makes at most ten padded experts however wide the padding
+// is. At the GEMM's own BN of 64 that was 82 080 workgroups to run 11, which
+// cost about 33 us a layer and was invisible because it was inside the
+// dispatch it padded; at the GEMV rungs, whose whole point is a narrower BN,
+// it is the dispatch. The bound below is exact at one token.
 func (g *MoEGPU) maxTiles(bm, rows int) int {
-	return g.maxRows(rows) / bm
+	pad := g.pad()
+	return roundUpInt(rows, pad)/bm + roundUpInt(rows*g.cfg.NExpertUsed, bm)/bm + g.touchable(rows)*(pad/bm)
 }
 
 // alloc lays out the five arenas. Nothing is read here — every size follows
@@ -480,6 +739,10 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	// is host-written because a dense group's is the identity.
 	shTiles := 2 + 3*(roundUpInt(rows, moeBMMax)/moeBMMin)
 	g.aShTilesUp = alloc(shTiles)
+	// The decode router's partial sums, f32 [KSLABS][routerN] (L8d-3). 92 KB
+	// at the widest rung, and allocated whichever rung runs — the arena plan
+	// is fixed at construction and the rung is not.
+	g.aRouterPart = alloc(moeRouterMaxSlabs * g.routerN())
 	g.aShTilesDown = alloc(shTiles)
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: moe fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
@@ -605,6 +868,11 @@ func (g *MoEGPU) build() error {
 			return err
 		}
 	}
+	for name, spirv := range moeRouterSPIRV {
+		if err := g.pipeline(name, spirv, spec); err != nil {
+			return err
+		}
+	}
 	for _, v := range gemmVariants {
 		if err := g.pipeline(string(v.name), v.spirv, spec); err != nil {
 			return err
@@ -667,10 +935,16 @@ func (g *MoEGPU) stage(layers []MoEWeights) error {
 // same staged bank, so this moves a pipeline and restages nothing.
 func (g *MoEGPU) SetPlan(up, down MoEKernel) error {
 	if moeBM(up) == 0 {
-		return fmt.Errorf("llm: no MoE up kernel %q (have %v)", up, MoEUpKernels())
+		return fmt.Errorf("llm: no MoE up kernel %q (have %v)", up, append(MoEUpKernels(), MoEDecodeKernels()...))
 	}
-	if moeBM(down) == 0 || moeBNOf(down) != moeBN {
-		return fmt.Errorf("llm: no MoE down kernel %q (have %v)", down, MoEKernels())
+	if moeBM(down) == 0 || (!MoEIsGemv(down) && moeBNOf(down) != moeBN) {
+		return fmt.Errorf("llm: no MoE down kernel %q (have %v)", down, append(MoEKernels(), MoEDecodeKernels()...))
+	}
+	// The GEMV reads one row of a tile, and a tile has exactly one real row
+	// only when the batch does: a token's top-k names ten *distinct* experts,
+	// so at one token every tile is one row and at two it may be two.
+	if err := moeCheckGemv(up, down, g.rows); err != nil {
+		return err
 	}
 	g.up, g.down = up, down
 	g.autoPlan = false
@@ -718,7 +992,9 @@ func (g *MoEGPU) Upload(x []float32, nTok int) error {
 	g.rows = nTok
 	if g.autoPlan {
 		g.router = GEMMKernelFor(nTok)
-		g.up, g.down = MoEPlanFor(nTok)
+		g.up, g.down, g.routerGemv = g.moePlan(nTok)
+	} else if err := moeCheckGemv(g.up, g.down, nTok); err != nil {
+		return err
 	}
 	rowsPad := roundUpInt(nTok, moeBMMax)
 	xn := make([]uint16, rowsPad*g.lda)
@@ -821,12 +1097,22 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 
 	// 1. The router, with the shared expert's gate as one more output column.
+	//    At one token it is a split-K GEMV in two dispatches and at every
+	//    other length the GEMM (L8d-3); both write the same f32 logits row.
 	router := base
 	router.OutOff, router.BOff = g.aLogits, w.router
 	router.GemmM = uint32(roundUpInt(g.rows, rv.bm))
 	router.GemmN, router.GemmK = uint32(g.routerN()), uint32(c.NEmbd)
-	add(string(g.router), "router", uint32(g.routerN()/attnBN),
-		uint32(roundUpInt(g.rows, rv.bm)/rv.bm), router)
+	if ks := moeRouterSlabs(g.routerGemv); ks > 0 {
+		router.GammaOff = g.aRouterPart
+		add(fmt.Sprintf("router_%s", g.routerGemv), "router",
+			uint32(ks), uint32(g.routerN()/16), router)
+		add(fmt.Sprintf("router_%s_r", g.routerGemv), "router.sum",
+			uint32(roundUpInt(g.routerN(), moeWave)/moeWave), 1, router)
+	} else {
+		add(string(g.router), "router", uint32(g.routerN()/attnBN),
+			uint32(roundUpInt(g.rows, rv.bm)/rv.bm), router)
+	}
 
 	// 2. The softmax, the ten argmaxes, the normalise and the shared gate.
 	route := base
@@ -866,7 +1152,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	down.CtxOff = g.hSwiglu
 	down.GemmN, down.GemmK = uint32(c.NEmbd), uint32(c.FFNExpert)
 	add(fmt.Sprintf("down_%s_%s", w.downFmt, g.down), "down",
-		uint32(c.NEmbd/moeBN), uint32(g.maxTiles(bmDown, g.rows)), down)
+		uint32(c.NEmbd/moeBNOf(g.down)), uint32(g.maxTiles(bmDown, g.rows)), down)
 
 	// 7-8. The shared expert: the same two kernels over one group whose
 	//      permutation is the identity, because it is the same shape as a
@@ -885,10 +1171,10 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
 	add(fmt.Sprintf("down_%s_%s", w.shDownFmt, g.down), "shexp.down",
-		uint32(c.NEmbd/moeBN), uint32(roundUpInt(g.rows, g.pad())/bmDown), shDown)
+		uint32(c.NEmbd/moeBNOf(g.down)), uint32(roundUpInt(g.rows, g.pad())/bmDown), shDown)
 
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.
-	add("combine", "combine", uint32(g.rows), 1, base)
+	add("combine", "combine", uint32(roundUpInt(c.NEmbd, moeCombineWG)/moeCombineWG), uint32(g.rows), base)
 	return d, kinds, nil
 }
 
@@ -1232,10 +1518,15 @@ func (g *MoEGPU) Resize(nTok int) error {
 	if nTok <= 0 || nTok > g.tokens {
 		return fmt.Errorf("llm: %d tokens, staged for %d", nTok, g.tokens)
 	}
+	if !g.autoPlan {
+		if err := moeCheckGemv(g.up, g.down, nTok); err != nil {
+			return err
+		}
+	}
 	g.rows = nTok
 	if g.autoPlan {
 		g.router = GEMMKernelFor(nTok)
-		g.up, g.down = MoEPlanFor(nTok)
+		g.up, g.down, g.routerGemv = g.moePlan(nTok)
 	}
 	g.syncShared()
 	return nil

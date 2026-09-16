@@ -880,6 +880,104 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-17 (forty-ninth) — stage L8d: the decode kernels, and five grids said the same thing
+
+**Result: decode is 23.15 tok/s against L8b's 14.71 — 1.57x — with no bank
+change of any kind, and prefill *faster* at both ubatches rather than merely
+no slower: 1049.8 tok/s at 2048 against 1041.1 and 653.9 at 512 against
+643.4.** A token is 66.7 ms to 43.0. The MoE block is 27.6 ms a token to
+12.05 (2.29x, **58 GB/s of bank to 133**) and the gated DeltaNet 18.9 to 11.0
+(1.72x, 119 to 205). Two decode runs agree to 0.13% (23.15 / 23.12) and two
+prefill runs to 0.6% and 0.02%. The whole `llm` suite passes.
+[Write-up](research/l8d-moe-decode.md) · `results/l8d_decode.csv`,
+`results/l8d_decode_gemm.csv`, `results/l8d_graph.csv`, `results/l8d_moe.csv`,
+`results/l8d_dn.csv` · `LLM.md` updated.
+
+Everything here is a grid or a kernel shape. Every byte is staged exactly as
+L5b and L8a staged it, so there is no accuracy question and none is argued;
+what changes is the **order of a sum**.
+
+**1. The MoE's tile grid was a static bound of 2052 records where eleven
+exist.** The grouped GEMM dispatches an upper bound of (expert, row block)
+records because the real count is built on the device, and the bound was
+`maxRows/bm` — which allows all 512 experts an alignment of slack. That is
+right for the row space and wrong for the tile list: a batch of `rows` tokens
+routes `rows*used` rows and so pads at most that many experts, **ten** at one
+token. At BN=64 the down mode was 40 x 2052 = 82 080 workgroups to run 11, at
+about 0.5 ns an empty launch. **It is also why the first GEMV ladder read as a
+catastrophe** — the routed down mode at BN=16 measured 481 us against the
+GEMM's 84, of which ~330 was empty launches, and at BN=1 it was 3666 us for
+5.25 M of them. A kernel whose whole purpose is a narrower column block cannot
+be measured against a grid bound that multiplies with it. D11 gets the
+corollary.
+
+**2. The combine was one workgroup, and its grid has an axis order worth
+9.2x.** `ffn_out` at one token was a single 256-lane workgroup walking 2560
+columns: 112 KB of reads on a 40-CU device, 22 us at 6 GB/s. Splitting the
+column axis is one line and is 7.8x — but the obvious spelling puts the token
+on x, Vulkan varies x fastest, and at ubatch 2048 that took the dispatch from
+815 us to **7505**, because consecutive workgroups are then consecutive tokens
+at the same 256-byte slice and a token's eleven rows are 10 KB apart in a
+566 MB arena. With the column block on x it is 1104.9 us at 228 GB/s — 1.35x
+faster than the single workgroup it replaced, at prefill as well as decode.
+
+**3. The router was nine workgroups, and D12 does not reach it.**
+`ffn_gate_inp` is [513, 2560] fp16, 2.63 MB, and **27.7% of the block at
+decode** — 64 us at 41 GB/s. `llm_moe_router.comp` is L7d's split-K over the
+same §2.8 tiling with no epilogue: 4.4 us plus a 1.0 us reduce, **11.8x**. Its
+KSLABS ladder is flat (4.3-4.9 us over 8/10/20/40) where the same kernel spans
+2.4x on the hyper-connection block, because §5.1b's 4 KB rotation is a DRAM
+channel effect and 2.63 MB never leaves the MALL.
+
+**4. At one token the expert GEMM is the wrong kernel, and a dot product has
+no fragment.** `llm_moe_gemv.comp` drops the LDS slab, the barrier in the K
+loop and the cooperative matrix — §2.2's rule is about a *fragment* — so LPR
+lanes share one output column, a lane unpacks its own dwords into registers
+and a whole row's loads are in flight at once. Routed up 196.5 us to 78.1,
+routed down 84.9 to 34.5, shared up 75.9 to **12.3** (6.17x), shared down 11.8
+to 7.3; **the block 464.5 us to 152.0, 3.06x**. It reads one row of a tile,
+which is every real row a tile has at one token and not at two, so the host
+refuses it above one token rather than dropping rows.
+
+**5. The same finding on the dense projections, and D12 *does* reach them.**
+`llm_gemv.comp` is the split-K with the hyper-connection epilogue removed, so
+it serves any `llm_gemm.comp` MODE 2 caller over either bank, tail and all.
+The gated DeltaNet's layer is 454.0 us to **242.5**: qkv 316.8 to 199.1, out
+124.3 to 26.7 (5.4x, on the projection whose grid was 40 workgroups). The rung
+moves with K exactly as D12 says — k8 at K = 2560, k32 at K = 6144 — and a
+rung also has to cut K into whole four-tile steps, which is why 16 and 32 do
+not exist for a K of 2560.
+
+**6. Nothing reads a different weight, and the text moves at one token
+anyway.** Against the GEMM over one token: rms 2.5e-06 on the MoE's `ffn_out`
+(scale 0.032), 1.75e-05 on the DeltaNet's fused projection (31.5), 1.77e-05 on
+its fp16 tail alone (8.79), 3.4e-05 on the router's logits (7.46) with 0 of 10
+top-k slots differing. It **does not move with the rung**, which is what makes
+it a measurement. `TestGraphLogits` is unchanged — argmax 561, llama.cpp's own
+top ten, the drift the same x1.085 a layer — and `Graph.PinSchedule` now
+covers four blocks so `TestGraphIsAChunkSplit`'s equalities still hold to the
+last place. At temperature zero the `<think>` block **re-words at completion
+token 47**, where the top two logits are **0.012 apart** against the 3-25 that
+decide the tokens either side; the capitals list and `Lisbon.` are identical.
+`LLM_DECODE_GEMM=1` is the control and reproduces L7c's completion exactly.
+
+**Next: L8e, which is the same finding a fifth time and is cheap.** The
+full-attention layer is now the third-largest block at decode — 354.5 ms of a
+2478 ms GPU total, 12.9%, ~126 GB/s — and its two projections are the same
+`llm_gemm.comp` MODE 2 dispatches the DeltaNet's were, with `llm_gemv.comp`
+already generic over both banks and both tail cases. Worth ~1.5 tok/s. Beside
+it: the MoE's shared expert wants a rung of its own (13 us a layer, because it
+shares the routed pair's LPR and the two invert on format), and `route` and
+the two `perm` dispatches are 11.6 us a layer and all three are one workgroup.
+Then **L8c**, the re-quantisation, onto a baseline 1.57x faster than the one
+it was planned against.
+
+Housekeeping: `shaders/` gained three `.comp` files and **61** SPIR-V builds
+(`llm_moe_gemv.comp` 30, `llm_gemv.comp` 23, `llm_moe_router.comp` 8), so a
+fresh checkout's `go generate ./...` is that much longer. `LLM.md` is now 3005
+lines and the next stage that closes should move L2-L5's per-stage sections
+into `research/`, which is what the file's own rule asks for.
+
 ### Session 2026-09-16 (forty-eighth) — stage L8b: the last dense family, and a split that is a column block
 
 **Result: the hyper-connection block at one token is 37.0 us a mixer against

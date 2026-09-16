@@ -137,7 +137,13 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 	fmt.Printf("%d layers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens\n\n",
 		g.Layers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
 
-	var plans [][3]string
+	// A plan is (scan, gemm, outGemm, qkvGemv, outGemv). The last two are the
+	// decode kernel's rungs (L8d-4) and they only exist at one token, where
+	// the first two are irrelevant — so `-gemm-ladder` walks a different
+	// cross there: the GEMV's, one axis at a time against the other's
+	// default, because the two projections are independent dispatches and a
+	// full cross of 6x6 would say nothing the two marginals do not.
+	var plans [][5]string
 	if ladder || gemmLadder {
 		scans := llm.DNKernels()
 		if gemmLadder && !ladder {
@@ -145,15 +151,35 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 		}
 		for _, s := range scans {
 			if !gemmLadder {
-				plans = append(plans, [3]string{string(s), "", ""})
+				plans = append(plans, [5]string{string(s), "", "", "", ""})
 				continue
 			}
 			for _, k := range llm.GEMMKernels() {
 				for _, o := range llm.GEMMKernels() {
-					plans = append(plans, [3]string{string(s), string(k), string(o)})
+					plans = append(plans, [5]string{string(s), string(k), string(o), "", ""})
 				}
 			}
 		}
+	}
+	gemvPlans := func(tok int) [][5]string {
+		if !gemmLadder || tok != 1 {
+			return nil
+		}
+		s := string(llm.DefaultDNKernel())
+		dq, do := llm.DNGemvFor(1)
+		var p [][5]string
+		p = append(p, [5]string{s, "gemm_m4", "gemm_m2", string(llm.GEMVOff), string(llm.GEMVOff)})
+		for _, k := range llm.GEMVKernels() {
+			if llm.GEMVFits(k, cfg.NEmbd) {
+				p = append(p, [5]string{s, "gemm_m4", "gemm_m2", string(k), string(do)})
+			}
+		}
+		for _, k := range llm.GEMVKernels() {
+			if llm.GEMVFits(k, cfg.Inner) {
+				p = append(p, [5]string{s, "gemm_m4", "gemm_m2", string(dq), string(k)})
+			}
+		}
+		return p
 	}
 
 	var rows [][]string
@@ -169,9 +195,9 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 		if err := g.Upload(xn, tok); err != nil {
 			return err
 		}
-		todo := plans
-		if todo == nil {
-			todo = [][3]string{{}}
+		todo := append(append([][5]string{}, plans...), gemvPlans(tok)...)
+		if len(todo) == 0 {
+			todo = [][5]string{{}}
 		}
 		for _, p := range todo {
 			if p[0] != "" {
@@ -185,9 +211,17 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 				if err := g.SetPlan(llm.DNKernel(p[0]), k, o); err != nil {
 					return err
 				}
+				dq, do := llm.DNGemvFor(tok)
+				if p[3] != "" {
+					dq, do = llm.GEMVKernel(p[3]), llm.GEMVKernel(p[4])
+				}
+				if err := g.SetGemv(dq, do); err != nil {
+					return err
+				}
 			}
 			s, k, o := g.Plan()
-			p = [3]string{string(s), string(k), string(o)}
+			dq, do := g.Gemv()
+			p = [5]string{string(s), string(k), string(o), string(dq), string(do)}
 			regs, wgs, reread := llm.DNShape(llm.DNKernel(p[0]), cfg)
 			arm := "LDS"
 			if llm.DNOperandsInRegisters(llm.DNKernel(p[0])) {
@@ -200,8 +234,12 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 			if err != nil {
 				return err
 			}
-			fmt.Printf("T = %-5d %-5s (%3d regs/lane, %4d workgroups, q/k %s read %3dx) / %s / %s\n",
-				tok, p[0], regs, wgs, arm, reread, p[1], p[2])
+			proj := fmt.Sprintf("%s / %s", p[1], p[2])
+			if p[3] != string(llm.GEMVOff) || p[4] != string(llm.GEMVOff) {
+				proj = fmt.Sprintf("gemv %s / %s", p[3], p[4])
+			}
+			fmt.Printf("T = %-5d %-5s (%3d regs/lane, %4d workgroups, q/k %s read %3dx) / %s\n",
+				tok, p[0], regs, wgs, arm, reread, proj)
 			var total time.Duration
 			for _, s := range st {
 				total += s.GPU
@@ -221,7 +259,7 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 				fmt.Println()
 				rows = append(rows, []string{
 					strconv.Itoa(tok), p[0], arm, strconv.Itoa(regs), strconv.Itoa(wgs), strconv.Itoa(reread),
-					p[1], p[2], s.Kind,
+					p[1] + "/" + p[3], p[2] + "/" + p[4], s.Kind,
 					fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*dnLayersPerGraph/1e3),
 					fmt.Sprintf("%.1f", gf), fmt.Sprintf("%.1f", gb),
 				})
@@ -231,7 +269,7 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 				us*dnLayersPerGraph/1e3)
 			rows = append(rows, []string{
 				strconv.Itoa(tok), p[0], arm, strconv.Itoa(regs), strconv.Itoa(wgs), strconv.Itoa(reread),
-				p[1], p[2], "layer",
+				p[1] + "/" + p[3], p[2] + "/" + p[4], "layer",
 				fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*dnLayersPerGraph/1e3), "", "",
 			})
 			if tok == 512 && plans == nil {

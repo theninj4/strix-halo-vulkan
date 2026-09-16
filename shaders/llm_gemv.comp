@@ -1,0 +1,152 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The vertical's **plain projection at one token**: LLM.md L8d.
+//
+// `llm_gemm.comp` MODE 2 is the ordinary projection kernel — the gated
+// DeltaNet's fused qkv and its output projection, the full-attention layer's
+// two — and at decode it runs at about half the bus for the reason L7d and
+// L8d have now found four times. Its A operand is one row padded to a
+// sixteen-row fragment, its B slab is unpacked into LDS per K-step behind a
+// barrier and consumed immediately, and its grid is `gemmN/64` workgroups:
+// 258 for the DeltaNet's qkv and **40** for its output projection, on a
+// 40-CU device.
+//
+// This is llm_hc_gemv.comp's split-K over the same §2.8 fragment tiling and
+// the same L8a bank, with that kernel's arithmetic unchanged and its
+// hyper-connection epilogue removed — so it serves any MODE 2 caller:
+//
+//   MODE 0  (s, nt) -> partial[s][nt*16 .. nt*16+16)     KSLABS x (N/16)
+//   MODE 1  sum over s -> the f32 output row
+//
+// At KSLABS = 1 there are no partials and MODE 0 stores the row itself, which
+// is the rung to stand on when N alone already fills the machine.
+//
+// A wave is four k-tiles by sixteen columns; a lane owns one output column
+// and sixteen consecutive k of it; the four lanes sharing a column are
+// lane, lane^16, lane^32 — two shuffles and no LDS, because within an n-tile
+// the tiles of consecutive kt are contiguous and a step reads straight
+// through.
+//
+// **-DQ8B is L8a's bank and it is bit-exact against the GEMM**, by L8b-2's
+// argument and not by tolerance: this kernel has no LDS to round a weight
+// through and `float(float16_t(x))` in a register is folded away by RADV
+// (D10), so the multiply is done **in fp16** — `float16_t(q) * d` of two
+// exact halves is a real f16 instruction whose correctly-rounded result is
+// the same half the GEMM's LDS store holds.
+//
+// **The tail is llm_gemm.comp MODE 2's, and MODE 2's split is the row and not
+// a column block.** A fused matrix whose last rows the checkpoint does not
+// ship as Q8_0 — the DeltaNet's F32 alpha and beta — keeps those rows as
+// halves at `pc.gateOff`, numbered from `pc.lowRank/16`; the host is what
+// guarantees the split falls on a whole n-tile.
+//
+// **KSLABS is D12's 4 KB rotation and the table moves with the bank.** A
+// workgroup's slab is `(gemmK/16/KSLABS) * 256` bytes on the int8 bank and
+// twice that on halves, and the rung to pick is the one whose stride is not a
+// whole multiple of 4 KB — which is a different rung for a K of 2560 than for
+// one of 6144, so the ladder is per projection and measured.
+
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0
+#endif
+#ifndef KSLABS
+#define KSLABS 4
+#endif
+
+#define TILE 16
+#define WAVE 64
+
+layout(local_size_x = WAVE) in;
+
+void main() {
+#if MODE == 0
+    uint slab = gl_WorkGroupID.x;                // which stripe of K
+    uint nt = gl_WorkGroupID.y;                  // which 16 output columns
+    uint ktiles = pc.gemmK / TILE;
+    uint perSlab = ktiles / KSLABS;
+    uint kt0 = slab * perSlab;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint col = lane % TILE;                      // the output column this lane owns
+    uint sub = lane / TILE;                      // which of the four tiles of a step
+    uint xbase = pc.xnOff + kt0 * TILE;
+
+    float sum = 0.0;
+#ifdef Q8B
+    // MODE 2's split is `pc.lowRank` itself — the first row that is not int8 —
+    // and `pc.gateOff` is where those rows' halves are, or NO_W for a matrix
+    // that is int8 all the way through.
+    bool tail = (pc.gateOff != NO_W) && (nt * TILE >= pc.lowRank);
+    if (!tail) {
+        uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 64u + lane * 4u;
+        uint sbase = ((pc.bOff + pc.gemmN * pc.gemmK) >> 1) + nt * (pc.gemmK >> 5) * TILE + col;
+        // One step is four tiles: 1024 bytes of weight, 64 halves of
+        // activation, and one scale a lane — a 32-element group is two whole
+        // k-tiles, so it is constant across the tile the lane owns.
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint w = qbase + c * 64u;
+            uint x = xbase + (c + sub) * TILE;
+            float16_t d = w16[sbase + ((kt0 + c + sub) >> 1) * TILE];
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint word = w8[w + u];
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    sum += float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d) *
+                        float(hact[x + u * 4u + t]);
+                }
+            }
+        }
+    } else {
+        uint wbase = pc.gateOff + ((nt - pc.lowRank / TILE) * ktiles + kt0) * (TILE * TILE)
+            + lane * TILE;
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint w = wbase + c * (TILE * TILE);
+            uint x = xbase + (c + sub) * TILE;
+            [[unroll]] for (uint i = 0u; i < TILE; i++) {
+                sum += float(w16[w + i]) * float(hact[x + i]);
+            }
+        }
+    }
+#else
+    uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE) + lane * TILE;
+    for (uint c = 0u; c < perSlab; c += 4u) {
+        uint w = wbase + c * (TILE * TILE);
+        uint x = xbase + (c + sub) * TILE;
+        [[unroll]] for (uint i = 0u; i < TILE; i++) {
+            sum += float(w16[w + i]) * float(hact[x + i]);
+        }
+    }
+#endif
+
+    // The four lanes holding the same column are lane, lane^16, lane^32.
+    sum += subgroupShuffleXor(sum, 16u);
+    sum += subgroupShuffleXor(sum, 32u);
+    if (sub == 0u) {
+#if KSLABS == 1
+        act[pc.outOff + nt * TILE + col] = sum;
+#else
+        // The partials ride `resOff`, which no MODE 2 caller uses: the push
+        // block is 64 uints, this device's whole range, and the wide residual
+        // is the hyper-connection block's tensor alone (llm_common.glsl).
+        act[pc.resOff + slab * pc.gemmN + nt * TILE + col] = sum;
+#endif
+    }
+#else
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.gemmN) {
+        return;
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
+        sum += act[pc.resOff + s * pc.gemmN + n];
+    }
+    act[pc.outOff + n] = sum;
+#endif
+}
