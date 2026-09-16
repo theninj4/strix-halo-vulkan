@@ -25,7 +25,7 @@ func dnGPU(t *testing.T, layer int) (*DeltaNetGPU, *Trace, DeltaNetConfig, Delta
 		t.Fatal(err)
 	}
 	dev, done := newTestDevice(t)
-	g, err := NewDeltaNetGPU(dev, c, nTok, []DeltaNetWeights{w})
+	g, err := NewDeltaNetGPU(dev, c, nTok, []DeltaNetWeights{w}, denseQ8Test)
 	if err != nil {
 		done()
 		t.Fatal(err)

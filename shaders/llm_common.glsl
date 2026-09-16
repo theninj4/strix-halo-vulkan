@@ -68,6 +68,25 @@ layout(binding = 6) readonly buffer QBank4 { uvec4 w[]; } qb4[NBANK];
 #define qbank4 qb4[MOE_BANK].w
 #endif
 
+// The **dense** weight bank read as raw words: LLM.md L8.
+//
+// Binding 3 above is the same buffer as halves, and for every kernel written
+// before L8 that is all it is. L8's bank is not halves: a dense weight is
+// staged as the checkpoint's own int8 with one fp16 scale per 32 elements of
+// a row — 8.5 bits a weight against 16 — because at decode a token reads
+// 8.07 GB of dense weight against the 3.67 the checkpoint ships, and that
+// ratio *is* the decode rate (L7c-5). So the tiles are bytes and the scales
+// are halves, in one buffer, and the buffer is bound twice: `w8` for the
+// tiles and `w16` for the plane that follows them.
+//
+// It takes binding 5 because a dense kernel is never a MoE kernel — the two
+// `#ifdef`s below are mutually exclusive and nothing declares both — and
+// because every pipeline in a recorded sequence carries its own descriptor
+// set, so a build that names six buffers may sit beside one that names five.
+#ifdef DENSE_Q8
+layout(binding = 5) readonly buffer W8 { uint w8[]; };
+#endif
+
 layout(push_constant) uniform PC {
     // The wide residual, fp32 in the activation arena: [T][hc*nEmbd], which
     // is ggml's [nEmbd, hc, T] read the same way round (ne[0] is fastest).

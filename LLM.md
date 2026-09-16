@@ -10,9 +10,10 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: the model generates, and it generates llama.cpp's text.** L0, L1,
-the whole of L2, L3, L4, L5, L6 and now **L7 — a prompt in, tokens out, one at
-a time, over a cache the last step extended.** The checkpoint is downloaded,
+**Status: the model generates, it generates llama.cpp's text, and phase 2 has
+started.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a prompt in, tokens
+out, one at a time, over a cache the last step extended — and now L8a, the
+dense bank in the width the checkpoint already ships.** The checkpoint is downloaded,
 llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
 there is a kernel for every layer and every sub-layer: the hyper-connection
 block in four dispatches where the reference has sixteen (4.24x, 14.9% of
@@ -106,9 +107,28 @@ one a block, ~490 submits to two, **1.18x**, with the attribution moved inside
 it: a timestamp after every dispatch, which is what llama.cpp's own
 `GGML_VK_PERF_LOGGER` reports on the other side of every comparison here.
 **A token is 84.1 ms at 122 GB/s, half the bus**, and the MoE is the only
-block still far off its bytes. **Next: L8, our own bank** — 8.07 of a token's
-9.67 GB are a dense half staged as halves, and not expanding it is 1.66x on
-the ceiling before a weight is re-quantised.
+block still far off its bytes.
+
+**L8a stops the dense half being halves, and the arithmetic does not move.**
+A dense weight is now staged as the int8 the checkpoint already ships it as,
+with one fp16 scale per 32 elements of a row in the same §2.8 fragment tiling,
+and `llm_gemm.comp`'s `-DQ8B` arm unpacks a slab into LDS per K-step.
+**Decode is 14.07 tok/s against 11.90 — 1.18x — prefill 1044.8 at ubatch 2048
+(2.67x), residency 84.20 GB to 82.40, and the completion is the same token
+list.** Not within a tolerance: ggml picks `d = amax/127`, so a Q8_0 block's
+largest level is always 127 and re-deriving (d, q) from the dequantised floats
+returns the checkpoint's own pair — **the halves the matrix cores multiply are
+the same halves, tile for tile**, and three tests say so as equalities. The
+three families the checkpoint does *not* store as Q8_0 — the DeltaNet's F32
+alpha and beta, the attention layer's BF16 indexer projections, the
+hyper-connection block's F32 inject — would be a real re-quantisation, and
+int8 took `ssm_alpha` from 1.3e-04 rms to 3.0e-03, past its own gate; they
+keep their halves in a tail, and the split falls on a column block in every
+case. **A token is 6.61 GB rather than 9.67 and this bank's own ceiling is
+36.6 tok/s rather than 25.0**, within 4% of what the checkpoint's own width
+allows. **Next: L8b**, the hyper-connection block — the last dense family on
+halves, 1.31 GB a token and 13.3% of the step, and the only one whose kernels
+are not the plain arm.
 
 ## The number to beat
 
@@ -127,7 +147,7 @@ A real generation agrees: `llama-completion -n 64 --temp 0` reports 24.66
 tok/s and coherent text. Reproducibility across two separate runs is 0.5% on
 pp512 and 0.8% on tg128. And the accuracy reference, on the same checkpoint:
 **PPL = 4.0340 ± 0.02283** over wikitext-2's 145 chunks at n_ctx 2048 — the
-figure L8's re-quantisation has to stay near, at the same corpus, context and
+figure L8c's re-quantisation has to stay near, at the same corpus, context and
 chunking. [Write-up](research/l1-baseline.md)
 
 **So the target moves.** Phase 1's job is the 38.2 tok/s the bytes allow, not
@@ -258,7 +278,7 @@ axis. [Write-up](research/l2b-hyper-connections.md) · `reference/out/llm/`
 > int8-per-token activations at 1.13x fp16's error and called W8A8 "99%
 > activation error"; that is not a projection about our bank, it is what the
 > reference implementation does. **D3 and D6 give up no activation axis the
-> reference keeps**, and L8's perplexity comparison is like-for-like on it.
+> reference keeps**, and L8c's perplexity comparison is like-for-like on it.
 
 ## What L2c established — the block runs on the GPU, and it is 4.24x
 
@@ -1341,6 +1361,78 @@ full-attention layer over a cache that outlives the batch.
 > at 1.56x off its own 4.18 GB. Underneath both is L8: 8.07 of those 9.67 GB
 > are a dense half staged as halves.
 
+## What L8a established — the dense bank, and a round trip that is an identity
+
+`llm/bank.go`, `shaders/llm_gemm.comp` (`-DQ8B`), `shaders/llm_common.glsl`,
+`llm/gpu_head.go`, `llm/gpu_deltanet.go`, `llm/gpu_attn.go`,
+`cmd/llm/bench_head.go`: decode at 14.07 tok/s.
+[Write-up](research/l8a-dense-bank.md) · `results/l8a_decode.csv` ·
+`results/l8a_decode_fp16.csv` · `results/l8a_graph.csv` ·
+`results/l8a_head.csv`
+
+> **L8a-1: the round trip is an identity, so the gate is an equality rather
+> than a tolerance.** A dense weight is staged as int8 in the same §2.8
+> fragment tiling — 256 contiguous *bytes* a tile — with one fp16 scale per 32
+> elements of a row in a k-major plane behind the tiles (D8). The scales are
+> not new information: ggml's `quantize_row_q8_0` picks `d = amax/127`, so the
+> largest level in a block is **always 127**, and re-deriving (d, q) from the
+> dequantised floats returns exactly the checkpoint's pair — `127*d` is exact
+> in f32, dividing by 127 is correctly rounded onto a representable result,
+> and `round(q*d*(1/d))` is `q`. Then `float(q)*float(d)` is exact and
+> rounding it to fp16 is what `tileB` wrote. So the kernel puts **the same
+> halves** in LDS that the fp16 arm loaded from global.
+> `TestBankQ8IsTheHalves` and `TestHeadGPUQ8IsTheHalves` are equalities, and
+> on the real `output.weight` **0 of 248320 logits differ**.
+>
+> **L8a-2: three families are not Q8_0, and they cost a tail rather than a
+> tolerance.** `ssm_alpha` and `ssm_beta` are F32, the indexer's two
+> projections are BF16, `hc_inject` is F32, and all three are fused into the
+> middle of somebody else's matrix. Quantising them with the rest **failed the
+> DeltaNet layer's own oracle** — 1.31e-04 rms to **2.99e-03**, past the
+> 2.0e-03 asserted since L3b — which is the arithmetic one would predict: a
+> 32-element int8 group carries ~7 bits relative to its own maximum, so a
+> 2560-long dot product lands ~1% from f32 against fp16's ~0.05%. They begin
+> **on a column-block boundary** in every case, so the answer is a split: the
+> Q8 arm reads `lowRank` as the first row that is not int8 — which is what it
+> already means in MODE 0 — and `gateOff` as where those rows' halves are, and
+> a whole 64-column workgroup falls on one side. With the tail back, every
+> tensor of both layers is identical to the fp16 bank's.
+>
+> **L8a-3: a compare in the k-loop cost 1.27x on a matrix with no tail.**
+> Branching per tile between an LDS fragment and a global one took `ssm_out` —
+> Q8_0 throughout, `tail` false in every workgroup — from **125.9 us to 160.0**,
+> which is the fp16 arm's own 163.3. Two `coopMatLoad`s in one loop body are
+> two fragments the compiler keeps live, and register pressure is what both
+> projection ladders were already bound by (L2f-5, L3b-4). Writing the loop
+> twice, hoisted above the k-loop, puts it back at 125.9 exactly.
+>
+> **L8a-4: the unpack costs 4% of the bus, and a tiny second dispatch is not
+> free.** `-head` stages `output.weight` on both banks in one process: at one
+> row the bank is **1.87x** smaller and the dispatch **1.80x** faster (6454.4
+> to 3585.7 us, 197.0 GB/s to 188.4), so the byte extract, the convert, the
+> multiply and the LDS store cost 4% of the bandwidth and nothing else. At 512
+> rows it is 1.43x, which is the re-read curve every projection ladder here
+> has. The tail was a *dispatch* first, and a [128, 2560] fp16 GEMM at one
+> token is two workgroups on a 40-CU device: **70.2 us for 0.8% of the rows**
+> against 325.1 for the other 99.2% — D11 again — so folding it into the same
+> grid was 1.20x on the fused projection.
+>
+> **L8a-5: 1.18x at decode, 1.055x at prefill, and 1.8 GB of residency.** The
+> DeltaNet layer is 1.50x at one token and 1.21x at 512, the attention layer
+> 1.46x and 1.21x, the head 1.80x and 1.43x. End to end: **84.0 ms a token
+> becomes 71.1**, DeltaNet 27.1 to 18.8, attention 7.8 to 5.6, head 6.3 to
+> 3.5, with the MoE unchanged at 28.5 by construction. Prefill at ubatch 2048
+> is 2067.4 ms to **1960.2**. Two runs agree to 0.36% and the fp16 control
+> reproduces L7d exactly (11.90 against 11.89).
+>
+> **L8a-6: the ceiling moved, and the MoE is now the token.** A token reads
+> **6.61 GB against 9.67** — dense 5.01 against 8.07 — so this bank's own
+> limit is **36.6 tok/s** rather than 25.0, within 4% of the 38.2 the
+> checkpoint's width allows, and we are at 38% of it. The step is MoE 40.1%,
+> DeltaNet 26.5%, hyper-connection 13.3%, attention 7.8%, head 4.9%. The MoE
+> is 4.3x off its own bytes where the head is 1.25x; **the bytes have stopped
+> being the thing to fix.**
+
 ---
 
 ## The three findings that set the direction
@@ -1414,17 +1506,21 @@ prefill at **941.3 tok/s against 391.42 — 2.40x** — with **96.6% of the pass
 inside the five blocks**, which is 82% of the way to the ~1150 above. **L7 is
 decode, and L7d closes phase 1's kernel work**: 11.89 tok/s against
 llama.cpp's 25.15, prefill at **990.6 tok/s — 2.53x** — and the model's own
-text unchanged. What is left at decode is not a kernel shape; it is the bank.
+text unchanged. What was left at decode was not a kernel shape; it was the
+bank. **L8a is the first three quarters of that bank**: 14.07 tok/s and
+1044.8 tok/s prefill, with the same text and the same halves.
 
-**Phase 2 — our own bank, and L7c made it worth 3.5x rather than 1.7x.** Our
-dense half is staged as **halves**, so a token reads 8.07 GB of it against the
-3.67 the shipped Q8_0 would be: the ceiling for the bank we actually run is
-**25.0 tok/s**, which is llama.cpp's measured rate exactly. **L7d makes this
-the next stage rather than one of several**: at 11.89 tok/s we are 48% of that
-ceiling, the step reads 122 GB/s of a 242 GB/s bus, and every block but the
-MoE is now within 1.7x of its own bytes — so the way left to go faster is to
-make the bytes fewer. **Not expanding
-the dense half is 1.66x before any re-quantisation at all.** Then re-quantise
+**Phase 2 — our own bank, and L8a has taken the first 1.18x of it without
+changing a number.** Our dense half *was* staged as halves, so a token read
+8.07 GB of it against the 3.67 the shipped Q8_0 would be, and the ceiling for
+the bank we ran was **25.0 tok/s** — llama.cpp's measured rate exactly.
+**L8a stages the DeltaNet, the attention layer and the head as the
+checkpoint's own int8 with an fp16 scale per 32 elements**, which is
+bit-identical arithmetic (L8a-1), and the token falls from 9.67 GB to 6.61:
+**decode 14.07 tok/s, the ceiling 36.6, prefill 1044.8**. What is left of "not
+expanding" is **L8b**, the hyper-connection block's 1.31 GB — three more
+kernel arms, and a token becomes ~6.00 GB against a 40.3 tok/s ceiling. Then
+re-quantise
 to the repo's W4A8 layout (§1.1's repack) at widths chosen for this bus rather
 than for a generic machine: ~4.25 bits on everything streamed, fp16 routers,
 the n-gram table left as IQ4_NL on disk, and — L0c — **fp16 scales per 32
@@ -1557,26 +1653,30 @@ tok/s**. Conversely, going below 4 bits on the *experts* buys very little —
 they are only a quarter of the traffic.
 
 **That table is the checkpoint's, and L7c-5 measured ours.** The dense blocks
-are dequantised on the way to the device and staged as **halves**, which L6a
+were dequantised on the way to the device and staged as **halves**, which L6a
 priced as capacity (6.79 GB of fp16 against 3.67 of Q8_0) and which at decode
-is bandwidth:
+is bandwidth. **L8a stopped three of the four families doing it**, and the
+fourth is L8b:
 
-    hyper-connection mixers          1.31 GB
-    gated DeltaNet, 36 layers        4.18 GB
-    full attention, 12 layers        1.24 GB
-    lm head                          1.27 GB
-    PLE projections                  0.07 GB
-                                    --------
-    dense, every token               8.07 GB   83%
-    experts, 11 of 512, 48 layers   ~1.60 GB   17%
-                                    --------
-    per token                        9.67 GB   -> 25.0 tok/s at 242 GB/s
-                                               -> we reach 7.46 (58 GB/s)
+                                     L7d      L8a
+    hyper-connection mixers       1.31 GB   1.31 GB   still halves — L8b
+    gated DeltaNet, 36 layers     4.18 GB   2.25 GB
+    full attention, 12 layers     1.24 GB   0.70 GB
+    lm head                       1.27 GB   0.68 GB
+    PLE projections               0.07 GB   0.07 GB
+                                 --------  --------
+    dense, every token            8.07 GB   5.01 GB   83% -> 76%
+    experts, 11 of 512           ~1.60 GB  ~1.60 GB
+                                 --------  --------
+    per token                     9.67 GB   6.61 GB
+    ceiling at 242 GB/s              25.0      36.6 tok/s
+    measured                         11.89     14.07  (93 GB/s)
 
-So **llama.cpp's 25.15 is the ceiling of the bank it reads**, and the 38.2 in
-the row above is a ceiling neither implementation is aiming at. The first
-1.66x of phase 2 needs no re-quantisation at all — only not expanding the
-dense half on the way to the device.
+So **llama.cpp's 25.15 was the ceiling of the bank it reads**, we were under
+our own, and 8.5 bits a weight is the checkpoint's own width — which is why
+L8a's 36.6 lands within 4% of the 38.2 in the row above. The 1.66x that needed
+no re-quantisation is 1.61x of the dense half so far, with the
+hyper-connection block's 1.31 GB the only expansion left.
 
 ### Context is cheap here, which is the good news
 
@@ -1627,6 +1727,9 @@ below Q8. Bandwidth is the whole story.
 | `llm/graph.go` | **L6b: the model.** The five blocks in `llama_model_qwen4exp::graph::graph`'s order over one staged model, and a `GraphStats` that splits a pass into block and glue. `Layers: N` truncates it to a prefix, which is how the order is checked in 7 GB. **L7b made it a sequence**: `Reset`/`Append`/`Extend` beside `Prefill`/`Hidden`/`Forward`, a `past` every block is told once a run, and the whole id list kept because the n-gram hash is a trigram. |
 | `llm/move.go`, `shaders/llm_move.comp` | **L6c: the move between two blocks' arenas.** Three bindings of its own — 1 and 2 the same buffer twice, so an fp32 and an fp16 destination are one pipeline shape — one pipeline per (source, destination) pair, and a `Port` per crossing tensor. Bit-exact against the host narrowing, and **2.0% of the pass** against the 22.7% it replaced. |
 | `vk.Buffer.Zero*` | **L6c: clearing a mapping in place.** `WriteFloat32At(off, make([]float32, n))` is two costs and on a hot path the allocation is the larger: 36 DeltaNet states is 113 MB of Go allocation a prefill, flat in the prompt length (L6c-4). |
+| `llm/bank.go` | **L8a: the dense bank in the checkpoint's own width.** `tileBQ8` writes a matrix into the §2.8 fragment tiling as int8 with one fp16 scale per 32 elements of a row, k-major inside an n-tile (D8), and the round trip through ggml's `d = amax/127` is an **identity** for a Q8_0 tensor — the halves the kernel forms are the halves `tileB` wrote. `q8Bytes`, `q8Align` and `q8Pipe` are the layout and the pipeline key a block on this bank needs. |
+| `shaders/llm_gemm.comp -DQ8B` | **L8a: that bank read.** The slab goes through LDS a K-step at a time, as llm_moe_gemm.comp's does and for §2.2's reason, with the scale constant across a sixteen-wide k-tile so a `uint` of four bytes takes one multiply. `pc.lowRank` and `pc.gateOff` carry the **fp16 tail** the three non-Q8_0 families keep (L8a-2), and the reduction is written twice rather than branched inside, because a compare in the k-loop cost 1.27x (L8a-3). `-DDENSE_Q8` is the sixth buffer: the same bank again, as raw words. |
+| `cmd/llm -head` | **L8a: the lm head on both banks in one process**, every rung at 1, 8, 64 and 512 rows, with the logits compared element for element — which is how "0 of 248320 differ" is a measurement rather than a claim. |
 | `llm/gpu_head.go` | **L6b: the lm head.** `output.weight`, [2560, 248320] Q8_0 — 675 MB, 1.27 GB as halves — staged a 4096-row slab at a time straight into the fragment tiling, and run as `llm_gemm.comp`'s MODE 2 on **one row**, because `inp_out_ids` is what the reference computes. The only matmul in the vertical with no epilogue: the final hyper-connection mixer is the output norm. |
 | `llm/arena.go` | **L6b: where an activation arena's memory comes from.** A HOST_CACHED memory type reads at **25.06 GB/s** against the write-combined default's **0.18**, for 0.14% on the kernels (L6b-4) — and `narrowRows`, the f32→fp16 conversion every block's `Upload` does, parallel over rows. `LLM_ARENA_UNCACHED=1` is the control. |
 | `vk.Device.NewHostCachedBuffer` | **L6b: a buffer from a HOST_CACHED type**, falling back to `NewBuffer` where there is none. For arenas the host reads; not for weight banks, which are written once. |
@@ -1695,7 +1798,12 @@ below Q8. Bandwidth is the whole story.
 9. **The decode kernels** (L7d): a K-split GEMV where a 336-column projection
    launches 21 workgroups, a row block of one where the MoE pads to 32, and
    one command buffer a token.
-10. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
+10. ~~**The dense bank in the checkpoint's own width**~~ — **done at L8a for
+   three of the four families.** int8 tiles and an fp16 scale plane, unpacked
+   into LDS, bit-identical to the halves they replace; 8.07 GB a token becomes
+   5.01 and decode 11.90 tok/s becomes 14.07. The hyper-connection block is
+   L8b, because none of its three kernels is the plain arm.
+11. **The re-quantiser** (L8c) and **MTP speculative decoding** (phase 3).
 
 ---
 
@@ -2016,12 +2124,42 @@ below Q8. Bandwidth is the whole story.
 
 ### L8 — phase 2, our own bank
 
-- [ ] **Stop expanding the dense half**, which is 1.66x on the decode ceiling
+- [x] **Stop expanding the dense half**, which is 1.66x on the decode ceiling
       before any re-quantisation: 8.07 GB a token of fp16 against 3.67 of the
-      Q8_0 the checkpoint ships (L7c-5). It would also leave enough page cache
-      for the 28.80 GB n-gram table, which L7c-3 measured at 8.5 ms a token
-      when there is not.
-- [ ] Choose per-tensor widths from L0d and L1's **PPL 4.0340**.
+      Q8_0 the checkpoint ships (L7c-5). **L8a does three of the four
+      families** — the gated DeltaNet, the full-attention layer and the lm
+      head — as the checkpoint's own int8 with an fp16 scale per 32 elements
+      of a row, in the same §2.8 fragment tiling, unpacked into LDS by
+      `llm_gemm.comp`'s `-DQ8B` arm. **8.07 GB becomes 5.01 and the token
+      6.61; decode 11.90 to 14.07, prefill 990.6 to 1044.8, residency 84.20 GB
+      to 82.40 — and the halves the matrix cores multiply are the same
+      halves.** [Write-up](research/l8a-dense-bank.md) ·
+      `results/l8a_decode.csv` · `results/l8a_graph.csv` ·
+      `results/l8a_head.csv`
+
+### L8b — the hyper-connection block on the same bank
+
+- [ ] **Three more arms of the same kernel.** The block is the last dense
+      family on halves — 1.31 GB a token, 13.3% of the step — and it is last
+      because none of its three kernels is the plain arm: the down projection
+      is MODE 0 with `inject` fused into its **last tile**, which is four F32
+      rows that do not start on a column block and so cannot take L8a-2's
+      tail as it stands; the up projection is MODE 1, whose epilogue collapses
+      the gate through 16 KB of LDS that the unpack would have to share; and
+      at one token neither runs, because L7d replaced the down projection with
+      `llm_hc_gemv.comp`'s split-K GEMV, which reads the fragment tiling
+      directly and has no LDS stage to put an unpack in.
+- [ ] Gate: the same text, ~0.70 GB a token for the block, and neither
+      projection slower at ubatch 512 or 2048. Expect ~6.00 GB a token, a
+      40.3 tok/s ceiling and ~15 tok/s measured if the block holds its
+      138 GB/s.
+### L8c — the widths that are ours rather than the checkpoint's
+
+- [ ] Choose per-tensor widths from L0d and L1's **PPL 4.0340**. Everything
+      L8a and L8b stage is still **the checkpoint's arithmetic**: 8.5 bits a
+      weight, its own levels, its own scales. D3's ~4.25 bits is where the
+      next 1.9x of the dense half is, and it is the first step in this
+      vertical that changes what the model computes.
 - [ ] Re-quantise (transcode from the GGUF, or from bf16 with unsloth's
       published imatrix) into the §1.1 W4A8 layout with an L0c scale plane.
       **If from bf16: apply llama.cpp's V-head reorder first** (L3a-3) — seven
@@ -2058,6 +2196,15 @@ below Q8. Bandwidth is the whole story.
                                              # and the 4 KB rule they measure
     go run ./cmd/llm -hc -model $M -ladder -csv results/l2c_hc.csv
     go run ./cmd/llm -ple -model $M -csv results/l2d_ple.csv   # L2d's block
+    go run ./cmd/llm -head -model $M                   # L8a: both dense banks,
+                                       # every rung, and the logits compared
+    go run ./cmd/llm -head -model $M -csv results/l8a_head.csv
+
+    # L8a's control. The dense banks are the checkpoint's int8 by default;
+    # this puts every block back on the halves it staged before L8, which is
+    # how the two are compared against one dump, one trace and one prompt.
+    LLM_DENSE_FP16=1 go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is'
+    LLM_DENSE_FP16=1 go test ./llm/ -run TestDeltaNetGPU -v
     go run ./cmd/llm -attn -model $M                    # L2f's layer, 64..2048
     go run ./cmd/llm -attn -model $M -tokens 512 -ladder
     go run ./cmd/llm -attn -model $M -ladder -csv results/l2f_attn.csv
@@ -2172,6 +2319,7 @@ below Q8. Bandwidth is the whole story.
 | D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
 | D11 | **At one token, read a dispatch's shape off its grid before anything else.** | L7d: three kernels were 23-71 GB/s for one reason — 7, 10 and 100 workgroups on a 40-CU device — and two of them had been attributed to padding and to arithmetic. Fix it by splitting **K** where N is the output (the down projection) or by narrowing **BN** where N is wide enough to cut (the MoE); both keep the staged weight exactly as it is. |
 | D12 | **A split's stride must miss the 4 KB rotation.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). |
+| D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
@@ -2191,13 +2339,34 @@ below Q8. Bandwidth is the whole story.
   the LDS round trip §2.2 said was unavoidable for a *fragment*; §1.8-§1.12
   have 25 grouped builds of that shape measured against a repacked bank, and
   none against this one.
-- **What is the gated DeltaNet at one token?** L7d-6 leaves it the largest
-  single block in the step — 27.0 ms of 84.1, 36 layers, 4.18 GB, 1.56x off
-  its own bytes — and nothing has yet profiled it with a batch of one in mind
-  the way L2c did the hyper-connection block. 1.56x is not a scandal; being a
-  third of the step at 1.56x is what makes it the next place to look after the
-  bank.
-- **L8's bf16 path has to replicate a head permutation, or it is a different
+- **What is the gated DeltaNet at one token?** L7d-6 left it the largest single
+  block in the step and **L8a-5 halved its bytes without halving its time**:
+  27.1 ms to 18.8 over 4.18 GB to 2.25, so it has gone from 1.56x off its own
+  bytes to **2.02x**, at 120 GB/s of a 242 GB/s bus. The fused projection is
+  329.6 us a layer at one token where the head — the same kernel, the same
+  bank format, 30x the weight — holds 188 GB/s, and the difference is that the
+  head's grid is 3880 workgroups and the DeltaNet's is 258. Nothing has yet
+  profiled the layer with a batch of one in mind the way L2c did the
+  hyper-connection block, and D11 says to read the grid first.
+- **Does the Q8 arm want a split-K rung at one token?** L8a-4 says the unpack
+  costs 4% of the bus where the grid is wide (the head, 3880 workgroups) and
+  L8a-5 says the two projections that are 258 and 218 workgroups sit at
+  120-126 GB/s. L7d-1 answered exactly this question for a *fragment-tiled
+  fp16* weight and got 7.95x; whether the same split works over int8 tiles —
+  where a lane's sixteen consecutive k are four words and one scale, which is
+  if anything simpler — is unmeasured, and it is the obvious next kernel after
+  L8b.
+- **What is the hyper-connection block's inject row doing to L8b?** L8a-2's
+  tail works because the rows that are not Q8_0 begin on a **column block** in
+  both matrices it applies to. `hc_inject` does not: it is four F32 rows at
+  row 320 of a fused [336, 10240] matrix whose BN is 48, and L2c put it there
+  precisely so that the tile whose columns start at lowRank is inject and
+  every other tile is the gate's. So L8b either splits the branch to a
+  **tile** rather than a workgroup — which is what L8a-3 measured at 1.27x —
+  or keeps inject's single tile in the int8 plane and prices what four F32
+  rows cost there, or un-fuses it and pays a dispatch. Unmeasured, and it is
+  the one place where L8a's shape does not carry over.
+- **L8c's bf16 path has to replicate a head permutation, or it is a different
   model.** L3a-3 and vLLM between them: llama.cpp's converter reorders the 48
   V heads from HF's grouped order into tiled order — `in_proj_qkv`'s V rows,
   `in_proj_z`, `in_proj_a`, `in_proj_b`, `A_log`, `dt_bias`, `conv1d`'s V
@@ -2297,7 +2466,7 @@ below Q8. Bandwidth is the whole story.
   *unmodelled* 9.3e-04 rather than its modelled 4.5e-07, the score is 24x
   further from the reference and the selection 17x. The layer's output does
   not currently care (L4b-5, 9.87e-04 rms at 4 k against 1.14e-03 at 7
-  tokens); whether the *model* does is L8's perplexity run. Un-fusing them
+  tokens); whether the *model* does is L8c's perplexity run. Un-fusing them
   would cost a dispatch — llama.cpp spends 5.03 ms a graph on those two lines.
 - **The select kernel is 4-6x off the bus, and it is 0.1% of a graph.** Three
   of its four radix passes walk every cell to test a prefix almost none of
@@ -2333,7 +2502,7 @@ below Q8. Bandwidth is the whole story.
   an fp16 accumulator halves accumulator register pressure, which L2f-5 and
   L3b-4 both found to be the binding constraint on the ladder. Worth a rung on
   the attention and projection ladders before L6 freezes them. The accuracy
-  half is L8's: **`PPL 4.0340` was measured with fp16 accumulation on**, so
+  half is L8c's: **`PPL 4.0340` was measured with fp16 accumulation on**, so
   matching it does not require avoiding it.
 - **The rotary table wants a row per cache cell**, which is right for prefill
   and wrong for a 262144-cell context (67 MB). L7 either builds it per batch,
@@ -2343,7 +2512,7 @@ below Q8. Bandwidth is the whole story.
   kernel (575 → 167 GB/s on the norm between 512 and 1024 tokens), **L2f found
   it again on a different kernel** (the attention pack, 379 → 172 GB/s across
   the same boundary), and it is worth ~1.5x on this block at a long ubatch. But the residual accumulates
-  across 97 combines, so it is L6's decision and L8's perplexity run, not a
+  across 97 combines, so it is L6's decision and L8c's perplexity run, not a
   kernel's.
 - **Q8_0 weights in the block's kernels.** L2c dequantises to fp16 at upload —
   13.4 MB a mixer against 7.1 — and the down projection is weight-read-bound,
@@ -2404,7 +2573,7 @@ below Q8. Bandwidth is the whole story.
   and that reproducing the pre-fix `max(|x|, eps)` is worth 15x on a DeltaNet
   layer. `TestDeltaNetL2NormIsTheBuilds` fails loudly if the build moves. The
   open part: **a rebuild invalidates the trace and the baseline together**, so
-  regenerating one means regenerating both, and L8's perplexity comparison
+  regenerating one means regenerating both, and L8c's perplexity comparison
   has to be against a number from the same binary as the checkpoint it grades.
 - **Why is `attn_pregate` 1.03e-04 where everything around it is 1e-06?** Its
   inputs are all modelled and rounding the query to fp16 moves it by 3%. What
@@ -2438,7 +2607,7 @@ below Q8. Bandwidth is the whole story.
   §1.8 measured the grouped GEMV paying 1.045-1.116x on the same axis and put
   it down to bytes alone, but it has not been tried with a k-major plane.
 - **How much of the Q8_0 dense allocation is actually needed?** D3 assumes
-  ~4.25 bits is enough; **4.0340** against L8's re-measurement is the only
+  ~4.25 bits is enough; **4.0340** against L8c's re-measurement is the only
   honest test.
 - **`§3.4 finding 4` says prefill is "98% memory-bound by weight bytes";
   §2.2's direct measurement of a Q4 block says 2.2x above its memory floor.**

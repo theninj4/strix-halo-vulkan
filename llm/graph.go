@@ -44,6 +44,7 @@ package llm
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"time"
@@ -69,7 +70,23 @@ type GraphOpts struct {
 	// NoHead leaves `output.weight` unstaged, which saves 1.27 GB and 20
 	// seconds for a caller that wants `result_norm` and not logits.
 	NoHead bool
+	// DenseFP16 stages the dense weights as halves, which is what every
+	// block did before L8. It is the control, not the default: the bank L8
+	// stages is the checkpoint's own int8 with an fp16 scale per 32 elements,
+	// which is half the bytes and — for a Q8_0 tensor — the same numbers
+	// (bank.go). `LLM_DENSE_FP16=1` sets it from the environment, on the
+	// precedent of L6b's `LLM_ARENA_UNCACHED`.
+	DenseFP16 bool
 }
+
+// denseQ8 is whether the dense banks are L8's. The environment wins, so that
+// a run can be repeated on the old bank without rebuilding a caller.
+func (o GraphOpts) denseQ8() bool { return !o.DenseFP16 && DenseQ8() }
+
+// DenseQ8 is that choice for a caller with no options of its own — the block
+// benchmarks and `-resident`. L8's bank is the default and `LLM_DENSE_FP16=1`
+// is the control, on the precedent of L6b's `LLM_ARENA_UNCACHED`.
+func DenseQ8() bool { return os.Getenv("LLM_DENSE_FP16") != "1" }
 
 // blockKind says which sublayer a layer's attention half is, and where in its
 // block's staged list it sits.
@@ -396,7 +413,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		dnCfg, dns = cfg, append(dns, w)
 	}
 	if len(dns) > 0 {
-		if g.dn, err = NewDeltaNetGPU(dev, dnCfg, g.maxTok, dns); err != nil {
+		if g.dn, err = NewDeltaNetGPU(dev, dnCfg, g.maxTok, dns, opts.denseQ8()); err != nil {
 			return fmt.Errorf("llm: deltanet: %w", err)
 		}
 		mark("deltanet", len(dns), g.dn.Buffers(), g.dn.WeightBytes(), g.dn.ActivationBytes(), start)
@@ -423,7 +440,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		atCfg, ats = cfg, append(ats, w)
 	}
 	if len(ats) > 0 {
-		if g.attn, err = NewAttnGPU(dev, atCfg, g.maxTok, g.nKV, ats); err != nil {
+		if g.attn, err = NewAttnGPU(dev, atCfg, g.maxTok, g.nKV, ats, opts.denseQ8()); err != nil {
 			return fmt.Errorf("llm: attn: %w", err)
 		}
 		mark("attention", len(ats), g.attn.Buffers(), g.attn.WeightBytes(), g.attn.ActivationBytes(), start)
@@ -440,7 +457,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		if err != nil {
 			return fmt.Errorf("llm: output.weight: %w", err)
 		}
-		if g.head, err = NewHeadGPU(dev, c.NEmbd, t, 1); err != nil {
+		if g.head, err = NewHeadGPU(dev, c.NEmbd, t, 1, opts.denseQ8()); err != nil {
 			return fmt.Errorf("llm: head: %w", err)
 		}
 		mark("lm head", 1, g.head.Buffers(), g.head.WeightBytes(), g.head.ActivationBytes(), start)

@@ -34,7 +34,7 @@ func attnGPU4k(t *testing.T) (*AttnGPU, *Trace, AttnConfig, int, func()) {
 	}
 	dev, done := newTestDevice(t)
 	start := time.Now()
-	g, err := NewAttnGPU(dev, c, nTok, nKV, []AttnWeights{w})
+	g, err := NewAttnGPU(dev, c, nTok, nKV, []AttnWeights{w}, denseQ8Test)
 	if err != nil {
 		done()
 		t.Fatal(err)

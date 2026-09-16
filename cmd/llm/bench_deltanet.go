@@ -129,7 +129,7 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 	for _, t := range tokens {
 		maxTok = max(maxTok, t)
 	}
-	g, err := llm.NewDeltaNetGPU(dev, cfg, maxTok, ws)
+	g, err := llm.NewDeltaNetGPU(dev, cfg, maxTok, ws, llm.DenseQ8())
 	if err != nil {
 		return err
 	}

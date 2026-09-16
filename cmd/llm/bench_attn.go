@@ -146,7 +146,7 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 		maxTok = max(maxTok, t)
 	}
 	nKV := max(ctx, roundUp(maxTok, 256))
-	g, err := llm.NewAttnGPU(dev, cfg, maxTok, nKV, ws)
+	g, err := llm.NewAttnGPU(dev, cfg, maxTok, nKV, ws, llm.DenseQ8())
 	if err != nil {
 		return err
 	}

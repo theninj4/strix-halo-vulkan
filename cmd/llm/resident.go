@@ -148,7 +148,7 @@ func residency(model string, maxTok, nKV int, bankLayers []int, denseOnly bool, 
 		}
 		dnCfg, dns = cfg, append(dns, w)
 	}
-	dn, err := llm.NewDeltaNetGPU(dev, dnCfg, maxTok, dns)
+	dn, err := llm.NewDeltaNetGPU(dev, dnCfg, maxTok, dns, llm.DenseQ8())
 	if err != nil {
 		return fmt.Errorf("deltanet: %w", err)
 	}
@@ -177,7 +177,7 @@ func residency(model string, maxTok, nKV int, bankLayers []int, denseOnly bool, 
 		}
 		atCfg, ats = cfg, append(ats, w)
 	}
-	at, err := llm.NewAttnGPU(dev, atCfg, maxTok, nKV, ats)
+	at, err := llm.NewAttnGPU(dev, atCfg, maxTok, nKV, ats, llm.DenseQ8())
 	if err != nil {
 		return fmt.Errorf("attn: %w", err)
 	}

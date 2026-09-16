@@ -57,6 +57,25 @@
 // No bounds checks, as everywhere else in this ladder: the host pads M up to
 // BM and the arenas are zeroed once, so the pad rows carry the products of
 // zeros and their outputs are ignored.
+//
+// **-DQ8B is L8's arm, and it is the same arithmetic.** The dense bank it
+// reads is not halves: a weight is staged as the int8 the checkpoint already
+// ships it as, with one fp16 scale per 32 elements of a row, so a token reads
+// 8.5 bits a weight instead of 16 (LLM.md L8). A cooperative-matrix
+// fragment's lane layout is not exposed, so the bytes cannot be unpacked into
+// registers and declared a fragment — the slab goes through LDS exactly as
+// llm_moe_gemm.comp's does, and for the same reason §2.2 gave. What is
+// different here is that the scale of a 32-element group is constant across a
+// sixteen-wide k-tile, so a whole `uvec4`'s worth of bytes takes one scale
+// and the unpack is a byte extract, a convert and a multiply.
+//
+// The values it puts in LDS are **bit-identical** to the halves the fp16 arm
+// reads, for every tensor the checkpoint stores as Q8_0 — which is every
+// dense weight but the routers, the two indexer projections and three small
+// gate matrices. ggml's Q8_0 picks d = amax/127, so the largest |q| in a
+// block is 127 and re-deriving (d, q) from the dequantised floats returns the
+// same pair; float(q) * float(d) is exact in f32 and rounding it to fp16 is
+// what the host's tileB stored. TestBankQ8IsTheHalves pins it.
 
 #include "llm_common.glsl"
 
@@ -87,6 +106,16 @@
 #define WAVE 64
 
 layout(local_size_x = WAVE) in;
+
+#ifdef Q8B
+// §2.2's pad, and L5b's reason for its size: a slab row of BK + 8 halves
+// keeps every row sixteen-byte aligned, which is what the cooperative-matrix
+// load off LDS needs to take its wide path, and eight of the 32 banks is as
+// good as a four-dword-aligned stride gets.
+#define LDS_PAD 8
+#define LDS_ROW (BK + LDS_PAD)
+shared float16_t sQB[BN * LDS_ROW];
+#endif
 
 #define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
 #define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
@@ -124,7 +153,85 @@ void main() {
     }
 
     uint ktiles = pc.gemmK / TILE;
+#ifdef Q8B
+    // The tiles are bytes at pc.bOff and the scale plane is the halves that
+    // follow them, so its base is derivable and needs no field of its own —
+    // which matters, because 64 uints is this device's whole push range and
+    // the block has been full since L5b. A matrix is staged as exactly
+    // gemmN x gemmK bytes.
+    uint qw0 = pc.bOff >> 2;                       // the tiles, in words
+    uint sc0 = (pc.bOff + pc.gemmN * pc.gemmK) >> 1;  // the plane, in halves
+    uint kgroups = pc.gemmK >> 5;
+    uint lane = gl_LocalInvocationID.x;
+    uint nt0 = wn0 / TILE;
+    // **Not every row of a fused matrix is Q8_0 in the checkpoint**, and the
+    // ones that are not stay halves rather than being re-quantised: the
+    // gated DeltaNet's F32 alpha and beta, the attention layer's BF16 indexer
+    // projections, the hyper-connection block's F32 inject. They are the
+    // *last* rows of their matrix in every case, so the split is one number —
+    // `pc.lowRank`, which in MODE 0 already means exactly this — and the tail
+    // is a fp16 fragment-tiled matrix of its own at `pc.gateOff`, numbered
+    // from the split. A whole column block falls on one side or the other, so
+    // the branch below is per workgroup and not per tile.
+    bool tail = pc.gateOff != NO_W && wn0 >= pc.lowRank;
+    uint tailNT = nt0 - pc.lowRank / TILE;
+#endif
+    // The reduction. On the Q8 arm it is written twice rather than branched
+    // inside: the tail's B comes straight out of the fp16 bank as it always
+    // did, the rest through LDS, and a compare in the k-loop cost 1.27x on
+    // the DeltaNet's output projection — a matrix with no tail at all —
+    // because the two `coopMatLoad`s in one loop body are register pressure
+    // the ladder is already bound by (L2f-5, L3b-4).
+#ifdef Q8B
+    if (tail) {
+        for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+            [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
+                FRAG_A_T fragA[WM];
+                FRAG_B_T fragB[WN];
+                [[unroll]] for (uint i = 0u; i < WM; i++) {
+                    coopMatLoad(fragA[i], hact, A_BUF_OFF + (wm0 + i * TILE) * A_LDA + k0 + kt * TILE,
+                        A_LDA, gl_CooperativeMatrixLayoutRowMajor);
+                }
+                [[unroll]] for (uint j = 0u; j < WN; j++) {
+                    coopMatLoad(fragB[j], w16, pc.gateOff +
+                        ((tailNT + j) * ktiles + (k0 + kt * TILE) / TILE) * (TILE * TILE),
+                        TILE, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+                [[unroll]] for (uint i = 0u; i < WM; i++) {
+                    [[unroll]] for (uint j = 0u; j < WN; j++) {
+                        acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);
+                    }
+                }
+            }
+        }
+    } else
+#endif
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+#ifdef Q8B
+        // Unpack this workgroup's BN x BK slab. A tile is 256 contiguous
+        // bytes and the tiles of one n-tile are contiguous across kt, so the
+        // WN runs below are each BK_TILES * 64 words long; within a tile a
+        // word is four consecutive k of one output column, which is why one
+        // scale serves it — a 32-element group is two whole k-tiles.
+        uint kt0 = k0 / TILE;
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            uint wbase = qw0 + ((nt0 + j) * ktiles + kt0) * 64u;
+            uint sbase = sc0 + (nt0 + j) * kgroups * TILE;
+            for (uint u = lane; u < BK_TILES * 64u; u += WAVE) {
+                uint kt = u >> 6;
+                uint b = (u & 63u) << 2;           // byte within the tile
+                uint n = b >> 4;                   // 0..15, the output column
+                uint kk = b & 15u;                 // 0..15, four consecutive k
+                uint word = w8[wbase + u];
+                float d = float(w16[sbase + ((kt0 + kt) >> 1) * TILE + n]);
+                uint dst = (j * TILE + n) * LDS_ROW + kt * TILE + kk;
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    sQB[dst + t] = float16_t(float(bitfieldExtract(int(word), int(t * 8u), 8)) * d);
+                }
+            }
+        }
+        barrier();
+#endif
         [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
             FRAG_A_T fragA[WM];
             FRAG_B_T fragB[WN];
@@ -133,9 +240,14 @@ void main() {
                     A_LDA, gl_CooperativeMatrixLayoutRowMajor);
             }
             [[unroll]] for (uint j = 0u; j < WN; j++) {
+#ifdef Q8B
+                coopMatLoad(fragB[j], sQB, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+#else
                 coopMatLoad(fragB[j], w16, pc.bOff +
                     (((wn0 + j * TILE) / TILE) * ktiles + (k0 + kt * TILE) / TILE) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutColumnMajor);
+#endif
             }
             [[unroll]] for (uint i = 0u; i < WM; i++) {
                 [[unroll]] for (uint j = 0u; j < WN; j++) {
@@ -143,6 +255,9 @@ void main() {
                 }
             }
         }
+#ifdef Q8B
+        barrier();
+#endif
     }
 
 #if MODE == 0

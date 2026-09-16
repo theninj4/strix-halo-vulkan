@@ -173,7 +173,15 @@ func dnVariantFor(k DNKernel) (dnVariant, bool) {
 
 // dnLayerWeights is where one layer's staged weights sit.
 type dnLayerWeights struct {
-	qkv, out  uint32 // fp16 bank
+	// qkv and out are halves into the fp16 bank, or **bytes** into L8's int8
+	// one — the arm of llm_gemm.comp that reads it takes bOff as a byte
+	// offset, because a matrix there is n*k bytes of tiles followed by its
+	// scale plane and the kernel derives the second from the first.
+	qkv, out uint32
+	// qkvTail is alpha and beta, halves, and only on the int8 bank: the two
+	// matrices the checkpoint does not store as Q8_0 stay fp16 and take a
+	// dispatch of their own. See qkvQ8Rows.
+	qkvTail   uint32
 	conv      uint32 // fp32 arena: [convWidth][kern], channel-major
 	gamma     uint32 // fp32 arena: ssm_norm, [headDim], shared by all 48 heads
 	a, dtBias uint32 // fp32 arena: [nHeadV] each
@@ -195,6 +203,11 @@ type DeltaNetGPU struct {
 	wbuf, abuf, hbuf, bank *vk.Buffer
 	pipes                  map[string]*vk.ComputePipeline
 	mods                   []*vk.ShaderModule
+
+	// q8 is whether the bank is L8's int8-plus-scales. 36 of the 48 layers
+	// are this block's, and its two projections are 4.18 GB of a decode
+	// token's 9.67 as halves — the largest single thing L8 halves.
+	q8 bool
 
 	layers []dnLayerWeights
 
@@ -250,6 +263,21 @@ func (g *DeltaNetGPU) colZ() int     { return g.cfg.ConvWidth() }
 func (g *DeltaNetGPU) colAlpha() int { return g.cfg.ConvWidth() + g.cfg.Inner }
 func (g *DeltaNetGPU) colBeta() int  { return g.colAlpha() + g.cfg.NHeadV }
 
+// qkvQ8Rows is how much of the fused projection L8's int8 bank holds, and
+// qkvTailRows is the rest.
+//
+// alpha and beta are the only two of the four matrices the checkpoint does
+// **not** store as Q8_0 — they are F32, 48 rows of 2560 each, the decay and
+// the delta-rule gate — so int8 would be a real re-quantisation of them where
+// it is an identity everywhere else (bank.go). L8a-2 measured what that
+// costs: `ssm_alpha` and `ssm_beta` go from 2.1e-04 rms against the CPU to
+// 3.0e-03, past this layer's own tolerance. They are 0.8% of the matrix and
+// they begin on a column-block boundary, so the answer is a second dispatch
+// over a small fp16 tail rather than a branch in the kernel: 0.66 MB a layer
+// against the 45 the int8 half saves.
+func (g *DeltaNetGPU) qkvQ8Rows() int   { return g.colAlpha() }
+func (g *DeltaNetGPU) qkvTailRows() int { return g.qkvN() - g.colAlpha() }
+
 // ColQ, ColK, ColV, ColZ, ColAlpha and ColBeta are those columns, for a test
 // that wants to slice one tensor out of the fused output.
 func (g *DeltaNetGPU) ColQ() int     { return g.colQ() }
@@ -264,7 +292,7 @@ func (g *DeltaNetGPU) ColBeta() int  { return g.colBeta() }
 // maxTokens is the longest prompt the arenas are built for. Every staged
 // layer gets its own recurrent state, zeroed here, because the state is the
 // layer's and not the batch's.
-func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []DeltaNetWeights) (*DeltaNetGPU, error) {
+func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []DeltaNetWeights, q8 bool) (*DeltaNetGPU, error) {
 	if maxTokens <= 0 {
 		return nil, fmt.Errorf("llm: %d tokens", maxTokens)
 	}
@@ -288,7 +316,7 @@ func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
 	g := &DeltaNetGPU{
-		dev: dev, cfg: cfg,
+		dev: dev, cfg: cfg, q8: q8,
 		pipes:    make(map[string]*vk.ComputePipeline),
 		tokens:   maxTokens,
 		rows:     maxTokens,
@@ -300,7 +328,7 @@ func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []
 		autoPlan: true,
 	}
 	align := coopMatTile
-	for _, v := range gemmVariants {
+	for _, v := range gemmBuilds(q8) {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
@@ -376,22 +404,39 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	perBank := g.qkvN()*c.NEmbd + c.NEmbd*c.Inner
-	if g.bank, err = g.dev.NewBuffer(nLayers * perBank * 2); err != nil {
-		return fmt.Errorf("llm: deltanet fp16 weight bank (%d MB): %w", (nLayers*perBank*2)>>20, err)
+	// A layer's two matrices, one after the other. In the fp16 bank an offset
+	// is a half and a matrix is n*k of them; in L8's it is a byte and a
+	// matrix is n*k bytes of int8 tiles plus a scale plane, aligned so that
+	// every base is a whole word for the kernel's `uint` view.
+	qkvBank, outBank, tailBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.Inner*2, 0
+	unit := 2
+	if g.q8 {
+		if g.qkvQ8Rows()%dnBN != 0 {
+			return fmt.Errorf("llm: alpha starts at column %d, not a whole %d-column block", g.qkvQ8Rows(), dnBN)
+		}
+		qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.Inner))
+		tailBank = g.qkvTailRows() * c.NEmbd * 2
+		unit = 1
+	}
+	perBank := qkvBank + tailBank + outBank
+	if g.bank, err = g.dev.NewBuffer(nLayers * perBank); err != nil {
+		return fmt.Errorf("llm: deltanet weight bank (%d MB): %w", (nLayers*perBank)>>20, err)
 	}
 	g.layers = make([]dnLayerWeights, nLayers)
 	for i := range g.layers {
 		base := uint32(i * perLayerW)
 		g.layers[i] = dnLayerWeights{
-			qkv:    uint32(i * perBank),
-			out:    uint32(i*perBank + g.qkvN()*c.NEmbd),
-			conv:   base,
-			gamma:  base + uint32(cw*c.Conv),
-			a:      base + uint32(cw*c.Conv+c.HeadDim),
-			dtBias: base + uint32(cw*c.Conv+c.HeadDim+c.NHeadV),
-			state:  g.aState + uint32(i*c.StateSize()),
-			win:    g.aWin + uint32(i*(c.Conv-1)*g.qkvN()),
+			qkv: uint32(i * perBank / unit),
+			// The fp16 tail is halves wherever it sits, because the build
+			// that reads it is the fp16 one.
+			qkvTail: uint32((i*perBank + qkvBank) / 2),
+			out:     uint32((i*perBank + qkvBank + tailBank) / unit),
+			conv:    base,
+			gamma:   base + uint32(cw*c.Conv),
+			a:       base + uint32(cw*c.Conv+c.HeadDim),
+			dtBias:  base + uint32(cw*c.Conv+c.HeadDim+c.NHeadV),
+			state:   g.aState + uint32(i*c.StateSize()),
+			win:     g.aWin + uint32(i*(c.Conv-1)*g.qkvN()),
 		}
 	}
 	return nil
@@ -399,6 +444,12 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 
 func (g *DeltaNetGPU) build() error {
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	// Only the two projections read the bank, and only their Q8 build names
+	// the sixth buffer; the conv, the scan and the norm are unchanged.
+	gemmBufs := bufs
+	if g.q8 {
+		gemmBufs = append(append([]*vk.Buffer{}, bufs...), g.bank)
+	}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"conv": shaders.LLMDNConv,
@@ -424,11 +475,24 @@ func (g *DeltaNetGPU) build() error {
 			return err
 		}
 	}
+	// Both builds, when the bank is L8's: the two projections read int8 and
+	// the fp16 tail dispatch reads halves out of the same buffer, so the
+	// block needs a pipeline of each. On the fp16 bank there is no tail and
+	// the second set is never built.
 	for _, v := range gemmVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
 		}); err != nil {
 			return err
+		}
+	}
+	if g.q8 {
+		for _, v := range gemmQ8Variants {
+			if err := g.pipeline(q8Pipe(v.name), v.spirv, vk.PipelineSpec{
+				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -494,13 +558,40 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 			return fmt.Errorf("llm: layer %d ssm_out is %d values, want %d", i, len(w.Out), c.NEmbd*c.Inner)
 		}
 
+		baseZ, baseA, baseB := g.colZ(), g.colAlpha(), g.colBeta()
+		if g.q8 {
+			// The conv and gate rows are Q8_0 and round-trip exactly; alpha
+			// and beta are F32 and would not, so they are a separate fp16
+			// tail with a dispatch of its own (qkvQ8Rows). The int8 plane is
+			// still the full qkvN rows, because the kernel derives the scale
+			// plane's offset from gemmN * gemmK and gemmN is the *stride* of
+			// the output it writes — 0.25 MB a layer for an arithmetic the
+			// push block has no room to state.
+			q8rows := g.qkvQ8Rows()
+			qs := make([]byte, g.qkvN()*c.NEmbd)
+			sc := make([]uint16, g.qkvN()*c.NEmbd/q8Group)
+			tileBQ8(qs, sc, w.QKV, cw, c.NEmbd, func(r int) int { return r })
+			tileBQ8(qs, sc, w.Z, c.Inner, c.NEmbd, func(r int) int { return baseZ + r })
+			g.bank.WriteBytesAt(int(g.layers[i].qkv), qs)
+			g.bank.WriteUint16At((int(g.layers[i].qkv)+len(qs))/2, sc)
+
+			tail := make([]uint16, g.qkvTailRows()*c.NEmbd)
+			tileB(tail, w.Alpha, c.NHeadV, c.NEmbd, func(r int) int { return baseA - q8rows + r })
+			tileB(tail, w.Beta, c.NHeadV, c.NEmbd, func(r int) int { return baseB - q8rows + r })
+			g.bank.WriteUint16At(int(g.layers[i].qkvTail), tail)
+
+			oq := make([]byte, c.NEmbd*c.Inner)
+			os := make([]uint16, c.NEmbd*c.Inner/q8Group)
+			tileBQ8(oq, os, w.Out, c.NEmbd, c.Inner, func(r int) int { return r })
+			g.bank.WriteBytesAt(int(g.layers[i].out), oq)
+			g.bank.WriteUint16At((int(g.layers[i].out)+len(oq))/2, os)
+			continue
+		}
+
 		qkv := make([]uint16, g.qkvN()*c.NEmbd)
 		tileB(qkv, w.QKV, cw, c.NEmbd, func(r int) int { return r })
-		baseZ := g.colZ()
 		tileB(qkv, w.Z, c.Inner, c.NEmbd, func(r int) int { return baseZ + r })
-		baseA := g.colAlpha()
 		tileB(qkv, w.Alpha, c.NHeadV, c.NEmbd, func(r int) int { return baseA + r })
-		baseB := g.colBeta()
 		tileB(qkv, w.Beta, c.NHeadV, c.NEmbd, func(r int) int { return baseB + r })
 		g.bank.WriteUint16At(int(g.layers[i].qkv), qkv)
 
@@ -725,11 +816,27 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		kinds = append(kinds, kind)
 	}
 
-	// 1. The one fused projection: four of llama.cpp's matrices, one matmul.
+	// 1. The one fused projection: four of llama.cpp's matrices, one matmul —
+	//    or two on L8's bank, because alpha and beta are the checkpoint's
+	//    only F32 matrices here and stay fp16 (qkvQ8Rows). The second
+	//    dispatch is the same kernel over the same output tensor: its columns
+	//    begin at the first one the first dispatch did not write, which is a
+	//    bias on outOff and nothing else, because the row stride the store
+	//    uses is gemmN and gemmN is the fused width either way.
 	qkv := base
 	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
 	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
-	add(string(g.gemm), "qkv", uint32(g.qkvN()/dnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+	gy := uint32(roundUpInt(g.rows, gv.bm) / gv.bm)
+	if g.q8 {
+		// The split, in the two fields MODE 2 does not otherwise use:
+		// `lowRank` is the first row that is not int8 — which is what it
+		// already means in MODE 0 — and `gateOff` is where those rows' halves
+		// are, or NO_W for a matrix that is int8 all the way through.
+		qkv.LowRank, qkv.GateOff = uint32(g.qkvQ8Rows()), w.qkvTail
+		add(q8Pipe(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
+	} else {
+		add(string(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
+	}
 
 	// 2. The convolution, its SiLU, the two L2 norms and the two per-head
 	//    scalars. One plane per head, plus one for the scalars.
@@ -747,7 +854,12 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
 	out.OutOff, out.BOff = g.aResult, w.out
 	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.Inner)
-	add(string(g.outGemm), "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	outPipe := string(g.outGemm)
+	if g.q8 {
+		outPipe = q8Pipe(g.outGemm)
+		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: ssm_out is Q8_0
+	}
+	add(outPipe, "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
 
 	// 6. The convolution's window, for whatever runs next: the last Conv-1
 	//    rows of the projection into this layer's ring. Three rows of 16512

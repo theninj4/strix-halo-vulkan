@@ -133,6 +133,25 @@ var gemmVariants = []gemmVariant{
 	{GEMMM8, shaders.LLMGEMMPlainM8, 128},
 }
 
+// The same three rungs over L8's dense bank: int8 tiles and an fp16 scale
+// plane instead of halves, unpacked into LDS per K-step. They are a separate
+// table rather than a field on the one above because a *build* of the kernel
+// is what differs, and the two are never mixed inside one block — a bank is
+// staged one way or the other and the rung is chosen afterwards.
+var gemmQ8Variants = []gemmVariant{
+	{GEMMM2, shaders.LLMGEMMQ8M2, 32},
+	{GEMMM4, shaders.LLMGEMMQ8M4, 64},
+	{GEMMM8, shaders.LLMGEMMQ8M8, 128},
+}
+
+// gemmBuilds is the table a block builds its pipelines from.
+func gemmBuilds(q8 bool) []gemmVariant {
+	if q8 {
+		return gemmQ8Variants
+	}
+	return gemmVariants
+}
+
 // GEMMKernels lists the rungs, narrowest first.
 func GEMMKernels() []GEMMKernel { return []GEMMKernel{GEMMM2, GEMMM4, GEMMM8} }
 
@@ -195,8 +214,11 @@ func gemmVariantFor(k GEMMKernel) (gemmVariant, bool) {
 
 // attnLayerWeights is where one layer's staged weights sit.
 type attnLayerWeights struct {
-	qkv, out         uint32 // fp16 bank
-	gQ, gK, gIQ, gIK uint32 // fp32 arena: the four norm gammas
+	// qkv and out are halves into the fp16 bank, or **bytes** into L8's int8
+	// one. qkvTail is the indexer's two projections, always halves, and only
+	// on the int8 bank — see qkvQ8Rows.
+	qkv, out, qkvTail uint32
+	gQ, gK, gIQ, gIK  uint32 // fp32 arena: the four norm gammas
 }
 
 // AttnGPU runs full-attention layers on the device. It holds however many
@@ -213,6 +235,11 @@ type AttnGPU struct {
 	wbuf, abuf, hbuf, bank *vk.Buffer
 	pipes                  map[string]*vk.ComputePipeline
 	mods                   []*vk.ShaderModule
+
+	// q8 is whether the two projections read L8's int8 bank. Twelve of the
+	// 48 layers are this block's, and they are 1.24 GB of a decode token's
+	// 9.67 as halves.
+	q8 bool
 
 	layers []attnLayerWeights
 
@@ -281,6 +308,18 @@ func (g *AttnGPU) colV() int  { return g.colK() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIQ() int { return g.colV() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIK() int { return g.colIQ() + g.cfg.IdxHeads*g.cfg.IdxDim }
 
+// qkvQ8Rows is how much of the fused projection L8's int8 bank holds, and
+// qkvTailRows is the rest.
+//
+// The query, the key and the value are Q8_0 and round-trip into int8 exactly
+// (bank.go); the indexer's two projections are **BF16**, the only such
+// weights in the model, and they are the ones L4b-4 already found the score
+// sensitive to — 24x further from the reference for an unmodelled activation.
+// So they stay halves, in a tail of their own, and the split falls on a
+// column block because colIQ is 13312.
+func (g *AttnGPU) qkvQ8Rows() int   { return g.colIQ() }
+func (g *AttnGPU) qkvTailRows() int { return g.qkvN() - g.colIQ() }
+
 // selWidth is what the selection asks for: whole blocks plus the incomplete
 // tail, `top_k + ratio - 1`, and never more cells than the cache has. At 2051
 // against a 256-cell cache it names every cell, which is why L2 could not test
@@ -344,7 +383,7 @@ func (g *AttnGPU) NBlocks() int { return (g.nKV + g.cfg.Ratio - 1) / g.cfg.Ratio
 // cell count, which is the reference's padded number rather than the prompt's:
 // the indexer's block grid, its bias and the rotary table are all cut against
 // it (research/l2e-attention.md).
-func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights) (*AttnGPU, error) {
+func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights, q8 bool) (*AttnGPU, error) {
 	if maxTokens <= 0 || nKV < maxTokens {
 		return nil, fmt.Errorf("llm: %d tokens in a %d-cell cache", maxTokens, nKV)
 	}
@@ -372,7 +411,7 @@ func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []Att
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
 	g := &AttnGPU{
-		dev: dev, cfg: cfg,
+		dev: dev, cfg: cfg, q8: q8,
 		pipes:    make(map[string]*vk.ComputePipeline),
 		tokens:   maxTokens,
 		rows:     maxTokens,
@@ -391,7 +430,7 @@ func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []Att
 	for _, v := range attnVariants {
 		align = maxInt(align, maxInt(v.rows, v.keys))
 	}
-	for _, v := range gemmVariants {
+	for _, v := range gemmBuilds(q8) {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
@@ -490,20 +529,34 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	perBank := g.qkvN()*c.NEmbd + c.NEmbd*c.GateWidth()
-	if g.bank, err = g.dev.NewBuffer(nLayers * perBank * 2); err != nil {
-		return fmt.Errorf("llm: attention fp16 weight bank (%d MB): %w", (nLayers*perBank*2)>>20, err)
+	// A layer's two matrices, and on L8's bank the fp16 tail between them.
+	// An offset into the int8 bank is a **byte**; the tail is halves, because
+	// the build that reads it is the fp16 one.
+	qkvBank, outBank, tailBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.GateWidth()*2, 0
+	unit := 2
+	if g.q8 {
+		if g.qkvQ8Rows()%attnBN != 0 {
+			return fmt.Errorf("llm: the indexer starts at column %d, not a whole %d-column block", g.qkvQ8Rows(), attnBN)
+		}
+		qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
+		tailBank = g.qkvTailRows() * c.NEmbd * 2
+		unit = 1
+	}
+	perBank := qkvBank + tailBank + outBank
+	if g.bank, err = g.dev.NewBuffer(nLayers * perBank); err != nil {
+		return fmt.Errorf("llm: attention weight bank (%d MB): %w", (nLayers*perBank)>>20, err)
 	}
 	g.layers = make([]attnLayerWeights, nLayers)
 	for i := range g.layers {
 		base := uint32(i * perLayer)
 		g.layers[i] = attnLayerWeights{
-			qkv: uint32(i * perBank),
-			out: uint32(i*perBank + g.qkvN()*c.NEmbd),
-			gQ:  base,
-			gK:  base + uint32(c.HeadDim),
-			gIQ: base + uint32(2*c.HeadDim),
-			gIK: base + uint32(2*c.HeadDim+c.IdxDim),
+			qkv:     uint32(i * perBank / unit),
+			qkvTail: uint32((i*perBank + qkvBank) / 2),
+			out:     uint32((i*perBank + qkvBank + tailBank) / unit),
+			gQ:      base,
+			gK:      base + uint32(c.HeadDim),
+			gIQ:     base + uint32(2*c.HeadDim),
+			gIK:     base + uint32(2*c.HeadDim+c.IdxDim),
 		}
 	}
 	return nil
@@ -544,11 +597,23 @@ func (g *AttnGPU) build() error {
 			return err
 		}
 	}
+	// Both builds when the bank is L8's: the two projections read int8 and
+	// the indexer's fp16 tail reads halves out of the same buffer.
 	for _, v := range gemmVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
 			return err
+		}
+	}
+	if g.q8 {
+		gemmBufs := append(append([]*vk.Buffer{}, bufs...), g.bank)
+		for _, v := range gemmQ8Variants {
+			if err := g.pipeline(q8Pipe(v.name), v.spirv, vk.PipelineSpec{
+				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -614,15 +679,36 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 			return fmt.Errorf("llm: layer %d attn_output is %d values, want %d", i, len(w.O), c.NEmbd*c.GateWidth())
 		}
 
+		base, baseV := g.colK(), g.colV()
+		baseIQ, baseIK := g.colIQ(), g.colIK()
+		if g.q8 {
+			q8rows := g.qkvQ8Rows()
+			qs := make([]byte, g.qkvN()*c.NEmbd)
+			sc := make([]uint16, g.qkvN()*c.NEmbd/q8Group)
+			tileBQ8(qs, sc, w.Q, c.QWidth(), c.NEmbd, func(r int) int { return r })
+			tileBQ8(qs, sc, w.K, c.KVWidth(), c.NEmbd, func(r int) int { return base + r })
+			tileBQ8(qs, sc, w.V, c.KVWidth(), c.NEmbd, func(r int) int { return baseV + r })
+			g.bank.WriteBytesAt(int(g.layers[i].qkv), qs)
+			g.bank.WriteUint16At((int(g.layers[i].qkv)+len(qs))/2, sc)
+
+			tail := make([]uint16, g.qkvTailRows()*c.NEmbd)
+			tileB(tail, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return baseIQ - q8rows + r })
+			tileB(tail, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return baseIK - q8rows + r })
+			g.bank.WriteUint16At(int(g.layers[i].qkvTail), tail)
+
+			oq := make([]byte, c.NEmbd*c.GateWidth())
+			os := make([]uint16, c.NEmbd*c.GateWidth()/q8Group)
+			tileBQ8(oq, os, w.O, c.NEmbd, c.GateWidth(), func(r int) int { return r })
+			g.bank.WriteBytesAt(int(g.layers[i].out), oq)
+			g.bank.WriteUint16At((int(g.layers[i].out)+len(oq))/2, os)
+			continue
+		}
+
 		qkv := make([]uint16, g.qkvN()*c.NEmbd)
 		tileB(qkv, w.Q, c.QWidth(), c.NEmbd, func(r int) int { return r })
-		base := g.colK()
 		tileB(qkv, w.K, c.KVWidth(), c.NEmbd, func(r int) int { return base + r })
-		baseV := g.colV()
 		tileB(qkv, w.V, c.KVWidth(), c.NEmbd, func(r int) int { return baseV + r })
-		baseIQ := g.colIQ()
 		tileB(qkv, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return baseIQ + r })
-		baseIK := g.colIK()
 		tileB(qkv, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return baseIK + r })
 		g.bank.WriteUint16At(int(g.layers[i].qkv), qkv)
 
@@ -787,7 +873,16 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	qkv := base
 	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
 	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
-	add(string(g.gemm), "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+	qkvPipe := string(g.gemm)
+	if g.q8 {
+		// The split, in the two fields MODE 2 does not otherwise use:
+		// `lowRank` is the first row that is not int8 and `gateOff` is where
+		// those rows' halves are (llm_common.glsl). Here that is the
+		// indexer's two BF16 projections.
+		qkvPipe = q8Pipe(g.gemm)
+		qkv.LowRank, qkv.GateOff = uint32(g.qkvQ8Rows()), w.qkvTail
+	}
+	add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
 
 	// 2. Norm, rotary and the fragment tiling for q, k and v together, plus
 	//    the one plane that is not a head: the indexer's raw key into its own
@@ -821,7 +916,12 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
 	out.OutOff, out.BOff = g.aOut, w.out
 	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.GateWidth())
-	add(string(g.outGemm), "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	outPipe := string(g.outGemm)
+	if g.q8 {
+		outPipe = q8Pipe(g.outGemm)
+		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: attn_output is Q8_0
+	}
+	add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
 	return d, kinds, nil
 }
 

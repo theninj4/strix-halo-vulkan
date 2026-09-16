@@ -5,7 +5,12 @@ package llm
 //
 // `output.weight` is [2560, 248320] Q8_0 — 675 MB in the checkpoint, 1.27 GB
 // as the halves the matrix cores want — and it is the only weight in the
-// vertical that is neither a mixer, a layer nor an expert. It is also the
+// vertical that is neither a mixer, a layer nor an expert. **L8 stops it
+// being halves**: staged as int8 with one fp16 scale per 32 elements it is
+// 0.68 GB, which is the checkpoint's own width, and the values the kernel
+// multiplies are bit-identical (bank.go). It is this vertical's first Q8 bank
+// because it is its simplest: one matrix, one dispatch, no fusion, and a
+// tensor that is Q8_0 all the way through. It is also the
 // only matmul here with nothing fused onto it: no norm before it (the final
 // hyper-connection mixer *is* the output norm, which is why this checkpoint
 // has no `output_norm.weight`), no epilogue after it. So it is llm_gemm.comp's
@@ -57,6 +62,10 @@ type HeadGPU struct {
 	nEmbd, vocab            int
 	tokens, arenaRows, rows int
 	lda                     int
+	// q8 is whether the bank is L8's int8-plus-scales or the fp16 tiling
+	// every block used before it. It picks the pipeline build, the bank size
+	// and what stage() writes, and nothing downstream of the dispatch.
+	q8 bool
 
 	hXn  uint32
 	aOut uint32
@@ -65,12 +74,13 @@ type HeadGPU struct {
 	autoPlan bool
 }
 
-// NewHeadGPU stages `output.weight` as halves in the fragment tiling.
+// NewHeadGPU stages `output.weight` in the fragment tiling, as L8's int8 and
+// scales or as the halves that preceded them.
 //
 // maxRows is how many rows of logits the arena holds. One is what a prefill
 // needs and what the reference computes; a caller that wants more is asking
 // for 0.99 MB of f32 per row and says so here rather than at a run.
-func NewHeadGPU(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int) (*HeadGPU, error) {
+func NewHeadGPU(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int, q8 bool) (*HeadGPU, error) {
 	if maxRows <= 0 {
 		return nil, fmt.Errorf("llm: head maxRows is %d", maxRows)
 	}
@@ -90,14 +100,14 @@ func NewHeadGPU(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int) (*HeadGP
 	}
 	g := &HeadGPU{
 		dev: dev, pipes: make(map[string]*vk.ComputePipeline),
-		nEmbd: nEmbd, vocab: vocab,
+		nEmbd: nEmbd, vocab: vocab, q8: q8,
 		tokens: maxRows, rows: maxRows,
 		lda:      nEmbd + gemmPad,
 		gemm:     OutGEMMKernelFor(maxRows),
 		autoPlan: true,
 	}
 	align := 1
-	for _, v := range gemmVariants {
+	for _, v := range gemmBuilds(q8) {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxRows, align)
@@ -136,14 +146,23 @@ func (g *HeadGPU) alloc() error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	if g.bank, err = g.dev.NewBuffer(g.vocab * g.nEmbd * 2); err != nil {
-		return fmt.Errorf("llm: head fp16 bank (%d MB): %w", (g.vocab*g.nEmbd*2)>>20, err)
+	bank := g.vocab * g.nEmbd * 2
+	if g.q8 {
+		bank = q8Bytes(g.vocab, g.nEmbd)
+	}
+	if g.bank, err = g.dev.NewBuffer(bank); err != nil {
+		return fmt.Errorf("llm: head weight bank (%d MB): %w", bank>>20, err)
 	}
 	return nil
 }
 
 func (g *HeadGPU) build() error {
+	// The Q8 build names a sixth buffer: the bank again, as raw words, for
+	// the tiles the scale plane at binding 3 belongs to (llm_common.glsl).
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	if g.q8 {
+		bufs = append(bufs, g.bank)
+	}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	feat := g.dev.Features()
 	sgs, err := g.dev.Physical().SubgroupSizeControl()
@@ -153,7 +172,7 @@ func (g *HeadGPU) build() error {
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
 		return fmt.Errorf("llm: the GEMM rungs need a pinned 64-wide subgroup")
 	}
-	for _, v := range gemmVariants {
+	for _, v := range gemmBuilds(g.q8) {
 		mod, err := g.dev.NewShaderModule(v.spirv)
 		if err != nil {
 			return fmt.Errorf("llm: shader head.%s: %w", v.name, err)
@@ -165,7 +184,11 @@ func (g *HeadGPU) build() error {
 		if err != nil {
 			return fmt.Errorf("llm: pipeline head.%s: %w", v.name, err)
 		}
-		g.pipes[string(v.name)] = pipe
+		name := string(v.name)
+		if g.q8 {
+			name = q8Pipe(v.name)
+		}
+		g.pipes[name] = pipe
 	}
 	return nil
 }
@@ -187,12 +210,30 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 	// length and its capacity is what keeps it from reallocating.
 	f32 := make([]float32, 0, headStageRows*g.nEmbd)
 	half := make([]uint16, headStageRows*g.nEmbd)
+	// The Q8 bank's two planes. A slab's tiles are bytes [r0*nEmbd, ...) and
+	// its scales are halves [r0*nEmbd/32, ...) of the plane behind them —
+	// both contiguous, because the slab is a whole number of sixteen-row
+	// tiles and the plane is k-major inside one.
+	var qs []byte
+	var sc []uint16
+	if g.q8 {
+		qs = make([]byte, headStageRows*g.nEmbd)
+		sc = make([]uint16, headStageRows*g.nEmbd/q8Group)
+	}
+	planeOff := g.vocab * g.nEmbd
 	for r0 := 0; r0 < g.vocab; r0 += headStageRows {
 		n := minInt(headStageRows, g.vocab-r0)
 		src, err := gguf.Dequantize(w.Type, w.Data[r0*rowBytes:(r0+n)*rowBytes],
 			int64(n*g.nEmbd), f32[:0])
 		if err != nil {
 			return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
+		}
+		if g.q8 {
+			tileBQ8(qs[:n*g.nEmbd], sc[:n*g.nEmbd/q8Group], src, n, g.nEmbd,
+				func(i int) int { return i })
+			g.bank.WriteBytesAt(r0*g.nEmbd, qs[:n*g.nEmbd])
+			g.bank.WriteUint16At(planeOff/2+r0*g.nEmbd/q8Group, sc[:n*g.nEmbd/q8Group])
+			continue
 		}
 		tileB(half[:n*g.nEmbd], src, n, g.nEmbd, func(i int) int { return i })
 		g.bank.WriteUint16At(r0*g.nEmbd, half[:n*g.nEmbd])
@@ -247,9 +288,18 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 		Tokens: uint32(g.rows), NEmbd: uint32(g.nEmbd),
 		XnOff: g.hXn, LDA: uint32(g.lda), OutOff: g.aOut, BOff: 0,
 		GemmM: uint32(m), GemmN: uint32(g.vocab), GemmK: uint32(g.nEmbd),
+		// No fp16 tail: `output.weight` is Q8_0 for all 248320 rows. The Q8
+		// arm reads these two whatever the bank is (llm_common.glsl), so the
+		// fp16 build gets them too rather than leaving a field that means
+		// something only half the time.
+		LowRank: uint32(g.vocab), GateOff: noW,
+	}
+	pipe := string(g.gemm)
+	if g.q8 {
+		pipe = q8Pipe(g.gemm)
 	}
 	return []vk.MultiDispatch{{
-		Pipeline: g.pipes[string(g.gemm)],
+		Pipeline: g.pipes[pipe],
 		GroupsX:  uint32(g.vocab / headBN), GroupsY: uint32(m / v.bm),
 		PushConstants: pc.bytes(),
 	}}, []string{"head"}

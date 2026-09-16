@@ -880,6 +880,64 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-16 (forty-seventh) — stage L8a: the dense bank stops being halves
+
+**Result: decode is 14.07 tok/s against 11.90 — 1.18x — and the arithmetic is
+unchanged, not within a tolerance.** Prefill 1044.8 tok/s at ubatch 2048
+(2.67x llama.cpp's 391.42) against 990.6, residency 84.20 GB to 82.40, and the
+completion is the same token list. Two runs agree to 0.36% (14.07 / 14.02) and
+the fp16 control reproduces L7d exactly (11.90 against 11.89).
+[Write-up](research/l8a-dense-bank.md) · `results/l8a_decode.csv`,
+`results/l8a_decode_fp16.csv`, `results/l8a_graph.csv`,
+`results/l8a_head.csv` · `LLM.md` updated.
+
+**1. The round trip is an identity, so the gate is an equality.** A dense
+weight is staged as int8 in the same §2.8 fragment tiling — 256 contiguous
+*bytes* a tile — with one fp16 scale per 32 elements of a row in a k-major
+plane behind the tiles. ggml's `quantize_row_q8_0` picks `d = amax/127`, so a
+block's largest level is **always 127**, and re-deriving (d, q) from the
+dequantised floats returns the checkpoint's own pair; `float(q)*float(d)` is
+exact in f32 and rounding it to fp16 is what `tileB` wrote. The kernel puts
+**the same halves** in LDS that the fp16 arm loaded from global.
+`TestBankQ8RoundTrip`, `TestBankQ8IsTheHalves` and `TestHeadGPUQ8IsTheHalves`
+are equalities; on the real `output.weight`, 0 of 248320 logits differ.
+
+**2. Three families are not Q8_0, and they cost a tail rather than a
+tolerance.** `ssm_alpha`/`ssm_beta` are F32, the indexer's two projections are
+BF16, `hc_inject` is F32. Quantising them with the rest failed the DeltaNet
+layer's own oracle — 1.31e-04 rms to **2.99e-03**, past the 2.0e-03 asserted
+since L3b — which is what ~7 bits relative to a 32-element group's maximum
+predicts. They begin on a column-block boundary, so the Q8 arm reads
+`pc.lowRank` as the first row that is not int8 (what it already means in MODE
+0) and `pc.gateOff` as where those rows' halves are; a 64-column workgroup
+falls on one side and the branch is free.
+
+**3. A compare in the k-loop cost 1.27x on a matrix with no tail.** Branching
+per tile took `ssm_out` from 125.9 us to 160.0 — the fp16 arm's own number —
+because two `coopMatLoad`s in one body are register pressure both projection
+ladders were already bound by. Writing the reduction twice put it back
+exactly.
+
+**4. The unpack is 4% of the bus; a two-workgroup dispatch is not free.** The
+head at one row: bank 1.87x smaller, dispatch 1.80x faster (6454.4 to 3585.7
+us, 197.0 to 188.4 GB/s). The fp16 tail was a *dispatch* first — a [128, 2560]
+GEMM at one token is two workgroups, **70.2 us for 0.8% of the rows** — which
+is D11 for the third time; folding it into the same grid was 1.20x.
+
+**5. Where the token went.** 84.0 ms to 71.1: DeltaNet 27.1 to 18.8,
+attention 7.8 to 5.6, head 6.3 to 3.5, MoE unchanged at 28.5. The dense half
+is 8.07 GB to **5.01** and the token 9.67 to **6.61**, so this bank's own
+ceiling is **36.6 tok/s** rather than 25.0 — within 4% of the 38.2 the
+checkpoint's width allows — and we are at 38% of it.
+
+**Next: L8b, the hyper-connection block.** It is the last dense family on
+halves (1.31 GB a token, 13.3% of the step) and it is last because none of its
+three kernels is the plain arm: MODE 0 with `inject` fused into its last tile
+— four F32 rows that do *not* start on a column block — MODE 1 with 16 KB of
+LDS already spoken for, and at one token `llm_hc_gemv.comp`'s split-K GEMV,
+which has no LDS stage to put an unpack in. Then L8c: widths that are ours
+rather than the checkpoint's, against `PPL 4.0340`.
+
 ### Session 2026-09-16 (forty-sixth) — stage L7d: the decode kernels, and a grid said twice
 
 **Result: decode is 11.89 tok/s against L7c's 7.46 — 1.59x — with the

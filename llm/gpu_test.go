@@ -10,6 +10,11 @@ import (
 
 const strixHaloDeviceID = 0x1586
 
+// denseQ8Test is which dense bank the GPU tests stage. L8's is the default,
+// because it is what the graph runs; `LLM_DENSE_FP16=1` puts them back on the
+// halves, which is how the two are compared against the same dump.
+var denseQ8Test = DenseQ8()
+
 func newTestDevice(t *testing.T) (*vk.Device, func()) {
 	t.Helper()
 	inst, err := vk.NewInstance("llm-test")

@@ -1969,6 +1969,15 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -o llm_gemm_plain_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -o llm_gemm_plain_m4.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -o llm_gemm_plain_m8.spv llm_gemm.comp
+
+// The same rungs over L8's dense bank: int8 tiles and an fp16 scale plane
+// instead of halves, unpacked a slab at a time into LDS. -DDENSE_Q8 is what
+// names the sixth buffer, -DQ8B what changes the kernel; they are two flags
+// because the first is a fact about the *descriptor set* and the second about
+// the loop, and llm_common.glsl is shared with kernels that want neither.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_gemm_q8_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_gemm_q8_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_gemm_q8_m8.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_gate.spv llm_ple_gate.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_conv.spv llm_ple_conv.comp
 
@@ -2044,6 +2053,15 @@ var LLMGEMMPlainM4 []byte
 
 //go:embed llm_gemm_plain_m8.spv
 var LLMGEMMPlainM8 []byte
+
+//go:embed llm_gemm_q8_m2.spv
+var LLMGEMMQ8M2 []byte
+
+//go:embed llm_gemm_q8_m4.spv
+var LLMGEMMQ8M4 []byte
+
+//go:embed llm_gemm_q8_m8.spv
+var LLMGEMMQ8M8 []byte
 
 //go:embed llm_ple_gate.spv
 var LLMPLEGate []byte

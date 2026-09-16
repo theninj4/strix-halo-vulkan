@@ -56,6 +56,7 @@ func main() {
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
 	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
 	moe := flag.Bool("moe", false, "benchmark the MoE block")
+	head := flag.Bool("head", false, "benchmark the lm head on both dense banks, L8's int8 and the halves it replaces")
 	graph := flag.Bool("graph", false, "run the whole model end to end, tokens to logits, and report tok/s")
 	gen := flag.Bool("gen", false, "generate: prefill the prompt, then decode one token at a time")
 	nPredict := flag.Int("n", 64, "for -gen: how many tokens to generate")
@@ -78,6 +79,20 @@ func main() {
 	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
+
+	if *head {
+		toks := []int{1, 8, 64, 512}
+		if flagSet("tokens") {
+			var err error
+			if toks, err = parseInts(*tokens); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if err := headBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if *ple {
 		toks, err := parseInts(*tokens)
