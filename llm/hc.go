@@ -1,6 +1,10 @@
 package llm
 
-import "math"
+import (
+	"math"
+	"runtime"
+	"sync"
+)
 
 // Hyper-connections: qwen3.8-flash-next's replacement for the residual
 // stream. Instead of one n_embd-wide vector between layers there are HC of
@@ -212,6 +216,35 @@ func HCInit(c HCConfig, embd []float32, nTok int) []float32 {
 	return out
 }
 
+// parallel runs fn over [0, n) in one contiguous chunk per core.
+//
+// Every use of it in this package is over *tokens*, which are independent of
+// each other inside a prefill, so it changes the wall clock and not one value.
+// That is what makes L4's 4096-token fixture a test rather than a coffee
+// break: the full-attention layer alone is 129 G multiply-adds of projection
+// and 52 more of attention at that length.
+func parallel(n int, fn func(lo, hi int)) {
+	w := runtime.NumCPU()
+	if w > n {
+		w = n
+	}
+	if w <= 1 {
+		fn(0, n)
+		return
+	}
+	chunk := (n + w - 1) / w
+	var wg sync.WaitGroup
+	for lo := 0; lo < n; lo += chunk {
+		hi := lo + chunk
+		if hi > n {
+			hi = n
+		}
+		wg.Add(1)
+		go func(lo, hi int) { defer wg.Done(); fn(lo, hi) }(lo, hi)
+	}
+	wg.Wait()
+}
+
 // matvec computes y = W x for a row-major W of n rows and k columns.
 func matvec(y, w, x []float32, n, k int) {
 	for r := 0; r < n; r++ {
@@ -297,7 +330,18 @@ func f16Round(x float32) float32 {
 		if rem > half || (rem == half && q&1 == 1) {
 			q++
 		}
-		return math.Float32frombits(sign) + float32(q)*sub14
+		// The sign has to be applied by negation, not by an add: -0.0 plus a
+		// positive magnitude is positive, so writing this as
+		// `Float32frombits(sign) + q*sub14` silently returns |x| for every
+		// negative subnormal half. L4 found it as 11 047 of `ffn_shexp-3`'s
+		// 10.5 M values failing to be fp16-exact when the reference's
+		// accumulator makes all of them so — the smallest magnitudes, all of
+		// them negative.
+		v := float32(q) * sub14
+		if sign != 0 {
+			v = -v
+		}
+		return v
 	default:
 		q := man >> 13
 		rem := man & 0x1fff
@@ -311,3 +355,33 @@ func f16Round(x float32) float32 {
 
 // sub14 is 2^-24, the spacing of subnormal halves.
 const sub14 = float32(1.0) / (1 << 24)
+
+// bf16Round returns x rounded to the nearest bfloat16, which is the top 16
+// bits of the f32 with round-half-to-even — `fp32_to_bf16` in the backend's
+// types.glsl, and `ggml_compute_fp32_to_bf16` behind it, bit for bit.
+//
+// It is here because of what the backend does with a **BF16 weight**. Above
+// `mul_mat_vec_max_cols` = 8 output columns `ggml_vk_mul_mat` hands the matmul
+// to the GEMM, and there a BF16 src0 with an F32 src1 sets `y_non_contig`,
+// which converts the *activation* to BF16 and runs a BF16 x BF16 kernel. So
+// the indexer's two projections — the only BF16 weights in this model — meet
+// an activation with **8 mantissa bits** at any real ubatch, and none of that
+// is visible in a 7-token dump, where the same matmul takes the f32 vector
+// path (L3a-5). It is worth 26x on `indexer_k_raw`.
+func bf16Round(x float32) float32 {
+	u := math.Float32bits(x)
+	if u&0x7f800000 == 0x7f800000 && u&0x7fffff != 0 {
+		return x // NaN: the add below could turn it into an infinity
+	}
+	u = (u + (0x7fff + ((u >> 16) & 1))) &^ 0xffff
+	return math.Float32frombits(u)
+}
+
+// bf16Copy is x with every value rounded to the nearest bfloat16.
+func bf16Copy(x []float32) []float32 {
+	out := make([]float32, len(x))
+	for i, v := range x {
+		out[i] = bf16Round(v)
+	}
+	return out
+}

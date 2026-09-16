@@ -32,6 +32,15 @@ import "math"
 // Layout, as everywhere in this package: [tokens][features] row-major, which
 // is ggml's [features, tokens] read the same way round.
 
+// vecMaxCols is ggml-vulkan's `mul_mat_vec_max_cols`: a matmul with at most
+// this many output columns goes to the f32 *vector* path, and anything wider
+// goes to the coopmat GEMM, where the operands are converted to whatever type
+// pairs with the weight. L3a-5 found the threshold; L4 found what is on the
+// other side of it for a BF16 weight.
+//
+// Every tolerance measured against the 7-token dump was measured below it.
+const vecMaxCols = 8
+
 // AttnConfig is the layer's shape, from the checkpoint's own metadata.
 type AttnConfig struct {
 	NEmbd    int
@@ -94,7 +103,11 @@ type AttnTrace struct {
 	IdxQ         []float32 // [T][idxHeads][idxDim] — `indexer_q`
 	IdxScore     []float32 // [T][nBlocks] — `indexer_score`, pre-bias
 	IdxScoreCell []float32 // [T][nKV] — `indexer_score_tokens`, biased and masked
-	TopK         []int32   // [T][width] — `indexer_top_k`
+	TopK         []int32   // [T][width] — `indexer_top_k`, ascending cell order
+	// TopKAbove is how many of each row's cells are strictly above the
+	// selection threshold. The rest are the tie fill, which the reference
+	// chooses arbitrarily — see topK.
+	TopKAbove []int32 // [T]
 }
 
 // AttnLayer runs one full-attention layer over a whole prompt from position
@@ -119,23 +132,25 @@ func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTr
 	t.Q = make([]float32, nTok*c.NHead*c.HeadDim)
 	t.K = make([]float32, nTok*c.KVWidth())
 	t.V = make([]float32, nTok*c.KVWidth())
-	var actBuf []float32
-	if c.Act == RefQ8 {
-		actBuf = make([]float32, c.NEmbd)
-	}
-	for i := 0; i < nTok; i++ {
-		a := quantAct(xn[i*c.NEmbd:(i+1)*c.NEmbd], actBuf, c.Act)
-		matvec(qFull[i*c.QWidth():(i+1)*c.QWidth()], w.Q, a, c.QWidth(), c.NEmbd)
-		matvec(kv[i*c.KVWidth():(i+1)*c.KVWidth()], w.K, a, c.KVWidth(), c.NEmbd)
-		matvec(t.V[i*c.KVWidth():(i+1)*c.KVWidth()], w.V, a, c.KVWidth(), c.NEmbd)
-
-		for h := 0; h < c.NHead; h++ {
-			src := qFull[i*c.QWidth()+h*2*c.HeadDim:]
-			copy(t.Q[(i*c.NHead+h)*c.HeadDim:], src[:c.HeadDim])
-			copy(t.Gate[i*c.GateWidth()+h*c.HeadDim:], src[c.HeadDim:2*c.HeadDim])
+	parallel(nTok, func(lo, hi int) {
+		var actBuf []float32
+		if c.Act == RefQ8 {
+			actBuf = make([]float32, c.NEmbd)
 		}
-		copy(t.K[i*c.KVWidth():], kv[i*c.KVWidth():(i+1)*c.KVWidth()])
-	}
+		for i := lo; i < hi; i++ {
+			a := quantAct(xn[i*c.NEmbd:(i+1)*c.NEmbd], actBuf, c.Act)
+			matvec(qFull[i*c.QWidth():(i+1)*c.QWidth()], w.Q, a, c.QWidth(), c.NEmbd)
+			matvec(kv[i*c.KVWidth():(i+1)*c.KVWidth()], w.K, a, c.KVWidth(), c.NEmbd)
+			matvec(t.V[i*c.KVWidth():(i+1)*c.KVWidth()], w.V, a, c.KVWidth(), c.NEmbd)
+
+			for h := 0; h < c.NHead; h++ {
+				src := qFull[i*c.QWidth()+h*2*c.HeadDim:]
+				copy(t.Q[(i*c.NHead+h)*c.HeadDim:], src[:c.HeadDim])
+				copy(t.Gate[i*c.GateWidth()+h*c.HeadDim:], src[c.HeadDim:2*c.HeadDim])
+			}
+			copy(t.K[i*c.KVWidth():], kv[i*c.KVWidth():(i+1)*c.KVWidth()])
+		}
+	})
 
 	// Per-head RMS norm, then the rotary.
 	headNorm(t.Q, w.QNorm, c.HeadDim, c.NHead*nTok, c.Eps)
@@ -174,14 +189,16 @@ func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTr
 	}
 
 	t.Out = make([]float32, nTok*c.NEmbd)
-	var outBuf []float32
-	if c.Act == RefQ8 {
-		outBuf = make([]float32, c.GateWidth())
-	}
-	for i := 0; i < nTok; i++ {
-		a := quantAct(t.Gated[i*c.GateWidth():(i+1)*c.GateWidth()], outBuf, c.Act)
-		matvec(t.Out[i*c.NEmbd:(i+1)*c.NEmbd], w.O, a, c.NEmbd, c.GateWidth())
-	}
+	parallel(nTok, func(lo, hi int) {
+		var outBuf []float32
+		if c.Act == RefQ8 {
+			outBuf = make([]float32, c.GateWidth())
+		}
+		for i := lo; i < hi; i++ {
+			a := quantAct(t.Gated[i*c.GateWidth():(i+1)*c.GateWidth()], outBuf, c.Act)
+			matvec(t.Out[i*c.NEmbd:(i+1)*c.NEmbd], w.O, a, c.NEmbd, c.GateWidth())
+		}
+	})
 	return t
 }
 
@@ -199,12 +216,33 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 	nBlocks := (nKV + c.Ratio - 1) / c.Ratio
 	nBid := nTok / c.Ratio // whole blocks only
 
+	// The indexer's two weights are the only BF16 tensors in this model, and
+	// what the backend does with a BF16 weight depends on the *width* of the
+	// batch rather than on the weight. Up to `mul_mat_vec_max_cols` = 8
+	// output columns `ggml_vk_mul_mat` takes the f32 vector path and the
+	// activation stays f32 — which is the whole of the 7-token dump. Above
+	// it the GEMM sees a BF16 src0 against an F32 src1, sets `y_non_contig`,
+	// converts the activation to **BF16** and runs a BF16 x BF16 kernel. So
+	// at any real ubatch these two projections meet an activation with eight
+	// mantissa bits, and modelling that is worth 2061x on `indexer_k_raw`
+	// at 4096 tokens: 9.18e-04 rms becomes 4.45e-07.
+	//
+	// Note it is bf16 and not fp16 — rounding to halves here is *worse* than
+	// not rounding at all (9.33e-04), which is what makes this a different
+	// numeric from L2e-3's rather than the same one seen again.
+	idxIn := xn
+	if c.Act == RefQ8 && nTok > vecMaxCols {
+		idxIn = bf16Copy(xn)
+	}
+
 	// The raw key, cached before the norm and the rotation — which is why
 	// pooling can precede both.
 	t.IdxKRaw = make([]float32, nTok*c.IdxDim)
-	for i := 0; i < nTok; i++ {
-		matvec(t.IdxKRaw[i*c.IdxDim:(i+1)*c.IdxDim], w.IdxK, xn[i*c.NEmbd:(i+1)*c.NEmbd], c.IdxDim, c.NEmbd)
-	}
+	parallel(nTok, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			matvec(t.IdxKRaw[i*c.IdxDim:(i+1)*c.IdxDim], w.IdxK, idxIn[i*c.NEmbd:(i+1)*c.NEmbd], c.IdxDim, c.NEmbd)
+		}
+	})
 
 	// What pooling reads is the *cache*, and the indexer cache is fp16 like
 	// the attention one — `llama_memory_hybrid_idx` passes the context's
@@ -251,11 +289,13 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 
 	t.IdxQ = make([]float32, nTok*c.IdxHeads*c.IdxDim)
 	pos := make([]int32, nTok)
-	for i := 0; i < nTok; i++ {
-		pos[i] = int32(i)
-		matvec(t.IdxQ[i*c.IdxHeads*c.IdxDim:(i+1)*c.IdxHeads*c.IdxDim], w.IdxQ,
-			xn[i*c.NEmbd:(i+1)*c.NEmbd], c.IdxHeads*c.IdxDim, c.NEmbd)
-	}
+	parallel(nTok, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			pos[i] = int32(i)
+			matvec(t.IdxQ[i*c.IdxHeads*c.IdxDim:(i+1)*c.IdxHeads*c.IdxDim], w.IdxQ,
+				idxIn[i*c.NEmbd:(i+1)*c.NEmbd], c.IdxHeads*c.IdxDim, c.NEmbd)
+		}
+	})
 	headNorm(t.IdxQ, w.IdxQNorm, c.IdxDim, c.IdxHeads*nTok, c.Eps)
 	RoPEMulti(c, t.IdxQ, pos, c.IdxHeads, c.IdxDim, nTok)
 
@@ -275,23 +315,25 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 		sk, sq = f16Copy(t.IdxK), f16Copy(t.IdxQ)
 	}
 	t.IdxScore = make([]float32, nTok*nBlocks)
-	for i := 0; i < nTok; i++ {
-		for b := 0; b < nBlocks; b++ {
-			var s float32
-			k := sk[b*c.IdxDim : (b+1)*c.IdxDim]
-			for h := 0; h < c.IdxHeads; h++ {
-				q := sq[(i*c.IdxHeads+h)*c.IdxDim:]
-				var d float32
-				for j := range k {
-					d += q[j] * k[j]
+	parallel(nTok, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			for b := 0; b < nBlocks; b++ {
+				var s float32
+				k := sk[b*c.IdxDim : (b+1)*c.IdxDim]
+				for h := 0; h < c.IdxHeads; h++ {
+					q := sq[(i*c.IdxHeads+h)*c.IdxDim:]
+					var d float32
+					for j := range k {
+						d += q[j] * k[j]
+					}
+					if d > 0 {
+						s += d
+					}
 				}
-				if d > 0 {
-					s += d
-				}
+				t.IdxScore[i*nBlocks+b] = s
 			}
-			t.IdxScore[i*nBlocks+b] = s
 		}
-	}
+	})
 
 	// The bias, then the expansion to cells, then the causal mask.
 	//
@@ -306,34 +348,36 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 	if nBid >= nBlocks {
 		deadBid = nBlocks - 1
 	}
-	bias := make([]float32, nBlocks)
-	for i := 0; i < nTok; i++ {
-		tailStart := (i + 1) / c.Ratio * c.Ratio
-		for b := 0; b < nBlocks; b++ {
-			switch {
-			case b >= nBid:
-				bias[b] = neg
-			case b*c.Ratio >= tailStart:
-				bias[b] = 1e9
-			default:
-				bias[b] = 0
+	parallel(nTok, func(lo, hi int) {
+		bias := make([]float32, nBlocks)
+		for i := lo; i < hi; i++ {
+			tailStart := (i + 1) / c.Ratio * c.Ratio
+			for b := 0; b < nBlocks; b++ {
+				switch {
+				case b >= nBid:
+					bias[b] = neg
+				case b*c.Ratio >= tailStart:
+					bias[b] = 1e9
+				default:
+					bias[b] = 0
+				}
+			}
+			if nBid < nBlocks {
+				bias[deadBid] = 1e9
+			}
+			for j := 0; j < nKV; j++ {
+				blk := deadBid
+				if j < nBid*c.Ratio {
+					blk = j / c.Ratio
+				}
+				v := t.IdxScore[i*nBlocks+blk] + bias[blk]
+				if j > i || j >= nTok {
+					v = neg // the causal mask, and every empty cell
+				}
+				t.IdxScoreCell[i*nKV+j] = v
 			}
 		}
-		if nBid < nBlocks {
-			bias[deadBid] = 1e9
-		}
-		for j := 0; j < nKV; j++ {
-			blk := deadBid
-			if j < nBid*c.Ratio {
-				blk = j / c.Ratio
-			}
-			v := t.IdxScore[i*nBlocks+blk] + bias[blk]
-			if j > i || j >= nTok {
-				v = neg // the causal mask, and every empty cell
-			}
-			t.IdxScoreCell[i*nKV+j] = v
-		}
-	}
+	})
 
 	// The reference asks for whole blocks plus the incomplete tail.
 	width := c.TopK + c.Ratio - 1
@@ -341,9 +385,14 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 		width = nKV
 	}
 	t.TopK = make([]int32, nTok*width)
-	for i := 0; i < nTok; i++ {
-		copy(t.TopK[i*width:(i+1)*width], topK(t.IdxScoreCell[i*nKV:(i+1)*nKV], width))
-	}
+	t.TopKAbove = make([]int32, nTok)
+	parallel(nTok, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			sel, above := topK(t.IdxScoreCell[i*nKV:(i+1)*nKV], width)
+			copy(t.TopK[i*width:(i+1)*width], sel)
+			t.TopKAbove[i] = int32(above)
+		}
+	})
 }
 
 // selected turns the top-k list into a per-token mask over the prompt's own
@@ -371,51 +420,53 @@ func attention(c AttnConfig, q, k, v []float32, nTok int, allow []bool) []float3
 	rep := c.NHead / c.NHeadKV
 	scale := float32(1 / math.Sqrt(float64(c.HeadDim)))
 	out := make([]float32, nTok*c.NHead*c.HeadDim)
-	scores := make([]float32, nTok)
-	for i := 0; i < nTok; i++ {
-		for h := 0; h < c.NHead; h++ {
-			kvh := h / rep
-			qv := q[(i*c.NHead+h)*c.HeadDim:]
-			n := 0
-			for j := 0; j <= i; j++ {
-				if allow != nil && !allow[i*nTok+j] {
-					continue
+	parallel(nTok, func(lo, hi int) {
+		scores := make([]float32, nTok)
+		for i := lo; i < hi; i++ {
+			for h := 0; h < c.NHead; h++ {
+				kvh := h / rep
+				qv := q[(i*c.NHead+h)*c.HeadDim:]
+				n := 0
+				for j := 0; j <= i; j++ {
+					if allow != nil && !allow[i*nTok+j] {
+						continue
+					}
+					kv := k[(j*c.NHeadKV+kvh)*c.HeadDim:]
+					var s float32
+					for d := 0; d < c.HeadDim; d++ {
+						s += qv[d] * kv[d]
+					}
+					scores[n] = s * scale
+					n++
 				}
-				kv := k[(j*c.NHeadKV+kvh)*c.HeadDim:]
-				var s float32
-				for d := 0; d < c.HeadDim; d++ {
-					s += qv[d] * kv[d]
+				// Softmax over the visible cells, then the value average.
+				max := scores[0]
+				for _, s := range scores[1:n] {
+					if s > max {
+						max = s
+					}
 				}
-				scores[n] = s * scale
-				n++
-			}
-			// Softmax over the visible cells, then the value average.
-			max := scores[0]
-			for _, s := range scores[1:n] {
-				if s > max {
-					max = s
+				var sum float32
+				for j := 0; j < n; j++ {
+					scores[j] = float32(math.Exp(float64(scores[j] - max)))
+					sum += scores[j]
 				}
-			}
-			var sum float32
-			for j := 0; j < n; j++ {
-				scores[j] = float32(math.Exp(float64(scores[j] - max)))
-				sum += scores[j]
-			}
-			dst := out[(i*c.NHead+h)*c.HeadDim:]
-			n = 0
-			for j := 0; j <= i; j++ {
-				if allow != nil && !allow[i*nTok+j] {
-					continue
-				}
-				wgt := scores[n] / sum
-				n++
-				vv := v[(j*c.NHeadKV+kvh)*c.HeadDim:]
-				for d := 0; d < c.HeadDim; d++ {
-					dst[d] += wgt * vv[d]
+				dst := out[(i*c.NHead+h)*c.HeadDim:]
+				n = 0
+				for j := 0; j <= i; j++ {
+					if allow != nil && !allow[i*nTok+j] {
+						continue
+					}
+					wgt := scores[n] / sum
+					n++
+					vv := v[(j*c.NHeadKV+kvh)*c.HeadDim:]
+					for d := 0; d < c.HeadDim; d++ {
+						dst[d] += wgt * vv[d]
+					}
 				}
 			}
 		}
-	}
+	})
 	return out
 }
 
@@ -498,27 +549,98 @@ func RoPEMulti(c AttnConfig, x []float32, pos []int32, nHeads, headDim, nTok int
 	}
 }
 
-// topK returns the indices of the n largest values, largest first.
+// topK is the reference's own selection, which is a **radix select and not a
+// sort**: `topk_radix_select.comp` finds the key of the n-th largest value by
+// four 8-bit passes over an order-preserving float->uint map, emits every cell
+// **strictly above** that threshold, and then fills the rest from the cells
+// **equal** to it — in `atomicAdd` order, which is whatever the GPU scheduled
+// first.
 //
-// Ties are *not* resolved the way ggml_top_k resolves them, and at any prompt
-// shorter than top_k most of a row is -inf, so the tail of this list is not
-// comparable against `indexer_top_k` and the tests only compare its finite
-// prefix. What matters downstream is the set, not the order.
-func topK(x []float32, n int) []int32 {
-	idx := make([]int32, len(x))
-	for i := range idx {
-		idx[i] = int32(i)
+// That matters at this model's shapes rather than being a detail of the
+// implementation. All `ratio` cells of a block carry one block score, so the
+// tie group at the threshold *is* a block, and the fill takes 1, 2 or 3 of its
+// 4 cells — which is a block **split**, and which no test writable at 7 tokens
+// can see.
+//
+// The fill here is taken in ascending cell index, and L4 measured that this is
+// the reference's choice too: on all 2045 rows of the 4k dump where the
+// selection bites it reproduces `indexer_top_k` set for set. That is a
+// property of a wave resolving an atomic in lane order over `ratio`
+// consecutive cells rather than something the shader promises, so
+// TestQSASelectionIsStableAcrossRuns checks the other half of it — two runs
+// give a different *order* on every row and the same visible set on every row.
+// nAbove is still reported, because the strictly-above set is the part that
+// the algorithm guarantees.
+//
+// nAbove is how many of the returned cells are strictly above the threshold,
+// so a caller can tell the certain part of the selection from the arbitrary
+// part. The returned list is in ascending cell order, not score order — the
+// reference's order is not reproducible and nothing downstream reads it.
+func topK(x []float32, n int) (sel []int32, nAbove int) {
+	thr := topKThreshold(x, n)
+	sel = make([]int32, 0, n)
+	for i, v := range x {
+		if f2ui(v) > thr {
+			sel = append(sel, int32(i))
+		}
 	}
-	// A partial selection sort: n is the whole row here and the rows are
-	// short, so this is the clearest thing that is also stable on ties.
-	for i := 0; i < n; i++ {
-		best := i
-		for j := i + 1; j < len(idx); j++ {
-			if x[idx[j]] > x[idx[best]] {
-				best = j
+	nAbove = len(sel)
+	for i, v := range x {
+		if len(sel) >= n {
+			break
+		}
+		if f2ui(v) == thr {
+			sel = append(sel, int32(i))
+		}
+	}
+	return sel, nAbove
+}
+
+// topKThreshold is the radix select itself, key for key as the shader does it:
+// four 8-bit histogram passes narrowing a prefix, each counting only the keys
+// that already match the bits fixed above it. It costs four passes over the
+// row where a partial sort costs n of them — 2051 of them at this width, which
+// is the difference between a 4096-token fixture running and not.
+func topKThreshold(x []float32, n int) uint32 {
+	var histo [256]uint32
+	prefix, desired := uint32(0), uint32(n)
+	for shift := 24; shift >= 0; shift -= 8 {
+		histo = [256]uint32{}
+		hiMask := uint32(0)
+		if shift+8 < 32 {
+			hiMask = 0xFFFFFFFF << uint(shift+8)
+		}
+		prefixHi := prefix & hiMask
+		for _, v := range x {
+			key := f2ui(v)
+			if key&hiMask == prefixHi {
+				histo[(key>>uint(shift))&255]++
 			}
 		}
-		idx[i], idx[best] = idx[best], idx[i]
+		// Top-down, so the bucket that straddles the n-th largest is found
+		// with everything above it already counted out of `desired`.
+		acc, b := uint32(0), uint32(0)
+		for bb := 255; bb >= 0; bb-- {
+			c := histo[bb]
+			if acc+c >= desired {
+				b = uint32(bb)
+				break
+			}
+			acc += c
+		}
+		prefix |= b << uint(shift)
+		desired -= acc
 	}
-	return idx[:n]
+	return prefix
+}
+
+// f2ui is the shader's order-preserving float -> uint map: flip the sign bit
+// of a positive, invert every bit of a negative. -inf becomes the smallest
+// key there is, which is what makes a row that is mostly mask work at all.
+func f2ui(v float32) uint32 {
+	y := math.Float32bits(v)
+	if y&0x80000000 != 0 {
+		return y ^ 0xFFFFFFFF
+	}
+	return y | 0x80000000
 }

@@ -14,6 +14,13 @@
 //	    -I$L/include -I$L/ggml/include -L$L/build/bin \
 //	    -lllama -lggml-base -Wl,-rpath,$L/build/bin
 //	/tmp/eval_dump -m MODEL.gguf -o DIR -p 'hello world' -n 'regex'
+//	/tmp/eval_dump -m MODEL.gguf -o DIR -f prompt.txt -nt 4096 -c 4096 -n 'regex'
+//
+// `-f` reads the prompt from a file and `-nt` truncates the token list to an
+// exact length, which is how L4's 4 k fixture is cut: the QSA selection only
+// starts excluding cells past `top_k + ratio - 1` = 2051, so the dump that
+// tests it has to be longer than that and a round 4096 makes the block
+// arithmetic legible.
 //
 // Only tensors whose name matches the POSIX extended regex are written, which
 // matters: an unfiltered pass over this model is 1224 tensors a layer-stack
@@ -111,21 +118,47 @@ static bool dump_cb(struct ggml_tensor *t, bool ask, void *user_data) {
     return true;
 }
 
+// read_file slurps a prompt file. The 4 k fixture is ~20 KB of wikitext, which
+// is not something to paste onto a command line.
+static char *read_file(const char *path, size_t *len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf = (char *) malloc((size_t) n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t) n, f) != (size_t) n) { free(buf); fclose(f); return NULL; }
+    buf[n] = 0;
+    fclose(f);
+    *len = (size_t) n;
+    return buf;
+}
+
 int main(int argc, char **argv) {
-    const char *model = NULL, *prompt = "hello world", *pattern = NULL;
-    int n_ctx = 512, n_ubatch = 0;
+    const char *model = NULL, *prompt = "hello world", *pattern = NULL, *promptfile = NULL;
+    int n_ctx = 512, n_ubatch = 0, n_trunc = 0;
+    size_t prompt_len = 0;
     snprintf(outdir, sizeof(outdir), "%s", "reference/out/eval");
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc)      { model   = argv[++i]; }
         else if (!strcmp(argv[i], "-p") && i + 1 < argc) { prompt  = argv[++i]; }
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) { pattern = argv[++i]; }
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc) { promptfile = argv[++i]; }
+        else if (!strcmp(argv[i], "-nt") && i + 1 < argc){ n_trunc = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-c") && i + 1 < argc) { n_ctx   = atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-ub") && i + 1 < argc){ n_ubatch= atoi(argv[++i]); }
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) { snprintf(outdir, sizeof(outdir), "%s", argv[++i]); }
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
-    if (!model) { fprintf(stderr, "usage: %s -m model.gguf [-o dir] [-p prompt] [-n regex] [-c ctx] [-ub ubatch]\n", argv[0]); return 2; }
+    if (!model) { fprintf(stderr, "usage: %s -m model.gguf [-o dir] [-p prompt | -f file] [-nt tokens] [-n regex] [-c ctx] [-ub ubatch]\n", argv[0]); return 2; }
+    if (promptfile) {
+        prompt = read_file(promptfile, &prompt_len);
+        if (!prompt) { return 1; }
+    } else {
+        prompt_len = strlen(prompt);
+    }
     if (pattern) {
         if (regcomp(&filter, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
             fprintf(stderr, "bad regex: %s\n", pattern); return 2;
@@ -151,13 +184,26 @@ int main(int argc, char **argv) {
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
     const struct llama_vocab *vocab = llama_model_get_vocab(m);
-    llama_token toks[4096];
-    int32_t nt = llama_tokenize(vocab, prompt, (int32_t) strlen(prompt), toks,
-                                (int32_t) (sizeof(toks) / sizeof(toks[0])), true, true);
+    // The cap is the prompt's own length in bytes: a token is at least one
+    // byte, so this cannot be short, and a 4 k fixture will not fit a fixed
+    // 4096-entry array once BOS and the chat specials are counted.
+    const int32_t cap = (int32_t) prompt_len + 8;
+    llama_token *toks = (llama_token *) malloc((size_t) cap * sizeof(llama_token));
+    if (!toks) { fprintf(stderr, "out of memory for %d tokens\n", cap); return 1; }
+    int32_t nt = llama_tokenize(vocab, prompt, (int32_t) prompt_len, toks, cap, true, true);
     if (nt <= 0) { fprintf(stderr, "tokenize failed: %d\n", nt); return 1; }
-    fprintf(stderr, "eval_dump: %d tokens:", nt);
-    for (int i = 0; i < nt; i++) { fprintf(stderr, " %d", toks[i]); }
-    fprintf(stderr, "\n");
+    // -nt cuts the prompt to an exact token count. The fixture's length is
+    // arithmetic the tests read back (block counts, the top-k width, where
+    // the selection starts to bite), so it wants to be a chosen number and
+    // not whatever a paragraph boundary happened to give.
+    if (n_trunc > 0) {
+        if (nt < n_trunc) { fprintf(stderr, "prompt is %d tokens, -nt asked for %d\n", nt, n_trunc); return 1; }
+        nt = n_trunc;
+    }
+    if (nt > (int32_t) n_ctx) { fprintf(stderr, "prompt is %d tokens, context is %d\n", nt, n_ctx); return 1; }
+    fprintf(stderr, "eval_dump: %d tokens", nt);
+    for (int i = 0; i < nt && i < 32; i++) { fprintf(stderr, " %d", toks[i]); }
+    fprintf(stderr, "%s\n", nt > 32 ? " ..." : "");
 
     // The token ids are the other half of the fixture: without them the Go
     // side cannot reproduce the same forward pass.
@@ -168,7 +214,9 @@ int main(int argc, char **argv) {
         fwrite("EVTK", 1, 4, tf);
         put_u32(tf, (uint32_t) nt);
         for (int i = 0; i < nt; i++) { put_u32(tf, (uint32_t) toks[i]); }
-        put_str(tf, prompt);
+        // The ids are the fixture; the text is a convenience, and after -nt
+        // it no longer spells them, so it is dropped rather than made to lie.
+        put_str(tf, n_trunc > 0 ? "" : prompt);
         fclose(tf);
     }
 

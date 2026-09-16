@@ -187,13 +187,18 @@ func f16(u uint16) float32 {
 		if man == 0 {
 			return math.Float32frombits(sign)
 		}
+		// A subnormal half is `man * 2^-24`. Shifting until bit 10 is set
+		// leaves `1.f * 2^(-14-k)` after k shifts, so the exponent field is
+		// 113 - k, and with e = -1-k that is 114+e — not 113+e, which is
+		// every subnormal half at half its value. L4 caught it with a
+		// round trip over all 65 536 halves.
 		e := int32(-1)
 		for man&0x400 == 0 {
 			man <<= 1
 			e--
 		}
 		man &= 0x3ff
-		return math.Float32frombits(sign | uint32(127-15+e+1)<<23 | man<<13)
+		return math.Float32frombits(sign | uint32(114+e)<<23 | man<<13)
 	case exp == 0x1f:
 		return math.Float32frombits(sign | 0xff<<23 | man<<13)
 	default:

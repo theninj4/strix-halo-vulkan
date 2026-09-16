@@ -10,7 +10,7 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1, the whole of L2 and the whole of L3 complete.** The
+**Status: L0, L1, the whole of L2, the whole of L3 and L4a complete.** The
 checkpoint is downloaded, llama.cpp runs it, the Go side reads it, the prefill
 mystery is solved, and **every layer of this model now runs on the GPU**: the
 hyper-connection block in four dispatches where the reference has sixteen
@@ -23,9 +23,17 @@ becoming 111.5, **1.37x, with the recurrence itself at 1.06x**. Between them
 L2 and L3 have taken **445.7 ms of llama.cpp's 1164.7 ms prefill graph down to
 192.5** — 38.3% of it replaced by 16.5%. 114 GB in 18 minutes;
 `models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL` shards and the
-2.79 GB MTP head. **Next: L4's 4k re-dump, which the QSA selection and every
-tolerance in L2 and L3 both need, and L5's MoE — 35.7% of the graph and the
-last block without a kernel.**
+2.79 GB MTP head.
+
+**And L4a has the 4k dump, which answered two questions rather than one.** The
+QSA selection is reproduced **set for set** on all 2045 rows where it bites,
+and the arithmetic every tolerance in L2 and L3 was measured against turns out
+not to be the arithmetic a real ubatch uses: **at 4096 columns every quantised
+matmul in the graph accumulates in fp16**, so the reference is the side losing
+precision at prefill and the tolerance there is 5e-3 rather than 1e-6. The
+same dump carries the whole MoE block, so **L5's fixture exists before L5
+starts**. **Next: L4b — the selection on the device and the layer at 4 k — and
+L5's MoE, 35.7% of the graph and the last block without a kernel.**
 
 ## The number to beat
 
@@ -525,6 +533,81 @@ the plain GEMM arm twice and three kernels of this layer's own.
 > shape. Same kernel, opposite schedules, decided by which side of one cache
 > the weight falls on.
 
+## What L4a established — the selection, and an arithmetic that changes at 8 columns
+
+The 4k dump: 4096 tokens of wikitext-2 in a 4096-cell cache, one ubatch, the
+same pinned build. 8.0 GB, 116 tensors, ~4 minutes — and the filter takes
+layers 0 and 3, so **the whole MoE block comes with it**.
+[Write-up](research/l4-qsa.md) · `reference/out/llm4k/`
+
+> **L4a-1: the selection is a radix select, and ours is the reference's.**
+> `topk_radix_select.comp` is **not a sort**: four 8-bit radix passes over an
+> order-preserving float→uint map find the key of the width-th largest value,
+> then it emits every cell **strictly above** it and fills the rest from the
+> cells **equal** to it in `atomicAdd` order. Ported pass for pass, `topK`
+> reproduces `indexer_top_k-3` on **all 4096 rows** — and, unexpectedly, **set
+> for set on the 2045 rows where the selection bites**, because filling the tie
+> in ascending cell index is what a wave resolving an atomic in lane order
+> does over `ratio` consecutive cells. It is also what makes a 4096-token
+> fixture affordable: four passes over a row where a partial selection sort
+> costs 2051 of them.
+>
+> **L4a-2: the order is not reproducible and the selection is.** A second dump
+> of the same prompt gives **byte-identical** per-cell scores, a top-k whose
+> order differs on **4096 of 4096** rows, whose set differs on **1967**, and
+> whose set *restricted to causally visible cells* differs on **none**. All the
+> run-to-run difference is among the -inf cells the mask drops anyway. **So a
+> kernel may emit the selection in whatever order is cheapest**, and must
+> reproduce the set, which it can.
+>
+> **L4a-3: block granularity is now checked rather than read.** vLLM supplied
+> the claim in L3 and llama.cpp only implies it; at 4 k it is a property of the
+> reference's own output. Past the biting point every row is `(i+1) mod ratio`
+> tail cells + **exactly 512** whole blocks + a split of `(width-tail) mod
+> ratio` cells off **the lowest-scoring block in the selection** — 3 cells 512
+> times, 2 cells 511, 1 cell 511, and **0 cells 511 times**. The selection
+> first drops a visible cell at token **2051**, which is the width.
+>
+> **L4a-4: and 0.0022% of it survives our own scores.** A top-k is
+> discontinuous, so two blocks within our error can swap across the threshold.
+> Run end to end from `hc_mixed-3` through our own indexer: **138 of 6 298 621**
+> visible cells differ, over **30 of 4096** tokens, worst row 8 cells — down
+> from 2354 over 471 tokens before L4a-6.
+>
+> **L4a-5: every quantised matmul accumulates in fp16 at a real ubatch, and
+> that is the tolerance.** At 4096 columns **100.0% of the values the reference
+> writes out of a quantised matmul are exactly IEEE halves** — `Qcur_full`,
+> `Kcur`, `Vcur`, `attn_output`, the DeltaNet's `z` and `linear_attn_out`, the
+> MoE's `ffn_gate`/`ffn_up`, `ffn_shexp`. That is `.f16acc`, an fp16
+> *accumulator*, and the exceptions confirm it: `hc_inject`, the F32 router and
+> `shared_expert_gate` are **0.0%**. The consequence is that no model of the
+> operands can close the gap — exact f32, fp16 operands and the reference's own
+> int8 activations land within **1.06x** of each other and all ~**5.4e-03 rms**
+> away on a tensor whose own rms is 1.21. **L2c-3, L2f-6 and L3b-6's reading
+> holds an order of magnitude larger and from a different cause: at prefill the
+> reference is the side losing precision.** A 1e-6 tolerance on a projection is
+> a fact about a 7-token dump.
+>
+> **L4a-6: and the indexer's BF16 weights meet a bf16 activation, worth
+> 2061x.** Above the 8-column threshold a BF16 `src0` against an F32 `src1`
+> sets `y_non_contig`, so the *activation* is converted to BF16 and a
+> BF16 x BF16 kernel runs — eight mantissa bits. `indexer_k_raw-3` goes from
+> **9.179e-04 rms to 4.454e-07**, and the control is that **fp16 is 1.02x
+> *worse* than f32**: this is a different numeric from L2e-3's, not the same
+> one again. With it, the whole indexer chain comes back (24-69x on the pooled
+> key, the normed key, the query and the score) — and **L2e-3 is separately
+> re-confirmed at 4096 columns**, the F32 x F32 score being 7.2x better in fp16
+> than in f32 and 59x better than in bf16.
+>
+> **L4a-7: two subnormal bugs, both invisible to five stages of comparison.**
+> The fp16 census caught `ffn_shexp-3` at 99.9% where everything else was
+> 100.0%, and the 11 047 exceptions were all the smallest magnitudes and all
+> negative: **`f16Round` returned |x| for every negative subnormal half**,
+> building it as `-0.0 + q*2^-24`. Fixing that exposed **`f16` widening every
+> subnormal half to *half* its value** — exponent field 113+e where the
+> arithmetic gives 114+e. `TestHalfPrecisionRoundTrips` now walks all 65 536
+> halves and all 65 536 bfloats.
+
 ---
 
 ## The three findings that set the direction
@@ -751,11 +834,12 @@ below Q8. Bandwidth is the whole story.
 | `cmd/llm` | the vertical's driver. `-tokenize` today; generation at L7. |
 | `zimage/tokenizer/` | **L1: `FromVocab`** builds the BPE from GGUF metadata, and `split()` now carries both Qwen pre-tokenizers. 213/213 against `llama-tokenize`. |
 | `llm/` | **L2b: the vertical's package.** `Config` from the checkpoint's own metadata, on-demand dequantisation, the `token_embd` gather (bit-exact), and the hyper-connection block — `HCInit`, `HCMix`, `HCCombine` — with a `Numerics` switch between the exact model and the reference's int8 arithmetic. |
-| `reference/eval_dump.c` | **L2b: the oracle.** Whole tensors of a real llama.cpp pass, where `llama-eval-callback` prints three per axis and a sum. `llm/evaldump.go` reads them back as a `Trace`. |
+| `reference/eval_dump.c` | **L2b: the oracle.** Whole tensors of a real llama.cpp pass, where `llama-eval-callback` prints three per axis and a sum. `llm/evaldump.go` reads them back as a `Trace`. **L4a** added `-f` (a prompt from a file) and `-nt` (an exact token count), and pins the build's headers. |
+| `reference/out/llm4k/` | **L4a: the second trace**, 4096 tokens in a 4096-cell cache in one ubatch — 8.0 GB, 116 tensors. The only place the QSA selection exists, the only place the reference's real prefill arithmetic is visible, and it carries the whole MoE block for L5. The 7-token trace stays beside it: the empty blocks, the spare block and the f32 vector path are only legible there. |
 | `llm/gpu.go` | **L2c: the block on the device.** Four arenas, the fused `[336, 10240]` down/inject weight, the up projection's row permutation, an M ladder per projection with a measured `PlanFor` schedule, and a sweep profiler that reads every staged mixer so the weights are as cold as a real graph's. |
 | `shaders/llm_gemm.comp` | **L2c/L2d/L2f: the vertical's GEMM**, one kernel and one epilogue per mode — MODE 0 down+inject+silu, MODE 1 up+sigmoid+collapse, MODE 2 plain — because in this architecture the epilogue is where the time goes. |
 | `shaders/llm_hc_*.comp`, `llm_ple_*.comp` | **L2c/L2d: the blocks.** `llm_hc_norm` (grouped RMSNorm → fp16 A operand), `llm_hc_combine`, `llm_ple_gate` (both norms, the signed-sqrt gate, the broadcast and the conv norm in one pass) and `llm_ple_conv` (four dilated taps, the SiLU and the residual add), over `llm_common.glsl`'s binding contract. |
-| `llm/attn.go` | **L2e: the full-attention layer.** The fused query/gate projection, interleaved M-RoPE, the QSA indexer's pool/score/select with the reference's own cache block structure, and causal GQA — with the fp16 KV cache and the fp16 F32-matmul the reference turns out to use. |
+| `llm/attn.go` | **L2e: the full-attention layer.** The fused query/gate projection, interleaved M-RoPE, the QSA indexer's pool/score/select with the reference's own cache block structure, and causal GQA — with the fp16 KV cache and the fp16 F32-matmul the reference turns out to use. **L4a** replaced the selection with a port of the reference's radix select, and made the indexer's two BF16 projections take a bf16 activation above the 8-column threshold. |
 | `llm/gpu_attn.go` | **L2f: that layer on the device, in six dispatches.** The fused `[13952, 2560]` projection for six of llama.cpp's matrices, a host-built rotary table, two BM ladders because the two projections fall on opposite sides of the MALL, and a sweep profiler over every staged layer. |
 | `shaders/llm_attn_*.comp` | **L2f: the layer's four kernels.** `llm_attn_pack` (per-head norm + interleaved M-RoPE + the fragment tiling for q, k and v in one grid), `llm_attn_idx` (the indexer's pooled key and query over two addressings), `llm_attn_score` (the rectified score, its bias, the cells and the causal mask) and `llm_attn_wmma` (causal GQA at headDim 256, **with the output gate in its epilogue**). |
 | `llm/deltanet.go` | **L3a: the gated DeltaNet, 36 of the 48 layers.** The fused [2560, 10240] qkv projection, the depthwise causal conv, the L2 norm under either of llama.cpp's two spellings of it (`QKNorm`), the two F32 gate projections and the delta rule itself — with a `DeltaNetState` carrying both the [128, 128, 48] recurrent state *and* the convolution's window, bit-identically across a batch split. |
@@ -786,9 +870,10 @@ below Q8. Bandwidth is the whole story.
    prefill graph (L3b-5).
 3. **QSA sparse attention** — indexer, top-2048 selection, gathered attention.
    Not in `IDEAS.md` at all; it needs a new section. 1.5% of prefill.
-   **L2e built the CPU reference and L2f the kernels** — what is left is the
-   *selection*, which cannot be tested at any prompt shorter than `top_k` and
-   so is L4's with a 4k dump beside it.
+   **L2e built the CPU reference, L2f the kernels and L4a the selection**,
+   which is a radix select reproduced set for set at 4 k. What is left is
+   **L4b**: that selection as a kernel, writing a per-cell bitmask for
+   `llm_attn_wmma.comp` to read beside the causal mask.
 4. **PLE n-gram** — trigram hashing into 16 heads over a 320 M-row mmap'd
    table, `layer_multipliers`, conv1d k=4, key/value projections.
 5. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
@@ -919,20 +1004,43 @@ below Q8. Bandwidth is the whole story.
 
 ### L4 — QSA
 
-- [ ] Indexer, top-2048 selection, gathered attention. **The selection is
-      block-granular** — top `top_k/ratio` = 512 blocks expanded to their
-      cells, plus the causal tail — which vLLM states directly and llama.cpp
-      only implies; a cell-level top-k that splits a block is wrong and no
-      7-token test catches it. [Addendum](research/l2e-attention.md)
-- [ ] Re-dump at 4 k. It is needed twice over: for the selection, and for
-      L3a-5's threshold — every tolerance in L2 and L3 was measured on the
-      f32 vector path that a real ubatch does not use.
-- [ ] Gate: layer 3 matches at 4 k context, where selection actually bites.
+- [x] **L4a — re-dump at 4 k, and settle the selection on the CPU.** 4096
+      tokens in a 4096-cell cache, one ubatch, 8.0 GB, the same pinned build
+      — and the filter brings the whole MoE block with it, so L5's fixture
+      exists already. `eval_dump.c` grew `-f` and `-nt`, and is now built
+      against headers extracted from the *build's* commit rather than from a
+      working tree that has moved on. The selection is a **radix select**
+      reproduced pass for pass (all 4096 rows algorithmically, **set for set
+      on the 2045 biting rows**), its block granularity is checked rather than
+      read, its order is measured to be irreproducible and its visible set to
+      be stable, and **0.0022% of it survives our own scores**. Two findings
+      that are not about QSA: **every quantised matmul accumulates in fp16 at
+      a real ubatch** (so the prefill tolerance is 5e-3, and the reference is
+      the side losing precision), and the indexer's **BF16 weights meet a bf16
+      activation**, worth 2061x. Plus two subnormal bugs.
+      [Write-up](research/l4-qsa.md)
+- [x] Gate: our selection is the reference's, from the reference's own scores
+      — `TestQSASelectionIsARadixSelect`, with
+      `TestQSASelectionIsStableAcrossRuns` and
+      `TestQSASelectionIsBlockGranular` beside it.
+- [ ] **L4b — the selection on the device, and the gathered attention.**
+      `llm_attn_score.comp` already produces `indexer_score_tokens`; what is
+      missing is a radix-select kernel (one workgroup a token, four histogram
+      passes over `n_kv`) writing a **per-cell bitmask** rather than an index
+      list, and `llm_attn_wmma.comp` reading it beside the causal mask. That
+      is also what llama.cpp does — `build_attn_qsa` turns `top_k` back into a
+      mask and runs **dense** flash attention over every cell — so the
+      sparsity is semantics at prefill, not a saving.
+- [ ] Gate: layer 3's `attn_output` matches at 4 k context, on the device,
+      where the selection actually bites.
 
 ### L5 — the MoE block
 
 - [ ] Router (F32), grouped Q4 GEMV for decode (§1.8-§1.12), Q4 WMMA GEMM for
-      prefill (§2.2), gather/combine.
+      prefill (§2.2), gather/combine. **The fixture is already there**: L4a's
+      4k dump carries `ffn_moe_logits`, `probs`, `argsort`, `topk`, `weights`,
+      `weights_sum`, `weights_norm`, `gate`, `up`, `swiglu`, `down`,
+      `weighted` and `out` for layers 0 and 3, at 4096 tokens.
 - [ ] Gate: one block matches; GB/s reported against L0a.
 
 ### L6 — the whole stack, prefill only
@@ -1001,6 +1109,19 @@ below Q8. Bandwidth is the whole story.
                                              # CPU and GPU, plus the controls
     go test ./llm/ -v -run TestDeltaNet      # L3a: the linear layers
     go test ./llm/ -v -run TestDeltaNetGPU   # L3b: its kernels, the ladder, the carry
+
+    # L4a's fixture: 4096 tokens, 4096 cells, one ubatch, 8.0 GB, ~4 minutes.
+    # The headers come from the *build's* commit — the checkout has moved past it.
+    H=$(mktemp -d) && (cd $L && git archive cff184438 include ggml/include | tar -x -C $H)
+    gcc -O2 -o /tmp/eval_dump reference/eval_dump.c -I$H/include -I$H/ggml/include \
+        -L$L/build/bin -lllama -lggml-base -Wl,-rpath,$L/build/bin
+    mkdir -p reference/out/llm4k
+    head -c 40000 models/wikitext-2-raw/wiki.test.raw | head -n -1 > reference/out/llm4k/prompt.txt
+    /tmp/eval_dump -m $M -o reference/out/llm4k -f reference/out/llm4k/prompt.txt \
+        -nt 4096 -c 4096 -ub 4096 \
+        -n '^(model\.input_embed|ple_embd|hc_init)$|-(0|3)$|^ple_(gate|gated_value|conv_out)-1$'
+    go test ./llm/ -v -run TestQSA           # L4a: the selection, at the length it exists
+    go test ./llm/ -v -run 'TestMatMuls|TestF16Acc|TestIndexerProjection|TestHalfPrecision'
 
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh
@@ -1073,6 +1194,16 @@ below Q8. Bandwidth is the whole story.
   llama.cpp's 0.7. It is a scalar workgroup per token at 4.1 TFLOP/s where the
   matrix cores do 39, and it is an obvious cooperative-matrix rewrite — but it
   is 0.07% of a prefill graph, so it is written down rather than done.
+- **Should our kernels follow the reference onto an fp16 accumulator?** L4a-5
+  says the reference does, everywhere a weight is quantised, and that it costs
+  it ~0.44% relative on every projection at prefill. Ours accumulate in f32 and
+  are therefore *nearer the model and further from the oracle* — which is
+  fine for a tensor comparison and is an open question for **throughput**:
+  an fp16 accumulator halves accumulator register pressure, which L2f-5 and
+  L3b-4 both found to be the binding constraint on the ladder. Worth a rung on
+  the attention and projection ladders before L6 freezes them. The accuracy
+  half is L8's: **`PPL 4.0340` was measured with fp16 accumulation on**, so
+  matching it does not require avoiding it.
 - **The rotary table wants a row per cache cell**, which is right for prefill
   and wrong for a 262144-cell context (67 MB). L7 either builds it per batch,
   as llama.cpp does, or goes back to computing the angle per lane and pays for
@@ -1095,19 +1226,15 @@ below Q8. Bandwidth is the whole story.
   of one channel block of forty tokens. Nothing else in this vertical has been
   checked for it, and §5.1b says the penalty is a property of the traversal
   rather than of the kernel.
-- ~~**When does the selection start to bite?**~~ **What it *is* is now
-  settled, by vLLM rather than by a dump.** The selection is
-  **block-granular**: top `top_k/ratio` = 512 blocks by rectified score, each
-  expanded to its `ratio` cells, plus the causal tail — and llama.cpp's
-  cell-level top-k at width `top_k + ratio - 1` reaches the same set only
-  because all four cells of a block share one score. **So L4 must return whole
-  blocks in score order**, and a cell top-k that splits a block on a tie is
-  wrong in a way no 7-token test can see. That also retires L2e-5's worry
-  about `TOP_K` being a selection and not a sort: the tie order inside a block
-  is unobservable *by construction*. Still open is only the *measurement* —
-  the gather has no kernel and no test until there is a 4k dump, which is the
-  same dump L3a-5 says every L2 tolerance now needs.
-  [Addendum](research/l2e-attention.md)
+- ~~**When does the selection start to bite?**~~ **Answered at L4a, by the
+  dump vLLM's formula was waiting for.** At token **2051** — the width — and
+  the shape is vLLM's: `(i+1) mod ratio` tail cells, **exactly 512** whole
+  blocks, and a split of at most `ratio-1` cells off the lowest-scoring block
+  in the selection. It is `topk_radix_select.comp` rather than a sort, ours
+  reproduces it **set for set on all 2045 biting rows**, the reference's
+  *order* is irreproducible run to run while its visible set is stable, and
+  **0.0022% of it moves** when the scores are our own. What is left is only
+  the kernel — L4b. [Write-up](research/l4-qsa.md)
 - ~~**The recurrent state.**~~ **L3a-6 settles the DeltaNet half and L3b-6
   does it on the device**: both the [128, 128, 48] state and the convolution's
   three-column window carry, and 3 + 4 tokens reproduce 7 bit-identically —
@@ -1120,11 +1247,24 @@ below Q8. Bandwidth is the whole story.
   `mul_mat_vec_max_cols = 8` output columns and the fp16 coopmat GEMM above
   it. So the answer is "everything wider than 8 columns" — which is every
   projection in the model at a real ubatch, and **none of them in the 7-token
-  dump**. What is now open is the consequence: **every tolerance in L2b, L2d,
-  L2e and L3a was measured on the vector path**, and L6 runs on the other one.
-  A longer dump is the only way to know what a 512-token tolerance looks like,
-  and it is the same dump L4 needs for the QSA selection.
-- **The oracle's build is pinned, and now it matters.** L3a-4 found that
+  dump**. ~~What is now open is the consequence.~~ **L4a measured it**, and it
+  is worse than "an fp16 operand": on the other side of the threshold every
+  quantised matmul accumulates in **fp16**, so the reference sits ~5.4e-03 rms
+  from the f32 model and no operand model of ours can get closer. The BF16
+  indexer projections take a **bf16** activation there, which is modelled and
+  worth 2061x. **Every 1e-6 tolerance in L2b, L2d, L2e and L3a is a fact about
+  a 7-token dump**; at prefill the number is 5e-3 and the gap is the oracle's.
+  What is still open is only whether the same holds for the *elementwise*
+  lines, which have no threshold and were never measured at width.
+- **The oracle's build is pinned, the checkout is not, and they have
+  diverged.** `/home/kube/repos/llama.cpp` is at **`d1d3c3396`** while
+  `build/bin` is still **`cff184438`**, so reading `src/models/qwen4exp.cpp`
+  today reads a *different implementation* from the one the oracle runs — it
+  already carries #28068's GDN fix and a rms_norm fusion. `include/llama.h`
+  and `ggml/include/ggml.h` have moved too, so **L4a builds `eval_dump.c`
+  against headers extracted from the build's own commit** (`git archive
+  cff184438 include ggml/include`) rather than from the working tree, and
+  every source citation should be `git show cff184438:…`. L3a-4 found that
   `cff184438` — the build behind the trace, `pp2048 388.60`, `tg128 25.15` and
   **`PPL 4.0340`** — predates llama.cpp's fix to `build_gdn_l2_norm` (#28068),
   and that reproducing the pre-fix `max(|x|, eps)` is worth 15x on a DeltaNet
