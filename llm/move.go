@@ -62,11 +62,20 @@ type movePush struct {
 	Narrow               uint32
 }
 
+// bytes pads the block out to the vertical's own push size, because a
+// sequence recorded into one command buffer pushes the same number of bytes
+// for every dispatch in it (L7d) — the shim reads the blocks out of one flat
+// array — and the moves now share a command buffer with the five blocks. The
+// pipeline layout below declares the same range, so the bytes past this
+// struct are inside it and no shader reads them.
 func (p movePush) bytes() []byte {
-	out := make([]byte, unsafe.Sizeof(p))
+	out := make([]byte, movePushSize)
 	*(*movePush)(unsafe.Pointer(&out[0])) = p
 	return out
 }
+
+// movePushSize is that shared size: the vertical's 64-uint block.
+var movePushSize = int(unsafe.Sizeof(push{}))
 
 // bufPair keys the pipeline cache. A compute pipeline here owns its
 // descriptor set, so one is needed per (source, destination) buffer pair —
@@ -75,6 +84,9 @@ type bufPair struct{ src, dst *vk.Buffer }
 
 // mover holds those pipelines.
 type mover struct {
+	// rec, when set, collects these dispatches into the pass's one command
+	// buffer instead of submitting them (record.go).
+	rec   *recorder
 	dev   *vk.Device
 	mod   *vk.ShaderModule
 	pipes map[bufPair]*vk.ComputePipeline
@@ -103,7 +115,7 @@ func (m *mover) pipeline(src, dst *vk.Buffer) (*vk.ComputePipeline, error) {
 	}
 	p, err := m.dev.NewPipeline(m.mod, vk.PipelineSpec{
 		Buffers:          []*vk.Buffer{src, dst, dst},
-		PushConstantSize: uint32(unsafe.Sizeof(movePush{})),
+		PushConstantSize: uint32(movePushSize),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("llm: move pipeline: %w", err)
@@ -139,9 +151,13 @@ func (m *mover) Move(dst, src Port, rows int) error {
 		return err
 	}
 	m.moves++
-	_, err = vk.DispatchMultiTimed([]vk.MultiDispatch{{
+	d := []vk.MultiDispatch{{
 		Pipeline: p, GroupsX: uint32(pad), GroupsY: 1, PushConstants: pc.bytes(),
-	}}, 1, 1, true)
+	}}
+	if m.rec.add(ownMove, d) {
+		return nil
+	}
+	_, err = vk.DispatchMultiTimed(d, 1, 1, true)
 	if err != nil {
 		return fmt.Errorf("llm: move of %d x %d: %w", rows, src.Width, err)
 	}

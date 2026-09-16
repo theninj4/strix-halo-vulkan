@@ -840,8 +840,32 @@ type MultiDispatch struct {
 // query pool and fence — and every push-constant block must be the same
 // length, since each pipeline layout declares one range.
 func DispatchMultiTimed(dispatches []MultiDispatch, groupsZ, iterations uint32, barriers bool) (time.Duration, error) {
+	d, _, err := dispatchMulti(dispatches, groupsZ, iterations, barriers, false)
+	return d, err
+}
+
+// DispatchMultiMarked records the same sequence and returns **one duration per
+// dispatch** as well as the total, by writing a timestamp after each rather
+// than only at the two ends.
+//
+// It is what makes one command buffer a *token* affordable to reason about
+// (LLM.md L7d). A submit and a fence wait is ~40 us on this device and a
+// decode step was ~490 of them, one a block — so merging them is worth about
+// 15% — but the per-block wall clock the engine has been tuned by lives in
+// exactly those boundaries. This moves the attribution inside the command
+// buffer, where it is GPU time rather than host time and so is strictly the
+// better number: it is what GGML_VK_PERF_LOGGER reports for llama.cpp's own
+// graph, on our side of the comparison.
+//
+// One pass only, and at most SHIM_QUERY_SLOTS-1 dispatches; past either it
+// falls back to the total, and the per-dispatch slice comes back nil.
+func DispatchMultiMarked(dispatches []MultiDispatch, barriers bool) (time.Duration, []time.Duration, error) {
+	return dispatchMulti(dispatches, 1, 1, barriers, true)
+}
+
+func dispatchMulti(dispatches []MultiDispatch, groupsZ, iterations uint32, barriers, marks bool) (time.Duration, []time.Duration, error) {
 	if len(dispatches) == 0 {
-		return 0, fmt.Errorf("DispatchMultiTimed: empty dispatch sequence")
+		return 0, nil, fmt.Errorf("DispatchMultiTimed: empty dispatch sequence")
 	}
 	dev := dispatches[0].Pipeline.dev
 	// The pipelines are copied by value rather than referenced: a
@@ -855,13 +879,13 @@ func DispatchMultiTimed(dispatches []MultiDispatch, groupsZ, iterations uint32, 
 	pcSize := len(dispatches[0].PushConstants)
 	for i, d := range dispatches {
 		if d.Pipeline == nil {
-			return 0, fmt.Errorf("DispatchMultiTimed: dispatch %d has no pipeline", i)
+			return 0, nil, fmt.Errorf("DispatchMultiTimed: dispatch %d has no pipeline", i)
 		}
 		if d.Pipeline.dev != dev {
-			return 0, fmt.Errorf("DispatchMultiTimed: dispatch %d is on a different device", i)
+			return 0, nil, fmt.Errorf("DispatchMultiTimed: dispatch %d is on a different device", i)
 		}
 		if len(d.PushConstants) != pcSize {
-			return 0, fmt.Errorf("DispatchMultiTimed: push-constant block %d is %d bytes, block 0 is %d",
+			return 0, nil, fmt.Errorf("DispatchMultiTimed: push-constant block %d is %d bytes, block 0 is %d",
 				i, len(d.PushConstants), pcSize)
 		}
 		handles[i] = d.Pipeline.handle
@@ -879,15 +903,30 @@ func DispatchMultiTimed(dispatches []MultiDispatch, groupsZ, iterations uint32, 
 	if barriers {
 		barrierFlag = 1
 	}
+	var markBuf []C.uint64_t
+	var markPtr *C.uint64_t
+	if marks && len(dispatches)+1 <= int(C.SHIM_QUERY_SLOTS) {
+		markBuf = make([]C.uint64_t, len(dispatches)+1)
+		markPtr = &markBuf[0]
+	}
 	if err := check("vkQueueSubmit", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
 		&handles[0],
 		&groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
 		C.uint32_t(groupsZ), C.uint32_t(iterations), barrierFlag,
-		pcPtr, C.uint32_t(pcSize), &start, &end)); err != nil {
-		return 0, err
+		pcPtr, C.uint32_t(pcSize), &start, &end, markPtr)); err != nil {
+		return 0, nil, err
 	}
 	ticks := float64(uint64(end)) - float64(uint64(start))
-	return time.Duration(ticks * dev.phys.TimestampPeriod), nil
+	total := time.Duration(ticks * dev.phys.TimestampPeriod)
+	if markBuf == nil {
+		return total, nil, nil
+	}
+	each := make([]time.Duration, len(dispatches))
+	for i := range each {
+		d := float64(uint64(markBuf[i+1])) - float64(uint64(markBuf[i]))
+		each[i] = time.Duration(d * dev.phys.TimestampPeriod)
+	}
+	return total, each, nil
 }
 
 // Dispatch records and submits a single dispatch covering groupsX

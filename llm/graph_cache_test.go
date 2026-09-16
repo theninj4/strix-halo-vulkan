@@ -60,6 +60,17 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 	t.Cleanup(g.Destroy)
 	t.Logf("%d layers, %d tokens, staged in %s", g.Layers(), nTok, time.Since(start).Round(time.Millisecond))
 
+	// Pinned, for the three equalities below. The ladders this vertical is
+	// made of are bit-exact against each other — they tile the same
+	// arithmetic differently — with one exception, and it is the rung the
+	// schedule picks at exactly the chunk length this test cares about:
+	// L7d's split-K GEMV associates a 10240-long sum 160 ways where the GEMM
+	// associates it in one sweep. So the equality is asserted against a fixed
+	// schedule, and what the decode schedule costs is the fourth subtest.
+	if err := g.PinSchedule(true); err != nil {
+		t.Fatal(err)
+	}
+
 	// The whole prompt in one run, and the two tensors it leaves: the wide
 	// residual of every token, and the one row the head would read.
 	norm, err := g.Hidden(ids)
@@ -113,6 +124,44 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 			t.Logf("%d chunks, %d tokens: result_norm identical to the last place", len(tc.chunks), nTok)
 		})
 	}
+
+	// What the decode schedule costs, on the hardest of the three splits.
+	// It is a different association of the same products and nothing else —
+	// the histories are the same histories — so the bar is fp32 round-off
+	// over a 10240-long dot product, amplified by L6b-3's x1.085 a layer and
+	// by seventeen steps of recurrence, and **not** the 1.785e+00 the control
+	// below reports for a history that was not carried.
+	t.Run("one token at a time, on the decode schedule", func(t *testing.T) {
+		if err := g.PinSchedule(false); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := g.PinSchedule(true); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		var got []float32
+		if err := g.Append(ids[:nTok-17]); err != nil {
+			t.Fatal(err)
+		}
+		for i := nTok - 17; i < nTok; i++ {
+			if got, err = g.HiddenExtend(ids[i : i+1]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		r, err := compare(got, wantNorm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("result_norm, split-K down projection: %v", r)
+		if r.rms > 1e-3 {
+			t.Errorf("the decode schedule moves result_norm by %.3e rms, which is more than a "+
+				"reassociated dot product can account for (%v)", r.rms, r)
+		}
+	})
 
 	// The control. Every token its own *sequence* rather than its own batch:
 	// the same dispatches, the same weights, the same order, and none of the

@@ -84,6 +84,14 @@ layout(push_constant) uniform PC {
     // combine, whose other input is the block output at outOff.
     uint outOff;
     // Per-stream RMSNorm gamma, fp32: [hc*nEmbd].
+    //
+    // **llm_hc_gemv.comp borrows it** (L7d), as HC_PARTIAL: f32
+    // [KSLABS][gemmN], the split-K down projection's partial sums. That
+    // kernel reads no norm and the push block is full — 64 uints is 256
+    // bytes, this device's whole range — so it is said by the one field of
+    // its own block it does not otherwise use, on the same rule as the
+    // SEQ_PAST family below: the mapping lives here and nothing spells the
+    // borrowed field's own name at the call site.
     uint gammaOff;
     // The packed fp16 weight, in the bank.
     uint bOff;

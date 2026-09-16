@@ -209,21 +209,41 @@ func endOfGeneration(set *gguf.Set, tok *tokenizer.Tokenizer) map[int32]bool {
 // reportPhases prints where a run's wall clock went, as a share of the wall
 // clock the caller measured rather than of the graph's own total — so that
 // whatever the graph does not account for shows up as the gap.
+//
+// **The first rows are GPU time and the last three are host time** (L7d). A
+// pass is one command buffer, so a block no longer has a wall clock of its
+// own; what it has is the sum of its dispatches' timestamps inside that
+// command buffer, which is the same figure llama.cpp's GGML_VK_PERF_LOGGER
+// reports on the other side of every comparison here. `on the GPU` is the
+// whole command buffer end to end, so the gap between it and the rows above
+// is what the barriers between dispatches cost, and `hand-over` is what the
+// submit and the fence wait take on top of it.
 func reportPhases(st llm.GraphStats, wall time.Duration) {
 	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 	total := float64(wall.Microseconds()) / 1000
+	row := func(name string, d time.Duration) {
+		if d <= 0 {
+			return
+		}
+		fmt.Printf("    %-12s %8.1f ms  %5.1f%%\n", name, ms(d), 100*ms(d)/total)
+	}
 	for _, r := range []struct {
 		name string
 		d    time.Duration
 	}{
 		{"hyper-conn", st.HC}, {"ple n-gram", st.PLE}, {"deltanet", st.DeltaNet},
 		{"attention", st.Attn}, {"moe", st.MoE}, {"lm head", st.Head},
-		{"move", st.Move}, {"gather", st.Gather}, {"glue", st.Glue},
+		{"move", st.Move},
 	} {
-		if r.d == 0 {
-			continue
-		}
-		fmt.Printf("    %-11s %8.1f ms  %5.1f%%\n", r.name, ms(r.d), 100*ms(r.d)/total)
+		row(r.name, r.d)
+	}
+	row("= on the GPU", st.GPU)
+	row("gather", st.Gather)
+	row("glue", st.Glue)
+	row("hand-over", wall-st.GPU-st.Gather-st.Glue)
+	if n := st.Dispatches / max(st.Runs, 1); n > 0 {
+		fmt.Printf("    %d dispatches a pass, in %d command buffer(s)\n",
+			n, (n+llm.MaxBatch-1)/llm.MaxBatch)
 	}
 }
 

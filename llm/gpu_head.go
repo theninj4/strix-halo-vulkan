@@ -45,6 +45,9 @@ const headStageRows = 4096
 // HeadGPU is the output projection: one fp16 bank, one fp16 A operand, one
 // f32 logit arena.
 type HeadGPU struct {
+	// rec, when set, collects this block's dispatches into the pass's one
+	// command buffer instead of submitting them (record.go).
+	rec *recorder
 	dev *vk.Device
 
 	wbuf, abuf, hbuf, bank *vk.Buffer
@@ -255,6 +258,9 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 // Run projects whatever Upload left in the A operand.
 func (g *HeadGPU) Run() error {
 	d, kinds := g.graph()
+	if g.rec.add(ownHead, d) {
+		return nil
+	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
 		return fmt.Errorf("llm: head dispatch (%s): %w", kinds[0], err)
 	}

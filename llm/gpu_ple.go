@@ -99,6 +99,9 @@ type PLEOpts struct {
 
 // PLEGPU runs the n-gram block for one layer.
 type PLEGPU struct {
+	// rec, when set, collects this block's dispatches into the pass's one
+	// command buffer instead of submitting them (record.go).
+	rec *recorder
 	dev *vk.Device
 	cfg PLEConfig
 
@@ -423,7 +426,11 @@ func (g *PLEGPU) Run() error {
 	// One command buffer for the whole block, not one a dispatch: a submit
 	// and a fence wait is ~150 us here and a decode step is a batch of one,
 	// so what the sequence costs is how many times it is handed over
-	// (LLM.md L7c).
+	// (LLM.md L7c). And when the graph is recording a whole pass, not even
+	// one a block (L7d).
+	if g.rec.add(ownPLE, d) {
+		return nil
+	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
 		return fmt.Errorf("llm: ple, %d dispatches (%v): %w", len(d), kinds, err)
 	}

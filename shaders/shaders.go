@@ -1922,6 +1922,27 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -o llm_hc_up_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -o llm_hc_up_m4.spv llm_gemm.comp
 
+// The down projection again, at one token: LLM.md L7d. `llm_gemm.comp` blocks
+// the output columns, so a fused N of 336 is seven workgroups on a 40-CU
+// device and the projection reads 29 GB/s of a 242 GB/s bus (L7c-6). At M=1
+// the parallelism has to come from K, so this is the split-K GEMV over the
+// same staged weight — one dispatch of 21 x KSLABS waves writing partial
+// sums, one that reduces them and carries the GEMM's own epilogue. KSLABS is
+// compiled in for the reason BM and BN are: the host sizes the scratch and
+// the grid from it.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -o llm_hc_gemv_s8.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=8 -o llm_hc_gemv_r8.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -o llm_hc_gemv_s16.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=16 -o llm_hc_gemv_r16.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -o llm_hc_gemv_s32.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=32 -o llm_hc_gemv_r32.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -o llm_hc_gemv_s40.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=40 -o llm_hc_gemv_r40.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -o llm_hc_gemv_s80.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=80 -o llm_hc_gemv_r80.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -o llm_hc_gemv_s160.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=160 -o llm_hc_gemv_r160.spv llm_hc_gemv.comp
+
 // The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
 // a prefill graph — its key projection is one dispatch of the 37 that share
 // that shape — so none of this is tuned; what it has to be is on the device,
@@ -1974,6 +1995,46 @@ var LLMHCUpM2 []byte
 
 //go:embed llm_hc_up_m4.spv
 var LLMHCUpM4 []byte
+
+// LLMHCGemvS* is the split-K down projection at one token and LLMHCGemvR* the
+// reduction and epilogue that closes it (L7d). They come in pairs: the slab
+// count is compiled into both.
+
+//go:embed llm_hc_gemv_s8.spv
+var LLMHCGemvS8 []byte
+
+//go:embed llm_hc_gemv_r8.spv
+var LLMHCGemvR8 []byte
+
+//go:embed llm_hc_gemv_s16.spv
+var LLMHCGemvS16 []byte
+
+//go:embed llm_hc_gemv_r16.spv
+var LLMHCGemvR16 []byte
+
+//go:embed llm_hc_gemv_s32.spv
+var LLMHCGemvS32 []byte
+
+//go:embed llm_hc_gemv_r32.spv
+var LLMHCGemvR32 []byte
+
+//go:embed llm_hc_gemv_s40.spv
+var LLMHCGemvS40 []byte
+
+//go:embed llm_hc_gemv_r40.spv
+var LLMHCGemvR40 []byte
+
+//go:embed llm_hc_gemv_s80.spv
+var LLMHCGemvS80 []byte
+
+//go:embed llm_hc_gemv_r80.spv
+var LLMHCGemvR80 []byte
+
+//go:embed llm_hc_gemv_s160.spv
+var LLMHCGemvS160 []byte
+
+//go:embed llm_hc_gemv_r160.spv
+var LLMHCGemvR160 []byte
 
 //go:embed llm_gemm_plain_m2.spv
 var LLMGEMMPlainM2 []byte
@@ -2217,6 +2278,21 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_m4.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q80_w2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q80_w4m1.spv llm_moe_gemm.comp
+
+// The **narrow-N** rungs of the up mode: LLM.md L7d. Every rung above blocks
+// the output columns at 64, so at one token the routed pair is 10 experts x
+// (640/64) = 100 workgroups and the shared expert is **ten**, on a 40-CU
+// device — and the kernel is unpack-bound, so what it is short of is
+// workgroups and not rows (L7c-6). These cut BN to 16 and 32 instead, which
+// multiplies the grid by four and two and divides the slab each workgroup
+// unpacks by the same, for the same total unpack. They are up-mode only: the
+// down mode's N is 2560 and its grid is already 400.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_n1m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_n2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_n1m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWN=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_n2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_n1m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWN=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_n2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m2.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q51_m4.spv llm_moe_gemm.comp
@@ -2272,6 +2348,24 @@ var LLMMoEUpQ80W2M1 []byte
 
 //go:embed llm_moe_up_q80_w4m1.spv
 var LLMMoEUpQ80W4M1 []byte
+
+//go:embed llm_moe_up_q4k_n1m1.spv
+var LLMMoEUpQ4KN1M1 []byte
+
+//go:embed llm_moe_up_q4k_n2m1.spv
+var LLMMoEUpQ4KN2M1 []byte
+
+//go:embed llm_moe_up_q5k_n1m1.spv
+var LLMMoEUpQ5KN1M1 []byte
+
+//go:embed llm_moe_up_q5k_n2m1.spv
+var LLMMoEUpQ5KN2M1 []byte
+
+//go:embed llm_moe_up_q80_n1m1.spv
+var LLMMoEUpQ80N1M1 []byte
+
+//go:embed llm_moe_up_q80_n2m1.spv
+var LLMMoEUpQ80N2M1 []byte
 
 //go:embed llm_moe_down_q51_m1.spv
 var LLMMoEDownQ51M1 []byte

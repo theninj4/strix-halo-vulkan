@@ -169,7 +169,7 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 
 	var plans [][2]llm.MoEKernel
 	if ladder {
-		for _, u := range llm.MoEKernels() {
+		for _, u := range llm.MoEUpKernels() {
 			for _, d := range llm.MoEKernels() {
 				plans = append(plans, [2]llm.MoEKernel{u, d})
 			}

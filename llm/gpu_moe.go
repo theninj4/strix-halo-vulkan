@@ -90,16 +90,44 @@ const (
 	MoEM4   MoEKernel = "m4"   // BM 64: one wave, four tiles
 	MoEW2M1 MoEKernel = "w2m1" // BM 32: two waves of one tile, sharing the slab
 	MoEW4M1 MoEKernel = "w4m1" // BM 64: four waves of one tile
+	// The decode rungs, and the third number a rung can move: **BN**, the
+	// output columns a workgroup covers (L7d). Every rung above leaves it at
+	// 64, which is right when there are enough row blocks to fill the
+	// machine and wrong at one token, where the routed pair is 10 experts x
+	// (640/64) = 100 workgroups and the shared expert is ten. Narrowing BN
+	// multiplies the grid and divides the slab a workgroup unpacks, for the
+	// same total unpack — which is what a kernel short of workgroups rather
+	// than of rows needs. Up mode only: the down mode's N is 2560.
+	MoEN2M1 MoEKernel = "n2m1" // BM 16, BN 32
+	MoEN1M1 MoEKernel = "n1m1" // BM 16, BN 16
 )
 
-// MoEKernels lists the rungs, narrowest first.
+// MoEKernels lists the rungs both modes have, narrowest first.
 func MoEKernels() []MoEKernel {
 	return []MoEKernel{MoEM1, MoEM2, MoEM4, MoEW2M1, MoEW4M1}
 }
 
+// MoEUpKernels lists every rung the up mode can run, which is the list above
+// plus the narrow-N pair.
+func MoEUpKernels() []MoEKernel {
+	return append(MoEKernels(), MoEN2M1, MoEN1M1)
+}
+
+// moeBNOf is a rung's column block. It is what the host has to know to shape
+// the grid, and it is compiled into the SPIR-V.
+func moeBNOf(k MoEKernel) int {
+	switch k {
+	case MoEN1M1:
+		return 16
+	case MoEN2M1:
+		return 32
+	}
+	return moeBN
+}
+
 func moeBM(k MoEKernel) int {
 	switch k {
-	case MoEM1:
+	case MoEM1, MoEN1M1, MoEN2M1:
 		return 16
 	case MoEM2, MoEW2M1:
 		return 32
@@ -140,8 +168,18 @@ const moeBMMax = 64
 // **3.90x** the rows that exist, at 2048 it is 1.90x and at 4096 1.46x. So
 // the ladder moves outward with the chunk, and the boundary sits where the
 // two effects cross. Getting it wrong costs 1.03-1.13x on either side.
+// At **one token** neither effect is the one that decides: ten experts have
+// one row each, so every rung makes exactly ten tiles and a wider row block
+// buys no reuse and costs only padding. What is left is the grid, and the
+// narrowest is the widest grid — `n1m1/m1` is 400 up workgroups against
+// `m2/m2`'s 100 and the shared expert's 40 against ten, which is **1.28x on
+// the block** (L7d): 612.3 us to 479.9, with the up mode at 93 GB/s of bank
+// against 71 and the shared expert's at 46 against 23.
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
-	if tokens <= 1024 {
+	switch {
+	case tokens == 1:
+		return MoEN1M1, MoEM1
+	case tokens <= 1024:
 		return MoEM2, MoEM2
 	}
 	return MoEM4, MoEM4
@@ -208,6 +246,12 @@ var moeSPIRV = map[string][]byte{
 	"up_q80_m4":     shaders.LLMMoEUpQ80M4,
 	"up_q80_w2m1":   shaders.LLMMoEUpQ80W2M1,
 	"up_q80_w4m1":   shaders.LLMMoEUpQ80W4M1,
+	"up_q4k_n2m1":   shaders.LLMMoEUpQ4KN2M1,
+	"up_q4k_n1m1":   shaders.LLMMoEUpQ4KN1M1,
+	"up_q5k_n2m1":   shaders.LLMMoEUpQ5KN2M1,
+	"up_q5k_n1m1":   shaders.LLMMoEUpQ5KN1M1,
+	"up_q80_n2m1":   shaders.LLMMoEUpQ80N2M1,
+	"up_q80_n1m1":   shaders.LLMMoEUpQ80N1M1,
 	"down_q51_m1":   shaders.LLMMoEDownQ51M1,
 	"down_q51_m2":   shaders.LLMMoEDownQ51M2,
 	"down_q51_m4":   shaders.LLMMoEDownQ51M4,
@@ -248,6 +292,9 @@ const moeMaxBanks = 48
 
 // MoEGPU runs the MoE block on the device.
 type MoEGPU struct {
+	// rec, when set, collects this block's dispatches into the pass's one
+	// command buffer instead of submitting them (record.go).
+	rec *recorder
 	dev *vk.Device
 	cfg MoEConfig
 
@@ -325,6 +372,10 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 	}
 	if cfg.NExpertUsed > 16 {
 		return nil, fmt.Errorf("llm: the route kernel is built for at most 16 experts a token, this checkpoint says %d", cfg.NExpertUsed)
+	}
+	if cfg.FFNShared%moeBN != 0 {
+		return nil, fmt.Errorf("llm: shared expert width %d is not a multiple of the column block %d",
+			cfg.FFNShared, moeBN)
 	}
 	if cfg.FFNExpert%moeBN != 0 || cfg.NEmbd%moeBN != 0 {
 		return nil, fmt.Errorf("llm: ffn %d and n_embd %d must be multiples of the column block %d",
@@ -615,10 +666,11 @@ func (g *MoEGPU) stage(layers []MoEWeights) error {
 // SetPlan chooses the two rungs. Every rung is built and they all read the
 // same staged bank, so this moves a pipeline and restages nothing.
 func (g *MoEGPU) SetPlan(up, down MoEKernel) error {
-	for _, k := range []MoEKernel{up, down} {
-		if moeBM(k) == 0 {
-			return fmt.Errorf("llm: no MoE kernel %q (have %v)", k, MoEKernels())
-		}
+	if moeBM(up) == 0 {
+		return fmt.Errorf("llm: no MoE up kernel %q (have %v)", up, MoEUpKernels())
+	}
+	if moeBM(down) == 0 || moeBNOf(down) != moeBN {
+		return fmt.Errorf("llm: no MoE down kernel %q (have %v)", down, MoEKernels())
 	}
 	g.up, g.down = up, down
 	g.autoPlan = false
@@ -805,7 +857,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	up.CtxOff = g.hSwiglu
 	up.GemmN, up.GemmK = uint32(c.FFNExpert), uint32(c.NEmbd)
 	add(fmt.Sprintf("up_%s_%s", w.gateFmt, g.up), "up",
-		uint32(c.FFNExpert/moeBN), uint32(g.maxTiles(bmUp, g.rows)), up)
+		uint32(c.FFNExpert/moeBNOf(g.up)), uint32(g.maxTiles(bmUp, g.rows)), up)
 
 	// 6. down, weighted and scattered to its (token, slot).
 	down := base
@@ -825,7 +877,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
 	add(fmt.Sprintf("up_%s_%s", w.shGateFmt, g.up), "shexp.up",
-		uint32(c.FFNShared/moeBN), uint32(roundUpInt(g.rows, g.pad())/bmUp), shUp)
+		uint32(c.FFNShared/moeBNOf(g.up)), uint32(roundUpInt(g.rows, g.pad())/bmUp), shUp)
 
 	shDown := base
 	shDown.MoEPermOff, shDown.MoETileOff = g.aPerm, g.aShTilesDown
@@ -849,7 +901,11 @@ func (g *MoEGPU) Run(layer int) error {
 	// One command buffer for the whole block, not one a dispatch: a submit
 	// and a fence wait is ~150 us here and a decode step is a batch of one,
 	// so what the sequence costs is how many times it is handed over
-	// (LLM.md L7c).
+	// (LLM.md L7c). And when the graph is recording a whole pass, not even
+	// one a block (L7d).
+	if g.rec.add(ownMoE, d) {
+		return nil
+	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
 		return fmt.Errorf("llm: moe, %d dispatches (%v): %w", len(d), kinds, err)
 	}

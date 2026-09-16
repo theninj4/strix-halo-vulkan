@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"strix-halo-vulkan/vk"
@@ -452,5 +453,92 @@ func TestHCGPUUnpermutedUpIsWrong(t *testing.T) {
 	t.Logf("unpermuted up: %v", r)
 	if r.rms < 10*tolLlamaM {
 		t.Errorf("staging the up projection unpermuted still lands within %.3e rms of llama.cpp, so the permutation is not doing what the kernel says it does", r.rms)
+	}
+}
+
+// TestHCGPUGemvAgrees is the L7d gate for the decode rungs: at one token the
+// split-K GEMV has to produce what the GEMM rung produces, for every split.
+//
+// It cannot be a bit-for-bit comparison, and that is the whole reason this is
+// a separate test rather than another arm of TestHCGPULadderAgrees. The GEMM
+// rungs agree with each other exactly because they differ only in how many
+// token rows a workgroup carries — the reduction over K is the same sequence
+// of cooperative-matrix steps in all three. The GEMV reduces K in a different
+// order and in a different place: `KSLABS` partial sums, each accumulated by
+// one lane over sixteen-wide strides and closed by two shuffles, then summed
+// slab by slab in the second dispatch. Every product is the same fp32 product
+// of the same two fp16 operands; only the association changes. So the bound
+// below is fp32 round-off over a 10240-long dot product, and the test asserts
+// it is that small rather than asserting zero.
+//
+// `lo` is the tensor to bound, because it is the one the up projection reads
+// and it carries a silu; `inject` is the same accumulator's other sixteen
+// columns, written fp32 without an epilogue.
+func TestHCGPUGemvAgrees(t *testing.T) {
+	g, _, _ := gpuFixture(t, 0, "attn")
+	m, tr := fixtures(t)
+	in := mixerInput(t, m, tr, 0, "attn")
+	// One token, which is what the decode rungs are for. The row is
+	// llama.cpp's own, so the magnitudes are the model's.
+	if err := g.Upload(in[:g.cfg.Wide()], 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetPlan(HCDownM1, HCUpM1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(0, false); err != nil {
+		t.Fatal(err)
+	}
+	baseLo, baseInject, baseMixed := g.Lo(), g.Inject(), g.Mixed()
+
+	// The scale the bounds are relative to, so a change in the fixture is
+	// visible rather than silently absorbed.
+	var loMax float64
+	for _, v := range baseLo {
+		loMax = max(loMax, math.Abs(float64(v)))
+	}
+	for _, down := range GemvKernels() {
+		if err := g.SetPlan(down, HCUpM1); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0, false); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name   string
+			got    []float32
+			want   []float32
+			maxAbs float64
+		}{
+			// `lo` is fp16 in the arena, so its own step is the floor: the
+			// bound is one ulp at the magnitudes this mixer reaches.
+			{"lo", g.Lo(), baseLo, 1e-2},
+			{"inject", g.Inject(), baseInject, 1e-3},
+			{"mixed", g.Mixed(), baseMixed, 1e-3},
+		} {
+			r, err := compare(tc.got, tc.want)
+			if err != nil {
+				t.Fatalf("%s %s: %v", down, tc.name, err)
+			}
+			t.Logf("%-14s %-7s %v", down, tc.name, r)
+			if r.maxAbs > tc.maxAbs {
+				t.Errorf("%s %s disagrees with down_m1: maxAbs %.3e over %.1e (|lo| to %.1f)",
+					down, tc.name, r.maxAbs, tc.maxAbs, loMax)
+			}
+		}
+	}
+}
+
+// TestHCGPUGemvRefusesABatch is the control for the one thing the decode
+// rungs cannot do. The GEMV writes a single output row and reads a single
+// activation row: there is no M in it at all, so a two-token run through it
+// would not be slow, it would silently drop a token. The plan has to refuse.
+func TestHCGPUGemvRefusesABatch(t *testing.T) {
+	g, _, nTok := gpuFixture(t, 0, "attn")
+	if nTok < 2 {
+		t.Skip("the fixture is one token")
+	}
+	if err := g.SetPlan(HCDownGemv160, HCUpM1); err == nil {
+		t.Fatalf("SetPlan took the decode rung for a %d-token run", nTok)
 	}
 }

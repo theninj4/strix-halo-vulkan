@@ -218,11 +218,22 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
 // between each, which is what the split costs if the engine cannot prove that.
 // Iterations are always separated by a barrier, exactly as the two calls above
 // do it, so the loop measures steady state either way.
+//
+// `out_marks`, when not NULL, receives `count + 1` timestamps: one before the
+// first dispatch and one after each. That is the whole point of recording a
+// graph into one command buffer rather than one a block — a submit is ~40 us
+// here and a decode token is ~490 of them (LLM.md L7c-5, L7d) — and the
+// per-block attribution the engine is tuned by has to survive the merge. It
+// requires `iterations == 1` and a sequence that fits the query pool
+// (SHIM_QUERY_SLOTS); anything else leaves it untouched and returns the two
+// ends alone.
+#define SHIM_QUERY_SLOTS 2048
+
 VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *pipes,
                                     const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
                                     uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
                                     const void *pushConstants, uint32_t pushConstantSize,
-                                    uint64_t *out_start, uint64_t *out_end);
+                                    uint64_t *out_start, uint64_t *out_end, uint64_t *out_marks);
 
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p);
 

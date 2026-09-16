@@ -77,19 +77,38 @@ re-converging within a sentence. Underneath it, two equalities: a 4096-token
 prompt through the attention layer in chunks of 512, 64, 7 or **one** is
 identical to the last place, and the whole graph over 512 tokens in chunks of
 128, of 9, or as 495 then seventeen single ones returns `result_norm`
-identical to the last place. **Prefill is 950.3 tok/s at ubatch 2048 against
-391.42 — 2.43x — and 587.1 at 512 against 313.62, 1.87x.**
+identical to the last place — on a pinned schedule, which is a distinction
+L7d had to introduce and measures. **Prefill is 990.6 tok/s at ubatch 2048
+against 391.42 — 2.53x — and 622.5 at 512 against 313.62, 1.98x.**
 
 **Decode is 7.46 tok/s against llama.cpp's 25.15, and the attribution is two
 kernels rather than a direction.** One `madvise(MADV_RANDOM)` on the n-gram
 table was worth **176x** on the host gather; a command buffer a block rather
 than a submit a dispatch was worth 12%; and the ceiling turns out to be **25.0
 tok/s and not 38.2**, because our dense half is staged as halves and a token
-reads 9.67 GB rather than the checkpoint's 6.334. We are at 30% of our own
-ceiling, and what is between us and it is the hyper-connection **down**
-projection at 29 GB/s (336 output columns, ~21 workgroups) and the MoE's
-32-row padding doing 32x the arithmetic for one token. **Next: L7d, the decode
-kernels.**
+reads 9.67 GB rather than the checkpoint's 6.334.
+
+**L7d took those two kernels, and they were one finding said twice: at one
+token every dispatch in this model is short of workgroups, not of rows.**
+Decode is **11.89 tok/s against L7c's 7.46 — 1.59x — with the completion
+unchanged**, and prefill comes along at **990.6 tok/s, 2.53x**. The
+hyper-connection down projection ran in **seven** workgroups because its fused
+N is 336 and BN is 48, so at M=1 the parallelism has to come from **K**:
+`llm_hc_gemv.comp` is the split-K GEMV over the weight the GEMM already
+staged, and §2.8's fragment tiling turns out to be exactly the layout it wants
+— **238.6 us to 30.0, 7.95x, 29 GB/s to 230, 95% of the bus**. Which split is
+**§5.1b's 4 KB period and not the workgroup count**: every rung whose slab
+stride is a whole multiple of 4 KB is slow and both that are not are fast. The
+MoE is the same finding on the other axis — ten experts have one row each, so
+every rung makes ten tiles and the padding was never the constraint; cutting
+BN from 64 to 16 is **1.28x**. And **one command buffer a pass** rather than
+one a block, ~490 submits to two, **1.18x**, with the attribution moved inside
+it: a timestamp after every dispatch, which is what llama.cpp's own
+`GGML_VK_PERF_LOGGER` reports on the other side of every comparison here.
+**A token is 84.1 ms at 122 GB/s, half the bus**, and the MoE is the only
+block still far off its bytes. **Next: L8, our own bank** — 8.07 of a token's
+9.67 GB are a dense half staged as halves, and not expanding it is 1.66x on
+the ceiling before a weight is re-quantised.
 
 ## The number to beat
 
@@ -1255,6 +1274,73 @@ full-attention layer over a cache that outlives the batch.
 > pads each expert's rows to its 32-row block (L5b-3), so **one token does 32x
 > the arithmetic it needs** and the kernel is unpack-bound at 70 GB/s of bank.
 
+## What L7d established — the decode kernels, and a grid said twice
+
+`shaders/llm_hc_gemv.comp`, `shaders/llm_moe_gemm.comp`, `llm/record.go`,
+`vk/shim.c`: decode at 11.89 tok/s.
+[Write-up](research/l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
+`results/l7d_hc_gemv.csv` · `results/l7d_moe_decode.csv`
+
+> **L7d-1: at one token this model is short of workgroups, not of rows, and
+> the down projection is 7.95x.** `llm_gemm.comp` blocks the output columns at
+> 48 over a fused N of 336, so at M=1 the whole matrix is **seven** workgroups
+> on a 40-CU device whatever BM is — 238.6, 256.4 and 303.7 us for m1, m2 and
+> m4, all at 23-29 GB/s. The parallelism has to come from **K**, and the split
+> is free of any repacking because §2.8's fragment tiling already puts an
+> n-tile's consecutive kt next to each other: a workgroup's whole slab is
+> **one contiguous run**, a wave of 64 lanes taking sixteen halves each covers
+> 1024 consecutive halves, and the (n%16)*16 + k%16 order hands each lane one
+> output column and sixteen k of it — one accumulator, no LDS, two shuffles.
+> **30.0 us at 230 GB/s, 95% of the bus**; the mixer goes 293.9 to 79.5.
+>
+> **L7d-2: which split is §5.1b's 4 KB period.** The ladder is not monotonic —
+> 8/16/32/40/80/160 slabs give 181/154/**219**/129/138/**230** GB/s — and what
+> separates them is the distance between two workgroups' slabs: 40960, 20480,
+> **10240**, 8192, 4096, **2048** bytes. Every rung that is a whole multiple
+> of 4 KB is slow and both that are not are fast. That is the rotation §5.1b
+> pinned across nine strides and §2.3 found in a leading dimension; this is the
+> third kernel it has shaped here and the first where the stride is **the
+> distance between two workgroups' addresses** rather than a matrix's.
+>
+> **L7d-3: the MoE's padding was not the constraint, its grid was.** At one
+> token ten experts have one row each, so every rung makes exactly ten tiles
+> and a narrower row block removes arithmetic nothing was waiting on. The
+> profiler shows a grid instead: `up` is 100 workgroups at 71 GB/s of bank,
+> the shared expert's `up` is **ten** at **23**, and `down` — same kernel,
+> same format, 400 workgroups — is at **136**. Cutting BN from 64 to 16
+> multiplies the grid and divides the slab each workgroup unpacks, for the
+> same total unpack: **the block goes 612.3 us to 479.9, 1.28x**, with the
+> shared expert's up at 46 GB/s against 23.
+>
+> **L7d-4: one command buffer a pass, and the attribution had to move with
+> it.** Nothing in the shim ever prevented mixing blocks — it binds each
+> dispatch's own pipeline, descriptor set and push constants. What stopped it
+> was that every number here came from the host wall clock around a block's
+> `Run`. So `vk.DispatchMultiMarked` writes a timestamp after **every**
+> dispatch and a block's figure becomes GPU time *inside* the command buffer,
+> which is the same quantity `GGML_VK_PERF_LOGGER` reports for llama.cpp's
+> graph and cannot be inflated by a fence wait. ~490 submits become **two**,
+> 1405 dispatches a token; **99.0 ms a token becomes 84.1, 1.18x**, and the
+> hand-over left is **0.96 ms**.
+>
+> **L7d-5: the first rung in this vertical that is not bit-exact against its
+> ladder.** Every other rung tiles the same arithmetic differently and never
+> re-associates a sum, which is why two ladder tests assert `maxAbs == 0`.
+> Splitting a 10240-long dot product 160 ways does re-associate it, and at one
+> token it is the rung the schedule picks — exactly the chunk length L7b's
+> gate is about. So the gate is pinned for its three equalities, which still
+> hold **to the last place**, and the decode schedule is measured beside them
+> at **4.43e-04 rms — 0.0024% of scale, 4000x smaller than a dropped
+> history**, and the same order as our distance from llama.cpp itself.
+>
+> **L7d-6: a token is 84.1 ms at 122 GB/s, half the bus.** MoE 33.9%,
+> DeltaNet 32.1%, hyper-connection 10.6%, attention 9.3%, head 7.5%, moves
+> 0.7%, host 5.4%. The hyper-connection block went from 6.9x off its bytes to
+> **1.65x** and is no longer where to look; **the MoE at 4.3x is the only
+> block still far off**, and **the DeltaNet is now the largest single block**
+> at 1.56x off its own 4.18 GB. Underneath both is L8: 8.07 of those 9.67 GB
+> are a dense half staged as halves.
+
 ---
 
 ## The three findings that set the direction
@@ -1325,13 +1411,19 @@ resident at once, with residency measured to cost nothing that scales with the
 bank. **L6b has the graph, and it clears the gate**: llama.cpp's own argmax
 out of llama.cpp's own top ten. **L6c put the glue on the device** and left
 prefill at **941.3 tok/s against 391.42 — 2.40x** — with **96.6% of the pass
-inside the five blocks**, which is 82% of the way to the ~1150 above. What is
-left of prefill is inside the kernels; the next stage is **L7**, decode.
+inside the five blocks**, which is 82% of the way to the ~1150 above. **L7 is
+decode, and L7d closes phase 1's kernel work**: 11.89 tok/s against
+llama.cpp's 25.15, prefill at **990.6 tok/s — 2.53x** — and the model's own
+text unchanged. What is left at decode is not a kernel shape; it is the bank.
 
 **Phase 2 — our own bank, and L7c made it worth 3.5x rather than 1.7x.** Our
 dense half is staged as **halves**, so a token reads 8.07 GB of it against the
 3.67 the shipped Q8_0 would be: the ceiling for the bank we actually run is
-**25.0 tok/s**, which is llama.cpp's measured rate exactly. **Not expanding
+**25.0 tok/s**, which is llama.cpp's measured rate exactly. **L7d makes this
+the next stage rather than one of several**: at 11.89 tok/s we are 48% of that
+ceiling, the step reads 122 GB/s of a 242 GB/s bus, and every block but the
+MoE is now within 1.7x of its own bytes — so the way left to go faster is to
+make the bytes fewer. **Not expanding
 the dense half is 1.66x before any re-quantisation at all.** Then re-quantise
 to the repo's W4A8 layout (§1.1's repack) at widths chosen for this bus rather
 than for a generic machine: ~4.25 bits on everything streamed, fp16 routers,
@@ -1889,21 +1981,38 @@ below Q8. Bandwidth is the whole story.
       **7.46 tok/s against 25.15** — 30% of the 25.0 this bank's own 9.67 GB a
       token allow (L7c-5) — and prefill unchanged at **950.3 tok/s, 2.43x**.
 
-### L7d — the decode kernels
+### L7d — the decode kernels  *(done)*
 
-- [ ] The hyper-connection **down** projection as a K-split GEMV. It is 237.6
-      us of a 293.5 us mixer at **29 GB/s**, because 336 output columns is
-      about 21 workgroups on a 40-CU device; `gemv_w4a8.comp` does 99-103% of
-      the bus at M=1 (§1.1) and no rung of a GEMM ladder can supply the
-      parallelism.
-- [ ] A row block of **one** for the MoE at decode. The permutation pads each
-      expert's rows to 32 (L5b-3), so one token does **32x** the arithmetic
-      and the kernel is unpack-bound at 70 GB/s of bank.
-- [ ] One command buffer a **token** rather than a block. ~490 submits at 31
-      us is ~15 ms of 134; nothing in the shim prevents it — it binds each
-      pipeline's own descriptor set — so this is a graph-level change and not
-      a Vulkan one.
-- [ ] Gate: the same text, and tok/s against this bank's 25.0 ceiling.
+- [x] **The hyper-connection down projection as a split-K GEMV**,
+      `shaders/llm_hc_gemv.comp`. Seven workgroups became 3360 and **238.6 us
+      became 30.0 — 7.95x, 29 GB/s to 230, 95% of the bus** — over the weight
+      the GEMM already staged, because §2.8's fragment tiling makes a
+      workgroup's whole slab one contiguous run and hands each lane a single
+      output column. Which split to take is **§5.1b's 4 KB period**: the two
+      rungs whose slab stride misses the rotation are the two fast ones, out
+      of six.
+- [x] **Narrow column blocks for the MoE**, not a narrower row block. At one
+      token ten experts have one row each, so every rung makes ten tiles and
+      the padding was never the constraint — `up` at 100 workgroups reads 71
+      GB/s and the shared expert's at **ten** reads **23**, where `down` at
+      400 reads 136. BN 64 to 16 is **1.28x on the block**.
+- [x] **One command buffer a pass**, `llm/record.go`: ~490 submits to two,
+      **1.18x**. It needed the attribution to move inside the command buffer —
+      `vk.DispatchMultiMarked` writes a timestamp after every dispatch, so a
+      block's figure is GPU time rather than host wall clock, which is the
+      same quantity `GGML_VK_PERF_LOGGER` reports for llama.cpp's graph.
+- [x] **The first rung here that is not bit-exact against its ladder.**
+      Splitting K re-associates a 10240-long sum, so `TestGraphIsAChunkSplit`
+      pins the schedule for its three equalities and measures the decode
+      schedule beside them: **4.43e-04 rms, 4000x smaller than a dropped
+      history** and the same order as our distance from llama.cpp itself.
+- [x] Gate: **the same text** — llama.cpp re-run beside it, the same single
+      divergence, the same `Lisbon.` — at **11.89 tok/s against 7.46**, 47% of
+      the reference's 25.15 and **48% of this bank's own 25.0 ceiling**, with
+      prefill at **990.6 tok/s, 2.53x**. Two runs agree to 0.08%.
+      [Write-up](research/l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
+      `results/l7d_graph.csv` · `results/l7d_hc_gemv.csv` ·
+      `results/l7d_moe_decode.csv`
 
 ### L8 — phase 2, our own bank
 
@@ -1943,8 +2052,10 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -gen -model $M -n 64 -top 3      # the alternatives it beat
     go run ./cmd/llm -gen -model $M -n 128 -temp 0.7 -top-p 0.8 -seed 1
     go run ./cmd/llm -gen -model $M -n 16 -layers 4   # the loop, in 7 GB
-    go run ./cmd/llm -gen -model $M -n 64 -csv results/l7c_decode.csv
+    go run ./cmd/llm -gen -model $M -n 64 -csv results/l7d_decode.csv
     go run ./cmd/llm -hc -model $M -tokens 512          # L2c's block, against L2a's table
+    go run ./cmd/llm -hc -model $M -tokens 1 -ladder    # L7d: the decode rungs,
+                                             # and the 4 KB rule they measure
     go run ./cmd/llm -hc -model $M -ladder -csv results/l2c_hc.csv
     go run ./cmd/llm -ple -model $M -csv results/l2d_ple.csv   # L2d's block
     go run ./cmd/llm -attn -model $M                    # L2f's layer, 64..2048
@@ -1956,6 +2067,7 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -dn -model $M -tokens 512                 # L3b's layer
     go run ./cmd/llm -dn -model $M -ladder -csv results/l3b_dn.csv
     go run ./cmd/llm -dn -model $M -tokens 512,2048 -gemm-ladder
+    go run ./cmd/llm -moe -model $M -tokens 1 -ladder      # L7d: the narrow-N rungs
     go run ./cmd/llm -moe -model $M -tokens 512,2048              # L5b's block
     go run ./cmd/llm -moe -model $M -tokens 512,2048 -ladder -iters 5 \
         -csv results/l5b_moe_ladder.csv
@@ -1965,7 +2077,7 @@ below Q8. Bandwidth is the whole story.
         -csv results/l6a_resident.csv                         # residency, priced
     go run ./cmd/llm -graph -model $M -tokens 512             # L6b: the model
     go run ./cmd/llm -graph -model $M -tokens 128,512,1024,2048 \
-        -csv results/l6c_graph.csv                            # the prefill ladder
+        -csv results/l7d_graph.csv                            # the prefill ladder
     go run ./cmd/llm -graph -model $M -tokens 512 -layers 4    # the shape, in 7 GB
     LLM_ARENA_UNCACHED=1 go run ./cmd/llm -graph -model $M -tokens 512
                                              # L6b-4's control: the arenas back
@@ -2030,6 +2142,9 @@ below Q8. Bandwidth is the whole story.
                                              # the no-history control
     go test ./llm/ -v -run 'TestArgmax|TestTopN|TestSampler'
                                              # L7c: the sampler
+    go test ./llm/ -v -run TestHCGPUGemv     # L7d: the split-K down
+                                             # projection against the GEMM
+                                             # rung, and the batch it refuses
     go test ./llm/ -v -run TestMove          # L6c: the arena-to-arena move,
                                              # value for value against the
                                              # host narrowing it replaced
@@ -2055,27 +2170,33 @@ below Q8. Bandwidth is the whole story.
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
 | D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
+| D11 | **At one token, read a dispatch's shape off its grid before anything else.** | L7d: three kernels were 23-71 GB/s for one reason — 7, 10 and 100 workgroups on a 40-CU device — and two of them had been attributed to padding and to arithmetic. Fix it by splitting **K** where N is the output (the down projection) or by narrowing **BN** where N is wide enough to cut (the MoE); both keep the staged weight exactly as it is. |
+| D12 | **A split's stride must miss the 4 KB rotation.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
 
-- **Why is the hyper-connection block's `down` projection 8.3x off the bus at
-  one token, and is a K-split GEMV all of it?** L7c-6: 237.6 us a mixer at
-  **29 GB/s**, where the `up` projection beside it reads the same kind of
-  weight at 143. The difference that is visible is the grid — 336 output
-  columns is about 21 workgroups against `up`'s 640 — and §1.1's GEMV is the
-  shape that fixes it. What is not yet checked is whether 21 workgroups
-  explains the whole 8.3x or only the occupancy half of it, and the cheap way
-  to find out is to run the same weight through `gemv_w4a8`'s shape before
-  writing an epilogue for it.
-- **Does the MoE want a row block of one at decode, or a GEMV per expert?**
-  L7c-6: the permutation pads each expert's rows to 32 (L5b-3, which is what
-  let the epilogue skip LDS entirely), so one token does **32x** the
-  arithmetic and the kernel is unpack-bound at 70 GB/s of bank. A row block of
-  one keeps the whole tile machinery and removes the padding; a GEMV per
-  expert removes the cooperative matrices too, and §1.8-§1.12 have 25 grouped
-  builds of exactly that already measured. Which one wins is a question about
-  whether the unpack can feed a GEMV, not about the padding.
+- **Answered by L7d, both of them, and the answer was the same one.** The
+  down projection's 8.3x was the grid and nothing else — a split-K GEMV over
+  the same staged weight is **230 GB/s, 95% of the bus** — and the MoE's was
+  the grid too rather than the 32-row padding, because at one token every rung
+  makes exactly ten tiles. What is left of each is below.
+- **Why does the MoE's up mode read 93 GB/s of bank where its down mode reads
+  136 on the same grid?** L7d-3 narrowed BN from 64 to 16 and moved `up` from
+  71 to 93, not to 136, so the grid was part of it and not all of it. The
+  difference that is left is that MODE 0 gathers its A rows into LDS per
+  K-step and MODE 1 does not — and at decode every workgroup gathers the
+  **same** 2560-long row, 400 times. So the question has become whether a
+  **GEMV per expert** can feed itself from the checkpoint's own Q4_K without
+  the LDS round trip §2.2 said was unavoidable for a *fragment*; §1.8-§1.12
+  have 25 grouped builds of that shape measured against a repacked bank, and
+  none against this one.
+- **What is the gated DeltaNet at one token?** L7d-6 leaves it the largest
+  single block in the step — 27.0 ms of 84.1, 36 layers, 4.18 GB, 1.56x off
+  its own bytes — and nothing has yet profiled it with a batch of one in mind
+  the way L2c did the hyper-connection block. 1.56x is not a scandal; being a
+  third of the step at 1.56x is what makes it the next place to look after the
+  bank.
 - **L8's bf16 path has to replicate a head permutation, or it is a different
   model.** L3a-3 and vLLM between them: llama.cpp's converter reorders the 48
   V heads from HF's grouped order into tiled order — `in_proj_qkv`'s V rows,

@@ -880,6 +880,68 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-16 (forty-sixth) — stage L7d: the decode kernels, and a grid said twice
+
+**Result: decode is 11.89 tok/s against L7c's 7.46 — 1.59x — with the
+completion unchanged (llama.cpp re-run beside it: the same list of capitals,
+the same `<think>`, the same single divergence, the same `Lisbon.`). Prefill
+comes along at 990.6 tok/s, 2.53x. Two runs agree to 0.08%.**
+[Write-up](research/l7d-decode-kernels.md) · `results/l7d_decode.csv`,
+`results/l7d_graph.csv`, `results/l7d_hc_gemv.csv`,
+`results/l7d_moe_decode.csv` · `LLM.md` rewritten.
+
+**1. The two kernels L7c blamed were one finding: at one token this model is
+short of workgroups, not of rows.** The hyper-connection down projection ran
+in **seven** workgroups — its fused N is 336 and BN is 48 — so no rung of the
+GEMM ladder could help, and the widest was the worst (238.6 / 256.4 / 303.7 us
+for m1 / m2 / m4, all at 23-29 GB/s). `shaders/llm_hc_gemv.comp` splits **K**
+instead, over the weight the GEMM already staged: §2.8's fragment tiling
+already puts an n-tile's consecutive kt next to each other, so a workgroup's
+whole slab is one contiguous run and the (n%16)*16 + k%16 order hands each
+lane one output column and sixteen k of it — one accumulator, no LDS, two
+shuffles. **238.6 us to 30.0: 7.95x, 29 GB/s to 230, 95% of the bus.**
+
+**2. Which split to take is §5.1b's 4 KB period, not the workgroup count.**
+8/16/32/40/80/160 slabs give 181/154/**219**/129/138/**230** GB/s, and the
+separator is the distance between two workgroups' slabs — 40960, 20480,
+**10240**, 8192, 4096, **2048** bytes. Every rung that is a whole multiple of
+4 KB is slow and both that are not are fast. Third time that rotation has
+decided a kernel's shape here (§2.3, §5.1b), and the first where the stride is
+the distance between two *workgroups'* addresses rather than a matrix's.
+
+**3. The MoE's 32-row padding was not the constraint either.** At one token
+ten experts have one row each, so every rung makes exactly ten tiles. The
+grid is what differs: `up` is 100 workgroups at 71 GB/s of bank, the shared
+expert's `up` is **ten** at **23**, and `down` — same kernel, same format,
+400 workgroups — is at 136. Cutting **BN** from 64 to 16 (new `n1m1`/`n2m1`
+rungs, up mode only) is **1.28x on the block**, 612.3 us to 479.9.
+
+**4. One command buffer a pass, and the attribution moved inside it.**
+`llm/record.go`: each block's `Run` appends to a recorder instead of
+submitting, and `Graph.Extend` submits the layers, the head mixer and the
+projection **once** — ~490 submits to two, 1405 dispatches a token, **1.18x**
+(99.0 ms a token to 84.1), leaving 0.96 ms of hand-over. It needed
+`vk.DispatchMultiMarked`: a timestamp after every dispatch, so a block's
+figure is GPU time *inside* the command buffer — the same quantity
+`GGML_VK_PERF_LOGGER` reports for llama.cpp's graph, and one a fence wait
+cannot inflate. The moves' 32-byte push block pads to the vertical's 256,
+because one command buffer pushes one size.
+
+**5. The first rung here that is not bit-exact against its ladder.** Splitting
+a 10240-long dot product 160 ways re-associates it, and at one token it is the
+rung the schedule picks — exactly the chunk length L7b's gate is about. So
+`TestGraphIsAChunkSplit` pins the schedule for its three equalities (still
+**identical to the last place**) and measures the decode schedule beside them:
+**4.43e-04 rms, 0.0024% of scale, 4000x smaller than a dropped history.**
+
+**What it leaves.** A token is 84.1 ms at **122 GB/s, half the bus**: MoE
+33.9%, DeltaNet 32.1%, hyper-connection 10.6%, attention 9.3%, head 7.5%,
+host 5.4%. The hyper-connection block went from 6.9x off its bytes to
+**1.65x**; the MoE at 4.3x is the only block still far off, and the
+**DeltaNet is now the largest single block**. Next is **L8**: 8.07 of a
+token's 9.67 GB are a dense half staged as halves, and not expanding it is
+1.66x on the ceiling before a weight is re-quantised.
+
 ### Session 2026-09-16 (forty-fifth) — stage L7: decode, and the model generates llama.cpp's text
 
 **Result: the model generates — in Go, on Vulkan, out of its own GGUF. At

@@ -115,6 +115,108 @@ type Graph struct {
 
 	// Stats accumulates across every Prefill since ResetStats.
 	Stats GraphStats
+
+	// rec is the pass being recorded, installed on every block for the
+	// duration of one forward pass and torn down by `flush` (record.go). It
+	// is what makes a pass **one command buffer** rather than ~490: the
+	// blocks' Run methods append to it instead of submitting.
+	rec *recorder
+}
+
+// record installs the recorder on every block, so that everything from here
+// to the matching `flush` is recorded rather than submitted. It is idempotent
+// per pass and paired with `flush` on every return path, which is why the
+// callers are the three entry points and not the layer loop.
+func (g *Graph) record() {
+	if g.rec == nil {
+		g.rec = &recorder{}
+	}
+	g.hc.rec = g.rec
+	g.move.rec = g.rec
+	if g.ple != nil {
+		g.ple.rec = g.rec
+	}
+	if g.dn != nil {
+		g.dn.rec = g.rec
+	}
+	if g.attn != nil {
+		g.attn.rec = g.rec
+	}
+	if g.moe != nil {
+		g.moe.rec = g.rec
+	}
+	if g.head != nil {
+		g.head.rec = g.rec
+	}
+}
+
+// flush submits everything recorded and folds the GPU time each block's
+// dispatches took into Stats. Every block goes back to submitting for itself
+// afterwards, because the per-block benchmarks and the tests drive them
+// directly and must not depend on a graph having been here.
+//
+// Nothing may read a device arena between `record` and here: the dispatches
+// have not run. That is the one rule this arrangement adds, and the three
+// entry points below are written around it — every `Mixed()`, `Logits()` and
+// `Res()` is after the flush.
+func (g *Graph) flush() error {
+	if g.rec == nil {
+		return nil
+	}
+	n := g.rec.len()
+	byOwner, total, err := g.rec.submit()
+	g.rec = nil
+	g.hc.rec, g.move.rec = nil, nil
+	if g.ple != nil {
+		g.ple.rec = nil
+	}
+	if g.dn != nil {
+		g.dn.rec = nil
+	}
+	if g.attn != nil {
+		g.attn.rec = nil
+	}
+	if g.moe != nil {
+		g.moe.rec = nil
+	}
+	if g.head != nil {
+		g.head.rec = nil
+	}
+	if err != nil {
+		return err
+	}
+	g.Stats.Dispatches += n
+	g.Stats.GPU += total
+	g.Stats.HC += byOwner[ownHC]
+	g.Stats.PLE += byOwner[ownPLE]
+	g.Stats.DeltaNet += byOwner[ownDN]
+	g.Stats.Attn += byOwner[ownAttn]
+	g.Stats.MoE += byOwner[ownMoE]
+	g.Stats.Head += byOwner[ownHead]
+	g.Stats.Move += byOwner[ownMove]
+	return nil
+}
+
+// PinSchedule fixes the hyper-connection block's kernel choice so that the
+// graph runs the same arithmetic whatever the chunk length, and puts it back
+// on the measured schedule when off.
+//
+// It exists for one equality and it is the equality L7b is about. Every rung
+// of every ladder in this vertical used to be **bit-exact** against its
+// siblings — they change how the work is tiled and never how a sum is
+// associated — so "a prompt in chunks is the prompt whole" could be asserted
+// to the last place even though a one-token chunk plans different kernels
+// than a 128-token one. L7d's split-K GEMV is the first rung that is not:
+// dividing a 10240-long dot product 160 ways and adding the pieces back is a
+// different association of the same products, and at one token it is the rung
+// the schedule picks. So the exactness claim is now conditional on the
+// schedule, and this is what lets a test say which half it is testing.
+func (g *Graph) PinSchedule(on bool) error {
+	if !on {
+		g.hc.AutoPlan()
+		return nil
+	}
+	return g.hc.SetPlan(HCDownM1, HCUpM4)
 }
 
 // ResetStats clears the accumulated timings.
@@ -123,6 +225,17 @@ func (g *Graph) ResetStats() { g.Stats = GraphStats{} }
 // since adds the elapsed time to one of the stat fields and returns now, so a
 // sequence of phases is a chain of one-line calls rather than a pile of
 // start/stop pairs.
+// blk routes a host interval to a block's stat field — except while a pass is
+// being recorded, when the host is only building push constants and the
+// block's real cost comes back from the GPU marks (record.go). Then the
+// interval is what recording it cost, which is glue.
+func (g *Graph) blk(dst *time.Duration, t0 time.Time) time.Time {
+	if g.rec != nil {
+		return since(&g.Stats.Glue, t0)
+	}
+	return since(dst, t0)
+}
+
 func since(dst *time.Duration, t0 time.Time) time.Time {
 	now := time.Now()
 	*dst += now.Sub(t0)
@@ -149,6 +262,12 @@ type GraphStats struct {
 	Move time.Duration
 	// Runs is how many prefills these totals cover.
 	Runs int
+	// GPU is what the pass's one command buffer took end to end, and
+	// Dispatches how many dispatches went into it (L7d). The per-block rows
+	// above are GPU time inside it and so sum to a little less than GPU
+	// itself — the difference is what the barriers between dispatches cost.
+	GPU        time.Duration
+	Dispatches int
 }
 
 // Blocks is the time inside the five blocks and the head.
@@ -417,8 +536,17 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	if g.head == nil {
 		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
 	}
-	norm, err = g.HiddenExtend(ids)
-	if err != nil {
+	// One command buffer for the whole of it, head included (L7d): the
+	// layers, the head mixer and the projection are recorded and submitted
+	// once, and the two read-backs below are after the flush because nothing
+	// has run until then.
+	g.record()
+	defer func() {
+		if ferr := g.flush(); ferr != nil && err == nil {
+			logits, norm, err = nil, nil, ferr
+		}
+	}()
+	if err := g.hidden(ids); err != nil {
 		return nil, nil, err
 	}
 	top := time.Now()
@@ -430,12 +558,19 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	if err := g.move.Move(g.head.InPort(), g.hc.MixedPort(), 1); err != nil {
 		return nil, nil, err
 	}
-	t0 = since(&g.Stats.Move, t0)
+	t0 = g.blk(&g.Stats.Move, t0)
 	if err := g.head.Run(); err != nil {
 		return nil, nil, err
 	}
-	t0 = since(&g.Stats.Head, t0)
-	logits = g.head.Logits()
+	g.blk(&g.Stats.Head, t0)
+	// The flush is where the pass actually runs, and what it takes is
+	// Stats.GPU plus the hand-over — so the clock restarts after it rather
+	// than folding a whole forward pass into the glue.
+	if err := g.flush(); err != nil {
+		return nil, nil, err
+	}
+	t0 = time.Now()
+	logits, norm = g.head.Logits(), g.hc.Mixed()
 	since(&g.Stats.Glue, t0)
 	g.Stats.Total += time.Since(top)
 	return logits, norm, nil
@@ -453,8 +588,29 @@ func (g *Graph) Hidden(ids []int32) ([]float32, error) {
 // HiddenExtend is Hidden without the reset: the next tokens of the sequence
 // the graph is already holding.
 func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
-	if err := g.Append(ids); err != nil {
+	top := time.Now()
+	g.record()
+	if err := g.hidden(ids); err != nil {
+		_ = g.flush()
 		return nil, err
+	}
+	if err := g.flush(); err != nil {
+		return nil, err
+	}
+	t0 := time.Now()
+	norm := g.hc.Mixed()
+	since(&g.Stats.Glue, t0)
+	g.Stats.Total += time.Since(top)
+	return norm, nil
+}
+
+// hidden is HiddenExtend's body, without the read-back and without the
+// submit: every layer, then the final mixer over the last token alone. It is
+// separate so that Extend can go on recording through the head rather than
+// flushing twice (L7d).
+func (g *Graph) hidden(ids []int32) error {
+	if err := g.appendN(ids, g.nLayer); err != nil {
+		return err
 	}
 	top := time.Now()
 	t0 := top
@@ -466,21 +622,18 @@ func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
 	// that holds one row.
 	last := g.hc.ResRowPort(len(ids) - 1)
 	if err := g.hc.Resize(1); err != nil {
-		return nil, err
+		return err
 	}
 	t0 = since(&g.Stats.Glue, t0)
 	if err := g.move.Move(g.hc.ResRowPort(0), last, 1); err != nil {
-		return nil, err
+		return err
 	}
-	t0 = since(&g.Stats.Move, t0)
+	t0 = g.blk(&g.Stats.Move, t0)
 	if err := g.hc.Run(2*g.nLayer, false); err != nil {
-		return nil, fmt.Errorf("llm: head mixer: %w", err)
+		return fmt.Errorf("llm: head mixer: %w", err)
 	}
-	t0 = since(&g.Stats.HC, t0)
-	norm := g.hc.Mixed()
-	since(&g.Stats.Glue, t0)
-	g.Stats.Total += time.Since(top)
-	return norm, nil
+	g.blk(&g.Stats.HC, t0)
+	return nil
 }
 
 // Residual is the wide residual as the last Prefill left it: [T][hc*nEmbd],
@@ -531,6 +684,20 @@ func (g *Graph) Append(ids []int32) error { return g.AppendN(ids, g.nLayer) }
 // run still reads two tokens that are not in it, which is why the graph keeps
 // the whole id list and hashes over all of it.
 func (g *Graph) AppendN(ids []int32, nLayer int) error {
+	top := time.Now()
+	g.record()
+	if err := g.appendN(ids, nLayer); err != nil {
+		_ = g.flush()
+		return err
+	}
+	err := g.flush()
+	g.Stats.Total += time.Since(top)
+	return err
+}
+
+// appendN is that body without the record/flush pair, for the entry points
+// that go on recording past the layers (L7d).
+func (g *Graph) appendN(ids []int32, nLayer int) error {
 	if nLayer <= 0 || nLayer > g.nLayer {
 		return fmt.Errorf("llm: %d layers, this graph staged %d", nLayer, g.nLayer)
 	}
@@ -607,22 +774,22 @@ func (g *Graph) AppendN(ids []int32, nLayer int) error {
 			if err := g.move.Move(g.ple.ResPort(), g.hc.ResPort(), nTok); err != nil {
 				return err
 			}
-			t0 = since(&g.Stats.Move, t0)
+			t0 = g.blk(&g.Stats.Move, t0)
 			if err := g.ple.Run(); err != nil {
 				return err
 			}
-			t0 = since(&g.Stats.PLE, t0)
+			t0 = g.blk(&g.Stats.PLE, t0)
 			if err := g.move.Move(g.hc.ResPort(), g.ple.ResPort(), nTok); err != nil {
 				return err
 			}
-			t0 = since(&g.Stats.Move, t0)
+			t0 = g.blk(&g.Stats.Move, t0)
 		}
 
 		// The attention half.
 		if err := g.hc.Run(2*l, false); err != nil {
 			return fmt.Errorf("llm: layer %d attn mix: %w", l, err)
 		}
-		t0 = since(&g.Stats.HC, t0)
+		t0 = g.blk(&g.Stats.HC, t0)
 		t1, err := g.sublayer(l, nTok, t0)
 		if err != nil {
 			return err
@@ -631,13 +798,13 @@ func (g *Graph) AppendN(ids []int32, nLayer int) error {
 		if err := g.hc.RunCombine(2 * l); err != nil {
 			return fmt.Errorf("llm: layer %d attn combine: %w", l, err)
 		}
-		t0 = since(&g.Stats.HC, t0)
+		t0 = g.blk(&g.Stats.HC, t0)
 
 		// The FFN half, which every layer has.
 		if err := g.hc.Run(2*l+1, false); err != nil {
 			return fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
 		}
-		t0 = since(&g.Stats.HC, t0)
+		t0 = g.blk(&g.Stats.HC, t0)
 		if err := g.moe.Resize(nTok); err != nil {
 			return err
 		}
@@ -645,22 +812,21 @@ func (g *Graph) AppendN(ids []int32, nLayer int) error {
 		if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), nTok); err != nil {
 			return err
 		}
-		t0 = since(&g.Stats.Move, t0)
+		t0 = g.blk(&g.Stats.Move, t0)
 		if err := g.moe.Run(l); err != nil {
 			return fmt.Errorf("llm: layer %d moe: %w", l, err)
 		}
-		t0 = since(&g.Stats.MoE, t0)
+		t0 = g.blk(&g.Stats.MoE, t0)
 		if err := g.move.Move(g.hc.BlockOutPort(), g.moe.OutPort(), nTok); err != nil {
 			return err
 		}
-		t0 = since(&g.Stats.Move, t0)
+		t0 = g.blk(&g.Stats.Move, t0)
 		if err := g.hc.RunCombine(2*l + 1); err != nil {
 			return fmt.Errorf("llm: layer %d ffn combine: %w", l, err)
 		}
-		t0 = since(&g.Stats.HC, t0)
+		t0 = g.blk(&g.Stats.HC, t0)
 	}
 	g.past += nTok
-	g.Stats.Total += time.Since(top)
 	g.Stats.Runs++
 	return nil
 }
@@ -695,19 +861,19 @@ func (g *Graph) sublayer(l, nTok int, t0 time.Time) (time.Time, error) {
 	if err := g.move.Move(in, g.hc.MixedPort(), nTok); err != nil {
 		return t0, err
 	}
-	t0 = since(&g.Stats.Move, t0)
+	t0 = g.blk(&g.Stats.Move, t0)
 	if err := run(); err != nil {
 		return t0, fmt.Errorf("llm: layer %d sublayer: %w", l, err)
 	}
 	if k.attn {
-		t0 = since(&g.Stats.Attn, t0)
+		t0 = g.blk(&g.Stats.Attn, t0)
 	} else {
-		t0 = since(&g.Stats.DeltaNet, t0)
+		t0 = g.blk(&g.Stats.DeltaNet, t0)
 	}
 	if err := g.move.Move(g.hc.BlockOutPort(), out, nTok); err != nil {
 		return t0, err
 	}
-	return since(&g.Stats.Move, t0), nil
+	return g.blk(&g.Stats.Move, t0), nil
 }
 
 // Destroy releases every block.

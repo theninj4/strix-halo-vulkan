@@ -156,12 +156,14 @@ func reportGraphRun(g *llm.Graph, n int) []string {
 	}{
 		{"hyper-conn", st.HC}, {"ple n-gram", st.PLE}, {"deltanet", st.DeltaNet},
 		{"attention", st.Attn}, {"moe", st.MoE}, {"lm head", st.Head},
-		{"move", st.Move}, {"gather", st.Gather}, {"glue", st.Glue},
+		{"move", st.Move}, {"= on the GPU", st.GPU},
+		{"gather", st.Gather}, {"glue", st.Glue},
+		{"hand-over", st.Total - st.GPU - st.Gather - st.Glue},
 	} {
-		if r.d == 0 {
+		if r.d <= 0 {
 			continue
 		}
-		fmt.Printf("    %-11s %8.1f ms  %5.1f%%\n", r.name, ms(r.d), 100*ms(r.d)/total)
+		fmt.Printf("    %-12s %8.1f ms  %5.1f%%\n", r.name, ms(r.d), 100*ms(r.d)/total)
 	}
 	// The line the next stage is scoped against: what the graph would do if
 	// the arena-to-arena moves were not there at all.
@@ -169,6 +171,8 @@ func reportGraphRun(g *llm.Graph, n int) []string {
 	fmt.Printf("    blocks alone %.1f ms = %.1f tok/s; the moves are %.1f ms (%.1f%%) and the host %.1f ms (%.1f%%)\n",
 		blocks, float64(n)/(blocks/1000), ms(st.Move), 100*ms(st.Move)/total,
 		ms(st.Gather)+ms(st.Glue), 100*(ms(st.Gather)+ms(st.Glue))/total)
+	fmt.Printf("    %d dispatches a pass, one command buffer per %d (L7d)\n",
+		st.Dispatches/max(st.Runs, 1), llm.MaxBatch)
 
 	return []string{
 		strconv.Itoa(n), strconv.Itoa(g.Layers()),

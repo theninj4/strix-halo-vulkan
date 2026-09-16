@@ -109,13 +109,16 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 		g.Mixers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
 
 	// Nil means the measured schedule, llm.PlanFor, chosen per length.
-	var plans [][2]llm.HCKernel
-	if ladder {
-		for _, d := range llm.DownKernels() {
+	// Nil means the measured schedule; a ladder is built per length, because
+	// the GEMV rungs only answer at one token (L7d).
+	ladderFor := func(tok int) [][2]llm.HCKernel {
+		var out [][2]llm.HCKernel
+		for _, d := range llm.DownKernelsAt(tok) {
 			for _, u := range llm.UpKernels() {
-				plans = append(plans, [2]llm.HCKernel{d, u})
+				out = append(out, [2]llm.HCKernel{d, u})
 			}
 		}
+		return out
 	}
 
 	var rows [][]string
@@ -134,8 +137,10 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 		if err := g.UploadBlockOut(make([]float32, tok*cfg.NEmbd)); err != nil {
 			return err
 		}
-		todo := plans
-		if todo == nil {
+		var todo [][2]llm.HCKernel
+		if ladder {
+			todo = ladderFor(tok)
+		} else {
 			d, u := llm.PlanFor(tok)
 			todo = [][2]llm.HCKernel{{d, u}}
 		}
@@ -175,7 +180,7 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 				strconv.Itoa(tok), string(p[0]), string(p[1]), "block",
 				fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*mixersPerGraph/1e3), "", "",
 			})
-			if tok == 512 && plans == nil {
+			if tok == 512 && !ladder {
 				reportAgainstLlama(st, total)
 			}
 			fmt.Println()

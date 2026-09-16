@@ -675,7 +675,12 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
     VkQueryPoolCreateInfo queryPoolInfo = {0};
     queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    queryPoolInfo.queryCount = 2;
+    // Big enough to mark every dispatch of a whole forward pass, not just the
+    // two ends: see shim_dispatch_multi_timed's out_marks. Only the pipeline
+    // that records a sequence uses more than two of them, and which one that
+    // is depends on the caller, so they all carry the pool. It is 16 KB a
+    // pipeline.
+    queryPoolInfo.queryCount = SHIM_QUERY_SLOTS;
     return vkCreateQueryPool(device, &queryPoolInfo, NULL, &out->queryPool);
 }
 
@@ -845,13 +850,17 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
                                     const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
                                     uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
                                     const void *pushConstants, uint32_t pushConstantSize,
-                                    uint64_t *out_start, uint64_t *out_end) {
+                                    uint64_t *out_start, uint64_t *out_end, uint64_t *out_marks) {
     if (iterations == 0) {
         iterations = 1;
     }
     if (count == 0) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
+    // Per-dispatch marks are only meaningful for a single pass, and the pool
+    // bounds how many there can be. Either condition falls back to the two
+    // ends, which is what every caller before L7d asked for.
+    uint32_t marks = (out_marks != NULL && iterations == 1 && count + 1 <= SHIM_QUERY_SLOTS) ? count + 1 : 0;
 
     // The recording lives in the first pipeline's command buffer; every other
     // pipeline contributes only its VkPipeline, layout and descriptor set.
@@ -865,7 +874,7 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
         return r;
     }
 
-    vkCmdResetQueryPool(rec->cmdBuf, rec->queryPool, 0, 2);
+    vkCmdResetQueryPool(rec->cmdBuf, rec->queryPool, 0, marks > 0 ? marks : 2);
     vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, rec->queryPool, 0);
 
     VkMemoryBarrier barrier = {0};
@@ -885,6 +894,9 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
                                     pushConstantSize, pc + (size_t)i * pushConstantSize);
             }
             vkCmdDispatch(rec->cmdBuf, groupsX[i], groupsY[i], groupsZ);
+            if (marks > 0) {
+                vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, i + 1);
+            }
             // Within an iteration the barrier is the caller's choice; between
             // iterations it is not, since the next iteration overwrites what
             // this one wrote.
@@ -896,7 +908,9 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
         }
     }
 
-    vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, 1);
+    if (marks == 0) {
+        vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, 1);
+    }
 
     r = vkEndCommandBuffer(rec->cmdBuf);
     if (r != VK_SUCCESS) {
@@ -921,6 +935,18 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
     r = vkWaitForFences(device, 1, &rec->fence, VK_TRUE, 20000000000ULL);
     if (r != VK_SUCCESS) {
         return r;
+    }
+
+    if (marks > 0) {
+        r = vkGetQueryPoolResults(device, rec->queryPool, 0, marks, (size_t)marks * sizeof(uint64_t),
+                                   out_marks, sizeof(uint64_t),
+                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r != VK_SUCCESS) {
+            return r;
+        }
+        *out_start = out_marks[0];
+        *out_end = out_marks[marks - 1];
+        return VK_SUCCESS;
     }
 
     uint64_t timestamps[2];

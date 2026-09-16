@@ -129,15 +129,30 @@ const (
 	HCUpM1   HCKernel = "up_m1"
 	HCUpM2   HCKernel = "up_m2"
 	HCUpM4   HCKernel = "up_m4"
+	// The decode rungs: the same weight as a split-K GEMV, two dispatches,
+	// one token only (L7d). The suffix is how many ways K is split, which is
+	// compiled into the SPIR-V pair.
+	HCDownGemv8   HCKernel = "down_gemv8"
+	HCDownGemv16  HCKernel = "down_gemv16"
+	HCDownGemv32  HCKernel = "down_gemv32"
+	HCDownGemv40  HCKernel = "down_gemv40"
+	HCDownGemv80  HCKernel = "down_gemv80"
+	HCDownGemv160 HCKernel = "down_gemv160"
 )
 
 // hcVariant is one build's geometry, which the host has to be told because BM
 // and BN are compiled into the SPIR-V.
+//
+// mode 2 is the split-K GEMV, which has no tile at all: `slabs` is how many
+// ways it cuts K and `reduce` the second dispatch's SPIR-V, because the pair
+// is compiled from one slab count and only makes sense together.
 type hcVariant struct {
 	name   HCKernel
 	spirv  []byte
 	mode   int
 	bm, bn int
+	reduce []byte
+	slabs  int
 }
 
 var hcVariants = []hcVariant{
@@ -147,11 +162,36 @@ var hcVariants = []hcVariant{
 	{name: HCUpM1, spirv: shaders.LLMHCUpM1, mode: 1, bm: 16, bn: 64},
 	{name: HCUpM2, spirv: shaders.LLMHCUpM2, mode: 1, bm: 32, bn: 64},
 	{name: HCUpM4, spirv: shaders.LLMHCUpM4, mode: 1, bm: 64, bn: 64},
+	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, mode: 2, reduce: shaders.LLMHCGemvR8, slabs: 8},
+	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, mode: 2, reduce: shaders.LLMHCGemvR16, slabs: 16},
+	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, mode: 2, reduce: shaders.LLMHCGemvR32, slabs: 32},
+	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, mode: 2, reduce: shaders.LLMHCGemvR40, slabs: 40},
+	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
+	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
 }
 
+// hcMaxSlabs is the widest split any rung asks for, and so how many rows of
+// gemmN the partial-sum scratch has to hold.
+const hcMaxSlabs = 160
+
 // DownKernels and UpKernels list the rungs of each ladder, narrowest first.
+// The GEMV rungs are not in DownKernels because they only answer at one token;
+// DownKernelsAt is the ladder for a given length.
 func DownKernels() []HCKernel { return []HCKernel{HCDownM1, HCDownM2, HCDownM4} }
 func UpKernels() []HCKernel   { return []HCKernel{HCUpM1, HCUpM2, HCUpM4} }
+
+// GemvKernels lists the decode rungs.
+func GemvKernels() []HCKernel {
+	return []HCKernel{HCDownGemv8, HCDownGemv16, HCDownGemv32, HCDownGemv40, HCDownGemv80, HCDownGemv160}
+}
+
+// DownKernelsAt is every rung that can run at a given token count.
+func DownKernelsAt(tokens int) []HCKernel {
+	if tokens == 1 {
+		return append(DownKernels(), GemvKernels()...)
+	}
+	return DownKernels()
+}
 
 // DefaultPlan is the best single pair over the whole prompt range, measured
 // by `cmd/llm -hc -ladder` (results/l2c_hc.csv). It is never more than 1.04x
@@ -180,6 +220,11 @@ func DefaultPlan() (HCKernel, HCKernel) { return HCDownM2, HCUpM2 }
 // wrong is at most 1.04x on either side.
 func PlanFor(tokens int) (HCKernel, HCKernel) {
 	switch {
+	case tokens == 1:
+		// Decode. The GEMM rung's grid is seven workgroups here whatever its
+		// BM; the GEMV's is 3360, and 160 is the split whose slab stride
+		// misses §5.1b's 4 KB rotation (L7d).
+		return HCDownGemv160, HCUpM2
 	case tokens <= 96:
 		return HCDownM1, HCUpM4
 	case tokens <= 384:
@@ -234,6 +279,7 @@ type HCGPU struct {
 
 	// fp32 arena.
 	aRes, aInject, aMixed, aOut, aGate uint32
+	aPart                              uint32
 	actElems                           int
 	// fp16 arena.
 	hXn, hLo uint32
@@ -248,6 +294,9 @@ type HCGPU struct {
 	// how the weights were staged and a reader of a wrong tensor should be
 	// able to ask.
 	ctl HCOpts
+	// rec, when set, collects this block's dispatches into the pass's one
+	// command buffer instead of submitting them (record.go).
+	rec *recorder
 }
 
 // downBN is the down ladder's column block. Its N is lowRank + one fragment
@@ -367,6 +416,11 @@ func (g *HCGPU) alloc(nMixers int) error {
 	g.aMixed = alloc(rows * c.NEmbd)
 	g.aOut = alloc(rows * c.NEmbd)
 	g.aInject = alloc(rows * g.injStride())
+	// The GEMV's partial sums, [hcMaxSlabs][gemmN] fp32: 43 KB, and the one
+	// tensor in this block that exists because of a grid rather than a
+	// formula. It is allocated whatever the run length, because which rung a
+	// graph names is decided per run and the arena is not.
+	g.aPart = alloc(hcMaxSlabs * g.gemmN())
 	g.aGate = noW
 	if g.gate {
 		g.aGate = alloc(rows * c.Wide())
@@ -436,6 +490,24 @@ func (g *HCGPU) build() error {
 		}
 		if v.mode == 1 && v.bn%(coopMatTile*g.cfg.HC) != 0 {
 			return fmt.Errorf("llm: up rung %q has BN %d, which is not whole feature blocks", v.name, v.bn)
+		}
+		if v.mode == 2 {
+			// A slab is a whole number of fragment tiles and a step is four
+			// of them, so K has to divide evenly twice over; the kernel has
+			// no remainder arm and would read the next n-tile's weights.
+			if ktiles := g.cfg.Wide() / coopMatTile; ktiles%(v.slabs*4) != 0 {
+				return fmt.Errorf("llm: gemv rung %q splits %d tiles %d ways in steps of four",
+					v.name, ktiles, v.slabs)
+			}
+			if v.slabs > hcMaxSlabs {
+				return fmt.Errorf("llm: gemv rung %q wants %d slabs, the scratch holds %d",
+					v.name, v.slabs, hcMaxSlabs)
+			}
+			if err := g.pipeline(string(v.name)+"_reduce", v.reduce, vk.PipelineSpec{
+				Buffers: bufs, PushConstantSize: pcSize,
+			}); err != nil {
+				return err
+			}
 		}
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
@@ -555,8 +627,11 @@ func packUpB(dst []uint16, up []float32, wide, lowRank, nEmbd int) {
 // and restages nothing.
 func (g *HCGPU) SetPlan(down, up HCKernel) error {
 	dv, ok := hcVariantFor(down)
-	if !ok || dv.mode != 0 {
-		return fmt.Errorf("llm: %q is not a down-projection kernel (have %v)", down, DownKernels())
+	if !ok || (dv.mode != 0 && dv.mode != 2) {
+		return fmt.Errorf("llm: %q is not a down-projection kernel (have %v)", down, DownKernelsAt(g.rows))
+	}
+	if dv.mode == 2 && g.rows != 1 {
+		return fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", down, g.rows)
 	}
 	uv, ok := hcVariantFor(up)
 	if !ok || uv.mode != 1 {
@@ -565,6 +640,12 @@ func (g *HCGPU) SetPlan(down, up HCKernel) error {
 	g.down, g.up = down, up
 	g.autoPlan = false
 	return nil
+}
+
+// AutoPlan puts the block back on the measured schedule, undoing a SetPlan.
+func (g *HCGPU) AutoPlan() {
+	g.autoPlan = true
+	g.down, g.up = PlanFor(g.rows)
 }
 
 // Plan reports the rungs in use.
@@ -669,8 +750,21 @@ func (g *HCGPU) graph(mixer int, combine bool) ([]vk.MultiDispatch, []string, er
 
 	down := base
 	down.BOff = m.down
-	down.GemmM, down.GemmN, down.GemmK = uint32(roundUpInt(g.rows, dv.bm)), uint32(g.gemmN()), uint32(c.Wide())
-	add(string(g.down), "down", uint32(g.gemmN()/dv.bn), uint32(roundUpInt(g.rows, dv.bm)/dv.bm), down)
+	down.GemmN, down.GemmK = uint32(g.gemmN()), uint32(c.Wide())
+	if dv.mode == 2 {
+		if g.rows != 1 {
+			return nil, nil, fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", g.down, g.rows)
+		}
+		// `gammaOff` carries the partial sums: the GEMV reads no norm, and
+		// the block is out of push fields (llm_common.glsl).
+		down.GammaOff = g.aPart
+		down.GemmM = 1
+		add(string(g.down), "down", uint32(dv.slabs), uint32(g.gemmN()/coopMatTile), down)
+		add(string(g.down)+"_reduce", "down_reduce", uint32(roundUpInt(g.gemmN(), 64)/64), 1, down)
+	} else {
+		down.GemmM = uint32(roundUpInt(g.rows, dv.bm))
+		add(string(g.down), "down", uint32(g.gemmN()/dv.bn), uint32(roundUpInt(g.rows, dv.bm)/dv.bm), down)
+	}
 
 	up := base
 	up.BOff = m.up
@@ -717,6 +811,9 @@ func (g *HCGPU) RunCombine(mixer int) error {
 		GroupsX:  uint32(g.rows), GroupsY: uint32(c.HC),
 		PushConstants: pc.bytes(),
 	}}
+	if g.rec.add(ownHC, d) {
+		return nil
+	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
 		return fmt.Errorf("llm: mixer %d combine: %w", mixer, err)
 	}
@@ -731,6 +828,9 @@ func (g *HCGPU) Run(mixer int, combine bool) error {
 	d, _, err := g.graph(mixer, combine)
 	if err != nil {
 		return err
+	}
+	if g.rec.add(ownHC, d) {
+		return nil
 	}
 	for i := 0; i < len(d); i += perSubmit {
 		j := minInt(i+perSubmit, len(d))

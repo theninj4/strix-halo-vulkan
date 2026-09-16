@@ -1,0 +1,141 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The hyper-connection down projection at **one token**: LLM.md L7d.
+//
+// L7c-6 priced it. At T=1 a mixer is 293.5 us of which the down projection is
+// 237.6 at **29 GB/s**, 8.3x off this machine's bus, while the up projection
+// beside it reads the same kind of weight at 143. Nothing about the
+// arithmetic is different; the grid is. `llm_gemm.comp` blocks the output
+// columns — BN=48 over a fused N of 336 — so the whole matrix is **seven
+// workgroups** on a 40-CU device, each pulling 1 MB of weight through one
+// wave, and fifteen of every sixteen rows of its A fragment are padding
+// because there is one token.
+//
+// At M=1 the parallelism cannot come from N: there are only 336 of them and
+// they are the *output*. It has to come from **K**, which is 10240. So this
+// is the ordinary split-K GEMV, in two dispatches:
+//
+//   MODE 0  (s, nt) -> partial[s][nt*16 .. nt*16+16)      KSLABS x 21 groups
+//   MODE 1  sum over s, then MODE 0 of llm_gemm's epilogue
+//
+// with `KSLABS` compiled in rather than pushed, for the reason BM and BN are:
+// the host has to know it to size the scratch and shape the grid, and a
+// mismatch would be a wrong answer rather than a slow one.
+//
+// **Which KSLABS is §5.1b's 4 KB period and not the workgroup count.** The
+// ladder is not monotonic and it is not noise — 8/16/32/40/80/160 slabs give
+// 181/154/219/129/138/230 GB/s — and what separates them is the distance
+// between two workgroups' slabs, `(gemmK/16/KSLABS) * 512` bytes:
+//
+//   KSLABS      8     16     32     40     80    160
+//   slab, B  40960  20480  10240   8192   4096   2048
+//   x 4 KB      10      5    2.5      2      1    0.5
+//   GB/s       181    154    219    129    138    230
+//
+// Every rung whose slab is a whole multiple of 4 KB is slow and both that are
+// not are fast, which is the period §5.1b pinned for DRAM channel aliasing on
+// this part — measured there across nine strides in one rotation, and here
+// across six with the byte set identical in all of them. So the rung to pick
+// is not the widest split; it is the one whose stride misses the rotation,
+// and at 160 that is **230 GB/s, 95% of the bus**, against the GEMM's 29.
+//
+// **The weight layout is the one the GEMM already staged** (§2.8 fragment
+// tiling, packDownB): tile (nt, kt) is 256 contiguous halves holding element
+// (k, n) at (n%16)*16 + k%16, tiles ordered kt-fastest. That is not a layout
+// a GEMV would have chosen, and it turns out not to matter — it is exactly
+// what makes this kernel's reads perfect. Within an n-tile the tiles of
+// consecutive kt are contiguous, so **one workgroup's whole slab is one
+// contiguous run** of `(gemmK/16/KSLABS) * 512` bytes, and inside it a wave
+// of 64 lanes taking 16 halves each covers 1024 consecutive halves with no
+// gaps. The (n%16)*16 + k%16 order then hands each lane a single output
+// column and sixteen consecutive k of it, which is one accumulator per lane
+// and no LDS at all.
+//
+// The cross-lane reduction is the shape that falls out of that: lane l holds
+// column l%16 of tile l/16, so the four lanes that share a column are
+// l, l^16, l^32 — two shuffles, and lanes 0..15 hold the sixteen sums.
+//
+// No bounds checks, as everywhere in this ladder. gemmN is a multiple of 16
+// by construction (lowRank + one tile, padded to the GEMM's BN), gemmK a
+// multiple of 16*KSLABS, and the arenas are zeroed once.
+
+#include "llm_common.glsl"
+
+#ifndef MODE
+#define MODE 0
+#endif
+// How many ways K is split. 10240 is 640 tiles; at KSLABS=160 a workgroup
+// reads four of them — 2 KB, contiguous, one step — and the grid is 160 x 21
+// = 3360 waves for a matrix the GEMM ran in seven. A slab has to be a whole
+// number of steps, so gemmK/16 must divide by 4*KSLABS; the host checks it.
+#ifndef KSLABS
+#define KSLABS 16
+#endif
+
+#define TILE 16
+#define WAVE 64
+
+layout(local_size_x = WAVE) in;
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+#if MODE == 0
+    uint slab = gl_WorkGroupID.x;                // which stripe of K
+    uint nt = gl_WorkGroupID.y;                  // which 16 output columns
+    uint ktiles = pc.gemmK / TILE;               // 640
+    uint perSlab = ktiles / KSLABS;              // 40
+    uint kt0 = slab * perSlab;
+
+    // Where this workgroup's contiguous run starts, in halves, and where the
+    // matching stretch of the activation row starts.
+    uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE);
+    uint xbase = pc.xnOff + kt0 * TILE;
+
+    uint lane = gl_LocalInvocationID.x;
+    uint col = lane % TILE;                      // the output column this lane owns
+    uint sub = lane / TILE;                      // which of the four tiles of a step
+
+    float sum = 0.0;
+    // One step is four tiles: 1024 halves of weight, 64 of activation.
+    for (uint c = 0u; c < perSlab; c += 4u) {
+        uint w = wbase + c * (TILE * TILE) + lane * TILE;
+        uint x = xbase + (c + sub) * TILE;
+        [[unroll]] for (uint i = 0u; i < TILE; i++) {
+            sum += float(w16[w + i]) * float(hact[x + i]);
+        }
+    }
+
+    // The four lanes holding the same column are lane, lane^16, lane^32.
+    sum += subgroupShuffleXor(sum, 16u);
+    sum += subgroupShuffleXor(sum, 32u);
+    if (sub == 0u) {
+        act[pc.gammaOff + slab * pc.gemmN + nt * TILE + col] = sum;
+    }
+#else
+    // The reduction, and llm_gemm.comp MODE 0's epilogue over one row: the
+    // gate's branch gets silu(x/hc) and is narrowed into the fp16 arena as
+    // the up projection's A operand, inject's tile is written fp32 because
+    // the combine reads it as a scalar per stream.
+    uint n = gl_GlobalInvocationID.x;
+    if (n >= pc.gemmN) {
+        return;
+    }
+    float sum = 0.0;
+    [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
+        sum += act[pc.gammaOff + s * pc.gemmN + n];
+    }
+    if (n < pc.lowRank) {
+        float v = sum / float(pc.hc);
+        hact[pc.loOff + n] = float16_t(v * sigmoidf(v));
+    } else {
+        act[pc.injOff + (n - pc.lowRank)] = sum;
+    }
+#endif
+}

@@ -365,6 +365,11 @@ func TestMoEGPULadderAgrees(t *testing.T) {
 	for _, plan := range [][2]MoEKernel{
 		{MoEM2, MoEM2}, {MoEM1, MoEM4}, {MoEM4, MoEM1}, {MoEM1, MoEM1}, {MoEM4, MoEM4},
 		{MoEW4M1, MoEW4M1}, {MoEW2M1, MoEM1}, {MoEM2, MoEW4M1},
+		// The narrow-N rungs (L7d). They move BN and nothing else, so a
+		// disagreement here is a column block reading the wrong bank rows —
+		// the same class of error the row blocks above are checked for, on
+		// the other axis, and it has to be exact for the same reason.
+		{MoEN1M1, MoEM1}, {MoEN2M1, MoEM1}, {MoEN1M1, MoEM4}, {MoEN2M1, MoEW2M1},
 	} {
 		if err := g.SetPlan(plan[0], plan[1]); err != nil {
 			t.Fatal(err)
