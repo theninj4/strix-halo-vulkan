@@ -880,6 +880,85 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-16 (forty-eighth) — stage L8b: the last dense family, and a split that is a column block
+
+**Result: the hyper-connection block at one token is 37.0 us a mixer against
+79.2 — 2.14x — and the arithmetic is unchanged, not within a tolerance.**
+Decode 14.71 tok/s against 14.07, a token 71.1 ms to 68.0 and 6.61 GB to 6.05,
+residency 82.40 GB to 81.89, prefill 1041.1 tok/s at ubatch 2048 against
+1044.8 — unchanged inside the 0.36% two runs agree to, which was this stage's
+gate rather than its target. Two decode runs agree to 0.34% (14.71 / 14.76).
+`TestGraphLogits` returns llama.cpp's own argmax out of its own top ten and
+`-gen -n 128` is L7c's completion down to `Lisbon.`
+[Write-up](research/l8b-hc-bank.md) · `results/l8b_decode.csv`,
+`results/l8b_graph.csv`, `results/l8b_graph_fp16.csv`, `results/l8b_hc.csv`,
+`results/l8b_hc_fp16.csv` · `LLM.md` updated.
+
+**1. The split is a column block, not a row, and 32 rows are staged twice.**
+L8a's tail needs a whole BN block on one side of it (a per-tile compare was
+1.27x, L8a-3), and this block cannot give it one: `inject` is four F32 rows at
+lowRank = 320 of a fused N of 336, and BN is 48 because 336 is 21 tiles and 21
+is 3 x 7. So the split is the column block that *contains* the first non-Q8
+row — 288 — and the 32 low-rank rows in between live in both planes. **0.33 MB
+a mixer, 32 MB a decode token, 0.5% of a step.** Both kernels derive it from
+`pc.lowRank` and their own BN, so it costs no push field. MODE 1 needs none of
+it — `hc_up.weight` is Q8_0 throughout — so its tail branch is compiled out,
+which also keeps `pc.gateOff` free to go on meaning the validation gate's
+arena there.
+
+**2. The GEMV has no LDS to round through, so it rounds in fp16.** The GEMM
+arm is bit-exact because it *stores* `float16_t(float(q)*d)` into LDS;
+`llm_hc_gemv.comp` has no LDS stage, and `float(float16_t(x))` in a register
+is folded away by RADV (D10), so its weight would have been the unrounded
+`q*d` — a weight ulp over a 10240-long dot product, ~1e-2 on `inject`, an
+order of magnitude past L7d's own agreement bound. `float16_t(q) * d` is a
+real f16 multiply of two exact halves: nothing to fold, and the same half,
+because q has ≤8 significant bits and d ≤11 so their f32 product is exact.
+`TestHCGPUQ8IsTheHalves` is an equality over 9 GEMM pairs and 6 splits.
+
+**3. The ladder slid one rung along the 4 KB rotation, and D12 said it would.**
+A slab is now `(gemmK/16/KSLABS) * 256` bytes: at 8/16/32/40/80/160 the
+strides are 5/2.5/1.25/1/0.5/0.25 x 4 KB and the rates
+**231/269/326/135/193/308 GB/s**. The two whole multiples are the two slow
+rungs. The winner is 32 rather than 160 — the same two strides, one rung
+along — so `PlanFor` now takes the bank as an argument.
+
+**4. The collapse's scratch was [BM][BN], and the unpack wanted the widest row
+block there is.** MODE 1's unpack costs **256/WM** conversions per matrix step
+and nothing else in the shape changes it (BK_TILES=4 was 1334 us, =1 was 984,
+against 1003 at 2). But the kernel is latency-bound and slows as its LDS grows
+— on the fp16 bank BM=64 was 1.38x BM=32 at 2048 — so a wide enough rung would
+not fit beside a [BM][BN] gate. Cut to **one m-tile** it is 4 KB at every rung,
+two barriers a tile instead of one, and the same arithmetic. Both banks
+gained: the fp16 arm's best up projection went 176.3 to 142.0 us at 512 and
+720.8 to 638.2 at 2048, and on the Q8 bank up_m4 wins from 64 tokens up. An
+m8 rung was added to both ladders and wins nowhere, which is what shows the
+ladder has a top.
+
+**5. At one token the bank is the kernel; at 2048 it is nearly irrelevant.**
+Each projection at its own best rung, fp16 → Q8: down 30.0 → **12.8** and up
+40.0 → **16.1** at one token; 254.5 → 253.2 and 142.0 → 152.8 at 512; 457.3 →
+525.6 and 638.2 → 694.5 at 2048. At 2048 each weight is read 32 times out of a
+32 MiB MALL, so the DRAM bytes were already hidden and only the unpack's ALU
+is left — **1.15x and 1.09x slower for 1.7-1.9x fewer bytes**, which is now
+D14. The whole graph absorbs it because the m-tile scratch pays it back.
+
+**Next: L8d, the MoE at decode — and the list was reordered to put it there.**
+Phase 2's plan was L8a, L8b, then L8c's re-quantisation; this stage's own
+numbers argue against that order. Two stages of bank work bought 1.24x at
+decode and left **the MoE at 56 GB/s of a 242 GB/s bus, 4.3x off its own
+bytes and 42% of a token**, where the lm head — the same kernel family over
+the same kind of bank — holds 194 and is 1.25x off. **If every block ran at
+the head's rate a token would be 31 ms rather than 68: 32 tok/s, from kernel
+work alone, with no bank change and therefore no accuracy to argue about.**
+That is worth more than L8c's ~1.9x on the dense half, and L8c lands on a
+faster baseline for having waited. Two leads came out of this stage and both
+are L8d's: the DeltaNet's two projections have no split-K rung at one token
+and L8b priced what one is worth over int8 (2.34x, 326 GB/s against 230), and
+nothing anywhere has tried issuing the unpack's loads a K-step ahead of the
+conversions that consume them — the same instruction sequence L5b-7 left the
+MoE 2.5x off its byte floor on. L8c keeps its name and follows.
+
 ### Session 2026-09-16 (forty-seventh) — stage L8a: the dense bank stops being halves
 
 **Result: decode is 14.07 tok/s against 11.90 — 1.18x — and the arithmetic is

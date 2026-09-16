@@ -129,14 +129,33 @@ shared float16_t sQB[BN * LDS_ROW];
 // accumulator and reading it back with ordinary indexing is what lets the
 // collapse pair a gate element with its xn element without depending on how
 // the implementation maps matrix elements to lanes -- which the cooperative
-// matrix extension does not define. It is 16 KB and one barrier.
-shared float gateLDS[BM * BN];
+// matrix extension does not define.
+//
+// It holds **one m-tile**, not the whole row block: 4 KB and two barriers a
+// tile, rather than BM x BN and one (L8b — see the epilogue). Beside the Q8
+// arm's 5 KB unpack slab that is 9 KB at every rung of the ladder, where a
+// [BM][BN] scratch would have been 21 at the widest.
+//
+// **This mode has no tail** — `hc_up.weight` is Q8_0 for all 10240 of its
+// rows, and `pc.gateOff` here is not a weight at all but the validation arena
+// the collapse optionally writes the wide gate into — so the tail branch is
+// compiled out rather than guarded, which is what keeps the k-loop to one
+// `coopMatLoad` of B (L8a-3).
+shared float gateLDS[TILE * BN];
 #else
 // MODE 0 and MODE 2 both read the fp16 A operand at xnOff: the hyper-
 // connection block's normalised residual, and the PLE block's gathered
 // embedding.
 #define A_BUF_OFF pc.xnOff
 #define A_LDA pc.lda
+#define Q8_TAIL 1
+#if MODE == 0
+// The column block holding the first non-Q8 row, not the row itself: see the
+// note at the branch.
+#define Q8_SPLIT ((pc.lowRank / BN) * BN)
+#else
+#define Q8_SPLIT pc.lowRank
+#endif
 #endif
 
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
@@ -164,17 +183,31 @@ void main() {
     uint kgroups = pc.gemmK >> 5;
     uint lane = gl_LocalInvocationID.x;
     uint nt0 = wn0 / TILE;
+#ifdef Q8_TAIL
     // **Not every row of a fused matrix is Q8_0 in the checkpoint**, and the
     // ones that are not stay halves rather than being re-quantised: the
     // gated DeltaNet's F32 alpha and beta, the attention layer's BF16 indexer
     // projections, the hyper-connection block's F32 inject. They are the
-    // *last* rows of their matrix in every case, so the split is one number —
-    // `pc.lowRank`, which in MODE 0 already means exactly this — and the tail
-    // is a fp16 fragment-tiled matrix of its own at `pc.gateOff`, numbered
-    // from the split. A whole column block falls on one side or the other, so
-    // the branch below is per workgroup and not per tile.
-    bool tail = pc.gateOff != NO_W && wn0 >= pc.lowRank;
-    uint tailNT = nt0 - pc.lowRank / TILE;
+    // *last* rows of their matrix in every case, so the split is one number
+    // and the tail is a fp16 fragment-tiled matrix of its own at
+    // `pc.gateOff`, numbered from the split. A whole column block falls on
+    // one side or the other, so the branch below is per workgroup and not per
+    // tile.
+    //
+    // **Where the split falls is the one thing MODE 0 does differently**, and
+    // it is L8b's whole difficulty. In MODE 2 the tail begins at
+    // `pc.lowRank`, which is a whole BN block by construction because the
+    // host chose the fused row order. In MODE 0 it cannot be: `inject` is
+    // four F32 rows at lowRank = 320 of a fused N of 336, and BN is 48
+    // because 336 is 21 tiles and 21 is 3 x 7. So the split is the *column
+    // block that contains* the first non-Q8 row — `pc.lowRank` rounded down
+    // to BN, 288 here — and the 32 low-rank rows between it and inject are
+    // staged in both planes, read out of the fp16 one, and cost 0.33 MB a
+    // mixer of the 3.2 the block saves.
+    uint qSplit = Q8_SPLIT;
+    bool tail = pc.gateOff != NO_W && wn0 >= qSplit;
+    uint tailNT = nt0 - qSplit / TILE;
+#endif
 #endif
     // The reduction. On the Q8 arm it is written twice rather than branched
     // inside: the tail's B comes straight out of the fp16 bank as it always
@@ -182,7 +215,7 @@ void main() {
     // the DeltaNet's output projection — a matrix with no tail at all —
     // because the two `coopMatLoad`s in one loop body are register pressure
     // the ladder is already bound by (L2f-5, L3b-4).
-#ifdef Q8B
+#if defined(Q8B) && defined(Q8_TAIL)
     if (tail) {
         for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
             [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
@@ -297,44 +330,58 @@ void main() {
     }
 #else
     // The gate, then the collapse, with the 10240-wide tensor never leaving
-    // the workgroup.
+    // the workgroup — **one m-tile at a time**, so the scratch is
+    // [TILE][BN] and not [BM][BN].
+    //
+    // That is L8b's change and the reason is occupancy, not correctness. This
+    // kernel is latency-bound on two streams it cannot prefetch, and every
+    // rung of it gets slower as its LDS grows: on the fp16 bank BM=64 was
+    // 1.38x BM=32 at 2048 tokens for 16 KB against 8. The Q8 arm then wants
+    // the *opposite* of what that ladder says — its unpack costs 256/WM
+    // element conversions per cooperative-matrix step, so it wants the widest
+    // row block there is — and a [BM][BN] gate would not let it have one. Cut
+    // to one m-tile the scratch is 4 KB whatever WM is, and the arithmetic is
+    // the same arithmetic: the same four gate values of the same feature, in
+    // the same order, summed into the same output.
+    uint blocks = BN / (TILE * HC_STREAMS);  // feature blocks this workgroup covers
+    uint outs = TILE * blocks * TILE;
+    float invHC = 1.0 / float(pc.hc);
+    uint wide = pc.hc * pc.nEmbd;
     [[unroll]] for (uint i = 0u; i < WM; i++) {
+        // The previous tile's readers have to be done with the scratch.
+        barrier();
         [[unroll]] for (uint j = 0u; j < WN; j++) {
             ACC_T g;
             [[unroll]] for (uint e = 0u; e < acc[i][j].length(); e++) {
                 g[e] = sigmoidf(float(acc[i][j][e]));
             }
-            coopMatStore(g, gateLDS, (i * TILE) * BN + j * TILE, BN,
-                gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(g, gateLDS, j * TILE, BN, gl_CooperativeMatrixLayoutRowMajor);
         }
-    }
-    barrier();
+        barrier();
 
-    // Column n of this block is (feature block, stream, feature) by the host's
-    // permutation, so the four streams of one feature are 16 columns apart
-    // inside the same 64-column group. One output is a dot product of length
-    // hc over a gate row in LDS and an xn row in the fp16 arena.
-    uint blocks = BN / (TILE * HC_STREAMS);  // feature blocks this workgroup covers
-    uint outs = BM * blocks * TILE;
-    float invHC = 1.0 / float(pc.hc);
-    uint wide = pc.hc * pc.nEmbd;
-    for (uint p = gl_LocalInvocationID.x; p < outs; p += WAVE) {
-        uint r = p % TILE;                   // feature inside its block; fastest, so
-        uint fb = (p / TILE) % blocks;       // consecutive lanes read consecutive halves
-        uint m = p / (TILE * blocks);
-        uint t = wm0 + m;
-        uint feat = (wn0 / (TILE * HC_STREAMS) + fb) * TILE + r;
-        uint gbase = m * BN + fb * (TILE * HC_STREAMS) + r;
-        uint xbase = pc.xnOff + t * pc.lda + feat;
-        float sum = 0.0;
-        [[unroll]] for (uint c = 0u; c < HC_STREAMS; c++) {
-            float gv = gateLDS[gbase + c * TILE];
-            sum += gv * float(hact[xbase + c * pc.nEmbd]);
-            if (pc.gateOff != NO_W) {
-                act[pc.gateOff + t * wide + c * pc.nEmbd + feat] = gv;
+        // Column n of this block is (feature block, stream, feature) by the
+        // host's permutation, so the four streams of one feature are 16
+        // columns apart inside the same 64-column group. One output is a dot
+        // product of length hc over a gate row in LDS and an xn row in the
+        // fp16 arena.
+        for (uint p = gl_LocalInvocationID.x; p < outs; p += WAVE) {
+            uint r = p % TILE;               // feature inside its block; fastest, so
+            uint fb = (p / TILE) % blocks;   // consecutive lanes read consecutive halves
+            uint m = p / (TILE * blocks);
+            uint t = wm0 + i * TILE + m;
+            uint feat = (wn0 / (TILE * HC_STREAMS) + fb) * TILE + r;
+            uint gbase = m * BN + fb * (TILE * HC_STREAMS) + r;
+            uint xbase = pc.xnOff + t * pc.lda + feat;
+            float sum = 0.0;
+            [[unroll]] for (uint c = 0u; c < HC_STREAMS; c++) {
+                float gv = gateLDS[gbase + c * TILE];
+                sum += gv * float(hact[xbase + c * pc.nEmbd]);
+                if (pc.gateOff != NO_W) {
+                    act[pc.gateOff + t * wide + c * pc.nEmbd + feat] = gv;
+                }
             }
+            act[pc.outOff + t * pc.nEmbd + feat] = sum * invHC;
         }
-        act[pc.outOff + t * pc.nEmbd + feat] = sum * invHC;
     }
 #endif
 }

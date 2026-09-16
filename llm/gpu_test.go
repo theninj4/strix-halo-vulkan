@@ -3,6 +3,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"math/rand"
 	"testing"
 
 	"strix-halo-vulkan/vk"
@@ -115,7 +116,7 @@ func gpuFixture(t *testing.T, layer int, side string) (*HCGPU, *Trace, int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewHCGPU(dev, m.Config.HCConfig(), len(ids), []HCWeights{w}, HCOpts{Gate: true})
+	g, err := NewHCGPU(dev, m.Config.HCConfig(), len(ids), []HCWeights{w}, HCOpts{Gate: true, Q8: denseQ8Test})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +242,7 @@ func TestHCGPUEveryMixer(t *testing.T) {
 			refs = append(refs, mixerRef{layer, side, nth})
 		}
 	}
-	g, err := NewHCGPU(dev, cfg, nTok, ws, HCOpts{Gate: true})
+	g, err := NewHCGPU(dev, cfg, nTok, ws, HCOpts{Gate: true, Q8: denseQ8Test})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +436,7 @@ func TestHCGPUUnpermutedUpIsWrong(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := NewHCGPU(dev, m.Config.HCConfig(), len(ids), []HCWeights{w}, HCOpts{UnpermutedUp: true})
+	g, err := NewHCGPU(dev, m.Config.HCConfig(), len(ids), []HCWeights{w}, HCOpts{UnpermutedUp: true, Q8: denseQ8Test})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,5 +546,175 @@ func TestHCGPUGemvRefusesABatch(t *testing.T) {
 	}
 	if err := g.SetPlan(HCDownGemv160, HCUpM1); err == nil {
 		t.Fatalf("SetPlan took the decode rung for a %d-token run", nTok)
+	}
+}
+
+// TestHCGPUQ8IsTheHalves is the L8b gate, and it is an equality rather than a
+// tolerance for the reason L8a's was: the int8 bank and the fp16 bank hold
+// **the same halves**.
+//
+// Both of this block's projections are Q8_0 in the checkpoint, so re-deriving
+// (d, q) from the dequantised floats returns the checkpoint's own pair
+// (TestBankQ8RoundTrip) and `float(q) * float(d)` rounded to fp16 is what
+// tileB wrote. The GEMM arm puts those halves in LDS instead of reading them
+// from global, and the GEMV arm multiplies in fp16 so that the rounding the
+// LDS store gives the GEMM for free happens in a register too — which it
+// would not if the product were formed in f32 and converted, because RADV
+// folds that pair away (D10). So every rung of both ladders has to agree with
+// the fp16 bank to the last bit, and the tail — the 32 low-rank rows the
+// split leaves over, plus the F32 `inject` — is the same fp16 fragment tiling
+// in both banks, so it cannot hide a difference either.
+//
+// The weights are synthetic and that is deliberate: the claim is a property
+// of the format, not of this checkpoint's values, and a [10240, 320] pair out
+// of the real model is 13 MB a mixer to make a point about rounding.
+func TestHCGPUQ8IsTheHalves(t *testing.T) {
+	dev, done := newTestDevice(t)
+	defer done()
+
+	// The checkpoint's own widths, because the GEMV rungs split 640 k-tiles
+	// up to 160 ways and a narrower K has no such ladder. The weights are
+	// synthetic and that is the point: this is a property of the format.
+	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320, Eps: 1e-6}
+	wide := cfg.Wide()
+	rng := rand.New(rand.NewSource(11))
+
+	// Down and Up are genuine Q8_0 values — a scale per 32 and a level at
+	// 127 in every group — because that is what the checkpoint holds and
+	// what makes the round trip exact. Norm and Inject are F32 in the
+	// checkpoint and fp16 in both banks.
+	down, _, _ := q8Source(rng, cfg.LowRank, wide)
+	up, _, _ := q8Source(rng, wide, cfg.LowRank)
+	w := HCWeights{
+		Norm:   make([]float32, wide),
+		Down:   down,
+		Up:     up,
+		Inject: make([]float32, cfg.HC*wide),
+	}
+	for i := range w.Norm {
+		w.Norm[i] = 1 + float32(rng.NormFloat64())*0.1
+	}
+	for i := range w.Inject {
+		w.Inject[i] = float32(rng.NormFloat64()) * 0.05
+	}
+
+	const nTok = 5
+	res := make([]float32, nTok*wide)
+	for i := range res {
+		res[i] = float32(rng.NormFloat64())
+	}
+	blockOut := make([]float32, nTok*cfg.NEmbd)
+	for i := range blockOut {
+		blockOut[i] = float32(rng.NormFloat64())
+	}
+
+	stage := func(q8 bool) *HCGPU {
+		t.Helper()
+		g, err := NewHCGPU(dev, cfg, nTok, []HCWeights{w}, HCOpts{Gate: true, Q8: q8})
+		if err != nil {
+			t.Fatalf("hc (q8=%v): %v", q8, err)
+		}
+		return g
+	}
+	// Destroyed before the device is, which is why this is a defer and not a
+	// t.Cleanup: cleanups run after the deferred device teardown above.
+	half, q8 := stage(false), stage(true)
+	defer half.Destroy()
+	defer q8.Destroy()
+	t.Logf("banks: %.2f MB of int8 and scales against %.2f MB of halves",
+		float64(q8.WeightBytes())/1e6, float64(half.WeightBytes())/1e6)
+	if q8.WeightBytes() >= half.WeightBytes() {
+		t.Fatalf("the q8 bank is %d bytes, no smaller than the fp16 one", q8.WeightBytes())
+	}
+
+	type out struct {
+		xn, lo, inject, mixed, gate, combined []float32
+	}
+	exec := func(g *HCGPU, dk, uk HCKernel, rows int) out {
+		t.Helper()
+		if err := g.Upload(res[:rows*wide], rows); err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+		if err := g.SetPlan(dk, uk); err != nil {
+			t.Fatalf("plan %s/%s: %v", dk, uk, err)
+		}
+		if err := g.Run(0, false); err != nil {
+			t.Fatalf("run %s/%s: %v", dk, uk, err)
+		}
+		o := out{xn: g.Xn(), lo: g.Lo(), inject: g.Inject(), mixed: g.Mixed(), gate: g.Gate()}
+		if err := g.UploadBlockOut(blockOut[:rows*cfg.NEmbd]); err != nil {
+			t.Fatalf("block out: %v", err)
+		}
+		if err := g.RunCombine(0); err != nil {
+			t.Fatalf("combine: %v", err)
+		}
+		o.combined = g.Res()
+		return o
+	}
+
+	equal := func(what string, a, b []float32) {
+		t.Helper()
+		if len(a) != len(b) {
+			t.Fatalf("%s: %d values against %d", what, len(a), len(b))
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("%s[%d]: q8 %.9g, fp16 %.9g", what, i, a[i], b[i])
+			}
+		}
+	}
+	compareRuns := func(label string, a, b out, tensors ...string) {
+		t.Helper()
+		got := map[string][2][]float32{
+			"hc_norm":    {a.xn, b.xn},
+			"lo":         {a.lo, b.lo},
+			"hc_inject":  {a.inject, b.inject},
+			"hc_gate":    {a.gate, b.gate},
+			"hc_mixed":   {a.mixed, b.mixed},
+			"hc_combine": {a.combined, b.combined},
+		}
+		for _, name := range tensors {
+			equal(label+" "+name, got[name][0], got[name][1])
+		}
+	}
+
+	// Every rung of both GEMM ladders at a length where the row blocks
+	// differ, then the decode pair at one token.
+	all := []string{"hc_norm", "lo", "hc_inject", "hc_gate", "hc_mixed", "hc_combine"}
+	for _, dk := range DownKernels() {
+		for _, uk := range UpKernels() {
+			compareRuns(fmt.Sprintf("%s/%s", dk, uk),
+				exec(q8, dk, uk, nTok), exec(half, dk, uk, nTok), all...)
+		}
+	}
+	for _, dk := range GemvKernels() {
+		compareRuns(string(dk), exec(q8, dk, HCUpM1, 1), exec(half, dk, HCUpM1, 1),
+			"lo", "hc_inject", "hc_mixed", "hc_combine")
+	}
+	t.Logf("%d GEMM pairs and %d split-K rungs, every tensor identical",
+		len(DownKernels())*len(UpKernels()), len(GemvKernels()))
+}
+
+// TestHCGPUQ8BankSize states what L8b stages against what it replaces, at the
+// checkpoint's own widths: the two projections of one mixer are 13.44 MB of
+// halves and 8.12 MB of int8-plus-scales, of which 0.98 is the fp16 tail the
+// split leaves over and 0.16 the int8 columns behind it that are never read.
+func TestHCGPUQ8BankSize(t *testing.T) {
+	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320}
+	g := &HCGPU{cfg: cfg}
+	wide, n := cfg.Wide(), g.gemmN()
+	half := (n*wide + wide*cfg.LowRank) * 2
+	q8 := q8Align(q8Bytes(n, wide)) + g.q8TailRows()*wide*2 + q8Align(q8Bytes(wide, cfg.LowRank))
+	// What a token actually reads is less: the int8 columns past the split
+	// are staged and skipped.
+	read := g.q8Split()*wide + (n*wide/q8Group)*2 + g.q8TailRows()*wide*2 +
+		wide*cfg.LowRank + (wide*cfg.LowRank/q8Group)*2
+	t.Logf("staged %.2f MB against %.2f, read %.2f MB a token against %.2f",
+		float64(q8)/1e6, float64(half)/1e6, float64(read)/1e6, float64(half)/1e6)
+	if g.q8Split() != 288 {
+		t.Fatalf("the split is column %d, want 288", g.q8Split())
+	}
+	if ratio := float64(half) / float64(read); ratio < 1.74 || ratio > 1.78 {
+		t.Fatalf("a token reads %.3fx less, want ~1.76", ratio)
 	}
 }

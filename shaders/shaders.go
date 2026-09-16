@@ -1921,6 +1921,23 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -o llm_hc_up_m1.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -o llm_hc_up_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -o llm_hc_up_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -o llm_hc_down_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -o llm_hc_up_m8.spv llm_gemm.comp
+
+// The same six rungs over L8's dense bank (LLM.md L8b). The hyper-connection
+// block is the last dense family staged as halves — 1.31 GB a token, 13.3% of
+// a decode step — and it is last because neither of its modes is the plain
+// arm: MODE 0 carries `inject` in its last tile, four F32 rows that do not
+// begin on a column block, and MODE 1 collapses the gate through LDS the
+// unpack now sits beside. Both are the same two flags the plain arm takes.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -DQ8B -DDENSE_Q8 -o llm_hc_down_q8_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -DQ8B -DDENSE_Q8 -o llm_hc_down_q8_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -DQ8B -DDENSE_Q8 -o llm_hc_down_q8_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_hc_up_q8_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_hc_up_q8_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_hc_up_q8_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -DQ8B -DDENSE_Q8 -o llm_hc_down_q8_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_hc_up_q8_m8.spv llm_gemm.comp
 
 // The down projection again, at one token: LLM.md L7d. `llm_gemm.comp` blocks
 // the output columns, so a fused N of 336 is seven workgroups on a 40-CU
@@ -1942,6 +1959,22 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=80 -o llm_hc_gemv_r80.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -o llm_hc_gemv_s160.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=160 -o llm_hc_gemv_r160.spv llm_hc_gemv.comp
+
+// And the same six splits over L8's bank (L8b). Only the first dispatch of
+// each pair has an arm: the reduction reads partial sums and touches no
+// weight, so a Q8 build of it would be the same SPIR-V.
+//
+// **The rung to pick is not the one L7d picked**, and that is D12 rather than
+// a surprise: a slab is now `(gemmK/16/KSLABS) * 256` bytes, half what it
+// was, so the whole ladder slides one rung along the 4 KB rotation and the
+// two splits whose stride is not a whole multiple of 4 KB are 16 and 32
+// rather than 32 and 160. Measured by `-hc -tokens 1 -ladder`.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s8.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s16.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s32.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s40.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s80.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s160.spv llm_hc_gemv.comp
 
 // The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
 // a prefill graph — its key projection is one dispatch of the 37 that share
@@ -2005,6 +2038,42 @@ var LLMHCUpM2 []byte
 //go:embed llm_hc_up_m4.spv
 var LLMHCUpM4 []byte
 
+// The widest rung of each ladder, and L8b's reason for it: the Q8 arm's
+// unpack costs 256/WM element conversions per cooperative-matrix step, so it
+// wants more token rows a workgroup than the fp16 arm ever did.
+
+//go:embed llm_hc_down_m8.spv
+var LLMHCDownM8 []byte
+
+//go:embed llm_hc_up_m8.spv
+var LLMHCUpM8 []byte
+
+// The same rungs over L8's dense bank (L8b).
+
+//go:embed llm_hc_down_q8_m1.spv
+var LLMHCDownQ8M1 []byte
+
+//go:embed llm_hc_down_q8_m2.spv
+var LLMHCDownQ8M2 []byte
+
+//go:embed llm_hc_down_q8_m4.spv
+var LLMHCDownQ8M4 []byte
+
+//go:embed llm_hc_up_q8_m1.spv
+var LLMHCUpQ8M1 []byte
+
+//go:embed llm_hc_up_q8_m2.spv
+var LLMHCUpQ8M2 []byte
+
+//go:embed llm_hc_up_q8_m4.spv
+var LLMHCUpQ8M4 []byte
+
+//go:embed llm_hc_down_q8_m8.spv
+var LLMHCDownQ8M8 []byte
+
+//go:embed llm_hc_up_q8_m8.spv
+var LLMHCUpQ8M8 []byte
+
 // LLMHCGemvS* is the split-K down projection at one token and LLMHCGemvR* the
 // reduction and epilogue that closes it (L7d). They come in pairs: the slab
 // count is compiled into both.
@@ -2044,6 +2113,27 @@ var LLMHCGemvS160 []byte
 
 //go:embed llm_hc_gemv_r160.spv
 var LLMHCGemvR160 []byte
+
+// LLMHCGemvQ8S* is the first dispatch of each pair over L8's bank (L8b). The
+// reduction is shared with the fp16 build: it reads partial sums.
+
+//go:embed llm_hc_gemv_q8_s8.spv
+var LLMHCGemvQ8S8 []byte
+
+//go:embed llm_hc_gemv_q8_s16.spv
+var LLMHCGemvQ8S16 []byte
+
+//go:embed llm_hc_gemv_q8_s32.spv
+var LLMHCGemvQ8S32 []byte
+
+//go:embed llm_hc_gemv_q8_s40.spv
+var LLMHCGemvQ8S40 []byte
+
+//go:embed llm_hc_gemv_q8_s80.spv
+var LLMHCGemvQ8S80 []byte
+
+//go:embed llm_hc_gemv_q8_s160.spv
+var LLMHCGemvQ8S160 []byte
 
 //go:embed llm_gemm_plain_m2.spv
 var LLMGEMMPlainM2 []byte

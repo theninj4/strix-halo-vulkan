@@ -95,7 +95,7 @@ func residency(model string, maxTok, nKV int, bankLayers []int, denseOnly bool, 
 		return fmt.Errorf("hc head mixer: %w", err)
 	}
 	mixers = append(mixers, head)
-	hc, err := llm.NewHCGPU(dev, c.HCConfig(), maxTok, mixers, llm.HCOpts{})
+	hc, err := llm.NewHCGPU(dev, c.HCConfig(), maxTok, mixers, llm.HCOpts{Q8: llm.DenseQ8()})
 	if err != nil {
 		return fmt.Errorf("hc: %w", err)
 	}

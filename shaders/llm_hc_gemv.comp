@@ -64,6 +64,25 @@
 // No bounds checks, as everywhere in this ladder. gemmN is a multiple of 16
 // by construction (lowRank + one tile, padded to the GEMM's BN), gemmK a
 // multiple of 16*KSLABS, and the arenas are zeroed once.
+//
+// **-DQ8B is L8b's arm, and it is bit-exact.** The bank it reads is the one
+// llm_gemm.comp's Q8 arm reads — int8 tiles in the same fragment tiling, an
+// fp16 scale per 32 elements of a row in a k-major plane behind them — so a
+// lane's sixteen consecutive halves become sixteen consecutive *bytes*, four
+// `uint` loads, and one scale: a 32-element group is two whole k-tiles, so
+// the scale is constant across the tile the lane owns.
+//
+// It is bit-exact rather than nearly so, and that needs one thing said. This
+// kernel has no LDS stage to round a weight through, and `float(float16_t(x))`
+// in a register is folded away by RADV (D10) — so the fp16 rounding the GEMM
+// gets for free from its LDS store would simply not happen here, and the two
+// would disagree by a weight ulp on a 10240-long dot product. The fix is to
+// do the multiply **in fp16**: `float16_t(q) * d` where both operands are
+// already exact halves is a real f16 instruction the compiler cannot fold,
+// and its correctly-rounded result is the same half `float16_t(float(q) * d)`
+// produces, because q has at most 8 significant bits and d at most 11, so
+// their f32 product is exact and the second rounding is the only one.
+// TestHCGPUQ8IsTheHalves is the check, over both dispatches of the pair.
 
 #include "llm_common.glsl"
 
@@ -76,6 +95,12 @@
 // number of steps, so gemmK/16 must divide by 4*KSLABS; the host checks it.
 #ifndef KSLABS
 #define KSLABS 16
+#endif
+// The down GEMM's column block, and the only thing this kernel needs to know
+// about that one: L8b's Q8 split is the block containing `inject`, so both
+// kernels round `pc.lowRank` down to it. Compiled in for the reason KSLABS is.
+#ifndef DOWN_BN
+#define DOWN_BN 48
 #endif
 
 #define TILE 16
@@ -93,16 +118,50 @@ void main() {
     uint perSlab = ktiles / KSLABS;              // 40
     uint kt0 = slab * perSlab;
 
-    // Where this workgroup's contiguous run starts, in halves, and where the
-    // matching stretch of the activation row starts.
-    uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE);
-    uint xbase = pc.xnOff + kt0 * TILE;
-
     uint lane = gl_LocalInvocationID.x;
     uint col = lane % TILE;                      // the output column this lane owns
     uint sub = lane / TILE;                      // which of the four tiles of a step
+    uint xbase = pc.xnOff + kt0 * TILE;
+
+#ifdef Q8B
+    // The fused down projection is int8 up to the column block that holds
+    // `inject`, and halves from there on: the same split llm_gemm.comp's
+    // MODE 0 arm derives, from the same `pc.lowRank`, because the two read
+    // one staged bank. DOWN_BN is that kernel's column block and the host
+    // checks the two agree — a mismatch would read the wrong plane, not run
+    // slowly.
+    uint qSplit = (pc.lowRank / DOWN_BN) * DOWN_BN;
+    bool tail = nt * TILE >= qSplit;
+    // The tiles as words and the scale plane as halves, exactly as the GEMM
+    // derives them: a matrix is gemmN x gemmK bytes and the plane follows it.
+    uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 64u + lane * 4u;
+    uint sbase = ((pc.bOff + pc.gemmN * pc.gemmK) >> 1) + nt * (pc.gemmK >> 5) * TILE + col;
+    // The tail's own tiling, numbered from the split.
+    uint wbase = pc.gateOff + ((nt - qSplit / TILE) * ktiles + kt0) * (TILE * TILE);
+#else
+    // Where this workgroup's contiguous run starts, in halves.
+    uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE);
+#endif
 
     float sum = 0.0;
+#ifdef Q8B
+    if (!tail) {
+        // One step is four tiles: 1024 bytes of weight, 64 halves of
+        // activation, and one scale a lane — group (kt0+c+sub)/2.
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint w = qbase + c * 64u;
+            uint x = xbase + (c + sub) * TILE;
+            float16_t d = w16[sbase + ((kt0 + c + sub) >> 1) * TILE];
+            [[unroll]] for (uint u = 0u; u < 4u; u++) {
+                uint word = w8[w + u];
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    sum += float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d) *
+                        float(hact[x + u * 4u + t]);
+                }
+            }
+        }
+    } else
+#endif
     // One step is four tiles: 1024 halves of weight, 64 of activation.
     for (uint c = 0u; c < perSlab; c += 4u) {
         uint w = wbase + c * (TILE * TILE) + lane * TILE;

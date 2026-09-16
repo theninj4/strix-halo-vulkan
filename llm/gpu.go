@@ -126,9 +126,11 @@ const (
 	HCDownM1 HCKernel = "down_m1"
 	HCDownM2 HCKernel = "down_m2"
 	HCDownM4 HCKernel = "down_m4"
+	HCDownM8 HCKernel = "down_m8"
 	HCUpM1   HCKernel = "up_m1"
 	HCUpM2   HCKernel = "up_m2"
 	HCUpM4   HCKernel = "up_m4"
+	HCUpM8   HCKernel = "up_m8"
 	// The decode rungs: the same weight as a split-K GEMV, two dispatches,
 	// one token only (L7d). The suffix is how many ways K is split, which is
 	// compiled into the SPIR-V pair.
@@ -146,9 +148,13 @@ const (
 // mode 2 is the split-K GEMV, which has no tile at all: `slabs` is how many
 // ways it cuts K and `reduce` the second dispatch's SPIR-V, because the pair
 // is compiled from one slab count and only makes sense together.
+// q8 is the same build over L8's dense bank, where one exists. The reduction
+// of a GEMV pair has none: it reads partial sums and touches no weight, so
+// the fp16 SPIR-V serves both banks.
 type hcVariant struct {
 	name   HCKernel
 	spirv  []byte
+	q8     []byte
 	mode   int
 	bm, bn int
 	reduce []byte
@@ -156,18 +162,26 @@ type hcVariant struct {
 }
 
 var hcVariants = []hcVariant{
-	{name: HCDownM1, spirv: shaders.LLMHCDownM1, mode: 0, bm: 16, bn: 48},
-	{name: HCDownM2, spirv: shaders.LLMHCDownM2, mode: 0, bm: 32, bn: 48},
-	{name: HCDownM4, spirv: shaders.LLMHCDownM4, mode: 0, bm: 64, bn: 48},
-	{name: HCUpM1, spirv: shaders.LLMHCUpM1, mode: 1, bm: 16, bn: 64},
-	{name: HCUpM2, spirv: shaders.LLMHCUpM2, mode: 1, bm: 32, bn: 64},
-	{name: HCUpM4, spirv: shaders.LLMHCUpM4, mode: 1, bm: 64, bn: 64},
-	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, mode: 2, reduce: shaders.LLMHCGemvR8, slabs: 8},
-	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, mode: 2, reduce: shaders.LLMHCGemvR16, slabs: 16},
-	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, mode: 2, reduce: shaders.LLMHCGemvR32, slabs: 32},
-	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, mode: 2, reduce: shaders.LLMHCGemvR40, slabs: 40},
-	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
-	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
+	{name: HCDownM1, spirv: shaders.LLMHCDownM1, q8: shaders.LLMHCDownQ8M1, mode: 0, bm: 16, bn: 48},
+	{name: HCDownM2, spirv: shaders.LLMHCDownM2, q8: shaders.LLMHCDownQ8M2, mode: 0, bm: 32, bn: 48},
+	{name: HCDownM4, spirv: shaders.LLMHCDownM4, q8: shaders.LLMHCDownQ8M4, mode: 0, bm: 64, bn: 48},
+	{name: HCDownM8, spirv: shaders.LLMHCDownM8, q8: shaders.LLMHCDownQ8M8, mode: 0, bm: 128, bn: 48},
+	{name: HCUpM1, spirv: shaders.LLMHCUpM1, q8: shaders.LLMHCUpQ8M1, mode: 1, bm: 16, bn: 64},
+	{name: HCUpM2, spirv: shaders.LLMHCUpM2, q8: shaders.LLMHCUpQ8M2, mode: 1, bm: 32, bn: 64},
+	{name: HCUpM4, spirv: shaders.LLMHCUpM4, q8: shaders.LLMHCUpQ8M4, mode: 1, bm: 64, bn: 64},
+	{name: HCUpM8, spirv: shaders.LLMHCUpM8, q8: shaders.LLMHCUpQ8M8, mode: 1, bm: 128, bn: 64},
+	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, q8: shaders.LLMHCGemvQ8S8,
+		mode: 2, reduce: shaders.LLMHCGemvR8, slabs: 8},
+	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, q8: shaders.LLMHCGemvQ8S16,
+		mode: 2, reduce: shaders.LLMHCGemvR16, slabs: 16},
+	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, q8: shaders.LLMHCGemvQ8S32,
+		mode: 2, reduce: shaders.LLMHCGemvR32, slabs: 32},
+	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, q8: shaders.LLMHCGemvQ8S40,
+		mode: 2, reduce: shaders.LLMHCGemvR40, slabs: 40},
+	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, q8: shaders.LLMHCGemvQ8S80,
+		mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
+	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160,
+		mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
 }
 
 // hcMaxSlabs is the widest split any rung asks for, and so how many rows of
@@ -177,8 +191,8 @@ const hcMaxSlabs = 160
 // DownKernels and UpKernels list the rungs of each ladder, narrowest first.
 // The GEMV rungs are not in DownKernels because they only answer at one token;
 // DownKernelsAt is the ladder for a given length.
-func DownKernels() []HCKernel { return []HCKernel{HCDownM1, HCDownM2, HCDownM4} }
-func UpKernels() []HCKernel   { return []HCKernel{HCUpM1, HCUpM2, HCUpM4} }
+func DownKernels() []HCKernel { return []HCKernel{HCDownM1, HCDownM2, HCDownM4, HCDownM8} }
+func UpKernels() []HCKernel   { return []HCKernel{HCUpM1, HCUpM2, HCUpM4, HCUpM8} }
 
 // GemvKernels lists the decode rungs.
 func GemvKernels() []HCKernel {
@@ -193,44 +207,72 @@ func DownKernelsAt(tokens int) []HCKernel {
 	return DownKernels()
 }
 
-// DefaultPlan is the best single pair over the whole prompt range, measured
-// by `cmd/llm -hc -ladder` (results/l2c_hc.csv). It is never more than 1.04x
-// off the rung that wins at a given length, where the worst pair in the table
-// is 1.21-1.29x off.
-func DefaultPlan() (HCKernel, HCKernel) { return HCDownM2, HCUpM2 }
+// DefaultPlan is the best single pair over the whole prompt range on the
+// bank the block was built with, measured by `cmd/llm -hc -ladder`
+// (results/l8b_hc.csv). It is never more than 1.05x off the rung that wins at
+// a given length.
+func DefaultPlan(q8 bool) (HCKernel, HCKernel) {
+	if q8 {
+		return HCDownM2, HCUpM4
+	}
+	return HCDownM2, HCUpM2
+}
 
-// PlanFor is the measured schedule: which pair wins at a given prompt length.
+// PlanFor is the measured schedule: which pair wins at a given prompt length,
+// **on which bank** — because L8b moved both ladders and did not move them the
+// same way. Microseconds a mixer at each projection's best rung
+// (results/l8b_hc.csv, results/l8b_hc_fp16.csv):
 //
-//	tokens   winner              runner-up
-//	    64   m1/up_m4  1.00x     m1/up_m1  1.01x
-//	   128   m1/up_m2  1.00x     m1/up_m4  1.03x
-//	   256   m1/up_m2  1.00x     m1/up_m4  1.03x
-//	   512   m2/up_m2  1.00x     m1/up_m2  1.01x
-//	  1024   m2/up_m2  1.00x     m4/up_m2  1.03x
-//	  2048   m2/up_m2  1.00x     m4/up_m2  1.00x
+//	         down                     up
+//	T      fp16         Q8          fp16        Q8
+//	   1   30.0 m160   12.8 gemv32   40.0 m2    16.1 m1
+//	  64  234.7 m1    204.2 m1       39.5 m2    30.9 m4
+//	 512  254.5 m2    253.2 m1      142.0 m4   152.8 m4
+//	2048  457.3 m4    525.6 m4      638.2 m2   694.5 m4
 //
-// The down projection's ladder moves because its cost barely depends on the
-// token count at all — 252 us at 64 tokens and 255 at 512, because what it
-// reads is 6.9 MB of weight per M block and not the activation — so the rung
-// that wins is the one that fills the machine, until there are enough tokens
-// that reading the weight fewer times matters more. The up projection's does
-// not: BM=32 wins from 128 tokens on.
+// Two things move. **The GEMV ladder slides one rung along §5.1b's 4 KB
+// rotation**, which is D12 rather than a surprise: a slab is now
+// `(gemmK/16/KSLABS) * 256` bytes and not 512, so the split whose stride
+// misses the rotation is 32 and no longer 160 — 5120 bytes against 2048 —
+// and 160 is second by 6%. **And the up projection wants a wider row block on
+// the Q8 bank than it ever did on halves**, because its unpack costs 256/WM
+// element conversions per cooperative-matrix step: up_m4 wins from 64 tokens
+// up, where the fp16 arm's own ladder is on m2 at every length but 128 and
+// 512. That is also why L8b cut the collapse's scratch to one m-tile — at
+// [BM][BN] a rung wide enough to amortise the unpack would not have fitted
+// beside it.
 //
-// The boundaries sit between measured points, and the cost of getting one
-// wrong is at most 1.04x on either side.
-func PlanFor(tokens int) (HCKernel, HCKernel) {
+// The boundaries sit between measured points. The worst a rung named here is
+// off the one that wins at its own length is **1.12x**, at 128 tokens on the
+// Q8 bank, where up_m8 beats up_m4 by 6 us a mixer; everywhere else it is
+// within 1.05x.
+func PlanFor(tokens int, q8 bool) (HCKernel, HCKernel) {
+	if !q8 {
+		switch {
+		case tokens == 1:
+			return HCDownGemv160, HCUpM2
+		case tokens <= 384:
+			return HCDownM1, HCUpM2
+		case tokens <= 768:
+			return HCDownM2, HCUpM4
+		case tokens <= 1536:
+			return HCDownM2, HCUpM2
+		default:
+			return HCDownM4, HCUpM2
+		}
+	}
 	switch {
 	case tokens == 1:
 		// Decode. The GEMM rung's grid is seven workgroups here whatever its
-		// BM; the GEMV's is 3360, and 160 is the split whose slab stride
-		// misses §5.1b's 4 KB rotation (L7d).
-		return HCDownGemv160, HCUpM2
-	case tokens <= 96:
-		return HCDownM1, HCUpM4
+		// BM; the GEMV's is 3360, and 32 is the split whose slab stride
+		// misses §5.1b's 4 KB rotation now that a slab is bytes (L8b-2).
+		return HCDownGemv32, HCUpM1
 	case tokens <= 384:
-		return HCDownM1, HCUpM2
+		return HCDownM1, HCUpM4
+	case tokens <= 1536:
+		return HCDownM2, HCUpM4
 	default:
-		return HCDownM2, HCUpM2
+		return HCDownM4, HCUpM4
 	}
 }
 
@@ -244,10 +286,16 @@ func hcVariantFor(k HCKernel) (hcVariant, bool) {
 }
 
 // hcMixer is where one mixer's weights sit in the arenas.
+//
+// On L8's bank `down` and `up` are **byte** offsets of int8 tiles with an
+// fp16 scale plane behind each, and `downTail` is the fp16 remainder of the
+// fused down projection — the column block that holds `inject`, in halves.
+// On the fp16 bank they are half offsets and there is no tail (bank.go).
 type hcMixer struct {
-	gamma uint32 // fp32 arena
-	down  uint32 // fp16 bank: the fused [lowRank + hc, wide] matrix
-	up    uint32 // fp16 bank: the permuted [wide, lowRank] matrix
+	gamma    uint32 // fp32 arena
+	down     uint32 // the fused [lowRank + hc, wide] matrix
+	downTail uint32 // halves: its last column block, or noW
+	up       uint32 // the permuted [wide, lowRank] matrix
 }
 
 // HCGPU runs hyper-connection mixers on the device. It holds however many
@@ -290,6 +338,11 @@ type HCGPU struct {
 	// that the tensor does not exist — so it costs an arena only when asked
 	// for.
 	gate bool
+	// q8 is whether the bank is L8's int8-plus-scales or the fp16 tiling it
+	// replaces (bank.go). It changes what stage writes, which pipeline a
+	// dispatch names and two fields of its push block, and nothing else:
+	// every tensor either bank produces is the same to the last place.
+	q8 bool
 	// ctl is the construction-time options, kept because one of them changes
 	// how the weights were staged and a reader of a wrong tensor should be
 	// able to ask.
@@ -303,6 +356,36 @@ type HCGPU struct {
 // tile = 336 = 21 tiles, and 21 is 3 x 7, so 48 is the widest block that
 // divides it — which is why that ladder moves BM alone.
 const downBN = 48
+
+// q8Split is where the fused down projection stops being int8 and becomes
+// halves, and it is the one number L8b turned on.
+//
+// `inject` is four **F32** rows at lowRank = 320 of a matrix whose fused N is
+// 336, so re-quantising them is L8c's decision and not this stage's (D13).
+// L8a's tail takes the rows that are not int8 out of the main plane and
+// stages them as a fp16 fragment-tiled matrix of their own — but it requires
+// a whole column block to fall on one side of the split, and 320 is not a
+// multiple of the down ladder's BN of 48. (48 is forced: 336 is 21 tiles and
+// 21 is 3 x 7.)
+//
+// So the split is the column block that *contains* the first non-Q8 row,
+// 288 here, and the 32 low-rank rows between 288 and inject are staged twice
+// — once in the int8 plane, where they are never read, and once in the tail,
+// where they are. That costs 0.33 MB a mixer against the 3.2 the block saves,
+// and it buys the branch staying per workgroup: a compare inside the k-loop
+// was 1.27x on a matrix with no tail at all (L8a-3).
+//
+// Both kernels derive it, from `pc.lowRank` and their own BN — llm_gemm.comp
+// MODE 0 from the BN it was built with, llm_hc_gemv.comp from DOWN_BN, which
+// build() checks against this one.
+func (g *HCGPU) q8Split() int { return g.cfg.LowRank / downBN * downBN }
+
+// q8TailRows is the rest of the fused N: the block the split leaves over.
+func (g *HCGPU) q8TailRows() int { return g.gemmN() - g.q8Split() }
+
+// HCQ8Split is that split for a caller with no block staged — the benchmark,
+// pricing what the down projection reads off DRAM.
+func HCQ8Split(c HCConfig) int { return (&HCGPU{cfg: c}).q8Split() }
 
 // injStride is the inject tensor's row stride: the down projection's last
 // fragment tile, not hc. The kernel stores a whole 16-wide tile of which the
@@ -331,6 +414,11 @@ type HCOpts struct {
 	// — an unpermuted stage produces a perfectly plausible tensor, so nothing
 	// but a test that demands it disagree can tell the two apart.
 	UnpermutedUp bool
+	// Q8 stages the two projections as L8's int8 bank rather than as halves
+	// (LLM.md L8b). It is an option and not the only way because the fp16
+	// bank is the control the two are compared against, and
+	// `LLM_DENSE_FP16=1` is how a whole graph is put back on it.
+	Q8 bool
 }
 
 // NewHCGPU stages mixers onto the device and builds every pipeline the block
@@ -364,7 +452,7 @@ func NewHCGPU(dev *vk.Device, cfg HCConfig, maxTokens int, mixers []HCWeights, o
 		dev: dev, cfg: cfg,
 		pipes:  make(map[string]*vk.ComputePipeline),
 		tokens: maxTokens, rows: maxTokens,
-		gate: opts.Gate, ctl: opts,
+		gate: opts.Gate, ctl: opts, q8: opts.Q8,
 		autoPlan: true,
 		lda:      cfg.Wide() + gemmPad,
 		ldaLo:    cfg.LowRank + gemmPad,
@@ -374,7 +462,7 @@ func NewHCGPU(dev *vk.Device, cfg HCConfig, maxTokens int, mixers []HCWeights, o
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
-	g.down, g.up = DefaultPlan()
+	g.down, g.up = DefaultPlan(g.q8)
 
 	if err := g.alloc(len(mixers)); err != nil {
 		g.Destroy()
@@ -444,16 +532,36 @@ func (g *HCGPU) alloc(nMixers int) error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	perMixer := g.gemmN()*c.Wide() + c.Wide()*c.LowRank
-	if g.bank, err = g.dev.NewBuffer(nMixers * perMixer * 2); err != nil {
-		return fmt.Errorf("llm: fp16 weight bank (%d MB): %w", (nMixers*perMixer*2)>>20, err)
+	// The two projections, one after the other. In the fp16 bank an offset is
+	// a half and a matrix is n*k of them; in L8's it is a byte, a matrix is
+	// n*k bytes of int8 tiles plus a scale plane, and the fused down
+	// projection carries a fp16 tail between the two (q8Split). Every piece
+	// is aligned so that each base is a whole word for the kernel's `uint`
+	// view and a whole half for the plane's.
+	downBank, upBank, tailBank := g.gemmN()*c.Wide()*2, c.Wide()*c.LowRank*2, 0
+	unit := 2
+	if g.q8 {
+		downBank = q8Align(q8Bytes(g.gemmN(), c.Wide()))
+		upBank = q8Align(q8Bytes(c.Wide(), c.LowRank))
+		tailBank = g.q8TailRows() * c.Wide() * 2
+		unit = 1
+	}
+	perMixer := downBank + tailBank + upBank
+	if g.bank, err = g.dev.NewBuffer(nMixers * perMixer); err != nil {
+		return fmt.Errorf("llm: weight bank (%d MB): %w", (nMixers*perMixer)>>20, err)
 	}
 	g.mixers = make([]hcMixer, nMixers)
 	for i := range g.mixers {
 		g.mixers[i] = hcMixer{
 			gamma: uint32(i * c.Wide()),
-			down:  uint32(i * perMixer),
-			up:    uint32(i*perMixer + g.gemmN()*c.Wide()),
+			down:  uint32(i * perMixer / unit),
+			// The tail is halves wherever it sits, because the build that
+			// reads it is the fp16 one.
+			downTail: uint32((i*perMixer + downBank) / 2),
+			up:       uint32((i*perMixer + downBank + tailBank) / unit),
+		}
+		if !g.q8 {
+			g.mixers[i].downTail = noW
 		}
 	}
 	return nil
@@ -462,8 +570,17 @@ func (g *HCGPU) alloc(nMixers int) error {
 // build compiles every pipeline over all four arenas, bound whether the
 // shader declares them or not, so one descriptor layout and one push-constant
 // size serve the whole sequence.
+// gemvDownBN is the column block llm_hc_gemv.comp's Q8 arm compiles in as
+// DOWN_BN. The two kernels read one staged bank and have to round `lowRank`
+// down to the same boundary, and a mismatch would read the wrong plane rather
+// than run slowly, so it is checked rather than trusted.
+const gemvDownBN = 48
+
 func (g *HCGPU) build() error {
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	// The Q8 builds name a sixth buffer: the bank again, as raw words, for
+	// the tiles the scale plane at binding 3 belongs to (llm_common.glsl).
+	q8bufs := append(append([]*vk.Buffer{}, bufs...), g.bank)
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"norm":    shaders.LLMHCNorm,
@@ -482,6 +599,14 @@ func (g *HCGPU) build() error {
 	}
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
 		return fmt.Errorf("llm: the GEMM rungs need a pinned 64-wide subgroup")
+	}
+	if downBN != gemvDownBN {
+		return fmt.Errorf("llm: the down ladder blocks %d columns and the GEMV's Q8 arm was built for %d",
+			downBN, gemvDownBN)
+	}
+	if g.q8 && g.q8Split()%downBN != 0 {
+		return fmt.Errorf("llm: the Q8 split is column %d, not a whole %d-column block",
+			g.q8Split(), downBN)
 	}
 	for _, v := range hcVariants {
 		if v.mode == 0 && v.bn != downBN {
@@ -509,8 +634,14 @@ func (g *HCGPU) build() error {
 				return err
 			}
 		}
-		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
-			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		spirv, pipeBufs := v.spirv, bufs
+		if g.q8 {
+			// The reduction of a GEMV pair stays on the fp16 build above: it
+			// reads partial sums out of the arena and no weight at all.
+			spirv, pipeBufs = v.q8, q8bufs
+		}
+		if err := g.pipeline(string(v.name), spirv, vk.PipelineSpec{
+			Buffers: pipeBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
 			return err
 		}
@@ -551,6 +682,13 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		}
 		g.wbuf.WriteFloat32At(int(g.mixers[i].gamma), w.Norm)
 
+		if g.q8 {
+			if err := g.stageQ8(i, w); err != nil {
+				return err
+			}
+			continue
+		}
+
 		down := make([]uint16, n*wide)
 		packDownB(down, w.Down, w.Inject, lr, c.HC, wide)
 		g.bank.WriteUint16At(int(g.mixers[i].down), down)
@@ -563,6 +701,52 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		}
 		g.bank.WriteUint16At(int(g.mixers[i].up), up)
 	}
+	return nil
+}
+
+// stageQ8 writes one mixer onto L8's bank: the two projections as the int8
+// the checkpoint already ships them as, and the down projection's last column
+// block as halves behind it.
+//
+// Both matrices are Q8_0 in the checkpoint, so every value here is the one
+// the fp16 bank holds — `float(q) * float(d)` is exact and rounding it to
+// fp16 is what tileB wrote (L8a-1). The tail is not a re-quantisation either:
+// its 32 low-rank rows are the same halves in both banks and `inject` is F32
+// in the checkpoint and fp16 in both.
+func (g *HCGPU) stageQ8(i int, w HCWeights) error {
+	c := g.cfg
+	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
+	split, tailRows := g.q8Split(), g.q8TailRows()
+
+	// The int8 plane is the full fused N rather than the split, because the
+	// kernel derives the scale plane's offset from gemmN * gemmK and gemmN is
+	// the stride of the output it writes. The columns past the split are
+	// staged and never read: 0.16 MB a mixer for an arithmetic the push block
+	// has no room to state.
+	qs := make([]byte, n*wide)
+	sc := make([]uint16, n*wide/q8Group)
+	tileBQ8(qs, sc, w.Down, lr, wide, func(r int) int { return r })
+	g.bank.WriteBytesAt(int(g.mixers[i].down), qs)
+	g.bank.WriteUint16At((int(g.mixers[i].down)+len(qs))/2, sc)
+
+	// The tail: the low-rank rows the split left over, then inject, in a
+	// fragment tiling of its own numbered from the split.
+	tail := make([]uint16, tailRows*wide)
+	tileB(tail, w.Down[split*wide:lr*wide], lr-split, wide, func(r int) int { return r })
+	if w.Inject != nil {
+		tileB(tail, w.Inject, c.HC, wide, func(r int) int { return lr - split + r })
+	}
+	g.bank.WriteUint16At(int(g.mixers[i].downTail), tail)
+
+	uq := make([]byte, wide*lr)
+	us := make([]uint16, wide*lr/q8Group)
+	row := upRow(wide, c.NEmbd)
+	if g.ctl.UnpermutedUp {
+		row = func(o int) int { return o }
+	}
+	tileBQ8(uq, us, w.Up, wide, lr, row)
+	g.bank.WriteBytesAt(int(g.mixers[i].up), uq)
+	g.bank.WriteUint16At((int(g.mixers[i].up)+len(uq))/2, us)
 	return nil
 }
 
@@ -614,12 +798,19 @@ func packDownB(dst []uint16, down, inject []float32, lowRank, hc, wide int) {
 // features x 4 streams and the kernel's epilogue reads column c*16 + r of the
 // block for stream c of feature (block*16 + r).
 func packUpB(dst []uint16, up []float32, wide, lowRank, nEmbd int) {
+	tileB(dst, up, wide, lowRank, upRow(wide, nEmbd))
+}
+
+// upRow is that permutation on its own, because L8's bank applies it to the
+// same rows through a different tiler (stageQ8) and a second copy of it would
+// be a layout stated twice.
+func upRow(wide, nEmbd int) func(int) int {
 	const tile = coopMatTile
 	hc := wide / nEmbd
-	tileB(dst, up, wide, lowRank, func(o int) int {
+	return func(o int) int {
 		c, i := o/nEmbd, o%nEmbd
 		return (i/tile)*(tile*hc) + c*tile + i%tile
-	})
+	}
 }
 
 // SetPlan chooses which rung each projection runs on. Every rung is built and
@@ -645,7 +836,7 @@ func (g *HCGPU) SetPlan(down, up HCKernel) error {
 // AutoPlan puts the block back on the measured schedule, undoing a SetPlan.
 func (g *HCGPU) AutoPlan() {
 	g.autoPlan = true
-	g.down, g.up = PlanFor(g.rows)
+	g.down, g.up = PlanFor(g.rows, g.q8)
 }
 
 // Plan reports the rungs in use.
@@ -675,7 +866,7 @@ func (g *HCGPU) Upload(res []float32, nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
-		g.down, g.up = PlanFor(nTok)
+		g.down, g.up = PlanFor(nTok, g.q8)
 	}
 	g.abuf.WriteFloat32At(int(g.aRes), res)
 	return nil
@@ -751,6 +942,12 @@ func (g *HCGPU) graph(mixer int, combine bool) ([]vk.MultiDispatch, []string, er
 	down := base
 	down.BOff = m.down
 	down.GemmN, down.GemmK = uint32(g.gemmN()), uint32(c.Wide())
+	// The split, in the one field the down projection does not otherwise use:
+	// `gateOff` is where the fp16 tail is, or NO_W on the bank that has none.
+	// Where it *begins* is not pushed — both kernels round `lowRank` down to
+	// the ladder's BN (q8Split) — because 64 uints is this device's whole
+	// push range and the block has been full since L5b.
+	down.GateOff = m.downTail
 	if dv.mode == 2 {
 		if g.rows != 1 {
 			return nil, nil, fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", g.down, g.rows)
@@ -1096,7 +1293,7 @@ func (g *HCGPU) Resize(nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
-		g.down, g.up = PlanFor(nTok)
+		g.down, g.up = PlanFor(nTok, g.q8)
 	}
 	return nil
 }

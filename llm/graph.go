@@ -362,7 +362,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		return fmt.Errorf("llm: hc head mixer: %w", err2)
 	}
 	mixers = append(mixers, head)
-	if g.hc, err = NewHCGPU(dev, c.HCConfig(), g.maxTok, mixers, HCOpts{}); err != nil {
+	if g.hc, err = NewHCGPU(dev, c.HCConfig(), g.maxTok, mixers, HCOpts{Q8: opts.denseQ8()}); err != nil {
 		return fmt.Errorf("llm: hc: %w", err)
 	}
 	mark("hyper-conn", len(mixers), g.hc.Buffers(), g.hc.WeightBytes(), g.hc.ActivationBytes(), start)
