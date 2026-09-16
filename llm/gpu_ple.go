@@ -29,7 +29,6 @@ import (
 	"time"
 	"unsafe"
 
-	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
 )
@@ -206,18 +205,18 @@ func (g *PLEGPU) alloc() error {
 	if g.convOut {
 		g.aConvOut = alloc(rows * wide)
 	}
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: PLE fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
 
 	g.hEmb = 0
 	g.hElems = rows * g.lda
-	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: PLE fp16 activation arena: %w", err)
 	}
 	// Zeroed once: the A operand's pad columns and a short run's pad rows.
-	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
-	g.abuf.WriteFloat32(make([]float32, g.actElems))
+	g.hbuf.Zero()
+	g.abuf.Zero()
 
 	if g.bank, err = g.dev.NewBuffer(g.kvN() * c.NEmbd * 2); err != nil {
 		return fmt.Errorf("llm: PLE fp16 weight bank (%d MB): %w", (g.kvN()*c.NEmbd*2)>>20, err)
@@ -337,13 +336,9 @@ func (g *PLEGPU) Upload(res, embd []float32, nTok int) error {
 		g.kv = PLEKernelFor(nTok)
 	}
 	g.abuf.WriteFloat32At(int(g.aRes), res)
-	row := make([]uint16, c.EmbdWidth())
-	for t := 0; t < nTok; t++ {
-		for i, v := range embd[t*c.EmbdWidth() : (t+1)*c.EmbdWidth()] {
-			row[i] = safetensors.F32ToF16(v)
-		}
-		g.hbuf.WriteUint16At(int(g.hEmb)+t*g.lda, row)
-	}
+	slab := make([]uint16, nTok*g.lda)
+	narrowRows(slab, embd, nTok, c.EmbdWidth(), g.lda)
+	g.hbuf.WriteUint16At(int(g.hEmb), slab)
 	return nil
 }
 
@@ -467,4 +462,32 @@ func (g *PLEGPU) Destroy() {
 			b.Destroy()
 		}
 	}
+}
+
+// ResPort is the wide residual this block adds into: fp32 [T][hc*nEmbd], read
+// and written in place. It is the only tensor of the PLE block that crosses a
+// boundary — the gathered n-gram embedding comes from the host, because the
+// 28.80 GB table it is gathered from never reaches the device (D2).
+func (g *PLEGPU) ResPort() Port {
+	return Port{Buf: g.abuf, Off: g.aRes, Stride: g.cfg.Wide(), Width: g.cfg.Wide(), Rows: g.rows}
+}
+
+// UploadEmbd writes the gathered n-gram embedding alone, for a caller that is
+// filling the residual with a Move rather than an Upload.
+func (g *PLEGPU) UploadEmbd(embd []float32, nTok int) error {
+	c := g.cfg
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	if len(embd) != nTok*c.EmbdWidth() {
+		return fmt.Errorf("llm: embedding is %d values, want %d", len(embd), nTok*c.EmbdWidth())
+	}
+	g.rows = nTok
+	if g.autoKernel {
+		g.kv = PLEKernelFor(nTok)
+	}
+	slab := make([]uint16, nTok*g.lda)
+	narrowRows(slab, embd, nTok, c.EmbdWidth(), g.lda)
+	g.hbuf.WriteUint16At(int(g.hEmb), slab)
+	return nil
 }

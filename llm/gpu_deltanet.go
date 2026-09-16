@@ -344,7 +344,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	g.aBeta = alloc(rows * c.NHeadV)
 	g.aState = alloc(nLayers * c.StateSize())
 	g.aResult = alloc(rows * c.NEmbd)
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: deltanet fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
 
@@ -355,14 +355,14 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	}
 	g.hXn = halloc(rows * g.lda)
 	g.hCtx = halloc(rows * g.ldCtx)
-	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: deltanet fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
 	// Zeroed once: the A operands' pad columns, every short run's pad rows,
 	// the convolution's history and every layer's recurrent state all start
 	// here, and none of these kernels bounds-check.
-	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
-	g.abuf.WriteFloat32(make([]float32, g.actElems))
+	g.hbuf.Zero()
+	g.abuf.Zero()
 
 	perBank := g.qkvN()*c.NEmbd + c.NEmbd*c.Inner
 	if g.bank, err = g.dev.NewBuffer(nLayers * perBank * 2); err != nil {
@@ -559,16 +559,12 @@ func (g *DeltaNetGPU) Upload(xn []float32, nTok int) error {
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
 	}
-	row := make([]uint16, c.NEmbd)
-	for t := 0; t < nTok; t++ {
-		for i, v := range xn[t*c.NEmbd : (t+1)*c.NEmbd] {
-			row[i] = safetensors.F32ToF16(v)
-		}
-		g.hbuf.WriteUint16At(int(g.hXn)+t*g.lda, row)
-	}
+	slab := make([]uint16, nTok*g.lda)
+	narrowRows(slab, xn, nTok, c.NEmbd, g.lda)
+	g.hbuf.WriteUint16At(int(g.hXn), slab)
 	if pad := g.arenaRows - nTok; pad > 0 {
-		g.hbuf.WriteUint16At(int(g.hXn)+nTok*g.lda, make([]uint16, pad*g.lda))
-		g.hbuf.WriteUint16At(int(g.hCtx)+nTok*g.ldCtx, make([]uint16, pad*g.ldCtx))
+		g.hbuf.ZeroUint16At(int(g.hXn)+nTok*g.lda, pad*g.lda)
+		g.hbuf.ZeroUint16At(int(g.hCtx)+nTok*g.ldCtx, pad*g.ldCtx)
 	}
 	return nil
 }
@@ -581,8 +577,8 @@ func (g *DeltaNetGPU) Reset(layer int) error {
 		return fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
 	c := g.cfg
-	g.abuf.WriteFloat32At(int(g.layers[layer].state), make([]float32, c.StateSize()))
-	g.abuf.WriteFloat32At(int(g.aQKVBase), make([]float32, (c.Conv-1)*g.qkvN()))
+	g.abuf.ZeroFloat32At(int(g.layers[layer].state), c.StateSize())
+	g.abuf.ZeroFloat32At(int(g.aQKVBase), (c.Conv-1)*g.qkvN())
 	return nil
 }
 
@@ -918,4 +914,37 @@ func DNOperandsInRegisters(k DNKernel) bool {
 func DNPrefetches(k DNKernel) bool {
 	v, _ := dnVariantFor(k)
 	return v.prefetch
+}
+
+// InPort is the layer's input as the fused projection's A operand wants it:
+// fp16 [T][lda], `hc_mixed` narrowed. The row count is the arena's, not the
+// run's, because the GEMM rungs have no bounds check and the rows between the
+// prompt and the row block have to carry the products of zeros.
+func (g *DeltaNetGPU) InPort() Port {
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
+		Rows: g.arenaRows, Half: true}
+}
+
+// OutPort is the layer's output, `linear_attn_out`: fp32 [T][nEmbd].
+func (g *DeltaNetGPU) OutPort() Port {
+	return Port{Buf: g.abuf, Off: g.aResult, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd}
+}
+
+// Resize sets the length of the run and clears what a Move will not reach.
+//
+// The context operand's pad rows are the part that matters: `llm_dn_norm`
+// writes only the run's tokens into `hCtx`, so a shorter run after a longer
+// one would leave the output projection reading the longer one's tail.
+func (g *DeltaNetGPU) Resize(nTok int) error {
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	g.rows = nTok
+	if g.autoPlan {
+		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+	}
+	if pad := g.arenaRows - nTok; pad > 0 {
+		g.hbuf.ZeroUint16At(int(g.hCtx)+nTok*g.ldCtx, pad*g.ldCtx)
+	}
+	return nil
 }

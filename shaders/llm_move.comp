@@ -1,0 +1,70 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The move between two blocks' arenas (LLM.md L6c).
+//
+// Every block in this vertical owns its own activation arenas, so an
+// activation that leaves one block and enters the next has to cross a buffer
+// boundary. Until L6c it crossed it through the *host*: read out of one
+// mapped arena, narrowed to halves on sixteen cores, written into the other.
+// That was 22.7% of the graph — not because it is much data (2560 floats a
+// token) but because it is 96 round trips a pass through a bus the GPU
+// otherwise owns.
+//
+// This is the same move as one dispatch. It is not part of llm_common.glsl's
+// contract and cannot be: the whole point is that its two buffers belong to
+// *different* blocks, where every other kernel here is built over one block's
+// five. So it declares three bindings of its own and a push block of its own,
+// and the host creates one pipeline per (source, destination) pair — nine of
+// them for the five blocks and the head.
+//
+// Bindings 1 and 2 are the *same* VkBuffer, bound twice: a destination is
+// either an fp32 arena or an fp16 one, and which it is decides which
+// declaration the kernel writes through. Binding a buffer at two descriptors
+// costs nothing and means the two cases are one pipeline shape rather than
+// two shaders — the same argument llm_common.glsl makes for its `actu`.
+//
+// Rows past `rows` are written as zeros up to `padRows`. That is not tidiness:
+// the MoE block's A operand is read by a GEMM whose row block is 64 and whose
+// kernels have no bounds check, so the rows between the prompt and the tile
+// have to carry the products of zeros — and a shorter run must not read what
+// a longer one left behind.
+
+layout(binding = 0) readonly buffer Src { float src[]; };
+layout(binding = 1) buffer Dst32 { float dst32[]; };
+layout(binding = 2) buffer Dst16 { float16_t dst16[]; };
+
+layout(push_constant) uniform PC {
+    uint srcOff;    // float offset of source row 0
+    uint dstOff;    // float or half offset of destination row 0
+    uint rows;      // rows that carry values
+    uint padRows;   // rows to write; [rows, padRows) get zeros
+    uint width;     // values in a row
+    uint srcStride; // floats between source rows
+    uint dstStride; // elements between destination rows
+    uint narrow;    // 1 = write halves through dst16, 0 = floats through dst32
+} pc;
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.padRows) {
+        return;
+    }
+    // Uniform across the workgroup, so the branch below is a branch per
+    // dispatch and not per element.
+    bool live = t < pc.rows;
+    uint s = pc.srcOff + t * pc.srcStride;
+    uint d = pc.dstOff + t * pc.dstStride;
+    for (uint i = gl_LocalInvocationID.x; i < pc.width; i += gl_WorkGroupSize.x) {
+        float v = live ? src[s + i] : 0.0;
+        if (pc.narrow != 0u) {
+            dst16[d + i] = float16_t(v);
+        } else {
+            dst32[d + i] = v;
+        }
+    }
+}

@@ -380,9 +380,12 @@ func reportResidency(plan []residentBlock, before, after int64, denseOnly bool) 
 		float64(w)/1e9, float64(a)/1e9, bufs)
 	if !denseOnly {
 		// The inventory's figure for everything but the n-gram table, which
-		// stays mmap'd (D2), less the two tensors nothing stages yet: the
-		// embedding is a host-side gather and the lm head has no block until
-		// L6b. What is left of the gap is the dense half becoming halves.
+		// stays mmap'd (D2), less the two tensors *this tool* does not stage:
+		// the embedding is a host-side gather, and the lm head belongs to the
+		// graph (llm/gpu_head.go, L6b) rather than to any block, so residency
+		// as measured here is the five blocks and not the whole 85.47 GB the
+		// graph puts on the device. What is left of the gap is the dense half
+		// becoming halves.
 		const core, unstaged = 82.52, 0.68 + 0.68
 		fmt.Printf("  against the checkpoint's %.2f GB resident core, less the %.2f GB of embedding\n",
 			core, unstaged)

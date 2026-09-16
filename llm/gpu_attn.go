@@ -397,7 +397,7 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// rather than branching, and an unallocated row would be a read past the
 	// buffer.
 	g.aSel = alloc(rows * g.selWords())
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
 
@@ -414,13 +414,13 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.hCtx = halloc(rows * g.ldCtx)
 	g.hIdxK = halloc(g.NBlocks() * c.IdxDim)
 	g.hIdxQ = halloc(rows * c.IdxHeads * c.IdxDim)
-	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
 	// Zeroed once: every A operand's pad columns and every short run's pad
 	// rows come from here, and none of these kernels bounds-check.
-	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
-	g.abuf.WriteFloat32(make([]float32, g.actElems))
+	g.hbuf.Zero()
+	g.abuf.Zero()
 
 	perBank := g.qkvN()*c.NEmbd + c.NEmbd*c.GateWidth()
 	if g.bank, err = g.dev.NewBuffer(nLayers * perBank * 2); err != nil {
@@ -654,13 +654,9 @@ func (g *AttnGPU) Upload(xn []float32, nTok int) error {
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
 	}
-	row := make([]uint16, c.NEmbd)
-	for t := 0; t < nTok; t++ {
-		for i, v := range xn[t*c.NEmbd : (t+1)*c.NEmbd] {
-			row[i] = safetensors.F32ToF16(v)
-		}
-		g.hbuf.WriteUint16At(int(g.hXn)+t*g.lda, row)
-	}
+	slab := make([]uint16, nTok*g.lda)
+	narrowRows(slab, xn, nTok, c.NEmbd, g.lda)
+	g.hbuf.WriteUint16At(int(g.hXn), slab)
 	return nil
 }
 
@@ -965,4 +961,28 @@ func (g *AttnGPU) Destroy() {
 			b.Destroy()
 		}
 	}
+}
+
+// InPort is the layer's input as the fused projection's A operand wants it:
+// fp16 [T][lda], `hc_mixed` narrowed.
+func (g *AttnGPU) InPort() Port {
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
+		Rows: g.arenaRows, Half: true}
+}
+
+// OutPort is the layer's output, `attn_output`: fp32 [T][nEmbd].
+func (g *AttnGPU) OutPort() Port {
+	return Port{Buf: g.abuf, Off: g.aOut, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd}
+}
+
+// Resize sets the length of the run without writing the input.
+func (g *AttnGPU) Resize(nTok int) error {
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	g.rows = nTok
+	if g.autoPlan {
+		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+	}
+	return nil
 }

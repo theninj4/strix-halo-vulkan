@@ -391,6 +391,34 @@ func (d *Device) MemoryTypes() ([]MemoryType, error) {
 	return out, nil
 }
 
+// NewHostCachedBuffer allocates a storage buffer from a HOST_CACHED memory
+// type when the device has one, and falls back to NewBuffer when it does not.
+//
+// It exists for **activation arenas the host reads back**, and the difference
+// is not marginal. On this device the type NewBuffer prefers —
+// DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT, write-combined — is written at
+// 50 GB/s and read at **0.18**, because an uncached mapping turns a read into
+// one uncached load per cache line. A HOST_CACHED type reads the same buffer
+// at **24.8 GB/s**, 138x, and writes it at 70. See LLM.md L6b.
+//
+// It is not the right choice for a weight bank: those are written once and
+// never read, so the cached type buys only its faster write, and the GPU-side
+// rate is what a bank is about (L0b: every type reads at 236-237 GB/s from
+// the device, so the choice is free there and it is not free here).
+func (d *Device) NewHostCachedBuffer(size int) (*Buffer, error) {
+	types, err := d.MemoryTypes()
+	if err != nil {
+		return nil, err
+	}
+	const want = MemoryHostVisible | MemoryHostCoherent | MemoryHostCached
+	for _, mt := range types {
+		if mt.BufferCompatible && mt.Has(want) {
+			return d.NewBufferOfType(size, mt.Index)
+		}
+	}
+	return d.NewBuffer(size)
+}
+
 // NewBufferOfType allocates a storage buffer from a named memory type rather
 // than from the one NewBuffer prefers. A type without HOST_VISIBLE cannot be
 // mapped, so MappedPointer and every Write/Read method on the result are
@@ -464,6 +492,31 @@ func (b *Buffer) ReadFloat32At(off, n int) []float32 {
 	out := make([]float32, n)
 	copy(out, src[off:])
 	return out
+}
+
+// ZeroFloat32At clears n float32s at an element offset, in place in the
+// mapped memory.
+//
+// It exists because `WriteFloat32At(off, make([]float32, n))` is two costs,
+// and on a hot path the allocation is the larger one: the gated DeltaNet's
+// recurrent state is 3.1 MB a layer and 36 layers of it are reset at the
+// start of every prefill, so the obvious spelling was **113 MB of Go
+// allocation a graph** — a fixed ~55 ms whatever the prompt length, which is
+// 12% of a 128-token pass and invisible at 2048 (LLM.md L6c-3).
+func (b *Buffer) ZeroFloat32At(off, n int) {
+	clear(unsafe.Slice((*float32)(b.mapped), off+n)[off:])
+}
+
+// ZeroUint16At clears n uint16s at an element offset, for the fp16 arenas.
+func (b *Buffer) ZeroUint16At(off, n int) {
+	clear(unsafe.Slice((*uint16)(b.mapped), off+n)[off:])
+}
+
+// Zero clears the whole buffer, which is what an arena wants once at
+// allocation: the pad columns of every A operand and the pad rows of a short
+// run come from here, and the kernels have no bounds checks.
+func (b *Buffer) Zero() {
+	clear(unsafe.Slice((*byte)(b.mapped), b.size))
 }
 
 // WriteUint16At copies src into the buffer's mapped memory at a uint16

@@ -2301,3 +2301,13 @@ var LLMMoEPerm []byte
 
 //go:embed llm_moe_combine.spv
 var LLMMoECombine []byte
+
+// The move between two blocks' activation arenas (LLM.md L6c). Three
+// bindings of its own rather than llm_common.glsl's five, because its two
+// buffers belong to *different* blocks; the host builds one pipeline per
+// (source, destination) pair.
+
+//go:generate glslc --target-env=vulkan1.2 -O -o llm_move.spv llm_move.comp
+
+//go:embed llm_move.spv
+var LLMMove []byte

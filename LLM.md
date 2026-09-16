@@ -10,19 +10,20 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1, the whole of L2, L3, L4 and L5, and now L6a — every block of
-this model runs on the GPU, and all 48 layers of all of them are resident at
-once.** The checkpoint is downloaded, llama.cpp runs
-it, the Go side reads it, the prefill mystery is solved, and there is a kernel
-for every layer and every sub-layer: the hyper-connection block in four
-dispatches where the reference has sixteen (4.24x, 14.9% of llama.cpp's whole
-prefill graph), the PLE n-gram block beside it with its trigram hash
-bit-exact, the full-attention layer with its QSA indexer **and** its selection
-in seven dispatches where the reference has twenty-eight (L2f and L4b, 2.32x),
-the gated DeltaNet — three quarters of the layers — in five where the
-reference has eleven (L3b, 1.37x, the recurrence itself at 1.06x), and now
-**L5b: the MoE block, 35.7% of the graph and 97% of the parameters, in nine
-dispatches against about 845**.
+**Status: the model runs, and prefill is 2.40x the reference.** L0, L1, the
+whole of L2, L3, L4, L5, L6a, L6b and now **L6c — tokens in, llama.cpp's own
+logits out, with nothing crossing a block boundary through the host.** The checkpoint is downloaded,
+llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
+there is a kernel for every layer and every sub-layer: the hyper-connection
+block in four dispatches where the reference has sixteen (4.24x, 14.9% of
+llama.cpp's whole prefill graph), the PLE n-gram block beside it with its
+trigram hash bit-exact, the full-attention layer with its QSA indexer **and**
+its selection in seven dispatches where the reference has twenty-eight (L2f
+and L4b, 2.32x), the gated DeltaNet — three quarters of the layers — in five
+where the reference has eleven (L3b, 1.37x, the recurrence itself at 1.06x),
+the MoE block, 35.7% of the graph and 97% of the parameters, in nine
+dispatches against about 845 (L5b), and now the order that makes them one
+forward pass.
 
 **Between them the five blocks have taken 1015.5 ms of llama.cpp's 1164.7 ms
 prefill graph down to 714.8** — 87.2% of it replaced by 61.4%, a 25.8% saving
@@ -34,31 +35,39 @@ on the whole graph. 114 GB in 18 minutes;
 layer's three expert banks are 2.52 billion weights — 5.03 GB as halves and
 241 GB across the model, against 1.57 GB and 75 GB as they ship — so the bank
 is staged byte for byte out of the mmap'd checkpoint and each workgroup
-unpacks its own Q4_K/Q5_K/Q5_1/Q8_0 slab into LDS per K-step. The schedule is
-L5a-4's routing made concrete: a device-built *list* of (expert, row block)
-records over a static bound, with every expert's rows padded up to the block
-so a cooperative-matrix store can go straight to global. **567.4 ms of
+unpacks its own Q4_K/Q5_K/Q5_1/Q8_0 slab into LDS per K-step. **567.4 ms of
 llama.cpp's graph becomes 522.3 — 1.09x at its own best ubatch — and 1758.4
 becomes 1131.6 at ubatch 2048, 1.55x**, with `ffn_out` at 8.132e-05 rms over
 all 4096 tokens and the top-10-of-512 selection the reference's set for set
-*and order for order*. Along the way the router turned out to be **bit-exact**
-against llama.cpp on all 2 097 152 logits, and so did `shared_expert_gate` —
-which corrects L5a-1: fusing that gate onto the router's matrix is not a
-deviation but a reproduction.
+*and order for order*.
 
-**L6a has since put the whole model on the device: 84.20 GB of weights and
-0.87 GB of arenas in 68 buffers, staged in 33 seconds, with 41 GB of this
-machine left over.** That needed one structural change and it was not in a
-kernel. Every block here lays its weights out as one arena with a per-layer
-offset, `maxStorageBufferRange` on this device is **4 GiB - 4**, and a
-layer's expert bank is 1.61 GB — so binding 5 became an **array of buffers,
-one a layer**, indexed by a push constant that had to ride in the top sixteen
-bits of an existing field because the block was already 64 uints against a
-256-byte limit. **Residency turns out to be free in the bank's size**: 2, 4,
-12, 24 and 48 banks span 10.4 to 84.2 GB resident and 11062-11242 us for the
-same block, a 1.6% spread with no trend, which is L0a holding at the size the
-model actually is. **Next: L6b, the graph that runs the five blocks in order,
-and logits against llama.cpp.**
+**L6a put the whole model on the device: 84.20 GB of weights and 0.87 GB of
+arenas in 68 buffers, staged in 33 seconds, with 41 GB of this machine left
+over.** That needed one structural change and it was not in a kernel: a
+layer's expert bank is 1.61 GB against a `maxStorageBufferRange` of 4 GiB - 4,
+so binding 5 became an **array of buffers, one a layer**. **Residency turns
+out to be free in the bank's size** — 2 to 48 banks span 10.4 to 84.2 GB
+resident and 11062-11242 us for the same block, a 1.6% spread with no trend.
+
+**L6b is the order, and it clears the gate.** On a seven-token prompt the last
+token's argmax is llama.cpp's (**561**), out of a top ten that is llama.cpp's
+ten tokens; the drift is a clean geometric **x1.085 a layer** with no step at
+any block, priced against a second oracle pass at six depths. Nothing in a
+shader changed to get there. **What did was a memory type**: the activation
+arenas were on a write-combined type the host reads at **0.18 GB/s** where a
+HOST_CACHED one reads them at **25.06**, and moving them was **5.0x on the
+whole graph** for 0.14% on the kernels.
+
+**L6c took the glue off the host, and not one number moved.** Every block owns
+its own arenas, so an activation crossing a block boundary was read out of one
+mapped arena, narrowed to halves and written into the other, 96 times a pass —
+22.7% of the graph. `shaders/llm_move.comp` is that move as one dispatch, and
+it is **bit-exact**: `l_last` at all six depths and both of the head's tensors
+came back identical to the last place. **Prefill is 941.3 tok/s at ubatch 2048
+against llama.cpp's best-of-any-ubatch 391.42 — 2.40x — and 572.9 at 512
+against its 313.62 for the same prompt, 1.83x.** The moves themselves are 2.0%
+of the pass, so the shared arena L6c was scoped as would buy that and nothing
+else. **96.6% of the graph is now the five blocks. Next: L7, decode.**
 
 ## The number to beat
 
@@ -931,6 +940,142 @@ dispatches, the plain GEMM arm once and four kernels of this block's own.
 > the 77 GB goes last — the peak is the resident model rather than the
 > resident model plus a dequantisation.
 
+## What L6b established — the model runs, and a memory type was worth 5x
+
+`llm/graph.go`, `llm/gpu_head.go`, `llm/arena.go`, `vk/engine.go`,
+`cmd/llm/bench_graph.go`: the five blocks in llama.cpp's own order, plus the
+embedding gather and the head. [Write-up](research/l6b-graph.md) ·
+`results/l6b_graph.csv` · `results/l6b_arena.csv`
+
+> **L6b-1: it picks llama.cpp's token.** On the seven-token prompt the last
+> token's argmax is **561** on both sides, and our top ten is llama.cpp's ten
+> tokens — three adjacent pairs inverted, which is reported rather than
+> demanded, because an inversion between logits a thousandth apart is a
+> different fact from a wrong token. `result_norm` is **0.519% of scale** and
+> `result_output` **1.983%**. **Nothing in a shader changed**: L6b is the
+> order, the two tensors no block owned, and the plumbing.
+>
+> **L6b-2: three structural facts, all of them the reference's.** There is
+> **no output norm** — `output_norm.weight` is absent and the final
+> hyper-connection mixer is it, which makes `llm/gpu_head.go` the only bare
+> matmul in the vertical. The **final mixer and the head run on one row**,
+> because `inp_out_ids` drops every other token before them and the trace
+> agrees: `result_output` is one row of 248320 floats for a seven-token
+> prompt. And **the wide residual never leaves the mixer's arena** —
+> `llm_hc_combine.comp` updates it in place — so what crosses a block
+> boundary is the 2560-wide `hc_mixed` out and the 2560-wide block output
+> back, not the 10240-wide stream.
+>
+> **L6b-3: the drift is a curve, and that is what makes 0.881% a number
+> rather than a worry.** A second oracle pass filtered to `l_last` every
+> eight layers, and the graph stopped at each depth off one staged model:
+> **0.034 / 0.055 / 0.103 / 0.154 / 0.330 / 0.881% of scale at 8 / 16 / 24 /
+> 32 / 40 / 48 layers** — a clean geometric **x1.085 a layer**, no step
+> anywhere. That is what fp16 operands against the reference's int8 dot
+> products (L2b-2) and its fp16 accumulators (L4a-5) compound to over 48
+> residual additions. The four-layer prefix test prints the same column at
+> depths 1-4 in 7 GB and three seconds.
+>
+> **L6b-4: the activation arenas were on the wrong memory type, and it was
+> worth 5.0x.** The first working graph did **280.3 tok/s, 0.72x llama.cpp**,
+> with 45.5% of its wall clock in plumbing that moves 5.24 MB a hop. The rate
+> was the reason: the type `NewBuffer` prefers here is write-combined, and
+> **the host reads it at 0.18 GB/s** where a HOST_CACHED type reads the same
+> buffer at **25.06** and writes it 1.4x faster as well — **139x**, and
+> DEVICE_LOCAL is one of the slow ones. **This is the other half of L0b**,
+> which measured the same table from the *device* at 236.0-237.4 GB/s across
+> all of it: free on the GPU, decisive on the host. The control says so
+> directly — the MoE block, 97% of the parameters, runs its layer in
+> **10834.5 us on cached arenas against 10850.2 on write-combined ones,
+> 0.14%** — and is kept as `LLM_ARENA_UNCACHED=1` rather than as a note.
+> Weight banks stay where they were: written once, never read.
+>
+> **L6b-5: the other half of the plumbing was the narrowing.** With cached
+> arenas the glue is `Upload`'s f32→fp16 conversion — 1.31 M values a
+> sublayer, 96 sublayers, **126 million a graph** — which was running on one
+> core. The rows of a prefill are independent, so parallelising it changes
+> the wall clock and not one value: **832 ms to 264** at ubatch 512.
+>
+> **L6b-6: the ladder inverts against the reference's.** 128 / 512 / 1024 /
+> 2048 give **177.3 / 403.7 / 553.9 / 713.9 tok/s** where llama.cpp's own are
+> 347.71 / 391.42 / 380.91 / 336.72: it peaks at 512 and **loses 14% by
+> 2048**, because its 10240-wide F32 residual is 20.97 MB at 512 — just
+> inside the 32 MiB MALL — and 83.9 MB at 2048 (L2a-4). Ours has no such
+> cliff, because the residual is never a graph tensor and the elementwise
+> glue that read it was fused away at L2c. So **1.82x** against the
+> reference's best ubatch and **2.12x** against it at 2048, where a long
+> prompt actually is. Staged for 512 alone — a quarter of the arenas — ubatch
+> 512 does **430.4, 1.10x**.
+>
+> **L6b-7: and what is left is the glue, at 22.7%.** Every block owns its own
+> arenas, so `hc_mixed` is read out of one and narrowed into another. The
+> blocks alone already do **931.6 tok/s at ubatch 2048**; deleting the moves
+> is one shared activation buffer across the five blocks, the sublayer's
+> input offset pointed at the mixer's output, the combine's output pointed at
+> the sublayer's, and one small narrowing kernel. L2a-3's projection for this
+> graph with its glue fused was ~1150.
+
+## What L6c established — the glue on the device, and a fixed cost that was hiding
+
+`shaders/llm_move.comp`, `llm/move.go`, `llm/graph.go`, `vk/engine.go`: the
+activation that crosses a block boundary, as one dispatch.
+[Write-up](research/l6c-moves.md) · `results/l6c_graph.csv`
+
+> **L6c-1: one dispatch, nine pipelines, and a `Port` a block.** The move
+> declares three bindings of its own rather than llm_common.glsl's five,
+> because its two buffers belong to *different* blocks — and bindings 1 and 2
+> are **the same VkBuffer bound twice**, so an fp32 destination and an fp16
+> one are one pipeline shape and a `narrow` push constant rather than two
+> shaders. A pipeline owns its descriptor set here, so there is one per
+> (source, destination) pair: nine for the five blocks and the head. Each
+> block exposes a `Port` for the two or three tensors that cross its boundary
+> and for nothing else, so what the graph may reach into is a list in the
+> block's own file and not an exported arena.
+>
+> **L6c-2: it is bit-exact.** `l_last` at all six depths, `result_norm` and
+> `result_output` came back **identical to the last place** — because
+> `float16_t(v)` in SPIR-V and `safetensors.F32ToF16(v)` in Go are the same
+> round-to-nearest-even. `TestMoveNarrow` makes that a claim rather than an
+> observation: 37 rows of 2560 against the host narrowing value for value,
+> over halfway cases, subnormals and magnitudes past fp16's exact-integer
+> range, with the pad rows zeroed and the A operand's pad *columns* untouched.
+> The pad rows are load-bearing — the GEMM rungs have no bounds check, so the
+> rows between the prompt and the consumer's row block have to carry the
+> products of zeros and a shorter run must not read what a longer one left.
+>
+> **L6c-3: and it costs 2.0%, which is what decides the shared arena.** The
+> 197 moves of a 2048-token pass are **43.7 ms of 2175.8** against the 22.7%
+> of host plumbing they replace; the host is 1.4% more. **One set of arenas —
+> what this stage was scoped as — would buy that 2.0% and nothing else**, for
+> a two-phase construction through five constructors, because a descriptor
+> set needs its buffer before a pipeline exists and a Vulkan buffer cannot
+> grow. So it is priced rather than built, the same way L3b-5 answered scan
+> versus chunk.
+>
+> **L6c-4: a fixed host cost was hiding behind fifty times its size.** With
+> the moves in, the host column **fell with the prompt length** — 70.5 ms at
+> 128 tokens against 15.9 at 2048 — and running the ladder backwards showed
+> it follows the length, not the position. That is what a flat per-graph cost
+> looks like, and it was `DeltaNetGPU.Reset` spelled `WriteFloat32At(off,
+> make([]float32, n))`: the recurrent state is 3.1 MB a layer and a fresh
+> sequence resets 36 of them, so **113 MB of Go allocation a prefill**,
+> zeroed by the runtime and then copied into a mapping that was about to be
+> zeroed anyway. `vk.Buffer.ZeroFloat32At` clears it in place and
+> `HCGPU.UploadInit` writes `hc_init` straight into the residual arena rather
+> than building its 84 MB on the host. The host column is now ~11 ms at every
+> length, and it was worth **1.14x at 128 tokens** and 1.01x at 2048.
+>
+> **L6c-5: the ladder, and where the pass goes.** 128 / 512 / 1024 / 2048 give
+> **259.0 / 570.4 / 761.8 / 941.3 tok/s**, 1.32-1.46x on L6b at every length,
+> two separate runs agreeing to 0.54% at 128 and **0.01% at 2048**. Staged for
+> 512 alone, ubatch 512 is **572.9** — 1.83x llama-bench's own pp512 of
+> 313.62. **96.6% of the graph is the blocks now**: MoE 53.7%, DeltaNet 20.3%,
+> hyper-connections 15.2%, attention 6.3%. The short-prompt end is the honest
+> weak spot — at 128 tokens the MoE is 73% of the pass, because an expert bank
+> costs what it costs to *read* however few tokens go through it, which is the
+> same reason llama.cpp's pp512 is below its pp2048. That is a decode problem
+> wearing a prefill hat, and it is L7's.
+
 ---
 
 ## The three findings that set the direction
@@ -998,9 +1143,11 @@ have taken 1015.5 ms of llama.cpp's 1164.7 ms prefill graph down to 714.8 —
 87.2% of it replaced by 61.4%, a 25.8% saving on the whole graph.** **L6a has
 the arena plan**: 84.20 GB in 68 buffers, all 48 layers of all five blocks
 resident at once, with residency measured to cost nothing that scales with the
-bank. What is left is **L6b** — the graph that runs them in order over one set
-of arenas, the embedding gather and the lm head — and its gate, logits against
-llama.cpp.
+bank. **L6b has the graph, and it clears the gate**: llama.cpp's own argmax
+out of llama.cpp's own top ten. **L6c put the glue on the device** and left
+prefill at **941.3 tok/s against 391.42 — 2.40x** — with **96.6% of the pass
+inside the five blocks**, which is 82% of the way to the ~1150 above. What is
+left of prefill is inside the kernels; the next stage is **L7**, decode.
 
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
@@ -1176,6 +1323,13 @@ below Q8. Bandwidth is the whole story.
 | `llm/gpu_moe.go` | **L5b: the MoE block on the device, in nine dispatches.** The fused `[nExpert+1, nEmbd]` router with the shared expert's gate as its 513th column, a **quantised** bank staged byte for byte out of the checkpoint (1.57 GB a layer, against 5.03 as halves), a seventh binding that is the same bank read as `uvec4`, the permuted row space with the shared expert's group at its front, the measured `MoEPlanFor` schedule and a sweep profiler. **L6a** made the quantised bank one buffer a layer, bound as one array of `moeMaxBanks`, with the layer index in the top sixteen bits of `moeUsed`. |
 | `shaders/llm_moe_gemm.comp` | **L5b: the grouped quantised GEMM.** Two modes — gate/up with `silu(gate)*up` on the accumulators, down in permutation order — crossed with the four formats the bank ships in (Q4_K, Q5_K, Q5_1, Q8_0) and five row-block rungs. Each workgroup unpacks its own BN x BK slab into LDS per K-step, and every store is a whole cooperative-matrix fragment because the permutation pads each expert's rows to the block. |
 | `shaders/llm_moe_{route,perm,combine}.comp` | **L5b: the routing.** `llm_moe_route` is the softmax over 512, ten workgroup argmaxes reproducing `ggml_argsort`'s DESC comparator without materialising the other 502 ranks, the normalised weights and the shared gate's sigmoid — one workgroup a token, `llm_attn_select.comp`'s shape. `llm_moe_perm` is a counting sort, the padded offsets, the sentinel fill, the inverse permutation and the two tile schedules, in one workgroup. `llm_moe_combine` is the eleven contributions weighted and summed in the reference's order. |
+| `llm/graph.go` | **L6b: the model.** The five blocks in `llama_model_qwen4exp::graph::graph`'s order over one staged model, `Prefill`/`PrefillN`/`Hidden`/`Forward`, and a `GraphStats` that splits a pass into block and glue. `Layers: N` truncates it to a prefix, which is how the order is checked in 7 GB. |
+| `llm/move.go`, `shaders/llm_move.comp` | **L6c: the move between two blocks' arenas.** Three bindings of its own — 1 and 2 the same buffer twice, so an fp32 and an fp16 destination are one pipeline shape — one pipeline per (source, destination) pair, and a `Port` per crossing tensor. Bit-exact against the host narrowing, and **2.0% of the pass** against the 22.7% it replaced. |
+| `vk.Buffer.Zero*` | **L6c: clearing a mapping in place.** `WriteFloat32At(off, make([]float32, n))` is two costs and on a hot path the allocation is the larger: 36 DeltaNet states is 113 MB of Go allocation a prefill, flat in the prompt length (L6c-4). |
+| `llm/gpu_head.go` | **L6b: the lm head.** `output.weight`, [2560, 248320] Q8_0 — 675 MB, 1.27 GB as halves — staged a 4096-row slab at a time straight into the fragment tiling, and run as `llm_gemm.comp`'s MODE 2 on **one row**, because `inp_out_ids` is what the reference computes. The only matmul in the vertical with no epilogue: the final hyper-connection mixer is the output norm. |
+| `llm/arena.go` | **L6b: where an activation arena's memory comes from.** A HOST_CACHED memory type reads at **25.06 GB/s** against the write-combined default's **0.18**, for 0.14% on the kernels (L6b-4) — and `narrowRows`, the f32→fp16 conversion every block's `Upload` does, parallel over rows. `LLM_ARENA_UNCACHED=1` is the control. |
+| `vk.Device.NewHostCachedBuffer` | **L6b: a buffer from a HOST_CACHED type**, falling back to `NewBuffer` where there is none. For arenas the host reads; not for weight banks, which are written once. |
+| `cmd/llm -graph` | **L6b: the model, end to end.** Tokens to logits, two timed passes a length, with the wall clock split by block and the glue named rather than averaged in. |
 | `llm/deltanet.go` | **L3a: the gated DeltaNet, 36 of the 48 layers.** The fused [2560, 10240] qkv projection, the depthwise causal conv, the L2 norm under either of llama.cpp's two spellings of it (`QKNorm`), the two F32 gate projections and the delta rule itself — with a `DeltaNetState` carrying both the [128, 128, 48] recurrent state *and* the convolution's window, bit-identically across a batch split. |
 | `llm/gpu_deltanet.go` | **L3b: that layer on the device, in five dispatches.** The fused `[16512, 2560]` projection for four of llama.cpp's matrices — including both F32 gate projections — a recurrent state per staged layer, the convolution's window as `Conv-1` rows of negative token index in front of the projection's own output, and a sweep profiler over every staged layer. |
 | `shaders/llm_dn_*.comp` | **L3b: the layer's three kernels.** `llm_dn_conv` (the depthwise causal convolution, its SiLU, the per-head L2 norm of q and k under either spelling, and the softplus/sigmoid pair, over a (plane, token) grid), `llm_dn_scan` (the delta rule — **a fifteen-rung ladder on LPC and QKREG**, whose ends are 6.3x apart) and `llm_dn_norm` (the gated RMS norm straight into the output matmul's A operand). |
@@ -1222,13 +1376,18 @@ below Q8. Bandwidth is the whole story.
    device-built tile *list* rather than a grid, and by padding each expert's
    rows to the block so the epilogue needs no LDS at all (L5b-3).
 6. ~~**Residency**~~ — **done at L6a**: 84.20 GB in 68 buffers, and a bank
-   that is an array because a storage buffer here is at most 4 GiB - 4. What
-   is left of the graph is the order, one set of arenas, and the head.
-7. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
+   that is an array because a storage buffer here is at most 4 GiB - 4.
+7. ~~**The order, the head, and the glue**~~ — **done at L6b and L6c.** The
+   model runs: the argmax is llama.cpp's, out of llama.cpp's own top ten, and
+   prefill is **2.40x** the reference at ubatch 2048 with **96.6% of the
+   graph in the five blocks**. What is left of prefill is inside the kernels,
+   not between them — L5b-7's unpack in the MoE (53.7% of the pass) and
+   L3b-5's fused projection in the DeltaNet (20.3%).
+8. **KV cache** and a decode loop. The mrope is **done at L2e and L2f**
    (interleaved, sections [11,11,10], 64 of 256 dims, NeoX on a text batch);
    what is left is the ring buffer, the indexer cache's own incremental
    pooling, and a rotary table that does not want a row per context cell.
-8. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
+9. **The re-quantiser** (phase 2) and **MTP speculative decoding** (phase 3).
 
 ---
 
@@ -1447,10 +1606,34 @@ below Q8. Bandwidth is the whole story.
       **8.133e-05 rms** against llama.cpp, the same run with the index forced
       to zero is **203x further away**, and every L5b gate still passes with
       the array in place.
-- [ ] **L6b — the graph.** The five blocks in llama.cpp's own order over one
-      set of arenas, plus the two tensors nothing stages yet: the embedding
-      gather and the lm head.
-- [ ] Gate: logits match llama.cpp; prefill tok/s against 388.60.
+- [x] **L6b — the graph.** The five blocks in llama.cpp's own order, plus the
+      two tensors no block owned: the embedding gather and the 675 MB lm
+      head. **Nothing in a shader changed.** The plumbing did — the
+      activation arenas moved to a **HOST_CACHED** memory type, because the
+      host reads a write-combined one at **0.18 GB/s** against **25.06**
+      (L6b-4, 5.0x on the graph for 0.14% on the kernels), and `Upload`'s
+      f32→fp16 narrowing was parallelised over rows (L6b-5).
+      [Write-up](research/l6b-graph.md) · `results/l6b_graph.csv` ·
+      `results/l6b_arena.csv`
+- [x] Gate: **the argmax is llama.cpp's** (561), out of llama.cpp's own top
+      ten, with the drift priced as a geometric x1.085 a layer at six depths
+      (L6b-3); prefill is **713.9 tok/s at ubatch 2048 against 391.42 —
+      1.82x**, and 2.12x against llama.cpp *at the same ubatch*.
+- [x] **L6c — the glue on the device.** Not the shared arena this was scoped
+      as: `shaders/llm_move.comp` is one dispatch over two blocks' buffers,
+      nine pipelines for the five blocks and the head, with a `Port` per
+      crossing tensor. **Bit-exact** — every figure of L6b's gate came back
+      identical to the last place (L6c-2) — and **2.0% of the pass**, which
+      is what a shared arena would now buy and why it is priced rather than
+      built (L6c-3). Along the way, 113 MB of Go allocation a prefill in
+      `DeltaNetGPU.Reset`, flat in the prompt length and so 12% of a
+      128-token pass (L6c-4). [Write-up](research/l6c-moves.md) ·
+      `results/l6c_graph.csv`
+- [x] Gate: **no host tensor between the embedding gather and the logits**;
+      **941.3 tok/s at ubatch 2048, 2.40x llama.cpp's 391.42**, and 572.9 at
+      512 against llama-bench's own pp512 of 313.62, 1.83x. 96.6% of the
+      graph is the blocks; L2a-3's ~1150 projection is 82% reached and the
+      rest of it is inside the kernels.
 
 ### L7 — decode
 
@@ -1505,6 +1688,13 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -resident -model $M -dense               # the 6.8 GB half alone
     go run ./cmd/llm -resident -model $M -bank 48,24,12,4,2 \
         -csv results/l6a_resident.csv                         # residency, priced
+    go run ./cmd/llm -graph -model $M -tokens 512             # L6b: the model
+    go run ./cmd/llm -graph -model $M -tokens 128,512,1024,2048 \
+        -csv results/l6c_graph.csv                            # the prefill ladder
+    go run ./cmd/llm -graph -model $M -tokens 512 -layers 4    # the shape, in 7 GB
+    LLM_ARENA_UNCACHED=1 go run ./cmd/llm -graph -model $M -tokens 512
+                                             # L6b-4's control: the arenas back
+                                             # on the write-combined type
 
     # the reference implementation, the oracle, the baseline
     less $L/src/models/qwen4exp.cpp                  # 1279 lines, the whole architecture
@@ -1546,6 +1736,22 @@ below Q8. Bandwidth is the whole story.
                                              # agreement and the padding control
     go test ./llm/ -v -run TestMoEGPUBankArray  # L6a: the bank index, and the
                                              # control that shows it is read
+    go test ./llm/ -v -run TestGraphPrefix   # L6b: four layers against
+                                             # `l_last-3`, and the drift at
+                                             # depths 1-4, in 7 GB
+    go test ./llm/ -v -run TestGraphLogits   # L6b's gate: the whole model,
+                                             # the drift every eight layers,
+                                             # and llama.cpp's own logits
+    go test ./llm/ -v -run TestArenaMemoryTypes  # L6b-4: what a mapped arena
+                                             # costs the host, by memory type
+    go test ./llm/ -v -run TestMove          # L6c: the arena-to-arena move,
+                                             # value for value against the
+                                             # host narrowing it replaced
+
+    # L6b's depth trace: `l_last` every eight layers of the same prompt.
+    /tmp/eval_dump -m $M -o reference/out/llmdepth -c 64 \
+        -p 'The capital of France is Paris.' \
+        -n '^l_last-(7|15|23|31|39|47)$|^result_(norm|output)$'
 
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh

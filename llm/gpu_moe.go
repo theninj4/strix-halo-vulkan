@@ -430,7 +430,7 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	shTiles := 2 + 3*(roundUpInt(rows, moeBMMax)/moeBMMin)
 	g.aShTilesUp = alloc(shTiles)
 	g.aShTilesDown = alloc(shTiles)
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: moe fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
 
@@ -443,14 +443,14 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	// permutation entry points and it has to be zero.
 	g.hXn = halloc((rows + moeBMMax) * g.lda)
 	g.hSwiglu = halloc(maxRows * g.ldCtx)
-	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: moe fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
 	// Zeroed once: the A operands' pad columns, the sentinel token's row and
 	// every swiglu row no tile ever writes. None of these kernels
 	// bounds-checks, and a stale half can be a NaN.
-	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
-	g.abuf.WriteFloat32(make([]float32, g.actElems))
+	g.hbuf.Zero()
+	g.abuf.Zero()
 
 	perRouter := g.routerN() * c.NEmbd
 	if g.bank, err = g.dev.NewBuffer(len(layers) * perRouter * 2); err != nil {
@@ -670,13 +670,7 @@ func (g *MoEGPU) Upload(x []float32, nTok int) error {
 	}
 	rowsPad := roundUpInt(nTok, moeBMMax)
 	xn := make([]uint16, rowsPad*g.lda)
-	for t := 0; t < nTok; t++ {
-		row := x[t*c.NEmbd : (t+1)*c.NEmbd]
-		dst := xn[t*g.lda:]
-		for i, v := range row {
-			dst[i] = safetensors.F32ToF16(v)
-		}
-	}
+	narrowRows(xn, x, nTok, c.NEmbd, g.lda)
 	g.hbuf.WriteUint16At(int(g.hXn), xn)
 	g.syncShared()
 	return nil
@@ -1158,4 +1152,33 @@ func (g *MoEGPU) SharedBytes(layer int) (upPair, down int) {
 func (g *MoEGPU) Formats(layer int) (gate, up, down string) {
 	w := g.layers[layer]
 	return w.gateFmt.String(), w.upFmt.String(), w.downFmt.String()
+}
+
+// InPort is the block's input as the router's and every routed tile's A
+// operand wants it: fp16 [T][lda], `hc_mixed` narrowed. The row count is the
+// widest row block a rung uses, because the grouped GEMM has no bounds check.
+func (g *MoEGPU) InPort() Port {
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
+		Rows: roundUpInt(g.rows, moeBMMax), Half: true}
+}
+
+// OutPort is the block's output, `ffn_out`: fp32 [T][nEmbd].
+func (g *MoEGPU) OutPort() Port {
+	return Port{Buf: g.abuf, Off: g.aOut, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd}
+}
+
+// Resize sets the length of the run and writes the shared expert's own
+// permutation and schedule, which are the identity over the run's tokens and
+// so stay host-side however the input arrives.
+func (g *MoEGPU) Resize(nTok int) error {
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, staged for %d", nTok, g.tokens)
+	}
+	g.rows = nTok
+	if g.autoPlan {
+		g.router = GEMMKernelFor(nTok)
+		g.up, g.down = MoEPlanFor(nTok)
+	}
+	g.syncShared()
+	return nil
 }

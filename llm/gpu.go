@@ -371,7 +371,7 @@ func (g *HCGPU) alloc(nMixers int) error {
 	if g.gate {
 		g.aGate = alloc(rows * c.Wide())
 	}
-	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
+	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
 
@@ -382,13 +382,13 @@ func (g *HCGPU) alloc(nMixers int) error {
 	}
 	g.hXn = halloc(rows * g.lda)
 	g.hLo = halloc(rows * g.ldaLo)
-	if g.hbuf, err = g.dev.NewBuffer(g.hElems * 2); err != nil {
+	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
 	// Zeroed once. The pad columns of every A operand and the pad rows of a
 	// short run come from here, and the kernels have no bounds checks.
-	g.hbuf.WriteFloat32(make([]float32, g.hElems/2))
-	g.abuf.WriteFloat32(make([]float32, g.actElems))
+	g.hbuf.Zero()
+	g.abuf.Zero()
 
 	perMixer := g.gemmN()*c.Wide() + c.Wide()*c.LowRank
 	if g.bank, err = g.dev.NewBuffer(nMixers * perMixer * 2); err != nil {
@@ -600,6 +600,34 @@ func (g *HCGPU) Upload(res []float32, nTok int) error {
 	return nil
 }
 
+// UploadInit writes `hc_init` — the embedding repeated into every stream —
+// straight into the residual arena.
+//
+// It is `Upload(HCInit(cfg, embd, nTok), nTok)` without the tensor in
+// between. HCInit's result is hc times the embedding, which at ubatch 2048 is
+// **84 MB** of Go allocation that exists only to be copied into a mapped
+// buffer and dropped; here the four streams are written where they belong and
+// the host never holds the wide tensor at all.
+func (g *HCGPU) UploadInit(embd []float32, nTok int) error {
+	c := g.cfg
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	if len(embd) != nTok*c.NEmbd {
+		return fmt.Errorf("llm: embedding is %d values, want %d", len(embd), nTok*c.NEmbd)
+	}
+	if err := g.Resize(nTok); err != nil {
+		return err
+	}
+	for t := 0; t < nTok; t++ {
+		row := embd[t*c.NEmbd : (t+1)*c.NEmbd]
+		for ch := 0; ch < c.HC; ch++ {
+			g.abuf.WriteFloat32At(int(g.aRes)+(t*c.HC+ch)*c.NEmbd, row)
+		}
+	}
+	return nil
+}
+
 // UploadBlockOut writes the block output the combine scatters back.
 func (g *HCGPU) UploadBlockOut(out []float32) error {
 	if len(out) != g.rows*g.cfg.NEmbd {
@@ -659,6 +687,40 @@ func (g *HCGPU) graph(mixer int, combine bool) ([]vk.MultiDispatch, []string, er
 		add("combine", "combine", uint32(g.rows), uint32(c.HC), cb)
 	}
 	return d, kinds, nil
+}
+
+// RunCombine executes the scatter alone, over whatever `inject` the mixer's
+// own Run left in the arena and whatever block output UploadBlockOut wrote.
+//
+// It exists because the graph is not `Run(mixer, true)`. A layer is mix, then
+// a block, then combine: the mix produces the block's input *and* the scatter
+// weights, the block runs on another set of arenas, and only then does the
+// residual move. `Run(mixer, true)` would recompute the mix on the way to the
+// combine, which is the same answer at 1.4 ms a mixer and 97 mixers a graph.
+//
+// The scatter reads nothing that names the mixer — the weights are in
+// `aInject` and not in the bank — so the argument is here for the error
+// message and for the reader, who should be able to see which mix a combine
+// closes.
+func (g *HCGPU) RunCombine(mixer int) error {
+	if mixer < 0 || mixer >= len(g.mixers) {
+		return fmt.Errorf("llm: mixer %d of %d", mixer, len(g.mixers))
+	}
+	c := g.cfg
+	pc := push{
+		ResOff: g.aRes, InjOff: g.aInject, OutOff: g.aOut,
+		Tokens: uint32(g.rows), NEmbd: uint32(c.NEmbd), HC: uint32(c.HC),
+		LowRank: uint32(c.LowRank), GemmN: uint32(g.gemmN()),
+	}
+	d := []vk.MultiDispatch{{
+		Pipeline: g.pipes["combine"],
+		GroupsX:  uint32(g.rows), GroupsY: uint32(c.HC),
+		PushConstants: pc.bytes(),
+	}}
+	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
+		return fmt.Errorf("llm: mixer %d combine: %w", mixer, err)
+	}
+	return nil
 }
 
 // perSubmit is how many dispatches go into one command buffer.
@@ -894,4 +956,47 @@ func parallelFor(n int, fn func(i int)) {
 		}()
 	}
 	wg.Wait()
+}
+
+// The graph's view of this block's arena (LLM.md L6c). Three tensors cross
+// the boundary: the mixer's output goes to a sublayer, the sublayer's output
+// comes back for the combine, and the wide residual goes to the PLE block and
+// returns. Everything else the block holds stays inside it.
+
+// MixedPort is `hc_mixed` as the mixer leaves it: fp32 [T][nEmbd].
+func (g *HCGPU) MixedPort() Port {
+	return Port{Buf: g.abuf, Off: g.aMixed, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd}
+}
+
+// BlockOutPort is where the combine reads a sublayer's output: fp32
+// [T][nEmbd]. The combine has no row block — one workgroup is one (token,
+// stream) — so nothing past the run's tokens needs writing.
+func (g *HCGPU) BlockOutPort() Port {
+	return Port{Buf: g.abuf, Off: g.aOut, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd, Rows: g.rows}
+}
+
+// ResPort is the wide residual: fp32 [T][hc*nEmbd], the one tensor here that
+// another block both reads and writes.
+func (g *HCGPU) ResPort() Port {
+	return Port{Buf: g.abuf, Off: g.aRes, Stride: g.cfg.Wide(), Width: g.cfg.Wide(), Rows: g.rows}
+}
+
+// ResRowPort is one token's row of that residual, which is what the final
+// mixer reads: `inp_out_ids` keeps the last token and drops the rest.
+func (g *HCGPU) ResRowPort(t int) Port {
+	wide := g.cfg.Wide()
+	return Port{Buf: g.abuf, Off: g.aRes + uint32(t*wide), Stride: wide, Width: wide, Rows: 1}
+}
+
+// Resize sets the length of the run without writing the residual, for a
+// caller that is about to fill it with a Move rather than an Upload.
+func (g *HCGPU) Resize(nTok int) error {
+	if nTok <= 0 || nTok > g.tokens {
+		return fmt.Errorf("llm: %d tokens, arenas are built for %d", nTok, g.tokens)
+	}
+	g.rows = nTok
+	if g.autoPlan {
+		g.down, g.up = PlanFor(nTok)
+	}
+	return nil
 }

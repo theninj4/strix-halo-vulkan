@@ -34,6 +34,16 @@ import (
 
 const defaultModel = "models/Qwen3.8-Flash-Next-GGUF"
 
+// graphDefaultPrompt is what -graph prefills when the caller names nothing.
+// It is English prose rather than a repeated token because the MoE routing
+// and the QSA selection are both properties of the text (L5a-4, L4b-6).
+const graphDefaultPrompt = "The capital of France is Paris. " +
+	"Hyper-connections replace the residual stream with four of them, and every " +
+	"block reads a learned mix and writes back with learned per-stream weights. " +
+	"Three quarters of the layers are a gated DeltaNet; the other quarter is " +
+	"sparse attention with a query-aware indexer. Ninety-seven per cent of the " +
+	"parameters are in five hundred and twelve experts, ten of which run per token."
+
 func main() {
 	log.SetFlags(0)
 	model := flag.String("model", defaultModel, "GGUF checkpoint, shard or directory")
@@ -46,6 +56,8 @@ func main() {
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
 	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
 	moe := flag.Bool("moe", false, "benchmark the MoE block")
+	graph := flag.Bool("graph", false, "run the whole model end to end, tokens to logits, and report tok/s")
+	prompt := flag.String("prompt", graphDefaultPrompt, "the text -graph prefills; repeated to reach -tokens")
 	resident := flag.Bool("resident", false, "stage every layer of every block on the device and report the plan")
 	dense := flag.Bool("dense", false, "for -resident: leave the 77 GB expert bank out and stage the dense half alone")
 	bank := flag.String("bank", "", "for -resident: stage these many expert banks instead of all 48 — a list, one stage each, to price residency against itself")
@@ -66,6 +78,21 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *graph {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		if err := graphBench(*model, *prompt, toks, layers, *ctx, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return
