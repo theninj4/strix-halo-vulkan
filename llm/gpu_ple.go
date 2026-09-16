@@ -226,7 +226,7 @@ func (g *PLEGPU) alloc() error {
 }
 
 func (g *PLEGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	feat := g.dev.Features()
 	sgs, err := g.dev.Physical().SubgroupSizeControl()

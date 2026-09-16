@@ -229,7 +229,17 @@ type AttnGPU struct {
 
 	// fp32 activations.
 	aQKV, aScore, aCell, aOut uint32
-	actElems                  int
+	// The QSA selection, a bitmask of nKV bits a token, read as uints out of
+	// the same fp32 arena through binding 4. L4b.
+	aSel     uint32
+	actElems int
+	// sparse is whether the selection is dispatched and the attention kernel
+	// reads it. It is decided by the cache the layer was built for, because
+	// `top_k + ratio - 1` cells out of fewer than that many is the identity —
+	// see selWidth. SetSparse overrides it, which is how the kernel is priced
+	// at a length where it does not bite and how the dense control runs at one
+	// where it does.
+	sparse bool
 	// fp16 activations.
 	hXn, hQ, hK, hV, hCtx, hIdxK, hIdxQ uint32
 	hElems                              int
@@ -251,6 +261,24 @@ func (g *AttnGPU) colK() int  { return g.cfg.QWidth() }
 func (g *AttnGPU) colV() int  { return g.colK() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIQ() int { return g.colV() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIK() int { return g.colIQ() + g.cfg.IdxHeads*g.cfg.IdxDim }
+
+// selWidth is what the selection asks for: whole blocks plus the incomplete
+// tail, `top_k + ratio - 1`, and never more cells than the cache has. At 2051
+// against a 256-cell cache it names every cell, which is why L2 could not test
+// the selection at all and why `sparse` is false there.
+func (g *AttnGPU) selWidth() int { return minInt(g.cfg.TopK+g.cfg.Ratio-1, g.nKV) }
+
+// selWords is the bitmask's row stride: one bit a cell, 32 cells a uint. At a
+// 4096-cell cache that is 128 uints a token — 2 MB for the whole prompt,
+// against the 32 MB the reference's `width` int32 indices would take.
+func (g *AttnGPU) selWords() int { return (g.nKV + 31) / 32 }
+
+// Sparse reports whether the layer runs the selection. SetSparse forces it
+// either way: on where it is the identity, to price the kernel against
+// llama.cpp's TOP_K, and off where it bites, which is the negative control
+// that says the selection changes the attention output at all.
+func (g *AttnGPU) Sparse() bool     { return g.sparse }
+func (g *AttnGPU) SetSparse(v bool) { g.sparse = v }
 
 // NBlocks is the indexer's block count: the cache's cell count over the
 // compress ratio, which at 7 tokens in a 256-cell cache is 64 — one real block
@@ -314,6 +342,11 @@ func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []Att
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
+	// The selection is the identity wherever it asks for at least as many
+	// cells as the cache holds, so below that it is not run and the attention
+	// kernel takes its dense arm. That is a fact about the cache rather than
+	// about the prompt, and the cache is fixed here.
+	g.sparse = cfg.TopK > 0 && g.selWidth() < nKV
 
 	if err := g.alloc(len(layers)); err != nil {
 		g.Destroy()
@@ -359,6 +392,11 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// projection holds, and aliasing them would cost the layer's own inputs —
 	// which at L6 the residual add still wants — to save that.
 	g.aOut = alloc(rows * c.NEmbd)
+	// The bitmask is allocated for every arena row, not just the prompt's,
+	// because the attention kernel's pad rows index it — they read it as dense
+	// rather than branching, and an unallocated row would be a read past the
+	// buffer.
+	g.aSel = alloc(rows * g.selWords())
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -404,7 +442,7 @@ func (g *AttnGPU) alloc(nLayers int) error {
 }
 
 func (g *AttnGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"pack":  shaders.LLMAttnPack,
@@ -422,6 +460,14 @@ func (g *AttnGPU) build() error {
 	}
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
 		return fmt.Errorf("llm: the attention and GEMM rungs need a pinned 64-wide subgroup")
+	}
+	// The selection's bucket search is a subgroup suffix sum over 256 radix
+	// buckets held four waves wide, so it wants the wave pinned for the same
+	// reason the matrix-core rungs do.
+	if err := g.pipeline("select", shaders.LLMAttnSelect, vk.PipelineSpec{
+		Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+	}); err != nil {
+		return err
 	}
 	for _, v := range attnVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
@@ -644,6 +690,10 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		Ratio: uint32(c.Ratio), RotDims: uint32(c.RopeDims),
 		AttnScale: math.Float32bits(float32(math.Log2(math.E) / math.Sqrt(float64(c.HeadDim)))),
 		GemmN:     uint32(g.qkvN()),
+		SelOff:    noW, SelWidth: uint32(g.selWidth()),
+	}
+	if g.sparse {
+		base.SelOff = g.aSel
 	}
 
 	var d []vk.MultiDispatch
@@ -670,10 +720,19 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// 4. Its score, the bias, the cells and the causal mask.
 	add("score", "score", uint32(g.rows), 1, base)
 
-	// 5. Causal GQA with the output gate in the epilogue.
+	// 5. The selection: one workgroup a token, four radix passes over the
+	//    cells, a bitmask out. Absent below 2051 cells, where it would name
+	//    every cell and the attention kernel's dense arm is the same
+	//    computation.
+	if g.sparse {
+		add("select", "select", uint32(g.rows), 1, base)
+	}
+
+	// 6. Causal GQA with the output gate in the epilogue, reading the
+	//    selection beside the causal mask.
 	add(string(g.attn), "attn", uint32(roundUpInt(g.rows, av.rows)/av.rows), uint32(c.NHead), base)
 
-	// 6. The output projection, off the gated context.
+	// 7. The output projection, off the gated context.
 	out := base
 	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
 	out.OutOff, out.BOff = g.aOut, w.out
@@ -794,6 +853,25 @@ func (g *AttnGPU) ColIK() int { return g.colIK() }
 // Score is the indexer's rectified per-block score, [T][nBlocks].
 func (g *AttnGPU) Score() []float32 {
 	return g.abuf.ReadFloat32At(int(g.aScore), g.rows*g.NBlocks())
+}
+
+// Selection is the QSA bitmask a run left behind: one bit a cell, 32 cells a
+// uint, [T][selWords]. SelectedCells unpacks one token's row into the
+// ascending cell list `topK` returns, so the two can be compared set for set.
+func (g *AttnGPU) Selection() []uint32 {
+	return g.abuf.ReadUint32At(int(g.aSel), g.rows*g.selWords())
+}
+
+// SelectedCells unpacks token t's row of the bitmask.
+func (g *AttnGPU) SelectedCells(mask []uint32, t int) []int32 {
+	out := make([]int32, 0, g.selWidth())
+	row := mask[t*g.selWords() : (t+1)*g.selWords()]
+	for j := 0; j < g.nKV; j++ {
+		if row[j>>5]&(1<<uint(j&31)) != 0 {
+			out = append(out, int32(j))
+		}
+	}
+	return out
 }
 
 // Cells is the same score biased, expanded over the cache and causally

@@ -6,6 +6,9 @@ package main
 //	go run ./cmd/llm -attn                        # the default sweep, 64..2048
 //	go run ./cmd/llm -attn -tokens 512 -ladder    # every rung at the reference's ubatch
 //	go run ./cmd/llm -attn -csv results/l2f_attn.csv
+//	go run ./cmd/llm -attn -tokens 512 -sel on    # price it where it is the identity
+//	go run ./cmd/llm -attn -tokens 4096 -ctx 4096 # the length where it actually bites
+//	go run ./cmd/llm -attn -tokens 4096 -ctx 4096 -sel off   # and the dense control
 //
 // What is timed is GPU dispatch time, swept across every staged layer. One
 // layer's weights are 103 MB — 3.2x the 32 MiB MALL on their own — so even a
@@ -41,10 +44,12 @@ import (
 //   - `ROPE` runs 48 times, which is four per full-attention layer — the
 //     query, the key, the indexer's query and its pooled key. It is split in
 //     half between the pack and the indexer.
-//   - `TOP_K` and `TOPK_QSA GET_ROWS` are the selection, which this graph does
-//     not do at all (at any prompt shorter than top_k it names every cell and
-//     is bit-identical to not selecting). They are reported beside the
-//     comparison and excluded from it, which is the conservative direction.
+//   - `TOP_K` and `TOPK_QSA GET_ROWS` are the selection. L2f's graph did not do
+//     it at all — at any prompt shorter than top_k it names every cell and is
+//     bit-identical to not selecting — so they were reported beside the
+//     comparison and excluded from it. **L4b built the kernel**, so they are
+//     now compared whenever our graph runs one, which `-sel` forces at a width
+//     where it is the identity and `-ctx 4096` gets for real.
 //
 // Everything else this layer spends — the pooling itself, the gate's SIGMOID
 // and MUL, the CONT that makes the gated context contiguous, the CPYs into the
@@ -91,7 +96,7 @@ const llamaFlashGFLOPs = 12280.9
 // the 48, the interval being 4.
 const layersPerGraph = 12
 
-func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool, csvPath string) error {
+func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool, sel, csvPath string) error {
 	m, err := llm.Open(model)
 	if err != nil {
 		return err
@@ -146,9 +151,23 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 		return err
 	}
 	defer g.Destroy()
-	fmt.Printf("%d layers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks)\n\n",
+	// The selection runs of its own accord only where `top_k + ratio - 1` is
+	// fewer cells than the cache has. `-sel` forces it on below that, which is
+	// what prices the kernel against llama.cpp's TOP_K at the reference
+	// graph's own 2048-cell shape — where the reference runs it too, and where
+	// it is the identity for both of them.
+	switch sel {
+	case "on":
+		g.SetSparse(true)
+	case "off":
+		g.SetSparse(false)
+	case "auto":
+	default:
+		return fmt.Errorf("-sel is auto, on or off, not %q", sel)
+	}
+	fmt.Printf("%d layers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks), selection %v\n\n",
 		g.Layers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6,
-		maxTok, g.NKV(), g.NBlocks())
+		maxTok, g.NKV(), g.NBlocks(), g.Sparse())
 
 	var plans [][3]string
 	if ladder {
@@ -162,7 +181,7 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 	}
 
 	var rows [][]string
-	rows = append(rows, []string{"tokens", "cells", "attn_kernel", "gemm_kernel", "out_kernel",
+	rows = append(rows, []string{"tokens", "cells", "selection", "attn_kernel", "gemm_kernel", "out_kernel",
 		"dispatch", "us_per_layer", "us_per_graph", "gflops", "gbps"})
 	for _, tok := range tokens {
 		xn := make([]float32, tok*cfg.NEmbd)
@@ -209,7 +228,7 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 				}
 				fmt.Println()
 				rows = append(rows, []string{
-					strconv.Itoa(tok), strconv.Itoa(g.NKV()), p[0], p[1], p[2], s.Kind,
+					strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()), p[0], p[1], p[2], s.Kind,
 					fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*layersPerGraph/1e3),
 					fmt.Sprintf("%.1f", gf), fmt.Sprintf("%.1f", gb),
 				})
@@ -218,14 +237,14 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 			fmt.Printf("  %-6s %9.1f us  x%d = %7.1f ms\n", "layer", us, layersPerGraph,
 				us*layersPerGraph/1e3)
 			rows = append(rows, []string{
-				strconv.Itoa(tok), strconv.Itoa(g.NKV()), p[0], p[1], p[2], "layer",
+				strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()), p[0], p[1], p[2], "layer",
 				fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*layersPerGraph/1e3), "", "",
 			})
 			if tok == 512 && plans == nil {
 				// The causal FLOP count of one attention dispatch: two GEMMs
 				// over half the score matrix.
 				flops := 2 * float64(cfg.NHead) * float64(tok) * float64(tok) * float64(cfg.HeadDim)
-				reportAttnAgainstLlama(st, total, flops)
+				reportAttnAgainstLlama(st, total, flops, g.NKV())
 			}
 			fmt.Println()
 		}
@@ -243,12 +262,22 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 // reportAttnAgainstLlama puts the measured layer beside the lines of
 // llama.cpp's own graph it replaces. Both sides are one prefill graph of 512
 // tokens over a 2048-cell cache.
-func reportAttnAgainstLlama(st []llm.Stage, total time.Duration, flops float64) {
+func reportAttnAgainstLlama(st []llm.Stage, total time.Duration, flops float64, nKV int) {
+	var ranSelect bool
+	for _, s := range st {
+		if s.Kind == "select" {
+			ranSelect = true
+		}
+	}
+	ref := llamaAttn
+	if ranSelect {
+		ref = append(append([]llamaOp{}, llamaAttn...), llamaAttnTopK...)
+	}
 	byKind := map[string]float64{}
 	disp := map[string]int{}
 	var refTotal float64
 	var refDisp int
-	for _, op := range llamaAttn {
+	for _, op := range ref {
 		byKind[op.kind] += op.usTotal
 		disp[op.kind] += op.dispatches
 		refTotal += op.usTotal
@@ -292,13 +321,40 @@ func reportAttnAgainstLlama(st []llm.Stage, total time.Duration, flops float64) 
 		sel += op.usTotal
 		selDisp += op.dispatches
 	}
-	fmt.Printf("  — and %d dispatches of selection (%.1f ms, TOP_K and its GET_ROWS) are left\n", selDisp, sel/1e3)
-	fmt.Println("    out of the comparison entirely: at this width the selection names every")
-	fmt.Println("    cell, so it is work neither side needs and only one side does. Counting")
-	fmt.Printf("    it would make the reference %.1f ms and the ratio %.2fx.\n", (refTotal+sel)/1e3, (refTotal+sel)/ours)
+	if ranSelect {
+		fmt.Printf("  — `select` **is** in the comparison: %d of the reference's dispatches\n", selDisp)
+		fmt.Println("    (TOP_K and the GET_ROWS that turns its index list back into a mask)")
+		fmt.Println("    against our one, which writes the mask directly. At this width it is")
+		fmt.Println("    the identity for both sides — the reference runs it anyway, so it is")
+		fmt.Println("    like for like — and past 2051 cells it is the model.")
+		if nKV != 2048 {
+			var us float64
+			for _, s := range st {
+				if s.Kind == "select" {
+					us = float64(s.GPU.Nanoseconds()) / 1e3 * layersPerGraph
+				}
+			}
+			fmt.Printf("    That row is not like for like either: the reference's cache is 2048\n")
+			fmt.Printf("    cells and this one is %d, so it does %.0fx the cells. Per cell it is\n",
+				nKV, float64(nKV)/2048)
+			fmt.Printf("    %.2fx.\n", byKind["select"]*float64(nKV)/2048/us)
+		}
+	} else {
+		fmt.Printf("  — and %d dispatches of selection (%.1f ms, TOP_K and its GET_ROWS) are left\n", selDisp, sel/1e3)
+		fmt.Println("    out of the comparison entirely: at this width the selection names every")
+		fmt.Println("    cell, so it is work neither side needs and only one side does. Counting")
+		fmt.Printf("    it would make the reference %.1f ms and the ratio %.2fx.\n", (refTotal+sel)/1e3, (refTotal+sel)/ours)
+	}
 	fmt.Println("  — the pooling, the gate's sigmoid and multiply, the CONT behind them and")
 	fmt.Println("    the CPYs into the KV cache are inside MUL/SIGMOID/CONT/CPY, which every")
 	fmt.Println("    other block shares; none of it is attributed and all of it is absent here.")
+}
+
+func selLabel(sparse bool) string {
+	if sparse {
+		return "sparse"
+	}
+	return "dense"
 }
 
 // attnRates reports what a dispatch achieved: arithmetic for the three
@@ -325,6 +381,10 @@ func attnRates(kind string, c llm.AttnConfig, tok, nKV int, d time.Duration) (gf
 	case "out":
 		g := float64(c.GateWidth())
 		return 2 * t * embd * g / s / 1e9, (embd*g*2 + t*g*2) / s / 1e9
+	case "select":
+		// One pass over the row's cells — the keys are cached in LDS, so the
+		// four radix passes and the emit read it once — and one bit a cell out.
+		return 0, (t*float64(nKV)*4 + t*float64(nKV)/8) / s / 1e9
 	case "score":
 		nb := float64((nKV + c.Ratio - 1) / c.Ratio)
 		return 2 * t * nb * float64(c.IdxHeads*c.IdxDim) / s / 1e9, 0

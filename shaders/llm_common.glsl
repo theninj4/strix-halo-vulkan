@@ -21,6 +21,15 @@ layout(binding = 0) readonly buffer Weights { float wbuf[]; };
 layout(binding = 1) buffer Act { float act[]; };
 layout(binding = 2) buffer HAct { float16_t hact[]; };
 layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
+// The fp32 activation arena again, read as uints. The QSA selection is a
+// bitmask — one bit per cache cell per token — and a bitmask is not a float:
+// punning it through `uintBitsToFloat` would put NaN payloads in a storage
+// buffer and trust them to survive, where binding the same VkBuffer at a
+// second descriptor costs nothing and says what the tensor is. Every pipeline
+// in this vertical declares it so that a sequence can still be recorded into
+// one command buffer; only llm_attn_select.comp writes it and only
+// llm_attn_wmma.comp reads it.
+layout(binding = 4) buffer ActU { uint actu[]; };
 
 layout(push_constant) uniform PC {
     // The wide residual, fp32 in the activation arena: [T][hc*nEmbd], which
@@ -102,6 +111,8 @@ layout(push_constant) uniform PC {
     uint ldCtx;      // the context's row stride in halves, gateWidth + pad
     uint idxHeads;
     uint idxDim;
+    uint selOff;     // uint [T][(nKV+31)/32] cell bitmask, or NO_W for dense
+    uint selWidth;   // top_k + ratio - 1, clamped to nKV: what the select asks for
     uint ratio;      // compress_ratio: cells pooled into one indexer block
     uint rotDims;    // n_rot -- 64 of the 256 head dims rotate
     uint attnScale;  // float bits: 1/sqrt(headDim) * log2(e), folded into q

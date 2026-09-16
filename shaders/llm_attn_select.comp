@@ -1,0 +1,225 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The QSA selection on the device: the fifth dispatch of the full-attention
+// layer, and the one that only does anything past 2051 cells (LLM.md L4b).
+//
+// llama.cpp's `topk_radix_select.comp` is **not a sort**. It finds the key of
+// the width-th largest value with four 8-bit radix passes over an
+// order-preserving float->uint map, emits every cell **strictly above** it,
+// and fills the rest from the cells **equal** to it — which at this model's
+// shapes is a *block split*, because all `ratio` cells of a block carry one
+// block score. L4a ported it pass for pass and reproduced `indexer_top_k-3`
+// on all 4096 rows of the 4k dump, and set for set on the 2045 rows where the
+// selection bites. This is that port as a kernel.
+//
+// Three things it does differently, all of them deliberate:
+//
+// **It writes a per-cell bitmask, not an index list.** The reference emits
+// `width` int32 cell indices and then spends a `GET_ROWS` (12 dispatches,
+// 207 us a graph) turning them back into an f16 mask for a *dense* flash
+// attention over every cell — so the sparsity is semantics at prefill and not
+// a saving. A bitmask is what the consumer actually wants, it is 32x smaller
+// than the index list it replaces (nKV/8 bytes a token against 4*width), and
+// it deletes that second dispatch.
+//
+// **The tie fill is by ascending cell index rather than by whoever won the
+// atomic.** The reference appends ties with `atomicAdd` and L4a measured the
+// consequence: the *order* of its output differs on 4096 of 4096 rows between
+// two runs of the same prompt, while the visible *set* differs on none. A
+// bitmask has no order to get wrong, and taking the lowest-indexed ties is
+// both reproducible and what the reference's wave-ordered atomic does in
+// practice — which is why `topK` in attn.go matches it set for set.
+//
+// **It does not gather.** The reference's QSA arm recomputes
+// `score[cell_blk[i]] + mask[i]` per element and caches it in a scratch
+// buffer to avoid doing it five times. `llm_attn_score.comp` has already
+// written exactly that tensor — the biased, expanded, causally masked
+// `indexer_score_tokens` — so this kernel reads it straight, and caches the
+// row's *keys* in LDS instead, which is 16 KB at a 4096-cell cache and turns
+// five passes over DRAM into one.
+
+#include "llm_common.glsl"
+
+#define WG 256
+#define RADIX_BITS 8
+#define RADIX_SIZE (1 << RADIX_BITS)
+
+// Cells whose keys are held in LDS. 4096 uints is 16 KB, which is the cache
+// size the 4k fixture uses and leaves the histogram and the scan beside it.
+// A longer context falls back to re-reading the row, as the reference does.
+#ifndef SEL_LDS
+#define SEL_LDS 4096
+#endif
+
+// The workgroup is exactly one lane per radix bucket, which is what lets the
+// top-down bucket search below be a suffix sum rather than a serial walk.
+#if WG != RADIX_SIZE
+#error "llm_attn_select assumes one lane per radix bucket"
+#endif
+
+layout(local_size_x = WG) in;
+
+shared uint histo[RADIX_SIZE];
+shared uint shBucket, shAbove;
+shared uint keys[SEL_LDS];
+shared uint shWave[WG / 64];
+
+// The order-preserving float -> uint map, the reference's exactly: flip the
+// sign bit of a positive, invert every bit of a negative. -inf becomes the
+// smallest key there is, which is what lets a row that is mostly causal mask
+// select at all.
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    return ((y & 0x80000000u) != 0u) ? (y ^ 0xFFFFFFFFu) : (y | 0x80000000u);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint ncols = pc.nKV;
+    uint words = (ncols + 31u) / 32u;
+    uint cellBase = pc.cellOff + t * ncols;
+    uint outBase = pc.selOff + t * words;
+    bool cached = ncols <= SEL_LDS;
+
+    if (cached) {
+        for (uint i = tid; i < ncols; i += WG) {
+            keys[i] = f2ui(act[cellBase + i]);
+        }
+        barrier();
+    }
+
+    // ---- The radix select. Four passes, each narrowing the threshold's
+    // prefix by eight bits and counting only the keys that already match the
+    // bits fixed above it. Four passes over the row where a partial selection
+    // sort costs `width` of them — 2051 at this width.
+    uint prefix = 0u;
+    uint desired = pc.selWidth;
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (uint i = tid; i < RADIX_SIZE; i += WG) {
+            histo[i] = 0u;
+        }
+        barrier();
+
+        uint hiMask = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        uint prefixHi = prefix & hiMask;
+        for (uint i = tid; i < ncols; i += WG) {
+            uint key = cached ? keys[i] : f2ui(act[cellBase + i]);
+            if ((key & hiMask) == prefixHi) {
+                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1u)], 1u);
+            }
+        }
+        barrier();
+
+        // Top-down, so the bucket straddling the width-th largest is found
+        // with everything above it already counted out of `desired`.
+        //
+        // The reference walks the 256 buckets **serially on lane 0** while the
+        // other 255 wait at a barrier, four times a row. That is 1024 
+        // dependent LDS reads on the critical path of a kernel whose whole
+        // input is 8 KB, and it was most of this kernel's time. The same
+        // answer is a suffix sum: `acc` at bucket b is exactly the count above
+        // b, so the bucket wanted is the **largest** b whose inclusive suffix
+        // still reaches `desired` — the suffix is non-increasing in b, so that
+        // is an atomicMax over the lanes that satisfy it, and one lane reads
+        // its own `acc` back out.
+        uint h = histo[tid];
+        uint waveTotal = subgroupAdd(h);
+        uint suffix = waveTotal - subgroupExclusiveAdd(h);
+        uint sg = tid / 64u;
+        if (subgroupElect()) {
+            shWave[sg] = waveTotal;
+        }
+        barrier();
+        [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+            if (w > sg) {
+                suffix += shWave[w];
+            }
+        }
+        if (tid == 0u) {
+            shBucket = 0u;
+        }
+        barrier();
+        if (suffix >= desired) {
+            atomicMax(shBucket, tid);
+        }
+        barrier();
+        if (tid == shBucket) {
+            shAbove = suffix - h;
+        }
+        barrier();
+        prefix |= shBucket << uint(shift);
+        desired -= shAbove;
+        barrier();
+    }
+
+    // After the last pass every bit of the threshold is fixed, so `desired`
+    // is exactly how many of the cells *equal* to it the fill still needs —
+    // no separate counting pass.
+    uint thr = prefix;
+    uint need = desired;
+
+    // ---- The emit, one lane per 32-cell word: the whole word's
+    // strictly-above bits at once, then as many of its tie bits as the fill
+    // has left. `taken` runs identically on every lane, so the running count
+    // across chunks needs no shared state of its own.
+    uint taken = 0u;
+    for (uint wbase = 0u; wbase < words; wbase += WG) {
+        uint w = wbase + tid;
+        uint above = 0u, eq = 0u;
+        if (w < words) {
+            uint lim = min(32u, ncols - w * 32u);
+            for (uint b = 0u; b < lim; ++b) {
+                uint key = cached ? keys[w * 32u + b] : f2ui(act[cellBase + w * 32u + b]);
+                if (key > thr) {
+                    above |= 1u << b;
+                } else if (key == thr) {
+                    eq |= 1u << b;
+                }
+            }
+        }
+
+        // An inclusive scan of the tie counts, so each lane knows the rank of
+        // its first tie among all the ties at or before it. One subgroup scan
+        // and one barrier, for the reason the bucket search above gives.
+        uint c = bitCount(eq);
+        uint cTotal = subgroupAdd(c);
+        uint cIncl = subgroupInclusiveAdd(c);
+        uint sg = tid / 64u;
+        if (subgroupElect()) {
+            shWave[sg] = cTotal;
+        }
+        barrier();
+        uint total = 0u;
+        uint before = 0u;
+        [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+            total += shWave[w];
+            if (w < sg) {
+                before += shWave[w];
+            }
+        }
+        uint rank = taken + before + cIncl - c;
+
+        uint fill = 0u;
+        while (eq != 0u && rank < need) {
+            uint b = findLSB(eq);
+            fill |= 1u << b;
+            eq &= eq - 1u;
+            rank++;
+        }
+        if (w < words) {
+            actu[outBase + w] = above | fill;
+        }
+        taken += total;
+        barrier();
+    }
+}

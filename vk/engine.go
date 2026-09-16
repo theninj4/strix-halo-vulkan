@@ -484,6 +484,17 @@ func (b *Buffer) ReadUint16At(off, n int) []uint16 {
 	return out
 }
 
+// ReadUint32At reads n uint32s starting at a uint32 element offset. Storage
+// buffers that hold bit-packed data rather than numbers — a mask, an index
+// list — are read through this instead of ReadFloat32At, so that nothing goes
+// through a float on the way.
+func (b *Buffer) ReadUint32At(off, n int) []uint32 {
+	src := unsafe.Slice((*uint32)(b.mapped), off+n)
+	out := make([]uint32, n)
+	copy(out, src[off:])
+	return out
+}
+
 // ReadUint32 reads n uint32s back out of the buffer's mapped memory.
 func (b *Buffer) ReadUint32(n int) []uint32 {
 	src := unsafe.Slice((*uint32)(b.mapped), n)

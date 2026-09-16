@@ -81,7 +81,9 @@ type push struct {
 	GammaKOff, GammaIQOff, GammaIKOff uint32
 	Heads, KVHeads, HeadDim           uint32
 	NKV, Plane, LDCtx                 uint32
-	IdxHeads, IdxDim, Ratio, RotDims  uint32
+	IdxHeads, IdxDim                  uint32
+	SelOff, SelWidth                  uint32
+	Ratio, RotDims                    uint32
 	AttnScale                         uint32
 
 	// The gated DeltaNet (gpu_deltanet.go). Six fields, because everything
@@ -395,7 +397,7 @@ func (g *HCGPU) alloc(nMixers int) error {
 // shader declares them or not, so one descriptor layout and one push-constant
 // size serve the whole sequence.
 func (g *HCGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"norm":    shaders.LLMHCNorm,

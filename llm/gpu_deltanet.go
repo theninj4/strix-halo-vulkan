@@ -385,7 +385,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 }
 
 func (g *DeltaNetGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"conv": shaders.LLMDNConv,

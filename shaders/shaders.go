@@ -2015,6 +2015,7 @@ var LLMPLEConv []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_pack.spv llm_attn_pack.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_idx.spv llm_attn_idx.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_score.spv llm_attn_score.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_select.spv llm_attn_select.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
@@ -2027,6 +2028,15 @@ var LLMAttnIdx []byte
 
 //go:embed llm_attn_score.spv
 var LLMAttnScore []byte
+
+// LLMAttnSelect is L4b's radix select: llama.cpp's topk_radix_select.comp
+// ported pass for pass, writing a per-cell bitmask instead of an index list
+// and so deleting the GET_ROWS the reference spends turning one into the
+// other. It only runs where the width binds — past 2051 cells — because below
+// that it provably names every cell.
+//
+//go:embed llm_attn_select.spv
+var LLMAttnSelect []byte
 
 //go:embed llm_attn_qt1_kt2.spv
 var LLMAttnQT1KT2 []byte

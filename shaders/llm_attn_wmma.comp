@@ -38,10 +38,19 @@
 // straight into the output projection's A layout. Three of llama.cpp's lines
 // and a [T, 6144] round trip through DRAM, deleted.
 //
-// The selection is not read. At any prompt shorter than top_k the indexer
-// names every cell (research/l2e-attention.md), so the sparse path and this
-// dense causal one are the same computation; L4 is where the width binds and
-// where this kernel grows a gather over llm_attn_score.comp's output.
+// **The selection is a second mask.** `llm_attn_select.comp` writes one bit
+// per cache cell per token, and this kernel reads it exactly where it reads
+// the causal one: out of the block row max, so an unselected cell cannot set
+// the scale, and out of P, which is what removes it from both O and the row
+// sum. That is also what the reference does — `build_attn_qsa` turns `top_k`
+// back into an f16 mask and runs **dense** flash attention over every cell —
+// so the sparsity is semantics at prefill and not a saving, and the cost here
+// is one bit-test per element rather than a gather.
+//
+// `selOff == NO_W` is the dense path, and it is the honest one below 2051
+// cells: at any prompt shorter than `top_k + ratio - 1` the selection names
+// every cell (research/l2e-attention.md), so running it would be the identity
+// and the branch is not an approximation.
 
 #include "llm_common.glsl"
 
@@ -76,6 +85,36 @@ shared float bcorr[QT * TILE * TILE];
 shared float rowMax[BM];
 shared float blkMax[BM];
 shared float rowSum[BM];
+// This key block's slice of the QSA bitmask, one word per (row, 32 cells).
+// It is staged once a block rather than bit-tested out of the arena per
+// element: the mask loop below touches BM*BN elements and the row max another
+// BM*TILE, which is 512 global reads a block where the block's whole mask is
+// BM*BN/32 words. Reading it per element cost the kernel 1.90x.
+shared uint selw[BM * (BN / 32)];
+
+// stageSel loads this key block's slice of the QSA bitmask into LDS: one word
+// per (row, 32 cells), read by both the row max and the mask loop below.
+//
+// `base` is a multiple of BN and BN a multiple of 32, so a word of the staged
+// slice is a word of the arena and not a shift of one. A pad row has no
+// selection — llm_attn_select.comp does not run past the prompt — so it stages
+// as all-ones and takes the dense path. Its output is never read; what this
+// avoids is a row with no visible cell at all, whose softmax denominator would
+// be zero.
+void stageSel(uint lane, uint q0, uint base) {
+    uint words = (pc.nKV + 31u) / 32u;
+    for (uint i = lane; i < BM * (BN / 32u); i += WAVE) {
+        uint row = i / (BN / 32u), wd = i % (BN / 32u);
+        uint token = q0 + row;
+        selw[i] = (token >= pc.tokens) ? 0xffffffffu
+                                       : actu[pc.selOff + token * words + ((base + wd * 32u) >> 5u)];
+    }
+}
+
+// selected reads one bit out of the staged slice.
+bool selected(uint row, uint col) {
+    return (selw[row * (BN / 32u) + (col >> 5u)] & (1u << (col & 31u))) != 0u;
+}
 
 void main() {
     uint head = gl_WorkGroupID.y;
@@ -85,6 +124,7 @@ void main() {
     if (q0 >= n || head >= pc.heads) {
         return;
     }
+    bool sparse = pc.selOff != NO_W;
 
     uint tiles = pc.plane / TILE;
     uint plane = head * tiles * (HDT * TILE * TILE);
@@ -148,6 +188,9 @@ void main() {
         for (uint i = lane; i < BM; i += WAVE) {
             blkMax[i] = -1.0 / 0.0;
         }
+        if (sparse) {
+            stageSel(lane, q0, base);
+        }
         barrier();
         [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
@@ -159,8 +202,12 @@ void main() {
                 uint qi = i / TILE, r = i % TILE;
                 float mx = blkMax[i];
                 for (uint c = 0u; c < TILE; ++c) {
-                    if (base + kk * TILE + c > q0 + i) {
+                    uint cell = base + kk * TILE + c;
+                    if (cell > q0 + i) {
                         break;      // and every c after it, the row is done
+                    }
+                    if (sparse && !selected(i, kk * TILE + c)) {
+                        continue;   // unselected: it must not set the scale
                     }
                     mx = max(mx, stage[qi * (TILE * TILE) + r * TILE + c]);
                 }
@@ -174,7 +221,11 @@ void main() {
             float mo = rowMax[i];
             float mn = max(mo, blkMax[i]);
             rowMax[i] = mn;
-            float corr = exp2(mo - mn);      // exp2(-inf - m) is 0: no first-block case
+            // exp2(-inf - m) is 0, so there is no first-block case. The equal
+            // test is for the selection: a key block with nothing selected in
+            // it leaves both maxima at -inf, and exp2(-inf - -inf) is a NaN
+            // that would poison the accumulators for the rest of the row.
+            float corr = (mo == mn) ? 1.0 : exp2(mo - mn);
             for (uint c = 0u; c < TILE; ++c) {
                 stage[qi * (TILE * TILE) + r * TILE + c] = mn;
                 bcorr[qi * (TILE * TILE) + r * TILE + c] = corr;
@@ -202,12 +253,16 @@ void main() {
         barrier();
 
         // Mask the pad keys and the future ones out of P, which is what
-        // removes them from both O and the row sums. Only the diagonal block
-        // needs it: every earlier block is entirely in the past of every row.
-        if (cnt < BN || base + BN > q0) {
+        // removes them from both O and the row sums. Without a selection only
+        // the diagonal block needs it — every earlier block is entirely in the
+        // past of every row — but the selection drops cells anywhere, so with
+        // it on every block passes through here.
+        if (sparse || cnt < BN || base + BN > q0) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 uint col = i & (BN - 1u);
-                if (col >= cnt || base + col > q0 + i / BN) {
+                uint row = i / BN;
+                if (col >= cnt || base + col > q0 + row ||
+                    (sparse && !selected(row, col))) {
                     pbuf[i] = float16_t(0.0);
                 }
             }
