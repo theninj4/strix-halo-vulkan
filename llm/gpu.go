@@ -83,6 +83,13 @@ type push struct {
 	NKV, Plane, LDCtx                 uint32
 	IdxHeads, IdxDim, Ratio, RotDims  uint32
 	AttnScale                         uint32
+
+	// The gated DeltaNet (gpu_deltanet.go). Six fields, because everything
+	// else the layer needs is already above under the same meaning — see the
+	// note in llm_common.glsl. 57 uints is 228 bytes against the device's
+	// 256, which is what TestAttnGPUPushBlockFits guards.
+	SSMGateOff, SSMBetaOff, SSMStateOff uint32
+	SSMAOff, SSMDTOff, SSMNorm          uint32
 }
 
 func (p push) bytes() []byte {

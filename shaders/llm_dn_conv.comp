@@ -1,0 +1,132 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The gated DeltaNet's staging pass: LLM.md L3b, and the whole of the layer
+// that is not a matmul and not the recurrence.
+//
+// Everything between the fused input projection and the delta rule happens
+// here, in one dispatch over a (plane, token) grid:
+//
+//	conv   out[t][c] = sum_k w1d[c][k] * qkv[t-(K-1-k)][c]     depthwise, K = 4
+//	silu   out[t][c] *= sigmoid(out[t][c])
+//	norm   q and k only: divide each head of 128 by its own L2 length
+//	gate   g[t][h] = softplus(alpha[t][h] + dt_bias[h]) * A[h]
+//	       beta[t][h] = sigmoid(beta_raw[t][h])
+//
+// llama.cpp spends SSM_CONV_SILU, two L2_NORMs, a SOFTPLUS, a MUL, a SIGMOID
+// and the CONTs between them on the same thing — eight lines of its graph at
+// 188 + 63 + change microseconds a layer (results/l2a_prefill_ops.csv).
+//
+// **The plane is what a workgroup is**, and the three families are contiguous
+// column ranges of the same convolution output, so the grid says which:
+//
+//	plane < kvHeads                  query head p          conv, silu, L2
+//	plane < 2*kvHeads                key head p-kvHeads    conv, silu, L2
+//	plane < 2*kvHeads + heads        value head            conv, silu
+//	plane == 2*kvHeads + heads       the 48 gate scalars   softplus, sigmoid
+//
+// One workgroup is 128 channels, which is exactly one head, which is exactly
+// the L2 norm's reduction — so the norm is structural rather than a divide,
+// the same argument llm_hc_norm.comp makes about the hyper-connection block's
+// grouped RMS and llm_attn_pack.comp about the per-head one. Reducing over
+// the 2048-wide q range would be plausible and wrong.
+//
+// **The convolution's history is three rows of negative token index.** The
+// host puts the fused projection's output at `qkvOff` with Conv-1 rows of the
+// previous batch's tail *in front of it*, so a tap that reaches before token
+// zero is an ordinary read at a negative offset — `uint` arithmetic wraps to
+// exactly the right address — and a fresh sequence is those rows zeroed. A
+// kernel that carries the [128, 128, 48] recurrent state and forgets this
+// 120 KB window is wrong in a way nothing but a batch-split test sees
+// (research/l3-deltanet.md finding 6), and at decode it would be wrong on
+// every token.
+//
+// **softplus is ggml's, cutoff and all.** `log(1 + exp(x))` evaluated in f32
+// flushes to exactly zero below about -16.6 rather than to exp(x), and the
+// identity above 20 is the reference's own cutoff and not an approximation of
+// it. `a_softplus-0` has one such zero among its 336 values.
+//
+// **The L2 norm has two spellings and the build picks one.** `ggml_l2_norm`
+// divides by max(|x|, eps); llama.cpp since 5fdfa6282 (#28068) divides by
+// sqrt(|x|^2 + eps). The build behind this repo's trace, its baseline and its
+// PPL predates the fix, so ssmNorm selects — 1 is the build's `max`, 0 the
+// model's `rsqrt`.
+
+#include "llm_common.glsl"
+
+#define WG 128
+
+layout(local_size_x = WG) in;
+
+shared float partial[WG];
+
+float siluf(float x) { return x / (1.0 + exp(-x)); }
+
+// ggml's softplus: the f32 add is load-bearing, see the header.
+float softplusf(float x) {
+    if (x > 20.0) {
+        return x;
+    }
+    return log(1.0 + exp(x));
+}
+
+void main() {
+    uint p = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint qk = pc.kvHeads * pc.headDim;          // the q range, and the k range
+    uint cw = 2u * qk + pc.heads * pc.headDim;  // the convolution's channels
+
+    if (p == 2u * pc.kvHeads + pc.heads) {
+        // The two per-head scalars. 48 of 128 lanes work; it is one workgroup
+        // a token against the 80 the convolution needs, and it saves the
+        // dispatch llama.cpp spends four graph lines on.
+        if (tid >= pc.heads) {
+            return;
+        }
+        uint colA = cw + pc.heads * pc.headDim;
+        float alpha = act[pc.qkvOff + t * pc.gemmN + colA + tid];
+        float beta = act[pc.qkvOff + t * pc.gemmN + colA + pc.heads + tid];
+        // ssm_a is stored as -exp(A_log) by the converter, so the decay is a
+        // multiply here and `gate` comes out in [-inf, 0].
+        act[pc.ssmGateOff + t * pc.heads + tid] =
+            softplusf(alpha + wbuf[pc.ssmDTOff + tid]) * wbuf[pc.ssmAOff + tid];
+        act[pc.ssmBetaOff + t * pc.heads + tid] = 1.0 / (1.0 + exp(-beta));
+        return;
+    }
+
+    uint c = p * pc.headDim + tid;
+
+    // Four taps along the token axis. Consecutive lanes read consecutive
+    // channels of one token, so each tap is one coalesced run; the history
+    // rows are the same read at a wrapped offset.
+    float sum = 0.0;
+    for (uint k = 0u; k < pc.kern; k++) {
+        uint back = pc.kern - 1u - k;
+        uint row = pc.qkvOff + uint(int(t) - int(back)) * pc.gemmN;
+        sum += wbuf[pc.convOff + c * pc.kern + k] * act[row + c];
+    }
+    float v = siluf(sum);
+    if (pc.convOutOff != NO_W) {
+        act[pc.convOutOff + t * cw + c] = v;
+    }
+
+    if (p < 2u * pc.kvHeads) {
+        partial[tid] = v * v;
+        barrier();
+        for (uint stride = WG / 2u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            barrier();
+        }
+        float eps = uintBitsToFloat(pc.eps);
+        float scale = (pc.ssmNorm == 1u)
+            ? 1.0 / max(sqrt(partial[0]), eps)   // ggml_l2_norm, the build's
+            : 1.0 / sqrt(partial[0] + eps);      // #28068, the model's
+        v *= scale;
+    }
+    act[pc.normOff + t * cw + c] = v;
+}

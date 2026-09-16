@@ -44,12 +44,14 @@ func main() {
 	hc := flag.Bool("hc", false, "benchmark the fused hyper-connection block")
 	ple := flag.Bool("ple", false, "benchmark the PLE n-gram block")
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
+	dn := flag.Bool("dn", false, "benchmark the gated DeltaNet layer")
 	ctx := flag.Int("ctx", 2048, "cache cells for -attn; llama.cpp's measured graph had 2048")
-	attnLayers := flag.Int("layers", 2, "how many full-attention layers to stage for -attn")
+	attnLayers := flag.Int("layers", 2, "how many layers to stage for -attn and -dn")
 	tokens := flag.String("tokens", "64,128,256,512,1024,2048", "token counts for -hc")
 	mixers := flag.Int("mixers", 8, "how many real mixers to stage for -hc; the sweep needs more than the 32 MiB MALL")
 	iters := flag.Int("iters", 20, "repetitions per timed dispatch for -hc")
 	ladder := flag.Bool("ladder", false, "run every kernel rung for -hc")
+	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
 
@@ -59,6 +61,17 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *dn {
+		toks, err := parseInts(*tokens)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err := dnBench(*model, toks, *attnLayers, *iters, *ladder, *gemmLadder, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return

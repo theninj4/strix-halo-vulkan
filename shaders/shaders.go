@@ -2036,3 +2036,117 @@ var LLMAttnQT1KT4 []byte
 
 //go:embed llm_attn_qt2_kt4.spv
 var LLMAttnQT2KT4 []byte
+
+// The gated DeltaNet (LLM.md L3b): 36 of the 48 layers, and the only kernel
+// in this model with a loop-carried dependency as long as the prompt.
+//
+// Three shaders. `llm_dn_conv` is everything between the fused input
+// projection and the recurrence — the depthwise causal convolution, its SiLU,
+// the per-head L2 normalisation of q and k, and the two per-head scalars the
+// decay and the write strength come from — in one dispatch over a (plane,
+// token) grid, against the eight lines of llama.cpp's graph that do the same.
+// `llm_dn_norm` is the gated RMS norm behind it, narrowed straight into the
+// output matmul's A operand. The input and output projections themselves run
+// on the plain arm of llm_gemm.comp, which is already built above.
+//
+// `llm_dn_scan` is the delta rule, and it is a **ladder rather than a
+// kernel**. LPC is how many lanes own one column of the [128, 128] state, so
+// it sets the register count per lane (128/LPC), the workgroup count per head
+// (128/(COLS*WAVES)) and the number of times each head's q and k row is
+// re-read per token, all at once. llama.cpp's own kernel is the top rung —
+// one column per workgroup, 6144 workgroups, a 128-fold re-read. Nineteen
+// builds over three dials, and their ends are **6.3x apart on identical
+// arithmetic**: the measured winner is LPC 8, which is 413 us a layer against
+// the reference's 438 (research/l3b-deltanet-gpu.md).
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_dn_conv.spv llm_dn_conv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_dn_norm.spv llm_dn_norm.comp
+// The second dial is QKREG: whether q and k live in registers beside the
+// state, as llama.cpp's kernel keeps them, or are staged once per token in
+// LDS. Registers are the default wherever 128/LPC of each still fit, and the
+// `…s` rungs are the same shapes with the LDS arm forced, which is what
+// prices the choice. LPC 2 and 1 have no register arm: 128 state elements a
+// lane plus 256 more would not fit a register file with 256.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=64 -DWAVES=1 -o llm_dn_scan_l64.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=32 -DWAVES=1 -o llm_dn_scan_l32.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -DWAVES=1 -o llm_dn_scan_l16.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -DWAVES=1 -o llm_dn_scan_l8.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -DWAVES=1 -o llm_dn_scan_l4.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=2 -DWAVES=1 -o llm_dn_scan_l2.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=1 -DWAVES=1 -o llm_dn_scan_l1.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -DWAVES=4 -o llm_dn_scan_l16w4.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -DWAVES=4 -o llm_dn_scan_l8w4.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -DWAVES=4 -o llm_dn_scan_l4w4.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=2 -DWAVES=4 -o llm_dn_scan_l2w4.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=64 -DWAVES=1 -DQKREG=0 -o llm_dn_scan_l64s.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -DWAVES=1 -DQKREG=0 -o llm_dn_scan_l16s.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -DWAVES=1 -DQKREG=0 -o llm_dn_scan_l8s.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -DWAVES=1 -DQKREG=0 -o llm_dn_scan_l4s.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=64 -DWAVES=1 -DPREFETCH=1 -o llm_dn_scan_l64p.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -DWAVES=1 -DPREFETCH=1 -o llm_dn_scan_l16p.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -DWAVES=1 -DPREFETCH=1 -o llm_dn_scan_l8p.spv llm_dn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -DWAVES=1 -DPREFETCH=1 -o llm_dn_scan_l4p.spv llm_dn_scan.comp
+
+//go:embed llm_dn_conv.spv
+var LLMDNConv []byte
+
+//go:embed llm_dn_norm.spv
+var LLMDNNorm []byte
+
+//go:embed llm_dn_scan_l64.spv
+var LLMDNScanL64 []byte
+
+//go:embed llm_dn_scan_l32.spv
+var LLMDNScanL32 []byte
+
+//go:embed llm_dn_scan_l16.spv
+var LLMDNScanL16 []byte
+
+//go:embed llm_dn_scan_l8.spv
+var LLMDNScanL8 []byte
+
+//go:embed llm_dn_scan_l4.spv
+var LLMDNScanL4 []byte
+
+//go:embed llm_dn_scan_l2.spv
+var LLMDNScanL2 []byte
+
+//go:embed llm_dn_scan_l1.spv
+var LLMDNScanL1 []byte
+
+//go:embed llm_dn_scan_l16w4.spv
+var LLMDNScanL16W4 []byte
+
+//go:embed llm_dn_scan_l8w4.spv
+var LLMDNScanL8W4 []byte
+
+//go:embed llm_dn_scan_l4w4.spv
+var LLMDNScanL4W4 []byte
+
+//go:embed llm_dn_scan_l2w4.spv
+var LLMDNScanL2W4 []byte
+
+//go:embed llm_dn_scan_l64s.spv
+var LLMDNScanL64S []byte
+
+//go:embed llm_dn_scan_l16s.spv
+var LLMDNScanL16S []byte
+
+//go:embed llm_dn_scan_l8s.spv
+var LLMDNScanL8S []byte
+
+//go:embed llm_dn_scan_l4s.spv
+var LLMDNScanL4S []byte
+
+//go:embed llm_dn_scan_l64p.spv
+var LLMDNScanL64P []byte
+
+//go:embed llm_dn_scan_l16p.spv
+var LLMDNScanL16P []byte
+
+//go:embed llm_dn_scan_l8p.spv
+var LLMDNScanL8P []byte
+
+//go:embed llm_dn_scan_l4p.spv
+var LLMDNScanL4P []byte

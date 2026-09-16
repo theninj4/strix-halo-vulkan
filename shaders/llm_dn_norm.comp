@@ -1,0 +1,54 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+// The gated DeltaNet's tail: an RMS norm per value head against a gamma every
+// head shares, times the sigmoid of a second projection, narrowed straight
+// into the output matmul's A layout.
+//
+//	final[t][h][j] = out[t][h][j] * rms(out[t][h]) * gamma[j] * sigmoid(z)
+//
+// llama.cpp spends RMS_NORM + MUL + SIGMOID + MUL + CONT on this, and the
+// tensor in the middle is [T, 6144] — 12.6 MB at 512 tokens, a third of the
+// MALL — written and read back three times over. Here nothing between the
+// scan's output and the fp16 A operand exists.
+//
+// The one numerical difference from Qwen3.5's gated DeltaNet is that this
+// gate is a **sigmoid** and not a SiLU, which vLLM and llama.cpp agree on.
+// The norm is over one head's 128, with a gamma of 128 shared by all 48 — one
+// workgroup, one head, so the reduction is structural.
+
+#include "llm_common.glsl"
+
+#define WG 128
+
+layout(local_size_x = WG) in;
+
+shared float partial[WG];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint d = pc.headDim;
+    // z is the fused projection's third range, straight after the
+    // convolution's channels: [q | k | v | z | alpha | beta].
+    uint colZ = 2u * pc.kvHeads * d + pc.heads * d;
+
+    float v = act[pc.outOff + (t * pc.heads + h) * d + tid];
+    partial[tid] = v * v;
+    barrier();
+    for (uint stride = WG / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        barrier();
+    }
+    // 1.0/sqrt rather than inversesqrt: ggml computes 1.0f/sqrtf(mean + eps)
+    // and this tensor is compared against its output.
+    float scale = 1.0 / sqrt(partial[0] / float(d) + uintBitsToFloat(pc.eps));
+    float z = act[pc.qkvOff + t * pc.gemmN + colZ + h * d + tid];
+    hact[pc.ctxOff + t * pc.ldCtx + h * d + tid] =
+        float16_t(v * scale * wbuf[pc.gammaOff + tid] * (1.0 / (1.0 + exp(-z))));
+}

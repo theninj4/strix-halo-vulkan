@@ -1,6 +1,6 @@
 # LLM — the qwen3.8-flash-next vertical
 
-> **Current work from 2026-09-15.** `SPEECH.md` is finished-ish (74.2x real
+> **Current work from 2026-09-16.** `SPEECH.md` is finished-ish (74.2x real
 > time, T7 open); `PIPELINE.md` (z-image) is parked at 14.26 s an image. Same
 > rules as both: this file is **rewritten** each session rather than appended
 > to, history goes to `TODO.md`, closed findings to `research/`. Stage numbers
@@ -10,21 +10,22 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: L0, L1, the whole of L2, and L3's CPU reference complete.** The
+**Status: L0, L1, the whole of L2 and the whole of L3 complete.** The
 checkpoint is downloaded, llama.cpp runs it, the Go side reads it, the prefill
-mystery is solved, and **all three of the dense skeleton's blocks now run on
-the GPU**: the hyper-connection block in four dispatches where the reference
-has sixteen (4.24x, 14.9% of llama.cpp's whole prefill graph), the PLE n-gram
-block beside it with its trigram hash bit-exact, and — L2f — **the
-full-attention layer and the QSA indexer in six dispatches where the reference
-has nineteen**, 66.3 ms of its 512-token graph becoming 27.6. **L3a now has
-the gated DeltaNet in Go** — three quarters of the layers, eighteen tensors
-matching, the recurrence at 3.11e-09 rms — so **every layer of this model has
-a reference implementation**. 114 GB in 18 minutes;
+mystery is solved, and **every layer of this model now runs on the GPU**: the
+hyper-connection block in four dispatches where the reference has sixteen
+(4.24x, 14.9% of llama.cpp's whole prefill graph), the PLE n-gram block beside
+it with its trigram hash bit-exact, the full-attention layer and the QSA
+indexer in six dispatches where the reference has nineteen (L2f, 2.40x), and
+— **L3b — the gated DeltaNet, three quarters of the layers, in five
+dispatches where the reference has eleven**: 152.8 ms of its 512-token graph
+becoming 111.5, **1.37x, with the recurrence itself at 1.06x**. Between them
+L2 and L3 have taken **445.7 ms of llama.cpp's 1164.7 ms prefill graph down to
+192.5** — 38.3% of it replaced by 16.5%. 114 GB in 18 minutes;
 `models/Qwen3.8-Flash-Next-GGUF/` holds the four `UD-Q4_K_XL` shards and the
-2.79 GB MTP head. **Next: L3's kernel, where the open question is whether to
-copy the reference's sequential scan or build the chunked form it declines to
-use.**
+2.79 GB MTP head. **Next: L4's 4k re-dump, which the QSA selection and every
+tolerance in L2 and L3 both need, and L5's MoE — 35.7% of the graph and the
+last block without a kernel.**
 
 ## The number to beat
 
@@ -382,12 +383,16 @@ against all eighteen tensors llama.cpp names inside layer 0.
 > decay masks — is in the tree and is not what ran; `q_conv_predelta` being
 > dumped with **16 heads and not 48** proves it, because the non-fused path
 > repeats q and k first. So the chunked form is L3's *performance* question,
-> and what it has to beat is **438 us a layer at ubatch 512** (2058 at 2048)
-> from 48 workgroups running 512 dependent iterations each. **vLLM answers it
-> the other way** — `chunk_gated_delta_rule` at chunk size 64 for prefill, a
-> fused recurrent update only for decode — so L3b is a real open question that
-> two teams have split on, and flash-linear-attention's four stages
-> (`scaled_dot_kkt` → `solve_tril` → `delta_h` → `fwd_o`) are its blueprint.
+> and what it has to beat is **438 us a layer at ubatch 512** (2058 at 2048).
+> *(L3b corrects the shape: the dispatch is `{H, n_seqs, S_v}` with one state
+> column per workgroup, which on a 64-wide wave is **6144** workgroups and not
+> 48 — the source's "one workgroup per head" is the loop's structure, not the
+> grid's.)* **vLLM answers it the other way** — `chunk_gated_delta_rule` at
+> chunk size 64 for prefill, a fused recurrent update only for decode — so L3b
+> is a real open question that two teams have split on, and
+> flash-linear-attention's four stages (`scaled_dot_kkt` → `solve_tril` →
+> `delta_h` → `fwd_o`) are its blueprint. **L3b answers it: neither team's
+> choice is worth much here, because the recurrence is 13% of the layer.**
 >
 > **L3a-3: the 48 value heads read the 16 key heads by `h % 16` — because
 > this checkpoint's V heads are permuted.** ggml's own two broadcast rules
@@ -439,6 +444,86 @@ against all eighteen tensors llama.cpp names inside layer 0.
 > views** that `eval_dump.c` writes as the parent region they span, so
 > `ReadDump` now gathers with the recorded strides (`q_conv-0`: 1.61e-01 rms
 > read flat, 1.04e-07 read properly).
+
+## What L3b established — the layer on the device, and a ladder that is 6.3x
+
+`llm/gpu_deltanet.go`, `shaders/llm_dn_{conv,scan,norm}.comp`: five dispatches,
+the plain GEMM arm twice and three kernels of this layer's own.
+[Write-up](research/l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
+
+> **L3b-1: five dispatches against eleven, and 152.8 ms becomes 111.5.** Per
+> 512-token graph, against the lines of llama.cpp's own graph that are nameably
+> this layer: the four projections 91.3 → **71.3 ms**, the convolution with its
+> SiLU, both L2 norms and the softplus 11.4 → **7.0**, the recurrence 15.8 →
+> **14.9**, the gated norm 8.6 → **2.2**, the output projection 25.7 → **16.1**.
+> **1.37x, and 13.1% of the whole graph becoming 9.6%** — a second run gives
+> 113.2 ms and 1.35x. The SiLU, the sigmoid of z, the multiply against it and
+> the CONTs behind all three are left out of the comparison entirely — they live in the shared MUL/SIGMOID/CONT lines and
+> are *absent* from our graph rather than faster in it.
+>
+> **L3b-2: four of the reference's matrices are one, and two of them are the
+> F32 scandal in miniature.** `attn_qkv`, `attn_gate` and the two **F32**
+> [2560, 48] gate projections read the same block input, so they are one
+> [16512, 2560] weight — L2a's argument for `inject` at a fourth site. The
+> F32 pair is 72 dispatches a graph, **7.8 ms at 1155 GFLOP/s for 0.25 MB of
+> weights**, and here it is 96 more columns on a matrix that already has
+> 16384. That puts alpha and beta on the fp16 matrix cores, which is a
+> deviation **from the 7-token dump and not from the reference**: L3a-5's
+> 8-column threshold means llama.cpp does the same at any real ubatch, and
+> **L1's PPL 4.0340 was measured with it**. Priced rather than hidden: 1.23e-03
+> rms on the log decay, and at most **1.105%** on the per-token forgetting
+> factor.
+>
+> **L3b-3: the scan's ladder is a re-read-to-ALU crossover, and its ends are
+> 6.3x apart.** LPC — how many lanes own one column of the [128, 128] state —
+> sets the registers a lane holds (128/LPC), the workgroups the layer
+> dispatches, and how many times each head's q and k row is re-read per token,
+> **all at once**. llama.cpp's own kernel is the top rung: `{H, n_seqs, S_v}`
+> with one column a workgroup is **6144 workgroups and a 128-fold re-read** on
+> a 64-wide wave — not the "48 workgroups" L3a inferred from the source — and
+> ours at that shape costs 2766 us. Five rungs sit pinned at **1.18-1.31 TB/s
+> while their flop rate varies 4x**, and the ablation is direct: **deleting the
+> operand loads takes the widest rung from 2766 us to 1013**, where deleting
+> both subgroup reductions moves it 5%. The winner is 16 state elements a lane
+> and 768 workgroups — **413 us against the reference's 438, 1.06x**, and 1.16x
+> at ubatch 2048.
+>
+> **L3b-4: registers beat LDS for the operands until they do not, and the
+> turn is at the same rung.** Keeping q and k beside the state is 1.15x at
+> LPC 16 and 1.08x at LPC 8, and **loses by 1.33x at LPC 4**, where 96
+> registers a lane costs more occupancy than an LDS round trip costs latency.
+> Two things that should have helped and did not: sharing the staged operands
+> across four waves of a workgroup cuts the re-read 4x and ties, and a one-deep
+> software pipeline is worth nothing at the wide end and 1.4x *against* at the
+> winner.
+>
+> **L3b-5: so the chunk is priced rather than built, and the question was
+> mis-scoped.** The recurrence is **13% of this layer**; the fused projection
+> is **64%**. flash-linear-attention's four stages come to 3.70 GFLOP at 512
+> tokens against the scan's 3.22 — **1.15x the arithmetic, all of it matmul
+> shaped** — so at §2.7's best measured 39.0 TFLOP/s it would be 95 us against
+> 413, a **4.3x ceiling**, and at an honest 10-15 TFLOP/s for 64x64x128 tiles
+> with a serial triangular solve and an 8-step serial carry, **1.1-1.6x**.
+> A *perfect* chunked kernel saves 10% of the layer and **1.0% of the prefill
+> graph**, and puts a recurrent state through fp16 operands where the scan is
+> at 2.4e-06. **Revisit at decode, not at prefill.**
+>
+> **L3b-6: it matches, and the state carries bit-identically.** `attn_output`
+> is **2.4e-06 rms** against both L3a's CPU reference and llama.cpp — 200x
+> tighter than the tensors feeding it, because the recurrence has no matmul in
+> it — and the fifteen rungs agree with each other to 2.6e-10 to 7.1e-10.
+> **3 + 4 tokens reproduce 7 exactly**, output and state, because the
+> convolution's window is three rows of *negative token index* in front of the
+> projection's own output: no branch, no second tensor. The control that zeroes
+> it moves the output by 4.0e-02.
+>
+> **L3b-7: and L2f-4's MALL rule holds on two more weights.** The fused
+> projection's B is **84.5 MB**, 2.6x the MALL, and wants the widest row block
+> everywhere — by 2.6x at 512 tokens and 3.3x at 2048. `ssm_out`'s is
+> **31.5 MB** and fits, and picks the narrow rung at 512 and the wide one at
+> 2048 — the same rungs at the same lengths as `attn_output`, which is the same
+> shape. Same kernel, opposite schedules, decided by which side of one cache
+> the weight falls on.
 
 ---
 
@@ -496,15 +581,16 @@ dense weight is read every time.
 L1**: the reader, the five dequant paths and the tokenizer all exist and are
 checked against llama.cpp. **L2 has the dense skeleton on the device** — the
 hyper-connection block, the PLE n-gram block and the full-attention layer with
-its indexer, all checked tensor-for-tensor against `llama-eval-callback`. **L3a
-has since added the DeltaNet's CPU reference**, so every layer of the model now
-has one and what is left is kernels. The acceptance criterion is *it generates
-the same text as llama.cpp*. **L2a sizes it**: ~1150 tok/s prefill against 391.4,
+its indexer — and **L3 has the linear-attention layer**, all checked
+tensor-for-tensor against `llama-eval-callback`. **Every layer of the model now
+has a kernel except the MoE.** The acceptance criterion is *it generates the
+same text as llama.cpp*. **L2a sizes it**: ~1150 tok/s prefill against 391.4,
 and 38.2 tok/s decode against 25.15, both reachable with kernels that already
-exist plus the epilogue fusion the hyper-connection block needs. **L2c and L2f
-between them have now taken 292.9 ms of llama.cpp's 1164.7 ms prefill graph
-down to 81.0 — 25.1% of it replaced by 7.0%, an 18.2% saving from two of the
-three dense blocks**, with the MoE's 35.7% still untouched at L5.
+exist plus the epilogue fusion the hyper-connection block needs. **L2c, L2f and
+L3b between them have taken 445.7 ms of llama.cpp's 1164.7 ms prefill graph
+down to 192.5 — 38.3% of it replaced by 16.5%, a 21.8% saving from all three
+dense blocks and three quarters of the layers**, with the MoE's 35.7% still
+untouched at L5.
 
 **Phase 2 — our own bank.** Re-quantise to the repo's W4A8 layout (§1.1's
 repack) at widths chosen for this bus rather than for a generic machine:
@@ -673,6 +759,8 @@ below Q8. Bandwidth is the whole story.
 | `llm/gpu_attn.go` | **L2f: that layer on the device, in six dispatches.** The fused `[13952, 2560]` projection for six of llama.cpp's matrices, a host-built rotary table, two BM ladders because the two projections fall on opposite sides of the MALL, and a sweep profiler over every staged layer. |
 | `shaders/llm_attn_*.comp` | **L2f: the layer's four kernels.** `llm_attn_pack` (per-head norm + interleaved M-RoPE + the fragment tiling for q, k and v in one grid), `llm_attn_idx` (the indexer's pooled key and query over two addressings), `llm_attn_score` (the rectified score, its bias, the cells and the causal mask) and `llm_attn_wmma` (causal GQA at headDim 256, **with the output gate in its epilogue**). |
 | `llm/deltanet.go` | **L3a: the gated DeltaNet, 36 of the 48 layers.** The fused [2560, 10240] qkv projection, the depthwise causal conv, the L2 norm under either of llama.cpp's two spellings of it (`QKNorm`), the two F32 gate projections and the delta rule itself — with a `DeltaNetState` carrying both the [128, 128, 48] recurrent state *and* the convolution's window, bit-identically across a batch split. |
+| `llm/gpu_deltanet.go` | **L3b: that layer on the device, in five dispatches.** The fused `[16512, 2560]` projection for four of llama.cpp's matrices — including both F32 gate projections — a recurrent state per staged layer, the convolution's window as `Conv-1` rows of negative token index in front of the projection's own output, and a sweep profiler over every staged layer. |
+| `shaders/llm_dn_*.comp` | **L3b: the layer's three kernels.** `llm_dn_conv` (the depthwise causal convolution, its SiLU, the per-head L2 norm of q and k under either spelling, and the softplus/sigmoid pair, over a (plane, token) grid), `llm_dn_scan` (the delta rule — **a fifteen-rung ladder on LPC and QKREG**, whose ends are 6.3x apart) and `llm_dn_norm` (the gated RMS norm straight into the output matmul's A operand). |
 | `llm/ple.go`, `llm/gpu_ple.go` | **L2d: the n-gram block.** The trigram hash and the host-side gather out of the mmap'd 28.80 GB table (D2), the CPU block, and the three-dispatch device path. |
 | `zimage/qwen/` | a working Qwen3 transformer on the GPU in Go — RMSNorm, RoPE, GQA, SwiGLU, four shared arenas. The skeleton for L2. |
 | `shaders/gemv_w4a8.comp` | decode GEMV at **99-103% of the bus** (§1.1, §1.7), plus 25 grouped / M-blocked / N-blocked MoE builds (§1.8-§1.12). |
@@ -688,15 +776,14 @@ below Q8. Bandwidth is the whole story.
 1. ~~**Hyper-connections**~~ — **done at L2b and L2c**, the block the whole
    prefill question turned on: 4-branch gated residual at width 10240, every
    layer, 194 low-rank projections a token, now four dispatches and 4.24x.
-2. ~~**Gated DeltaNet — 36 of the 48 layers**~~ — **CPU reference done at
-   L3a**, all eighteen tensors of layer 0 matching and the recurrence at
-   3.11e-09 rms. What is left is the kernel, and L3a-2 reframes it: the
-   reference runs a **sequential scan**, not the chunked form §3.6 assumed, so
-   the question is whether 48 workgroups deep in a 512-iteration serial loop
-   (438 us a layer) beats a triangular solve plus four matmuls per 64-token
-   chunk per head. **L2a prices the reference's whole DeltaNet core at 2.7% of
-   prefill**, so the risk was always getting it right rather than making it
-   fast — and that half is now done.
+2. ~~**Gated DeltaNet — 36 of the 48 layers**~~ — **done at L3a and L3b.**
+   The CPU reference matches all eighteen tensors of layer 0 with the
+   recurrence at 3.11e-09 rms, and the kernel runs the whole layer in five
+   dispatches at 1.37x the reference, the scan itself at 1.06x. §3.6's
+   question — scan or chunk — is **answered by pricing rather than by
+   building**: the recurrence is 13% of this layer against the fused
+   projection's 64%, and a perfect chunked kernel would save 1.0% of the
+   prefill graph (L3b-5).
 3. **QSA sparse attention** — indexer, top-2048 selection, gathered attention.
    Not in `IDEAS.md` at all; it needs a new section. 1.5% of prefill.
    **L2e built the CPU reference and L2f the kernels** — what is left is the
@@ -798,7 +885,7 @@ below Q8. Bandwidth is the whole story.
       on the CPU and `attn_output-3` at 1.14e-03 against llama.cpp on the
       device. `l_last-3` needs the MoE half, which is L5.
 
-### L3 — Gated DeltaNet  *(the big one)*
+### L3 — Gated DeltaNet  *(done)*
 
 - [x] **L3a — CPU reference, fp32 state, against the dump.** All eighteen
       tensors of layer 0's graph match: the recurrence **3.11e-09 rms**, its
@@ -815,10 +902,20 @@ below Q8. Bandwidth is the whole story.
       boundary — 3 + 4 tokens reproduce 7 exactly, output and state, with the
       convolution's window carried beside the recurrent state and a control
       showing the carry matters (4.5e-02 rms without it).
-- [ ] **L3b — the GPU kernel.** L3a-2 reframes §3.6's question: the reference
-      runs a sequential scan at 438 us a layer (ubatch 512), 48 workgroups
-      deep in a 512-iteration serial loop, and declines to use its own chunked
-      path. Find out which this hardware wants.
+- [x] **L3b — the GPU kernel.** Five dispatches against eleven: one fused
+      [16512, 2560] projection for four of llama.cpp's matrices, one pass doing
+      the convolution, its SiLU, both L2 norms and the two per-head scalars,
+      the delta rule with the state in registers, the gated norm straight into
+      the output matmul's A operand, and the output projection. **152.8 ms of
+      llama.cpp's 512-token graph becomes 111.5 — 1.37x** — and the scan itself
+      is **413 us against 438**. §3.6's question is answered by a price rather
+      than a build: the recurrence is 13% of this layer, the projection 64%,
+      and a perfect chunked kernel saves 1.0% of the prefill graph.
+      [Write-up](research/l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
+- [x] Gate: layers 0, 1 and 2 match — `attn_output` at **2.4e-06 rms** against
+      both the CPU reference and llama.cpp — and 3 + 4 tokens reproduce 7
+      **bit-identically** on the device, with the control that zeroes the
+      convolution's window moving the output by 4.0e-02.
 
 ### L4 — QSA
 
@@ -883,6 +980,9 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -attn -model $M                    # L2f's layer, 64..2048
     go run ./cmd/llm -attn -model $M -tokens 512 -ladder
     go run ./cmd/llm -attn -model $M -ladder -csv results/l2f_attn.csv
+    go run ./cmd/llm -dn -model $M -tokens 512                 # L3b's layer
+    go run ./cmd/llm -dn -model $M -ladder -csv results/l3b_dn.csv
+    go run ./cmd/llm -dn -model $M -tokens 512,2048 -gemm-ladder
 
     # the reference implementation, the oracle, the baseline
     less $L/src/models/qwen4exp.cpp                  # 1279 lines, the whole architecture
@@ -900,6 +1000,7 @@ below Q8. Bandwidth is the whole story.
     go test ./llm/ -v                        # the block against that trace,
                                              # CPU and GPU, plus the controls
     go test ./llm/ -v -run TestDeltaNet      # L3a: the linear layers
+    go test ./llm/ -v -run TestDeltaNetGPU   # L3b: its kernels, the ladder, the carry
 
     # re-fetch (resumable, checks sizes)
     reference/fetch_llm_checkpoint.sh
@@ -930,30 +1031,44 @@ below Q8. Bandwidth is the whole story.
   It would be wrong in **36 of the 48 layers** with nothing but perplexity to
   notice. Either replicate `_reorder_v_heads` or switch `kHeadOfV` to divide;
   never half of each. Transcoding the GGUF (D1's default) is unaffected.
-- **Does the DeltaNet kernel want the scan or the chunk?** L3a-2 found the
-  reference declining its own chunked path: `ggml_gated_delta_net` walks 512
-  tokens serially with 48 workgroups and the state in registers, at 438 us a
-  layer. The chunked form is a 64x64 triangular solve plus four matmuls per
-  chunk per head — vastly more arithmetic, all of it parallel, and it would
-  put this layer on the matrix cores where §3.6 assumed it belonged. Neither
-  has been measured here and the reference's choice is evidence about CUDA,
-  not about RDNA3.5.
+- ~~**Does the DeltaNet kernel want the scan or the chunk?**~~ **Answered at
+  L3b, by pricing rather than by building.** The scan, at the rung this
+  hardware wants, is **413 us a layer against the reference's 438** — and it is
+  **13% of the layer**, where the fused input projection is 64%. The chunked
+  form is 1.15x the arithmetic on the matrix cores: a 4.3x ceiling at §2.7's
+  best measured rate, 1.1-1.6x at an honest one for 64x64x128 tiles with a
+  serial triangular solve in the middle, and a *perfect* version saves 1.0% of
+  the prefill graph while putting a recurrent state through fp16 operands.
+  **What is still open is the same question at decode**, where a chunk is a
+  token and the whole argument changes; that is L7's.
+- **Why is llama.cpp's own scan shape 6.3x better in its kernel than in
+  ours?** L3b-3 ran the reference's decomposition — one state column per
+  workgroup, 6144 workgroups, q and k re-read 128 times — and got 2766 us
+  where llama.cpp's own kernel does 438 at what should be the same work. The
+  operand traffic is most of ours (deleting it: 2766 → 1013 us) and the
+  subgroup reductions are not (5%), but 1013 is still 2.3x the reference's
+  whole dispatch. Ours wins at a different rung and by more than this costs,
+  so it is written down rather than chased — but it is the one place in this
+  vertical where the reference does something we cannot reproduce.
 
 - ~~**Why is prefill 393 and not ~2000?**~~ **Answered by L2a**: neither
   candidate. It is the hyper-connection block's glue and its `[10240, 4]` F32
   `inject` projection, plus a MoE kernel 2.53x off ours. See L2a above.
 - ~~**How much of the 30.6% glue actually fuses?**~~ **L2c answers it for the
   first block** (4.24x on the nameable lines, the optimistic end of L2a's
-  711-to-1159 spread) **and L2f for the second** (2.40x, 1.60x at equal
-  attention work). Two of the three dense blocks are in and both land inside
+  711-to-1159 spread), **L2f for the second** (2.40x, 1.60x at equal attention
+  work) **and L3b for the linear layers** (1.37x on the layer, 3.90x on the
+  gated norm alone). All three dense blocks are in and all three land inside
   that spread. What is still open is the MoE's, which is L5 and is 35.7% of
   the graph on its own.
 - **Do the two projection ladders generalise?** L2f-4 found the same kernel
   wanting opposite BM schedules on two weights that differ only in falling
   either side of the 32 MiB MALL — widest-wins at 71.4 MB, narrowest-wins at
-  31.5. Every other GEMM in this repo picks one rung per shape family. The MoE
-  bank, the DeltaNet projections and the lm_head all have their own sizes and
-  none has been checked against that boundary.
+  31.5. **L3b-7 checks the DeltaNet's two and the rule holds**: the 84.5 MB
+  fused projection wants the widest rung by 2.6x at 512 tokens and 3.3x at
+  2048, and `ssm_out` at 31.5 MB picks the narrow rung at 512 and the wide one
+  at 2048 — the same rungs at the same lengths as `attn_output`, which is the
+  same shape. Still unchecked: the MoE bank and the lm_head.
 - **The indexer's score is the one line we lose on**, 0.8 ms against
   llama.cpp's 0.7. It is a scalar workgroup per token at 4.1 TFLOP/s where the
   matrix cores do 39, and it is an obvious cooperative-matrix rewrite — but it
@@ -993,10 +1108,12 @@ below Q8. Bandwidth is the whole story.
   the gather has no kernel and no test until there is a 4k dump, which is the
   same dump L3a-5 says every L2 tolerance now needs.
   [Addendum](research/l2e-attention.md)
-- ~~**The recurrent state.**~~ **L3a-6 settles the DeltaNet half**: both the
-  [128, 128, 48] state and the convolution's three-column window carry, and
-  3 + 4 tokens reproduce 7 bit-identically with a control showing the carry
-  matters. L2d's PLE convolution reaches 9 tokens back and is still only zeros
+- ~~**The recurrent state.**~~ **L3a-6 settles the DeltaNet half and L3b-6
+  does it on the device**: both the [128, 128, 48] state and the convolution's
+  three-column window carry, and 3 + 4 tokens reproduce 7 bit-identically —
+  in Go and in the kernel — with a control showing the carry matters. On the
+  device the window is not a second tensor at all: it is `Conv-1` rows of
+  *negative token index* in front of the fused projection's own output. L2d's PLE convolution reaches 9 tokens back and is still only zeros
   at position zero; wiring both into a ring buffer is L7.
 - ~~**What else is the backend computing in fp16?**~~ **L3a-5 answers it with
   a rule**: `ggml_vk_mul_mat` takes the f32 *vector* path at up to

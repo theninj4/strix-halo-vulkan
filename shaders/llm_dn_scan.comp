@@ -1,0 +1,261 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The delta rule itself: LLM.md L3b, and the one kernel in this model with a
+// loop-carried dependency 512 iterations deep.
+//
+// Per value head and per token, with S the [128, 128] state:
+//
+//	S  <- S * exp(g)          decay, one scalar for the whole head
+//	u  <- v - k^T S           what the state already predicts for this key
+//	S  <- S + k (beta*u)^T    write the correction back
+//	o  <- q^T S / sqrt(128)   read it out
+//
+// The state is held **transposed**, s[j*128 + i] = S[i][j], which is the
+// reference's layout and not a tidy-up of it: row j is the column all three
+// of a token's dot products read, so every access in the loop below is
+// contiguous and the row can live in registers across the whole token loop.
+// That is what makes the sequential form viable at all.
+//
+// **The dial is LPC, and it moves three things at once.** A column j of the
+// state is owned by LPC lanes holding 128/LPC elements each, so:
+//
+//	LPC   state/lane   columns per wave   workgroups   q,k re-read   us @ 512
+//	 64        2              1              6144         128x         2766
+//	 16        8              4              1536          32x          605
+//	  8       16              8               768          16x          413  <-
+//	  4       32             16               384           8x          454
+//	  1      128             64                96           2x          868
+//
+// Fewer lanes per column is more registers, fewer workgroups (so less
+// occupancy), a narrower cross-lane reduction, and — because every workgroup
+// of a head reads that head's whole q and k row every token — proportionally
+// less traffic. llama.cpp's own kernel sits at the top of that ladder: it
+// dispatches {H, n_seqs, S_v} with one column per workgroup, which on a
+// 64-wide wave is 6144 workgroups and a 128-fold re-read of q and k.
+//
+// **It is a bandwidth-to-ALU crossover and it turns at LPC = 8.** The widest
+// rungs are pinned at 1.18-1.31 TB/s while their arithmetic rate varies 4x,
+// and deleting the operand loads takes LPC 64 from 2766 us to 1013 where
+// deleting both subgroup reductions moves it 5%. Below LPC 8 the register
+// file starts costing more occupancy than the saved traffic is worth. The
+// measured winner is **413 us a layer against llama.cpp's 438**
+// (research/l3b-deltanet-gpu.md).
+//
+// WAVES is the second dial, and it buys nothing: waves of one workgroup share
+// the staged operands, so (LPC, WAVES) = (8, 4) reads each row four times
+// instead of sixteen and **ties** the single-wave rung. Once the re-read has
+// stopped being the bottleneck, removing more of it is free in the wrong
+// direction.
+//
+// **Where q and k live is the third dial, and its crossover is the same
+// rung.** llama.cpp keeps them in registers, 128/LPC of each per lane beside
+// the state; at LPC = 1 that would be 384 floats in a register file with 256,
+// so this kernel can also stage them once per token in LDS and read them back
+// with ordinary indexing (every lane of a cluster reads the same address, a
+// broadcast, or LPC consecutive ones; neither conflicts). Registers win 1.15x
+// at LPC 16 and 1.08x at LPC 8, and **lose 1.33x at LPC 4**, where 96
+// registers a lane costs more occupancy than an LDS round trip costs latency.
+// QKREG defaults to registers wherever 128/LPC of each fits, which is every
+// rung down to LPC 4; LPC 2 and 1 have no register arm at all.
+//
+// The head map is **modulo**: value head h reads q/k head h % kvHeads, which
+// is `iq1 = iv1 % neq1` in the fused op. It is right only because this
+// checkpoint's V heads have already been permuted into tiled order by
+// llama.cpp's converter — see llm/deltanet.go, and do not carry it to weights
+// read from the HF checkpoint.
+
+#include "llm_common.glsl"
+
+#ifndef LPC
+#define LPC 16          // lanes per state column
+#endif
+#ifndef WAVES
+#define WAVES 1         // waves per workgroup, sharing the staged q and k
+#endif
+
+#define WAVE 64
+#define S_V 128                 // head dim; the host checks the checkpoint
+#define COLS (WAVE / LPC)       // state columns a wave owns
+#define RPL (S_V / LPC)         // state elements a lane holds
+
+#ifndef PREFETCH
+#define PREFETCH 0
+#endif
+
+#ifndef QKREG
+#if (S_V / LPC) <= 32
+#define QKREG 1
+#else
+#define QKREG 0
+#endif
+#endif
+
+layout(local_size_x = WAVE * WAVES) in;
+
+#if !QKREG
+shared float qs[S_V];
+shared float ks[S_V];
+#endif
+
+void main() {
+    uint h = gl_WorkGroupID.x;                  // value head
+    uint tid = gl_LocalInvocationID.x;
+    uint wave = tid / WAVE;
+    uint w = tid % WAVE;
+    uint lane = w % LPC;                        // position inside the column
+    uint col = (gl_WorkGroupID.y * WAVES + wave) * COLS + w / LPC;
+
+    uint hk = h % pc.kvHeads;
+    uint qk = pc.kvHeads * pc.headDim;
+    uint cw = 2u * qk + pc.heads * pc.headDim;
+    uint qcol = hk * S_V;
+    uint kcol = qk + hk * S_V;
+    uint vcol = 2u * qk + h * S_V;
+    float scale = inversesqrt(float(S_V));
+
+    uint sbase = pc.ssmStateOff + h * (S_V * S_V) + col * S_V;
+    float s[RPL];
+    [[unroll]] for (uint r = 0u; r < RPL; r++) {
+        s[r] = act[sbase + r * LPC + lane];
+    }
+
+#if QKREG && PREFETCH
+    // A one-deep software pipeline, and the thing it is working around is an
+    // aliasing rule rather than a latency: every tensor this kernel touches
+    // lives in the same read-write SSBO (llm_common.glsl's four-arena
+    // contract), so the store at the end of token t may, as far as the
+    // compiler can prove, be the load at the start of token t+1. It therefore
+    // cannot hoist the loads across the store, and each of 512 iterations
+    // pays a full memory round trip on its critical path. llama.cpp's kernel
+    // has seven separate bindings, five of them `readonly`, and gets the
+    // pipelining for free.
+    //
+    // Issuing the next token's operands *before* this token's arithmetic puts
+    // one iteration of latency in flight. It costs 2*RPL more registers,
+    // which is why it is a rung and not the kernel.
+    float qn[RPL], kn[RPL], vn, gn, bn;
+    {
+        uint row = pc.normOff;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            qn[r] = act[row + qcol + r * LPC + lane];
+            kn[r] = act[row + kcol + r * LPC + lane];
+        }
+        vn = act[row + vcol + col];
+        gn = act[pc.ssmGateOff + h];
+        bn = act[pc.ssmBetaOff + h];
+    }
+    for (uint t = 0u; t < pc.tokens; t++) {
+        float qr[RPL], kr[RPL];
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            qr[r] = qn[r];
+            kr[r] = kn[r];
+        }
+        float v = vn, g = exp(gn), beta = bn;
+        if (t + 1u < pc.tokens) {
+            uint row = pc.normOff + (t + 1u) * cw;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                qn[r] = act[row + qcol + r * LPC + lane];
+                kn[r] = act[row + kcol + r * LPC + lane];
+            }
+            vn = act[row + vcol + col];
+            gn = act[pc.ssmGateOff + (t + 1u) * pc.heads + h];
+            bn = act[pc.ssmBetaOff + (t + 1u) * pc.heads + h];
+        }
+
+        float kv = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            kv += g * s[r] * kr[r];
+        }
+#if LPC == WAVE
+        kv = subgroupAdd(kv);
+#elif LPC > 1
+        kv = subgroupClusteredAdd(kv, LPC);
+#endif
+        float delta = (v - kv) * beta;
+
+        float o = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] = g * s[r] + kr[r] * delta;
+            o += s[r] * qr[r];
+        }
+#if LPC == WAVE
+        o = subgroupAdd(o);
+#elif LPC > 1
+        o = subgroupClusteredAdd(o, LPC);
+#endif
+        if (lane == 0u) {
+            act[pc.outOff + (t * pc.heads + h) * S_V + col] = o * scale;
+        }
+    }
+#else
+    for (uint t = 0u; t < pc.tokens; t++) {
+        uint row = pc.normOff + t * cw;
+#if QKREG
+        // The reference's shape: each lane reads the 128/LPC components of q
+        // and k it will multiply, and nothing crosses LDS.
+        float qr[RPL], kr[RPL];
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            qr[r] = act[row + qcol + r * LPC + lane];
+            kr[r] = act[row + kcol + r * LPC + lane];
+        }
+#define QV(r) qr[r]
+#define KV(r) kr[r]
+#else
+        // One staging pass for the whole workgroup: 256 floats, however many
+        // columns the waves between them own.
+        for (uint i = tid; i < S_V; i += WAVE * WAVES) {
+            qs[i] = act[row + qcol + i];
+            ks[i] = act[row + kcol + i];
+        }
+        barrier();
+#define QV(r) qs[r * LPC + lane]
+#define KV(r) ks[r * LPC + lane]
+#endif
+
+        float g = exp(act[pc.ssmGateOff + t * pc.heads + h]);
+        float beta = act[pc.ssmBetaOff + t * pc.heads + h];
+
+        float kv = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            kv += g * s[r] * KV(r);
+        }
+#if LPC == WAVE
+        kv = subgroupAdd(kv);
+#elif LPC > 1
+        kv = subgroupClusteredAdd(kv, LPC);
+#endif
+        float delta = (act[row + vcol + col] - kv) * beta;
+
+        float o = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] = g * s[r] + KV(r) * delta;
+            o += s[r] * QV(r);
+        }
+#if LPC == WAVE
+        o = subgroupAdd(o);
+#elif LPC > 1
+        o = subgroupClusteredAdd(o, LPC);
+#endif
+        if (lane == 0u) {
+            act[pc.outOff + (t * pc.heads + h) * S_V + col] = o * scale;
+        }
+#if !QKREG
+        barrier();
+#endif
+#undef QV
+#undef KV
+    }
+
+#endif
+
+    [[unroll]] for (uint r = 0u; r < RPL; r++) {
+        act[sbase + r * LPC + lane] = s[r];
+    }
+}

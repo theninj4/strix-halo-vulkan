@@ -105,6 +105,25 @@ layout(push_constant) uniform PC {
     uint ratio;      // compress_ratio: cells pooled into one indexer block
     uint rotDims;    // n_rot -- 64 of the 256 head dims rotate
     uint attnScale;  // float bits: 1/sqrt(headDim) * log2(e), folded into q
+
+    // The gated DeltaNet (llm_dn_conv.comp, llm_dn_scan.comp,
+    // llm_dn_norm.comp). Thirty-six of the 48 layers, and the only ones with
+    // a recurrent state.
+    //
+    // Six fields, because the rest of this block already says what the layer
+    // needs: `qkvOff` is the one fused projection again ([q | k | v | z |
+    // alpha | beta], six of llama.cpp's four matrices), `gemmN` its row
+    // stride, `convOff`/`kern` the depthwise taps as the PLE block states
+    // them, `normOff` the convolution's normalised output, `outOff` the
+    // recurrence's, `ctxOff` the fp16 A operand of the output projection,
+    // `gammaOff` the shared head norm and `heads`/`kvHeads`/`headDim` the
+    // 48/16/128 the whole layer is shaped around.
+    uint ssmGateOff;  // f32 [T][heads]: the log decay, softplus(a)*A
+    uint ssmBetaOff;  // f32 [T][heads]: sigmoid(beta)
+    uint ssmStateOff; // f32 [heads][headDim][headDim], s[h][j][i] = S[i][j]
+    uint ssmAOff;     // f32 [heads]: ssm_a, already -exp(A_log)
+    uint ssmDTOff;    // f32 [heads]: ssm_dt.bias
+    uint ssmNorm;     // 1 = ggml_l2_norm's max(|x|, eps), 0 = #28068's rsqrt
 } pc;
 
 const uint NO_W = 0xffffffffu;
