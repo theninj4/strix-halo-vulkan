@@ -504,6 +504,31 @@ layers**, which is the one open item that is not about a width. Past all of it
 is **phase 3**, where MTP speculation is worth 1.5-1.8x and batching amortises
 the dense half completely.
 
+---
+
+## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
+
+The 2026-09-18 review re-derived the decode budget and found the bank is no
+longer the binding constraint: 31.5 tok/s measured against an honest ~53
+ceiling (the quoted 56.5 counts weights only; DeltaNet state read+write is
+~0.22 GB a token, KV and activations another ~0.06), so **~12 ms of every
+31.7 ms token is unexplained by bytes at any achievable rate** and nothing
+has attributed a decode step since L8e. The order below follows from that;
+each item's full plan and gate is in `LLM2.md`.
+
+| # | item | why it is where it is |
+|---|---|---|
+| **P0** | **The >2560-row stall** (the open question below) | Blocks the product and every long-context claim — a server that hangs on a 3k-token prompt is not a server. Bisect plan in `LLM2.md`. |
+| **P1** | **Re-attribute the decode step** | One day with L8d's own timestamps; names the ~12 ms and re-prices everything below. The likely first fix it names is a pre-recorded decode command buffer (IDEAS §4.2, never carried into this vertical). |
+| **P2** | **`ple_proj`, and close L8c** | Half a day, two bank stages in one, and D13's payoff: delete the two-plane fp16-tail machinery now that the exception list is empty. Ends with the complete plan's 145-chunk number. |
+| **P3** | **The shipped-widths decision (D18)** | The knapsack: additivity + per-family corpus deltas make plans composable, and uniform 4.5 is provably not optimal — `full_attn` costs 5.52 pp/GB where `deltanet` costs 0.87. Sim-grade `q5_k` on `full_attn` first (8 minutes, no kernel), screen the winner on a second corpus. |
+| **P4** | **The router at fp16 and the experts at ~4.25 bits** | +4.5 tok/s of ceiling. The expert half is a transcode, not a kernel — `llm_moe_gemm/gemv` already read Q4_K — and L8c-3 says the calibrated form behaves. Grade each on 145 chunks separately; D4 holds. |
+| **P5** | **MTP speculation** | ×1.5-1.8 on everything above, so it loses nothing by going after P0/P1. Needs the rollback design first: a rejected draft rewinds 36 recurrent states, both rings, the KV and the host id list, and verification runs at M = 2-8 where D15 refuses the GEMV — the crossover has never been measured. |
+| **P6** | **Batching** | Pending the product question: will the API serve more than one stream? Each sequence owns 113 MB of DeltaNet state. If yes, batching may beat MTP for the same effort. |
+
+Parked, unchanged: W4A8 with the asymmetric epilogue, the unpack prefetch,
+the fp16 residual, the hot-expert fast path, the float-atomic combine, the
+vision tower.
 
 ## The number to beat
 
@@ -3494,7 +3519,7 @@ below Q8. Bandwidth is the whole story.
       part in forty of a ±0.0231 standard error, with **all 116** per-chunk
       rows differing — so the narrower indexer selects different cells and the
       corpus cannot tell.
-- [ ] **`ple_proj`, the last family**, and the smallest thing in the model:
+- [ ] **`ple_proj`, the last family** *(P2)*, and the smallest thing in the model:
       0.033 B parameters run **once**, at layer 1, for 0.035 GB of a token.
       `ple_key` and `ple_value` are both 2560 wide, so there is no obstacle —
       but `PLEGPU` never got L8a's int8 bank either, so this is two bank
@@ -3520,8 +3545,8 @@ below Q8. Bandwidth is the whole story.
       well inside a single side's ±0.024. **And the pp-per-GB ranking is
       bimodal rather than monotone in anything**: `deltanet` 0.87,
       `hyper_conn` 0.93, `lm_head` 2.59, `full_attn` **5.52**.
-- [ ] Then the two the simulation cannot reach, which are worth more together
-      than narrowing `hyper_conn` and `full_attn`: **the router to fp16**
+- [ ] Then the two the simulation cannot reach *(P4 — after P1's
+      attribution, which is worth more than both together)*: **the router to fp16**
       (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
       **the 512 expert banks at ~4.25** (+3.0 tok/s, D4's floor, and they are
       the *calibrated* part of the checkpoint so naive re-quantisation is the
@@ -3533,7 +3558,9 @@ below Q8. Bandwidth is the whole story.
       next 1.9x of the dense half is, and it is the first step in this
       vertical that changes what the model computes.
 - [ ] Re-quantise (transcode from the GGUF, or from bf16 with unsloth's
-      published imatrix) into the §1.1 W4A8 layout with an L0c scale plane —
+      published imatrix) into the §1.1 W4A8 layout with an L0c scale plane
+      *(parked at the 2026-09-18 review — the GEMM arm's epilogue cost is
+      unmeasured and the bank is no longer where the decode time is)* —
       **asymmetric now, per L8c-3, so the plane carries a min beside the
       scale and the epilogue carries the column-sum correction.**
       **If from bf16: apply llama.cpp's V-head reorder first** (L3a-3) — seven
@@ -3572,9 +3599,13 @@ below Q8. Bandwidth is the whole story.
       streamed, with stop sequences on the same holdback and a prefix reuse
       that makes a second turn a continuation. `go run ./cmd/serve -llm`. See
       `API.md`.
-- [ ] MTP speculative decoding (the separate GGUF). Target 1.5-1.8x.
+- [ ] MTP speculative decoding (the separate GGUF). Target 1.5-1.8x. *(P5 —
+      the rollback design doc comes first: recurrent state checkpointing,
+      ring rewind, KV truncate, the host id list, and the M = 2-8
+      verification-kernel decision D15 currently refuses. See `LLM2.md`.)*
 - [ ] Batching — which is now also "more than one conversation at a time",
-      since the served graph is one sequence's.
+      since the served graph is one sequence's. *(P6 — gated on the product
+      question; each sequence owns 113 MB of DeltaNet state.)*
 - [ ] Vision tower, if wanted.
 
 ---
@@ -3954,7 +3985,8 @@ below Q8. Bandwidth is the whole story.
 
 ## Open questions
 
-- **Why does the whole-model graph never return above ~2560 rows?** L8c-7
+- **Why does the whole-model graph never return above ~2560 rows?** *(P0 —
+  the top of the priority list; the bisect plan is in `LLM2.md`.)* L8c-7
   went looking for a context at which the QSA selection bites and found a
   cliff that is not about any bank. In one staging at 48 layers, `-graph
   -tokens 2048,2560,3072,3584,4096` runs 2048 at **1039.2 tok/s** and 2560 at
