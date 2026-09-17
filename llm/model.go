@@ -360,7 +360,7 @@ func (m *Model) AttnConfig(layer int) (AttnConfig, bool, error) {
 // included.
 func (m *Model) AttnWeights(layer int) (AttnWeights, error) {
 	p := fmt.Sprintf("blk.%d.", layer)
-	var w AttnWeights
+	w := AttnWeights{Layer: layer}
 	for _, t := range []struct {
 		name string
 		dst  *[]float32

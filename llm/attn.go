@@ -75,6 +75,12 @@ func (c AttnConfig) KVWidth() int   { return c.NHeadKV * c.HeadDim }
 
 // AttnWeights is the layer's tensors, row-major [out][in].
 type AttnWeights struct {
+	// Layer is which of the 48 this is, and it is here for the same reason
+	// DeltaNetWeights carries it (L8c-5): a 4.5-bit bank looks each source of
+	// the fused projection up in the published imatrix under its own tensor
+	// name, and `blk.7.attn_q.weight` is not `blk.11.attn_q.weight`.
+	Layer int
+
 	Q     []float32 // [nHead*2*headDim][nEmbd]
 	K, V  []float32 // [nHeadKV*headDim][nEmbd]
 	O     []float32 // [nEmbd][nHead*headDim]

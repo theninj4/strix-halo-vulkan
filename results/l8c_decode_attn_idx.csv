@@ -1,0 +1,2 @@
+prompt_tokens,gen_tokens,ctx,prefill_tok_s,decode_tok_s,against_llama,ms_per_token,hc_ms,ple_ms,dn_ms,attn_ms,moe_ms,head_ms,move_ms,gather_ms,glue_ms
+5,64,2048,33.2,31.51,1.253,31.7,4.2,0.4,6.8,2.1,11.6,1.9,0.6,2.3,0.9

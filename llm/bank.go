@@ -198,11 +198,6 @@ func bankPipe(b DenseBank, k GEMMKernel) string {
 	return string(k)
 }
 
-// q8Pipe names the Q8 build of a GEMM rung inside a block that holds both.
-// A block on L8's bank still needs the fp16 arm for whatever rows of a fused
-// matrix the checkpoint does not ship as Q8_0, so the two cannot share a key.
-func q8Pipe(k GEMMKernel) string { return "q8_" + string(k) }
-
 // GEMVKernel names one build of shaders/llm_gemv.comp, by how many ways it
 // splits K — the vertical's plain projection **at one token** (LLM.md L8d).
 //
@@ -274,11 +269,8 @@ func GEMVFits(k GEMVKernel, gemmK int) bool {
 	return kt%s == 0 && (kt/s)%4 == 0
 }
 
-// gemvPipe names the pipeline for a rung: the partials over one bank or
+// gemvBankPipe names the pipeline for a rung: the partials over one bank or
 // another, and the sum.
-func gemvPipe(k GEMVKernel, q8 bool) string { return gemvBankPipe(k, bankOf(q8)) }
-
-// gemvBankPipe is the same, by bank.
 func gemvBankPipe(k GEMVKernel, b DenseBank) string {
 	switch b {
 	case BankQ8:

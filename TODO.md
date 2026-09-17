@@ -108,7 +108,19 @@ argmax is llama.cpp's own out of llama.cpp's own top ten), and L6c took the
 glue between blocks off the host. Prefill is 941.3 tok/s at ubatch 2048
 against the reference's 391.42 — 2.40x — with 96.6% of the pass inside the
 five blocks. What is left of prefill is inside the kernels, not between them;
-the next stage is L7, decode.** All three files are rewritten each
+the next stage is L7, decode.** **L7 then closed the loop** — a prompt in,
+tokens out, over a cache the last step extends, writing llama.cpp's own
+completion at temperature zero — and **phase 2 is most of the way through its
+bank half**: L8a and L8b put every dense weight on the width the checkpoint
+already ships, L8d and L8e gave every block that dominates a decode step a
+kernel shaped for one row, and L8c-4 through L8c-7 put the lm head, the 36
+gated DeltaNet layers, the 97 hyper-connection mixers and the 12
+full-attention layers with their QSA indexers on **4.5 bits**. **Decode is
+31.5 tok/s against llama.cpp's 25.15 — 1.25x — prefill 1071.8 at ubatch 2048
+against 391.42, residency 79.85 GB, and perplexity 4.1787 against our own
+4.0289 at identical weights, +3.72%.** One dense family is left (`ple_proj`),
+and the sharpest open item is not a width: **the whole-model graph never
+returns above ~2560 rows at 48 layers.** All three files are rewritten each
 session rather than appended to, and the current one is the file to read
 first.
 
@@ -879,6 +891,105 @@ twice a step. `PIPELINE.md` has both.
 Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
+
+### Session 2026-09-17 (fifty-fifth) — stage L8c-7: the attention layer at 4.5 bits, and a family that took two contexts to grade
+
+**Result: the twelve full-attention layers are on L8c-4's bank, decode is 31.4
+tok/s against 30.1 — 1.25x llama.cpp — prefill is faster at every ubatch, and
+the family costs +1.65% of perplexity, which is 5.52 percentage points per GB
+of decode token and makes it the most expensive of the four by 2.1x. Four
+families together are 4.1787, +3.72%, against a sum of their four separate
+corpus deltas of 3.71% — additivity to 0.01 pp.** The fourth family needed
+nothing new: every matrix in the block is a multiple of 256 wide and
+`llm_gemm.comp -DQ4B` / `llm_gemv.comp -DQ4B` already had every arm, including
+the fp16 tail arm L8c-5 first exercised. So the stage is wiring, and the last
+of the two-valued `q8 bool` spelling (`q8Pipe`, `gemvPipe`, `gemmBuilds`)
+leaves the package with it.
+
+| | L8c-6 (three families) | **L8c-7 (four)** | **+ `qsa_indexer`** |
+|---|---:|---:|---:|
+| decode | 30.05 / 30.11 tok/s | **31.41 / 31.57** | **31.51** |
+| a token | 33.3 ms | **31.8** | **31.7** |
+| the attention block, per token | 3.5 ms | **2.3** | **2.1** |
+| the block's staged bank | 0.70 GB | **0.39** | **0.35** |
+| residency | 80.20 GB | **79.89** | **79.85** |
+| prefill, ubatch 512 / 2048 | 669.7 / 1065.9 | **671.4 / 1071.8** | — |
+| perplexity, 145 chunks | 4.1104 | **4.1787 (+3.72%)** | — |
+
+**Built:** `NewAttnGPUBank` and `AttnGPU.stageQ4K` in `llm/gpu_attn.go` (the
+three-valued `DenseBank` the other blocks already spoke, plus `qkvQuantRows`
+for the tail); `AttnWeights.Layer`, because each source of the fused matrix is
+calibrated under its own tensor name; the plan wiring in `llm/graph.go` and
+`cmd/llm/bench_attn.go`; and three tests — `TestAttnGPUQ4IsTheSim`,
+`TestAttnGPUQ4Gemv`, `TestAttnGPUQ4BankSize`.
+
+**Five things worth carrying forward:**
+
+1. **The accuracy ranking is bimodal, and the split is depth rather than
+   size.** In percentage points per GB of decode token bought back the four
+   families read `deltanet` **0.87**, `hyper_conn` **0.93**, `lm_head`
+   **2.59**, `full_attn` **5.52** — so the two present at 36 layers and 97
+   mixers are nearly equal and cheap, and the two present at 12 layers and one
+   matrix are 3x and 6x them. L8c-1's "the cost of 4 bits runs inverse to the
+   bytes" is retired for the second time and in a new shape. The mechanism is
+   **not** measured; the reading that fits is that error injected at many
+   depths is partly re-absorbed by the residual stream it goes into.
+2. **Additivity is now exact enough to plan on.** Four corpus deltas summing
+   to 3.71% measure **3.72%**, against ±0.024 of standard error on each side.
+   The sum of *screens* still predicts nothing: `full_attn` is the fourth
+   family to miss its eight-chunk row, at +1.05% → +1.65%.
+3. **D14's boundary is measurable twice inside one block.** The fused
+   [13952, 2560] projection is 35.7 MB at int8 and **17.9** at 4.5 bits, so it
+   crosses the 32 MiB MALL and is 1.13x at ubatch 2048; the output
+   [2560, 6144] projection is 15.7 and 7.9, fits at every width, pays only the
+   unpack, and is **1.00x at 128 tokens and 1.04x slower at 512**. The block
+   is faster at all four ubatches anyway. Expect this shape wherever one block
+   holds a weight on each side.
+4. **A tail is worth pricing before assuming it is cheap.** The indexer's 640
+   BF16 rows are 4.6% of the fused matrix and cost **0.51 bits a weight over
+   the whole layer** — 5.7% of it at int8 and **11.3%** at 4.5 bits, because
+   the fraction is of a number that halved twice. Putting them on the plane
+   makes the layer 4.500 bits exactly and costs +0.005%.
+5. **An instrument can be exactly blind, and saying so needs a second
+   context.** At n_ctx 2048 a 4.5-bit QSA indexer is **bit-identical over all
+   145 chunks** — the per-chunk `nll` columns match to six decimals, the CSVs
+   differ only in `seconds` — because `top_k + ratio - 1` is 2051, the
+   selection names every cell and the score is discarded. L8c-1 argued that
+   from the width; this measures it as an equality. At **n_ctx 2560**, where
+   `selWidth` is 2051 of 2560 and the selection is dispatched, it is 4.0723 to
+   **4.0725 over 116 chunks, +0.005%**, with all 116 rows differing.
+
+**How it was measured:** `-gen -n 64 -prompt 'The capital of France is'` and
+`-graph -tokens 128,512,1024,2048` on four and five families;
+`-attn -tokens 1,64,128,512,1024,2048 -layers 2` twice per bank (rows agreeing
+to 0.92-1.07, looser at the long lengths); `-attn -tokens 1 -gemm-ladder`;
+three 145-chunk `-ppl` runs and two 116-chunk ones at `-ctx 2560`.
+
+**Correctness:** the bank is the format three ways — 97 664 projection values
+and 17 920 output values identical to the same format through `sim.go` on
+**both** arrangements of the tail; the bank and its simulation agreeing chunk
+for chunk over eight chunks, `nll` to six decimals; and the split-K GEMV
+against the GEMM at one row, which is the one path neither of the others
+reaches and the one that has to derive the tail split from `pc.lowRank`. The
+completion parts from three families' at the eighth token and both continue
+coherently; the text gate retired at L8c-4 and the grade is perplexity.
+
+**Next.** One family is left — `ple_proj`, 0.033 B parameters run **once** at
+layer 1, and the one block that never got L8a's int8 bank either, so it is two
+bank stages in one and worth 0.017 GB a token. But **the item that should
+actually be next is not a width**: the whole-model graph never returns above
+~2560 rows at 48 layers. In one staging, `-graph -tokens 2048,2560,3072,3584,4096`
+runs 2048 at 1039.2 tok/s and 2560 at 1090.9 and then 3072 never returns —
+default int8 bank, no `-ppl`, so it is pre-existing. The 4-layer prefix runs
+4096 in 297 ms and the attention block alone at 4096 tokens in a 4096-cell
+cache with the selection live is 325 ms for twelve layers, so neither the
+block nor the selection is implicated. `SIGQUIT` puts the stall in
+`Graph.flush → recorder.submit`, in `[syscall]`, one thread at 100% of a core
+with the GPU at 2-3%, no disk I/O, and the shim's 20-second fence timeout
+never firing — before the wait, inside the driver's submit. Untested
+suspicion: ~82 GB of pinned buffers plus the 28.8 GB mmap'd n-gram table plus
+arenas that double with the context add up to about the machine. A long
+context is what this model is for.
 
 ### Session 2026-09-17 (fifty-third) — stage L8c-5: the gated DeltaNet at 4.5 bits, and a screen with the wrong sign
 

@@ -146,7 +146,22 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemm
 		maxTok = max(maxTok, t)
 	}
 	nKV := max(ctx, roundUp(maxTok, 256))
-	g, err := llm.NewAttnGPU(dev, cfg, maxTok, nKV, ws, llm.DenseQ8())
+	// L8c-7's bank, where `LLM_DENSE_BANK` names this family — so the rung
+	// ladders below can be re-run on it, which D12 says they have to be: a
+	// slab of nibbles is half the bytes of a slab of int8, and the split that
+	// misses §5.1b's 4 KB rotation moves with the width.
+	bank, sim := llm.BankFor(llm.DenseQ8()), llm.QuantSim{}
+	if q, ok := llm.DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
+		bank, sim = llm.BankQ4K, q
+	}
+	idxQ := false
+	if _, ok := llm.DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
+		if bank != llm.BankQ4K {
+			return fmt.Errorf("qsa_indexer shares the fused projection's plane, so it needs full_attn on the same bank")
+		}
+		idxQ = true
+	}
+	g, err := llm.NewAttnGPUBank(dev, cfg, maxTok, nKV, ws, bank, sim, idxQ)
 	if err != nil {
 		return err
 	}
@@ -165,8 +180,9 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemm
 	default:
 		return fmt.Errorf("-sel is auto, on or off, not %q", sel)
 	}
-	fmt.Printf("%d layers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks), selection %v\n\n",
-		g.Layers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6,
+	fmt.Printf("%d layers staged on the %s bank%s: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks), selection %v\n\n",
+		g.Layers(), bank, map[bool]string{true: " (the indexer on it too)"}[idxQ],
+		float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6,
 		maxTok, g.NKV(), g.NBlocks(), g.Sparse())
 
 	// A plan is (attn, gemm, outGemm, qkvGemv, outGemv). The last two are the

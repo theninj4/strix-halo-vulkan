@@ -503,7 +503,26 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		atCfg, ats = cfg, append(ats, w)
 	}
 	if len(ats) > 0 {
-		if g.attn, err = NewAttnGPU(dev, atCfg, g.maxTok, g.nKV, ats, opts.denseQ8()); err != nil {
+		// L8c-7's bank, where the plan names this family. `attn_q` is the
+		// tensor `simFamily` maps to "full_attn" and the checkpoint ships it
+		// as Q8_0, which is what the `true` says; the indexer's two are
+		// **BF16**, which is what the `false` says, and they are a family of
+		// their own because L4b-4 measured the score sensitive to them.
+		atBank, atSim := bankOf(opts.denseQ8()), QuantSim{}
+		if q, ok := DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
+			atBank, atSim = BankQ4K, q
+		}
+		idxQ := false
+		if q, ok := DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
+			if atBank != BankQ4K {
+				return fmt.Errorf("llm: qsa_indexer is staged in the fused projection's plane, so it needs full_attn on the same bank")
+			}
+			if q != atSim {
+				return fmt.Errorf("llm: full_attn is %s and qsa_indexer is %s, and they share one plane", atSim, q)
+			}
+			idxQ = true
+		}
+		if g.attn, err = NewAttnGPUBank(dev, atCfg, g.maxTok, g.nKV, ats, atBank, atSim, idxQ); err != nil {
 			return fmt.Errorf("llm: attn: %w", err)
 		}
 		mark("attention", len(ats), g.attn.Buffers(), g.attn.WeightBytes(), g.attn.ActivationBytes(), start)
