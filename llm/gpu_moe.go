@@ -318,8 +318,10 @@ func (g *MoEGPU) PinGemv(on bool) {
 		if g.rows > 1 {
 			g.up, g.down = MoEM2, MoEM2
 		}
+		g.shUp, g.shDown = g.up, g.down
 	} else {
 		g.up, g.down = MoEPlanFor(g.rows)
+		g.shUp, g.shDown = MoESharedPlanFor(g.rows)
 		g.routerGemv = MoERouterFor(g.rows)
 	}
 	g.syncShared()
@@ -336,6 +338,17 @@ func (g *MoEGPU) moePlan(nTok int) (MoEKernel, MoEKernel, MoERouterKernel) {
 	}
 	up, down := MoEPlanFor(nTok)
 	return up, down, MoERouterFor(nTok)
+}
+
+// moeSharedPlan is the shared expert's pair for a batch, honouring the pin —
+// which puts it back on whatever the routed pair runs, because the pin's whole
+// job is to make the block one kernel family again.
+func (g *MoEGPU) moeSharedPlan(nTok int) (MoEKernel, MoEKernel) {
+	if g.pinGemv {
+		up, down, _ := g.moePlan(nTok)
+		return up, down
+	}
+	return MoESharedPlanFor(nTok)
 }
 
 // moeCheckGemv is the one thing a GEMV plan needs that a GEMM plan does not.
@@ -362,6 +375,42 @@ func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 		return MoEM2, MoEM2
 	}
 	return MoEM4, MoEM4
+}
+
+// MoESharedPlanFor is the **shared expert's** pair, and at one token it is not
+// the routed pair's (L8e-2, read off results/l8e_moe.csv one dispatch at a
+// time rather than by block total).
+//
+// **Only the down mode moved, and the reason the up mode did not is D16.**
+// The ladder below is measured on a two-layer bank whose ten routed experts
+// are 32 MB — the MALL exactly — re-read by every iteration of the sweep, and
+// it says the routed up mode wants v16w4 (63.7 us a layer at 288 GB/s, which
+// is already past this machine's 242 GB/s bus and so cannot be a DRAM rate).
+// In the whole model each expert is read once from DRAM, and there the same
+// change is **42.1 ms worse over 64 tokens** where the micro-bench predicted
+// 43.6 better. So the routed pair keeps v64w4/v16w4.
+//
+// The two are the same grouped GEMM over the same [2560, 640] and [640, 2560]
+// shapes, and they ran on one field until now. But a GEMV rung is LPR — how
+// many lanes share an output column and walk its row of the bank in stride —
+// and what that wants is a row's **payload words**, which is a fact about the
+// format and not about the shape. Q4_K packs a 2560-long row into 320 payload
+// dwords; Q8_0 packs the same row into 640. The routed banks are Q4_K (Q5_K on
+// layer 2) and Q5_1, the shared expert's three are Q8_0 everywhere — so the
+// ladders invert, us a layer at one token:
+//
+//	up     v16w4  63.7   v32w4  78.0   v64w4  78.1     routed, Q4_K
+//	sh.up  v16w4  35.8   v32w4  19.4   v64w4  12.0     shared, Q8_0
+//
+// One field had to pick the better *joint* rung, which was v64w4 at 90.1 us
+// against v16w4's 100.7. Two fields pick 63.7 + 12.0 = **75.7**. The down mode
+// is the same story an order of magnitude smaller: the routed one wants v16w4
+// (34.7) and the shared one v32w4 (5.68 against v16w4's 7.13).
+func MoESharedPlanFor(tokens int) (MoEKernel, MoEKernel) {
+	if tokens == 1 && DecodeGEMV() {
+		return MoEV64W4, MoEV32W4
+	}
+	return MoEPlanFor(tokens)
 }
 
 // moeFmt is which of the checkpoint's quantised formats a bank ships in, and
@@ -540,10 +589,16 @@ type MoEGPU struct {
 
 	layers []moeLayerWeights
 
-	up, down   MoEKernel
-	router     GEMMKernel
-	routerGemv MoERouterKernel
-	autoPlan   bool
+	up, down MoEKernel
+	// The shared expert's own pair. It is the same two kernels over the same
+	// shape, so it rode the routed pair's rung until L8e-2 — and at one token
+	// the two want **opposite** ends of the LPR ladder, because a lane group
+	// is sized to a row's payload words and the routed bank is Q4_K where the
+	// shared one is Q8_0 (MoESharedPlanFor).
+	shUp, shDown MoEKernel
+	router       GEMMKernel
+	routerGemv   MoERouterKernel
+	autoPlan     bool
 	// pinGemv holds the block on llm_moe_gemm.comp and the GEMM router
 	// whatever the batch: see Graph.PinSchedule and DeltaNetGPU.pinGemv.
 	pinGemv bool
@@ -637,6 +692,7 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 		autoPlan:   true,
 	}
 	g.up, g.down = MoEPlanFor(maxTokens)
+	g.shUp, g.shDown = MoESharedPlanFor(maxTokens)
 	align := moeBMMax
 	for _, v := range gemmVariants {
 		align = maxInt(align, v.bm)
@@ -662,7 +718,12 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 // of the two modes' row blocks, so that both tile lists divide it exactly and
 // no tile ever straddles two experts. It is what lets the GEMM store whole
 // cooperative-matrix fragments straight to global.
-func (g *MoEGPU) pad() int { return maxInt(moeBM(g.up), moeBM(g.down)) }
+// pad is the permuted row space's alignment: the widest row block any of the
+// four expert dispatches runs, because every one of them reads the same
+// permutation and a tile list has to divide the space it indexes.
+func (g *MoEGPU) pad() int {
+	return maxInt(maxInt(moeBM(g.up), moeBM(g.down)), maxInt(moeBM(g.shUp), moeBM(g.shDown)))
+}
 
 // maxRows is the static upper bound on the permuted row space: the shared
 // expert's group at the front, every routed row, and at most one alignment of
@@ -947,6 +1008,7 @@ func (g *MoEGPU) SetPlan(up, down MoEKernel) error {
 		return err
 	}
 	g.up, g.down = up, down
+	g.shUp, g.shDown = up, down
 	g.autoPlan = false
 	// The shared expert's schedule is host-built and cut to the same row
 	// blocks, so it has to move with them. A plan set after an Upload would
@@ -955,8 +1017,31 @@ func (g *MoEGPU) SetPlan(up, down MoEKernel) error {
 	return nil
 }
 
-// Plan reports the rungs in use.
+// SetSharedPlan chooses the shared expert's two rungs on their own, for the
+// ladder and for the plan L8e-2 measured. Call it **after** SetPlan, which
+// puts both pairs on the rungs it is given — so a caller that names only the
+// routed pair still gets the one-field behaviour this split replaced.
+func (g *MoEGPU) SetSharedPlan(up, down MoEKernel) error {
+	if moeBM(up) == 0 {
+		return fmt.Errorf("llm: no MoE up kernel %q (have %v)", up, append(MoEUpKernels(), MoEDecodeKernels()...))
+	}
+	if moeBM(down) == 0 || (!MoEIsGemv(down) && moeBNOf(down) != moeBN) {
+		return fmt.Errorf("llm: no MoE down kernel %q (have %v)", down, append(MoEKernels(), MoEDecodeKernels()...))
+	}
+	if err := moeCheckGemv(up, down, g.rows); err != nil {
+		return err
+	}
+	g.shUp, g.shDown = up, down
+	g.autoPlan = false
+	g.syncShared()
+	return nil
+}
+
+// Plan reports the routed rungs in use.
 func (g *MoEGPU) Plan() (MoEKernel, MoEKernel) { return g.up, g.down }
+
+// SharedPlan reports the shared expert's two rungs.
+func (g *MoEGPU) SharedPlan() (MoEKernel, MoEKernel) { return g.shUp, g.shDown }
 
 // Layers and Tokens report what was staged.
 func (g *MoEGPU) Layers() int { return len(g.layers) }
@@ -993,7 +1078,10 @@ func (g *MoEGPU) Upload(x []float32, nTok int) error {
 	if g.autoPlan {
 		g.router = GEMMKernelFor(nTok)
 		g.up, g.down, g.routerGemv = g.moePlan(nTok)
+		g.shUp, g.shDown = g.moeSharedPlan(nTok)
 	} else if err := moeCheckGemv(g.up, g.down, nTok); err != nil {
+		return err
+	} else if err := moeCheckGemv(g.shUp, g.shDown, nTok); err != nil {
 		return err
 	}
 	rowsPad := roundUpInt(nTok, moeBMMax)
@@ -1034,7 +1122,7 @@ func (g *MoEGPU) syncShared() {
 	for _, t := range []struct {
 		off uint32
 		bm  int
-	}{{g.aShTilesUp, moeBM(g.up)}, {g.aShTilesDown, moeBM(g.down)}} {
+	}{{g.aShTilesUp, moeBM(g.shUp)}, {g.aShTilesDown, moeBM(g.shDown)}} {
 		n := reserve / t.bm
 		rec := make([]uint32, 2+3*n)
 		rec[0] = uint32(n)
@@ -1120,15 +1208,30 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	route.MoEPermOff = g.aPerm
 	add("route", "route", uint32(g.rows), 1, route)
 
-	// 3-4. The counting sort, and the two tile schedules it implies. It runs
+	// 3-4. The counting sort, and the tile schedules it implies. It runs
 	//      twice because the two modes are cut to different row blocks and a
 	//      tile list is only consistent with the permutation that outlives
 	//      it — so both passes happen before either GEMM reads one.
-	for _, t := range []struct {
+	//
+	//      **Unless the two row blocks are the same number**, which is every
+	//      decode step: all six GEMV rungs cut their tile list to sixteen
+	//      rows, so the second pass recomputes the first pass's permutation
+	//      and emits the same records into a second buffer (L8e-3). Then
+	//      there is one pass and `downTiles` points the down mode at the up
+	//      mode's list.
+	passes := []struct {
 		off uint32
 		bm  int
 		lbl string
-	}{{g.aTilesUp, bmUp, "perm.up"}, {g.aTilesDown, bmDown, "perm.down"}} {
+	}{{g.aTilesUp, bmUp, "perm.up"}}
+	if bmDown != bmUp {
+		passes = append(passes, struct {
+			off uint32
+			bm  int
+			lbl string
+		}{g.aTilesDown, bmDown, "perm.down"})
+	}
+	for _, t := range passes {
 		p := base
 		p.GemmK, p.GemmM, p.GemmN = uint32(c.NExpert), uint32(t.bm), uint32(g.pad())
 		p.MoEPermOff, p.MoETileOff, p.MoEBOff2 = g.aPerm, t.off, g.aBook
@@ -1147,7 +1250,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 
 	// 6. down, weighted and scattered to its (token, slot).
 	down := base
-	down.MoEPermOff, down.MoETileOff = g.aPerm, g.aTilesDown
+	down.MoEPermOff, down.MoETileOff = g.aPerm, g.downTiles()
 	down.BOff = w.down
 	down.CtxOff = g.hSwiglu
 	down.GemmN, down.GemmK = uint32(c.NEmbd), uint32(c.FFNExpert)
@@ -1162,16 +1265,16 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
-	add(fmt.Sprintf("up_%s_%s", w.shGateFmt, g.up), "shexp.up",
-		uint32(c.FFNShared/moeBNOf(g.up)), uint32(roundUpInt(g.rows, g.pad())/bmUp), shUp)
+	add(fmt.Sprintf("up_%s_%s", w.shGateFmt, g.shUp), "shexp.up",
+		uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shUp)), shUp)
 
 	shDown := base
 	shDown.MoEPermOff, shDown.MoETileOff = g.aPerm, g.aShTilesDown
 	shDown.BOff = w.shDown
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
-	add(fmt.Sprintf("down_%s_%s", w.shDownFmt, g.down), "shexp.down",
-		uint32(c.NEmbd/moeBNOf(g.down)), uint32(roundUpInt(g.rows, g.pad())/bmDown), shDown)
+	add(fmt.Sprintf("down_%s_%s", w.shDownFmt, g.shDown), "shexp.down",
+		uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shDown)), shDown)
 
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.
 	add("combine", "combine", uint32(roundUpInt(c.NEmbd, moeCombineWG)/moeCombineWG), uint32(g.rows), base)
@@ -1320,12 +1423,22 @@ func (g *MoEGPU) Rows() int {
 	return g.Reserve() + exec
 }
 
+// downTiles is the list the down mode reads: its own, or the up mode's when
+// the two are cut to the same row block and the second sort pass was elided
+// (L8e-3).
+func (g *MoEGPU) downTiles() uint32 {
+	if moeBM(g.down) == moeBM(g.up) {
+		return g.aTilesUp
+	}
+	return g.aTilesDown
+}
+
 // Tiles reports how many (expert, row block) records each schedule holds
 // against the static bound the grid covers, which is what says how much of
 // the dispatch is empty.
 func (g *MoEGPU) Tiles() (up, down, boundUp, boundDown int) {
 	u := g.abuf.ReadUint32At(int(g.aTilesUp), 1)[0]
-	d := g.abuf.ReadUint32At(int(g.aTilesDown), 1)[0]
+	d := g.abuf.ReadUint32At(int(g.downTiles()), 1)[0]
 	return int(u), int(d), g.maxTiles(moeBM(g.up), g.rows), g.maxTiles(moeBM(g.down), g.rows)
 }
 
@@ -1522,11 +1635,15 @@ func (g *MoEGPU) Resize(nTok int) error {
 		if err := moeCheckGemv(g.up, g.down, nTok); err != nil {
 			return err
 		}
+		if err := moeCheckGemv(g.shUp, g.shDown, nTok); err != nil {
+			return err
+		}
 	}
 	g.rows = nTok
 	if g.autoPlan {
 		g.router = GEMMKernelFor(nTok)
 		g.up, g.down, g.routerGemv = g.moePlan(nTok)
+		g.shUp, g.shDown = g.moeSharedPlan(nTok)
 	}
 	g.syncShared()
 	return nil

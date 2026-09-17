@@ -880,6 +880,101 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-17 (fiftieth) — stage L8e: the last projection, and a ladder that lied
+
+**Result: decode is 24.66 tok/s against L8d's 23.15 — 1.065x — with no bank
+change of any kind, no shader changed, and prefill faster at both ubatches:
+1052.8 tok/s at 2048 against 1049.8 and 655.2 at 512 against 653.9.** A token
+is 43.2 ms to **40.5**. The full-attention layer is 5.5 ms a token to **3.5**
+(1.57x, its layer 414.8 us to 225.9) and the MoE 12.1 to **11.7**; a pass is
+**1501 dispatches at decode and 1261 at prefill**, 48 fewer at both. Two
+decode runs agree to 0.7% (24.66 / 24.48), the attention ladder reproduces at
+median 1.0000 over 104 common rows and the MoE ladder at 1.0003 over 993. The
+whole `llm` suite passes, `TestGraphLogits` included.
+[Write-up](research/l8e-attn-decode.md) · `results/l8e_decode.csv`,
+`results/l8e_graph.csv`, `results/l8e_attn.csv`, `results/l8e_moe.csv` ·
+`LLM.md` updated.
+
+**1. The full-attention layer is D11 a fifth time.** Its two projections were
+still `llm_gemm.comp` MODE 2 at one token — 218 and **40** workgroups for a
+sixteen-row cooperative-matrix fragment holding one real row — and
+`llm_gemv.comp` was already generic over both banks and both tail cases, so
+the work was the wiring, a partial-sum arena and a KSLABS ladder per
+projection. The layer is **414.8 us to 225.9**: qkv 263.8 to 174.3 and out
+124.9 to 24.6. D12's rung was measured rather than copied and landed on the
+DeltaNet's two anyway — **k8** at K = 2560 (where k2's 20 480-byte slab is
+five whole 4 KB pages and the worst rung on the ladder) and **k32** at
+K = 6144. **The fused projection reads its 39.5 MB of bank at 227 GB/s of a
+242 GB/s bus**, the first dispatch in this vertical to be *at* the bus.
+`TestAttnGPUGemvAgrees` compares the indexer's BF16 tail on its own as well as
+the whole matrix: rms 2.93-2.95e-06 over 13 952 columns, 9.89-9.98e-06 on the
+tail, a 0.4% spread across six splits.
+
+**2. The MoE's shared expert has a lane group of its own — and half of what
+that was scoped as was wrong.** Read L8d's own ladder one dispatch at a time
+and the routed pair and the shared expert want opposite ends of the LPR
+ladder, because a lane group is sized to a row's *payload words* and Q4_K
+packs 320 into a 2560-long row where Q8_0 packs 640. So `shUp`/`shDown` are
+now their own fields, `pad()` is the widest of four dispatches, and the shared
+down mode goes v16w4 to **v32w4**. But carrying the *routed* up mode to the
+v16w4 the ladder names is **42.1 ms worse over 64 tokens** in the whole model
+where the micro-bench predicted 43.6 better.
+
+**3. D16 — a micro-bench rung whose rate is above the bus is not a DRAM
+measurement.** `-moe -tokens 1 -ladder` stages two layers and repeats one
+dispatch twenty times; a token's ten routed experts are ~32 MB, **the MALL
+exactly**, so every repetition after the first reads at 805-965 GB/s. v16w4's
+63.7 us over 18.4 MB is **288 GB/s**, a rate this machine does not have. D12
+said a ladder does not carry across a bank (L7d-2), a width (L8b-3) or a
+matrix (L8d-5); D16 is that it does not carry across a **residency**, and that
+one is the harness's fault rather than the kernel's. The screen is on the face
+of the number and it is cheap: any ladder row whose `gbps` exceeds 242 has to
+be confirmed end to end before it is believed.
+
+**4. The second counting sort was the first one again.** `llm_moe_perm.comp`
+ran twice a layer because the two expert modes are cut to different row
+blocks — except that at decode all six GEMV rungs fix BM at sixteen, and at
+prefill `m2/m2` and `m4/m4` are equal too. One pass, with `downTiles()`
+pointing the down mode at the up mode's list: **-48 dispatches a pass at every
+length**, 2.9 us a layer at one token and 17.8 at ubatch 512.
+
+**5. What was left alone, and why.** `route` is 5.8 us a layer, one workgroup
+of 256 lanes doing a softmax over 512 experts and ten sequential argmaxes. It
+is D11's symptom but not its disease: the only axis it has across is the
+token, and at decode there is one. Splitting the top-k needs a second dispatch
+to merge and a dispatch here is 1-2 us of the 5.8. The item's own condition
+was "only worth it if the token gets short enough for it to matter"; at 40.5
+ms the 0.28 ms it could plausibly buy is 0.7%, and it is not.
+
+**What it costs in exactness.** Nothing reads a different weight and no bank
+moved; what changes is the order of a sum. `TestGraphLogits` is unchanged —
+llama.cpp's own argmax (**561**) out of llama.cpp's own top ten, drift 0.881%
+at 48 layers — and `Graph.PinSchedule` now covers **five** blocks, so
+`TestGraphIsAChunkSplit`'s equalities hold to the last place. The completion
+over 128 tokens at temperature zero is **identical to `LLM_DECODE_GEMM=1`'s,
+token for token, diffed rather than eyeballed**: L8e lands back on L7c's text
+where L8d had re-worded one sentence of the `<think>` block at a tie 0.012
+apart. That is luck rather than a property — the extra reassociation flipped
+the tie back — and the honest claim is still "the same text at this precision,
+with a tie in it that either ordering may win".
+
+**Next: L8c, the re-quantisation**, onto a baseline that is **1.67x** faster
+than the one it was planned against (24.66 against L8b's 14.71). Everything
+L8a and L8b stage is still the checkpoint's arithmetic at 8.5 bits a weight;
+D3's ~4.25 is where the next 1.9x of the dense half is, and it is the first
+step in this vertical that changes what the model computes — so it is also the
+first that needs a perplexity number beside it (**4.0340** on wikitext-2 at
+n_ctx 2048). The kernel work above it is done: every projection in the model
+now has a one-token kernel, and the two largest blocks left at decode are the
+gated DeltaNet (11.0 ms, 205 GB/s) and the MoE (11.7 ms), neither of which is
+a grid any more.
+
+Housekeeping: no new shader and no new SPIR-V this session — `llm_gemv.comp`
+and `llm_moe_gemv.comp`'s existing builds cover all of it. `LLM.md` is now
+~3090 lines and still carries L2-L5's per-stage sections; the file's own rule
+asks for them to move into `research/`, and L8c is the stage that should do
+it.
+
 ### Session 2026-09-17 (forty-ninth) — stage L8d: the decode kernels, and five grids said the same thing
 
 **Result: decode is 23.15 tok/s against L8b's 14.71 — 1.57x — with no bank

@@ -174,8 +174,9 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 	// one token — so the two crosses are walked separately and then the six
 	// mixtures that pair each kernel's best with the other's.
 	type moePlan struct {
-		up, down llm.MoEKernel
-		router   llm.MoERouterKernel
+		up, down     llm.MoEKernel
+		shUp, shDown llm.MoEKernel
+		router       llm.MoERouterKernel
 	}
 	plansFor := func(tok int) []moePlan {
 		if !ladder {
@@ -184,34 +185,45 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 		var p []moePlan
 		for _, u := range llm.MoEUpKernels() {
 			for _, d := range llm.MoEKernels() {
-				p = append(p, moePlan{u, d, ""})
+				p = append(p, moePlan{u, d, "", "", ""})
 			}
 		}
 		if tok == 1 {
 			for _, u := range llm.MoEDecodeKernels() {
 				for _, d := range llm.MoEDecodeKernels() {
-					p = append(p, moePlan{u, d, ""})
+					p = append(p, moePlan{u, d, "", "", ""})
 				}
 			}
 			for _, u := range llm.MoEDecodeKernels() {
-				p = append(p, moePlan{u, llm.MoEM1, ""})
+				p = append(p, moePlan{u, llm.MoEM1, "", "", ""})
 			}
 			for _, d := range llm.MoEDecodeKernels() {
-				p = append(p, moePlan{llm.MoEN1M1, d, ""})
+				p = append(p, moePlan{llm.MoEN1M1, d, "", "", ""})
 			}
 			// And the router's own ladder, which does not cross the experts'
 			// — it is a different matrix and a different kernel (L8d-3), so
 			// it is walked once against the plan the experts settle on.
 			du, dd := llm.MoEPlanFor(1)
 			for _, r := range append([]llm.MoERouterKernel{llm.MoERouterGEMM}, llm.MoERouterKernels()...) {
-				p = append(p, moePlan{du, dd, r})
+				p = append(p, moePlan{du, dd, "", "", r})
+			}
+			// And the **shared expert's** own two axes (L8e-2). They do not
+			// cross the routed pair's either: it is the same kernel over a
+			// different *format*, so what moves is the lane group and the
+			// two marginals say everything a 6x6 cross would.
+			su, sd := llm.MoESharedPlanFor(1)
+			for _, u := range llm.MoEDecodeKernels() {
+				p = append(p, moePlan{du, dd, u, sd, ""})
+			}
+			for _, d := range llm.MoEDecodeKernels() {
+				p = append(p, moePlan{du, dd, su, d, ""})
 			}
 		}
 		return p
 	}
 
 	var rows [][]string
-	rows = append(rows, []string{"tokens", "up_kernel", "down_kernel", "experts_touched",
+	rows = append(rows, []string{"tokens", "up_kernel", "down_kernel", "shexp_kernels", "experts_touched",
 		"up_tiles", "up_rows_exec", "down_tiles", "down_rows_exec",
 		"dispatch", "us_per_layer", "ms_per_graph", "gflops", "weight_gbps"})
 	for _, tok := range tokens {
@@ -223,6 +235,15 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 				if err := g.SetPlan(p.up, p.down); err != nil {
 					return err
 				}
+				// SetPlan puts both pairs on the routed rungs, so the shared
+				// expert's plan is named after it or not at all.
+				su, sd := llm.MoESharedPlanFor(tok)
+				if p.shUp != "" {
+					su, sd = p.shUp, p.shDown
+				}
+				if err := g.SetSharedPlan(su, sd); err != nil {
+					return err
+				}
 			}
 			if p.router != "" {
 				if err := g.SetRouter(p.router); err != nil {
@@ -230,6 +251,7 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 				}
 			}
 			up, down := g.Plan()
+			shUp, shDown := g.SharedPlan()
 			// The schedule has to exist before it can be reported, and it is
 			// the device that builds it.
 			if err := g.Run(0); err != nil {
@@ -238,8 +260,9 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 			touched := g.Touched()
 			upTiles, upExec, realRows := g.Schedule(up)
 			dnTiles, dnExec, _ := g.Schedule(down)
-			fmt.Printf("T = %-5d %s/%s/%s (%d and %d waves a workgroup)  %d of %d experts touched, %d rows: %d up tiles (%d rows, %.2fx), %d down tiles (%d rows, %.2fx)\n",
-				tok, up, down, g.Router(), llm.MoEWaves(up), llm.MoEWaves(down), touched, cfg.NExpert, realRows,
+			fmt.Printf("T = %-5d %s/%s/%s (shexp %s/%s, %d and %d waves a workgroup)  %d of %d experts touched, %d rows: %d up tiles (%d rows, %.2fx), %d down tiles (%d rows, %.2fx)\n",
+				tok, up, down, g.Router(), shUp, shDown,
+				llm.MoEWaves(up), llm.MoEWaves(down), touched, cfg.NExpert, realRows,
 				upTiles, upExec, float64(upExec)/float64(realRows),
 				dnTiles, dnExec, float64(dnExec)/float64(realRows))
 
@@ -262,7 +285,8 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 				}
 				fmt.Println()
 				rows = append(rows, []string{
-					strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()), strconv.Itoa(touched),
+					strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()),
+					string(shUp) + "/" + string(shDown), strconv.Itoa(touched),
 					strconv.Itoa(upTiles), strconv.Itoa(upExec), strconv.Itoa(dnTiles), strconv.Itoa(dnExec),
 					s.Kind, fmt.Sprintf("%.3f", us),
 					fmt.Sprintf("%.1f", us*moeLayersPerGraph/1e3),
@@ -273,7 +297,8 @@ func moeBench(model string, tokens []int, nLayers, iters int, ladder bool, csvPa
 			fmt.Printf("  %-10s %9.1f us  x%d = %7.1f ms\n", "block", us, moeLayersPerGraph,
 				us*moeLayersPerGraph/1e3)
 			rows = append(rows, []string{
-				strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()), strconv.Itoa(touched),
+				strconv.Itoa(tok), string(up), string(down) + "/" + string(g.Router()),
+				string(shUp) + "/" + string(shDown), strconv.Itoa(touched),
 				strconv.Itoa(upTiles), strconv.Itoa(upExec), strconv.Itoa(dnTiles), strconv.Itoa(dnExec),
 				"block", fmt.Sprintf("%.3f", us),
 				fmt.Sprintf("%.1f", us*moeLayersPerGraph/1e3), "", "",

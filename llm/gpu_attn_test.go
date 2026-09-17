@@ -422,3 +422,107 @@ func scaled(x []float32, s float32) []float32 {
 	}
 	return out
 }
+
+// TestAttnGPUGemvAgrees is L8e-1's gate: llm_gemv.comp against llm_gemm.comp
+// MODE 2 on both of this layer's projections, at the one token the GEMV
+// exists for. It is TestDeltaNetGPUGemvAgrees on the other block, and the two
+// claims are the same two.
+//
+// The **fused projection** has a tail — the indexer's q_proj and k_proj are
+// the model's only BF16 weights and stay halves at `gateOff`, numbered from
+// `lowRank/16` — so this is also the check that the GEMV derives the same
+// split the GEMM does, and a column read out of the wrong plane is not a
+// tolerance but somebody else's indexer query. The **output projection** has
+// none: `attn_output` is Q8_0 all the way through.
+//
+// It is a tolerance and not an equality at every rung, including KSLABS = 1.
+// The *weights* are the same halves — L8b-2's argument, and the reason this
+// kernel multiplies in fp16 rather than converting — but a cooperative-matrix
+// accumulator sums sixteen k an instruction in an order the extension does not
+// define where a lane sums them serially, so the two differ by f32 round-off
+// over a 2560- or 6144-long chain. What makes that a measurement rather than
+// an alibi is that it does not move with the rung.
+func TestAttnGPUGemvAgrees(t *testing.T) {
+	g, _, c, _, in, nTok, _, done := attnGPU(t)
+	defer done()
+	if nTok < 1 {
+		t.Skip("the trace has no tokens")
+	}
+	run := func(qkv, out GEMVKernel) ([]float32, []float32) {
+		t.Helper()
+		if err := g.SetPlan(DefaultAttnKernel(), GEMMKernelFor(1), OutGEMMKernelFor(1)); err != nil {
+			t.Fatal(err)
+		}
+		g.Reset()
+		if err := g.Upload(in[:c.NEmbd], 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...)
+	}
+
+	refQKV, refOut := run(GEMVOff, GEMVOff)
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.NEmbd) {
+			continue
+		}
+		gotQKV, _ := run(k, GEMVOff)
+		r, err := compare(gotQKV, refQKV)
+		if err != nil {
+			t.Fatalf("qkv %s: %v", k, err)
+		}
+		t.Logf("qkv %-4s against the GEMM over %d columns: %v", k, len(refQKV), r)
+		if r.rms > 1e-4 {
+			t.Errorf("qkv %s: rms %.3e against the GEMM (%v)", k, r.rms, r)
+		}
+		// And the BF16 tail on its own. Folded into the whole-matrix rms
+		// above it is 4.6% of the columns and would hide.
+		tail := g.qkvQ8Rows()
+		rt, err := compare(gotQKV[tail:], refQKV[tail:])
+		if err != nil {
+			t.Fatalf("qkv %s tail: %v", k, err)
+		}
+		t.Logf("    tail (the indexer's two, %d halved rows from %d): %v", len(refQKV)-tail, tail, rt)
+		if rt.rms > 1e-4 {
+			t.Errorf("qkv %s: the fp16 tail is rms %.3e from the GEMM's (%v)", k, rt.rms, rt)
+		}
+	}
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.GateWidth()) {
+			continue
+		}
+		_, gotOut := run(GEMVOff, k)
+		r, err := compare(gotOut, refOut)
+		if err != nil {
+			t.Fatalf("out %s: %v", k, err)
+		}
+		t.Logf("out %-4s against the GEMM over %d columns: %v", k, len(refOut), r)
+		if r.rms > 1e-4 {
+			t.Errorf("out %s: rms %.3e against the GEMM (%v)", k, r.rms, r)
+		}
+	}
+
+	// The negative controls: a rung that cannot cut K into whole four-tile
+	// steps, and a batch the one-token kernel does not read.
+	for _, k := range GEMVKernels() {
+		if GEMVFits(k, c.NEmbd) {
+			continue
+		}
+		if err := g.SetGemv(k, GEMVOff); err == nil {
+			t.Errorf("qkv %s was accepted for K = %d, which it does not divide into whole steps", k, c.NEmbd)
+		}
+	}
+	if nTok > 1 {
+		if err := g.Resize(nTok); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(attnQKVGemv, attnOutGemv); err == nil {
+			t.Errorf("the GEMV rungs were accepted for a batch of %d rows", nTok)
+		}
+	}
+}

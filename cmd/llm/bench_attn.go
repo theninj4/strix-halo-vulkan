@@ -96,7 +96,7 @@ const llamaFlashGFLOPs = 12280.9
 // the 48, the interval being 4.
 const layersPerGraph = 12
 
-func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool, sel, csvPath string) error {
+func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemmLadder bool, sel, csvPath string) error {
 	m, err := llm.Open(model)
 	if err != nil {
 		return err
@@ -169,20 +169,46 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 		g.Layers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6,
 		maxTok, g.NKV(), g.NBlocks(), g.Sparse())
 
-	var plans [][3]string
+	// A plan is (attn, gemm, outGemm, qkvGemv, outGemv). The last two are the
+	// decode kernel's rungs (L8e-1) and they only exist at one token, where
+	// the first three are irrelevant — so `-gemm-ladder` walks a different
+	// cross there: the GEMV's, one axis at a time against the other's
+	// default, because the two projections are independent dispatches and a
+	// full cross of 6x6 would say nothing the two marginals do not.
+	var plans [][5]string
 	if ladder {
 		for _, a := range llm.AttnKernels() {
 			for _, k := range llm.GEMMKernels() {
 				for _, o := range llm.GEMMKernels() {
-					plans = append(plans, [3]string{string(a), string(k), string(o)})
+					plans = append(plans, [5]string{string(a), string(k), string(o), "", ""})
 				}
 			}
 		}
 	}
+	gemvPlans := func(tok int) [][5]string {
+		if !gemmLadder || tok != 1 {
+			return nil
+		}
+		a := string(llm.DefaultAttnKernel())
+		aq, ao := llm.AttnGemvFor(1)
+		var p [][5]string
+		p = append(p, [5]string{a, "gemm_m4", "gemm_m2", string(llm.GEMVOff), string(llm.GEMVOff)})
+		for _, k := range llm.GEMVKernels() {
+			if llm.GEMVFits(k, cfg.NEmbd) {
+				p = append(p, [5]string{a, "gemm_m4", "gemm_m2", string(k), string(ao)})
+			}
+		}
+		for _, k := range llm.GEMVKernels() {
+			if llm.GEMVFits(k, cfg.GateWidth()) {
+				p = append(p, [5]string{a, "gemm_m4", "gemm_m2", string(aq), string(k)})
+			}
+		}
+		return p
+	}
 
 	var rows [][]string
 	rows = append(rows, []string{"tokens", "cells", "selection", "attn_kernel", "gemm_kernel", "out_kernel",
-		"dispatch", "us_per_layer", "us_per_graph", "gflops", "gbps"})
+		"qkv_gemv", "out_gemv", "dispatch", "us_per_layer", "us_per_graph", "gflops", "gbps"})
 	for _, tok := range tokens {
 		xn := make([]float32, tok*cfg.NEmbd)
 		for i := range xn {
@@ -196,23 +222,42 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 		// Upload has already chosen the measured schedule for this length;
 		// naming it back through SetPlan would freeze it for every length
 		// after, which is what the empty `plans` case is avoiding.
-		todo := plans
-		if todo == nil {
-			todo = [][3]string{{}}
+		todo := append(append([][5]string{}, plans...), gemvPlans(tok)...)
+		if len(todo) == 0 {
+			todo = [][5]string{{}}
 		}
 		for _, p := range todo {
 			if p[0] != "" {
-				if err := g.SetPlan(llm.AttnKernel(p[0]), llm.GEMMKernel(p[1]), llm.GEMMKernel(p[2])); err != nil {
+				// The measured schedule for *this* length, re-derived rather
+				// than read back: SetPlan turns the auto-plan off, so a rung
+				// named once would otherwise freeze at every length after.
+				k, o := llm.GEMMKernelFor(tok), llm.OutGEMMKernelFor(tok)
+				if p[1] != "" {
+					k, o = llm.GEMMKernel(p[1]), llm.GEMMKernel(p[2])
+				}
+				if err := g.SetPlan(llm.AttnKernel(p[0]), k, o); err != nil {
+					return err
+				}
+				aq, ao := llm.AttnGemvFor(tok)
+				if p[3] != "" {
+					aq, ao = llm.GEMVKernel(p[3]), llm.GEMVKernel(p[4])
+				}
+				if err := g.SetGemv(aq, ao); err != nil {
 					return err
 				}
 			}
 			a, k, o := g.Plan()
-			p = [3]string{string(a), string(k), string(o)}
+			aq, ao := g.Gemv()
+			p = [5]string{string(a), string(k), string(o), string(aq), string(ao)}
 			st, err := g.ProfileSweep(iters)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("T = %-5d %s / %s / %s\n", tok, p[0], p[1], p[2])
+			proj := fmt.Sprintf("%s / %s", p[1], p[2])
+			if p[3] != string(llm.GEMVOff) || p[4] != string(llm.GEMVOff) {
+				proj = fmt.Sprintf("gemv %s / %s", p[3], p[4])
+			}
+			fmt.Printf("T = %-5d %s / %s\n", tok, p[0], proj)
 			var total time.Duration
 			for _, s := range st {
 				total += s.GPU
@@ -228,7 +273,8 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 				}
 				fmt.Println()
 				rows = append(rows, []string{
-					strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()), p[0], p[1], p[2], s.Kind,
+					strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()),
+					p[0], p[1], p[2], p[3], p[4], s.Kind,
 					fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*layersPerGraph/1e3),
 					fmt.Sprintf("%.1f", gf), fmt.Sprintf("%.1f", gb),
 				})
@@ -237,10 +283,11 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder bool,
 			fmt.Printf("  %-6s %9.1f us  x%d = %7.1f ms\n", "layer", us, layersPerGraph,
 				us*layersPerGraph/1e3)
 			rows = append(rows, []string{
-				strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()), p[0], p[1], p[2], "layer",
+				strconv.Itoa(tok), strconv.Itoa(g.NKV()), selLabel(g.Sparse()),
+				p[0], p[1], p[2], p[3], p[4], "layer",
 				fmt.Sprintf("%.3f", us), fmt.Sprintf("%.1f", us*layersPerGraph/1e3), "", "",
 			})
-			if tok == 512 && plans == nil {
+			if tok == 512 && plans == nil && p[3] == string(llm.GEMVOff) {
 				// The causal FLOP count of one attention dispatch: two GEMMs
 				// over half the score matrix.
 				flops := 2 * float64(cfg.NHead) * float64(tok) * float64(tok) * float64(cfg.HeadDim)

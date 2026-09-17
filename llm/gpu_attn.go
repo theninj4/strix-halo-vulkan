@@ -61,6 +61,18 @@ import (
 // projections here run on.
 const attnBN = 64
 
+// attnWave is the wave every rung here is pinned to, and the width the
+// decode GEMV's reduce divides.
+const attnWave = 64
+
+// The decode rungs of this layer's two projections, from results/l8e_attn.csv
+// (L8e-1). Same kernel and the same two reduction extents as the gated
+// DeltaNet's pair — nEmbd = 2560 for the fused projection and 6144 for the
+// output one — and D12 still says the rung is per *matrix* and not per K, so
+// the ladder was re-measured here rather than copied from dnQKVGemv.
+const attnQKVGemv = GEMVK8
+const attnOutGemv = GEMVK32
+
 // AttnKernel names one build of shaders/llm_attn_wmma.comp, by its tile.
 type AttnKernel string
 
@@ -245,6 +257,14 @@ type AttnGPU struct {
 
 	attn          AttnKernel
 	gemm, outGemm GEMMKernel
+	// The decode rungs of the same two projections: llm_gemv.comp at one
+	// token, GEMVOff at every other length (L8e-1, on L8d-4's kernel).
+	qkvGemv, outGemv GEMVKernel
+	// pinGemv holds both projections on llm_gemm.comp whatever the batch, so
+	// that a prompt run in chunks is the prompt run whole to the last place
+	// (Graph.PinSchedule). A split sum is a different association of the same
+	// products, which is the one thing a rung here does not preserve.
+	pinGemv bool
 	// autoPlan re-chooses both GEMM rungs per run. SetPlan turns it off,
 	// because a caller that named a rung meant it.
 	autoPlan bool
@@ -268,7 +288,9 @@ type AttnGPU struct {
 	aQKV, aScore, aCell, aOut uint32
 	// The QSA selection, a bitmask of nKV bits a token, read as uints out of
 	// the same fp32 arena through binding 4. L4b.
-	aSel     uint32
+	aSel uint32
+	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1).
+	aPart    uint32
 	actElems int
 	// sparse is whether the selection is dispatched and the attention kernel
 	// reads it. It is decided by the cache the layer was built for, because
@@ -489,6 +511,11 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// rather than branching, and an unallocated row would be a read past the
 	// buffer.
 	g.aSel = alloc(rows * g.selWords())
+	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1). The wider
+	// of the two projections is the fused one, so 40 x 13952 x 4 = 2.2 MB —
+	// allocated whichever rung runs, because the arena plan is fixed at
+	// construction and the rung is not.
+	g.aPart = alloc(gemvMaxSlabs * g.qkvN())
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -606,14 +633,28 @@ func (g *AttnGPU) build() error {
 			return err
 		}
 	}
+	// Only the two projections read the bank, and only their Q8 build names
+	// the sixth buffer; the pack, the indexer, the score and the attention
+	// kernel are unchanged.
+	gemmBufs := bufs
 	if g.q8 {
-		gemmBufs := append(append([]*vk.Buffer{}, bufs...), g.bank)
+		gemmBufs = append(append([]*vk.Buffer{}, bufs...), g.bank)
 		for _, v := range gemmQ8Variants {
 			if err := g.pipeline(q8Pipe(v.name), v.spirv, vk.PipelineSpec{
 				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 			}); err != nil {
 				return err
 			}
+		}
+	}
+	// The decode GEMV, every rung of both banks plus the reduce (L8e-1). They
+	// are built whatever the bank is, because the reduce reads neither and
+	// the fp16 partials arm is what a block on the fp16 bank runs.
+	for name, spirv := range gemvSPIRV {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{
+			Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: attnWave,
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -780,6 +821,60 @@ func (g *AttnGPU) Plan() (AttnKernel, GEMMKernel, GEMMKernel) {
 	return g.attn, g.gemm, g.outGemm
 }
 
+// SetGemv chooses the two projections' decode rungs, or GEMVOff to leave them
+// on llm_gemm.comp. It is separate from SetPlan for the reason DeltaNetGPU's
+// is: the GEMV is a different kernel over the same staged weight, its ladder
+// does not cross the GEMM's, and the two projections do not want the same
+// split because K is 2560 on one and 6144 on the other.
+func (g *AttnGPU) SetGemv(qkv, out GEMVKernel) error {
+	for _, t := range []struct {
+		k     GEMVKernel
+		gemmK int
+		what  string
+	}{{qkv, g.cfg.NEmbd, "qkv"}, {out, g.cfg.GateWidth(), "out"}} {
+		if t.k == GEMVOff {
+			continue
+		}
+		if gemvSlabs(t.k) == 0 {
+			return fmt.Errorf("llm: no GEMV kernel %q (have %v)", t.k, GEMVKernels())
+		}
+		if !GEMVFits(t.k, t.gemmK) {
+			return fmt.Errorf("llm: GEMV rung %q does not cut K = %d of %s into whole four-tile steps",
+				t.k, t.gemmK, t.what)
+		}
+	}
+	if (qkv != GEMVOff || out != GEMVOff) && g.rows != 1 {
+		return fmt.Errorf("llm: the GEMV rungs read one token's row; this batch is %d", g.rows)
+	}
+	g.qkvGemv, g.outGemv = qkv, out
+	g.autoPlan = false
+	return nil
+}
+
+// Gemv reports the decode rungs in use.
+func (g *AttnGPU) Gemv() (GEMVKernel, GEMVKernel) { return g.qkvGemv, g.outGemv }
+
+// PinGemv holds the two projections on llm_gemm.comp whatever the batch, and
+// releases them to the measured schedule when off. See Graph.PinSchedule.
+func (g *AttnGPU) PinGemv(on bool) {
+	g.pinGemv = on
+	if on {
+		g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+	} else if g.autoPlan {
+		g.qkvGemv, g.outGemv = AttnGemvFor(g.rows)
+	}
+}
+
+// AttnGemvFor is the decode plan: llm_gemv.comp at one token and the GEMM at
+// every other length, where its A operand is a full fragment and its grid is
+// no longer `gemmN/64` workgroups for one row.
+func AttnGemvFor(tokens int) (GEMVKernel, GEMVKernel) {
+	if tokens != 1 || !DecodeGEMV() {
+		return GEMVOff, GEMVOff
+	}
+	return attnQKVGemv, attnOutGemv
+}
+
 // Layers is how many layers are staged, Tokens the longest prompt the arenas
 // were built for and NKV the cache's cell count.
 func (g *AttnGPU) Layers() int { return len(g.layers) }
@@ -807,6 +902,11 @@ func (g *AttnGPU) Upload(xn []float32, nTok int) error {
 	g.rows = nTok
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+		if g.pinGemv {
+			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+		} else {
+			g.qkvGemv, g.outGemv = AttnGemvFor(nTok)
+		}
 	}
 	slab := make([]uint16, nTok*g.lda)
 	narrowRows(slab, xn, nTok, c.NEmbd, g.lda)
@@ -882,7 +982,21 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		qkvPipe = q8Pipe(g.gemm)
 		qkv.LowRank, qkv.GateOff = uint32(g.qkvQ8Rows()), w.qkvTail
 	}
-	add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+	if ks := gemvSlabs(g.qkvGemv); ks > 0 {
+		// The decode kernel: one row, so the parallelism comes from K and not
+		// from a sixteen-row fragment of which fifteen rows are padding
+		// (L8e-1). The partials ride `resOff`, which this block does not use.
+		// `lowRank` carries the int8 split here rather than ATTN_PAST, which
+		// is what it already does on the GEMM arm above — a projection has no
+		// use for the cache position.
+		qkv.ResOff = g.aPart
+		add(gemvPipe(g.qkvGemv, g.q8), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
+		if ks > 1 {
+			add(gemvSumPipe(g.qkvGemv), "qkv.sum", uint32(roundUpInt(g.qkvN(), attnWave)/attnWave), 1, qkv)
+		}
+	} else {
+		add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+	}
 
 	// 2. Norm, rotary and the fragment tiling for q, k and v together, plus
 	//    the one plane that is not a head: the indexer's raw key into its own
@@ -921,7 +1035,15 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		outPipe = q8Pipe(g.outGemm)
 		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: attn_output is Q8_0
 	}
-	add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	if ks := gemvSlabs(g.outGemv); ks > 0 {
+		out.ResOff = g.aPart
+		add(gemvPipe(g.outGemv, g.q8), "out", uint32(ks), uint32(c.NEmbd/coopMatTile), out)
+		if ks > 1 {
+			add(gemvSumPipe(g.outGemv), "out.sum", uint32(roundUpInt(c.NEmbd, attnWave)/attnWave), 1, out)
+		}
+	} else {
+		add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	}
 	return d, kinds, nil
 }
 
@@ -1193,6 +1315,11 @@ func (g *AttnGPU) Resize(nTok int) error {
 	g.rows = nTok
 	if g.autoPlan {
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
+		if g.pinGemv {
+			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
+		} else {
+			g.qkvGemv, g.outGemv = AttnGemvFor(nTok)
+		}
 	}
 	return nil
 }

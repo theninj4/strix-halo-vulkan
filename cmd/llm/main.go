@@ -76,7 +76,7 @@ func main() {
 	mixers := flag.Int("mixers", 8, "how many real mixers to stage for -hc; the sweep needs more than the 32 MiB MALL")
 	iters := flag.Int("iters", 20, "repetitions per timed dispatch for -hc")
 	ladder := flag.Bool("ladder", false, "run every kernel rung for -hc")
-	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn")
+	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn and -attn, and at one token the decode GEMV's split per projection")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
 
@@ -188,7 +188,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err := attnBench(*model, toks, *ctx, *attnLayers, *iters, *ladder, *sel, *csvPath); err != nil {
+		if err := attnBench(*model, toks, *ctx, *attnLayers, *iters, *ladder, *gemmLadder, *sel, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return

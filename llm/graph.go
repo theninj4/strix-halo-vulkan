@@ -251,13 +251,17 @@ func (g *Graph) flush() error {
 // and for the same reason: a cooperative-matrix accumulator sums sixteen k an
 // instruction in an order the extension does not define, a GEMV lane sums them
 // serially, and a split-K reduce adds the slabs afterwards. So the pin now
-// covers four blocks rather than one.
+// covers four blocks rather than one — **five with L8e**, which puts the
+// full-attention layer's two projections on the same kernel.
 func (g *Graph) PinSchedule(on bool) error {
 	if g.moe != nil {
 		g.moe.PinGemv(on)
 	}
 	if g.dn != nil {
 		g.dn.PinGemv(on)
+	}
+	if g.attn != nil {
+		g.attn.PinGemv(on)
 	}
 	if !on {
 		g.hc.AutoPlan()

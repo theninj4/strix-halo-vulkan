@@ -45,9 +45,13 @@ func moeGPU4k(t *testing.T) (*MoEGPU, *Trace, MoEConfig, MoEWeights, []float32, 
 	return g, tr, c, w, in, nTok, func() { g.Destroy(); done() }
 }
 
-// TestMoEGPUGraph is the cheap structural guard: nine dispatches, in the order
-// the block depends on, against the roughly forty lines llama.cpp's graph
-// spends on the same work.
+// TestMoEGPUGraph is the cheap structural guard: eight or nine dispatches, in
+// the order the block depends on, against the roughly forty lines llama.cpp's
+// graph spends on the same work.
+//
+// The second counting-sort pass is there only when the two modes are cut to
+// different row blocks (L8e-3); at this fixture's rung they are the same, so
+// the down mode reads the up mode's tile list and the pass is absent.
 func TestMoEGPUGraph(t *testing.T) {
 	g, _, _, _, _, _, done := moeGPU4k(t)
 	defer done()
@@ -56,7 +60,10 @@ func TestMoEGPUGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%d dispatches: %v", len(d), kinds)
-	want := []string{"router", "route", "perm.up", "perm.down", "up", "down", "shexp.up", "shexp.down", "combine"}
+	want := []string{"router", "route", "perm.up", "up", "down", "shexp.up", "shexp.down", "combine"}
+	if moeBM(g.down) != moeBM(g.up) {
+		want = []string{"router", "route", "perm.up", "perm.down", "up", "down", "shexp.up", "shexp.down", "combine"}
+	}
 	if len(kinds) != len(want) {
 		t.Fatalf("the graph is %v, want %v", kinds, want)
 	}
@@ -694,5 +701,94 @@ func TestMoEGPUDecode(t *testing.T) {
 		t.Error("a GEMV plan was accepted for a two-token batch, where a tile may hold two rows")
 	} else {
 		t.Logf("refused above one token: %v", err)
+	}
+}
+
+// TestMoEGPUSharedPlan is L8e-2's gate: the shared expert's two rungs moved
+// off the routed pair's field, which is a schedule change and has to be no
+// change at all in the arithmetic.
+//
+// Two things could break and neither is a tolerance. The shared expert's tile
+// list is **host-built** and cut to its own row block now, so a rung whose BM
+// differs from the routed pair's would index the permuted row space with
+// records that do not divide it — and its group sits at the *front* of that
+// space, so the failure mode is the shared expert reading a routed expert's
+// rows. And `pad` is the alignment all four dispatches share, so it has to be
+// the widest of the four and not of the two.
+func TestMoEGPUSharedPlan(t *testing.T) {
+	c, w, in, _, _ := moeFixtures4k(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g, err := NewMoEGPU(dev, c, 2, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.Upload(in[:c.NEmbd], 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// The reference is one field: both pairs on the routed plan, which is
+	// what SetPlan alone gives and what ran before this split existed.
+	ru, rd := MoEPlanFor(1)
+	if err := g.SetPlan(ru, rd); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(0); err != nil {
+		t.Fatal(err)
+	}
+	ref := append([]float32(nil), g.Out()...)
+	refSh := append([]float32(nil), g.ShSwiglu()...)
+
+	for _, plan := range [][2]MoEKernel{
+		{MoEV64W4, MoEV32W4}, {MoEV16, MoEV16}, {MoEV32W4, MoEV16W4},
+		{MoEV64, MoEV32}, {MoEV16W4, MoEV64W4},
+		// And mixed with the GEMM, whose row block is the same sixteen.
+		{MoEN1M1, MoEV32W4}, {MoEV64W4, MoEM1},
+	} {
+		name := fmt.Sprintf("%s/%s", plan[0], plan[1])
+		if err := g.SetPlan(ru, rd); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetSharedPlan(plan[0], plan[1]); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got, want := g.pad(), maxInt(maxInt(moeBM(ru), moeBM(rd)), maxInt(moeBM(plan[0]), moeBM(plan[1]))); got != want {
+			t.Errorf("%s: the row space is aligned to %d, want %d", name, got, want)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		rs, err := compare(g.ShSwiglu(), refSh)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		ro, err := compare(g.Out(), ref)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		t.Logf("shexp %-12s swiglu %v\n%18s ffn_out %v", name, rs, "", ro)
+		// A lane group is a different association of the same products, so
+		// this is the same bound the routed rungs get and for the same reason.
+		if rs.rms > 2e-3 {
+			t.Errorf("shexp %s: the swiglu is rms %.3e from the one-field plan's", name, rs.rms)
+		}
+		if ro.rms > 2e-3 {
+			t.Errorf("shexp %s: ffn_out is rms %.3e from the one-field plan's", name, ro.rms)
+		}
+	}
+
+	// The negative control: the GEMV rungs read one row of a tile, so the
+	// shared expert's pair is refused above one token exactly as the routed
+	// pair is. The routed pair has to come off them first, because Resize
+	// refuses the whole plan and not one half of it.
+	if err := g.SetPlan(MoEM2, MoEM2); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Resize(2); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetSharedPlan(MoEV64W4, MoEV32W4); err == nil {
+		t.Error("the shared expert's GEMV rungs were accepted for a batch of two rows")
 	}
 }
