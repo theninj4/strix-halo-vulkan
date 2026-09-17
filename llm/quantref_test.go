@@ -36,6 +36,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"testing"
 
 	"strix-halo-vulkan/safetensors"
@@ -51,10 +52,33 @@ const (
 	// — the format D7 now names, and the one make_qx_quants is reached
 	// through for every 4-bit rung here.
 	ggmlTypeQ4_0 = 2
+	// ggmlTypeQ4_K and ggmlTypeQ5_K are L8c-3's asymmetric arm: a super-block
+	// of eight groups of 32 with a 6-bit scale and min apiece, against one
+	// fp16 pair — the form this checkpoint's own experts are in and the one
+	// unsloth's imatrix was collected for.
+	ggmlTypeQ4_K = 12
+	ggmlTypeQ5_K = 13
 	// quantRefRows keeps the fixture small enough to commit: 64 rows of the
-	// two widths below is 2.5 MB of input.
-	quantRefRows = 64
+	// two widths below is 819 200 weights, which is what L8c-2's claim is
+	// stated over. L8c-3's two K arms take a quarter of that — 204 800 each
+	// — because three formats times two arms at 64 rows would be a 39 MB
+	// fixture, and a bit-exactness check does not get more true with rows.
+	quantRefRows  = 64
+	quantRefRowsK = 16
 )
+
+// quantRefTypes are the formats each case is quantised in, and the spec
+// llm/sim.go is asked for the same thing by. Every one of them reaches a
+// different ggml entry point.
+var quantRefTypes = []struct {
+	ggml int
+	spec string
+	rows int
+}{
+	{ggmlTypeQ4_0, "q4_0/32", quantRefRows},
+	{ggmlTypeQ4_K, "q4_k/32", quantRefRowsK},
+	{ggmlTypeQ5_K, "q5_k/32", quantRefRowsK},
+}
 
 // quantRefCases are real weights, one per shape that matters: the DeltaNet's
 // fused projection at k = 2560 and the hyper-connection block's down
@@ -62,10 +86,21 @@ const (
 var quantRefCases = []string{"blk.0.attn_qkv.weight", "blk.0.hc_attn_down.weight"}
 
 type quantRecord struct {
+	typ     int
 	rows, k int
 	haveIm  bool
 	x       []float32
 	im      []float32
+}
+
+// spec names the sim format a record's ggml type stands for.
+func (r quantRecord) spec() string {
+	for _, t := range quantRefTypes {
+		if t.ggml == r.typ {
+			return t.spec
+		}
+	}
+	return ""
 }
 
 func TestQuantSimMatchesGGML(t *testing.T) {
@@ -90,8 +125,12 @@ func TestQuantSimMatchesGGML(t *testing.T) {
 		if rec.haveIm {
 			mode = "imatrix"
 		}
-		t.Run(fmt.Sprintf("%s/k%d", mode, rec.k), func(t *testing.T) {
-			q, err := ParseQuantSim("q4_0/32")
+		spec := rec.spec()
+		if spec == "" {
+			t.Fatalf("record %d: ggml type %d is not one this test knows", i, rec.typ)
+		}
+		t.Run(fmt.Sprintf("%s/%s/k%d", strings.TrimSuffix(spec, "/32"), mode, rec.k), func(t *testing.T) {
+			q, err := ParseQuantSim(spec)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -104,9 +143,12 @@ func TestQuantSimMatchesGGML(t *testing.T) {
 			if len(got) != len(want) {
 				t.Fatalf("%d values against %d", len(got), len(want))
 			}
-			bad, at := 0, -1
+			bad, at, exact := 0, -1, 0
 			var worst float64
 			for j := range got {
+				if got[j] == want[j] {
+					exact++
+				}
 				// ggml hands back the f32 product; the bank holds the half.
 				if safetensors.F32ToF16(got[j]) != safetensors.F32ToF16(want[j]) {
 					bad++
@@ -123,7 +165,12 @@ func TestQuantSimMatchesGGML(t *testing.T) {
 					mode, bad, len(got), worst, at, got[at], want[at])
 				return
 			}
-			t.Logf("%s, k=%d: %d values identical to ggml's, half for half", mode, rec.k, len(got))
+			// The asymmetric arm reproduces ggml's dequant expression term
+			// for term — `d*sc*l - dmin*m` in f32 — so it is exact in f32
+			// and not only in the half, which is a stronger statement than
+			// the gate needs and the one that says the port is the port.
+			t.Logf("%s, k=%d: %d values identical to ggml's, half for half (%d of them in f32)",
+				mode, rec.k, len(got), exact)
 		})
 	}
 }
@@ -155,30 +202,33 @@ func writeQuantInput(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		x := all[:quantRefRows*k]
+		all = all[:quantRefRows*k]
 		var cols []float32
 		if imErr == nil {
 			if cols, err = im.Columns(name); err != nil {
 				t.Fatal(err)
 			}
 		}
-		for _, withIm := range []bool{false, true} {
-			if withIm && cols == nil {
-				continue
-			}
-			hdr := []uint32{ggmlTypeQ4_0, uint32(quantRefRows), uint32(k), 0}
-			if withIm {
-				hdr[3] = 1
-			}
-			if err := binary.Write(f, binary.LittleEndian, hdr); err != nil {
-				t.Fatal(err)
-			}
-			if err := binary.Write(f, binary.LittleEndian, x); err != nil {
-				t.Fatal(err)
-			}
-			if withIm {
-				if err := binary.Write(f, binary.LittleEndian, cols); err != nil {
+		for _, typ := range quantRefTypes {
+			for _, withIm := range []bool{false, true} {
+				if withIm && cols == nil {
+					continue
+				}
+				x := all[:typ.rows*k]
+				hdr := []uint32{uint32(typ.ggml), uint32(typ.rows), uint32(k), 0}
+				if withIm {
+					hdr[3] = 1
+				}
+				if err := binary.Write(f, binary.LittleEndian, hdr); err != nil {
 					t.Fatal(err)
+				}
+				if err := binary.Write(f, binary.LittleEndian, x); err != nil {
+					t.Fatal(err)
+				}
+				if withIm {
+					if err := binary.Write(f, binary.LittleEndian, cols); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 		}
@@ -198,6 +248,7 @@ func readQuantRecords(path string, wantIm bool) ([]quantRecord, error) {
 		if off+16 > len(raw) {
 			return nil, fmt.Errorf("%s: short header at %d", path, off)
 		}
+		typ := int(binary.LittleEndian.Uint32(raw[off:]))
 		rows := int(binary.LittleEndian.Uint32(raw[off+4:]))
 		k := int(binary.LittleEndian.Uint32(raw[off+8:]))
 		haveIm := binary.LittleEndian.Uint32(raw[off+12:]) == 1
@@ -210,7 +261,7 @@ func readQuantRecords(path string, wantIm bool) ([]quantRecord, error) {
 		if off+need > len(raw) {
 			return nil, fmt.Errorf("%s: short payload at %d", path, off)
 		}
-		rec := quantRecord{rows: rows, k: k, haveIm: haveIm, x: make([]float32, n)}
+		rec := quantRecord{typ: typ, rows: rows, k: k, haveIm: haveIm, x: make([]float32, n)}
 		for i := range rec.x {
 			rec.x[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[off+4*i:]))
 		}

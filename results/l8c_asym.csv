@@ -1,0 +1,24 @@
+chunks,baseline_ppl,scope,format,bits_per_weight,quant,ppl,delta_pct,symmetric_ppl,symmetric_delta_pct,note
+8,2.0189,none (control: the bank we run),as shipped,8.50,,2.0189,0.00,2.0189,0.00,reproduces L8c-1's control
+8,2.0189,every streamed dense family,q4_k/32,4.50,rtn,2.1968,8.81,2.3927,18.51,symmetric is q4_0/32 at the same 4.50 bits
+8,2.0189,every streamed dense family,q4_k/32,4.50,search,2.2366,10.78,2.4802,22.85,make_qkx3 alone; the search loses on both forms
+8,2.0189,every streamed dense family,q4_k/32,4.50,imatrix,2.0981,3.92,2.4702,22.35,calibration helps here and hurts there
+8,2.0189,hyper_conn,q4_k/32,4.50,rtn,2.0563,1.85,2.1396,5.98,
+8,2.0189,hyper_conn,q4_k/32,4.50,search,2.0932,3.68,,,no symmetric search arm was run per family
+8,2.0189,hyper_conn,q4_k/32,4.50,imatrix,2.0370,0.90,2.2014,9.04,L8c-2's outlier: 10x less cost
+8,2.0189,hyper_conn,q5_k/32,5.50,rtn,2.0169,-0.10,2.0935,3.70,symmetric is q5sym/32
+8,2.0189,hyper_conn,q5_k/32,5.50,imatrix,1.9915,-1.36,,,
+8,2.0189,deltanet,q4_k/32,4.50,rtn,2.0422,1.15,2.0489,1.49,
+8,2.0189,deltanet,q4_k/32,4.50,imatrix,2.0128,-0.30,2.0487,1.48,
+8,2.0189,full_attn,q4_k/32,4.50,rtn,2.0601,2.04,2.0990,3.97,
+8,2.0189,lm_head,q4_k/32,4.50,rtn,2.0269,0.40,2.0245,0.28,the one family the symmetric form wins
+8,2.0189,full_attn,q4_k/32,4.50,imatrix,2.0402,1.05,,,
+8,2.0189,lm_head,q4_k/32,4.50,imatrix,2.0269,0.40,,,identical to rtn: the published matrix has no entry for the head
+8,2.0189,mixed plan: hc at q5_k / rest q4_k,q4_k+q5_k/32,4.63,imatrix,2.0740,2.73,,,
+8,2.0189,mixed plan: hc+attn at q5_k / rest q4_k,q4_k+q5_k/32,4.75,imatrix,2.0561,1.84,,,
+145,4.0289,none (L8c-0),as shipped,8.50,,4.0289,0.00,4.0289,0.00,our own number on the bank we run (D17)
+145,4.0289,L8c-1's symmetric mixed plan,dn+head 4.50 / attn+hc 6.50,5.30,rtn,4.2699,5.98,4.2699,5.98,the plan L8c-3 replaces
+145,4.0289,every streamed dense family,q4_k/32,4.50,imatrix,4.1998,4.24,,,4.264 GB/token and a 56.7 tok/s ceiling
+145,4.0289,mixed plan: hc+attn at q5_k / rest q4_k,q4_k+q5_k/32,4.75,imatrix,4.1377,2.70,,,4.419 GB/token and a 54.8 tok/s ceiling
+145,4.0289,every streamed dense family,q4_k/32,4.50,rtn,4.3124,7.04,4.6127,14.49,the 2x2 at corpus scale: same bits and same bytes both rows
+145,4.0289,every streamed dense family,q4_0/32,4.50,imatrix,4.6588,15.63,4.6588,15.63,the symmetric calibrated arm; the sign flip is a corpus-scale result

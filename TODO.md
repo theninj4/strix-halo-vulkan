@@ -880,6 +880,116 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-17 (fifty-first) — stage L8c-3: the asymmetric form, and the calibration that only works on it
+
+**Result: D7 is reversed and D3 is back. The 2x2 over the whole corpus, from
+our own 4.0289 and at identical bits *and identical bytes* — 4.500 and 4.264
+GB a token in every cell:**
+
+| 145 chunks | `rtn` | `imatrix` |
+|---|---:|---:|
+| symmetric `q4_0/32` | 4.6127 (+14.49%) | 4.6588 (+15.63%) |
+| **asymmetric `q4_k/32`** | 4.3124 (+7.04%) | **4.1998 (+4.24%)** |
+
+**Uncalibrated the asymmetric form is 2.06x cheaper; calibrated it is 3.69x,
+because the imatrix L8c-2 found broken *works* on it — worth −2.80 points here
+and +1.14 there.** A mixed
+asymmetric plan at 4.75 bits is **4.1377, +2.70%**. Both beat L8c-1's
+recommendation (+5.98% at 5.30 bits, 52.9 tok/s) on **both** axes at once —
+4.264 and 4.419 GB a token against 4.575, and 56.7 and 54.8 tok/s of ceiling
+against 52.9. No shader and no kernel changed: this is still the simulation.
+[Write-up](research/l8c-asymmetric.md) · `results/l8c_asym.csv`,
+`results/l8c_ppl_asym.csv`, `results/l8c_ppl_asym_mixed.csv` · `LLM.md` and
+D3/D7 updated.
+
+**1. The min costs nothing, which is what D7 got wrong.** L0d priced
+asymmetric at 1.043-1.053x better reconstruction and rejected it because a min
+per group is a second number to store. **ggml does not store it per group**:
+it nests, a super-block of eight groups of 32 carrying one fp16 `d` and one
+fp16 `dmin` while each group carries a 6-bit scale and a 6-bit min against
+that pair. Twelve bits a group plus 32 a super-block is **0.500 bits a weight
+— exactly what a symmetric fp16 scale per 32 costs** — so `q4_k/32` and
+`q4_0/32` are both 4.500 and `q5_k/32` and `q5sym/32` both 5.500. Every
+comparison in this stage is free of a width argument, which is why it is worth
+running at all.
+
+**2. Uncalibrated it is 2.06x, and widest where the model is most sensitive.**
+Over the corpus, +7.04% against +14.49%. Per family the screen is eight
+chunks, baseline 2.0189: every streamed dense family +8.81% against +18.51%; `hyper_conn` +1.85% against +5.98% (**3.2x**); `full_attn` +2.04%
+against +3.97%; `deltanet` +1.15% against +1.49%. The one family the
+symmetric form wins is the lm head, +0.28% against +0.40%. On reconstruction
+the gap is **1.22-1.30x**, not L0d's 1.043-1.053x — so the proxy under-read it
+twice over, once as a metric and once on the hierarchical two-level scale L0d
+never measured.
+
+**3. The imatrix works on this form, and that is the stage's real result.**
+Three arms again, because ggml searches and calibrates in one function. The
+search alone still loses on **both** forms (+10.78% asymmetric, +22.85%
+symmetric), so the win is calibration and not ggml's extra machinery. What
+changes is the matrix: symmetric it recovered 0.5 points of the search's
+4.3-point regression and ended 3.8 points worse than round-to-nearest;
+asymmetric it goes **4.9 points past it**. Per family it now helps everything
+it covers — `hyper_conn` from L8c-2's catastrophic +9.04% to **+0.90%**,
+`deltanet` from +1.48% to **−0.30%**, `full_attn` to +1.05% — and `lm_head`
+does not move because the published matrix has no entry for it, which the run
+prints.
+
+**4. The mechanism is the second parameter, and it is measured.** L8c-2's
+explanation was a systematic gain error that compounds on L6b-3's x1.085 a
+layer where residual noise averages out. That makes a prediction: **a
+symmetric group has one free parameter and it *is* the gain**, so a calibrated
+fit has nowhere to express a preference but the scale; an asymmetric group has
+two, and the min can absorb an offset. `TestQuantSimGain` now sweeps both
+forms, and the extra shrinkage calibration costs `hc_attn_up` is **1.24 pp
+symmetric against 0.47 pp asymmetric**, on `hc_attn_down` 0.19 against 0.03,
+and on `attn_qkv` it is gone. Note what it is *not*: the asymmetric `imatrix`
+arm still has a worse *unweighted* reconstruction than its own `rtn`, as the
+symmetric one did, and wins the model anyway — the systematic part is what
+predicts behaviour on both forms. L8c-2's rule gains a clause: an imatrix
+helps in proportion to how evenly importance is spread inside a scale group
+**and how many parameters that group has to express a preference with**.
+
+**5. The port matched ggml first try, and in f32.** `reference/quant_ref.c`
+already carried the ggml type in its header, so the oracle needed only Q4_K
+and Q5_K records beside the Q4_0 ones. All four new arms are **identical to
+`ggml_quantize_chunk` over 204 800 values apiece and identical in f32**, not
+merely in the half — available here because the asymmetric arm reproduces
+ggml's dequant expression term for term, `d*sc*l - dmin*m`, which is what
+`llm_moe_gemv.comp` already computes over this checkpoint's own experts. The
+three details that cost L8c-2 a day (`nearest_int` rounds half to **even**,
+two `float` accumulators) are shared and had already been paid for.
+`makeQkxQuants` is `make_qkx2_quants` and `make_qkx3_quants` at once — they
+differ in two places and neither is reachable — and `makeQpQuants` is
+`make_qp_quants`, the part of the format with no symmetric counterpart.
+
+**6. One departure from ggml, on the tensor the question is about.**
+K-quants assert `k % 256 == 0` and `llama-quantize` falls back to another type
+otherwise. Every dense row here is a whole number of super-blocks *except*
+`hc_{attn,ffn}_up` and `output_hc_up`, which read the low-rank space and are
+**320** wide — and `hc_attn_up` is L8c-2's outlier, the tensor whose
+importance sits in an effective 4.4 of 32 columns and which carried the entire
+imatrix regression. Falling back to `q4_0` there would have answered a
+different question, so the super-block is ggml's eight where eight fits and
+**the whole row** where it does not: ten groups, **4.475 bits a weight**,
+stated rather than rounded off. Nothing in `make_qkx3_quants` or
+`make_qp_quants` knows the count. It is bit-exactness-checked only where ggml
+will run; `TestQuantSimAsym` covers the rest structurally.
+
+**Next: the dense kernel**, which reverses what L8c-1 and L8c-2 concluded. The
+re-quantisation's honest end is no longer +5.98% at 5.30 bits but **+2.70% at
+4.75** or **+4.24% at 4.50**, and at 4.264 GB a token that is 1.49x the bytes
+and a **56.7 tok/s ceiling**. §1.1's W4A8 is a *symmetric* layout; the
+asymmetric one folds the min into the epilogue as a per-group correction times
+the activation's column sum — one extra reduction over A at prefill, nothing
+at decode where A is one row, and no change to the matrix core. That
+reduction's cost against L8b-5's already-unpack-bound prefill arm is the one
+thing nobody has measured, and it is in `LLM.md`'s open questions. Beside it
+sit the two the simulation still cannot reach — the F32 router at fp16 (+1.5
+tok/s of ceiling) and the 512 expert banks at ~4.25 (+3.0) — and the experts
+are already Q4_K and already the calibrated part of this checkpoint, which
+after this stage is a reason to expect them to behave rather than to fear
+them.
+
 ### Session 2026-09-17 (fiftieth) — stage L8e: the last projection, and a ladder that lied
 
 **Result: decode is 24.66 tok/s against L8d's 23.15 — 1.065x — with no bank

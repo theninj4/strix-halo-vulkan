@@ -396,6 +396,15 @@ func TestImatrixQuant(t *testing.T) {
 // the optimum trades a little bias for a lot of variance. That is the right
 // trade for one group in isolation and the wrong one for a residual stream
 // read 97 times a pass.
+//
+// **L8c-3 runs the same diagnostic over the asymmetric form**, because that
+// is where the mechanism makes a prediction rather than a description: a
+// symmetric group has one free parameter and it *is* the gain, so a squared
+// error fit has nowhere to put a bias but into the gain. A K-quant group has
+// two — a scale and a min — so the fit can absorb an offset without shrinking
+// the scale, and if the mechanism is right the asymmetric gain should sit
+// nearer 1 on exactly the tensor (`hc_attn_up`) where the symmetric one does
+// not. The formats are swept beside each other for that comparison.
 func TestQuantSimGain(t *testing.T) {
 	m, _ := fixtures(t)
 	im, err := DefaultImatrix()
@@ -423,41 +432,43 @@ func TestQuantSimGain(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, mode := range []string{"rtn", "search", "imatrix"} {
-				q, err := ParseQuantSim("q4_0/32")
-				if err != nil {
-					t.Fatal(err)
-				}
-				q.Mode = mode
-				var qw []float32
-				if mode == "imatrix" {
-					if cols == nil {
-						t.Logf("%-8s no imatrix entry, skipped", mode)
-						continue
+			for _, spec := range []string{"q4_0/32", "q4_k/32"} {
+				for _, mode := range []string{"rtn", "search", "imatrix"} {
+					q, err := ParseQuantSim(spec)
+					if err != nil {
+						t.Fatal(err)
 					}
-					qw = cols
+					q.Mode = mode
+					var qw []float32
+					if mode == "imatrix" {
+						if cols == nil {
+							t.Logf("%-7s %-8s no imatrix entry, skipped", spec, mode)
+							continue
+						}
+						qw = cols
+					}
+					got := append([]float32(nil), ref...)
+					if err := q.ApplyWeighted(got, k, qw); err != nil {
+						t.Fatal(err)
+					}
+					// gain is the least-squares scalar; resid is what is left
+					// after removing it, which is the part that averages out.
+					var wx, ww, se float64
+					for i := range got {
+						wx += float64(got[i]) * float64(ref[i])
+						ww += float64(ref[i]) * float64(ref[i])
+						d := float64(got[i] - ref[i])
+						se += d * d
+					}
+					gain := wx / ww
+					var rs float64
+					for i := range got {
+						d := float64(got[i]) - gain*float64(ref[i])
+						rs += d * d
+					}
+					t.Logf("%-7s %-8s gain %.6f  (%+.3f%%)   rel rms %.4e   residual after gain %.4e",
+						spec, mode, gain, 100*(gain-1), math.Sqrt(se/ww), math.Sqrt(rs/ww))
 				}
-				got := append([]float32(nil), ref...)
-				if err := q.ApplyWeighted(got, k, qw); err != nil {
-					t.Fatal(err)
-				}
-				// gain is the least-squares scalar; resid is what is left
-				// after removing it, which is the part that averages out.
-				var wx, ww, se float64
-				for i := range got {
-					wx += float64(got[i]) * float64(ref[i])
-					ww += float64(ref[i]) * float64(ref[i])
-					d := float64(got[i] - ref[i])
-					se += d * d
-				}
-				gain := wx / ww
-				var rs float64
-				for i := range got {
-					d := float64(got[i]) - gain*float64(ref[i])
-					rs += d * d
-				}
-				t.Logf("%-8s gain %.6f  (%+.3f%%)   rel rms %.4e   residual after gain %.4e",
-					mode, gain, 100*(gain-1), math.Sqrt(se/ww), math.Sqrt(rs/ww))
 			}
 		})
 	}
@@ -522,5 +533,112 @@ func TestImatrixSkew(t *testing.T) {
 		pr /= float64(groups)
 		t.Logf("%-28s k=%5d  max/median %8.1f  top1%% share %5.1f%%  mean group participation %.3f",
 			name, k, float64(s[k-1])/math.Max(float64(s[k/2]), 1e-30), 100*top/sum, pr)
+	}
+}
+
+// TestQuantSimAsym is the structural half of L8c-3: the K-quant arm is the
+// format it says it is, including on the one row width ggml's own quantiser
+// refuses.
+//
+//	go test ./llm/ -v -run TestQuantSimAsym
+//
+// The arithmetic half is TestQuantSimMatchesGGML, which says the port is
+// bit-identical to ggml where ggml will run at all. This is the part ggml
+// cannot check, because `quantize_row_q4_K_ref` asserts `k % 256 == 0` and
+// `hc_attn_up` — L8c-2's outlier, and the tensor the whole asymmetric
+// question is about — is 320 wide. There the super-block is the whole row,
+// ten groups rather than eight, which is 4.475 bits a weight and not 4.500.
+func TestQuantSimAsym(t *testing.T) {
+	q4, err := ParseQuantSim("q4_k/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q5, err := ParseQuantSim("q5_k/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := q4.BitsPerWeight(); got != 4.5 {
+		t.Errorf("q4_k/32 is %.4f bits, want 4.5 — the same as q4_0/32, which is the point", got)
+	}
+	if got := q5.BitsPerWeight(); got != 5.5 {
+		t.Errorf("q5_k/32 is %.4f bits, want 5.5", got)
+	}
+	for _, tc := range []struct {
+		k    int
+		sub  int
+		bits float64
+	}{
+		{2560, 8, 4.500}, {6144, 8, 4.500}, {10240, 8, 4.500}, {320, 10, 4.475},
+	} {
+		sub, err := q4.superBlocks(tc.k)
+		if err != nil {
+			t.Fatalf("k=%d: %v", tc.k, err)
+		}
+		if sub != tc.sub {
+			t.Errorf("k=%d: %d groups a super-block, want %d", tc.k, sub, tc.sub)
+		}
+		if got := q4.bitsPerWeightSuper(sub); math.Abs(got-tc.bits) > 1e-9 {
+			t.Errorf("k=%d: %.4f bits, want %.4f", tc.k, got, tc.bits)
+		}
+	}
+	// A width that is neither eight super-blocks nor one short row has no
+	// honest reading, and guessing would make the bits column a fiction.
+	if _, err := q4.superBlocks(544); err == nil {
+		t.Error("k=544 gave a super-block, want an error")
+	}
+	if _, err := q4.superBlocks(300); err == nil {
+		t.Error("k=300 is not a whole number of groups, want an error")
+	}
+
+	// And on real weights, including the 320-wide one. An asymmetric group
+	// has 2^bits reachable levels where the symmetric form reaches 15 or 16,
+	// and the min means they need not straddle zero.
+	m, _ := fixtures(t)
+	for _, name := range []string{"blk.0.hc_attn_up.weight", "blk.0.hc_attn_down.weight", "blk.0.attn_qkv.weight"} {
+		t.Run(name, func(t *testing.T) {
+			tn, err := m.Set.Get(name)
+			if err != nil {
+				t.Skipf("no %s: %v", name, err)
+			}
+			k := int(tn.Dims[0])
+			ref, err := tn.Dequantize(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rows := 256; len(ref) > rows*k {
+				ref = ref[:rows*k]
+			}
+			for _, spec := range []string{"q4_0/32", "q4_k/32", "q5sym/32", "q5_k/32"} {
+				q, err := ParseQuantSim(spec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := append([]float32(nil), ref...)
+				if err := q.Apply(got, k); err != nil {
+					t.Fatal(err)
+				}
+				levels := map[float32]bool{}
+				for _, v := range got[:q.Group] {
+					levels[v] = true
+				}
+				if n, max := len(levels), 1<<q.Bits; n > max {
+					t.Errorf("%s: %d distinct values in a group of %d, %d bits allow %d",
+						spec, n, q.Group, q.Bits, max)
+				}
+				var se, sr float64
+				for i := range got {
+					d := float64(got[i] - ref[i])
+					se += d * d
+					sr += float64(ref[i]) * float64(ref[i])
+				}
+				sub, _ := q.superBlocks(k)
+				bits := q.BitsPerWeight()
+				if q.Asym {
+					bits = q.bitsPerWeightSuper(sub)
+				}
+				t.Logf("%-9s %5.3f bits/w   rel rms %.4e   %2d levels used in group 0",
+					spec, bits, math.Sqrt(se/sr), len(levels))
+			}
+		})
 	}
 }

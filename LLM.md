@@ -279,16 +279,55 @@ the mechanism and does not close the gap. **The rule: an imatrix helps in
 proportion to how evenly importance is spread inside a scale group — where it
 is concentrated, what goes up is the systematic error.**
 
-**Next: not the dense kernel.** The re-quantisation's honest end is L8c-1's
-mixed plan, **+5.98% for 1.38x the bytes and a 52.9 tok/s ceiling**, and the
-lever that might have improved it does not. What is left in phase 2 is the
-router and the experts — 0.503 and 1.504 GB a token, neither reachable by the
-simulation — and past them **phase 3, where MTP speculation is worth 1.5-1.8x
-and batching amortises the dense half completely**. Both are larger than the
-widths. One thread is still live and is a *format* question rather than a
-width one: this was Q4_0's symmetric form, where the checkpoint's own experts
-are **Q4_K**, asymmetric with a min and a scale — which is what the imatrix
-was collected against. **That reopens D7 on a different argument than L0d's.**
+**L8c-2 left one caveat it could not test — every rung it measured was Q4_0's
+*symmetric* form, where this checkpoint's own experts and unsloth's matrix's
+own target are Q4_K — and L8c-3 tested it. It reverses D7 and resurrects D3.**
+The symmetric form was chosen on L0d's reconstruction ladder, which L8c-1 had
+already retired as a proxy — and the bytes it was chosen to save do not exist:
+**ggml nests the min**, a super-block of eight groups of 32 carrying one fp16
+pair plus 12 bits a group, which is **0.500 bits a weight, exactly what a
+symmetric fp16 scale per 32 costs**. So `q4_k/32` and `q4_0/32` are both 4.500
+bits and every comparison is free of a width argument. **Uncalibrated, the
+asymmetric form is 2.06x cheaper over the whole corpus — 4.3124 against 4.6127,
++7.04% against +14.49% — and 3.2x on the hyper-connection block that decides
+the plan**, against a reconstruction gap of 1.22-1.30x and L0d's claimed
+1.043-1.053x; the proxy under-read it twice over. **And the imatrix works on
+this form**: 4.5 bits on every streamed dense family is **4.1998 against our
+4.0289, +4.24%, where the same matrix on the symmetric form makes it worse
+still — 4.6588, +15.63%**. The 2x2 is the stage, and the sign flip is a
+corpus-scale result rather than a screen: calibration is worth **−2.80 points**
+asymmetric and **+1.14** symmetric, and it now helps every family it covers
+(`hyper_conn` +9.04% to **+0.90%**, `deltanet` +1.48% to **−0.30%**).
+**The mechanism is the second parameter, and it is measured**: a symmetric
+group has one free parameter and it *is* the gain, so a calibrated fit can only
+express its preference by shrinking the whole group — the extra shrinkage
+calibration costs `hc_attn_up` is **1.24 pp symmetric and 0.47 pp asymmetric**,
+and on `attn_qkv` it is gone. L8c-2's rule keeps its clause and gains one: an
+imatrix helps in proportion to how evenly importance is spread inside a scale
+group **and how many parameters that group has to express a preference with**.
+The port is bit-identical to `ggml_quantize_chunk` over 204 800 values an arm
+and **in f32**, not merely in the half. One departure from ggml, and it is on
+the tensor the question is about: K-quants want `k % 256 == 0` where
+`hc_*_up` is 320 wide, so its super-block is the whole row — ten groups,
+4.475 bits.
+
+**So the plan is 4.50 bits, not 5.30, and it costs +4.24% rather than +5.98%
+— 4.264 GB a token against 4.575 and a 56.7 tok/s ceiling against 52.9, or
++2.70% at 4.75 bits and 54.8 tok/s if the last quarter-bit goes to the two
+sensitive families.** Every
+asymmetric plan measured dominates L8c-1's recommendation on both axes at once,
+which is not a trade-off — so **the dense kernel is the next thing to build
+after all**, reversing what L8c-1 and L8c-2 concluded. §1.1's W4A8 layout is
+for a symmetric weight; an asymmetric one folds the min into the epilogue as a
+per-group correction times the activation's column sum, one extra reduction
+over A and no change to the matrix core. Beside it sit the two the simulation
+still cannot reach and which are worth more together than the last half-bit —
+the F32 router at fp16 (+1.5 tok/s of ceiling) and the 512 expert banks at
+~4.25 (+3.0) — and the experts are already Q4_K and already the calibrated part
+of this checkpoint, which after this stage is a reason to expect them to behave
+rather than to fear them. Past all of it is **phase 3**, where MTP speculation
+is worth 1.5-1.8x and batching amortises the dense half completely.
+
 
 ## The number to beat
 
@@ -1877,15 +1916,41 @@ dense weight is read every time.
 | | resident core | GB/token | **tok/s ceiling** | PPL |
 |---|---:|---:|---:|---:|
 | UD-Q4_K_XL as shipped | 82.52 GB | 6.334 | **38.2** | **4.0289** (L8c-0) |
-| ~4.25 bits on everything streamed — D3 as written | ~67 GB | ~3.9 | **62.2** | **+18.5%** (L8c-1) |
+| ~4.25 bits on everything streamed, **symmetric** — D3 as written | ~67 GB | ~3.9 | **62.2** | **+18.5%** (L8c-1) |
 | L8c-1's mixed plan: DeltaNet + head 4.5, attention + hc 6.5 | ~73 GB | 4.575 | **52.9** | **4.2699, +5.98%** |
+| **L8c-3: 4.5 bits on the dense half, `q4_k` + the imatrix** | 80.5 GB | **4.264** | **56.7** | **4.1998, +4.24%** |
+| L8c-3's mixed plan: `q5_k` on attention + hc, `q4_k` on the rest | 80.6 GB | 4.419 | **54.8** | **4.1377, +2.70%** |
+| the same 4.5 bits in the **symmetric** form — what D3 was retired on | 80.5 GB | 4.264 | 56.7 | 4.6127 rtn / 4.6588 imatrix, **+14.5 / +15.6%** |
 
-**L8c-1 retired the middle row.** It was an inference from L0d's
-weight-reconstruction ladder and a bandwidth argument, with no perplexity
-beside it; measured, the uniform width is the one arrangement guaranteed to be
-wrong at both ends, because the cost of 4 bits runs *inverse* to the bytes.
-The bottom row is what the measurement argues for, and at +5.98% it is not yet
-a bank worth building a kernel for — see L8c-2.
+> **The residency column is not on one basis and the GB/token column is.**
+> Rows two and three are pre-simulation estimates that price the *experts*
+> down as well as the dense half; rows four to six are `cmd/gguf -width`'s own
+> arithmetic over the dense half alone, which is all L8c-3 measured — the
+> experts stay as shipped at 77.02 GB of the 80.5, so re-quantising them is
+> where the rest of the residency is (and +3.0 tok/s of ceiling with it).
+> **The tok/s and GB/token columns are comparable throughout**, since a token
+> reads 10 of 512 experts either way.
+
+**L8c-1 retired row two and L8c-3 brought it back at a different width and in
+a different form** — rows four and five are the same "everything streamed"
+idea, at 4.5 bits rather than 4.25, asymmetric rather than symmetric, and
+calibrated. They beat row three on **both** axes. **Row six is the control that makes the point**: the same 4.5 bits, the same
+4.264 GB a token and the same residency in the symmetric form is +14.5%, and
+calibrating it makes it +15.6% — so what retired D3 was the form, not the
+width.
+
+Row two was an inference from L0d's weight-reconstruction ladder and a
+bandwidth argument, with no perplexity beside it, and **L8c-1 retired it**:
+measured in the symmetric form, a uniform width is the one arrangement
+guaranteed to be wrong at both ends, because the cost of 4 bits runs *inverse*
+to the bytes. That made row three the recommendation, and at +5.98% it was not
+yet a bank worth building a kernel for — see L8c-2. **L8c-3 changed which
+sentence in that was load-bearing**: "uniform is wrong at both ends" was a
+statement about a format whose group has one free parameter. In the
+asymmetric form the sensitive family's cost falls from +5.98% to +0.90% and a
+uniform 4.5 bits is the best row on the table, so the bottom row is both
+cheaper and more accurate than the plan it replaces — and **is** worth its
+kernel.
 
 ---
 
@@ -1958,11 +2023,34 @@ ceiling**, not 67. **So the kernel is not the next thing to build.** Every
 rung was round-to-nearest, against a checkpoint whose experts are
 imatrix-quantised and whose imatrix unsloth publish free
 (`imatrix_unsloth.gguf`, 580 MB); calibration is days where the W4A8 layout is
-weeks, and the widths it allows are what that layout would be built for. L8c-2
-is the imatrix. Beside it sit the two things the dense widths cannot reach and
-which are worth more together than narrowing the two sensitive families — the
-F32 router at fp16 (+1.5 tok/s of ceiling) and the 512 expert banks at ~4.25
-(+3.0) — and, free either way, **D13's fp16 tail as int8 for +0.01%**.
+weeks, and the widths it allows are what that layout would be built for.
+**L8c-2 pulled that lever and it moved the wrong way** — calibration cost
+another 3.8 points, all of it in the hyper-connection block, through a
+systematic gain error that compounds where residual noise averages out — which
+left one untested caveat: every rung in both stages was Q4_0's *symmetric*
+form, where the checkpoint's own experts and the matrix's own target are Q4_K.
+
+**L8c-3 is that caveat, and it reverses the recommendation.** The min costs
+nothing, because ggml nests it — a super-block of eight groups of 32 with one
+fp16 pair and 12 bits a group is **0.500 bits a weight, the same as a
+symmetric fp16 scale per 32** — so the two forms are compared at 4.500 bits
+exactly. Uncalibrated the asymmetric form is **2.1x** cheaper end to end and
+**3.2x** on the family that decides the plan; calibrated it is **4.1998
+against 4.0289, +4.24%**, where the symmetric form with the same matrix cost
++22.4%. **The mechanism is the second parameter**: a symmetric group's one
+free parameter *is* the gain, so a calibrated fit can only express a
+preference by shrinking the group, and the extra shrinkage calibration costs
+`hc_attn_up` is 1.24 pp symmetric against 0.47 asymmetric. **So the dense
+kernel is the next thing to build after all**, at 4.5 bits rather than 5.30,
+for 4.264 GB a token and a **56.7 tok/s** ceiling — better than L8c-1's plan
+on both axes at once. §1.1's W4A8 is a symmetric layout; the asymmetric one
+folds the min into the epilogue as a per-group correction times the
+activation's column sum, which is one extra reduction over A and no change to
+the matrix core. Beside it sit the two things the dense widths cannot reach
+and which are worth more together than the last half-bit — the F32 router at
+fp16 (+1.5 tok/s of ceiling) and the 512 expert banks at ~4.25 (+3.0), which
+are already Q4_K and already the calibrated part of this checkpoint — and,
+free either way, **D13's fp16 tail as int8 for +0.01%**.
 
 **Phase 3 — the throughput levers that are worth more than the format.** The
 MTP head is downloaded (2.79 GB, `mtp-…-Q4_K_M.gguf`); a draft step is ~12% of
@@ -2720,11 +2808,16 @@ below Q8. Bandwidth is the whole story.
 
 ### L8c — the widths that are ours rather than the checkpoint's  *(in progress)*
 
-> **L8c-0 and L8c-1 are done and they changed the stage's direction.** The
-> instrument came first, and what it measured retired D3: the re-quantisation
-> as specified costs far more accuracy than it was assumed to, so the order is
-> now *calibrate, then decide whether to build the kernel* rather than *build
-> the kernel*. The items below are in execution order.
+> **L8c-0 through L8c-3 are done, and the stage's direction turned twice.**
+> The instrument came first, and what it measured retired D3: the
+> re-quantisation as specified costs far more accuracy than it was assumed to,
+> so the order became *calibrate, then decide whether to build the kernel*
+> rather than *build the kernel*. L8c-2 calibrated, and the answer was no.
+> **L8c-3 found that both of those were statements about a format rather than
+> about the model** — in ggml's asymmetric K-quant, at the same bits, 4-bit
+> dense weights cost +4.24% rather than +18.5% and calibration *helps* — so
+> D3 is back at 4.5 bits, D7 is reversed, and the kernel is the next thing to
+> build. The items below are in execution order.
 
 - [x] **The instrument first**, because this is the stage where a tensor
       comparison stops being a grade. `Graph.ForwardRows` is a prefill without
@@ -2768,32 +2861,63 @@ below Q8. Bandwidth is the whole story.
       scale group** — `hc_attn_up`'s scale is fitted to an effective 4.4 of 32
       columns. Forcing the scale unbiased recovers a third.
       [Write-up](research/l8c-imatrix.md) · `results/l8c_imatrix.csv`
-- [ ] **So the dense kernel is not the next thing to build.** The
-      re-quantisation's honest end is L8c-1's mixed plan — +5.98% for 1.38x
-      the bytes and a 52.9 tok/s ceiling — and the lever that might have
-      improved it does not. Phase 2's remaining throughput is the router and
-      the experts below; past them is **phase 3**, where MTP speculation is
-      1.5-1.8x and batching amortises the dense half completely. Both are
-      larger than the widths.
+- [x] **L8c-3 — the asymmetric form, and it reverses D7 and the
+      recommendation.** L8c-2's one untested caveat was that every rung in
+      this stage was Q4_0's *symmetric* form. The min turns out to cost
+      nothing — ggml nests it, so a super-block of eight groups of 32 with one
+      fp16 pair and 12 bits a group is **0.500 bits a weight, exactly a
+      symmetric fp16 scale per 32** — and at those identical 4.500 bits
+      asymmetric is **2.06x cheaper uncalibrated** — 4.3124 against 4.6127
+      over the whole corpus, +7.04% against +14.49% — and 3.2x on
+      `hyper_conn`. **And the imatrix works on this form**: 4.5 bits on every
+      streamed dense family is **4.1998 against 4.0289, +4.24%**, where the
+      same matrix on the symmetric form makes it *worse* (4.6588, +15.63%),
+      and calibration now helps every family it covers. A mixed plan at 4.75
+      bits is **4.1377, +2.70%**. **The mechanism is the
+      second parameter**, measured: a symmetric group's one free parameter
+      *is* the gain, so a calibrated fit can only express a preference by
+      shrinking the group — the extra shrinkage calibration costs
+      `hc_attn_up` is **1.24 pp symmetric against 0.47 asymmetric**, and on
+      `attn_qkv` it is gone. The port is bit-identical to
+      `ggml_quantize_chunk` over 204 800 values an arm and **in f32**. One
+      departure from ggml, on the tensor the question is about: K-quants want
+      `k % 256 == 0` where `hc_*_up` is 320 wide, so its super-block is the
+      whole row — ten groups, 4.475 bits.
+      [Write-up](research/l8c-asymmetric.md) · `results/l8c_asym.csv` ·
+      `results/l8c_ppl_asym.csv` · `results/l8c_ppl_asym_mixed.csv`
+- [ ] **So the dense kernel *is* the next thing to build**, which reverses
+      what L8c-1 and L8c-2 concluded. The honest end of the re-quantisation is
+      no longer +5.98% at 5.30 bits but **+4.24% at 4.50 or +2.70% at
+      4.75** — 4.264 GB a token
+      against 4.575 and a **56.7 tok/s ceiling against 52.9**, better on both
+      axes at once. §1.1's W4A8 is a *symmetric* layout; the asymmetric one
+      folds the min into the epilogue as a per-group correction times the
+      activation's column sum, one extra reduction over A and no change to the
+      matrix core.
 - [ ] Then the two the simulation cannot reach, which are worth more together
       than narrowing `hyper_conn` and `full_attn`: **the router to fp16**
       (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
       **the 512 expert banks at ~4.25** (+3.0 tok/s, D4's floor, and they are
       the *calibrated* part of the checkpoint so naive re-quantisation is the
-      likeliest way to lose). Everything
+      likeliest way to lose — though **L8c-3 makes that the reason to
+      expect them to behave rather than to fear them**, since Q4_K
+      *is* the form calibration works on). Everything
       L8a and L8b stage is still **the checkpoint's arithmetic**: 8.5 bits a
-      weight, its own levels, its own scales. D3's ~4.25 bits is where the
+      weight, its own levels, its own scales. D3's ~4.5 bits is where the
       next 1.9x of the dense half is, and it is the first step in this
       vertical that changes what the model computes.
 - [ ] Re-quantise (transcode from the GGUF, or from bf16 with unsloth's
-      published imatrix) into the §1.1 W4A8 layout with an L0c scale plane.
+      published imatrix) into the §1.1 W4A8 layout with an L0c scale plane —
+      **asymmetric now, per L8c-3, so the plane carries a min beside the
+      scale and the epilogue carries the column-sum correction.**
       **If from bf16: apply llama.cpp's V-head reorder first** (L3a-3) — seven
       tensor families per linear layer, or `kHeadOfV` is wrong on 32 of 48
-      heads in 36 of 48 layers. **Gated on L8c-2**: the widths are what this
-      layout would be built for, and at L8c-1's widths it is not worth
-      building. Note also that §1.1's W4A8 is an *int8-activation* format,
-      where every L8c-1 rung was measured with an fp16 A operand — so its
-      accuracy is not L8c-1's table (see the open question).
+      heads in 36 of 48 layers. ~~**Gated on L8c-2**: at L8c-1's widths it is
+      not worth building.~~ **Ungated at L8c-3**: at the asymmetric form's
+      widths it is. Note still that §1.1's W4A8 is an *int8-activation*
+      format, where every L8c-1 and L8c-3 rung was measured with an fp16 A
+      operand — so its accuracy is not either table's (see the open
+      question).
 - [ ] Gate: perplexity within a stated delta of **4.0289** — our own number on
       the bank we run, not the reference's 4.0340, since L8c-0 shows the two
       already differ by −0.13% at identical weights — on the same corpus,
@@ -2802,10 +2926,15 @@ below Q8. Bandwidth is the whole story.
       for a percent**: four chunks put us +0.32% above the reference where 145
       put us 0.13% below, and L8c-1's fp16-tail result read −0.53% at eight
       chunks and **+0.01%** over the corpus.
-      **The tok/s and residency half of this gate is now L8c-2's to set.**
-      ~67 tok/s and ≤67 GB came off D3, which L8c-1 retired; the widths that
-      hold the model together are 52.9 tok/s of ceiling and ~73 GB, and
-      whether even that is worth its kernel depends on what calibration buys.
+      **The tok/s and residency half of this gate is L8c-3's to set, and it
+      has.** ~67 tok/s and ≤67 GB came off D3 as written; L8c-1 retired that
+      and left 52.9 tok/s and ~73 GB; L8c-3's uniform asymmetric plan is
+      **56.7 tok/s of ceiling, 4.264 GB a token and 80.5 GB resident, at
+      4.1998 — +4.24% of our own number** (or 54.8, 4.419, 80.6 and +2.70% at
+      4.75 bits). That is the delta the kernel is built to reproduce. The
+      residency barely moves because the dense half is 5.5 GB of 82.52 and
+      the experts are 77.02 of it; **≤67 GB was always an expert number**,
+      and it stays with the expert item below.
 
 ### L9 — phase 3, and shipping
 
@@ -2871,7 +3000,19 @@ below Q8. Bandwidth is the whole story.
     LLM_DENSE_SIM_QUANT=imatrix+gain LLM_DENSE_SIM=hyper_conn=q4_0/32 go run ./cmd/llm -ppl
     go test ./llm/ -run TestImatrixQuant -v    # the three arms on real weights
     go test ./llm/ -run TestQuantSimGain -v    # gain against residual, per arm
+                                               # and per *form* since L8c-3
     go test ./llm/ -run TestImatrixSkew -v     # why hc_attn_up is the outlier
+
+    # L8c-3: the same three arms on ggml's asymmetric form, which is the same
+    # 4.500 bits as q4_0/32 — a super-block of eight groups of 32, each with a
+    # 6-bit scale and min against one fp16 pair. `q5_k/32` is 5.500, beside
+    # `q5sym/32`. The 320-wide hyper-connection rows take a ten-group
+    # super-block (4.475 bits), because ggml's K-quants want k % 256 == 0 and
+    # that is the one family the question is about.
+    LLM_DENSE_SIM=q4_k/32 LLM_DENSE_SIM_QUANT=imatrix go run ./cmd/llm -ppl -chunks 8
+    LLM_DENSE_SIM=hyper_conn=q5_k/32 go run ./cmd/llm -ppl -chunks 8
+    go test ./llm/ -run TestQuantSimAsym -v    # the super-block rule, the
+                                               # levels, and the 320-wide row
 
     # the oracle for the port, on dequant_ref.c's precedent. Both testdata
     # files are committed, so the test needs no toolchain.
@@ -3052,10 +3193,10 @@ below Q8. Bandwidth is the whole story.
 |---|---|---|
 | D1 | **Consume UD-Q4_K_XL first, don't quantise from bf16.** | 114 GB instead of 360, an imatrix-calibrated checkpoint, and a bit-exact oracle. Phase order: run it, profile it, then optimise (`TODO.md`). |
 | D2 | **The n-gram table lives off-heap, mmap'd.** | 28.80 GB of capacity for 1.41 KB/token of bandwidth. **L1: llama.cpp already does this** — `TENSOR_READ_LAZY` — so it is the reference behaviour, not a deviation. |
-| D3 | ~~**Target ~4.25 bits on everything *streamed*, not just the experts.**~~ **Retired at L8c-1: measured, it is +18.5% of perplexity.** | The premise was right — 76% of decode bytes are dense — and the width was an inference from L0d's reconstruction ladder, which is a *proxy*. Measured end to end, the cost of 4 bits runs **inverse to the bytes**: the gated DeltaNet is 46% of a dense token for +1.49%, the hyper-connection block 14% for +5.98%. What replaces it is a **plan, not a width** (L8c-1's table), and the plan is not the sum of its families — errors injected at 36 or 48 depths compound on L6b-3's x1.085 a layer. L0d's finding 2 still stands where it was measured, on *weight reconstruction under int8 activations*; it does not carry to perplexity under fp16 ones. |
+| D3 | **Target ~4.5 bits on everything *streamed*, not just the experts.** ~~Retired at L8c-1~~ — **restored at L8c-3, in a different format.** | The premise was always right: 76% of decode bytes are dense. The *width* came off L0d's reconstruction ladder, and measured end to end in **Q4_0's symmetric form** it was +18.5% of perplexity, which is what retired it — and what replaced it was a plan, not a width (L8c-1's mixed table, +5.98% at 5.30 bits). **L8c-3 found the width was not the thing that was wrong; the form was.** At the same 4.500 bits, ggml's asymmetric `q4_k` with unsloth's published imatrix is **4.1998 against our 4.0289, +4.24%**, and a mixed plan at 4.75 bits is **4.1377, +2.70%** — better accuracy than the 5.30-bit symmetric plan at **4.264 GB a token against 4.575** and a **56.7 tok/s ceiling against 52.9**. L0d's finding 2 still stands where it was measured, on weight reconstruction under int8 activations; what L8c-1 established is that it does not carry to perplexity, and what L8c-3 adds is that it does not even rank the *formats* correctly — the reconstruction gap between the two is 1.22-1.30x where the corpus-level gap is **2.06x uncalibrated and 3.69x calibrated**, at identical bits and identical bytes. **A plan is still not the sum of its families** (four families sum to +2.05% where the uniform plan measures +3.92% at eight chunks), but the compounding is much milder than the symmetric form's 11.7% into 18.5%. |
 | D4 | **Do not go below 4 bits on the experts.** | They are 24% of the traffic; Q3 buys ~11% for a real accuracy hit. |
 | D6 | **W4A8, with per-token activation scales.** | L0d: int8-per-token costs **1.13x** the error of fp16 activations, against a 3x throughput cliff. Per-token is free in the RMSNorm epilogue (§3.1). |
-| D7 | **Symmetric Q4, not asymmetric — and `q4_0`'s sixteen levels, not `q4sym`'s fifteen. Reopened at L8c-2 on a new argument.** | L0d: asymmetric is 1.043-1.053x at equal bits, where §7 predicted 2x. **L8c-1 found the larger factor was inside the symmetric family**: every number in L0d used `d = amax/7` with q clamped to [-8, 7], of which only fifteen levels are reachable, where ggml's Q4_0 uses `d = -maxval/8` and reaches all sixteen. That is **1.13x on reconstruction at identical bits** and much more end to end (2.2813 against 2.4688 at four chunks) — bigger than the asymmetric gap D7 was decided on, and free. So the decision stands and its baseline moves: a 4-bit rung here is `q4_0`. **L8c-2 reopens it for a reason L0d could not see**: calibration *hurts* the symmetric form on the families whose importance is concentrated, and the format unsloth's imatrix was actually collected against is **Q4_K** — asymmetric, with a min and a scale per super-block, which is also what this checkpoint's own experts are. The case for asymmetric is no longer a 5% error reduction; it is that it may be the format calibration works with at all. Untested. |
+| D7 | ~~**Symmetric Q4, not asymmetric.**~~ **Reversed at L8c-3: a 4-bit rung here is `q4_k`, ggml's asymmetric K-quant, and not `q4_0`.** | L0d decided it on weight reconstruction: asymmetric was 1.043-1.053x at equal bits where §7 predicted 2x, so the min was not worth its bytes. **Two things were wrong with that.** The bytes are not a trade at all — ggml nests the min, a super-block of eight groups of 32 carrying one fp16 pair and 12 bits a group, which is **0.500 bits a weight, exactly what a symmetric fp16 scale per 32 costs** — so `q4_k/32` and `q4_0/32` are both 4.500. And the metric was the proxy L8c-1 had already retired: measured over the whole corpus the asymmetric form is **2.06x cheaper at identical bits and identical bytes** (4.3124 against 4.6127, +7.04% against +14.49%), 3.2x on the family that decides the plan. **The larger half is L8c-2's lever, which works on this form and not on the other**: the imatrix takes 4.5 bits on every streamed dense family to **4.1998, +4.24%**, where the same matrix on the symmetric form makes it *worse* — 4.6588, +15.63% — because a symmetric group has one free parameter and it *is* the gain, so a calibrated fit can only express its preference by shrinking the whole group — measured, the extra shrinkage calibration costs `hc_attn_up` is 1.24 pp symmetric and **0.47 pp** asymmetric. The 1.13x `q4_0` gained over L0d's fifteen-level `q4sym` (L8c-1) still stands and is now a fact about the arm that lost. |
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
 | D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
@@ -3102,6 +3243,17 @@ below Q8. Bandwidth is the whole story.
   epilogue removed — and the DeltaNet's two are 1.58x and 5.43x. **L8e-1 is
   the last pair**: the attention layer's fused projection is 1.51x and its
   output projection 5.08x, on the same two rungs the DeltaNet's pair took.
+- **Does the asymmetric epilogue cost what it looks like it costs?** L8c-3
+  settles the *format* and leaves its kernel an open shape. Dequantising a
+  K-quant group is `d*sc*l - dmin*m`, and the subtraction is not free in a
+  cooperative-matrix GEMM: it is a rank-one correction, `-dmin*m` times the
+  column sum of A over the group, so it comes out of the matrix core and into
+  an epilogue that needs one reduction over A per group of 32. At decode that
+  reduction is over one row and is nothing; at prefill it is over BM rows and
+  competes with the unpack that L8b-5 already found is what a cached bank is
+  bound by. `llm_moe_gemv.comp` does the affine form per lane today and is at
+  236-356 GB/s, which says the *GEMV* arm is fine and says nothing about the
+  GEMM arm. Nobody has measured the GEMM one.
 - **What does the unpack cost when the bytes are already cached?** L8b-5 is
   the first measurement in this vertical where a *narrower* bank is **slower**:
   at ubatch 2048 the hyper-connection block's two projections are 1.09-1.15x

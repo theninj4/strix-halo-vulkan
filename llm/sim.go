@@ -31,8 +31,16 @@ package llm
 // candidate's. Bytes are arithmetic (`cmd/gguf`'s decode budget); accuracy is
 // not, which is why this is the half that gets an instrument.
 //
+// The one place that reasoning is spelled differently is L8c-3's asymmetric
+// arm. A K-quant group is affine — `d*sc*l - dmin*m` — and the subtraction is
+// done in f32 by the one kernel here that already reads the format
+// (`llm_moe_gemv.comp`, over the checkpoint's own experts), so that arm
+// stages the f32 the kernel forms and lets the bank's own staging round it.
+// The half is the same either way; what changes is which step does it.
+//
 //	LLM_DENSE_SIM=q4sym/32 go run ./cmd/llm -ppl
 //	LLM_DENSE_SIM=q4_0/32  go run ./cmd/llm -gen -n 64
+//	LLM_DENSE_SIM=q4_k/32  go run ./cmd/llm -ppl   # L8c-3, the same 4.5 bits
 //	LLM_DENSE_SIM=off      # the default: the checkpoint's own widths
 
 import (
@@ -86,6 +94,21 @@ type QuantSim struct {
 	// where maxval is the signed element of largest magnitude, which reaches
 	// all 16. They differ by one level out of fifteen and L8c-1 prices it.
 	Ggml bool
+	// Asym is ggml's K-quant form rather than a symmetric one, and it is the
+	// axis L8c-3 is about — D7, reopened.
+	//
+	// A symmetric group has one number: a scale, and the levels straddle
+	// zero. An asymmetric one has two — a scale and a min, with the levels
+	// unsigned in [0, 2^b - 1] — and ggml does not spend an fp16 on each of
+	// them per group of 32. It nests: a **super-block** of Sub groups carries
+	// one fp16 `d` and one fp16 `dmin`, and each group carries a 6-bit scale
+	// and a 6-bit min quantised against them. That is 12 bits a group plus 32
+	// a super-block, which at eight groups of 32 is 0.5 bits a weight —
+	// **exactly what a symmetric fp16 scale per 32 costs**, so `q4_k/32` and
+	// `q4_0/32` are 4.5 bits apiece and the comparison is free of a width
+	// argument. It is the form this checkpoint's own experts are in, and the
+	// form unsloth's imatrix was collected against.
+	Asym bool
 }
 
 // Off reports whether this simulation does nothing.
@@ -107,11 +130,25 @@ func (q QuantSim) BitsPerWeight() float64 {
 	if q.Off() {
 		return 0
 	}
+	if q.Asym {
+		return q.bitsPerWeightSuper(asymSuperBlocks)
+	}
 	return float64(q.Bits) + 16/float64(q.Group)
 }
 
+// bitsPerWeightSuper is the asymmetric cost at a given super-block: the
+// levels, plus 12 bits a group for the 6-bit scale and min, plus the 32 bits
+// of the fp16 pair spread over the whole super-block.
+//
+// It takes the super-block because `Apply` picks it from the row (see
+// superBlocks): eight groups is ggml's QK_K and what every number below is
+// quoted at, but a 320-wide row has ten and costs 4.475 rather than 4.500.
+func (q QuantSim) bitsPerWeightSuper(sub int) float64 {
+	return float64(q.Bits) + (12*float64(sub)+16*2)/float64(sub*q.Group)
+}
+
 // ParseQuantSim reads a spec: "off", or "<format>/<group>" where format is
-// q2sym…q8sym or q4_0.
+// q2sym…q8sym, q4_0, or q4_k / q5_k for L8c-3's asymmetric arm.
 func ParseQuantSim(s string) (QuantSim, error) {
 	s = strings.TrimSpace(s)
 	if s == "" || s == "off" {
@@ -129,6 +166,20 @@ func ParseQuantSim(s string) (QuantSim, error) {
 	switch {
 	case name == "q4_0":
 		q.Bits, q.Ggml = 4, true
+	case name == "q4_k" || name == "q5_k":
+		// Only the two ggml has. Q6_K is not this format — it is symmetric
+		// with an 8-bit scale per sixteen — and Q2_K/Q3_K are below D4's
+		// floor, so a `q6_k` here would be a name for something that does
+		// not exist rather than a rung.
+		q.Bits, q.Asym = int(name[1]-'0'), true
+		if g != 32 {
+			// ggml's sub-block is 32 and the two constants that steer the
+			// search (`rmin`, `rdelta`) were fitted at that length. A
+			// different group would be a different format wearing the name
+			// of one whose numbers are published, which is the thing this
+			// whole file exists not to do.
+			return QuantSim{}, fmt.Errorf("llm: %s is defined on groups of 32, not %d", name, g)
+		}
 	case strings.HasPrefix(name, "q") && strings.HasSuffix(name, "sym"):
 		b, err := strconv.Atoi(name[1 : len(name)-3])
 		if err != nil || b < 2 || b > 8 {
@@ -510,6 +561,9 @@ func (q QuantSim) ApplyWeighted(x []float32, k int, qw []float32) error {
 	if q.Mode == "imatrix" && qw == nil {
 		return fmt.Errorf("llm: mode imatrix with no importance columns")
 	}
+	if q.Asym {
+		return q.applyAsym(x, k, qw)
+	}
 	half := 1 << (q.Bits - 1)
 	lo, hi := float32(-half), float32(half-1)
 	rows := len(x) / k
@@ -726,6 +780,388 @@ func unbiasedScale(x []float32, lv []int8, d float32) float32 {
 		return d
 	}
 	return g
+}
+
+// asymSuperBlocks is ggml's QK_K/32: eight groups of 32 share one fp16 pair.
+// It is the shape every published K-quant number is quoted at.
+const asymSuperBlocks = 8
+
+// superBlocks is how many groups of `q.Group` share one fp16 (d, dmin) pair
+// in a row of k, and it is the one place this arm departs from ggml.
+//
+// ggml's K-quants require `k % 256 == 0` and `llama-quantize` falls back to a
+// different type where a row is not a whole number of super-blocks. **Every
+// dense row in this model is, except one family and it is the family the
+// question is about**: `hc_{attn,ffn}_up` and `output_hc_up` read the
+// low-rank space, so their k is 320 — and `hc_attn_up` is L8c-2's outlier,
+// the tensor whose importance is concentrated in 4.4 effective columns of 32
+// and which carries the whole imatrix regression. Falling back to Q4_0 there
+// would answer a different question than the one asked.
+//
+// So the super-block is ggml's eight where eight fits, and **the whole row**
+// where it does not and the row is short enough for a 6-bit scale to still be
+// amortised. That is a real format — nothing in `make_qkx3_quants` or
+// `make_qp_quants` knows the count — and it costs 4.475 bits a weight at 320
+// rather than 4.500, which the caller states rather than rounds off.
+func (q QuantSim) superBlocks(k int) (int, error) {
+	if k%q.Group != 0 {
+		return 0, fmt.Errorf("llm: group %d does not divide a row of %d", q.Group, k)
+	}
+	if k%(asymSuperBlocks*q.Group) == 0 {
+		return asymSuperBlocks, nil
+	}
+	if n := k / q.Group; n >= 2 && n <= 2*asymSuperBlocks {
+		return n, nil
+	}
+	return 0, fmt.Errorf("llm: a row of %d is neither a multiple of %d nor short enough to be one super-block",
+		k, asymSuperBlocks*q.Group)
+}
+
+// applyAsym round-trips a weight through ggml's K-quant form: LLM.md L8c-3.
+//
+// Two arms, and they are the same two the symmetric side has. `rtn` is
+// `quantize_row_q4_K_ref` — `make_qkx2_quants` per group against
+// `av_x + |x|`, then the group scales and mins quantised to six bits against
+// their own maxima. `search`/`imatrix` is `quantize_row_q4_K_impl` —
+// `make_qkx3_quants` per group, then `make_qp_quants` over the group scales
+// weighted by how much calibration mass each group carries. Only the weight
+// vector differs between `search` and `imatrix`, which is what keeps the
+// attribution honest (L8c-2's rule).
+//
+// The value staged is the one a kernel forms: `d*sc*l - dmin*m` in f32, which
+// is exactly `llm_moe_gemv.comp`'s Q4_K unpack — the kernel that already
+// reads this format here. Unlike the symmetric arm it is not rounded to fp16
+// on the way out, because the affine form has a subtraction in it and the
+// shader does that subtraction in f32; the bank's own staging rounds the
+// result once, which is the same half either way.
+func (q QuantSim) applyAsym(x []float32, k int, qw []float32) error {
+	sub, err := q.superBlocks(k)
+	if err != nil {
+		return err
+	}
+	nmax := 1<<q.Bits - 1
+	// The two constants that steer make_qkx2_quants' twenty-rung sweep, which
+	// ggml sets per format: Q4_K's is (-1, 0.1, 20) and Q5_K's (-0.5, 0.1,
+	// 15). The calibrated path uses (-0.9, 0.05, 36) for both.
+	rmin, nstep := float32(-1), 20
+	if q.Bits == 5 {
+		rmin, nstep = -0.5, 15
+	}
+	calibrated := strings.HasPrefix(q.Mode, "search") || strings.HasPrefix(q.Mode, "imatrix")
+	n := sub * q.Group
+	rows := len(x) / k
+	parallelFor(rows, func(r int) {
+		row := x[r*k : (r+1)*k]
+		scales := make([]float32, sub)
+		mins := make([]float32, sub)
+		sw := make([]float32, sub)
+		ls := make([]int, sub)
+		lm := make([]int, sub)
+		w := make([]float32, q.Group)
+		lv := make([]uint8, q.Group)
+		laux := make([]uint8, q.Group)
+		for s := 0; s < k; s += n {
+			blk := row[s : s+n]
+			var d, dmin float32
+			if calibrated {
+				// sigma2 is over the **super-block** here, where the
+				// symmetric arm's is over the whole row: ggml computes it
+				// per block of QK_K in quantize_row_q4_K_impl, and its
+				// accumulator is a float.
+				var sum2 float32
+				for _, v := range blk {
+					sum2 += v * v
+				}
+				sigma2 := 2 * sum2 / float32(n)
+				avx := sqrt32(sigma2)
+				for j := 0; j < sub; j++ {
+					g := blk[j*q.Group : (j+1)*q.Group]
+					var sumw float32
+					for i, v := range g {
+						if qw != nil {
+							w[i] = qw[s+j*q.Group+i] * sqrt32(sigma2+v*v)
+						} else {
+							w[i] = avx + abs32(v)
+						}
+						sumw += w[i]
+					}
+					sw[j] = sumw
+					scales[j], mins[j] = makeQkxQuants(g, nmax, w, lv, laux, -0.9, 0.05, 36)
+				}
+				d = makeQpQuants(scales, 63, sw, ls)
+				dmin = makeQpQuants(mins, 63, sw, lm)
+			} else {
+				var maxScale, maxMin float32
+				for j := 0; j < sub; j++ {
+					g := blk[j*q.Group : (j+1)*q.Group]
+					var sum2 float32
+					for _, v := range g {
+						sum2 += v * v
+					}
+					avx := sqrt32(sum2 / float32(q.Group))
+					for i, v := range g {
+						w[i] = avx + abs32(v)
+					}
+					scales[j], mins[j] = makeQkxQuants(g, nmax, w, lv, laux, rmin, 0.1, nstep)
+					if scales[j] > maxScale {
+						maxScale = scales[j]
+					}
+					if mins[j] > maxMin {
+						maxMin = mins[j]
+					}
+				}
+				var invScale, invMin float32
+				if maxScale > 0 {
+					invScale = 63 / maxScale
+				}
+				if maxMin > 0 {
+					invMin = 63 / maxMin
+				}
+				for j := 0; j < sub; j++ {
+					ls[j] = clamp63(nearestInt(invScale * scales[j]))
+					lm[j] = clamp63(nearestInt(invMin * mins[j]))
+				}
+				d, dmin = maxScale/63, maxMin/63
+			}
+			// **The pair is stored as halves and read back**, so the levels
+			// below are chosen against the stored value and not against the
+			// one the search returned — the same reason the symmetric arm
+			// rounds its scale before quantising (D10's neighbour).
+			df := safetensors.F16ToF32(safetensors.F32ToF16(d))
+			dmf := safetensors.F16ToF32(safetensors.F32ToF16(dmin))
+			for j := 0; j < sub; j++ {
+				g := blk[j*q.Group : (j+1)*q.Group]
+				ds, dm := df*float32(ls[j]), dmf*float32(lm[j])
+				if ds == 0 {
+					// ggml's `if (!d) continue;` leaves the levels alone and
+					// dequantises them through a zero scale, so every
+					// element of the group comes back as -dm. Writing zero
+					// here instead would be a different format.
+					for i := range g {
+						g[i] = -dm
+					}
+					continue
+				}
+				for i, v := range g {
+					l := nearestInt((v + dm) / ds)
+					if l < 0 {
+						l = 0
+					}
+					if l > float32(nmax) {
+						l = float32(nmax)
+					}
+					g[i] = ds*l - dm
+				}
+			}
+		}
+	})
+	return nil
+}
+
+// makeQkxQuants is ggml's `make_qkx2_quants` and `make_qkx3_quants`, which
+// are the same function.
+//
+// They differ in two places and neither is reachable: qkx3 accepts a null
+// weight vector where qkx2 requires one (every call site here passes one),
+// and qkx3's degenerate test is `max <= min` where qkx2's is `max == min`,
+// after a line that has already forced `min <= 0 <= max`. So the port is one
+// function and the arms are the caller's three constants.
+//
+// It fits an affine group: levels `l` in [0, nmax] and a pair (scale, min)
+// with `x ~ scale*l + min`, min <= 0. The first pass takes the obvious
+// `iscale = nmax/(max-min)`; then `nstep+1` rungs slide that scale, and for
+// each one the *weighted least squares* (scale, min) is solved in closed form
+// over the levels it produces and kept if it lowers the weighted error. It
+// returns the scale and `-min`, which is ggml's sign convention: the stored
+// `dmin` is positive and the dequant subtracts.
+func makeQkxQuants(x []float32, nmax int, w []float32, lv, laux []uint8,
+	rmin, rdelta float32, nstep int) (scale, theMin float32) {
+
+	min, max := x[0], x[0]
+	sumW, sumX := w[0], w[0]*x[0]
+	for i := 1; i < len(x); i++ {
+		if x[i] < min {
+			min = x[i]
+		}
+		if x[i] > max {
+			max = x[i]
+		}
+		sumW += w[i]
+		sumX += w[i] * x[i]
+	}
+	if min > 0 {
+		min = 0
+	}
+	if max <= min {
+		for i := range lv {
+			lv[i] = 0
+		}
+		return 0, -min
+	}
+	iscale := float32(nmax) / (max - min)
+	scale = 1 / iscale
+	clampLevel := func(f float32) uint8 {
+		l := nearestInt(f)
+		if l < 0 {
+			l = 0
+		}
+		if l > float32(nmax) {
+			l = float32(nmax)
+		}
+		return uint8(l)
+	}
+	var bestErr float32
+	for i, v := range x {
+		lv[i] = clampLevel(iscale * (v - min))
+		diff := scale*float32(lv[i]) + min - v
+		bestErr += w[i] * diff * diff
+	}
+	if nstep < 1 {
+		return scale, -min
+	}
+	for is := 0; is <= nstep; is++ {
+		iscale = (rmin + rdelta*float32(is) + float32(nmax)) / (max - min)
+		var sumL, sumL2, sumXL float32
+		for i, v := range x {
+			l := clampLevel(iscale * (v - min))
+			laux[i] = l
+			fl := float32(l)
+			sumL += w[i] * fl
+			sumL2 += w[i] * fl * fl
+			sumXL += w[i] * fl * v
+		}
+		det := sumW*sumL2 - sumL*sumL
+		if det <= 0 {
+			continue
+		}
+		thisScale := (sumW*sumXL - sumX*sumL) / det
+		thisMin := (sumL2*sumX - sumL*sumXL) / det
+		if thisMin > 0 {
+			thisMin = 0
+			thisScale = sumXL / sumL2
+		}
+		var err float32
+		for i, v := range x {
+			diff := thisScale*float32(laux[i]) + thisMin - v
+			err += w[i] * diff * diff
+		}
+		if err < bestErr {
+			copy(lv, laux)
+			bestErr = err
+			scale, min = thisScale, thisMin
+		}
+	}
+	return scale, -min
+}
+
+// makeQpQuants is ggml's `make_qp_quants`: the non-negative quantiser the
+// calibrated K-quant path uses for the super-block's own scales and mins.
+//
+// It is `make_qx_quants`'s sibling for values that cannot be negative — nine
+// rungs of an initial scale, then **five sweeps of coordinate descent**, each
+// asking of every level whether moving it raises `sumlx^2/suml2`. The weight
+// is `sw`, the calibration mass of each group, so a group the imatrix cares
+// about gets a 6-bit scale nearer its own optimum.
+func makeQpQuants(x []float32, nmax int, w []float32, lv []int) float32 {
+	var max float32
+	for _, v := range x {
+		if v > max {
+			max = v
+		}
+	}
+	if max < 1e-15 { // GROUP_MAX_EPS
+		for i := range lv {
+			lv[i] = 0
+		}
+		return 0
+	}
+	iscale := float32(nmax) / max
+	for i, v := range x {
+		lv[i] = int(nearestInt(iscale * v))
+	}
+	scale := 1 / iscale
+	var bestMSE float32
+	for i, v := range x {
+		diff := v - scale*float32(lv[i])
+		bestMSE += w[i] * diff * diff
+	}
+	for is := -4; is <= 4; is++ {
+		if is == 0 {
+			continue
+		}
+		iscaleIs := (0.1*float32(is) + float32(nmax)) / max
+		scaleIs := 1 / iscaleIs
+		var mse float32
+		for i, v := range x {
+			l := clamp(nearestInt(iscaleIs*v), nmax)
+			diff := v - scaleIs*l
+			mse += w[i] * diff * diff
+		}
+		if mse < bestMSE {
+			bestMSE = mse
+			iscale = iscaleIs
+		}
+	}
+	var sumlx, suml2 float32
+	for i, v := range x {
+		l := clamp(nearestInt(iscale*v), nmax)
+		lv[i] = int(l)
+		sumlx += w[i] * v * l
+		suml2 += w[i] * l * l
+	}
+	for try := 0; try < 5; try++ {
+		changed := 0
+		for i, v := range x {
+			slx := sumlx - w[i]*v*float32(lv[i])
+			sl2 := suml2 - w[i]*float32(lv[i])*float32(lv[i])
+			if slx <= 0 || sl2 <= 0 {
+				continue
+			}
+			newL := clamp(nearestInt(v*sl2/slx), nmax)
+			if int(newL) == lv[i] {
+				continue
+			}
+			slx += w[i] * v * newL
+			sl2 += w[i] * newL * newL
+			if slx*slx*suml2 > sumlx*sumlx*sl2 {
+				lv[i], sumlx, suml2 = int(newL), slx, sl2
+				changed++
+			}
+		}
+		if changed == 0 {
+			break
+		}
+	}
+	if suml2 > 0 {
+		return sumlx / suml2
+	}
+	return 0
+}
+
+// clamp is make_qp_quants' MIN(nmax, l), which has no lower bound because
+// every value it is given is non-negative.
+func clamp(v float32, nmax int) float32 {
+	if v > float32(nmax) {
+		return float32(nmax)
+	}
+	return v
+}
+
+func clamp63(v float32) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 63 {
+		return 63
+	}
+	return int(v)
+}
+
+func abs32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // nearestInt is ggml's, and it is **not** roundHalfAway.
