@@ -83,7 +83,12 @@ layout(binding = 6) readonly buffer QBank4 { uvec4 w[]; } qb4[NBANK];
 // `#ifdef`s below are mutually exclusive and nothing declares both — and
 // because every pipeline in a recorded sequence carries its own descriptor
 // set, so a build that names six buffers may sit beside one that names five.
-#ifdef DENSE_Q8
+//
+// **L8c-4 narrows it again and the binding does not change.** The 4.5-bit
+// bank is nibble tiles plus a sixteen-byte ggml record per (column,
+// super-block), so `w8` is the whole of it as raw words there too — the two
+// `-D`s name which bank a build reads and both bind the same way.
+#if defined(DENSE_Q8) || defined(DENSE_Q4)
 layout(binding = 5) readonly buffer W8 { uint w8[]; };
 #endif
 

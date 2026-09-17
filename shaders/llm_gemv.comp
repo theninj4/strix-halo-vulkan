@@ -52,6 +52,21 @@
 // whole multiple of 4 KB — which is a different rung for a K of 2560 than for
 // one of 6144, so the ladder is per projection and measured.
 
+// **-DQ4B is L8c-4's bank on the same kernel** — nibble tiles and a
+// sixteen-byte ggml record per (column, super-block) instead of bytes and an
+// fp16 scale — and the one thing it cannot inherit is L8b-2's bit-exactness.
+// A K-quant group is affine, `d*sc*l - dmin*m`, and there is no pair of exact
+// halves to multiply: the subtraction is done in f32 here and rounded to a
+// half by the GEMM's LDS store, so this kernel carries one **fewer** rounding
+// per weight than the GEMM it agrees with. That is exactly
+// `llm_moe_gemv.comp`'s position against `llm_moe_gemm.comp` over the same
+// format, and it is measured rather than asserted (TestHeadQ4Agrees).
+//
+// A lane reads its own column's record into a register and refreshes it when
+// the split crosses a super-block — 256 k, sixteen k-tiles, four steps of
+// this loop — so the records cost the format's own 12.5% and not eight times
+// that.
+
 #include "llm_common.glsl"
 
 #ifndef MODE
@@ -63,6 +78,10 @@
 
 #define TILE 16
 #define WAVE 64
+
+#ifdef Q4B
+#include "llm_q4k.glsl"
+#endif
 
 layout(local_size_x = WAVE) in;
 
@@ -80,7 +99,56 @@ void main() {
     uint xbase = pc.xnOff + kt0 * TILE;
 
     float sum = 0.0;
-#ifdef Q8B
+#ifdef Q4B
+    // MODE 2's split, exactly as the Q8 arm states it: `pc.lowRank` is the
+    // first row that is not in this bank and `pc.gateOff` is where those
+    // rows' halves are, or NO_W for a matrix that is quantised all through.
+    bool tail = (pc.gateOff != NO_W) && (nt * TILE >= pc.lowRank);
+    if (!tail) {
+        uint nsb = pc.gemmK >> 8;
+        uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
+        // A tile is 32 words and a lane owns two of them — the eight k
+        // either side of `col`'s sixteen — with `sub` picking which of the
+        // step's four tiles, the way lane*4 does on the Q8 arm.
+        uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
+        uint curSB = 0xffffffffu;
+        uvec4 rec = uvec4(0u);
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint g = (kt0 + c + sub) >> 1;       // a 32-group is two k-tiles
+            uint sb = g >> 3;
+            if (sb != curSB) {
+                curSB = sb;
+                uint idx = rec0 + ((nt * nsb + sb) * TILE + col) * 4u;
+                rec = uvec4(w8[idx], w8[idx + 1u], w8[idx + 2u], w8[idx + 3u]);
+            }
+            uint sc, mn;
+            q4kScaleMin(g & 7u, uvec3(rec.y, rec.z, rec.w), sc, mn);
+            vec2 dd = unpackHalf2x16(rec.x);
+            float ds = dd.x * float(sc), dm = dd.y * float(mn);
+            uint w = qbase + c * 32u;
+            uint x = xbase + (c + sub) * TILE;
+            [[unroll]] for (uint u = 0u; u < 2u; u++) {
+                uint word = w8[w + u];
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    uint by = bitfieldExtract(word, int(t * 8u), 8);
+                    uint e = u * 8u + t * 2u;
+                    sum += (ds * float(by & 0xFu) - dm) * float(hact[x + e]);
+                    sum += (ds * float(by >> 4) - dm) * float(hact[x + e + 1u]);
+                }
+            }
+        }
+    } else {
+        uint wbase = pc.gateOff + ((nt - pc.lowRank / TILE) * ktiles + kt0) * (TILE * TILE)
+            + lane * TILE;
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint w = wbase + c * (TILE * TILE);
+            uint x = xbase + (c + sub) * TILE;
+            [[unroll]] for (uint i = 0u; i < TILE; i++) {
+                sum += float(w16[w + i]) * float(hact[x + i]);
+            }
+        }
+    }
+#elif defined(Q8B)
     // MODE 2's split is `pc.lowRank` itself — the first row that is not int8 —
     // and `pc.gateOff` is where those rows' halves are, or NO_W for a matrix
     // that is int8 all the way through.

@@ -880,6 +880,105 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-17 (fifty-second) — stage L8c-4: the bank is the format, and a screen that under-reads
+
+**Result: L8c-3's 4.5-bit asymmetric form now exists as a bank and two kernel
+arms, and on the lm head the real bank's 248 320 logits are *identical* to the
+same format run through `sim.go`.** The head is 0.675 GB in the checkpoint's
+own Q8_0 and **0.358 GB** at 4.500 bits; both banks run the decode GEMV at
+**210 GB/s of a 242 GB/s bus**, so the bytes are the time and the dispatch is
+**1.89x**. In the whole model:
+
+| `-gen -n 64`, same prompt | q8 bank (L8e) | **head at `q4_k/32`** |
+|---|---:|---:|
+| decode | 24.66 tok/s | **25.75** (1.044x) |
+| against llama.cpp's 25.15 | 0.981x | **1.024x** |
+| a token | 40.5 ms | **38.8 ms** |
+| the head block | 3.5 ms | **1.9 ms** |
+| perplexity, 145 chunks | 4.0289 | **4.0621** (+0.82%) |
+
+**First time this vertical is ahead of llama.cpp at decode.**
+[Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv`,
+`results/l8c_ppl_head_q4k.csv`, `results/l8c_decode_q4k.csv` · `LLM.md` and
+D14 updated.
+
+**1. One encoder, two callers, and that is the whole correctness argument.**
+`applyAsym` did ggml's super-block arithmetic inline and threw the levels
+away, because a simulation only needs the floats. `llm/quantk.go` is that
+arithmetic as an object that keeps them, so the simulation writes back
+`d*sc*l - dmin*m` and the bank packs the levels the same value came from.
+"This is the format L8c-3 measured" is then true by construction and the only
+thing left to test is the *addressing* — `TestBankQ4KIsTheSim` does it over a
+row permutation rather than the identity, and `cmd/llm -head` grew a fourth
+arm so the bank and the simulation of it are produced in one process against
+one activation.
+
+**2. The layout is our tiling and ggml's record.** §2.8's fragment tiling with
+a nibble where L8a puts a byte — a `uint` is **eight** consecutive k of one
+output column, two to a byte, low nibble first — plus a plane of sixteen-byte
+records, one per (n-tile, super-block, row): `d`, `dmin` and the twelve bytes
+`get_scale_min_k4` reads eight 6-bit (scale, min) pairs out of. 4 bits of
+level, 12 bits a group of 32 and 32 a super-block of 256 is **4.500 bits a
+weight exactly**. The twelve bytes are ggml's packing and not a convenient one
+of our own, which costs a four-way branch per group and buys the thing the
+stage is about.
+
+**3. A record covers 256 k where a k-slab is 32, so it lives in a register.**
+Read inside the unpack it would be fetched eight times. In the GEMM each lane
+holds its own column's record, refreshes it only where the loop crosses a
+super-block, and turns it into `(d*sc, dmin*m)` in a BN-long LDS vector — the
+format's own 12.5% of record traffic, and no `get_scale_min_k4` in the inner
+loop. Needs BK = 32, which is every build in `shaders.go`, and the kernel
+`#error`s rather than assuming it.
+
+**4. The GEMV is not bit-exact against the GEMM on this bank and cannot be.**
+L8b-2's argument was `float16_t(q) * d` over two exact halves. A K-quant group
+is affine, so there is a subtraction: the GEMV does it in f32 and the GEMM
+rounds the result to a half into LDS, and the register path carries one
+**fewer** rounding per weight. Measured over the head's row: **rms 2.29e-04
+relative**, against the Q8 pair's 7.84e-06 (which is reduction order alone).
+This is `llm_moe_gemv.comp`'s position against `llm_moe_gemm.comp` exactly.
+
+**5. D14 gains a clause, and the head is its counter-example.** A narrower
+bank was a decode decision — L8b-5 measured the hyper-connection block
+1.09-1.15x *slower* at ubatch 2048, because each weight is read 32 times out
+of a 32 MiB MALL and the DRAM bytes were already hidden. The head's B is 357
+MB at 4.5 bits and fits the MALL at no width, so **18839 us to 17461 at 512
+rows, 1.08x**. The unpack does show up (82 GB/s of bank against the Q8 arm's
+143); it just does not win. D14 is a statement about a weight that fits the
+MALL.
+
+**6. The per-family screen under-reads by 2.05x.** L8c-3's table puts
+`lm_head q4_k/32` at +0.40%, and the real bank reproduces that eight-chunk
+screen to four decimal places — 2.0269 against 2.0269. Over 145 chunks the
+same bank is **+0.82%**. L8c-0 established that a short run is not calibrated
+for a percent on the whole model; this is the same fact one level down, and
+every per-family row in `results/l8c_asym.csv` is eight-chunk. The uniform
+plan's +4.24% is itself a corpus number and stands; the attribution under it
+is optimistic.
+
+**7. The text gate retires, and the divergence is one near-tie.** At
+temperature zero the completion parts at the third token of the body, and
+`-top 3` shows both runs offering the same two candidates there: q8 takes
+`561 " The"` at 15.590 over `11751 " Paris"` at 15.229 (**0.361** apart), and
+the 4.5-bit head takes `" Paris"` at 15.537 over `" The"` at 15.462
+(**0.075**). Downstream they share nothing — capitals ending at `Lisbon.` in
+69 tokens against a syllogism for the full 128 — but that is a five-token
+prompt branching. D17's gate is a perplexity.
+
+**Next.** The other four streamed families on the bank that now exists, in the
+order their bytes justify: the gated DeltaNet (46% of a dense token), the
+full-attention layer, the PLE projections, then the hyper-connection block —
+which needs a **packing of its own**, because `hc_{attn,ffn}_up` and
+`output_hc_up` are 320 wide and `get_scale_min_k4`'s scheme *is* eight groups,
+four low and four high, not a length. Both fused matrices also carry L8a-2's
+fp16 tail, which the `-DQ4B` arms already branch for and nothing has
+exercised. Two smaller ones: the head's own decode GEMV is worth **0.35 ms a
+token** and is not wired into `Graph` (L8d left the head on the GEMM when the
+GEMM was at 189 GB/s; on this bank it is at 174 and the GEMV at 210), and
+`q5_k` — L8c-3's mixed plan at +2.70% — needs a fifth-bit plane the way ggml's
+`qh` is.
+
 ### Session 2026-09-17 (fifty-first) — stage L8c-3: the asymmetric form, and the calibration that only works on it
 
 **Result: D7 is reversed and D3 is back. The 2x2 over the whole corpus, from

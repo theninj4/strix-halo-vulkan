@@ -55,17 +55,30 @@ type HeadGPU struct {
 	rec *recorder
 	dev *vk.Device
 
-	wbuf, abuf, hbuf, bank *vk.Buffer
-	pipes                  map[string]*vk.ComputePipeline
-	mods                   []*vk.ShaderModule
+	wbuf, abuf, hbuf, wbank *vk.Buffer
+	pipes                   map[string]*vk.ComputePipeline
+	mods                    []*vk.ShaderModule
 
 	nEmbd, vocab            int
 	tokens, arenaRows, rows int
 	lda                     int
-	// q8 is whether the bank is L8's int8-plus-scales or the fp16 tiling
-	// every block used before it. It picks the pipeline build, the bank size
-	// and what stage() writes, and nothing downstream of the dispatch.
-	q8 bool
+	// bank is which width `output.weight` is staged in: the fp16 tiling every
+	// block used before L8, L8a's int8-plus-scales, or L8c-4's 4.5-bit
+	// K-quant. It picks the pipeline build, the bank size and what stage()
+	// writes, and nothing downstream of the dispatch.
+	bank DenseBank
+	// sim is the format the 4.5-bit bank quantises to — `q4_k/32` and a mode
+	// — and is unread on the other two. It is a QuantSim because that is what
+	// L8c-3 measured the format with, and both go through one encoder
+	// (quantk.go), which is what makes "the bank is what was simulated" a
+	// fact rather than a claim.
+	sim QuantSim
+	// gemv is the decode rung, or GEMVOff for llm_gemm.comp MODE 2. The head
+	// is the one block L8d and L8e left on the GEMM — 194 GB/s on a 242 GB/s
+	// bus at one row — so this is off by default and exists to price the
+	// narrower bank's GEMV against a matrix big enough to fill the machine
+	// from N alone.
+	gemv GEMVKernel
 
 	hXn  uint32
 	aOut uint32
@@ -81,6 +94,14 @@ type HeadGPU struct {
 // needs and what the reference computes; a caller that wants more is asking
 // for 0.99 MB of f32 per row and says so here rather than at a run.
 func NewHeadGPU(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int, q8 bool) (*HeadGPU, error) {
+	return NewHeadGPUBank(dev, nEmbd, w, maxRows, bankOf(q8), QuantSim{})
+}
+
+// NewHeadGPUBank is the same, with the bank named rather than implied — and
+// with the format, for the one bank that has one to choose.
+func NewHeadGPUBank(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int,
+	bank DenseBank, sim QuantSim) (*HeadGPU, error) {
+
 	if maxRows <= 0 {
 		return nil, fmt.Errorf("llm: head maxRows is %d", maxRows)
 	}
@@ -98,16 +119,25 @@ func NewHeadGPU(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int, q8 bool)
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
+	if bank == BankQ4K {
+		if err := q4kFits(vocab, nEmbd); err != nil {
+			return nil, err
+		}
+		if sim.Off() {
+			return nil, fmt.Errorf("llm: a q4_k head bank needs a format to quantise to")
+		}
+	}
 	g := &HeadGPU{
 		dev: dev, pipes: make(map[string]*vk.ComputePipeline),
-		nEmbd: nEmbd, vocab: vocab, q8: q8,
+		nEmbd: nEmbd, vocab: vocab, bank: bank, sim: sim,
 		tokens: maxRows, rows: maxRows,
 		lda:      nEmbd + gemmPad,
 		gemm:     OutGEMMKernelFor(maxRows),
+		gemv:     GEMVOff,
 		autoPlan: true,
 	}
 	align := 1
-	for _, v := range gemmBuilds(q8) {
+	for _, v := range gemmBuildsFor(bank) {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxRows, align)
@@ -146,12 +176,15 @@ func (g *HeadGPU) alloc() error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	bank := g.vocab * g.nEmbd * 2
-	if g.q8 {
-		bank = q8Bytes(g.vocab, g.nEmbd)
+	size := g.vocab * g.nEmbd * 2
+	switch g.bank {
+	case BankQ8:
+		size = q8Bytes(g.vocab, g.nEmbd)
+	case BankQ4K:
+		size = q4kBytes(g.vocab, g.nEmbd)
 	}
-	if g.bank, err = g.dev.NewBuffer(bank); err != nil {
-		return fmt.Errorf("llm: head weight bank (%d MB): %w", bank>>20, err)
+	if g.wbank, err = g.dev.NewBuffer(size); err != nil {
+		return fmt.Errorf("llm: head weight bank (%d MB): %w", size>>20, err)
 	}
 	return nil
 }
@@ -159,9 +192,9 @@ func (g *HeadGPU) alloc() error {
 func (g *HeadGPU) build() error {
 	// The Q8 build names a sixth buffer: the bank again, as raw words, for
 	// the tiles the scale plane at binding 3 belongs to (llm_common.glsl).
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
-	if g.q8 {
-		bufs = append(bufs, g.bank)
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf}
+	if g.bank != BankFP16 {
+		bufs = append(bufs, g.wbank)
 	}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	feat := g.dev.Features()
@@ -172,7 +205,7 @@ func (g *HeadGPU) build() error {
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
 		return fmt.Errorf("llm: the GEMM rungs need a pinned 64-wide subgroup")
 	}
-	for _, v := range gemmBuilds(g.q8) {
+	for _, v := range gemmBuildsFor(g.bank) {
 		mod, err := g.dev.NewShaderModule(v.spirv)
 		if err != nil {
 			return fmt.Errorf("llm: shader head.%s: %w", v.name, err)
@@ -184,11 +217,30 @@ func (g *HeadGPU) build() error {
 		if err != nil {
 			return fmt.Errorf("llm: pipeline head.%s: %w", v.name, err)
 		}
-		name := string(v.name)
-		if g.q8 {
-			name = q8Pipe(v.name)
+		g.pipes[bankPipe(g.bank, v.name)] = pipe
+	}
+	// The decode rungs, on the quantised banks only: `llm_gemv.comp` has an
+	// arm for each of them and none for the halves this block also stages.
+	// KSLABS = 1 alone, because at N = 248320 the grid is 15520 workgroups
+	// from the output width by itself — there is nothing for a split of K to
+	// buy, and no partial-sum arena to pay for (D11).
+	if g.bank != BankFP16 {
+		spv, ok := gemvSPIRV[gemvBankPipe(GEMVK1, g.bank)]
+		if !ok {
+			return fmt.Errorf("llm: no GEMV build for the %s bank", g.bank)
 		}
-		g.pipes[name] = pipe
+		mod, err := g.dev.NewShaderModule(spv)
+		if err != nil {
+			return fmt.Errorf("llm: shader head.gemv: %w", err)
+		}
+		g.mods = append(g.mods, mod)
+		pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		})
+		if err != nil {
+			return fmt.Errorf("llm: pipeline head.gemv: %w", err)
+		}
+		g.pipes[gemvBankPipe(GEMVK1, g.bank)] = pipe
 	}
 	return nil
 }
@@ -216,9 +268,40 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 	// tiles and the plane is k-major inside one.
 	var qs []byte
 	var sc []uint16
-	if g.q8 {
+	if g.bank == BankQ8 {
 		qs = make([]byte, headStageRows*g.nEmbd)
 		sc = make([]uint16, headStageRows*g.nEmbd/q8Group)
+	}
+	// The 4.5-bit bank's two, on the same argument: a slab's nibbles are
+	// bytes [r0*nEmbd/2, ...) and its records are [r0/16 * nsb * 256, ...),
+	// both contiguous for the same reason.
+	var q4 []byte
+	var rec []byte
+	var qw []float32
+	nsb := g.nEmbd / (q4kSuper * 32)
+	if !g.sim.Off() {
+		var err error
+		// The published matrix covers `blk.N.*` only, so the head has no
+		// calibration data and this is nil — which is what makes `lm_head`
+		// the one family L8c-3 measured at rtn on both forms. It is looked
+		// up rather than assumed, because a bank that silently skipped
+		// calibration is the bug sim.go's tally exists to catch.
+		if qw, err = imatrixCols(w.Name, g.sim.Mode); err != nil {
+			return err
+		}
+		if qw == nil && g.sim.Mode == "imatrix" {
+			// ggml's own fallback: `quantize_row_q4_K_impl` returns
+			// `quantize_row_q4_K_ref` on a null `quant_weights`, so an
+			// uncovered tensor is round-to-nearest and not the *search* with
+			// unit weights — a different arm, and one L8c-3 measured as
+			// worse than either. sim.go's `ApplyTo` does the same thing for
+			// the same reason.
+			g.sim.Mode = "rtn"
+		}
+	}
+	if g.bank == BankQ4K {
+		q4 = make([]byte, headStageRows*g.nEmbd/2)
+		rec = make([]byte, headStageRows/coopMatTile*nsb*coopMatTile*q4kRecord)
 	}
 	planeOff := g.vocab * g.nEmbd
 	for r0 := 0; r0 < g.vocab; r0 += headStageRows {
@@ -237,15 +320,36 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 		if err := DensePlan().ApplyTo(w.Name, w.Type == gguf.Q8_0, src, g.nEmbd); err != nil {
 			return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
 		}
-		if g.q8 {
+		// **The simulation of a bank, on the bank it is a simulation of.**
+		// A format given to the fp16 arm is L8c-1's round trip done
+		// explicitly rather than through the environment, and it is what
+		// lets `cmd/llm -head` hold the simulated q4_k and the real one in
+		// one process and compare their logits element for element. On the
+		// q4_k bank itself it would be the same quantisation applied twice,
+		// so it is the fp16 arm's alone.
+		if g.bank == BankFP16 && !g.sim.Off() {
+			if err := g.sim.ApplyWeighted(src, g.nEmbd, qw); err != nil {
+				return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
+			}
+		}
+		switch g.bank {
+		case BankQ8:
 			tileBQ8(qs[:n*g.nEmbd], sc[:n*g.nEmbd/q8Group], src, n, g.nEmbd,
 				func(i int) int { return i })
-			g.bank.WriteBytesAt(r0*g.nEmbd, qs[:n*g.nEmbd])
-			g.bank.WriteUint16At(planeOff/2+r0*g.nEmbd/q8Group, sc[:n*g.nEmbd/q8Group])
-			continue
+			g.wbank.WriteBytesAt(r0*g.nEmbd, qs[:n*g.nEmbd])
+			g.wbank.WriteUint16At(planeOff/2+r0*g.nEmbd/q8Group, sc[:n*g.nEmbd/q8Group])
+		case BankQ4K:
+			nr := n / coopMatTile * nsb * coopMatTile * q4kRecord
+			if err := tileBQ4K(q4[:n*g.nEmbd/2], rec[:nr], src, n, g.nEmbd,
+				func(i int) int { return i }, g.sim, qw); err != nil {
+				return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
+			}
+			g.wbank.WriteBytesAt(r0*g.nEmbd/2, q4[:n*g.nEmbd/2])
+			g.wbank.WriteBytesAt(g.vocab*g.nEmbd/2+r0/coopMatTile*nsb*coopMatTile*q4kRecord, rec[:nr])
+		default:
+			tileB(half[:n*g.nEmbd], src, n, g.nEmbd, func(i int) int { return i })
+			g.wbank.WriteUint16At(r0*g.nEmbd, half[:n*g.nEmbd])
 		}
-		tileB(half[:n*g.nEmbd], src, n, g.nEmbd, func(i int) int { return i })
-		g.bank.WriteUint16At(r0*g.nEmbd, half[:n*g.nEmbd])
 	}
 	return nil
 }
@@ -270,7 +374,7 @@ func (g *HeadGPU) Vocab() int { return g.vocab }
 func (g *HeadGPU) MaxRows() int { return g.tokens }
 
 // WeightBytes is the staged bank; ActivationBytes the two arenas.
-func (g *HeadGPU) WeightBytes() int     { return g.bank.Size() }
+func (g *HeadGPU) WeightBytes() int     { return g.wbank.Size() }
 func (g *HeadGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 func (g *HeadGPU) Buffers() int         { return 4 }
 
@@ -282,6 +386,9 @@ func (g *HeadGPU) Upload(x []float32, rows int) error {
 	}
 	if len(x) != rows*g.nEmbd {
 		return fmt.Errorf("llm: head input is %d values, want %d", len(x), rows*g.nEmbd)
+	}
+	if g.gemv != GEMVOff && rows != 1 {
+		return fmt.Errorf("llm: the GEMV reads one row, not %d (D15)", rows)
 	}
 	g.rows = rows
 	if g.autoPlan {
@@ -307,15 +414,43 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 		// something only half the time.
 		LowRank: uint32(g.vocab), GateOff: noW,
 	}
-	pipe := string(g.gemm)
-	if g.q8 {
-		pipe = q8Pipe(g.gemm)
+	if g.gemv != GEMVOff {
+		// The decode kernel (D15): one workgroup per sixteen output columns,
+		// no row block at all, and at KSLABS = 1 no partial sums to reduce.
+		// It reads one row of A, so the host refuses it above one — dropping
+		// rows silently is the failure mode this rule exists for.
+		return []vk.MultiDispatch{{
+			Pipeline: g.pipes[gemvBankPipe(g.gemv, g.bank)],
+			GroupsX:  1, GroupsY: uint32(g.vocab / coopMatTile),
+			PushConstants: pc.bytes(),
+		}}, []string{"head_gemv"}
 	}
 	return []vk.MultiDispatch{{
-		Pipeline: g.pipes[pipe],
+		Pipeline: g.pipes[bankPipe(g.bank, g.gemm)],
 		GroupsX:  uint32(g.vocab / headBN), GroupsY: uint32(m / v.bm),
 		PushConstants: pc.bytes(),
 	}}, []string{"head"}
+}
+
+// SetGEMV puts the projection on `llm_gemv.comp` at one row, or GEMVOff back
+// on the GEMM. Only KSLABS = 1 is built here (see build), and only on a
+// quantised bank.
+func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
+	if k == GEMVOff {
+		g.gemv = k
+		return nil
+	}
+	if g.bank == BankFP16 {
+		return fmt.Errorf("llm: the GEMV has no fp16 arm")
+	}
+	if k != GEMVK1 {
+		return fmt.Errorf("llm: the head builds GEMV rung %s only, not %s", GEMVK1, k)
+	}
+	if g.rows != 1 {
+		return fmt.Errorf("llm: the GEMV reads one row, not %d", g.rows)
+	}
+	g.gemv = k
+	return nil
 }
 
 // Run projects whatever Upload left in the A operand.
@@ -356,7 +491,7 @@ func (g *HeadGPU) Destroy() {
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank} {
+	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank} {
 		if b != nil {
 			b.Destroy()
 		}
@@ -374,6 +509,9 @@ func (g *HeadGPU) InPort() Port {
 func (g *HeadGPU) Resize(rows int) error {
 	if rows <= 0 || rows > g.tokens {
 		return fmt.Errorf("llm: %d rows, the head arena is built for %d", rows, g.tokens)
+	}
+	if g.gemv != GEMVOff && rows != 1 {
+		return fmt.Errorf("llm: the GEMV reads one row, not %d (D15)", rows)
 	}
 	g.rows = rows
 	if g.autoPlan {

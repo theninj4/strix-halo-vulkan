@@ -69,6 +69,24 @@
 // sixteen-wide k-tile, so a whole `uvec4`'s worth of bytes takes one scale
 // and the unpack is a byte extract, a convert and a multiply.
 //
+// **-DQ4B is L8c-4's arm, and it is the first bank here that is not the
+// checkpoint's arithmetic.** 4 bits of level, 12 bits a group of 32 for a
+// 6-bit scale and a 6-bit min, and 32 bits a super-block of 256 for the fp16
+// pair those are quantised against: 4.500 bits a weight, ggml's own Q4_K, and
+// the form L8c-3 measured at **+4.24% of perplexity with unsloth's published
+// imatrix** where the symmetric form at identical bits is +15.63%. The tiles
+// are nibbles — a `uint` is eight consecutive k of one output column where
+// the Q8 arm's is four — and the group parameters come out of a sixteen-byte
+// record per (column, super-block) that `llm_q4k.glsl` decodes.
+//
+// Its unpack is the Q8 arm's plus an affine term, and the one structural
+// difference is **where the record is read**. A record covers 256 k and a
+// k-slab is BK = 32, so a naive read would fetch it eight times: instead each
+// lane holds *its own* column's record in a register, refreshed when the loop
+// crosses a super-block, and turns it into (d*sc, dmin*m) in a BN-long LDS
+// vector the unpack indexes. That is one sixteen-byte load per column per 256
+// k — the format's own 12.5% — rather than eight.
+//
 // The values it puts in LDS are **bit-identical** to the halves the fp16 arm
 // reads, for every tensor the checkpoint stores as Q8_0 — which is every
 // dense weight but the routers, the two indexer projections and three small
@@ -81,6 +99,12 @@
 
 #ifndef MODE
 #define MODE 0
+#endif
+// The two quantised banks share every line below but the unpack: the LDS
+// slab, the fp16 tail and the barriers are the same, so they are one arm with
+// two spellings of "what a word holds".
+#if defined(Q8B) || defined(Q4B)
+#define QBANK 1
 #endif
 #ifndef WM
 #define WM 4        // accumulator tiles, M direction
@@ -107,7 +131,7 @@
 
 layout(local_size_x = WAVE) in;
 
-#ifdef Q8B
+#ifdef QBANK
 // §2.2's pad, and L5b's reason for its size: a slab row of BK + 8 halves
 // keeps every row sixteen-byte aligned, which is what the cooperative-matrix
 // load off LDS needs to take its wide path, and eight of the 32 banks is as
@@ -115,6 +139,19 @@ layout(local_size_x = WAVE) in;
 #define LDS_PAD 8
 #define LDS_ROW (BK + LDS_PAD)
 shared float16_t sQB[BN * LDS_ROW];
+#endif
+
+#ifdef Q4B
+#include "llm_q4k.glsl"
+// A k-slab is exactly one 32-element group, which is what lets the record be
+// decoded once a slab into BN floats rather than once per unpacked word. It
+// is a compile-time fact of every build in shaders.go and the arithmetic
+// below assumes it rather than testing it.
+#if BK != 32
+#error "the q4_k arm wants BK_TILES = 2, so that a k-slab is one scale group"
+#endif
+shared float sQS[BN];   // d * sc for this slab's group, per column
+shared float sQM[BN];   // dmin * m, the same
 #endif
 
 #define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
@@ -172,6 +209,20 @@ void main() {
     }
 
     uint ktiles = pc.gemmK / TILE;
+#ifdef Q4B
+    // The nibble tiles are at pc.bOff and the record plane follows them, so
+    // its base is derivable and needs no push field of its own — the same
+    // arrangement, and the same reason, as the Q8 arm below.
+    uint qw0 = pc.bOff >> 2;                                   // the tiles, in words
+    uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2; // the records, in words
+    uint nsb = pc.gemmK >> 8;                                  // super-blocks a row
+    uint lane = gl_LocalInvocationID.x;
+    uint nt0 = wn0 / TILE;
+    // This lane's column of the slab, and the record it holds for it. Lanes
+    // at or past BN have no column; BN is 48 or 64 against a 64-wide wave.
+    uvec4 myRec = uvec4(0u);
+    uint myNT = nt0 + (lane >> 4), myRow = lane & 15u;
+#endif
 #ifdef Q8B
     // The tiles are bytes at pc.bOff and the scale plane is the halves that
     // follow them, so its base is derivable and needs no field of its own —
@@ -183,6 +234,8 @@ void main() {
     uint kgroups = pc.gemmK >> 5;
     uint lane = gl_LocalInvocationID.x;
     uint nt0 = wn0 / TILE;
+#endif
+#ifdef QBANK
 #ifdef Q8_TAIL
     // **Not every row of a fused matrix is Q8_0 in the checkpoint**, and the
     // ones that are not stay halves rather than being re-quantised: the
@@ -215,7 +268,7 @@ void main() {
     // the DeltaNet's output projection — a matrix with no tail at all —
     // because the two `coopMatLoad`s in one loop body are register pressure
     // the ladder is already bound by (L2f-5, L3b-4).
-#if defined(Q8B) && defined(Q8_TAIL)
+#if defined(QBANK) && defined(Q8_TAIL)
     if (tail) {
         for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
             [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
@@ -240,6 +293,47 @@ void main() {
     } else
 #endif
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+#ifdef Q4B
+        // The group parameters first, one lane a column. A record covers 256
+        // k and this slab is 32, so the load is refreshed only where the loop
+        // crosses a super-block and the rest is the six-bit unpack.
+        if (lane < BN) {
+            if ((k0 & 255u) == 0u) {
+                uint idx = rec0 + ((myNT * nsb + (k0 >> 8)) * TILE + myRow) * 4u;
+                myRec = uvec4(w8[idx], w8[idx + 1u], w8[idx + 2u], w8[idx + 3u]);
+            }
+            uint sc, mn;
+            q4kScaleMin((k0 >> 5) & 7u, uvec3(myRec.y, myRec.z, myRec.w), sc, mn);
+            vec2 dd = unpackHalf2x16(myRec.x);
+            sQS[lane] = dd.x * float(sc);
+            sQM[lane] = dd.y * float(mn);
+        }
+        barrier();
+        // Unpack this workgroup's BN x BK slab. A tile is 128 contiguous
+        // bytes and the tiles of one n-tile are contiguous across kt, so the
+        // WN runs below are each BK_TILES * 32 words long; within a tile a
+        // word is **eight** consecutive k of one output column, two to a
+        // byte, low nibble first.
+        uint kt0q = k0 / TILE;
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            uint wbase = qw0 + ((nt0 + j) * ktiles + kt0q) * 32u;
+            for (uint u = lane; u < BK_TILES * 32u; u += WAVE) {
+                uint kt = u >> 5;
+                uint wi = u & 31u;
+                uint n = wi >> 1;              // 0..15, the output column
+                uint kk = (wi & 1u) * 8u;      // eight consecutive k
+                uint word = w8[wbase + u];
+                float ds = sQS[j * TILE + n], dm = sQM[j * TILE + n];
+                uint dst = (j * TILE + n) * LDS_ROW + kt * TILE + kk;
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    uint by = bitfieldExtract(word, int(t * 8u), 8);
+                    sQB[dst + t * 2u] = float16_t(ds * float(by & 0xFu) - dm);
+                    sQB[dst + t * 2u + 1u] = float16_t(ds * float(by >> 4) - dm);
+                }
+            }
+        }
+        barrier();
+#endif
 #ifdef Q8B
         // Unpack this workgroup's BN x BK slab. A tile is 256 contiguous
         // bytes and the tiles of one n-tile are contiguous across kt, so the
@@ -273,7 +367,7 @@ void main() {
                     A_LDA, gl_CooperativeMatrixLayoutRowMajor);
             }
             [[unroll]] for (uint j = 0u; j < WN; j++) {
-#ifdef Q8B
+#ifdef QBANK
                 coopMatLoad(fragB[j], sQB, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
                     gl_CooperativeMatrixLayoutColumnMajor);
 #else
@@ -288,7 +382,7 @@ void main() {
                 }
             }
         }
-#ifdef Q8B
+#ifdef QBANK
         barrier();
 #endif
     }

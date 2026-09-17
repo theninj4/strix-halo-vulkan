@@ -510,7 +510,18 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		if headRows <= 0 {
 			headRows = 1
 		}
-		if g.head, err = NewHeadGPU(dev, c.NEmbd, t, headRows, opts.denseQ8()); err != nil {
+		// L8c-4's bank, where the plan names this family. Everything else
+		// is still the checkpoint's own width (D13): the 4.5-bit bank has a
+		// kernel for a matrix whose k is a multiple of 256, which is every
+		// dense weight here but the 320-wide hyper-connection pair.
+		// `true` is "the checkpoint ships it as Q8_0", which `output.weight`
+		// does — it is what `LLM_DENSE_BANK_SRC` would select on if this
+		// plan ever grew one.
+		bank, sim := bankOf(opts.denseQ8()), QuantSim{}
+		if q, ok := DenseBankPlan().For(t.Name, true); ok {
+			bank, sim = BankQ4K, q
+		}
+		if g.head, err = NewHeadGPUBank(dev, c.NEmbd, t, headRows, bank, sim); err != nil {
 			return fmt.Errorf("llm: head: %w", err)
 		}
 		mark("lm head", 1, g.head.Buffers(), g.head.WeightBytes(), g.head.ActivationBytes(), start)

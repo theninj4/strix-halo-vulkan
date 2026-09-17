@@ -108,6 +108,13 @@ func perplexity(o pplOpts) error {
 
 	fmt.Printf("%s\n%s: %d tokens, %d chunks of %d, scoring %d each from position %d\n",
 		o.model, o.file, len(ids), nChunk, o.ctx, perChunk, first)
+	if p := llm.DenseBankPlan(); !p.Off() {
+		// The *real* bank, not a simulation of one (L8c-4). It is printed on
+		// the same line the simulation gets, and for the same reason: a
+		// perplexity is only attributable if the run says which weights it
+		// was measured over.
+		fmt.Printf("dense bank: %s — %v\n\n", p, p.Widths())
+	}
 	if p := llm.DensePlan(); !p.Off() {
 		// L8c-1: a candidate bank, staged as the halves it would produce.
 		// Printed before staging rather than after, because a run this long

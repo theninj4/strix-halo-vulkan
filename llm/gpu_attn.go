@@ -156,10 +156,24 @@ var gemmQ8Variants = []gemmVariant{
 	{GEMMM8, shaders.LLMGEMMQ8M8, 128},
 }
 
+// The same three rungs again over L8c-4's 4.5-bit bank: nibble tiles and a
+// sixteen-byte ggml record per (column, super-block).
+var gemmQ4Variants = []gemmVariant{
+	{GEMMM2, shaders.LLMGEMMQ4M2, 32},
+	{GEMMM4, shaders.LLMGEMMQ4M4, 64},
+	{GEMMM8, shaders.LLMGEMMQ4M8, 128},
+}
+
 // gemmBuilds is the table a block builds its pipelines from.
-func gemmBuilds(q8 bool) []gemmVariant {
-	if q8 {
+func gemmBuilds(q8 bool) []gemmVariant { return gemmBuildsFor(bankOf(q8)) }
+
+// gemmBuildsFor is the same, by bank.
+func gemmBuildsFor(b DenseBank) []gemmVariant {
+	switch b {
+	case BankQ8:
 		return gemmQ8Variants
+	case BankQ4K:
+		return gemmQ4Variants
 	}
 	return gemmVariants
 }

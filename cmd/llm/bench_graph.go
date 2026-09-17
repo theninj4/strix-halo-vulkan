@@ -131,8 +131,15 @@ func reportStaging(g *llm.Graph, wall time.Duration) {
 			float64(s.Weights)/1e9, float64(s.Arenas)/1e6, s.Elapsed.Round(time.Millisecond))
 		w, a, bufs = w+s.Weights, a+s.Arenas, bufs+s.Buffers
 	}
-	fmt.Printf("%-12s %7d %8d %9.2f GB %8.1f MB %11s\n\n", "total", g.Layers(), bufs,
+	fmt.Printf("%-12s %7d %8d %9.2f GB %8.1f MB %11s\n", "total", g.Layers(), bufs,
 		float64(w)/1e9, float64(a)/1e6, wall.Round(time.Millisecond))
+	// Which dense families are on L8c-4's 4.5-bit bank rather than the
+	// checkpoint's own width, since that is the one staging fact a tok/s or a
+	// completion cannot be read without.
+	if p := llm.DenseBankPlan(); !p.Off() {
+		fmt.Printf("dense bank: %s — %v\n", p, p.Widths())
+	}
+	fmt.Println()
 }
 
 // llamaPrefill is llama.cpp's own prefill rate on this checkpoint and this

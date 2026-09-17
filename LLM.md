@@ -10,8 +10,8 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: the model generates, it generates llama.cpp's text, and phase 2's
-kernel half is finished.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
+**Status: the model generates, phase 2's kernel half is finished, and the
+first dense weight is now at a width the checkpoint does not ship.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
 L8a and L8b, which between them put every dense weight in the model
 on the width the checkpoint already ships, L8d, which gives the two
@@ -310,6 +310,28 @@ and **in f32**, not merely in the half. One departure from ggml, and it is on
 the tensor the question is about: K-quants want `k % 256 == 0` where
 `hc_*_up` is 320 wide, so its super-block is the whole row — ten groups,
 4.475 bits.
+
+**L8c-4 builds it, and the bank is the format rather than a neighbour of it.**
+The 4.5-bit asymmetric form is now §2.8's fragment tiling with a *nibble*
+where L8a puts a byte — a `uint` is eight consecutive k of one output column —
+plus ggml's own sixteen-byte super-block record per (n-tile, super-block,
+row), which is **4.500 bits a weight exactly**. One encoder serves the
+simulation and the bank, so on the lm head the real bank's **248 320 logits
+are identical** to the same format's through `sim.go`, and its eight-chunk
+perplexity is `results/l8c_asym.csv`'s simulated row to four decimal places.
+**The head is 0.675 GB to 0.358, 1.89x at one token at 210 GB/s of a 242 GB/s
+bus, decode 24.66 tok/s to 25.75 (1.024x llama.cpp, ahead of it for the first
+time), and 4.0621 against our own 4.0289 —
++0.82%.** Three things came with it. **D14 gains a clause**: the head's B is
+357 MB and fits the MALL at no width, so the narrower bank is 1.08x at *512
+rows* too, where the hyper-connection block's was 1.09-1.15x slower. **The
+GEMV is not bit-exact against the GEMM on this bank and cannot be** — a
+K-quant group is affine, so there is no pair of exact halves to multiply and
+the register path carries one fewer rounding, rms 2.29e-04 against the Q8
+pair's 7.84e-06. And **the per-family screen under-reads by 2.05x**: `lm_head`
+screens at +0.40% over eight chunks and measures +0.82% over 145, which is
+L8c-0's warning one level down and applies to every per-family row the plan
+was assembled from.
 
 **So the plan is 4.50 bits, not 5.30, and it costs +4.24% rather than +5.98%
 — 4.264 GB a token against 4.575 and a 56.7 tok/s ceiling against 52.9, or
@@ -1870,6 +1892,97 @@ both. [Write-up](research/l8e-attn-decode.md).
 > drift 0.881% at 48 layers) and `Graph.PinSchedule` now covers **five**
 > blocks.
 
+## What L8c-4 established — the bank is the format, and a screen that under-reads
+
+**The 4.5-bit asymmetric bank L8c-3 recommended now exists, and the first
+thing it had to prove it proved as an equality: on the lm head its 248 320
+logits are identical to the same format run through `sim.go`.** The head is
+0.675 GB in the checkpoint's own Q8_0 and **0.358 GB** at 4.500 bits, **1.89x
+at one token** — both banks run the decode GEMV at 210 GB/s of a 242 GB/s bus,
+so the bytes *are* the time — and 3.80x against the halves it staged before
+L8. In the whole model **decode is 25.75 tok/s against L8e's 24.66 — 1.044x, and **1.024x
+llama.cpp**, the first time this vertical is ahead of it at decode — with a
+token 40.5 ms to **38.8** and the head block 3.5 ms to **1.9****, and **perplexity is 4.0621
+against our own 4.0289 — +0.82%**.
+[Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv` ·
+`results/l8c_ppl_head_q4k.csv` · `results/l8c_decode_q4k.csv`.
+
+> **L8c-4-1: one encoder, two callers, and that is the whole correctness
+> argument.** `applyAsym` used to do ggml's super-block arithmetic inline and
+> throw the levels away, because a simulation only needs the floats.
+> `llm/quantk.go` is that arithmetic as an object that keeps them, so the
+> simulation writes back `d*sc*l - dmin*m` and the bank packs the levels the
+> same value came from — "this is the format L8c-3 measured" is true by
+> construction rather than by a tolerance. What is left to test is the
+> *addressing*, which is the only bug a new bank can have, and
+> `TestBankQ4KIsTheSim` tests it over a row permutation rather than the
+> identity.
+>
+> **L8c-4-2: the layout is our tiling and ggml's record.** §2.8's fragment
+> tiling with a nibble where L8a puts a byte — a `uint` is **eight**
+> consecutive k of one output column, two to a byte, low nibble first — and a
+> second plane of sixteen-byte records, one per (n-tile, super-block, row):
+> `d`, `dmin` and the twelve bytes `get_scale_min_k4` reads eight 6-bit
+> (scale, min) pairs out of, k-major inside an n-tile for D8's reason. 4 bits
+> of level, 12 bits a group of 32 and 32 bits a super-block of 256 is
+> **4.500 bits a weight exactly**. The twelve bytes are ggml's packing and not
+> a convenient one of our own, which costs a four-way branch per group and
+> buys the thing the stage is about: the encoder that produced L8c-3's numbers
+> is the encoder of the bank.
+>
+> **L8c-4-3: a record covers 256 k where a k-slab is 32, so it is held in a
+> register.** Read inside the unpack it would be fetched eight times. In the
+> GEMM each lane holds *its own column's* record, refreshes it only where the
+> loop crosses a super-block, and turns it into `(d*sc, dmin*m)` in a BN-long
+> LDS vector the unpack indexes — the format's own 12.5% of record traffic,
+> and no `get_scale_min_k4` in the inner loop. It needs BK = 32, which is
+> every build in `shaders.go`, and the kernel `#error`s rather than assuming
+> it. The GEMV does the same in a register across the four steps of a
+> super-block and has no LDS at all.
+>
+> **L8c-4-4: the GEMV is not bit-exact against the GEMM here, and cannot be.**
+> L8b-2's argument was that `float16_t(q) * d` is one f16 instruction over two
+> exact halves. A K-quant group is affine — `d*sc*l - dmin*m` has a
+> subtraction in it — the GEMV does it in f32 and the GEMM rounds the result
+> to a half on its way into LDS, so the GEMV carries one **fewer** rounding
+> per weight. That is `llm_moe_gemv.comp`'s position against
+> `llm_moe_gemm.comp` over the same format, and it is measured: over the
+> head's 248 320 logits the two are **rms 2.29e-04 relative**, against the Q8
+> pair's 7.84e-06, which is reduction order alone.
+>
+> **L8c-4-5: D14 gains a clause, because the head is its counter-example.**
+> A narrower bank was a decode decision — L8b-5 measured the
+> hyper-connection block 2.3-2.5x faster at one token and **1.09-1.15x
+> slower** at ubatch 2048, since at 2048 each weight is read 32 times out of a
+> 32 MiB MALL and the DRAM bytes were already hidden. The head's B is 357 MB
+> at 4.5 bits and fits the MALL at no width, so there is nothing to hide
+> behind: **18839 us to 17461 at 512 rows, 1.08x, the way D14 warns against**.
+> The unpack does show up — 82 GB/s of bank against the Q8 arm's 143 — it just
+> does not win. So D14 is about a weight that fits the MALL.
+>
+> **L8c-4-6: the per-family screen under-reads, by 2.05x on the one family now
+> run both ways.** L8c-3's table puts `lm_head q4_k/32` at **+0.40%**, and the
+> real bank reproduces that eight-chunk screen to four decimal places —
+> 2.0269 against 2.0269. Over 145 chunks the same bank is **+0.82%**. L8c-0
+> established that a short run is not calibrated for a percent on the whole
+> model; this is the same fact one level down, and it matters because every
+> per-family row in `results/l8c_asym.csv` is eight-chunk. The uniform plan's
+> +4.24% is itself a corpus number and stands; the attribution under it is
+> optimistic.
+>
+> **L8c-4-7: the text is no longer a gate, and the divergence is one
+> near-tie.** At temperature zero the completion parts at the third token of
+> the body, and `-top 3` shows both runs offering the *same two* candidates
+> there: the Q8 bank takes `561 " The"` at 15.590 over `11751 " Paris"` at
+> 15.229 — **0.361 apart** — and the 4.5-bit head takes `" Paris"` at 15.537
+> over `" The"` at 15.462, **0.075**. The bank moved that pair by 0.36 of a
+> logit and flipped a tie that was already thin. Downstream the two texts
+> share nothing — capitals ending at `Lisbon.` in 69 tokens against a
+> syllogism about Paris for the full 128 — but that is a five-token prompt
+> branching, not the head going wrong. This is the first stage in the vertical
+> where the two were ever allowed to differ: D17's gate is a perplexity, and
+> the text gate retires with L8b.
+
 ---
 
 ## The three findings that set the direction
@@ -1919,9 +2032,19 @@ dense weight is read every time.
 | ~4.25 bits on everything streamed, **symmetric** — D3 as written | ~67 GB | ~3.9 | **62.2** | **+18.5%** (L8c-1) |
 | L8c-1's mixed plan: DeltaNet + head 4.5, attention + hc 6.5 | ~73 GB | 4.575 | **52.9** | **4.2699, +5.98%** |
 | **L8c-3: 4.5 bits on the dense half, `q4_k` + the imatrix** | 80.5 GB | **4.264** | **56.7** | **4.1998, +4.24%** |
+| **L8c-4: the first family of that, built — `lm_head` alone** | 82.20 GB | **6.016** | **40.2** | **4.0621, +0.82%** |
 | L8c-3's mixed plan: `q5_k` on attention + hc, `q4_k` on the rest | 80.6 GB | 4.419 | **54.8** | **4.1377, +2.70%** |
 | the same 4.5 bits in the **symmetric** form — what D3 was retired on | 80.5 GB | 4.264 | 56.7 | 4.6127 rtn / 4.6588 imatrix, **+14.5 / +15.6%** |
 
+> **L8c-4's row is on this table's basis and not on L8b's.** A token reads
+> 6.334 GB of the checkpoint's own widths and the head is 0.676 of them, so
+> 4.5 bits there is 6.016 and 40.2 tok/s, and the resident core 82.52 GB to
+> 82.20 — the head is 0.318 GB of it and the experts are untouched. Measured against *our staged bank*
+> — which L8b quotes at 6.05 GB and a 40.0 tok/s ceiling, since it is not the
+> same set of bytes — the same change is 5.733 GB and 42.2, and the
+> **measured** rate is 25.75 tok/s against 24.66. The delta is 0.318 GB
+> either way; only the denominator moves.
+>
 > **The residency column is not on one basis and the GB/token column is.**
 > Rows two and three are pre-simulation estimates that price the *experts*
 > down as well as the dense half; rows four to six are `cmd/gguf -width`'s own
@@ -2051,6 +2174,19 @@ and which are worth more together than the last half-bit — the F32 router at
 fp16 (+1.5 tok/s of ceiling) and the 512 expert banks at ~4.25 (+3.0), which
 are already Q4_K and already the calibrated part of this checkpoint — and,
 free either way, **D13's fp16 tail as int8 for +0.01%**.
+
+**L8c-4 builds the bank and puts the first family on it.** The format is
+§2.8's fragment tiling with a nibble where L8a puts a byte plus ggml's own
+sixteen-byte super-block record — 4.500 bits a weight exactly — and one
+encoder serves it and the simulation, so the lm head's 248 320 logits off the
+real bank are **identical** to the same format's through `sim.go`. **The head
+is 0.675 GB to 0.358, decode 24.66 tok/s to 25.75 — 1.024x llama.cpp, ahead
+of it for the first time — and perplexity 4.0621 against our own 4.0289,
++0.82%.** The other four streamed families are the same kernel and the same
+plumbing, in the order their bytes justify (the DeltaNet is 46% of a dense
+token), with one real obstacle left in the last of them: `hc_*_up` is 320 wide
+and `get_scale_min_k4`'s twelve-byte scheme *is* eight groups, so the
+hyper-connection block needs a packing of its own.
 
 **Phase 3 — the throughput levers that are worth more than the format.** The
 MTP head is downloaded (2.79 GB, `mtp-…-Q4_K_M.gguf`); a draft step is ~12% of
@@ -2257,10 +2393,14 @@ below Q8. Bandwidth is the whole story.
 | `vk.Buffer.Zero*` | **L6c: clearing a mapping in place.** `WriteFloat32At(off, make([]float32, n))` is two costs and on a hot path the allocation is the larger: 36 DeltaNet states is 113 MB of Go allocation a prefill, flat in the prompt length (L6c-4). |
 | `llm/bank.go` | **L8a: the dense bank in the checkpoint's own width.** `tileBQ8` writes a matrix into the §2.8 fragment tiling as int8 with one fp16 scale per 32 elements of a row, k-major inside an n-tile (D8), and the round trip through ggml's `d = amax/127` is an **identity** for a Q8_0 tensor — the halves the kernel forms are the halves `tileB` wrote. `q8Bytes`, `q8Align` and `q8Pipe` are the layout and the pipeline key a block on this bank needs. |
 | `shaders/llm_gemm.comp -DQ8B` | **L8a: that bank read.** The slab goes through LDS a K-step at a time, as llm_moe_gemm.comp's does and for §2.2's reason, with the scale constant across a sixteen-wide k-tile so a `uint` of four bytes takes one multiply. `pc.lowRank` and `pc.gateOff` carry the **fp16 tail** the three non-Q8_0 families keep (L8a-2), and the reduction is written twice rather than branched inside, because a compare in the k-loop cost 1.27x (L8a-3). `-DDENSE_Q8` is the sixth buffer: the same bank again, as raw words. |
+| `llm/quantk.go` | **L8c-4: ggml's K-quant super-block, as a thing that can be stored.** `asymEnc` is the per-super-block arithmetic `applyAsym` used to do inline and throw the levels away, with `packScaleMinK4` beside it — the inverse of `get_scale_min_k4`. Both callers go through it: the simulation writes back `d*sc*l - dmin*m` as floats, the bank packs the levels, so "the bank is the format L8c-3 measured" is true by construction rather than by a tolerance. |
+| `llm/bank_q4.go`, `shaders/llm_q4k.glsl` | **L8c-4: the dense bank at 4.500 bits.** §2.8's fragment tiling with a *nibble* where L8a puts a byte — a `uint` is eight consecutive k of one output column — plus a record plane of sixteen bytes per (n-tile, super-block, row): `d`, `dmin` and the twelve bytes ggml packs eight 6-bit (scale, min) pairs into, k-major inside an n-tile for D8's reason. `q4kFits` refuses a row that is not a whole number of 256-element super-blocks, which is the 320-wide hyper-connection family and nothing else. |
+| `shaders/llm_gemm.comp -DQ4B`, `llm_gemv.comp -DQ4B` | **L8c-4: that bank read.** The Q8 arm plus an affine term, and one structural difference: a record covers 256 k where a k-slab is 32, so each lane holds *its own column's* record in a register and refreshes it only where the loop crosses a super-block, turning it into `(d*sc, dmin*m)` in a BN-long LDS vector — the format's own 12.5% of record traffic rather than eight times it. The GEMV keeps the record in a register across the four steps of a super-block and has **no LDS at all**, which is also why it is not bit-exact against the GEMM on this bank (L8c-4's finding 3). |
 | `llm/imatrix.go`, `reference/quant_ref.c` | **L8c-2: the published importance matrix, and ggml's quantiser checked against ggml.** The imatrix is a GGUF — `<weight>.in_sum2` per input column, `.counts` beside it — so `gguf/` opened it unchanged; it covers `blk.N.*` only, so the lm head has no calibration data and falls back to rtn the way ggml does. `make_qx_quants` is ported into `sim.go` with three arms (`rtn`, `search`, `imatrix`, and `+gain`) and is **bit-identical to `ggml_quantize_chunk` over 819 200 values**, which is what `reference/quant_ref.c` exists for. |
 | `llm/sim.go`, `cmd/gguf -width` | **L8c-1: a width, graded before its kernel exists.** `Model.F32` is the seam every streamed dense weight crosses, so a candidate format is one round trip inserted there — and because a quantised kernel multiplies in fp16 (L8b-2), the half it stages is the half that kernel would form. Not a model of the bank: the bank's own numbers. `LLM_DENSE_SIM` takes a plan (`deltanet=q4_0/32,hyper_conn=q6sym/32`) because the families do not want the same width, `_SRC` splits it on L8a-2's line, and every run prints the weights it actually touched — which is how `lm_head` reading as "free" was caught as a missed staging path rather than believed. `cmd/gguf -width` is the bytes half. |
 | `cmd/llm -ppl`, `llm.Graph.ForwardRows` | **L8c-0: perplexity, in llama.cpp's own protocol.** A prefill without `inp_out_ids` — the final mixer over the whole batch, the head over slabs of `GraphOpts.HeadRows` because a row of logits is 0.99 MB — and 145 chunks of `wiki.test.raw` reduced the way `tools/perplexity/perplexity.cpp` reduces them. `HCGPU.MixedRowPort(t)` is the one new port it needed. **4.0289 against the reference's 4.0340**, in 7m58s. |
-| `cmd/llm -head` | **L8a: the lm head on both banks in one process**, every rung at 1, 8, 64 and 512 rows, with the logits compared element for element — which is how "0 of 248320 differ" is a measurement rather than a claim. |
+| `cmd/llm -head` | **L8a: the lm head on both banks in one process**, every rung at 1, 8, 64 and 512 rows, with the logits compared element for element — which is how "0 of 248320 differ" is a measurement rather than a claim. **L8c-4 makes it four arms**: the 4.5-bit bank, and *the simulation of it* staged beside it as halves, so the format's own numbers and the bank's are produced in one process against one activation. Plus the decode GEMV at one row on both quantised banks. |
+| `LLM_DENSE_BANK`, `llm.DenseBankPlan` | **L8c-4: which families are on the real 4.5-bit bank**, in `LLM_DENSE_SIM`'s own grammar so an accuracy row and a byte row still name the same thing. It defaults to `imatrix` where a simulation defaults to `rtn`, because a bank is built at the arm L8c-3 recommends; a family the published matrix does not cover falls back to round-to-nearest the way ggml does. Setting it *and* `LLM_DENSE_SIM` is refused rather than averaged — it would quantise the same weight twice. |
 | `llm/gpu_head.go` | **L6b: the lm head.** `output.weight`, [2560, 248320] Q8_0 — 675 MB, 1.27 GB as halves — staged a 4096-row slab at a time straight into the fragment tiling, and run as `llm_gemm.comp`'s MODE 2 on **one row**, because `inp_out_ids` is what the reference computes. The only matmul in the vertical with no epilogue: the final hyper-connection mixer is the output norm. |
 | `llm/arena.go` | **L6b: where an activation arena's memory comes from.** A HOST_CACHED memory type reads at **25.06 GB/s** against the write-combined default's **0.18**, for 0.14% on the kernels (L6b-4) — and `narrowRows`, the f32→fp16 conversion every block's `Upload` does, parallel over rows. `LLM_ARENA_UNCACHED=1` is the control. |
 | `vk.Device.NewHostCachedBuffer` | **L6b: a buffer from a HOST_CACHED type**, falling back to `NewBuffer` where there is none. For arenas the host reads; not for weight banks, which are written once. |
@@ -2334,7 +2474,10 @@ below Q8. Bandwidth is the whole story.
    into LDS, bit-identical to the halves they replace; 8.07 GB a token becomes
    5.01 and decode 11.90 tok/s becomes 14.07. The hyper-connection block is
    L8b, because none of its three kernels is the plain arm.
-11. **The re-quantiser** (L8c) and **MTP speculative decoding** (phase 3).
+11. **The re-quantiser** (L8c) — **done at L8c-4 for the lm head**, which is
+   the format, both kernel arms and the plumbing; what is left is the other
+   four streamed families on the bank that now exists, plus a packing for the
+   320-wide hyper-connection pair. And **MTP speculative decoding** (phase 3).
 
 ---
 
@@ -2885,15 +3028,41 @@ below Q8. Bandwidth is the whole story.
       whole row — ten groups, 4.475 bits.
       [Write-up](research/l8c-asymmetric.md) · `results/l8c_asym.csv` ·
       `results/l8c_ppl_asym.csv` · `results/l8c_ppl_asym_mixed.csv`
-- [ ] **So the dense kernel *is* the next thing to build**, which reverses
-      what L8c-1 and L8c-2 concluded. The honest end of the re-quantisation is
-      no longer +5.98% at 5.30 bits but **+4.24% at 4.50 or +2.70% at
-      4.75** — 4.264 GB a token
-      against 4.575 and a **56.7 tok/s ceiling against 52.9**, better on both
-      axes at once. §1.1's W4A8 is a *symmetric* layout; the asymmetric one
-      folds the min into the epilogue as a per-group correction times the
-      activation's column sum, one extra reduction over A and no change to the
-      matrix core.
+- [x] **L8c-4 — the dense kernel, and the bank is the format.** §2.8's
+      fragment tiling with a *nibble* where L8a puts a byte — a `uint` is
+      eight consecutive k of one output column — plus ggml's own sixteen-byte
+      super-block record per (n-tile, super-block, row), k-major inside an
+      n-tile for D8's reason: **4.500 bits a weight exactly**. One encoder
+      (`llm/quantk.go`) serves both the simulation and the bank, so
+      "this is the format L8c-3 measured" is true by construction, and the
+      head's 248 320 logits off the real bank are **identical** to the same
+      format's through `sim.go`. `-DQ4B` on both `llm_gemm.comp` and
+      `llm_gemv.comp`; the record is held in a register per lane and refreshed
+      only where the loop crosses a super-block, which is the format's own
+      12.5% of record traffic rather than eight times it.
+      **The head is 0.675 GB to 0.358, 1.89x at one token at 210 GB/s of a
+      242 GB/s bus, and 4.0621 against 4.0289 over the corpus — +0.82%.**
+      [Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv` ·
+      `results/l8c_ppl_head_q4k.csv`
+- [ ] **The other four streamed families on the same bank**, in the order
+      their bytes justify: the gated DeltaNet (46% of a dense token), the
+      full-attention layer, the PLE projections, and then the
+      hyper-connection block — which needs a **packing of its own**, because
+      `hc_{attn,ffn}_up` and `output_hc_up` are 320 wide and
+      `get_scale_min_k4`'s scheme *is* eight groups, four low and four high,
+      not a length. Both fused matrices also carry L8a-2's fp16 tail, which
+      the `-DQ4B` arms already branch for and nothing has exercised.
+      §1.1's W4A8 stays open beside this: it is a *symmetric* layout and an
+      int8-activation one, where every rung here multiplies an fp16 A —
+      the asymmetric version folds the min into the epilogue as a per-group
+      correction times the activation's column sum.
+- [ ] **The per-family attribution is eight-chunk and it under-reads.**
+      `lm_head` screened at +0.40% and measures **+0.82%** over the corpus,
+      2.05x, on a bank that reproduces the screen to four decimal places — so
+      the gap is the screen, not the bank. The plan's own +4.24% is a corpus
+      number and stands; the rows it was assembled from do not, and the next
+      family to get a kernel should be re-screened at 145 chunks before its
+      width is called.
 - [ ] Then the two the simulation cannot reach, which are worth more together
       than narrowing `hyper_conn` and `full_attn`: **the router to fp16**
       (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
@@ -2968,9 +3137,28 @@ below Q8. Bandwidth is the whole story.
                                              # and the 4 KB rule they measure
     go run ./cmd/llm -hc -model $M -ladder -csv results/l2c_hc.csv
     go run ./cmd/llm -ple -model $M -csv results/l2d_ple.csv   # L2d's block
-    go run ./cmd/llm -head -model $M                   # L8a: both dense banks,
-                                       # every rung, and the logits compared
-    go run ./cmd/llm -head -model $M -csv results/l8a_head.csv
+    go run ./cmd/llm -head -model $M                   # L8a/L8c-4: all three
+                                       # dense banks plus the simulation of
+                                       # the third, every rung, the decode
+                                       # GEMV, and the logits compared
+    go run ./cmd/llm -head -model $M -csv results/l8c_head.csv
+
+    # L8c-4: the **real** 4.5-bit bank, not a simulation of one. Same grammar
+    # as LLM_DENSE_SIM, and the two refuse to run together — a weight
+    # quantised twice is neither format. The mode defaults to `imatrix` here
+    # where a simulation defaults to `rtn`, because a bank is built at the arm
+    # L8c-3 recommends. Only `lm_head` has a kernel so far.
+    LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -ppl -model $M -chunks 8
+    LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -ppl -model $M \
+        -csv results/l8c_ppl_head_q4k.csv
+    LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -gen -model $M -n 64 \
+        -prompt 'The capital of France is'
+    LLM_DENSE_BANK_QUANT=rtn LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -ppl ...
+    go test ./llm/ -run TestBankQ4KIsTheSim -v   # the bank against the
+                                       # simulation, value for value, over a
+                                       # row permutation
+    go test ./llm/ -run TestHeadGPUQ4 -v         # the same on the device, the
+                                       # GEMV against the GEMM, and the bits
 
     # L8c-0: perplexity, llama.cpp's protocol over our graph. 145 chunks,
     # 36.8 s of staging and 7m58s; -chunks N screens for broken, not for a
@@ -3205,7 +3393,7 @@ below Q8. Bandwidth is the whole story.
 | D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. **L8d-5 shows it does not carry to another *matrix* either** — k8 wins at K = 2560 and k32 at K = 6144 on one kernel over one bank — and **L8d-3 shows where it stops applying**: the 2.63 MB router never leaves the MALL, so its KSLABS ladder is flat within 0.6 us. A rule about DRAM channels says nothing about a weight that does not reach DRAM. |
 | D16 | **A micro-bench rung whose measured rate is above the 242 GB/s bus is not a DRAM measurement; confirm it in the whole model before believing it.** | L8e-2: `-moe -tokens 1 -ladder` stages two layers and re-runs one dispatch twenty times, and a token's ten routed experts are ~32 MB — **the MALL exactly** — so every repetition after the first reads at 805-965 GB/s. The ladder then measures kernel shape against an L3 hit and picks the rung with the most parallelism rather than the best DRAM locality: v16w4 at **288 GB/s** for the routed up mode, which is **42.1 ms worse over 64 tokens** in the whole model where each expert is read once. This is D12 widened a fourth time — a ladder does not carry across a bank (L7d-2), a width (L8b-3), a matrix (L8d-5) or a **residency** — and the last one is a property of the harness rather than of the kernel. The test is on the face of the number: the fused attention projection's winner reads 39.5 MB in 174.3 us (227 GB/s, sound), its output projection's 16.7 MB in 24.6 (679, not). |
 | D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. **L8b holds the rule where it costs something**: `inject` does not begin on a column block, so keeping it in the tail means staging 32 low-rank rows twice, and the answer is to pay the 0.33 MB a mixer rather than to re-quantise four rows early. **L8c-1 makes the deferred decision and the tail loses**: `ssm_alpha`, `ssm_beta` and `inject` as int8 with a scale per 32 are **4.0294 against 4.0289, +0.01%** over the whole corpus — five times inside the error bar — so the two-plane machinery can go. It is worth **0.030 GB a token, 0.6%**, so the reason is deleting `lowRank`/`gateOff` from two kernels and L8b-1's doubled rows, not speed. The indexer's two BF16 projections rode along untested, because nothing at `-c 2048` reads them (L8c-1's finding 2). |
-| D14 | **At prefill the bank is not the kernel; at decode it is.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. |
+| D14 | **At prefill the bank is not the kernel; at decode it is — *where the weight fits the MALL*.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. **L8c-4 found the counter-example and it names the condition**: the lm head's B is 357 MB at 4.5 bits and never fits the MALL at any width, so there is nothing for the re-reads to hide behind and the bank is the kernel at *every* length — 18839 us to **17461** at 512 rows, 1.08x, in the direction this rule warns about. The unpack does show up there (82 GB/s of bank against the Q8 arm's 143); it just does not win. So the rule is about a weight that fits the MALL, and where one does not, a narrower bank is faster at both ends. |
 | D17 | **An accuracy delta is stated against our own number, not against the oracle's.** | L8c-0: at *identical* weights our perplexity is **4.0289** and llama.cpp's **4.0340** — −0.13%, a fifth of either side's standard error, and in the direction L4a-5 predicts, since the reference accumulates every quantised matmul in fp16 above 8 output columns where ours accumulate in f32. That gap is settled, is not the bank, and would be silently charged to the re-quantisation by a delta measured from 4.0340. The reference's number stays as the sanity check that the two implementations are the same model; the *stage's* gate is a delta from ours. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 

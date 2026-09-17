@@ -33,6 +33,44 @@ import (
 	"strix-halo-vulkan/shaders"
 )
 
+// DenseBank is which width a dense weight is staged in — the one axis phase 2
+// is about, and now the only one with three values.
+//
+//	BankFP16  the halves every GEMM here read before L8: 16 bits a weight,
+//	          and the bank a simulation still runs on (sim.go).
+//	BankQ8    the checkpoint's own int8 with an fp16 scale per 32 (L8a,
+//	          L8b): 8.5 bits, and **bit-identical arithmetic**.
+//	BankQ4K   ggml's asymmetric K-quant, 4.500 bits (L8c-4): the first bank
+//	          here that changes what the model computes, at +4.24% of
+//	          perplexity for 4.264 GB a token against 6.334.
+type DenseBank int
+
+const (
+	BankFP16 DenseBank = iota
+	BankQ8
+	BankQ4K
+)
+
+// String names a bank the way every CSV and header line in this vertical
+// does.
+func (b DenseBank) String() string {
+	switch b {
+	case BankQ8:
+		return "q8"
+	case BankQ4K:
+		return "q4_k"
+	}
+	return "fp16"
+}
+
+// bankOf is the two-valued spelling every constructor took before L8c-4.
+func bankOf(q8 bool) DenseBank {
+	if q8 {
+		return BankQ8
+	}
+	return BankFP16
+}
+
 // q8Group is how many elements of a row share one fp16 scale. It is ggml's
 // Q8_0 block, which is what makes the round trip exact — and it is two whole
 // sixteen-wide k-tiles, which is what makes the scale constant across a
@@ -112,6 +150,20 @@ func roundI8(v float32) int8 {
 // that is not four-aligned would read across the boundary.
 func q8Align(n int) int { return (n + 15) &^ 15 }
 
+// bankPipe names a bank's build of a GEMM rung inside a block that holds
+// more than one. A block on a quantised bank still needs the fp16 arm for
+// whatever rows of a fused matrix the checkpoint does not ship quantised, so
+// the builds cannot share a key.
+func bankPipe(b DenseBank, k GEMMKernel) string {
+	switch b {
+	case BankQ8:
+		return "q8_" + string(k)
+	case BankQ4K:
+		return "q4_" + string(k)
+	}
+	return string(k)
+}
+
 // q8Pipe names the Q8 build of a GEMM rung inside a block that holds both.
 // A block on L8's bank still needs the fp16 arm for whatever rows of a fused
 // matrix the checkpoint does not ship as Q8_0, so the two cannot share a key.
@@ -188,11 +240,17 @@ func GEMVFits(k GEMVKernel, gemmK int) bool {
 	return kt%s == 0 && (kt/s)%4 == 0
 }
 
-// gemvPipe names the pipeline for a rung: the partials over one bank or the
-// other, and the sum.
-func gemvPipe(k GEMVKernel, q8 bool) string {
-	if q8 {
+// gemvPipe names the pipeline for a rung: the partials over one bank or
+// another, and the sum.
+func gemvPipe(k GEMVKernel, q8 bool) string { return gemvBankPipe(k, bankOf(q8)) }
+
+// gemvBankPipe is the same, by bank.
+func gemvBankPipe(k GEMVKernel, b DenseBank) string {
+	switch b {
+	case BankQ8:
 		return fmt.Sprintf("gemv_q8_k%d", gemvSlabs(k))
+	case BankQ4K:
+		return fmt.Sprintf("gemv_q4_k%d", gemvSlabs(k))
 	}
 	return fmt.Sprintf("gemv_k%d", gemvSlabs(k))
 }
@@ -225,4 +283,12 @@ var gemvSPIRV = map[string][]byte{
 	"gemv_sum_k8":  shaders.LLMGEMVSumK8,
 	"gemv_sum_k16": shaders.LLMGEMVSumK16,
 	"gemv_sum_k32": shaders.LLMGEMVSumK32,
+	"gemv_q4_k1":   shaders.LLMGEMVQ4K1,
+	"gemv_q4_k2":   shaders.LLMGEMVQ4K2,
+	"gemv_q4_k4":   shaders.LLMGEMVQ4K4,
+	"gemv_q4_k8":   shaders.LLMGEMVQ4K8,
+	"gemv_q4_k16":  shaders.LLMGEMVQ4K16,
+	"gemv_q4_k20":  shaders.LLMGEMVQ4K20,
+	"gemv_q4_k32":  shaders.LLMGEMVQ4K32,
+	"gemv_q4_k40":  shaders.LLMGEMVQ4K40,
 }

@@ -376,6 +376,47 @@ func DensePlan() QuantPlan {
 	return densePlan
 }
 
+var (
+	denseBankOnce sync.Once
+	denseBankPlan QuantPlan
+)
+
+// DenseBankPlan is which dense families are staged on **the real 4.5-bit
+// bank** (bank_q4.go), from `LLM_DENSE_BANK` — the same grammar `LLM_DENSE_SIM`
+// takes, and `LLM_DENSE_BANK_QUANT` beside it, because a plan is a plan
+// whether it is simulated or built.
+//
+//	LLM_DENSE_BANK=lm_head=q4_k/32              the family L8c-4 has a kernel for
+//	LLM_DENSE_BANK_QUANT=imatrix                the default; rtn is the control
+//
+// It defaults to `imatrix` where `LLM_DENSE_SIM` defaults to `rtn`, and that
+// is deliberate: a simulation's default arm is the one every L8c-1 rung was
+// measured with, where a *bank*'s is the one L8c-3 recommends building
+// (+4.24% against the calibrated symmetric form's +15.63%). A family the
+// matrix does not cover falls back to round-to-nearest the way ggml does.
+//
+// The two are separate variables and a run that sets both is measuring
+// something incoherent — a weight quantised twice — so `-ppl` and the graph
+// refuse it rather than average it.
+func DenseBankPlan() QuantPlan {
+	denseBankOnce.Do(func() {
+		mode := os.Getenv("LLM_DENSE_BANK_QUANT")
+		if strings.TrimSpace(mode) == "" {
+			mode = "imatrix"
+		}
+		p, err := ParseQuantPlan(os.Getenv("LLM_DENSE_BANK"), "", "", mode)
+		if err != nil {
+			panic(err)
+		}
+		if !p.Off() && !DensePlan().Off() {
+			panic(fmt.Errorf("llm: LLM_DENSE_BANK=%s and LLM_DENSE_SIM=%s would quantise the same weight twice",
+				p, DensePlan()))
+		}
+		denseBankPlan = p
+	})
+	return denseBankPlan
+}
+
 // ApplyTo round-trips one staged weight through the plan, if the plan covers
 // it, and records what it touched.
 //
@@ -420,6 +461,30 @@ func (p QuantPlan) ApplyTo(name string, q8Source bool, x []float32, k int) error
 	}
 	simCount(name, len(x))
 	return nil
+}
+
+// imatrixCols is the published importance row for a tensor, or nil — which is
+// both "this mode does not calibrate" and "the matrix has no entry for this
+// tensor", because ggml treats the second as the first
+// (`quantize_row_q4_K_impl` falls back to `_ref` on a null `quant_weights`)
+// and so does everything here.
+//
+// It is `ApplyTo`'s lookup as a function, because L8c-4's *bank* needs the
+// same row the *simulation* used and the two reading different matrices would
+// be the bug this file was written to avoid.
+func imatrixCols(name, mode string) ([]float32, error) {
+	if mode != "imatrix" && mode != "imatrix+gain" {
+		return nil, nil
+	}
+	im, err := DefaultImatrix()
+	if err != nil {
+		return nil, err
+	}
+	qw, err := im.Columns(name)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return qw, nil
 }
 
 // The simulation's own tally, by family.
@@ -839,119 +904,20 @@ func (q QuantSim) applyAsym(x []float32, k int, qw []float32) error {
 	if err != nil {
 		return err
 	}
-	nmax := 1<<q.Bits - 1
-	// The two constants that steer make_qkx2_quants' twenty-rung sweep, which
-	// ggml sets per format: Q4_K's is (-1, 0.1, 20) and Q5_K's (-0.5, 0.1,
-	// 15). The calibrated path uses (-0.9, 0.05, 36) for both.
-	rmin, nstep := float32(-1), 20
-	if q.Bits == 5 {
-		rmin, nstep = -0.5, 15
-	}
-	calibrated := strings.HasPrefix(q.Mode, "search") || strings.HasPrefix(q.Mode, "imatrix")
 	n := sub * q.Group
 	rows := len(x) / k
 	parallelFor(rows, func(r int) {
 		row := x[r*k : (r+1)*k]
-		scales := make([]float32, sub)
-		mins := make([]float32, sub)
-		sw := make([]float32, sub)
-		ls := make([]int, sub)
-		lm := make([]int, sub)
-		w := make([]float32, q.Group)
-		lv := make([]uint8, q.Group)
-		laux := make([]uint8, q.Group)
+		e := newAsymEnc(q, sub)
 		for s := 0; s < k; s += n {
 			blk := row[s : s+n]
-			var d, dmin float32
-			if calibrated {
-				// sigma2 is over the **super-block** here, where the
-				// symmetric arm's is over the whole row: ggml computes it
-				// per block of QK_K in quantize_row_q4_K_impl, and its
-				// accumulator is a float.
-				var sum2 float32
-				for _, v := range blk {
-					sum2 += v * v
-				}
-				sigma2 := 2 * sum2 / float32(n)
-				avx := sqrt32(sigma2)
-				for j := 0; j < sub; j++ {
-					g := blk[j*q.Group : (j+1)*q.Group]
-					var sumw float32
-					for i, v := range g {
-						if qw != nil {
-							w[i] = qw[s+j*q.Group+i] * sqrt32(sigma2+v*v)
-						} else {
-							w[i] = avx + abs32(v)
-						}
-						sumw += w[i]
-					}
-					sw[j] = sumw
-					scales[j], mins[j] = makeQkxQuants(g, nmax, w, lv, laux, -0.9, 0.05, 36)
-				}
-				d = makeQpQuants(scales, 63, sw, ls)
-				dmin = makeQpQuants(mins, 63, sw, lm)
-			} else {
-				var maxScale, maxMin float32
-				for j := 0; j < sub; j++ {
-					g := blk[j*q.Group : (j+1)*q.Group]
-					var sum2 float32
-					for _, v := range g {
-						sum2 += v * v
-					}
-					avx := sqrt32(sum2 / float32(q.Group))
-					for i, v := range g {
-						w[i] = avx + abs32(v)
-					}
-					scales[j], mins[j] = makeQkxQuants(g, nmax, w, lv, laux, rmin, 0.1, nstep)
-					if scales[j] > maxScale {
-						maxScale = scales[j]
-					}
-					if mins[j] > maxMin {
-						maxMin = mins[j]
-					}
-				}
-				var invScale, invMin float32
-				if maxScale > 0 {
-					invScale = 63 / maxScale
-				}
-				if maxMin > 0 {
-					invMin = 63 / maxMin
-				}
-				for j := 0; j < sub; j++ {
-					ls[j] = clamp63(nearestInt(invScale * scales[j]))
-					lm[j] = clamp63(nearestInt(invMin * mins[j]))
-				}
-				d, dmin = maxScale/63, maxMin/63
+			var cols []float32
+			if qw != nil {
+				cols = qw[s : s+n]
 			}
-			// **The pair is stored as halves and read back**, so the levels
-			// below are chosen against the stored value and not against the
-			// one the search returned — the same reason the symmetric arm
-			// rounds its scale before quantising (D10's neighbour).
-			df := safetensors.F16ToF32(safetensors.F32ToF16(d))
-			dmf := safetensors.F16ToF32(safetensors.F32ToF16(dmin))
-			for j := 0; j < sub; j++ {
-				g := blk[j*q.Group : (j+1)*q.Group]
-				ds, dm := df*float32(ls[j]), dmf*float32(lm[j])
-				if ds == 0 {
-					// ggml's `if (!d) continue;` leaves the levels alone and
-					// dequantises them through a zero scale, so every
-					// element of the group comes back as -dm. Writing zero
-					// here instead would be a different format.
-					for i := range g {
-						g[i] = -dm
-					}
-					continue
-				}
-				for i, v := range g {
-					l := nearestInt((v + dm) / ds)
-					if l < 0 {
-						l = 0
-					}
-					if l > float32(nmax) {
-						l = float32(nmax)
-					}
-					g[i] = ds*l - dm
-				}
+			e.Encode(blk, cols)
+			for i := range blk {
+				blk[i] = e.Dequant(i)
 			}
 		}
 	})
