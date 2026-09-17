@@ -1265,6 +1265,15 @@ func (g *HCGPU) MixedPort() Port {
 	return Port{Buf: g.abuf, Off: g.aMixed, Stride: g.cfg.NEmbd, Width: g.cfg.NEmbd}
 }
 
+// MixedRowPort is that same tensor from row t on, for a caller that reads it
+// a slab at a time rather than whole. The head's logit arena is 0.99 MB a
+// row, so a perplexity run over 2048 tokens takes the mixer's output in
+// pieces the head is built for (L8c).
+func (g *HCGPU) MixedRowPort(t int) Port {
+	n := g.cfg.NEmbd
+	return Port{Buf: g.abuf, Off: g.aMixed + uint32(t*n), Stride: n, Width: n}
+}
+
 // BlockOutPort is where the combine reads a sublayer's output: fp32
 // [T][nEmbd]. The combine has no row block — one workgroup is one (token,
 // stream) — so nothing past the run's tokens needs writing.

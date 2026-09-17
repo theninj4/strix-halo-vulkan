@@ -76,6 +76,10 @@ func main() {
 	mixers := flag.Int("mixers", 8, "how many real mixers to stage for -hc; the sweep needs more than the 32 MiB MALL")
 	iters := flag.Int("iters", 20, "repetitions per timed dispatch for -hc")
 	ladder := flag.Bool("ladder", false, "run every kernel rung for -hc")
+	ppl := flag.Bool("ppl", false, "measure perplexity over a corpus, in llama.cpp's own protocol")
+	pplFile := flag.String("ppl-file", "models/wikitext-2-raw/wiki.test.raw", "for -ppl: the corpus")
+	chunks := flag.Int("chunks", 0, "for -ppl: stop after this many chunks, 0 for the whole corpus")
+	headRows := flag.Int("head-rows", 256, "for -ppl: rows of logits the head's arena holds; a row is 0.99 MB")
 	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn and -attn, and at one token the decode GEMV's split per projection")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
@@ -100,6 +104,20 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *ppl {
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		if err := perplexity(pplOpts{
+			model: *model, file: *pplFile, ctx: *ctx, chunks: *chunks,
+			headRows: *headRows, layers: layers, csv: *csvPath,
+		}); err != nil {
 			log.Fatal(err)
 		}
 		return

@@ -99,7 +99,21 @@ func (m *Model) F32(name string) ([]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-	return t.Dequantize(nil)
+	x, err := t.Dequantize(nil)
+	if err != nil {
+		return nil, err
+	}
+	// L8c's width simulation, if one is running: a streamed dense weight is
+	// round-tripped through the candidate format on its way to the device,
+	// so that a width can be graded before there is a kernel that reads it
+	// (sim.go). Off by default, and off is an identity.
+	// ggml memory order: a tensor stated [in, out] reads back as out rows of
+	// in values, so a row is Dims[0] long and a group runs along k, which is
+	// what a format groups along and what an imatrix column indexes.
+	if err := DensePlan().ApplyTo(name, t.Type == gguf.Q8_0, x, int(t.Dims[0])); err != nil {
+		return nil, err
+	}
+	return x, nil
 }
 
 // Embedding gathers one row of token_embd, which is a lookup and not a

@@ -41,8 +41,9 @@ func TestAuthorizeProxy(t *testing.T) {
 				_, _ = w.Write([]byte("Success"))
 			})
 
-			// Wrap the test handler with our authorizeProxy middleware
-			handler := authorize(testHandler)
+			// Wrap the test handler with our authorize middleware
+			s := &Server{Token: "womblesofwimbledon"}
+			handler := s.authorize(testHandler)
 
 			// Create a test request
 			req := httptest.NewRequest("GET", "/test", http.NoBody)

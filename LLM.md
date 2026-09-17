@@ -209,8 +209,86 @@ routed experts are 32 MB and the sweep re-reads them out of a 32 MiB MALL. In
 the whole model that same change is **42.1 ms worse over 64 tokens**. A
 micro-bench rung whose rate is above the bus is not a DRAM measurement.
 
-**Next: L8c, the re-quantisation, onto a baseline that is 1.67x faster than
-the one it was planned against.**
+**L8c starts with the instrument, and the instrument says our model is the
+reference's model.** L8c is the first stage here that changes what the model
+computes, so a tensor comparison stops being a grade and its gate is written
+against a perplexity — a number nothing in this vertical could produce, because
+`inp_out_ids` means a prefill computes one row of logits. `Graph.ForwardRows`
+is that pass without the move: the final mixer over the whole batch, the head
+over slabs of 256 rows, and `TestGraphForwardRows` asserting the thing that
+makes a second-half perplexity mean anything — **row t of the batch is
+identical, to the last place, to the prompt truncated at t**. `cmd/llm -ppl`
+is then llama.cpp's protocol line for line off the oracle's own build, over a
+tokenization checked to be **297 193 identical ids**. **Ours is 4.0289 ±
+0.02279 against llama.cpp's 4.0340 ± 0.02283 — −0.13%, a fifth of one side's
+standard error**, in 7m58s over 145 chunks. Forty-eight layers, twenty-three
+kernels and a bank that is not the reference's arrangement of the same bits
+move perplexity by less than the corpus can resolve, and the sign is the one
+L4a-5 predicts: the reference accumulates in fp16 above 8 output columns where
+we accumulate in f32, so ours is nearer the model and, it turns out, nearer
+the text. **So L8c's delta is stated against 4.0289, not against 4.0340.**
+
+**L8c-1 grades the widths on it, and D3 does not survive.** `llm/sim.go`
+round-trips a streamed dense weight through a candidate format on its way to
+the device, and because a quantised kernel multiplies in fp16 (L8b-2) the half
+it stages is the half that kernel would form — so this is the format's own
+perplexity, not a model of it. It is checked where the answer is known
+(`q8sym/32` over a Q8_0 tensor is an identity on **696 M real weights**) and
+then through the whole graph, where **the default int8 bank, the fp16 arm and
+`q8sym/32` on the Q8_0 tensors are a three-way identity at 2.0189** — L8a's
+and L8b's bit-exactness claim measured at the corpus level rather than tensor
+by tensor.
+
+**~4.25 bits on everything streamed is +18.5% of perplexity**, and the cost of
+4 bits runs **inverse to the bytes**: the gated DeltaNet is 46% of a dense
+token and costs +1.49%, the lm head is 14% and costs +0.28%, while the
+hyper-connection block is 14% and costs **+5.98%** — it is the model's
+plumbing, and it wants **levels rather than a finer scale group** (halving the
+group is worth 1.06 points where doubling the levels is worth 1.56). The best
+mixed plan — DeltaNet and head at 4.5 bits, attention and hyper-connections at
+6.5 — is **4.2699 against 4.0289, +5.98%, for 4.575 GB a token against 6.334
+and a 52.9 tok/s ceiling**. And **a plan is not the sum of its families**:
+uniform 4.5 bits is 18.5% where its four families sum to 11.7%, because errors
+injected at 36 or 48 depths compound on L6b-3's x1.085 a layer rather than
+adding. Two smaller results fall out — **ggml's 16-level `q4_0` beats L0d's
+15-level `q4sym` by 1.13x at identical bits**, which is the baseline D7 was
+decided against; and **D13's fp16 tail can be int8 for +0.01%**, though it is
+worth only 0.6% of a token, so the reason to do it is deleting the two-plane
+machinery rather than speed.
+
+**L8c-2 pulled the one lever left, and it moves the wrong way.** Unsloth's
+`imatrix_unsloth.gguf` is a GGUF our own reader opens, and `make_qx_quants` is
+ported from ggml and checked against it — **bit-identical over 819 200 values**
+through `reference/quant_ref.c`, once three details matched that are each a
+case where the more accurate choice is wrong (`nearest_int` rounds half to
+**even**, and both its accumulator and `sigma2`'s are `float`). Three arms,
+because ggml does the scale search and the calibration in one function.
+**Calibration is worse: 22.4% against round-to-nearest's 18.5%**, and per
+family the whole loss is the hyper-connection block (+9.04% against +5.98%)
+while the DeltaNet does not move at all.
+
+**The mechanism is a gain error, not noise.** Round-to-nearest shrinks a
+matrix by 0.08-0.12%; the search shrinks it by 0.32-0.37% and the imatrix
+shrinks `hc_attn_up` by **1.35%** — and a systematic bias compounds on L6b-3's
+x1.085 a layer where residual noise averages out. **What predicts it is how
+evenly the calibration spreads inside a scale group**: `hc_attn_up` reads the
+low-rank space, 1% of its 320 columns carry 90% of the energy, and its scale
+is fitted to an effective **4.4 of 32** columns against `attn_q`'s 22.5.
+Forcing the scale unbiased recovers a third of the regression, which confirms
+the mechanism and does not close the gap. **The rule: an imatrix helps in
+proportion to how evenly importance is spread inside a scale group — where it
+is concentrated, what goes up is the systematic error.**
+
+**Next: not the dense kernel.** The re-quantisation's honest end is L8c-1's
+mixed plan, **+5.98% for 1.38x the bytes and a 52.9 tok/s ceiling**, and the
+lever that might have improved it does not. What is left in phase 2 is the
+router and the experts — 0.503 and 1.504 GB a token, neither reachable by the
+simulation — and past them **phase 3, where MTP speculation is worth 1.5-1.8x
+and batching amortises the dense half completely**. Both are larger than the
+widths. One thread is still live and is a *format* question rather than a
+width one: this was Q4_0's symmetric form, where the checkpoint's own experts
+are **Q4_K**, asymmetric with a min and a scale — which is what the imatrix
+was collected against. **That reopens D7 on a different argument than L0d's.**
 
 ## The number to beat
 
@@ -1796,10 +1874,18 @@ bus that is the single most expensive choice available, because **76% of the
 bytes read per token are dense** — each expert is read 10 times in 512, every
 dense weight is read every time.
 
-| | resident core | GB/token | **tok/s ceiling** | measured |
+| | resident core | GB/token | **tok/s ceiling** | PPL |
 |---|---:|---:|---:|---:|
-| UD-Q4_K_XL as shipped | 82.52 GB | 6.334 | **38.2** | llama.cpp: **25.15** |
-| our own bank, ~4.25 bits on everything streamed | ~67 GB | ~3.6 | **~67** | — |
+| UD-Q4_K_XL as shipped | 82.52 GB | 6.334 | **38.2** | **4.0289** (L8c-0) |
+| ~4.25 bits on everything streamed — D3 as written | ~67 GB | ~3.9 | **62.2** | **+18.5%** (L8c-1) |
+| L8c-1's mixed plan: DeltaNet + head 4.5, attention + hc 6.5 | ~73 GB | 4.575 | **52.9** | **4.2699, +5.98%** |
+
+**L8c-1 retired the middle row.** It was an inference from L0d's
+weight-reconstruction ladder and a bandwidth argument, with no perplexity
+beside it; measured, the uniform width is the one arrangement guaranteed to be
+wrong at both ends, because the cost of 4 bits runs *inverse* to the bytes.
+The bottom row is what the measurement argues for, and at +5.98% it is not yet
+a bank worth building a kernel for — see L8c-2.
 
 ---
 
@@ -1855,16 +1941,28 @@ expert modes share a row block — **decode 24.66 tok/s, a token 40.5 ms,
 prefill 1052.8 and 655.2, and 48 fewer dispatches a pass at every length.**
 That is **62% of this bank's own 40.0 ceiling**, 65% of the checkpoint's 38.2
 and **0.98x llama.cpp's measured 25.15**, and nothing in the model computes
-anything different yet.
-*Now* re-quantise
-to the repo's W4A8 layout (§1.1's repack) at widths chosen for this bus rather
-than for a generic machine: ~4.25 bits on everything streamed, fp16 routers,
-the n-gram table left as IQ4_NL on disk, and — L0c — **fp16 scales per 32
-nibbles in a k-major plane**. Target ~67 tok/s against this bank's 40.0
-ceiling, the checkpoint's 38.2 and the reference's 25.15.
-Source it either by transcoding the GGUF (cheap, double-quantises) or from
-the 360 GB bf16 (clean — and **unsloth publish their imatrix**,
-`imatrix_unsloth.gguf`, 580 MB, so the calibration is free).
+anything different yet. **L8c-0 is the instrument for the stage where that
+stops being true**: `-ppl` is llama.cpp's own perplexity protocol over our
+graph, and it puts the bank we run at **4.0289 against the reference's 4.0340
+— −0.13%, inside both error bars** — which is the left-hand side every width
+below is a delta from.
+*Then* the re-quantisation — and **L8c-1 measured what it is worth before
+building it, which changed the plan.** The stated target was ~4.25 bits on
+everything streamed for ~67 tok/s; measured, that is **+18.5% of perplexity**,
+and the cost of 4 bits runs *inverse* to the bytes — the gated DeltaNet is 46%
+of a dense token for +1.49%, the hyper-connection block 14% for **+5.98%**.
+The widths that keep the model together are a **plan** (DeltaNet and head at
+4.5 bits, attention and hyper-connections at 6.5), and that plan is
+**4.2699 against 4.0289 — +5.98% — for 4.575 GB a token and a 52.9 tok/s
+ceiling**, not 67. **So the kernel is not the next thing to build.** Every
+rung was round-to-nearest, against a checkpoint whose experts are
+imatrix-quantised and whose imatrix unsloth publish free
+(`imatrix_unsloth.gguf`, 580 MB); calibration is days where the W4A8 layout is
+weeks, and the widths it allows are what that layout would be built for. L8c-2
+is the imatrix. Beside it sit the two things the dense widths cannot reach and
+which are worth more together than narrowing the two sensitive families — the
+F32 router at fp16 (+1.5 tok/s of ceiling) and the 512 expert banks at ~4.25
+(+3.0) — and, free either way, **D13's fp16 tail as int8 for +0.01%**.
 
 **Phase 3 — the throughput levers that are worth more than the format.** The
 MTP head is downloaded (2.79 GB, `mtp-…-Q4_K_M.gguf`); a draft step is ~12% of
@@ -2071,6 +2169,9 @@ below Q8. Bandwidth is the whole story.
 | `vk.Buffer.Zero*` | **L6c: clearing a mapping in place.** `WriteFloat32At(off, make([]float32, n))` is two costs and on a hot path the allocation is the larger: 36 DeltaNet states is 113 MB of Go allocation a prefill, flat in the prompt length (L6c-4). |
 | `llm/bank.go` | **L8a: the dense bank in the checkpoint's own width.** `tileBQ8` writes a matrix into the §2.8 fragment tiling as int8 with one fp16 scale per 32 elements of a row, k-major inside an n-tile (D8), and the round trip through ggml's `d = amax/127` is an **identity** for a Q8_0 tensor — the halves the kernel forms are the halves `tileB` wrote. `q8Bytes`, `q8Align` and `q8Pipe` are the layout and the pipeline key a block on this bank needs. |
 | `shaders/llm_gemm.comp -DQ8B` | **L8a: that bank read.** The slab goes through LDS a K-step at a time, as llm_moe_gemm.comp's does and for §2.2's reason, with the scale constant across a sixteen-wide k-tile so a `uint` of four bytes takes one multiply. `pc.lowRank` and `pc.gateOff` carry the **fp16 tail** the three non-Q8_0 families keep (L8a-2), and the reduction is written twice rather than branched inside, because a compare in the k-loop cost 1.27x (L8a-3). `-DDENSE_Q8` is the sixth buffer: the same bank again, as raw words. |
+| `llm/imatrix.go`, `reference/quant_ref.c` | **L8c-2: the published importance matrix, and ggml's quantiser checked against ggml.** The imatrix is a GGUF — `<weight>.in_sum2` per input column, `.counts` beside it — so `gguf/` opened it unchanged; it covers `blk.N.*` only, so the lm head has no calibration data and falls back to rtn the way ggml does. `make_qx_quants` is ported into `sim.go` with three arms (`rtn`, `search`, `imatrix`, and `+gain`) and is **bit-identical to `ggml_quantize_chunk` over 819 200 values**, which is what `reference/quant_ref.c` exists for. |
+| `llm/sim.go`, `cmd/gguf -width` | **L8c-1: a width, graded before its kernel exists.** `Model.F32` is the seam every streamed dense weight crosses, so a candidate format is one round trip inserted there — and because a quantised kernel multiplies in fp16 (L8b-2), the half it stages is the half that kernel would form. Not a model of the bank: the bank's own numbers. `LLM_DENSE_SIM` takes a plan (`deltanet=q4_0/32,hyper_conn=q6sym/32`) because the families do not want the same width, `_SRC` splits it on L8a-2's line, and every run prints the weights it actually touched — which is how `lm_head` reading as "free" was caught as a missed staging path rather than believed. `cmd/gguf -width` is the bytes half. |
+| `cmd/llm -ppl`, `llm.Graph.ForwardRows` | **L8c-0: perplexity, in llama.cpp's own protocol.** A prefill without `inp_out_ids` — the final mixer over the whole batch, the head over slabs of `GraphOpts.HeadRows` because a row of logits is 0.99 MB — and 145 chunks of `wiki.test.raw` reduced the way `tools/perplexity/perplexity.cpp` reduces them. `HCGPU.MixedRowPort(t)` is the one new port it needed. **4.0289 against the reference's 4.0340**, in 7m58s. |
 | `cmd/llm -head` | **L8a: the lm head on both banks in one process**, every rung at 1, 8, 64 and 512 rows, with the logits compared element for element — which is how "0 of 248320 differ" is a measurement rather than a claim. |
 | `llm/gpu_head.go` | **L6b: the lm head.** `output.weight`, [2560, 248320] Q8_0 — 675 MB, 1.27 GB as halves — staged a 4096-row slab at a time straight into the fragment tiling, and run as `llm_gemm.comp`'s MODE 2 on **one row**, because `inp_out_ids` is what the reference computes. The only matmul in the vertical with no epilogue: the final hyper-connection mixer is the output norm. |
 | `llm/arena.go` | **L6b: where an activation arena's memory comes from.** A HOST_CACHED memory type reads at **25.06 GB/s** against the write-combined default's **0.18**, for 0.14% on the kernels (L6b-4) — and `narrowRows`, the f32→fp16 conversion every block's `Upload` does, parallel over rows. `LLM_ARENA_UNCACHED=1` is the control. |
@@ -2617,9 +2718,69 @@ below Q8. Bandwidth is the whole story.
       [Write-up](research/l8e-attn-decode.md) · `results/l8e_decode.csv` ·
       `results/l8e_graph.csv` · `results/l8e_attn.csv` · `results/l8e_moe.csv`
 
-### L8c — the widths that are ours rather than the checkpoint's  *(next)*
+### L8c — the widths that are ours rather than the checkpoint's  *(in progress)*
 
-- [ ] Choose per-tensor widths from L0d and L1's **PPL 4.0340**. Everything
+> **L8c-0 and L8c-1 are done and they changed the stage's direction.** The
+> instrument came first, and what it measured retired D3: the re-quantisation
+> as specified costs far more accuracy than it was assumed to, so the order is
+> now *calibrate, then decide whether to build the kernel* rather than *build
+> the kernel*. The items below are in execution order.
+
+- [x] **The instrument first**, because this is the stage where a tensor
+      comparison stops being a grade. `Graph.ForwardRows` is a prefill without
+      `inp_out_ids` — the final mixer over the whole batch, the head over
+      slabs of `GraphOpts.HeadRows` — and `cmd/llm -ppl` is llama.cpp's
+      protocol off the oracle's own build `cff184438`: no BOS (this
+      checkpoint's `add_bos_token` is false), 145 chunks of 2048, a fresh
+      sequence each, positions `[1024, 2047)` scored against the token to
+      their right, over a tokenization checked to be **297 193 identical
+      ids**. **Ours is 4.0289 ± 0.02279 against 4.0340 ± 0.02283 — −0.13% —
+      in 7m58s**, and `TestGraphForwardRows` says row t of the batch is
+      identical to the prompt truncated at t **to the last place**.
+      [Write-up](research/l8c-perplexity.md) · `results/l8c_ppl.csv`
+- [x] **Choose per-tensor widths — by measuring them, because L0d's ladder is
+      a proxy and D3's number came off it.** `llm/sim.go` stages a candidate
+      format's own halves through the kernels that exist, checked where the
+      answer is known (`q8sym/32` over Q8_0 is an identity on 696 M weights)
+      and against a **three-way control** — the int8 bank, the fp16 arm and
+      `q8sym/32` on the Q8_0 tensors all at 2.0189. **D3's ~4.25 bits on
+      everything is +18.5%**; the cost of 4 bits is **inverse to the bytes**
+      (DeltaNet 46% of a token for +1.49%, hyper-connections 14% for +5.98%);
+      the sensitive family wants **levels, not a finer group**; **`q4_0`'s
+      sixteen levels beat `q4sym`'s fifteen by 1.13x free**; and the mixed
+      plan is **4.2699, +5.98%, for a 52.9 tok/s ceiling**. **A plan is not
+      the sum of its families.** [Write-up](research/l8c-widths.md) ·
+      `results/l8c_widths.csv` · `results/l8c_ppl_mixed.csv`
+- [x] **Settle D13's fp16 tail**, which L8a-2 deferred to here: int8 for
+      **+0.01%** over the whole corpus, worth 0.6% of a token, so it is a
+      simplification rather than a speed-up. `results/l8c_ppl_tail.csv`
+- [x] **L8c-2 — the imatrix, and it makes this model worse.** Unsloth's
+      published matrix is a GGUF our reader opens; `make_qx_quants` is ported
+      and **bit-identical to ggml over 819 200 values** via
+      `reference/quant_ref.c`, once `nearest_int`'s round-half-to-**even** and
+      two `float` accumulators were matched. Three arms, because ggml searches
+      and calibrates in one function. **Calibration is 22.4% against
+      round-to-nearest's 18.5%**, all of the loss in the hyper-connection
+      block (+9.04% against +5.98%, the DeltaNet unmoved). **The mechanism is
+      a gain error**: rtn shrinks a matrix 0.08-0.12%, the imatrix shrinks
+      `hc_attn_up` **1.35%**, and bias compounds on L6b-3's x1.085 where noise
+      averages out. **What predicts it is the participation ratio inside a
+      scale group** — `hc_attn_up`'s scale is fitted to an effective 4.4 of 32
+      columns. Forcing the scale unbiased recovers a third.
+      [Write-up](research/l8c-imatrix.md) · `results/l8c_imatrix.csv`
+- [ ] **So the dense kernel is not the next thing to build.** The
+      re-quantisation's honest end is L8c-1's mixed plan — +5.98% for 1.38x
+      the bytes and a 52.9 tok/s ceiling — and the lever that might have
+      improved it does not. Phase 2's remaining throughput is the router and
+      the experts below; past them is **phase 3**, where MTP speculation is
+      1.5-1.8x and batching amortises the dense half completely. Both are
+      larger than the widths.
+- [ ] Then the two the simulation cannot reach, which are worth more together
+      than narrowing `hyper_conn` and `full_attn`: **the router to fp16**
+      (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
+      **the 512 expert banks at ~4.25** (+3.0 tok/s, D4's floor, and they are
+      the *calibrated* part of the checkpoint so naive re-quantisation is the
+      likeliest way to lose). Everything
       L8a and L8b stage is still **the checkpoint's arithmetic**: 8.5 bits a
       weight, its own levels, its own scales. D3's ~4.25 bits is where the
       next 1.9x of the dense half is, and it is the first step in this
@@ -2628,10 +2789,23 @@ below Q8. Bandwidth is the whole story.
       published imatrix) into the §1.1 W4A8 layout with an L0c scale plane.
       **If from bf16: apply llama.cpp's V-head reorder first** (L3a-3) — seven
       tensor families per linear layer, or `kHeadOfV` is wrong on 32 of 48
-      heads in 36 of 48 layers.
-- [ ] Gate: ~67 tok/s, ≤67 GB resident, perplexity within a stated delta of
-      **4.0340** on the same corpus, context and chunking — and the same text
-      at temperature zero for as long as L7c's is.
+      heads in 36 of 48 layers. **Gated on L8c-2**: the widths are what this
+      layout would be built for, and at L8c-1's widths it is not worth
+      building. Note also that §1.1's W4A8 is an *int8-activation* format,
+      where every L8c-1 rung was measured with an fp16 A operand — so its
+      accuracy is not L8c-1's table (see the open question).
+- [ ] Gate: perplexity within a stated delta of **4.0289** — our own number on
+      the bank we run, not the reference's 4.0340, since L8c-0 shows the two
+      already differ by −0.13% at identical weights — on the same corpus,
+      context and chunking, and the same text at temperature zero for as long
+      as L7c's is. **A short `-chunks N` run is a screen for broken and not
+      for a percent**: four chunks put us +0.32% above the reference where 145
+      put us 0.13% below, and L8c-1's fp16-tail result read −0.53% at eight
+      chunks and **+0.01%** over the corpus.
+      **The tok/s and residency half of this gate is now L8c-2's to set.**
+      ~67 tok/s and ≤67 GB came off D3, which L8c-1 retired; the widths that
+      hold the model together are 52.9 tok/s of ceiling and ~73 GB, and
+      whether even that is worth its kernel depends on what calibration buys.
 
 ### L9 — phase 3, and shipping
 
@@ -2668,6 +2842,50 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -head -model $M                   # L8a: both dense banks,
                                        # every rung, and the logits compared
     go run ./cmd/llm -head -model $M -csv results/l8a_head.csv
+
+    # L8c-0: perplexity, llama.cpp's protocol over our graph. 145 chunks,
+    # 36.8 s of staging and 7m58s; -chunks N screens for broken, not for a
+    # percent. -head-rows is the logit arena, 0.99 MB a row.
+    go run ./cmd/llm -ppl -model $M -csv results/l8c_ppl.csv
+    go run ./cmd/llm -ppl -model $M -chunks 4        # the four-chunk screen
+    go run ./cmd/llm -ppl -model $M -chunks 2 -layers 4   # the plumbing, in 8 GB
+
+    # L8c-1: a candidate bank's accuracy, before there is a kernel that reads
+    # it. Model.F32 round-trips a streamed dense weight through the candidate
+    # format on its way to the device, and the half it stages is the half the
+    # kernel would form (llm/sim.go) — so this is the format's own perplexity
+    # and not a model of it. A sim forces the fp16 arm, so it says nothing
+    # about tok/s; `cmd/gguf -width` is the bytes half.
+    LLM_DENSE_SIM=q4_0/32 go run ./cmd/llm -ppl -model $M -chunks 8
+    LLM_DENSE_SIM=deltanet=q4_0/32,hyper_conn=q6sym/32 go run ./cmd/llm -ppl -model $M
+    LLM_DENSE_SIM_FAMILIES=deltanet go run ./cmd/llm -ppl ...   # one family
+    LLM_DENSE_SIM_SRC=tail go run ./cmd/llm -ppl ...            # L8a-2's split
+    go test ./llm/ -run TestQuantSim -v        # the simulator against q8sym/32,
+                                               # where it has to be an identity
+
+    # L8c-2: how the levels and the scale are chosen. `rtn` is ggml's
+    # uncalibrated path and every L8c-1 rung; `search` is make_qx_quants
+    # alone; `imatrix` is quantize_row_q4_0_impl; `+gain` replaces the
+    # search's scale with the unbiased one.
+    LLM_DENSE_SIM_QUANT=imatrix LLM_DENSE_SIM=q4_0/32 go run ./cmd/llm -ppl -chunks 8
+    LLM_DENSE_SIM_QUANT=imatrix+gain LLM_DENSE_SIM=hyper_conn=q4_0/32 go run ./cmd/llm -ppl
+    go test ./llm/ -run TestImatrixQuant -v    # the three arms on real weights
+    go test ./llm/ -run TestQuantSimGain -v    # gain against residual, per arm
+    go test ./llm/ -run TestImatrixSkew -v     # why hc_attn_up is the outlier
+
+    # the oracle for the port, on dequant_ref.c's precedent. Both testdata
+    # files are committed, so the test needs no toolchain.
+    L=/home/kube/repos/llama.cpp
+    gcc -O2 -o /tmp/quant_ref reference/quant_ref.c \
+        -I$L/ggml/include -L$L/build/bin -lggml-base -Wl,-rpath,$L/build/bin
+    go test ./llm/ -run TestQuantSimMatchesGGML -updatequant
+    /tmp/quant_ref llm/testdata/quant_in.bin llm/testdata/quant_ref.bin
+    go test ./llm/ -run TestQuantSimMatchesGGML -v
+
+    # L8c-1's other half, which is arithmetic rather than a measurement:
+    # what a candidate width does to a decode token and to the ceiling.
+    go run ./cmd/gguf -width 4.5 $M
+    go run ./cmd/gguf -width 4.5 -expert-width 4.25 -router-width 16 $M
 
     # L8a's control. The dense banks are the checkpoint's int8 by default;
     # this puts every block back on the halves it staged before L8, which is
@@ -2732,6 +2950,10 @@ below Q8. Bandwidth is the whole story.
         -p 'The capital of France is'         # L7c's gate, the other side
     $L/build/bin/llama-eval-callback -m $M -p 'hello' -n 1   # per-tensor dumps
     $L/build/bin/llama-perplexity -m $M -f models/wikitext-2-raw/wiki.test.raw -c 2048 -b 2048
+    $L/build/bin/llama-perplexity -m $M -f models/wikitext-2-raw/wiki.test.raw \
+        -c 2048 -b 2048 --chunks 4           # L8c-0's per-chunk comparison
+    $L/build/bin/llama-tokenize -m $M -f models/wikitext-2-raw/wiki.test.raw \
+        --ids --no-parse-special             # 297 193 ids, `cmp`-identical to ours
 
     # L2a's tool: a timestamp query around every dispatch in the Vulkan graph.
     # Costs 4-7% and prints one per-op-shape table per graph compute.
@@ -2808,6 +3030,10 @@ below Q8. Bandwidth is the whole story.
     go test ./llm/ -v -run TestHCGPUQ8       # L8b: the block on both banks,
                                              # fifteen rungs, every tensor
                                              # identical to the last bit
+    go test ./llm/ -v -run TestGraphForwardRows
+                                             # L8c-0: row t of a batch against
+                                             # the prompt truncated at t, and
+                                             # the head's slab loop
     go test ./llm/ -v -run TestMove          # L6c: the arena-to-arena move,
                                              # value for value against the
                                              # host narrowing it replaced
@@ -2826,10 +3052,10 @@ below Q8. Bandwidth is the whole story.
 |---|---|---|
 | D1 | **Consume UD-Q4_K_XL first, don't quantise from bf16.** | 114 GB instead of 360, an imatrix-calibrated checkpoint, and a bit-exact oracle. Phase order: run it, profile it, then optimise (`TODO.md`). |
 | D2 | **The n-gram table lives off-heap, mmap'd.** | 28.80 GB of capacity for 1.41 KB/token of bandwidth. **L1: llama.cpp already does this** — `TENSOR_READ_LAZY` — so it is the reference behaviour, not a deviation. |
-| D3 | **Target ~4.25 bits on everything *streamed*, not just the experts.** | 76% of decode bytes are dense. L0d adds the accuracy half: above ~5 bits the int8 activations are the floor anyway. |
+| D3 | ~~**Target ~4.25 bits on everything *streamed*, not just the experts.**~~ **Retired at L8c-1: measured, it is +18.5% of perplexity.** | The premise was right — 76% of decode bytes are dense — and the width was an inference from L0d's reconstruction ladder, which is a *proxy*. Measured end to end, the cost of 4 bits runs **inverse to the bytes**: the gated DeltaNet is 46% of a dense token for +1.49%, the hyper-connection block 14% for +5.98%. What replaces it is a **plan, not a width** (L8c-1's table), and the plan is not the sum of its families — errors injected at 36 or 48 depths compound on L6b-3's x1.085 a layer. L0d's finding 2 still stands where it was measured, on *weight reconstruction under int8 activations*; it does not carry to perplexity under fp16 ones. |
 | D4 | **Do not go below 4 bits on the experts.** | They are 24% of the traffic; Q3 buys ~11% for a real accuracy hit. |
 | D6 | **W4A8, with per-token activation scales.** | L0d: int8-per-token costs **1.13x** the error of fp16 activations, against a 3x throughput cliff. Per-token is free in the RMSNorm epilogue (§3.1). |
-| D7 | **Symmetric Q4, not asymmetric.** | L0d: 1.043-1.053x at equal bits, where §7 predicted 2x. Revisit only if L9's perplexity asks for it. |
+| D7 | **Symmetric Q4, not asymmetric — and `q4_0`'s sixteen levels, not `q4sym`'s fifteen. Reopened at L8c-2 on a new argument.** | L0d: asymmetric is 1.043-1.053x at equal bits, where §7 predicted 2x. **L8c-1 found the larger factor was inside the symmetric family**: every number in L0d used `d = amax/7` with q clamped to [-8, 7], of which only fifteen levels are reachable, where ggml's Q4_0 uses `d = -maxval/8` and reaches all sixteen. That is **1.13x on reconstruction at identical bits** and much more end to end (2.2813 against 2.4688 at four chunks) — bigger than the asymmetric gap D7 was decided on, and free. So the decision stands and its baseline moves: a 4-bit rung here is `q4_0`. **L8c-2 reopens it for a reason L0d could not see**: calibration *hurts* the symmetric form on the families whose importance is concentrated, and the format unsloth's imatrix was actually collected against is **Q4_K** — asymmetric, with a min and a scale per super-block, which is also what this checkpoint's own experts are. The case for asymmetric is no longer a 5% error reduction; it is that it may be the format calibration works with at all. Untested. |
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
 | D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
@@ -2837,8 +3063,9 @@ below Q8. Bandwidth is the whole story.
 | D15 | **At one token a block runs a different *kernel*, not a different rung, and the host refuses it above one token.** | L8d: `llm_moe_gemv.comp`, `llm_moe_router.comp` and `llm_gemv.comp` are the decode pipeline — no LDS slab, no barrier in the K loop, no cooperative matrix — and they are 1.87-3.06x on the two blocks that dominate a step while being *slower* at prefill, where the GEMM's fragment is full. The MoE's GEMV reads one row of a tile, which is every real row a tile has at one token and not at two, so `SetPlan`, `Upload` and `Resize` refuse it rather than drop rows; `Graph.PinSchedule` is what lets a test ask for the prefill kernels at any length. **§2.2's rule survives intact and was over-read**: nibbles cannot be unpacked into a cooperative-matrix *fragment*, and a dot product has no fragment. **L8e-1 adds the fifth block**, the full-attention layer, on the same kernel and the same refusal. |
 | D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. **L8d-5 shows it does not carry to another *matrix* either** — k8 wins at K = 2560 and k32 at K = 6144 on one kernel over one bank — and **L8d-3 shows where it stops applying**: the 2.63 MB router never leaves the MALL, so its KSLABS ladder is flat within 0.6 us. A rule about DRAM channels says nothing about a weight that does not reach DRAM. |
 | D16 | **A micro-bench rung whose measured rate is above the 242 GB/s bus is not a DRAM measurement; confirm it in the whole model before believing it.** | L8e-2: `-moe -tokens 1 -ladder` stages two layers and re-runs one dispatch twenty times, and a token's ten routed experts are ~32 MB — **the MALL exactly** — so every repetition after the first reads at 805-965 GB/s. The ladder then measures kernel shape against an L3 hit and picks the rung with the most parallelism rather than the best DRAM locality: v16w4 at **288 GB/s** for the routed up mode, which is **42.1 ms worse over 64 tokens** in the whole model where each expert is read once. This is D12 widened a fourth time — a ladder does not carry across a bank (L7d-2), a width (L8b-3), a matrix (L8d-5) or a **residency** — and the last one is a property of the harness rather than of the kernel. The test is on the face of the number: the fused attention projection's winner reads 39.5 MB in 174.3 us (227 GB/s, sound), its output projection's 16.7 MB in 24.6 (679, not). |
-| D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. **L8b holds the rule where it costs something**: `inject` does not begin on a column block, so keeping it in the tail means staging 32 low-rank rows twice, and the answer is to pay the 0.33 MB a mixer rather than to re-quantise four rows early. |
+| D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. **L8b holds the rule where it costs something**: `inject` does not begin on a column block, so keeping it in the tail means staging 32 low-rank rows twice, and the answer is to pay the 0.33 MB a mixer rather than to re-quantise four rows early. **L8c-1 makes the deferred decision and the tail loses**: `ssm_alpha`, `ssm_beta` and `inject` as int8 with a scale per 32 are **4.0294 against 4.0289, +0.01%** over the whole corpus — five times inside the error bar — so the two-plane machinery can go. It is worth **0.030 GB a token, 0.6%**, so the reason is deleting `lowRank`/`gateOff` from two kernels and L8b-1's doubled rows, not speed. The indexer's two BF16 projections rode along untested, because nothing at `-c 2048` reads them (L8c-1's finding 2). |
 | D14 | **At prefill the bank is not the kernel; at decode it is.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. |
+| D17 | **An accuracy delta is stated against our own number, not against the oracle's.** | L8c-0: at *identical* weights our perplexity is **4.0289** and llama.cpp's **4.0340** — −0.13%, a fifth of either side's standard error, and in the direction L4a-5 predicts, since the reference accumulates every quantised matmul in fp16 above 8 output columns where ours accumulate in f32. That gap is settled, is not the bank, and would be silently charged to the re-quantisation by a delta measured from 4.0340. The reference's number stays as the sanity check that the two implementations are the same model; the *stage's* gate is a delta from ours. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
@@ -3138,9 +3365,23 @@ below Q8. Bandwidth is the whole story.
 - **Does the scale plane's layout matter at *decode* too?** L0c is all GEMM.
   §1.8 measured the grouped GEMV paying 1.045-1.116x on the same axis and put
   it down to bytes alone, but it has not been tried with a k-major plane.
-- **How much of the Q8_0 dense allocation is actually needed?** D3 assumes
-  ~4.25 bits is enough; **4.0340** against L8c's re-measurement is the only
-  honest test.
+- ~~**How much of the Q8_0 dense allocation is actually needed?**~~
+  **Answered at L8c-1, and the answer is "most of it".** Unsloth put every
+  dense tensor at Q8_0 and the assumption here was that ~4.25 bits would do;
+  measured, that is **+18.5%** of perplexity, and the best mixed plan is
+  **+5.98%** for 1.38x the bytes. The choice was deliberate, not lazy. What is
+  now open is the *next* question rather than this one — **does calibration
+  move it** — which is L8c-2.
+- **Does the width question change under int8 activations?** L8c-1 measured
+  every rung with an **fp16 A operand**, because that is what our kernels
+  multiply; L0d's whole ladder assumes **int8 activations** and reports a
+  2.865e-02 activation floor that our numbers do not sit on. The two disagree
+  about which end is binding: L0d says above ~5 bits the activations are the
+  floor and so weight bits are wasted, and L8c-1 says the hyper-connection
+  block still wants 6.5 weight bits with no activation error at all. If W4A8
+  is ever built, its accuracy is **not** L8c-1's table plus a constant — the
+  errors are near-independent (L0d finding 2) and compound in quadrature, over
+  48 depths. Nobody has measured a W4A8 rung end to end on this model.
 - **`§3.4 finding 4` says prefill is "98% memory-bound by weight bytes";
   §2.2's direct measurement of a Q4 block says 2.2x above its memory floor.**
   L2a settles which is nearer: at 2048 tokens the expert bank is 64 GB, a

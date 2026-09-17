@@ -1,0 +1,10 @@
+chunks,baseline_ppl,scope,format,quant,ppl,delta_pct,note
+8,2.0189,every streamed dense family,q4_0/32,rtn,2.3927,18.51,ggml's quantize_row_q4_0_ref
+8,2.0189,every streamed dense family,q4_0/32,search,2.4802,22.85,make_qx_quants rmse_type 1
+8,2.0189,every streamed dense family,q4_0/32,imatrix,2.4702,22.35,quantize_row_q4_0_impl
+8,2.0189,every streamed dense family,q4_0/32,imatrix+gain,2.4798,22.83,unbiased scale over the same levels
+8,2.0189,hyper_conn,q4_0/32,rtn,2.1396,5.98,
+8,2.0189,hyper_conn,q4_0/32,imatrix,2.2014,9.04,
+8,2.0189,hyper_conn,q4_0/32,imatrix+gain,2.1768,7.82,the gain correction recovers a third
+8,2.0189,deltanet,q4_0/32,rtn,2.0489,1.49,
+8,2.0189,deltanet,q4_0/32,imatrix,2.0487,1.48,unmoved

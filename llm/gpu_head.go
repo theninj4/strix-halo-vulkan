@@ -228,6 +228,15 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 		if err != nil {
 			return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
 		}
+		// L8c's width simulation. The head is the one dense weight that does
+		// not reach the device through Model.F32 — it is 2.54 GB as floats
+		// and is dequantised a slab at a time here so that no whole f32 copy
+		// ever exists — so the hook has to be repeated rather than inherited.
+		// A slab is whole rows, so the grouping along k is the same as it
+		// would be for the matrix entire.
+		if err := DensePlan().ApplyTo(w.Name, w.Type == gguf.Q8_0, src, g.nEmbd); err != nil {
+			return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
+		}
 		if g.q8 {
 			tileBQ8(qs[:n*g.nEmbd], sc[:n*g.nEmbd/q8Group], src, n, g.nEmbd,
 				func(i int) int { return i })
@@ -255,6 +264,10 @@ func (g *HeadGPU) Kernel() GEMMKernel { return g.gemm }
 
 // Vocab is the head's output width.
 func (g *HeadGPU) Vocab() int { return g.vocab }
+
+// MaxRows is how many rows of logits the arena holds — what NewHeadGPU was
+// given, and the slab a caller that wants more than one row works in.
+func (g *HeadGPU) MaxRows() int { return g.tokens }
 
 // WeightBytes is the staged bank; ActivationBytes the two arenas.
 func (g *HeadGPU) WeightBytes() int     { return g.bank.Size() }

@@ -1,7 +1,10 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
+
 	"strix-halo-vulkan/util"
 )
 
@@ -115,4 +118,48 @@ type Message struct {
 	Content    MessageContent `json:"content,omitempty"`      // List of complex content (or a plain string when received)
 	ToolCallID string         `json:"tool_call_id,omitempty"` // ID of the tool call
 	ToolCalls  []*ToolCall    `json:"tool_calls,omitempty"`   // List of tool calls
+}
+
+// UnmarshalJSON accepts both shapes OpenAI's schema allows for a message's
+// content: a bare string, which is what most clients send, and an array of
+// content blocks, which is what a multimodal message is. Both land as an
+// array here, so nothing downstream has to know which arrived.
+//
+// A null content -- which an assistant message carrying only tool calls has
+// -- decodes to no blocks rather than an error.
+func (c *MessageContent) UnmarshalJSON(b []byte) error {
+	trimmed := bytes.TrimSpace(b)
+	switch {
+	case len(trimmed) == 0 || string(trimmed) == "null":
+		*c = nil
+		return nil
+	case trimmed[0] == '"':
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return err
+		}
+		*c = MessageContent{{Type: "text", Text: s}}
+		return nil
+	default:
+		var parts []Content
+		if err := json.Unmarshal(trimmed, &parts); err != nil {
+			return err
+		}
+		*c = parts
+		return nil
+	}
+}
+
+// Text is the message's text blocks joined, which is what a text-only model
+// is given. Blocks of any other type are skipped rather than rendered, so an
+// image in a conversation does not arrive as a caption the model would read
+// as words.
+func (c MessageContent) Text() string {
+	var b strings.Builder
+	for _, part := range c {
+		if part.Type == "" || part.Type == "text" {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
 }

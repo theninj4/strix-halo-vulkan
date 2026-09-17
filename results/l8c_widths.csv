@@ -1,0 +1,30 @@
+chunks,baseline_ppl,scope,format,bits_per_weight,ppl,delta_pct
+8,2.0189,none (control: default int8 arm),as shipped,8.50,2.0189,0.00
+8,2.0189,none (control: fp16 arm),as shipped,8.50,2.0189,0.00
+8,2.0189,Q8_0 sources only (control),q8sym/32,8.50,2.0189,0.00
+8,2.0189,non-Q8_0 sources only (the fp16 tail),q8sym/32,8.50,2.0082,-0.53
+8,2.0189,deltanet,q4_0/32,4.50,2.0489,1.49
+8,2.0189,deltanet,q5sym/32,5.50,2.0218,0.14
+8,2.0189,deltanet,q6sym/32,6.50,2.0263,0.37
+8,2.0189,full_attn,q4_0/32,4.50,2.0990,3.97
+8,2.0189,full_attn,q5sym/32,5.50,2.0350,0.80
+8,2.0189,full_attn,q6sym/32,6.50,2.0097,-0.46
+8,2.0189,hyper_conn,q4_0/32,4.50,2.1396,5.98
+8,2.0189,hyper_conn,q5sym/32,5.50,2.0935,3.70
+8,2.0189,hyper_conn,q6sym/32,6.50,2.0250,0.30
+8,2.0189,lm_head,q4_0/32,4.50,2.0245,0.28
+8,2.0189,lm_head,q5sym/32,5.50,2.0199,0.05
+8,2.0189,lm_head,q6sym/32,6.50,2.0205,0.08
+8,2.0189,qsa_indexer,q4_0/32,4.50,2.0189,0.00
+8,2.0189,ple_proj,q4_0/32,4.50,2.0087,-0.51
+8,2.0189,every streamed dense family,q4_0/32,4.50,2.3927,18.51
+16,3.0436,hyper_conn,q4_0/16,5.00,3.1969,5.04
+16,3.0436,hyper_conn,q5sym/32,5.50,3.1494,3.48
+16,3.0436,hyper_conn,q5sym/16,6.00,3.1172,2.42
+145,4.0289,none (L8c-0),as shipped,8.50,4.0289,0.00
+145,4.0289,the mixed plan,dn+head 4.50 / attn+hc 6.50,5.30,4.2699,5.98
+4,1.9432,every streamed dense family but lm_head (pre-fix),q4sym/32,4.50,2.4688,27.05
+4,1.9432,every streamed dense family but lm_head (pre-fix),q4_0/32,4.50,2.2813,17.40
+4,1.9432,every streamed dense family but lm_head (pre-fix),q4_0/64,4.25,2.4722,27.22
+4,1.9432,every streamed dense family but lm_head (pre-fix),q5sym/32,5.50,2.0353,4.74
+145,4.0289,non-Q8_0 sources only (the fp16 tail),q8sym/32,8.50,4.0294,0.01

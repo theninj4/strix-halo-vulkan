@@ -36,17 +36,38 @@ func main() {
 	tensors := flag.Bool("tensors", false, "list every tensor instead of collapsing repeated layers")
 	kv := flag.Bool("kv", false, "print the metadata table")
 	check := flag.String("check", "", "compare the tensor table against reference/gguf_inventory.py's tensors.json")
+	width := flag.Float64("width", 0, "L8c: re-price the decode budget with the streamed dense families at this many bits a weight")
+	expertWidth := flag.Float64("expert-width", 0, "L8c: and the 512 expert banks at this many")
+	routerWidth := flag.Float64("router-width", 0, "L8c: and the F32 router at this many (16 is D3's fp16)")
 	flag.Parse()
 	if flag.NArg() != 1 {
 		fmt.Fprintf(os.Stderr, "usage: %s [-tensors] [-kv] [-check tensors.json] <checkpoint|shard|dir>\n", os.Args[0])
 		os.Exit(2)
 	}
-	if err := run(flag.Arg(0), *tensors, *kv, *check); err != nil {
+	w := widths{dense: *width, experts: *expertWidth, router: *routerWidth}
+	if err := run(flag.Arg(0), *tensors, *kv, *check, w); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(path string, listTensors, listKV bool, check string) error {
+// widths is L8c's what-if: a candidate bits-per-weight for each of the three
+// parts of the budget that could move, zero meaning "as the checkpoint ships
+// it". It prices a format; it says nothing about whether the model survives
+// it, which is what `cmd/llm -ppl` under `LLM_DENSE_SIM` is for.
+type widths struct{ dense, experts, router float64 }
+
+func (w widths) any() bool { return w.dense > 0 || w.experts > 0 || w.router > 0 }
+
+// streamedDense are the groups a dense re-quantisation would reach: every
+// matmul read once per token that is not the router and not an expert. It is
+// the same list as llm.SimFamilies(), so an accuracy row and a byte row name
+// the same thing.
+var streamedDense = map[string]bool{
+	"deltanet": true, "hyper_conn": true, "lm_head": true,
+	"full_attn": true, "qsa_indexer": true, "ple_proj": true,
+}
+
+func run(path string, listTensors, listKV bool, check string, w widths) error {
 	set, err := gguf.OpenSet(path)
 	if err != nil {
 		return err
@@ -67,7 +88,7 @@ func run(path string, listTensors, listKV bool, check string) error {
 		printKV(set)
 	}
 
-	printGroups(set)
+	printGroups(set, w)
 
 	if listTensors {
 		printTensors(set)
@@ -122,7 +143,7 @@ type groupStat struct {
 	mix    map[gguf.Type]int64
 }
 
-func printGroups(set *gguf.Set) {
+func printGroups(set *gguf.Set, w widths) {
 	g := map[string]*groupStat{}
 	for _, t := range set.Tensors {
 		name := group(t.Name)
@@ -190,6 +211,72 @@ func printGroups(set *gguf.Set) {
 		float64(dense)/1e9, experts/1e9, perToken/1e9)
 	fmt.Printf("  at %.0f GB/s (IDEAS §1.7) that is a %.1f tok/s ceiling\n", busGBs, busGBs/(perToken/1e9))
 	fmt.Printf("  dense is %.0f%% of it\n", 100*float64(dense)/perToken)
+
+	if w.any() {
+		printWidths(g, names, w, nExpert, nUsed, perToken)
+	}
+}
+
+// printWidths re-prices the budget at a candidate set of widths.
+//
+// Bytes are the half of L8c that is arithmetic: a group's parameter count is
+// a fact about the checkpoint, so what it costs at 4.25 bits needs no
+// measurement. The half that does is whether the model survives, and that is
+// `LLM_DENSE_SIM` plus `cmd/llm -ppl`.
+func printWidths(g map[string]*groupStat, names []string, w widths, nExpert, nUsed uint64, was float64) {
+	bytesAt := func(name string, s *groupStat) float64 {
+		bits := 0.0
+		switch {
+		case streamedDense[name]:
+			bits = w.dense
+		case name == "moe_experts":
+			bits = w.experts
+		case name == "moe_router":
+			bits = w.router
+		}
+		if bits <= 0 {
+			return float64(s.bytes)
+		}
+		return float64(s.params) * bits / 8
+	}
+	fmt.Printf("\nre-priced: dense %s, experts %s, router %s\n",
+		bitsLabel(w.dense), bitsLabel(w.experts), bitsLabel(w.router))
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "GROUP\tBITS/W\tGB\tGB/TOKEN\tWAS")
+	var dense, expertBytes float64
+	for _, n := range names {
+		s := g[n]
+		if gathered[n] {
+			continue
+		}
+		now := bytesAt(n, s)
+		share := 1.0
+		if n == "moe_experts" && nExpert > 0 {
+			share = float64(nUsed) / float64(nExpert)
+			expertBytes = now
+		} else if n != "moe_experts" {
+			dense += now
+		}
+		fmt.Fprintf(tw, "%s\t%.2f\t%.2f\t%.3f\t%.3f\n", n, now*8/float64(s.params),
+			now/1e9, now*share/1e9, float64(s.bytes)*share/1e9)
+	}
+	tw.Flush()
+	experts := expertBytes
+	if nExpert > 0 {
+		experts = expertBytes * float64(nUsed) / float64(nExpert)
+	}
+	now := dense + experts
+	fmt.Printf("decode: dense %.3f + experts %.3f = %.3f GB/token  (was %.3f, %.2fx)\n",
+		dense/1e9, experts/1e9, now/1e9, was/1e9, was/now)
+	fmt.Printf("  at %.0f GB/s that is a %.1f tok/s ceiling (was %.1f)\n",
+		busGBs, busGBs/(now/1e9), busGBs/(was/1e9))
+}
+
+func bitsLabel(b float64) string {
+	if b <= 0 {
+		return "as shipped"
+	}
+	return fmt.Sprintf("%.2f bits", b)
 }
 
 func mixString(mix map[gguf.Type]int64) string {

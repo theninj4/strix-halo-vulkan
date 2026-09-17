@@ -70,6 +70,13 @@ type GraphOpts struct {
 	// NoHead leaves `output.weight` unstaged, which saves 1.27 GB and 20
 	// seconds for a caller that wants `result_norm` and not logits.
 	NoHead bool
+	// HeadRows is how many rows of logits the head's arena holds. One is
+	// what the reference computes and what every caller before L8c wanted:
+	// llama.cpp's graph ends with `inp_out_ids`, so prefill projects the
+	// last token alone. A perplexity run wants every row, and a row is
+	// 0.99 MB of f32 — 2.03 GB for a 2048-token chunk — so it names the
+	// slab it works in here rather than asking for the batch.
+	HeadRows int
 	// DenseFP16 stages the dense weights as halves, which is what every
 	// block did before L8. It is the control, not the default: the bank L8
 	// stages is the checkpoint's own int8 with an fp16 scale per 32 elements,
@@ -86,7 +93,15 @@ func (o GraphOpts) denseQ8() bool { return !o.DenseFP16 && DenseQ8() }
 // DenseQ8 is that choice for a caller with no options of its own — the block
 // benchmarks and `-resident`. L8's bank is the default and `LLM_DENSE_FP16=1`
 // is the control, on the precedent of L6b's `LLM_ARENA_UNCACHED`.
-func DenseQ8() bool { return os.Getenv("LLM_DENSE_FP16") != "1" }
+//
+// **A width simulation forces the fp16 arm** (sim.go). L8a's int8 bank is an
+// identity only for a Q8_0 tensor, so staging a simulated Q4 weight through
+// it would quantise twice and the number measured would be neither format's.
+// The fp16 tiling holds the candidate's own halves exactly, which is the
+// whole basis of the simulation, so it is the arm a sim has to use — at the
+// cost of residency and tok/s being the fp16 arm's, which a sim cannot
+// measure anyway.
+func DenseQ8() bool { return os.Getenv("LLM_DENSE_FP16") != "1" && DensePlan().Off() }
 
 // DecodeGEMV is whether the one-token kernels L8d added are in use: the MoE's
 // expert GEMVs and split-K router, and the dense split-K GEMV under the gated
@@ -491,7 +506,11 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		if err != nil {
 			return fmt.Errorf("llm: output.weight: %w", err)
 		}
-		if g.head, err = NewHeadGPU(dev, c.NEmbd, t, 1, opts.denseQ8()); err != nil {
+		headRows := opts.HeadRows
+		if headRows <= 0 {
+			headRows = 1
+		}
+		if g.head, err = NewHeadGPU(dev, c.NEmbd, t, headRows, opts.denseQ8()); err != nil {
 			return fmt.Errorf("llm: head: %w", err)
 		}
 		mark("lm head", 1, g.head.Buffers(), g.head.WeightBytes(), g.head.ActivationBytes(), start)
@@ -625,6 +644,79 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	since(&g.Stats.Glue, t0)
 	g.Stats.Total += time.Since(top)
 	return logits, norm, nil
+}
+
+// ForwardRows runs the model over a prompt as a fresh sequence and hands
+// every row's logits from `first` on to fn, a head-arena slab at a time.
+//
+// It is Forward without `inp_out_ids`, and it exists because perplexity is
+// the one question in this vertical that needs a logit per token. The
+// reference's graph drops every row but the last before the final mixer, so
+// `hidden` moves one row to the front and runs the mixer and the head on it;
+// here the mixer runs over the whole batch — it is per token, so that is the
+// same arithmetic on nTok times the work — and the head then runs over slabs
+// of GraphOpts.HeadRows, because a row of logits is 0.99 MB and nothing
+// reads two of them at once.
+//
+// fn sees a slice into the head's mapped arena and must not keep it: the
+// next slab overwrites it.
+func (g *Graph) ForwardRows(ids []int32, first int, fn func(t int, logits []float32) error) error {
+	if g.head == nil {
+		return fmt.Errorf("llm: this graph was staged without a head")
+	}
+	if first < 0 || first >= len(ids) {
+		return fmt.Errorf("llm: first row %d of %d tokens", first, len(ids))
+	}
+	if err := g.Reset(); err != nil {
+		return err
+	}
+	top := time.Now()
+	g.record()
+	if err := g.appendN(ids, g.nLayer); err != nil {
+		_ = g.flush()
+		return err
+	}
+	t0 := time.Now()
+	if err := g.hc.Run(2*g.nLayer, false); err != nil {
+		_ = g.flush()
+		return fmt.Errorf("llm: head mixer: %w", err)
+	}
+	g.blk(&g.Stats.HC, t0)
+	if err := g.flush(); err != nil {
+		return err
+	}
+
+	// The head, a slab at a time. Each slab is its own command buffer
+	// because the logits have to be read between them, and nothing may read
+	// a device arena while a pass is being recorded (flush's one rule).
+	slab, vocab := g.head.MaxRows(), g.head.Vocab()
+	for r0 := first; r0 < len(ids); r0 += slab {
+		n := minInt(slab, len(ids)-r0)
+		g.record()
+		err := func() error {
+			if err := g.head.Resize(n); err != nil {
+				return err
+			}
+			if err := g.move.Move(g.head.InPort(), g.hc.MixedRowPort(r0), n); err != nil {
+				return err
+			}
+			return g.head.Run()
+		}()
+		if ferr := g.flush(); err == nil {
+			err = ferr
+		}
+		if err != nil {
+			return err
+		}
+		lg := g.head.Logits()
+		for i := 0; i < n; i++ {
+			if err := fn(r0+i, lg[i*vocab:(i+1)*vocab]); err != nil {
+				return err
+			}
+		}
+	}
+	g.Stats.Total += time.Since(top)
+	return nil
 }
 
 // Hidden runs every layer and the final mixer over a fresh sequence, and

@@ -37,6 +37,12 @@ want "UD-Q4_K_XL/$N-00002-of-00004.gguf" 49859583136 || exit 1
 want "UD-Q4_K_XL/$N-00003-of-00004.gguf" 49376141504 || exit 1
 want "UD-Q4_K_XL/$N-00004-of-00004.gguf" 12087983520 || exit 1
 want "MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf" 2786204800 || exit 1
+# Unsloth's published importance matrix (LLM.md L8c-2): 1852 F32 tensors,
+# `<weight>.in_sum2` and `.counts`, 45 chunks of their own calibration set.
+# It is what makes "does calibration move the widths" a free question rather
+# than a 360 GB one. Note the source name's `_file` suffix.
+want "imatrix_unsloth.gguf_file" 580038720 || exit 1
+[ -f "$D/imatrix_unsloth.gguf" ] || mv "$D/imatrix_unsloth.gguf_file" "$D/imatrix_unsloth.gguf"
 # The perplexity corpus, so the accuracy reference is reproducible: L1's
 # PPL = 4.0340 is this file at n_ctx 2048 (research/l1-baseline.md).
 W=$(dirname "$D")/wikitext-2-raw
