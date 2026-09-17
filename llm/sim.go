@@ -868,18 +868,25 @@ const asymSuperBlocks = 8
 // amortised. That is a real format — nothing in `make_qkx3_quants` or
 // `make_qp_quants` knows the count — and it costs 4.475 bits a weight at 320
 // rather than 4.500, which the caller states rather than rounds off.
-func (q QuantSim) superBlocks(k int) (int, error) {
-	if k%q.Group != 0 {
-		return 0, fmt.Errorf("llm: group %d does not divide a row of %d", q.Group, k)
+// **L8c-6 makes the bank read it too**, rather than a copy of it: a staged
+// 320-wide row has to be divided into the same ten groups the simulation
+// measured, or "the bank is the format" stops being true by construction.
+func (q QuantSim) superBlocks(k int) (int, error) { return asymSubBlocks(k, q.Group) }
+
+// asymSubBlocks is that rule with the group length passed in, which is what
+// bank_q4.go has and a QuantSim is not always at hand for.
+func asymSubBlocks(k, group int) (int, error) {
+	if group <= 0 || k%group != 0 {
+		return 0, fmt.Errorf("llm: group %d does not divide a row of %d", group, k)
 	}
-	if k%(asymSuperBlocks*q.Group) == 0 {
+	if k%(asymSuperBlocks*group) == 0 {
 		return asymSuperBlocks, nil
 	}
-	if n := k / q.Group; n >= 2 && n <= 2*asymSuperBlocks {
+	if n := k / group; n >= 2 && n <= 2*asymSuperBlocks {
 		return n, nil
 	}
 	return 0, fmt.Errorf("llm: a row of %d is neither a multiple of %d nor short enough to be one super-block",
-		k, asymSuperBlocks*q.Group)
+		k, asymSuperBlocks*group)
 }
 
 // applyAsym round-trips a weight through ggml's K-quant form: LLM.md L8c-3.

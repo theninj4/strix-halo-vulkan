@@ -26,3 +26,28 @@ void q4kScaleMin(uint j, uvec3 s, out uint sc, out uint mn) {
         mn = (a >> 4) | ((q4kByte(s, j) >> 6) << 4);
     }
 }
+
+// **The ten-group record**: LLM.md L8c-6, and the one place this bank is not
+// ggml's.
+//
+// `get_scale_min_k4` above *is* eight groups — four pairs carried whole and
+// four whose high bits are stolen from the first four's spare ones — so there
+// is no ten-group spelling of it. The hyper-connection block's up projection
+// reads the low-rank space and is 320 wide, which is ten groups of 32 and one
+// super-block for the whole row, so its record is twenty bytes rather than
+// sixteen: the fp16 pair, then twelve bits a group at bit 12*j of a
+// little-endian bit stream, scale in the low six and min in the high six.
+//
+// The decode is a shift and a mask where ggml's is a branch. j*12 crosses a
+// word boundary only at j = 2 and j = 5, and in both the next word exists, so
+// there is no guard on the high half beyond the shift that makes it zero.
+void q4kScaleMin12(uint j, uvec4 s, out uint sc, out uint mn) {
+    uint b = j * 12u;
+    uint w = b >> 5, o = b & 31u;
+    uint v = s[w] >> o;
+    if (o > 20u) {
+        v |= s[w + 1u] << (32u - o);
+    }
+    sc = v & 63u;
+    mn = (v >> 6) & 63u;
+}

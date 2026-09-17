@@ -1939,6 +1939,21 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -DQ8B -DDENSE_Q8 -o llm_hc_down_q8_m8.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -DQ8B -DDENSE_Q8 -o llm_hc_up_q8_m8.spv llm_gemm.comp
 
+// The same eight rungs over L8c-4's 4.5-bit bank (LLM.md L8c-6), and the one
+// build in this file that is not ggml's K-quant. MODE 0's k is 10240, so a
+// super-block is ggml's eight groups of 32 and the record is its sixteen
+// bytes; **MODE 1's k is 320** — the low-rank space — so its super-block is
+// the whole row, ten groups, and `-DQ4K_SUB=10` picks the twenty-byte record
+// and the twelve-bit decode `get_scale_min_k4` has no spelling for.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m8.spv llm_gemm.comp
+
 // The down projection again, at one token: LLM.md L7d. `llm_gemm.comp` blocks
 // the output columns, so a fused N of 336 is seven workgroups on a 40-CU
 // device and the projection reads 29 GB/s of a 242 GB/s bus (L7c-6). At M=1
@@ -1975,6 +1990,17 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s40.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s80.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ8B -DDENSE_Q8 -o llm_hc_gemv_q8_s160.spv llm_hc_gemv.comp
+
+// And the same six over the 4.5-bit bank (L8c-6). A slab is
+// `(gemmK/16/KSLABS) * 128` bytes here — half the Q8 arm's again — so D12
+// says the ladder slides one more rung along §5.1b's 4 KB rotation and the
+// rung to pick is measured rather than carried over.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s8.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s16.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s32.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s40.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s80.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s160.spv llm_hc_gemv.comp
 
 // The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
 // a prefill graph — its key projection is one dispatch of the 37 that share
@@ -2083,6 +2109,32 @@ var LLMHCDownQ8M8 []byte
 //go:embed llm_hc_up_q8_m8.spv
 var LLMHCUpQ8M8 []byte
 
+// The same rungs over L8c-4's 4.5-bit bank (L8c-6).
+
+//go:embed llm_hc_down_q4_m1.spv
+var LLMHCDownQ4M1 []byte
+
+//go:embed llm_hc_down_q4_m2.spv
+var LLMHCDownQ4M2 []byte
+
+//go:embed llm_hc_down_q4_m4.spv
+var LLMHCDownQ4M4 []byte
+
+//go:embed llm_hc_down_q4_m8.spv
+var LLMHCDownQ4M8 []byte
+
+//go:embed llm_hc_up_q4_m1.spv
+var LLMHCUpQ4M1 []byte
+
+//go:embed llm_hc_up_q4_m2.spv
+var LLMHCUpQ4M2 []byte
+
+//go:embed llm_hc_up_q4_m4.spv
+var LLMHCUpQ4M4 []byte
+
+//go:embed llm_hc_up_q4_m8.spv
+var LLMHCUpQ4M8 []byte
+
 // LLMHCGemvS* is the split-K down projection at one token and LLMHCGemvR* the
 // reduction and epilogue that closes it (L7d). They come in pairs: the slab
 // count is compiled into both.
@@ -2143,6 +2195,26 @@ var LLMHCGemvQ8S80 []byte
 
 //go:embed llm_hc_gemv_q8_s160.spv
 var LLMHCGemvQ8S160 []byte
+
+// LLMHCGemvQ4S* is the same over the 4.5-bit bank (L8c-6).
+
+//go:embed llm_hc_gemv_q4_s8.spv
+var LLMHCGemvQ4S8 []byte
+
+//go:embed llm_hc_gemv_q4_s16.spv
+var LLMHCGemvQ4S16 []byte
+
+//go:embed llm_hc_gemv_q4_s32.spv
+var LLMHCGemvQ4S32 []byte
+
+//go:embed llm_hc_gemv_q4_s40.spv
+var LLMHCGemvQ4S40 []byte
+
+//go:embed llm_hc_gemv_q4_s80.spv
+var LLMHCGemvQ4S80 []byte
+
+//go:embed llm_hc_gemv_q4_s160.spv
+var LLMHCGemvQ4S160 []byte
 
 //go:embed llm_gemm_plain_m2.spv
 var LLMGEMMPlainM2 []byte

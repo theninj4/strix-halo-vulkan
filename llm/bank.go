@@ -154,6 +154,36 @@ func roundI8(v float32) int8 {
 // that is not four-aligned would read across the boundary.
 func q8Align(n int) int { return (n + 15) &^ 15 }
 
+// BankLevelBytes and BankPlaneBytes split a staged [n, k] matrix into its two
+// planes, because the benchmarks price them separately: a fused matrix stages
+// the *whole* N in both planes and reads only part of the first, so the
+// arithmetic a dispatch's GB/s comes out of is not `q8Bytes` or `q4kBytes`.
+//
+//	fp16    2 bytes a weight, no second plane
+//	q8      1 byte a weight, an fp16 scale per 32
+//	q4_k    a nibble a weight, a sixteen- or twenty-byte record per
+//	        (n-tile, super-block, row)
+func BankLevelBytes(b DenseBank, n, k int) int {
+	switch b {
+	case BankQ8:
+		return n * k
+	case BankQ4K:
+		return n * k / 2
+	}
+	return n * k * 2
+}
+
+// BankPlaneBytes is the second plane alone, and zero on the fp16 bank.
+func BankPlaneBytes(b DenseBank, n, k int) int {
+	switch b {
+	case BankQ8:
+		return n * k / q8Group * 2
+	case BankQ4K:
+		return q4kBytes(n, k) - n*k/2
+	}
+	return 0
+}
+
 // bankPipe names a bank's build of a GEMM rung inside a block that holds
 // more than one. A block on a quantised bank still needs the fp16 arm for
 // whatever rows of a fused matrix the checkpoint does not ship quantised, so

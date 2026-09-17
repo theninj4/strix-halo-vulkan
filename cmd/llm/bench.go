@@ -100,13 +100,14 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 	for _, t := range tokens {
 		maxTok = max(maxTok, t)
 	}
-	g, err := llm.NewHCGPU(dev, cfg, maxTok, ws, llm.HCOpts{Q8: llm.DenseQ8()})
+	g, err := llm.NewHCGPU(dev, cfg, maxTok, ws, llm.HCBankOpts())
 	if err != nil {
 		return err
 	}
 	defer g.Destroy()
-	fmt.Printf("%d mixers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens\n\n",
-		g.Mixers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
+	bank := g.Bank()
+	fmt.Printf("%d mixers staged on the %s bank: %.1f MB of weights, %.1f MB of arenas for %d tokens\n\n",
+		g.Mixers(), bank, float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
 
 	// Nil means the measured schedule, llm.PlanFor, chosen per length.
 	// Nil means the measured schedule; a ladder is built per length, because
@@ -141,7 +142,7 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 		if ladder {
 			todo = ladderFor(tok)
 		} else {
-			d, u := llm.PlanFor(tok, llm.DenseQ8())
+			d, u := llm.PlanForBank(tok, bank)
 			todo = [][2]llm.HCKernel{{d, u}}
 		}
 		for _, p := range todo {
@@ -157,7 +158,7 @@ func hcBench(model string, tokens []int, mixers, iters int, ladder bool, csvPath
 			for _, s := range st {
 				total += s.GPU
 				us := float64(s.GPU.Nanoseconds()) / 1e3
-				gf, gb := hcRates(s.Kind, cfg, tok, llm.DenseQ8(), s.GPU)
+				gf, gb := hcRates(s.Kind, cfg, tok, bank, s.GPU)
 				fmt.Printf("  %-8s %8.1f us  x%d = %7.1f ms", s.Kind, us, mixersPerGraph,
 					us*mixersPerGraph/1e3)
 				if gf > 0 {
@@ -232,7 +233,7 @@ func reportAgainstLlama(st []llm.Stage, total time.Duration) {
 // last column block is halves (LLM.md L8b). Quoting fp16 bytes against a Q8
 // bank would report a rate the kernel never asked the bus for, which is the
 // one number this table exists to be honest about.
-func hcRates(kind string, c llm.HCConfig, tok int, q8 bool, d time.Duration) (gflops, gbps float64) {
+func hcRates(kind string, c llm.HCConfig, tok int, bank llm.DenseBank, d time.Duration) (gflops, gbps float64) {
 	if d <= 0 {
 		return 0, 0
 	}
@@ -244,9 +245,9 @@ func hcRates(kind string, c llm.HCConfig, tok int, q8 bool, d time.Duration) (gf
 		return 0, (t*wide*4 + t*wide*2) / s / 1e9
 	case "down":
 		n := lr + float64(coopTile)
-		return 2 * t * n * wide / s / 1e9, (hcWeightBytes(n, wide, q8, c) + t*wide*2) / s / 1e9
+		return 2 * t * n * wide / s / 1e9, (hcWeightBytes(n, wide, bank, c) + t*wide*2) / s / 1e9
 	case "up":
-		return 2 * t * wide * lr / s / 1e9, (hcWeightBytes(wide, lr, q8, llm.HCConfig{}) + t*wide*2) / s / 1e9
+		return 2 * t * wide * lr / s / 1e9, (hcWeightBytes(wide, lr, bank, llm.HCConfig{}) + t*wide*2) / s / 1e9
 	case "combine":
 		// Read the residual, read the block output, write the residual.
 		return 0, (2*t*wide*4 + t*wide/4*4) / s / 1e9
@@ -256,18 +257,20 @@ func hcRates(kind string, c llm.HCConfig, tok int, q8 bool, d time.Duration) (gf
 
 // hcWeightBytes is what one [n, k] projection of this block pulls off DRAM.
 // A non-zero cfg marks the fused down projection, whose last column block is
-// a fp16 tail the Q8 arm reads instead of the int8 columns behind it.
-func hcWeightBytes(n, k float64, q8 bool, down llm.HCConfig) float64 {
-	if !q8 {
+// a fp16 tail a quantised arm reads instead of the levels behind it.
+func hcWeightBytes(n, k float64, bank llm.DenseBank, down llm.HCConfig) float64 {
+	if bank == llm.BankFP16 {
 		return n * k * 2
 	}
 	split := n
 	if down.LowRank != 0 {
 		split = float64(llm.HCQ8Split(down))
 	}
-	// int8 up to the split, the scale plane for the whole staged N, and the
-	// tail as halves.
-	return split*k + n*k/32*2 + (n-split)*k*2
+	// The levels up to the split, the second plane for the whole staged N —
+	// the kernel derives its base from gemmN and cannot be told otherwise —
+	// and the tail as halves.
+	return float64(llm.BankLevelBytes(bank, int(split), int(k))) +
+		float64(llm.BankPlaneBytes(bank, int(n), int(k))) + (n-split)*k*2
 }
 
 // coopTile is the fragment extent the inject columns are padded up to.

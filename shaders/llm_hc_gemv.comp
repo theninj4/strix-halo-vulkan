@@ -84,6 +84,19 @@
 // their f32 product is exact and the second rounding is the only one.
 // TestHCGPUQ8IsTheHalves is the check, over both dispatches of the pair.
 
+// **-DQ4B is L8c-6's arm**, and it is the same kernel again with a nibble
+// where the Q8 arm has a byte. The fused down projection's k is 10240, so a
+// super-block is ggml's eight groups and the record is the sixteen bytes
+// `llm_q4k.glsl` decodes — the ten-group packing the block's *up* projection
+// needs never reaches this kernel, because at one token the up projection is
+// still a GEMM (its N is 10240 and the parallelism is already there).
+//
+// Unlike the Q8 arm it is **not** bit-exact against the GEMM, and cannot be:
+// a K-quant group is affine, so `d*sc*l - dmin*m` has a subtraction in it and
+// there is no pair of exact halves to multiply. The register path carries one
+// fewer rounding than the GEMM's LDS store, which is L8c-4's finding on the
+// lm head and the same size here.
+
 #include "llm_common.glsl"
 
 #ifndef MODE
@@ -106,6 +119,10 @@
 #define TILE 16
 #define WAVE 64
 
+#ifdef Q4B
+#include "llm_q4k.glsl"
+#endif
+
 layout(local_size_x = WAVE) in;
 
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
@@ -123,7 +140,20 @@ void main() {
     uint sub = lane / TILE;                      // which of the four tiles of a step
     uint xbase = pc.xnOff + kt0 * TILE;
 
-#ifdef Q8B
+#ifdef Q4B
+    // The split is the Q8 arm's, derived the same way from the same
+    // `pc.lowRank`: the fused down projection is quantised up to the column
+    // block that holds `inject` and halves from there on.
+    uint qSplit = (pc.lowRank / DOWN_BN) * DOWN_BN;
+    bool tail = nt * TILE >= qSplit;
+    uint nsb = pc.gemmK >> 8;
+    uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
+    // A tile is 32 words and a lane owns two of them — the eight k either
+    // side of `col`'s sixteen — with `sub` picking which of the step's four
+    // tiles, the way lane*4 does on the Q8 arm.
+    uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
+    uint wbase = pc.gateOff + ((nt - qSplit / TILE) * ktiles + kt0) * (TILE * TILE);
+#elif defined(Q8B)
     // The fused down projection is int8 up to the column block that holds
     // `inject`, and halves from there on: the same split llm_gemm.comp's
     // MODE 0 arm derives, from the same `pc.lowRank`, because the two read
@@ -144,7 +174,36 @@ void main() {
 #endif
 
     float sum = 0.0;
-#ifdef Q8B
+#ifdef Q4B
+    if (!tail) {
+        uint curSB = 0xffffffffu;
+        uvec4 rec = uvec4(0u);
+        for (uint c = 0u; c < perSlab; c += 4u) {
+            uint g = (kt0 + c + sub) >> 1;       // a 32-group is two k-tiles
+            uint sb = g >> 3;
+            if (sb != curSB) {
+                curSB = sb;
+                uint idx = rec0 + ((nt * nsb + sb) * TILE + col) * 4u;
+                rec = uvec4(w8[idx], w8[idx + 1u], w8[idx + 2u], w8[idx + 3u]);
+            }
+            uint sc, mn;
+            q4kScaleMin(g & 7u, rec.yzw, sc, mn);
+            vec2 dd = unpackHalf2x16(rec.x);
+            float ds = dd.x * float(sc), dm = dd.y * float(mn);
+            uint w = qbase + c * 32u;
+            uint x = xbase + (c + sub) * TILE;
+            [[unroll]] for (uint u = 0u; u < 2u; u++) {
+                uint word = w8[w + u];
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    uint by = bitfieldExtract(word, int(t * 8u), 8);
+                    uint e = u * 8u + t * 2u;
+                    sum += (ds * float(by & 0xFu) - dm) * float(hact[x + e]);
+                    sum += (ds * float(by >> 4) - dm) * float(hact[x + e + 1u]);
+                }
+            }
+        }
+    } else
+#elif defined(Q8B)
     if (!tail) {
         // One step is four tiles: 1024 bytes of weight, 64 halves of
         // activation, and one scale a lane — group (kt0+c+sub)/2.

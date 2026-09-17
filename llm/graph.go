@@ -411,7 +411,13 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		return fmt.Errorf("llm: hc head mixer: %w", err2)
 	}
 	mixers = append(mixers, head)
-	if g.hc, err = NewHCGPU(dev, c.HCConfig(), g.maxTok, mixers, HCOpts{Q8: opts.denseQ8()}); err != nil {
+	// L8c-6's bank, where the plan names this family. `hc_attn_down` is the
+	// tensor `simFamily` maps to "hyper_conn" and the checkpoint ships it as
+	// Q8_0, which is what the `true` says; `inject` is F32 and stays in the
+	// fp16 tail whatever this is (D13).
+	hcOpts := HCBankOpts()
+	hcOpts.Q8 = opts.denseQ8()
+	if g.hc, err = NewHCGPU(dev, c.HCConfig(), g.maxTok, mixers, hcOpts); err != nil {
 		return fmt.Errorf("llm: hc: %w", err)
 	}
 	mark("hyper-conn", len(mixers), g.hc.Buffers(), g.hc.WeightBytes(), g.hc.ActivationBytes(), start)

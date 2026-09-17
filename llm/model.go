@@ -149,6 +149,7 @@ func (m *Model) HCWeights(layer int, side string) (HCWeights, error) {
 	}
 	var w HCWeights
 	var err error
+	w.Name = prefix
 	if w.Norm, err = m.F32(prefix + "norm.weight"); err != nil {
 		return w, err
 	}

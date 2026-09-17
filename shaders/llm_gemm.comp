@@ -87,6 +87,13 @@
 // vector the unpack indexes. That is one sixteen-byte load per column per 256
 // k — the format's own 12.5% — rather than eight.
 //
+// **-DQ4K_SUB=10 is L8c-6's build of the same arm**, for the one dense family
+// whose k is not a multiple of 256: the hyper-connection block's up
+// projection reads the low-rank space and is 320 wide, so its super-block is
+// the whole row. Three numbers change — a super-block is 320 k, a record is
+// five words rather than four, and the pairs come out of `q4kScaleMin12`
+// instead of `get_scale_min_k4` — and nothing else does.
+//
 // The values it puts in LDS are **bit-identical** to the halves the fp16 arm
 // reads, for every tensor the checkpoint stores as Q8_0 — which is every
 // dense weight but the routers, the two indexer projections and three small
@@ -149,6 +156,22 @@ shared float16_t sQB[BN * LDS_ROW];
 // below assumes it rather than testing it.
 #if BK != 32
 #error "the q4_k arm wants BK_TILES = 2, so that a k-slab is one scale group"
+#endif
+// **How many groups share one fp16 pair**, and the one thing about this bank
+// that is not the same in every build: LLM.md L8c-6. Eight is ggml's QK_K/32
+// and every matrix in this model whose k is a multiple of 256; ten is the
+// 320-wide hyper-connection up projection, whose super-block is the whole row
+// because `get_scale_min_k4` is four low pairs and four high ones and not a
+// length. The two differ in three numbers — the super-block's extent, the
+// record's word count and which decode reads it — and in nothing else.
+#ifndef Q4K_SUB
+#define Q4K_SUB 8
+#endif
+#define Q4K_SB (32u * uint(Q4K_SUB))
+#if Q4K_SUB == 8
+#define Q4K_REC_WORDS 4u
+#else
+#define Q4K_REC_WORDS 5u
 #endif
 shared float sQS[BN];   // d * sc for this slab's group, per column
 shared float sQM[BN];   // dmin * m, the same
@@ -215,12 +238,15 @@ void main() {
     // arrangement, and the same reason, as the Q8 arm below.
     uint qw0 = pc.bOff >> 2;                                   // the tiles, in words
     uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2; // the records, in words
-    uint nsb = pc.gemmK >> 8;                                  // super-blocks a row
+    uint nsb = pc.gemmK / Q4K_SB;                              // super-blocks a row
     uint lane = gl_LocalInvocationID.x;
     uint nt0 = wn0 / TILE;
     // This lane's column of the slab, and the record it holds for it. Lanes
     // at or past BN have no column; BN is 48 or 64 against a 64-wide wave.
-    uvec4 myRec = uvec4(0u);
+    // The pair is one word and the packed pairs are the rest, which is three
+    // words at eight groups and four at ten.
+    uint myRecD = 0u;
+    uvec4 myRecS = uvec4(0u);
     uint myNT = nt0 + (lane >> 4), myRow = lane & 15u;
 #endif
 #ifdef Q8B
@@ -298,13 +324,22 @@ void main() {
         // k and this slab is 32, so the load is refreshed only where the loop
         // crosses a super-block and the rest is the six-bit unpack.
         if (lane < BN) {
-            if ((k0 & 255u) == 0u) {
-                uint idx = rec0 + ((myNT * nsb + (k0 >> 8)) * TILE + myRow) * 4u;
-                myRec = uvec4(w8[idx], w8[idx + 1u], w8[idx + 2u], w8[idx + 3u]);
+            if ((k0 % Q4K_SB) == 0u) {
+                uint idx = rec0 + ((myNT * nsb + k0 / Q4K_SB) * TILE + myRow) * Q4K_REC_WORDS;
+                myRecD = w8[idx];
+#if Q4K_SUB == 8
+                myRecS = uvec4(w8[idx + 1u], w8[idx + 2u], w8[idx + 3u], 0u);
+#else
+                myRecS = uvec4(w8[idx + 1u], w8[idx + 2u], w8[idx + 3u], w8[idx + 4u]);
+#endif
             }
             uint sc, mn;
-            q4kScaleMin((k0 >> 5) & 7u, uvec3(myRec.y, myRec.z, myRec.w), sc, mn);
-            vec2 dd = unpackHalf2x16(myRec.x);
+#if Q4K_SUB == 8
+            q4kScaleMin((k0 >> 5) & 7u, myRecS.xyz, sc, mn);
+#else
+            q4kScaleMin12((k0 >> 5) % uint(Q4K_SUB), myRecS, sc, mn);
+#endif
+            vec2 dd = unpackHalf2x16(myRecD);
             sQS[lane] = dd.x * float(sc);
             sQM[lane] = dd.y * float(mn);
         }

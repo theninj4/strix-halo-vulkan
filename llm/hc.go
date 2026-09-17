@@ -45,6 +45,12 @@ type HCWeights struct {
 	Down   []float32
 	Up     []float32
 	Inject []float32
+	// Name is the mixer's tensor prefix — `blk.7.hc_ffn_` or `output_hc_` —
+	// and it is here for one reason: the 4.5-bit bank looks each matrix's
+	// importance row up under its own name (LLM.md L8c-6), so a block that
+	// does not know what it is holding cannot be calibrated the way the
+	// simulation the number came from was. Empty is fine on every other bank.
+	Name string
 }
 
 // Numerics selects how a matmul against a Q8_0 weight is evaluated.

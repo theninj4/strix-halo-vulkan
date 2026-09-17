@@ -718,3 +718,214 @@ func TestHCGPUQ8BankSize(t *testing.T) {
 		t.Fatalf("a token reads %.3fx less, want ~1.76", ratio)
 	}
 }
+
+// TestHCGPUQ4IsTheSim is L8c-6's first gate, and it is the same shape as the
+// lm head's and the gated DeltaNet's: **the bank against the simulation that
+// chose it**, value for value, over a whole mixer.
+//
+// L8c-3's +4.24% is a perplexity measured through `sim.go`, which stages a
+// candidate format's floats and lets the fp16 kernels multiply them. This
+// bank stores that format instead, through the same encoder, so the halves
+// the matrix cores see are the same halves and the two arms have to agree
+// exactly.
+//
+// Two things in this block are not the DeltaNet's, and both are checked here.
+// **The up projection's k is 320**, so its super-block is the whole row —
+// ten groups — and a wrong record packing would show as a wrong scale on one
+// group in ten rather than as garbage. And **the fp16 tail is no longer
+// free**: the 32 low-rank rows between the split and `inject` are read out of
+// the tail plane, so if `stageQ4` staged the *unquantised* rows there the
+// bank would be more accurate than the format it claims to be — which is a
+// difference `hc_mixed` shows and `hc_inject` does not, because inject's four
+// rows are F32 in the checkpoint and stay halves on both arms (D13).
+//
+// It is `rtn` rather than `imatrix` so the test needs nothing but a device;
+// the calibrated arm is the same code path with `qw` non-nil, and
+// TestBankQ4KIsTheSim covers that at the encoder.
+func TestHCGPUQ4IsTheSim(t *testing.T) {
+	dev, done := newTestDevice(t)
+	defer done()
+
+	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320, Eps: 1e-6}
+	wide := cfg.Wide()
+	rng := rand.New(rand.NewSource(23))
+	sim, err := ParseQuantSim("q4_k/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim.Mode = "rtn"
+
+	w := HCWeights{
+		Norm:   make([]float32, wide),
+		Down:   make([]float32, cfg.LowRank*wide),
+		Up:     make([]float32, wide*cfg.LowRank),
+		Inject: make([]float32, cfg.HC*wide),
+		Name:   "blk.0.hc_attn_",
+	}
+	for i := range w.Norm {
+		w.Norm[i] = 1 + float32(rng.NormFloat64())*0.1
+	}
+	for _, x := range [][]float32{w.Down, w.Up, w.Inject} {
+		for i := range x {
+			x[i] = float32(rng.NormFloat64()) * 0.05
+		}
+	}
+
+	const nTok = 5
+	res := make([]float32, nTok*wide)
+	for i := range res {
+		res[i] = float32(rng.NormFloat64())
+	}
+	blockOut := make([]float32, nTok*cfg.NEmbd)
+	for i := range blockOut {
+		blockOut[i] = float32(rng.NormFloat64())
+	}
+
+	stage := func(bank DenseBank) *HCGPU {
+		t.Helper()
+		g, err := NewHCGPU(dev, cfg, nTok, []HCWeights{w},
+			HCOpts{Gate: true, Bank: bank, Q8: bank == BankQ8, Sim: sim})
+		if err != nil {
+			t.Fatalf("hc (%s): %v", bank, err)
+		}
+		return g
+	}
+	simulated, q4 := stage(BankFP16), stage(BankQ4K)
+	defer simulated.Destroy()
+	defer q4.Destroy()
+	t.Logf("bank %.2f MB against the simulation's %.2f MB of halves",
+		float64(q4.WeightBytes())/1e6, float64(simulated.WeightBytes())/1e6)
+	if q4.WeightBytes() >= simulated.WeightBytes() {
+		t.Fatalf("the q4_k bank is %d bytes, no smaller than %d",
+			q4.WeightBytes(), simulated.WeightBytes())
+	}
+
+	type out struct {
+		xn, lo, inject, mixed, gate, combined []float32
+	}
+	exec := func(g *HCGPU, dk, uk HCKernel, rows int) out {
+		t.Helper()
+		if err := g.Upload(res[:rows*wide], rows); err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+		if err := g.SetPlan(dk, uk); err != nil {
+			t.Fatalf("plan %s/%s: %v", dk, uk, err)
+		}
+		if err := g.Run(0, false); err != nil {
+			t.Fatalf("run %s/%s: %v", dk, uk, err)
+		}
+		o := out{xn: g.Xn(), lo: g.Lo(), inject: g.Inject(), mixed: g.Mixed(), gate: g.Gate()}
+		if err := g.UploadBlockOut(blockOut[:rows*cfg.NEmbd]); err != nil {
+			t.Fatalf("block out: %v", err)
+		}
+		if err := g.RunCombine(0); err != nil {
+			t.Fatalf("combine: %v", err)
+		}
+		o.combined = g.Res()
+		return o
+	}
+
+	equal := func(what string, a, b []float32) {
+		t.Helper()
+		if len(a) != len(b) {
+			t.Fatalf("%s: %d values against %d", what, len(a), len(b))
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("%s[%d]: bank %.9g, simulation %.9g", what, i, a[i], b[i])
+			}
+		}
+	}
+	n := 0
+	for _, dk := range DownKernels() {
+		for _, uk := range UpKernels() {
+			a, b := exec(q4, dk, uk, nTok), exec(simulated, dk, uk, nTok)
+			label := fmt.Sprintf("%s/%s ", dk, uk)
+			equal(label+"hc_norm", a.xn, b.xn)
+			equal(label+"lo", a.lo, b.lo)
+			equal(label+"hc_inject", a.inject, b.inject)
+			equal(label+"hc_gate", a.gate, b.gate)
+			equal(label+"hc_mixed", a.mixed, b.mixed)
+			equal(label+"hc_combine", a.combined, b.combined)
+			n += len(a.xn) + len(a.lo) + len(a.inject) + len(a.gate) + len(a.mixed) + len(a.combined)
+		}
+	}
+	t.Logf("%d GEMM pairs, %d values identical to the simulation",
+		len(DownKernels())*len(UpKernels()), n)
+
+	// The split-K GEMV at one token is **not** bit-exact against the GEMM on
+	// this bank and cannot be (L8c-4): a K-quant group is affine, so there is
+	// no pair of exact halves to multiply and the register path carries one
+	// fewer rounding than the GEMM's LDS store. What it has to be is the same
+	// arithmetic to within that one rounding, over a 10240-long dot product.
+	ref := exec(simulated, HCDownM1, HCUpM1, 1)
+	for _, dk := range GemvKernels() {
+		got := exec(q4, dk, HCUpM1, 1)
+		var num, den float64
+		for i := range ref.mixed {
+			d := float64(got.mixed[i] - ref.mixed[i])
+			num += d * d
+			den += float64(ref.mixed[i]) * float64(ref.mixed[i])
+		}
+		rms := math.Sqrt(num / math.Max(den, 1e-30))
+		if rms > 1e-3 {
+			t.Fatalf("%s: hc_mixed is %.3e rms off the simulation's GEMM", dk, rms)
+		}
+		t.Logf("%-14s hc_mixed %.3e rms against the GEMM, one rounding apart", dk, rms)
+	}
+}
+
+// TestHCGPUQ4BankSize states what L8c-6 stages against what it replaces, at
+// the checkpoint's own widths, and says where the 4.500 bits stop being exact.
+//
+// Three places, and each is a decision this stage made rather than an
+// approximation. The **fp16 tail** is `inject`'s four F32 rows plus the 32
+// low-rank rows the split leaves over — 0.98 MB a mixer, unchanged from L8b,
+// and now the larger part of the staged bank's overhead. The **quantised
+// plane still covers the whole fused N**, because the kernel derives the
+// record plane's base from gemmN * gemmK. And the **up projection's record is
+// twenty bytes over 320 weights** where ggml's is sixteen over 256: the
+// simulation quotes that row at 4.475 bits because nothing there has to be
+// addressable, and a word-aligned record makes it exactly 4.500.
+func TestHCGPUQ4BankSize(t *testing.T) {
+	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320}
+	g := &HCGPU{cfg: cfg}
+	wide, n := cfg.Wide(), g.gemmN()
+	tail := g.q8TailRows() * wide * 2
+
+	half := (n*wide + wide*cfg.LowRank) * 2
+	q8 := q8Align(q8Bytes(n, wide)) + tail + q8Align(q8Bytes(wide, cfg.LowRank))
+	q4 := q8Align(q4kBytes(n, wide)) + tail + q8Align(q4kBytes(wide, cfg.LowRank))
+	weights := cfg.LowRank*wide + wide*cfg.LowRank + cfg.HC*wide
+
+	t.Logf("a mixer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
+		float64(q4)/1e6, float64(q8)/1e6, float64(half)/1e6,
+		float64(q4)*8/float64(weights), float64(q8)*8/float64(weights),
+		float64(half)*8/float64(weights))
+	t.Logf("97 mixers: %.2f GB against %.2f GB and %.2f GB",
+		float64(97*q4)/1e9, float64(97*q8)/1e9, float64(97*half)/1e9)
+	if q4 >= q8 || q8 >= half {
+		t.Fatalf("the three banks are %d, %d, %d bytes and are not in order", q4, q8, half)
+	}
+
+	// The up projection alone is the 320-wide family, and it is exactly
+	// 4.500 bits: nibbles plus one twenty-byte record per row.
+	up := q4kBytes(wide, cfg.LowRank)
+	if bits := float64(up) * 8 / float64(wide*cfg.LowRank); bits != 4.5 {
+		t.Fatalf("the up projection is %.4f bits a weight, want 4.500", bits)
+	}
+	if rec := q4kRecordBytes(hcUpSub); rec != 20 {
+		t.Fatalf("a ten-group record is %d bytes, want 20", rec)
+	}
+
+	// What a token reads is less than what is staged: the nibble columns past
+	// the split are staged and skipped, where the record plane behind them is
+	// not — the kernel derives its base from gemmN and cannot be told
+	// otherwise.
+	read := g.q8Split()*wide/2 + (q4kBytes(n, wide) - n*wide/2) + tail +
+		q4kBytes(wide, cfg.LowRank)
+	t.Logf("read %.2f MB a token against the fp16 bank's %.2f", float64(read)/1e6, float64(half)/1e6)
+	if ratio := float64(half) / float64(read); ratio < 2.9 || ratio > 3.05 {
+		t.Fatalf("a token reads %.3fx less than on halves, want ~2.97", ratio)
+	}
+}

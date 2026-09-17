@@ -19,6 +19,7 @@ package llm
 // and it is an equality.
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	"strix-halo-vulkan/safetensors"
@@ -200,8 +201,8 @@ func quantCalibrated(mode string) bool {
 // It is ggml's packing verbatim at sub = 8 and nothing at any other length —
 // the scheme *is* eight groups, four low and four high — so a super-block
 // that is not eight groups is a different packing wearing the same name.
-// That is the 320-wide hyper-connection family, and it is the next stage's
-// problem (L8c-4's note).
+// That is the 320-wide hyper-connection family, and L8c-6 gives it
+// `packScaleMin12` rather than a tenth pair this scheme has nowhere to put.
 //
 // The lengths are the caller's to check, once, before it starts a parallel
 // loop: `q4kSuper` is a constant and an error returned from inside
@@ -224,11 +225,11 @@ func packScaleMinK4(dst []byte, ls, lm []int) {
 	}
 }
 
-// q4kPackFits is packScaleMinK4's precondition, stated where a caller can act
-// on it.
+// q4kPackFits is the record packings' precondition, stated where a caller can
+// act on it: eight groups in ggml's twelve bytes, or ten in L8c-6's fifteen.
 func q4kPackFits(sub int) error {
-	if sub != 8 {
-		return fmt.Errorf("llm: get_scale_min_k4 is eight groups into twelve bytes, not %d", sub)
+	if sub != asymSuperBlocks && sub != 10 {
+		return fmt.Errorf("llm: a record is eight groups (get_scale_min_k4) or ten (L8c-6), not %d", sub)
 	}
 	return nil
 }
@@ -241,4 +242,91 @@ func unpackScaleMinK4(src []byte, j int) (sc, mn int) {
 	}
 	a := src[j+4]
 	return int(a&0xF) | int(src[j-4]>>6)<<4, int(a>>4) | int(src[j]>>6)<<4
+}
+
+// q4kRecordBytes is one super-block's record for one output column, in bytes:
+// the fp16 (d, dmin) pair and then the packed six-bit (scale, min) pairs,
+// rounded up to a whole word because every kernel reads the plane through a
+// `uint` view.
+//
+//	sub =  8   4 + 12 = 16 bytes, ggml's own record  (4.500 bits a weight)
+//	sub = 10   4 + 15 = 19, rounded to 20            (4.500 bits a weight)
+//
+// The rounding is the only place the bank is wider than the format L8c-3
+// measured: the simulation's 320-wide row is quoted at 4.475 bits because
+// nothing there has to be addressable. One byte of padding a record is
+// 0.025 bits a weight, and it is stated rather than rounded off.
+func q4kRecordBytes(sub int) int { return (4 + (12*sub+7)/8 + 3) &^ 3 }
+
+// packScaleMin12 is the ten-group super-block's packing, and it exists
+// because `get_scale_min_k4` is not a length (LLM.md L8c-6).
+//
+// ggml's scheme steals the two high bits of each of the first four pairs to
+// carry the four high ones: it *is* eight groups, four low and four high, and
+// there is no ten-group spelling of it. The hyper-connection block's up
+// projection reads the low-rank space and is 320 wide, so its super-block is
+// the whole row — ten groups — and it gets the obvious packing instead: the
+// twelve bits of group j at bit 12*j of a little-endian bit stream, scale in
+// the low six and min in the high six.
+//
+// 120 bits into four words, with the top eight unused. The decode is two
+// shifts and a mask (`q4kScaleMin12` in shaders/llm_q4k.glsl), where ggml's
+// is a branch on j — so the departure costs nothing to read and is confined
+// to the one family that forces it.
+func packScaleMin12(dst []byte, ls, lm []int) {
+	for i := range dst {
+		dst[i] = 0
+	}
+	for j := range ls {
+		v := uint32(ls[j]&63) | uint32(lm[j]&63)<<6
+		b := 12 * j
+		for i := 0; i < 12; i++ {
+			if v>>uint(i)&1 != 0 {
+				dst[(b+i)/8] |= 1 << uint((b+i)%8)
+			}
+		}
+	}
+}
+
+// unpackScaleMin12 is its inverse, for the test that reads a staged bank back
+// the way the shader does.
+func unpackScaleMin12(src []byte, j int) (sc, mn int) {
+	var v uint32
+	b := 12 * j
+	for i := 0; i < 12; i++ {
+		if src[(b+i)/8]>>uint((b+i)%8)&1 != 0 {
+			v |= 1 << uint(i)
+		}
+	}
+	return int(v & 63), int(v >> 6 & 63)
+}
+
+// packQ4KRecord writes one column's record: the pair, then whichever packing
+// its super-block length has.
+func packQ4KRecord(dst []byte, e *asymEnc) error {
+	binary.LittleEndian.PutUint16(dst[0:], e.D)
+	binary.LittleEndian.PutUint16(dst[2:], e.DMin)
+	switch e.sub {
+	case asymSuperBlocks:
+		packScaleMinK4(dst[4:16], e.LS, e.LM)
+	case 10:
+		packScaleMin12(dst[4:19], e.LS, e.LM)
+	default:
+		return fmt.Errorf("llm: no record packing for a %d-group super-block", e.sub)
+	}
+	return nil
+}
+
+// unpackQ4KRecord is the read side, and the shaders' `q4kScaleMin`/
+// `q4kScaleMin12` are its two spellings.
+func unpackQ4KRecord(src []byte, sub, j int) (d, dmin float32, sc, mn int) {
+	d = f16(binary.LittleEndian.Uint16(src[0:]))
+	dmin = f16(binary.LittleEndian.Uint16(src[2:]))
+	switch sub {
+	case asymSuperBlocks:
+		sc, mn = unpackScaleMinK4(src[4:16], j)
+	default:
+		sc, mn = unpackScaleMin12(src[4:19], j)
+	}
+	return
 }

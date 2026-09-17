@@ -155,32 +155,44 @@ type hcVariant struct {
 	name   HCKernel
 	spirv  []byte
 	q8     []byte
+	q4     []byte
 	mode   int
 	bm, bn int
 	reduce []byte
 	slabs  int
 }
 
+// spirvFor is a rung's build for a bank. Every rung has all three.
+func (v hcVariant) spirvFor(b DenseBank) []byte {
+	switch b {
+	case BankQ8:
+		return v.q8
+	case BankQ4K:
+		return v.q4
+	}
+	return v.spirv
+}
+
 var hcVariants = []hcVariant{
-	{name: HCDownM1, spirv: shaders.LLMHCDownM1, q8: shaders.LLMHCDownQ8M1, mode: 0, bm: 16, bn: 48},
-	{name: HCDownM2, spirv: shaders.LLMHCDownM2, q8: shaders.LLMHCDownQ8M2, mode: 0, bm: 32, bn: 48},
-	{name: HCDownM4, spirv: shaders.LLMHCDownM4, q8: shaders.LLMHCDownQ8M4, mode: 0, bm: 64, bn: 48},
-	{name: HCDownM8, spirv: shaders.LLMHCDownM8, q8: shaders.LLMHCDownQ8M8, mode: 0, bm: 128, bn: 48},
-	{name: HCUpM1, spirv: shaders.LLMHCUpM1, q8: shaders.LLMHCUpQ8M1, mode: 1, bm: 16, bn: 64},
-	{name: HCUpM2, spirv: shaders.LLMHCUpM2, q8: shaders.LLMHCUpQ8M2, mode: 1, bm: 32, bn: 64},
-	{name: HCUpM4, spirv: shaders.LLMHCUpM4, q8: shaders.LLMHCUpQ8M4, mode: 1, bm: 64, bn: 64},
-	{name: HCUpM8, spirv: shaders.LLMHCUpM8, q8: shaders.LLMHCUpQ8M8, mode: 1, bm: 128, bn: 64},
-	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, q8: shaders.LLMHCGemvQ8S8,
+	{name: HCDownM1, spirv: shaders.LLMHCDownM1, q8: shaders.LLMHCDownQ8M1, q4: shaders.LLMHCDownQ4M1, mode: 0, bm: 16, bn: 48},
+	{name: HCDownM2, spirv: shaders.LLMHCDownM2, q8: shaders.LLMHCDownQ8M2, q4: shaders.LLMHCDownQ4M2, mode: 0, bm: 32, bn: 48},
+	{name: HCDownM4, spirv: shaders.LLMHCDownM4, q8: shaders.LLMHCDownQ8M4, q4: shaders.LLMHCDownQ4M4, mode: 0, bm: 64, bn: 48},
+	{name: HCDownM8, spirv: shaders.LLMHCDownM8, q8: shaders.LLMHCDownQ8M8, q4: shaders.LLMHCDownQ4M8, mode: 0, bm: 128, bn: 48},
+	{name: HCUpM1, spirv: shaders.LLMHCUpM1, q8: shaders.LLMHCUpQ8M1, q4: shaders.LLMHCUpQ4M1, mode: 1, bm: 16, bn: 64},
+	{name: HCUpM2, spirv: shaders.LLMHCUpM2, q8: shaders.LLMHCUpQ8M2, q4: shaders.LLMHCUpQ4M2, mode: 1, bm: 32, bn: 64},
+	{name: HCUpM4, spirv: shaders.LLMHCUpM4, q8: shaders.LLMHCUpQ8M4, q4: shaders.LLMHCUpQ4M4, mode: 1, bm: 64, bn: 64},
+	{name: HCUpM8, spirv: shaders.LLMHCUpM8, q8: shaders.LLMHCUpQ8M8, q4: shaders.LLMHCUpQ4M8, mode: 1, bm: 128, bn: 64},
+	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, q8: shaders.LLMHCGemvQ8S8, q4: shaders.LLMHCGemvQ4S8,
 		mode: 2, reduce: shaders.LLMHCGemvR8, slabs: 8},
-	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, q8: shaders.LLMHCGemvQ8S16,
+	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, q8: shaders.LLMHCGemvQ8S16, q4: shaders.LLMHCGemvQ4S16,
 		mode: 2, reduce: shaders.LLMHCGemvR16, slabs: 16},
-	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, q8: shaders.LLMHCGemvQ8S32,
+	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, q8: shaders.LLMHCGemvQ8S32, q4: shaders.LLMHCGemvQ4S32,
 		mode: 2, reduce: shaders.LLMHCGemvR32, slabs: 32},
-	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, q8: shaders.LLMHCGemvQ8S40,
+	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, q8: shaders.LLMHCGemvQ8S40, q4: shaders.LLMHCGemvQ4S40,
 		mode: 2, reduce: shaders.LLMHCGemvR40, slabs: 40},
-	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, q8: shaders.LLMHCGemvQ8S80,
+	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, q8: shaders.LLMHCGemvQ8S80, q4: shaders.LLMHCGemvQ4S80,
 		mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
-	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160,
+	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160, q4: shaders.LLMHCGemvQ4S160,
 		mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
 }
 
@@ -211,8 +223,13 @@ func DownKernelsAt(tokens int) []HCKernel {
 // bank the block was built with, measured by `cmd/llm -hc -ladder`
 // (results/l8b_hc.csv). It is never more than 1.05x off the rung that wins at
 // a given length.
-func DefaultPlan(q8 bool) (HCKernel, HCKernel) {
-	if q8 {
+func DefaultPlan(q8 bool) (HCKernel, HCKernel) { return DefaultPlanBank(bankOf(q8)) }
+
+// DefaultPlanBank is the same by bank, which is the three-valued spelling
+// L8c-6 needs.
+func DefaultPlanBank(b DenseBank) (HCKernel, HCKernel) {
+	switch b {
+	case BankQ8, BankQ4K:
 		return HCDownM2, HCUpM4
 	}
 	return HCDownM2, HCUpM2
@@ -246,7 +263,60 @@ func DefaultPlan(q8 bool) (HCKernel, HCKernel) {
 // off the one that wins at its own length is **1.12x**, at 128 tokens on the
 // Q8 bank, where up_m8 beats up_m4 by 6 us a mixer; everywhere else it is
 // within 1.05x.
-func PlanFor(tokens int, q8 bool) (HCKernel, HCKernel) {
+func PlanFor(tokens int, q8 bool) (HCKernel, HCKernel) { return PlanForBank(tokens, bankOf(q8)) }
+
+// PlanForBank is the same by bank, and L8c-6 adds the third column.
+// Microseconds a *block* at each length's best pair, 24 mixers staged
+// (results/l8c_hc_ladder.csv, results/l8c_hc_ladder_q8.csv):
+//
+//	T        q8                q4_k             q4_k / q8
+//	   1    36.9 gemv32/m1     24.6 gemv32/m1     1.50x
+//	  64   255.1 m1/up_m4     202.4 m1/up_m4      1.26x
+//	 128   289.3 m1/up_m2     241.9 m1/up_m8      1.20x
+//	 512   536.9 m2/up_m4     517.1 m1/up_m8      1.04x
+//	1024  1629.3 m2/up_m4    1601.1 m2/up_m8      1.02x
+//	2048  3303.0 m4/up_m4    3373.3 m4/up_m4      0.98x
+//
+// **Two things do not move and one does.** The GEMV rung stays at 32, where
+// D12 predicted it would slide: a slab is `(gemmK/16/KSLABS) * 128` bytes
+// here, half the int8 arm's, so **no** rung is a whole multiple of 4 KB and
+// L7d's rule does not decide this ladder at all — yet the spread is still
+// 1.65x, with 32 (2560 bytes) fastest and 40 (2048) second-slowest. What the
+// two quantised banks share is that the winner is 5/8 of a 4 KB multiple on
+// both, which is why nothing moved; it is written down rather than promoted
+// to a rule. And the down ladder's row block is the Q8 one shifted a rung
+// *narrower* at 512, because what a wide BM buys is reuse of an unpack and
+// this bank's unpack has already halved the bytes it feeds on.
+//
+// **What moves is `up`, and it moves to m8** at every length between 128 and
+// 1536 — the projection whose k is 320 and whose unpack is now a nibble, a
+// six-bit pair and an affine term per weight. L8b's rule ("the Q8 arm wants a
+// wider row block than the fp16 arm ever did, because the unpack costs
+// 256/WM conversions a matrix step") applies once more and in the same
+// direction.
+//
+// **And D14's hazard fires at the top of the range**: at ubatch 2048 the
+// narrower bank is **0.98x**, the second time in this vertical a narrower
+// bank is slower (L8b-5 was the first). Each weight is read 32 times out of
+// the 32 MiB MALL there, so only the unpack's ALU is left and this one has
+// more of it. Whether that survives into the graph is a different question
+// and `-graph` answers it.
+func PlanForBank(tokens int, b DenseBank) (HCKernel, HCKernel) {
+	if b == BankQ4K {
+		switch {
+		case tokens == 1:
+			return hcQ4DecodePlan()
+		case tokens <= 64:
+			return HCDownM1, HCUpM4
+		case tokens <= 768:
+			return HCDownM1, HCUpM8
+		case tokens <= 1536:
+			return HCDownM2, HCUpM8
+		default:
+			return HCDownM4, HCUpM4
+		}
+	}
+	q8 := b == BankQ8
 	if !q8 {
 		switch {
 		case tokens == 1:
@@ -338,11 +408,21 @@ type HCGPU struct {
 	// that the tensor does not exist — so it costs an arena only when asked
 	// for.
 	gate bool
-	// q8 is whether the bank is L8's int8-plus-scales or the fp16 tiling it
-	// replaces (bank.go). It changes what stage writes, which pipeline a
-	// dispatch names and two fields of its push block, and nothing else:
-	// every tensor either bank produces is the same to the last place.
+	// q8 is whether the bank is quantised at all — L8's int8-plus-scales or
+	// L8c-6's nibbles, rather than the fp16 tiling both replace (bank.go). It
+	// changes what stage writes, which pipeline a dispatch names and two
+	// fields of its push block; on the int8 bank and nothing else, every
+	// tensor it produces is the same to the last place.
 	q8 bool
+	// dbank is which of the three it is, and sim the format the 4.5-bit one
+	// encodes with. Everything the two quantised banks share is said through
+	// `q8`; everything that differs is said here.
+	dbank DenseBank
+	sim   QuantSim
+	// names is one tensor prefix a mixer — `blk.7.hc_ffn_` or `output_hc_` —
+	// because the 4.5-bit bank looks each matrix's importance row up under
+	// its own name, the way L8c-5's fused projection does.
+	names []string
 	// ctl is the construction-time options, kept because one of them changes
 	// how the weights were staged and a reader of a wrong tensor should be
 	// able to ask.
@@ -351,6 +431,20 @@ type HCGPU struct {
 	// command buffer instead of submitting them (record.go).
 	rec *recorder
 }
+
+// hcQ4DecodePlan is the pair the 4.5-bit bank runs at one token, and it is
+// named rather than inlined because the GEMV rung is the one number in this
+// file D12 says has to be **re-measured** whenever a slab's stride changes.
+// L8c-6 is the third bank this ladder has been run on and the first where
+// the winner did not move; the next width has to run it again anyway.
+func hcQ4DecodePlan() (HCKernel, HCKernel) { return HCDownGemv32, HCUpM1 }
+
+// hcUpSub is the super-block the up rungs were compiled for: `-DQ4K_SUB=10`,
+// because the up projection's k is the low rank and 320 is ten groups of 32,
+// not a multiple of ggml's 256 (LLM.md L8c-6). It is compiled in for the
+// reason BM and BN are — a mismatch would decode a record with the wrong
+// scheme rather than run slowly — so the host checks the checkpoint agrees.
+const hcUpSub = 10
 
 // downBN is the down ladder's column block. Its N is lowRank + one fragment
 // tile = 336 = 21 tiles, and 21 is 3 x 7, so 48 is the widest block that
@@ -419,6 +513,32 @@ type HCOpts struct {
 	// bank is the control the two are compared against, and
 	// `LLM_DENSE_FP16=1` is how a whole graph is put back on it.
 	Q8 bool
+	// Bank overrides Q8 with the whole three-valued choice, and Sim is the
+	// format BankQ4K encodes with (LLM.md L8c-6). A zero Bank means "whatever
+	// Q8 says", which is what every caller from before L8c-6 means.
+	Bank DenseBank
+	Sim  QuantSim
+}
+
+// bank is that choice resolved: the plan's if it names this family, and the
+// two-valued one otherwise.
+func (o HCOpts) bank() DenseBank {
+	if o.Bank == BankQ4K {
+		return BankQ4K
+	}
+	return bankOf(o.Q8)
+}
+
+// HCBankOpts is the bank half of HCOpts as `LLM_DENSE_BANK` and
+// `LLM_DENSE_FP16` between them decide it. It is exported because a benchmark
+// that staged a different bank from the graph's would be measuring a kernel
+// nothing runs, and the two lines that decide it should exist once.
+func HCBankOpts() HCOpts {
+	o := HCOpts{Q8: DenseQ8()}
+	if q, ok := DenseBankPlan().For("blk.0.hc_attn_down.weight", true); ok {
+		o.Bank, o.Sim = BankQ4K, q
+	}
+	return o
 }
 
 // NewHCGPU stages mixers onto the device and builds every pipeline the block
@@ -452,17 +572,51 @@ func NewHCGPU(dev *vk.Device, cfg HCConfig, maxTokens int, mixers []HCWeights, o
 		dev: dev, cfg: cfg,
 		pipes:  make(map[string]*vk.ComputePipeline),
 		tokens: maxTokens, rows: maxTokens,
-		gate: opts.Gate, ctl: opts, q8: opts.Q8,
+		gate: opts.Gate, ctl: opts,
+		dbank: opts.bank(), sim: opts.Sim,
 		autoPlan: true,
 		lda:      cfg.Wide() + gemmPad,
 		ldaLo:    cfg.LowRank + gemmPad,
+	}
+	g.q8 = g.dbank != BankFP16
+	if g.dbank == BankQ4K {
+		if opts.Sim.Off() {
+			return nil, fmt.Errorf("llm: the 4.5-bit bank needs the format to stage in")
+		}
+		if err := q4kFits(g.gemmN(), cfg.Wide()); err != nil {
+			return nil, fmt.Errorf("llm: hc down projection: %w", err)
+		}
+		// The up projection is the 320-wide one, and the whole reason this
+		// bank needed a second record packing (L8c-6).
+		if err := q4kFits(cfg.Wide(), cfg.LowRank); err != nil {
+			return nil, fmt.Errorf("llm: hc up projection: %w", err)
+		}
+		sub, _, _, err := q4kShape(cfg.LowRank)
+		if err != nil {
+			return nil, err
+		}
+		if sub != hcUpSub {
+			return nil, fmt.Errorf("llm: the up rungs are built for a %d-group super-block, "+
+				"a low rank of %d wants %d", hcUpSub, cfg.LowRank, sub)
+		}
+		// The *down* rungs and `llm_hc_gemv.comp`'s Q4 arm are the plain
+		// build, so the fused projection's k has to be ggml's own eight
+		// groups; both derive `nsb` as `gemmK >> 8` and index a group with
+		// `& 7`, which a 320-wide k would answer wrongly rather than slowly.
+		if sub, _, _, err = q4kShape(cfg.Wide()); err != nil {
+			return nil, err
+		}
+		if sub != q4kSuper {
+			return nil, fmt.Errorf("llm: the down rungs are built for a %d-group super-block, "+
+				"a width of %d wants %d", q4kSuper, cfg.Wide(), sub)
+		}
 	}
 	align := coopMatTile
 	for _, v := range hcVariants {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
-	g.down, g.up = DefaultPlan(g.q8)
+	g.down, g.up = DefaultPlanBank(g.dbank)
 
 	if err := g.alloc(len(mixers)); err != nil {
 		g.Destroy()
@@ -478,6 +632,9 @@ func NewHCGPU(dev *vk.Device, cfg HCConfig, maxTokens int, mixers []HCWeights, o
 	}
 	return g, nil
 }
+
+// Bank is which width this block's two projections were staged in.
+func (g *HCGPU) Bank() DenseBank { return g.dbank }
 
 // WantGate reports whether this block was built to materialise the gate.
 func (g *HCGPU) WantGate() bool { return g.gate }
@@ -541,8 +698,19 @@ func (g *HCGPU) alloc(nMixers int) error {
 	downBank, upBank, tailBank := g.gemmN()*c.Wide()*2, c.Wide()*c.LowRank*2, 0
 	unit := 2
 	if g.q8 {
-		downBank = q8Align(q8Bytes(g.gemmN(), c.Wide()))
-		upBank = q8Align(q8Bytes(c.Wide(), c.LowRank))
+		if g.dbank == BankQ4K {
+			// Both planes of both projections, at 4.5 bits. The down
+			// projection's plane is still the full fused N — the kernel
+			// derives the record plane's base from gemmN * gemmK and gemmN is
+			// the stride of the output it writes — so the columns past the
+			// split are staged and never read: 0.08 MB a mixer of nibbles
+			// against the 1.6 the width saves.
+			downBank = q8Align(q4kBytes(g.gemmN(), c.Wide()))
+			upBank = q8Align(q4kBytes(c.Wide(), c.LowRank))
+		} else {
+			downBank = q8Align(q8Bytes(g.gemmN(), c.Wide()))
+			upBank = q8Align(q8Bytes(c.Wide(), c.LowRank))
+		}
 		tailBank = g.q8TailRows() * c.Wide() * 2
 		unit = 1
 	}
@@ -637,8 +805,10 @@ func (g *HCGPU) build() error {
 		spirv, pipeBufs := v.spirv, bufs
 		if g.q8 {
 			// The reduction of a GEMV pair stays on the fp16 build above: it
-			// reads partial sums out of the arena and no weight at all.
-			spirv, pipeBufs = v.q8, q8bufs
+			// reads partial sums out of the arena and no weight at all. Both
+			// quantised banks bind the same sixth buffer — the bank again, as
+			// raw words — so only the SPIR-V differs (llm_common.glsl).
+			spirv, pipeBufs = v.spirvFor(g.dbank), q8bufs
 		}
 		if err := g.pipeline(string(v.name), spirv, vk.PipelineSpec{
 			Buffers: pipeBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
@@ -667,7 +837,9 @@ func (g *HCGPU) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error 
 func (g *HCGPU) stage(mixers []HCWeights) error {
 	c := g.cfg
 	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
+	g.names = make([]string, len(mixers))
 	for i, w := range mixers {
+		g.names[i] = w.Name
 		if len(w.Norm) != wide {
 			return fmt.Errorf("llm: mixer %d norm is %d, want %d", i, len(w.Norm), wide)
 		}
@@ -682,6 +854,12 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		}
 		g.wbuf.WriteFloat32At(int(g.mixers[i].gamma), w.Norm)
 
+		if g.dbank == BankQ4K {
+			if err := g.stageQ4(i, w); err != nil {
+				return err
+			}
+			continue
+		}
 		if g.q8 {
 			if err := g.stageQ8(i, w); err != nil {
 				return err
@@ -689,15 +867,44 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 			continue
 		}
 
+		// **The simulation of the 4.5-bit bank, on the fp16 arm** (L8c-5's
+		// precedent). A format handed to the halves is L8c-1's round trip
+		// done explicitly rather than through the environment, and it is what
+		// lets one process hold the simulated q4_k and the real one and
+		// compare a mixer's output value for value. It covers exactly what
+		// `stageQ4` quantises — both projections whole, `inject` not at all —
+		// so the two arms are the same format on the same weights.
+		downSrc, upSrc := w.Down, w.Up
+		if !g.sim.Off() {
+			for _, t := range []struct {
+				suffix string
+				src    *[]float32
+				k      int
+			}{
+				{"down.weight", &downSrc, wide},
+				{"up.weight", &upSrc, lr},
+			} {
+				q, qw, err := g.hcImatrix(i, t.suffix)
+				if err != nil {
+					return err
+				}
+				x := append([]float32(nil), *t.src...)
+				if err := q.ApplyWeighted(x, t.k, qw); err != nil {
+					return fmt.Errorf("llm: mixer %d %s%s: %w", i, g.names[i], t.suffix, err)
+				}
+				*t.src = x
+			}
+		}
+
 		down := make([]uint16, n*wide)
-		packDownB(down, w.Down, w.Inject, lr, c.HC, wide)
+		packDownB(down, downSrc, w.Inject, lr, c.HC, wide)
 		g.bank.WriteUint16At(int(g.mixers[i].down), down)
 
 		up := make([]uint16, wide*lr)
 		if g.ctl.UnpermutedUp {
-			tileB(up, w.Up, wide, lr, func(o int) int { return o })
+			tileB(up, upSrc, wide, lr, func(o int) int { return o })
 		} else {
-			packUpB(up, w.Up, wide, lr, c.NEmbd)
+			packUpB(up, upSrc, wide, lr, c.NEmbd)
 		}
 		g.bank.WriteUint16At(int(g.mixers[i].up), up)
 	}
@@ -747,6 +954,93 @@ func (g *HCGPU) stageQ8(i int, w HCWeights) error {
 	tileBQ8(uq, us, w.Up, wide, lr, row)
 	g.bank.WriteBytesAt(int(g.mixers[i].up), uq)
 	g.bank.WriteUint16At((int(g.mixers[i].up)+len(uq))/2, us)
+	return nil
+}
+
+// hcImatrix is one of a mixer's matrices as the 4.5-bit bank encodes it: the
+// format, and the published importance row for that tensor or nil.
+//
+// **Each matrix is calibrated under its own name**, which is what the
+// simulation L8c-3's number came out of did — `hc_attn_up` and `hc_ffn_up`
+// are different tensors with very different importance (L8c-2's outlier is
+// one of them), and a bank that calibrated a mixer with one row would not be
+// the format that was measured.
+func (g *HCGPU) hcImatrix(i int, suffix string) (QuantSim, []float32, error) {
+	if g.names[i] == "" {
+		if quantCalibrated(g.sim.Mode) {
+			return g.sim, nil, fmt.Errorf("llm: mixer %d has no tensor name to calibrate %s against", i, suffix)
+		}
+		return g.sim, nil, nil
+	}
+	return bankImatrix(g.names[i]+suffix, g.sim)
+}
+
+// stageQ4 writes one mixer onto L8c-4's 4.5-bit bank: LLM.md L8c-6.
+//
+// Three things make it more than stageQ8 with a different tiler.
+//
+// **The up projection is the 320-wide family**, so its super-block is the
+// whole row — ten groups of 32 — and its record is `packScaleMin12`'s twenty
+// bytes rather than ggml's sixteen. Nothing here says so: `tileBQ4K` reads it
+// off k, exactly as the simulation does, which is what keeps the two the same
+// format by construction rather than by agreement.
+//
+// **The fp16 tail is no longer free.** On L8's bank the 32 low-rank rows
+// between the split and `inject` were Q8_0, so the halves in the tail and the
+// bytes in the main plane were the same numbers and it did not matter which
+// the kernel read. At 4.5 bits it does: the simulation quantises all 320 rows
+// of `hc_*_down`, so the tail has to carry the *quantised* rows or the bank
+// would be 10% of a matrix more accurate than the format it claims to be.
+// They go through the same encoder and are then rounded to halves, which is
+// what `sim.go` does one step later.
+//
+// **`inject` stays exactly where D13 left it**: four F32 rows of the
+// checkpoint, staged as halves, never quantised — and the split is still the
+// column block that contains them, because the ladder's BN has not moved.
+func (g *HCGPU) stageQ4(i int, w HCWeights) error {
+	c := g.cfg
+	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
+	split, tailRows := g.q8Split(), g.q8TailRows()
+
+	q, qw, err := g.hcImatrix(i, "down.weight")
+	if err != nil {
+		return err
+	}
+	dq := make([]byte, n*wide/2)
+	drec := make([]byte, q4kRecPlane(n, wide))
+	if err := tileBQ4K(dq, drec, w.Down, lr, wide, func(r int) int { return r }, q, qw); err != nil {
+		return fmt.Errorf("llm: mixer %d %sdown.weight: %w", i, g.names[i], err)
+	}
+	g.bank.WriteBytesAt(int(g.mixers[i].down), dq)
+	g.bank.WriteBytesAt(int(g.mixers[i].down)+len(dq), drec)
+
+	// The tail, through the same format: the rows the split left over
+	// quantised and then narrowed, `inject` narrowed alone.
+	tailSrc := append([]float32(nil), w.Down[split*wide:lr*wide]...)
+	if err := q.ApplyWeighted(tailSrc, wide, qw); err != nil {
+		return fmt.Errorf("llm: mixer %d %sdown.weight tail: %w", i, g.names[i], err)
+	}
+	tail := make([]uint16, tailRows*wide)
+	tileB(tail, tailSrc, lr-split, wide, func(r int) int { return r })
+	if w.Inject != nil {
+		tileB(tail, w.Inject, c.HC, wide, func(r int) int { return lr - split + r })
+	}
+	g.bank.WriteUint16At(int(g.mixers[i].downTail), tail)
+
+	if q, qw, err = g.hcImatrix(i, "up.weight"); err != nil {
+		return err
+	}
+	row := upRow(wide, c.NEmbd)
+	if g.ctl.UnpermutedUp {
+		row = func(o int) int { return o }
+	}
+	uq := make([]byte, wide*lr/2)
+	urec := make([]byte, q4kRecPlane(wide, lr))
+	if err := tileBQ4K(uq, urec, w.Up, wide, lr, row, q, qw); err != nil {
+		return fmt.Errorf("llm: mixer %d %sup.weight: %w", i, g.names[i], err)
+	}
+	g.bank.WriteBytesAt(int(g.mixers[i].up), uq)
+	g.bank.WriteBytesAt(int(g.mixers[i].up)+len(uq), urec)
 	return nil
 }
 
@@ -836,7 +1130,7 @@ func (g *HCGPU) SetPlan(down, up HCKernel) error {
 // AutoPlan puts the block back on the measured schedule, undoing a SetPlan.
 func (g *HCGPU) AutoPlan() {
 	g.autoPlan = true
-	g.down, g.up = PlanFor(g.rows, g.q8)
+	g.down, g.up = PlanForBank(g.rows, g.dbank)
 }
 
 // Plan reports the rungs in use.
@@ -866,7 +1160,7 @@ func (g *HCGPU) Upload(res []float32, nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
-		g.down, g.up = PlanFor(nTok, g.q8)
+		g.down, g.up = PlanForBank(nTok, g.dbank)
 	}
 	g.abuf.WriteFloat32At(int(g.aRes), res)
 	return nil
@@ -1302,7 +1596,7 @@ func (g *HCGPU) Resize(nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
-		g.down, g.up = PlanFor(nTok, g.q8)
+		g.down, g.up = PlanForBank(nTok, g.dbank)
 	}
 	return nil
 }
