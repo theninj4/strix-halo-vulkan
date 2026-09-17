@@ -7,23 +7,10 @@ import "net/http"
 // They are registered rather than left off the mux so that a client gets a
 // 501 with a message saying what is missing, instead of a 404 that looks like
 // a misspelled path. Each one becomes a handler when its backend arrives:
-// chat completions, responses and messages when `llm`'s generation loop does
-// (LLM.md L7), embeddings when there is an embedding model at all
-// (GOALS.md), and images when `zimage`'s pipeline is wired in. The nil check
-// each one will then carry -- "loaded, or not asked for on the command line"
-// -- is the one handleSpeech and handleTranscription already have.
-
-func (s *Server) handleChatCompletions(w http.ResponseWriter, _ *http.Request) {
-	notImplementedYet(w, "/v1/chat/completions", "the language model")
-}
-
-func (s *Server) handleResponses(w http.ResponseWriter, _ *http.Request) {
-	notImplementedYet(w, "/v1/responses", "the language model")
-}
-
-func (s *Server) handleMessages(w http.ResponseWriter, _ *http.Request) {
-	notImplementedYet(w, "/v1/messages", "the language model")
-}
+// embeddings when there is an embedding model at all (GOALS.md), and images
+// when `zimage`'s pipeline is wired in. The nil check each one will then
+// carry -- "loaded, or not asked for on the command line" -- is the one the
+// four endpoints that do answer already have.
 
 func (s *Server) handleEmbeddings(w http.ResponseWriter, _ *http.Request) {
 	notImplementedYet(w, "/v1/embeddings", "an embedding model")

@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	"strix-halo-vulkan/gguf"
 	"strix-halo-vulkan/llm"
 	"strix-halo-vulkan/zimage/tokenizer"
 )
@@ -60,7 +59,7 @@ func generate(o genOpts) error {
 		return err
 	}
 	defer m.Close()
-	tok, err := LoadTokenizer(m.Set)
+	tok, err := llm.LoadTokenizer(m.Set)
 	if err != nil {
 		return err
 	}
@@ -75,7 +74,7 @@ func generate(o genOpts) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("the prompt tokenizes to nothing")
 	}
-	eog := endOfGeneration(m.Set, tok)
+	eog := llm.EndOfGeneration(m.Set, tok)
 
 	dev, done, err := openDevice()
 	if err != nil {
@@ -185,34 +184,6 @@ func generate(o genOpts) error {
 			ms(st.Head), ms(st.Move), ms(st.Gather), ms(st.Glue),
 		},
 	})
-}
-
-// endOfGeneration is the set of tokens that stop the loop.
-//
-// It is **not** `tokenizer.ggml.eos_token_id` alone, and the difference is
-// visible on the first prompt anyone tries: this checkpoint's EOS is 248046
-// and what the model actually emits to finish a completion is 248044,
-// `<|endoftext|>`. llama.cpp marks a control token end-of-generation by
-// *name* as well as by the metadata key — `llama_vocab` flags `<|endoftext|>`,
-// `<|im_end|>` and `<|eot_id|>` wherever the vocabulary has them — so a loop
-// that trusts the key alone runs past the end of the text and then repeats
-// one token until -n is exhausted.
-func endOfGeneration(set *gguf.Set, tok *tokenizer.Tokenizer) map[int32]bool {
-	eog := map[int32]bool{}
-	if v, ok := set.Uint("tokenizer.ggml.eos_token_id"); ok {
-		eog[int32(v)] = true
-	}
-	for _, k := range []string{"eot_token_id", "eom_token_id"} {
-		if v, ok := set.Uint("tokenizer.ggml." + k); ok {
-			eog[int32(v)] = true
-		}
-	}
-	for _, name := range []string{"<|endoftext|>", "<|im_end|>", "<|eot_id|>", "<|end|>"} {
-		if id, ok := tok.ID(name); ok {
-			eog[id] = true
-		}
-	}
-	return eog
 }
 
 // reportPhases prints where a run's wall clock went, as a share of the wall

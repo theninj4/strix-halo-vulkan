@@ -3,6 +3,8 @@ package backend
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 
 	"strix-halo-vulkan/api"
@@ -165,7 +167,7 @@ func (s *STT) Transcribe(ctx context.Context, clip *audio.Clip,
 		if err != nil {
 			return nil, err
 		}
-		return &api.TranscriptionResponse{Text: out.Text}, nil
+		return s.response(out, clip)
 	}
 
 	// The front end stays on the host: it is a few thousand 512-point FFTs,
@@ -200,5 +202,133 @@ func (s *STT) Transcribe(ctx context.Context, clip *audio.Clip,
 	if err != nil {
 		return nil, err
 	}
-	return &api.TranscriptionResponse{Text: out.Text}, nil
+	return s.response(out, clip)
+}
+
+// response is the transcript with its timings, which every request gets and
+// only `verbose_json` prints.
+//
+// They are computed here rather than in the handler because grouping tokens
+// into words is a fact about this tokenizer -- SentencePiece marks a word
+// start with U+2581 -- and `api` has no business knowing it. The cost is a
+// walk over a few hundred emissions.
+func (s *STT) response(t *parakeet.Transcript, clip *audio.Clip) (*api.TranscriptionResponse, error) {
+	words, err := s.words(t, clip.Duration())
+	if err != nil {
+		return nil, err
+	}
+	return &api.TranscriptionResponse{
+		Text:     t.Text,
+		Duration: milliseconds(clip.Duration()),
+		Words:    words,
+		Segments: segments(words),
+	}, nil
+}
+
+// secondsPerFrame is what an encoder frame is worth, derived rather than
+// written down: the STFT's hop, times every stride in the subsampling stack,
+// over the sample rate. For this checkpoint it is 160 * 8 / 16000 = 80 ms.
+func (s *STT) secondsPerFrame() float64 {
+	f := s.model.Config.Features
+	stride := 1
+	for _, c := range s.model.Encoder.Subsampling.Convs {
+		if c.Stride > 1 {
+			stride *= c.Stride
+		}
+	}
+	return float64(f.HopLength) * float64(stride) / float64(f.SamplingRate)
+}
+
+// words groups the transducer's emissions into words and times them.
+//
+// **These are the model's own timings and not a forced alignment.** Every
+// emission records the encoder frame it was made at, and a TDT transducer
+// also predicts how many frames to skip afterwards -- that prediction is
+// what gives a word an end rather than only a beginning. It is a duration
+// head, so it is approximate in a way a Viterbi alignment against the audio
+// would not be, and 80 ms is the finest it can be.
+func (s *STT) words(t *parakeet.Transcript, duration float64) ([]api.TranscriptionWord, error) {
+	spf := s.secondsPerFrame()
+	tok := s.model.Tokenizer
+
+	// The steps that begin each word, by the marker the tokenizer's own
+	// decoder reads.
+	var starts []int
+	for i, step := range t.Steps {
+		piece, err := tok.Piece(step.Token)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 || strings.HasPrefix(piece, parakeet.Metaspace) {
+			starts = append(starts, i)
+		}
+	}
+
+	out := make([]api.TranscriptionWord, 0, len(starts))
+	for w, first := range starts {
+		last := len(t.Steps) - 1
+		if w+1 < len(starts) {
+			last = starts[w+1] - 1
+		}
+		ids := make([]int, 0, last-first+1)
+		for _, step := range t.Steps[first : last+1] {
+			ids = append(ids, step.Token)
+		}
+		text, err := tok.Decode(ids)
+		if err != nil {
+			return nil, err
+		}
+		if text == "" {
+			continue
+		}
+		end := float64(t.Steps[last].Frame+t.Steps[last].Duration) * spf
+		out = append(out, api.TranscriptionWord{
+			Word:  text,
+			Start: milliseconds(min(float64(t.Steps[first].Frame)*spf, duration)),
+			End:   milliseconds(min(end, duration)),
+		})
+	}
+	// A word whose duration head said nothing ends where the next one
+	// starts, rather than at the instant it began.
+	for i := range out {
+		if out[i].End > out[i].Start {
+			continue
+		}
+		if i+1 < len(out) {
+			out[i].End = out[i+1].Start
+		} else {
+			out[i].End = milliseconds(duration)
+		}
+	}
+	return out, nil
+}
+
+// milliseconds rounds a time to the millisecond, which is three orders finer
+// than the 80 ms frame it came from and is there for one reason: 41 frames of
+// 0.08 s is 3.2800000000000002 in binary floating point, and nobody reading a
+// transcript should have to see that.
+func milliseconds(t float64) float64 { return math.Round(t*1000) / 1000 }
+
+// segments groups words into sentences, which is what a caller asking for
+// segment timestamps wants and the only division this model offers: it
+// punctuates, so a sentence end is a token and not a guess about silence.
+func segments(words []api.TranscriptionWord) []api.TranscriptionSegment {
+	var out []api.TranscriptionSegment
+	var cur *api.TranscriptionSegment
+	for _, w := range words {
+		if cur == nil {
+			out = append(out, api.TranscriptionSegment{ID: len(out), Start: w.Start})
+			cur = &out[len(out)-1]
+		}
+		if cur.Text != "" {
+			cur.Text += " "
+		}
+		cur.Text += w.Word
+		cur.End = w.End
+		if strings.HasSuffix(w.Word, ".") || strings.HasSuffix(w.Word, "?") ||
+			strings.HasSuffix(w.Word, "!") {
+			cur = nil
+		}
+	}
+	return out
 }

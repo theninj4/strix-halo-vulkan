@@ -184,3 +184,75 @@ func TestLogRequestDoesNotBufferHugeBodies(t *testing.T) {
 		t.Errorf("log output %q, want it to say the body was not read", got)
 	}
 }
+
+// TestLogRequestWithoutBodies is what a long-lived server runs with: the
+// request line, the status, the duration and the sizes, and none of the text.
+// A chat server's bodies are its users' conversations, and a log is not a
+// reason to keep them.
+func TestLogRequestWithoutBodies(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) == "" {
+			t.Error("the handler was given no body")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"answer":"seventeen"}`))
+	})
+
+	var logOutput bytes.Buffer
+	log.SetOutput(&logOutput)
+	defer log.SetOutput(os.Stderr)
+
+	req, err := http.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"messages":[{"role":"user","content":"my secret question"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	LogRequestFunc(false)(handler).ServeHTTP(httptest.NewRecorder(), req)
+
+	got := logOutput.String()
+	for _, want := range []string{"POST", "/v1/chat/completions", "200"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the log line does not carry %q: %s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"my secret question", "seventeen"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("the log line carries %q with bodies off: %s", unwanted, got)
+		}
+	}
+	// What replaces them is the size and the media type, which is what an
+	// operator reads anyway.
+	if !strings.Contains(got, "bytes of application/json") {
+		t.Errorf("the log line does not summarise the bodies: %s", got)
+	}
+}
+
+// TestLogRequestNeverKeepsAStream: the first kilobyte of an event stream is a
+// fragment of a frame, so it is summarised even when bodies are on.
+func TestLogRequestNeverKeepsAStream(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"delta\":\"my secret answer\"}\n\n"))
+	})
+
+	var logOutput bytes.Buffer
+	log.SetOutput(&logOutput)
+	defer log.SetOutput(os.Stderr)
+
+	req, err := http.NewRequest("POST", "/v1/chat/completions", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	LogRequest(handler).ServeHTTP(httptest.NewRecorder(), req)
+
+	got := logOutput.String()
+	if strings.Contains(got, "my secret answer") {
+		t.Errorf("the log line carries the stream's text: %s", got)
+	}
+	if !strings.Contains(got, "bytes of text/event-stream") {
+		t.Errorf("the log line does not summarise the stream: %s", got)
+	}
+}

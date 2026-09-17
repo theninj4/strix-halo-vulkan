@@ -46,21 +46,56 @@ type TranscriptionBackend interface {
 	Transcribe(ctx context.Context, clip *audio.Clip, req *TranscriptionRequest) (*TranscriptionResponse, error)
 }
 
-// CompletionBackend, EmbeddingBackend and ImageBackend are placeholders: they
-// let a process advertise a model it has loaded through GET /v1/models, and
-// they carry no generation method yet.
+// CompletionBackend generates text.
 //
-// The methods are deliberately absent rather than guessed. A chat backend's
-// real signature is a streaming one -- tokens arrive one at a time and the
-// handler has to forward them as SSE -- and what that looks like is decided
-// by the generation loop in `llm` (LLM.md L7), not in advance here. The
-// endpoints answer 501 until then.
-type CompletionBackend interface{ Backend }
+// **The signature is a streaming one**, and the buffered response is written
+// in terms of it rather than the other way round. That is not a preference:
+// a token on this part costs 12 ms (LLM.md L8d), so a 500-token answer is six
+// seconds, and an interface that returned the whole thing would make the
+// streamed endpoint impossible to build on top of it while the buffered one
+// is trivial to build on this. emit is called once per token; an error from
+// it -- a client that hung up -- stops the loop and comes back from Complete.
+//
+// What crosses this boundary is model-shaped and not HTTP-shaped: the backend
+// says what it generated and what stopped it, and the handler decides what a
+// `chat.completion` object looks like. Rendering the conversation into the
+// checkpoint's own chat template is the backend's, because the template is
+// part of the checkpoint.
+type CompletionBackend interface {
+	Backend
+	Complete(ctx context.Context, req *CompletionRequest, emit func(Delta) error) (*CompletionResult, error)
+}
 
-// EmbeddingBackend is a placeholder; see CompletionBackend.
+// CompletionResult is how a generation ended.
+//
+// The text is not in it. The handler has already seen every token through
+// emit, and a backend that returned the whole answer as well would be a
+// second copy of it that could disagree with the first.
+type CompletionResult struct {
+	// FinishReason is "stop" -- the model emitted an end-of-generation
+	// token, or ran into a stop sequence -- "length", or "tool_calls".
+	FinishReason string
+	// StopSequence is the stop sequence that ended the generation, when one
+	// did. OpenAI's envelopes fold that into "stop" and Anthropic's reports
+	// it, which is the only reason it is carried separately.
+	StopSequence string
+	// ToolCalls are the calls the generation made, whole. They are not
+	// streamed: a call is not a call until it has closed, and its arguments
+	// are not JSON until they have been typed against the tool's schema.
+	ToolCalls []*ToolCall
+	Usage     Usage
+}
+
+// EmbeddingBackend is a placeholder: it lets a process advertise a model it
+// has loaded through GET /v1/models, and carries no method yet, because
+// there is no embedding model in this repository to give it one (GOALS.md).
 type EmbeddingBackend interface{ Backend }
 
-// ImageBackend is a placeholder; see CompletionBackend.
+// ImageBackend is a placeholder; see EmbeddingBackend. `zimage/pipeline` is
+// the right shape for one -- resident weights, Generate(prompt, seed,
+// progress) -- but its width and height are fixed at construction, so
+// `aspect_ratio` is a residency question rather than a parameter and the
+// interface should not pretend otherwise.
 type ImageBackend interface{ Backend }
 
 // ErrUnsupported is what a backend returns when a request is well formed but

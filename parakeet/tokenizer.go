@@ -58,7 +58,7 @@ func LoadTokenizer(dir string) (*Tokenizer, error) {
 	// The decoder is the half of the file this depends on, so a checkpoint
 	// that changes it should fail here rather than silently produce text with
 	// no spaces in it.
-	if raw.Decoder.Type != "Metaspace" || raw.Decoder.Replacement != metaspace ||
+	if raw.Decoder.Type != "Metaspace" || raw.Decoder.Replacement != Metaspace ||
 		raw.Decoder.PrependScheme != "always" {
 		return nil, fmt.Errorf("parakeet: tokenizer.json has a %q decoder (%q, %q), this reads Metaspace/▁/always",
 			raw.Decoder.Type, raw.Decoder.Replacement, raw.Decoder.PrependScheme)
@@ -86,7 +86,11 @@ func LoadTokenizer(dir string) (*Tokenizer, error) {
 	return t, nil
 }
 
-const metaspace = "▁"
+// Metaspace is SentencePiece's word-start marker: the tokenizer's Metaspace
+// decoder replaces it with a space, so a piece that begins with it begins a
+// word. That is what the word timings in `backend` group on, which is why it
+// is exported.
+const Metaspace = "▁"
 
 // Size is the number of ids the vocabulary covers, which is the model's
 // `vocab_size`: the blank has an entry of its own at 8192, added as
@@ -121,7 +125,7 @@ func (t *Tokenizer) Decode(ids []int) (string, error) {
 		}
 		b.WriteString(piece)
 	}
-	out := strings.ReplaceAll(b.String(), metaspace, " ")
+	out := strings.ReplaceAll(b.String(), Metaspace, " ")
 	// prepend_scheme "always" puts a marker before the first word; exactly
 	// one leading space comes back off, so text that legitimately began with
 	// whitespace is not silently trimmed.

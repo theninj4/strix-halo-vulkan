@@ -77,7 +77,7 @@ func perplexity(o pplOpts) error {
 		return err
 	}
 	defer m.Close()
-	tok, err := LoadTokenizer(m.Set)
+	tok, err := llm.LoadTokenizer(m.Set)
 	if err != nil {
 		return err
 	}

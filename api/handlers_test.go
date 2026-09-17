@@ -43,6 +43,7 @@ func (f *fakeSpeech) Speak(_ context.Context, req *SpeechRequest) (*audio.Clip, 
 type fakeSTT struct {
 	clip *audio.Clip
 	req  *TranscriptionRequest
+	resp *TranscriptionResponse
 	err  error
 }
 
@@ -55,6 +56,9 @@ func (f *fakeSTT) Transcribe(_ context.Context, clip *audio.Clip,
 	f.clip, f.req = clip, req
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.resp != nil {
+		return f.resp, nil
 	}
 	return &TranscriptionResponse{Text: "the quick brown fox"}, nil
 }
@@ -329,8 +333,8 @@ func TestTranscriptionRejects(t *testing.T) {
 		{"streaming", TranscriptionRequest{Data: testWAV(t, 16000, 800), Stream: true}, "streaming"},
 		{
 			"format",
-			TranscriptionRequest{Data: testWAV(t, 16000, 800), ResponseFormat: "srt"},
-			"srt",
+			TranscriptionRequest{Data: testWAV(t, 16000, 800), ResponseFormat: "xml"},
+			"verbose_json",
 		},
 	}
 	for _, tc := range cases {
@@ -440,5 +444,153 @@ func TestUploadLimit(t *testing.T) {
 	}
 	if fake.clip != nil {
 		t.Errorf("the backend was handed a clip anyway")
+	}
+}
+
+// TestTranscriptionFormats covers the shapes the timings made possible.
+// The fake returns a transcript with two sentences of words in it, which is
+// what a backend hands over: the grouping is the model's business and the
+// container is this package's.
+func transcriptFake() *fakeSTT {
+	return &fakeSTT{resp: &TranscriptionResponse{
+		Text:     "Hello there. General Kenobi.",
+		Duration: 2.4,
+		Words: []TranscriptionWord{
+			{Word: "Hello", Start: 0, End: 0.4},
+			{Word: "there.", Start: 0.4, End: 0.8},
+			{Word: "General", Start: 1.2, End: 1.76},
+			{Word: "Kenobi.", Start: 1.76, End: 2.4},
+		},
+		Segments: []TranscriptionSegment{
+			{ID: 0, Start: 0, End: 0.8, Text: "Hello there."},
+			{ID: 1, Start: 1.2, End: 2.4, Text: "General Kenobi."},
+		},
+	}}
+}
+
+func transcriptionRequest(t *testing.T, body map[string]any) *http.Request {
+	t.Helper()
+	body["file"] = testWAV(t, 16000, 800)
+	return jsonRequest("POST", "/v1/audio/transcriptions", body)
+}
+
+func TestTranscriptionJSONIsTheTextAlone(t *testing.T) {
+	s := &Server{Transcription: transcriptFake()}
+	rec := do(t, s, transcriptionRequest(t, map[string]any{}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	// OpenAI's `json` is the text and nothing else: a client that asked for
+	// the short shape should not have to ignore four more fields.
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["text"] != "Hello there. General Kenobi." {
+		t.Errorf("body %v", got)
+	}
+}
+
+func TestTranscriptionVerboseJSON(t *testing.T) {
+	s := &Server{Transcription: transcriptFake()}
+	rec := do(t, s, transcriptionRequest(t, map[string]any{
+		"response_format":         "verbose_json",
+		"language":                "en",
+		"timestamp_granularities": []string{"word", "segment"},
+	}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var got TranscriptionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Task != "transcribe" || got.Language != "en" || got.Duration != 2.4 {
+		t.Errorf("%+v", got)
+	}
+	if len(got.Words) != 4 || got.Words[0].Word != "Hello" {
+		t.Errorf("words %+v", got.Words)
+	}
+	if len(got.Segments) != 2 || got.Segments[1].Text != "General Kenobi." {
+		t.Errorf("segments %+v", got.Segments)
+	}
+	// Whisper's decoder fields are absent rather than invented: a number in
+	// `no_speech_prob` would be one a client could filter on.
+	for _, absent := range []string{"avg_logprob", "no_speech_prob", "compression_ratio", "seek"} {
+		if strings.Contains(rec.Body.String(), absent) {
+			t.Errorf("the body carries %q, which this model has no value for", absent)
+		}
+	}
+}
+
+// TestTranscriptionGranularities: segments are the default, and asking for
+// words alone leaves the segments out rather than sending both.
+func TestTranscriptionGranularities(t *testing.T) {
+	cases := []struct {
+		name                string
+		granularities       any
+		wantWords, wantSegs bool
+	}{
+		{"unset", nil, false, true},
+		{"word", []string{"word"}, true, false},
+		{"segment", []string{"segment"}, false, true},
+		{"both", []string{"word", "segment"}, true, true},
+	}
+	for _, c := range cases {
+		body := map[string]any{"response_format": "verbose_json"}
+		if c.granularities != nil {
+			body["timestamp_granularities"] = c.granularities
+		}
+		s := &Server{Transcription: transcriptFake()}
+		rec := do(t, s, transcriptionRequest(t, body))
+		var got TranscriptionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if (len(got.Words) > 0) != c.wantWords {
+			t.Errorf("%s: %d words", c.name, len(got.Words))
+		}
+		if (len(got.Segments) > 0) != c.wantSegs {
+			t.Errorf("%s: %d segments", c.name, len(got.Segments))
+		}
+	}
+}
+
+func TestTranscriptionSubtitles(t *testing.T) {
+	s := &Server{Transcription: transcriptFake()}
+	rec := do(t, s, transcriptionRequest(t, map[string]any{"response_format": "srt"}))
+	wantSRT := "1\n00:00:00,000 --> 00:00:00,800\nHello there.\n\n" +
+		"2\n00:00:01,200 --> 00:00:02,400\nGeneral Kenobi.\n\n"
+	if rec.Body.String() != wantSRT {
+		t.Errorf("srt:\n%q\nwant\n%q", rec.Body.String(), wantSRT)
+	}
+
+	s = &Server{Transcription: transcriptFake()}
+	rec = do(t, s, transcriptionRequest(t, map[string]any{"response_format": "vtt"}))
+	wantVTT := "WEBVTT\n\n00:00:00.000 --> 00:00:00.800\nHello there.\n\n" +
+		"00:00:01.200 --> 00:00:02.400\nGeneral Kenobi.\n\n"
+	if rec.Body.String() != wantVTT {
+		t.Errorf("vtt:\n%q\nwant\n%q", rec.Body.String(), wantVTT)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/vtt") {
+		t.Errorf("vtt content-type %q", ct)
+	}
+}
+
+func TestTimecode(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "00:00:00,000"},
+		{-1, "00:00:00,000"},
+		{0.8, "00:00:00,800"},
+		{61.5, "00:01:01,500"},
+		{3723.456, "01:02:03,456"},
+	}
+	for _, c := range cases {
+		if got := timecode(c.in, ","); got != c.want {
+			t.Errorf("timecode(%v) = %s, want %s", c.in, got, c.want)
+		}
 	}
 }

@@ -35,6 +35,14 @@ type Server struct {
 	// upload, an image to edit. Zero takes defaultMaxUpload.
 	MaxUploadBytes int64
 
+	// LogBodies prints each request's and response's text in the access
+	// log. It is off by default because this server's bodies are
+	// conversations: a chat endpoint with body logging on writes every
+	// prompt and every answer to disk as a side effect of having a log.
+	// With it off the log still carries the method, the path, the status,
+	// the duration and the sizes.
+	LogBodies bool
+
 	// The backends, any of which may be nil.
 	Speech        SpeechBackend
 	Transcription TranscriptionBackend
@@ -52,7 +60,7 @@ func (s *Server) Handler() http.Handler {
 	// No request / response, it's just headers. This is registered outside
 	// the authorization middleware on purpose: browsers never send
 	// Authorization on a preflight.
-	mux.Handle("OPTIONS /v1/", util.LogRequest(http.HandlerFunc(util.CORSPreflight)))
+	mux.Handle("OPTIONS /v1/", s.log(http.HandlerFunc(util.CORSPreflight)))
 
 	// Output: ModelsResponse{}
 	mux.Handle("GET /v1/models", s.route(s.handleModels))
@@ -89,7 +97,12 @@ func (s *Server) Handler() http.Handler {
 // The body limit is outside the logger on purpose: the logger reads small
 // bodies so it can print them, and it must never be handed an unbounded one.
 func (s *Server) route(h http.HandlerFunc) http.Handler {
-	return s.limitBody(util.LogRequest(s.authorize(addHeaders(h))))
+	return s.limitBody(s.log(s.authorize(addHeaders(h))))
+}
+
+// log is the access log, with or without the bodies.
+func (s *Server) log(h http.Handler) http.HandlerFunc {
+	return util.LogRequestFunc(s.LogBodies)(h)
 }
 
 // limitBody caps what a request may carry. Past the cap the read fails with

@@ -7,6 +7,7 @@
 //
 //	go run ./cmd/llm -tokenize 'hello world'
 //	go run ./cmd/llm -model … -tokenize-file prompt.txt -ids-only
+//	go run ./cmd/llm -model … -chat-template     # the checkpoint's own Jinja
 //
 // At L2 it also drives the first kernel of the vertical, the fused
 // hyper-connection block, against the per-op attribution of llama.cpp's own
@@ -29,6 +30,7 @@ import (
 	"strings"
 
 	"strix-halo-vulkan/gguf"
+	"strix-halo-vulkan/llm"
 	"strix-halo-vulkan/zimage/tokenizer"
 )
 
@@ -51,6 +53,7 @@ func main() {
 	file := flag.String("tokenize-file", "", "tokenize the contents of this file")
 	idsOnly := flag.Bool("ids-only", false, "print ids alone, one line, space separated")
 	chat := flag.Bool("chat", false, "wrap the text in the chat template first")
+	chatTemplate := flag.Bool("chat-template", false, "print the checkpoint's own tokenizer.chat_template and exit")
 	hc := flag.Bool("hc", false, "benchmark the fused hyper-connection block")
 	ple := flag.Bool("ple", false, "benchmark the PLE n-gram block")
 	attn := flag.Bool("attn", false, "benchmark the full-attention layer and the QSA indexer")
@@ -83,6 +86,13 @@ func main() {
 	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn and -attn, and at one token the decode GEMV's split per projection")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
+
+	if *chatTemplate {
+		if err := printChatTemplate(*model); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	if *head {
 		toks := []int{1, 8, 64, 512}
@@ -243,27 +253,26 @@ func main() {
 	}
 }
 
-// LoadTokenizer builds the tokenizer out of a checkpoint's metadata. Only
-// shard 1 carries it, and it is 12 MB of strings, so this is the one part of
-// a 111 GB checkpoint that is copied onto the Go heap.
-func LoadTokenizer(set *gguf.Set) (*tokenizer.Tokenizer, error) {
-	tokens, ok := set.Strings("tokenizer.ggml.tokens")
+// printChatTemplate writes the checkpoint's own chat template to stdout.
+//
+// It is here because `llm.RenderChat` is a transcription of that template and
+// the oracle it is checked against is Jinja rendering the original
+// (reference/dump_chat_template.py) -- which needs the original, and the only
+// copy of it is 180 lines of metadata inside a 107 GB GGUF:
+//
+//	go run ./cmd/llm -model … -chat-template > reference/out/chat/template.jinja
+func printChatTemplate(model string) error {
+	set, err := gguf.OpenSet(model)
+	if err != nil {
+		return err
+	}
+	defer set.Close()
+	tmpl, ok := set.Str("tokenizer.chat_template")
 	if !ok {
-		return nil, fmt.Errorf("llm: the checkpoint has no tokenizer.ggml.tokens")
+		return fmt.Errorf("%s carries no tokenizer.chat_template", model)
 	}
-	merges, ok := set.Strings("tokenizer.ggml.merges")
-	if !ok {
-		return nil, fmt.Errorf("llm: the checkpoint has no tokenizer.ggml.merges")
-	}
-	v := tokenizer.Vocab{Tokens: tokens, Merges: merges}
-	v.Pre, _ = set.Str("tokenizer.ggml.pre")
-	if raw, ok := set.Ints("tokenizer.ggml.token_type"); ok {
-		v.Types = make([]tokenizer.TokenType, len(raw))
-		for i, t := range raw {
-			v.Types[i] = tokenizer.TokenType(t)
-		}
-	}
-	return tokenizer.FromVocab(v)
+	_, err = os.Stdout.WriteString(tmpl)
+	return err
 }
 
 func run(model, text string, idsOnly bool) error {
@@ -273,7 +282,7 @@ func run(model, text string, idsOnly bool) error {
 	}
 	defer set.Close()
 
-	tok, err := LoadTokenizer(set)
+	tok, err := llm.LoadTokenizer(set)
 	if err != nil {
 		return err
 	}

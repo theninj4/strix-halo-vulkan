@@ -105,7 +105,7 @@ func graphBench(model, prompt string, toks []int, nLayers, ctx int, csvPath stri
 // id, because a run of identical tokens routes to one expert and is not a
 // measurement of this model.
 func graphPrompt(m *llm.Model, prompt string, n int) ([]int32, error) {
-	tok, err := LoadTokenizer(m.Set)
+	tok, err := llm.LoadTokenizer(m.Set)
 	if err != nil {
 		return nil, err
 	}

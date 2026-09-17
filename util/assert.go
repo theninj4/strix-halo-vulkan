@@ -31,6 +31,11 @@ type responseRecorder struct {
 	statusCode int
 	body       bytes.Buffer
 	size       int
+	// keep is whether this response's text is wanted in the log at all. It
+	// is off for a server carrying conversations, and off for an event
+	// stream whatever the caller asked, because a fragment of the first
+	// kilobyte of a stream is noise rather than a record.
+	keep bool
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
@@ -40,7 +45,7 @@ func (r *responseRecorder) WriteHeader(code int) {
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	r.size += len(b)
-	if textual(r.Header().Get("Content-Type")) && r.body.Len() <= maxLogBodySize {
+	if r.keep && r.body.Len() <= maxLogBodySize {
 		r.body.Write(b)
 	}
 	return r.ResponseWriter.Write(b)
@@ -95,8 +100,19 @@ func textual(contentType string) bool {
 
 // bodyFor is what the log prints for one body: the body itself when it is
 // text, and its size and type when it is not.
+// resBodyFor is the response's line: its text when the text is wanted and
+// keepable, and its size and media type otherwise. An event stream is always
+// the latter -- the first kilobyte of a stream is a fragment of a frame.
+func resBodyFor(rec *responseRecorder, bodies bool) string {
+	ct := rec.Header().Get("Content-Type")
+	if !bodies || mediaType(ct) == "text/event-stream" {
+		return bodyFor(ct, nil, rec.size)
+	}
+	return bodyFor(ct, rec.body.Bytes(), rec.size)
+}
+
 func bodyFor(contentType string, b []byte, size int) string {
-	if textual(contentType) {
+	if textual(contentType) && b != nil {
 		return truncate(b)
 	}
 	if t := mediaType(contentType); t != "" {
@@ -165,14 +181,31 @@ func AssertOk(ok bool, msg string, args ...interface{}) {
 // would hold the whole thing in memory before whatever limit the handler set
 // could apply, which on the transcription endpoint is the difference between
 // a bounded upload and an unbounded one.
-func LogRequest(fs http.Handler) http.HandlerFunc {
+func LogRequest(fs http.Handler) http.HandlerFunc { return LogRequestFunc(true)(fs) }
+
+// LogRequestFunc is LogRequest with the bodies made optional.
+//
+// **A chat server's bodies are its users' conversations.** Logging them is
+// the right default for a tool being driven by hand -- every other command
+// here is one -- and the wrong default for a process that stays up and serves
+// other people, where it puts every prompt and every answer on disk as a side
+// effect of having a log at all. So `cmd/serve` turns them off and takes a
+// flag to turn them back on, and what is printed instead is the size and the
+// media type, which is what an operator actually reads.
+func LogRequestFunc(bodies bool) func(http.Handler) http.HandlerFunc {
+	return func(fs http.Handler) http.HandlerFunc {
+		return logRequest(fs, bodies)
+	}
+}
+
+func logRequest(fs http.Handler, bodies bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Read and buffer the request body, when it is small and textual, so
 		// downstream handlers can still consume it.
 		var reqBody []byte
 		buffered := false
 		ct := r.Header.Get("Content-Type")
-		if r.Body != nil && textual(ct) && r.ContentLength >= 0 && r.ContentLength <= maxBufferedBody {
+		if bodies && r.Body != nil && textual(ct) && r.ContentLength >= 0 && r.ContentLength <= maxBufferedBody {
 			var err error
 			reqBody, err = io.ReadAll(r.Body)
 			r.Body.Close()
@@ -189,6 +222,7 @@ func LogRequest(fs http.Handler) http.HandlerFunc {
 		}
 
 		rec := &responseRecorder{ResponseWriter: w, statusCode: http.StatusOK}
+		rec.keep = bodies
 		start := time.Now()
 		fs.ServeHTTP(rec, r)
 		duration := time.Since(start)
@@ -199,13 +233,16 @@ func LogRequest(fs http.Handler) http.HandlerFunc {
 			req = truncate(reqBody)
 		case r.ContentLength == 0:
 			req = ""
-		case !textual(ct):
+		case r.ContentLength < 0:
+			// A chunked body of unknown length, which was streamed past
+			// this logger: the default line above says so.
+		case !bodies || !textual(ct):
 			req = bodyFor(ct, nil, int(r.ContentLength))
 		}
 
 		log.Printf("%s %s %d %v\n  headers: %s\n  req body: %s\n  res body: %s",
 			r.Method, r.URL.Path, rec.statusCode, duration,
 			formatHeaders(r.Header), req,
-			bodyFor(rec.Header().Get("Content-Type"), rec.body.Bytes(), rec.size))
+			resBodyFor(rec, bodies))
 	}
 }

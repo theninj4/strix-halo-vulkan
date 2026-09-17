@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"strix-halo-vulkan/gguf"
+	"strix-halo-vulkan/llm"
 )
 
 // checkpoint is the local UD-Q4_K_XL checkout. The test is skipped when it is
@@ -52,7 +53,7 @@ func TestTokenizerMatchesLlamaCpp(t *testing.T) {
 	}
 	defer set.Close()
 
-	tok, err := LoadTokenizer(set)
+	tok, err := llm.LoadTokenizer(set)
 	if err != nil {
 		t.Fatal(err)
 	}

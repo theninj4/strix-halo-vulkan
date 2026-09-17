@@ -10,8 +10,11 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: the model generates, phase 2's kernel half is finished, and five of
-the six dense families are now at a width the checkpoint does not ship.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
+**Status: the model generates, it is served over HTTP, phase 2's kernel half
+is finished, and five of the six dense families are now at a width the
+checkpoint does not ship.** **L9a** put the generation loop behind
+`cmd/serve` — the checkpoint's own chat template transcribed and checked
+against Jinja, and three envelopes over one loop (`API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
 L8a and L8b, which between them put every dense weight in the model
 on the width the checkpoint already ships, L8d and L8e, which give every block
@@ -2212,6 +2215,80 @@ to; the incumbents stay because no candidate disagrees.
 
 ---
 
+## What L9a established — the chat template, and three envelopes over one loop
+
+> **L9a-1: the prompt is metadata, not a design.** A chat request is a list of
+> messages and this model reads one string. What turns one into the other is
+> `tokenizer.chat_template` in the GGUF's own metadata — **180 lines of
+> Jinja** that merge the leading system turns, add a reasoning-effort
+> sentence, write the tool block, keep each assistant turn's `<think>` and
+> open the generation prompt. A server that improvises it does not fail; it
+> answers slightly wrong, everywhere, with nothing to point at. So
+> `llm.RenderChat` is a **transcription**, and the gate is Jinja's own output:
+> `go run ./cmd/llm -chat-template` exports the template,
+> `reference/dump_chat_template.py` renders **23 cases** with the environment
+> transformers builds, and `TestRenderChat` diffs them character for
+> character.
+>
+> **L9a-2: four differences hid in one filter.** The template writes a tool
+> with `tool | tojson`, and transformers binds that to
+> `json.dumps(ensure_ascii=False)`. Go's `encoding/json` writes no space after
+> a separator where Python writes one, escapes `<`, `>` and `&` where Python
+> does not, escapes U+2028 where Python does not, and sorts a `map[string]any`
+> where Python keeps insertion order. Each is legal JSON and each is a
+> different prompt, so `llm.pyJSON` re-encodes Python's way and `api.Tool`
+> keeps **the bytes the client sent** rather than round-tripping through a
+> struct — whose field order is its own and which would add every field the
+> client left out.
+>
+> **L9a-3: the boundaries are markers, and markers straddle tokens.** The
+> generation prompt leaves `<think>` open, so the model's first token is
+> reasoning and `</think>` is where the answer starts; the tool block asks for
+> `<tool_call>`. Both can be split across two tokens, and a `<` already sent
+> to a client as an answer cannot be taken back. `llm.ChatDecoder` holds back
+> any tail that could still be a marker's beginning — and any trailing
+> whitespace, because the blank line before a call is the format's separator
+> and not the answer's — which is what makes the streamed and the buffered
+> answer the same string.
+>
+> **L9a-4: reading a call back needs the schema.** The template writes a
+> string argument raw between its tags and everything else as JSON, so `123`
+> is the number for an `integer` parameter and the text `"123"` for a `string`
+> one. Rebuilding OpenAI's `arguments` therefore reads the request's own tool
+> schema; without one, valid JSON is taken at face value and anything else is
+> a string. Tool calls are also the one thing not streamed: a call is not a
+> call until it has closed.
+>
+> **L9a-5: three envelopes, one generation.** `api.CompletionBackend` is a
+> *streaming* interface — `Complete(ctx, req, emit)` — and the buffered
+> response is a string builder over it, because the reverse cannot be written.
+> `/v1/chat/completions`, `/v1/responses` and `/v1/messages` are then
+> translations in and out of it, each with its own SSE taxonomy and none with
+> a second copy of the loop. `go test ./api/` runs all three, streams
+> included, against a fake in **5 ms** and needs no checkpoint.
+>
+> **L9a-6: a second turn is a continuation.** A chat client re-sends the whole
+> conversation every turn, so the naive server prefills ten turns of history
+> to answer the tenth. The adapter keeps the token sequence the graph is
+> holding and `Extend`s the new tokens onto it, which is the same call a
+> generated token makes and is covered by L7b's gate. Measured on the second
+> turn of a two-turn conversation: **90 prompt tokens, 71 reused, 216 ms
+> against 421**. The reuse is all-or-nothing because the **gated DeltaNet has
+> no rewind** — the attention cache is masked by position and both convolution
+> rings are addressed by it, so those would survive a fork, but a DeltaNet
+> layer's recurrent state is a running product with no inverse.
+>
+> **L9a-7: it answers.** `go run ./cmd/serve -llm` stages the whole model in
+> **33.5 s**, and then: "What is the capital of France?" with thinking off is
+> `Paris` in **356 ms**; a two-step arithmetic question at effort `low`
+> separates 42 tokens into a `reasoning_content` and a `content` of `15:55`;
+> and a tool request comes back as `get_weather({"city":"Wimbledon","days":2})`
+> — the `days` typed as a number by L9a-4 — in 4.6 s. Decode measures
+> **22.71 tok/s** through the server, against L7d's 11.89 on the checkpoint's
+> own width.
+
+---
+
 ## The three findings that set the direction
 
 **1. `llama.cpp` already implements this architecture, is built with Vulkan on
@@ -3487,8 +3564,17 @@ below Q8. Bandwidth is the whole story.
 
 ### L9 — phase 3, and shipping
 
+- [x] **L9a — the HTTP API `GOALS.md` asks for.** The chat template
+      transcribed from the checkpoint's own metadata and checked against Jinja
+      on 23 cases, the decoder that splits a token stream into reasoning,
+      answer and tool calls, and three envelopes over one generation loop:
+      `/v1/chat/completions`, `/v1/responses` and `/v1/messages`, buffered and
+      streamed, with stop sequences on the same holdback and a prefix reuse
+      that makes a second turn a continuation. `go run ./cmd/serve -llm`. See
+      `API.md`.
 - [ ] MTP speculative decoding (the separate GGUF). Target 1.5-1.8x.
-- [ ] Batching, then the HTTP API `GOALS.md` asks for.
+- [ ] Batching — which is now also "more than one conversation at a time",
+      since the served graph is one sequence's.
 - [ ] Vision tower, if wanted.
 
 ---
@@ -3506,6 +3592,14 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -gen -model $M -n 64 -top 3      # the alternatives it beat
     go run ./cmd/llm -gen -model $M -n 128 -temp 0.7 -top-p 0.8 -seed 1
     go run ./cmd/llm -gen -model $M -n 16 -layers 4   # the loop, in 7 GB
+    go run ./cmd/llm -model $M -chat-template        # the checkpoint's own Jinja
+
+    # the server (API.md): the same loop behind three chat envelopes
+    go run ./cmd/serve -llm                          # 33.5 s to stage, ~84 GB
+    go run ./cmd/serve -llm -llm-layers 4            # the HTTP side, in 7 GB
+    curl -sH 'Authorization: Bearer womblesofwimbledon' -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":48}' \
+        http://127.0.0.1:8080/v1/chat/completions
     go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is' \
         -csv results/l8e_decode.csv          # every committed decode CSV is
                                              # this prompt; the default is
