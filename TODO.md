@@ -880,6 +880,77 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-17 (fifty-third) — stage L8c-5: the gated DeltaNet at 4.5 bits, and a screen with the wrong sign
+
+**Result: 36 of the 48 layers are on L8c-4's bank, decode is 28.9 tok/s
+against 25.75 — 1.15x llama.cpp — prefill is faster at both ubatches, and the
+family costs +0.93% of perplexity where its own eight-chunk screen said
+−0.30%.** The gated DeltaNet is the largest dense thing in the model (2.087 B
+parameters, 2.247 GB of a 6.334 GB token, 46% of the dense half) and it
+needed no new kernel: `llm_gemm.comp -DQ4B` and `llm_gemv.comp -DQ4B` already
+had every arm, **including the fp16 tail branch nothing had exercised**.
+
+| `-gen -n 64`, same prompt | L8e (q8) | L8c-4 (+head) | **L8c-5 (+deltanet)** |
+|---|---:|---:|---:|
+| decode | 24.66 tok/s | 25.75 | **28.73 / 29.07** |
+| against llama.cpp's 25.15 | 0.981x | 1.024x | **1.15x** |
+| a token | 40.5 ms | 38.8 ms | **34.4 ms** |
+| the DeltaNet block, per token | 11.0 ms | 10.9 ms | **6.8 ms** |
+| residency | 81.89 GB | 81.57 GB | **80.53 GB** |
+| prefill, ubatch 2048 / 512 | 1052.8 / 655.2 | — | **1070.1 / 667.0** |
+| perplexity, 145 chunks | 4.0289 | 4.0621 (+0.82%) | **4.1012 (+1.79%)** |
+
+**What it cost in host code, and it is all about names.** `tileBQ4K`'s
+destination row count is now the *plane's* rather than the source's, so four
+of llama.cpp's matrices can be staged into one fused plane; `DeltaNetWeights`
+carries its layer index, because each source of that fused matrix is
+calibrated under **its own tensor name** — which is what the simulation the
+format's number came out of did, and the property "the bank is the format" is
+the only thing this whole stage rests on. `DeltaNetGPU.q8 bool` became
+`bank DenseBank` + `sim QuantSim`, on `HeadGPU`'s precedent, and its weight
+buffer is `wbank` now that `bank` means a width.
+
+**Two equalities, at two scales.** `TestDeltaNetGPUQ4IsTheSim` stages one
+layer twice from the same weights — the fp16 bank with `sim.go` applied, and
+the real 4.5-bit bank — and the fused projection's 115 360 values *and the
+layer's 17 920 output values* are identical. Over the corpus the bank and its
+simulation agree **chunk for chunk to four decimals** at eight chunks, with
+`LLM_DENSE_SIM_SRC=q8` as what makes them the same question (the simulation's
+default scope includes the two F32 matrices the bank leaves in its tail).
+
+**The finding is the instrument.** L8c-3's per-family screen puts this family
+at **−0.30%** — calibrated 4-bit weights beating the checkpoint's own Q8_0,
+quoted as one of that stage's headline results — and over 145 chunks it is
+**+0.93%**. So L8c-4's "a screen under-reads by 2.05x" is the weaker of the
+two statements: **a per-family row does not fix the sign.** Both families
+measured both ways now sit +0.42 and +1.23 pp above their screens, and every
+remaining width has to be called from a 145-chunk run (8 minutes). What *is*
+safe is adding corpus numbers: 0.82 + 0.93 = 1.75 against a measured 1.79,
+where L8c-1's four symmetric families summed to 11.7% and measured 18.5%.
+
+**D14 gains its boundary rather than a third side.** Prefill is 1.09-1.11x
+*faster* here (the block 350.7 ms to 320.5 at ubatch 2048, 96.5 to 86.7 at
+512), and the reason is arithmetic: the fused [16512, 2560] projection is
+84.5 MB as halves, 44.9 at int8 and **23.8 at 4.5 bits**, so it **changes
+side** of the 32 MiB MALL and sixteen re-reads a graph come off DRAM. Three
+blocks, three answers: the hyper-connection block fits at every width and was
+slower, the head fits at none and was faster, this one crosses.
+
+**And one ladder was re-run and could not be believed.** D12 says a split-K
+ladder does not survive a change of bank, so `-dn -tokens 1 -gemm-ladder` was
+re-run on nibbles: it names k8 and k32, which are L8d's own two, at
+**1700-1800 GB/s** — seven times the bus, because the bench stages a handful
+of layers over a bank that fits the MALL (D16). Nothing moved and nothing
+could have been trusted to. That also retro-taints `results/l8d_dn.csv`; it
+is in LLM.md's open questions.
+
+**Next: the last three families**, in the order their bytes justify —
+`hyper_conn` (0.695 GB a token), `full_attn` (0.635), `ple_proj` (0.035). The
+first needs a **packing of its own**: `hc_{attn,ffn}_up` and `output_hc_up`
+are 320 wide and `get_scale_min_k4`'s twelve-byte scheme *is* eight groups,
+four low and four high, not a length — and it is the family the whole imatrix
+result turns on, so its width must come from a 145-chunk run.
+
 ### Session 2026-09-17 (fifty-second) — stage L8c-4: the bank is the format, and a screen that under-reads
 
 **Result: L8c-3's 4.5-bit asymmetric form now exists as a bank and two kernel

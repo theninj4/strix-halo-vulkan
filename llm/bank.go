@@ -63,6 +63,10 @@ func (b DenseBank) String() string {
 	return "fp16"
 }
 
+// BankFor is bankOf for a caller outside the package — the benchmarks, which
+// take the same two-valued choice from `LLM_DENSE_FP16` that a graph does.
+func BankFor(q8 bool) DenseBank { return bankOf(q8) }
+
 // bankOf is the two-valued spelling every constructor took before L8c-4.
 func bankOf(q8 bool) DenseBank {
 	if q8 {

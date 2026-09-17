@@ -129,13 +129,21 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 	for _, t := range tokens {
 		maxTok = max(maxTok, t)
 	}
-	g, err := llm.NewDeltaNetGPU(dev, cfg, maxTok, ws, llm.DenseQ8())
+	// L8c-5's bank, where `LLM_DENSE_BANK` names this family — so the rung
+	// ladders below can be re-run on it, which D12 says they have to be: a
+	// slab of nibbles is half the bytes of a slab of int8, and the split
+	// that misses §5.1b's 4 KB rotation moves with the width.
+	bank, sim := llm.BankFor(llm.DenseQ8()), llm.QuantSim{}
+	if q, ok := llm.DenseBankPlan().For("blk.0.attn_qkv.weight", true); ok {
+		bank, sim = llm.BankQ4K, q
+	}
+	g, err := llm.NewDeltaNetGPUBank(dev, cfg, maxTok, ws, bank, sim)
 	if err != nil {
 		return err
 	}
 	defer g.Destroy()
-	fmt.Printf("%d layers staged: %.1f MB of weights, %.1f MB of arenas for %d tokens\n\n",
-		g.Layers(), float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
+	fmt.Printf("%d layers staged on the %s bank: %.1f MB of weights, %.1f MB of arenas for %d tokens\n\n",
+		g.Layers(), bank, float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6, maxTok)
 
 	// A plan is (scan, gemm, outGemm, qkvGemv, outGemv). The last two are the
 	// decode kernel's rungs (L8d-4) and they only exist at one token, where

@@ -419,7 +419,7 @@ func (m *Model) DeltaNetConfig(layer int) (DeltaNetConfig, bool, error) {
 // DeltaNetWeights loads one linear-attention layer's tensors.
 func (m *Model) DeltaNetWeights(layer int) (DeltaNetWeights, error) {
 	p := fmt.Sprintf("blk.%d.", layer)
-	var w DeltaNetWeights
+	w := DeltaNetWeights{Layer: layer}
 	for _, t := range []struct {
 		name string
 		dst  *[]float32

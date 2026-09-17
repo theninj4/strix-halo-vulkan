@@ -84,12 +84,26 @@ func q4kFits(n, k int) error {
 // (`q4_k/32`) and `qw` the importance of each of the k input columns
 // — the imatrix row for this tensor, or nil for round-to-nearest.
 //
-// dstQ is n*k/2 bytes and dstR is the record plane. Both are the *whole*
-// matrix's planes or a slab's, as long as the slab is whole sixteen-row tiles
-// of the destination, which is what lets the lm head stage 4096 rows at a
-// time without a 2.54 GB copy of itself ever existing.
+// dstQ and dstR are the destination's two planes, and their length is what
+// says how many rows the destination has. They are the *whole* matrix's or a
+// slab's, as long as the slab is whole sixteen-row tiles of the destination,
+// which is what lets the lm head stage 4096 rows at a time without a 2.54 GB
+// copy of itself ever existing — and they may be wider than `n`, which is
+// what lets four of llama.cpp's matrices be staged into one fused plane.
 func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q QuantSim, qw []float32) error {
-	if err := q4kFits(n, k); err != nil {
+	if k%(q4kSuper*32) != 0 {
+		return fmt.Errorf("llm: a q4_k bank wants k a multiple of %d, not %d — "+
+			"the 320-wide hyper-connection family needs its own packing", q4kSuper*32, k)
+	}
+	// **The destination's rows are the plane's, not the source's.** The lm
+	// head stages one matrix into a plane of its own size, but the gated
+	// DeltaNet's fused projection is four of llama.cpp's matrices written
+	// into one — `row` sends each source row to its column of the fused
+	// output — so the plane a call fills is wider than the rows it carries.
+	// The buffer says how wide: dstQ is dstN*k/2 bytes and nothing else can
+	// be, which is the same check one level up.
+	dstN := len(dstQ) * 2 / k
+	if err := q4kFits(dstN, k); err != nil {
 		return err
 	}
 	if !q.Asym || q.Group != 32 {
@@ -111,12 +125,18 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 	const tile = coopMatTile
 	kt := k / tile
 	nsb := k / (q4kSuper * 32)
-	if len(dstQ) != n*k/2 {
-		return fmt.Errorf("llm: q4_k tile plane is %d bytes, want %d", len(dstQ), n*k/2)
+	if len(dstQ) != dstN*k/2 {
+		return fmt.Errorf("llm: q4_k tile plane is %d bytes, want %d", len(dstQ), dstN*k/2)
 	}
-	if len(dstR) != (n/tile)*nsb*tile*q4kRecord {
+	if len(dstR) != (dstN/tile)*nsb*tile*q4kRecord {
 		return fmt.Errorf("llm: q4_k record plane is %d bytes, want %d",
-			len(dstR), (n/tile)*nsb*tile*q4kRecord)
+			len(dstR), (dstN/tile)*nsb*tile*q4kRecord)
+	}
+	if n > dstN {
+		return fmt.Errorf("llm: %d source rows into a %d-row plane", n, dstN)
+	}
+	if len(src) < n*k {
+		return fmt.Errorf("llm: %d source values for %d rows of %d", len(src), n, k)
 	}
 	if err := q4kPackFits(q4kSuper); err != nil {
 		return err
@@ -173,4 +193,25 @@ func q4kDequant(bankQ, bankR []byte, n, k, dstRow, col int) float32 {
 	dmin := f16(binary.LittleEndian.Uint16(rec[2:]))
 	sc, mn := unpackScaleMinK4(rec[4:16], (col%(q4kSuper*32))/32)
 	return d*float32(sc)*float32(l) - dmin*float32(mn)
+}
+
+// bankImatrix is one tensor's importance row and the format to encode it
+// with: the plan's, or round-to-nearest where the published matrix has no
+// entry for the tensor.
+//
+// The fallback is ggml's own — `quantize_row_q4_K_impl` returns
+// `quantize_row_q4_K_ref` on a null `quant_weights`, not the *search* with
+// unit weights, which is a third arm and one L8c-3 measured as worse than
+// either — and it is what `sim.go`'s `ApplyTo` does. A bank that did anything
+// else at an uncovered tensor would not be the format the simulation
+// measured, which is the one property this whole stage rests on.
+func bankImatrix(name string, q QuantSim) (QuantSim, []float32, error) {
+	qw, err := imatrixCols(name, q.Mode)
+	if err != nil {
+		return q, nil, err
+	}
+	if qw == nil && (q.Mode == "imatrix" || q.Mode == "imatrix+gain") {
+		q.Mode = "rtn"
+	}
+	return q, qw, nil
 }

@@ -462,7 +462,15 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		dnCfg, dns = cfg, append(dns, w)
 	}
 	if len(dns) > 0 {
-		if g.dn, err = NewDeltaNetGPU(dev, dnCfg, g.maxTok, dns, opts.denseQ8()); err != nil {
+		// L8c-5's bank, where the plan names this family. `attn_qkv` is the
+		// tensor `simFamily` maps to "deltanet" and the checkpoint ships it
+		// as Q8_0, which is what the `true` says — the block's own two F32
+		// matrices stay in the fp16 tail whatever this is (D13).
+		dnBank, dnSim := bankOf(opts.denseQ8()), QuantSim{}
+		if q, ok := DenseBankPlan().For("blk.0.attn_qkv.weight", true); ok {
+			dnBank, dnSim = BankQ4K, q
+		}
+		if g.dn, err = NewDeltaNetGPUBank(dev, dnCfg, g.maxTok, dns, dnBank, dnSim); err != nil {
 			return fmt.Errorf("llm: deltanet: %w", err)
 		}
 		mark("deltanet", len(dns), g.dn.Buffers(), g.dn.WeightBytes(), g.dn.ActivationBytes(), start)

@@ -10,13 +10,13 @@
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
-**Status: the model generates, phase 2's kernel half is finished, and the
-first dense weight is now at a width the checkpoint does not ship.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
+**Status: the model generates, phase 2's kernel half is finished, and two of
+the five dense families are now at a width the checkpoint does not ship.** L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
 L8a and L8b, which between them put every dense weight in the model
-on the width the checkpoint already ships, L8d, which gives the two
-blocks that dominate a decode step a kernel shaped for one row, and now L8e,
-which gives it to the third and takes two dispatches a layer off the MoE.** The checkpoint is downloaded,
+on the width the checkpoint already ships, L8d and L8e, which give every block
+that dominates a decode step a kernel shaped for one row, and now L8c-4 and
+L8c-5, which put the lm head and all 36 gated DeltaNet layers on 4.5 bits.** The checkpoint is downloaded,
 llama.cpp runs it, the Go side reads it, the prefill mystery is solved, and
 there is a kernel for every layer and every sub-layer: the hyper-connection
 block in four dispatches where the reference has sixteen (4.24x, 14.9% of
@@ -332,6 +332,34 @@ pair's 7.84e-06. And **the per-family screen under-reads by 2.05x**: `lm_head`
 screens at +0.40% over eight chunks and measures +0.82% over 145, which is
 L8c-0's warning one level down and applies to every per-family row the plan
 was assembled from.
+
+**L8c-5 puts the largest dense family on that bank, and the finding is not
+the speed.** The gated DeltaNet is 36 of the 48 layers and 2.247 GB of a
+6.334 GB token — 46% of the dense half — and it needed no new kernel and no
+new format: `-DQ4B` already had the arms, including the fp16 tail arm nothing
+had exercised, and `ssm_alpha` and `ssm_beta` stay exactly where L8a left
+them. **Decode is 25.75 tok/s to 28.9 — 1.15x llama.cpp — the block 10.9 ms
+a token to 6.8 (1.60x), a layer 62.28 MB to 33.28, residency 81.57 GB to
+80.53, and prefill 1070.1 tok/s at ubatch 2048 against 1052.8 and 667.0 at
+512 against 655.2.** Two equalities say the bank is the format: a whole
+layer's output off the real bank is *identical* to the same format through
+`sim.go`, and the bank and the simulation agree **chunk for chunk** over
+eight chunks.
+
+**The finding is that L8c-4's screen warning is worse than a factor — it is a
+sign.** L8c-3's per-family row puts this family at **−0.30%**, calibrated
+4-bit weights beating the checkpoint's own Q8_0, and that was one of that
+stage's headline results; measured over 145 chunks it is **+0.93%**. So a
+per-family row does not bound its family's corpus cost and does not fix its
+sign, and the two families now measured both ways sit +0.42 and +1.23
+percentage points above their screens. **What does hold is additivity**:
+`lm_head` at +0.82% and `deltanet` at +0.93% together measure **4.1012,
++1.79%**, against a sum of 1.75 — where the symmetric form compounded four
+families' 11.7% into 18.5%. **And D14 gains its boundary**: prefill is
+1.09-1.11x *faster* rather than slower, because the fused [16512, 2560]
+projection is 44.9 MB at int8 and **23.8 at 4.5 bits** — it changes side of
+the 32 MiB MALL, so sixteen re-reads a graph come off DRAM. Three blocks,
+three answers, one rule.
 
 **So the plan is 4.50 bits, not 5.30, and it costs +4.24% rather than +5.98%
 — 4.264 GB a token against 4.575 and a 56.7 tok/s ceiling against 52.9, or
@@ -1985,6 +2013,82 @@ against our own 4.0289 — +0.82%**.
 
 ---
 
+## What L8c-5 established — the largest family, and a screen with the wrong sign
+
+**1. The gated DeltaNet is on the bank, and it needed no new kernel.** 36 of
+the 48 layers, 2.087 B parameters, 2.247 GB of a 6.334 GB token — 46% of the
+dense half and the largest single dense thing in the model. `llm_gemm.comp
+-DQ4B` and `llm_gemv.comp -DQ4B` already had every arm, **including the fp16
+tail branch nothing had exercised**: `ssm_alpha` and `ssm_beta` are the
+checkpoint's only F32 matrices here and they stay where L8a put them (D13),
+at a split of 16384 that is a whole column block by construction — the easy
+case L8b's `inject` was not. **A layer is 62.28 MB to 33.28 and 36 of them
+2.24 GB to 1.20; residency 81.57 GB to 80.53.** Two host changes made it
+possible and both are about names rather than widths: `tileBQ4K`'s
+destination row count is the **plane's** and not the source's, so four of
+llama.cpp's matrices can be staged into one fused plane, and
+`DeltaNetWeights` carries its layer index, so each source is calibrated under
+**its own tensor name** — which is what the simulation the format was
+measured with did.
+
+**2. The bank is the format, said as two equalities.**
+`TestDeltaNetGPUQ4IsTheSim` stages one layer twice from the same weights —
+the fp16 bank with `sim.go` applied, and the real 4.5-bit bank — and the
+fused projection's 115 360 values *and the whole layer's 17 920 output
+values* come back **identical**. Over the corpus, the bank and its simulation
+agree **chunk for chunk to four decimals** over eight chunks, with
+`LLM_DENSE_SIM_SRC=q8` as the thing that makes them the same question: the
+simulation's default scope includes the two F32 matrices the bank leaves in
+its tail.
+
+**3. Decode is 28.9 tok/s and the block is 1.60x.** 10.9 ms a token to
+**6.8**, 28.1% of a token to 19.8%, a token 38.8 ms to **34.4**, and the
+whole model **25.75 tok/s to 28.73 and 29.07 on two runs — 1.15x
+llama.cpp's 25.15**. The block moves 176 GB/s of staged bank against the Q8
+bank's 205, which is the unpack's price on a bank that halves; netting out
+the ~0.5 ms a token of scan, convolution, norm and history that read no bank
+puts the two projections at roughly 190 against 215.
+
+**4. Prefill is faster, and D14 gains its boundary rather than another
+side.** **1070.1 tok/s at ubatch 2048 against 1052.8 and 667.0 at 512 against
+655.2** — the block 350.7 ms to 320.5 and 96.5 to 86.7. D14 said a narrower
+bank costs at prefill because the re-reads come out of the MALL; L8c-4 added
+that this is about a weight that *fits* it. This block's fused projection is
+84.5 MB as halves, **44.9 at int8 and 23.8 at 4.5 bits** — it **changes
+side** of the 32 MiB MALL, so sixteen re-reads a graph come off DRAM
+entirely. Three blocks, three answers, one rule: the hyper-connection block
+fits at every width and was 1.09-1.15x slower, the head fits at none and was
+faster, this one crosses and is faster.
+
+**5. The finding is the accuracy, and it is about the instrument.** The
+family costs **+0.93% over 145 chunks — 4.0665 against 4.0289 — where
+L8c-3's eight-chunk screen said −0.30%.** That screen was not a noisy
+estimate: on the first 8184 tokens of `wiki.test.raw` the calibrated 4-bit
+DeltaNet is *better than the checkpoint's own Q8_0*, and it was quoted as
+such. So L8c-4's "the screen under-reads by 2.05x" is the weaker statement of
+the two; **a per-family row does not fix the sign**, and the two families
+measured both ways now sit +0.42 and +1.23 percentage points above their
+screens. Every remaining width has to be called from a 145-chunk run.
+
+**6. What does hold is adding corpus numbers.** `lm_head` at +0.82% and
+`deltanet` at +0.93% together measure **4.1012, +1.79%**, against a sum of
+1.75 — 0.04 pp of compounding over two families, where L8c-1's four symmetric
+families summed to 11.7% and measured 18.5%. L8c-3 predicted the asymmetric
+form would compound mildly; this is the first built confirmation, at 36 and 1
+depths against L6b-3's x1.085 a layer.
+
+**7. The decode rungs did not move, and the ladder that says so is D16.**
+D12 says a split-K ladder does not survive a change of bank, so it was re-run
+on nibbles: k8 for the fused projection and k32 for the output one, which are
+L8d's own two. But every rung reads **1700-1800 GB/s**, seven times the bus,
+because the bench stages a handful of layers over a bank that fits the MALL —
+so what it ranks is kernel shape against an L3 hit, the spread is 1.18x where
+L7d-2 saw 2.4x in DRAM, and the rung whose slab stride *is* a whole multiple
+of 4 KB is only the second-worst. Nothing moved and nothing could be trusted
+to; the incumbents stay because no candidate disagrees.
+
+---
+
 ## The three findings that set the direction
 
 **1. `llama.cpp` already implements this architecture, is built with Vulkan on
@@ -2033,9 +2137,17 @@ dense weight is read every time.
 | L8c-1's mixed plan: DeltaNet + head 4.5, attention + hc 6.5 | ~73 GB | 4.575 | **52.9** | **4.2699, +5.98%** |
 | **L8c-3: 4.5 bits on the dense half, `q4_k` + the imatrix** | 80.5 GB | **4.264** | **56.7** | **4.1998, +4.24%** |
 | **L8c-4: the first family of that, built — `lm_head` alone** | 82.20 GB | **6.016** | **40.2** | **4.0621, +0.82%** |
+| **L8c-5: the second and largest — `+ deltanet`** | 81.12 GB | **4.943** | **49.0** | **4.1012, +1.79%** |
 | L8c-3's mixed plan: `q5_k` on attention + hc, `q4_k` on the rest | 80.6 GB | 4.419 | **54.8** | **4.1377, +2.70%** |
 | the same 4.5 bits in the **symmetric** form — what D3 was retired on | 80.5 GB | 4.264 | 56.7 | 4.6127 rtn / 4.6588 imatrix, **+14.5 / +15.6%** |
 
+> **L8c-5's row is L8c-4's plus the DeltaNet's group**: `cmd/gguf -width`
+> puts `deltanet` at 2.247 GB a token as shipped and 1.174 at 4.5 bits, so a
+> token is 6.016 to **4.943** and the ceiling 40.2 to **49.0**. Measured
+> against *our staged bank* it is 5.733 GB to 4.69 and a 51.6 tok/s ceiling,
+> with the measured rate **28.9 tok/s** against 25.75; the resident core is
+> **80.53 GB** on that basis. The delta is 1.04-1.07 GB either way.
+>
 > **L8c-4's row is on this table's basis and not on L8b's.** A token reads
 > 6.334 GB of the checkpoint's own widths and the head is 0.676 of them, so
 > 4.5 bits there is 6.016 and 40.2 tok/s, and the resident core 82.52 GB to
@@ -2182,11 +2294,24 @@ encoder serves it and the simulation, so the lm head's 248 320 logits off the
 real bank are **identical** to the same format's through `sim.go`. **The head
 is 0.675 GB to 0.358, decode 24.66 tok/s to 25.75 — 1.024x llama.cpp, ahead
 of it for the first time — and perplexity 4.0621 against our own 4.0289,
-+0.82%.** The other four streamed families are the same kernel and the same
-plumbing, in the order their bytes justify (the DeltaNet is 46% of a dense
-token), with one real obstacle left in the last of them: `hc_*_up` is 320 wide
-and `get_scale_min_k4`'s twelve-byte scheme *is* eight groups, so the
-hyper-connection block needs a packing of its own.
++0.82%.**
+
+**L8c-5 is the second family and the largest**, and it is the same kernel and
+the same plumbing: the gated DeltaNet's 36 layers, 46% of a dense token, with
+the fp16 tail exactly where L8a left it. **Decode 25.75 tok/s to 28.9 — 1.15x
+llama.cpp — the block 10.9 ms a token to 6.8, a layer 62.28 MB to 33.28,
+residency 81.57 GB to 80.53, and prefill *faster* at both ubatches (1070.1 at
+2048, 667.0 at 512).** Its accuracy is where the stage earns its keep:
+**+0.93% over 145 chunks where the eight-chunk screen said −0.30%**, so
+L8c-4's "the screen under-reads by 2.05x" is really "the screen does not fix
+the sign" — while the two families together measure **+1.79% against a sum of
+1.75**, which is the mildest compounding this vertical has seen. Three
+families are left, in the order their bytes justify (`hyper_conn` 0.695 GB a
+token, `full_attn` 0.635, `ple_proj` 0.035), with one real obstacle in the
+first of them: `hc_*_up` is 320 wide and `get_scale_min_k4`'s twelve-byte
+scheme *is* eight groups, so the hyper-connection block needs a packing of its
+own — and, on two data points, its width should be called from a 145-chunk run
+rather than from a screen.
 
 **Phase 3 — the throughput levers that are worth more than the format.** The
 MTP head is downloaded (2.79 GB, `mtp-…-Q4_K_M.gguf`); a draft step is ~12% of
@@ -2951,7 +3076,7 @@ below Q8. Bandwidth is the whole story.
 
 ### L8c — the widths that are ours rather than the checkpoint's  *(in progress)*
 
-> **L8c-0 through L8c-3 are done, and the stage's direction turned twice.**
+> **L8c-0 through L8c-5 are done, and the stage's direction turned twice.**
 > The instrument came first, and what it measured retired D3: the
 > re-quantisation as specified costs far more accuracy than it was assumed to,
 > so the order became *calibrate, then decide whether to build the kernel*
@@ -2960,7 +3085,10 @@ below Q8. Bandwidth is the whole story.
 > about the model** — in ggml's asymmetric K-quant, at the same bits, 4-bit
 > dense weights cost +4.24% rather than +18.5% and calibration *helps* — so
 > D3 is back at 4.5 bits, D7 is reversed, and the kernel is the next thing to
-> build. The items below are in execution order.
+> build. **L8c-4 built it and L8c-5 put the largest family on it**, and between
+> them they turned the stage's own instrument into a finding: an eight-chunk
+> per-family screen does not bound a family's corpus cost and does not even
+> fix its sign. The items below are in execution order.
 
 - [x] **The instrument first**, because this is the stage where a tensor
       comparison stops being a grade. `Graph.ForwardRows` is a prefill without
@@ -3044,25 +3172,49 @@ below Q8. Bandwidth is the whole story.
       242 GB/s bus, and 4.0621 against 4.0289 over the corpus — +0.82%.**
       [Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv` ·
       `results/l8c_ppl_head_q4k.csv`
-- [ ] **The other four streamed families on the same bank**, in the order
-      their bytes justify: the gated DeltaNet (46% of a dense token), the
-      full-attention layer, the PLE projections, and then the
-      hyper-connection block — which needs a **packing of its own**, because
-      `hc_{attn,ffn}_up` and `output_hc_up` are 320 wide and
-      `get_scale_min_k4`'s scheme *is* eight groups, four low and four high,
-      not a length. Both fused matrices also carry L8a-2's fp16 tail, which
-      the `-DQ4B` arms already branch for and nothing has exercised.
+- [x] **L8c-5 — the gated DeltaNet, the largest of the four.** 36 layers,
+      46% of a dense token, and no new kernel: `-DQ4B`'s MODE 2 arm and its
+      **fp16 tail branch**, which nothing had exercised, over the split L8a
+      chose for `ssm_alpha` and `ssm_beta` (D13). `tileBQ4K` gained one
+      property to allow it — the destination's row count is the *plane's*,
+      not the source's — and `DeltaNetWeights` gained its layer index,
+      because each of the fused matrix's sources is calibrated under its own
+      tensor name, which is what the simulation did. **Decode 25.75 tok/s to
+      28.73/29.07, the block 10.9 ms a token to 6.8 (1.60x, 205 GB/s of bank
+      to 176), a layer 62.28 MB to 33.28 and 36 of them 2.24 GB to 1.20,
+      residency 81.57 GB to 80.53, prefill 1052.8 tok/s to 1070.1 at ubatch
+      2048 and 655.2 to 667.0 at 512.**
+      [Write-up](research/l8c-dn-bank.md) · `results/l8c_decode_dn.csv` ·
+      `results/l8c_graph_dn.csv` · `results/l8c_ppl_dn_q4k.csv` ·
+      `results/l8c_ppl_dn_only.csv` · `results/l8c_dn_gemv.csv`
+- [x] Gate: **the bank is the format**, twice — a whole layer's output off the
+      real bank is identical to the same format through `sim.go`
+      (`TestDeltaNetGPUQ4IsTheSim`, 115 360 projection values and 17 920
+      output values), and the bank and its simulation agree **chunk for
+      chunk** over eight chunks. Perplexity **4.1012 against 4.0289, +1.79%**
+      for head and DeltaNet together and **4.0665, +0.93%** for the DeltaNet
+      alone. Prefill *faster* at both ubatches rather than merely no slower,
+      which is D14's hazard not firing for a reason the stage names.
+- [ ] **The last three families**, in the order their bytes justify:
+      `hyper_conn` (0.695 GB a token), `full_attn` (0.635) and `ple_proj`
+      (0.035), with `qsa_indexer` riding along. The first of them needs a
+      **packing of its own**, because `hc_{attn,ffn}_up` and `output_hc_up`
+      are 320 wide and `get_scale_min_k4`'s scheme *is* eight groups, four low
+      and four high, not a length — and it is the family the whole imatrix
+      result turns on.
       §1.1's W4A8 stays open beside this: it is a *symmetric* layout and an
       int8-activation one, where every rung here multiplies an fp16 A —
       the asymmetric version folds the min into the epilogue as a per-group
       correction times the activation's column sum.
-- [ ] **The per-family attribution is eight-chunk and it under-reads.**
-      `lm_head` screened at +0.40% and measures **+0.82%** over the corpus,
-      2.05x, on a bank that reproduces the screen to four decimal places — so
-      the gap is the screen, not the bank. The plan's own +4.24% is a corpus
-      number and stands; the rows it was assembled from do not, and the next
-      family to get a kernel should be re-screened at 145 chunks before its
-      width is called.
+- [ ] **The per-family attribution is eight-chunk, and it does not fix the
+      sign.** `lm_head` screened at +0.40% and measures **+0.82%** over the
+      corpus; `deltanet` screened at **−0.30%** — better than the checkpoint —
+      and measures **+0.93%**. Both banks reproduce their screens to four
+      decimal places, so the gap is the screen and not the bank. The plan's
+      own +4.24% is a corpus number and stands; the rows it was assembled from
+      do not, and **the next family's width has to be called from a 145-chunk
+      run**. What *is* safe is adding corpus numbers: 0.82 + 0.93 = 1.75
+      against a measured 1.79.
 - [ ] Then the two the simulation cannot reach, which are worth more together
       than narrowing `hyper_conn` and `full_attn`: **the router to fp16**
       (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
@@ -3143,12 +3295,32 @@ below Q8. Bandwidth is the whole story.
                                        # GEMV, and the logits compared
     go run ./cmd/llm -head -model $M -csv results/l8c_head.csv
 
-    # L8c-4: the **real** 4.5-bit bank, not a simulation of one. Same grammar
+    # L8c-4 and L8c-5: the **real** 4.5-bit bank, not a simulation of one. Same grammar
     # as LLM_DENSE_SIM, and the two refuse to run together — a weight
     # quantised twice is neither format. The mode defaults to `imatrix` here
     # where a simulation defaults to `rtn`, because a bank is built at the arm
-    # L8c-3 recommends. Only `lm_head` has a kernel so far.
+    # L8c-3 recommends. `lm_head` and `deltanet` have kernels; the other
+    # three families are still the checkpoint's own width.
     LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -ppl -model $M -chunks 8
+    # L8c-5 adds the second family. `deltanet` is 36 layers and the largest
+    # of the five; the two names together are what results/l8c_*_dn*.csv is.
+    LLM_DENSE_BANK=lm_head=q4_k/32,deltanet=q4_k/32 go run ./cmd/llm -gen \
+        -model $M -n 64 -prompt 'The capital of France is' \
+        -csv results/l8c_decode_dn.csv
+    LLM_DENSE_BANK=lm_head=q4_k/32,deltanet=q4_k/32 go run ./cmd/llm -graph \
+        -model $M -tokens 128,512,1024,2048 -csv results/l8c_graph_dn.csv
+    LLM_DENSE_BANK=deltanet=q4_k/32 go run ./cmd/llm -ppl -model $M \
+        -csv results/l8c_ppl_dn_only.csv      # the family's own corpus number
+    LLM_DENSE_BANK=deltanet=q4_k/32 go run ./cmd/llm -dn -model $M \
+        -tokens 1 -gemm-ladder -csv results/l8c_dn_gemv.csv   # D12's re-run,
+                                       # which D16 says is an L3 measurement
+    # the simulation of exactly that bank — SRC=q8 is what excludes the two
+    # F32 matrices the bank leaves in its fp16 tail, without which the two
+    # arms quantise different sets of weights. Agrees chunk for chunk.
+    LLM_DENSE_SIM=lm_head=q4_k/32,deltanet=q4_k/32 LLM_DENSE_SIM_SRC=q8 \
+        LLM_DENSE_SIM_QUANT=imatrix go run ./cmd/llm -ppl -model $M -chunks 8
+    go test ./llm/ -run TestDeltaNetGPUQ4 -v     # the layer on both arms,
+                                       # value for value, and the bank's size
     LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -ppl -model $M \
         -csv results/l8c_ppl_head_q4k.csv
     LLM_DENSE_BANK=lm_head=q4_k/32 go run ./cmd/llm -gen -model $M -n 64 \
@@ -3393,7 +3565,7 @@ below Q8. Bandwidth is the whole story.
 | D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. **L8d-5 shows it does not carry to another *matrix* either** — k8 wins at K = 2560 and k32 at K = 6144 on one kernel over one bank — and **L8d-3 shows where it stops applying**: the 2.63 MB router never leaves the MALL, so its KSLABS ladder is flat within 0.6 us. A rule about DRAM channels says nothing about a weight that does not reach DRAM. |
 | D16 | **A micro-bench rung whose measured rate is above the 242 GB/s bus is not a DRAM measurement; confirm it in the whole model before believing it.** | L8e-2: `-moe -tokens 1 -ladder` stages two layers and re-runs one dispatch twenty times, and a token's ten routed experts are ~32 MB — **the MALL exactly** — so every repetition after the first reads at 805-965 GB/s. The ladder then measures kernel shape against an L3 hit and picks the rung with the most parallelism rather than the best DRAM locality: v16w4 at **288 GB/s** for the routed up mode, which is **42.1 ms worse over 64 tokens** in the whole model where each expert is read once. This is D12 widened a fourth time — a ladder does not carry across a bank (L7d-2), a width (L8b-3), a matrix (L8d-5) or a **residency** — and the last one is a property of the harness rather than of the kernel. The test is on the face of the number: the fused attention projection's winner reads 39.5 MB in 174.3 us (227 GB/s, sound), its output projection's 16.7 MB in 24.6 (679, not). |
 | D13 | **A dense weight is staged in the checkpoint's own width, never expanded.** | L8a: 8.5 bits a weight against 16 is 1.61x of a decode token's dense half and **costs nothing in accuracy**, because ggml's `d = amax/127` makes the round trip an identity. The three families the checkpoint does not ship as Q8_0 keep their halves in a tail rather than being re-quantised early — that is L8c's decision to make, with a perplexity number beside it. **L8b holds the rule where it costs something**: `inject` does not begin on a column block, so keeping it in the tail means staging 32 low-rank rows twice, and the answer is to pay the 0.33 MB a mixer rather than to re-quantise four rows early. **L8c-1 makes the deferred decision and the tail loses**: `ssm_alpha`, `ssm_beta` and `inject` as int8 with a scale per 32 are **4.0294 against 4.0289, +0.01%** over the whole corpus — five times inside the error bar — so the two-plane machinery can go. It is worth **0.030 GB a token, 0.6%**, so the reason is deleting `lowRank`/`gateOff` from two kernels and L8b-1's doubled rows, not speed. The indexer's two BF16 projections rode along untested, because nothing at `-c 2048` reads them (L8c-1's finding 2). |
-| D14 | **At prefill the bank is not the kernel; at decode it is — *where the weight fits the MALL*.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. **L8c-4 found the counter-example and it names the condition**: the lm head's B is 357 MB at 4.5 bits and never fits the MALL at any width, so there is nothing for the re-reads to hide behind and the bank is the kernel at *every* length — 18839 us to **17461** at 512 rows, 1.08x, in the direction this rule warns about. The unpack does show up there (82 GB/s of bank against the Q8 arm's 143); it just does not win. So the rule is about a weight that fits the MALL, and where one does not, a narrower bank is faster at both ends. |
+| D14 | **At prefill the bank is not the kernel; at decode it is — *where the weight fits the MALL*.** | L8b-5: the hyper-connection block's two projections are 2.3-2.5x faster on int8 at one token and **1.09-1.15x slower at ubatch 2048**, because at 2048 each weight is read 32 times out of a 32 MiB MALL and the DRAM bytes were already hidden — what is left is the unpack's ALU, 256/WM conversions a matrix step. A narrower bank is a decode decision, and a block that is asked to serve both needs a *ladder* per bank rather than a kernel per bank. **L8c-4 found the counter-example and it names the condition**: the lm head's B is 357 MB at 4.5 bits and never fits the MALL at any width, so there is nothing for the re-reads to hide behind and the bank is the kernel at *every* length — 18839 us to **17461** at 512 rows, 1.08x, in the direction this rule warns about. The unpack does show up there (82 GB/s of bank against the Q8 arm's 143); it just does not win. So the rule is about a weight that fits the MALL, and where one does not, a narrower bank is faster at both ends. **L8c-5 is the third case and it names the boundary rather than the two sides of it**: the gated DeltaNet's fused [16512, 2560] projection is 84.5 MB as halves, 44.9 at int8 and **23.8 at 4.5 bits**, so it *changes side* — sixteen re-reads a graph at ubatch 2048 come off DRAM — and the block is 1.09-1.11x **faster** at prefill (350.7 ms to 320.5 at 2048, 96.5 to 86.7 at 512). Three blocks, three answers: the hyper-connection block's weights fit at every width and it was slower, the head's fit at none and it was faster, this one crosses and it is faster. |
 | D17 | **An accuracy delta is stated against our own number, not against the oracle's.** | L8c-0: at *identical* weights our perplexity is **4.0289** and llama.cpp's **4.0340** — −0.13%, a fifth of either side's standard error, and in the direction L4a-5 predicts, since the reference accumulates every quantised matmul in fp16 above 8 output columns where ours accumulate in f32. That gap is settled, is not the bank, and would be silently charged to the re-quantisation by a delta measured from 4.0340. The reference's number stays as the sanity check that the two implementations are the same model; the *stage's* gate is a delta from ours. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
@@ -3736,7 +3908,12 @@ below Q8. Bandwidth is the whole story.
   `gbps` exceeds 242 was not measuring DRAM. The prefill rungs are the ones
   worth screening, because a 2048-token ubatch reads its weights 32 times out
   of the MALL for real (D14) and there the residency is the *truth* rather
-  than an artefact.
+  than an artefact. **L8c-5 screened one of them and it failed**: every rung
+  of `-dn -tokens 1 -gemm-ladder` on the 4.5-bit bank reads 1700-1800 GB/s, so
+  `results/l8d_dn.csv`'s decode rungs were chosen against an L3 hit too. They
+  happen to be the rungs the new ladder also names, so nothing was acted on —
+  but the question is now "which of these ladders has ever measured DRAM", and
+  the answer so far is none of the one-token ones.
 - **Batch and speculation.** At batch 4 the dense 76% amortises completely.
   Worth knowing whether the API will ever serve more than one stream before
   optimising the batch-1 path to death.

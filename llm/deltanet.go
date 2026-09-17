@@ -133,6 +133,11 @@ func (c DeltaNetConfig) StateSize() int { return c.NHeadV * c.HeadDim * c.HeadDi
 
 // DeltaNetWeights is the layer's tensors, row-major [out][in].
 type DeltaNetWeights struct {
+	// Layer is which `blk.N.` these came from. It is carried rather than
+	// inferred because the published imatrix is keyed by tensor name, and a
+	// bank at 4.5 bits has to look each of the fused matrix's sources up
+	// under the name the simulation looked it up under (L8c-5).
+	Layer int
 	QKV   []float32 // [convWidth][nEmbd]  — blk.N.attn_qkv, Q8_0
 	Z     []float32 // [inner][nEmbd]      — blk.N.attn_gate, Q8_0
 	Out   []float32 // [nEmbd][inner]      — blk.N.ssm_out, Q8_0

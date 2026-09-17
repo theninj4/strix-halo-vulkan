@@ -550,3 +550,115 @@ func TestDeltaNetGPUGemvAgrees(t *testing.T) {
 		}
 	}
 }
+
+// TestDeltaNetGPUQ4IsTheSim is L8c-5's first gate, and it is the same shape
+// as the lm head's: **the bank against the simulation that chose it**, value
+// for value, over a whole layer rather than one matmul.
+//
+// L8c-3's +4.24% is a perplexity measured through `sim.go`, which stages a
+// candidate format's floats and lets the fp16 kernels multiply them. This
+// bank stores that format instead, through the same encoder — so the halves
+// the matrix cores see are the same halves, the fragment order is the same,
+// and the two arms have to agree exactly. They are compared at the fused
+// projection, where a wrong address would show first, and at the layer's
+// output, where the convolution, the recurrence and the second projection
+// have all run on top of it.
+//
+// It is `rtn` rather than `imatrix` so the test needs nothing but the
+// checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
+// TestBankQ4KIsTheSim covers that at the encoder.
+func TestDeltaNetGPUQ4IsTheSim(t *testing.T) {
+	tr, c, w, nTok := dnFixtures(t, dnLayer)
+	in, err := tr.Get(fmt.Sprintf("hc_mixed-%d", dnLayer), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim, err := ParseQuantSim("q4_k/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim.Mode = "rtn"
+
+	dev, done := newTestDevice(t)
+	defer done()
+
+	run := func(bank DenseBank) ([]float32, []float32, int) {
+		t.Helper()
+		g, err := NewDeltaNetGPUBank(dev, c, nTok, []DeltaNetWeights{w}, bank, sim)
+		if err != nil {
+			t.Fatalf("deltanet (%s): %v", bank, err)
+		}
+		defer g.Destroy()
+		if err := g.Upload(in.Vals, nTok); err != nil {
+			t.Fatalf("upload (%s): %v", bank, err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatalf("run (%s): %v", bank, err)
+		}
+		return append([]float32(nil), g.Column(g.ColQ(), g.ColBeta()+c.NHeadV)...),
+			append([]float32(nil), g.Result()...), g.WeightBytes()
+	}
+
+	simQKV, simOut, simBytes := run(BankFP16)
+	q4QKV, q4Out, q4Bytes := run(BankQ4K)
+
+	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
+		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
+	if q4Bytes >= simBytes {
+		t.Fatalf("the q4_k bank is %d bytes, no smaller than %d", q4Bytes, simBytes)
+	}
+	for _, tc := range []struct {
+		what     string
+		got, ref []float32
+	}{
+		{"the fused projection", q4QKV, simQKV},
+		{"the layer's output", q4Out, simOut},
+	} {
+		if len(tc.got) != len(tc.ref) {
+			t.Fatalf("%s: %d values against %d", tc.what, len(tc.got), len(tc.ref))
+		}
+		for i := range tc.ref {
+			if tc.got[i] != tc.ref[i] {
+				t.Fatalf("%s [%d]: bank %.9g, simulation %.9g", tc.what, i, tc.got[i], tc.ref[i])
+			}
+		}
+		t.Logf("%s: %d values identical", tc.what, len(tc.ref))
+	}
+}
+
+// TestDeltaNetGPUQ4BankSize states what L8c-5 stages against what it
+// replaces, and where the 4.500 bits stop being exact.
+//
+// The fused projection's tail is the reason: alpha and beta are the
+// checkpoint's own F32 and stay halves (qkvQ8Rows), and the quantised plane
+// still covers all qkvN rows because the kernel derives the record plane's
+// base from gemmN * gemmK. So the matrix as staged is a little over 4.5 bits
+// and the test says how much rather than asserting a round number.
+func TestDeltaNetGPUQ4BankSize(t *testing.T) {
+	_, c, _, _ := dnFixtures(t, dnLayer)
+	n, k := roundUpInt(c.ConvWidth()+c.Inner+2*c.NHeadV, dnBN), c.NEmbd
+	tail := n - (c.ConvWidth() + c.Inner)
+
+	q4 := q8Align(q4kBytes(n, k)) + tail*k*2 + q8Align(q4kBytes(c.NEmbd, c.Inner))
+	q8 := q8Align(q8Bytes(n, k)) + tail*k*2 + q8Align(q8Bytes(c.NEmbd, c.Inner))
+	half := n*k*2 + c.NEmbd*c.Inner*2
+	weights := (c.ConvWidth()+c.Inner)*k + c.NEmbd*c.Inner + tail*k
+
+	t.Logf("a layer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
+		float64(q4)/1e6, float64(q8)/1e6, float64(half)/1e6,
+		float64(q4)*8/float64(weights), float64(q8)*8/float64(weights),
+		float64(half)*8/float64(weights))
+	t.Logf("36 layers: %.2f GB against %.2f GB and %.2f GB",
+		float64(36*q4)/1e9, float64(36*q8)/1e9, float64(36*half)/1e9)
+	if q4 >= q8 || q8 >= half {
+		t.Fatalf("the three banks are %d, %d, %d bytes and are not in order", q4, q8, half)
+	}
+	// The quantised half alone is the format's own width to the bit.
+	body := q4kBytes(n, k) - tail*k/2 + q4kBytes(c.NEmbd, c.Inner)
+	bodyW := (c.ConvWidth()+c.Inner)*k + c.NEmbd*c.Inner
+	// The record plane covers the tail's rows too, so subtract only the
+	// nibbles and state the remainder rather than demanding 4.500.
+	if bits := float64(body) * 8 / float64(bodyW); bits < 4.5 || bits > 4.52 {
+		t.Fatalf("the quantised half is %.4f bits a weight, want 4.500 plus the tail's records", bits)
+	}
+}

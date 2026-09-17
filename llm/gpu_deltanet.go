@@ -211,14 +211,26 @@ type DeltaNetGPU struct {
 	dev *vk.Device
 	cfg DeltaNetConfig
 
-	wbuf, abuf, hbuf, bank *vk.Buffer
-	pipes                  map[string]*vk.ComputePipeline
-	mods                   []*vk.ShaderModule
+	wbuf, abuf, hbuf, wbank *vk.Buffer
+	pipes                   map[string]*vk.ComputePipeline
+	mods                    []*vk.ShaderModule
 
-	// q8 is whether the bank is L8's int8-plus-scales. 36 of the 48 layers
-	// are this block's, and its two projections are 4.18 GB of a decode
-	// token's 9.67 as halves — the largest single thing L8 halves.
-	q8 bool
+	// bank is which width this block's two projections are staged in: the
+	// halves every block ran on before L8, L8a's int8-plus-scales, or
+	// L8c-5's 4.5-bit K-quant. 36 of the 48 layers are this block's, and its
+	// two projections are 4.18 GB of a decode token's 9.67 as halves — the
+	// largest single thing L8 narrows, at every width.
+	bank DenseBank
+	// sim is the format the 4.5-bit bank quantises to (`q4_k/32` and a
+	// mode), and is unread on the other two. It is a QuantSim because that
+	// is what L8c-3 measured the format with, and one encoder serves both
+	// (quantk.go).
+	sim QuantSim
+	// imLayer maps a staged layer to its `blk.N.` prefix, which is what the
+	// published imatrix is keyed by: the fused projection's two quantised
+	// sources are different tensors with different importance rows, and the
+	// simulation this bank has to reproduce looked each of them up by name.
+	imLayer []int
 
 	layers []dnLayerWeights
 
@@ -266,6 +278,11 @@ type DeltaNetGPU struct {
 	hElems    int
 }
 
+// quant is whether the bank is one of the two the kernel unpacks — which is
+// what every line that is about "int8 or halves" rather than about a
+// particular width asks.
+func (g *DeltaNetGPU) quant() bool { return g.bank != BankFP16 }
+
 // qkvN is the fused projection's output width: the convolution's 10240
 // channels, the output gate's 6144, and the two per-head scalars, padded up
 // to the GEMM's column block. Four of llama.cpp's matrices, one of ours.
@@ -284,8 +301,10 @@ func (g *DeltaNetGPU) colZ() int     { return g.cfg.ConvWidth() }
 func (g *DeltaNetGPU) colAlpha() int { return g.cfg.ConvWidth() + g.cfg.Inner }
 func (g *DeltaNetGPU) colBeta() int  { return g.colAlpha() + g.cfg.NHeadV }
 
-// qkvQ8Rows is how much of the fused projection L8's int8 bank holds, and
-// qkvTailRows is the rest.
+// qkvQ8Rows is how much of the fused projection a quantised bank holds, and
+// qkvTailRows is the rest. It is the same split at 8.5 bits and at 4.5
+// (L8c-5): a width that was a re-quantisation of alpha and beta at int8 is
+// more of one at a nibble.
 //
 // alpha and beta are the only two of the four matrices the checkpoint does
 // **not** store as Q8_0 — they are F32, 48 rows of 2560 each, the decay and
@@ -314,6 +333,13 @@ func (g *DeltaNetGPU) ColBeta() int  { return g.colBeta() }
 // layer gets its own recurrent state, zeroed here, because the state is the
 // layer's and not the batch's.
 func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []DeltaNetWeights, q8 bool) (*DeltaNetGPU, error) {
+	return NewDeltaNetGPUBank(dev, cfg, maxTokens, layers, bankOf(q8), QuantSim{})
+}
+
+// NewDeltaNetGPUBank is the same, with the bank named rather than implied —
+// and with the format, for the one bank that has one to choose (L8c-5).
+func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
+	layers []DeltaNetWeights, bank DenseBank, sim QuantSim) (*DeltaNetGPU, error) {
 	if maxTokens <= 0 {
 		return nil, fmt.Errorf("llm: %d tokens", maxTokens)
 	}
@@ -336,8 +362,11 @@ func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
+	if bank == BankQ4K && sim.Off() {
+		return nil, fmt.Errorf("llm: a q4_k deltanet bank needs a format to quantise to")
+	}
 	g := &DeltaNetGPU{
-		dev: dev, cfg: cfg, q8: q8,
+		dev: dev, cfg: cfg, bank: bank, sim: sim,
 		pipes:    make(map[string]*vk.ComputePipeline),
 		tokens:   maxTokens,
 		rows:     maxTokens,
@@ -348,8 +377,12 @@ func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []
 		outGemm:  OutGEMMKernelFor(maxTokens),
 		autoPlan: true,
 	}
+	g.imLayer = make([]int, len(layers))
+	for i, w := range layers {
+		g.imLayer[i] = w.Layer
+	}
 	align := coopMatTile
-	for _, v := range gemmBuilds(q8) {
+	for _, v := range gemmBuildsFor(bank) {
 		align = maxInt(align, v.bm)
 	}
 	g.arenaRows = roundUpInt(maxTokens, align)
@@ -436,16 +469,31 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	// every base is a whole word for the kernel's `uint` view.
 	qkvBank, outBank, tailBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.Inner*2, 0
 	unit := 2
-	if g.q8 {
+	if g.quant() {
 		if g.qkvQ8Rows()%dnBN != 0 {
 			return fmt.Errorf("llm: alpha starts at column %d, not a whole %d-column block", g.qkvQ8Rows(), dnBN)
 		}
-		qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.Inner))
+		// Both quantised banks hold **all** qkvN rows of the fused
+		// projection, tail included, because the kernel derives the second
+		// plane's base from gemmN * gemmK and gemmN is the stride of the
+		// output it writes (stage). At 4.5 bits that is 0.12 MB a layer of
+		// nibbles nothing reads, against the 11 the width saves.
+		if g.bank == BankQ4K {
+			if err := q4kFits(g.qkvN(), c.NEmbd); err != nil {
+				return err
+			}
+			if err := q4kFits(c.NEmbd, c.Inner); err != nil {
+				return err
+			}
+			qkvBank, outBank = q8Align(q4kBytes(g.qkvN(), c.NEmbd)), q8Align(q4kBytes(c.NEmbd, c.Inner))
+		} else {
+			qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.Inner))
+		}
 		tailBank = g.qkvTailRows() * c.NEmbd * 2
 		unit = 1
 	}
 	perBank := qkvBank + tailBank + outBank
-	if g.bank, err = g.dev.NewBuffer(nLayers * perBank); err != nil {
+	if g.wbank, err = g.dev.NewBuffer(nLayers * perBank); err != nil {
 		return fmt.Errorf("llm: deltanet weight bank (%d MB): %w", (nLayers*perBank)>>20, err)
 	}
 	g.layers = make([]dnLayerWeights, nLayers)
@@ -469,12 +517,12 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 }
 
 func (g *DeltaNetGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf}
 	// Only the two projections read the bank, and only their Q8 build names
 	// the sixth buffer; the conv, the scan and the norm are unchanged.
 	gemmBufs := bufs
-	if g.q8 {
-		gemmBufs = append(append([]*vk.Buffer{}, bufs...), g.bank)
+	if g.quant() {
+		gemmBufs = append(append([]*vk.Buffer{}, bufs...), g.wbank)
 	}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
@@ -501,10 +549,10 @@ func (g *DeltaNetGPU) build() error {
 			return err
 		}
 	}
-	// Both builds, when the bank is L8's: the two projections read int8 and
-	// the fp16 tail dispatch reads halves out of the same buffer, so the
-	// block needs a pipeline of each. On the fp16 bank there is no tail and
-	// the second set is never built.
+	// Both builds, when the bank is quantised: the two projections read the
+	// narrow plane and the fp16 tail dispatch reads halves out of the same
+	// buffer, so the block needs a pipeline of each. On the fp16 bank there
+	// is no tail and the second set is never built.
 	for _, v := range gemmVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
@@ -512,9 +560,9 @@ func (g *DeltaNetGPU) build() error {
 			return err
 		}
 	}
-	if g.q8 {
-		for _, v := range gemmQ8Variants {
-			if err := g.pipeline(q8Pipe(v.name), v.spirv, vk.PipelineSpec{
+	if g.quant() {
+		for _, v := range gemmBuildsFor(g.bank) {
+			if err := g.pipeline(bankPipe(g.bank, v.name), v.spirv, vk.PipelineSpec{
 				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
 			}); err != nil {
 				return err
@@ -595,7 +643,68 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 		}
 
 		baseZ, baseA, baseB := g.colZ(), g.colAlpha(), g.colBeta()
-		if g.q8 {
+		if g.bank == BankQ4K {
+			// L8c-5's bank, and the fp16 tail is exactly where L8a left it:
+			// alpha and beta are the checkpoint's own F32 and a *narrower*
+			// width for them is even less defensible than int8 was, so the
+			// split is unchanged and only the quantised half moves.
+			//
+			// **Each source of the fused matrix is quantised under its own
+			// name.** The published matrix has a row per tensor, `attn_qkv`
+			// and `attn_gate` are different tensors, and the simulation
+			// L8c-3's number came out of looked each of them up separately —
+			// so a bank that calibrated the fused thing with one row would
+			// not be the format that was measured, however little the two
+			// rows differ.
+			q4rows := g.qkvQ8Rows()
+			nsbQKV := c.NEmbd / (q4kSuper * 32)
+			q4 := make([]byte, g.qkvN()*c.NEmbd/2)
+			rec := make([]byte, g.qkvN()/coopMatTile*nsbQKV*coopMatTile*q4kRecord)
+			for _, t := range []struct {
+				name string
+				src  []float32
+				n    int
+				base int
+			}{
+				{"attn_qkv.weight", w.QKV, cw, 0},
+				{"attn_gate.weight", w.Z, c.Inner, baseZ},
+			} {
+				name := fmt.Sprintf("blk.%d.%s", g.imLayer[i], t.name)
+				q, qw, err := bankImatrix(name, g.sim)
+				if err != nil {
+					return err
+				}
+				base := t.base
+				if err := tileBQ4K(q4, rec, t.src, t.n, c.NEmbd,
+					func(r int) int { return base + r }, q, qw); err != nil {
+					return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
+				}
+			}
+			g.wbank.WriteBytesAt(int(g.layers[i].qkv), q4)
+			g.wbank.WriteBytesAt(int(g.layers[i].qkv)+len(q4), rec)
+
+			tail := make([]uint16, g.qkvTailRows()*c.NEmbd)
+			tileB(tail, w.Alpha, c.NHeadV, c.NEmbd, func(r int) int { return baseA - q4rows + r })
+			tileB(tail, w.Beta, c.NHeadV, c.NEmbd, func(r int) int { return baseB - q4rows + r })
+			g.wbank.WriteUint16At(int(g.layers[i].qkvTail), tail)
+
+			name := fmt.Sprintf("blk.%d.ssm_out.weight", g.imLayer[i])
+			q, qw, err := bankImatrix(name, g.sim)
+			if err != nil {
+				return err
+			}
+			nsbOut := c.Inner / (q4kSuper * 32)
+			oq := make([]byte, c.NEmbd*c.Inner/2)
+			orec := make([]byte, c.NEmbd/coopMatTile*nsbOut*coopMatTile*q4kRecord)
+			if err := tileBQ4K(oq, orec, w.Out, c.NEmbd, c.Inner,
+				func(r int) int { return r }, q, qw); err != nil {
+				return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
+			}
+			g.wbank.WriteBytesAt(int(g.layers[i].out), oq)
+			g.wbank.WriteBytesAt(int(g.layers[i].out)+len(oq), orec)
+			continue
+		}
+		if g.quant() {
 			// The conv and gate rows are Q8_0 and round-trip exactly; alpha
 			// and beta are F32 and would not, so they are a separate fp16
 			// tail with a dispatch of its own (qkvQ8Rows). The int8 plane is
@@ -608,32 +717,63 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 			sc := make([]uint16, g.qkvN()*c.NEmbd/q8Group)
 			tileBQ8(qs, sc, w.QKV, cw, c.NEmbd, func(r int) int { return r })
 			tileBQ8(qs, sc, w.Z, c.Inner, c.NEmbd, func(r int) int { return baseZ + r })
-			g.bank.WriteBytesAt(int(g.layers[i].qkv), qs)
-			g.bank.WriteUint16At((int(g.layers[i].qkv)+len(qs))/2, sc)
+			g.wbank.WriteBytesAt(int(g.layers[i].qkv), qs)
+			g.wbank.WriteUint16At((int(g.layers[i].qkv)+len(qs))/2, sc)
 
 			tail := make([]uint16, g.qkvTailRows()*c.NEmbd)
 			tileB(tail, w.Alpha, c.NHeadV, c.NEmbd, func(r int) int { return baseA - q8rows + r })
 			tileB(tail, w.Beta, c.NHeadV, c.NEmbd, func(r int) int { return baseB - q8rows + r })
-			g.bank.WriteUint16At(int(g.layers[i].qkvTail), tail)
+			g.wbank.WriteUint16At(int(g.layers[i].qkvTail), tail)
 
 			oq := make([]byte, c.NEmbd*c.Inner)
 			os := make([]uint16, c.NEmbd*c.Inner/q8Group)
 			tileBQ8(oq, os, w.Out, c.NEmbd, c.Inner, func(r int) int { return r })
-			g.bank.WriteBytesAt(int(g.layers[i].out), oq)
-			g.bank.WriteUint16At((int(g.layers[i].out)+len(oq))/2, os)
+			g.wbank.WriteBytesAt(int(g.layers[i].out), oq)
+			g.wbank.WriteUint16At((int(g.layers[i].out)+len(oq))/2, os)
 			continue
 		}
 
+		// **The simulation of this bank, on the fp16 arm.** A format handed
+		// to the halves is L8c-1's round trip done explicitly rather than
+		// through the environment, and it is what lets one process hold the
+		// simulated q4_k and the real one and compare a layer's output value
+		// for value. It covers exactly what the q4_k bank quantises — the
+		// two fused sources and the output projection, not the tail — so the
+		// two arms are the same format applied to the same weights.
+		qkvSrc, zSrc, outSrc := w.QKV, w.Z, w.Out
+		if g.bank == BankFP16 && !g.sim.Off() {
+			for _, t := range []struct {
+				name string
+				src  *[]float32
+				k    int
+			}{
+				{"attn_qkv.weight", &qkvSrc, c.NEmbd},
+				{"attn_gate.weight", &zSrc, c.NEmbd},
+				{"ssm_out.weight", &outSrc, c.Inner},
+			} {
+				name := fmt.Sprintf("blk.%d.%s", g.imLayer[i], t.name)
+				q, qw, err := bankImatrix(name, g.sim)
+				if err != nil {
+					return err
+				}
+				x := append([]float32(nil), *t.src...)
+				if err := q.ApplyWeighted(x, t.k, qw); err != nil {
+					return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
+				}
+				*t.src = x
+			}
+		}
+
 		qkv := make([]uint16, g.qkvN()*c.NEmbd)
-		tileB(qkv, w.QKV, cw, c.NEmbd, func(r int) int { return r })
-		tileB(qkv, w.Z, c.Inner, c.NEmbd, func(r int) int { return baseZ + r })
+		tileB(qkv, qkvSrc, cw, c.NEmbd, func(r int) int { return r })
+		tileB(qkv, zSrc, c.Inner, c.NEmbd, func(r int) int { return baseZ + r })
 		tileB(qkv, w.Alpha, c.NHeadV, c.NEmbd, func(r int) int { return baseA + r })
 		tileB(qkv, w.Beta, c.NHeadV, c.NEmbd, func(r int) int { return baseB + r })
-		g.bank.WriteUint16At(int(g.layers[i].qkv), qkv)
+		g.wbank.WriteUint16At(int(g.layers[i].qkv), qkv)
 
 		out := make([]uint16, c.NEmbd*c.Inner)
-		tileB(out, w.Out, c.NEmbd, c.Inner, func(r int) int { return r })
-		g.bank.WriteUint16At(int(g.layers[i].out), out)
+		tileB(out, outSrc, c.NEmbd, c.Inner, func(r int) int { return r })
+		g.wbank.WriteUint16At(int(g.layers[i].out), out)
 	}
 	return nil
 }
@@ -654,6 +794,11 @@ func (g *DeltaNetGPU) SetPlan(scan DNKernel, gemm, outGemm GEMMKernel) error {
 	g.autoPlan = false
 	return nil
 }
+
+// Bank reports which width the two projections are staged in, and Format the
+// plan that chose it — "off" on the two banks that are the checkpoint's own.
+func (g *DeltaNetGPU) Bank() DenseBank  { return g.bank }
+func (g *DeltaNetGPU) Format() QuantSim { return g.sim }
 
 // Plan reports the rungs in use.
 func (g *DeltaNetGPU) Plan() (DNKernel, GEMMKernel, GEMMKernel) {
@@ -729,7 +874,7 @@ func (g *DeltaNetGPU) Tokens() int { return g.tokens }
 
 // WeightBytes is what the staged layers cost on the device and
 // ActivationBytes what the shared arenas cost.
-func (g *DeltaNetGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+func (g *DeltaNetGPU) WeightBytes() int { return g.wbuf.Size() + g.wbank.Size() }
 
 // Buffers is how many device allocations the layer holds (L6a). All 36
 // layers' fused projections are one bank of 4.18 GB, which clears this
@@ -913,8 +1058,8 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 
 	// 1. The one fused projection: four of llama.cpp's matrices, one matmul —
-	//    or two on L8's bank, because alpha and beta are the checkpoint's
-	//    only F32 matrices here and stay fp16 (qkvQ8Rows). The second
+	//    or two on a quantised bank, because alpha and beta are the
+	//    checkpoint's only F32 matrices here and stay fp16 (qkvQ8Rows). The second
 	//    dispatch is the same kernel over the same output tensor: its columns
 	//    begin at the first one the first dispatch did not write, which is a
 	//    bias on outOff and nothing else, because the row stride the store
@@ -923,7 +1068,7 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
 	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
 	gy := uint32(roundUpInt(g.rows, gv.bm) / gv.bm)
-	if g.q8 {
+	if g.quant() {
 		// The split, in the two fields MODE 2 does not otherwise use:
 		// `lowRank` is the first row that is not int8 — which is what it
 		// already means in MODE 0 — and `gateOff` is where those rows' halves
@@ -935,12 +1080,12 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// from a sixteen-row fragment of which fifteen rows are padding
 		// (L8d-4). The partials ride `resOff`, which this block does not use.
 		qkv.ResOff = g.aPart
-		add(gemvPipe(g.qkvGemv, g.q8), "qkv", uint32(ks), uint32(g.qkvN()/16), qkv)
+		add(gemvBankPipe(g.qkvGemv, g.bank), "qkv", uint32(ks), uint32(g.qkvN()/16), qkv)
 		if ks > 1 {
 			add(gemvSumPipe(g.qkvGemv), "qkv.sum", uint32(roundUpInt(g.qkvN(), dnWave)/dnWave), 1, qkv)
 		}
-	} else if g.q8 {
-		add(q8Pipe(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
+	} else if g.quant() {
+		add(bankPipe(g.bank, g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
 	} else {
 		add(string(g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
 	}
@@ -962,13 +1107,13 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	out.OutOff, out.BOff = g.aResult, w.out
 	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.Inner)
 	outPipe := string(g.outGemm)
-	if g.q8 {
-		outPipe = q8Pipe(g.outGemm)
+	if g.quant() {
+		outPipe = bankPipe(g.bank, g.outGemm)
 		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: ssm_out is Q8_0
 	}
 	if ks := gemvSlabs(g.outGemv); ks > 0 {
 		out.ResOff = g.aPart
-		add(gemvPipe(g.outGemv, g.q8), "out", uint32(ks), uint32(c.NEmbd/16), out)
+		add(gemvBankPipe(g.outGemv, g.bank), "out", uint32(ks), uint32(c.NEmbd/16), out)
 		if ks > 1 {
 			add(gemvSumPipe(g.outGemv), "out.sum", uint32(roundUpInt(c.NEmbd, dnWave)/dnWave), 1, out)
 		}
@@ -1157,7 +1302,7 @@ func (g *DeltaNetGPU) Destroy() {
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.bank} {
+	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank} {
 		if b != nil {
 			b.Destroy()
 		}
