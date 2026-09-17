@@ -20,6 +20,11 @@ type Model struct {
 	// and it is here because the alternative is a second round trip to find
 	// out what /v1/audio/speech will accept.
 	Voices []string `json:"voices,omitempty"`
+	// Image is the geometry an image model will accept, and is here for the
+	// same reason: the sizes /v1/images/generations takes are decided by what
+	// this process staged, so a client that has to guess will guess wrong on
+	// a server started at something other than 1024x1024.
+	Image *ImageGeometry `json:"image,omitempty"`
 }
 
 // backends returns every loaded backend, in the order GET /v1/models lists
@@ -66,18 +71,27 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 		voices := s.Speech.Voices()
 		sort.Strings(voices)
 		for i := range resp.Data {
-			if speaks(s.Speech, resp.Data[i].ID) {
+			if owns(s.Speech, resp.Data[i].ID) {
 				resp.Data[i].Voices = voices
+			}
+		}
+	}
+	if s.Image != nil {
+		geo := s.Image.Geometry()
+		for i := range resp.Data {
+			if owns(s.Image, resp.Data[i].ID) {
+				g := geo
+				resp.Data[i].Image = &g
 			}
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// speaks reports whether id is one of the speech backend's own models, so
-// that the voice list is attached to those and not to the transcription
-// model sitting beside them.
-func speaks(b SpeechBackend, id string) bool {
+// owns reports whether id is one of this backend's own models, so that the
+// voice list and the image geometry land on the models they describe and not
+// on whatever else the process loaded beside them.
+func owns(b Backend, id string) bool {
 	for _, m := range b.Models() {
 		if m.ID == id {
 			return true

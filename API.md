@@ -3,12 +3,10 @@
 `cmd/serve` is the long-lived process: an OpenAI-shaped API over the models in
 this repository, with one flag per vertical deciding what is resident.
 
-    go run ./cmd/serve -llm -tts -stt
+    go run ./cmd/serve -llm -embed -tts -stt
 
 `GOALS.md`'s last line — "we will ultimately serve up a HTTP API serving these
-features, in Go" — is what this is. It is stage one of that: the routing
-layer, three of the five verticals wired to it, and the shape the other two
-plug into.
+features, in Go" — is what this is, and all five verticals are now behind it.
 
 ## What answers today
 
@@ -20,8 +18,9 @@ plug into.
 | `POST /v1/messages` | **done** — the same generation, Anthropic's envelope |
 | `POST /v1/audio/speech` | **done** — kokoro, `-tts` |
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
-| `POST /v1/embeddings` | 501 — `models/Qwen3-Embedding-0.6B` has not been started |
-| `POST /v1/images/generations`, `/edits` | 501 — `zimage/pipeline` runs, it is not wired here |
+| `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
+| `POST /v1/images/generations` | **done** — z-image-turbo, `-image`, any size the arenas hold |
+| `POST /v1/images/edits` | 501 — needs the VAE's *encoder*: weights in the checkpoint, port not written |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -35,10 +34,12 @@ it, which flag. A 404 would mean a misspelled path and nothing else.
 
 The direction of the dependency is `cmd/serve -> backend -> api`, never the
 other way. `api` *declares* the backend interfaces (`api.SpeechBackend`,
-`api.TranscriptionBackend`, `api.CompletionBackend`) and implements none of
-them, so it pulls in no checkpoint loader and no Vulkan, and its tests run
-against fakes in milliseconds — `go test ./api/` needs no `models/` directory
-and no GPU, including for the three chat envelopes and their streams.
+`api.TranscriptionBackend`, `api.CompletionBackend`, `api.EmbeddingBackend`,
+`api.ImageBackend`) and implements none of them, so it pulls in no checkpoint
+loader and no Vulkan, and its tests run against fakes in milliseconds —
+`go test ./api/` needs no `models/` directory and no GPU, including for the
+three chat envelopes and their streams and for every size the image endpoint
+resolves.
 
 What crosses the boundary is deliberately model-shaped and not
 container-shaped. A speech backend returns `*audio.Clip` — samples and a rate
@@ -105,6 +106,52 @@ runs in the same arenas — `UploadMel` settles the geometry per run. A request
 costs a front end on the host and two submits. A longer clip is refused with a
 message saying what the server was sized for, rather than being truncated.
 
+**The embedding model is resident**, and it is the cheapest thing here:
+`-embed` stages 0.88 GB of fp16 banks in **1.3 s**, and an input then costs
+**11.5 ms** whatever it says — a 27-token query and an 8-token document take
+the same time, because at these lengths the run is the weights read once
+(EMBEDDING.md E6). `-embed-tokens` sizes the arenas and is therefore where an
+input is truncated: the front of the text survives and the end-of-text token
+is re-appended, because last-token pooling takes *that* row and an input
+truncated through it would be pooled from an ordinary word.
+
+**The image pipeline is resident, and its resolution is not part of what is
+resident.** `-image` stages 7.2 GB of text encoder, 12.5 GB of transformer and
+0.3 GB of VAE in **20.4 s**, sizes 4.9 GB of activation arenas for
+`-image-size`, and then a request moves no weight. That last clause is what
+this endpoint needed and did not have: `zimage/pipeline` used to fix its width
+and height at construction, so a size was a residency question.
+
+It is not one, and none of the three graphs had to change to stop it being
+one. The transformer states its run length per upload (`GPUStack.Upload`,
+which the caption phase has always used to run 32 rows in a 4128-row arena),
+the VAE re-records its graph from the latent it is handed and checks the arena
+rather than assuming it, and the rotary table is rebuilt per run anyway. So
+`-image-size` became a *ceiling* and a default, the way `-max-audio` is for
+parakeet, and every smaller image runs in the same arenas. Measured on one
+1024x1024 process, two runs each:
+
+| size | image tokens | request |
+|---|---|---|
+| 1024x1024 | 4096 | **14.55 s** / 14.62 |
+| 1024x576 | 2304 | 7.95 s |
+| 512x512 | 1024 | **3.65 s** / 3.64 |
+| 256x256 | 256 | 1.33 s |
+
+**What bounds a request is each side, and not the area** — which is worth
+stating because the plausible guess is the other one. A diffusion model's cost
+is its token count, so the same area in another shape should be the same work,
+and for the transformer it is: 512x2048 is the same 4096 rows as the square.
+The decoder disagrees. Stage 8 gave it an fp16 arena of *blocked* copies of
+each convolution's input, and a block is padded on each axis separately, so
+redistributing the same area over a taller grid needs more arena than it has —
+measured at 33 MB against 32. A run that got that far would fail in the VAE
+after the whole denoising loop, so `pipeline.geomFor` refuses it at the door
+and the endpoint refuses it before that. Both sides inside the ceiling makes
+every tensor in all three graphs smaller elementwise, which is the condition
+that actually holds; `zimage/pipeline`'s `TestSameAreaTallerShapeIsRefused` is
+the measurement.
+
 **Kokoro is not.** Its arenas are sized for one utterance's frame count, and
 the durations decide that, so nothing can be staged until the phoneme side has
 run (SPEECH.md T2, T4c). `-tts-gpu` therefore stages *per request* — the
@@ -151,6 +198,20 @@ Two things would fix it, and both are measurements rather than arguments:
     -stt         false            load parakeet-tdt-0.6b-v3
     -stt-model   models/parakeet-tdt-0.6b-v3
     -max-audio   60               longest clip the arenas are sized for, in seconds
+
+    -embed         false          load Qwen3-Embedding-0.6B
+    -embed-model   models/Qwen3-Embedding-0.6B
+    -embed-tokens  512            longest input the arenas hold; longer inputs are truncated
+
+    -image             false               load Z-Image-Turbo
+    -image-model       models/Z-Image-Turbo
+    -image-size        1024x1024           the largest image the arenas hold, and the default
+    -image-steps       8                   what a request that names no steps gets
+    -image-max-prompt  512                 longest prompt the image text encoder is built for
+
+**-llm and -image do not fit together.** ~84 GB and ~25 GB against 128 GB of
+unified memory the rest of the machine is also in: they are separate
+processes on this part, or separate runs.
 
 ## A second turn is a continuation
 
@@ -249,7 +310,18 @@ Words are grouped by the tokenizer's own rule (SentencePiece's U+2581 marks a
 word start) and segments are sentences, which this model can do because it
 punctuates — a sentence end is a token rather than a guess about silence.
 
-## Two extensions, and three refusals
+## Extensions, and what is refused rather than faked
+
+`POST /v1/embeddings` takes an **`"instruct"`** field that is not OpenAI's.
+Qwen3-Embedding is instruction aware: a *query* is meant to be prefixed with a
+one-sentence description of the retrieval task and a *document* is not, and
+the card measures 1-5% on downstream tasks for it. There is nowhere in
+OpenAI's envelope to say so, so the field carries the task description —
+`"instruct": "default"` asks for the card's own — and leaving it off embeds
+the text as given, which is the document behaviour and the safe half. The
+prefix is applied to the *text*, so it is inside the `usage` the response
+reports. `"dimensions"` is honoured the way the card asks (MRL): the vector is
+truncated and renormalised, so a 32-wide vector is still a unit vector.
 
 `POST /v1/audio/speech` takes a **`"phonemes"`** field that is not OpenAI's: IPA
 to speak directly, winning over `input`. The checkpoint's vocabulary is 178 IPA
@@ -258,6 +330,21 @@ rules (SPEECH.md T5), so a caller that has already done that says so instead of
 having it guessed. It is also how the endpoint is driven without a lexicon on
 disk. `GET /v1/models` carries a **`voices`** array on the speech model, so a
 client does not need a second call to populate a menu.
+
+`POST /v1/images/generations` takes three fields that are not OpenAI's, and
+each of them exists because the parameter is real here and there is nowhere
+else to put it. **`"seed"`** names the initial latent's seed, and a response
+reports the seed whether or not the request named one — a drawn seed that the
+client is not told is an image that cannot be asked for twice. **`"steps"`**
+is the denoising schedule's length, which is a host-side array and therefore
+genuinely per request. And **`"aspect_ratio"`** — `"16:9"` and the like — is
+fitted to the largest image *this* server holds, so a client wanting a
+landscape picture does not have to know the ceiling to ask for one; `size`
+wins when both are set, because that is the field every other server reads.
+`GET /v1/models` carries an **`image`** object on the image model, alongside
+the speech model's voices and for the same reason: `default_size`, `max_size`,
+`size_multiple` and `default_steps`, which are decided by what this process
+staged.
 
 What is refused rather than faked:
 
@@ -273,6 +360,27 @@ What is refused rather than faked:
   naming what the server does encode. *Transcripts* are a different question
   and are no longer refused: `json`, `verbose_json`, `text`, `srt` and `vtt`
   all answer, because the timings they need exist.
+- **`stream: true` on image generation.** The pipeline does produce the latent
+  after every step, so a preview is available — but decoding one is the whole
+  VAE, 0.8 s against a 1.7 s step, so previews would cost half the image.
+  What that wants is the small decoder GOALS.md names for it
+  (`madebyollin/taef1`), not a goroutine.
+- **`response_format: "url"`.** There is nowhere to host an image; the
+  endpoint returns `b64_json`, and says so.
+- **`output_format` other than png and jpeg.** Go's standard library encodes
+  those two, and a webp request gets a 400 naming them rather than a PNG with
+  the wrong `Content-Type`.
+- **A size the arenas were not built for**, rather than the nearest one that
+  fits. A client that asked for 1000x1000 and got 992x992 has no way to find
+  out; the 400 says what the ceiling is and what the sides have to be a
+  multiple of.
+- **`/v1/images/edits` altogether.** The one 501 on the server that no flag
+  fixes: an edit starts from a picture, and bringing a picture into the
+  transformer's latent space is the VAE's *encoder*. **The weights are in the
+  checkpoint** — z-image ships a stock Flux `AutoencoderKL`, and the 34 M
+  encoder parameters sit in the same 167 MB file `-image` already opens for
+  the decoder's 50 M — so this is a missing port, not a missing download, and
+  the message says which.
 
 And on the chat endpoints, the same principle with a longer list: **`n > 1`**
 (n completions are n runs of a model sized to saturate the device), **`min_p`
@@ -286,7 +394,6 @@ nothing.
 
 ## What is left
 
-- Embeddings, which need a model at all.
 - **Constrained decoding**, which is the one refusal above that is a missing
   capability rather than a missing shape. It would close `response_format`,
   `text.format` and a `tool_choice` that names a function in one go.
@@ -296,9 +403,31 @@ nothing.
   which is a measurement rather than an argument.
 - **MTP speculative decoding** (LLM.md L9), which is the next thing worth
   1.5-1.8x on the endpoint that has just been wired.
-- Images: `zimage/pipeline` is already the right shape for a server — resident
-  weights, `Generate(prompt, seed, progress)` — but its width and height are
-  fixed at construction, so `aspect_ratio` in the request is a residency
-  question and not a parameter.
+- **In-progress previews, and so a streamed image.** `madebyollin/taef1`
+  (GOALS.md) is the small decoder that makes a per-step preview cost a
+  percent instead of half the image, and it is the only thing standing between
+  the pipeline's existing `progress(Step)` callback and OpenAI's
+  `image_generation.partial_image` frames.
+- **The VAE's encoder**, which is what `/v1/images/edits` needs. The weights
+  ship with the checkpoint and go unread today, and the port is mostly reuse:
+  the encoder is the decoder's mirror and shares conv2d, group norm, SiLU, the
+  residual add and the mid block with attention. What is genuinely new is a
+  **stride-2 convolution** — `vae.Conv2D` has no stride field at all, and the
+  three downsamplers need one with diffusers' asymmetric `(0,1,0,1)` pad — and
+  the **DiagonalGaussian head**, `conv_out` being `[32, 512, 3, 3]` for a mean
+  and a log-variance over 16 channels. Encoding is not the whole endpoint
+  either: an *edit* also needs a strategy (SDEdit — noise the encoded latent
+  to an intermediate sigma and run the tail — is the cheap one and needs no
+  new weights, but whether an 8-NFE turbo distillation edits acceptably that
+  way is unmeasured), and OpenAI's endpoint also takes a **mask**, which is
+  masked blending per step and a different thing again.
+- **The image adapter holds the device lock for the whole run**, where the
+  language model's takes it per forward pass. The same fix applies — between
+  two denoising steps there is no work in flight — but it would mean the
+  pipeline calling back out around every submit, and a step at 1024x1024 is
+  1.7 s, so what a speech request waiting behind it would actually gain is a
+  measurement rather than an argument.
+- **`n > 1` images are serial**, and capped at four, because the device lock
+  is. Four 1024x1024 images is a minute in one request.
 - **A forced alignment** for the transcript timings, if the 80 ms grid and the
   duration head's approximation ever turn out not to be enough.

@@ -20,6 +20,16 @@ type Config struct {
 	VocabSize        int     `json:"vocab_size"`
 	RMSEps           float64 `json:"rms_norm_eps"`
 	RopeTheta        float64 `json:"rope_theta"`
+
+	// Prefix is what a tensor name starts with in this checkpoint, used
+	// verbatim and empty for none. It is not in config.json, because it is
+	// not a property of the architecture: Z-Image ships its text encoder as
+	// a `Qwen3ForCausalLM` and names every tensor `model.layers.0…`, which
+	// is what LoadConfig fills in, while Qwen3-Embedding ships the same
+	// layers as a bare `Qwen3Model` and names them `layers.0…`, which is
+	// `embed.LoadConfig` clearing this. Same weights, same loader, one
+	// string apart.
+	Prefix string `json:"-"`
 }
 
 // LoadConfig reads a text encoder checkpoint's config.json.
@@ -35,6 +45,7 @@ func LoadConfig(dir string) (*Config, error) {
 	if c.HiddenSize == 0 || c.NumLayers == 0 || c.HeadDim == 0 {
 		return nil, fmt.Errorf("qwen: config.json is missing hidden_size, num_hidden_layers or head_dim")
 	}
+	c.Prefix = "model."
 	return &c, nil
 }
 
@@ -106,6 +117,12 @@ func Load(dir string, layers int) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	return LoadWith(dir, cfg, layers)
+}
+
+// LoadWith is Load against a config the caller already holds, which is how a
+// checkpoint that names its tensors differently gets in (Config.Prefix).
+func LoadWith(dir string, cfg *Config, layers int) (*Model, error) {
 	if layers <= 0 || layers > cfg.NumLayers {
 		return nil, fmt.Errorf("qwen: asked for %d of %d layers", layers, cfg.NumLayers)
 	}
@@ -134,14 +151,15 @@ func Load(dir string, layers int) (*Model, error) {
 // and the table is the authority on how far.
 func LoadEmbedding(set *safetensors.Set, cfg *Config) (int, []float32, error) {
 	l := &loader{set: set}
-	shape := l.shape(embedName)
+	name := cfg.Prefix + embedName
+	shape := l.shape(name)
 	if l.err != nil {
 		return 0, nil, l.err
 	}
 	if len(shape) != 2 || shape[1] != cfg.HiddenSize {
-		return 0, nil, fmt.Errorf("qwen: %s is %v, want [rows %d]", embedName, shape, cfg.HiddenSize)
+		return 0, nil, fmt.Errorf("qwen: %s is %v, want [rows %d]", name, shape, cfg.HiddenSize)
 	}
-	data := l.f32(embedName)
+	data := l.f32(name)
 	return shape[0], data, l.err
 }
 
@@ -151,7 +169,7 @@ func LoadEmbedding(set *safetensors.Set, cfg *Config) (int, []float32, error) {
 // the 404 MB one layer costs rather than the 14.1 GB all 35 would.
 func LoadLayer(set *safetensors.Set, i int, cfg *Config) (*Layer, error) {
 	l := &loader{set: set}
-	p := fmt.Sprintf("model.layers.%d.", i)
+	p := fmt.Sprintf("%slayers.%d.", cfg.Prefix, i)
 	layer := &Layer{
 		AttnNorm: l.rms(p+"input_layernorm", cfg.RMSEps),
 		Q:        l.linear(p + "self_attn.q_proj"),
@@ -195,7 +213,9 @@ func LoadLayer(set *safetensors.Set, i int, cfg *Config) (*Layer, error) {
 	return layer, nil
 }
 
-// embedName is the one tensor outside the layers that the encoder reads. The
-// final norm and the lm_head are in the checkpoint and are never loaded:
-// hidden_states[-2] is taken before either of them runs.
-const embedName = "model.embed_tokens.weight"
+// embedName is the one tensor outside the layers that the encoder reads,
+// under Config.Prefix. The final norm and the lm_head are in the checkpoint
+// and are never loaded by *this* path: hidden_states[-2] is taken before
+// either of them runs. An embedding model wants both and reads them itself
+// (embed/load.go), which is why they are not here.
+const embedName = "embed_tokens.weight"

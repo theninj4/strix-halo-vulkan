@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
 	"log"
 	"net/http"
 	"strconv"
@@ -86,17 +87,123 @@ type CompletionResult struct {
 	Usage     Usage
 }
 
-// EmbeddingBackend is a placeholder: it lets a process advertise a model it
-// has loaded through GET /v1/models, and carries no method yet, because
-// there is no embedding model in this repository to give it one (GOALS.md).
-type EmbeddingBackend interface{ Backend }
+// EmbeddingBackend turns texts into vectors.
+//
+// The whole request crosses the boundary rather than just the texts, because
+// three of its fields are the model's business and not the envelope's: the
+// instruction a query is prefixed with, the output width an MRL model can be
+// truncated to, and -- through the text count -- how the backend batches. The
+// encoding format is *not* the backend's: base64 or JSON numbers is a
+// transport question, and a model that knew about it would be answering two
+// questions at once.
+//
+// Vectors come back in the request's order, one per input, already
+// normalised: every consumer of an embedding either takes a cosine or a dot
+// product, and those are the same number only if the vectors are unit length.
+type EmbeddingBackend interface {
+	Backend
+	Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingResult, error)
+}
 
-// ImageBackend is a placeholder; see EmbeddingBackend. `zimage/pipeline` is
-// the right shape for one -- resident weights, Generate(prompt, seed,
-// progress) -- but its width and height are fixed at construction, so
-// `aspect_ratio` is a residency question rather than a parameter and the
-// interface should not pretend otherwise.
-type ImageBackend interface{ Backend }
+// EmbeddingResult is a batch of vectors and what they cost.
+type EmbeddingResult struct {
+	// Vectors are in the request's input order, one per input.
+	Vectors [][]float32
+	// Usage counts the tokens actually run, which is after truncation and
+	// after any instruction prefix -- what the model read, as everywhere
+	// else in this API. CompletionTokens is always zero.
+	Usage Usage
+}
+
+// errVectorCount is the one thing the handler checks about a backend's
+// answer, because getting it wrong misaligns a client's corpus silently.
+var errVectorCount = errors.New("the backend returned a different number of vectors than there were inputs")
+
+// ImageBackend generates images.
+//
+// What crosses this boundary is an `image.Image` and not a file, for the same
+// reason a SpeechBackend returns samples: PNG or JPEG, base64 or raw, is what
+// the request asked for and is none of the model's business.
+//
+// The geometry is split in two because the two halves are different kinds of
+// decision. **A size is a request parameter** -- the transformer states its
+// run length per upload and the VAE re-records its graph from the latent it
+// is handed, so a smaller image is the same graph with smaller numbers in it.
+// **A ceiling is residency**, fixed when the arenas were allocated. So a
+// backend answers Geometry() once and the handler validates against it,
+// rather than every request discovering the limit by failing.
+type ImageBackend interface {
+	Backend
+	// Generate renders one image. The request's geometry is already resolved
+	// -- `size`, `aspect_ratio` and the defaults are the HTTP layer's
+	// business -- so what arrives here is pixels.
+	Generate(ctx context.Context, req *ImageRequest) (*ImageResult, error)
+	// Geometry is what this process was started for: the size a request that
+	// names none gets, and the largest it will accept.
+	Geometry() ImageGeometry
+}
+
+// ImageRequest is one image to render, with everything resolved.
+type ImageRequest struct {
+	Prompt string
+	// Width and Height are in pixels; zero takes the backend's default.
+	Width, Height int
+	// Steps is the denoising schedule's length; zero takes the backend's.
+	Steps int
+	// Seed is the initial latent's. Nil draws one, and the result says which
+	// was drawn, so an image a caller likes can be asked for again.
+	Seed *int64
+}
+
+// ImageResult is one rendered image and the parameters that produced it --
+// including the ones the request left to the server, which is the only way a
+// client can reproduce an image it did not fully specify.
+type ImageResult struct {
+	Image         image.Image
+	Width, Height int
+	Steps         int
+	Seed          int64
+}
+
+// ImageGeometry is what an image backend will accept. It is reported on the
+// model object in GET /v1/models for the same reason the voice list is: the
+// alternative is a client discovering the limit from a 400.
+//
+// **MaxWidth and MaxHeight bound each side, and the area is not a second,
+// looser rule.** It is tempting to think it would be -- a diffusion model's
+// cost is its token count, so the same area in another shape should be the
+// same work -- and for the transformer it is. It is not for the decoder: the
+// z-image VAE holds blocked fp16 copies of each convolution's input, padded
+// per axis, so 128x512 needs more arena than the 256x256 it has the same area
+// as. Both sides inside the ceiling makes every tensor smaller elementwise,
+// which is the condition that actually holds.
+type ImageGeometry struct {
+	// Width and Height are what a request that names no size gets.
+	Width, Height int
+	// MaxWidth and MaxHeight are the largest each side may be.
+	MaxWidth, MaxHeight int
+	// Multiple is what both sides must be a multiple of.
+	Multiple int
+	// Steps is the default denoising schedule's length.
+	Steps int
+}
+
+// MarshalJSON writes the geometry the way a client reads it: the two pairs
+// spelled as OpenAI spells a size, so one can be echoed straight back into a
+// request's `size` without being reassembled first.
+func (g ImageGeometry) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		DefaultSize  string `json:"default_size"`
+		MaxSize      string `json:"max_size"`
+		SizeMultiple int    `json:"size_multiple"`
+		DefaultSteps int    `json:"default_steps"`
+	}{
+		DefaultSize:  formatSize(g.Width, g.Height),
+		MaxSize:      formatSize(g.MaxWidth, g.MaxHeight),
+		SizeMultiple: g.Multiple,
+		DefaultSteps: g.Steps,
+	})
+}
 
 // ErrUnsupported is what a backend returns when a request is well formed but
 // asks for something this model cannot do -- an unknown voice, a sample rate

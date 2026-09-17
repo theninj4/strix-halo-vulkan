@@ -57,7 +57,16 @@ taking an utterance to **74.2x real time**. **T6 is finished: the phoneme side
 is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
 stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
-image with its resume points stated at the top. **`LLM.md`** is the qwen3.8-flash-next
+image with its resume points stated at the top. **`EMBEDDING.md`** is the
+qwen3-embedding-0.6b vertical, opened and all but finished on 2026-09-18:
+E0-E6 and E8 are closed, a text is **11.5 ms** on the device against 170 ms on
+the host, the model card's own similarity matrix is reproduced to 1.3e-4
+**over HTTP** (`go run ./cmd/serve -embed`), and the one stage open is E7,
+batching, which the measurements price at up to 10x of throughput on short
+texts. It cost so little because it is `zimage/qwen`'s Qwen3 with every layer
+run, a final norm, last-token pooling and an L2 normalise on top; the two
+changes it needed in that package were a tensor-name prefix and two
+accessors. **`LLM.md`** is the qwen3.8-flash-next
 (text-generation) vertical and is **the current work**: L0, L1 and the whole of
 L2 (L2a-L2f) are closed. The checkpoint is downloaded (114 GB in 18 minutes,
 `models/Qwen3.8-Flash-Next-GGUF/`), llama.cpp runs it, and **the number to beat

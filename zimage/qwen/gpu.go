@@ -830,13 +830,22 @@ func Elapsed(stages []Stage) time.Duration {
 // hidden state -- `hidden_states[-2]` when the encoder holds
 // cfg.EncoderLayers() layers, which is what the DiT's cap_embedder consumes.
 func (g *GPUEncoder) Forward(ids []int32) (*Mat, error) {
-	if err := g.upload(ids); err != nil {
-		return nil, err
-	}
-	if err := g.Run(); err != nil {
+	if err := g.RunIDs(ids); err != nil {
 		return nil, err
 	}
 	return g.Read(g.aX, g.cfg.HiddenSize), nil
+}
+
+// RunIDs is Forward without the read-back: it uploads a token sequence and
+// runs every layer, leaving the result in the residual stream for the caller
+// to read how it likes. A caller that wants one row of the output rather than
+// all of it (ReadRow) saves the whole tensor's trip back through a 0.2 GB/s
+// mapping, which at a few hundred tokens is larger than the forward pass.
+func (g *GPUEncoder) RunIDs(ids []int32) error {
+	if err := g.upload(ids); err != nil {
+		return err
+	}
+	return g.Run()
 }
 
 // Run is Forward without the upload or the read-back: it runs every layer
@@ -971,6 +980,15 @@ func (g *GPUEncoder) Read(off uint32, cols int) *Mat {
 	out := NewMat(g.rows, cols)
 	copy(out.Data, g.abuf.ReadFloat32At(int(off), g.rows*cols))
 	return out
+}
+
+// ReadRow copies one row out of the fp32 activation arena. It exists for the
+// case where the whole tensor is not wanted: this arena reads at 0.2 GB/s
+// (research/stage-3-dit-attention.md), so an embedding model that only needs
+// the last token's row pays 4 KB rather than the run's whole hidden state.
+func (g *GPUEncoder) ReadRow(off uint32, row, cols int) []float32 {
+	// Offsets into this arena are in float32s, not bytes, as Read's are.
+	return g.abuf.ReadFloat32At(int(off)+row*cols, cols)
 }
 
 // ReadF16 copies a [tokens, cols] tensor out of the fp16 arena, widening it.

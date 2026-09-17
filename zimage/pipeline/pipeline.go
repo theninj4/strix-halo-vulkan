@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"time"
@@ -13,15 +14,24 @@ import (
 	"strix-halo-vulkan/zimage/vae"
 )
 
-// Options configures a Pipeline. The sizes are fixed at construction because
-// every arena in it is: the text encoder is built for a maximum prompt, the
-// transformer for a maximum unified sequence, and the VAE decoder for one
-// latent grid.
+// Options configures a Pipeline.
+//
+// **Width and Height are a ceiling and a default, not a fixed size.** Every
+// arena in the pipeline is sized at construction -- the text encoder for a
+// maximum prompt, the transformer for a maximum unified sequence, the VAE
+// decoder for the largest latent grid -- but none of the three graphs is
+// *built* for one geometry: the transformer's run length is per dispatch
+// (`GPUStack.Upload` states it), the decoder re-records its graph from the
+// latent it is handed, and the rotary table is replaced per run anyway. So
+// these two numbers decide the residency and the size a request that names
+// none gets, and any smaller image runs in the same arenas. That is the same
+// arrangement `-max-audio` gives parakeet, and for the same reason: a ceiling
+// is a residency decision and a request's size is not.
 type Options struct {
 	Model     string // the checkpoint root, holding transformer/, vae/, ...
-	Width     int    // image pixels; a multiple of 16
+	Width     int    // the largest image, in pixels; a multiple of 16
 	Height    int
-	Steps     int
+	Steps     int // the schedule a request that names none gets
 	MaxPrompt int // the longest prompt the text encoder is built for
 	// CPUHead runs the patch embedder and the final layer on the host, which
 	// is what stage 6 did. It is the slow path kept beside the device one
@@ -61,6 +71,27 @@ func (o Options) Defaults() Options {
 // multiple of 16.
 const vaeScale = 8
 
+// SizeMultiple is what both sides of an image have to be a multiple of, for
+// the reason above. It is exported because a server validating a request's
+// size should say the number rather than discover it from an error.
+const SizeMultiple = 2 * vaeScale
+
+// ErrPromptTooLong is a prompt past the length the text encoder's arenas were
+// built for.
+//
+// It is a value rather than a string because it is the one failure in here
+// that the *caller* can fix: a server turns this into a 400 and everything
+// else the pipeline returns into a 500, and telling them apart by matching on
+// a message is a test that passes until someone rewords it.
+var ErrPromptTooLong = errors.New("the prompt is longer than the text encoder was built for")
+
+// promptTooLong carries both numbers as well as the sentinel, because what the
+// caller needs in order to act on it is how far over they were.
+func promptTooLong(limit, got int) error {
+	return fmt.Errorf("pipeline: the prompt is %d tokens, the encoder was built for %d: %w",
+		got, limit, ErrPromptTooLong)
+}
+
 // Pipeline holds every stage resident: 7.07 GB of text encoder, 12.54 GB of
 // transformer and the VAE, plus their activation arenas. Construction is what
 // costs -- a little over twenty seconds, nearly all of it staging weights --
@@ -81,9 +112,10 @@ type Pipeline struct {
 
 	dec *vae.GPUDecoder
 
-	sched *FlowMatchEuler
-	scale float64 // the VAE's scaling_factor
-	shift float64 // its shift_factor
+	schedCfg *SchedulerConfig
+	sched    *FlowMatchEuler // the default schedule, for Options.Steps
+	scale    float64         // the VAE's scaling_factor
+	shift    float64         // its shift_factor
 
 	// The three phases' block indices, in the order the transformer runs
 	// them. StackBlocks lays the stack out this way, so they follow from the
@@ -93,10 +125,41 @@ type Pipeline struct {
 	// ctl is empty in every real use except for Options.CPUHead; see controls.
 	ctl controls
 
+	// max is the geometry the arenas were built for and def the one a run
+	// that names no size gets. Options sets them from the same pair, so they
+	// are equal today; they are two fields rather than one because they are
+	// two questions -- one is residency and the other is a default -- and
+	// everything downstream already reports them separately.
+	max, def   geom
+	maxUnified int
+}
+
+// geom is one image's shape, all the way down: the pixels asked for, the
+// latent grid the VAE decodes from, and the number of rows the transformer
+// runs over. Everything in it follows from the width and the height, and it
+// is derived per run rather than stored on the Pipeline because the Pipeline
+// serves more than one size.
+type geom struct {
+	width, height    int
 	latentH, latentW int
 	imgTokens        int // the image stream before padding
 	imgTotal         int // and after
-	maxUnified       int
+}
+
+// Request is one image to generate.
+//
+// Width, Height and Steps take the pipeline's own defaults when they are
+// zero, which is what makes `Generate` a one-liner over this. Latents, when
+// given, replaces the seeded noise -- and is written through, because the
+// denoising loop integrates in place and the caller usually wants the final
+// latent as well as the picture.
+type Request struct {
+	Prompt        string
+	Width, Height int
+	Steps         int
+	Seed          int64
+	Latents       []float32
+	Progress      func(Step)
 }
 
 // Timings is what one image cost, by stage.
@@ -109,6 +172,10 @@ type Timings struct {
 	Tokens   int // the prompt's length
 	CapTotal int // the caption stream after padding
 	Unified  int // the sequence the layers ran over
+	// Width and Height are the image this run actually produced, which is
+	// the request's size or the pipeline's default and not necessarily what
+	// the arenas were built for.
+	Width, Height int
 }
 
 // controls are the deliberate breakages the negative control switches on.
@@ -154,20 +221,18 @@ type Step struct {
 // New builds the pipeline, staging every weight onto the device.
 func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	opt = opt.Defaults()
-	if opt.Width%(2*vaeScale) != 0 || opt.Height%(2*vaeScale) != 0 {
-		return nil, fmt.Errorf("pipeline: %dx%d; both sides must be a multiple of %d", opt.Width, opt.Height, 2*vaeScale)
-	}
-	p := &Pipeline{
-		opt:     opt,
-		latentH: opt.Height / vaeScale,
-		latentW: opt.Width / vaeScale,
-	}
-
-	schedCfg, err := LoadSchedulerConfig(opt.Model + "/scheduler")
-	if err != nil {
+	// Checked before anything is staged: an unusable size should not cost a
+	// 7 GB text encoder first.
+	if err := checkSize(opt.Width, opt.Height); err != nil {
 		return nil, err
 	}
-	if p.sched, err = NewFlowMatchEuler(opt.Steps, schedCfg); err != nil {
+	p := &Pipeline{opt: opt}
+
+	var err error
+	if p.schedCfg, err = LoadSchedulerConfig(opt.Model + "/scheduler"); err != nil {
+		return nil, err
+	}
+	if p.sched, err = NewFlowMatchEuler(opt.Steps, p.schedCfg); err != nil {
 		return nil, err
 	}
 
@@ -209,12 +274,15 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 			p.cfg.CapFeat, encCfg.HiddenSize)
 	}
 
-	p.imgTokens = (p.latentH / p.head.Patch) * (p.latentW / p.head.Patch)
-	p.imgTotal = dit.PadTo(p.imgTokens)
-	p.maxUnified = p.imgTotal + dit.PadTo(opt.MaxPrompt)
+	if p.max, err = newGeom(opt.Width, opt.Height, p.head.Patch); err != nil {
+		p.Destroy()
+		return nil, err
+	}
+	p.def = p.max
+	p.maxUnified = p.max.imgTotal + dit.PadTo(opt.MaxPrompt)
 	// The rotary table is replaced per run and per phase; this one only has
 	// to be the right size and inside the axes' ranges.
-	ids, err := p.head.PositionIDs(opt.MaxPrompt, p.latentH, p.latentW)
+	ids, err := p.head.PositionIDs(opt.MaxPrompt, p.max.latentH, p.max.latentW)
 	if err != nil {
 		p.Destroy()
 		return nil, err
@@ -249,7 +317,7 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: vae: %w", err)
 	}
-	if p.dec, err = vae.NewGPUDecoder(dev, cpu, p.latentH, p.latentW); err != nil {
+	if p.dec, err = vae.NewGPUDecoder(dev, cpu, p.max.latentH, p.max.latentW); err != nil {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: vae: %w", err)
 	}
@@ -274,23 +342,128 @@ func (p *Pipeline) Destroy() {
 	p.dec, p.stack, p.enc, p.gpuHead = nil, nil, nil, nil
 }
 
-// Scheduler is the noise schedule the pipeline walks.
+// Scheduler is the noise schedule the pipeline walks by default. A request
+// that names its own step count gets a schedule of its own, built from the
+// same config -- the schedule is a few dozen host floats, so a step count is
+// a parameter and not a residency question the way a size is.
 func (p *Pipeline) Scheduler() *FlowMatchEuler { return p.sched }
 
-// Latent is the grid the transformer denoises: 16 channels at an eighth of
-// the image's size.
+// Size is the image a request that names none gets, and MaxSize the largest
+// the arenas hold -- the largest on *each side*; see geomFor.
+func (p *Pipeline) Size() (width, height int)    { return p.def.width, p.def.height }
+func (p *Pipeline) MaxSize() (width, height int) { return p.max.width, p.max.height }
+
+// Steps is the default schedule's length.
+func (p *Pipeline) Steps() int { return p.sched.Steps() }
+
+// Latent is the grid the transformer denoises at the default size: 16
+// channels at an eighth of the image's sides.
 func (p *Pipeline) Latent() (channels, height, width int) {
-	return p.cfg.InChan, p.latentH, p.latentW
+	return p.cfg.InChan, p.def.latentH, p.def.latentW
 }
 
-// Noise draws an initial latent from a seeded Gaussian.
-func (p *Pipeline) Noise(seed int64) []float32 {
+// LatentFor is Latent for a size this pipeline can run but was not built
+// around. A size it cannot run is an error rather than a rounded-up answer.
+func (p *Pipeline) LatentFor(width, height int) (channels, h, w int, err error) {
+	g, err := p.geomFor(width, height)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return p.cfg.InChan, g.latentH, g.latentW, nil
+}
+
+// Noise draws an initial latent for the default size from a seeded Gaussian.
+func (p *Pipeline) Noise(seed int64) []float32 { return p.noise(p.def, seed) }
+
+// NoiseFor is Noise at a named size.
+func (p *Pipeline) NoiseFor(width, height int, seed int64) ([]float32, error) {
+	g, err := p.geomFor(width, height)
+	if err != nil {
+		return nil, err
+	}
+	return p.noise(g, seed), nil
+}
+
+func (p *Pipeline) noise(g geom, seed int64) []float32 {
 	rng := rand.New(rand.NewSource(seed))
-	out := make([]float32, p.cfg.InChan*p.latentH*p.latentW)
+	out := make([]float32, p.cfg.InChan*g.latentH*g.latentW)
 	for i := range out {
 		out[i] = float32(rng.NormFloat64())
 	}
 	return out
+}
+
+// checkSize is the half of the geometry that needs no checkpoint: both sides
+// a positive multiple of SizeMultiple, because the VAE upsamples 8x and the
+// transformer's patch is 2.
+func checkSize(width, height int) error {
+	if width <= 0 || height <= 0 {
+		return fmt.Errorf("pipeline: %dx%d is not an image", width, height)
+	}
+	if width%SizeMultiple != 0 || height%SizeMultiple != 0 {
+		return fmt.Errorf("pipeline: %dx%d; both sides must be a multiple of %d",
+			width, height, SizeMultiple)
+	}
+	return nil
+}
+
+// newGeom resolves a size all the way down to the transformer's row count.
+func newGeom(width, height, patch int) (geom, error) {
+	if err := checkSize(width, height); err != nil {
+		return geom{}, err
+	}
+	g := geom{
+		width: width, height: height,
+		latentH: height / vaeScale, latentW: width / vaeScale,
+	}
+	g.imgTokens = (g.latentH / patch) * (g.latentW / patch)
+	g.imgTotal = dit.PadTo(g.imgTokens)
+	return g, nil
+}
+
+// geomFor resolves a request's size against the pipeline's. A zero side takes
+// the default, and one side given alone takes the other from it -- which is
+// what "512" means when a client says it.
+//
+// **The bound is each side, not the area, and that is a measurement rather
+// than a conservative choice.** The transformer would take any shape with few
+// enough rows -- imgTotal + caption against maxUnified -- so by the DiT's
+// arithmetic a pipeline built for 1024x1024 could run 512x2048, the same 4096
+// tokens. The VAE cannot: its fp16 arena holds *blocked* copies of each
+// convolution's input (stage 8), and a block is padded on each axis
+// separately, so the same area in a different shape needs more of it. A
+// pipeline built for 256x256 measures 33 MB against a 32 MB arena at 128x512
+// -- the identical area -- and fails in the decoder after the whole denoising
+// loop has run.
+//
+// With both sides inside the ceiling every tensor in both graphs is smaller
+// elementwise, and every padded tensor is too, since a per-axis round-up is
+// monotone in the axis. So this one check is sufficient for all three graphs,
+// and it is the one worth making up front: the alternative is discovering it
+// eight denoising steps later.
+func (p *Pipeline) geomFor(width, height int) (geom, error) {
+	switch {
+	case width == 0 && height == 0:
+		return p.def, nil
+	case width == 0:
+		width = height
+	case height == 0:
+		height = width
+	}
+	if width == p.def.width && height == p.def.height {
+		return p.def, nil
+	}
+	g, err := newGeom(width, height, p.head.Patch)
+	if err != nil {
+		return geom{}, err
+	}
+	if g.width > p.max.width || g.height > p.max.height {
+		return geom{}, fmt.Errorf(
+			"pipeline: %dx%d; these arenas were built for %dx%d and every side has to be inside it "+
+				"(the VAE's blocked copies are padded per axis, so the same area in another shape does not fit)",
+			width, height, p.max.width, p.max.height)
+	}
+	return g, nil
 }
 
 // Encode runs the tokenizer and the text encoder, and returns the caption
@@ -302,8 +475,7 @@ func (p *Pipeline) Encode(prompt string) (*dit.Mat, int, error) {
 		return nil, 0, fmt.Errorf("pipeline: tokenizing: %w", err)
 	}
 	if len(ids) > p.opt.MaxPrompt {
-		return nil, 0, fmt.Errorf("pipeline: the prompt is %d tokens, the encoder was built for %d",
-			len(ids), p.opt.MaxPrompt)
+		return nil, 0, promptTooLong(p.opt.MaxPrompt, len(ids))
 	}
 	hidden, err := p.enc.Forward(ids)
 	if err != nil {
@@ -316,42 +488,72 @@ func (p *Pipeline) Encode(prompt string) (*dit.Mat, int, error) {
 	return cap, len(ids), nil
 }
 
-// Generate runs the whole pipeline: prompt in, decoded image out. The image
-// is [3, H, W] in [-1, 1], which is what the VAE produces and what a PNG
-// writer has to map.
+// Generate runs the whole pipeline at the default size: prompt in, decoded
+// image out. The image is [3, H, W] in [-1, 1], which is what the VAE
+// produces and what a PNG writer has to map.
 func (p *Pipeline) Generate(prompt string, seed int64, progress func(Step)) (*vae.Tensor, *Timings, error) {
-	latents := p.Noise(seed)
-	return p.GenerateFrom(prompt, latents, progress)
+	return p.Run(Request{Prompt: prompt, Seed: seed, Progress: progress})
 }
 
 // GenerateFrom is Generate over an initial latent that is given rather than
 // drawn, which is what makes an end-to-end comparison against diffusers
 // possible: the two RNGs do not agree and nothing else in the pipeline is
-// random.
+// random. The latent's size decides the image's, so nothing has to say it
+// twice.
 func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(Step)) (*vae.Tensor, *Timings, error) {
-	if want := p.cfg.InChan * p.latentH * p.latentW; len(latents) != want {
-		return nil, nil, fmt.Errorf("pipeline: %d latents, want C*H*W = %d", len(latents), want)
+	return p.Run(Request{Prompt: prompt, Latents: latents, Progress: progress})
+}
+
+// Run generates one image.
+//
+// The request's size and step count are resolved against the pipeline's own
+// and then nothing else in here reads Options: every arena was sized for the
+// ceiling at construction, the transformer's run length is stated per upload,
+// the rotary table is rebuilt per run and the VAE re-records its graph from
+// the latent it is given. So a 512x512 image out of a 1024x1024 pipeline is
+// the same code path with smaller numbers in it, not a second one.
+func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
+	g, err := p.geomFor(req.Width, req.Height)
+	if err != nil {
+		return nil, nil, err
 	}
-	tm := &Timings{}
+	sched := p.sched
+	if req.Steps > 0 && req.Steps != sched.Steps() {
+		if sched, err = NewFlowMatchEuler(req.Steps, p.schedCfg); err != nil {
+			return nil, nil, err
+		}
+	}
+	latents := req.Latents
+	want := p.cfg.InChan * g.latentH * g.latentW
+	if latents == nil {
+		latents = p.noise(g, req.Seed)
+	} else if len(latents) != want {
+		// A latent that is the wrong length for the size asked for is almost
+		// always a latent from another size, so the message names both.
+		return nil, nil, fmt.Errorf("pipeline: %d latents for a %dx%d image, want C*H*W = %d",
+			len(latents), g.width, g.height, want)
+	}
+
+	tm := &Timings{Width: g.width, Height: g.height}
 	whole := time.Now()
 
 	// --- the caption, once per image ---------------------------------
 	t0 := time.Now()
-	cap, tokens, err := p.Encode(prompt)
+	cap, tokens, err := p.Encode(req.Prompt)
 	if err != nil {
 		return nil, nil, err
 	}
 	tm.Encode = time.Since(t0)
 	tm.Tokens, tm.CapTotal = tokens, cap.Rows
-	unified := p.imgTotal + cap.Rows
+	unified := g.imgTotal + cap.Rows
 	tm.Unified = unified
 
-	ids, err := p.head.PositionIDs(tokens, p.latentH, p.latentW)
+	ids, err := p.head.PositionIDs(tokens, g.latentH, g.latentW)
 	if err != nil {
 		return nil, nil, err
 	}
 	if p.ctl.capPosFromZero {
-		for i := p.imgTotal; i < len(ids); i++ {
+		for i := g.imgTotal; i < len(ids); i++ {
 			ids[i][0]--
 		}
 	}
@@ -359,7 +561,7 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 	if err != nil {
 		return nil, nil, err
 	}
-	ropeCap, err := dit.NewRoPE(ids[p.imgTotal:], p.cfg.AxesDims, p.cfg.AxesLens, p.cfg.RopeTheta)
+	ropeCap, err := dit.NewRoPE(ids[g.imgTotal:], p.cfg.AxesDims, p.cfg.AxesLens, p.cfg.RopeTheta)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -385,16 +587,16 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 	}
 
 	// --- the denoising loop -------------------------------------------
-	for step := 0; step < p.sched.Steps(); step++ {
+	for step := 0; step < sched.Steps(); step++ {
 		t0 = time.Now()
 		d := Step{Index: step, Latents: latents,
-			Sigma: p.sched.Sigmas[step], NextSig: p.sched.Sigmas[step+1]}
+			Sigma: sched.Sigmas[step], NextSig: sched.Sigmas[step+1]}
 
-		adaln, err := p.head.Timestep(p.sched.ModelT(step))
+		adaln, err := p.head.Timestep(sched.ModelT(step))
 		if err != nil {
 			return nil, nil, err
 		}
-		patches, err := p.head.Patchify(latents, p.latentH, p.latentW)
+		patches, err := p.head.Patchify(latents, g.latentH, g.latentW)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -418,10 +620,10 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		// patches go up as fp16 and the [4096, 3840] stream is written by a
 		// GEMM that never leaves the device.
 		if x != nil {
-			if err := p.stack.Upload(x, 0, p.imgTotal); err != nil {
+			if err := p.stack.Upload(x, 0, g.imgTotal); err != nil {
 				return nil, nil, err
 			}
-		} else if err := p.gpuHead.Embed(patches, p.imgTotal); err != nil {
+		} else if err := p.gpuHead.Embed(patches, g.imgTotal); err != nil {
 			return nil, nil, err
 		}
 		if err := p.stack.Run(p.noiseRefiner); err != nil {
@@ -433,7 +635,7 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		if p.ctl.staleCaption {
 			tail = cap
 		}
-		if err := p.stack.Upload(tail, p.imgTotal, unified); err != nil {
+		if err := p.stack.Upload(tail, g.imgTotal, unified); err != nil {
 			return nil, nil, err
 		}
 		if err := p.stack.Run(p.layers); err != nil {
@@ -450,17 +652,17 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 		var final *dit.Mat
 		if p.gpuHead == nil || p.ctl.cpuHead {
 			stream := p.stack.Read(p.stack.TensorX(), p.cfg.Dim)
-			image := &dit.Mat{Rows: p.imgTokens, Cols: stream.Cols, Data: stream.Data[:p.imgTokens*stream.Cols]}
+			image := &dit.Mat{Rows: g.imgTokens, Cols: stream.Cols, Data: stream.Data[:g.imgTokens*stream.Cols]}
 			if final, err = p.head.Final(image, adaln); err != nil {
 				return nil, nil, err
 			}
 		} else {
-			if final, err = p.gpuHead.Final(p.imgTotal); err != nil {
+			if final, err = p.gpuHead.Final(g.imgTotal); err != nil {
 				return nil, nil, err
 			}
-			final = &dit.Mat{Rows: p.imgTokens, Cols: final.Cols, Data: final.Data[:p.imgTokens*final.Cols]}
+			final = &dit.Mat{Rows: g.imgTokens, Cols: final.Cols, Data: final.Data[:g.imgTokens*final.Cols]}
 		}
-		out, err := p.head.Unpatchify(final, p.latentH, p.latentW)
+		out, err := p.head.Unpatchify(final, g.latentH, g.latentW)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -472,20 +674,20 @@ func (p *Pipeline) GenerateFrom(prompt string, latents []float32, progress func(
 				out[i] = -out[i]
 			}
 		}
-		if err := p.sched.Step(step, latents, out); err != nil {
+		if err := sched.Step(step, latents, out); err != nil {
 			return nil, nil, err
 		}
 		d.Head += time.Since(t0)
 
 		tm.Steps = append(tm.Steps, d.Blocks+d.Head)
-		if progress != nil {
-			progress(d)
+		if req.Progress != nil {
+			req.Progress(d)
 		}
 	}
 
 	// --- the decode ----------------------------------------------------
 	t0 = time.Now()
-	latent := vae.NewTensor(1, p.cfg.InChan, p.latentH, p.latentW)
+	latent := vae.NewTensor(1, p.cfg.InChan, g.latentH, g.latentW)
 	for i, v := range latents {
 		latent.Data[i] = float32(float64(v)/p.scale + p.shift)
 	}

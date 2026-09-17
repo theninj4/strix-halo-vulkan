@@ -1,12 +1,12 @@
 # PIPELINE — the z-image-turbo vertical slice
 
-> **PARKED 2026-09-14, and this file is the record of where.** The current
-> work is [`SPEECH.md`](SPEECH.md) — the parakeet and kokoro verticals — and
-> this slice resumes after them. Nothing below is stale: it is the state the
-> pipeline is in, and the three items under "Where the image budget stands"
-> are where to pick it up. The short version: an image is **14.26 s**, the DiT
-> is **94%** of it, and the only thing left worth more than a percent is the
-> **quarter of the WMMA ceiling the seven projections do not reach — 2.6 s**.
+> **SUPERSEDED 2026-09-18 by [`IMAGE.md`](IMAGE.md)**, which is now the file
+> to read first for this vertical — it carries the current state, the
+> re-checked hypotheses and the priority list (stages I0, I1, …). This file
+> stays as the record of how the slice was built (stages 1-10), the full
+> model inventory, the validation rules, and the measured budget the I-stages
+> price against. Nothing below has been re-measured since 2026-09-14: an
+> image is **14.26 s**, the DiT is **94%** of it.
 
 > **This file is rewritten, not appended.** It states where the pipeline is
 > *now* and what happens next. History belongs in `TODO.md` (session
@@ -36,6 +36,10 @@ image**, and inside a block it is 74% GEMM at 73-76% of the WMMA ceiling, 14%
 attention and 12% elementwise. Nothing outside it is worth a percent.
 
 **Target**: `prompt → PNG` for Z-Image-Turbo at 1024x1024, 8 steps, fp16.
+
+Since I1 the *size* is a ceiling rather than a fixture — `pipeline.Options`
+sizes the arenas, `pipeline.Run` takes a size per image — which moved no
+arithmetic and so changes nothing below. `IMAGE.md` has it.
 
 ## Why this exists
 

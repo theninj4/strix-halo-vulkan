@@ -1,0 +1,401 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// fakeImage is an image backend that renders a flat colour, records what it
+// was asked for, and answers a geometry. Everything in this file is about the
+// translation between a request and that struct, which is the whole of what
+// `api` owns: the model is a device away.
+type fakeImage struct {
+	reqs           []ImageRequest
+	geo            ImageGeometry
+	err            error
+	returnsNothing bool // (nil, nil), which a backend should never do
+}
+
+func (f *fakeImage) Models() []Model {
+	return []Model{{ID: "z-image-turbo", Object: "model", OwnedBy: "local"}}
+}
+
+func (f *fakeImage) Geometry() ImageGeometry {
+	if f.geo.Width == 0 {
+		return ImageGeometry{Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
+			Multiple: 16, Steps: 8}
+	}
+	return f.geo
+}
+
+func (f *fakeImage) Generate(_ context.Context, req *ImageRequest) (*ImageResult, error) {
+	f.reqs = append(f.reqs, *req)
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.returnsNothing {
+		return nil, nil
+	}
+	w, h := req.Width, req.Height
+	if w == 0 || h == 0 {
+		w, h = f.Geometry().Width, f.Geometry().Height
+	}
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, color.RGBA{1, 2, 3, 255})
+		}
+	}
+	seed := int64(99)
+	if req.Seed != nil {
+		seed = *req.Seed
+	}
+	steps := req.Steps
+	if steps == 0 {
+		steps = f.Geometry().Steps
+	}
+	return &ImageResult{Image: img, Width: w, Height: h, Steps: steps, Seed: seed}, nil
+}
+
+func generate(t *testing.T, s *Server, body any) (*httptest.ResponseRecorder, ImageGenerationResponse) {
+	t.Helper()
+	rec := do(t, s, jsonRequest("POST", "/v1/images/generations", body))
+	var got ImageGenerationResponse
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("%v: %s", err, rec.Body)
+		}
+	}
+	return rec, got
+}
+
+func TestImageGenerationDefaultSize(t *testing.T) {
+	fake := &fakeImage{}
+	s := &Server{Token: "t", Image: fake}
+	rec, got := generate(t, s, ImageGenerationRequest{Prompt: "a red fox in the snow"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if len(fake.reqs) != 1 {
+		t.Fatalf("%d backend calls", len(fake.reqs))
+	}
+	// A request that named no size is handed the backend's own, resolved
+	// here: the backend should never have to ask what its default was.
+	if fake.reqs[0].Width != 1024 || fake.reqs[0].Height != 1024 {
+		t.Errorf("backend got %dx%d, want the default 1024x1024",
+			fake.reqs[0].Width, fake.reqs[0].Height)
+	}
+	if fake.reqs[0].Seed != nil {
+		t.Errorf("seed %v, want nil so the backend draws one", *fake.reqs[0].Seed)
+	}
+	if got.Size != "1024x1024" || got.OutputFormat != "png" {
+		t.Errorf("echoed %q / %q", got.Size, got.OutputFormat)
+	}
+	if len(got.Data) != 1 {
+		t.Fatalf("%d images", len(got.Data))
+	}
+	// The seed the server drew comes back, because that is the only way a
+	// client can ask for the same image twice.
+	if got.Data[0].Seed != 99 || got.Data[0].Steps != 8 {
+		t.Errorf("seed %d, steps %d", got.Data[0].Seed, got.Data[0].Steps)
+	}
+	raw, err := base64.StdEncoding.DecodeString(got.Data[0].B64JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if format != "png" || cfg.Width != 1024 || cfg.Height != 1024 {
+		t.Errorf("%s %dx%d", format, cfg.Width, cfg.Height)
+	}
+}
+
+func TestImageGenerationSizeReachesTheBackend(t *testing.T) {
+	for _, c := range []struct {
+		name          string
+		req           ImageGenerationRequest
+		width, height int
+	}{
+		{"explicit", ImageGenerationRequest{Prompt: "p", Size: "512x768"}, 512, 768},
+		{"auto", ImageGenerationRequest{Prompt: "p", Size: "auto"}, 1024, 1024},
+		// A non-square out of a server built square, which is the whole of
+		// what the pipeline change bought: half the tokens, the same arenas.
+		{"landscape", ImageGenerationRequest{Prompt: "p", Size: "1024x512"}, 1024, 512},
+		{"aspect ratio", ImageGenerationRequest{Prompt: "p", AspectRatio: "16:9"}, 1024, 576},
+		// Size wins over aspect_ratio, because one of them is OpenAI's field
+		// and a client that sent both meant the one every other server reads.
+		{"size beats ratio", ImageGenerationRequest{Prompt: "p", Size: "256x256", AspectRatio: "16:9"}, 256, 256},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeImage{}
+			s := &Server{Image: fake}
+			rec, got := generate(t, s, c.req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if fake.reqs[0].Width != c.width || fake.reqs[0].Height != c.height {
+				t.Errorf("backend got %dx%d, want %dx%d",
+					fake.reqs[0].Width, fake.reqs[0].Height, c.width, c.height)
+			}
+			if want := formatSize(c.width, c.height); got.Size != want {
+				t.Errorf("echoed size %q, want %q", got.Size, want)
+			}
+		})
+	}
+}
+
+// The sizes a resizable pipeline still has to refuse, and the reason each one
+// is refused rather than rounded: a client that asked for 1000x1000 and got
+// 992x992 has no way to find out.
+func TestImageGenerationRejectsSizes(t *testing.T) {
+	for _, c := range []struct{ name, size, want string }{
+		{"not a size", "big", "WIDTHxHEIGHT"},
+		{"no height", "1024x", "not a height"},
+		{"negative", "-16x16", "not a width"},
+		{"off the grid", "1000x1000", "multiple of 16"},
+		{"past the ceiling", "2048x2048", "neither side may be past it"},
+		{"past it on one side only", "1024x1088", "neither side may be past it"},
+		// The same area in a taller shape, which the transformer would take
+		// and the VAE will not -- see pipeline.geomFor, where it is measured.
+		{"same area, wrong shape", "512x2048", "neither side may be past it"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeImage{}
+			s := &Server{Image: fake}
+			rec, _ := generate(t, s, ImageGenerationRequest{Prompt: "p", Size: c.size})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), c.want) {
+				t.Errorf("body %s, want it to mention %q", rec.Body, c.want)
+			}
+			if len(fake.reqs) != 0 {
+				t.Errorf("the backend ran anyway")
+			}
+		})
+	}
+}
+
+// A ratio is fitted to the *server's* ceiling, so the same request answers on
+// a server started at a different size. It is the one place this endpoint
+// computes a size rather than checking one, and rounding down on both sides is
+// what keeps the answer inside the budget.
+func TestAspectRatioFitsTheCeiling(t *testing.T) {
+	for _, c := range []struct {
+		ratio         string
+		geo           ImageGeometry
+		width, height int
+	}{
+		{"1:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 1024, 1024},
+		{"16:9", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 1024, 576},
+		{"9:16", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 576, 1024},
+		{"2:1", ImageGeometry{MaxWidth: 512, MaxHeight: 512, Multiple: 16}, 512, 256},
+		// The width binds and the height comes out well under its own
+		// ceiling, which is the ratio being honoured rather than the area
+		// being spent.
+		{"3:2", ImageGeometry{MaxWidth: 512, MaxHeight: 512, Multiple: 16}, 512, 336},
+		// A non-square ceiling: the height binds for the first of these and
+		// the width for the second, which is the only way to tell the two
+		// halves of the fit apart.
+		{"1:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 512, Multiple: 16}, 512, 512},
+		{"2:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 512, Multiple: 16}, 1024, 512},
+	} {
+		t.Run(c.ratio+" into "+formatSize(c.geo.MaxWidth, c.geo.MaxHeight), func(t *testing.T) {
+			w, h, err := fitRatio(c.ratio, c.geo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w != c.width || h != c.height {
+				t.Fatalf("%s into %dx%d gave %dx%d, want %dx%d", c.ratio,
+					c.geo.MaxWidth, c.geo.MaxHeight, w, h, c.width, c.height)
+			}
+			if w > c.geo.MaxWidth || h > c.geo.MaxHeight {
+				t.Errorf("%dx%d is outside the ceiling it was fitted to", w, h)
+			}
+		})
+	}
+}
+
+func TestImageGenerationN(t *testing.T) {
+	fake := &fakeImage{}
+	s := &Server{Image: fake}
+	seed := int64(7)
+	rec, got := generate(t, s, ImageGenerationRequest{Prompt: "p", N: 3, Seed: &seed})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if len(got.Data) != 3 || len(fake.reqs) != 3 {
+		t.Fatalf("%d images from %d runs", len(got.Data), len(fake.reqs))
+	}
+	// Three images from one named seed are three *different* images, or the
+	// parameter did something a client did not ask for.
+	for i, r := range fake.reqs {
+		if r.Seed == nil || *r.Seed != seed+int64(i) {
+			t.Errorf("run %d got seed %v, want %d", i, r.Seed, seed+int64(i))
+		}
+		if got.Data[i].Seed != seed+int64(i) {
+			t.Errorf("run %d reported seed %d", i, got.Data[i].Seed)
+		}
+	}
+}
+
+func TestImageGenerationRefusals(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		req  ImageGenerationRequest
+		want string
+	}{
+		{"empty prompt", ImageGenerationRequest{Prompt: "  "}, "prompt is empty"},
+		{"streaming", ImageGenerationRequest{Prompt: "p", Stream: true}, "streaming image generation"},
+		{"n too large", ImageGenerationRequest{Prompt: "p", N: 9}, "1 to 4"},
+		{"url", ImageGenerationRequest{Prompt: "p", ResponseFormat: "url"}, "nowhere to host"},
+		{"webp", ImageGenerationRequest{Prompt: "p", OutputFormat: "webp"}, "png and jpeg"},
+		{"quality", ImageGenerationRequest{Prompt: "p", OutputCompression: 101}, "outside [0, 100]"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeImage{}
+			s := &Server{Image: fake}
+			rec, _ := generate(t, s, c.req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if !strings.Contains(rec.Body.String(), c.want) {
+				t.Errorf("body %s, want it to mention %q", rec.Body, c.want)
+			}
+			if len(fake.reqs) != 0 {
+				t.Errorf("the backend ran anyway")
+			}
+		})
+	}
+}
+
+func TestImageGenerationJPEG(t *testing.T) {
+	s := &Server{Image: &fakeImage{}}
+	rec, got := generate(t, s, ImageGenerationRequest{
+		Prompt: "p", Size: "64x64", OutputFormat: "jpeg", OutputCompression: 50,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if got.OutputFormat != "jpeg" {
+		t.Errorf("output_format %q", got.OutputFormat)
+	}
+	raw, err := base64.StdEncoding.DecodeString(got.Data[0].B64JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("not a JPEG: %v", err)
+	}
+}
+
+// An unsupported request from the backend is the client's fault; anything else
+// is ours. The distinction is the whole reason api.ErrUnsupported exists, and
+// it is a wrapped sentinel rather than a message so that rewording the message
+// cannot silently turn a 400 into a 500.
+func TestImageGenerationBackendErrors(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		fake *fakeImage
+		want int
+	}{
+		{"unsupported", &fakeImage{err: fmt.Errorf("the prompt is 700 tokens: %w", ErrUnsupported)}, 400},
+		{"broken", &fakeImage{err: errors.New("device lost")}, 500},
+		{"nothing at all", &fakeImage{returnsNothing: true}, 500},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := &Server{Image: c.fake}
+			rec, _ := generate(t, s, ImageGenerationRequest{Prompt: "p"})
+			if rec.Code != c.want {
+				t.Fatalf("status %d, want %d: %s", rec.Code, c.want, rec.Body)
+			}
+		})
+	}
+}
+
+// /v1/images/edits is the one 501 that no flag fixes, and the message says so
+// rather than naming a flag the caller cannot pass.
+func TestImageEditIsRefusedForTheEncoder(t *testing.T) {
+	s := &Server{Image: &fakeImage{}}
+	rec := do(t, s, jsonRequest("POST", "/v1/images/edits", ImageEditRequest{Prompt: "p"}))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "encoder") {
+		t.Errorf("body %s, want it to name the missing encoder", rec.Body)
+	}
+}
+
+func TestImageGenerationNeedsTheFlag(t *testing.T) {
+	rec, _ := generate(t, &Server{}, ImageGenerationRequest{Prompt: "p"})
+	if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "-image") {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+}
+
+// The geometry rides on the model object for the same reason the voices do: a
+// client that has to guess this server's ceiling will guess wrong on a server
+// started at anything but the default.
+func TestModelsCarriesTheImageGeometry(t *testing.T) {
+	s := &Server{
+		Speech: &fakeSpeech{},
+		Image: &fakeImage{geo: ImageGeometry{
+			Width: 768, Height: 768, MaxWidth: 1024, MaxHeight: 1024, Multiple: 16, Steps: 8,
+		}},
+	}
+	rec := do(t, s, httptest.NewRequest("GET", "/v1/models", http.NoBody))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	var got struct {
+		Data []struct {
+			ID    string `json:"id"`
+			Image *struct {
+				DefaultSize  string `json:"default_size"`
+				MaxSize      string `json:"max_size"`
+				SizeMultiple int    `json:"size_multiple"`
+				DefaultSteps int    `json:"default_steps"`
+			} `json:"image"`
+			Voices []string `json:"voices"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range got.Data {
+		switch m.ID {
+		case "z-image-turbo":
+			if m.Image == nil {
+				t.Fatal("the image model has no geometry")
+			}
+			if m.Image.DefaultSize != "768x768" || m.Image.MaxSize != "1024x1024" {
+				t.Errorf("sizes %q / %q", m.Image.DefaultSize, m.Image.MaxSize)
+			}
+			if m.Image.SizeMultiple != 16 || m.Image.DefaultSteps != 8 {
+				t.Errorf("geometry %+v", *m.Image)
+			}
+			if len(m.Voices) != 0 {
+				t.Errorf("the image model has voices: %v", m.Voices)
+			}
+		case "kokoro-82m":
+			if m.Image != nil {
+				t.Errorf("the speech model has an image geometry: %+v", *m.Image)
+			}
+		default:
+			t.Errorf("unexpected model %q", m.ID)
+		}
+	}
+}

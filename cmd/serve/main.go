@@ -10,14 +10,18 @@
 //	go run ./cmd/serve -llm -llm-layers 4           # the server, in 7 GB, for the HTTP side
 //	go run ./cmd/serve -tts -voice bm_george -addr :8080
 //	go run ./cmd/serve -stt -max-audio 300          # five-minute clips
+//	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
+//	go run ./cmd/serve -image                       # z-image-turbo, 25 GB resident
+//	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -tts -gpu=false              # the CPU reference
 //
-// The endpoints that answer today are GET /v1/models, POST
-// /v1/chat/completions, POST /v1/audio/speech and POST
-// /v1/audio/transcriptions. The rest are routed and answer 501: /v1/responses
-// and /v1/messages are the same model in two more envelopes, embeddings wait
-// on there being an embedding model at all, and images on zimage's pipeline
-// being wired in.
+// Every endpoint answers today except POST /v1/images/edits, which needs the
+// VAE's encoder and not a flag (see api.Server.handleImageEdit).
+//
+// **-llm and -image do not fit together.** The language model is ~84 GB
+// resident and the image pipeline ~25 GB, against 128 GB of unified memory
+// that the rest of the machine is also in; the two are separate processes on
+// this part, or separate runs.
 //
 // Two things about the device are worth knowing before reading the timings.
 // **Requests are serialised at the queue**, because a vk.Device has one and
@@ -38,6 +42,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -81,14 +87,29 @@ func main() {
 	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
 
+	embedOn := flag.Bool("embed", false, "load Qwen3-Embedding-0.6B and serve /v1/embeddings")
+	embedModel := flag.String("embed-model", "models/Qwen3-Embedding-0.6B", "embedding checkpoint directory")
+	embedTokens := flag.Int("embed-tokens", 512, "longest input the embedding arenas hold; longer inputs are truncated")
+
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
 	maxAudio := flag.Float64("max-audio", 60, "longest clip the transcription arenas are sized for, in seconds")
+
+	imgOn := flag.Bool("image", false, "load Z-Image-Turbo and serve /v1/images/generations")
+	imgModel := flag.String("image-model", "models/Z-Image-Turbo", "z-image checkpoint root")
+	imgSize := flag.String("image-size", "1024x1024",
+		"largest image the arenas are built for, and the size a request that names none gets; both sides a multiple of 16")
+	imgSteps := flag.Int("image-steps", 8, "denoising steps a request that names none gets; the checkpoint's NFE is 8")
+	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn {
+	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
-			"Pass -llm, -tts and/or -stt.")
+			"Pass -llm, -embed, -image, -tts and/or -stt.")
+	}
+	imgW, imgH, err := parseSize(*imgSize)
+	if *imgOn && err != nil {
+		log.Fatalf("-image-size: %v", err)
 	}
 
 	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies}
@@ -97,7 +118,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || (*tts && *ttsGPU)) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -140,6 +161,38 @@ func main() {
 			where(dev != nil), time.Since(start).Round(time.Millisecond))
 	}
 
+	if *embedOn {
+		start := time.Now()
+		b, err := backend.NewEmbed(backend.EmbedOptions{
+			Model: *embedModel, Device: dev, MaxTokens: *embedTokens,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		srv.Embedding = b
+		log.Printf("embed: %s, inputs to %d tokens, %s, in %v", *embedModel, b.MaxTokens(),
+			where(dev != nil), time.Since(start).Round(time.Millisecond))
+	}
+
+	if *imgOn {
+		start := time.Now()
+		b, err := backend.NewImage(backend.ImageOptions{
+			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
+			Steps: *imgSteps, MaxPrompt: *imgPrompt,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		srv.Image = b
+		enc, tr, vaeW, act := b.Residency()
+		log.Printf("image: %s, to %dx%d, %d steps, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
+			*imgModel, imgW, imgH, *imgSteps,
+			float64(enc+tr+vaeW+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9,
+			time.Since(start).Round(time.Millisecond))
+	}
+
 	// The language model is staged last, and on purpose: it is most of this
 	// machine's memory and tens of seconds of staging, so a mistake in a
 	// speech flag is reported before the wait rather than after it.
@@ -170,6 +223,24 @@ func main() {
 	}
 }
 
+// parseSize reads -image-size, which is spelled the way a request spells it so
+// that the flag and the API field are not two notations for one thing.
+func parseSize(s string) (int, int, error) {
+	w, h, ok := strings.Cut(strings.ToLower(strings.TrimSpace(s)), "x")
+	if !ok {
+		return 0, 0, fmt.Errorf("%q is not WIDTHxHEIGHT", s)
+	}
+	width, err := strconv.Atoi(strings.TrimSpace(w))
+	if err != nil || width <= 0 {
+		return 0, 0, fmt.Errorf("%q: %q is not a width", s, w)
+	}
+	height, err := strconv.Atoi(strings.TrimSpace(h))
+	if err != nil || height <= 0 {
+		return 0, 0, fmt.Errorf("%q: %q is not a height", s, h)
+	}
+	return width, height, nil
+}
+
 func where(gpu bool) string {
 	if gpu {
 		return "on the device"
@@ -193,7 +264,8 @@ func listen(srv *api.Server, addr string) error {
 	go func() {
 		log.Printf("listening on http://%s", addr)
 		for _, route := range []string{
-			"/v1/models", "/v1/chat/completions", "/v1/audio/speech", "/v1/audio/transcriptions",
+			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
+			"/v1/audio/speech", "/v1/audio/transcriptions", "/v1/images/generations",
 		} {
 			log.Printf("  %s", route)
 		}
