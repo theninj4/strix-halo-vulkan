@@ -2,6 +2,8 @@ package llm
 
 import (
 	"fmt"
+	"runtime"
+	"sync"
 
 	"strix-halo-vulkan/gguf"
 )
@@ -297,20 +299,68 @@ func (m *Model) PLEGather(rows []int32, nHeads, headDim int) ([]float32, error) 
 			return nil, fmt.Errorf("llm: per_layer_token_embd madvise: %w", err)
 		}
 	}
-	out := make([]float32, len(rows)*headDim)
-	// gguf.Dequantize appends, so the scratch row is handed over empty and
-	// kept only for its capacity.
-	buf := make([]float32, 0, headDim)
 	for i, r := range rows {
 		if int64(r) < 0 || int64(r) >= t.Dims[1] {
 			return nil, fmt.Errorf("llm: PLE row %d (head %d of token %d) is outside the table's %d rows",
 				r, i%nHeads, i/nHeads, t.Dims[1])
 		}
-		v, err := t.DequantizeRow(int64(r), buf[:0])
+	}
+	out := make([]float32, len(rows)*headDim)
+
+	// **P1.** The rows go in parallel, and the reason is not the dequant.
+	//
+	// A token's sixteen rows are sixteen *random* offsets into a 28.80 GB
+	// mmap'd table (D2), and on a machine holding 84 GB of resident model
+	// they are not in the page cache: measured, a decode step's gather takes
+	// **16.3 major faults**, one a head, and serves them one at a time.
+	// That is 819-853 us a step of pure device latency — 7% of a 31.8 ms
+	// decode token — for 1.4 KB of data. Issuing the same sixteen faults
+	// concurrently leaves the count identical (16.3) and costs **109-122 us,
+	// 7.0-7.5x**: nothing is read that was not read before, it is read with
+	// sixteen requests outstanding instead of one. D9's MADV_RANDOM is what
+	// makes each fault small; this is what stops them being serial.
+	//
+	// The split is by row and the destinations are disjoint, so the result
+	// is the same values in the same places whatever the scheduling. At
+	// prefill there are nTok*16 rows and the pool is bounded rather than one
+	// goroutine a row.
+	workers := minInt(len(rows), runtime.GOMAXPROCS(0))
+	if workers <= 1 {
+		buf := make([]float32, 0, headDim)
+		for i, r := range rows {
+			v, err := t.DequantizeRow(int64(r), buf[:0])
+			if err != nil {
+				return nil, err
+			}
+			copy(out[i*headDim:], v)
+		}
+		return out, nil
+	}
+	errs := make([]error, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// gguf.Dequantize appends, so the scratch row is handed over
+			// empty and kept only for its capacity -- one a worker, since
+			// they run at once.
+			buf := make([]float32, 0, headDim)
+			for i := w; i < len(rows); i += workers {
+				v, err := t.DequantizeRow(int64(rows[i]), buf[:0])
+				if err != nil {
+					errs[w] = err
+					return
+				}
+				copy(out[i*headDim:], v)
+			}
+		}(w)
+	}
+	wg.Wait()
+	for _, err := range errs {
 		if err != nil {
 			return nil, err
 		}
-		copy(out[i*headDim:], v)
 	}
 	return out, nil
 }

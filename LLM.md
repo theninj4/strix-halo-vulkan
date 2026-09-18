@@ -12,11 +12,19 @@ third vertical, and 200x the parameters of the other two put together.
 
 **Status: the model generates, it is served over HTTP, phase 2's kernel half
 is finished, five of the six dense families are now at a width the checkpoint
-does not ship, and the one correctness cliff is closed.** **P0** found that the
+does not ship, the one correctness cliff is closed, and a decode token is
+attributed to the dispatch.** **P0** found that the
 graph's never returning above ~2560 rows was amdgpu's gfx ring watchdog killing
 any submit that holds the ring past **2 s** — nothing about this model, this
 bank or residency — so the recorder chunks by time and **prefill runs to 8192
-rows at 1213.5 tok/s, 3.10x llama.cpp, still climbing**. **L9a** put the generation loop behind
+rows at 1213.5 tok/s, 3.10x llama.cpp, still climbing**. **P1** then attributed
+the decode step: **30.52 ms over 36 dispatch labels and six host phases, a 5 us
+residual**, and the review's "~12 ms unexplained" is 5.54 ms of dispatches
+below 227 GB/s, 3.46 of dispatches that stream no weight and 3.01 of host. It
+found the n-gram gather to be **sixteen serialised major page faults a token**
+and made them concurrent, which is **decode 31.51 → 32.72 tok/s, 1.30x
+llama.cpp**, and it re-ranked everything below it: the bank has stopped being
+where decode time is. **L9a** put the generation loop behind
 `cmd/serve` — the checkpoint's own chat template transcribed and checked
 against Jinja, and three envelopes over one loop (`API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
@@ -512,20 +520,27 @@ the dense half completely.
 
 ## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
 
-**P0 is done** (2026-09-18) and is struck through below; **P1 is next.**
+**P0 and P1 are done** (2026-09-18) and are struck through below; **P2 is
+next**, and the order of everything after it has moved.
 
 The 2026-09-18 review re-derived the decode budget and found the bank is no
 longer the binding constraint: 31.5 tok/s measured against an honest ~53
-ceiling (the quoted 56.5 counts weights only; DeltaNet state read+write is
-~0.22 GB a token, KV and activations another ~0.06), so **~12 ms of every
-31.7 ms token is unexplained by bytes at any achievable rate** and nothing
-has attributed a decode step since L8e. The order below follows from that;
-each item's full plan and gate is in `LLM2.md`.
+ceiling, so **~12 ms of every 31.7 ms token is unexplained by bytes at any
+achievable rate** and nothing had attributed a decode step since L8e. **P1
+attributed it, to the dispatch**, and the 12 ms is 5.54 ms of weight-streaming
+dispatches below 227 GB/s, 3.46 ms of dispatches that stream no weight, and
+3.01 ms of host. It also found and fixed the largest host item on the way —
+the n-gram gather was **sixteen serialised major page faults a token** — which
+is **31.51 → 32.72 tok/s** on its own. The order below follows from that
+table; each item's full plan and gate is in `LLM2.md`.
 
 | # | item | why it is where it is |
 |---|---|---|
 | ~~**P0**~~ | ~~**The >2560-row stall**~~ — **done**, and it was a 2 s ring watchdog rather than anything about this model: the recorder now chunks a submit by *time*. `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192 (**1213.5, 3.10x**), and `-ppl -ctx 4096` completes at 48 layers at **PPL 3.9392**. | The blocker is gone, so everything long-context below is now measurable. [Write-up](research/p0-ring-watchdog.md) |
-| **P1** | **Re-attribute the decode step** | One day with L8d's own timestamps; names the ~12 ms and re-prices everything below. The likely first fix it names is a pre-recorded decode command buffer (IDEAS §4.2, never carried into this vertical). |
+| ~~**P1**~~ | ~~**Re-attribute the decode step**~~ — **done**, and the step now sums: 30.52 ms over 36 dispatch labels and six host phases, residual 5 us. The ~12 ms is **5.54 slow + 3.46 weightless + 3.01 host**. The gather was **16.3 serialised major faults a token** and going parallel is 7.0-7.5x, worth **31.51 → 32.72 tok/s** by itself. The pre-recorded command buffer is priced at **1.96 ms** and is *fourth*, not first; the leaders are `hyper_conn` at 114.6 GB/s (485 dispatches a pass) and `moe.down` at 147.5 against `moe.up`'s 200.6. Idea 9 closed with it. | The blocker on every estimate below. [Write-up](research/p1-decode-attribution.md) |
+| **P1a** | **The hyper-connection block's 485 dispatches** | 1.56 ms of bank and 0.97 ms of weightless norms and combines — **13.6% of the step for 8.4% of the bytes**, at 114.6 GB/s against seven families at 147-204. D14 says the weights never leave the MALL, so this is shape, not bytes: fuse the mixer's five dispatches or batch across the 97. The largest single misallocation in the token. |
+| **P1b** | **`moe.down`'s rung, and the shared expert's** | 1.19 + 0.73 ms. Same bank, same experts, same layer as `moe.up`, and 147.5 GB/s against 200.6 — a row block chosen for one shape and never re-screened for the other (D11/D12). A ladder run, not a kernel. |
+| **P1c** | **The pre-recorded decode command buffer** (idea 2) | 1.127 ms of recording plus 0.828 of hand-over, **6.4% of the step, ~+2.2 tok/s**. The decode graph is shape-stable: same 1501 dispatches, same buffers, only the position and the token id change. |
 | **P2** | **`ple_proj`, and close L8c** | Half a day, two bank stages in one, and D13's payoff: delete the two-plane fp16-tail machinery now that the exception list is empty. Ends with the complete plan's 145-chunk number. |
 | **P3** | **The shipped-widths decision (D18)** | The knapsack: additivity + per-family corpus deltas make plans composable, and uniform 4.5 is provably not optimal — `full_attn` costs 5.52 pp/GB where `deltanet` costs 0.87. Sim-grade `q5_k` on `full_attn` first (8 minutes, no kernel), screen the winner on a second corpus. |
 | **P4** | **The router at fp16 and the experts at ~4.25 bits** | +4.5 tok/s of ceiling. The expert half is a transcode, not a kernel — `llm_moe_gemm/gemv` already read Q4_K — and L8c-3 says the calibrated form behaves. Grade each on 145 chunks separately; D4 holds. |
@@ -2425,6 +2440,65 @@ to; the incumbents stay because no candidate disagrees.
 
 ---
 
+## What P1 established — the step, to the dispatch, and a gather that was disk
+
+> **P1-1: the step sums, and the ~12 ms is three things.** Every block's
+> `graph` method has always built a `kinds []string` beside its dispatches, for
+> its error messages, and nothing read it — so the per-dispatch timestamps L7d
+> already collects were folded into six *block* rows, and "the MoE is 11.6 ms"
+> could not say which of nine kernels that was. `recorder.add` now takes the
+> labels, `GraphStats` carries them, and `-gen -attrib` prints the whole token:
+> **30.52 ms over 36 dispatch labels and six host phases, with a 5 us
+> residual.** Two runs, 32.67 and 32.76 tok/s, 0.3% apart. Against 4.281 GB at
+> the 227 GB/s a dispatch actually reaches — 18.86 ms — the gap is
+> **5.54 ms of weight-streaming dispatches below that rate, 3.46 ms of
+> dispatches that stream no weight at all, and 3.01 ms of host**, which is
+> 12.01 against the review's estimate of ~12.
+>
+> **P1-2: the n-gram gather was sixteen serialised major page faults, and that
+> is 1.2 tok/s.** `PLEGather` reads sixteen 90-byte rows a token at random
+> offsets into a 320-million-row, 28.80 GB mmap'd table that D2 keeps off the
+> device; beside 84 GB of resident model they are not in the page cache.
+> Counting `majflt` around 200 gathers of fresh rows: serial **853.2/819.4 us**
+> a step at **16.27/16.29** major faults, sixteen touched concurrently first
+> **122.2/108.8 us** at **16.34/16.30**. The fault count is identical to two
+> decimal places — nothing extra is read, nothing extra is cached — and the
+> only thing that changes is how many are outstanding at once. A bounded worker
+> pool over the rows takes the gather **2.244 → 0.902 ms** in the whole model
+> and decode **31.51 → 32.72 tok/s, 1.30x llama.cpp**. This is the other half
+> of **D9**: `MADV_RANDOM` made each fault small, this stops them queueing.
+>
+> **P1-3: seven of eight families read at 147-204 GB/s and the
+> hyper-connection block reads at 114.6.** It is not short of bandwidth — D14
+> established that these weights fit the MALL at every width — it is short of
+> work per dispatch: **97 mixers x 5 dispatches = 485 dispatches a pass at
+> 1.4-17 us each**. Counting its weightless norms and combines the block is
+> **4.15 ms, 13.6% of the step, for 8.4% of the bytes**, the largest single
+> misallocation in the token, and the lever is fusion, not a narrower bank.
+>
+> **P1-4: `moe.down` is 1.19 ms behind `moe.up` off the same bank.** 147.5
+> against 200.6 GB/s, same experts, same layer, back to back; the difference is
+> [NEmbd, FFNExpert] against [FFNExpert, NEmbd], a shape whose row block was
+> chosen for one and never re-screened for the other. The shared expert's pair
+> repeats it at **136.5 GB/s**, 0.73 ms. This is D12's operative half applied
+> to a kernel instead of a bank, and both are a ladder run from an answer.
+>
+> **P1-5: the pre-recorded command buffer is priced, and it is fourth.**
+> Idea 2 was the review's leading candidate for the whole 12 ms. It is
+> **1.127 ms of host recording plus 0.828 of hand-over — 1.96 ms, 6.4%, about
+> +2.2 tok/s** — which is worth building and is behind the two kernel-shape
+> items above. That re-ranking is what P1 was for.
+>
+> **P1-6: the 0.38 GB is the router and the shared expert** (idea 9). The
+> checkpoint inventory files both under "dense, every token"; L8b's table files
+> them with the MoE. Less L8b-1's doubled `inject` rows, `PLEGPU`'s halves and
+> rounding, the two partitions reconcile exactly. **Every ceiling is now quoted
+> on one basis: 4.281 GB a token**, 56.5 tok/s at 242 GB/s and **53.0 at the
+> 227 dispatches reach** — against which the measured step is **62%**.
+> [Write-up](research/p1-decode-attribution.md) · `results/p1_decode_attrib.csv`
+
+---
+
 ## The three findings that set the direction
 
 **1. `llama.cpp` already implements this architecture, is built with Vulkan on
@@ -2809,10 +2883,16 @@ fourth:**
 So **llama.cpp's 25.15 was the ceiling of the bank it reads**, we were under
 our own, and 8.5 bits a weight is the checkpoint's own width — which is why
 L8a's 36.6 landed within 4% of the 38.2 in the row above. **L8b's 40.0 goes
-past it**, and the 0.38 GB between our 4.45 GB dense half and the budget's
-4.830 is not accounted for here — that budget is an inventory of what the
-checkpoint holds and ours is a count of what the graph reads, and nothing has
-reconciled the two tensor by tensor. **The 1.66x that needed no
+past it**, and ~~the 0.38 GB between our 4.45 GB dense half and the budget's
+4.830 is not accounted for here~~ — **P1-6 accounts for it.** The two columns
+are different partitions of the same tensors: the inventory files the **MoE
+router (0.252 GB) and the shared expert (0.251)** under "dense, every token"
+where the table above files them with the MoE, and the table's column is
+larger than the inventory's on three families — L8b-1's doubled `inject` rows
+(0.045), `PLEGPU`'s halves (0.035, the one family D13 never reached and P2's)
+and rounding on the attention pair (0.026). 0.503 − 0.106 = 0.397, which is
+the 0.38. **Every ceiling in this file is now quoted on the third basis, the
+measured one: 4.281 GB a token at the shipped bank.** **The 1.66x that needed no
 re-quantisation came to 1.81x of the dense half and 1.24x of the rate**, and
 the only halves left anywhere are the PLE block's one projection and the
 three families that are not Q8_0 on disk.
@@ -3742,6 +3822,19 @@ below Q8. Bandwidth is the whole story.
     curl -sH 'Authorization: Bearer womblesofwimbledon' -H 'Content-Type: application/json' \
         -d '{"messages":[{"role":"user","content":"Capital of France?"}],"max_tokens":48}' \
         http://127.0.0.1:8080/v1/chat/completions
+    # P1: where a decode token goes, per dispatch label and per host phase.
+    # The labels are the ones each block already builds for its error
+    # messages; `-attrib` is what reads them. With `-csv` the file *is* the
+    # attribution table rather than the one-row summary, because the two do
+    # not fit in one shape.
+    go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is' \
+        -attrib -csv results/p1_decode_attrib.csv
+    go run ./cmd/llm -gen -model $M -n 16 -layers 4 -attrib   # the table, in 7 GB
+    go test ./llm/ -run TestPLEGatherPoolIsTheSerialGather -v
+                                             # P1-2: the gather's worker pool
+                                             # against one row at a time, at
+                                             # the row counts where a stride
+                                             # is wrong
     go run ./cmd/llm -gen -model $M -n 64 -prompt 'The capital of France is' \
         -csv results/l8e_decode.csv          # every committed decode CSV is
                                              # this prompt; the default is
@@ -4103,7 +4196,7 @@ below Q8. Bandwidth is the whole story.
 | D7 | ~~**Symmetric Q4, not asymmetric.**~~ **Reversed at L8c-3: a 4-bit rung here is `q4_k`, ggml's asymmetric K-quant, and not `q4_0`.** | L0d decided it on weight reconstruction: asymmetric was 1.043-1.053x at equal bits where §7 predicted 2x, so the min was not worth its bytes. **Two things were wrong with that.** The bytes are not a trade at all — ggml nests the min, a super-block of eight groups of 32 carrying one fp16 pair and 12 bits a group, which is **0.500 bits a weight, exactly what a symmetric fp16 scale per 32 costs** — so `q4_k/32` and `q4_0/32` are both 4.500. And the metric was the proxy L8c-1 had already retired: measured over the whole corpus the asymmetric form is **2.06x cheaper at identical bits and identical bytes** (4.3124 against 4.6127, +7.04% against +14.49%), 3.2x on the family that decides the plan. **The larger half is L8c-2's lever, which works on this form and not on the other**: the imatrix takes 4.5 bits on every streamed dense family to **4.1998, +4.24%**, where the same matrix on the symmetric form makes it *worse* — 4.6588, +15.63% — because a symmetric group has one free parameter and it *is* the gain, so a calibrated fit can only express its preference by shrinking the whole group — measured, the extra shrinkage calibration costs `hc_attn_up` is 1.24 pp symmetric and **0.47 pp** asymmetric. The 1.13x `q4_0` gained over L0d's fifteen-level `q4sym` (L8c-1) still stands and is now a fact about the arm that lost. |
 | D8 | **fp16 scales per 32 nibbles, in a k-major plane.** | L0c made the fine block cost 1.0% instead of 14.2% at prefill. The remaining cost is decode bytes — 11.1% of the bank against 3.0% at per-128 — the one axis still worth trading if tok/s falls short. |
 | D5 | **`llama.cpp` is the oracle, not a Python dump.** | It is built, it is Vulkan, it supports `qwen4exp`, and L1 got correctness, accuracy and a baseline out of one binary. |
-| D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. |
+| D9 | **`MADV_RANDOM` on the n-gram table, and on nothing else — and the sixteen reads go in parallel.** | L7c-3: sixteen scattered 90-byte reads a token draw sixteen 128 KB readahead windows — 2 MB to deliver 1.41 KB — and removing it is **176x** at decode. Set on that tensor's pages alone, on the first gather, because the rest of the shard is read once, sequentially, and wants the readahead. **P1-2 is the other half.** With the readahead gone each read is still a *fault* — the table is 28.80 GB and D2 keeps it mmap'd beside 84 GB of resident model — and `PLEGather` served them one at a time: **16.3 major faults a step, 853.2/819.4 us**. Issuing them concurrently leaves the fault count identical to two decimal places (16.34/16.30) at **122.2/108.8 us, 7.0-7.5x**, because what was being measured was sixteen device latencies end to end rather than any amount of data. In the whole model, 2.244 → 0.902 ms a token and **31.51 → 32.72 tok/s**. A random-access mapping wants both halves: small faults, and several of them in flight. |
 | D11 | **At one token, read a dispatch's shape off its grid before anything else — including the part of the grid that does nothing.** | L7d: three kernels were 23-71 GB/s for one reason — 7, 10 and 100 workgroups on a 40-CU device — and two of them had been attributed to padding and to arithmetic. Fix it by splitting **K** where N is the output (the down projection, the router, both dense projections) or by narrowing **BN** where N is wide enough to cut (the MoE, the combine); both keep the staged weight exactly as it is. **L8d found it five more times and added the corollary**: a *static upper bound* on a grid is a dispatch too. The MoE's tile grid was 2052 records where eleven exist, 82 080 workgroups to run 11 at about 0.5 ns each, and it multiplies with every narrowing of BN — so it has to be tightened on the same axis the kernel narrows, or the kernel measures as a catastrophe (481 us against a GEMM's 84, of which 330 was empty launches). |
 | D15 | **At one token a block runs a different *kernel*, not a different rung, and the host refuses it above one token.** | L8d: `llm_moe_gemv.comp`, `llm_moe_router.comp` and `llm_gemv.comp` are the decode pipeline — no LDS slab, no barrier in the K loop, no cooperative matrix — and they are 1.87-3.06x on the two blocks that dominate a step while being *slower* at prefill, where the GEMM's fragment is full. The MoE's GEMV reads one row of a tile, which is every real row a tile has at one token and not at two, so `SetPlan`, `Upload` and `Resize` refuse it rather than drop rows; `Graph.PinSchedule` is what lets a test ask for the prefill kernels at any length. **§2.2's rule survives intact and was over-read**: nibbles cannot be unpacked into a cooperative-matrix *fragment*, and a dot product has no fragment. **L8e-1 adds the fifth block**, the full-attention layer, on the same kernel and the same refusal. |
 | D12 | **A split's stride must miss the 4 KB rotation, and the rung to pick moves when the weight's width does.** | L7d-2: the split-K ladder is 181/154/219/129/138/230 GB/s and the fast rungs are exactly the two whose slab stride is not a multiple of 4 KB. §5.1b's law applies to the distance between two *workgroups*' addresses, not only to a matrix's leading dimension (§2.3). **L8b-3 re-ran it on the same kernel over int8**, where a slab is half the bytes: the ladder is 231/269/326/135/193/308 and the winner is 32 rather than 160 — the same two strides, one rung along. A ladder measured on one bank does not carry to another. **L8d-5 shows it does not carry to another *matrix* either** — k8 wins at K = 2560 and k32 at K = 6144 on one kernel over one bank — and **L8d-3 shows where it stops applying**: the 2.63 MB router never leaves the MALL, so its KSLABS ladder is flat within 0.6 us. A rule about DRAM channels says nothing about a weight that does not reach DRAM. **L8c-6 re-ran the hyper-connection ladder a third time, on nibbles, and the rung did not move — but the *formulation* does not survive it.** A slab is `(gemmK/16/KSLABS) * 128` bytes there, so **no** rung is a whole multiple of 4 KB (2.5, 1.25, 0.625, 0.5, 0.25, 0.125 of it) and L7d's "whole multiple" test cannot separate them — yet the spread is still 1.65x, the two slowest are 2.5 and 0.5 and the two fastest 0.625 and 0.125. What the two quantised banks share is only that the winner's slab is 5/8 of a 4 KB multiple on both (5120 bytes at int8, 2560 at 4.5 bits), which is why the incumbent rung stayed; that is written down rather than promoted, because six rungs on one kernel cannot distinguish it from magnitude. The operative half of D12 — **re-measure when the width changes** — is unaffected and is what caught it. |

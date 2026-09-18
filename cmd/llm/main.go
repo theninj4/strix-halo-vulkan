@@ -84,6 +84,7 @@ func main() {
 	chunks := flag.Int("chunks", 0, "for -ppl: stop after this many chunks, 0 for the whole corpus")
 	headRows := flag.Int("head-rows", 256, "for -ppl: rows of logits the head's arena holds; a row is 0.99 MB")
 	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn and -attn, and at one token the decode GEMV's split per projection")
+	attrib := flag.Bool("attrib", false, "for -gen: attribute a decode step per dispatch label and per host phase (P1)")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
 
@@ -141,7 +142,7 @@ func main() {
 		if err := generate(genOpts{
 			model: *model, prompt: *prompt, n: *nPredict, ctx: *ctx, layers: layers,
 			temp: *temp, topK: *topK, topP: *topP, seed: *seed, chat: *chat, top: *showTop,
-			csv: *csvPath,
+			csv: *csvPath, attrib: *attrib,
 		}); err != nil {
 			log.Fatal(err)
 		}

@@ -214,7 +214,9 @@ func (g *Graph) flush() error {
 		return nil
 	}
 	n := g.rec.len()
-	byOwner, total, err := g.rec.submit()
+	t0 := time.Now()
+	byOwner, byKind, total, err := g.rec.submit()
+	submit := time.Since(t0)
 	g.rec = nil
 	g.hc.rec, g.move.rec = nil, nil
 	if g.ple != nil {
@@ -237,6 +239,15 @@ func (g *Graph) flush() error {
 	}
 	g.Stats.Dispatches += n
 	g.Stats.GPU += total
+	g.Stats.Submit += submit
+	if g.Stats.Kinds == nil {
+		g.Stats.Kinds = make(map[string]DispatchStat, len(byKind))
+	}
+	for k, v := range byKind {
+		s := g.Stats.Kinds[k]
+		s.Count, s.GPU = s.Count+v.Count, s.GPU+v.GPU
+		g.Stats.Kinds[k] = s
+	}
 	g.Stats.HC += byOwner[ownHC]
 	g.Stats.PLE += byOwner[ownPLE]
 	g.Stats.DeltaNet += byOwner[ownDN]
@@ -335,6 +346,17 @@ type GraphStats struct {
 	// itself — the difference is what the barriers between dispatches cost.
 	GPU        time.Duration
 	Dispatches int
+	// Submit is the **host** wall clock around the submit and the fence
+	// wait — GPU is the part of it the timestamps saw, so `Submit - GPU` is
+	// what handing one command buffer over costs (P1). It is separated from
+	// the rest of the host side because it is the one interval a
+	// pre-recorded command buffer would not remove.
+	Submit time.Duration
+	// Kinds is the same GPU time split by each dispatch's own label rather
+	// than by the block it came from (P1). A decode step is ~490 dispatches
+	// over about thirty distinct labels, so this is the resolution at which
+	// "where does the token go" has an answer.
+	Kinds map[string]DispatchStat
 }
 
 // Blocks is the time inside the five blocks and the head.

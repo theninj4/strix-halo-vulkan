@@ -94,6 +94,40 @@ func TestPLEGather(t *testing.T) {
 	}
 }
 
+// TestPLEGatherPoolIsTheSerialGather checks the P1 split: the gather runs a
+// bounded pool of workers striding the row list, and the answer must not
+// depend on how the rows fall across them. Row counts that are not a multiple
+// of the pool are where a stride is wrong, so the awkward ones are here.
+func TestPLEGatherPoolIsTheSerialGather(t *testing.T) {
+	m, _, c, ids := pleFixtures(t)
+	all := PLERows(c, ids)
+	for _, n := range []int{1, 2, 15, 16, 17, 31, 33, len(all)} {
+		if n > len(all) {
+			continue
+		}
+		rows := all[:n]
+		got, err := m.PLEGather(rows, c.NHeads, c.HeadDim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != n*c.HeadDim {
+			t.Fatalf("%d rows gathered %d floats, want %d", n, len(got), n*c.HeadDim)
+		}
+		for i, r := range rows {
+			want, err := m.PLEGather([]int32{r}, 1, c.HeadDim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for j, v := range want {
+				if got[i*c.HeadDim+j] != v {
+					t.Fatalf("%d rows: row %d (table row %d) element %d is %g, one at a time it is %g",
+						n, i, r, j, got[i*c.HeadDim+j], v)
+				}
+			}
+		}
+	}
+}
+
 // TestPLERowsCutOnEOS states the window rule as a checked claim rather than a
 // comment. Running off the start of a sequence reads as EOS, and so does an
 // EOS in the window — so a token at position 0 and the same token after an EOS

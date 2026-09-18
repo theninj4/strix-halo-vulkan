@@ -120,21 +120,35 @@ func envInt(name string, def int) int {
 type recorder struct {
 	d     []vk.MultiDispatch
 	owner []string
+	// kind is the block's own name for each dispatch -- "moe.up",
+	// "attn.qkv" -- which is what P1 needed and what every block's `graph`
+	// method has always built for its error messages. A block name is where
+	// the time is *not*: the MoE is 11.6 ms of a 31.7 ms token and says
+	// nothing about which of its nine kernels that is.
+	kind []string
 	// rows is what the pass is passing, which is what a dispatch's cost --
 	// and so how many of them fit in one submit -- scales with.
 	rows int
 }
 
-// add appends one block's sequence. A nil recorder is the direct path, which
-// is what every block does when the graph is not batching and what the
-// per-block benchmarks always do.
-func (r *recorder) add(owner string, d []vk.MultiDispatch) bool {
+// add appends one block's sequence, with the block's own label per dispatch.
+// A nil recorder is the direct path, which is what every block does when the
+// graph is not batching and what the per-block benchmarks always do.
+//
+// `kinds` may be shorter than `d` or nil -- the mover has one dispatch and no
+// label of its own -- in which case the owner's name stands in.
+func (r *recorder) add(owner string, kinds []string, d []vk.MultiDispatch) bool {
 	if r == nil {
 		return false
 	}
 	r.d = append(r.d, d...)
-	for range d {
+	for i := range d {
 		r.owner = append(r.owner, owner)
+		k := owner
+		if i < len(kinds) {
+			k = owner + "." + kinds[i]
+		}
+		r.kind = append(r.kind, k)
 	}
 	return true
 }
@@ -146,11 +160,20 @@ func (r *recorder) len() int {
 	return len(r.d)
 }
 
+// DispatchStat is one kernel's share of a pass: how many dispatches carried
+// that label and what they cost on the GPU.
+type DispatchStat struct {
+	Count int
+	GPU   time.Duration
+}
+
 // submit runs everything recorded, in order, and returns the GPU time each
-// block's dispatches took. It chunks at batchFor(rows), which costs one more
-// fence wait per chunk and keeps the marks.
-func (r *recorder) submit() (map[string]time.Duration, time.Duration, error) {
+// block's dispatches took, and the same split by the label each carried. It
+// chunks at batchFor(rows), which costs one more fence wait per chunk and
+// keeps the marks.
+func (r *recorder) submit() (map[string]time.Duration, map[string]DispatchStat, time.Duration, error) {
 	byOwner := make(map[string]time.Duration, 8)
+	byKind := make(map[string]DispatchStat, 64)
 	var total time.Duration
 	r.dumpRange()
 	batch := batchFor(r.rows)
@@ -158,7 +181,7 @@ func (r *recorder) submit() (map[string]time.Duration, time.Duration, error) {
 		j := minInt(i+batch, len(r.d))
 		el, each, err := vk.DispatchMultiMarked(r.d[i:j], true)
 		if err != nil {
-			return nil, 0, fmt.Errorf("llm: dispatches %d-%d: %w", i, j-1, err)
+			return nil, nil, 0, fmt.Errorf("llm: dispatches %d-%d: %w", i, j-1, err)
 		}
 		if batchTimes {
 			fmt.Fprintf(os.Stderr, "batch %d-%d: %v on the GPU\n", i, j-1, el)
@@ -168,14 +191,20 @@ func (r *recorder) submit() (map[string]time.Duration, time.Duration, error) {
 			// The shim refused the marks, which at this size it cannot; the
 			// pass still ran, so report it as one block rather than losing it.
 			byOwner[r.owner[i]] += el
+			s := byKind[r.kind[i]]
+			s.Count, s.GPU = s.Count+j-i, s.GPU+el
+			byKind[r.kind[i]] = s
 			continue
 		}
 		for k, d := range each {
 			byOwner[r.owner[i+k]] += d
+			s := byKind[r.kind[i+k]]
+			s.Count, s.GPU = s.Count+1, s.GPU+d
+			byKind[r.kind[i+k]] = s
 		}
 	}
-	r.d, r.owner = r.d[:0], r.owner[:0]
-	return byOwner, total, nil
+	r.d, r.owner, r.kind = r.d[:0], r.owner[:0], r.kind[:0]
+	return byOwner, byKind, total, nil
 }
 
 // dumpRange prints the block and grid of a slice of the recorded sequence

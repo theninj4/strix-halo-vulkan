@@ -154,7 +154,7 @@ func (m *mover) Move(dst, src Port, rows int) error {
 	d := []vk.MultiDispatch{{
 		Pipeline: p, GroupsX: uint32(pad), GroupsY: 1, PushConstants: pc.bytes(),
 	}}
-	if m.rec.add(ownMove, d) {
+	if m.rec.add(ownMove, nil, d) {
 		return nil
 	}
 	_, err = vk.DispatchMultiTimed(d, 1, 1, true)

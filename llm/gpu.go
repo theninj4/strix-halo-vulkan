@@ -1302,7 +1302,7 @@ func (g *HCGPU) RunCombine(mixer int) error {
 		GroupsX:  uint32(g.rows), GroupsY: uint32(c.HC),
 		PushConstants: pc.bytes(),
 	}}
-	if g.rec.add(ownHC, d) {
+	if g.rec.add(ownHC, []string{"combine"}, d) {
 		return nil
 	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
@@ -1316,11 +1316,11 @@ const perSubmit = 8
 
 // Run executes one mixer over whatever Upload left in the residual.
 func (g *HCGPU) Run(mixer int, combine bool) error {
-	d, _, err := g.graph(mixer, combine)
+	d, kinds, err := g.graph(mixer, combine)
 	if err != nil {
 		return err
 	}
-	if g.rec.add(ownHC, d) {
+	if g.rec.add(ownHC, kinds, d) {
 		return nil
 	}
 	for i := 0; i < len(d); i += perSubmit {

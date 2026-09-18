@@ -456,7 +456,7 @@ func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
 // Run projects whatever Upload left in the A operand.
 func (g *HeadGPU) Run() error {
 	d, kinds := g.graph()
-	if g.rec.add(ownHead, d) {
+	if g.rec.add(ownHead, kinds, d) {
 		return nil
 	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {

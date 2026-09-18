@@ -6,8 +6,10 @@
 
 ## Where this stands, in five lines
 
-- **Decode 31.51 tok/s** against llama.cpp's 25.15 — **1.25x** — at a
-  measured bank of 4.281 GB a token and a quoted ceiling of 56.5.
+- **Decode 32.72 tok/s** against llama.cpp's 25.15 — **1.30x** — at a
+  measured bank of 4.281 GB a token, a ceiling of 56.5 at the bus and 53.0
+  at the rate dispatches reach. P1 attributed the step to the dispatch and
+  took the n-gram gather's sixteen serialised page faults out of it.
 - **Prefill 1071.8 tok/s** at ubatch 2048 against 391.4 — **2.7x** — and
   671.4 at 512. The original L2a target of ~1150 is 93% reached.
 - **Perplexity 4.1787 against our 4.0289 — +3.72%** (and +3.59% against the
@@ -31,7 +33,7 @@ both axes. **The competition from here is our own ceiling, not llama.cpp.**
 
 | hypothesis | verdict |
 |---|---|
-| **"Decode is DRAM-bound by weight bytes"** (the premise of D3, L8a-L8c) | **Was true, is now only 56% true.** Through L8b, measured ≈ ceiling: 14.71 tok/s against 15.4 GB-derived numbers. Today 31.5 measured against 56.5 ceiling is **56%**, and the doc itself says the bank has not been where the time is since L8c-5. The binding constraint has moved and **nothing has re-measured where to**. See P1. |
+| **"Decode is DRAM-bound by weight bytes"** (the premise of D3, L8a-L8c) | **Was true, is now 79% true, and P1 says where the rest is.** Through L8b, measured ≈ ceiling: 14.71 tok/s against 15.4 GB-derived numbers. Today the weight-streaming dispatches are **24.05 ms of a 30.52 ms step, 79%** — but they run at **178 GB/s against the 227 a dispatch reaches**, so 5.54 ms of that is shape rather than bytes, and another 3.46 ms of dispatches stream no weight at all. The binding constraint has moved from *how many bytes* to *how the dispatches are shaped*: `hyper_conn` at 114.6 GB/s and `moe.down` at 147.5 against `moe.up`'s 200.6 off the same bank. |
 | **"The cost of 4 bits runs inverse to the bytes"** (L8c-1's headline) | **Retired by its own successors.** The pp-per-GB ranking over 145 chunks is bimodal: `deltanet` 0.87, `hyper_conn` 0.93, `lm_head` 2.59, `full_attn` 5.52 — and the split is presence (36 layers / 97 mixers vs 12 layers / 1 matrix), not size. |
 | **"An 8-chunk screen predicts a family's corpus cost"** | **Retired, four ways.** +0.40→+0.82, −0.30→+0.93, +0.90→+0.31, +1.05→+1.65. A screen does not bound, does not fix the sign, does not rank. Every future width call needs a 145-chunk run (8 min — affordable). |
 | **"Corpus deltas add"** (the asymmetric form's additivity) | **Confirmed to 0.01 pp across four families** — where the symmetric form compounded 11.7% into 18.5%. This is now a *tool*: plans are composable from measured per-family deltas (see idea 4). Caveat: only demonstrated on the asymmetric form at 4.5 bits. |
@@ -56,26 +58,43 @@ The 56.5 tok/s ceiling counts streamed weights only. A token also moves:
 Measured 31.5 tok/s is 31.7 ms a token; 4.56 GB at the best measured
 dispatch rate (227 GB/s) is ~20 ms. **~12 ms a token — 37% of the step — is
 not accounted for by streaming bytes at any achievable rate**, and no
-attribution has been run since L8e (two families and two kernel generations
-ago). Candidates, none priced: host record/submit per token, sampler +
-detokenize, the PLE host gather, dispatches still far off the bus, block
-boundaries. That 12 ms is worth more than the router and the experts
-combined (+4.5 tok/s of *ceiling*), and it is a day of measurement with
-tooling that already exists (L8d's per-dispatch timestamps).
+attribution has been run since L8e.
+
+**P1 ran it, and the estimate was right to 0.01 ms.** The step is 30.52 ms
+after the gather fix, and it sums:
+
+    weight-streaming dispatches, 4.281 GB at 178 GB/s      24.05 ms
+      of which, over the 18.86 ms the same bytes take at 227   5.54
+    dispatches that stream no weight (scan, moves, norms,
+      permutations, combines)                               3.46 ms
+    host: record 1.127, gather 0.902, hand-over 0.828,
+      sample 0.142, detokenize + emit 0.007                 3.01 ms
+    unattributed                                            0.005 ms
+
+**5.54 + 3.46 + 3.01 = 12.01.** The candidates list above was almost exactly
+wrong in its ordering: the sampler and detokenizer are **0.15 ms together**,
+host record and submit are 1.96, and the two real items are dispatches off
+the bus (`hyper_conn` at 114.6 GB/s, `moe.down` at 147.5) and the 3.46 ms of
+dispatches nobody had counted because they read no weights at all. The one
+candidate that was under-rated is the PLE host gather, which was 2.24 ms and
+is now 0.90 — see P1's finding 1.
 
 ---
 
 ## Ideas that are not in the current plan
 
-1. **Re-attribute the decode step** (above). The single highest
-   information-per-hour item on the list.
+1. ~~**Re-attribute the decode step**~~ **— done (P1), and it was the single
+   highest information-per-hour item on the list**: it paid for itself with
+   the gather fix before the analysis was written, and it demoted idea 2
+   from first to fourth.
 2. **A pre-recorded, reusable decode command buffer.** IDEAS §4.2 was never
    carried into this vertical. The decode graph is shape-stable token to
-   token — same ~490 dispatches, same buffers; only the position and the
-   token id change. Record once, feed the varying scalars through a small
-   uniform buffer (or indirect dispatch) instead of re-recording. Only worth
-   building if P1's attribution names host record time — but if it does,
-   this is the fix, and nothing in `LLM.md` mentions it.
+   token — **1501 dispatches** (P1 counted them; the ~490 here was the
+   pre-L7d submit count), same buffers; only the position and the token id
+   change. Record once, feed the varying scalars through a small uniform
+   buffer (or indirect dispatch) instead of re-recording. **P1 priced it:
+   1.127 ms of recording plus 0.828 of hand-over, 6.4% of the step, about
+   +2.2 tok/s** — real, and behind two cheaper kernel-shape items (P1a, P1b).
 3. **MTP needs a rollback story before it needs a kernel.** Speculation on a
    *recurrent* model is not the usual KV-truncate: a rejected draft must
    rewind (a) 36 DeltaNet states — checkpoint/restore of 113 MB, ~0.3 ms as
@@ -116,9 +135,12 @@ tooling that already exists (L8d's per-dispatch timestamps).
    sequence's today. The open product question ("will the API ever serve
    more than one stream?") should be answered before P5/P6 ordering is
    final, because if yes, batching may beat MTP for the same effort.
-9. **Reconcile the 0.38 GB** between the graph's 4.45 GB dense count and the
-   checkpoint's 4.830 inventory (flagged in `LLM.md`, never chased). Fold
-   into P1's attribution — the ceilings quoted everywhere inherit it.
+9. ~~**Reconcile the 0.38 GB**~~ **— closed at P1.** It is the MoE router
+   (0.252 GB) and the shared expert (0.251), which the checkpoint inventory
+   files under "dense, every token" and L8b's table files with the MoE, less
+   L8b-1's doubled `inject` rows, `PLEGPU`'s halves and rounding. Both
+   counts were right; they partitioned the same tensors differently. Every
+   ceiling is now quoted on **4.281 GB a token**.
 
 ---
 
@@ -164,17 +186,55 @@ Full write-up: [research/p0-ring-watchdog.md](research/p0-ring-watchdog.md).
       ctx 8192, decode tok/s against context, and a needle test through the
       API — are now possible and are not yet run.
 
-### P1 — re-attribute the decode step  *(one day; prices everything below)*
+### ~~P1 — re-attribute the decode step~~  *(**done**, 2026-09-18)*
 
-- [ ] Per-dispatch timestamps over 64 decode steps on today's bank, plus
-      the host side split (record, submit, sampler, PLE gather, detokenize)
-      — a table that sums to 31.7 ms within 5%.
-- [ ] Reconcile the 0.38 GB (idea 9) so the ceilings are on one basis.
-- [ ] Act on anything ≥1 ms with a known fix (idea 2's pre-recorded command
-      buffer is the likely first); write the rest down.
-- [ ] Gate: the gap between measured and honest ceiling is *named*, and the
-      list below is re-ranked with those numbers rather than these
-      estimates.
+- [x] Per-dispatch timestamps over 64 decode steps on today's bank, plus
+      the host side split — **the table sums to 30.52 ms with a 5 us
+      residual**, over 36 dispatch labels and six host phases.
+      `-gen -attrib`, `results/p1_decode_attrib.csv`.
+- [x] Reconcile the 0.38 GB (idea 9): **it is the MoE router (0.252) and the
+      shared expert (0.251)**, which the checkpoint inventory files under
+      "dense, every token" and L8b's table files with the MoE, less three
+      doublings in the other column. Every ceiling is now quoted on
+      **4.281 GB a token**.
+- [x] Act on anything ≥1 ms with a known fix: **the PLE gather, 2.244 ms,
+      was sixteen serialised major page faults a token** — not compute, not
+      bytes. Concurrent: identical fault count (16.3), **7.0-7.5x**,
+      2.244 → 0.902 ms, **decode 31.51 → 32.72 tok/s**. The rest is written
+      down as P1a-P1c below.
+- [x] Gate: the gap is named. **12.01 ms = 5.54 (weight-streaming dispatches
+      below 227 GB/s) + 3.46 (dispatches that stream no weight) + 3.01
+      (host)**, and idea 2 — the review's favourite for the whole of it — is
+      **1.96 ms** and now ranks fourth. [Write-up](research/p1-decode-attribution.md)
+
+### P1a — the hyper-connection block's 485 dispatches  *(the biggest single item)*
+
+- [ ] 97 mixers x 5 dispatches at 1.4-17 us each: **114.6 GB/s** where seven
+      other families are 147-204, and **13.6% of the step for 8.4% of the
+      bytes**. D14 says the weights never leave the MALL, so this is shape.
+- [ ] Fuse the mixer's norm/down/reduce/up/combine, or batch across mixers.
+      Worth **1.56 ms of bank plus 0.97 ms of weightless norms and combines**.
+- [ ] Gate: the block's own ladder re-run, and `-gen -attrib` showing the
+      label count and the GB/s move together.
+
+### P1b — `moe.down`'s rung, and the shared expert's  *(a ladder, not a kernel)*
+
+- [ ] **147.5 GB/s against `moe.up`'s 200.6**, same bank, same experts, same
+      layer, back to back — a row block chosen for [FFNExpert, NEmbd] and
+      never re-screened for [NEmbd, FFNExpert] (D11/D12). 1.19 ms.
+- [ ] The shared expert's pair repeats it at **136.5 GB/s**, 0.73 ms.
+- [ ] Gate: D16's test on the face of every rung — a ladder that reads above
+      242 GB/s is measuring the MALL — then the whole-model number.
+
+### P1c — the pre-recorded decode command buffer  *(idea 2, now priced)*
+
+- [ ] **1.127 ms of recording plus 0.828 of hand-over: 6.4%, ~+2.2 tok/s.**
+      The decode graph is shape-stable — same 1501 dispatches, same buffers,
+      only the position and the token id change.
+- [ ] Feed the varying scalars through a uniform buffer or indirect dispatch
+      rather than re-recording.
+- [ ] Gate: bit-identical tokens against the re-recording path over 128
+      tokens, and the two host rows gone from `-gen -attrib`.
 
 ### P2 — `ple_proj`, and close L8c  *(half a day; closes the stage)*
 
@@ -241,15 +301,19 @@ together).
 
 ## Why this order
 
-**P0 is done; P1 is next.** P1 is a day and
-re-prices everything after it — acting on P4 or P5 before P1 risks
-optimising bytes while 12 ms a token sits in something that is not bytes.
-P2 and P3 close the accuracy story while additivity and the instruments are
-warm, and they are small. P4 is known-value ceiling work. P5 is the largest
-single multiplier on the list but wants P0 (long prompts are where serving
-happens), P1 (its verification step inherits whatever the attribution
-finds), and its own design pass first — and its multiplier applies on top
-of whatever P4 buys, so it loses nothing by going after.
+**P0 and P1 are done, and P1 moved the list.** The suspicion it was written
+to test — that the bank had stopped being the binding constraint — is
+confirmed, and the replacement is **kernel shape**: four of the five leading
+items are dispatches that are too small or the wrong way round, not bytes.
+So P1a and P1b come before P2-P4, which are accuracy and ceiling work on a
+bank that is already only 79% of the step. P1c is real but is a bigger build
+than either for less time. P2 and P3 still close the accuracy story while
+additivity and the instruments are warm, and they are small. P5 is the
+largest single multiplier on the list but wants its own design pass, and its
+multiplier applies on top of whatever the rest buys, so it loses nothing by
+going after.
 
-**The numbers to beat from here: 31.5 tok/s measured, ~53 honest ceiling on
-today's bank, and llama.cpp at 25.15 already behind at every ubatch.**
+**The numbers to beat from here: 32.72 tok/s measured, 53.0 honest ceiling
+on today's bank at the 227 GB/s dispatches reach — so the step is **62%**
+efficient and the gap is itemised — and llama.cpp at 25.15, already behind at
+every ubatch.**

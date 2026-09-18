@@ -1218,7 +1218,7 @@ func (g *AttnGPU) Run(layer int) error {
 	// so what the sequence costs is how many times it is handed over
 	// (LLM.md L7c). And when the graph is recording a whole pass, not even
 	// one a block (L7d).
-	if g.rec.add(ownAttn, d) {
+	if g.rec.add(ownAttn, kinds, d) {
 		return nil
 	}
 	if _, err := vk.DispatchMultiTimed(d, 1, 1, true); err != nil {
