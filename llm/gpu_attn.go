@@ -409,7 +409,7 @@ func (g *AttnGPU) SetSparse(v bool) { g.sparse = v }
 // rather than merely unread. What a fresh sequence does need is the whole
 // pooled block table rebuilt, and `blockRange` is where that is said.
 func (g *AttnGPU) Past() int { return g.past }
-func (g *AttnGPU) Reset()    { g.past = 0 }
+func (g *AttnGPU) Reset()    { g.past = 0; g.writeSeq() }
 
 // SetPast places the next run's first token at cell n.
 func (g *AttnGPU) SetPast(n int) error {
@@ -417,8 +417,16 @@ func (g *AttnGPU) SetPast(n int) error {
 		return fmt.Errorf("llm: cell %d of a %d-cell cache", n, g.nKV)
 	}
 	g.past = n
+	g.writeSeq()
 	return nil
 }
+
+// writeSeq puts the position where the kernels read it: dword 0 of the fp32
+// arena (SEQ_PAST in llm_common.glsl). A host write to a mapped buffer, so
+// it costs nothing a push constant did not — and unlike a push constant it
+// is not baked into a recorded command buffer, which is what lets P1c record
+// the decode step once.
+func (g *AttnGPU) writeSeq() { g.abuf.WriteUint32At(0, []uint32{uint32(g.past)}) }
 
 // blockRange is the half-open range of pooled indexer blocks a run rebuilds,
 // and llm_attn_idx.comp derives the same two numbers from the push block.
@@ -556,6 +564,13 @@ func (g *AttnGPU) alloc(nLayers int) error {
 		g.actElems += (n + 63) &^ 63
 		return off
 	}
+	// The sequence position, and it must be the arena's dword 0: the shaders
+	// read it as `actu[0]` (SEQ_PAST in llm_common.glsl), because P1c moved it
+	// out of the push block so that a decode step's command buffer is
+	// byte-identical every token. SetPast writes it.
+	if seq := alloc(1); seq != 0 {
+		return fmt.Errorf("llm: the sequence slot is at %d, and SEQ_PAST is actu[0]", seq)
+	}
 	g.aQKV = alloc(rows * g.qkvN())
 	g.aScore = alloc(rows * g.NBlocks())
 	g.aCell = alloc(rows * g.nKV)
@@ -577,6 +592,7 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
+	g.writeSeq()
 
 	halloc := func(n int) uint32 {
 		off := uint32(g.hElems)
@@ -1099,11 +1115,12 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		KOff:    g.hK + uint32(layer*g.kvStride),
 		VOff:    g.hV + uint32(layer*g.kvStride),
 		IdxKOff: g.hIdxK + uint32(layer*g.idxKStride),
-		// ATTN_IDXRAW and ATTN_PAST: two fields this layer does not otherwise
-		// use, because the push block is full at 64 uints. llm_common.glsl
-		// carries the mapping.
+		// ATTN_IDXRAW: a field this layer does not otherwise use, because the
+		// push block is full at 64 uints. llm_common.glsl carries the mapping.
+		// The position is *not* here any more: SEQ_PAST is dword 0 of the
+		// arena (P1c), written by SetPast, so `lowRank` stays zero and the
+		// dispatch is byte-identical every decode step.
 		LoOff:    g.hIdxRaw + uint32(layer*g.idxRawStride),
-		LowRank:  uint32(g.past),
 		ScoreOff: g.aScore, CellOff: g.aCell, RopeOff: g.wRope,
 		GammaOff: w.gQ, GammaKOff: w.gK, GammaIQOff: w.gIQ, GammaIKOff: w.gIK,
 		Heads: uint32(c.NHead), KVHeads: uint32(c.NHeadKV), HeadDim: uint32(c.HeadDim),

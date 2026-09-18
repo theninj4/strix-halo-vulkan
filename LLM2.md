@@ -10,7 +10,10 @@
   measured bank of 4.281 GB a token, a ceiling of 56.5 at the bus and 53.0
   at the rate dispatches reach. P1 attributed the step to the dispatch and
   took the n-gram gather's sixteen serialised page faults out of it; P1a
-  fused the hyper-connection boundary, 1501 dispatches a pass to 1407.
+  fused the hyper-connection boundary, 1501 dispatches a pass to 1407; P1c
+  put the step in one pre-recorded command buffer, −1.90 ms a token
+  (measured 25.4 → 26.7 on a day the machine itself was 29% slower — see
+  P1c's environment finding before comparing across days).
 - **Prefill 1089.2 tok/s** at ubatch 2048 against 391.4 — **2.78x** — and
   668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
   is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
@@ -97,7 +100,8 @@ is now 0.90 — see P1's finding 1.
    change. Record once, feed the varying scalars through a small uniform
    buffer (or indirect dispatch) instead of re-recording. **P1 priced it:
    1.127 ms of recording plus 0.828 of hand-over, 6.4% of the step, about
-   +2.2 tok/s** — real, and behind two cheaper kernel-shape items (P1a, P1b).
+   +2.2 tok/s** — real, and, with P1a done and P1b measured empty, now the
+   front of the list.
 3. **MTP needs a rollback story before it needs a kernel.** Speculation on a
    *recurrent* model is not the usual KV-truncate: a rejected draft must
    rewind (a) 36 DeltaNet states — checkpoint/restore of 113 MB, ~0.3 ms as
@@ -242,24 +246,76 @@ and the grid is priced rather than rebuilt.**
       on the prefill path, so 0.7% of decode does not buy it.
       [Write-up](research/p1a-hyper-connection-shape.md)
 
-### P1b — `moe.down`'s rung, and the shared expert's  *(a ladder, not a kernel)*
+### ~~P1b — `moe.down`'s rung, and the shared expert's~~  *(**done**, 2026-09-18 — a ladder, and no rung moves)*
 
-- [ ] **147.5 GB/s against `moe.up`'s 200.6**, same bank, same experts, same
-      layer, back to back — a row block chosen for [FFNExpert, NEmbd] and
-      never re-screened for [NEmbd, FFNExpert] (D11/D12). 1.19 ms.
-- [ ] The shared expert's pair repeats it at **136.5 GB/s**, 0.73 ms.
-- [ ] Gate: D16's test on the face of every rung — a ladder that reads above
-      242 GB/s is measuring the MALL — then the whole-model number.
+**The 1.19 + 0.73 ms was the MALL's arithmetic. Re-screened against DRAM the
+plan survives on every axis, and what is real is a 1.33 ms environment gap
+that is not a rung choice.**
 
-### P1c — the pre-recorded decode command buffer  *(idea 2, now priced)*
+- [x] The ladder, honest: **sixteen cold banks at `-iters 1`** (25.6 GB, so
+      `ProfileSweep` walks a dispatch across layers and never re-reads a bank
+      warm), against l8e's two-layer, 20-iteration fixture whose every GEMV
+      down rung read **267-357 GB/s of a 242 GB/s bus**. Two runs agree to a
+      median ratio of 0.9991 (p10-p90 0.982-1.012).
+      `results/p1b_moe.csv`.
+- [x] The ranking is unchanged: routed **v64w4/v16w4** (99.0 us at 186 GB/s,
+      59.3 at 207), shared **v64w4/v32w4** (22.7, 10.9), router **k40**
+      (13.4) win every marginal cold — the plan the model already runs. The
+      MALL inflated magnitudes (down 34.4 → 59.3 us), not the order. D16's
+      up-mode contradiction closes: cold, v16w4 loses to v64w4 by 1.15x, the
+      same side as the whole model's 42.1 ms. And the router was never 3.5x
+      off — its 4.4 us ladder rate was two fp16 router matrices in the MALL;
+      cold it is 13.4-14.8 against 15.1 in the model.
+- [x] Gate: D16's test passes on the face of every rung — no row above 242
+      GB/s — and the whole-model number is unchanged, as it must be when no
+      rung changes: **32.78 tok/s, step 30.51 ms** (P1a measured 32.93),
+      `results/p1b_decode_attrib.csv`. What the honest floors expose is a
+      **1.33 ms a token environment gap** — moe.down 72.2 us in the model
+      against 59.3 alone-and-cold (1.22x), the other four labels 1.08-1.16x —
+      between a dispatch alone with a fence on a bank last read microseconds
+      ago and the same dispatch in a 1407-dispatch buffer against a bank last
+      read 4.3 GB ago. Bounded under P1c's 1.96 ms; written down, not chased.
+      [Write-up](research/p1b-moe-decode-rescreen.md)
 
-- [ ] **1.127 ms of recording plus 0.828 of hand-over: 6.4%, ~+2.2 tok/s.**
-      The decode graph is shape-stable — same 1501 dispatches, same buffers,
-      only the position and the token id change.
-- [ ] Feed the varying scalars through a uniform buffer or indirect dispatch
-      rather than re-recording.
-- [ ] Gate: bit-identical tokens against the re-recording path over 128
-      tokens, and the two host rows gone from `-gen -attrib`.
+### ~~P1c — the pre-recorded decode command buffer~~  *(**done**, 2026-09-18 — 1.90 ms of the priced 1.96)*
+
+**The whole varying state of a decode step turned out to be one uint, and
+with it in a buffer the step is one command buffer recorded once.**
+
+- [x] The instrument first: `TestDecodeDispatchDiff` diffs consecutive
+      one-token passes dispatch for dispatch. Over 40 steps, every pipeline,
+      grid and label is identical, and the only differing push dword in the
+      step is `lowRank` carrying the position — the token id never touches a
+      push constant or a grid.
+- [x] So the "uniform buffer for the varying scalars" is smaller than the
+      idea: **`SEQ_PAST` is now dword 0 of each block's own fp32 arena**
+      (`actu[0]`, first allocation, written by `SetPast` as a 4-byte mapped
+      write; one macro in `llm_common.glsl`, nine `.spv`, no layout change),
+      after which **131 of 131 dispatches are byte-identical** step to step.
+- [x] `vk.Prerecorded` records all 1407 dispatches in **one** buffer (the
+      live path chunks into two), with the query-pool reset inside it so the
+      per-dispatch marks re-arm every submit — `-gen -attrib` works
+      unchanged on the replay. The first one-token `Extend` with `past > 0`
+      captures; every later one uploads, sets the position and submits
+      (`extendPrerecorded`). `LLM_NO_PRERECORD=1` is the control.
+- [x] Gate, bit-level: 48 greedy tokens *and all 48 full logit rows*
+      identical to the re-recording arm off one staged graph; whole-model
+      greedy text identical to EOG; prefill at 2048 unregressed against the
+      baseline binary the same hour (1070.3 vs 1061.5 tok/s).
+- [x] The two host rows: `record` **1.127 → 0.16** (what remains is the real
+      per-token uploads), hand-over **0.82 → 0.25** (one submit + fence is
+      the floor). On matched machine state **39.39 → 37.50 ms a step,
+      25.4 → 26.7 tok/s** — see the caveat below, which is its own finding.
+- [x] **The machine moved more than the fix**: yesterday's binary, byte for
+      byte, measures 39.20 ms a step where P1b measured 30.51 — every
+      dense-bank kernel 1.6-1.9x slower (dn.qkv 115 → 206 us, head
+      1964 → 3531), every MoE expert rung unchanged (moe.up 1.02x). 32-day
+      uptime, swap full; suspicion is GTT page fragmentation of the
+      float-staged dense banks, unprovable without root. Standing rule, D16
+      one level up: **a whole-model number is only comparable against a
+      control staged the same hour.** On P1b's machine state the arithmetic
+      says ~28.6 ms, ~34.9 tok/s — the priced +2.2.
+      [Write-up](research/p1c-prerecorded-decode.md)
 
 ### P2 — `ple_proj`, and close L8c  *(half a day; closes the stage)*
 
@@ -326,7 +382,7 @@ together).
 
 ## Why this order
 
-**P0, P1 and P1a are done, and each of them moved the list.** P1's suspicion —
+**P0, P1, P1a and P1b are done, and each of them moved the list.** P1's suspicion —
 that the bank had stopped being the binding constraint — is confirmed, and
 the replacement is **kernel shape**: four of the five leading items are
 dispatches that are too small or the wrong way round, not bytes.
@@ -341,17 +397,31 @@ the law on identical bytes: **168 workgroups is 9.26 us where 672 is 5.54**.
 unpinning it is priced at 0.22 ms a token — real, and not worth every rung's
 epilogue on the prefill path.
 
-**That makes P1b the largest item on the list by a factor of four**, and it
-is the same question in a block where the answer is free: `moe.down` and
-`moe.up` read the same bank in the same layer at 147.5 and 200.6 GB/s, and
-the one thing nobody has varied for `down` is the grid its row block implies.
-P1c is real but is a bigger build for less time. P2 and P3 still close the
-accuracy story while additivity and the instruments are warm, and they are
-small. P5 is the largest single multiplier on the list but wants its own
-design pass, and its multiplier applies on top of whatever the rest buys, so
-it loses nothing by going after.
+**P1b looked like the largest item on the list by a factor of four, and it
+was the MALL's arithmetic.** The one-token MoE ladder those rungs were chosen
+from was an L3 measurement end to end (every GEMV down rung above the bus);
+re-run on sixteen cold banks the ranking does not move on any axis, so the
+1.9 ms was never there. What is there is a **1.33 ms environment gap** — the
+same dispatch is 8-22% slower inside a real step than alone on a cold bank —
+which promoted P1c to the front of the list.
 
-**The numbers to beat from here: 32.93 tok/s measured, 53.0 honest ceiling
-on today's bank at the 227 GB/s dispatches reach — so the step is **62%**
-efficient and the gap is itemised — and llama.cpp at 25.15, already behind at
+**P1c is done and worth its price — 1.90 ms of the estimated 1.96 — and its
+lasting lesson is about the instrument, twice over.** Once small: the decode
+step's entire varying state was a single uint, so "feed the varying scalars
+through a uniform buffer" collapsed to one arena dword and a one-line macro.
+Once large: the *machine* moved 8.7 ms a step overnight with yesterday's
+binary — every dense-bank kernel 1.6-1.9x slower, every MoE expert rung
+unchanged — so P1b's environment gap has a much bigger sibling that lives
+across days rather than within a step, and every whole-model number now
+needs a same-hour control the way D16 made every ladder need a cold bank.
+P2 and P3 still close the accuracy story while additivity and the
+instruments are warm, and they are small. P5 is the largest single
+multiplier on the list but wants its own design pass, and its multiplier
+applies on top of whatever the rest buys, so it loses nothing by going
+after.
+
+**The numbers to beat from here, each on its own day's control: 26.7 tok/s
+against 25.4 on the slow day this was measured (32.93 against llama.cpp's
+25.15 on P1b's day, ~34.9 by arithmetic on that state), 53.0 honest
+good-day ceiling at the 227 GB/s dispatches reach — and llama.cpp behind at
 every ubatch.**

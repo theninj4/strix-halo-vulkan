@@ -207,6 +207,12 @@ func (g *PLEGPU) alloc() error {
 		g.actElems += (n + 63) &^ 63
 		return off
 	}
+	// The sequence position, and it must be the arena's dword 0: the kernels
+	// read it as `actu[0]` (SEQ_PAST in llm_common.glsl, P1c). SetPast writes
+	// it.
+	if seq := alloc(1); seq != 0 {
+		return fmt.Errorf("llm: the sequence slot is at %d, and SEQ_PAST is actu[0]", seq)
+	}
 	g.aRes = alloc(rows * wide)
 	g.aKV = alloc(rows * g.kvN())
 	g.aGated = alloc(rows * wide)
@@ -371,10 +377,12 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 		GammaQOff: g.wNormQuery, GammaCOff: g.wNormConv,
 		Kern: uint32(c.Conv), Dil: uint32(c.NGram),
 		GemmN: uint32(g.kvN()),
-		// SEQ_HIST and SEQ_PAST: two fields this block does not otherwise
-		// use, because the push block is full at 64 uints (llm_common.glsl).
-		InjOff:  g.aHist,
-		LowRank: uint32(g.past),
+		// SEQ_HIST: a field this block does not otherwise use, because the
+		// push block is full at 64 uints (llm_common.glsl). The position is
+		// not here any more: SEQ_PAST is dword 0 of the arena (P1c), written
+		// by SetPast, so `lowRank` stays zero and the dispatch is
+		// byte-identical every decode step.
+		InjOff: g.aHist,
 	}
 
 	var d []vk.MultiDispatch
@@ -408,7 +416,7 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 // before position zero, so the ring's contents are unreachable rather than
 // merely stale.
 func (g *PLEGPU) Past() int { return g.past }
-func (g *PLEGPU) Reset()    { g.past = 0 }
+func (g *PLEGPU) Reset()    { g.past = 0; g.writeSeq() }
 
 // SetPast places the next run's first token at position n.
 func (g *PLEGPU) SetPast(n int) error {
@@ -416,8 +424,14 @@ func (g *PLEGPU) SetPast(n int) error {
 		return fmt.Errorf("llm: position %d", n)
 	}
 	g.past = n
+	g.writeSeq()
 	return nil
 }
+
+// writeSeq puts the position where the kernels read it: dword 0 of the fp32
+// arena (SEQ_PAST in llm_common.glsl), a host write instead of a push
+// constant so the recorded decode step is byte-identical every token (P1c).
+func (g *PLEGPU) writeSeq() { g.abuf.WriteUint32At(0, []uint32{uint32(g.past)}) }
 
 // Run executes the block over whatever Upload left in the arenas. The
 // residual is updated in place.

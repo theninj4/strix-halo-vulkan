@@ -429,6 +429,12 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	// is wrong in a way nothing but a chunk-split test sees (L7b-2), which is
 	// why it is per layer here and was not before.
 	hist := c.Conv - 1
+	// The sequence position, and it must be the arena's dword 0: the kernels
+	// read it as `actu[0]` (SEQ_PAST in llm_common.glsl, P1c). SetPast writes
+	// it.
+	if seq := alloc(1); seq != 0 {
+		return fmt.Errorf("llm: the sequence slot is at %d, and SEQ_PAST is actu[0]", seq)
+	}
 	g.aQKV = alloc(rows * g.qkvN())
 	g.aWin = alloc(nLayers * hist * g.qkvN())
 	g.aNorm = alloc(rows * cw)
@@ -446,6 +452,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: deltanet fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
+	g.writeSeq()
 
 	halloc := func(n int) uint32 {
 		off := uint32(g.hElems)
@@ -929,8 +936,14 @@ func (g *DeltaNetGPU) SetPast(n int) error {
 		return fmt.Errorf("llm: position %d", n)
 	}
 	g.past = n
+	g.writeSeq()
 	return nil
 }
+
+// writeSeq puts the position where the kernels read it: dword 0 of the fp32
+// arena (SEQ_PAST in llm_common.glsl), a host write instead of a push
+// constant so the recorded decode step is byte-identical every token (P1c).
+func (g *DeltaNetGPU) writeSeq() { g.abuf.WriteUint32At(0, []uint32{uint32(g.past)}) }
 
 // Reset zeroes one layer's recurrent state and the convolution's window,
 // which is what a fresh sequence starts from.
@@ -1041,10 +1054,12 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		SSMAOff: w.a, SSMDTOff: w.dtBias, SSMNorm: norm,
 		Heads: uint32(c.NHeadV), KVHeads: uint32(c.NHeadK), HeadDim: uint32(c.HeadDim),
 		GemmN: uint32(g.qkvN()),
-		// SEQ_HIST and SEQ_PAST: two fields this layer does not otherwise
-		// use, because the push block is full at 64 uints (llm_common.glsl).
-		InjOff:  w.win,
-		LowRank: uint32(g.past),
+		// SEQ_HIST: a field this layer does not otherwise use, because the
+		// push block is full at 64 uints (llm_common.glsl). The position is
+		// not here any more: SEQ_PAST is dword 0 of the arena (P1c), written
+		// by SetPast, so `lowRank` stays zero and the dispatch is
+		// byte-identical every decode step.
+		InjOff: w.win,
 	}
 	if g.keepSilu {
 		base.ConvOutOff = g.aSilu

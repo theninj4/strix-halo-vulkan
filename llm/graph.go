@@ -183,7 +183,25 @@ type Graph struct {
 	// is what makes a pass **one command buffer** rather than ~490: the
 	// blocks' Run methods append to it instead of submitting.
 	rec *recorder
+
+	// The decode step, recorded once (P1c). A one-token pass is the same
+	// dispatches with the same push constants every time — the position moved
+	// into the arenas at P1c, and TestDecodeDispatchDiff is the proof — so
+	// the first one-token Extend captures its sequence into a reusable
+	// command buffer and every later one submits that instead of re-encoding
+	// 1407 dispatches. preKinds and preOwner are the captured labels, so the
+	// replay feeds Stats exactly as the recording path does.
+	pre      *vk.Prerecorded
+	preKinds []string
+	preOwner []string
+	// capture arms the next flush to build `pre` from what it submits.
+	capture bool
 }
+
+// Prerecord is whether decode replays a recorded command buffer. On by
+// default; LLM_NO_PRERECORD=1 re-records every token, which is the control
+// the P1c gate compares tokens against.
+func Prerecord() bool { return os.Getenv("LLM_NO_PRERECORD") != "1" }
 
 // record installs the recorder on every block, so that everything from here
 // to the matching `flush` is recorded rather than submitted. It is idempotent
@@ -227,6 +245,19 @@ func (g *Graph) flush() error {
 		return nil
 	}
 	n := g.rec.len()
+	// The capture, before submit resets the recorder's slices. The pass has
+	// to run once through the ordinary path anyway, so the sequence is taken
+	// from what is about to be submitted — the same dispatches, byte for
+	// byte — and the prerecorded buffer is built only if that submit
+	// succeeds.
+	var capD []vk.MultiDispatch
+	var capK, capO []string
+	if g.capture {
+		g.capture = false
+		capD = append([]vk.MultiDispatch(nil), g.rec.d...)
+		capK = append([]string(nil), g.rec.kind...)
+		capO = append([]string(nil), g.rec.owner...)
+	}
 	t0 := time.Now()
 	byOwner, byKind, total, err := g.rec.submit()
 	submit := time.Since(t0)
@@ -249,6 +280,19 @@ func (g *Graph) flush() error {
 	}
 	if err != nil {
 		return err
+	}
+	if capD != nil {
+		// One buffer for the whole step, where the live path chunks at
+		// maxBatch: a decode step is ~27 ms of GPU against the ring
+		// watchdog's 2 s, and the prerecorded pool sizes its own marks.
+		pre, perr := vk.NewPrerecorded(capD, true, true)
+		if perr != nil {
+			// The pass itself succeeded; losing the fast path costs 6% of a
+			// step, not correctness, so say so and go on re-recording.
+			fmt.Fprintf(os.Stderr, "llm: decode prerecord failed, re-recording each token: %v\n", perr)
+		} else {
+			g.pre, g.preKinds, g.preOwner = pre, capK, capO
+		}
 	}
 	g.Stats.Dispatches += n
 	g.Stats.GPU += total
@@ -294,6 +338,10 @@ func (g *Graph) flush() error {
 // covers four blocks rather than one — **five with L8e**, which puts the
 // full-attention layer's two projections on the same kernel.
 func (g *Graph) PinSchedule(on bool) error {
+	// The pin changes which pipelines a one-token pass plans, so a captured
+	// decode step no longer matches what the graph would record; the next
+	// one-token Extend captures afresh.
+	g.dropPrerecorded()
 	if g.moe != nil {
 		g.moe.PinGemv(on)
 	}
@@ -686,6 +734,20 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	if g.head == nil {
 		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
 	}
+	// P1c: a one-token pass is the same dispatches with the same bytes every
+	// time, so the first one is captured (`capture`, read by flush) and every
+	// later one replays it. The capture rides the ordinary path, which is
+	// what makes the two arms comparable: the recorded buffer *is* the
+	// sequence the first token submitted. `past > 0` because a fresh
+	// sequence is a different shape: at position zero the attention block
+	// rebuilds its whole pooled table, so its grid is NBlocks rather than
+	// one (blockRange).
+	if len(ids) == 1 && g.past > 0 && Prerecord() {
+		if g.pre != nil {
+			return g.extendPrerecorded(ids[0])
+		}
+		g.capture = true
+	}
 	// One command buffer for the whole of it, head included (L7d): the
 	// layers, the head mixer and the projection are recorded and submitted
 	// once, and the two read-backs below are after the flush because nothing
@@ -719,6 +781,116 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	if err := g.flush(); err != nil {
 		return nil, nil, err
 	}
+	t0 = time.Now()
+	logits, norm = g.head.Logits(), g.hc.Mixed()
+	since(&g.Stats.Glue, t0)
+	g.Stats.Total += time.Since(top)
+	return logits, norm, nil
+}
+
+// extendPrerecorded is Extend for one token over the captured command buffer
+// (P1c): the host work of a decode step — the two gathers, the uploads, the
+// position — and then one submit of the sequence the first decode token
+// recorded, instead of re-encoding 1407 dispatches to build it again.
+//
+// It mirrors the host side of appendN + hidden + Extend in their order, and
+// only that side: everything the dispatches used to be re-recorded for is
+// either byte-identical every step (TestDecodeDispatchDiff) or reaches the
+// GPU through a mapped write here. The Resizes stay because a pass that
+// followed a prefill would otherwise run with the prompt's row count in the
+// blocks' host-side state — they are field sets and pad clears, not
+// dispatches.
+func (g *Graph) extendPrerecorded(id int32) (logits, norm []float32, err error) {
+	if g.past+1 > g.nKV {
+		return nil, nil, fmt.Errorf("llm: a token at position %d of a %d-cell context", g.past, g.nKV)
+	}
+	top := time.Now()
+	t0 := top
+	embd, err := g.m.Embeddings([]int32{id})
+	if err != nil {
+		return nil, nil, fmt.Errorf("llm: token_embd: %w", err)
+	}
+	g.ids = append(g.ids, id)
+	var pleEmbd []float32
+	if g.hasPLE {
+		rows := PLERows(g.pleCfg, g.ids)[g.past*g.pleCfg.NHeads:]
+		pleEmbd, err = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
+		if err != nil {
+			return nil, nil, fmt.Errorf("llm: per_layer_token_embd: %w", err)
+		}
+	}
+	t0 = since(&g.Stats.Gather, t0)
+
+	if err := g.hc.UploadInit(embd, 1); err != nil {
+		return nil, nil, err
+	}
+	if g.attn != nil {
+		if err := g.attn.SetPast(g.past); err != nil {
+			return nil, nil, err
+		}
+		if err := g.attn.Resize(1); err != nil {
+			return nil, nil, err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.SetPast(g.past); err != nil {
+			return nil, nil, err
+		}
+		if err := g.ple.UploadEmbd(pleEmbd, 1); err != nil {
+			return nil, nil, err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.SetPast(g.past); err != nil {
+			return nil, nil, err
+		}
+		if err := g.dn.Resize(1); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := g.moe.Resize(1); err != nil {
+		return nil, nil, err
+	}
+	if err := g.head.Resize(1); err != nil {
+		return nil, nil, err
+	}
+	t0 = since(&g.Stats.Glue, t0)
+
+	total, each, err := g.pre.Submit()
+	submit := time.Since(t0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("llm: prerecorded decode step: %w", err)
+	}
+	g.Stats.Dispatches += g.pre.Count()
+	g.Stats.GPU += total
+	g.Stats.Submit += submit
+	if g.Stats.Kinds == nil {
+		g.Stats.Kinds = make(map[string]DispatchStat, len(g.preKinds))
+	}
+	for i, d := range each {
+		s := g.Stats.Kinds[g.preKinds[i]]
+		s.Count, s.GPU = s.Count+1, s.GPU+d
+		g.Stats.Kinds[g.preKinds[i]] = s
+		switch g.preOwner[i] {
+		case ownHC:
+			g.Stats.HC += d
+		case ownPLE:
+			g.Stats.PLE += d
+		case ownDN:
+			g.Stats.DeltaNet += d
+		case ownAttn:
+			g.Stats.Attn += d
+		case ownMoE:
+			g.Stats.MoE += d
+		case ownHead:
+			g.Stats.Head += d
+		case ownMove:
+			g.Stats.Move += d
+		}
+	}
+	g.past++
+	g.Stats.Runs++
+
 	t0 = time.Now()
 	logits, norm = g.head.Logits(), g.hc.Mixed()
 	since(&g.Stats.Glue, t0)
@@ -1135,8 +1307,22 @@ func (g *Graph) sublayer(l, nTok int, t0 time.Time) (time.Time, error) {
 	return g.blk(&g.Stats.Move, t0), nil
 }
 
+// Prerecorded reports whether a captured decode step is live — the P1c fast
+// path, engaged from the second one-token Extend on.
+func (g *Graph) Prerecorded() bool { return g.pre != nil }
+
+// dropPrerecorded releases the captured decode step, if any; the next
+// one-token Extend records and captures a fresh one.
+func (g *Graph) dropPrerecorded() {
+	if g.pre != nil {
+		g.pre.Destroy()
+		g.pre, g.preKinds, g.preOwner = nil, nil, nil
+	}
+}
+
 // Destroy releases every block.
 func (g *Graph) Destroy() {
+	g.dropPrerecorded()
 	if g.move != nil {
 		g.move.Destroy()
 	}

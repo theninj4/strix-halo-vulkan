@@ -30,7 +30,24 @@ workgroup's work said twice, and fusing them is **1501 dispatches a pass to
 1407, decode 32.59 → 32.93 tok/s, bit for bit** — while the block's low GB/s
 turns out to be a **grid**, not a fusion, because at one token **168
 workgroups is 9.26 us where 672 is 5.54 for identical bytes** and `up` is
-pinned at 160 by its collapse's 64-column block. **L9a** put the generation loop behind
+pinned at 160 by its collapse's 64-column block. **P1b** then re-screened the
+MoE decode rungs against DRAM — sixteen cold banks, `-iters 1` — because
+every rate the old two-layer ladder reported was an L3 measurement (all six
+GEMV down rungs above the 242 GB/s bus), and **no rung moves**: the plan
+survives on every axis, the review's 1.9 ms was the MALL's arithmetic, and
+what is real is a **1.33 ms a token environment gap** between a dispatch
+alone on a cold bank and the same dispatch inside a step. **P1c** then took
+the step's re-recording off the host: the only value that varied anywhere in
+a decode step's 1407 dispatches was the position in one push dword, so
+`SEQ_PAST` moved to dword 0 of each block's arena, the step became
+byte-identical token to token, and it is now **one command buffer recorded
+once and replayed with a fence** — `record` 1.127 → 0.16 ms, hand-over
+0.82 → 0.25, **−1.90 ms a token of the priced 1.96**, bit-identical logits
+against the re-recording arm — measured 25.4 → 26.7 tok/s on a day the
+machine itself ran every dense-bank kernel 1.6-1.9x slower than P1b's
+(yesterday's binary: 39.20 ms a step where it had measured 30.51), which is
+its own finding: whole-model numbers now require a same-hour control.
+**L9a** put the generation loop behind
 `cmd/serve` — the checkpoint's own chat template transcribed and checked
 against Jinja, and three envelopes over one loop (`API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
@@ -526,9 +543,14 @@ the dense half completely.
 
 ## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
 
-**P0, P1 and P1a are done** (2026-09-18) and are struck through below;
-**P1b is next**, and it is now the largest item on the list by a factor of
-four.
+**P0, P1, P1a and P1b are done** (2026-09-18) and are struck through below;
+**P1c is next**. P1b was the largest item on the list by a factor of four and
+it evaporated on measurement: the rungs were chosen against the MALL but they
+were chosen *right*, so the honest re-screen changes nothing and the 1.9 ms
+it promised does not exist. What it found instead is a **1.33 ms environment
+gap** — the same dispatch is 8-22% slower inside a real step than alone on a
+cold bank — which is bounded under P1c's 1.96 ms and is a new question, not a
+rung.
 
 The 2026-09-18 review re-derived the decode budget and found the bank is no
 longer the binding constraint: 31.5 tok/s measured against an honest ~53
@@ -551,7 +573,7 @@ item's full plan and gate is in `LLM2.md`.
 | ~~**P0**~~ | ~~**The >2560-row stall**~~ — **done**, and it was a 2 s ring watchdog rather than anything about this model: the recorder now chunks a submit by *time*. `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192 (**1213.5, 3.10x**), and `-ppl -ctx 4096` completes at 48 layers at **PPL 3.9392**. | The blocker is gone, so everything long-context below is now measurable. [Write-up](research/p0-ring-watchdog.md) |
 | ~~**P1**~~ | ~~**Re-attribute the decode step**~~ — **done**, and the step now sums: 30.52 ms over 36 dispatch labels and six host phases, residual 5 us. The ~12 ms is **5.54 slow + 3.46 weightless + 3.01 host**. The gather was **16.3 serialised major faults a token** and going parallel is 7.0-7.5x, worth **31.51 → 32.72 tok/s** by itself. The pre-recorded command buffer is priced at **1.96 ms** and is *fourth*, not first; the leaders are `hyper_conn` at 114.6 GB/s (485 dispatches a pass) and `moe.down` at 147.5 against `moe.up`'s 200.6. Idea 9 closed with it. | The blocker on every estimate below. [Write-up](research/p1-decode-attribution.md) |
 | ~~**P1a**~~ | ~~**The hyper-connection block's 485 dispatches**~~ — **done**, and it was two answers rather than one. The weightless half fused: the scatter that closes a mixer and the norm that opens the next are the same 2560 values per (token, stream) written and read straight back, so `llm_hc_cn.comp` does both in one pass over registers — **1501 dispatches a pass to 1407, 30.69 ms to 30.37, decode 32.59 → 32.93 tok/s**, and **identical to the last place** on `res`, `xn` and `mixed`. The bank half was not a fusion question: the down projection's decode ladder reads the same 1.94 MB off the same bank at a grid that varies twenty-fold, and **168 workgroups is 9.26 us where 672 is 5.54** — so `up_m1`'s 10.87 us at **160 workgroups** is `down_gemv8`'s number at `down_gemv8`'s width, not MODE 1's M=1 waste. What pins it is the collapse's 64-column block, and unpinning it is priced at **0.22 ms a token** and not taken. | The step's GB/s did not move and the label count did, which is the finding. [Write-up](research/p1a-hyper-connection-shape.md) |
-| **P1b** | **`moe.down`'s rung, and the shared expert's** | 1.19 + 0.73 ms. Same bank, same experts, same layer as `moe.up`, and 147.5 GB/s against 200.6 — a row block chosen for one shape and never re-screened for the other (D11/D12). A ladder run, not a kernel. |
+| ~~**P1b**~~ | ~~**`moe.down`'s rung, and the shared expert's**~~ — **done, and no rung moves.** The whole one-token MoE ladder in `l8e_moe.csv` was an L3 measurement — every GEMV down rung read 267-357 GB/s of a 242 GB/s bus — so it was re-run on **sixteen cold banks at `-iters 1`** (25.6 GB, so `ProfileSweep` never re-reads a bank warm). Two runs agree to a median ratio of 0.9991, no rung reads above the bus, and **the ranking is unchanged on every axis**: v64w4/v16w4 routed, v64w4/v32w4 shared, k40 router — the plan the model already runs. The honest floors are up 99.0 us at 186 GB/s, down 59.3 at 207, shexp 22.7 + 10.9, router 13.4; the whole model sits 8-22% above them (down 72.2, the widest), a **1.33 ms a token** environment gap that is not a rung choice. D16's up-mode contradiction also closes: cold, v16w4 loses to v64w4 by 1.15x, the same side as the whole model. | The 1.19 + 0.73 ms the review priced was the MALL's arithmetic, not a mis-chosen row block. [Write-up](research/p1b-moe-decode-rescreen.md) |
 | **P1c** | **The pre-recorded decode command buffer** (idea 2) | 1.127 ms of recording plus 0.828 of hand-over, **6.4% of the step, ~+2.2 tok/s**. The decode graph is shape-stable: same 1501 dispatches, same buffers, only the position and the token id change. |
 | **P2** | **`ple_proj`, and close L8c** | Half a day, two bank stages in one, and D13's payoff: delete the two-plane fp16-tail machinery now that the exception list is empty. Ends with the complete plan's 145-chunk number. |
 | **P3** | **The shipped-widths decision (D18)** | The knapsack: additivity + per-family corpus deltas make plans composable, and uniform 4.5 is provably not optimal — `full_attn` costs 5.52 pp/GB where `deltanet` costs 0.87. Sim-grade `q5_k` on `full_attn` first (8 minutes, no kernel), screen the winner on a second corpus. |
@@ -4122,6 +4144,13 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -moe -model $M -tokens 1 -ladder -csv results/l8e_moe.csv
                                              # L8e adds the shared expert's
                                              # two marginals to that cross
+    go run ./cmd/llm -moe -model $M -tokens 1 -ladder -layers 16 -iters 1 \
+        -csv results/p1b_moe.csv             # P1b: the same cross against
+                                             # DRAM — sixteen cold banks and
+                                             # one iteration, so ProfileSweep
+                                             # never re-reads a bank warm.
+                                             # Rows from the two-layer form
+                                             # above read past the bus (D16)
     go run ./cmd/llm -dn -model $M -tokens 1 -gemm-ladder  # L8d: the dense
                                              # GEMV's split, per projection,
                                              # and the GEMM control beside it
@@ -4673,7 +4702,23 @@ below Q8. Bandwidth is the whole story.
   `results/l8d_dn.csv`'s decode rungs were chosen against an L3 hit too. They
   happen to be the rungs the new ladder also names, so nothing was acted on —
   but the question is now "which of these ladders has ever measured DRAM", and
-  the answer so far is none of the one-token ones.
+  the answer so far is none of the one-token ones. **P1b re-ran the whole MoE
+  decode cross against DRAM** — sixteen cold banks, one iteration — and the
+  pattern held a third time: every old rate was L3, no ranking changed. So
+  the *screen* stays necessary and the mis-choice has yet to actually occur;
+  the one D16 caught (routed up, v16w4) was the whole-model number
+  disagreeing, and cold DRAM now agrees with the whole model there too. The
+  DeltaNet, attention and hyper-connection one-token ladders could be re-run
+  the same way (`-layers` high, `-iters 1`) if a decision ever hangs on one.
+- **Why is a dispatch 8-22% slower inside a step than alone on a cold bank?**
+  P1b's residue. moe.down is 59.3 us alone-and-cold and 72.2 in the model
+  (1.22x, the widest); the five MoE weight-streaming labels sum to a **1.33
+  ms a token** gap. Two environments differ at once: alone, a dispatch has
+  its own fence and a bank read 16 dispatches ago; in the step it sits behind
+  barriers in a 1407-dispatch buffer and its bank was last read 4.3 GB of
+  traffic ago (TLB and page-table walks are the byte-side suspect, barrier
+  drain the buffer-side one). P1c's pre-recorded command buffer touches the
+  second suspect, so measure again after it.
 - **Batch and speculation.** At batch 4 the dense 76% amortises completely.
   Worth knowing whether the API will ever serve more than one stream before
   optimising the batch-1 path to death.

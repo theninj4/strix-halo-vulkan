@@ -901,6 +901,30 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-18 — P1c: the decode step recorded once, and the day the machine moved more than the fix
+
+**Result: decode is one pre-recorded command buffer replayed with a fence per
+token — 1.90 ms of P1's priced 1.96 back, `record` 1.127 → 0.16 ms,
+hand-over 0.82 → 0.25, 25.4 → 26.7 tok/s against a same-hour control — and
+the enabling fact was measured before it was designed: a diff of consecutive
+decode steps showed the entire varying state of 1407 dispatches is one uint.**
+So "feed the varying scalars through a uniform buffer" collapsed to moving
+`SEQ_PAST` into dword 0 of each block's fp32 arena (`actu[0]`, one macro,
+nine `.spv`, no pipeline change), after which every dispatch is
+byte-identical step to step and `vk.Prerecorded` records all 1407 in one
+buffer with the query-pool reset inside it, so `-attrib`'s per-dispatch marks
+survive the replay. Gate: 48 greedy tokens and all 48 full logit rows
+bit-identical to the re-recording arm (`LLM_NO_PRERECORD=1`), whole-model
+greedy text identical to EOG, prefill 1070.3 against the baseline binary's
+1061.5 the same hour. Two environment findings worth more than the item:
+**yesterday's binary measures 39.20 ms a step where P1b measured 30.51** —
+every dense-bank kernel 1.6-1.9x slower, every MoE expert rung unchanged, so
+cross-day whole-model numbers are not comparable and every delta above is
+same-hour — and **run 1 of a freshly staged graph diverges from runs 2+ at
+~1.6e-5 in the logits**, prerecording or not, so bitwise gates warm the graph
+first. Write-up: `research/p1c-prerecorded-decode.md`; next is P2
+(`ple_proj`, closing L8c) per `LLM2.md`.
+
 ### Session 2026-09-17 (fifty-fifth) — stage L8c-7: the attention layer at 4.5 bits, and a family that took two contexts to grade
 
 **Result: the twelve full-attention layers are on L8c-4's bank, decode is 31.4

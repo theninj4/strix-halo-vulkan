@@ -194,12 +194,13 @@ layout(push_constant) uniform PC {
     // rule: the mapping lives here, and nothing spells the borrowed field's
     // own name.
     //
-    //   lowRank   SEQ_PAST:    tokens of this sequence already behind the
-    //             run. For the attention layer that is cells in the KV cache,
-    //             so token t is cell SEQ_PAST + t at position SEQ_PAST + t;
-    //             for the PLE block it is how far back its convolution may
-    //             reach. Zero is a fresh sequence. Only the hyper-connection
-    //             block uses `lowRank` as itself.
+    //   SEQ_PAST (no longer a push field — see the define below): tokens of
+    //             this sequence already behind the run. For the attention
+    //             layer that is cells in the KV cache, so token t is cell
+    //             SEQ_PAST + t at position SEQ_PAST + t; for the PLE block it
+    //             is how far back its convolution may reach. Zero is a fresh
+    //             sequence. It rode `lowRank` until P1c; only the
+    //             hyper-connection block uses `lowRank` as itself now.
     //   injOff    SEQ_HIST:    the ring a convolution over the token axis
     //             reads behind itself, addressed by **position modulo its
     //             length**: f32 [(kern-1)*dil][hc*nEmbd] for the PLE block,
@@ -301,9 +302,19 @@ layout(push_constant) uniform PC {
 
 const uint NO_W = 0xffffffffu;
 
-// The four fields a *continuing* run borrows (L7). See the notes in the push
+// The fields a *continuing* run borrows (L7). See the notes in the push
 // block: 64 uints is 256 bytes and there was no room for a 65th.
-#define SEQ_PAST    pc.lowRank
+//
+// **SEQ_PAST is not a push constant any more (P1c).** It is dword 0 of the
+// block's own fp32 activation arena, read through the `actu` view — the
+// first thing each of the three sequence-carrying blocks allocates, written
+// by the host in SetPast. It moved out of the push block because it was the
+// *only* value in a decode step's 1407 dispatches that changed from one
+// token to the next: with the position in a buffer the recorded command
+// buffer is byte-identical every step, so it can be recorded once and
+// replayed. Only the seven kernels that read SEQ_PAST care; everything else
+// still sees `lowRank` as whatever its own block says it is.
+#define SEQ_PAST    actu[0]
 #define SEQ_HIST    pc.injOff
 #define SEQ_SRC     pc.loOff
 #define ATTN_IDXRAW pc.loOff

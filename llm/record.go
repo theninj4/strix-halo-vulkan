@@ -160,6 +160,13 @@ func (r *recorder) len() int {
 	return len(r.d)
 }
 
+// captureSink, when set, is handed a copy of every recorded sequence at the
+// moment it is submitted — pipeline, grid and push-constant bytes, with each
+// dispatch's label. It exists for P1c's first question: which dispatches of a
+// decode step actually differ from the last step's, asked by capturing two
+// consecutive steps and diffing them. Test-only; nothing in the model sets it.
+var captureSink func(d []vk.MultiDispatch, kind []string)
+
 // DispatchStat is one kernel's share of a pass: how many dispatches carried
 // that label and what they cost on the GPU.
 type DispatchStat struct {
@@ -175,6 +182,14 @@ func (r *recorder) submit() (map[string]time.Duration, map[string]DispatchStat, 
 	byOwner := make(map[string]time.Duration, 8)
 	byKind := make(map[string]DispatchStat, 64)
 	var total time.Duration
+	if captureSink != nil {
+		d := make([]vk.MultiDispatch, len(r.d))
+		for i, md := range r.d {
+			d[i] = md
+			d[i].PushConstants = append([]byte(nil), md.PushConstants...)
+		}
+		captureSink(d, append([]string(nil), r.kind...))
+	}
 	r.dumpRange()
 	batch := batchFor(r.rows)
 	for i := 0; i < len(r.d); i += batch {

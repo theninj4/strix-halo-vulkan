@@ -237,4 +237,40 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
 
 void shim_destroy_compute_pipeline(VkDevice device, ShimComputePipeline *p);
 
+// A dispatch sequence recorded once and submitted many times (LLM.md P1c).
+//
+// shim_dispatch_multi_timed re-records its sequence into pipes[0]'s command
+// buffer on every call, which for a decode token is ~1.1 ms of host work per
+// 30 ms step spent re-encoding the same 1407 dispatches: the sequence is
+// byte-identical from token to token once nothing position-dependent rides
+// the push constants. This pair splits record from submit. The recording owns
+// its command pool, fence and query pool, so the pipelines' own single
+// command buffers stay free for whoever re-records them.
+typedef struct {
+    VkCommandPool cmdPool;
+    VkCommandBuffer cmdBuf;
+    VkFence fence;
+    VkQueryPool queryPool;
+    uint32_t marks; // timestamp slots the recording writes: count+1, or 2
+} ShimPrerecorded;
+
+// Records the same sequence shim_dispatch_multi_timed would (one iteration,
+// `barriers` as there), without submitting it. wantMarks != 0 records a
+// timestamp after every dispatch as well as at the two ends — the query-pool
+// reset is inside the command buffer, so the marks are re-armed on every
+// submit and the per-dispatch attribution survives the replay.
+VkResult shim_prerecord_multi(VkDevice device, uint32_t queueFamily, const ShimComputePipeline *pipes,
+                               const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
+                               uint32_t barriers, uint32_t wantMarks,
+                               const void *pushConstants, uint32_t pushConstantSize,
+                               ShimPrerecorded *out);
+
+// Submits the recording and blocks until it completes. out_ticks receives
+// p->marks raw timestamp ticks (start, one per dispatch when recorded with
+// marks, end).
+VkResult shim_submit_prerecorded(VkDevice device, VkQueue queue, const ShimPrerecorded *p,
+                                  uint64_t *out_ticks);
+
+void shim_destroy_prerecorded(VkDevice device, ShimPrerecorded *p);
+
 #endif

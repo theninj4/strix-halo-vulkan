@@ -548,6 +548,14 @@ func (b *Buffer) ReadUint32At(off, n int) []uint32 {
 	return out
 }
 
+// WriteUint32At copies src into the buffer's mapped memory at a uint32
+// element offset — the write half of ReadUint32At, for the tensors that are
+// counters or positions rather than numbers.
+func (b *Buffer) WriteUint32At(off int, src []uint32) {
+	dst := unsafe.Slice((*uint32)(b.mapped), off+len(src))
+	copy(dst[off:], src)
+}
+
 // ReadUint32 reads n uint32s back out of the buffer's mapped memory.
 func (b *Buffer) ReadUint32(n int) []uint32 {
 	src := unsafe.Slice((*uint32)(b.mapped), n)
@@ -927,6 +935,101 @@ func dispatchMulti(dispatches []MultiDispatch, groupsZ, iterations uint32, barri
 		each[i] = time.Duration(d * dev.phys.TimestampPeriod)
 	}
 	return total, each, nil
+}
+
+// Prerecorded is a dispatch sequence recorded once into its own command
+// buffer and submitted many times (LLM.md P1c).
+//
+// It exists for decode. DispatchMultiMarked re-encodes the same 1407
+// dispatches every token — ~1.1 ms of host work per 30 ms step — and once
+// nothing position-dependent rides the push constants the sequence is
+// byte-identical from token to token, so encoding it once is the whole win.
+// The varying state (the token's embedding, the sequence position) reaches
+// the GPU through mapped buffers the host writes before each Submit.
+type Prerecorded struct {
+	dev    *Device
+	handle C.ShimPrerecorded
+	count  int
+}
+
+// NewPrerecorded records the sequence — the same recording DispatchMultiMarked
+// would make, barriers included — without submitting it. marks keeps the
+// per-dispatch timestamps: the query-pool reset is inside the command buffer,
+// so every Submit re-arms them and the attribution survives the replay.
+func NewPrerecorded(dispatches []MultiDispatch, barriers, marks bool) (*Prerecorded, error) {
+	if len(dispatches) == 0 {
+		return nil, fmt.Errorf("NewPrerecorded: empty dispatch sequence")
+	}
+	dev := dispatches[0].Pipeline.dev
+	handles := make([]C.ShimComputePipeline, len(dispatches))
+	groupsX := make([]C.uint32_t, len(dispatches))
+	groupsY := make([]C.uint32_t, len(dispatches))
+	var flat []byte
+	pcSize := len(dispatches[0].PushConstants)
+	for i, d := range dispatches {
+		if d.Pipeline == nil {
+			return nil, fmt.Errorf("NewPrerecorded: dispatch %d has no pipeline", i)
+		}
+		if d.Pipeline.dev != dev {
+			return nil, fmt.Errorf("NewPrerecorded: dispatch %d is on a different device", i)
+		}
+		if len(d.PushConstants) != pcSize {
+			return nil, fmt.Errorf("NewPrerecorded: push-constant block %d is %d bytes, block 0 is %d",
+				i, len(d.PushConstants), pcSize)
+		}
+		handles[i] = d.Pipeline.handle
+		groupsX[i] = C.uint32_t(d.GroupsX)
+		groupsY[i] = C.uint32_t(d.GroupsY)
+		flat = append(flat, d.PushConstants...)
+	}
+	var pcPtr unsafe.Pointer
+	if len(flat) > 0 {
+		pcPtr = unsafe.Pointer(&flat[0])
+	}
+	var barrierFlag, markFlag C.uint32_t
+	if barriers {
+		barrierFlag = 1
+	}
+	if marks {
+		markFlag = 1
+	}
+	p := &Prerecorded{dev: dev, count: len(dispatches)}
+	if err := check("prerecord sequence", C.shim_prerecord_multi(dev.handle, C.uint32_t(dev.queueFamily),
+		&handles[0], &groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
+		barrierFlag, markFlag, pcPtr, C.uint32_t(pcSize), &p.handle)); err != nil {
+		p.Destroy()
+		return nil, err
+	}
+	return p, nil
+}
+
+// Count is how many dispatches the recording holds.
+func (p *Prerecorded) Count() int { return p.count }
+
+// Submit runs the recording and blocks until it completes, returning the
+// GPU time end to end and — when recorded with marks — one duration per
+// dispatch, exactly as DispatchMultiMarked reports them.
+func (p *Prerecorded) Submit() (time.Duration, []time.Duration, error) {
+	ticks := make([]C.uint64_t, p.handle.marks)
+	if err := check("submit prerecorded", C.shim_submit_prerecorded(p.dev.handle, p.dev.queue,
+		&p.handle, &ticks[0])); err != nil {
+		return 0, nil, err
+	}
+	period := p.dev.phys.TimestampPeriod
+	total := time.Duration((float64(uint64(ticks[len(ticks)-1])) - float64(uint64(ticks[0]))) * period)
+	if int(p.handle.marks) != p.count+1 {
+		return total, nil, nil
+	}
+	each := make([]time.Duration, p.count)
+	for i := range each {
+		each[i] = time.Duration((float64(uint64(ticks[i+1])) - float64(uint64(ticks[i]))) * period)
+	}
+	return total, each, nil
+}
+
+// Destroy releases the recording's command pool, fence and query pool.
+func (p *Prerecorded) Destroy() {
+	C.shim_destroy_prerecorded(p.dev.handle, &p.handle)
 }
 
 // Dispatch records and submits a single dispatch covering groupsX
