@@ -35,6 +35,32 @@ package llm
 // 4 bits of level, 12 bits a group of 32 and 32 bits a super-block of 256 is
 // **4.500 bits a weight**, which is the number every L8c-3 rung is quoted at.
 //
+// # The fifth bit: P3a's `qh` plane
+//
+// P3 measured what a fifth bit is worth and it is the best remaining trade on
+// the board by three times — `full_attn` at `q5_k` recovers 1.1 points of
+// perplexity for 0.077 GB a token, **14.1 pp/GB**, where the best arm the
+// four-bit kernel can stage is 4.6. ggml's own `Q5_K` is `Q4_K` plus a
+// `qh` bit-plane and *the same record*, so the format here is the same three
+// numbers plus one plane:
+//
+//	high     tile (nt, kt) is 32 contiguous bytes, one per 128-byte nibble
+//	         tile and in the same order, and **byte i of it is the top bit of
+//	         each of the eight levels in word i of the nibble tile** — bit e
+//	         for the level at k offset e. So the high byte's index inside a
+//	         tile *is* the nibble word's index inside that tile, which is
+//	         what makes the unpack a second load at the same address
+//	         arithmetic rather than a second addressing scheme: the GEMM's
+//	         `u` and the GEMV's `col*2 + u` index both planes unchanged.
+//
+// It sits **between** the tiles and the records — bOff, then n*k/2, then
+// n*k/8 — so the record plane's base stays derivable from `gemmN * gemmK`
+// and no push field is needed for either (64 uints is this device's whole
+// push range and the block has been full since L5b).
+//
+// 5 bits of level, 12 bits a group of 32 and 32 bits a super-block is
+// **5.500 bits a weight**, ggml's own Q5_K number.
+//
 // # The 320-wide family, and the one place this is not ggml
 //
 // A super-block is ggml's eight groups wherever `k % 256 == 0`, which is
@@ -50,6 +76,8 @@ package llm
 import (
 	"fmt"
 	"sync"
+
+	"strix-halo-vulkan/vk"
 )
 
 // q4kSuper is the groups in a super-block: ggml's QK_K/32.
@@ -71,21 +99,43 @@ func q4kShape(k int) (sub, nsb, rec int, err error) {
 	return sub, k / (sub * 32), q4kRecordBytes(sub), nil
 }
 
-// q4kBytes is the staged size of an [n, k] matrix: the nibble tiles, then the
-// record plane. As with L8a's, the kernel derives the plane's offset from
-// bOff + n*k/2 rather than from a push field — 64 uints is this device's
-// whole push range and the block has been full since L5b.
-func q4kBytes(n, k int) int {
-	_, nsb, rec, err := q4kShape(k)
-	if err != nil {
-		return 0
+// qkBits is the level width a plan's format stages at, and the one check
+// that says which of the two banks a matrix lands on: four bits is L8c-4's
+// nibble tiles alone, five is those tiles plus P3a's `qh` plane.
+func qkBits(q QuantSim) (int, error) {
+	if !q.Asym || q.Group != 32 {
+		return 0, fmt.Errorf("llm: %s is not an asymmetric K-quant on groups of 32", q)
 	}
-	return n*k/2 + (n/coopMatTile)*nsb*coopMatTile*rec
+	if q.Bits != 4 && q.Bits != 5 {
+		return 0, fmt.Errorf("llm: %s is %d bits and this bank is nibbles or nibbles plus a plane", q, q.Bits)
+	}
+	return q.Bits, nil
 }
 
-// q4kRecPlane is the record plane's size for an [n, k] matrix, which the two
+// qkBytes is the staged size of an [n, k] matrix: the nibble tiles, the
+// fifth-bit plane where there is one, then the record plane. As with L8a's,
+// the kernel derives both following planes from bOff + n*k/2 rather than from
+// a push field — 64 uints is this device's whole push range and the block has
+// been full since L5b.
+func qkBytes(bits, n, k int) int {
+	return n*k/2 + qkHighPlane(bits, n, k) + qkRecPlane(n, k)
+}
+
+// qkHighPlane is P3a's plane alone: one bit a weight, and nothing at four
+// bits. It is one 32-byte tile per 128-byte nibble tile, in the same order,
+// so it is exactly a quarter of the level plane.
+func qkHighPlane(bits, n, k int) int {
+	if bits != 5 {
+		return 0
+	}
+	return n * k / 8
+}
+
+// qkRecPlane is the record plane's size for an [n, k] matrix, which the
 // planes' callers allocate separately because they write them separately.
-func q4kRecPlane(n, k int) int {
+// ggml's Q5_K carries the same record as its Q4_K, so this does not move with
+// the width.
+func qkRecPlane(n, k int) int {
 	_, nsb, rec, err := q4kShape(k)
 	if err != nil {
 		return 0
@@ -93,30 +143,38 @@ func q4kRecPlane(n, k int) int {
 	return (n / coopMatTile) * nsb * coopMatTile * rec
 }
 
-// q4kFits reports whether a matrix can be staged in this bank at all.
-func q4kFits(n, k int) error {
+// qkFits reports whether a matrix can be staged in this bank at all. It is
+// the same answer at both widths: the tiling is the four-bit one and the
+// fifth bit rides on it.
+func qkFits(n, k int) error {
 	if n%coopMatTile != 0 {
-		return fmt.Errorf("llm: a q4_k bank wants whole %d-row tiles, not %d rows", coopMatTile, n)
+		return fmt.Errorf("llm: a K-quant bank wants whole %d-row tiles, not %d rows", coopMatTile, n)
 	}
 	_, _, _, err := q4kShape(k)
 	return err
 }
 
-// tileBQ4K writes one [n, k] row-major matrix into the bank, quantising it
+// tileBQK writes one [n, k] row-major matrix into the bank, quantising it
 // through the same encoder `sim.go` measured the format with.
 //
 // `src` is n rows of k floats, `row` is tileB's row remapping, `q` the format
-// (`q4_k/32`) and `qw` the importance of each of the k input columns
-// — the imatrix row for this tensor, or nil for round-to-nearest.
+// (`q4_k/32` or `q5_k/32`) and `qw` the importance of each of the k input
+// columns — the imatrix row for this tensor, or nil for round-to-nearest.
 //
-// dstQ and dstR are the destination's two planes, and their length is what
-// says how many rows the destination has. They are the *whole* matrix's or a
-// slab's, as long as the slab is whole sixteen-row tiles of the destination,
-// which is what lets the lm head stage 4096 rows at a time without a 2.54 GB
-// copy of itself ever existing — and they may be wider than `n`, which is
-// what lets four of llama.cpp's matrices be staged into one fused plane.
-func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q QuantSim, qw []float32) error {
+// dstQ, dstH and dstR are the destination's planes, and the first one's
+// length is what says how many rows the destination has. `dstH` is nil at
+// four bits and `qkHighPlane` bytes at five. They are the *whole* matrix's or
+// a slab's, as long as the slab is whole sixteen-row tiles of the
+// destination, which is what lets the lm head stage 4096 rows at a time
+// without a 2.54 GB copy of itself ever existing — and they may be wider than
+// `n`, which is what lets four of llama.cpp's matrices be staged into one
+// fused plane.
+func tileBQK(dstQ, dstH, dstR []byte, src []float32, n, k int, row func(int) int, q QuantSim, qw []float32) error {
 	sub, nsb, recBytes, err := q4kShape(k)
+	if err != nil {
+		return err
+	}
+	bits, err := qkBits(q)
 	if err != nil {
 		return err
 	}
@@ -128,21 +186,8 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 	// The buffer says how wide: dstQ is dstN*k/2 bytes and nothing else can
 	// be, which is the same check one level up.
 	dstN := len(dstQ) * 2 / k
-	if err := q4kFits(dstN, k); err != nil {
+	if err := qkFits(dstN, k); err != nil {
 		return err
-	}
-	if !q.Asym || q.Group != 32 {
-		return fmt.Errorf("llm: %s is not an asymmetric K-quant on groups of 32", q)
-	}
-	// **Four bits, because a tile is nibbles.** L8c-3's mixed plan puts the
-	// attention layer and the hyper-connection block at `q5_k` for +2.70%
-	// against the uniform plan's +4.24%, and a fifth bit is a plane of its
-	// own the way ggml's `qh` is — a third stream through the unpack, and a
-	// format whose tiles are no longer one byte per two elements. The
-	// uniform plan is what this bank is built for; the fifth bit is the
-	// decision the mixed one costs.
-	if q.Bits != 4 {
-		return fmt.Errorf("llm: %s is %d bits and a tile of this bank is nibbles", q, q.Bits)
 	}
 	if qw != nil && len(qw) != k {
 		return fmt.Errorf("llm: %d importance columns for a row of %d", len(qw), k)
@@ -150,10 +195,13 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 	const tile = coopMatTile
 	kt := k / tile
 	if len(dstQ) != dstN*k/2 {
-		return fmt.Errorf("llm: q4_k tile plane is %d bytes, want %d", len(dstQ), dstN*k/2)
+		return fmt.Errorf("llm: K-quant tile plane is %d bytes, want %d", len(dstQ), dstN*k/2)
+	}
+	if want := qkHighPlane(bits, dstN, k); len(dstH) != want {
+		return fmt.Errorf("llm: %d-bit high plane is %d bytes, want %d", bits, len(dstH), want)
 	}
 	if len(dstR) != (dstN/tile)*nsb*tile*recBytes {
-		return fmt.Errorf("llm: q4_k record plane is %d bytes, want %d",
+		return fmt.Errorf("llm: K-quant record plane is %d bytes, want %d",
 			len(dstR), (dstN/tile)*nsb*tile*recBytes)
 	}
 	if n > dstN {
@@ -170,9 +218,14 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 			r := row(i)
 			// The tiles of one n-tile are contiguous across kt, and a tile is
 			// 128 bytes, so this row's nibbles start at the n-tile's base and
-			// are indexed by (kt, n%16, k%16) from there.
+			// are indexed by (kt, n%16, k%16) from there. The high plane is
+			// the same arithmetic at a quarter of the stride — a tile is 32
+			// bytes there, and the byte index inside it is the nibble *word*
+			// index inside the 128.
 			base := (r / tile) * kt * (tile * tile / 2)
 			lane := (r % tile) * (tile / 2)
+			hbase := (r / tile) * kt * (tile * tile / 8)
+			hlane := (r % tile) * (tile / 8)
 			rbase := ((r/tile)*nsb*tile + r%tile) * recBytes
 			x := src[i*k : (i+1)*k]
 			for s := 0; s < nsb; s++ {
@@ -189,7 +242,22 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 				for j := 0; j < sub*32; j += 2 {
 					c := s*sub*32 + j
 					dstQ[base+(c/tile)*(tile*tile/2)+lane+(c%tile)/2] =
-						e.Q[j] | e.Q[j+1]<<4
+						e.Q[j]&0xF | (e.Q[j+1]&0xF)<<4
+					if bits != 5 {
+						continue
+					}
+					// Two levels a byte of nibbles is two bits a byte of
+					// plane, at bit (k%8) — and eight k of one column share
+					// one byte, so the first pair of a byte writes it and the
+					// other three or-in. A super-block starts on a multiple
+					// of 32, so `c%8 == 0` is exactly a byte's first pair.
+					h := (e.Q[j]>>4)&1 | ((e.Q[j+1]>>4)&1)<<1
+					hi := hbase + (c/tile)*(tile*tile/8) + hlane + (c%tile)/8
+					if c%8 == 0 {
+						dstH[hi] = h << (c % 8)
+					} else {
+						dstH[hi] |= h << (c % 8)
+					}
 				}
 			}
 		}
@@ -197,10 +265,11 @@ func tileBQ4K(dstQ, dstR []byte, src []float32, n, k int, row func(int) int, q Q
 	return perr
 }
 
-// q4kDequant reads one element back out of a staged bank exactly as the
-// kernels do — the record's pair, `get_scale_min_k4`, and d*sc*l - dmin*m in
-// f32. It is what the tests compare against the simulation.
-func q4kDequant(bankQ, bankR []byte, n, k, dstRow, col int) float32 {
+// qkDequant reads one element back out of a staged bank exactly as the
+// kernels do — the nibble, P3a's top bit where there is one, the record's
+// pair, `get_scale_min_k4`, and d*sc*l - dmin*m in f32. It is what the tests
+// compare against the simulation.
+func qkDequant(bankQ, bankH, bankR []byte, bits, n, k, dstRow, col int) float32 {
 	const tile = coopMatTile
 	kt := k / tile
 	sub, nsb, recBytes, err := q4kShape(k)
@@ -212,6 +281,11 @@ func q4kDequant(bankQ, bankR []byte, n, k, dstRow, col int) float32 {
 	l := int(b & 0xF)
 	if col%2 == 1 {
 		l = int(b >> 4)
+	}
+	if bits == 5 {
+		hbase := (dstRow/tile)*kt*(tile*tile/8) + (dstRow%tile)*(tile/8)
+		hb := bankH[hbase+(col/tile)*(tile*tile/8)+(col%tile)/8]
+		l |= int(hb>>uint(col%8)&1) << 4
 	}
 	sb := col / (sub * 32)
 	rec := bankR[((dstRow/tile)*nsb*tile+sb*tile+dstRow%tile)*recBytes:]
@@ -238,4 +312,61 @@ func bankImatrix(name string, q QuantSim) (QuantSim, []float32, error) {
 		q.Mode = "rtn"
 	}
 	return q, qw, nil
+}
+
+// qkStage is one matrix's staged planes, in the order the bank writes them
+// and the order every kernel derives them from `bOff`: nibble tiles, P3a's
+// fifth-bit plane — empty at four bits — then the records.
+//
+// It exists so that "the planes are contiguous, in this order" is stated once
+// instead of at each of the six blocks that stage a dense matrix. Before P3a
+// there were two planes and each site wrote them itself; with three, one of
+// which is sometimes absent, the ordering is the sort of fact that goes wrong
+// in one place and is found by a perplexity run rather than by a test.
+type qkStage struct {
+	Bits           int
+	Lvl, High, Rec []byte
+}
+
+// newQKStage allocates the planes of an [n, k] matrix at one of the two
+// widths. n is the *destination plane's* rows, which is wider than the source
+// wherever several of llama.cpp's matrices are fused into one.
+func newQKStage(bits, n, k int) qkStage {
+	return qkStage{
+		Bits: bits,
+		Lvl:  make([]byte, n*k/2),
+		High: make([]byte, qkHighPlane(bits, n, k)),
+		Rec:  make([]byte, qkRecPlane(n, k)),
+	}
+}
+
+// Fill quantises one source matrix into the planes. It may be called more
+// than once on the same stage with different `row` remappings, which is how a
+// fused plane is written from the several matrices that share it.
+func (s qkStage) Fill(src []float32, n, k int, row func(int) int, q QuantSim, qw []float32) error {
+	return tileBQK(s.Lvl, s.High, s.Rec, src, n, k, row, q, qw)
+}
+
+// Len is the staged size, which has to equal `qkBytes` for the same shape.
+func (s qkStage) Len() int { return len(s.Lvl) + len(s.High) + len(s.Rec) }
+
+// WriteTo copies the planes into the bank at `off`, in that order.
+func (s qkStage) WriteTo(b *vk.Buffer, off int) {
+	b.WriteBytesAt(off, s.Lvl)
+	if len(s.High) > 0 {
+		b.WriteBytesAt(off+len(s.Lvl), s.High)
+	}
+	b.WriteBytesAt(off+len(s.Lvl)+len(s.High), s.Rec)
+}
+
+// Rows is the stage restricted to the first n rows of an [n, k] fill, which
+// is how the lm head stages one slab at a time of a matrix that is 2.54 GB as
+// floats and never exists whole.
+func (s qkStage) Rows(n, k int) qkStage {
+	return qkStage{
+		Bits: s.Bits,
+		Lvl:  s.Lvl[:n*k/2],
+		High: s.High[:qkHighPlane(s.Bits, n, k)],
+		Rec:  s.Rec[:qkRecPlane(n, k)],
+	}
 }

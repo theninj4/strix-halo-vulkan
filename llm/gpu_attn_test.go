@@ -547,18 +547,35 @@ func TestAttnGPUGemvAgrees(t *testing.T) {
 //
 // It is `rtn` rather than `imatrix` so the test needs nothing but the
 // checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
-// TestBankQ4KIsTheSim covers that at the encoder.
+// TestBankQKIsTheSim covers that at the encoder.
+//
+// **Both widths run it**, and the fifth bit is the reason this block has one:
+// P3 measured `full_attn` at `q5_k` as 14.1 pp/GB against the best buildable
+// four-bit arm's 4.6, so P3a's `qh` plane lands here first. The plane is
+// addressed off the same tile index as the nibbles it belongs to, which is
+// exactly the kind of arithmetic that is right in the GEMM and wrong in the
+// GEMV, so the gate is the whole layer on both.
 func TestAttnGPUQ4IsTheSim(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { attnBankIsTheSim(t, spec) })
+	}
+}
+
+func attnBankIsTheSim(t *testing.T, spec string) {
 	_, tr, c, w, nTok, nKV := attnFixtures(t)
 	in, err := tr.Get("hc_mixed-3", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	dev, done := newTestDevice(t)
 	defer done()
@@ -599,11 +616,11 @@ func TestAttnGPUQ4IsTheSim(t *testing.T) {
 	}
 
 	simQKV, simOut, simBytes := run(BankFP16, QuantSim{}, simW)
-	q4QKV, q4Out, q4Bytes := run(BankQ4K, sim, w)
-	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
-		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
+	q4QKV, q4Out, q4Bytes := run(bank, sim, w)
+	t.Logf("%s bank %.1f MB against the simulation's %.1f MB of halves",
+		bank, float64(q4Bytes)/1e6, float64(simBytes)/1e6)
 	if q4Bytes >= simBytes {
-		t.Fatalf("the q4_k bank is %d bytes, no smaller than %d", q4Bytes, simBytes)
+		t.Fatalf("the %s bank is %d bytes, no smaller than %d", bank, q4Bytes, simBytes)
 	}
 	for _, tc := range []struct {
 		what     string
@@ -635,7 +652,7 @@ func TestAttnGPUQ4BankSize(t *testing.T) {
 	n, k := roundUpInt(real, attnBN), c.NEmbd
 	pad := n - real
 
-	q4 := q8Align(q4kBytes(n, k)) + q8Align(q4kBytes(c.NEmbd, c.GateWidth()))
+	q4 := q8Align(qkBytes(4, n, k)) + q8Align(qkBytes(4, c.NEmbd, c.GateWidth()))
 	q8 := q8Align(q8Bytes(n, k)) + q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
 	half := n*k*2 + c.NEmbd*c.GateWidth()*2
 	weights := real*k + c.NEmbd*c.GateWidth()
@@ -650,7 +667,7 @@ func TestAttnGPUQ4BankSize(t *testing.T) {
 	}
 	// Subtract the pad rows' nibbles and state the remainder rather than
 	// demanding 4.500 — the record plane covers the pad rows too.
-	body := q4kBytes(n, k) - pad*k/2 + q4kBytes(c.NEmbd, c.GateWidth())
+	body := qkBytes(4, n, k) - pad*k/2 + qkBytes(4, c.NEmbd, c.GateWidth())
 	if bits := float64(body) * 8 / float64(weights); bits < 4.5 || bits > 4.53 {
 		t.Fatalf("the staged matrix is %.4f bits a weight, want 4.500 plus the padding's records", bits)
 	}
@@ -668,22 +685,37 @@ func TestAttnGPUQ4BankSize(t *testing.T) {
 // What has to hold exactly is the addressing, and the fused projection is
 // where a wrong address shows — so the indexer's columns are compared on
 // their own as well as folded in: they are 4.6% of the width and would hide.
+//
+// **Both widths**, because P3a's plane is read here with an index the GEMV
+// derives differently from the GEMM — `col*2 + u` inside a tile rather than a
+// lane's share of the whole run — and a plane byte off by one is a wrong
+// weight, not a slow one.
 func TestAttnGPUQ4Gemv(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { attnBankGemv(t, spec) })
+	}
+}
+
+func attnBankGemv(t *testing.T, spec string) {
 	_, tr, c, w, _, nKV := attnFixtures(t)
 	in, err := tr.Get("hc_mixed-3", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	dev, done := newTestDevice(t)
 	defer done()
 
-	g, err := NewAttnGPUBank(dev, c, 1, nKV, []AttnWeights{w}, BankQ4K, sim)
+	g, err := NewAttnGPUBank(dev, c, 1, nKV, []AttnWeights{w}, bank, sim)
 	if err != nil {
 		t.Fatal(err)
 	}

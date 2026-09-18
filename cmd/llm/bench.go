@@ -388,7 +388,11 @@ func pleBench(model string, tokens []int, iters int, csvPath string) error {
 	}
 	opts := llm.PLEOpts{Bank: llm.BankFor(llm.DenseQ8()), Layer: cfg.Layers[0]}
 	if q, ok := llm.DenseBankPlan().For(fmt.Sprintf("blk.%d.ple_key.weight", cfg.Layers[0]), true); ok {
-		opts.Bank, opts.Sim = llm.BankQ4K, q
+		b, err := llm.BankForSim(q)
+		if err != nil {
+			return err
+		}
+		opts.Bank, opts.Sim = b, q
 	}
 	g, err := llm.NewPLEGPU(dev, cfg, maxTok, w, opts)
 	if err != nil {

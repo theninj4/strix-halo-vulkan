@@ -119,12 +119,12 @@ func NewHeadGPUBank(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int,
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
-	if bank == BankQ4K {
-		if err := q4kFits(vocab, nEmbd); err != nil {
+	if _, ok := qkBank(bank); ok {
+		if err := qkFits(vocab, nEmbd); err != nil {
 			return nil, err
 		}
 		if sim.Off() {
-			return nil, fmt.Errorf("llm: a q4_k head bank needs a format to quantise to")
+			return nil, fmt.Errorf("llm: a %s head bank needs a format to quantise to", bank)
 		}
 	}
 	g := &HeadGPU{
@@ -180,8 +180,9 @@ func (g *HeadGPU) alloc() error {
 	switch g.bank {
 	case BankQ8:
 		size = q8Bytes(g.vocab, g.nEmbd)
-	case BankQ4K:
-		size = q4kBytes(g.vocab, g.nEmbd)
+	case BankQ4K, BankQ5K:
+		bits, _ := qkBank(g.bank)
+		size = qkBytes(bits, g.vocab, g.nEmbd)
 	}
 	if g.wbank, err = g.dev.NewBuffer(size); err != nil {
 		return fmt.Errorf("llm: head weight bank (%d MB): %w", size>>20, err)
@@ -272,13 +273,14 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 		qs = make([]byte, headStageRows*g.nEmbd)
 		sc = make([]uint16, headStageRows*g.nEmbd/q8Group)
 	}
-	// The 4.5-bit bank's two, on the same argument: a slab's nibbles are
-	// bytes [r0*nEmbd/2, ...) and its records are [r0/16 * nsb * 256, ...),
-	// both contiguous for the same reason.
-	var q4 []byte
-	var rec []byte
+	// The K-quant bank's planes, on the same argument: a slab's nibbles are
+	// bytes [r0*nEmbd/2, ...), its fifth bits [r0*nEmbd/8, ...) of the plane
+	// behind them and its records [r0/16 * nsb * 256, ...) of the plane
+	// behind those — each contiguous for the same reason, and each at its
+	// own base, which is the one place in the vertical where a matrix's
+	// planes are not written one after another.
+	var qk qkStage
 	var qw []float32
-	nsb := g.nEmbd / (q4kSuper * 32)
 	if !g.sim.Off() {
 		var err error
 		// The published matrix covers `blk.N.*` only, so the head has no
@@ -299,11 +301,13 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 			g.sim.Mode = "rtn"
 		}
 	}
-	if g.bank == BankQ4K {
-		q4 = make([]byte, headStageRows*g.nEmbd/2)
-		rec = make([]byte, headStageRows/coopMatTile*nsb*coopMatTile*q4kRecord)
+	if bits, ok := qkBank(g.bank); ok {
+		qk = newQKStage(bits, headStageRows, g.nEmbd)
 	}
 	planeOff := g.vocab * g.nEmbd
+	// The two K-quant planes' bases, which the kernel derives the same way.
+	highOff := g.vocab * g.nEmbd / 2
+	recOff := highOff + qkHighPlane(qk.Bits, g.vocab, g.nEmbd)
 	for r0 := 0; r0 < g.vocab; r0 += headStageRows {
 		n := minInt(headStageRows, g.vocab-r0)
 		src, err := gguf.Dequantize(w.Type, w.Data[r0*rowBytes:(r0+n)*rowBytes],
@@ -338,14 +342,17 @@ func (g *HeadGPU) stage(w *gguf.Tensor) error {
 				func(i int) int { return i })
 			g.wbank.WriteBytesAt(r0*g.nEmbd, qs[:n*g.nEmbd])
 			g.wbank.WriteUint16At(planeOff/2+r0*g.nEmbd/q8Group, sc[:n*g.nEmbd/q8Group])
-		case BankQ4K:
-			nr := n / coopMatTile * nsb * coopMatTile * q4kRecord
-			if err := tileBQ4K(q4[:n*g.nEmbd/2], rec[:nr], src, n, g.nEmbd,
+		case BankQ4K, BankQ5K:
+			slab := qk.Rows(n, g.nEmbd)
+			if err := slab.Fill(src, n, g.nEmbd,
 				func(i int) int { return i }, g.sim, qw); err != nil {
 				return fmt.Errorf("llm: head rows %d-%d: %w", r0, r0+n, err)
 			}
-			g.wbank.WriteBytesAt(r0*g.nEmbd/2, q4[:n*g.nEmbd/2])
-			g.wbank.WriteBytesAt(g.vocab*g.nEmbd/2+r0/coopMatTile*nsb*coopMatTile*q4kRecord, rec[:nr])
+			g.wbank.WriteBytesAt(r0*g.nEmbd/2, slab.Lvl)
+			if len(slab.High) > 0 {
+				g.wbank.WriteBytesAt(highOff+r0*g.nEmbd/8, slab.High)
+			}
+			g.wbank.WriteBytesAt(recOff+qkRecPlane(r0, g.nEmbd), slab.Rec)
 		default:
 			tileB(half[:n*g.nEmbd], src, n, g.nEmbd, func(i int) int { return i })
 			g.wbank.WriteUint16At(r0*g.nEmbd, half[:n*g.nEmbd])

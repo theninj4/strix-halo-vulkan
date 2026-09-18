@@ -135,13 +135,20 @@ void main() {
 
 #ifdef Q4B
     uint nsb = pc.gemmK >> 8;
-    uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
+    uint nk = pc.gemmN * pc.gemmK;
+    // P3a's plane sits between the tiles and the records; `QK_HIGH_BYTES` is
+    // zero without -DQ5B, so this is the same base it always was there.
+    uint high0 = (pc.bOff + (nk >> 1)) >> 2;
+    uint rec0 = (pc.bOff + (nk >> 1) + QK_HIGH_BYTES(nk)) >> 2;
     // A tile is 32 words and a lane owns two of them — the eight k either
     // side of `col`'s sixteen — with `sub` picking which of the step's four
     // tiles, the way lane*4 does on the Q8 arm. The fused down projection is
     // quantised all the way through — `inject` included, since D13's payoff
     // (P2) — so there is no split and no fp16 tail.
     uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
+    // The same index without the buffer base is the plane's byte index: a
+    // high byte covers exactly the nibble word it is named by.
+    uint hbi = (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
 #elif defined(Q8B)
     // The tiles as words and the scale plane as halves, exactly as the GEMM
     // derives them: a matrix is gemmN x gemmK bytes and the plane follows it,
@@ -174,11 +181,12 @@ void main() {
             uint x = xbase + (c + sub) * TILE;
             [[unroll]] for (uint u = 0u; u < 2u; u++) {
                 uint word = w8[w + u];
+                uint hb = QK_HIGH_BYTE(high0, hbi + c * 32u + u);
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     uint by = bitfieldExtract(word, int(t * 8u), 8);
                     uint e = u * 8u + t * 2u;
-                    sum += (ds * float(by & 0xFu) - dm) * float(hact[x + e]);
-                    sum += (ds * float(by >> 4) - dm) * float(hact[x + e + 1u]);
+                    sum += (ds * float(QK_LEVEL_LO(by, hb, t)) - dm) * float(hact[x + e]);
+                    sum += (ds * float(QK_LEVEL_HI(by, hb, t)) - dm) * float(hact[x + e + 1u]);
                 }
             }
         }

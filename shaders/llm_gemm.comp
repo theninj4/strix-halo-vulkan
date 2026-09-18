@@ -226,7 +226,11 @@ void main() {
     // its base is derivable and needs no push field of its own — the same
     // arrangement, and the same reason, as the Q8 arm below.
     uint qw0 = pc.bOff >> 2;                                   // the tiles, in words
-    uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2; // the records, in words
+    uint nkq = pc.gemmN * pc.gemmK;
+    // P3a's fifth-bit plane sits between the two, and `QK_HIGH_BYTES` is
+    // zero without -DQ5B, so the record base is where it always was.
+    uint high0 = (pc.bOff + (nkq >> 1)) >> 2;                  // the qh plane, in words
+    uint rec0 = (pc.bOff + (nkq >> 1) + QK_HIGH_BYTES(nkq)) >> 2; // the records, in words
     uint nsb = pc.gemmK / Q4K_SB;                              // super-blocks a row
     uint lane = gl_LocalInvocationID.x;
     uint nt0 = wn0 / TILE;
@@ -296,12 +300,15 @@ void main() {
                 uint n = wi >> 1;              // 0..15, the output column
                 uint kk = (wi & 1u) * 8u;      // eight consecutive k
                 uint word = w8[wbase + u];
+                // The plane byte index is the nibble word index, and `u`
+                // already counts words across the WN run's BK_TILES tiles.
+                uint hb = QK_HIGH_BYTE(high0, ((nt0 + j) * ktiles + kt0q) * 32u + u);
                 float ds = sQS[j * TILE + n], dm = sQM[j * TILE + n];
                 uint dst = (j * TILE + n) * LDS_ROW + kt * TILE + kk;
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     uint by = bitfieldExtract(word, int(t * 8u), 8);
-                    sQB[dst + t * 2u] = float16_t(ds * float(by & 0xFu) - dm);
-                    sQB[dst + t * 2u + 1u] = float16_t(ds * float(by >> 4) - dm);
+                    sQB[dst + t * 2u] = float16_t(ds * float(QK_LEVEL_LO(by, hb, t)) - dm);
+                    sQB[dst + t * 2u + 1u] = float16_t(ds * float(QK_LEVEL_HI(by, hb, t)) - dm);
                 }
             }
         }

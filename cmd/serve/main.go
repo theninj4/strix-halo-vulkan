@@ -18,11 +18,13 @@
 // Every endpoint answers today except POST /v1/images/edits, which needs the
 // VAE's encoder and not a flag (see api.Server.handleImageEdit).
 //
-// **-llm stages D18's widths by default** (P3): the uniform 4.5-bit dense
-// bank with `ple_proj` on int8, 4.281 GB a token and 4.1850 perplexity.
-// `LLM_DENSE_BANK` overrides it by naming any other plan, and `off` serves
-// L8a's int8 bank instead. `cmd/llm` has no such default on purpose -- a
-// measurement tool should stage only what its command line names.
+// **-llm stages D19's widths by default** (P3a): D18's 4.5-bit plan with
+// `ple_proj` on int8, plus P3a's fifth bit on `full_attn`, `qsa_indexer`,
+// `lm_head` and `hyper_conn` -- 4.518 GB a token, 4.0948 perplexity (+1.63%
+// against D18's +3.87%) and 34.57 tok/s. `LLM_DENSE_BANK` overrides it by
+// naming any other plan, and `off` serves L8a's int8 bank instead.
+// `cmd/llm` has no such default on purpose -- a measurement tool should
+// stage only what its command line names.
 //
 // **-llm and -image do not fit together.** The language model is ~84 GB
 // resident and the image pipeline ~25 GB, against 128 GB of unified memory
@@ -119,7 +121,7 @@ func main() {
 		log.Fatalf("-image-size: %v", err)
 	}
 
-	// **P3/D18: the server stages the shipped widths unless told otherwise.**
+	// **P3a/D19: the server stages the shipped widths unless told otherwise.**
 	// `llm.DenseBankPlan` reads `LLM_DENSE_BANK` and defaults to off, because
 	// a measurement tool that staged a plan nobody named would make every CSV
 	// in `results/` ambiguous. A *product* run wants the opposite default, so

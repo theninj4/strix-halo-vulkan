@@ -749,18 +749,33 @@ func TestHCGPUQ8BankSize(t *testing.T) {
 // It is `rtn` rather than `imatrix` so the test needs nothing but a device;
 // the calibrated arm is the same code path with `qw` non-nil, and
 // TestBankQ4KIsTheSim covers that at the encoder.
+//
+// Both widths, since P3a. This block is the one that stages **two** record
+// packings — the down projection's eight groups and the 320-wide up
+// projection's ten — so it is where the fifth bit's plane has to survive a
+// super-block that is the whole row.
 func TestHCGPUQ4IsTheSim(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { hcBankIsTheSim(t, spec) })
+	}
+}
+
+func hcBankIsTheSim(t *testing.T, spec string) {
 	dev, done := newTestDevice(t)
 	defer done()
 
 	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320, Eps: 1e-6}
 	wide := cfg.Wide()
 	rng := rand.New(rand.NewSource(23))
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := HCWeights{
 		Norm:   make([]float32, wide),
@@ -797,7 +812,7 @@ func TestHCGPUQ4IsTheSim(t *testing.T) {
 		}
 		return g
 	}
-	simulated, q4 := stage(BankFP16), stage(BankQ4K)
+	simulated, q4 := stage(BankFP16), stage(bank)
 	defer simulated.Destroy()
 	defer q4.Destroy()
 	t.Logf("bank %.2f MB against the simulation's %.2f MB of halves",
@@ -900,7 +915,7 @@ func TestHCGPUQ4BankSize(t *testing.T) {
 
 	half := (n*wide + wide*cfg.LowRank) * 2
 	q8 := q8Align(q8Bytes(n, wide)) + q8Align(q8Bytes(wide, cfg.LowRank))
-	q4 := q8Align(q4kBytes(n, wide)) + q8Align(q4kBytes(wide, cfg.LowRank))
+	q4 := q8Align(qkBytes(4, n, wide)) + q8Align(qkBytes(4, wide, cfg.LowRank))
 	weights := cfg.LowRank*wide + wide*cfg.LowRank + cfg.HC*wide
 
 	t.Logf("a mixer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
@@ -915,7 +930,7 @@ func TestHCGPUQ4BankSize(t *testing.T) {
 
 	// The up projection alone is the 320-wide family, and it is exactly
 	// 4.500 bits: nibbles plus one twenty-byte record per row.
-	up := q4kBytes(wide, cfg.LowRank)
+	up := qkBytes(4, wide, cfg.LowRank)
 	if bits := float64(up) * 8 / float64(wide*cfg.LowRank); bits != 4.5 {
 		t.Fatalf("the up projection is %.4f bits a weight, want 4.500", bits)
 	}

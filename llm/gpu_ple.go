@@ -77,6 +77,13 @@ var pleQ4Variants = []pleVariant{
 	{PLEKVM8, shaders.LLMGEMMQ4M8, 128},
 }
 
+// pleQ5Variants is P3a's fifth bit on the same three rungs.
+var pleQ5Variants = []pleVariant{
+	{PLEKVM2, shaders.LLMGEMMQ5M2, 32},
+	{PLEKVM4, shaders.LLMGEMMQ5M4, 64},
+	{PLEKVM8, shaders.LLMGEMMQ5M8, 128},
+}
+
 // pleBuildsFor is the table the block builds its bank pipelines from.
 func pleBuildsFor(b DenseBank) []pleVariant {
 	switch b {
@@ -84,6 +91,8 @@ func pleBuildsFor(b DenseBank) []pleVariant {
 		return pleQ8Variants
 	case BankQ4K:
 		return pleQ4Variants
+	case BankQ5K:
+		return pleQ5Variants
 	}
 	return pleVariants
 }
@@ -210,8 +219,8 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
-	if opts.Bank == BankQ4K && opts.Sim.Off() {
-		return nil, fmt.Errorf("llm: a q4_k ple bank needs a format to quantise to")
+	if _, ok := qkBank(opts.Bank); ok && opts.Sim.Off() {
+		return nil, fmt.Errorf("llm: a %s ple bank needs a format to quantise to", opts.Bank)
 	}
 	g := &PLEGPU{
 		dev: dev, cfg: cfg,
@@ -302,11 +311,12 @@ func (g *PLEGPU) alloc() error {
 	switch g.bank {
 	case BankQ8:
 		bankBytes = q8Align(q8Bytes(g.kvN(), c.NEmbd))
-	case BankQ4K:
-		if err := q4kFits(g.kvN(), c.NEmbd); err != nil {
+	case BankQ4K, BankQ5K:
+		bits, _ := qkBank(g.bank)
+		if err := qkFits(g.kvN(), c.NEmbd); err != nil {
 			return err
 		}
-		bankBytes = q8Align(q4kBytes(g.kvN(), c.NEmbd))
+		bankBytes = q8Align(qkBytes(bits, g.kvN(), c.NEmbd))
 	}
 	if g.wbank, err = g.dev.NewBuffer(bankBytes); err != nil {
 		return fmt.Errorf("llm: PLE %s weight bank (%d MB): %w", g.bank, bankBytes>>20, err)
@@ -400,7 +410,7 @@ func (g *PLEGPU) stage(w PLEWeights) error {
 	// Key rows first, then value's: the gate kernel reads the value at column
 	// `wide` of the same row, which is what makes this one dispatch.
 	switch g.bank {
-	case BankQ4K:
+	case BankQ4K, BankQ5K:
 		return g.stageQ4K(w)
 	case BankQ8:
 		// The checkpoint's own width: both tensors ship as Q8_0, so this is
@@ -429,8 +439,8 @@ func (g *PLEGPU) stage(w PLEWeights) error {
 func (g *PLEGPU) stageQ4K(w PLEWeights) error {
 	c := g.cfg
 	wide := c.Wide()
-	q4 := make([]byte, g.kvN()*c.NEmbd/2)
-	rec := make([]byte, q4kRecPlane(g.kvN(), c.NEmbd))
+	bits, _ := qkBank(g.bank)
+	kv := newQKStage(bits, g.kvN(), c.NEmbd)
 	for _, t := range []struct {
 		name string
 		src  []float32
@@ -446,13 +456,12 @@ func (g *PLEGPU) stageQ4K(w PLEWeights) error {
 			return err
 		}
 		base := t.base
-		if err := tileBQ4K(q4, rec, t.src, t.n, c.NEmbd,
+		if err := kv.Fill(t.src, t.n, c.NEmbd,
 			func(r int) int { return base + r }, q, qw); err != nil {
 			return fmt.Errorf("llm: %s: %w", name, err)
 		}
 	}
-	g.wbank.WriteBytesAt(0, q4)
-	g.wbank.WriteBytesAt(len(q4), rec)
+	kv.WriteTo(g.wbank, 0)
 	return nil
 }
 

@@ -513,8 +513,19 @@ func TestPLEGPUQ8IsTheHalves(t *testing.T) {
 //
 // It is `rtn` rather than `imatrix` so the test needs nothing but the
 // checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
-// TestBankQ4KIsTheSim covers that at the encoder.
+// TestBankQKIsTheSim covers that at the encoder.
+//
+// Both widths, since P3a: `ple_proj` at `q5_k` is the steepest slope on the
+// board (47.8 pp/GB) for the smallest prize (0.196 points), so it rides along
+// free with whatever plane the kernel gains and never justifies its own work
+// — but it has to be *correct* on it.
 func TestPLEGPUQ4IsTheSim(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { pleBankIsTheSim(t, spec) })
+	}
+}
+
+func pleBankIsTheSim(t *testing.T, spec string) {
 	m, tr, c, ids := pleFixtures(t)
 	nTok := len(ids)
 	w, err := m.PLEWeights(c.Layers[0])
@@ -529,11 +540,15 @@ func TestPLEGPUQ4IsTheSim(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dev, done := newTestDevice(t)
 	defer done()
 
@@ -550,7 +565,7 @@ func TestPLEGPUQ4IsTheSim(t *testing.T) {
 	}
 	simKey, simVal, simRes, simBytes := pleBankRun(t, dev, c, nTok, simW, PLEOpts{}, in.Vals, embd.Vals)
 	q4Key, q4Val, q4Res, q4Bytes := pleBankRun(t, dev, c, nTok, w,
-		PLEOpts{Bank: BankQ4K, Sim: sim, Layer: c.Layers[0]}, in.Vals, embd.Vals)
+		PLEOpts{Bank: bank, Sim: sim, Layer: c.Layers[0]}, in.Vals, embd.Vals)
 	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
 		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
 	if q4Bytes >= simBytes {

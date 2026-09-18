@@ -341,8 +341,8 @@ func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
-	if bank == BankQ4K && sim.Off() {
-		return nil, fmt.Errorf("llm: a q4_k deltanet bank needs a format to quantise to")
+	if _, ok := qkBank(bank); ok && sim.Off() {
+		return nil, fmt.Errorf("llm: a %s deltanet bank needs a format to quantise to", bank)
 	}
 	g := &DeltaNetGPU{
 		dev: dev, cfg: cfg, bank: bank, sim: sim,
@@ -458,14 +458,15 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	qkvBank, outBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.Inner*2
 	unit := 2
 	if g.quant() {
-		if g.bank == BankQ4K {
-			if err := q4kFits(g.qkvN(), c.NEmbd); err != nil {
+		if bits, ok := qkBank(g.bank); ok {
+			if err := qkFits(g.qkvN(), c.NEmbd); err != nil {
 				return err
 			}
-			if err := q4kFits(c.NEmbd, c.Inner); err != nil {
+			if err := qkFits(c.NEmbd, c.Inner); err != nil {
 				return err
 			}
-			qkvBank, outBank = q8Align(q4kBytes(g.qkvN(), c.NEmbd)), q8Align(q4kBytes(c.NEmbd, c.Inner))
+			qkvBank = q8Align(qkBytes(bits, g.qkvN(), c.NEmbd))
+			outBank = q8Align(qkBytes(bits, c.NEmbd, c.Inner))
 		} else {
 			qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.Inner))
 		}
@@ -619,7 +620,7 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 		}
 
 		baseZ, baseA, baseB := g.colZ(), g.colAlpha(), g.colBeta()
-		if g.bank == BankQ4K {
+		if _, ok := qkBank(g.bank); ok {
 			// L8c-5's bank, with the fp16 tail gone (D13's payoff, P2):
 			// alpha and beta go on the plane at the family's width, which is
 			// what the simulation behind L8c-3's uniform number always did —
@@ -632,9 +633,8 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 			// so a bank that calibrated the fused thing with one row would
 			// not be the format that was measured, however little the two
 			// rows differ.
-			nsbQKV := c.NEmbd / (q4kSuper * 32)
-			q4 := make([]byte, g.qkvN()*c.NEmbd/2)
-			rec := make([]byte, g.qkvN()/coopMatTile*nsbQKV*coopMatTile*q4kRecord)
+			bits, _ := qkBank(g.bank)
+			qkv := newQKStage(bits, g.qkvN(), c.NEmbd)
 			for _, t := range []struct {
 				name string
 				src  []float32
@@ -652,28 +652,24 @@ func (g *DeltaNetGPU) stage(layers []DeltaNetWeights) error {
 					return err
 				}
 				base := t.base
-				if err := tileBQ4K(q4, rec, t.src, t.n, c.NEmbd,
+				if err := qkv.Fill(t.src, t.n, c.NEmbd,
 					func(r int) int { return base + r }, q, qw); err != nil {
 					return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
 				}
 			}
-			g.wbank.WriteBytesAt(int(g.layers[i].qkv), q4)
-			g.wbank.WriteBytesAt(int(g.layers[i].qkv)+len(q4), rec)
+			qkv.WriteTo(g.wbank, int(g.layers[i].qkv))
 
 			name := fmt.Sprintf("blk.%d.ssm_out.weight", g.imLayer[i])
 			q, qw, err := bankImatrix(name, g.sim)
 			if err != nil {
 				return err
 			}
-			nsbOut := c.Inner / (q4kSuper * 32)
-			oq := make([]byte, c.NEmbd*c.Inner/2)
-			orec := make([]byte, c.NEmbd/coopMatTile*nsbOut*coopMatTile*q4kRecord)
-			if err := tileBQ4K(oq, orec, w.Out, c.NEmbd, c.Inner,
+			out := newQKStage(bits, c.NEmbd, c.Inner)
+			if err := out.Fill(w.Out, c.NEmbd, c.Inner,
 				func(r int) int { return r }, q, qw); err != nil {
 				return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
 			}
-			g.wbank.WriteBytesAt(int(g.layers[i].out), oq)
-			g.wbank.WriteBytesAt(int(g.layers[i].out)+len(oq), orec)
+			out.WriteTo(g.wbank, int(g.layers[i].out))
 			continue
 		}
 		if g.quant() {

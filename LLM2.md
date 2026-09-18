@@ -8,7 +8,10 @@
 
 - **Decode 35.89 tok/s** against llama.cpp's 25.15 — **1.43x**, measured
   the day P2 landed (27.87 ms a step; same-hour ladder 28.40 → 28.34 →
-  27.87) — at a streamed bank of ~4.15 GB a token after P2. P1 attributed
+  27.87) — at a streamed bank of ~4.15 GB a token after P2. **On D19's
+  widths it is 34.57, 1.37x**, measured against a same-hour D18 control at
+  35.70: the fifth bit's 0.237 GB a token is the price of taking the
+  quantisation damage from +3.87% to +1.63%. P1 attributed
   the step to the dispatch and took the n-gram gather's sixteen serialised
   page faults out of it; P1a fused the hyper-connection boundary, 1501
   dispatches a pass to 1407; P1c put the step in one pre-recorded command
@@ -20,16 +23,18 @@
   668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
   is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
   MALL in between.
-- **Perplexity 4.1850 against our 4.0289 — +3.87%** since P3 set **D18**:
-  the uniform 4.5-bit plan with `ple_proj` back on int8, 0.0165 GB a token
-  for 0.367 points and a decode cost below the instrument's floor. The
-  uniform plan it replaces is 4.2010, +4.27%. **On a second corpus (Go
-  stdlib) the same plans rank identically at 2.5x smaller magnitudes** —
-  +1.34% and +1.67% — so the wikitext figure is the pessimistic end.
-  Additivity now leaks **both ways** and both leaks are the n-gram block, so
-  a plan is measured and never composed.
+- **Perplexity 4.0948 against our 4.0289 — +1.63%** since P3a built the
+  fifth bit and set **D19**: D18's plan (uniform 4.5-bit with `ple_proj` on
+  int8, 4.1850, +3.87%) plus ggml's `qh` plane on `full_attn`, `qsa_indexer`,
+  `lm_head` and `hyper_conn` — **38% of D18's accuracy cost for 1.13 tok/s**,
+  35.70 → 34.57 over two interleaved passes. `deltanet`'s fifth bit is
+  refused at 1.6 pp/GB against the 4.6 D18 already declined. 4.518 GB a
+  token, a 53.6 tok/s ceiling. **On a second corpus (Go stdlib) the plans
+  rank identically at 2.5x smaller magnitudes**, so the wikitext figure is
+  the pessimistic end. Additivity leaks **both ways** and both leaks are the
+  n-gram block, so a plan is measured and never composed.
 - **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse —
-  and since P3 it stages **D18** by default (`llm.ShippedDenseBank`).
+  and since P3a it stages **D19** by default (`llm.ShippedDenseBank`).
 - ~~**One correctness cliff**~~: **closed at P0 (2026-09-18)**. It was
   amdgpu's gfx ring watchdog killing any submit that holds the ring past
   **2 s** — not rows, layers, bytes or residency. The recorder chunks by time
@@ -415,29 +420,60 @@ worth taking, while everything better needs a fifth bit.**
       multiple-choice set on this machine and fetching one was out of scope;
       the cross-corpus half is done. [Write-up](research/p3-widths.md)
 
-### P3a — the fifth bit: a `qh` plane for the dense bank  *(the accuracy item that is left)*
+### ~~P3a — the fifth bit: a `qh` plane for the dense bank~~  *(**done**, 2026-09-18 — and it is D19)*
 
-**P3 measured the case and it is the best remaining pp-per-GB on the board
-by 3x.** `full_attn` at `q5_k` is **14.1 pp/GB** where the best buildable
-int8 arm is 4.6, and a plan carrying it lands near **+2.5% at ~4.36 GB** —
-which no arrangement of widths the current kernel can stage reaches on both
-axes at once.
+**The plane is exact and three of the four families are worth it.** P3's
+estimates held to 6% on the three it simulated and were **1.75x optimistic on
+the one it inferred** — which is `deltanet`, the only one refused.
 
-- [ ] The format: ggml's `Q5_K` is `Q4_K` plus a `qh` bit-plane, so the
-      change is a third stream through the unpack and a tile that is no
-      longer one byte per two elements. `bank_q4.go`'s four-bit check
-      becomes a two-format branch; the record plane (6-bit scale and min
-      against one fp16 pair) is unchanged.
-- [ ] Order the families by measured return, and re-measure rather than
-      compose at each step: `full_attn` (14.1 pp/GB), `lm_head` (8.0),
-      `hyper_conn` (~5.6), `deltanet` (~2.8 and 0.26 GB — the one family
-      where a fifth bit is genuinely expensive). `ple_proj` at `q5_k` is the
-      steepest slope on the board (47.8) but the prize is 0.196 pp, so it
-      rides along free and never justifies its own work.
-- [ ] Gate: the bank equal to the simulation chunk for chunk at the new
-      width, a 145-chunk number for each family added, decode measured in
-      the whole model against a same-hour control (P1c), and D18 amended
-      rather than replaced.
+- [x] The format: ggml's `Q5_K` is `Q4_K` plus a `qh` bit-plane and **the
+      same record**, so nothing L8c-4 or L8c-6 built for the record moves.
+      The plane is one 32-byte tile per 128-byte nibble tile, in the same
+      order, and **byte i of it is the top bit of each of the eight levels in
+      word i of the nibble tile** — so the plane byte index *is* the nibble
+      word index, which every kernel already computes (`u` in the GEMM,
+      `col*2 + u` in the two GEMVs). The unpack gains a load and two bit
+      tests and no second addressing scheme; the plane sits *between* the
+      tiles and the records, so both derived bases survive and no push field
+      is needed. `-DQ5B` beside `-DQ4B`, 25 new `.spv`, and the four-bit arm
+      disassembles unchanged.
+- [x] `bank_q4.go:144`'s four-bit refusal is `qkBits` (4 or 5) and the
+      two-plane staging is `qkStage` — three planes, their order stated once
+      rather than at each of the six blocks. `BankQ5K` is a fourth
+      `DenseBank`, because the bank value is what names a pipeline and sizes
+      a buffer: staging one width and building another's SPIR-V would be a
+      wrong answer, not a slow one.
+- [x] Order the families by measured return, each a **complete plan** over
+      145 chunks on D18's basis. `full_attn` + `qsa_indexer` **14.9 pp/GB**
+      (4.1386, +2.72%), `lm_head` **7.8** (4.1136, +2.10%), `hyper_conn`
+      **5.9** (4.0948, +1.63%), `deltanet` **1.6** (4.0780, +1.22% — 0.260 GB
+      a token, five times any other family, for the smallest gain). D18
+      refused an arm at 4.6 pp/GB, so the line is already drawn and the first
+      three are above it.
+- [x] Gate: **0 of 145 chunks differ** between the bank and P3's simulation
+      of the same complete plan at `full_attn=q5_k` — 4.1560, equal in nll to
+      six decimals (`results/p3a_ppl_attn_q5k.csv` against
+      `p3_ppl_attn_q5k.csv`). Every block's bank-against-simulation test now
+      runs both widths and all five are identical on the GEMM path and one
+      rounding apart on the GEMV. Decode: five plans, two interleaved passes,
+      one binary, one hour — **35.70 / 35.49 / 35.11 / 34.57 / 33.13**,
+      within-arm spread 0.06-0.28. **D18 amended to D19**, `ple_proj`'s int8
+      row untouched. [Write-up](research/p3a-fifth-bit.md)
+- [ ] Carried forward, priced and not taken: **the GEMV rungs were not
+      re-screened at the new width.** D12 says a split's stride must miss the
+      4 KB rotation and that the rung moves when the weight's width does — a
+      q5 slab is 1.22x a q4 slab plus a second stream. Every rung measured
+      *correct*, and the decode numbers above are on the q4 bank's rungs, so
+      this is tok/s possibly left on the table rather than a risk.
+      `-attn -tokens 1 -gemm-ladder` with `-layers` high and `-iters 1`
+      (P1b's honest floors) is the run.
+- [ ] Also carried forward: **the fifth bit costs less decode than its bytes
+      predict** — 0.078 GB is −0.55 tok/s at P1's measured 178 GB/s and
+      measures −0.21; the whole ladder's 0.497 GB prices at −3.1 and measures
+      −2.57. The plane is a second sequential stream at a quarter of the
+      first's width out of the same loop, so it plausibly lands nearer the
+      227 GB/s a dispatch can reach. Written down; nothing on the list turns
+      on it.
 
 ### P4 — the last bytes: the router and the experts  *(+4.5 tok/s of ceiling)*
 
@@ -527,8 +563,8 @@ mis-costed: `ple_proj`, quoted at ~12 pp/GB from *halves* where every other
 family was quoted from int8, and worth ~35 on the consistent basis. Put back
 on int8 it is **0.367 points for 0.0165 GB and no measurable tok/s**, which
 is D18. **What the stage really bought is the case for P3a**: `full_attn` at
-`q5_k` is 14.1 pp/GB against the best buildable arm's 4.6, and the fifth bit
-is now the only accuracy work left with a measured return.
+`q5_k` is 14.1 pp/GB against the best buildable arm's 4.6 — and P3a built it
+and measured 14.9, so the case was right and slightly under-stated.
 
 Three instrument rules came out of it. **A plan is measured, never
 composed** — additivity leaks 0.22 pp sub- and ~0.15 pp super-additively and
@@ -538,9 +574,25 @@ difference of ~0.04. And **a perplexity delta names its corpus**: the same
 plans rank identically on code at 2.5x smaller magnitudes, so +3.87% is a
 wikitext figure.
 
-**The numbers to beat from here, each on its own day's control: 35.89 tok/s
-(27.87 ms a step, 1.43x llama.cpp's 25.15), perplexity 4.1850 (+3.87%) on
-4.281 GB a token with a 56.5 tok/s ceiling — and llama.cpp behind at every
-ubatch. The accuracy frontier now has one item on it (P3a, the `qh` plane,
-worth ~1.1 points at `full_attn` alone) and the throughput frontier has P4,
-P5 and P6.**
+**P3a built the plane and the accuracy frontier is now flat.** The fifth bit
+behaved: the bank is the simulation to six decimals of nll over all 145
+chunks, and P3's pre-kernel estimates landed within 6% on the three families
+`sim.go` actually simulated. The one that missed — `deltanet`, 1.6 pp/GB
+against an estimated ~2.8 — is the one P3 marked *inferred*, which is P3's
+own rule ("a plan is measured, never composed") coming back one level up: an
+estimate that was never simulated is a composition wearing a number.
+
+The cut needed no new judgement. D18 had already refused a trade at 4.6
+pp/GB and taken one at 22; the fifth bit offers 14.9, 7.8, 5.9 and 1.6, so
+**D19 is D18's own line applied unmoved** — three families in, `deltanet`
+out. What is left on the frontier is a sixth bit, which nobody expects to
+rank differently, and the one item P3 carried forward: **the downstream task
+eval**, now more valuable than it was, because a plan at +1.63% of wikitext
+perplexity may be close enough to the unquantised model that perplexity no
+longer separates the arms at all.
+
+**The numbers to beat from here, each on its own day's control: 34.57 tok/s
+on D19's widths (1.37x llama.cpp's 25.15, against a same-hour D18 control at
+35.70), perplexity 4.0948 (+1.63%) on 4.518 GB a token with a 53.6 tok/s
+ceiling — and llama.cpp behind at every ubatch. The accuracy frontier is
+closed; the throughput frontier has P4, P5 and P6.**

@@ -148,14 +148,16 @@ const (
 // mode 2 is the split-K GEMV, which has no tile at all: `slabs` is how many
 // ways it cuts K and `reduce` the second dispatch's SPIR-V, because the pair
 // is compiled from one slab count and only makes sense together.
-// q8 is the same build over L8's dense bank, where one exists. The reduction
-// of a GEMV pair has none: it reads partial sums and touches no weight, so
-// the fp16 SPIR-V serves both banks.
+// q8 is the same build over L8's dense bank, where one exists, and q4/q5 the
+// two K-quant widths — P3a's fifth bit is a third build of the same source
+// and not a third kernel. The reduction of a GEMV pair has none: it reads
+// partial sums and touches no weight, so the fp16 SPIR-V serves every bank.
 type hcVariant struct {
 	name   HCKernel
 	spirv  []byte
 	q8     []byte
 	q4     []byte
+	q5     []byte
 	mode   int
 	bm, bn int
 	reduce []byte
@@ -169,30 +171,32 @@ func (v hcVariant) spirvFor(b DenseBank) []byte {
 		return v.q8
 	case BankQ4K:
 		return v.q4
+	case BankQ5K:
+		return v.q5
 	}
 	return v.spirv
 }
 
 var hcVariants = []hcVariant{
-	{name: HCDownM1, spirv: shaders.LLMHCDownM1, q8: shaders.LLMHCDownQ8M1, q4: shaders.LLMHCDownQ4M1, mode: 0, bm: 16, bn: 48},
-	{name: HCDownM2, spirv: shaders.LLMHCDownM2, q8: shaders.LLMHCDownQ8M2, q4: shaders.LLMHCDownQ4M2, mode: 0, bm: 32, bn: 48},
-	{name: HCDownM4, spirv: shaders.LLMHCDownM4, q8: shaders.LLMHCDownQ8M4, q4: shaders.LLMHCDownQ4M4, mode: 0, bm: 64, bn: 48},
-	{name: HCDownM8, spirv: shaders.LLMHCDownM8, q8: shaders.LLMHCDownQ8M8, q4: shaders.LLMHCDownQ4M8, mode: 0, bm: 128, bn: 48},
-	{name: HCUpM1, spirv: shaders.LLMHCUpM1, q8: shaders.LLMHCUpQ8M1, q4: shaders.LLMHCUpQ4M1, mode: 1, bm: 16, bn: 64},
-	{name: HCUpM2, spirv: shaders.LLMHCUpM2, q8: shaders.LLMHCUpQ8M2, q4: shaders.LLMHCUpQ4M2, mode: 1, bm: 32, bn: 64},
-	{name: HCUpM4, spirv: shaders.LLMHCUpM4, q8: shaders.LLMHCUpQ8M4, q4: shaders.LLMHCUpQ4M4, mode: 1, bm: 64, bn: 64},
-	{name: HCUpM8, spirv: shaders.LLMHCUpM8, q8: shaders.LLMHCUpQ8M8, q4: shaders.LLMHCUpQ4M8, mode: 1, bm: 128, bn: 64},
-	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, q8: shaders.LLMHCGemvQ8S8, q4: shaders.LLMHCGemvQ4S8,
+	{name: HCDownM1, spirv: shaders.LLMHCDownM1, q8: shaders.LLMHCDownQ8M1, q4: shaders.LLMHCDownQ4M1, q5: shaders.LLMHCDownQ5M1, mode: 0, bm: 16, bn: 48},
+	{name: HCDownM2, spirv: shaders.LLMHCDownM2, q8: shaders.LLMHCDownQ8M2, q4: shaders.LLMHCDownQ4M2, q5: shaders.LLMHCDownQ5M2, mode: 0, bm: 32, bn: 48},
+	{name: HCDownM4, spirv: shaders.LLMHCDownM4, q8: shaders.LLMHCDownQ8M4, q4: shaders.LLMHCDownQ4M4, q5: shaders.LLMHCDownQ5M4, mode: 0, bm: 64, bn: 48},
+	{name: HCDownM8, spirv: shaders.LLMHCDownM8, q8: shaders.LLMHCDownQ8M8, q4: shaders.LLMHCDownQ4M8, q5: shaders.LLMHCDownQ5M8, mode: 0, bm: 128, bn: 48},
+	{name: HCUpM1, spirv: shaders.LLMHCUpM1, q8: shaders.LLMHCUpQ8M1, q4: shaders.LLMHCUpQ4M1, q5: shaders.LLMHCUpQ5M1, mode: 1, bm: 16, bn: 64},
+	{name: HCUpM2, spirv: shaders.LLMHCUpM2, q8: shaders.LLMHCUpQ8M2, q4: shaders.LLMHCUpQ4M2, q5: shaders.LLMHCUpQ5M2, mode: 1, bm: 32, bn: 64},
+	{name: HCUpM4, spirv: shaders.LLMHCUpM4, q8: shaders.LLMHCUpQ8M4, q4: shaders.LLMHCUpQ4M4, q5: shaders.LLMHCUpQ5M4, mode: 1, bm: 64, bn: 64},
+	{name: HCUpM8, spirv: shaders.LLMHCUpM8, q8: shaders.LLMHCUpQ8M8, q4: shaders.LLMHCUpQ4M8, q5: shaders.LLMHCUpQ5M8, mode: 1, bm: 128, bn: 64},
+	{name: HCDownGemv8, spirv: shaders.LLMHCGemvS8, q8: shaders.LLMHCGemvQ8S8, q4: shaders.LLMHCGemvQ4S8, q5: shaders.LLMHCGemvQ5S8,
 		mode: 2, reduce: shaders.LLMHCGemvR8, slabs: 8},
-	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, q8: shaders.LLMHCGemvQ8S16, q4: shaders.LLMHCGemvQ4S16,
+	{name: HCDownGemv16, spirv: shaders.LLMHCGemvS16, q8: shaders.LLMHCGemvQ8S16, q4: shaders.LLMHCGemvQ4S16, q5: shaders.LLMHCGemvQ5S16,
 		mode: 2, reduce: shaders.LLMHCGemvR16, slabs: 16},
-	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, q8: shaders.LLMHCGemvQ8S32, q4: shaders.LLMHCGemvQ4S32,
+	{name: HCDownGemv32, spirv: shaders.LLMHCGemvS32, q8: shaders.LLMHCGemvQ8S32, q4: shaders.LLMHCGemvQ4S32, q5: shaders.LLMHCGemvQ5S32,
 		mode: 2, reduce: shaders.LLMHCGemvR32, slabs: 32},
-	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, q8: shaders.LLMHCGemvQ8S40, q4: shaders.LLMHCGemvQ4S40,
+	{name: HCDownGemv40, spirv: shaders.LLMHCGemvS40, q8: shaders.LLMHCGemvQ8S40, q4: shaders.LLMHCGemvQ4S40, q5: shaders.LLMHCGemvQ5S40,
 		mode: 2, reduce: shaders.LLMHCGemvR40, slabs: 40},
-	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, q8: shaders.LLMHCGemvQ8S80, q4: shaders.LLMHCGemvQ4S80,
+	{name: HCDownGemv80, spirv: shaders.LLMHCGemvS80, q8: shaders.LLMHCGemvQ8S80, q4: shaders.LLMHCGemvQ4S80, q5: shaders.LLMHCGemvQ5S80,
 		mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
-	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160, q4: shaders.LLMHCGemvQ4S160,
+	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160, q4: shaders.LLMHCGemvQ4S160, q5: shaders.LLMHCGemvQ5S160,
 		mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
 }
 
@@ -229,7 +233,7 @@ func DefaultPlan(q8 bool) (HCKernel, HCKernel) { return DefaultPlanBank(bankOf(q
 // L8c-6 needs.
 func DefaultPlanBank(b DenseBank) (HCKernel, HCKernel) {
 	switch b {
-	case BankQ8, BankQ4K:
+	case BankQ8, BankQ4K, BankQ5K:
 		return HCDownM2, HCUpM4
 	}
 	return HCDownM2, HCUpM2
@@ -302,7 +306,7 @@ func PlanFor(tokens int, q8 bool) (HCKernel, HCKernel) { return PlanForBank(toke
 // more of it. Whether that survives into the graph is a different question
 // and `-graph` answers it.
 func PlanForBank(tokens int, b DenseBank) (HCKernel, HCKernel) {
-	if b == BankQ4K {
+	if _, ok := qkBank(b); ok {
 		switch {
 		case tokens == 1:
 			return hcQ4DecodePlan()
@@ -491,8 +495,8 @@ type HCOpts struct {
 // bank is that choice resolved: the plan's if it names this family, and the
 // two-valued one otherwise.
 func (o HCOpts) bank() DenseBank {
-	if o.Bank == BankQ4K {
-		return BankQ4K
+	if _, ok := qkBank(o.Bank); ok {
+		return o.Bank
 	}
 	return bankOf(o.Q8)
 }
@@ -504,7 +508,11 @@ func (o HCOpts) bank() DenseBank {
 func HCBankOpts() HCOpts {
 	o := HCOpts{Q8: DenseQ8()}
 	if q, ok := DenseBankPlan().For("blk.0.hc_attn_down.weight", true); ok {
-		o.Bank, o.Sim = BankQ4K, q
+		b, err := bankOfSim(q)
+		if err != nil {
+			panic(err)
+		}
+		o.Bank, o.Sim = b, q
 	}
 	return o
 }
@@ -547,16 +555,16 @@ func NewHCGPU(dev *vk.Device, cfg HCConfig, maxTokens int, mixers []HCWeights, o
 		ldaLo:    cfg.LowRank + gemmPad,
 	}
 	g.q8 = g.dbank != BankFP16
-	if g.dbank == BankQ4K {
+	if _, ok := qkBank(g.dbank); ok {
 		if opts.Sim.Off() {
-			return nil, fmt.Errorf("llm: the 4.5-bit bank needs the format to stage in")
+			return nil, fmt.Errorf("llm: the %s bank needs the format to stage in", g.dbank)
 		}
-		if err := q4kFits(g.gemmN(), cfg.Wide()); err != nil {
+		if err := qkFits(g.gemmN(), cfg.Wide()); err != nil {
 			return nil, fmt.Errorf("llm: hc down projection: %w", err)
 		}
 		// The up projection is the 320-wide one, and the whole reason this
 		// bank needed a second record packing (L8c-6).
-		if err := q4kFits(cfg.Wide(), cfg.LowRank); err != nil {
+		if err := qkFits(cfg.Wide(), cfg.LowRank); err != nil {
 			return nil, fmt.Errorf("llm: hc up projection: %w", err)
 		}
 		sub, _, _, err := q4kShape(cfg.LowRank)
@@ -666,9 +674,9 @@ func (g *HCGPU) alloc(nMixers int) error {
 	downBank, upBank := g.gemmN()*c.Wide()*2, c.Wide()*c.LowRank*2
 	unit := 2
 	if g.q8 {
-		if g.dbank == BankQ4K {
-			downBank = q8Align(q4kBytes(g.gemmN(), c.Wide()))
-			upBank = q8Align(q4kBytes(c.Wide(), c.LowRank))
+		if bits, ok := qkBank(g.dbank); ok {
+			downBank = q8Align(qkBytes(bits, g.gemmN(), c.Wide()))
+			upBank = q8Align(qkBytes(bits, c.Wide(), c.LowRank))
 		} else {
 			downBank = q8Align(q8Bytes(g.gemmN(), c.Wide()))
 			upBank = q8Align(q8Bytes(c.Wide(), c.LowRank))
@@ -801,7 +809,7 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		}
 		g.wbuf.WriteFloat32At(int(g.mixers[i].gamma), w.Norm)
 
-		if g.dbank == BankQ4K {
+		if _, ok := qkBank(g.dbank); ok {
 			if err := g.stageQ4(i, w); err != nil {
 				return err
 			}
@@ -932,13 +940,13 @@ func (g *HCGPU) stageQ4(i int, w HCWeights) error {
 	c := g.cfg
 	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
 
+	bits, _ := qkBank(g.dbank)
 	q, qw, err := g.hcImatrix(i, "down.weight")
 	if err != nil {
 		return err
 	}
-	dq := make([]byte, n*wide/2)
-	drec := make([]byte, q4kRecPlane(n, wide))
-	if err := tileBQ4K(dq, drec, w.Down, lr, wide, func(r int) int { return r }, q, qw); err != nil {
+	down := newQKStage(bits, n, wide)
+	if err := down.Fill(w.Down, lr, wide, func(r int) int { return r }, q, qw); err != nil {
 		return fmt.Errorf("llm: mixer %d %sdown.weight: %w", i, g.names[i], err)
 	}
 	if w.Inject != nil {
@@ -946,12 +954,11 @@ func (g *HCGPU) stageQ4(i int, w HCWeights) error {
 		if err != nil {
 			return err
 		}
-		if err := tileBQ4K(dq, drec, w.Inject, c.HC, wide, func(r int) int { return lr + r }, iq, iqw); err != nil {
+		if err := down.Fill(w.Inject, c.HC, wide, func(r int) int { return lr + r }, iq, iqw); err != nil {
 			return fmt.Errorf("llm: mixer %d %sinject.weight: %w", i, g.names[i], err)
 		}
 	}
-	g.bank.WriteBytesAt(int(g.mixers[i].down), dq)
-	g.bank.WriteBytesAt(int(g.mixers[i].down)+len(dq), drec)
+	down.WriteTo(g.bank, int(g.mixers[i].down))
 
 	if q, qw, err = g.hcImatrix(i, "up.weight"); err != nil {
 		return err
@@ -960,13 +967,11 @@ func (g *HCGPU) stageQ4(i int, w HCWeights) error {
 	if g.ctl.UnpermutedUp {
 		row = func(o int) int { return o }
 	}
-	uq := make([]byte, wide*lr/2)
-	urec := make([]byte, q4kRecPlane(wide, lr))
-	if err := tileBQ4K(uq, urec, w.Up, wide, lr, row, q, qw); err != nil {
+	up := newQKStage(bits, wide, lr)
+	if err := up.Fill(w.Up, wide, lr, row, q, qw); err != nil {
 		return fmt.Errorf("llm: mixer %d %sup.weight: %w", i, g.names[i], err)
 	}
-	g.bank.WriteBytesAt(int(g.mixers[i].up), uq)
-	g.bank.WriteBytesAt(int(g.mixers[i].up)+len(uq), urec)
+	up.WriteTo(g.bank, int(g.mixers[i].up))
 	return nil
 }
 

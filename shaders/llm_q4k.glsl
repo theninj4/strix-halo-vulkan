@@ -51,3 +51,30 @@ void q4kScaleMin12(uint j, uvec4 s, out uint sc, out uint mn) {
     sc = v & 63u;
     mn = (v >> 6) & 63u;
 }
+
+// **P3a's fifth bit.** `-DQ5B` (always beside `-DQ4B`) adds ggml's `qh` to
+// the bank: the record above does not move — ggml's own Q5_K carries Q4_K's
+// record — and neither does the nibble tiling. What is added is one plane of
+// one bit a weight, sitting **between** the tiles and the records, so both
+// following bases stay derivable from `gemmN * gemmK` and neither needs a
+// push field (64 uints is this device's whole push range, full since L5b).
+//
+// The plane is one 32-byte tile per 128-byte nibble tile, in the same order,
+// and **byte i of it is the top bit of each of the eight levels in word i of
+// the nibble tile**, bit e for the level at k offset e inside that word. So
+// the plane byte index *is* the nibble word index, and every kernel reads it
+// with the address arithmetic it already had: `QK_HIGH_BYTE` takes that word
+// index and the plane's word base and returns the eight bits.
+#ifdef Q5B
+#define QK_HIGH_BYTES(NK) ((NK) >> 3)
+#define QK_HIGH_BYTE(H0, WI) ((w8[(H0) + ((WI) >> 2)] >> (((WI) & 3u) * 8u)) & 0xFFu)
+// The level of the nibble pair in byte `t` of a word: the low nibble carries
+// bit 2t of the plane byte and the high one bit 2t+1.
+#define QK_LEVEL_LO(BY, HB, T) (((BY) & 0xFu) | ((((HB) >> ((T) * 2u)) & 1u) << 4))
+#define QK_LEVEL_HI(BY, HB, T) (((BY) >> 4) | ((((HB) >> ((T) * 2u + 1u)) & 1u) << 4))
+#else
+#define QK_HIGH_BYTES(NK) 0u
+#define QK_HIGH_BYTE(H0, WI) 0u
+#define QK_LEVEL_LO(BY, HB, T) ((BY) & 0xFu)
+#define QK_LEVEL_HI(BY, HB, T) ((BY) >> 4)
+#endif

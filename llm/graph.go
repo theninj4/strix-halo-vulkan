@@ -528,7 +528,11 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		// too.
 		pleOpts := PLEOpts{Bank: bankOf(opts.denseQ8()), Layer: pleCfg.Layers[0]}
 		if q, ok := DenseBankPlan().For(fmt.Sprintf("blk.%d.ple_key.weight", pleCfg.Layers[0]), true); ok {
-			pleOpts.Bank, pleOpts.Sim = BankQ4K, q
+			b, err := bankOfSim(q)
+			if err != nil {
+				return err
+			}
+			pleOpts.Bank, pleOpts.Sim = b, q
 		}
 		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, pleOpts); err != nil {
 			return fmt.Errorf("llm: ple: %w", err)
@@ -567,7 +571,11 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		// matrices stay in the fp16 tail whatever this is (D13).
 		dnBank, dnSim := bankOf(opts.denseQ8()), QuantSim{}
 		if q, ok := DenseBankPlan().For("blk.0.attn_qkv.weight", true); ok {
-			dnBank, dnSim = BankQ4K, q
+			b, err := bankOfSim(q)
+			if err != nil {
+				return err
+			}
+			dnBank, dnSim = b, q
 		}
 		if g.dn, err = NewDeltaNetGPUBank(dev, dnCfg, g.maxTok, dns, dnBank, dnSim); err != nil {
 			return fmt.Errorf("llm: deltanet: %w", err)
@@ -605,10 +613,14 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		// averaged: they are one fused matrix.
 		atBank, atSim := bankOf(opts.denseQ8()), QuantSim{}
 		if q, ok := DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
-			atBank, atSim = BankQ4K, q
+			b, err := bankOfSim(q)
+			if err != nil {
+				return err
+			}
+			atBank, atSim = b, q
 		}
 		if q, ok := DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
-			if atBank != BankQ4K {
+			if _, isQK := qkBank(atBank); !isQK {
 				return fmt.Errorf("llm: qsa_indexer is staged in the fused projection's plane, so it needs full_attn on the same bank")
 			}
 			if q != atSim {
@@ -645,7 +657,11 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		// plan ever grew one.
 		bank, sim := bankOf(opts.denseQ8()), QuantSim{}
 		if q, ok := DenseBankPlan().For(t.Name, true); ok {
-			bank, sim = BankQ4K, q
+			b, err := bankOfSim(q)
+			if err != nil {
+				return err
+			}
+			bank, sim = b, q
 		}
 		if g.head, err = NewHeadGPUBank(dev, c.NEmbd, t, headRows, bank, sim); err != nil {
 			return fmt.Errorf("llm: head: %w", err)

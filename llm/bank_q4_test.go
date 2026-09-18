@@ -1,6 +1,7 @@
 package llm
 
-// The 4.5-bit dense bank against the simulation that chose it: LLM.md L8c-4.
+// The K-quant dense bank against the simulation that chose it: LLM.md L8c-4,
+// and P3a's fifth bit on the same gate.
 
 import (
 	"math/rand"
@@ -18,7 +19,7 @@ func mustQ4K(t *testing.T, spec, mode string) QuantSim {
 	return q
 }
 
-// TestBankQ4KIsTheSim is the stage's first gate, and it is an equality.
+// TestBankQKIsTheSim is the stage's first gate, and it is an equality.
 //
 // L8c-3's number is a perplexity measured through `sim.go`, which round-trips
 // a weight to floats and lets the fp16 kernels multiply them. This bank is
@@ -26,25 +27,37 @@ func mustQ4K(t *testing.T, spec, mode string) QuantSim {
 // the value the simulation staged — not close to it. Both go through
 // `asymEnc`, so the test is really that the packing and the addressing are
 // each other's inverse, which is exactly the thing a tolerance would hide.
-func TestBankQ4KIsTheSim(t *testing.T) {
+func TestBankQKIsTheSim(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	for _, tc := range []struct {
 		name    string
 		n, k    int
 		spec    string
 		mode    string
+		bits    float64
 		weights bool
 	}{
-		{"q4_k rtn 64x2560", 64, 2560, "q4_k/32", "rtn", false},
-		{"q4_k imatrix 64x2560", 64, 2560, "q4_k/32", "imatrix", true},
-		{"q4_k rtn 32x6144", 32, 6144, "q4_k/32", "rtn", false},
-		{"q4_k search 32x256", 32, 256, "q4_k/32", "search", false},
+		{"q4_k rtn 64x2560", 64, 2560, "q4_k/32", "rtn", 4.5, false},
+		{"q4_k imatrix 64x2560", 64, 2560, "q4_k/32", "imatrix", 4.5, true},
+		{"q4_k rtn 32x6144", 32, 6144, "q4_k/32", "rtn", 4.5, false},
+		{"q4_k search 32x256", 32, 256, "q4_k/32", "search", 4.5, false},
 		// L8c-6's family: 320 is ten groups of 32 and one super-block for
 		// the whole row, so the record is `packScaleMin12`'s twenty bytes
 		// and not ggml's sixteen. Both arms, because the calibrated one is
 		// the arm a bank is built at.
-		{"q4_k rtn 64x320", 64, 320, "q4_k/32", "rtn", false},
-		{"q4_k imatrix 64x320", 64, 320, "q4_k/32", "imatrix", true},
+		{"q4_k rtn 64x320", 64, 320, "q4_k/32", "rtn", 4.5, false},
+		{"q4_k imatrix 64x320", 64, 320, "q4_k/32", "imatrix", 4.5, true},
+		// **P3a's fifth bit**, the same rows again. The record does not move
+		// — ggml's Q5_K carries Q4_K's — so what this exercises that the
+		// four-bit rows do not is the `qh` plane's addressing: one bit a
+		// weight at bit (k%8) of the byte whose index is the *nibble word's*
+		// index inside its tile, which is the one place the two widths differ.
+		{"q5_k rtn 64x2560", 64, 2560, "q5_k/32", "rtn", 5.5, false},
+		{"q5_k imatrix 64x2560", 64, 2560, "q5_k/32", "imatrix", 5.5, true},
+		{"q5_k rtn 32x6144", 32, 6144, "q5_k/32", "rtn", 5.5, false},
+		{"q5_k search 32x256", 32, 256, "q5_k/32", "search", 5.5, false},
+		{"q5_k rtn 64x320", 64, 320, "q5_k/32", "rtn", 5.5, false},
+		{"q5_k imatrix 64x320", 64, 320, "q5_k/32", "imatrix", 5.5, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			q := mustQ4K(t, tc.spec, tc.mode)
@@ -65,30 +78,33 @@ func TestBankQ4KIsTheSim(t *testing.T) {
 				t.Fatal(err)
 			}
 			// The bank's: the same format, stored and read back.
-			bq := make([]byte, tc.n*tc.k/2)
-			br := make([]byte, q4kRecPlane(tc.n, tc.k))
+			bits, err := qkBits(q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			st := newQKStage(bits, tc.n, tc.k)
 			// A row remapping, so the addressing is exercised rather than
 			// assumed to be the identity.
 			perm := make([]int, tc.n)
 			for i := range perm {
 				perm[i] = tc.n - coopMatTile - (i/coopMatTile)*coopMatTile + i%coopMatTile
 			}
-			if err := tileBQ4K(bq, br, x, tc.n, tc.k, func(i int) int { return perm[i] }, q, qw); err != nil {
+			if err := st.Fill(x, tc.n, tc.k, func(i int) int { return perm[i] }, q, qw); err != nil {
 				t.Fatal(err)
 			}
-			if got := q4kBytes(tc.n, tc.k); got != len(bq)+len(br) {
-				t.Fatalf("q4kBytes says %d, the two planes are %d", got, len(bq)+len(br))
+			if got := qkBytes(bits, tc.n, tc.k); got != st.Len() {
+				t.Fatalf("qkBytes says %d, the planes are %d", got, st.Len())
 			}
 			// 4.500 bits at both super-block lengths: eight groups carry
 			// 4 + 12 = 16 bytes over 256 weights, ten carry 4 + 15 = 19
-			// rounded up to a word over 320.
-			if bits := float64(len(bq)+len(br)) * 8 / float64(tc.n*tc.k); bits != 4.5 {
-				t.Fatalf("%.4f bits a weight, want 4.5", bits)
+			// rounded up to a word over 320. The fifth bit is one more.
+			if bpw := float64(st.Len()) * 8 / float64(tc.n*tc.k); bpw != tc.bits {
+				t.Fatalf("%.4f bits a weight, want %.1f", bpw, tc.bits)
 			}
 			diff := 0
 			for i := 0; i < tc.n; i++ {
 				for c := 0; c < tc.k; c++ {
-					got := q4kDequant(bq, br, tc.n, tc.k, perm[i], c)
+					got := qkDequant(st.Lvl, st.High, st.Rec, bits, tc.n, tc.k, perm[i], c)
 					if got != want[i*tc.k+c] {
 						diff++
 					}

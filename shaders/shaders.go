@@ -1947,13 +1947,21 @@ var KokoroGELU []byte
 // the whole row, ten groups, and `-DQ4K_SUB=10` picks the twenty-byte record
 // and the twelve-bit decode `get_scale_min_k4` has no spelling for.
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_down_q5_m1.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_down_q5_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_down_q5_m4.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -DQ4B -DDENSE_Q4 -o llm_hc_down_q4_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=8 -DWN=3 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_down_q5_m8.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m1.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=1 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q5_m1.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=2 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q5_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=4 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q5_m4.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -DQ4B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q4_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DWM=8 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -DQ4K_SUB=10 -o llm_hc_up_q5_m8.spv llm_gemm.comp
 
 // The down projection again, at one token: LLM.md L7d. `llm_gemm.comp` blocks
 // the output columns, so a fused N of 336 is seven workgroups on a 40-CU
@@ -1997,11 +2005,17 @@ var KokoroGELU []byte
 // says the ladder slides one more rung along §5.1b's 4 KB rotation and the
 // rung to pick is measured rather than carried over.
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s8.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s8.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s16.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s16.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s32.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s32.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s40.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s40.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s80.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s80.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s160.spv llm_hc_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s160.spv llm_hc_gemv.comp
 
 // The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
 // a prefill graph — its key projection is one dispatch of the 37 that share
@@ -2045,8 +2059,11 @@ var KokoroGELU []byte
 // because a nibble bank and a byte bank are both "the dense bank as raw
 // words"; -DQ4B is the unpack.
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -DQ4B -DDENSE_Q4 -o llm_gemm_q4_m2.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=2 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemm_q5_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -DQ4B -DDENSE_Q4 -o llm_gemm_q4_m4.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=4 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemm_q5_m4.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -DQ4B -DDENSE_Q4 -o llm_gemm_q4_m8.spv llm_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -DWM=8 -DWN=4 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemm_q5_m8.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_gate.spv llm_ple_gate.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_ple_conv.spv llm_ple_conv.comp
 
@@ -2118,26 +2135,50 @@ var LLMHCUpQ8M8 []byte
 //go:embed llm_hc_down_q4_m1.spv
 var LLMHCDownQ4M1 []byte
 
+//go:embed llm_hc_down_q5_m1.spv
+var LLMHCDownQ5M1 []byte
+
 //go:embed llm_hc_down_q4_m2.spv
 var LLMHCDownQ4M2 []byte
+
+//go:embed llm_hc_down_q5_m2.spv
+var LLMHCDownQ5M2 []byte
 
 //go:embed llm_hc_down_q4_m4.spv
 var LLMHCDownQ4M4 []byte
 
+//go:embed llm_hc_down_q5_m4.spv
+var LLMHCDownQ5M4 []byte
+
 //go:embed llm_hc_down_q4_m8.spv
 var LLMHCDownQ4M8 []byte
+
+//go:embed llm_hc_down_q5_m8.spv
+var LLMHCDownQ5M8 []byte
 
 //go:embed llm_hc_up_q4_m1.spv
 var LLMHCUpQ4M1 []byte
 
+//go:embed llm_hc_up_q5_m1.spv
+var LLMHCUpQ5M1 []byte
+
 //go:embed llm_hc_up_q4_m2.spv
 var LLMHCUpQ4M2 []byte
+
+//go:embed llm_hc_up_q5_m2.spv
+var LLMHCUpQ5M2 []byte
 
 //go:embed llm_hc_up_q4_m4.spv
 var LLMHCUpQ4M4 []byte
 
+//go:embed llm_hc_up_q5_m4.spv
+var LLMHCUpQ5M4 []byte
+
 //go:embed llm_hc_up_q4_m8.spv
 var LLMHCUpQ4M8 []byte
+
+//go:embed llm_hc_up_q5_m8.spv
+var LLMHCUpQ5M8 []byte
 
 // LLMHCGemvS* is the split-K down projection at one token and LLMHCGemvR* the
 // reduction and epilogue that closes it (L7d). They come in pairs: the slab
@@ -2205,20 +2246,38 @@ var LLMHCGemvQ8S160 []byte
 //go:embed llm_hc_gemv_q4_s8.spv
 var LLMHCGemvQ4S8 []byte
 
+//go:embed llm_hc_gemv_q5_s8.spv
+var LLMHCGemvQ5S8 []byte
+
 //go:embed llm_hc_gemv_q4_s16.spv
 var LLMHCGemvQ4S16 []byte
+
+//go:embed llm_hc_gemv_q5_s16.spv
+var LLMHCGemvQ5S16 []byte
 
 //go:embed llm_hc_gemv_q4_s32.spv
 var LLMHCGemvQ4S32 []byte
 
+//go:embed llm_hc_gemv_q5_s32.spv
+var LLMHCGemvQ5S32 []byte
+
 //go:embed llm_hc_gemv_q4_s40.spv
 var LLMHCGemvQ4S40 []byte
+
+//go:embed llm_hc_gemv_q5_s40.spv
+var LLMHCGemvQ5S40 []byte
 
 //go:embed llm_hc_gemv_q4_s80.spv
 var LLMHCGemvQ4S80 []byte
 
+//go:embed llm_hc_gemv_q5_s80.spv
+var LLMHCGemvQ5S80 []byte
+
 //go:embed llm_hc_gemv_q4_s160.spv
 var LLMHCGemvQ4S160 []byte
+
+//go:embed llm_hc_gemv_q5_s160.spv
+var LLMHCGemvQ5S160 []byte
 
 //go:embed llm_gemm_plain_m2.spv
 var LLMGEMMPlainM2 []byte
@@ -2241,11 +2300,20 @@ var LLMGEMMQ8M8 []byte
 //go:embed llm_gemm_q4_m2.spv
 var LLMGEMMQ4M2 []byte
 
+//go:embed llm_gemm_q5_m2.spv
+var LLMGEMMQ5M2 []byte
+
 //go:embed llm_gemm_q4_m4.spv
 var LLMGEMMQ4M4 []byte
 
+//go:embed llm_gemm_q5_m4.spv
+var LLMGEMMQ5M4 []byte
+
 //go:embed llm_gemm_q4_m8.spv
 var LLMGEMMQ4M8 []byte
+
+//go:embed llm_gemm_q5_m8.spv
+var LLMGEMMQ5M8 []byte
 
 // The **decode** projection: llm_gemv.comp, LLM.md L8d. llm_gemm.comp MODE 2
 // at one token is a sixteen-row fragment holding one row, an LDS slab per
@@ -2266,11 +2334,17 @@ var LLMGEMMQ4M8 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k16.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k32.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k1.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k2.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k4.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k8.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k16.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k32.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k32.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=2 -o llm_gemv_sum_k2.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=4 -o llm_gemv_sum_k4.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=8 -o llm_gemv_sum_k8.spv llm_gemv.comp
@@ -2316,20 +2390,38 @@ var LLMGEMVQ8K32 []byte
 //go:embed llm_gemv_q4_k1.spv
 var LLMGEMVQ4K1 []byte
 
+//go:embed llm_gemv_q5_k1.spv
+var LLMGEMVQ5K1 []byte
+
 //go:embed llm_gemv_q4_k2.spv
 var LLMGEMVQ4K2 []byte
+
+//go:embed llm_gemv_q5_k2.spv
+var LLMGEMVQ5K2 []byte
 
 //go:embed llm_gemv_q4_k4.spv
 var LLMGEMVQ4K4 []byte
 
+//go:embed llm_gemv_q5_k4.spv
+var LLMGEMVQ5K4 []byte
+
 //go:embed llm_gemv_q4_k8.spv
 var LLMGEMVQ4K8 []byte
+
+//go:embed llm_gemv_q5_k8.spv
+var LLMGEMVQ5K8 []byte
 
 //go:embed llm_gemv_q4_k16.spv
 var LLMGEMVQ4K16 []byte
 
+//go:embed llm_gemv_q5_k16.spv
+var LLMGEMVQ5K16 []byte
+
 //go:embed llm_gemv_q4_k32.spv
 var LLMGEMVQ4K32 []byte
+
+//go:embed llm_gemv_q5_k32.spv
+var LLMGEMVQ5K32 []byte
 
 //go:embed llm_gemv_sum_k2.spv
 var LLMGEMVSumK2 []byte
@@ -2349,10 +2441,12 @@ var LLMGEMVSumK32 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -o llm_gemv_k20.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k20.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k20.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=20 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k20.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=20 -o llm_gemv_sum_k20.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -o llm_gemv_k40.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ8B -DDENSE_Q8 -o llm_gemv_q8_k40.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ4B -DDENSE_Q4 -o llm_gemv_q4_k40.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=40 -DQ4B -DQ5B -DDENSE_Q4 -o llm_gemv_q5_k40.spv llm_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=40 -o llm_gemv_sum_k40.spv llm_gemv.comp
 
 //go:embed llm_gemv_k20.spv
@@ -2363,6 +2457,9 @@ var LLMGEMVQ8K20 []byte
 
 //go:embed llm_gemv_q4_k20.spv
 var LLMGEMVQ4K20 []byte
+
+//go:embed llm_gemv_q5_k20.spv
+var LLMGEMVQ5K20 []byte
 
 //go:embed llm_gemv_sum_k20.spv
 var LLMGEMVSumK20 []byte
@@ -2375,6 +2472,9 @@ var LLMGEMVQ8K40 []byte
 
 //go:embed llm_gemv_q4_k40.spv
 var LLMGEMVQ4K40 []byte
+
+//go:embed llm_gemv_q5_k40.spv
+var LLMGEMVQ5K40 []byte
 
 //go:embed llm_gemv_sum_k40.spv
 var LLMGEMVSumK40 []byte

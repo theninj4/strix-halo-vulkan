@@ -901,6 +901,72 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-18 — P3a: the fifth bit built, and D19
+
+**Result: ggml's `qh` plane is in the dense bank, it is exact, and three of
+the four candidate families are worth it — D19 is D18 plus `q5_k` on
+`full_attn`, `qsa_indexer`, `lm_head` and `hyper_conn`: 4.0948 +/- 0.02322
+(+1.63%) against D18's 4.1850 (+3.87%), 38% of the accuracy cost, for
+1.13 tok/s of measured decode (35.70 -> 34.57 over two interleaved passes on
+one binary within one hour). 4.518 GB a token, a 53.6 tok/s ceiling, 1.37x
+llama.cpp.** The format's one decision is where the bit-plane goes, and it is
+chosen so the plane costs no new addressing: **the plane is one 32-byte tile
+per 128-byte nibble tile, in the same order, and byte i of it is the top bit
+of each of the eight levels in word i of the nibble tile** — so the plane
+byte index *is* the nibble word index, which the GEMM already has as `u` and
+both GEMVs as `col*2 + u`. The record does not move at all (ggml's Q5_K
+carries Q4_K's), so L8c-6's ten-group packing for the 320-wide family came
+along untouched. The plane sits between the tiles and the records, keeping
+both bases derivable from `gemmN * gemmK` and needing no push field. Shipped
+as `-DQ5B` beside `-DQ4B` — 25 new `.spv`, four macros in `llm_q4k.glsl` —
+and **the four-bit arm's SPIR-V disassembles unchanged** (verified against
+builds of the HEAD sources; `llm_gemv_q4_k1` differs only in where one
+`OpIMul` is hoisted). On the host, `bank_q4.go:144`'s four-bit refusal became
+`qkBits` and the two-plane staging became `qkStage`, which states "the planes
+are contiguous, in this order" once instead of at six blocks; `BankQ5K` is a
+fourth `DenseBank`, because the bank value names a pipeline and sizes a
+buffer and staging one width while building another's SPIR-V would be a wrong
+answer rather than a slow one. **The gate is an equality: 0 of 145 chunks
+differ** between the bank and P3's *simulation* of the same complete plan at
+`full_attn=q5_k` — 4.1560, equal in nll to all six recorded decimals — so
+P2's "the bank is the simulation" survives the fifth bit. Every block's
+bank-against-simulation device test now runs both widths: attention,
+DeltaNet, hyper-connection (including its 320-wide ten-group record), lm head
+and PLE are all **identical** on the GEMM path and one rounding apart on
+every GEMV rung. **The four families, measured as complete 145-chunk plans on
+D18's basis and never composed**: `full_attn` + `qsa_indexer` 4.1386 (+2.72%,
+**14.9 pp/GB**), `lm_head` 4.1136 (+2.10%, **7.8**), `hyper_conn` 4.0948
+(+1.63%, **5.9**), `deltanet` 4.0780 (+1.22%, **1.6** — 0.260 GB a token,
+five times any other family, for the smallest gain on the board). **The cut
+needed no new principle**: D18 had already refused an arm at 4.6 pp/GB, so
+the first three are above its own line and `deltanet` is below it by three
+times. Two findings beyond the decision. **P3's pre-kernel estimates held to
+within 6% on the three families `sim.go` simulated (14.1/8.0/~5.6 against
+14.9/7.8/5.9) and were 1.75x optimistic on the one it *inferred*** —
+`deltanet`, which is P3's own "a plan is measured, never composed" coming
+back one level up. And **the fifth bit costs less decode than its bytes
+predict**: 0.078 GB is −0.55 tok/s at P1's measured 178 GB/s and measures
+−0.21; the whole ladder's 0.497 GB prices at −3.1 and measures −2.57 —
+plausibly because the plane is a second sequential stream at a quarter of the
+first's width out of the same loop, so it lands nearer the 227 GB/s a
+dispatch can reach. Written down, not chased. `cmd/serve -llm` stages D19 by
+default (`llm.ShippedDenseBank`); `cmd/llm` still stages nothing.
+Reproducibility: the ppl runs are deterministic and the bank/sim pair agrees
+to six decimals of nll over all 145 chunks; the decode claim is two
+interleaved passes of five arms, within-arm spread 0.06-0.28 tok/s against
+step differences of 0.21-1.44, with both passes agreeing in sign at every
+step. Runs: `results/p3a_ppl_attn_q5k.csv` (the gate),
+`p3a_ppl_d18_attn.csv`, `p3a_ppl_d18_attn_head.csv`,
+`p3a_ppl_d18_attn_head_hc.csv` (D19), `p3a_ppl_d18_all4.csv`. Write-up:
+`research/p3a-fifth-bit.md`; next is **P4** (the router at fp16 and the
+expert banks toward ~4.25 bits, +4.5 tok/s of ceiling) or **P5** (MTP, with
+idea 3's rollback design first), per `LLM2.md`. Carried forward: the GEMV
+rungs were **not** re-screened at the new width (D12 says the rung moves when
+the weight's width does; every rung measured correct, so this is tok/s
+possibly on the table, not a risk), and idea 5's downstream task eval, which
+still has no dataset on this machine and matters more now that the plan is
+only +1.63% from the unquantised model.
+
 ### Session 2026-09-18 — P3: the widths decided (D18), and the case for a fifth bit
 
 **Result: L8c's knapsack solved by measuring six complete plans rather than

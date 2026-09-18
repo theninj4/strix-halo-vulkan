@@ -376,23 +376,37 @@ func DensePlan() QuantPlan {
 	return densePlan
 }
 
-// ShippedDenseBank is P3's decision, D18: the plan a product run stages when
+// ShippedDenseBank is P3a's decision, D19: the plan a product run stages when
 // nothing on the command line says otherwise.
 //
-// It is the uniform 4.5-bit plan with **`ple_proj` left off**, which stages
-// that family on L8a's int8 bank instead. Both its tensors ship Q8_0, so the
-// int8 stage is bit-identical arithmetic and the fifth family costs 0.0165 GB
-// a token — 0.4% of the bank, measured at **0.06 tok/s over three interleaved
-// pairs** — for **0.367 points of perplexity**, 22 pp/GB and five times the
-// return of the next-best width a kernel already exists for. 145 chunks:
-// **4.1850 against 4.0289, +3.87%**, where the uniform plan is 4.1998, +4.24%.
+// It amends D18 rather than replacing it. D18 was the uniform 4.5-bit plan
+// with **`ple_proj` left off**, which stages that family on L8a's int8 bank
+// instead — both its tensors ship Q8_0, so that stage is bit-identical
+// arithmetic and costs 0.0165 GB a token for 0.367 points of perplexity,
+// 22 pp/GB and still the best trade in the plan. That row is untouched.
+//
+// What P3a adds is **the fifth bit, on the three families whose measured
+// return beats the trade D18 already refused** (`full_attn` → int8 at
+// 4.6 pp/GB). Each was measured as a complete 145-chunk plan, never composed:
+//
+//	full_attn, qsa_indexer   4.1386  +2.72%   1.15 pp for 0.078 GB  14.9 pp/GB
+//	then lm_head             4.1136  +2.10%   0.62 pp for 0.079 GB   7.8
+//	then hyper_conn          4.0948  +1.63%   0.47 pp for 0.080 GB   5.9
+//	deltanet, refused        4.0780  +1.22%   0.41 pp for 0.260 GB   1.6
+//
+// So: **4.0948 ± 0.02322 against 4.0289, +1.63%**, where D18 is +3.87% —
+// 38% of the accuracy cost for **1.13 tok/s** of measured decode over two
+// interleaved passes (35.70 → 34.57). 4.518 GB a token, a 53.6 tok/s ceiling.
+// `deltanet`'s fifth bit is the one that is not worth it: five times the
+// bytes of any other family for the smallest gain on the board.
 //
 // It is deliberately *not* the default of `DenseBankPlan` itself: a
 // measurement tool that staged a plan nobody named would make every CSV in
 // `results/` ambiguous about what it measured. `cmd/serve` opts in; `cmd/llm`
-// does not. See research/p3-widths.md.
-const ShippedDenseBank = "deltanet=q4_k/32,hyper_conn=q4_k/32,lm_head=q4_k/32," +
-	"full_attn=q4_k/32,qsa_indexer=q4_k/32"
+// does not. See research/p3a-fifth-bit.md, and research/p3-widths.md for the
+// `ple_proj` half.
+const ShippedDenseBank = "deltanet=q4_k/32,hyper_conn=q5_k/32,lm_head=q5_k/32," +
+	"full_attn=q5_k/32,qsa_indexer=q5_k/32"
 
 var (
 	denseBankOnce sync.Once

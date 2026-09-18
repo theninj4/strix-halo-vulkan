@@ -112,18 +112,33 @@ func TestHeadGPUQ8BankSize(t *testing.T) {
 // it to the same half the host's `tileB` writes — so the two have to agree
 // exactly. A tolerance would hide the only kind of bug a new bank can have,
 // which is an address.
+//
+// Both widths, since P3a — and the head is the one block whose planes are
+// **not** written one after another: it stages slabs of a matrix that is
+// 2.54 GB as floats, so each slab's nibbles, fifth bits and records go to
+// three separate bases. That is the arithmetic this gate is really checking.
 func TestHeadGPUQ4IsTheSim(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { headBankIsTheSim(t, spec) })
+	}
+}
+
+func headBankIsTheSim(t *testing.T, spec string) {
 	dev, done := newTestDevice(t)
 	defer done()
 
 	const nEmbd, vocab, rows = 256, 640, 4
 	rng := rand.New(rand.NewSource(11))
 	w := q8Tensor(rng, "output.weight", nEmbd, vocab)
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	x := make([]float32, rows*nEmbd)
 	for i := range x {
@@ -147,9 +162,15 @@ func TestHeadGPUQ4IsTheSim(t *testing.T) {
 	}
 
 	simLogits, simBytes := run(BankFP16)
-	q4, q4Bytes := run(BankQ4K)
-	if bits := float64(q4Bytes) * 8 / float64(vocab*nEmbd); bits != 4.5 {
-		t.Fatalf("the bank is %.4f bits a weight, want 4.5", bits)
+	q4, q4Bytes := run(bank)
+	// 4.500 or 5.500 — the head's k is a multiple of 256, so the record is
+	// ggml's own sixteen bytes and there is no padding to state around.
+	want := 4.5
+	if bits, _ := qkBank(bank); bits == 5 {
+		want = 5.5
+	}
+	if bits := float64(q4Bytes) * 8 / float64(vocab*nEmbd); bits != want {
+		t.Fatalf("the %s bank is %.4f bits a weight, want %.1f", bank, bits, want)
 	}
 	if simBytes != vocab*nEmbd*2 {
 		t.Fatalf("the simulation's bank is %d bytes, want halves", simBytes)
@@ -171,19 +192,29 @@ func TestHeadGPUQ4IsTheSim(t *testing.T) {
 // So the GEMV carries one *fewer* rounding per weight, and what the test
 // states is how far apart that puts them.
 func TestHeadGPUQ4Gemv(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { headBankGemv(t, spec) })
+	}
+}
+
+func headBankGemv(t *testing.T, spec string) {
 	dev, done := newTestDevice(t)
 	defer done()
 
 	const nEmbd, vocab = 256, 640
 	rng := rand.New(rand.NewSource(13))
 	w := q8Tensor(rng, "output.weight", nEmbd, vocab)
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	g, err := NewHeadGPUBank(dev, nEmbd, w, 4, BankQ4K, sim)
+	g, err := NewHeadGPUBank(dev, nEmbd, w, 4, bank, sim)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +250,7 @@ func TestHeadGPUQ4Gemv(t *testing.T) {
 	if rel > 1e-3 {
 		t.Fatalf("the GEMV is %.3g from the GEMM relative, want one rounding's worth", rel)
 	}
-	t.Logf("GEMV against GEMM on the q4_k bank: rms %.3g relative", rel)
+	t.Logf("GEMV against GEMM on the %s bank: rms %.3g relative", bank, rel)
 
 	// D15: the GEMV reads one row of A, so more than one is refused rather
 	// than silently dropped.
@@ -242,7 +273,7 @@ func TestHeadGPUQ4Gemv(t *testing.T) {
 // this model's [2560, 248320] head is 0.36 GB against 0.68 and 1.27.
 func TestHeadGPUQ4BankSize(t *testing.T) {
 	const nEmbd, vocab = 2560, 248320
-	q4, q8, half := q4kBytes(vocab, nEmbd), q8Bytes(vocab, nEmbd), vocab*nEmbd*2
+	q4, q8, half := qkBytes(4, vocab, nEmbd), q8Bytes(vocab, nEmbd), vocab*nEmbd*2
 	if bits := float64(q4) * 8 / float64(vocab*nEmbd); bits != 4.5 {
 		t.Fatalf("%.4f bits a weight, want 4.500", bits)
 	}

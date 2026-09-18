@@ -43,13 +43,44 @@ import (
 //	BankQ4K   ggml's asymmetric K-quant, 4.500 bits (L8c-4): the first bank
 //	          here that changes what the model computes, at +4.24% of
 //	          perplexity for 4.264 GB a token against 6.334.
+//	BankQ5K   the same format with P3a's `qh` plane, 5.500 bits: the same
+//	          tiles and the same record plus one bit a weight, which P3
+//	          priced at 14.1 pp/GB on `full_attn` against 4.6 for the best
+//	          arm the four-bit kernel can stage.
 type DenseBank int
 
 const (
 	BankFP16 DenseBank = iota
 	BankQ8
 	BankQ4K
+	BankQ5K
 )
+
+// qkBank reports whether a bank is one of the two K-quant widths, and which
+// level width it stages at. Everything but the bytes and the build key is
+// shared between them, so this is the predicate most callers want.
+func qkBank(b DenseBank) (bits int, ok bool) {
+	switch b {
+	case BankQ4K:
+		return 4, true
+	case BankQ5K:
+		return 5, true
+	}
+	return 0, false
+}
+
+// bankOfSim is which bank a plan's format stages on, for the constructors
+// that take a `QuantSim` from `DenseBankPlan` and have to say where it lands.
+func bankOfSim(q QuantSim) (DenseBank, error) {
+	bits, err := qkBits(q)
+	if err != nil {
+		return BankFP16, err
+	}
+	if bits == 5 {
+		return BankQ5K, nil
+	}
+	return BankQ4K, nil
+}
 
 // String names a bank the way every CSV and header line in this vertical
 // does.
@@ -59,6 +90,8 @@ func (b DenseBank) String() string {
 		return "q8"
 	case BankQ4K:
 		return "q4_k"
+	case BankQ5K:
+		return "q5_k"
 	}
 	return "fp16"
 }
@@ -66,6 +99,17 @@ func (b DenseBank) String() string {
 // BankFor is bankOf for a caller outside the package — the benchmarks, which
 // take the same two-valued choice from `LLM_DENSE_FP16` that a graph does.
 func BankFor(q8 bool) DenseBank { return bankOf(q8) }
+
+// BankForSim is bankOfSim for a caller outside the package: which of the two
+// K-quant banks a plan's format stages on. The benchmarks need it for the
+// same reason the graph does — a bench that staged a different width from the
+// one the graph stages would be measuring a kernel nothing runs.
+func BankForSim(q QuantSim) (DenseBank, error) { return bankOfSim(q) }
+
+// KQuant reports whether a bank is one of the two K-quant widths, for the
+// callers outside the package that have to say "this family is on the narrow
+// bank" without saying which of the two.
+func (b DenseBank) KQuant() bool { _, ok := qkBank(b); return ok }
 
 // bankOf is the two-valued spelling every constructor took before L8c-4.
 func bankOf(q8 bool) DenseBank {
@@ -163,23 +207,27 @@ func q8Align(n int) int { return (n + 15) &^ 15 }
 //	q8      1 byte a weight, an fp16 scale per 32
 //	q4_k    a nibble a weight, a sixteen- or twenty-byte record per
 //	        (n-tile, super-block, row)
+//	q5_k    the same, plus P3a's one-bit plane — which counts with the
+//	        record rather than with the levels, because it is addressed off
+//	        the same derived base and not off bOff
 func BankLevelBytes(b DenseBank, n, k int) int {
 	switch b {
 	case BankQ8:
 		return n * k
-	case BankQ4K:
+	case BankQ4K, BankQ5K:
 		return n * k / 2
 	}
 	return n * k * 2
 }
 
-// BankPlaneBytes is the second plane alone, and zero on the fp16 bank.
+// BankPlaneBytes is everything but the levels, and zero on the fp16 bank.
 func BankPlaneBytes(b DenseBank, n, k int) int {
 	switch b {
 	case BankQ8:
 		return n * k / q8Group * 2
-	case BankQ4K:
-		return q4kBytes(n, k) - n*k/2
+	case BankQ4K, BankQ5K:
+		bits, _ := qkBank(b)
+		return qkBytes(bits, n, k) - n*k/2
 	}
 	return 0
 }
@@ -194,6 +242,8 @@ func bankPipe(b DenseBank, k GEMMKernel) string {
 		return "q8_" + string(k)
 	case BankQ4K:
 		return "q4_" + string(k)
+	case BankQ5K:
+		return "q5_" + string(k)
 	}
 	return string(k)
 }
@@ -277,6 +327,8 @@ func gemvBankPipe(k GEMVKernel, b DenseBank) string {
 		return fmt.Sprintf("gemv_q8_k%d", gemvSlabs(k))
 	case BankQ4K:
 		return fmt.Sprintf("gemv_q4_k%d", gemvSlabs(k))
+	case BankQ5K:
+		return fmt.Sprintf("gemv_q5_k%d", gemvSlabs(k))
 	}
 	return fmt.Sprintf("gemv_k%d", gemvSlabs(k))
 }
@@ -317,4 +369,12 @@ var gemvSPIRV = map[string][]byte{
 	"gemv_q4_k20":  shaders.LLMGEMVQ4K20,
 	"gemv_q4_k32":  shaders.LLMGEMVQ4K32,
 	"gemv_q4_k40":  shaders.LLMGEMVQ4K40,
+	"gemv_q5_k1":   shaders.LLMGEMVQ5K1,
+	"gemv_q5_k2":   shaders.LLMGEMVQ5K2,
+	"gemv_q5_k4":   shaders.LLMGEMVQ5K4,
+	"gemv_q5_k8":   shaders.LLMGEMVQ5K8,
+	"gemv_q5_k16":  shaders.LLMGEMVQ5K16,
+	"gemv_q5_k20":  shaders.LLMGEMVQ5K20,
+	"gemv_q5_k32":  shaders.LLMGEMVQ5K32,
+	"gemv_q5_k40":  shaders.LLMGEMVQ5K40,
 }

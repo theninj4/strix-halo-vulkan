@@ -135,7 +135,11 @@ func dnBench(model string, tokens []int, nLayers, iters int, ladder, gemmLadder 
 	// that misses §5.1b's 4 KB rotation moves with the width.
 	bank, sim := llm.BankFor(llm.DenseQ8()), llm.QuantSim{}
 	if q, ok := llm.DenseBankPlan().For("blk.0.attn_qkv.weight", true); ok {
-		bank, sim = llm.BankQ4K, q
+		b, err := llm.BankForSim(q)
+		if err != nil {
+			return err
+		}
+		bank, sim = b, q
 	}
 	g, err := llm.NewDeltaNetGPUBank(dev, cfg, maxTok, ws, bank, sim)
 	if err != nil {

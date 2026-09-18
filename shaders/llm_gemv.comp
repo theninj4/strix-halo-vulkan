@@ -103,11 +103,18 @@ void main() {
     // so a quantised matrix is quantised all the way through.
     {
         uint nsb = pc.gemmK >> 8;
-        uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
+        uint nk = pc.gemmN * pc.gemmK;
+        // P3a's plane sits between the tiles and the records, so both bases
+        // are still derived and `QK_HIGH_BYTES` is zero without -DQ5B.
+        uint high0 = (pc.bOff + (nk >> 1)) >> 2;
+        uint rec0 = (pc.bOff + (nk >> 1) + QK_HIGH_BYTES(nk)) >> 2;
         // A tile is 32 words and a lane owns two of them — the eight k
         // either side of `col`'s sixteen — with `sub` picking which of the
         // step's four tiles, the way lane*4 does on the Q8 arm.
         uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
+        // The same index without the buffer base is the plane's byte index,
+        // because a high byte covers exactly the word it is named by.
+        uint hbi = (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
         uint curSB = 0xffffffffu;
         uvec4 rec = uvec4(0u);
         for (uint c = 0u; c < perSlab; c += 4u) {
@@ -126,11 +133,12 @@ void main() {
             uint x = xbase + (c + sub) * TILE;
             [[unroll]] for (uint u = 0u; u < 2u; u++) {
                 uint word = w8[w + u];
+                uint hb = QK_HIGH_BYTE(high0, hbi + c * 32u + u);
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     uint by = bitfieldExtract(word, int(t * 8u), 8);
                     uint e = u * 8u + t * 2u;
-                    sum += (ds * float(by & 0xFu) - dm) * float(hact[x + e]);
-                    sum += (ds * float(by >> 4) - dm) * float(hact[x + e + 1u]);
+                    sum += (ds * float(QK_LEVEL_LO(by, hb, t)) - dm) * float(hact[x + e]);
+                    sum += (ds * float(QK_LEVEL_HI(by, hb, t)) - dm) * float(hact[x + e + 1u]);
                 }
             }
         }

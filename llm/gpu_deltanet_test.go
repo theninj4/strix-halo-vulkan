@@ -580,17 +580,31 @@ func TestDeltaNetGPUGemvAgrees(t *testing.T) {
 // It is `rtn` rather than `imatrix` so the test needs nothing but the
 // checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
 // TestBankQ4KIsTheSim covers that at the encoder.
+//
+// Both widths, since P3a: the `qh` plane is the same code in every block and
+// a plane index that is right here and wrong in one other is exactly what a
+// per-block gate catches.
 func TestDeltaNetGPUQ4IsTheSim(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { dnBankIsTheSim(t, spec) })
+	}
+}
+
+func dnBankIsTheSim(t *testing.T, spec string) {
 	tr, c, w, nTok := dnFixtures(t, dnLayer)
 	in, err := tr.Get(fmt.Sprintf("hc_mixed-%d", dnLayer), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sim, err := ParseQuantSim("q4_k/32")
+	sim, err := ParseQuantSim(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	dev, done := newTestDevice(t)
 	defer done()
@@ -613,7 +627,7 @@ func TestDeltaNetGPUQ4IsTheSim(t *testing.T) {
 	}
 
 	simQKV, simOut, simBytes := run(BankFP16)
-	q4QKV, q4Out, q4Bytes := run(BankQ4K)
+	q4QKV, q4Out, q4Bytes := run(bank)
 
 	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
 		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
@@ -650,7 +664,7 @@ func TestDeltaNetGPUQ4BankSize(t *testing.T) {
 	n, k := roundUpInt(real, dnBN), c.NEmbd
 	pad := n - real
 
-	q4 := q8Align(q4kBytes(n, k)) + q8Align(q4kBytes(c.NEmbd, c.Inner))
+	q4 := q8Align(qkBytes(4, n, k)) + q8Align(qkBytes(4, c.NEmbd, c.Inner))
 	q8 := q8Align(q8Bytes(n, k)) + q8Align(q8Bytes(c.NEmbd, c.Inner))
 	half := n*k*2 + c.NEmbd*c.Inner*2
 	weights := real*k + c.NEmbd*c.Inner
@@ -666,7 +680,7 @@ func TestDeltaNetGPUQ4BankSize(t *testing.T) {
 	}
 	// Subtract the pad rows' nibbles and state the remainder rather than
 	// demanding 4.500 — the record plane covers the pad rows too.
-	body := q4kBytes(n, k) - pad*k/2 + q4kBytes(c.NEmbd, c.Inner)
+	body := qkBytes(4, n, k) - pad*k/2 + qkBytes(4, c.NEmbd, c.Inner)
 	if bits := float64(body) * 8 / float64(weights); bits < 4.5 || bits > 4.52 {
 		t.Fatalf("the staged matrix is %.4f bits a weight, want 4.500 plus the padding's records", bits)
 	}

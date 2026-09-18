@@ -164,6 +164,14 @@ var gemmQ4Variants = []gemmVariant{
 	{GEMMM8, shaders.LLMGEMMQ4M8, 128},
 }
 
+// gemmQ5Variants is P3a's fifth bit on the same three rungs: the same tiles
+// and the same record with a `qh` plane between them.
+var gemmQ5Variants = []gemmVariant{
+	{GEMMM2, shaders.LLMGEMMQ5M2, 32},
+	{GEMMM4, shaders.LLMGEMMQ5M4, 64},
+	{GEMMM8, shaders.LLMGEMMQ5M8, 128},
+}
+
 // gemmBuildsFor is the table a block builds its pipelines from, by bank.
 func gemmBuildsFor(b DenseBank) []gemmVariant {
 	switch b {
@@ -171,6 +179,8 @@ func gemmBuildsFor(b DenseBank) []gemmVariant {
 		return gemmQ8Variants
 	case BankQ4K:
 		return gemmQ4Variants
+	case BankQ5K:
+		return gemmQ5Variants
 	}
 	return gemmVariants
 }
@@ -459,8 +469,8 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
-	if bank == BankQ4K && sim.Off() {
-		return nil, fmt.Errorf("llm: a q4_k attention bank needs a format to quantise to")
+	if _, ok := qkBank(bank); ok && sim.Off() {
+		return nil, fmt.Errorf("llm: a %s attention bank needs a format to quantise to", bank)
 	}
 	g := &AttnGPU{
 		dev: dev, cfg: cfg, bank: bank, sim: sim,
@@ -601,14 +611,15 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	qkvBank, outBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.GateWidth()*2
 	unit := 2
 	if g.quant() {
-		if g.bank == BankQ4K {
-			if err := q4kFits(g.qkvN(), c.NEmbd); err != nil {
+		if bits, ok := qkBank(g.bank); ok {
+			if err := qkFits(g.qkvN(), c.NEmbd); err != nil {
 				return err
 			}
-			if err := q4kFits(c.NEmbd, c.GateWidth()); err != nil {
+			if err := qkFits(c.NEmbd, c.GateWidth()); err != nil {
 				return err
 			}
-			qkvBank, outBank = q8Align(q4kBytes(g.qkvN(), c.NEmbd)), q8Align(q4kBytes(c.NEmbd, c.GateWidth()))
+			qkvBank = q8Align(qkBytes(bits, g.qkvN(), c.NEmbd))
+			outBank = q8Align(qkBytes(bits, c.NEmbd, c.GateWidth()))
 		} else {
 			qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
 		}
@@ -768,7 +779,7 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 
 		base, baseV := g.colK(), g.colV()
 		baseIQ, baseIK := g.colIQ(), g.colIK()
-		if g.bank == BankQ4K {
+		if _, ok := qkBank(g.bank); ok {
 			if err := g.stageQ4K(i, w); err != nil {
 				return err
 			}
@@ -826,8 +837,8 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 // retired the fp16 tail (D13's payoff, P2).
 func (g *AttnGPU) stageQ4K(i int, w AttnWeights) error {
 	c := g.cfg
-	q4 := make([]byte, g.qkvN()*c.NEmbd/2)
-	rec := make([]byte, q4kRecPlane(g.qkvN(), c.NEmbd))
+	bits, _ := qkBank(g.bank)
+	qkv := newQKStage(bits, g.qkvN(), c.NEmbd)
 	for _, t := range []struct {
 		name string
 		src  []float32
@@ -846,27 +857,24 @@ func (g *AttnGPU) stageQ4K(i int, w AttnWeights) error {
 			return err
 		}
 		base := t.base
-		if err := tileBQ4K(q4, rec, t.src, t.n, c.NEmbd,
+		if err := qkv.Fill(t.src, t.n, c.NEmbd,
 			func(r int) int { return base + r }, q, qw); err != nil {
 			return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
 		}
 	}
-	g.wbank.WriteBytesAt(int(g.layers[i].qkv), q4)
-	g.wbank.WriteBytesAt(int(g.layers[i].qkv)+len(q4), rec)
+	qkv.WriteTo(g.wbank, int(g.layers[i].qkv))
 
 	name := fmt.Sprintf("blk.%d.attn_output.weight", w.Layer)
 	q, qw, err := bankImatrix(name, g.sim)
 	if err != nil {
 		return err
 	}
-	oq := make([]byte, c.NEmbd*c.GateWidth()/2)
-	orec := make([]byte, q4kRecPlane(c.NEmbd, c.GateWidth()))
-	if err := tileBQ4K(oq, orec, w.O, c.NEmbd, c.GateWidth(),
+	out := newQKStage(bits, c.NEmbd, c.GateWidth())
+	if err := out.Fill(w.O, c.NEmbd, c.GateWidth(),
 		func(r int) int { return r }, q, qw); err != nil {
 		return fmt.Errorf("llm: layer %d %s: %w", i, name, err)
 	}
-	g.wbank.WriteBytesAt(int(g.layers[i].out), oq)
-	g.wbank.WriteBytesAt(int(g.layers[i].out)+len(oq), orec)
+	out.WriteTo(g.wbank, int(g.layers[i].out))
 	return nil
 }
 

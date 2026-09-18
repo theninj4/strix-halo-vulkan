@@ -152,10 +152,14 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemm
 	// misses §5.1b's 4 KB rotation moves with the width.
 	bank, sim := llm.BankFor(llm.DenseQ8()), llm.QuantSim{}
 	if q, ok := llm.DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
-		bank, sim = llm.BankQ4K, q
+		b, err := llm.BankForSim(q)
+		if err != nil {
+			return err
+		}
+		bank, sim = b, q
 	}
 	if _, ok := llm.DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
-		if bank != llm.BankQ4K {
+		if !bank.KQuant() {
 			return fmt.Errorf("qsa_indexer shares the fused projection's plane, so it needs full_attn on the same bank")
 		}
 	}
