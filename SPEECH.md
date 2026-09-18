@@ -101,6 +101,7 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T6c | The six bidirectional LSTMs, 73 ms — 96% of the phoneme side | **done** — 73 ms to 6 ms, durations unchanged |
 | T6d | The chain between them: readbacks, the regulator, the text encoder | **done** — 17 ms to 8 ms, two submits and two readbacks |
 | T7 | The excitation: float64 phase accumulation on the host | **next** — the largest single stage in the model, 14 ms |
+| T8 | Voice blending: a request that names several voices | open — the style packs are already in memory, see below |
 
 ## What exists
 
@@ -625,3 +626,40 @@ readbacks T6d could not remove, and four submits. Closing any of it means
 moving the *vocoder's* input boundary — `asr` currently goes host-side into
 `GPUDecoder.Upload` — which is one change, not four, and is the thing to do
 after T7 rather than before it.
+
+## T8 — voice blending
+
+A client asked `/v1/audio/speech` for
+`"voice": "af_alloy,af_bella,af_heart"` and got a 400:
+
+    api: 400: no voice "af_alloy,af_bella,af_heart"; this checkpoint has 54: unsupported request
+
+Nothing is missing from the checkpoint. All 54 voices load, each of the three
+named exists on its own, and `GET /v1/models` already reports the list so a
+client can populate a menu. What is missing is the **blend**: `backend/tts.go`
+looks the request's voice up in `model.Voices` as a literal key, so a
+comma-joined name is simply a name that is not there.
+
+It is the cheapest item on this list. `Model.Voices` is
+`map[string][]float32` — one `[510*256]` style pack per name — and
+`Style` (`kokoro/load.go:81`) picks row `phonemes-1` out of the pack and
+splits it into the decoder and predictor halves. A blend is a weighted mean of
+those vectors, taken before the row is picked. It is linear, so per-row and
+whole-pack means are the same number; it touches no shader, no arena and
+nothing downstream of `Style`. The two places that reject it today are the
+lookup at `backend/tts.go:160` and the same lookup at `:92` that validates
+`-voice` at startup.
+
+What is not settled is the **spelling**, and it is ours to choose: OpenAI's
+API has no notion of mixing voices, so nothing constrains this except that a
+single name must keep meaning exactly what it means now. `af_bella,af_sky` as
+an equal mix is the obvious reading; `af_bella:0.7,af_sky:0.3` is the obvious
+way to weight it; whether bare weights are normalised or required to sum to
+one is a decision rather than a discovery. The error message for an unknown
+name inside a blend should name *which* component was unknown, since "no
+voice" against a three-part string is the message that started this.
+
+And it wants the same treatment every other stage here got: a reference dump
+of a known mix from upstream, and a comparison against it. A blend that is
+merely plausible is the failure mode this document keeps warning about — it
+sounds like a voice, so nothing downstream catches that it is the wrong one.

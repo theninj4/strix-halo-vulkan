@@ -14,7 +14,14 @@ import (
 
 // TranscriptionRequest represents the request structure for audio transcription.
 type TranscriptionRequest struct {
-	host             string
+	host string
+	// filename and declaredType are what a multipart upload called itself.
+	// They are unexported because they are not part of the wire request --
+	// nothing may set them from JSON -- but they are the two facts that
+	// make "this did not decode" a diagnosable message rather than a
+	// verdict.
+	filename         string
+	declaredType     string
 	Model            string  `json:"model"`
 	ChunkingStrategy string  `json:"chunking_strategy"` // "auto"
 	Language         string  `json:"language"`          // "en"
@@ -123,7 +130,9 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 
 	clip, err := audio.DecodeWAV(req.Data)
 	if err != nil {
-		badRequest(ctx, w, "this server decodes 16-bit PCM WAV only: "+err.Error())
+		logf(ctx, "transcription: rejected %s: %v", describeUpload(&req), err)
+		badRequest(ctx, w, "this server decodes 16-bit PCM WAV only: "+err.Error()+
+			"; convert with `ffmpeg -i in -ar 16000 -ac 1 -c:a pcm_s16le out.wav`")
 		return
 	}
 
@@ -217,6 +226,20 @@ func timecode(t float64, sep string) string {
 		ms/3600000, ms/60000%60, ms/1000%60, sep, ms%1000)
 }
 
+// describeUpload names an upload the way a log line wants it: what the client
+// called it, what the client said it was, and how big it turned out to be.
+func describeUpload(req *TranscriptionRequest) string {
+	name := req.filename
+	if name == "" {
+		name = "<unnamed>"
+	}
+	declared := req.declaredType
+	if declared == "" {
+		declared = "no declared type"
+	}
+	return fmt.Sprintf("%q (%s, %d bytes)", name, declared, len(req.Data))
+}
+
 // parseMultipart reads OpenAI's multipart form into req. It answers the
 // client itself on a malformed body and reports whether to carry on.
 func parseMultipart(w http.ResponseWriter, r *http.Request, req *TranscriptionRequest) bool {
@@ -233,12 +256,20 @@ func parseMultipart(w http.ResponseWriter, r *http.Request, req *TranscriptionRe
 	}
 	defer func() { _ = r.MultipartForm.RemoveAll() }()
 
-	f, _, err := r.FormFile("file")
+	f, hdr, err := r.FormFile("file")
 	if err != nil {
 		badRequest(ctx, w, "no 'file' part in the form: "+err.Error())
 		return false
 	}
 	defer f.Close()
+	// What the client called it and what it said it was. Neither is trusted
+	// -- the bytes decide -- but when the bytes turn out to be the wrong
+	// format, these two are what say which client sent them and what it
+	// thought it was sending.
+	if hdr != nil {
+		req.filename = hdr.Filename
+		req.declaredType = hdr.Header.Get("Content-Type")
+	}
 	if req.Data, err = io.ReadAll(f); err != nil {
 		if tooLarge(ctx, w, err) {
 			return false

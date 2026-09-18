@@ -54,6 +54,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -272,7 +273,18 @@ func main() {
 	// invisible at startup, and the first sign of it was a 401 from a
 	// client that never knew it had to send anything.
 	if *token == "" {
-		log.Printf("auth: -token is empty; this server authorizes nothing")
+		// An open server on loopback is a development convenience. An open
+		// server on a routable address is every model on this box offered
+		// to whoever can reach the port, so say which of the two this is
+		// rather than printing one line for both.
+		if openToNetwork(*addr) {
+			log.Printf("auth: -token is empty and -addr is %s: "+
+				"this server authorizes nothing and is reachable from the network. "+
+				"Anyone who can reach this port can run the models on it.", *addr)
+		} else {
+			log.Printf("auth: -token is empty; this server authorizes nothing, "+
+				"and -addr %s is loopback, so only this machine can reach it", *addr)
+		}
 	} else {
 		log.Printf("auth: bearer token required on every /v1 request; "+
 			"send %q (set it with -token, or -token= to serve open)",
@@ -292,6 +304,25 @@ func redactToken(tok string) string {
 		return fmt.Sprintf("<%d characters>", len(tok))
 	}
 	return tok[:2] + strings.Repeat(".", 6) + tok[len(tok)-2:]
+}
+
+// openToNetwork reports whether -addr is reachable from somewhere other than
+// this machine. An empty host ("" in ":11434") means every interface, which
+// is the easy one to miss.
+func openToNetwork(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Not a host:port at all; say nothing reassuring about it.
+		return true
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return !strings.EqualFold(host, "localhost")
+	}
+	return !ip.IsLoopback()
 }
 
 // defaultPreviewModel is where -previews looks for taef1, matching every other

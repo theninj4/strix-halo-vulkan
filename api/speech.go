@@ -82,6 +82,18 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	switch format {
 	case "wav", "pcm":
+	case "mp3", "opus", "aac", "flac":
+		// OpenAI's speech endpoint defaults to mp3, so a client written
+		// against it asks for a compressed format without anyone
+		// choosing to -- which makes this the likeliest 400 on this
+		// endpoint, and worth answering with the fix rather than just
+		// the refusal.
+		badRequest(ctx, w, "response_format "+strconv.Quote(format)+
+			" is not supported; this server has no audio encoder and writes wav and pcm "+
+			"(16-bit signed, little endian, mono). "+
+			strconv.Quote(format)+" is OpenAI's default rather than something you asked for, "+
+			"so send \"response_format\": \"wav\", or omit the field, which is the same thing")
+		return
 	default:
 		badRequest(ctx, w, "response_format "+strconv.Quote(format)+
 			" is not supported; this server encodes wav and pcm (16-bit signed, little endian, mono)")

@@ -57,7 +57,11 @@ func ReadWAV(path string) (*Clip, error) {
 // ffmpeg and friends write does not have to be modelled.
 func DecodeWAV(buf []byte) (*Clip, error) {
 	if len(buf) < 12 || string(buf[0:4]) != "RIFF" || string(buf[8:12]) != "WAVE" {
-		return nil, fmt.Errorf("not a RIFF/WAVE file")
+		// Name what did arrive. The overwhelmingly common cause of this
+		// error is a client that sent a perfectly good file in a format
+		// this decoder does not read, and "not a RIFF/WAVE file" alone
+		// does not distinguish that from a corrupt upload.
+		return nil, fmt.Errorf("not a RIFF/WAVE file: looks like %s", Sniff(buf))
 	}
 
 	var (
