@@ -139,7 +139,8 @@ type ImageBackend interface {
 	// business -- so what arrives here is pixels.
 	Generate(ctx context.Context, req *ImageRequest) (*ImageResult, error)
 	// Geometry is what this process was started for: the size a request that
-	// names none gets, and the largest it will accept.
+	// names none gets, the largest it will accept, and whether it can send
+	// in-progress previews.
 	Geometry() ImageGeometry
 }
 
@@ -153,6 +154,48 @@ type ImageRequest struct {
 	// Seed is the initial latent's. Nil draws one, and the result says which
 	// was drawn, so an image a caller likes can be asked for again.
 	Seed *int64
+
+	// PartialImages is how many in-progress frames the caller wants before
+	// the finished one, and Partial is where they go. Zero, or a nil Partial,
+	// asks for none -- which is the only thing a backend without a preview
+	// decoder can honour, and why ImageGeometry reports whether it has one.
+	//
+	// **Which steps they come from is the backend's decision, not the HTTP
+	// layer's.** The step count is the backend's (a request may not have
+	// named one), the relationship between a step and how finished the
+	// picture looks is the scheduler's, and neither is visible from a
+	// handler. What the handler decides is how many.
+	PartialImages int
+	// Partial is called with each in-progress frame, in order, before
+	// Generate returns. An error from it -- a client that hung up mid-stream
+	// is the one that happens -- stops any *further* frames and is what
+	// Generate returns.
+	//
+	// It does not stop the run. A denoising step is a submit-and-fence with
+	// no cancellation point in it, so a request that is abandoned halfway
+	// still costs the device the whole image; what it stops costing is the
+	// encoding and the writing. That is the same bargain the non-streaming
+	// path already makes, and it is written down in API.md rather than fixed.
+	Partial func(ImagePartial) error
+}
+
+// ImagePartial is one in-progress frame of an image being generated.
+//
+// It is a decoded picture rather than a latent for the same reason
+// ImageResult is: what a preview decoder is for is that the HTTP layer never
+// has to know what a latent is.
+type ImagePartial struct {
+	// Index counts the partials actually sent, from zero. It is OpenAI's
+	// partial_image_index and it is not the step number -- a client asking
+	// for three frames of an eight-step schedule gets 0, 1, 2.
+	Index int
+	// Step is the denoising step the frame came from, and Steps how many
+	// there are. Neither is in OpenAI's envelope; they are here because a
+	// client watching a preview arrive wants to know how much is left, and
+	// the alternative is guessing from the index.
+	Step, Steps   int
+	Image         image.Image
+	Width, Height int
 }
 
 // ImageResult is one rendered image and the parameters that produced it --
@@ -186,6 +229,14 @@ type ImageGeometry struct {
 	Multiple int
 	// Steps is the default denoising schedule's length.
 	Steps int
+	// Previews reports whether this backend can send in-progress frames, i.e.
+	// whether a preview decoder is loaded. A client reads it to know whether
+	// `stream: true` will be answered or refused.
+	Previews bool
+	// MaxPartials bounds `partial_images`. It is OpenAI's 3 and it is a
+	// policy rather than a limit of the model: each frame is a decode, and
+	// what makes three reasonable is that it is 5% of the image at 1024x1024.
+	MaxPartials int
 }
 
 // MarshalJSON writes the geometry the way a client reads it: the two pairs
@@ -197,11 +248,15 @@ func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 		MaxSize      string `json:"max_size"`
 		SizeMultiple int    `json:"size_multiple"`
 		DefaultSteps int    `json:"default_steps"`
+		Previews     bool   `json:"previews"`
+		MaxPartials  int    `json:"max_partial_images,omitempty"`
 	}{
 		DefaultSize:  formatSize(g.Width, g.Height),
 		MaxSize:      formatSize(g.MaxWidth, g.MaxHeight),
 		SizeMultiple: g.Multiple,
 		DefaultSteps: g.Steps,
+		Previews:     g.Previews,
+		MaxPartials:  g.MaxPartials,
 	})
 }
 

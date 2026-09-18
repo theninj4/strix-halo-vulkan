@@ -44,6 +44,27 @@ func (f *fakeImage) Generate(_ context.Context, req *ImageRequest) (*ImageResult
 	if f.err != nil {
 		return nil, f.err
 	}
+	// The partials, which a real backend picks the steps for. This one sends
+	// exactly as many as were asked for, so the handler's framing is what is
+	// under test rather than the schedule's spacing.
+	if req.Partial != nil && req.PartialImages > 0 {
+		steps := req.Steps
+		if steps == 0 {
+			steps = f.Geometry().Steps
+		}
+		for i := 0; i < req.PartialImages; i++ {
+			w, h := req.Width, req.Height
+			if w == 0 || h == 0 {
+				w, h = f.Geometry().Width, f.Geometry().Height
+			}
+			frame := image.NewRGBA(image.Rect(0, 0, w, h))
+			if err := req.Partial(ImagePartial{
+				Index: i, Step: i, Steps: steps, Image: frame, Width: w, Height: h,
+			}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	if f.returnsNothing {
 		return nil, nil
 	}
@@ -259,7 +280,6 @@ func TestImageGenerationRefusals(t *testing.T) {
 		want string
 	}{
 		{"empty prompt", ImageGenerationRequest{Prompt: "  "}, "prompt is empty"},
-		{"streaming", ImageGenerationRequest{Prompt: "p", Stream: true}, "streaming image generation"},
 		{"n too large", ImageGenerationRequest{Prompt: "p", N: 9}, "1 to 4"},
 		{"url", ImageGenerationRequest{Prompt: "p", ResponseFormat: "url"}, "nowhere to host"},
 		{"webp", ImageGenerationRequest{Prompt: "p", OutputFormat: "webp"}, "png and jpeg"},

@@ -977,6 +977,7 @@ var SoftmaxSubgroupW32 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_conv2d.spv vae_conv2d.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_groupnorm.spv vae_groupnorm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_silu.spv vae_silu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_relu.spv vae_relu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_add.spv vae_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_upsample2x.spv vae_upsample2x.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_nchw_to_rows.spv vae_nchw_to_rows.comp
@@ -993,6 +994,11 @@ var VAEGroupNorm []byte
 
 //go:embed vae_silu.spv
 var VAESiLU []byte
+
+// taef1's activation; see vae_relu.comp.
+
+//go:embed vae_relu.spv
+var VAEReLU []byte
 
 //go:embed vae_add.spv
 var VAEAdd []byte

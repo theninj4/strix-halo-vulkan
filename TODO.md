@@ -901,6 +901,97 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-18 — I2: taef1 previews, and a streamed image
+
+**Result: `madebyollin/taef1` is ported, and `POST /v1/images/generations`
+streams. A preview decode is 87.4 ms at 1024x1024 against the full VAE's 876
+— 10.0x — a streamed request with three partial frames costs 4.4% over one
+without (15.40/15.41 s against 14.72/14.80), and the first picture reaches the
+client at 3.6 s instead of at fifteen.** That closes the last capability
+`GOALS.md` names for this vertical; the full write-up is
+[`IMAGE.md`](IMAGE.md), which this session rewrote.
+
+The port itself was cheap and the reason is stage 8: taef1's graph is 48
+convolutions, three nearest upsamples, 40 ReLUs and 10 adds, and every one of
+those but the ReLU was already a tuned kernel. So `zimage/vae` grew an
+`engine` — the four buffers, the pipelines over them, the two weight arenas
+and the implicit-GEMM convolution — that `GPUDecoder` and the new `GPUTiny`
+both sit on, and one new shader, `vae_relu.comp`.
+
+**Four findings, in the order they cost time.**
+
+*The preview decodes the denoised estimate, not the latent.* This is the one
+that would have been wrong. The schedule is flow matching, so `latents` at
+step k is `x_t = (1-σ)x0 + σε`, and with shift 3.0 the sigmas are 1.00, 0.95,
+0.90, 0.83, 0.75, 0.64, 0.50, 0.30 — **four steps into eight the state is
+still 75% noise**, and decoding it gives a picture of noise. The estimate is
+`x0 = x_t - σv`, which the loop forms for nothing because it has the velocity
+in hand, and it is a recognisable fox after the *first* step of eight.
+Measured as mean distance from the finished image over the run, x0 goes
+0.29 → 0.02 and x_t goes 0.48 → 0.02. `TestPreviewIsNotTheRawLatent` decodes
+both sequences through the same decoder and pins the ordering; without it
+every other test in the file would pass on either choice, because both are
+plausible pictures.
+
+*The latent convention is not visible by eye.* taef1 takes the raw diffusion
+latent rather than the `(z/scale + shift)` the full decoder is handed — but
+the wrong one still produces a recognisable picture, because the decoder opens
+with `tanh(x/3)*3` and a latent 2.8x too large is squashed rather than blown
+out. What separates them is the distance from the full VAE's image for the
+same latent: 2.0% against 6.7%, a 3.3x separation, measured on a real 256x256
+trajectory by `reference/dump_taef1.py --from-run`.
+
+*The container costs more than the model.* At 1024x1024 Go's default PNG
+encoder is **344 ms** — four times the decode it wraps — against
+`png.BestSpeed`'s 60 for a file 15% larger, and JPEG q90's 23. Partial frames
+now go out at BestSpeed and the finished image does not. Found by the wall
+clock not adding up (18.20 s against a 15.04 s sum of its parts), not by
+suspecting it.
+
+*The stage-8 default convolution does not transfer.* The ladder was swept on
+the full decoder's 128-512 output channels and picked a BM of 128; every
+convolution in taef1 produces 64, so half the A tile is padding.
+`Conv64x64W32` is 86.1 ms where the inherited `Conv128x64W32` is 97.2 — 1.13x
+for reading the shape rather than taking the default.
+
+*And one claim that did not survive its own control.* taef1's activation arena
+is host-cached where the full decoder's is not, on the L6b argument that a
+preview's 12.6 MB readback would otherwise be 70 ms against an 87 ms decode.
+`ZIMAGE_TINY_UNCACHED=1` measures **no difference** — 87.7/88.2/87.1 ms
+against 90.9/87.7/88.3 in the full pipeline — and this vertical already knew
+why: stage 9 found 0.18 GB/s to be a property of the *device-local* heap,
+whose budget here is ~8 GB, so a 25 GB program gets cached memory whichever
+type it asks for. The cached type is kept because it is free and because the
+arithmetic would bite in a small process; the comment now says what was
+measured rather than what was expected. Worth remembering that stage 9 had to
+correct the same citation once already.
+
+**And one number that was wrong in the plan.** `IMAGE.md` expected "low
+milliseconds" from taef1 being 1/40th of the VAE's parameters. The right ratio
+is arithmetic — 566 GFLOP against 10.47 TFLOP, **18.5x**, because taef1 does
+all its work at full resolution in 64 channels where the big decoder has
+narrowed to 128 — and 10x of that 18.5 is delivered. The gap is a new stage,
+**I8**: the pack pass is **38.3 ms of the 87**, 47% of the decode, where stage
+8 priced it at 7 ms against a 30 ms convolution. The arithmetic is exact — the
+pack moves C·H·W whatever the filter is, and taef1's K is 576 against the full
+decoder's 4608 — and the fix is the fusion I5 wants anyway, since every
+convolution in taef1 is fed by a ReLU or an add.
+
+**The surface.** `stream: true` and OpenAI's `partial_images` (0-3), answered
+with `image_generation.partial_image` frames and one
+`image_generation.completed`; no `[DONE]`, because named events do not need
+one. `GET /v1/models` reports `previews` and `max_partial_images` so a client
+can find out before it asks. Without `-preview` it is a 501 naming the flag.
+Which steps a partial comes from is the *backend's* decision — the step count
+may not be in the request and how finished a picture looks at step k is the
+scheduler's business — and the last step never gives one, since its estimate
+*is* the final latent.
+
+**Next.** I7 is a scope decision (`GOALS.md` does not ask for edits) and
+everything else is percents: **I8** (38 ms of an 87 ms preview, the cheapest
+of them and the same pattern as I3), then **I3** (1.6 s of the image), then
+I4, then I5. `IMAGE.md` ranks them and says why.
+
 ### Session 2026-09-18 — P3a: the fifth bit built, and D19
 
 **Result: ggml's `qh` plane is in the dense bank, it is exact, and three of

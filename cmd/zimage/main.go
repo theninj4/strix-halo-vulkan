@@ -24,6 +24,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"strings"
 	"time"
 
 	"strix-halo-vulkan/vk"
@@ -48,6 +49,8 @@ func main() {
 	latentFile := flag.String("latents", "", "read the initial latent from this file instead of the RNG")
 	dumpLatent := flag.String("dumplatent", "", "write the denoised latent here, before the VAE")
 	reps := flag.Int("reps", 1, "generate this many times, reporting each")
+	preview := flag.String("preview", "",
+		"a madebyollin/taef1 checkpoint; writes <out>.preview.<step>.png after every step and times the decode")
 	flag.Parse()
 
 	if *height == 0 {
@@ -83,6 +86,7 @@ func main() {
 		Model: *model, Width: *width, Height: *height, Steps: *steps, MaxPrompt: *maxPrompt,
 		CPUHead:       *cpuHead,
 		UnfusedLayout: *unfusedLayout,
+		Preview:       *preview,
 	})
 	must(err)
 	defer p.Destroy()
@@ -101,11 +105,33 @@ func main() {
 			must(err)
 		}
 		fmt.Printf("prompt: %q\n", *prompt)
+		var previewTotal time.Duration
 		img, tm, err := p.GenerateFrom(*prompt, latents, func(d pipeline.Step) {
-			fmt.Printf("  step %d/%d  sigma %.4f -> %.4f  %8s  blocks %8s  head %7s\n",
+			fmt.Printf("  step %d/%d  sigma %.4f -> %.4f  %8s  blocks %8s  head %7s",
 				d.Index+1, *steps, d.Sigma, d.NextSig, ms(d.Blocks+d.Head), ms(d.Blocks), ms(d.Head))
+			if d.Preview == nil {
+				fmt.Println()
+				return
+			}
+			// Timed and written here rather than inside the pipeline, because
+			// what this flag is for is the *cost*: a preview is only worth
+			// having if it is small beside the step it interrupts, and the
+			// two numbers belong on the same line.
+			t0 := time.Now()
+			frame, err := d.Preview()
+			must(err)
+			dt := time.Since(t0)
+			previewTotal += dt
+			name := fmt.Sprintf("%s.preview.%d.png", strings.TrimSuffix(*out, ".png"), d.Index)
+			must(writePNGOpt(name, frame, true))
+			fmt.Printf("  preview %7s (%.1f%% of the step) -> %s\n",
+				ms(dt), 100*dt.Seconds()/(d.Blocks+d.Head).Seconds(), name)
 		})
 		must(err)
+		if previewTotal > 0 {
+			fmt.Printf("  previews: %d x taef1, %s total, %.1f%% of the image\n",
+				len(tm.Steps), ms(previewTotal), 100*previewTotal.Seconds()/tm.Total.Seconds())
+		}
 
 		if *dumpLatent != "" {
 			must(writeLatent(*dumpLatent, latents))
@@ -115,12 +141,12 @@ func main() {
 			name = fmt.Sprintf("%s.%d.png", *out, rep)
 		}
 		must(writePNG(name, img))
-		report(tm, name)
+		report(tm, name, previewTotal)
 	}
 }
 
 // report prints where the image's seconds went.
-func report(tm *pipeline.Timings, name string) {
+func report(tm *pipeline.Timings, name string, previews time.Duration) {
 	var steps time.Duration
 	for _, d := range tm.Steps {
 		steps += d
@@ -132,6 +158,13 @@ func report(tm *pipeline.Timings, name string) {
 	row("text encoder", tm.Encode, fmt.Sprintf("%d tokens", tm.Tokens))
 	row("caption refiners", tm.Caption, fmt.Sprintf("%d rows, once per image", tm.CapTotal))
 	row("denoising", steps, fmt.Sprintf("%d steps over %d tokens, %s each", len(tm.Steps), tm.Unified, ms(steps/time.Duration(len(tm.Steps)))))
+	if previews > 0 {
+		// Inside TOTAL, because the callback runs inside the denoising loop
+		// and the pipeline's clock is around the whole of it. It is its own
+		// row rather than folded into the steps for the same reason it is
+		// worth measuring at all.
+		row("taef1 previews", previews, fmt.Sprintf("%d frames", len(tm.Steps)))
+	}
 	row("vae decode", tm.Decode, "")
 	fmt.Printf("%-22s %10s\n", "TOTAL", ms(tm.Total))
 	fmt.Printf("wrote %s\n\n", name)
@@ -146,7 +179,14 @@ func sigmas(p *pipeline.Pipeline) string {
 }
 
 // writePNG maps the decoder's [-1, 1] output to 8-bit RGB.
-func writePNG(path string, img *vae.Tensor) error {
+//
+// fast is png.BestSpeed, and it is set for previews only. At 1024x1024 the
+// default encoder is 344 ms against BestSpeed's 60 for a file 15% larger, so
+// writing eight previews the careful way would cost more than twice what
+// generating them does and would put this flag's own timing line in the shade.
+func writePNG(path string, img *vae.Tensor) error { return writePNGOpt(path, img, false) }
+
+func writePNGOpt(path string, img *vae.Tensor, fast bool) error {
 	rgb := image.NewRGBA(image.Rect(0, 0, img.W, img.H))
 	for y := 0; y < img.H; y++ {
 		for x := 0; x < img.W; x++ {
@@ -163,7 +203,11 @@ func writePNG(path string, img *vae.Tensor) error {
 		return err
 	}
 	defer f.Close()
-	return png.Encode(f, rgb)
+	enc := png.Encoder{}
+	if fast {
+		enc.CompressionLevel = png.BestSpeed
+	}
+	return enc.Encode(f, rgb)
 }
 
 func readLatent(path string, want int) ([]float32, error) {

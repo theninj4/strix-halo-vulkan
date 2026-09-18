@@ -2,12 +2,14 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
+	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -54,9 +56,18 @@ type ImageGenerationRequest struct {
 	// Steps is an extension: the denoising schedule's length. The checkpoint
 	// is a turbo distillation whose NFE is 8, so this is a knob for looking at
 	// the trade rather than one a client should normally turn.
-	Steps  int    `json:"steps,omitempty"`
-	Stream bool   `json:"stream,omitempty"`
-	User   string `json:"user,omitempty"`
+	Steps int `json:"steps,omitempty"`
+	// Stream sends the image over Server-Sent Events, with in-progress
+	// frames as it goes. It needs a preview decoder loaded; see
+	// handleImageGeneration.
+	Stream bool `json:"stream,omitempty"`
+	// PartialImages is how many in-progress frames to send before the
+	// finished one, 0 to ImageGeometry.MaxPartials. It is OpenAI's field and
+	// OpenAI's default of zero, which means a stream that carries only the
+	// finished image -- so `stream: true` alone is a framing choice and
+	// `partial_images` is what costs anything.
+	PartialImages int    `json:"partial_images,omitempty"`
+	User          string `json:"user,omitempty"`
 }
 
 // ImageEditRequest is OpenAI's edit request. It is parsed and refused; see
@@ -101,15 +112,15 @@ type ImageData struct {
 // see three of them come back.
 const maxImages = 4
 
-// handleImageGeneration renders a prompt.
+// handleImageGeneration renders a prompt, over one JSON body or over
+// Server-Sent Events.
 //
-// It does not stream. OpenAI's streaming image endpoint sends partial images
-// as the denoiser passes them, and the pipeline does produce the latent after
-// every step -- but decoding one is the full VAE, 0.8 s against a 1.7 s step,
-// which would make a preview cost half the image. What that wants is the
-// small decoder GOALS.md names for it (madebyollin/taef1), and until that is
-// loaded a `stream: true` is refused rather than answered with one frame at
-// the end.
+// **Streaming needs the preview decoder**, and that is the whole of the
+// condition. Decoding an in-progress latent through the full VAE is 0.87 s
+// against a 1.67 s step, so a frame would cost half a step and three of them
+// a fifth of the image; through madebyollin/taef1 it is 87 ms, 5% of a step.
+// So a server started without `-preview` refuses `stream: true` and says
+// which flag it wants, rather than answering with one frame at the end.
 func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 	if s.Image == nil {
 		notLoaded(w, "image generation", "-image")
@@ -123,9 +134,27 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "prompt is empty")
 		return
 	}
-	if req.Stream {
-		badRequest(w, "streaming image generation is not implemented; "+
-			"decoding a preview costs the whole VAE, and the small decoder that would make it cheap is not loaded")
+	geo := s.Image.Geometry()
+	if req.Stream && !geo.Previews {
+		// A 501 rather than a 400, and the same kind of answer -image itself
+		// gives: the request is well formed and the server was started
+		// without the thing that would answer it. writeError rather than
+		// notLoaded because what is missing is a decoder inside a model that
+		// *is* loaded, which its sentence does not fit.
+		writeError(w, http.StatusNotImplemented, "not_implemented",
+			"streaming image generation needs the preview decoder, which this server was started without; "+
+				"pass -preview with a madebyollin/taef1 checkpoint (it is what makes an in-progress frame "+
+				"cost 87 ms instead of the full VAE's 876)")
+		return
+	}
+	if req.PartialImages < 0 || req.PartialImages > geo.MaxPartials {
+		badRequest(w, "partial_images is "+strconv.Itoa(req.PartialImages)+"; this server sends 0 to "+
+			strconv.Itoa(geo.MaxPartials)+" in-progress frames, because each one is a decode")
+		return
+	}
+	if req.PartialImages > 0 && !req.Stream {
+		badRequest(w, "partial_images needs stream: true; there is nowhere to put an in-progress "+
+			"frame in a single JSON response")
 		return
 	}
 	n := req.N
@@ -164,10 +193,20 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	geo := s.Image.Geometry()
+	if req.Stream && n != 1 {
+		badRequest(w, "n is "+strconv.Itoa(n)+" with stream: true; the event stream carries one image, "+
+			"and its frames have no field that would say which")
+		return
+	}
+
 	width, height, err := resolveSize(req.Size, req.AspectRatio, geo)
 	if err != nil {
 		badRequest(w, err.Error())
+		return
+	}
+
+	if req.Stream {
+		s.streamImage(w, r, &req, width, height, format)
 		return
 	}
 
@@ -209,6 +248,120 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ImageStreamEvent is one frame of a streamed image generation.
+//
+// It is OpenAI's envelope -- `type` names the event, `partial_image_index`
+// numbers the in-progress frames -- plus the three fields this server has that
+// theirs does not: `seed` and `steps`, without which a streamed image could not
+// be asked for again, and `step`/`steps` on a partial, so a client watching one
+// arrive knows how much is left. OpenAI's client reads the fields it knows and
+// ignores these.
+type ImageStreamEvent struct {
+	Type      string `json:"type"`
+	B64JSON   string `json:"b64_json,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+	Size      string `json:"size,omitempty"`
+	// OutputFormat is the container the frame is in, and it is the same for a
+	// partial as for the finished image: a client decoding the stream should
+	// not have to switch decoders halfway through it.
+	OutputFormat string `json:"output_format,omitempty"`
+	// PartialImageIndex is present on partials only, and counts from zero.
+	PartialImageIndex *int `json:"partial_image_index,omitempty"`
+	// Step and Steps are the denoising step a partial came from, out of how
+	// many. Extensions.
+	Step  *int  `json:"step,omitempty"`
+	Steps int   `json:"steps,omitempty"`
+	Seed  int64 `json:"seed,omitempty"`
+}
+
+// The event names, which are OpenAI's.
+const (
+	eventPartialImage = "image_generation.partial_image"
+	eventImageDone    = "image_generation.completed"
+)
+
+// streamImage renders one image over Server-Sent Events.
+//
+// **There is no `[DONE]` sentinel**, which is the one place this differs from
+// the chat stream next door. OpenAI's image events are named, and a named
+// terminal event -- `image_generation.completed` -- is already unambiguous;
+// the sentinel exists on the chat endpoint because its frames are unnamed and
+// nothing else marks the last one.
+//
+// An error *after* the first frame cannot be a status code, because the status
+// was committed when the stream opened. It goes out as an `error` event, which
+// is what the chat stream does and what a client can act on; an error before
+// any frame is still a 400 or a 500, which is why every check the handler can
+// make happens before newSSE is called.
+func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, req *ImageGenerationRequest,
+	width, height int, format string) {
+	size := formatSize(width, height)
+	str := newSSE(w)
+
+	// The partial frames go out from inside the backend's run, on its
+	// goroutine, before Generate returns. Encoding and writing them here is
+	// what makes the stream a stream: there is no queue, and a client that
+	// reads slowly slows the denoiser down rather than filling memory.
+	sendPartial := func(p ImagePartial) error {
+		if err := r.Context().Err(); err != nil {
+			return err
+		}
+		body, err := encode(p.Image, format, req.OutputCompression, true)
+		if err != nil {
+			return err
+		}
+		idx, step := p.Index, p.Step
+		return str.send(eventPartialImage, ImageStreamEvent{
+			Type:              eventPartialImage,
+			B64JSON:           base64.StdEncoding.EncodeToString(body),
+			CreatedAt:         time.Now().Unix(),
+			Size:              formatSize(p.Width, p.Height),
+			OutputFormat:      format,
+			PartialImageIndex: &idx,
+			Step:              &step,
+			Steps:             p.Steps,
+		})
+	}
+
+	out, err := s.Image.Generate(r.Context(), &ImageRequest{
+		Prompt: req.Prompt, Width: width, Height: height, Steps: req.Steps, Seed: req.Seed,
+		PartialImages: req.PartialImages, Partial: sendPartial,
+	})
+	if err != nil {
+		streamError(str, "images", err)
+		return
+	}
+	if out == nil || out.Image == nil {
+		streamError(str, "images", errNoImage)
+		return
+	}
+	body, err := encodeImage(out.Image, format, req.OutputCompression)
+	if err != nil {
+		streamError(str, "images", err)
+		return
+	}
+	_ = str.send(eventImageDone, ImageStreamEvent{
+		Type:         eventImageDone,
+		B64JSON:      base64.StdEncoding.EncodeToString(body),
+		CreatedAt:    time.Now().Unix(),
+		Size:         size,
+		OutputFormat: format,
+		Seed:         out.Seed,
+		Steps:        out.Steps,
+	})
+}
+
+// streamError reports a failure that happened after the status was committed.
+// A client that hung up gets nothing, because there is nobody to tell.
+func streamError(str *sse, where string, err error) {
+	if errors.Is(err, context.Canceled) {
+		log.Printf("api: %s: client cancelled", where)
+		return
+	}
+	log.Printf("api: %s: %v", where, err)
+	_ = str.send("error", errorResponse{Error: errorBody{Message: err.Error(), Type: "server_error"}})
 }
 
 // handleImageEdit is the one endpoint on this server that no flag fixes.
@@ -326,7 +479,20 @@ func formatSize(width, height int) string {
 // output_compression where the request gave one and 90 where it did not,
 // which is high enough that a client comparing formats is comparing the
 // containers and not this default.
+//
+// **fast trades bytes for latency, and it is only ever set on a partial
+// frame.** Measured on a 1024x1024 image on this machine: Go's default PNG
+// encoder is 344 ms, `png.BestSpeed` is 60 ms for a file 15% larger, and JPEG
+// at quality 90 is 23 ms. Those are not rounding errors next to what a preview
+// costs to produce -- the taef1 decode behind one is 87 ms -- so the default
+// encoder would make the *container* three quarters of a preview's price and
+// put a frame 430 ms behind the step it came from. A finished image keeps the
+// slower encoder, because it is the deliverable and it is written once.
 func encodeImage(img image.Image, format string, compression int) ([]byte, error) {
+	return encode(img, format, compression, false)
+}
+
+func encode(img image.Image, format string, compression int, fast bool) ([]byte, error) {
 	var buf bytes.Buffer
 	switch format {
 	case "jpeg", "jpg":
@@ -338,7 +504,11 @@ func encodeImage(img image.Image, format string, compression int) ([]byte, error
 			return nil, err
 		}
 	default:
-		if err := png.Encode(&buf, img); err != nil {
+		enc := png.Encoder{}
+		if fast {
+			enc.CompressionLevel = png.BestSpeed
+		}
+		if err := enc.Encode(&buf, img); err != nil {
 			return nil, err
 		}
 	}

@@ -168,10 +168,17 @@ func (g *gpuWeights) put(name string, v []float32) uint32 {
 	return off
 }
 
-// GPUDecoder runs the decoder graph on a Vulkan device.
-type GPUDecoder struct {
+// engine is the device-side machinery a convolution graph runs on.
+//
+// It is its own type because this package now holds *two* convolution graphs
+// -- the AutoencoderKL decoder and taef1's preview decoder (tiny_gpu.go) --
+// and everything below the graph is the same for both: four buffers under one
+// descriptor layout, the pipelines built over that layout, the fp32 weight
+// arena and its fp16 fragment-tile companion, and stage 8's implicit-GEMM
+// convolution with its packing pass. What each decoder adds on top is its own
+// kernels and its own graph.
+type engine struct {
 	dev  *vk.Device
-	cpu  *Decoder
 	wbuf *vk.Buffer
 	abuf *vk.Buffer
 	// The fp16 pair, allocated only on the matrix-core path (stage 7): the
@@ -185,23 +192,32 @@ type GPUDecoder struct {
 
 	weights *gpuWeights
 	w16     map[string]uint32
-	arena   arena
-	harena  arena
 
-	// attn and gemm are the mid block's kernels, conv every convolution's.
-	// A zero spirv means the fp32 path of stage 2b, which is both the
-	// fallback on a device without matrix cores and the oracle the fp16 path
-	// is measured against. The two are chosen independently: the mid block
-	// and the convolutions are different kernels on different tensors, and a
-	// test that wants one narrowing and not the other has to be able to ask.
-	attn attnVariant
-	gemm gemmVariant
+	// conv is every convolution's kernel. A zero spirv means the fp32 path of
+	// stage 2b, which is both the fallback on a device without matrix cores
+	// and the oracle the fp16 path is measured against.
 	conv convVariant
 
-	// convs is every convolution in the graph, in the order flattenWeights
-	// walked them. Both fp16 stagings read it, so the names a dispatch looks
-	// up cannot drift from the names the arena was built with.
+	// convs is every convolution in the graph, in the order the weights were
+	// flattened. Both fp16 stagings read it, so the names a dispatch looks up
+	// cannot drift from the names the arena was built with.
 	convs []convRef
+}
+
+// GPUDecoder runs the decoder graph on a Vulkan device.
+type GPUDecoder struct {
+	engine
+	cpu *Decoder
+
+	arena  arena
+	harena arena
+
+	// attn and gemm are the mid block's kernels. Same convention as
+	// engine.conv, and chosen independently of it: the mid block and the
+	// convolutions are different kernels on different tensors, and a test
+	// that wants one narrowing and not the other has to be able to ask.
+	attn attnVariant
+	gemm gemmVariant
 
 	// dispatches accumulates the recorded graph so a decode is one submit.
 	dispatches []vk.MultiDispatch
@@ -256,13 +272,7 @@ func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDeco
 // which is what the ladder in cmd/vaebench sweeps and what the negative
 // controls in the tests select.
 func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt Options) (*GPUDecoder, error) {
-	g := &GPUDecoder{
-		dev:     dev,
-		cpu:     cpu,
-		pipes:   make(map[string]*vk.ComputePipeline),
-		weights: &gpuWeights{off: make(map[string]uint32)},
-		w16:     make(map[string]uint32),
-	}
+	g := &GPUDecoder{engine: newEngine(dev), cpu: cpu}
 	if err := g.chooseKernels(opt); err != nil {
 		return nil, err
 	}
@@ -336,7 +346,7 @@ func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt O
 		// controls is a wrong pack rather than a wrong kernel (gpu_conv.go).
 		set["pack_conv"] = g.conv.packSpirv()
 	}
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.w16buf}
+	bufs := g.bufs()
 	pcSize := uint32(unsafe.Sizeof(pushConstants{}))
 	for name, spirv := range set {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
@@ -430,7 +440,7 @@ func (g *GPUDecoder) chooseKernels(opt Options) error {
 func (g *GPUDecoder) wmma() bool { return g.attn.spirv != nil }
 
 // convCores reports whether the convolutions do.
-func (g *GPUDecoder) convCores() bool { return g.conv.spirv != nil }
+func (e *engine) convCores() bool { return e.conv.spirv != nil }
 
 // f16 reports whether anything in the graph needs the two fp16 arenas. They
 // are bound to every pipeline either way -- one descriptor layout across the
@@ -451,40 +461,51 @@ func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel, ConvKernel) {
 }
 
 // pipeline builds one pipeline and records its module for destruction.
-func (g *GPUDecoder) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {
-	mod, err := g.dev.NewShaderModule(spirv)
+func (e *engine) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {
+	mod, err := e.dev.NewShaderModule(spirv)
 	if err != nil {
 		return fmt.Errorf("vae: shader %s: %w", name, err)
 	}
-	g.mods = append(g.mods, mod)
-	pipe, err := g.dev.NewPipeline(mod, spec)
+	e.mods = append(e.mods, mod)
+	pipe, err := e.dev.NewPipeline(mod, spec)
 	if err != nil {
 		return fmt.Errorf("vae: pipeline %s: %w", name, err)
 	}
-	g.pipes[name] = pipe
+	e.pipes[name] = pipe
 	return nil
 }
 
+// newEngine is an engine with nothing staged on it yet.
+func newEngine(dev *vk.Device) engine {
+	return engine{
+		dev:     dev,
+		pipes:   make(map[string]*vk.ComputePipeline),
+		weights: &gpuWeights{off: make(map[string]uint32)},
+		w16:     make(map[string]uint32),
+	}
+}
+
+// bufs is the four-buffer set every pipeline in a graph is built over, in the
+// binding order vae_common.glsl declares.
+func (e *engine) bufs() []*vk.Buffer { return []*vk.Buffer{e.wbuf, e.abuf, e.hbuf, e.w16buf} }
+
 // Destroy releases every Vulkan object.
-func (g *GPUDecoder) Destroy() {
-	for _, p := range g.pipes {
+func (g *GPUDecoder) Destroy() { g.engine.destroy() }
+
+func (e *engine) destroy() {
+	for _, p := range e.pipes {
 		p.Destroy()
 	}
-	for _, m := range g.mods {
+	for _, m := range e.mods {
 		m.Destroy()
 	}
-	if g.abuf != nil {
-		g.abuf.Destroy()
+	for _, b := range []*vk.Buffer{e.abuf, e.wbuf, e.hbuf, e.w16buf} {
+		if b != nil {
+			b.Destroy()
+		}
 	}
-	if g.wbuf != nil {
-		g.wbuf.Destroy()
-	}
-	if g.hbuf != nil {
-		g.hbuf.Destroy()
-	}
-	if g.w16buf != nil {
-		g.w16buf.Destroy()
-	}
+	e.pipes, e.mods = map[string]*vk.ComputePipeline{}, nil
+	e.abuf, e.wbuf, e.hbuf, e.w16buf = nil, nil, nil, nil
 }
 
 // flattenWeights copies every weight the graph reads into one arena, in the
@@ -561,7 +582,11 @@ func (t tensor) elems() int { return t.C * t.H * t.W }
 
 // builder records the decode graph into a dispatch list.
 type builder struct {
-	g     *GPUDecoder
+	e *engine
+	// dec is the full decoder's graph and kernels, and is nil for a graph
+	// that is not it -- taef1's, which has no mid block. Everything the two
+	// share reaches the device through e.
+	dec   *GPUDecoder
 	ar    *arena
 	har   *arena
 	out   []vk.MultiDispatch
@@ -595,8 +620,8 @@ func (b *builder) addXY(pipe string, gx, gy uint32, pc pushConstants) {
 	// planSize records the same graph with no pipelines built, purely to
 	// size the arena, so a missing pipeline is an error only once there are
 	// any at all.
-	p := b.g.pipes[pipe]
-	if p == nil && len(b.g.pipes) > 0 {
+	p := b.e.pipes[pipe]
+	if p == nil && len(b.e.pipes) > 0 {
 		b.err = fmt.Errorf("vae: no pipeline %q", pipe)
 		return
 	}
@@ -618,7 +643,7 @@ func (b *builder) release(ts ...tensor) {
 }
 
 func (b *builder) wOff(name string) uint32 {
-	off, ok := b.g.weights.off[name]
+	off, ok := b.e.weights.off[name]
 	if !ok && b.err == nil {
 		b.err = fmt.Errorf("vae: no weight %q", name)
 	}
@@ -626,7 +651,7 @@ func (b *builder) wOff(name string) uint32 {
 }
 
 func (b *builder) bOff(name string) uint32 {
-	if off, ok := b.g.weights.off[name]; ok {
+	if off, ok := b.e.weights.off[name]; ok {
 		return off
 	}
 	return noBias
@@ -635,7 +660,7 @@ func (b *builder) bOff(name string) uint32 {
 // conv appends a convolution producing a fresh tensor. Both shapes this
 // decoder uses -- 3x3 pad 1 and the 1x1 pad 0 shortcuts -- preserve H and W.
 func (b *builder) conv(name string, c *Conv2D, x tensor) tensor {
-	if b.g.convCores() {
+	if b.e.convCores() {
 		return b.convCores(name, c, x)
 	}
 	out := tensor{off: b.ar.alloc(c.OutC * x.H * x.W), C: c.OutC, H: x.H, W: x.W}
@@ -810,11 +835,11 @@ func (b *builder) upsample(name string, c *Conv2D, x tensor) tensor {
 
 // build records the whole decode and returns the output tensor.
 func (b *builder) build(latentH, latentW int) tensor {
-	d := b.g.cpu
+	d := b.dec.cpu
 	x := tensor{off: b.ar.alloc(d.ConvIn.InC * latentH * latentW), C: d.ConvIn.InC, H: latentH, W: latentW}
 	h := b.conv("conv_in", d.ConvIn, x)
 	h = b.resnet("mid.r1", d.Mid.Resnet1, h)
-	if b.g.wmma() {
+	if b.dec.wmma() {
 		h = b.attentionWMMA("mid.attn", d.Mid.Attn, h)
 	} else {
 		h = b.attention("mid.attn", d.Mid.Attn, h)
@@ -840,7 +865,7 @@ func (b *builder) build(latentH, latentW int) tensor {
 func (g *GPUDecoder) planSize(latentH, latentW int) (uint32, uint32, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{g: g, ar: &arena{}, har: &arena{}}
+	b := &builder{e: &g.engine, dec: g, ar: &arena{}, har: &arena{}}
 	b.build(latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
@@ -862,7 +887,7 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 
 	g.arena.reset()
 	g.harena.reset()
-	b := &builder{g: g, ar: &g.arena, har: &g.harena}
+	b := &builder{e: &g.engine, dec: g, ar: &g.arena, har: &g.harena}
 	out := b.build(latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err
@@ -917,7 +942,7 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 func (g *GPUDecoder) Dispatches(latentH, latentW int) (int, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{g: g, ar: &arena{}, har: &arena{}}
+	b := &builder{e: &g.engine, dec: g, ar: &arena{}, har: &arena{}}
 	b.build(latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
@@ -959,7 +984,7 @@ type Stage struct {
 func (g *GPUDecoder) Profile(latent *Tensor) ([]Stage, error) {
 	g.arena.reset()
 	g.harena.reset()
-	b := &builder{g: g, ar: &g.arena, har: &g.harena}
+	b := &builder{e: &g.engine, dec: g, ar: &g.arena, har: &g.harena}
 	out := b.build(latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err

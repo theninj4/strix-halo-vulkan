@@ -242,7 +242,7 @@ func (b *builder) narrow(in tensor, rows, rowsPad, lda int) uint32 {
 // whole tiles, so the rows past the image are part of the allocation and have
 // to be part of what the arena reclaims.
 func (b *builder) proj(name string, l *Linear, aOff uint32, rows, rowsPad, lda int) tensor {
-	v := b.g.gemm
+	v := b.dec.gemm
 	out := tensor{off: b.ar.alloc(rowsPad * l.Out), C: l.Out, H: rowsPad, W: 1}
 	b.label(fmt.Sprintf("gemm %d->%d x%d", l.In, l.Out, rows),
 		2*float64(rowsPad)*float64(l.Out)*float64(l.In))
@@ -313,7 +313,7 @@ func (b *builder) attentionWMMA(name string, a *Attention, x tensor) tensor {
 	ctx := tensor{off: b.ar.alloc(rowsPad * dim), C: dim, H: rowsPad, W: 1}
 	b.label(fmt.Sprintf("attention %d rows x %d", rows, dim),
 		2*2*float64(rows)*float64(rows)*float64(dim))
-	b.add("attn_wmma", uint32((rows+b.g.attn.qt*coopMatTile-1)/(b.g.attn.qt*coopMatTile)), pushConstants{
+	b.add("attn_wmma", uint32((rows+b.dec.attn.qt*coopMatTile-1)/(b.dec.attn.qt*coopMatTile)), pushConstants{
 		InOff: hQ, OutOff: ctx.off, ResOff: hK, Aux2: hV,
 		C:    uint32(dim),
 		Aux0: uint32(rows),
@@ -338,7 +338,7 @@ func (b *builder) attentionWMMA(name string, a *Attention, x tensor) tensor {
 
 // b16Off resolves a projection weight in the fp16 arena.
 func (b *builder) b16Off(name string) uint32 {
-	off, ok := b.g.w16[name]
+	off, ok := b.e.w16[name]
 	if !ok && b.err == nil {
 		b.err = fmt.Errorf("vae: no fp16 weight %q", name)
 	}

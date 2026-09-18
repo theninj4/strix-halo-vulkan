@@ -215,18 +215,21 @@ func expandBias(bias []float32, oc int) []float32 {
 }
 
 // stageConvWeights appends every conv filter to the fp16 weight arena in its
-// fragment-tile layout. This is 84 M parameters -- the whole decoder -- so
-// unlike stage 7's four projections it is worth saying what it costs: 168 MB
-// of fp16 beside the 336 MB of fp32 the scalar path still reads for the
-// convs it keeps. Nothing is freed, because the fp32 copy is what
-// TestGPUConvMatchesScalar compares against and what a device without matrix
-// cores runs.
-func (g *GPUDecoder) stageConvWeights(data []uint16) []uint16 {
-	for _, cr := range g.convs {
+// fragment-tile layout. For the full decoder this is 84 M parameters -- the
+// whole of it -- so unlike stage 7's four projections it is worth saying what
+// it costs: 168 MB of fp16 beside the 336 MB of fp32 the scalar path still
+// reads for the convs it keeps. Nothing is freed, because the fp32 copy is
+// what TestGPUConvMatchesScalar compares against and what a device without
+// matrix cores runs.
+//
+// It is on the engine rather than on either decoder because the packed layout
+// is the engine's: taef1 stages its 1.2 M parameters through the same call.
+func (e *engine) stageConvWeights(data []uint16) []uint16 {
+	for _, cr := range e.convs {
 		off := uint32(len(data))
 		data = append(data, make([]uint16, convWeightElems(cr.conv))...)
 		packConvA(data[off:], cr.conv.Weight, cr.conv.OutC, cr.conv.InC, cr.conv.KH*cr.conv.KW)
-		g.w16[cr.name+".weight"] = off
+		e.w16[cr.name+".weight"] = off
 	}
 	return data
 }
@@ -258,7 +261,7 @@ func (b *builder) packConv(x tensor) uint32 {
 // carries the row as well as the tile, and the shader is told how many tiles
 // a row holds rather than dividing by a constant it does not have.
 func (b *builder) convCores(name string, c *Conv2D, x tensor) tensor {
-	v := b.g.conv
+	v := b.e.conv
 	out := tensor{off: b.ar.alloc(c.OutC * x.H * x.W), C: c.OutC, H: x.H, W: x.W}
 	packed := b.packConv(x)
 	tilesPerRow := (x.W + v.bn - 1) / v.bn
@@ -279,7 +282,7 @@ func (b *builder) convCores(name string, c *Conv2D, x tensor) tensor {
 // not a case this decoder has, but there is no push-constant value that means
 // "not set" (stage 6), so it is said rather than assumed.
 func (b *builder) convBiasOff(name string) uint32 {
-	if off, ok := b.g.weights.off[name+".bias16"]; ok {
+	if off, ok := b.e.weights.off[name+".bias16"]; ok {
 		return off
 	}
 	return noBias

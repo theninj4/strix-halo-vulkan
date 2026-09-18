@@ -9,3 +9,7 @@ func sqrt64(v float64) float64 { return math.Sqrt(v) }
 // but correctness first: this matches PyTorch, which also computes sigmoid
 // in the tensor's own precision via a float32 expf.
 func exp32(v float32) float32 { return float32(math.Exp(float64(v))) }
+
+// tanh32 is math.Tanh at float32 width, for taef1's input clamp. Same
+// argument as exp32: PyTorch evaluates it in the tensor's own precision.
+func tanh32(v float32) float32 { return float32(math.Tanh(float64(v))) }

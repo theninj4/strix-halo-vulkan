@@ -19,7 +19,7 @@ features, in Go" — is what this is, and all five verticals are now behind it.
 | `POST /v1/audio/speech` | **done** — kokoro, `-tts` |
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
-| `POST /v1/images/generations` | **done** — z-image-turbo, `-image`, any size the arenas hold |
+| `POST /v1/images/generations` | **done** — z-image-turbo, `-image`, any size the arenas hold, streaming previews with `-preview` |
 | `POST /v1/images/edits` | 501 — needs the VAE's *encoder*: weights in the checkpoint, port not written |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
@@ -117,7 +117,7 @@ truncated through it would be pooled from an ordinary word.
 
 **The image pipeline is resident, and its resolution is not part of what is
 resident.** `-image` stages 7.2 GB of text encoder, 12.5 GB of transformer and
-0.3 GB of VAE in **20.4 s**, sizes 4.9 GB of activation arenas for
+0.3 GB of VAE in **21.2 s**, sizes 4.9 GB of activation arenas for
 `-image-size`, and then a request moves no weight. That last clause is what
 this endpoint needed and did not have: `zimage/pipeline` used to fix its width
 and height at construction, so a size was a residency question.
@@ -137,6 +137,11 @@ parakeet, and every smaller image runs in the same arenas. Measured on one
 | 1024x576 | 2304 | 7.95 s |
 | 512x512 | 1024 | **3.65 s** / 3.64 |
 | 256x256 | 256 | 1.33 s |
+
+`-previews` adds 1.0 GB of arena to that and no measurable staging time —
+24.9 GB becomes **25.9** — and the two processes render the same non-streamed
+1024x1024 image in 14.64/14.72 s and 14.72/14.80. A preview decoder that is
+not asked for costs residency and nothing else.
 
 **What bounds a request is each side, and not the area** — which is worth
 stating because the plausible guess is the other one. A diffusion model's cost
@@ -208,6 +213,8 @@ Two things would fix it, and both are measurements rather than arguments:
     -image-size        1024x1024           the largest image the arenas hold, and the default
     -image-steps       8                   what a request that names no steps gets
     -image-max-prompt  512                 longest prompt the image text encoder is built for
+    -preview           ""                  a madebyollin/taef1 checkpoint; loads the preview decoder
+    -previews          false               shorthand for -preview models/taef1
 
 **-llm and -image do not fit together.** ~84 GB and ~25 GB against 128 GB of
 unified memory the rest of the machine is also in: they are separate
@@ -343,8 +350,46 @@ landscape picture does not have to know the ceiling to ask for one; `size`
 wins when both are set, because that is the field every other server reads.
 `GET /v1/models` carries an **`image`** object on the image model, alongside
 the speech model's voices and for the same reason: `default_size`, `max_size`,
-`size_multiple` and `default_steps`, which are decided by what this process
-staged.
+`size_multiple`, `default_steps`, `previews` and `max_partial_images`, which
+are decided by what this process staged. The last two are how a client finds
+out that `stream: true` will be answered rather than discovering it from a
+501.
+
+**Streaming an image** is OpenAI's `stream` and `partial_images`, and it needs
+`-preview`. The frames are `image_generation.partial_image` — `b64_json`,
+`size`, `output_format` and `partial_image_index`, plus a `step`/`steps` pair
+this server adds so a client watching one arrive knows how much is left —
+followed by one `image_generation.completed` carrying the finished image and
+the `seed` and `steps` that produced it. There is **no `[DONE]` sentinel**:
+these events are named, so the terminal one is already unambiguous, and the
+sentinel exists on the chat endpoint only because its frames are not.
+
+Measured on one `-image -previews` process at 1024x1024, two runs each:
+
+| request | wall clock | first picture |
+|---|---|---|
+| no stream | 14.72 s / 14.80 | 14.7 s |
+| `stream: true` | 14.76 s / 14.75 | 14.8 s |
+| `stream: true, partial_images: 3` | **15.40 s** / 15.41 | **3.6 s** |
+
+So the framing is free and three in-progress frames cost **4.4%** — and what
+they buy is a picture at 3.6 seconds instead of at fifteen. The frames land at
+3.6, 7.1 and 10.7 s, from steps 1, 3 and 5 of the eight.
+
+Two numbers inside that 4.4% are worth separating, because only one of them is
+the model. A preview decode is **87 ms** (`madebyollin/taef1`, IMAGE.md I2);
+encoding the frame is the other **60**, and it would have been **344** at Go's
+default PNG compression — four times the decode. Partial frames therefore go
+out at `png.BestSpeed`, 15% more bytes for a fifth of the latency, while the
+finished image keeps the careful encoder. A transient frame and a deliverable
+are not the same object.
+
+**Which steps a partial comes from is the backend's decision**, not the
+handler's: the step count may not have been named in the request, and how
+finished a picture looks at step k is the scheduler's business. `backend`
+spreads them evenly and never takes the last step, whose denoised estimate
+*is* the final latent — a frame there would be the finished image sent twice,
+once through each decoder.
 
 What is refused rather than faked:
 
@@ -360,27 +405,9 @@ What is refused rather than faked:
   naming what the server does encode. *Transcripts* are a different question
   and are no longer refused: `json`, `verbose_json`, `text`, `srt` and `vtt`
   all answer, because the timings they need exist.
-- **`stream: true` on image generation.** The pipeline does produce the latent
-  after every step, so a preview is available — but decoding one is the whole
-  VAE, 0.8 s against a 1.7 s step, so previews would cost half the image.
-  What that wants is the small decoder GOALS.md names for it
-  (`madebyollin/taef1`), not a goroutine.
-- **`response_format: "url"`.** There is nowhere to host an image; the
-  endpoint returns `b64_json`, and says so.
-- **`output_format` other than png and jpeg.** Go's standard library encodes
-  those two, and a webp request gets a 400 naming them rather than a PNG with
-  the wrong `Content-Type`.
-- **A size the arenas were not built for**, rather than the nearest one that
-  fits. A client that asked for 1000x1000 and got 992x992 has no way to find
-  out; the 400 says what the ceiling is and what the sides have to be a
-  multiple of.
-- **`/v1/images/edits` altogether.** The one 501 on the server that no flag
-  fixes: an edit starts from a picture, and bringing a picture into the
-  transformer's latent space is the VAE's *encoder*. **The weights are in the
-  checkpoint** — z-image ships a stock Flux `AutoencoderKL`, and the 34 M
-  encoder parameters sit in the same 167 MB file `-image` already opens for
-  the decoder's 50 M — so this is a missing port, not a missing download, and
-  the message says which.
+- **`stream: true` without `-preview`.** It is a 501 naming the flag rather
+  than a 400, because the request is well formed and the server was started
+  without the decoder that answers it. With the flag it streams; see below.
 
 And on the chat endpoints, the same principle with a longer list: **`n > 1`**
 (n completions are n runs of a model sized to saturate the device), **`min_p`
@@ -403,11 +430,6 @@ nothing.
   which is a measurement rather than an argument.
 - **MTP speculative decoding** (LLM.md L9), which is the next thing worth
   1.5-1.8x on the endpoint that has just been wired.
-- **In-progress previews, and so a streamed image.** `madebyollin/taef1`
-  (GOALS.md) is the small decoder that makes a per-step preview cost a
-  percent instead of half the image, and it is the only thing standing between
-  the pipeline's existing `progress(Step)` callback and OpenAI's
-  `image_generation.partial_image` frames.
 - **The VAE's encoder**, which is what `/v1/images/edits` needs. The weights
   ship with the checkpoint and go unread today, and the port is mostly reuse:
   the encoder is the decoder's mirror and shares conv2d, group norm, SiLU, the

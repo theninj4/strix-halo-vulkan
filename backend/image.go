@@ -38,6 +38,13 @@ type ImageOptions struct {
 	Steps int
 	// MaxPrompt is the longest prompt the text encoder is built for.
 	MaxPrompt int
+	// Preview is a madebyollin/taef1 checkpoint directory. Naming one loads
+	// the small decoder beside the big one and is what makes `stream: true`
+	// answerable; leaving it empty makes that request a 400 that says so.
+	//
+	// It is a flag rather than always-on because it is residency: 4.9 MB of
+	// weights, but 1.0 GB of activation arena at a 1024x1024 ceiling.
+	Preview string
 	// ID is the model id this backend answers to in /v1/models.
 	ID string
 }
@@ -47,6 +54,11 @@ const (
 	defaultImageSize    = 1024
 	defaultImageSteps   = 8
 	defaultMaxPrompt    = 512
+	// maxPartialImages is OpenAI's bound on `partial_images`, kept because
+	// the cost argument agrees with it: a preview is 87 ms at 1024x1024
+	// against a 14.5 s image, so three of them is 1.8% and a frame per step
+	// would be 4.8%. It is a policy, not a limit of the decoder.
+	maxPartialImages = 3
 )
 
 // Image is the z-image adapter: an api.ImageBackend over the pipeline
@@ -107,7 +119,7 @@ func NewImage(opt ImageOptions) (*Image, error) {
 	err := opt.Device.Do(func(dev *vk.Device) error {
 		p, err := pipeline.New(dev, pipeline.Options{
 			Model: opt.Model, Width: opt.Width, Height: opt.Height,
-			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt,
+			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt, Preview: opt.Preview,
 		})
 		if err != nil {
 			return err
@@ -130,12 +142,20 @@ func (b *Image) Models() []api.Model {
 func (b *Image) Geometry() api.ImageGeometry {
 	w, h := b.pipe.Size()
 	mw, mh := b.pipe.MaxSize()
-	return api.ImageGeometry{
+	geo := api.ImageGeometry{
 		Width: w, Height: h,
 		MaxWidth: mw, MaxHeight: mh,
 		Multiple: pipeline.SizeMultiple,
 		Steps:    b.pipe.Steps(),
+		Previews: b.pipe.HasPreview(),
 	}
+	// Zero when there is no preview decoder, so the two fields cannot
+	// disagree: a client reading `max_partial_images: 3` beside
+	// `previews: false` would reasonably conclude it could ask for three.
+	if geo.Previews {
+		geo.MaxPartials = maxPartialImages
+	}
+	return geo
 }
 
 // Residency reports what the pipeline holds on the device, for the startup
@@ -202,16 +222,52 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
 
+	// Which steps a partial comes from. The handler said how many it wants;
+	// this is the half that needs the step count, and it is why the decision
+	// is here (api.ImageRequest.PartialImages says so).
+	var (
+		partialAt map[int]int
+		partialN  int
+		perr      error
+	)
+	if req.Partial != nil && req.PartialImages > 0 && b.pipe.HasPreview() {
+		partialAt = partialSteps(steps, min(req.PartialImages, maxPartialImages))
+		partialN = len(partialAt)
+	}
+	progress := func(st pipeline.Step) {
+		idx, want := partialAt[st.Index]
+		if !want || perr != nil || st.Preview == nil {
+			return
+		}
+		t, err := st.Preview()
+		if err != nil {
+			perr = fmt.Errorf("preview at step %d: %w", st.Index, err)
+			return
+		}
+		perr = req.Partial(api.ImagePartial{
+			Index: idx, Step: st.Index, Steps: steps,
+			Image: toRGBA(t), Width: t.W, Height: t.H,
+		})
+	}
+	if partialN == 0 {
+		progress = nil
+	}
+
 	var img *vae.Tensor
 	var tm *pipeline.Timings
 	err := b.opt.Device.Do(func(*vk.Device) error {
 		var err error
 		img, tm, err = b.pipe.Run(pipeline.Request{
 			Prompt: req.Prompt, Width: req.Width, Height: req.Height,
-			Steps: steps, Seed: seed,
+			Steps: steps, Seed: seed, Progress: progress,
 		})
 		return err
 	})
+	// A frame the client could not be given -- they hung up -- is the failure,
+	// not whatever the rest of the run did, so it is reported first.
+	if perr != nil {
+		return nil, perr
+	}
 	if err != nil {
 		// A prompt past the text encoder's arena is the client's fault and
 		// fixable by them, which is the whole of what ErrUnsupported means.
@@ -250,4 +306,38 @@ func toRGBA(t *vae.Tensor) image.Image {
 		}
 	}
 	return img
+}
+
+// partialSteps picks which denoising steps a partial image comes from: n
+// frames spread evenly over the schedule, as a map from step index to the
+// frame's own index.
+//
+// The last step is excluded, and that is the only judgement in here. Its
+// denoised estimate *is* the final latent -- the terminal sigma is zero -- so
+// a partial there would be the finished image sent twice, once through the
+// preview decoder and once through the real one, and the two are not quite
+// the same picture. Everything else follows: with fewer steps than frames
+// asked for there are simply fewer frames, and with one step there are none.
+func partialSteps(steps, n int) map[int]int {
+	if steps < 2 || n <= 0 {
+		return nil
+	}
+	out := make(map[int]int, n)
+	last := steps - 2 // the last step a partial may come from
+	idx := 0
+	for j := 1; j <= n; j++ {
+		k := j*steps/(n+1) - 1
+		if k < 0 {
+			k = 0
+		}
+		if k > last {
+			k = last
+		}
+		if _, seen := out[k]; seen {
+			continue
+		}
+		out[k] = idx
+		idx++
+	}
+	return out
 }

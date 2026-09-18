@@ -39,6 +39,18 @@ type Options struct {
 	// because the measurement that justifies stage 9 is the difference
 	// between the two on the same image.
 	CPUHead bool
+	// Preview is a madebyollin/taef1 checkpoint directory, and turning it on
+	// is what makes in-progress previews possible: the pipeline holds the
+	// small decoder resident beside the big one and Step.Preview decodes the
+	// step's denoised estimate through it. Empty leaves it out entirely, and
+	// then Step.Preview is nil rather than slow.
+	//
+	// It costs what the arenas cost, which at the ceiling is most of it: 4.9
+	// MB of weights and, at 1024x1024, 872 MB of fp32 activations and 135 MB
+	// of fp16 -- 4% on top of the ~25 GB the pipeline already holds. What it
+	// buys is an 87 ms preview against the 876 ms the full decoder takes
+	// for the same picture.
+	Preview string
 	// UnfusedLayout keeps the two pure-layout dispatches stage 10 removed --
 	// `pack v` and `narrow ctx` -- as their own passes. Same reason as
 	// CPUHead: the slow path is what the fast one is measured against, and
@@ -111,6 +123,13 @@ type Pipeline struct {
 	gpuHead *dit.GPUHead
 
 	dec *vae.GPUDecoder
+	// tiny is the preview decoder, nil unless Options.Preview named one.
+	tiny *vae.GPUTiny
+	// x0 is the denoised-estimate buffer a progress callback is handed. It is
+	// one buffer reused across steps rather than one per step, because a
+	// callback that wants to keep it has to copy it -- the same contract
+	// Step.Latents already has.
+	x0 []float32
 
 	schedCfg *SchedulerConfig
 	sched    *FlowMatchEuler // the default schedule, for Options.Steps
@@ -210,12 +229,40 @@ type controls struct {
 // head and tail; they are separated because the head is the pipeline's one
 // unoptimised piece. Latents is the state the step left, [C, H, W] -- it is the
 // pipeline's own buffer and the next step overwrites it, so a callback that
-// wants to keep it (to decode a preview, say) has to copy it.
+// wants to keep it has to copy it. So is X0, and so is the tensor Preview
+// returns.
 type Step struct {
 	Index          int
 	Blocks, Head   time.Duration
 	Latents        []float32
 	Sigma, NextSig float64
+
+	// X0 is the *denoised estimate*: where the trajectory is heading, as
+	// opposed to Latents, which is where it currently is.
+	//
+	// **This is the tensor a preview decodes, and it is not the obvious
+	// one.** The schedule is flow matching, so Latents at step k is an
+	// interpolation x_t = (1-sigma) x0 + sigma eps -- four steps into an
+	// eight-step run that is still 75% noise, and decoding it gives a picture
+	// of noise. The estimate is x0 = x_t - sigma*v, which the loop can form
+	// for nothing because it has the velocity in hand, and it is a recognisable
+	// image after the *first* step of eight. reference/dump_taef1.py --from-run
+	// measured both sequences against the finished image: x0 runs
+	// 0.29 -> 0.02 over the eight steps and x_t runs 0.48 -> 0.02.
+	//
+	// At the last step the two coincide, since the terminal sigma is zero.
+	X0 []float32
+	// Preview decodes X0 through taef1 into an image in [-1, 1], the same
+	// range and layout the full decoder produces. It is nil unless
+	// Options.Preview named a checkpoint, and it is valid only for the
+	// duration of the callback.
+	//
+	// It is a closure rather than a decoded tensor because a preview is
+	// expensive enough to be worth not doing: 87 ms at 1024x1024 against a
+	// 1.67 s step, so previewing every step of eight is 42% of one step and
+	// 5% of the image, and a client that asked for three partial images
+	// should pay for three.
+	Preview func() (*vae.Tensor, error)
 }
 
 // New builds the pipeline, staging every weight onto the device.
@@ -321,11 +368,42 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: vae: %w", err)
 	}
+
+	// The preview decoder, last because it is the only optional stage and
+	// because its arenas are sized from the same ceiling as the big one's.
+	if opt.Preview != "" {
+		tinyCPU, err := vae.LoadTinyDecoder(opt.Preview, vae.TAEF1Config())
+		if err != nil {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: taef1: %w", err)
+		}
+		// The two decoders have to agree on the latent, or a preview would be
+		// a picture of something else. Checked rather than assumed: they are
+		// separate checkpoints and nothing else in the pipeline would notice.
+		if tinyCPU.Cfg.LatentChannels != p.cfg.InChan {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: taef1 takes %d latent channels, the transformer produces %d",
+				tinyCPU.Cfg.LatentChannels, p.cfg.InChan)
+		}
+		if tinyCPU.Scale() != vaeScale {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: taef1 upsamples %dx, the pipeline's geometry assumes %d",
+				tinyCPU.Scale(), vaeScale)
+		}
+		if p.tiny, err = vae.NewGPUTiny(dev, tinyCPU, p.max.latentH, p.max.latentW); err != nil {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: taef1: %w", err)
+		}
+	}
 	return p, nil
 }
 
 // Destroy releases every device resource.
 func (p *Pipeline) Destroy() {
+	if p.tiny != nil {
+		p.tiny.Destroy()
+		p.tiny = nil
+	}
 	if p.dec != nil {
 		p.dec.Destroy()
 	}
@@ -681,6 +759,30 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 
 		tm.Steps = append(tm.Steps, d.Blocks+d.Head)
 		if req.Progress != nil {
+			// The denoised estimate, which is what a preview decodes. `out`
+			// is the velocity the scheduler was just handed -- already
+			// negated, so it points the way the schedule runs -- and
+			// x_t = x0 + sigma*v holds at every sigma on the trajectory, so
+			// subtracting sigma*v from the state the step left gives the
+			// estimate at the sigma it left it at. At the final step that
+			// sigma is zero and x0 is the latent itself.
+			//
+			// One pass over 16*H*W floats: 0.3 ms at 1024x1024 against a
+			// 1.67 s step, and only when someone is listening.
+			// len rather than cap: `cap` is the caption stream in this
+			// scope, and a shadowed builtin is not worth the byte it saves.
+			if len(p.x0) < len(latents) {
+				p.x0 = make([]float32, len(latents))
+			}
+			d.X0 = p.x0[:len(latents)]
+			sigma := float32(sched.Sigmas[step+1])
+			for j := range latents {
+				d.X0[j] = latents[j] - sigma*out[j]
+			}
+			if p.tiny != nil {
+				x0, lh, lw := d.X0, g.latentH, g.latentW
+				d.Preview = func() (*vae.Tensor, error) { return p.PreviewDecode(x0, lh, lw) }
+			}
 			req.Progress(d)
 		}
 	}
@@ -707,10 +809,42 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 // the rest of the graph still use.
 func (p *Pipeline) Residency() (encoder, transformer, vae, activations int) {
 	vaeW32, vaeW16 := p.dec.WeightBytes()
+	act := p.stack.ActivationBytes() + p.dec.ActivationBytes() + p.dec.F16ActivationBytes()
+	if p.tiny != nil {
+		tw32, tw16 := p.tiny.WeightBytes()
+		vaeW32, vaeW16 = vaeW32+tw32, vaeW16+tw16
+		act += p.tiny.ActivationBytes() + p.tiny.F16ActivationBytes()
+	}
 	return p.enc.WeightBytes() + p.enc.ActivationBytes(),
 		p.stack.WeightBytes(),
 		vaeW32 + vaeW16,
-		p.stack.ActivationBytes() + p.dec.ActivationBytes() + p.dec.F16ActivationBytes()
+		act
+}
+
+// HasPreview reports whether Step.Preview will be set, i.e. whether
+// Options.Preview named a taef1 checkpoint. A server answering `stream: true`
+// asks this rather than starting a run and finding out.
+func (p *Pipeline) HasPreview() bool { return p.tiny != nil }
+
+// PreviewDecode decodes a latent through taef1 into an image in [-1, 1].
+//
+// It takes the *raw* diffusion latent -- the state the loop holds, or its
+// denoised estimate -- with no scaling_factor applied, which is the opposite
+// of what the full decoder wants and is measured rather than assumed
+// (zimage/vae/tiny.go). It is exported for the benefit of a caller that kept
+// a Step.X0 and wants to decode it later; inside a callback, Step.Preview is
+// the same call with the geometry already filled in.
+func (p *Pipeline) PreviewDecode(latents []float32, latentH, latentW int) (*vae.Tensor, error) {
+	if p.tiny == nil {
+		return nil, fmt.Errorf("pipeline: no preview decoder; Options.Preview named no taef1 checkpoint")
+	}
+	want := p.cfg.InChan * latentH * latentW
+	if len(latents) != want {
+		return nil, fmt.Errorf("pipeline: %d latents for a %dx%d grid, want %d", len(latents), latentH, latentW, want)
+	}
+	t := vae.NewTensor(1, p.cfg.InChan, latentH, latentW)
+	copy(t.Data, latents)
+	return p.tiny.Apply(t)
 }
 
 func seq(lo, hi int) []int {

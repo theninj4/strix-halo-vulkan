@@ -13,10 +13,17 @@
 //	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
 //	go run ./cmd/serve -image                       # z-image-turbo, 25 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
+//	go run ./cmd/serve -image -preview              # and stream in-progress frames
 //	go run ./cmd/serve -tts -gpu=false              # the CPU reference
 //
 // Every endpoint answers today except POST /v1/images/edits, which needs the
 // VAE's encoder and not a flag (see api.Server.handleImageEdit).
+//
+// **-preview is what makes `stream: true` answerable** on the image endpoint.
+// It loads madebyollin/taef1 beside the full VAE, and the reason it is a flag
+// rather than always on is residency: 4.9 MB of weights but 1.0 GB of
+// activation arena at a 1024x1024 ceiling. What it buys is a preview at 87 ms
+// against the 870 the full decoder would take for the same frame.
 //
 // **-llm stages D19's widths by default** (P3a): D18's 4.5-bit plan with
 // `ple_proj` on int8, plus P3a's fifth bit on `full_attn`, `qsa_indexer`,
@@ -110,6 +117,10 @@ func main() {
 		"largest image the arenas are built for, and the size a request that names none gets; both sides a multiple of 16")
 	imgSteps := flag.Int("image-steps", 8, "denoising steps a request that names none gets; the checkpoint's NFE is 8")
 	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
+	imgPreview := flag.String("preview", "",
+		"a madebyollin/taef1 checkpoint; loads the preview decoder, which is what lets /v1/images/generations stream")
+	imgPreviewOn := flag.Bool("previews", false,
+		"shorthand for -preview models/taef1")
 	flag.Parse()
 
 	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
@@ -201,9 +212,13 @@ func main() {
 
 	if *imgOn {
 		start := time.Now()
+		preview := *imgPreview
+		if preview == "" && *imgPreviewOn {
+			preview = defaultPreviewModel
+		}
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
-			Steps: *imgSteps, MaxPrompt: *imgPrompt,
+			Steps: *imgSteps, MaxPrompt: *imgPrompt, Preview: preview,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -211,8 +226,12 @@ func main() {
 		defer b.Close()
 		srv.Image = b
 		enc, tr, vaeW, act := b.Residency()
-		log.Printf("image: %s, to %dx%d, %d steps, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
-			*imgModel, imgW, imgH, *imgSteps,
+		previews := "no previews (-preview)"
+		if b.Geometry().Previews {
+			previews = "previews from " + preview
+		}
+		log.Printf("image: %s, to %dx%d, %d steps, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
+			*imgModel, imgW, imgH, *imgSteps, previews,
 			float64(enc+tr+vaeW+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9,
 			time.Since(start).Round(time.Millisecond))
 	}
@@ -246,6 +265,10 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+// defaultPreviewModel is where -previews looks for taef1, matching every other
+// checkpoint's place in models/.
+const defaultPreviewModel = "models/taef1"
 
 // parseSize reads -image-size, which is spelled the way a request spells it so
 // that the flag and the API field are not two notations for one thing.

@@ -21,6 +21,10 @@ const (
 )
 
 type manifest struct {
+	// dir is where the tensors this manifest describes live, so that a test
+	// reading a second dump -- taef1's -- uses the same loader rather than a
+	// copy of it.
+	dir        string
 	Seed       int `json:"seed"`
 	LatentSize int `json:"latent_size"`
 	Tensors    map[string]struct {
@@ -32,12 +36,19 @@ type manifest struct {
 }
 
 func loadManifest(t *testing.T) *manifest {
+	return loadManifestFrom(t, refDir, "reference/dump_vae.py")
+}
+
+// loadManifestFrom reads a dump directory's manifest, skipping the test if it
+// has not been produced. gen is the script that produces it, so the skip says
+// what to run.
+func loadManifestFrom(t *testing.T, dir, gen string) *manifest {
 	t.Helper()
-	buf, err := os.ReadFile(filepath.Join(refDir, "manifest.json"))
+	buf, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
-		t.Skipf("no reference dump (%v); run reference/dump_vae.py", err)
+		t.Skipf("no reference dump (%v); run %s", err, gen)
 	}
-	var m manifest
+	m := manifest{dir: dir}
 	if err := json.Unmarshal(buf, &m); err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +62,7 @@ func loadRef(t *testing.T, m *manifest, name string) *Tensor {
 	if !ok {
 		t.Fatalf("reference has no tensor %q", name)
 	}
-	raw, err := os.ReadFile(filepath.Join(refDir, name+".bin"))
+	raw, err := os.ReadFile(filepath.Join(m.dir, name+".bin"))
 	if err != nil {
 		t.Fatal(err)
 	}

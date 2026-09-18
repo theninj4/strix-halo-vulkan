@@ -272,6 +272,18 @@ func (l *loader) shape(name string) []int {
 }
 
 func (l *loader) conv(prefix string, pad int) *Conv2D {
+	c := l.convOptBias(prefix, pad)
+	if l.err == nil && c.Bias == nil {
+		l.err = fmt.Errorf("vae: %s has no bias", prefix)
+	}
+	return c
+}
+
+// convOptBias is conv where the bias may legitimately be absent. Only taef1
+// needs it -- the three convolutions after its upsamples are built with
+// bias=False -- and it is separate from conv so that a missing bias stays an
+// error everywhere it would be a silently wrong answer.
+func (l *loader) convOptBias(prefix string, pad int) *Conv2D {
 	sh := l.shape(prefix + ".weight")
 	if l.err != nil {
 		return nil
@@ -280,11 +292,14 @@ func (l *loader) conv(prefix string, pad int) *Conv2D {
 		l.err = fmt.Errorf("vae: %s.weight has shape %v, want 4 dims", prefix, sh)
 		return nil
 	}
-	return &Conv2D{
+	c := &Conv2D{
 		OutC: sh[0], InC: sh[1], KH: sh[2], KW: sh[3], Pad: pad,
 		Weight: l.f32(prefix + ".weight"),
-		Bias:   l.f32(prefix + ".bias"),
 	}
+	if l.set.Has(prefix + ".bias") {
+		c.Bias = l.f32(prefix + ".bias")
+	}
+	return c
 }
 
 func (l *loader) groupNorm(prefix string, groups int, eps float64) *GroupNorm {
