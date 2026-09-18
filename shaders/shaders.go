@@ -1915,6 +1915,7 @@ var KokoroGELU []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_norm.spv llm_hc_norm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_combine.spv llm_hc_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_cn.spv llm_hc_cn.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -o llm_hc_down_m1.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -o llm_hc_down_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -o llm_hc_down_m4.spv llm_gemm.comp
@@ -2054,6 +2055,9 @@ var LLMHCNorm []byte
 
 //go:embed llm_hc_combine.spv
 var LLMHCCombine []byte
+
+//go:embed llm_hc_cn.spv
+var LLMHCCN []byte
 
 //go:embed llm_hc_down_m1.spv
 var LLMHCDownM1 []byte

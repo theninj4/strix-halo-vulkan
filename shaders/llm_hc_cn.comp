@@ -1,0 +1,110 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// build_hc_combine and the next mixer's grouped RMSNorm, in one dispatch:
+// LLM.md P1a's first fusion.
+//
+//   res[t][c] += out[t] * 2*sigmoid(inject[t][c] / hc)      the combine
+//   xn[t][c]   = res[t][c] / rms(res[t][c]) * gamma[c]      the norm
+//
+// They are two kernels here only because they belong to two mixers. Every
+// layer is mix, block, combine, and then the *next* mixer's norm — and the
+// combine's output is precisely the norm's input, one stream at a time, with
+// no other reader in between. Both are already one workgroup per
+// (token, stream), so the fusion needs no new decomposition: a workgroup
+// combines its own 2560 values, keeps them in registers, and norms them
+// without going back to DRAM.
+//
+// P1 priced what that is worth. At one token the pair is 3.8 + 6.4 us against
+// a 1.0-1.6 us floor for a dispatch that does nothing, and 191 KB of arena
+// traffic against 151 fused — so the fusion takes a dispatch out of the step
+// **97 times** (the label count is what P1a's gate reads) and one 40 KB read
+// of the wide residual with it.
+//
+// **It is bit-exact against the pair**, which is why the workgroup is 256
+// wide and not wider: the norm's sum is a per-thread strided partial and a
+// 256-way tree, and both depend on how many threads there are. A wider
+// workgroup would be a different sum. The combine is elementwise and carries
+// no order at all.
+//
+// The two mixers it spans are said by the push block alone — `injOff` and
+// `gemmN`/`lowRank` are the *closing* mixer's scatter weights, `gammaOff` the
+// *opening* mixer's norm — and the two sets of fields do not overlap, which
+// is what let this kernel be added without a 65th push field.
+
+#include "llm_common.glsl"
+
+#define CN_LOCAL 256
+// Registers per thread: nEmbd / CN_LOCAL, rounded up. 2560 is ten.
+#define CN_MAX 10
+
+layout(local_size_x = CN_LOCAL) in;
+
+shared float partials[CN_LOCAL];
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint c = gl_WorkGroupID.y;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint n = pc.nEmbd;
+    uint tid = gl_LocalInvocationID.x;
+    uint dst = pc.resOff + (t * pc.hc + c) * n;
+    uint src = pc.outOff + t * n;
+    uint xn = pc.xnOff + t * pc.lda + c * n;
+    uint g = pc.gammaOff + c * n;
+
+    // The inject row stride is the down projection's tile, not hc: the fused
+    // [lowRank + hc, wide] weight puts the scatter weights in one 16-wide
+    // tile and the kernel stores it whole.
+    uint inj = pc.injOff + t * (pc.gemmN - pc.lowRank) + c;
+    float w = 2.0 * (1.0 / (1.0 + exp(-act[inj] / float(pc.hc))));
+
+    // The combined residual, kept in registers so the norm below reads it
+    // from there rather than from the arena it was just written to. The
+    // indices are compile-time constants, which is what keeps them registers
+    // and not scratch.
+    //
+    // **`precise` is what makes this the same bits as the pair**, and it is
+    // not about this kernel's own arithmetic. `llm_hc_combine.comp` writes
+    // `act[dst] += act[src] * w` and the backend leaves it a multiply and an
+    // add; here the sum has a second reader — the square below — and ACO
+    // contracts the pair into a fused multiply-add, which rounds once where
+    // the scatter rounds twice. One ulp on 23% of the residual, and every
+    // value downstream of it. The SPIR-V of the two is identical: this is a
+    // backend decision and `precise` is the only thing that says no to it.
+    precise float r[CN_MAX];
+    float sumSq = 0.0;
+    [[unroll]] for (uint j = 0u; j < CN_MAX; j++) {
+        uint i = tid + j * CN_LOCAL;
+        if (i < n) {
+            float v = act[dst + i] + act[src + i] * w;
+            act[dst + i] = v;
+            r[j] = v;
+            sumSq += v * v;
+        }
+    }
+
+    partials[tid] = sumSq;
+    barrier();
+    for (uint stride = CN_LOCAL / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        barrier();
+    }
+
+    // 1/sqrt rather than inversesqrt: ggml computes 1.0f/sqrtf(mean + eps)
+    // and this tensor is compared against its output.
+    float scale = 1.0 / sqrt(partials[0] / float(n) + uintBitsToFloat(pc.eps));
+    [[unroll]] for (uint j = 0u; j < CN_MAX; j++) {
+        uint i = tid + j * CN_LOCAL;
+        if (i < n) {
+            hact[xn + i] = float16_t(r[j] * scale * wbuf[g + i]);
+        }
+    }
+}

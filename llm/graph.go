@@ -103,6 +103,19 @@ func (o GraphOpts) denseQ8() bool { return !o.DenseFP16 && DenseQ8() }
 // measure anyway.
 func DenseQ8() bool { return os.Getenv("LLM_DENSE_FP16") != "1" && DensePlan().Off() }
 
+// HCFuse is whether P1a's combine+norm fusion is in use: one dispatch per
+// mixer boundary (`llm_hc_cn.comp`) instead of a scatter and a norm.
+// `LLM_HC_NOFUSE=1` puts the pair back, which is the control the write-up's
+// numbers are measured against and the arm
+// TestHCFusionIsTheCombineThenTheNorm compares against.
+//
+// The two arms compute the **same bits**, which is what makes the control
+// worth keeping: the combine is elementwise and the fused kernel keeps the
+// norm's 256-thread partition and its 256-way tree, so nothing about the
+// order of a sum changes. What changes is 94 dispatches a pass and one read
+// of the wide residual per boundary.
+func HCFuse() bool { return os.Getenv("LLM_HC_NOFUSE") != "1" }
+
 // DecodeGEMV is whether the one-token kernels L8d added are in use: the MoE's
 // expert GEMVs and split-K router, and the dense split-K GEMV under the gated
 // DeltaNet's two projections. They are the default; `LLM_DECODE_GEMM=1` puts
@@ -972,11 +985,49 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	}
 	t0 = since(&g.Stats.Glue, t0)
 
+	// P1a's fusion, as a scheduling rule rather than a kernel choice. A
+	// combine and the next mixer's norm are the same 2560 values per
+	// (token, stream) read, written and read again, so `RunCombineMix` does
+	// both in one dispatch — but only where nothing else touches the wide
+	// residual in between. So a combine is *held* rather than issued, and
+	// whatever comes next either absorbs it or flushes it: the PLE block,
+	// which moves the residual out of this arena and back, flushes; the end
+	// of the pass flushes, because the final mixer is reached through a row
+	// move in `hidden`. Everything else absorbs, which is 94 of the 96.
+	pending := -1
+	flushHC := func() error {
+		if pending < 0 {
+			return nil
+		}
+		m := pending
+		pending = -1
+		return g.hc.RunCombine(m)
+	}
+	fuse := HCFuse()
+	mixHC := func(m int) error {
+		if pending < 0 {
+			return g.hc.Run(m, false)
+		}
+		if !fuse {
+			if err := flushHC(); err != nil {
+				return err
+			}
+			return g.hc.Run(m, false)
+		}
+		p := pending
+		pending = -1
+		return g.hc.RunCombineMix(p, m)
+	}
+
 	for l := 0; l < nLayer; l++ {
 		if g.hasPLE && g.pleCfg.IsPLE(l) {
 			// The one block that reads and writes the wide residual, so the
 			// only place the 10240-wide tensor crosses a boundary — twice,
 			// once a graph.
+			if err := flushHC(); err != nil {
+				return fmt.Errorf("llm: layer %d ple combine: %w", l, err)
+			}
+			t0 = g.blk(&g.Stats.HC, t0)
 			if err := g.ple.UploadEmbd(pleEmbd, nTok); err != nil {
 				return err
 			}
@@ -996,7 +1047,7 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 		}
 
 		// The attention half.
-		if err := g.hc.Run(2*l, false); err != nil {
+		if err := mixHC(2 * l); err != nil {
 			return fmt.Errorf("llm: layer %d attn mix: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.HC, t0)
@@ -1005,13 +1056,10 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 			return err
 		}
 		t0 = t1
-		if err := g.hc.RunCombine(2 * l); err != nil {
-			return fmt.Errorf("llm: layer %d attn combine: %w", l, err)
-		}
-		t0 = g.blk(&g.Stats.HC, t0)
+		pending = 2 * l
 
 		// The FFN half, which every layer has.
-		if err := g.hc.Run(2*l+1, false); err != nil {
+		if err := mixHC(2*l + 1); err != nil {
 			return fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.HC, t0)
@@ -1031,11 +1079,12 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 			return err
 		}
 		t0 = g.blk(&g.Stats.Move, t0)
-		if err := g.hc.RunCombine(2*l + 1); err != nil {
-			return fmt.Errorf("llm: layer %d ffn combine: %w", l, err)
-		}
-		t0 = g.blk(&g.Stats.HC, t0)
+		pending = 2*l + 1
 	}
+	if err := flushHC(); err != nil {
+		return fmt.Errorf("llm: last combine: %w", err)
+	}
+	t0 = g.blk(&g.Stats.HC, t0)
 	g.past += nTok
 	g.Stats.Runs++
 	return nil

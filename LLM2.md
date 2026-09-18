@@ -6,12 +6,15 @@
 
 ## Where this stands, in five lines
 
-- **Decode 32.72 tok/s** against llama.cpp's 25.15 — **1.30x** — at a
+- **Decode 32.93 tok/s** against llama.cpp's 25.15 — **1.31x** — at a
   measured bank of 4.281 GB a token, a ceiling of 56.5 at the bus and 53.0
   at the rate dispatches reach. P1 attributed the step to the dispatch and
-  took the n-gram gather's sixteen serialised page faults out of it.
-- **Prefill 1071.8 tok/s** at ubatch 2048 against 391.4 — **2.7x** — and
-  671.4 at 512. The original L2a target of ~1150 is 93% reached.
+  took the n-gram gather's sixteen serialised page faults out of it; P1a
+  fused the hyper-connection boundary, 1501 dispatches a pass to 1407.
+- **Prefill 1089.2 tok/s** at ubatch 2048 against 391.4 — **2.78x** — and
+  668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
+  is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
+  MALL in between.
 - **Perplexity 4.1787 against our 4.0289 — +3.72%** (and +3.59% against the
   reference's own 4.0340), with five of six dense families at 4.5 bits and
   additivity holding to 0.01 pp.
@@ -207,15 +210,37 @@ Full write-up: [research/p0-ring-watchdog.md](research/p0-ring-watchdog.md).
       (host)**, and idea 2 — the review's favourite for the whole of it — is
       **1.96 ms** and now ranks fourth. [Write-up](research/p1-decode-attribution.md)
 
-### P1a — the hyper-connection block's 485 dispatches  *(the biggest single item)*
+### ~~P1a — the hyper-connection block's 485 dispatches~~  *(**done**, 2026-09-18)*
 
-- [ ] 97 mixers x 5 dispatches at 1.4-17 us each: **114.6 GB/s** where seven
-      other families are 147-204, and **13.6% of the step for 8.4% of the
-      bytes**. D14 says the weights never leave the MALL, so this is shape.
-- [ ] Fuse the mixer's norm/down/reduce/up/combine, or batch across mixers.
-      Worth **1.56 ms of bank plus 0.97 ms of weightless norms and combines**.
-- [ ] Gate: the block's own ladder re-run, and `-gen -attrib` showing the
-      label count and the GB/s move together.
+**The weightless half is fused away bit-exactly; the other half is a grid,
+and the grid is priced rather than rebuilt.**
+
+- [x] The scatter that closes one mixer and the norm that opens the next are
+      the same 2560 values per (token, stream) written and read straight
+      back, and both were already one workgroup per (token, stream).
+      `llm_hc_cn.comp` does both in one pass over registers: **1501
+      dispatches a pass to 1407, 30.69 ms to 30.37, decode 32.59 → 32.93
+      tok/s**, both arms on one build (`LLM_HC_NOFUSE=1` is the control).
+      **Prefill comes along at ubatch 2048 — 1070.8 → 1089.2 tok/s, +1.7%,
+      the block 330.1 → 294.6 ms** — where the fusion removes an 84 MB read a
+      boundary; at 512 it is worth nothing, because 21 MB fits the MALL.
+- [x] **Identical to the last place** on `res`, `xn` and `mixed`
+      (`TestHCFusionIsTheCombineThenTheNorm`, `TestHCFusionRunsThePass`).
+      The ulp chased first: giving the sum a *second reader* lets ACO
+      contract it into an FMA where the scatter rounds twice, and `precise`
+      is the only thing that says no.
+- [x] Gate: the label count moved and **the GB/s did not** — 114.9 against
+      114.6 — and the ladder says why. The down projection's decode rungs
+      read the same 1.94 MB off the same bank with a grid that varies
+      twenty-fold, and **168 workgroups is 9.26 us where 672 is 5.54**. So
+      `up_m1`'s 10.87 us at **160 workgroups** is not MODE 1's M=1 waste; it
+      is `down_gemv8`'s number at `down_gemv8`'s width.
+- [ ] Carried forward, priced and not taken: `BN` cannot fall below 64 in
+      MODE 1 because `packUpB` makes a 64-column block 16 features x 4
+      streams. A 4x4 block would be 640 workgroups, worth **2.3 us a mixer,
+      0.22 ms a token, +0.24 tok/s** — and it is every `up` rung's epilogue
+      on the prefill path, so 0.7% of decode does not buy it.
+      [Write-up](research/p1a-hyper-connection-shape.md)
 
 ### P1b — `moe.down`'s rung, and the shared expert's  *(a ladder, not a kernel)*
 
@@ -301,19 +326,32 @@ together).
 
 ## Why this order
 
-**P0 and P1 are done, and P1 moved the list.** The suspicion it was written
-to test — that the bank had stopped being the binding constraint — is
-confirmed, and the replacement is **kernel shape**: four of the five leading
-items are dispatches that are too small or the wrong way round, not bytes.
-So P1a and P1b come before P2-P4, which are accuracy and ceiling work on a
-bank that is already only 79% of the step. P1c is real but is a bigger build
-than either for less time. P2 and P3 still close the accuracy story while
-additivity and the instruments are warm, and they are small. P5 is the
-largest single multiplier on the list but wants its own design pass, and its
-multiplier applies on top of whatever the rest buys, so it loses nothing by
-going after.
+**P0, P1 and P1a are done, and each of them moved the list.** P1's suspicion —
+that the bank had stopped being the binding constraint — is confirmed, and
+the replacement is **kernel shape**: four of the five leading items are
+dispatches that are too small or the wrong way round, not bytes.
 
-**The numbers to beat from here: 32.72 tok/s measured, 53.0 honest ceiling
+**P1a then sharpened what "too small" means, and it is not what the phrase
+suggested.** Fusing the weightless half of the hyper-connection boundary was
+worth its estimate (+0.34 tok/s, 94 dispatches, bit-exact); the *bank* half
+was not a fusion question at all. A one-token dispatch on this device is
+short of **workgroups**, and the down projection's own decode ladder measures
+the law on identical bytes: **168 workgroups is 9.26 us where 672 is 5.54**.
+`up` sits at 160 workgroups because MODE 1's collapse pins `BN` at 64, and
+unpinning it is priced at 0.22 ms a token — real, and not worth every rung's
+epilogue on the prefill path.
+
+**That makes P1b the largest item on the list by a factor of four**, and it
+is the same question in a block where the answer is free: `moe.down` and
+`moe.up` read the same bank in the same layer at 147.5 and 200.6 GB/s, and
+the one thing nobody has varied for `down` is the grid its row block implies.
+P1c is real but is a bigger build for less time. P2 and P3 still close the
+accuracy story while additivity and the instruments are warm, and they are
+small. P5 is the largest single multiplier on the list but wants its own
+design pass, and its multiplier applies on top of whatever the rest buys, so
+it loses nothing by going after.
+
+**The numbers to beat from here: 32.93 tok/s measured, 53.0 honest ceiling
 on today's bank at the 227 GB/s dispatches reach — so the step is **62%**
 efficient and the gap is itemised — and llama.cpp at 25.15, already behind at
 every ubatch.**

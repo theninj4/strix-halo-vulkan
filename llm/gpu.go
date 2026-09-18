@@ -753,6 +753,12 @@ func (g *HCGPU) build() error {
 	for name, spirv := range map[string][]byte{
 		"norm":    shaders.LLMHCNorm,
 		"combine": shaders.LLMHCCombine,
+		// P1a: the two of them in one dispatch, for the 94 boundaries of the
+		// 96 where a combine is immediately followed by the next mixer's
+		// norm. Both spellings stay built: the graph still needs a standalone
+		// combine where the PLE block or the final row move comes between,
+		// and a standalone norm opens the pass.
+		"cn": shaders.LLMHCCN,
 	} {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
 			return err
@@ -1206,9 +1212,17 @@ func (g *HCGPU) UploadBlockOut(out []float32) error {
 // graph builds one mixer's dispatch sequence, with a label per dispatch, and
 // is shared by Run and Profile so that what the profiler times is what a run
 // executes. combine appends the scatter, which needs a block output.
-func (g *HCGPU) graph(mixer int, combine bool) ([]vk.MultiDispatch, []string, error) {
+//
+// `prev` is P1a's fusion: a mixer >= 0 whose *combine* this graph opens with,
+// in the one dispatch that also does this mixer's norm (`llm_hc_cn.comp`).
+// -1 is the standalone norm, which is what a bench, a test and the two
+// boundaries in the graph that something else sits across all want.
+func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []string, error) {
 	if mixer < 0 || mixer >= len(g.mixers) {
 		return nil, nil, fmt.Errorf("llm: mixer %d of %d", mixer, len(g.mixers))
+	}
+	if prev >= len(g.mixers) {
+		return nil, nil, fmt.Errorf("llm: closing mixer %d of %d", prev, len(g.mixers))
 	}
 	c := g.cfg
 	m := g.mixers[mixer]
@@ -1231,7 +1245,20 @@ func (g *HCGPU) graph(mixer int, combine bool) ([]vk.MultiDispatch, []string, er
 		kinds = append(kinds, kind)
 	}
 
-	add("norm", "norm", uint32(g.rows), uint32(c.HC), base)
+	if prev >= 0 {
+		// The closing mixer's scatter and the opening mixer's norm read and
+		// write the same 2560 values per (token, stream) back to back, so
+		// they are one workgroup's work rather than two dispatches'. The
+		// scatter weights are in the arena and not in the bank — nothing here
+		// names `prev` — so what the fusion needs from the push block is the
+		// block output and the inject row stride the combine would have set.
+		cn := base
+		cn.OutOff = g.aOut
+		cn.GemmN = uint32(g.gemmN())
+		add("cn", "cn", uint32(g.rows), uint32(c.HC), cn)
+	} else {
+		add("norm", "norm", uint32(g.rows), uint32(c.HC), base)
+	}
 
 	down := base
 	down.BOff = m.down
@@ -1316,7 +1343,7 @@ const perSubmit = 8
 
 // Run executes one mixer over whatever Upload left in the residual.
 func (g *HCGPU) Run(mixer int, combine bool) error {
-	d, kinds, err := g.graph(mixer, combine)
+	d, kinds, err := g.graph(mixer, -1, combine)
 	if err != nil {
 		return err
 	}
@@ -1327,6 +1354,37 @@ func (g *HCGPU) Run(mixer int, combine bool) error {
 		j := minInt(i+perSubmit, len(d))
 		if _, err := vk.DispatchMultiTimed(d[i:j], 1, 1, true); err != nil {
 			return fmt.Errorf("llm: mixer %d dispatch %d-%d: %w", mixer, i, j-1, err)
+		}
+	}
+	return nil
+}
+
+// RunCombineMix closes mixer `prev` and opens mixer `mixer` in one sequence,
+// with the scatter and the norm fused into a single dispatch (P1a).
+//
+// It is `RunCombine(prev)` followed by `Run(mixer, false)` and it is the
+// same arithmetic to the last place — the combine is elementwise and the
+// norm's sum keeps its 256-thread partition — but it is four dispatches
+// where the pair is five, and it reads the wide residual once where the pair
+// reads it twice. The graph uses it at every boundary where nothing else
+// touches `res` in between, which is 94 of the model's 96 combines: the PLE
+// block moves the residual out and back at its own layer, and the final
+// mixer is reached through a row move.
+func (g *HCGPU) RunCombineMix(prev, mixer int) error {
+	if prev < 0 {
+		return fmt.Errorf("llm: RunCombineMix needs a mixer to close, not %d", prev)
+	}
+	d, kinds, err := g.graph(mixer, prev, false)
+	if err != nil {
+		return err
+	}
+	if g.rec.add(ownHC, kinds, d) {
+		return nil
+	}
+	for i := 0; i < len(d); i += perSubmit {
+		j := minInt(i+perSubmit, len(d))
+		if _, err := vk.DispatchMultiTimed(d[i:j], 1, 1, true); err != nil {
+			return fmt.Errorf("llm: mixer %d after %d, dispatch %d-%d: %w", mixer, prev, i, j-1, err)
 		}
 	}
 	return nil
@@ -1352,7 +1410,7 @@ func Elapsed(st []Stage) time.Duration {
 // measurement of the block: it carries the upload and the read-back, and this
 // arena reads at 0.2 GB/s.
 func (g *HCGPU) Profile(mixer int, combine bool, iters int) ([]Stage, error) {
-	d, kinds, err := g.graph(mixer, combine)
+	d, kinds, err := g.graph(mixer, -1, combine)
 	if err != nil {
 		return nil, err
 	}
@@ -1382,7 +1440,7 @@ func (g *HCGPU) ProfileSweep(combine bool, iters int) ([]Stage, error) {
 	if iters <= 0 {
 		iters = 1
 	}
-	_, kinds, err := g.graph(0, combine)
+	_, kinds, err := g.graph(0, -1, combine)
 	if err != nil {
 		return nil, err
 	}
@@ -1390,7 +1448,7 @@ func (g *HCGPU) ProfileSweep(combine bool, iters int) ([]Stage, error) {
 	for k := range kinds {
 		var d []vk.MultiDispatch
 		for m := range g.mixers {
-			dm, _, err := g.graph(m, combine)
+			dm, _, err := g.graph(m, -1, combine)
 			if err != nil {
 				return nil, err
 			}
