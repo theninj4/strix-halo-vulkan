@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"log"
 	"net/http"
 	"strconv"
 
 	"strix-halo-vulkan/audio"
+	"strix-halo-vulkan/util"
 )
 
 // Backend is what every adapter has in common: the model ids it answers to.
@@ -319,37 +321,55 @@ func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: errorBody{Message: msg, Type: typ}})
 }
 
+// logf is how this package logs anything about a request in flight. It
+// carries the access log's request id, without which a line like
+// "api: chat completion: context deadline exceeded" cannot be attributed to
+// one of the several requests that were in flight when it was written.
+func logf(ctx context.Context, format string, args ...any) {
+	if id := util.RequestID(ctx); id != "" {
+		log.Printf("[%s] api: %s", id, fmt.Sprintf(format, args...))
+		return
+	}
+	log.Printf("api: %s", fmt.Sprintf(format, args...))
+}
+
 // badRequest is the client's fault; serverError is ours, and is the one that
 // gets logged, because nobody sees the response body of a 500 at 3am.
-func badRequest(w http.ResponseWriter, msg string) {
+//
+// A 400 is logged too. It is the client's mistake rather than the server's,
+// but it is still a request that did not do what whoever sent it wanted, and
+// the reason is in the response body where only they can see it.
+func badRequest(ctx context.Context, w http.ResponseWriter, msg string) {
+	logf(ctx, "400: %s", msg)
 	writeError(w, http.StatusBadRequest, "invalid_request_error", msg)
 }
 
-func serverError(w http.ResponseWriter, where string, err error) {
-	log.Printf("api: %s: %v", where, err)
+func serverError(ctx context.Context, w http.ResponseWriter, where string, err error) {
+	logf(ctx, "%s: %v", where, err)
 	writeError(w, http.StatusInternalServerError, "server_error", err.Error())
 }
 
 // backendError maps a backend's error onto a status. ErrUnsupported is the
 // client's fault; anything else is a run that went wrong.
-func backendError(w http.ResponseWriter, where string, err error) {
+func backendError(ctx context.Context, w http.ResponseWriter, where string, err error) {
 	if errors.Is(err, ErrUnsupported) {
-		badRequest(w, err.Error())
+		badRequest(ctx, w, err.Error())
 		return
 	}
 	if errors.Is(err, context.Canceled) {
 		// The client hung up mid-run. There is nobody to answer.
-		log.Printf("api: %s: client cancelled", where)
+		logf(ctx, "%s: client cancelled", where)
 		return
 	}
-	serverError(w, where, err)
+	serverError(ctx, w, where, err)
 }
 
 // notLoaded is the 501 an endpoint gives when the process was started without
 // the model behind it. The message names the flag, because the answer to
 // "why did this 501" is almost always "it was not asked for on the command
 // line".
-func notLoaded(w http.ResponseWriter, what, flag string) {
+func notLoaded(ctx context.Context, w http.ResponseWriter, what, flag string) {
+	logf(ctx, "501: %s is not loaded (needs %s)", what, flag)
 	writeError(w, http.StatusNotImplemented, "not_implemented",
 		what+" is not loaded; start the server with "+flag)
 }
@@ -363,7 +383,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // tooLarge answers 413 when err is the body cap being hit, and reports
 // whether it did. A body over the limit is its own failure and not a
 // malformed one: the client can retry with a shorter clip.
-func tooLarge(w http.ResponseWriter, err error) bool {
+func tooLarge(ctx context.Context, w http.ResponseWriter, err error) bool {
 	var maxErr *http.MaxBytesError
 	if !errors.As(err, &maxErr) {
 		return false
@@ -376,12 +396,12 @@ func tooLarge(w http.ResponseWriter, err error) bool {
 
 // decodeJSON reads a JSON request body into v, answering the client itself if
 // it cannot. It reports whether the handler should carry on.
-func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+func decodeJSON(ctx context.Context, w http.ResponseWriter, r *http.Request, v any) bool {
 	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		if tooLarge(w, err) {
+		if tooLarge(ctx, w, err) {
 			return false
 		}
-		badRequest(w, "malformed JSON body: "+err.Error())
+		badRequest(ctx, w, "malformed JSON body: "+err.Error())
 		return false
 	}
 	return true

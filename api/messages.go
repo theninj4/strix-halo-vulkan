@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -123,29 +122,30 @@ type messagesDelta struct {
 
 // handleMessages is the Anthropic endpoint.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Completion == nil {
-		notLoaded(w, "the language model", "-llm")
+		notLoaded(ctx, w, "the language model", "-llm")
 		return
 	}
 	var req MessagesRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	if req.MaxTokens <= 0 {
-		badRequest(w, "max_tokens is required and must be positive")
+		badRequest(ctx, w, "max_tokens is required and must be positive")
 		return
 	}
 	if req.Thinking != nil && req.Thinking.BudgetTokens > 0 {
-		badRequest(w, "thinking.budget_tokens is not implemented; this model's reasoning ends where it ends, "+
+		badRequest(ctx, w, "thinking.budget_tokens is not implemented; this model's reasoning ends where it ends, "+
 			"and a budget that is not enforced is worse than one that is refused")
 		return
 	}
 	comp, err := completionFromMessages(&req)
 	if err != nil {
-		badRequest(w, err.Error())
+		badRequest(ctx, w, err.Error())
 		return
 	}
-	if !validCompletion(w, comp) {
+	if !validCompletion(ctx, w, comp) {
 		return
 	}
 
@@ -163,7 +163,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		backendError(w, "messages", err)
+		backendError(ctx, w, "messages", err)
 		return
 	}
 	stop, seq := stopReason(res)
@@ -227,13 +227,14 @@ func stopReason(res *CompletionResult) (string, *string) {
 func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request,
 	comp *CompletionRequest, id, model string,
 ) {
+	ctx := r.Context()
 	stream := newSSE(w)
 	fail := func(err error) {
 		if r.Context().Err() != nil {
-			log.Printf("api: messages: client cancelled")
+			logf(ctx, "messages: client cancelled")
 			return
 		}
-		log.Printf("api: messages: %v", err)
+		logf(ctx, "messages: %v", err)
 		_ = stream.send("error", map[string]any{
 			"type":  "error",
 			"error": errorBody{Message: err.Error(), Type: "server_error"},

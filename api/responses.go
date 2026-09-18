@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -137,20 +136,21 @@ type responsesEvent struct {
 
 // handleResponses is the Responses endpoint.
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Completion == nil {
-		notLoaded(w, "the language model", "-llm")
+		notLoaded(ctx, w, "the language model", "-llm")
 		return
 	}
 	var req ResponsesRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	comp, err := completionFromResponses(&req)
 	if err != nil {
-		badRequest(w, err.Error())
+		badRequest(ctx, w, err.Error())
 		return
 	}
-	if !validCompletion(w, comp) {
+	if !validCompletion(ctx, w, comp) {
 		return
 	}
 
@@ -177,7 +177,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		backendError(w, "responses", err)
+		backendError(ctx, w, "responses", err)
 		return
 	}
 	out := base()
@@ -228,13 +228,14 @@ func responseOutput(id, reasoning, content string, calls []*ToolCall) []Response
 func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request,
 	comp *CompletionRequest, base func() *ResponsesResponse, id string,
 ) {
+	ctx := r.Context()
 	stream := newSSE(w)
 	fail := func(err error) {
 		if r.Context().Err() != nil {
-			log.Printf("api: responses: client cancelled")
+			logf(ctx, "responses: client cancelled")
 			return
 		}
-		log.Printf("api: responses: %v", err)
+		logf(ctx, "responses: %v", err)
 		_ = stream.send("error", errorBody{Message: err.Error(), Type: "server_error"})
 	}
 	send := func(typ string, e responsesEvent) error {

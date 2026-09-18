@@ -15,7 +15,9 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"strix-halo-vulkan/util"
@@ -140,6 +142,13 @@ func (s *Server) HTTPServer(addr string) *http.Server {
 	}
 }
 
+// authorize gates every /v1 route on the bearer token.
+//
+// A rejection is logged with *why* it was rejected. The access log already
+// records that a request got a 401, but "the header was absent", "it was some
+// other scheme" and "the token was wrong" are three different bugs in the
+// caller and the status alone does not separate them -- which is the whole
+// reason a 401 is hard to chase from the other end of the wire.
 func (s *Server) authorize(fs http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.Token == "" || r.Header.Get("Authorization") == "Bearer "+s.Token {
@@ -147,10 +156,33 @@ func (s *Server) authorize(fs http.Handler) http.HandlerFunc {
 			return
 		}
 
-		w.WriteHeader(http.StatusUnauthorized)
-		// A write that fails here is a client that hung up, which is not
-		// this process's problem: log nothing and return.
-		_, _ = w.Write([]byte("Unauthorized"))
+		reason := unauthorizedReason(r.Header.Get("Authorization"))
+		logf(r.Context(), "401 %s %s: %s", r.Method, r.URL.Path, reason)
+		// The reason goes to the client too, in the same envelope every
+		// other error here uses. It names what is wrong with the header
+		// and never echoes the token that was offered.
+		writeError(w, http.StatusUnauthorized, "invalid_request_error", reason)
+	}
+}
+
+// unauthorizedReason classifies a failed Authorization header. It is written
+// from the header alone and never compares against the configured token
+// beyond "it did not match", so no part of the real credential can reach a
+// log line or a response body through it.
+func unauthorizedReason(header string) string {
+	switch {
+	case header == "":
+		return "no Authorization header; pass \"Authorization: Bearer <token>\""
+	case strings.EqualFold(header, "Bearer"), strings.EqualFold(header, "Bearer "):
+		return "Authorization header carries no token after \"Bearer\""
+	case !strings.HasPrefix(header, "Bearer "):
+		scheme, _, ok := strings.Cut(header, " ")
+		if !ok || scheme == "" {
+			return "Authorization header is not \"Bearer <token>\""
+		}
+		return fmt.Sprintf("Authorization uses the %q scheme; this API takes \"Bearer <token>\"", scheme)
+	default:
+		return "bearer token does not match the server's -token"
 	}
 }
 

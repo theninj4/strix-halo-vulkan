@@ -10,7 +10,6 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"strconv"
@@ -155,34 +154,35 @@ const maxImages = 4
 // So a server started without `-preview` refuses `stream: true` and says
 // which flag it wants, rather than answering with one frame at the end.
 func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Image == nil {
-		notLoaded(w, "image generation", "-image")
+		notLoaded(ctx, w, "image generation", "-image")
 		return
 	}
 	var req ImageGenerationRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	if strings.TrimSpace(req.Prompt) == "" {
-		badRequest(w, "prompt is empty")
+		badRequest(ctx, w, "prompt is empty")
 		return
 	}
 	geo := s.Image.Geometry()
-	if !s.checkStreaming(w, geo, req.Stream, req.PartialImages) {
+	if !s.checkStreaming(ctx, w, geo, req.Stream, req.PartialImages) {
 		return
 	}
-	n, ok := s.imageCount(w, req.N, req.Stream)
+	n, ok := s.imageCount(ctx, w, req.N, req.Stream)
 	if !ok {
 		return
 	}
-	out, ok := s.imageOutput(w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
+	out, ok := s.imageOutput(ctx, w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
 	if !ok {
 		return
 	}
 
 	width, height, err := resolveSize(req.Size, req.AspectRatio, geo)
 	if err != nil {
-		badRequest(w, err.Error())
+		badRequest(ctx, w, err.Error())
 		return
 	}
 
@@ -201,15 +201,15 @@ type imageOutputs struct {
 
 // imageOutput validates response_format, output_format and
 // output_compression, which are the same three fields on both endpoints.
-func (s *Server) imageOutput(w http.ResponseWriter, responseFormat, outputFormat string, compression int) (imageOutputs, bool) {
+func (s *Server) imageOutput(ctx context.Context, w http.ResponseWriter, responseFormat, outputFormat string, compression int) (imageOutputs, bool) {
 	switch responseFormat {
 	case "", "b64_json":
 	case "url":
-		badRequest(w, "response_format \"url\" is not supported; this server has nowhere to host an image, "+
+		badRequest(ctx, w, "response_format \"url\" is not supported; this server has nowhere to host an image, "+
 			"so it returns b64_json")
 		return imageOutputs{}, false
 	default:
-		badRequest(w, "response_format "+strconv.Quote(responseFormat)+
+		badRequest(ctx, w, "response_format "+strconv.Quote(responseFormat)+
 			" is not supported; this server returns b64_json")
 		return imageOutputs{}, false
 	}
@@ -220,29 +220,29 @@ func (s *Server) imageOutput(w http.ResponseWriter, responseFormat, outputFormat
 	switch format {
 	case "png", "jpeg", "jpg":
 	default:
-		badRequest(w, "output_format "+strconv.Quote(format)+
+		badRequest(ctx, w, "output_format "+strconv.Quote(format)+
 			" is not supported; this server encodes png and jpeg")
 		return imageOutputs{}, false
 	}
 	if compression < 0 || compression > 100 {
-		badRequest(w, "output_compression is "+strconv.Itoa(compression)+", outside [0, 100]")
+		badRequest(ctx, w, "output_compression is "+strconv.Itoa(compression)+", outside [0, 100]")
 		return imageOutputs{}, false
 	}
 	return imageOutputs{format: format, compression: compression}, true
 }
 
 // imageCount resolves and bounds `n`.
-func (s *Server) imageCount(w http.ResponseWriter, n int, stream bool) (int, bool) {
+func (s *Server) imageCount(ctx context.Context, w http.ResponseWriter, n int, stream bool) (int, bool) {
 	if n == 0 {
 		n = 1
 	}
 	if n < 1 || n > maxImages {
-		badRequest(w, "n is "+strconv.Itoa(n)+"; this server renders 1 to "+strconv.Itoa(maxImages)+
+		badRequest(ctx, w, "n is "+strconv.Itoa(n)+"; this server renders 1 to "+strconv.Itoa(maxImages)+
 			" images per request, serially, because each one is a full run of the model")
 		return 0, false
 	}
 	if stream && n != 1 {
-		badRequest(w, "n is "+strconv.Itoa(n)+" with stream: true; the event stream carries one image, "+
+		badRequest(ctx, w, "n is "+strconv.Itoa(n)+" with stream: true; the event stream carries one image, "+
 			"and its frames have no field that would say which")
 		return 0, false
 	}
@@ -251,7 +251,7 @@ func (s *Server) imageCount(w http.ResponseWriter, n int, stream bool) (int, boo
 
 // checkStreaming is the preview decoder's condition, which both endpoints
 // share because a partial frame of an edit is a partial frame.
-func (s *Server) checkStreaming(w http.ResponseWriter, geo ImageGeometry, stream bool, partials int) bool {
+func (s *Server) checkStreaming(ctx context.Context, w http.ResponseWriter, geo ImageGeometry, stream bool, partials int) bool {
 	if stream && !geo.Previews {
 		// A 501 rather than a 400, and the same kind of answer -image itself
 		// gives: the request is well formed and the server was started
@@ -265,12 +265,12 @@ func (s *Server) checkStreaming(w http.ResponseWriter, geo ImageGeometry, stream
 		return false
 	}
 	if partials < 0 || partials > geo.MaxPartials {
-		badRequest(w, "partial_images is "+strconv.Itoa(partials)+"; this server sends 0 to "+
+		badRequest(ctx, w, "partial_images is "+strconv.Itoa(partials)+"; this server sends 0 to "+
 			strconv.Itoa(geo.MaxPartials)+" in-progress frames, because each one is a decode")
 		return false
 	}
 	if partials > 0 && !stream {
-		badRequest(w, "partial_images needs stream: true; there is nowhere to put an in-progress "+
+		badRequest(ctx, w, "partial_images needs stream: true; there is nowhere to put an in-progress "+
 			"frame in a single JSON response")
 		return false
 	}
@@ -304,6 +304,7 @@ type imageRun struct {
 
 // render answers one resolved request, buffered or over SSE.
 func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
+	ctx := r.Context()
 	if run.stream {
 		s.streamImage(w, r, run)
 		return
@@ -329,16 +330,16 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
 			Init: run.init, Strength: run.strength,
 		})
 		if err != nil {
-			backendError(w, "images", err)
+			backendError(ctx, w, "images", err)
 			return
 		}
 		if out == nil || out.Image == nil {
-			serverError(w, "images", errNoImage)
+			serverError(ctx, w, "images", errNoImage)
 			return
 		}
 		body, err := encodeImage(out.Image, run.format, run.compression)
 		if err != nil {
-			serverError(w, "images", err)
+			serverError(ctx, w, "images", err)
 			return
 		}
 		resp.Data = append(resp.Data, ImageData{
@@ -396,6 +397,7 @@ const (
 // any frame is still a 400 or a 500, which is why every check the handler can
 // make happens before newSSE is called.
 func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageRun) {
+	ctx := r.Context()
 	size := formatSize(run.width, run.height)
 	format := run.format
 	str := newSSE(w)
@@ -432,16 +434,16 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageR
 		PartialImages: run.partials, Partial: sendPartial,
 	})
 	if err != nil {
-		streamError(str, "images", err)
+		streamError(ctx, str, "images", err)
 		return
 	}
 	if out == nil || out.Image == nil {
-		streamError(str, "images", errNoImage)
+		streamError(ctx, str, "images", errNoImage)
 		return
 	}
 	body, err := encodeImage(out.Image, format, run.compression)
 	if err != nil {
-		streamError(str, "images", err)
+		streamError(ctx, str, "images", err)
 		return
 	}
 	_ = str.send(eventImageDone, ImageStreamEvent{
@@ -457,12 +459,12 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageR
 
 // streamError reports a failure that happened after the status was committed.
 // A client that hung up gets nothing, because there is nobody to tell.
-func streamError(str *sse, where string, err error) {
+func streamError(ctx context.Context, str *sse, where string, err error) {
 	if errors.Is(err, context.Canceled) {
-		log.Printf("api: %s: client cancelled", where)
+		logf(ctx, "%s: client cancelled", where)
 		return
 	}
-	log.Printf("api: %s: %v", where, err)
+	logf(ctx, "%s: %v", where, err)
 	_ = str.send("error", errorResponse{Error: errorBody{Message: err.Error(), Type: "server_error"}})
 }
 
@@ -489,8 +491,9 @@ func streamError(str *sse, where string, err error) {
 // takes **the input picture's own shape**, fitted inside the ceiling, because
 // that is the only answer that does not silently reframe what was sent.
 func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Image == nil {
-		notLoaded(w, "image generation", "-image")
+		notLoaded(ctx, w, "image generation", "-image")
 		return
 	}
 	geo := s.Image.Geometry()
@@ -509,12 +512,12 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 		if !parseImageEditForm(w, r, &req) {
 			return
 		}
-	} else if !decodeJSON(w, r, &req) {
+	} else if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 
 	if strings.TrimSpace(req.Prompt) == "" {
-		badRequest(w, "prompt is empty; an edit is a prompt applied to a picture, so there is nothing to apply")
+		badRequest(ctx, w, "prompt is empty; an edit is a prompt applied to a picture, so there is nothing to apply")
 		return
 	}
 	if req.Mask != "" {
@@ -527,39 +530,39 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	switch len(req.Image) {
 	case 1:
 	case 0:
-		badRequest(w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image'")
+		badRequest(ctx, w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image'")
 		return
 	default:
-		badRequest(w, strconv.Itoa(len(req.Image))+" images; this endpoint edits one picture. "+
+		badRequest(ctx, w, strconv.Itoa(len(req.Image))+" images; this endpoint edits one picture. "+
 			"OpenAI's field is a list because their model composites several, and this model does not")
 		return
 	}
 	raw, err := decodeImageField(req.Image[0])
 	if err != nil {
-		badRequest(w, "image: "+err.Error())
+		badRequest(ctx, w, "image: "+err.Error())
 		return
 	}
 	init, kind, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		badRequest(w, "image: this server decodes png and jpeg: "+err.Error())
+		badRequest(ctx, w, "image: this server decodes png and jpeg: "+err.Error())
 		return
 	}
 	if req.Strength < 0 || req.Strength > 1 {
-		badRequest(w, "strength is "+strconv.FormatFloat(req.Strength, 'g', -1, 64)+
+		badRequest(ctx, w, "strength is "+strconv.FormatFloat(req.Strength, 'g', -1, 64)+
 			", outside (0, 1]; it is how much of the denoising schedule to run over the picture, so 1 "+
 			"discards the picture entirely and anything near 0 returns it almost unchanged")
 		return
 	}
 
-	out, ok := s.imageOutput(w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
+	out, ok := s.imageOutput(ctx, w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
 	if !ok {
 		return
 	}
-	n, ok := s.imageCount(w, req.N, req.Stream)
+	n, ok := s.imageCount(ctx, w, req.N, req.Stream)
 	if !ok {
 		return
 	}
-	if !s.checkStreaming(w, geo, req.Stream, req.PartialImages) {
+	if !s.checkStreaming(ctx, w, geo, req.Stream, req.PartialImages) {
 		return
 	}
 
@@ -574,10 +577,10 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 		width, height, err = fitBounds(b.Dx(), b.Dy(), geo)
 	}
 	if err != nil {
-		badRequest(w, err.Error())
+		badRequest(ctx, w, err.Error())
 		return
 	}
-	log.Printf("api: images/edits: %dx%d %s in, %dx%d out, strength %g",
+	logf(ctx, "images/edits: %dx%d %s in, %dx%d out, strength %g",
 		b.Dx(), b.Dy(), kind, width, height, req.Strength)
 
 	s.render(w, r, &imageRun{
@@ -612,14 +615,15 @@ func decodeImageField(v string) ([]byte, error) {
 // parseImageEditForm reads the multipart encoding OpenAI's clients send into
 // the same struct the JSON one fills.
 func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRequest) bool {
+	ctx := r.Context()
 	// ParseMultipartForm's argument is how much it keeps in memory; the rest
 	// spills to a temporary file, and Server.limitBody is what bounds the
 	// upload.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		if tooLarge(w, err) {
+		if tooLarge(ctx, w, err) {
 			return false
 		}
-		badRequest(w, "malformed multipart body: "+err.Error())
+		badRequest(ctx, w, "malformed multipart body: "+err.Error())
 		return false
 	}
 	defer func() { _ = r.MultipartForm.RemoveAll() }()
@@ -632,16 +636,16 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 		for _, fh := range r.MultipartForm.File[field] {
 			f, err := fh.Open()
 			if err != nil {
-				badRequest(w, "reading the '"+field+"' part: "+err.Error())
+				badRequest(ctx, w, "reading the '"+field+"' part: "+err.Error())
 				return false
 			}
 			raw, err := io.ReadAll(f)
 			_ = f.Close()
 			if err != nil {
-				if tooLarge(w, err) {
+				if tooLarge(ctx, w, err) {
 					return false
 				}
-				badRequest(w, "reading the '"+field+"' part: "+err.Error())
+				badRequest(ctx, w, "reading the '"+field+"' part: "+err.Error())
 				return false
 			}
 			// Back to base64 so that the two encodings converge on one struct
@@ -673,7 +677,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 		if v := r.FormValue(f.name); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil {
-				badRequest(w, f.name+" is not a number: "+v)
+				badRequest(ctx, w, f.name+" is not a number: "+v)
 				return false
 			}
 			*f.dst = n
@@ -682,7 +686,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 	if v := r.FormValue("strength"); v != "" {
 		f, err := strconv.ParseFloat(v, 64)
 		if err != nil {
-			badRequest(w, "strength is not a number: "+v)
+			badRequest(ctx, w, "strength is not a number: "+v)
 			return false
 		}
 		req.Strength = f
@@ -690,7 +694,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 	if v := r.FormValue("seed"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			badRequest(w, "seed is not a number: "+v)
+			badRequest(ctx, w, "seed is not a number: "+v)
 			return false
 		}
 		req.Seed = &n
@@ -698,7 +702,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 	if v := r.FormValue("stream"); v != "" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			badRequest(w, "stream is not a boolean: "+v)
+			badRequest(ctx, w, "stream is not a boolean: "+v)
 			return false
 		}
 		req.Stream = b

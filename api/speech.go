@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // OpenAI Speech Request
@@ -49,27 +50,28 @@ const (
 // so there is nothing to send early. A request with stream:true is refused
 // rather than answered with a whole body pretending to be a stream.
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Speech == nil {
-		notLoaded(w, "text to speech", "-tts")
+		notLoaded(ctx, w, "text to speech", "-tts")
 		return
 	}
 	var req SpeechRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	if req.Input == "" && req.Phonemes == "" {
-		badRequest(w, "input is empty")
+		badRequest(ctx, w, "input is empty")
 		return
 	}
 	if req.Stream {
-		badRequest(w, "streaming speech is not implemented; the utterance's durations are decided before any samples exist")
+		badRequest(ctx, w, "streaming speech is not implemented; the utterance's durations are decided before any samples exist")
 		return
 	}
 	if req.Speed == 0 {
 		req.Speed = 1
 	}
 	if req.Speed < minSpeed || req.Speed > maxSpeed {
-		badRequest(w, "speed is "+strconv.FormatFloat(req.Speed, 'g', -1, 64)+
+		badRequest(ctx, w, "speed is "+strconv.FormatFloat(req.Speed, 'g', -1, 64)+
 			", outside ["+strconv.FormatFloat(minSpeed, 'g', -1, 64)+", "+
 			strconv.FormatFloat(maxSpeed, 'g', -1, 64)+"]")
 		return
@@ -81,18 +83,36 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	switch format {
 	case "wav", "pcm":
 	default:
-		badRequest(w, "response_format "+strconv.Quote(format)+
+		badRequest(ctx, w, "response_format "+strconv.Quote(format)+
 			" is not supported; this server encodes wav and pcm (16-bit signed, little endian, mono)")
 		return
 	}
 
+	// The synthesis is timed on its own, not just as part of the request:
+	// what it costs per second of audio produced is the number that says
+	// whether this endpoint got faster, and the request's total duration
+	// includes encoding and the write to the client.
+	start := time.Now()
 	clip, err := s.Speech.Speak(r.Context(), &req)
 	if err != nil {
-		backendError(w, "speech", err)
+		backendError(ctx, w, "speech", err)
 		return
 	}
+	if clip != nil {
+		took := time.Since(start)
+		audioLen := clip.Duration()
+		// Faster than real time is the point, so report the ratio that
+		// way round: 20x means a second of speech took 50 ms to make.
+		speed := 0.0
+		if took > 0 {
+			speed = audioLen / took.Seconds()
+		}
+		logf(ctx, "speech: %d characters -> %.2fs of audio at %d Hz, voice %q, in %v (%.1fx real time)",
+			len(req.Input)+len(req.Phonemes), audioLen, clip.Rate, req.Voice,
+			took.Round(time.Millisecond), speed)
+	}
 	if clip == nil || len(clip.Samples) == 0 {
-		serverError(w, "speech", errEmptyAudio)
+		serverError(ctx, w, "speech", errEmptyAudio)
 		return
 	}
 
@@ -100,7 +120,7 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	switch format {
 	case "wav":
 		if body, err = clip.EncodeWAV(); err != nil {
-			serverError(w, "speech", err)
+			serverError(ctx, w, "speech", err)
 			return
 		}
 		w.Header().Set("Content-Type", "audio/wav")

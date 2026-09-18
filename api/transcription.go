@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"strix-halo-vulkan/audio"
 )
@@ -97,8 +98,9 @@ const defaultMaxUpload = 128 << 20
 // what OpenAI's clients send, and a JSON body whose "file" is base64, which
 // is what curl and a test can write by hand.
 func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Transcription == nil {
-		notLoaded(w, "speech to text", "-stt")
+		notLoaded(ctx, w, "speech to text", "-stt")
 		return
 	}
 	// The body is already capped by Server.limitBody.
@@ -107,29 +109,40 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		if !parseMultipart(w, r, &req) {
 			return
 		}
-	} else if !decodeJSON(w, r, &req) {
+	} else if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	if len(req.Data) == 0 {
-		badRequest(w, "no audio: send multipart/form-data with a 'file' part, or JSON with a base64 'file'")
+		badRequest(ctx, w, "no audio: send multipart/form-data with a 'file' part, or JSON with a base64 'file'")
 		return
 	}
 	if req.Stream {
-		badRequest(w, "streaming transcription is not implemented")
+		badRequest(ctx, w, "streaming transcription is not implemented")
 		return
 	}
 
 	clip, err := audio.DecodeWAV(req.Data)
 	if err != nil {
-		badRequest(w, "this server decodes 16-bit PCM WAV only: "+err.Error())
+		badRequest(ctx, w, "this server decodes 16-bit PCM WAV only: "+err.Error())
 		return
 	}
 
+	start := time.Now()
 	resp, err := s.Transcription.Transcribe(r.Context(), clip, &req)
 	if err != nil {
-		backendError(w, "transcription", err)
+		backendError(ctx, w, "transcription", err)
 		return
 	}
+	// Same shape as the speech line: the clip's length against the time it
+	// took to hear it, which is what a change to this path moves.
+	took := time.Since(start)
+	speed := 0.0
+	if took > 0 {
+		speed = clip.Duration() / took.Seconds()
+	}
+	logf(ctx, "transcription: %.2fs of audio at %d Hz -> %d characters, %d segments, in %v (%.1fx real time)",
+		clip.Duration(), clip.Rate, len(resp.Text), len(resp.Segments),
+		took.Round(time.Millisecond), speed)
 
 	switch req.ResponseFormat {
 	case "", "json":
@@ -165,7 +178,7 @@ func (s *Server) handleTranscription(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, encodeVTT(resp.Segments))
 	default:
-		badRequest(w, "response_format "+strconv.Quote(req.ResponseFormat)+
+		badRequest(ctx, w, "response_format "+strconv.Quote(req.ResponseFormat)+
 			" is not supported; this server writes json, verbose_json, text, srt and vtt")
 	}
 }
@@ -207,29 +220,30 @@ func timecode(t float64, sep string) string {
 // parseMultipart reads OpenAI's multipart form into req. It answers the
 // client itself on a malformed body and reports whether to carry on.
 func parseMultipart(w http.ResponseWriter, r *http.Request, req *TranscriptionRequest) bool {
+	ctx := r.Context()
 	// ParseMultipartForm's argument is how much it keeps in memory; the rest
 	// spills to a temporary file, and Server.limitBody is what actually
 	// bounds the upload.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		if tooLarge(w, err) {
+		if tooLarge(ctx, w, err) {
 			return false
 		}
-		badRequest(w, "malformed multipart body: "+err.Error())
+		badRequest(ctx, w, "malformed multipart body: "+err.Error())
 		return false
 	}
 	defer func() { _ = r.MultipartForm.RemoveAll() }()
 
 	f, _, err := r.FormFile("file")
 	if err != nil {
-		badRequest(w, "no 'file' part in the form: "+err.Error())
+		badRequest(ctx, w, "no 'file' part in the form: "+err.Error())
 		return false
 	}
 	defer f.Close()
 	if req.Data, err = io.ReadAll(f); err != nil {
-		if tooLarge(w, err) {
+		if tooLarge(ctx, w, err) {
 			return false
 		}
-		badRequest(w, "reading the 'file' part: "+err.Error())
+		badRequest(ctx, w, "reading the 'file' part: "+err.Error())
 		return false
 	}
 
@@ -244,13 +258,13 @@ func parseMultipart(w http.ResponseWriter, r *http.Request, req *TranscriptionRe
 	req.GranularitiesArray = r.Form["timestamp_granularities[]"]
 	if v := r.FormValue("temperature"); v != "" {
 		if req.Temperature, err = strconv.ParseFloat(v, 64); err != nil {
-			badRequest(w, "temperature is not a number: "+v)
+			badRequest(ctx, w, "temperature is not a number: "+v)
 			return false
 		}
 	}
 	if v := r.FormValue("stream"); v != "" {
 		if req.Stream, err = strconv.ParseBool(v); err != nil {
-			badRequest(w, "stream is not a boolean: "+v)
+			badRequest(ctx, w, "stream is not a boolean: "+v)
 			return false
 		}
 	}

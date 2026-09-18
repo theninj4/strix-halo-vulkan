@@ -3,12 +3,16 @@ package util
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,14 +40,26 @@ type responseRecorder struct {
 	// stream whatever the caller asked, because a fragment of the first
 	// kilobyte of a stream is noise rather than a record.
 	keep bool
+
+	// first is when the first byte of the response went out. On a
+	// streaming endpoint that is the number worth optimising -- the total
+	// only says how long the whole generation took, while this says how
+	// long the caller sat looking at nothing.
+	first time.Time
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
 	r.statusCode = code
+	if r.first.IsZero() {
+		r.first = time.Now()
+	}
 	r.ResponseWriter.WriteHeader(code)
 }
 
 func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.first.IsZero() {
+		r.first = time.Now()
+	}
 	r.size += len(b)
 	if r.keep && r.body.Len() <= maxLogBodySize {
 		r.body.Write(b)
@@ -51,10 +67,32 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
+// Unwrap lets http.ResponseController reach the real writer, so a handler
+// that sets a deadline or flushes through the controller is not defeated by
+// this wrapper.
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 func (r *responseRecorder) Flush() {
 	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// timings renders how long the request took, and -- when the response was
+// streamed rather than written in one go -- how long the caller waited for
+// its first byte. The two are the same number on a buffered response, so the
+// second is only printed when it says something the first does not.
+func timings(rec *responseRecorder, start time.Time, total time.Duration) string {
+	if rec.first.IsZero() {
+		return fmt.Sprintf("in %v (nothing written)", total.Round(time.Microsecond))
+	}
+	ttfb := rec.first.Sub(start)
+	if total-ttfb < time.Millisecond {
+		return fmt.Sprintf("in %v", total.Round(time.Microsecond))
+	}
+	return fmt.Sprintf("in %v (ttfb %v, then %v streaming)",
+		total.Round(time.Microsecond), ttfb.Round(time.Microsecond),
+		(total - ttfb).Round(time.Microsecond))
 }
 
 // errorReader replays a read failure to whoever reads next.
@@ -173,6 +211,48 @@ func AssertOk(ok bool, msg string, args ...interface{}) {
 	}
 }
 
+// requestCounter numbers requests within one process run. A counter rather
+// than a random id because it is short, it sorts, and "how many requests has
+// this server taken" is then readable off any single line.
+var requestCounter atomic.Uint64
+
+type requestIDKey struct{}
+
+// RequestID returns the id the access log gave this request, or "" outside
+// one. Every line a handler logs about a request should carry it: the access
+// log prints several lines per request and a busy server interleaves them, so
+// the id is the only thing that says which lines belong together.
+func RequestID(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
+}
+
+// safeRequestID accepts a client's own id only if it is short and printable.
+// It ends up in a log line and in a response header, and a header is whatever
+// the caller decided to send: an id carrying a newline would otherwise let a
+// client write its own lines into this server's journal.
+func safeRequestID(id string) string {
+	if len(id) == 0 || len(id) > 64 {
+		return ""
+	}
+	for _, c := range id {
+		if c < ' ' || c > '~' {
+			return ""
+		}
+	}
+	return id
+}
+
+// clientAddr is the caller's IP without the ephemeral port, which changes
+// every connection and so is noise in a log that is read by eye.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // LogRequest logs the HTTP request method, URL path, duration, and the
 // payloads worth printing.
 //
@@ -200,6 +280,17 @@ func LogRequestFunc(bodies bool) func(http.Handler) http.HandlerFunc {
 
 func logRequest(fs http.Handler, bodies bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// One id per request, echoed to the client in X-Request-Id so a
+		// caller holding a failed response can name the exact line to
+		// look at here. An id the client supplied wins, which is what
+		// makes a trace survive a proxy in front of this.
+		id := safeRequestID(r.Header.Get("X-Request-Id"))
+		if id == "" {
+			id = "r" + strconv.FormatUint(requestCounter.Add(1), 10)
+		}
+		r = r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id))
+		w.Header().Set("X-Request-Id", id)
+
 		// Read and buffer the request body, when it is small and textual, so
 		// downstream handlers can still consume it.
 		var reqBody []byte
@@ -240,9 +331,13 @@ func logRequest(fs http.Handler, bodies bool) http.HandlerFunc {
 			req = bodyFor(ct, nil, int(r.ContentLength))
 		}
 
-		log.Printf("%s %s %d %v\n  headers: %s\n  req body: %s\n  res body: %s",
-			r.Method, r.URL.Path, rec.statusCode, duration,
-			formatHeaders(r.Header), req,
-			resBodyFor(rec, bodies))
+		// The id leads every line, including the continuations, so that
+		// `grep -F "[r42]"` pulls one whole request out of an
+		// interleaved log rather than just its first line.
+		tag := "[" + id + "]"
+		log.Printf("%s %s %s %d %s from %s\n  %s headers: %s\n  %s req body: %s\n  %s res body: %s (%d bytes)",
+			tag, r.Method, r.URL.Path, rec.statusCode, timings(rec, start, duration), clientAddr(r),
+			tag, formatHeaders(r.Header), tag, req,
+			tag, resBodyFor(rec, bodies), rec.size)
 	}
 }

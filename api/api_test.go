@@ -3,8 +3,31 @@ package api
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// A 401 must say which of the three client mistakes it was, and must never
+// echo the credential it was offered.
+func TestUnauthorizedReason(t *testing.T) {
+	tests := []struct{ header, want string }{
+		{"", "no Authorization header"},
+		{"Bearer", "no token"},
+		{"Bearer ", "no token"},
+		{"Basic dXNlcjpwdw==", `"Basic" scheme`},
+		{"tokenwithnoscheme", `not "Bearer <token>"`},
+		{"Bearer wrongtoken", "does not match"},
+	}
+	for _, tt := range tests {
+		got := unauthorizedReason(tt.header)
+		if !strings.Contains(got, tt.want) {
+			t.Errorf("unauthorizedReason(%q) = %q, want it to contain %q", tt.header, got, tt.want)
+		}
+		if strings.Contains(got, "wrongtoken") || strings.Contains(got, "dXNlcjpwdw==") {
+			t.Errorf("unauthorizedReason(%q) = %q, which echoes the credential", tt.header, got)
+		}
+	}
+}
 
 func TestAuthorizeProxy(t *testing.T) {
 	tests := []struct {
@@ -23,13 +46,22 @@ func TestAuthorizeProxy(t *testing.T) {
 			name:           "Unauthorized request - no header",
 			authHeader:     "",
 			expectedStatus: http.StatusUnauthorized,
-			expectedBody:   "Unauthorized",
+			expectedBody:   "no Authorization header",
 		},
 		{
 			name:           "Unauthorized request - wrong token",
 			authHeader:     "Bearer wrongtoken",
 			expectedStatus: http.StatusUnauthorized,
-			expectedBody:   "Unauthorized",
+			expectedBody:   "does not match",
+		},
+		{
+			name:           "Unauthorized request - wrong scheme",
+			authHeader:     "Basic dXNlcjpwdw==",
+			expectedStatus: http.StatusUnauthorized,
+			// The envelope is JSON, so the quotes around the scheme
+			// arrive backslash-escaped; match the part that does not
+			// depend on the encoding.
+			expectedBody: "scheme; this API takes",
 		},
 	}
 
@@ -62,9 +94,11 @@ func TestAuthorizeProxy(t *testing.T) {
 				t.Errorf("Expected status code %d, got %d", tt.expectedStatus, rec.Code)
 			}
 
-			// Check the response body
-			if rec.Body.String() != tt.expectedBody {
-				t.Errorf("Expected body %q, got %q", tt.expectedBody, rec.Body.String())
+			// The body is OpenAI's error envelope on a rejection, so
+			// what matters is that it names the reason, not that it is
+			// one exact string.
+			if !strings.Contains(rec.Body.String(), tt.expectedBody) {
+				t.Errorf("Expected body to contain %q, got %q", tt.expectedBody, rec.Body.String())
 			}
 		})
 	}

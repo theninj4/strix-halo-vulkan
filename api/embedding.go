@@ -61,12 +61,13 @@ type EmbeddingUsage struct {
 
 // handleEmbeddings is POST /v1/embeddings.
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Embedding == nil {
-		notLoaded(w, "the embedding model", "-embed")
+		notLoaded(ctx, w, "the embedding model", "-embed")
 		return
 	}
 	var req EmbeddingRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
 	if len(req.Input) == 0 {
@@ -95,14 +96,14 @@ func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.Embedding.Embed(r.Context(), &req)
 	if err != nil {
-		backendError(w, "embedding", err)
+		backendError(ctx, w, "embedding", err)
 		return
 	}
 	if len(res.Vectors) != len(req.Input) {
 		// A backend that returned a different number of vectors than there
 		// were inputs would silently misalign a client's corpus, so it is an
 		// error here rather than a response.
-		backendError(w, "embedding", errVectorCount)
+		backendError(ctx, w, "embedding", errVectorCount)
 		return
 	}
 

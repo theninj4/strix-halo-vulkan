@@ -267,12 +267,31 @@ func main() {
 			*llmModel, layers, b.Context(), *llmBatch, time.Since(start).Round(time.Millisecond))
 	}
 
+	// Say which it is, every time. Only logging the open case meant the
+	// usual case -- a token is in force, because one is the default -- was
+	// invisible at startup, and the first sign of it was a 401 from a
+	// client that never knew it had to send anything.
 	if *token == "" {
-		log.Printf("warning: -token is empty; this server authorizes nothing")
+		log.Printf("auth: -token is empty; this server authorizes nothing")
+	} else {
+		log.Printf("auth: bearer token required on every /v1 request; "+
+			"send %q (set it with -token, or -token= to serve open)",
+			"Authorization: Bearer "+redactToken(*token))
 	}
 	if err := listen(srv, *addr); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// redactToken shows a token's first and last two characters so the startup
+// line can be matched against what a client is configured with, without
+// putting the credential in the journal. Anything short enough that this
+// would give most of it away is shown as its length alone.
+func redactToken(tok string) string {
+	if len(tok) < 12 {
+		return fmt.Sprintf("<%d characters>", len(tok))
+	}
+	return tok[:2] + strings.Repeat(".", 6) + tok[len(tok)-2:]
 }
 
 // defaultPreviewModel is where -previews looks for taef1, matching every other

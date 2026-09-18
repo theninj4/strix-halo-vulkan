@@ -1,9 +1,9 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -27,15 +27,16 @@ import (
 
 // handleChatCompletions is the OpenAI chat endpoint.
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if s.Completion == nil {
-		notLoaded(w, "the language model", "-llm")
+		notLoaded(ctx, w, "the language model", "-llm")
 		return
 	}
 	var req CompletionRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
-	if !validCompletion(w, &req) {
+	if !validCompletion(ctx, w, &req) {
 		return
 	}
 
@@ -54,7 +55,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err != nil {
-		backendError(w, "chat completion", err)
+		backendError(ctx, w, "chat completion", err)
 		return
 	}
 	msg := &Delta{
@@ -84,6 +85,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 	req *CompletionRequest, id, model string, created int64,
 ) {
+	ctx := r.Context()
 	stream := newSSE(w)
 	frame := func(v any) error { return stream.send("", v) }
 	chunk := func(d *Delta, finish *string) Chunk {
@@ -96,7 +98,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 	// The role arrives on its own, before any content: it is what tells a
 	// client which message the deltas that follow belong to.
 	if err := frame(chunk(&Delta{Role: "assistant"}, nil)); err != nil {
-		log.Printf("api: chat completion: %v", err)
+		logf(ctx, "chat completion: %v", err)
 		return
 	}
 
@@ -106,10 +108,10 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		if r.Context().Err() != nil {
 			// The client hung up mid-generation. There is nobody to tell.
-			log.Printf("api: chat completion: client cancelled")
+			logf(ctx, "chat completion: client cancelled")
 			return
 		}
-		log.Printf("api: chat completion: %v", err)
+		logf(ctx, "chat completion: %v", err)
 		_ = frame(errorResponse{Error: errorBody{Message: err.Error(), Type: "server_error"}})
 		return
 	}
@@ -119,7 +121,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 		last.ToolCalls = res.ToolCalls
 	}
 	if err := frame(chunk(last, &res.FinishReason)); err != nil {
-		log.Printf("api: chat completion: %v", err)
+		logf(ctx, "chat completion: %v", err)
 		return
 	}
 	// OpenAI's usage chunk: an extra frame with no choices, and only when
@@ -130,7 +132,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
 			Choices: []Choice{}, Usage: &usage,
 		}); err != nil {
-			log.Printf("api: chat completion: %v", err)
+			logf(ctx, "chat completion: %v", err)
 			return
 		}
 	}
@@ -139,40 +141,40 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 
 // validCompletion answers the client itself on a request this server will not
 // serve, and reports whether the handler should carry on.
-func validCompletion(w http.ResponseWriter, req *CompletionRequest) bool {
+func validCompletion(ctx context.Context, w http.ResponseWriter, req *CompletionRequest) bool {
 	if len(req.Messages) == 0 {
-		badRequest(w, "messages is empty")
+		badRequest(ctx, w, "messages is empty")
 		return false
 	}
 	for i, m := range req.Messages {
 		if kind := m.Content.NonText(); kind != "" {
-			badRequest(w, "message "+strconv.Itoa(i)+" carries a "+strconv.Quote(kind)+
+			badRequest(ctx, w, "message "+strconv.Itoa(i)+" carries a "+strconv.Quote(kind)+
 				" content block; this server has no vision model and would answer about the text alone")
 			return false
 		}
 	}
 	if req.N > 1 {
-		badRequest(w, "n is "+strconv.Itoa(req.N)+
+		badRequest(ctx, w, "n is "+strconv.Itoa(req.N)+
 			"; this server generates one completion per request, and n of them would be n runs of a model sized to saturate the device")
 		return false
 	}
 	if len(req.Stop) > maxStopSequences {
-		badRequest(w, strconv.Itoa(len(req.Stop))+" stop sequences; this server takes at most "+
+		badRequest(ctx, w, strconv.Itoa(len(req.Stop))+" stop sequences; this server takes at most "+
 			strconv.Itoa(maxStopSequences))
 		return false
 	}
 	for _, seq := range req.Stop {
 		if seq == "" {
-			badRequest(w, "a stop sequence is empty, which every generation matches immediately")
+			badRequest(ctx, w, "a stop sequence is empty, which every generation matches immediately")
 			return false
 		}
 	}
 	if req.MinP != nil || req.RepeatPenalty != nil {
-		badRequest(w, "min_p and repeat_penalty are not implemented; this server's sampler is temperature, top_k and top_p")
+		badRequest(ctx, w, "min_p and repeat_penalty are not implemented; this server's sampler is temperature, top_k and top_p")
 		return false
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type != "" && req.ResponseFormat.Type != "text" {
-		badRequest(w, "response_format "+strconv.Quote(req.ResponseFormat.Type)+
+		badRequest(ctx, w, "response_format "+strconv.Quote(req.ResponseFormat.Type)+
 			" is not implemented; there is no constrained decoding in this server yet")
 		return false
 	}
