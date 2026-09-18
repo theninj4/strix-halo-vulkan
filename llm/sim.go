@@ -376,6 +376,24 @@ func DensePlan() QuantPlan {
 	return densePlan
 }
 
+// ShippedDenseBank is P3's decision, D18: the plan a product run stages when
+// nothing on the command line says otherwise.
+//
+// It is the uniform 4.5-bit plan with **`ple_proj` left off**, which stages
+// that family on L8a's int8 bank instead. Both its tensors ship Q8_0, so the
+// int8 stage is bit-identical arithmetic and the fifth family costs 0.0165 GB
+// a token — 0.4% of the bank, measured at **0.06 tok/s over three interleaved
+// pairs** — for **0.367 points of perplexity**, 22 pp/GB and five times the
+// return of the next-best width a kernel already exists for. 145 chunks:
+// **4.1850 against 4.0289, +3.87%**, where the uniform plan is 4.1998, +4.24%.
+//
+// It is deliberately *not* the default of `DenseBankPlan` itself: a
+// measurement tool that staged a plan nobody named would make every CSV in
+// `results/` ambiguous about what it measured. `cmd/serve` opts in; `cmd/llm`
+// does not. See research/p3-widths.md.
+const ShippedDenseBank = "deltanet=q4_k/32,hyper_conn=q4_k/32,lm_head=q4_k/32," +
+	"full_attn=q4_k/32,qsa_indexer=q4_k/32"
+
 var (
 	denseBankOnce sync.Once
 	denseBankPlan QuantPlan

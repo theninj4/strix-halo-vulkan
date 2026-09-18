@@ -20,13 +20,16 @@
   668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
   is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
   MALL in between.
-- **Perplexity 4.2010 against our 4.0289 — +4.27%** (and +4.14% against the
-  reference's own 4.0340), with **all six** dense families at 4.5 bits and
-  no fp16 tail anywhere — the bank is L8c-3's simulation (which projected
-  +4.24%) with no scope carve-out. Additivity broke at the sixth family:
-  the separate deltas sum to 4.31% where five-families-plus-`ple_proj`
-  measured 4.09% (P2).
-- **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse.
+- **Perplexity 4.1850 against our 4.0289 — +3.87%** since P3 set **D18**:
+  the uniform 4.5-bit plan with `ple_proj` back on int8, 0.0165 GB a token
+  for 0.367 points and a decode cost below the instrument's floor. The
+  uniform plan it replaces is 4.2010, +4.27%. **On a second corpus (Go
+  stdlib) the same plans rank identically at 2.5x smaller magnitudes** —
+  +1.34% and +1.67% — so the wikitext figure is the pessimistic end.
+  Additivity now leaks **both ways** and both leaks are the n-gram block, so
+  a plan is measured and never composed.
+- **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse —
+  and since P3 it stages **D18** by default (`llm.ShippedDenseBank`).
 - ~~**One correctness cliff**~~: **closed at P0 (2026-09-18)**. It was
   amdgpu's gfx ring watchdog killing any submit that holds the ring past
   **2 s** — not rows, layers, bytes or residency. The recorder chunks by time
@@ -118,21 +121,26 @@ is now 0.90 — see P1's finding 1.
    *refuses* the GEMV path by design — the M=2..8 GEMM/GEMV crossover
    (IDEAS §1.5) has never been measured on this model's shapes. A half-page
    design doc first; it changes the state-object API (P5).
-4. **The accuracy knapsack.** Additivity + per-family corpus deltas mean the
-   shipped plan is now a solvable trade, and the uniform plan is provably
-   not optimal in pp-per-GB: `full_attn` buys 0.299 GB a token for +1.65%
-   while `deltanet` buys 1.07 GB for +0.93%. Two composable options, both
-   computable *today* from numbers already in `results/`:
-   - `full_attn` back to int8: ~4.58 GB a token, ~52.8 ceiling, **~+2.07%**.
-   - `full_attn` at 5.5 bits: `sim.go` can grade a q5_k arm in one 8-min
-     run **before any kernel exists** — likely most of the bytes back for a
-     fraction of the 1.65.
-   Nothing forces uniform 4.5. Decide with numbers, record it as D18.
-5. **A second corpus, and one downstream eval.** +3.72% rests entirely on
-   wikitext-2. The instrument is corpus-agnostic — one run on code or on
-   chat-formatted text is 8 minutes — and the HTTP API makes a small
-   task-level screen (a few hundred multiple-choice items) an evening. Cheap
-   insurance before the widths are declared shipped.
+4. ~~**The accuracy knapsack.**~~ **— solved at P3, and both of its options
+   lost.** `full_attn` back to int8 measures **+2.72%**, not the ~+2.07% the
+   additivity estimate gave, and it is **strictly dominated** by L8c-3's
+   `hc + attn` at `q5_k` (+2.70% at 4.419 GB against +2.72% at 4.592).
+   `full_attn` at 5.5 bits *is* the right answer and the sim priced it
+   without a kernel — **4.1560, +3.15%, 14.1 pp/GB** — but `bank_q4.go` is
+   nibbles by construction, so it is a kernel stage and became **P3a**. What
+   shipped instead is the row nobody had costed: **`ple_proj` back to int8**,
+   22 pp/GB, which is D18. The framing error worth remembering is that the
+   list quoted `ple_proj` at ~12 pp/GB *from halves* where every other family
+   was quoted from int8; on the consistent basis it was ~35, the worst trade
+   in the plan by three times the stated margin.
+5. **A second corpus** — **done at P3**; the downstream eval is not.
+   The Go standard library, cut to wiki.test.raw's byte count: the plans
+   **rank identically** and the magnitudes are **2.5x smaller** (D18 +1.34%
+   against +3.87%), so wikitext is the pessimistic end rather than a
+   universal number, and both of P3's decisions strengthen off it. The
+   task-level screen still has no dataset on this machine — a few hundred
+   multiple-choice items through the HTTP API remains an evening's work and
+   is the last unpriced thing about the widths.
 6. **The DeltaNet state's width.** 0.22 GB a token of the honest budget is
    f32 state traffic. fp16 state halves it (+~1.3 tok/s of ceiling) — but
    the recurrence accumulates, which is exactly where fp16 goes wrong.
@@ -361,17 +369,75 @@ because after the deletion the bank *is* the simulation, no carve-outs.**
       the fresh inventory is P3's.
       [Write-up](research/p2-ple-proj.md)
 
-### P3 — the shipped-widths decision  *(the knapsack, then D18)*
+### ~~P3 — the shipped-widths decision~~  *(**done**, 2026-09-18 — D18, and the answer is the small one)*
 
-- [ ] Sim-grade `q5_k` on `full_attn` (and, if cheap, on `lm_head` — the
-      other expensive family) — no kernel needed to get the number.
-- [ ] Pick the plan from measured corpus deltas: uniform 4.5 (+3.72%),
-      `full_attn` at int8 (~+2.07%, −3.7 tok/s of ceiling), or `full_attn`
-      at 5.5 bits if the sim says it earns its arm.
-- [ ] Screen the winner on a second corpus and one small downstream eval
-      (idea 5).
-- [ ] Gate: a decision row **D18** with a 145-chunk number, and the served
-      default set to it.
+**The knapsack was solved by measuring six complete plans, not by composing
+per-family deltas — and the only upgrade the current kernel can stage is
+worth taking, while everything better needs a fifth bit.**
+
+- [x] Sim-grade `q5_k`: **`full_attn` 4.1560 (+3.15%)**, `lm_head` 4.1743
+      (+3.61%), `ple_proj` 4.1919 (+4.05%), against the uniform control's
+      4.1998. The fifth bit recovers **66-77% of a family's whole 4.5-bit
+      cost for a quarter of int8's bytes**; `lm_head` recovers most because
+      unsloth's matrix has **no row for `output.weight`** and the family is
+      round-to-nearest.
+- [x] Two arms the list did not have, and they are the ones that decided it.
+      `bank_q4.go:144` is **nibbles by construction**, so `q5_k` is a kernel
+      stage while int8 is free — a family left off the plan stages on L8a's
+      bank. **`ple_proj` → int8 is 0.367 pp for 0.0165 GB (22 pp/GB)**;
+      `full_attn` → int8 is 1.522 pp for 0.328 GB (4.6), measures **+2.72%**
+      where idea 4 priced it at +2.07%, and is **strictly dominated** by
+      L8c-3's `hc + attn` at `q5_k` (+2.70% at 4.419 GB against +2.72% at
+      4.592). Idea 4 is closed: no int8 arm belongs in the plan but this one.
+- [x] **D18 = uniform `q4_k` with `ple_proj` on int8.** 145 chunks:
+      **4.1850 ± 0.02389, +3.87%**, the bank equal to the simulation to four
+      decimals *and to the same standard error*. Decode over **three
+      interleaved pairs**: means 35.74 (uniform) against 35.79 (D18), the
+      sign flipping pair to pair against a **within-arm spread of 0.31
+      tok/s** — the bytes predict 0.12 tok/s and the instrument cannot
+      resolve it. Fresh inventory **4.281 GB a token, 56.5 tok/s ceiling**
+      (and note the collision: that 4.281 is *arithmetic*, P1's was
+      *measured* at a different bank state).
+- [x] Second corpus (idea 5, first half): the Go standard library, cut to
+      wiki.test.raw's byte count, 145 chunks. **The ranking is invariant** —
+      1.6288 baseline, 1.6560 uniform (+1.67%), 1.6506 D18 (+1.34%), 1.6450
+      `full_attn` at `q5_k` (+0.99%) — while the **magnitudes are 2.5x
+      smaller**, so **+4.27% is a wikitext figure and the pessimistic end of
+      the range**. `ple_proj` is a *larger* share of the damage on code (20%
+      against 8.7%) and `full_attn`'s fifth bit recovers 41% against 26%:
+      both decisions strengthen off wikitext.
+- [x] Gate: **D18** recorded in `LLM.md` with its 145-chunk number, and
+      `cmd/serve -llm` stages it by default (`llm.ShippedDenseBank`;
+      `LLM_DENSE_BANK` overrides, `off` restores the int8 bank). `cmd/llm`
+      deliberately keeps no default — a measurement tool that staged a plan
+      nobody named would make every CSV in `results/` ambiguous.
+- [ ] Carried forward: idea 5's **downstream task eval**. There is no
+      multiple-choice set on this machine and fetching one was out of scope;
+      the cross-corpus half is done. [Write-up](research/p3-widths.md)
+
+### P3a — the fifth bit: a `qh` plane for the dense bank  *(the accuracy item that is left)*
+
+**P3 measured the case and it is the best remaining pp-per-GB on the board
+by 3x.** `full_attn` at `q5_k` is **14.1 pp/GB** where the best buildable
+int8 arm is 4.6, and a plan carrying it lands near **+2.5% at ~4.36 GB** —
+which no arrangement of widths the current kernel can stage reaches on both
+axes at once.
+
+- [ ] The format: ggml's `Q5_K` is `Q4_K` plus a `qh` bit-plane, so the
+      change is a third stream through the unpack and a tile that is no
+      longer one byte per two elements. `bank_q4.go`'s four-bit check
+      becomes a two-format branch; the record plane (6-bit scale and min
+      against one fp16 pair) is unchanged.
+- [ ] Order the families by measured return, and re-measure rather than
+      compose at each step: `full_attn` (14.1 pp/GB), `lm_head` (8.0),
+      `hyper_conn` (~5.6), `deltanet` (~2.8 and 0.26 GB — the one family
+      where a fifth bit is genuinely expensive). `ple_proj` at `q5_k` is the
+      steepest slope on the board (47.8) but the prize is 0.196 pp, so it
+      rides along free and never justifies its own work.
+- [ ] Gate: the bank equal to the simulation chunk for chunk at the new
+      width, a 145-chunk number for each family added, decode measured in
+      the whole model against a same-hour control (P1c), and D18 amended
+      rather than replaced.
 
 ### P4 — the last bytes: the router and the experts  *(+4.5 tok/s of ceiling)*
 
@@ -452,9 +518,29 @@ multiplier on the list but wants its own design pass, and its multiplier
 applies on top of whatever the rest buys, so it loses nothing by going
 after.
 
+**P3 closes the accuracy story, and its lesson is about which question was
+open.** The review framed the knapsack as a trade between `full_attn`'s
+bytes and its perplexity, and both of the options it listed lost — the int8
+arm to a plan L8c-3 had already measured, the `q5_k` arm to `bank_q4.go`
+being nibbles by construction. The row that won was the one the list had
+mis-costed: `ple_proj`, quoted at ~12 pp/GB from *halves* where every other
+family was quoted from int8, and worth ~35 on the consistent basis. Put back
+on int8 it is **0.367 points for 0.0165 GB and no measurable tok/s**, which
+is D18. **What the stage really bought is the case for P3a**: `full_attn` at
+`q5_k` is 14.1 pp/GB against the best buildable arm's 4.6, and the fifth bit
+is now the only accuracy work left with a measured return.
+
+Three instrument rules came out of it. **A plan is measured, never
+composed** — additivity leaks 0.22 pp sub- and ~0.15 pp super-additively and
+both leaks are the n-gram block. **An A/B on a difference this small is
+interleaved** — one pair would have read −0.06 and another +0.14 on a real
+difference of ~0.04. And **a perplexity delta names its corpus**: the same
+plans rank identically on code at 2.5x smaller magnitudes, so +3.87% is a
+wikitext figure.
+
 **The numbers to beat from here, each on its own day's control: 35.89 tok/s
-(27.87 ms a step, P2's day, 1.43x llama.cpp's 25.15), ~54.5 honest ceiling
-on the ~4.15 GB bank at the 227 GB/s dispatches reach — and llama.cpp
-behind at every ubatch. P3 (the shipped-widths decision) now owns the
-accuracy story: its knapsack gained a sixth row (`ple_proj`, the worst
-pp-per-GB of the six) and lost additivity as a free tool.**
+(27.87 ms a step, 1.43x llama.cpp's 25.15), perplexity 4.1850 (+3.87%) on
+4.281 GB a token with a 56.5 tok/s ceiling — and llama.cpp behind at every
+ubatch. The accuracy frontier now has one item on it (P3a, the `qh` plane,
+worth ~1.1 points at `full_attn` alone) and the throughput frontier has P4,
+P5 and P6.**

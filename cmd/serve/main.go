@@ -18,6 +18,12 @@
 // Every endpoint answers today except POST /v1/images/edits, which needs the
 // VAE's encoder and not a flag (see api.Server.handleImageEdit).
 //
+// **-llm stages D18's widths by default** (P3): the uniform 4.5-bit dense
+// bank with `ple_proj` on int8, 4.281 GB a token and 4.1850 perplexity.
+// `LLM_DENSE_BANK` overrides it by naming any other plan, and `off` serves
+// L8a's int8 bank instead. `cmd/llm` has no such default on purpose -- a
+// measurement tool should stage only what its command line names.
+//
 // **-llm and -image do not fit together.** The language model is ~84 GB
 // resident and the image pipeline ~25 GB, against 128 GB of unified memory
 // that the rest of the machine is also in; the two are separate processes on
@@ -49,6 +55,7 @@ import (
 
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/backend"
+	"strix-halo-vulkan/llm"
 )
 
 // defaultToken is what the API has always used. It is a flag so that a
@@ -110,6 +117,21 @@ func main() {
 	imgW, imgH, err := parseSize(*imgSize)
 	if *imgOn && err != nil {
 		log.Fatalf("-image-size: %v", err)
+	}
+
+	// **P3/D18: the server stages the shipped widths unless told otherwise.**
+	// `llm.DenseBankPlan` reads `LLM_DENSE_BANK` and defaults to off, because
+	// a measurement tool that staged a plan nobody named would make every CSV
+	// in `results/` ambiguous. A *product* run wants the opposite default, so
+	// the opt-in is here and nowhere else: set the variable to any other plan
+	// to override it, or to `off` to serve L8a's int8 bank.
+	if *llmOn {
+		if _, named := os.LookupEnv("LLM_DENSE_BANK"); !named {
+			if err := os.Setenv("LLM_DENSE_BANK", llm.ShippedDenseBank); err != nil {
+				log.Fatalf("setting the shipped dense bank: %v", err)
+			}
+		}
+		log.Printf("llm: dense bank %s", llm.DenseBankPlan())
 	}
 
 	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies}

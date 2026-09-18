@@ -901,6 +901,60 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-18 — P3: the widths decided (D18), and the case for a fifth bit
+
+**Result: L8c's knapsack solved by measuring six complete plans rather than
+composing per-family deltas, and D18 is the small answer — the uniform
+4.5-bit plan with `ple_proj` back on int8: 0.0165 GB a token for 0.367
+points of perplexity, 4.1850 +/- 0.02389 (+3.87%) against the uniform
+plan's 4.2010 (+4.27%), with the real bank equal to the simulation to four
+decimals and to the same standard error. Three interleaved A/B decode pairs
+put its cost below the instrument's floor: means 35.74 against 35.79 with
+the sign flipping pair to pair, against a within-arm spread of 0.31 tok/s
+where the bytes predict 0.12.** The decision turned out to be **three-way
+per family, not two**: `bank_q4.go:144` refuses anything but nibbles, so
+`q5_k` is a kernel stage (a third `qh` stream through the unpack) while
+int8 is free — a family left off `LLM_DENSE_BANK` stages on L8a's bank —
+and the int8 arms therefore earned measurements rather than estimates. **The
+fifth bit recovers 66-77% of a family's whole 4.5-bit cost for a quarter of
+int8's bytes**: `full_attn` 4.1560 (+3.15%, **14.1 pp/GB**), `lm_head`
+4.1743 (8.0 pp/GB, recovering 77% because unsloth's matrix has no row for
+`output.weight` and the family is round-to-nearest), `ple_proj` 4.1919
+(47.8 pp/GB for a 0.196 pp prize), where the marginal step from `q5_k` up to
+int8 on `full_attn` is **1.9 pp/GB** — the clearest stop on the frontier.
+**Idea 4 closed with both its options losing**: `full_attn` at int8 measures
+**+2.72%** against the +2.07% additivity predicted, and is strictly
+dominated by L8c-3's `hc + attn` at `q5_k` (+2.70% at 4.419 GB against
++2.72% at 4.592). **Additivity leaks both ways and both leaks are the
+n-gram block** — `ple_proj` marginal is 0.367 pp where standalone it is
+0.59 (P2's 0.22 pp seen from the other side), and `hc + attn` recovers 1.54
+where its parts give ~1.39 — so a plan is measured, never composed. Also
+corrected: LLM2 ranked `ple_proj` at ~12 pp/GB quoted *from halves* where
+every other family was quoted from int8; on the consistent basis it is ~35,
+the plan's worst trade by three times the stated margin. **Second corpus
+(idea 5, first half)**: the Go standard library cut to wiki.test.raw's byte
+count, 145 chunks — 1.6288 baseline, 1.6560 uniform (+1.67%), 1.6506 D18
+(+1.34%), 1.6450 `full_attn` q5_k (+0.99%). **The ranking is invariant and
+the magnitudes are 2.5x smaller**, so +3.87% is a wikitext figure and the
+pessimistic end; `ple_proj` is a larger share of the damage on code (20%
+against 8.7%) and the fifth bit recovers 41% against 26%, so both decisions
+strengthen off wikitext. Fresh decode inventory **4.281 GB a token, 56.5
+tok/s ceiling** — arithmetic, and not to be confused with P1's
+identically-numbered *measured* 4.281 at a different bank state.
+`cmd/serve -llm` now stages D18 by default (`llm.ShippedDenseBank`;
+`LLM_DENSE_BANK` overrides it, `off` restores the int8 bank) while `cmd/llm`
+deliberately keeps no default, so no CSV in `results/` becomes ambiguous
+about what it measured. Reproducibility: the ppl runs are deterministic and
+the sim/bank pair for D18 agrees to four decimals and the same standard
+error; the decode claim is three interleaved pairs rather than one, which is
+what the small difference required. Runs: `results/p3_ppl_attn_q5k.csv`,
+`p3_ppl_ple_q5k.csv`, `p3_ppl_head_q5k.csv`, `p3_ppl_attn_int8.csv`,
+`p3_ppl_ple_int8.csv`, `p3_ppl_d18_bank.csv`, `p3_code_{base,q4k,d18,attnq5k}.csv`.
+Write-up: `research/p3-widths.md`; next is **P3a** (the `qh` plane — the
+only accuracy item left with a measured return, 14.1 pp/GB at `full_attn`)
+or P4/P5 on the throughput side, per `LLM2.md`. Carried forward: idea 5's
+downstream task eval, which has no dataset on this machine.
+
 ### Session 2026-09-18 — P2: `ple_proj` on the bank, the fp16 tail deleted, and L8c closed
 
 **Result: the last streamed dense family is on the 4.5-bit bank, the
