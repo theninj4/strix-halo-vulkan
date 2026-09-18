@@ -231,7 +231,7 @@ func main() {
 		srv.Image = b
 		enc, tr, vaeW, act := b.Residency()
 		geo := b.Geometry()
-		previews := "no previews (-preview)"
+		previews := "no previews (-previews)"
 		if geo.Previews {
 			previews = "previews from " + preview
 		}
