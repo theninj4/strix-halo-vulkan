@@ -521,7 +521,16 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		if err != nil {
 			return fmt.Errorf("llm: ple layer %d: %w", pleCfg.Layers[0], err)
 		}
-		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, PLEOpts{}); err != nil {
+		// P2's bank, where the plan names this family. `ple_key` is the
+		// tensor `simFamily` maps to "ple_proj" and the checkpoint ships it
+		// as Q8_0, which is what the `true` says — the one block that never
+		// got L8a's int8 stage either, so the two-valued default is new here
+		// too.
+		pleOpts := PLEOpts{Bank: bankOf(opts.denseQ8()), Layer: pleCfg.Layers[0]}
+		if q, ok := DenseBankPlan().For(fmt.Sprintf("blk.%d.ple_key.weight", pleCfg.Layers[0]), true); ok {
+			pleOpts.Bank, pleOpts.Sim = BankQ4K, q
+		}
+		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, pleOpts); err != nil {
 			return fmt.Errorf("llm: ple: %w", err)
 		}
 		g.pleCfg, g.hasPLE = pleCfg, true
@@ -589,14 +598,15 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 	if len(ats) > 0 {
 		// L8c-7's bank, where the plan names this family. `attn_q` is the
 		// tensor `simFamily` maps to "full_attn" and the checkpoint ships it
-		// as Q8_0, which is what the `true` says; the indexer's two are
-		// **BF16**, which is what the `false` says, and they are a family of
-		// their own because L4b-4 measured the score sensitive to them.
+		// as Q8_0, which is what the `true` says. The indexer's two BF16
+		// projections ride the same plane at the same width — the fp16 tail
+		// left with D13's payoff (P2) — so a plan that names `qsa_indexer`
+		// at a different width than `full_attn` is refused rather than
+		// averaged: they are one fused matrix.
 		atBank, atSim := bankOf(opts.denseQ8()), QuantSim{}
 		if q, ok := DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
 			atBank, atSim = BankQ4K, q
 		}
-		idxQ := false
 		if q, ok := DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
 			if atBank != BankQ4K {
 				return fmt.Errorf("llm: qsa_indexer is staged in the fused projection's plane, so it needs full_attn on the same bank")
@@ -604,9 +614,8 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			if q != atSim {
 				return fmt.Errorf("llm: full_attn is %s and qsa_indexer is %s, and they share one plane", atSim, q)
 			}
-			idxQ = true
 		}
-		if g.attn, err = NewAttnGPUBank(dev, atCfg, g.maxTok, g.nKV, ats, atBank, atSim, idxQ); err != nil {
+		if g.attn, err = NewAttnGPUBank(dev, atCfg, g.maxTok, g.nKV, ats, atBank, atSim); err != nil {
 			return fmt.Errorf("llm: attn: %w", err)
 		}
 		mark("attention", len(ats), g.attn.Buffers(), g.attn.WeightBytes(), g.attn.ActivationBytes(), start)

@@ -358,14 +358,12 @@ func hcVariantFor(k HCKernel) (hcVariant, bool) {
 // hcMixer is where one mixer's weights sit in the arenas.
 //
 // On L8's bank `down` and `up` are **byte** offsets of int8 tiles with an
-// fp16 scale plane behind each, and `downTail` is the fp16 remainder of the
-// fused down projection — the column block that holds `inject`, in halves.
-// On the fp16 bank they are half offsets and there is no tail (bank.go).
+// fp16 scale plane behind each. On the fp16 bank they are half offsets
+// (bank.go). There is no fp16 tail: `inject` is on the plane (P2).
 type hcMixer struct {
-	gamma    uint32 // fp32 arena
-	down     uint32 // the fused [lowRank + hc, wide] matrix
-	downTail uint32 // halves: its last column block, or noW
-	up       uint32 // the permuted [wide, lowRank] matrix
+	gamma uint32 // fp32 arena
+	down  uint32 // the fused [lowRank + hc, wide] matrix
+	up    uint32 // the permuted [wide, lowRank] matrix
 }
 
 // HCGPU runs hyper-connection mixers on the device. It holds however many
@@ -450,36 +448,6 @@ const hcUpSub = 10
 // tile = 336 = 21 tiles, and 21 is 3 x 7, so 48 is the widest block that
 // divides it — which is why that ladder moves BM alone.
 const downBN = 48
-
-// q8Split is where the fused down projection stops being int8 and becomes
-// halves, and it is the one number L8b turned on.
-//
-// `inject` is four **F32** rows at lowRank = 320 of a matrix whose fused N is
-// 336, so re-quantising them is L8c's decision and not this stage's (D13).
-// L8a's tail takes the rows that are not int8 out of the main plane and
-// stages them as a fp16 fragment-tiled matrix of their own — but it requires
-// a whole column block to fall on one side of the split, and 320 is not a
-// multiple of the down ladder's BN of 48. (48 is forced: 336 is 21 tiles and
-// 21 is 3 x 7.)
-//
-// So the split is the column block that *contains* the first non-Q8 row,
-// 288 here, and the 32 low-rank rows between 288 and inject are staged twice
-// — once in the int8 plane, where they are never read, and once in the tail,
-// where they are. That costs 0.33 MB a mixer against the 3.2 the block saves,
-// and it buys the branch staying per workgroup: a compare inside the k-loop
-// was 1.27x on a matrix with no tail at all (L8a-3).
-//
-// Both kernels derive it, from `pc.lowRank` and their own BN — llm_gemm.comp
-// MODE 0 from the BN it was built with, llm_hc_gemv.comp from DOWN_BN, which
-// build() checks against this one.
-func (g *HCGPU) q8Split() int { return g.cfg.LowRank / downBN * downBN }
-
-// q8TailRows is the rest of the fused N: the block the split leaves over.
-func (g *HCGPU) q8TailRows() int { return g.gemmN() - g.q8Split() }
-
-// HCQ8Split is that split for a caller with no block staged — the benchmark,
-// pricing what the down projection reads off DRAM.
-func HCQ8Split(c HCConfig) int { return (&HCGPU{cfg: c}).q8Split() }
 
 // injStride is the inject tensor's row stride: the down projection's last
 // fragment tile, not hc. The kernel stores a whole 16-wide tile of which the
@@ -690,31 +658,24 @@ func (g *HCGPU) alloc(nMixers int) error {
 	g.abuf.Zero()
 
 	// The two projections, one after the other. In the fp16 bank an offset is
-	// a half and a matrix is n*k of them; in L8's it is a byte, a matrix is
-	// n*k bytes of int8 tiles plus a scale plane, and the fused down
-	// projection carries a fp16 tail between the two (q8Split). Every piece
-	// is aligned so that each base is a whole word for the kernel's `uint`
-	// view and a whole half for the plane's.
-	downBank, upBank, tailBank := g.gemmN()*c.Wide()*2, c.Wide()*c.LowRank*2, 0
+	// a half and a matrix is n*k of them; in L8's it is a byte and a matrix
+	// is n*k bytes of int8 tiles plus a scale plane. There is no fp16 tail:
+	// `inject` is quantised onto the plane with the rest of the family
+	// (D13's payoff, P2). Every piece is aligned so that each base is a
+	// whole word for the kernel's `uint` view.
+	downBank, upBank := g.gemmN()*c.Wide()*2, c.Wide()*c.LowRank*2
 	unit := 2
 	if g.q8 {
 		if g.dbank == BankQ4K {
-			// Both planes of both projections, at 4.5 bits. The down
-			// projection's plane is still the full fused N — the kernel
-			// derives the record plane's base from gemmN * gemmK and gemmN is
-			// the stride of the output it writes — so the columns past the
-			// split are staged and never read: 0.08 MB a mixer of nibbles
-			// against the 1.6 the width saves.
 			downBank = q8Align(q4kBytes(g.gemmN(), c.Wide()))
 			upBank = q8Align(q4kBytes(c.Wide(), c.LowRank))
 		} else {
 			downBank = q8Align(q8Bytes(g.gemmN(), c.Wide()))
 			upBank = q8Align(q8Bytes(c.Wide(), c.LowRank))
 		}
-		tailBank = g.q8TailRows() * c.Wide() * 2
 		unit = 1
 	}
-	perMixer := downBank + tailBank + upBank
+	perMixer := downBank + upBank
 	if g.bank, err = g.dev.NewBuffer(nMixers * perMixer); err != nil {
 		return fmt.Errorf("llm: weight bank (%d MB): %w", (nMixers*perMixer)>>20, err)
 	}
@@ -723,13 +684,7 @@ func (g *HCGPU) alloc(nMixers int) error {
 		g.mixers[i] = hcMixer{
 			gamma: uint32(i * c.Wide()),
 			down:  uint32(i * perMixer / unit),
-			// The tail is halves wherever it sits, because the build that
-			// reads it is the fp16 one.
-			downTail: uint32((i*perMixer + downBank) / 2),
-			up:       uint32((i*perMixer + downBank + tailBank) / unit),
-		}
-		if !g.q8 {
-			g.mixers[i].downTail = noW
+			up:    uint32((i*perMixer + downBank) / unit),
 		}
 	}
 	return nil
@@ -738,12 +693,6 @@ func (g *HCGPU) alloc(nMixers int) error {
 // build compiles every pipeline over all four arenas, bound whether the
 // shader declares them or not, so one descriptor layout and one push-constant
 // size serve the whole sequence.
-// gemvDownBN is the column block llm_hc_gemv.comp's Q8 arm compiles in as
-// DOWN_BN. The two kernels read one staged bank and have to round `lowRank`
-// down to the same boundary, and a mismatch would read the wrong plane rather
-// than run slowly, so it is checked rather than trusted.
-const gemvDownBN = 48
-
 func (g *HCGPU) build() error {
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
 	// The Q8 builds name a sixth buffer: the bank again, as raw words, for
@@ -773,14 +722,6 @@ func (g *HCGPU) build() error {
 	}
 	if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
 		return fmt.Errorf("llm: the GEMM rungs need a pinned 64-wide subgroup")
-	}
-	if downBN != gemvDownBN {
-		return fmt.Errorf("llm: the down ladder blocks %d columns and the GEMV's Q8 arm was built for %d",
-			downBN, gemvDownBN)
-	}
-	if g.q8 && g.q8Split()%downBN != 0 {
-		return fmt.Errorf("llm: the Q8 split is column %d, not a whole %d-column block",
-			g.q8Split(), downBN)
 	}
 	for _, v := range hcVariants {
 		if v.mode == 0 && v.bn != downBN {
@@ -878,9 +819,9 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		// done explicitly rather than through the environment, and it is what
 		// lets one process hold the simulated q4_k and the real one and
 		// compare a mixer's output value for value. It covers exactly what
-		// `stageQ4` quantises — both projections whole, `inject` not at all —
-		// so the two arms are the same format on the same weights.
-		downSrc, upSrc := w.Down, w.Up
+		// `stageQ4` quantises — both projections and `inject` (P2) — so the
+		// two arms are the same format on the same weights.
+		downSrc, upSrc, injSrc := w.Down, w.Up, w.Inject
 		if !g.sim.Off() {
 			for _, t := range []struct {
 				suffix string
@@ -889,7 +830,11 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 			}{
 				{"down.weight", &downSrc, wide},
 				{"up.weight", &upSrc, lr},
+				{"inject.weight", &injSrc, wide},
 			} {
+				if *t.src == nil {
+					continue
+				}
 				q, qw, err := g.hcImatrix(i, t.suffix)
 				if err != nil {
 					return err
@@ -903,7 +848,7 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 		}
 
 		down := make([]uint16, n*wide)
-		packDownB(down, downSrc, w.Inject, lr, c.HC, wide)
+		packDownB(down, downSrc, injSrc, lr, c.HC, wide)
 		g.bank.WriteUint16At(int(g.mixers[i].down), down)
 
 		up := make([]uint16, wide*lr)
@@ -918,38 +863,26 @@ func (g *HCGPU) stage(mixers []HCWeights) error {
 }
 
 // stageQ8 writes one mixer onto L8's bank: the two projections as the int8
-// the checkpoint already ships them as, and the down projection's last column
-// block as halves behind it.
+// the checkpoint already ships them as.
 //
 // Both matrices are Q8_0 in the checkpoint, so every value here is the one
 // the fp16 bank holds — `float(q) * float(d)` is exact and rounding it to
-// fp16 is what tileB wrote (L8a-1). The tail is not a re-quantisation either:
-// its 32 low-rank rows are the same halves in both banks and `inject` is F32
-// in the checkpoint and fp16 in both.
+// fp16 is what tileB wrote (L8a-1). `inject` is F32 in the checkpoint, so
+// int8 is a real re-quantisation of it — priced at L8c-1 as +0.01% over the
+// whole corpus with alpha and beta, which is what retired the fp16 tail
+// (D13's payoff, P2).
 func (g *HCGPU) stageQ8(i int, w HCWeights) error {
 	c := g.cfg
 	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
-	split, tailRows := g.q8Split(), g.q8TailRows()
 
-	// The int8 plane is the full fused N rather than the split, because the
-	// kernel derives the scale plane's offset from gemmN * gemmK and gemmN is
-	// the stride of the output it writes. The columns past the split are
-	// staged and never read: 0.16 MB a mixer for an arithmetic the push block
-	// has no room to state.
 	qs := make([]byte, n*wide)
 	sc := make([]uint16, n*wide/q8Group)
 	tileBQ8(qs, sc, w.Down, lr, wide, func(r int) int { return r })
+	if w.Inject != nil {
+		tileBQ8(qs, sc, w.Inject, c.HC, wide, func(r int) int { return lr + r })
+	}
 	g.bank.WriteBytesAt(int(g.mixers[i].down), qs)
 	g.bank.WriteUint16At((int(g.mixers[i].down)+len(qs))/2, sc)
-
-	// The tail: the low-rank rows the split left over, then inject, in a
-	// fragment tiling of its own numbered from the split.
-	tail := make([]uint16, tailRows*wide)
-	tileB(tail, w.Down[split*wide:lr*wide], lr-split, wide, func(r int) int { return r })
-	if w.Inject != nil {
-		tileB(tail, w.Inject, c.HC, wide, func(r int) int { return lr - split + r })
-	}
-	g.bank.WriteUint16At(int(g.mixers[i].downTail), tail)
 
 	uq := make([]byte, wide*lr)
 	us := make([]uint16, wide*lr/q8Group)
@@ -991,22 +924,13 @@ func (g *HCGPU) hcImatrix(i int, suffix string) (QuantSim, []float32, error) {
 // off k, exactly as the simulation does, which is what keeps the two the same
 // format by construction rather than by agreement.
 //
-// **The fp16 tail is no longer free.** On L8's bank the 32 low-rank rows
-// between the split and `inject` were Q8_0, so the halves in the tail and the
-// bytes in the main plane were the same numbers and it did not matter which
-// the kernel read. At 4.5 bits it does: the simulation quantises all 320 rows
-// of `hc_*_down`, so the tail has to carry the *quantised* rows or the bank
-// would be 10% of a matrix more accurate than the format it claims to be.
-// They go through the same encoder and are then rounded to halves, which is
-// what `sim.go` does one step later.
-//
-// **`inject` stays exactly where D13 left it**: four F32 rows of the
-// checkpoint, staged as halves, never quantised — and the split is still the
-// column block that contains them, because the ladder's BN has not moved.
+// **There is no fp16 tail** (D13's payoff, P2): `inject` is quantised onto
+// the plane at the family's width under its own name, which is exactly what
+// the simulation behind L8c-3's uniform number always did — the bank is the
+// simulation with no scope carve-out.
 func (g *HCGPU) stageQ4(i int, w HCWeights) error {
 	c := g.cfg
 	wide, lr, n := c.Wide(), c.LowRank, g.gemmN()
-	split, tailRows := g.q8Split(), g.q8TailRows()
 
 	q, qw, err := g.hcImatrix(i, "down.weight")
 	if err != nil {
@@ -1017,21 +941,17 @@ func (g *HCGPU) stageQ4(i int, w HCWeights) error {
 	if err := tileBQ4K(dq, drec, w.Down, lr, wide, func(r int) int { return r }, q, qw); err != nil {
 		return fmt.Errorf("llm: mixer %d %sdown.weight: %w", i, g.names[i], err)
 	}
+	if w.Inject != nil {
+		iq, iqw, err := g.hcImatrix(i, "inject.weight")
+		if err != nil {
+			return err
+		}
+		if err := tileBQ4K(dq, drec, w.Inject, c.HC, wide, func(r int) int { return lr + r }, iq, iqw); err != nil {
+			return fmt.Errorf("llm: mixer %d %sinject.weight: %w", i, g.names[i], err)
+		}
+	}
 	g.bank.WriteBytesAt(int(g.mixers[i].down), dq)
 	g.bank.WriteBytesAt(int(g.mixers[i].down)+len(dq), drec)
-
-	// The tail, through the same format: the rows the split left over
-	// quantised and then narrowed, `inject` narrowed alone.
-	tailSrc := append([]float32(nil), w.Down[split*wide:lr*wide]...)
-	if err := q.ApplyWeighted(tailSrc, wide, qw); err != nil {
-		return fmt.Errorf("llm: mixer %d %sdown.weight tail: %w", i, g.names[i], err)
-	}
-	tail := make([]uint16, tailRows*wide)
-	tileB(tail, tailSrc, lr-split, wide, func(r int) int { return r })
-	if w.Inject != nil {
-		tileB(tail, w.Inject, c.HC, wide, func(r int) int { return lr - split + r })
-	}
-	g.bank.WriteUint16At(int(g.mixers[i].downTail), tail)
 
 	if q, qw, err = g.hcImatrix(i, "up.weight"); err != nil {
 		return err
@@ -1263,12 +1183,6 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 	down := base
 	down.BOff = m.down
 	down.GemmN, down.GemmK = uint32(g.gemmN()), uint32(c.Wide())
-	// The split, in the one field the down projection does not otherwise use:
-	// `gateOff` is where the fp16 tail is, or NO_W on the bank that has none.
-	// Where it *begins* is not pushed — both kernels round `lowRank` down to
-	// the ladder's BN (q8Split) — because 64 uints is this device's whole
-	// push range and the block has been full since L5b.
-	down.GateOff = m.downTail
 	if dv.mode == 2 {
 		if g.rows != 1 {
 			return nil, nil, fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", g.down, g.rows)

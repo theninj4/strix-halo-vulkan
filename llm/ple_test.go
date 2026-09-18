@@ -1,6 +1,10 @@
 package llm
 
-import "testing"
+import (
+	"testing"
+
+	"strix-halo-vulkan/vk"
+)
 
 // pleFixtures opens the checkpoint, the trace and the block's constants.
 func pleFixtures(t *testing.T) (*Model, *Trace, PLEConfig, []int32) {
@@ -425,4 +429,134 @@ func TestPLEConvIsDilatedAndOrdered(t *testing.T) {
 				tc.name, tc.rms/good)
 		}
 	}
+}
+
+// pleBankRun stages the block on one bank and runs the trace's tokens
+// through it, returning the fused projection's two halves, the residual the
+// block added into, and what the weights cost on the device.
+func pleBankRun(t *testing.T, dev *vk.Device, c PLEConfig, nTok int, w PLEWeights,
+	opts PLEOpts, res, embd []float32) (key, val, out []float32, bytes int) {
+	t.Helper()
+	g, err := NewPLEGPU(dev, c, nTok, w, opts)
+	if err != nil {
+		t.Fatalf("ple (%s): %v", opts.Bank, err)
+	}
+	defer g.Destroy()
+	if err := g.Upload(res, embd, nTok); err != nil {
+		t.Fatalf("upload (%s): %v", opts.Bank, err)
+	}
+	if err := g.Run(); err != nil {
+		t.Fatalf("run (%s): %v", opts.Bank, err)
+	}
+	return append([]float32(nil), g.Key()...), append([]float32(nil), g.Value()...),
+		append([]float32(nil), g.Res()...), g.WeightBytes()
+}
+
+// pleBankEqual is the identity the bank stages rest on, value for value —
+// taken at the projection, where a wrong address would show first, and at
+// the residual, where the gate, the scaling and the convolution have all run
+// on top of it.
+func pleBankEqual(t *testing.T, what string, got, ref []float32) {
+	t.Helper()
+	if len(got) != len(ref) {
+		t.Fatalf("%s: %d values against %d", what, len(got), len(ref))
+	}
+	for i := range ref {
+		if got[i] != ref[i] {
+			t.Fatalf("%s [%d]: bank %.9g, reference %.9g", what, i, got[i], ref[i])
+		}
+	}
+	t.Logf("%s: %d values identical", what, len(ref))
+}
+
+// TestPLEGPUQ8IsTheHalves is the L8a stage this block never got, arriving
+// with P2: `ple_key` and `ple_value` both ship as Q8_0, so the int8 bank is
+// the checkpoint's own width and must be **bit-identical** to the fp16 arm —
+// ggml's d = amax/127 makes the round trip an identity, and the halves the
+// unpack puts in LDS are the halves tileB stored (TestBankQ8IsTheHalves at
+// the encoder; this is the same fact through the whole block).
+func TestPLEGPUQ8IsTheHalves(t *testing.T) {
+	m, tr, c, ids := pleFixtures(t)
+	nTok := len(ids)
+	w, err := m.PLEWeights(c.Layers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	embd, err := tr.Get("ple_embd", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := tr.Get("l_last-0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+
+	fpKey, fpVal, fpRes, fpBytes := pleBankRun(t, dev, c, nTok, w, PLEOpts{}, in.Vals, embd.Vals)
+	q8Key, q8Val, q8Res, q8Bytes := pleBankRun(t, dev, c, nTok, w,
+		PLEOpts{Bank: BankQ8, Layer: c.Layers[0]}, in.Vals, embd.Vals)
+	t.Logf("bank %.1f MB against %.1f MB of halves", float64(q8Bytes)/1e6, float64(fpBytes)/1e6)
+	if q8Bytes >= fpBytes {
+		t.Fatalf("the int8 bank is %d bytes, no smaller than %d", q8Bytes, fpBytes)
+	}
+	pleBankEqual(t, "the key projection", q8Key, fpKey)
+	pleBankEqual(t, "the value projection", q8Val, fpVal)
+	pleBankEqual(t, "the residual", q8Res, fpRes)
+}
+
+// TestPLEGPUQ4IsTheSim is P2's other gate and the same shape as the four
+// families before it: **the bank against the simulation that priced it**. The
+// format's floats are staged as halves on the fp16 arm through the same
+// encoder, so the matrix cores see the same halves and the two arms have to
+// agree exactly.
+//
+// It is `rtn` rather than `imatrix` so the test needs nothing but the
+// checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
+// TestBankQ4KIsTheSim covers that at the encoder.
+func TestPLEGPUQ4IsTheSim(t *testing.T) {
+	m, tr, c, ids := pleFixtures(t)
+	nTok := len(ids)
+	w, err := m.PLEWeights(c.Layers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	embd, err := tr.Get("ple_embd", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := tr.Get("l_last-0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim, err := ParseQuantSim("q4_k/32")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim.Mode = "rtn"
+	dev, done := newTestDevice(t)
+	defer done()
+
+	// The simulation's arm: the two tensors round-tripped through the format
+	// before the fp16 bank ever sees them, each under its own name.
+	simW := w
+	simW.Key = append([]float32(nil), w.Key...)
+	simW.Value = append([]float32(nil), w.Value...)
+	if err := sim.Apply(simW.Key, c.NEmbd); err != nil {
+		t.Fatal(err)
+	}
+	if err := sim.Apply(simW.Value, c.NEmbd); err != nil {
+		t.Fatal(err)
+	}
+	simKey, simVal, simRes, simBytes := pleBankRun(t, dev, c, nTok, simW, PLEOpts{}, in.Vals, embd.Vals)
+	q4Key, q4Val, q4Res, q4Bytes := pleBankRun(t, dev, c, nTok, w,
+		PLEOpts{Bank: BankQ4K, Sim: sim, Layer: c.Layers[0]}, in.Vals, embd.Vals)
+	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
+		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
+	if q4Bytes >= simBytes {
+		t.Fatalf("the q4_k bank is %d bytes, no smaller than %d", q4Bytes, simBytes)
+	}
+	pleBankEqual(t, "the key projection", q4Key, simKey)
+	pleBankEqual(t, "the value projection", q4Val, simVal)
+	pleBankEqual(t, "the residual", q4Res, simRes)
 }

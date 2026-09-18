@@ -6,21 +6,26 @@
 
 ## Where this stands, in five lines
 
-- **Decode 32.93 tok/s** against llama.cpp's 25.15 — **1.31x** — at a
-  measured bank of 4.281 GB a token, a ceiling of 56.5 at the bus and 53.0
-  at the rate dispatches reach. P1 attributed the step to the dispatch and
-  took the n-gram gather's sixteen serialised page faults out of it; P1a
-  fused the hyper-connection boundary, 1501 dispatches a pass to 1407; P1c
-  put the step in one pre-recorded command buffer, −1.90 ms a token
-  (measured 25.4 → 26.7 on a day the machine itself was 29% slower — see
-  P1c's environment finding before comparing across days).
+- **Decode 35.89 tok/s** against llama.cpp's 25.15 — **1.43x**, measured
+  the day P2 landed (27.87 ms a step; same-hour ladder 28.40 → 28.34 →
+  27.87) — at a streamed bank of ~4.15 GB a token after P2. P1 attributed
+  the step to the dispatch and took the n-gram gather's sixteen serialised
+  page faults out of it; P1a fused the hyper-connection boundary, 1501
+  dispatches a pass to 1407; P1c put the step in one pre-recorded command
+  buffer, −1.90 ms a token; P2 took the last fp16 matmul and the fp16
+  tails out of the bank, −0.47 ms. Every whole-model number needs a
+  same-hour control — see P1c's environment finding before comparing
+  across days.
 - **Prefill 1089.2 tok/s** at ubatch 2048 against 391.4 — **2.78x** — and
   668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
   is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
   MALL in between.
-- **Perplexity 4.1787 against our 4.0289 — +3.72%** (and +3.59% against the
-  reference's own 4.0340), with five of six dense families at 4.5 bits and
-  additivity holding to 0.01 pp.
+- **Perplexity 4.2010 against our 4.0289 — +4.27%** (and +4.14% against the
+  reference's own 4.0340), with **all six** dense families at 4.5 bits and
+  no fp16 tail anywhere — the bank is L8c-3's simulation (which projected
+  +4.24%) with no scope carve-out. Additivity broke at the sixth family:
+  the separate deltas sum to 4.31% where five-families-plus-`ple_proj`
+  measured 4.09% (P2).
 - **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse.
 - ~~**One correctness cliff**~~: **closed at P0 (2026-09-18)**. It was
   amdgpu's gfx ring watchdog killing any submit that holds the ring past
@@ -28,8 +33,9 @@
   now, and prefill runs to **8192 rows at 1213.5 tok/s, 3.10x**, still
   climbing where llama.cpp's plateaus.
 
-Phase 1 is done, phase 2's kernel half is done, and phase 2's width half is
-one trivial family (`ple_proj`) from done. The plan as originally drawn —
+Phase 1 is done and phase 2 is done on both halves: the kernels, and the
+widths — **L8c is closed at P2**, all six streamed families on the 4.5-bit
+bank and the fp16-tail machinery deleted. The plan as originally drawn —
 run it, profile it, then optimise — executed, and the reference is beaten on
 both axes. **The competition from here is our own ceiling, not llama.cpp.**
 
@@ -317,17 +323,43 @@ with it in a buffer the step is one command buffer recorded once.**
       says ~28.6 ms, ~34.9 tok/s — the priced +2.2.
       [Write-up](research/p1c-prerecorded-decode.md)
 
-### P2 — `ple_proj`, and close L8c  *(half a day; closes the stage)*
+### ~~P2 — `ple_proj`, and close L8c~~  *(**done**, 2026-09-18 — and the family is the plan's worst trade)*
 
-- [ ] The last family: two 2560-wide matrices, no obstacle, two bank stages
-      in one since `PLEGPU` never got the int8 bank either. 0.017 GB a
-      token.
-- [ ] Take D13's payoff: delete the two-plane fp16-tail machinery
-      (`lowRank`/`gateOff` in the kernels, L8b-1's doubled rows) now that
-      every tail is priced and the exception list is empty.
-- [ ] Gate: bank-is-the-format equalities as at L8c-5/6/7, a 145-chunk
-      corpus number for the **complete** uniform plan, and L8c closed in
-      `LLM.md` with that number as the stage's result.
+**Both halves landed, and the stage closes on 4.2010 (+4.27%) — beside the
+4.1998 (+4.24%) L8c-3's simulation projected before any kernel existed,
+because after the deletion the bank *is* the simulation, no carve-outs.**
+
+- [x] The last family, two bank stages in one: int8 (bit-identical, both
+      tensors ship Q8_0) and q4_k — 65.8 → 35.1 → 18.7 MB, the same MODE 2
+      builds the attention block runs, no new kernel. Bank-is-the-format
+      three ways: `TestPLEGPUQ8IsTheHalves`, `TestPLEGPUQ4IsTheSim`
+      (identical through the whole block), and chunk-for-chunk with the sim
+      over eight chunks.
+- [x] **The accuracy is the finding**: `ple_proj` alone is **+0.59%** over
+      145 chunks for 0.047 GB a token — the worst pp-per-GB of the six
+      families by an order of magnitude (~12, against `full_attn`'s 5.5 and
+      `deltanet`'s 0.87), and the 8-chunk screen said **−0.11%**: a fifth
+      reading of the screen warning and a second sign flip. And the six
+      deltas **no longer add**: separate deltas sum to 4.31% where the
+      complete plan measures 4.09% (tails still fp16) — the first material
+      deviation from additivity (0.22 pp), traceable to the n-gram block.
+- [x] D13's payoff: the `Q8_TAIL` arm left `llm_gemm.comp`, the tail arms
+      left `llm_gemv.comp` and `llm_hc_gemv.comp`, and `qkvTail`/`downTail`/
+      `idxQuant`/L8b-1's doubled rows left the three blocks. On a quantised
+      bank alpha, beta, inject and the indexer are quantised at the family
+      width under their own names; `qsa_indexer` must equal `full_attn`'s
+      format (one plane). Cost of the deletion, measured: **+0.18 pp**
+      (4.1939 → 4.2010) for ~0.085 GB a token back and the code gone. The
+      int8 bank is no longer bit-identical on those four tensors — the
+      trace tests carry that as `bankTol` at D13's measured prices, and
+      `TestGraphLogits` accepts an argmax flip only on a measured near-tie.
+- [x] Gate: **complete-plan bank ≡ full-scope sim chunk for chunk** (no
+      `SRC=q8`), 145-chunk number **4.2010 (+4.27%)** in
+      `results/l8c_ppl_uniform_notail.csv`, decode the same hour
+      28.400 → 28.336 → **27.865 ms, 35.89 tok/s, 1.43x** llama.cpp, and
+      L8c closed in `LLM.md`. Streamed bank ~4.15 GB a token by subtraction;
+      the fresh inventory is P3's.
+      [Write-up](research/p2-ple-proj.md)
 
 ### P3 — the shipped-widths decision  *(the knapsack, then D18)*
 
@@ -420,8 +452,9 @@ multiplier on the list but wants its own design pass, and its multiplier
 applies on top of whatever the rest buys, so it loses nothing by going
 after.
 
-**The numbers to beat from here, each on its own day's control: 26.7 tok/s
-against 25.4 on the slow day this was measured (32.93 against llama.cpp's
-25.15 on P1b's day, ~34.9 by arithmetic on that state), 53.0 honest
-good-day ceiling at the 227 GB/s dispatches reach — and llama.cpp behind at
-every ubatch.**
+**The numbers to beat from here, each on its own day's control: 35.89 tok/s
+(27.87 ms a step, P2's day, 1.43x llama.cpp's 25.15), ~54.5 honest ceiling
+on the ~4.15 GB bank at the 227 GB/s dispatches reach — and llama.cpp
+behind at every ubatch. P3 (the shipped-widths decision) now owns the
+accuracy story: its knapsack gained a sixth row (`ple_proj`, the worst
+pp-per-GB of the six) and lost additivity as a free tool.**

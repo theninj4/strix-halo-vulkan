@@ -119,7 +119,11 @@ func residency(model string, maxTok, nKV int, bankLayers []int, denseOnly bool, 
 		if err != nil {
 			return fmt.Errorf("ple layer %d: %w", pleCfg.Layers[0], err)
 		}
-		ple, err := llm.NewPLEGPU(dev, pleCfg, maxTok, pw, llm.PLEOpts{})
+		pleOpts := llm.PLEOpts{Bank: llm.BankFor(llm.DenseQ8()), Layer: pleCfg.Layers[0]}
+		if q, ok := llm.DenseBankPlan().For(fmt.Sprintf("blk.%d.ple_key.weight", pleCfg.Layers[0]), true); ok {
+			pleOpts.Bank, pleOpts.Sim = llm.BankQ4K, q
+		}
+		ple, err := llm.NewPLEGPU(dev, pleCfg, maxTok, pw, pleOpts)
 		if err != nil {
 			return fmt.Errorf("ple: %w", err)
 		}

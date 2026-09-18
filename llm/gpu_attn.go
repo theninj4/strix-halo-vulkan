@@ -238,10 +238,9 @@ func gemmVariantFor(k GEMMKernel) (gemmVariant, bool) {
 // attnLayerWeights is where one layer's staged weights sit.
 type attnLayerWeights struct {
 	// qkv and out are halves into the fp16 bank, or **bytes** into a
-	// quantised one. qkvTail is the indexer's two projections as halves, and
-	// only on a quantised bank that leaves them there — see qkvQuantRows.
-	qkv, out, qkvTail uint32
-	gQ, gK, gIQ, gIK  uint32 // fp32 arena: the four norm gammas
+	// quantised one.
+	qkv, out         uint32
+	gQ, gK, gIQ, gIK uint32 // fp32 arena: the four norm gammas
 }
 
 // AttnGPU runs full-attention layers on the device. It holds however many
@@ -262,15 +261,12 @@ type AttnGPU struct {
 	// bank is which width the two projections are staged in, and sim the
 	// format the 4.5-bit one encodes with (L8c-7). Twelve of the 48 layers
 	// are this block's, and with the indexer they read 1.27 GB of a decode
-	// token as halves, 0.674 on L8a's int8 and 0.375 here — 0.347 if
-	// `qsa_indexer` puts the tail on the plane too.
+	// token as halves, 0.674 on L8a's int8 and 0.347 here. The indexer's two
+	// BF16 projections go on the quantised plane with the rest of the fused
+	// matrix — the fp16 tail left with D13's payoff (P2), priced by L8c-7 at
+	// +0.005% where the selection bites.
 	bank DenseBank
 	sim  QuantSim
-	// idxQuant is whether the indexer's two BF16 projections went into the
-	// quantised plane with the rest of the fused matrix, or stayed in the
-	// fp16 tail L8a gave them. It is `qsa_indexer` in the plan, and it is a
-	// separate family because L4b-4 measured the score sensitive.
-	idxQuant bool
 
 	layers []attnLayerWeights
 
@@ -349,28 +345,6 @@ func (g *AttnGPU) colV() int  { return g.colK() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIQ() int { return g.colV() + g.cfg.KVWidth() }
 func (g *AttnGPU) colIK() int { return g.colIQ() + g.cfg.IdxHeads*g.cfg.IdxDim }
 
-// qkvQuantRows is how much of the fused projection a quantised bank holds,
-// and qkvTailRows is the rest.
-//
-// The query, the key and the value are Q8_0 and round-trip into int8 exactly
-// (bank.go); the indexer's two projections are **BF16**, the only such
-// weights in the model, and they are the ones L4b-4 already found the score
-// sensitive to — 24x further from the reference for an unmodelled activation.
-// So by default they stay halves, in a tail of their own, and the split falls
-// on a column block because colIQ is 13312.
-//
-// `qsa_indexer` in the plan moves them into the quantised plane instead, and
-// then there is no tail at all (L8c-7). It is a family of its own precisely
-// because that sensitivity is a claim about the score and not about the
-// bytes: 0.039 GB of a token against `full_attn`'s 0.635.
-func (g *AttnGPU) qkvQuantRows() int {
-	if g.idxQuant {
-		return g.qkvN()
-	}
-	return g.colIQ()
-}
-func (g *AttnGPU) qkvTailRows() int { return g.qkvN() - g.qkvQuantRows() }
-
 // quant is whether the two projections read a narrow bank at all.
 func (g *AttnGPU) quant() bool { return g.bank != BankFP16 }
 
@@ -378,10 +352,6 @@ func (g *AttnGPU) quant() bool { return g.bank != BankFP16 }
 // the 4.5-bit one used, for a header line and a CSV.
 func (g *AttnGPU) Bank() DenseBank  { return g.bank }
 func (g *AttnGPU) Format() QuantSim { return g.sim }
-
-// IndexerQuantised is whether the indexer's two BF16 projections went into
-// that bank beside the query, the key and the value.
-func (g *AttnGPU) IndexerQuantised() bool { return g.idxQuant }
 
 // selWidth is what the selection asks for: whole blocks plus the incomplete
 // tail, `top_k + ratio - 1`, and never more cells than the cache has. At 2051
@@ -455,14 +425,14 @@ func (g *AttnGPU) NBlocks() int { return (g.nKV + g.cfg.Ratio - 1) / g.cfg.Ratio
 // the indexer's block grid, its bias and the rotary table are all cut against
 // it (research/l2e-attention.md).
 func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights, q8 bool) (*AttnGPU, error) {
-	return NewAttnGPUBank(dev, cfg, maxTokens, nKV, layers, bankOf(q8), QuantSim{}, false)
+	return NewAttnGPUBank(dev, cfg, maxTokens, nKV, layers, bankOf(q8), QuantSim{})
 }
 
-// NewAttnGPUBank is the same with the bank named rather than implied, the
-// format the 4.5-bit one encodes with, and whether the indexer's two BF16
-// projections join it or stay in the fp16 tail (L8c-7).
+// NewAttnGPUBank is the same with the bank named rather than implied and the
+// format the 4.5-bit one encodes with. The indexer's two BF16 projections go
+// on a quantised bank's plane with the rest of the fused matrix (P2).
 func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights,
-	bank DenseBank, sim QuantSim, idxQuant bool) (*AttnGPU, error) {
+	bank DenseBank, sim QuantSim) (*AttnGPU, error) {
 	if maxTokens <= 0 || nKV < maxTokens {
 		return nil, fmt.Errorf("llm: %d tokens in a %d-cell cache", maxTokens, nKV)
 	}
@@ -492,14 +462,8 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 	if bank == BankQ4K && sim.Off() {
 		return nil, fmt.Errorf("llm: a q4_k attention bank needs a format to quantise to")
 	}
-	if idxQuant && bank != BankQ4K {
-		// The indexer is BF16 in the checkpoint, so the int8 bank would be a
-		// real re-quantisation of it and L8a declined to make one; only the
-		// 4.5-bit bank has a measured answer to put there.
-		return nil, fmt.Errorf("llm: the indexer's projections are only staged on a q4_k bank, not on %s", bank)
-	}
 	g := &AttnGPU{
-		dev: dev, cfg: cfg, bank: bank, sim: sim, idxQuant: idxQuant,
+		dev: dev, cfg: cfg, bank: bank, sim: sim,
 		pipes:    make(map[string]*vk.ComputePipeline),
 		tokens:   maxTokens,
 		rows:     maxTokens,
@@ -630,21 +594,13 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	// A layer's two matrices, and on a quantised bank the fp16 tail between
-	// them. An offset into a quantised bank is a **byte**; the tail is
-	// halves, because the build that reads it is the fp16 one.
-	qkvBank, outBank, tailBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.GateWidth()*2, 0
+	// A layer's two matrices, one after the other. An offset into a
+	// quantised bank is a **byte**; there is no fp16 tail — the indexer's
+	// two BF16 projections are quantised onto the plane with the rest of the
+	// fused matrix (D13's payoff, P2).
+	qkvBank, outBank := g.qkvN()*c.NEmbd*2, c.NEmbd*c.GateWidth()*2
 	unit := 2
 	if g.quant() {
-		if g.qkvQuantRows()%attnBN != 0 {
-			return fmt.Errorf("llm: the tail starts at column %d, not a whole %d-column block", g.qkvQuantRows(), attnBN)
-		}
-		// Both quantised banks hold **all** qkvN rows of the fused
-		// projection, tail included, because the kernel derives the second
-		// plane's base from gemmN * gemmK and gemmN is the stride of the
-		// output it writes (stage). At 4.5 bits the indexer's 640 unread
-		// rows are 0.82 MB a layer of nibbles nothing reads, against the
-		// 25.7 a layer the width saves.
 		if g.bank == BankQ4K {
 			if err := q4kFits(g.qkvN(), c.NEmbd); err != nil {
 				return err
@@ -656,10 +612,9 @@ func (g *AttnGPU) alloc(nLayers int) error {
 		} else {
 			qkvBank, outBank = q8Align(q8Bytes(g.qkvN(), c.NEmbd)), q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
 		}
-		tailBank = g.qkvTailRows() * c.NEmbd * 2
 		unit = 1
 	}
-	perBank := qkvBank + tailBank + outBank
+	perBank := qkvBank + outBank
 	if g.wbank, err = g.dev.NewBuffer(nLayers * perBank); err != nil {
 		return fmt.Errorf("llm: attention weight bank (%d MB): %w", (nLayers*perBank)>>20, err)
 	}
@@ -667,13 +622,12 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	for i := range g.layers {
 		base := uint32(i * perLayer)
 		g.layers[i] = attnLayerWeights{
-			qkv:     uint32(i * perBank / unit),
-			qkvTail: uint32((i*perBank + qkvBank) / 2),
-			out:     uint32((i*perBank + qkvBank + tailBank) / unit),
-			gQ:      base,
-			gK:      base + uint32(c.HeadDim),
-			gIQ:     base + uint32(2*c.HeadDim),
-			gIK:     base + uint32(2*c.HeadDim+c.IdxDim),
+			qkv: uint32(i * perBank / unit),
+			out: uint32((i*perBank + qkvBank) / unit),
+			gQ:  base,
+			gK:  base + uint32(c.HeadDim),
+			gIQ: base + uint32(2*c.HeadDim),
+			gIK: base + uint32(2*c.HeadDim+c.IdxDim),
 		}
 	}
 	return nil
@@ -821,19 +775,18 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 			continue
 		}
 		if g.quant() {
-			qrows := g.qkvQuantRows()
+			// The indexer's two BF16 projections go on the plane as int8 —
+			// a real re-quantisation where q, k and v round-trip exactly,
+			// bounded by L8c-7's +0.005% at half these bits (P2).
 			qs := make([]byte, g.qkvN()*c.NEmbd)
 			sc := make([]uint16, g.qkvN()*c.NEmbd/q8Group)
 			tileBQ8(qs, sc, w.Q, c.QWidth(), c.NEmbd, func(r int) int { return r })
 			tileBQ8(qs, sc, w.K, c.KVWidth(), c.NEmbd, func(r int) int { return base + r })
 			tileBQ8(qs, sc, w.V, c.KVWidth(), c.NEmbd, func(r int) int { return baseV + r })
+			tileBQ8(qs, sc, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return baseIQ + r })
+			tileBQ8(qs, sc, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return baseIK + r })
 			g.wbank.WriteBytesAt(int(g.layers[i].qkv), qs)
 			g.wbank.WriteUint16At((int(g.layers[i].qkv)+len(qs))/2, sc)
-
-			tail := make([]uint16, g.qkvTailRows()*c.NEmbd)
-			tileB(tail, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return baseIQ - qrows + r })
-			tileB(tail, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return baseIK - qrows + r })
-			g.wbank.WriteUint16At(int(g.layers[i].qkvTail), tail)
 
 			oq := make([]byte, c.NEmbd*c.GateWidth())
 			os := make([]uint16, c.NEmbd*c.GateWidth()/q8Group)
@@ -868,33 +821,25 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 // simulation measured. `attn_q` is the query *and its gate* interleaved per
 // head, which is the checkpoint's own tensor and its own imatrix row.
 //
-// The indexer's two BF16 projections go in beside them or stay as halves in
-// the tail, and that is the `qsa_indexer` family (qkvQuantRows). Where they
-// stay, the quantised plane still covers their rows — the kernel derives the
-// record plane's base from gemmN * gemmK — so they are written twice and read
-// once, which costs 0.82 MB a layer and keeps the address arithmetic one
-// expression.
+// The indexer's two BF16 projections go in beside them at the same width —
+// L8c-7 priced that at +0.005% where the selection bites, which is what
+// retired the fp16 tail (D13's payoff, P2).
 func (g *AttnGPU) stageQ4K(i int, w AttnWeights) error {
 	c := g.cfg
 	q4 := make([]byte, g.qkvN()*c.NEmbd/2)
 	rec := make([]byte, q4kRecPlane(g.qkvN(), c.NEmbd))
-	type source struct {
+	for _, t := range []struct {
 		name string
 		src  []float32
 		n    int
 		base int
-	}
-	srcs := []source{
+	}{
 		{"attn_q.weight", w.Q, c.QWidth(), 0},
 		{"attn_k.weight", w.K, c.KVWidth(), g.colK()},
 		{"attn_v.weight", w.V, c.KVWidth(), g.colV()},
-	}
-	if g.idxQuant {
-		srcs = append(srcs,
-			source{"indexer.q_proj.weight", w.IdxQ, c.IdxHeads * c.IdxDim, g.colIQ()},
-			source{"indexer.k_proj.weight", w.IdxK, c.IdxDim, g.colIK()})
-	}
-	for _, t := range srcs {
+		{"indexer.q_proj.weight", w.IdxQ, c.IdxHeads * c.IdxDim, g.colIQ()},
+		{"indexer.k_proj.weight", w.IdxK, c.IdxDim, g.colIK()},
+	} {
 		name := fmt.Sprintf("blk.%d.%s", w.Layer, t.name)
 		q, qw, err := bankImatrix(name, g.sim)
 		if err != nil {
@@ -908,14 +853,6 @@ func (g *AttnGPU) stageQ4K(i int, w AttnWeights) error {
 	}
 	g.wbank.WriteBytesAt(int(g.layers[i].qkv), q4)
 	g.wbank.WriteBytesAt(int(g.layers[i].qkv)+len(q4), rec)
-
-	if rows := g.qkvTailRows(); rows > 0 {
-		qrows := g.qkvQuantRows()
-		tail := make([]uint16, rows*c.NEmbd)
-		tileB(tail, w.IdxQ, c.IdxHeads*c.IdxDim, c.NEmbd, func(r int) int { return g.colIQ() - qrows + r })
-		tileB(tail, w.IdxK, c.IdxDim, c.NEmbd, func(r int) int { return g.colIK() - qrows + r })
-		g.wbank.WriteUint16At(int(g.layers[i].qkvTail), tail)
-	}
 
 	name := fmt.Sprintf("blk.%d.attn_output.weight", w.Layer)
 	q, qw, err := bankImatrix(name, g.sim)
@@ -1148,24 +1085,12 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
 	qkvPipe := string(g.gemm)
 	if g.quant() {
-		// The split, in the two fields MODE 2 does not otherwise use:
-		// `lowRank` is the first row that is not on the narrow plane and
-		// `gateOff` is where those rows' halves are (llm_common.glsl). Here
-		// that is the indexer's two BF16 projections — or nothing at all,
-		// where `qsa_indexer` put them on the plane too.
 		qkvPipe = bankPipe(g.bank, g.gemm)
-		qkv.LowRank, qkv.GateOff = uint32(g.qkvQuantRows()), w.qkvTail
-		if g.idxQuant {
-			qkv.GateOff = noW
-		}
 	}
 	if ks := gemvSlabs(g.qkvGemv); ks > 0 {
 		// The decode kernel: one row, so the parallelism comes from K and not
 		// from a sixteen-row fragment of which fifteen rows are padding
 		// (L8e-1). The partials ride `resOff`, which this block does not use.
-		// `lowRank` carries the int8 split here rather than ATTN_PAST, which
-		// is what it already does on the GEMM arm above — a projection has no
-		// use for the cache position.
 		qkv.ResOff = g.aPart
 		add(gemvBankPipe(g.qkvGemv, g.bank), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
 		if ks > 1 {
@@ -1210,7 +1135,6 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	outPipe := string(g.outGemm)
 	if g.quant() {
 		outPipe = bankPipe(g.bank, g.outGemm)
-		out.LowRank, out.GateOff = uint32(c.NEmbd), noW // no tail: attn_output is Q8_0
 	}
 	if ks := gemvSlabs(g.outGemv); ks > 0 {
 		out.ResOff = g.aPart

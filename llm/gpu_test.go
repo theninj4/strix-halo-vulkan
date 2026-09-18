@@ -154,6 +154,22 @@ const (
 	tolLlamaM  = 2e-2 // worst 6.53e-03
 )
 
+// bankTol widens a trace bound where the default bank's *deliberate* width
+// change moved it: P2 put the fp16 tail's tensors — `inject`, `ssm_alpha`,
+// `ssm_beta` and the indexer's two projections — on the quantised plane at
+// D13's measured price (+0.01% of corpus perplexity for the int8 three,
+// L8c-1), so the staged model now differs from the reference by more than
+// the kernels' own rounding on exactly those tensors. The fp16 bank
+// (LLM_DENSE_FP16=1) keeps the tight bound, which is what makes these tests
+// still a kernel gate rather than a width gate. A structural bug — a wrong
+// plane, a wrong record — is orders of magnitude past either bound.
+func bankTol(fp16, quantised float64) float64 {
+	if denseQ8Test {
+		return quantised
+	}
+	return fp16
+}
+
 // TestHCGPUMixer is the L2 gate for the fused kernel: every tensor of the
 // first mixer of layer 0 — whose input is `hc_init`, so nothing upstream can
 // be wrong — against both the CPU reference it was ported from and
@@ -182,7 +198,7 @@ func TestHCGPUMixer(t *testing.T) {
 		rtol float64
 	}{
 		{"hc_norm-0", g.Xn(), wantXn, tolXn, "hc_norm-0", tolLlamaXn},
-		{"hc_inject-0", g.Inject(), wantInject, tolInject, "hc_inject-0", tolInject},
+		{"hc_inject-0", g.Inject(), wantInject, bankTol(tolInject, 4e-2), "hc_inject-0", bankTol(tolInject, 4e-2)},
 		{"hc_gate-0", g.Gate(), wantGate, tolGate, "hc_gate-0", tolLlamaG},
 		{"hc_mixed-0", g.Mixed(), wantMixed, tolMixed, "hc_mixed-0", tolLlamaM},
 	} {
@@ -271,7 +287,7 @@ func TestHCGPUEveryMixer(t *testing.T) {
 			{"hc_norm", g.Xn(), cpuXn, tolXn, tolLlamaXn},
 			{"hc_gate", g.Gate(), cpuGate, tolGate, tolLlamaG},
 			{"hc_mixed", g.Mixed(), cpuMixed, tolMixed, tolLlamaM},
-			{"hc_inject", g.Inject(), cpuInject, tolInject, tolInject},
+			{"hc_inject", g.Inject(), cpuInject, bankTol(tolInject, 4e-2), bankTol(tolInject, 4e-2)},
 		} {
 			r, err := compare(tc.got, tc.cpu)
 			if err != nil {
@@ -561,9 +577,8 @@ func TestHCGPUGemvRefusesABatch(t *testing.T) {
 // LDS store gives the GEMM for free happens in a register too — which it
 // would not if the product were formed in f32 and converted, because RADV
 // folds that pair away (D10). So every rung of both ladders has to agree with
-// the fp16 bank to the last bit, and the tail — the 32 low-rank rows the
-// split leaves over, plus the F32 `inject` — is the same fp16 fragment tiling
-// in both banks, so it cannot hide a difference either.
+// the fp16 bank to the last bit — `inject` included, now that it sits on the
+// plane with everything else (P2).
 //
 // The weights are synthetic and that is deliberate: the claim is a property
 // of the format, not of this checkpoint's values, and a [10240, 320] pair out
@@ -579,23 +594,23 @@ func TestHCGPUQ8IsTheHalves(t *testing.T) {
 	wide := cfg.Wide()
 	rng := rand.New(rand.NewSource(11))
 
-	// Down and Up are genuine Q8_0 values — a scale per 32 and a level at
-	// 127 in every group — because that is what the checkpoint holds and
-	// what makes the round trip exact. Norm and Inject are F32 in the
-	// checkpoint and fp16 in both banks.
+	// Down, Up and Inject are genuine Q8_0 values — a scale per 32 and a
+	// level at 127 in every group — because that is what makes the round
+	// trip exact. The real `inject` is F32 and its int8 staging is a real
+	// re-quantisation (P2); values on the int8 grid keep this an *equality*
+	// test of the addressing, while the accuracy of quantising the real
+	// inject is the corpus's question, not this test's.
 	down, _, _ := q8Source(rng, cfg.LowRank, wide)
 	up, _, _ := q8Source(rng, wide, cfg.LowRank)
+	inject, _, _ := q8Source(rng, cfg.HC, wide)
 	w := HCWeights{
 		Norm:   make([]float32, wide),
 		Down:   down,
 		Up:     up,
-		Inject: make([]float32, cfg.HC*wide),
+		Inject: inject,
 	}
 	for i := range w.Norm {
 		w.Norm[i] = 1 + float32(rng.NormFloat64())*0.1
-	}
-	for i := range w.Inject {
-		w.Inject[i] = float32(rng.NormFloat64()) * 0.05
 	}
 
 	const nTok = 5
@@ -696,26 +711,18 @@ func TestHCGPUQ8IsTheHalves(t *testing.T) {
 }
 
 // TestHCGPUQ8BankSize states what L8b stages against what it replaces, at the
-// checkpoint's own widths: the two projections of one mixer are 13.44 MB of
-// halves and 8.12 MB of int8-plus-scales, of which 0.98 is the fp16 tail the
-// split leaves over and 0.16 the int8 columns behind it that are never read.
+// checkpoint's own widths. There is no fp16 tail any more (P2): the whole
+// fused N — `inject` and the pad rows included — is int8 plus scales, so what
+// a token reads is exactly what is staged.
 func TestHCGPUQ8BankSize(t *testing.T) {
 	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320}
 	g := &HCGPU{cfg: cfg}
 	wide, n := cfg.Wide(), g.gemmN()
 	half := (n*wide + wide*cfg.LowRank) * 2
-	q8 := q8Align(q8Bytes(n, wide)) + g.q8TailRows()*wide*2 + q8Align(q8Bytes(wide, cfg.LowRank))
-	// What a token actually reads is less: the int8 columns past the split
-	// are staged and skipped.
-	read := g.q8Split()*wide + (n*wide/q8Group)*2 + g.q8TailRows()*wide*2 +
-		wide*cfg.LowRank + (wide*cfg.LowRank/q8Group)*2
-	t.Logf("staged %.2f MB against %.2f, read %.2f MB a token against %.2f",
-		float64(q8)/1e6, float64(half)/1e6, float64(read)/1e6, float64(half)/1e6)
-	if g.q8Split() != 288 {
-		t.Fatalf("the split is column %d, want 288", g.q8Split())
-	}
-	if ratio := float64(half) / float64(read); ratio < 1.74 || ratio > 1.78 {
-		t.Fatalf("a token reads %.3fx less, want ~1.76", ratio)
+	q8 := q8Align(q8Bytes(n, wide)) + q8Align(q8Bytes(wide, cfg.LowRank))
+	t.Logf("staged and read %.2f MB against %.2f of halves", float64(q8)/1e6, float64(half)/1e6)
+	if ratio := float64(half) / float64(q8); ratio < 1.85 || ratio > 1.91 {
+		t.Fatalf("a token reads %.3fx less, want ~1.88", ratio)
 	}
 }
 
@@ -876,26 +883,24 @@ func TestHCGPUQ4IsTheSim(t *testing.T) {
 }
 
 // TestHCGPUQ4BankSize states what L8c-6 stages against what it replaces, at
-// the checkpoint's own widths, and says where the 4.500 bits stop being exact.
+// the checkpoint's own widths, and says where the 4.500 bits stop being
+// exact.
 //
-// Three places, and each is a decision this stage made rather than an
-// approximation. The **fp16 tail** is `inject`'s four F32 rows plus the 32
-// low-rank rows the split leaves over — 0.98 MB a mixer, unchanged from L8b,
-// and now the larger part of the staged bank's overhead. The **quantised
-// plane still covers the whole fused N**, because the kernel derives the
-// record plane's base from gemmN * gemmK. And the **up projection's record is
-// twenty bytes over 320 weights** where ggml's is sixteen over 256: the
-// simulation quotes that row at 4.475 bits because nothing there has to be
-// addressable, and a word-aligned record makes it exactly 4.500.
+// Two places, and each is a decision rather than an approximation. The
+// **plane covers the whole fused N** — `inject` and the twelve pad rows
+// included, now that the fp16 tail is gone (P2) — so the pad rows are staged
+// nibbles nothing reads. And the **up projection's record is twenty bytes
+// over 320 weights** where ggml's is sixteen over 256: the simulation quotes
+// that row at 4.475 bits because nothing there has to be addressable, and a
+// word-aligned record makes it exactly 4.500.
 func TestHCGPUQ4BankSize(t *testing.T) {
 	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320}
 	g := &HCGPU{cfg: cfg}
 	wide, n := cfg.Wide(), g.gemmN()
-	tail := g.q8TailRows() * wide * 2
 
 	half := (n*wide + wide*cfg.LowRank) * 2
-	q8 := q8Align(q8Bytes(n, wide)) + tail + q8Align(q8Bytes(wide, cfg.LowRank))
-	q4 := q8Align(q4kBytes(n, wide)) + tail + q8Align(q4kBytes(wide, cfg.LowRank))
+	q8 := q8Align(q8Bytes(n, wide)) + q8Align(q8Bytes(wide, cfg.LowRank))
+	q4 := q8Align(q4kBytes(n, wide)) + q8Align(q4kBytes(wide, cfg.LowRank))
 	weights := cfg.LowRank*wide + wide*cfg.LowRank + cfg.HC*wide
 
 	t.Logf("a mixer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
@@ -918,14 +923,8 @@ func TestHCGPUQ4BankSize(t *testing.T) {
 		t.Fatalf("a ten-group record is %d bytes, want 20", rec)
 	}
 
-	// What a token reads is less than what is staged: the nibble columns past
-	// the split are staged and skipped, where the record plane behind them is
-	// not — the kernel derives its base from gemmN and cannot be told
-	// otherwise.
-	read := g.q8Split()*wide/2 + (q4kBytes(n, wide) - n*wide/2) + tail +
-		q4kBytes(wide, cfg.LowRank)
-	t.Logf("read %.2f MB a token against the fp16 bank's %.2f", float64(read)/1e6, float64(half)/1e6)
-	if ratio := float64(half) / float64(read); ratio < 2.9 || ratio > 3.05 {
-		t.Fatalf("a token reads %.3fx less than on halves, want ~2.97", ratio)
+	t.Logf("read %.2f MB a token against the fp16 bank's %.2f", float64(q4)/1e6, float64(half)/1e6)
+	if ratio := float64(half) / float64(q4); ratio < 3.4 || ratio > 3.6 {
+		t.Fatalf("a token reads %.3fx less than on halves, want ~3.5", ratio)
 	}
 }

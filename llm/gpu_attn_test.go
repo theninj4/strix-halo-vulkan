@@ -88,8 +88,8 @@ func TestAttnGPUFusedProjection(t *testing.T) {
 		{"attn_q+gate", 0, c.QWidth(), proj(w.Q, c.QWidth()), 2e-3},
 		{"attn_k", g.ColK(), c.KVWidth(), proj(w.K, c.KVWidth()), 2e-3},
 		{"attn_v", g.ColV(), c.KVWidth(), proj(w.V, c.KVWidth()), 2e-3},
-		{"indexer_q_raw", g.ColIQ(), c.IdxHeads * c.IdxDim, proj(w.IdxQ, c.IdxHeads*c.IdxDim), 2e-3},
-		{"indexer_k_raw", g.ColIK(), c.IdxDim, proj(w.IdxK, c.IdxDim), 2e-3},
+		{"indexer_q_raw", g.ColIQ(), c.IdxHeads * c.IdxDim, proj(w.IdxQ, c.IdxHeads*c.IdxDim), bankTol(2e-3, 5e-3)},
+		{"indexer_k_raw", g.ColIK(), c.IdxDim, proj(w.IdxK, c.IdxDim), bankTol(2e-3, 5e-3)},
 	} {
 		r, err := compare(g.Column(tc.col, tc.width), tc.want)
 		if err != nil {
@@ -112,8 +112,8 @@ func TestAttnGPUFusedProjection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%-14s           vs llama.cpp  %v", "indexer_k_raw", r)
-	if r.rms > 2e-3 {
-		t.Errorf("indexer_k_raw-3: rms %.3e over 2e-3 (%v)", r.rms, r)
+	if r.rms > bankTol(2e-3, 5e-3) {
+		t.Errorf("indexer_k_raw-3: rms %.3e over %.0e (%v)", r.rms, bankTol(2e-3, 5e-3), r)
 	}
 }
 
@@ -145,8 +145,8 @@ func TestAttnGPUIndexer(t *testing.T) {
 		got, want []float32
 		tol, rtol float64
 	}{
-		{"indexer_k_pooled-3", g.IdxK(), cpu.IdxK, 1e-3, 1e-3},
-		{"indexer_q-3", g.IdxQ(), cpu.IdxQ, 1e-3, 1e-3},
+		{"indexer_k_pooled-3", g.IdxK(), cpu.IdxK, bankTol(1e-3, 5e-3), bankTol(1e-3, 5e-3)},
+		{"indexer_q-3", g.IdxQ(), cpu.IdxQ, bankTol(1e-3, 5e-3), bankTol(1e-3, 5e-3)},
 		{"indexer_score-3", g.Score(), cpu.IdxScore, 5e-2, 5e-2},
 	} {
 		r, err := compare(tc.got, tc.want)
@@ -480,16 +480,16 @@ func TestAttnGPUGemvAgrees(t *testing.T) {
 		if r.rms > 1e-4 {
 			t.Errorf("qkv %s: rms %.3e against the GEMM (%v)", k, r.rms, r)
 		}
-		// And the BF16 tail on its own. Folded into the whole-matrix rms
-		// above it is 4.6% of the columns and would hide.
-		tail := g.qkvQuantRows()
+		// And the indexer's columns on their own. Folded into the
+		// whole-matrix rms above they are 4.6% of the columns and would hide.
+		tail := g.colIQ()
 		rt, err := compare(gotQKV[tail:], refQKV[tail:])
 		if err != nil {
-			t.Fatalf("qkv %s tail: %v", k, err)
+			t.Fatalf("qkv %s indexer columns: %v", k, err)
 		}
-		t.Logf("    tail (the indexer's two, %d halved rows from %d): %v", len(refQKV)-tail, tail, rt)
+		t.Logf("    the indexer's two (%d rows from %d): %v", len(refQKV)-tail, tail, rt)
 		if rt.rms > 1e-4 {
-			t.Errorf("qkv %s: the fp16 tail is rms %.3e from the GEMM's (%v)", k, rt.rms, rt)
+			t.Errorf("qkv %s: the indexer's columns are rms %.3e from the GEMM's (%v)", k, rt.rms, rt)
 		}
 	}
 	for _, k := range GEMVKernels() {
@@ -541,10 +541,9 @@ func TestAttnGPUGemvAgrees(t *testing.T) {
 // output, where the pack, the indexer, the score, the flash attention and the
 // second projection have all run on top of it.
 //
-// Both arrangements of the indexer are checked, because the tail is the one
-// structural choice this stage makes: with `qsa_indexer` out of the plan its
-// two BF16 projections stay halves and the GEMM takes its tail branch, and
-// with it in there is no tail at all.
+// The indexer's two BF16 projections are on the plane with everything else —
+// the fp16 tail left with D13's payoff (P2) — so the simulation's arm
+// quantises all six sources.
 //
 // It is `rtn` rather than `imatrix` so the test needs nothing but the
 // checkpoint; the calibrated arm is the same code path with `qw` non-nil, and
@@ -564,9 +563,9 @@ func TestAttnGPUQ4IsTheSim(t *testing.T) {
 	dev, done := newTestDevice(t)
 	defer done()
 
-	run := func(bank DenseBank, idxQ bool) ([]float32, []float32, int) {
+	run := func(bank DenseBank, s QuantSim, ws AttnWeights) ([]float32, []float32, int) {
 		t.Helper()
-		g, err := NewAttnGPUBank(dev, c, nTok, nKV, []AttnWeights{w}, bank, sim, idxQ)
+		g, err := NewAttnGPUBank(dev, c, nTok, nKV, []AttnWeights{ws}, bank, s)
 		if err != nil {
 			t.Fatalf("attn (%s): %v", bank, err)
 		}
@@ -580,19 +579,17 @@ func TestAttnGPUQ4IsTheSim(t *testing.T) {
 		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...), g.WeightBytes()
 	}
 
-	// The simulation's arm. A plan that covers `full_attn` alone quantises
-	// the query, the key and the value and leaves the indexer's two BF16
-	// matrices as the checkpoint's own floats — which on the fp16 bank is
-	// exactly what staging them unquantised means — so the same fixture
-	// serves both arrangements as long as the halves it stages are the
-	// format's. That is what simQuantise does here, in place, before the
-	// block ever sees the weights.
+	// The simulation's arm: every source of the fused matrix and the output
+	// projection round-tripped through the format, each under its own name,
+	// before the fp16 bank ever sees the weights.
 	simW := w
 	simW.Q = append([]float32(nil), w.Q...)
 	simW.K = append([]float32(nil), w.K...)
 	simW.V = append([]float32(nil), w.V...)
 	simW.O = append([]float32(nil), w.O...)
-	for _, x := range [][]float32{simW.Q, simW.K, simW.V} {
+	simW.IdxQ = append([]float32(nil), w.IdxQ...)
+	simW.IdxK = append([]float32(nil), w.IdxK...)
+	for _, x := range [][]float32{simW.Q, simW.K, simW.V, simW.IdxQ, simW.IdxK} {
 		if err := sim.Apply(x, c.NEmbd); err != nil {
 			t.Fatal(err)
 		}
@@ -601,22 +598,8 @@ func TestAttnGPUQ4IsTheSim(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	simQKV, simOut, simBytes := func() ([]float32, []float32, int) {
-		g, err := NewAttnGPUBank(dev, c, nTok, nKV, []AttnWeights{simW}, BankFP16, QuantSim{}, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer g.Destroy()
-		if err := g.Upload(in.Vals, nTok); err != nil {
-			t.Fatal(err)
-		}
-		if err := g.Run(0); err != nil {
-			t.Fatal(err)
-		}
-		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...), g.WeightBytes()
-	}()
-
-	q4QKV, q4Out, q4Bytes := run(BankQ4K, false)
+	simQKV, simOut, simBytes := run(BankFP16, QuantSim{}, simW)
+	q4QKV, q4Out, q4Bytes := run(BankQ4K, sim, w)
 	t.Logf("bank %.1f MB against the simulation's %.1f MB of halves",
 		float64(q4Bytes)/1e6, float64(simBytes)/1e6)
 	if q4Bytes >= simBytes {
@@ -639,91 +622,37 @@ func TestAttnGPUQ4IsTheSim(t *testing.T) {
 		}
 		t.Logf("%s: %d values identical", tc.what, len(tc.ref))
 	}
-
-	// And the same with the indexer on the plane, against a simulation that
-	// quantises its two matrices too. Only the fused projection's indexer
-	// columns can differ, so both tensors are compared again rather than
-	// only the ones that moved.
-	idxW := simW
-	idxW.IdxQ = append([]float32(nil), w.IdxQ...)
-	idxW.IdxK = append([]float32(nil), w.IdxK...)
-	for _, x := range [][]float32{idxW.IdxQ, idxW.IdxK} {
-		if err := sim.Apply(x, c.NEmbd); err != nil {
-			t.Fatal(err)
-		}
-	}
-	idxSimQKV, idxSimOut, _ := func() ([]float32, []float32, int) {
-		g, err := NewAttnGPUBank(dev, c, nTok, nKV, []AttnWeights{idxW}, BankFP16, QuantSim{}, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer g.Destroy()
-		if err := g.Upload(in.Vals, nTok); err != nil {
-			t.Fatal(err)
-		}
-		if err := g.Run(0); err != nil {
-			t.Fatal(err)
-		}
-		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...), g.WeightBytes()
-	}()
-	idxQKV, idxOut, idxBytes := run(BankQ4K, true)
-	t.Logf("with the indexer on the plane: %.1f MB, against %.1f MB with it in the fp16 tail",
-		float64(idxBytes)/1e6, float64(q4Bytes)/1e6)
-	if idxBytes >= q4Bytes {
-		t.Fatalf("staging the indexer at 4.5 bits is %d bytes, no smaller than %d", idxBytes, q4Bytes)
-	}
-	for _, tc := range []struct {
-		what     string
-		got, ref []float32
-	}{
-		{"the fused projection, indexer included", idxQKV, idxSimQKV},
-		{"the layer's output, indexer included", idxOut, idxSimOut},
-	} {
-		for i := range tc.ref {
-			if tc.got[i] != tc.ref[i] {
-				t.Fatalf("%s [%d]: bank %.9g, simulation %.9g", tc.what, i, tc.got[i], tc.ref[i])
-			}
-		}
-		t.Logf("%s: %d values identical", tc.what, len(tc.ref))
-	}
 }
 
 // TestAttnGPUQ4BankSize states what L8c-7 stages against what it replaces,
-// and where the 4.500 bits stop being exact.
-//
-// The fused projection's tail is the reason: the indexer's two projections
-// are BF16 in the checkpoint and stay halves unless `qsa_indexer` is in the
-// plan, and the quantised plane still covers all qkvN rows because the kernel
-// derives the record plane's base from gemmN * gemmK. So the matrix as staged
-// is a little over 4.5 bits and the test says how much rather than asserting
-// a round number.
+// and where the 4.500 bits stop being exact: the plane covers qkvN rows, of
+// which the last few are the column block's padding — staged nibbles nothing
+// reads — so the matrix as staged is a little over 4.5 bits and the test says
+// how much rather than asserting a round number.
 func TestAttnGPUQ4BankSize(t *testing.T) {
 	_, _, c, _, _, _ := attnFixtures(t)
-	n, k := roundUpInt(c.QWidth()+2*c.KVWidth()+c.IdxHeads*c.IdxDim+c.IdxDim, attnBN), c.NEmbd
-	tail := n - (c.QWidth() + 2*c.KVWidth())
+	real := c.QWidth() + 2*c.KVWidth() + c.IdxHeads*c.IdxDim + c.IdxDim
+	n, k := roundUpInt(real, attnBN), c.NEmbd
+	pad := n - real
 
-	q4 := q8Align(q4kBytes(n, k)) + tail*k*2 + q8Align(q4kBytes(c.NEmbd, c.GateWidth()))
-	q4idx := q8Align(q4kBytes(n, k)) + q8Align(q4kBytes(c.NEmbd, c.GateWidth()))
-	q8 := q8Align(q8Bytes(n, k)) + tail*k*2 + q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
+	q4 := q8Align(q4kBytes(n, k)) + q8Align(q4kBytes(c.NEmbd, c.GateWidth()))
+	q8 := q8Align(q8Bytes(n, k)) + q8Align(q8Bytes(c.NEmbd, c.GateWidth()))
 	half := n*k*2 + c.NEmbd*c.GateWidth()*2
-	weights := (c.QWidth()+2*c.KVWidth())*k + c.NEmbd*c.GateWidth() + tail*k
+	weights := real*k + c.NEmbd*c.GateWidth()
 
-	t.Logf("a layer: q4_k %.2f MB (%.2f with the indexer on the plane), q8 %.2f MB, halves %.2f MB — %.3f, %.3f, %.3f and %.3f bits a weight",
-		float64(q4)/1e6, float64(q4idx)/1e6, float64(q8)/1e6, float64(half)/1e6,
-		float64(q4)*8/float64(weights), float64(q4idx)*8/float64(weights),
-		float64(q8)*8/float64(weights), float64(half)*8/float64(weights))
-	t.Logf("12 layers: %.2f GB (%.2f) against %.2f GB and %.2f GB",
-		float64(12*q4)/1e9, float64(12*q4idx)/1e9, float64(12*q8)/1e9, float64(12*half)/1e9)
-	if q4idx >= q4 || q4 >= q8 || q8 >= half {
-		t.Fatalf("the four banks are %d, %d, %d, %d bytes and are not in order", q4idx, q4, q8, half)
+	t.Logf("a layer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
+		float64(q4)/1e6, float64(q8)/1e6, float64(half)/1e6,
+		float64(q4)*8/float64(weights), float64(q8)*8/float64(weights), float64(half)*8/float64(weights))
+	t.Logf("12 layers: %.2f GB against %.2f GB and %.2f GB",
+		float64(12*q4)/1e9, float64(12*q8)/1e9, float64(12*half)/1e9)
+	if q4 >= q8 || q8 >= half {
+		t.Fatalf("the three banks are %d, %d, %d bytes and are not in order", q4, q8, half)
 	}
-	// The quantised half alone is the format's own width to the bit. The
-	// record plane covers the tail's rows too, so subtract only the nibbles
-	// and state the remainder rather than demanding 4.500.
-	body := q4kBytes(n, k) - tail*k/2 + q4kBytes(c.NEmbd, c.GateWidth())
-	bodyW := (c.QWidth()+2*c.KVWidth())*k + c.NEmbd*c.GateWidth()
-	if bits := float64(body) * 8 / float64(bodyW); bits < 4.5 || bits > 4.53 {
-		t.Fatalf("the quantised half is %.4f bits a weight, want 4.500 plus the tail's records", bits)
+	// Subtract the pad rows' nibbles and state the remainder rather than
+	// demanding 4.500 — the record plane covers the pad rows too.
+	body := q4kBytes(n, k) - pad*k/2 + q4kBytes(c.NEmbd, c.GateWidth())
+	if bits := float64(body) * 8 / float64(weights); bits < 4.5 || bits > 4.53 {
+		t.Fatalf("the staged matrix is %.4f bits a weight, want 4.500 plus the padding's records", bits)
 	}
 }
 
@@ -737,11 +666,8 @@ func TestAttnGPUQ4BankSize(t *testing.T) {
 // and multiplies it by the fp16 activation in f32 where the GEMM rounds that
 // same value to a half on its way into LDS — one *fewer* rounding per weight.
 // What has to hold exactly is the addressing, and the fused projection is
-// where a wrong address shows: with the indexer in the fp16 tail the GEMV has
-// to derive the same split the GEMM does, and a column read out of the wrong
-// plane is not a tolerance but somebody else's indexer query. So the tail's
-// columns are compared on their own as well as folded in — they are 4.6% of
-// the width and would hide.
+// where a wrong address shows — so the indexer's columns are compared on
+// their own as well as folded in: they are 4.6% of the width and would hide.
 func TestAttnGPUQ4Gemv(t *testing.T) {
 	_, tr, c, w, _, nKV := attnFixtures(t)
 	in, err := tr.Get("hc_mixed-3", 0)
@@ -757,67 +683,65 @@ func TestAttnGPUQ4Gemv(t *testing.T) {
 	dev, done := newTestDevice(t)
 	defer done()
 
-	for _, idxQ := range []bool{false, true} {
-		g, err := NewAttnGPUBank(dev, c, 1, nKV, []AttnWeights{w}, BankQ4K, sim, idxQ)
-		if err != nil {
+	g, err := NewAttnGPUBank(dev, c, 1, nKV, []AttnWeights{w}, BankQ4K, sim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	run := func(qkv, out GEMVKernel) ([]float32, []float32) {
+		t.Helper()
+		g.Reset()
+		if err := g.Upload(in.Vals[:c.NEmbd], 1); err != nil {
 			t.Fatal(err)
 		}
-		run := func(qkv, out GEMVKernel) ([]float32, []float32) {
-			t.Helper()
-			g.Reset()
-			if err := g.Upload(in.Vals[:c.NEmbd], 1); err != nil {
-				t.Fatal(err)
-			}
-			if err := g.SetGemv(qkv, out); err != nil {
-				t.Fatal(err)
-			}
-			if err := g.Run(0); err != nil {
-				t.Fatal(err)
-			}
-			return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...)
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
 		}
-		refQKV, refOut := run(GEMVOff, GEMVOff)
-		tail := g.qkvQuantRows()
-		for _, k := range GEMVKernels() {
-			if !GEMVFits(k, c.NEmbd) {
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...)
+	}
+	refQKV, refOut := run(GEMVOff, GEMVOff)
+	tail := g.colIQ()
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.NEmbd) {
+			continue
+		}
+		gotQKV, _ := run(k, GEMVOff)
+		for _, tc := range []struct {
+			what     string
+			got, ref []float32
+		}{
+			{"qkv", gotQKV, refQKV},
+			{"qkv's indexer columns", gotQKV[tail:], refQKV[tail:]},
+		} {
+			if len(tc.ref) == 0 {
 				continue
 			}
-			gotQKV, _ := run(k, GEMVOff)
-			for _, tc := range []struct {
-				what     string
-				got, ref []float32
-			}{
-				{"qkv", gotQKV, refQKV},
-				{"qkv's fp16 tail", gotQKV[tail:], refQKV[tail:]},
-			} {
-				if len(tc.ref) == 0 {
-					continue
-				}
-				r, err := compare(tc.got, tc.ref)
-				if err != nil {
-					t.Fatalf("%s %s: %v", tc.what, k, err)
-				}
-				t.Logf("indexer quantised %-5v %-14s %-4s against the GEMM: %v", idxQ, tc.what, k, r)
-				if r.rms > 1e-3 {
-					t.Errorf("indexer quantised %v: %s %s is rms %.3e from the GEMM, want one rounding's worth (%v)",
-						idxQ, tc.what, k, r.rms, r)
-				}
-			}
-		}
-		for _, k := range GEMVKernels() {
-			if !GEMVFits(k, c.GateWidth()) {
-				continue
-			}
-			_, gotOut := run(GEMVOff, k)
-			r, err := compare(gotOut, refOut)
+			r, err := compare(tc.got, tc.ref)
 			if err != nil {
-				t.Fatalf("out %s: %v", k, err)
+				t.Fatalf("%s %s: %v", tc.what, k, err)
 			}
-			t.Logf("indexer quantised %-5v out            %-4s against the GEMM: %v", idxQ, k, r)
+			t.Logf("%-21s %-4s against the GEMM: %v", tc.what, k, r)
 			if r.rms > 1e-3 {
-				t.Errorf("indexer quantised %v: out %s is rms %.3e from the GEMM (%v)", idxQ, k, r.rms, r)
+				t.Errorf("%s %s is rms %.3e from the GEMM, want one rounding's worth (%v)",
+					tc.what, k, r.rms, r)
 			}
 		}
-		g.Destroy()
+	}
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.GateWidth()) {
+			continue
+		}
+		_, gotOut := run(GEMVOff, k)
+		r, err := compare(gotOut, refOut)
+		if err != nil {
+			t.Fatalf("out %s: %v", k, err)
+		}
+		t.Logf("out                   %-4s against the GEMM: %v", k, r)
+		if r.rms > 1e-3 {
+			t.Errorf("out %s is rms %.3e from the GEMM (%v)", k, r.rms, r)
+		}
 	}
 }

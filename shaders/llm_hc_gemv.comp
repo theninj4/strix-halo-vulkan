@@ -109,13 +109,6 @@
 #ifndef KSLABS
 #define KSLABS 16
 #endif
-// The down GEMM's column block, and the only thing this kernel needs to know
-// about that one: L8b's Q8 split is the block containing `inject`, so both
-// kernels round `pc.lowRank` down to it. Compiled in for the reason KSLABS is.
-#ifndef DOWN_BN
-#define DOWN_BN 48
-#endif
-
 #define TILE 16
 #define WAVE 64
 
@@ -141,33 +134,20 @@ void main() {
     uint xbase = pc.xnOff + kt0 * TILE;
 
 #ifdef Q4B
-    // The split is the Q8 arm's, derived the same way from the same
-    // `pc.lowRank`: the fused down projection is quantised up to the column
-    // block that holds `inject` and halves from there on.
-    uint qSplit = (pc.lowRank / DOWN_BN) * DOWN_BN;
-    bool tail = nt * TILE >= qSplit;
     uint nsb = pc.gemmK >> 8;
     uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
     // A tile is 32 words and a lane owns two of them — the eight k either
     // side of `col`'s sixteen — with `sub` picking which of the step's four
-    // tiles, the way lane*4 does on the Q8 arm.
+    // tiles, the way lane*4 does on the Q8 arm. The fused down projection is
+    // quantised all the way through — `inject` included, since D13's payoff
+    // (P2) — so there is no split and no fp16 tail.
     uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 32u + sub * 32u + col * 2u;
-    uint wbase = pc.gateOff + ((nt - qSplit / TILE) * ktiles + kt0) * (TILE * TILE);
 #elif defined(Q8B)
-    // The fused down projection is int8 up to the column block that holds
-    // `inject`, and halves from there on: the same split llm_gemm.comp's
-    // MODE 0 arm derives, from the same `pc.lowRank`, because the two read
-    // one staged bank. DOWN_BN is that kernel's column block and the host
-    // checks the two agree — a mismatch would read the wrong plane, not run
-    // slowly.
-    uint qSplit = (pc.lowRank / DOWN_BN) * DOWN_BN;
-    bool tail = nt * TILE >= qSplit;
     // The tiles as words and the scale plane as halves, exactly as the GEMM
-    // derives them: a matrix is gemmN x gemmK bytes and the plane follows it.
+    // derives them: a matrix is gemmN x gemmK bytes and the plane follows it,
+    // and every row — `inject` included — is int8 on it.
     uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 64u + lane * 4u;
     uint sbase = ((pc.bOff + pc.gemmN * pc.gemmK) >> 1) + nt * (pc.gemmK >> 5) * TILE + col;
-    // The tail's own tiling, numbered from the split.
-    uint wbase = pc.gateOff + ((nt - qSplit / TILE) * ktiles + kt0) * (TILE * TILE);
 #else
     // Where this workgroup's contiguous run starts, in halves.
     uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE);
@@ -175,7 +155,7 @@ void main() {
 
     float sum = 0.0;
 #ifdef Q4B
-    if (!tail) {
+    {
         uint curSB = 0xffffffffu;
         uvec4 rec = uvec4(0u);
         for (uint c = 0u; c < perSlab; c += 4u) {
@@ -202,9 +182,9 @@ void main() {
                 }
             }
         }
-    } else
+    }
 #elif defined(Q8B)
-    if (!tail) {
+    {
         // One step is four tiles: 1024 bytes of weight, 64 halves of
         // activation, and one scale a lane — group (kt0+c+sub)/2.
         for (uint c = 0u; c < perSlab; c += 4u) {
@@ -219,8 +199,8 @@ void main() {
                 }
             }
         }
-    } else
-#endif
+    }
+#else
     // One step is four tiles: 1024 halves of weight, 64 of activation.
     for (uint c = 0u; c < perSlab; c += 4u) {
         uint w = wbase + c * (TILE * TILE) + lane * TILE;
@@ -229,6 +209,7 @@ void main() {
             sum += float(w16[w + i]) * float(hact[x + i]);
         }
     }
+#endif
 
     // The four lanes holding the same column are lane, lane^16, lane^32.
     sum += subgroupShuffleXor(sum, 16u);

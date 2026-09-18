@@ -256,21 +256,15 @@ func hcRates(kind string, c llm.HCConfig, tok int, bank llm.DenseBank, d time.Du
 }
 
 // hcWeightBytes is what one [n, k] projection of this block pulls off DRAM.
-// A non-zero cfg marks the fused down projection, whose last column block is
-// a fp16 tail a quantised arm reads instead of the levels behind it.
+// There is no fp16 tail any more (P2): every row of a quantised bank is on
+// the plane, `inject` included, so the read is levels plus records for the
+// whole staged N.
 func hcWeightBytes(n, k float64, bank llm.DenseBank, down llm.HCConfig) float64 {
 	if bank == llm.BankFP16 {
 		return n * k * 2
 	}
-	split := n
-	if down.LowRank != 0 {
-		split = float64(llm.HCQ8Split(down))
-	}
-	// The levels up to the split, the second plane for the whole staged N —
-	// the kernel derives its base from gemmN and cannot be told otherwise —
-	// and the tail as halves.
-	return float64(llm.BankLevelBytes(bank, int(split), int(k))) +
-		float64(llm.BankPlaneBytes(bank, int(n), int(k))) + (n-split)*k*2
+	return float64(llm.BankLevelBytes(bank, int(n), int(k))) +
+		float64(llm.BankPlaneBytes(bank, int(n), int(k)))
 }
 
 // coopTile is the fragment extent the inject columns are padded up to.
@@ -392,7 +386,11 @@ func pleBench(model string, tokens []int, iters int, csvPath string) error {
 	for _, t := range tokens {
 		maxTok = max(maxTok, t)
 	}
-	g, err := llm.NewPLEGPU(dev, cfg, maxTok, w, llm.PLEOpts{})
+	opts := llm.PLEOpts{Bank: llm.BankFor(llm.DenseQ8()), Layer: cfg.Layers[0]}
+	if q, ok := llm.DenseBankPlan().For(fmt.Sprintf("blk.%d.ple_key.weight", cfg.Layers[0]), true); ok {
+		opts.Bank, opts.Sim = llm.BankQ4K, q
+	}
+	g, err := llm.NewPLEGPU(dev, cfg, maxTok, w, opts)
 	if err != nil {
 		return err
 	}

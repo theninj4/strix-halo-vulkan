@@ -524,6 +524,41 @@ and the four corpus deltas add rather than compound. **One family is left**:
 **once** at layer 1 — 0.017 GB a token, and the one block in this vertical
 that never got L8a's int8 bank either, so it is two bank stages in one.
 
+**P2 stages it, deletes the fp16 tail, and closes L8c (2026-09-18).** The
+two bank stages cost no new kernel — the fused [12800, 2560] B is MODE 2 of
+`llm_gemm.comp`, the mode that exists for this block, so the attention
+block's own `-DQ8B`/`-DQ4B` builds serve: 65.8 MB of halves to 35.1 of int8
+(bit-identical, both tensors ship Q8_0) to **18.7 at 4.5 bits**, identical
+to the simulation through the whole block and chunk for chunk over the
+corpus screen. **The accuracy is the finding, twice.** `ple_proj` alone is
+**4.0528, +0.59%** over 145 chunks — the worst pp-per-GB of the six
+families by an order of magnitude (~12 per GB, for a family present at one
+layer and run once), against an eight-chunk screen of **−0.11%**: a fifth
+reading of L8c-4's warning and a second sign flip. And **additivity breaks
+at the sixth family**: the six separate deltas sum to 4.31% where the
+measured plan (tails still fp16) is **4.1939, +4.09%** — 0.22 pp
+sub-additive where four families summed to 0.01. Then D13's payoff, taken:
+the `Q8_TAIL` arm left `llm_gemm.comp`, the tail arms left `llm_gemv.comp`
+and `llm_hc_gemv.comp`, L8b-1's doubled rows and the `idxQuant` flag left
+the blocks, and on a quantised bank alpha, beta, `inject` and the indexer's
+two projections are quantised at the family's width under their own names —
+**+0.18 pp measured** (the int8 three were priced +0.01% at L8c-1; the q4_k
+difference is the sixth family's own kind of surprise) for ~0.085 GB a
+token back and the machinery gone. **The stage's closing number: the
+complete uniform plan as built is 4.2010, +4.27% — beside the 4.1998,
++4.24% L8c-3's simulation projected before any kernel existed — and after
+the deletion that is not a coincidence but an identity: the bank quantises
+exactly the set of weights the simulation always did, and the two agree
+chunk for chunk with no `SRC=q8` carve-out.** Decode the same hour:
+28.400 → 28.336 → **27.865 ms a step, 35.89 tok/s, 1.43x llama.cpp** — the
+tails' separate reads across 36 layers, 97 mixers and 12 layers returned
+0.47 ms — on a streamed bank of ~4.15 GB a token by subtraction (P3 owns
+the fresh inventory). The int8 bank is no longer bit-identical arithmetic
+on the four re-quantised tensors; the trace tests carry that as `bankTol`
+at D13's measured prices, with the tight bound kept under
+`LLM_DENSE_FP16=1`. Full write-up:
+[research/p2-ple-proj.md](research/p2-ple-proj.md).
+
 **After it, the bank is not where the decode time is, and has not been since
 L8c-5**: 31.5 tok/s measured against a 56.5 ceiling is 56%. What is left on
 that side is the two things the simulation cannot reach — the F32 router at
@@ -543,8 +578,8 @@ the dense half completely.
 
 ## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
 
-**P0, P1, P1a and P1b are done** (2026-09-18) and are struck through below;
-**P1c is next**. P1b was the largest item on the list by a factor of four and
+**P0, P1, P1a, P1b, P1c and P2 are done** (2026-09-18) and are struck
+through below; **P3 is next**. P1b was the largest item on the list by a factor of four and
 it evaporated on measurement: the rungs were chosen against the MALL but they
 were chosen *right*, so the honest re-screen changes nothing and the 1.9 ms
 it promised does not exist. What it found instead is a **1.33 ms environment
@@ -574,8 +609,8 @@ item's full plan and gate is in `LLM2.md`.
 | ~~**P1**~~ | ~~**Re-attribute the decode step**~~ — **done**, and the step now sums: 30.52 ms over 36 dispatch labels and six host phases, residual 5 us. The ~12 ms is **5.54 slow + 3.46 weightless + 3.01 host**. The gather was **16.3 serialised major faults a token** and going parallel is 7.0-7.5x, worth **31.51 → 32.72 tok/s** by itself. The pre-recorded command buffer is priced at **1.96 ms** and is *fourth*, not first; the leaders are `hyper_conn` at 114.6 GB/s (485 dispatches a pass) and `moe.down` at 147.5 against `moe.up`'s 200.6. Idea 9 closed with it. | The blocker on every estimate below. [Write-up](research/p1-decode-attribution.md) |
 | ~~**P1a**~~ | ~~**The hyper-connection block's 485 dispatches**~~ — **done**, and it was two answers rather than one. The weightless half fused: the scatter that closes a mixer and the norm that opens the next are the same 2560 values per (token, stream) written and read straight back, so `llm_hc_cn.comp` does both in one pass over registers — **1501 dispatches a pass to 1407, 30.69 ms to 30.37, decode 32.59 → 32.93 tok/s**, and **identical to the last place** on `res`, `xn` and `mixed`. The bank half was not a fusion question: the down projection's decode ladder reads the same 1.94 MB off the same bank at a grid that varies twenty-fold, and **168 workgroups is 9.26 us where 672 is 5.54** — so `up_m1`'s 10.87 us at **160 workgroups** is `down_gemv8`'s number at `down_gemv8`'s width, not MODE 1's M=1 waste. What pins it is the collapse's 64-column block, and unpinning it is priced at **0.22 ms a token** and not taken. | The step's GB/s did not move and the label count did, which is the finding. [Write-up](research/p1a-hyper-connection-shape.md) |
 | ~~**P1b**~~ | ~~**`moe.down`'s rung, and the shared expert's**~~ — **done, and no rung moves.** The whole one-token MoE ladder in `l8e_moe.csv` was an L3 measurement — every GEMV down rung read 267-357 GB/s of a 242 GB/s bus — so it was re-run on **sixteen cold banks at `-iters 1`** (25.6 GB, so `ProfileSweep` never re-reads a bank warm). Two runs agree to a median ratio of 0.9991, no rung reads above the bus, and **the ranking is unchanged on every axis**: v64w4/v16w4 routed, v64w4/v32w4 shared, k40 router — the plan the model already runs. The honest floors are up 99.0 us at 186 GB/s, down 59.3 at 207, shexp 22.7 + 10.9, router 13.4; the whole model sits 8-22% above them (down 72.2, the widest), a **1.33 ms a token** environment gap that is not a rung choice. D16's up-mode contradiction also closes: cold, v16w4 loses to v64w4 by 1.15x, the same side as the whole model. | The 1.19 + 0.73 ms the review priced was the MALL's arithmetic, not a mis-chosen row block. [Write-up](research/p1b-moe-decode-rescreen.md) |
-| **P1c** | **The pre-recorded decode command buffer** (idea 2) | 1.127 ms of recording plus 0.828 of hand-over, **6.4% of the step, ~+2.2 tok/s**. The decode graph is shape-stable: same 1501 dispatches, same buffers, only the position and the token id change. |
-| **P2** | **`ple_proj`, and close L8c** | Half a day, two bank stages in one, and D13's payoff: delete the two-plane fp16-tail machinery now that the exception list is empty. Ends with the complete plan's 145-chunk number. |
+| ~~**P1c**~~ | ~~**The pre-recorded decode command buffer**~~ — **done**, 1.90 ms of the priced 1.96: the step's whole varying state was one uint (`SEQ_PAST`, now dword 0 of each block's arena), so all 1407 dispatches record once and replay byte-identical. Record **1.127 → 0.16 ms**, hand-over **0.82 → 0.25**. And the machine moved more than the fix — yesterday's binary was 8.7 ms slower a step overnight — so **a whole-model number is only comparable against a control staged the same hour**. | Bit-level gate: 48 greedy tokens and all 48 logit rows identical to the re-recording arm. [Write-up](research/p1c-prerecorded-decode.md) |
+| ~~**P2**~~ | ~~**`ple_proj`, and close L8c**~~ — **done, and the stage closes on 4.2010 (+4.27%)**, beside L8c-3's pre-kernel projection of 4.1998 — an identity, not a coincidence, because the fp16 tail is deleted and the bank quantises exactly what the simulation always did. `ple_proj` alone is **+0.59%** for 0.047 GB — the plan's worst trade — and its screen read **−0.11%**; the six deltas no longer add (sum 4.31% against 4.09% measured). Decode the same hour **27.87 ms, 35.89 tok/s, 1.43x**. | The knapsack (P3) inherits a sixth row and loses additivity as a free tool. [Write-up](research/p2-ple-proj.md) |
 | **P3** | **The shipped-widths decision (D18)** | The knapsack: additivity + per-family corpus deltas make plans composable, and uniform 4.5 is provably not optimal — `full_attn` costs 5.52 pp/GB where `deltanet` costs 0.87. Sim-grade `q5_k` on `full_attn` first (8 minutes, no kernel), screen the winner on a second corpus. |
 | **P4** | **The router at fp16 and the experts at ~4.25 bits** | +4.5 tok/s of ceiling. The expert half is a transcode, not a kernel — `llm_moe_gemm/gemv` already read Q4_K — and L8c-3 says the calibrated form behaves. Grade each on 145 chunks separately; D4 holds. |
 | **P5** | **MTP speculation** | ×1.5-1.8 on everything above, so it loses nothing by going after P0/P1. Needs the rollback design first: a rejected draft rewinds 36 recurrent states, both rings, the KV and the host id list, and verification runs at M = 2-8 where D15 refuses the GEMV — the crossover has never been measured. |

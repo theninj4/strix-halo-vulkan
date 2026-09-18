@@ -207,7 +207,19 @@ func TestGraphLogits(t *testing.T) {
 	t.Logf("top 10: ours      %v", got)
 	t.Logf("        llama.cpp %v", want)
 	if got[0] != want[0] {
-		t.Errorf("argmax %d, llama.cpp says %d", got[0], want[0])
+		// On the quantised default bank the staged model deliberately
+		// differs from the reference's — P2 put the fp16 tail's tensors on
+		// the plane at D13's measured price — so a near-tie may resolve the
+		// other way: the flip is tolerated only where the reference's own
+		// gap between the two tokens is within the measured logit drift.
+		// Anything wider is still a defect, exactly as before.
+		gap := float64(wantLog.Vals[want[0]] - wantLog.Vals[got[0]])
+		if denseQ8Test && gap >= 0 && gap <= 3*rl.rms {
+			t.Logf("argmax %d against llama.cpp's %d: a near-tie, %.4f apart against drift rms %.4f",
+				got[0], want[0], gap, rl.rms)
+		} else {
+			t.Errorf("argmax %d, llama.cpp says %d (gap %.4f, drift rms %.4f)", got[0], want[0], gap, rl.rms)
+		}
 	}
 	if n := sameSet(got, want); n != len(want) {
 		t.Errorf("top 10: %d of %d tokens in common", n, len(want))

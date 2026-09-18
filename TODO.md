@@ -901,6 +901,40 @@ Housekeeping: `PIPELINE.md` is 330 lines against its own ~200-line budget,
 and the next stage that closes should pay some of that back by moving closed
 detail into `research/`.
 
+### Session 2026-09-18 — P2: `ple_proj` on the bank, the fp16 tail deleted, and L8c closed
+
+**Result: the last streamed dense family is on the 4.5-bit bank, the
+two-plane fp16-tail machinery is deleted from three kernels and three
+blocks, and the stage closes on 4.2010 (+4.27%) over 145 chunks — beside
+the 4.1998 (+4.24%) L8c-3's simulation projected before any kernel existed,
+which after the deletion is an identity: the complete-plan bank agrees with
+the full-scope simulation chunk for chunk, no `SRC=q8` carve-out. Decode
+the same hour: 27.87 ms a step, 35.89 tok/s, 1.43x llama.cpp's 25.15.**
+`ple_proj` was two bank stages in one (never got L8a's int8 either):
+65.8 MB of halves → 35.1 int8 (bit-identical, both tensors ship Q8_0) →
+18.7 at 4.5 bits, on the attention block's own MODE 2 builds — no new
+kernel. The accuracy is the finding, twice: the family alone is **+0.59%**
+for 0.047 GB a token, the plan's worst trade by an order of magnitude
+(~12 pp/GB, one layer, run once), its 8-chunk screen read **−0.11%** (a
+fifth screen failure, second sign flip) — and **additivity broke at the
+sixth family** (separate deltas sum 4.31% against 4.09% measured, tails
+fp16). The deletion put alpha, beta, `inject` and the indexer's two
+projections on the plane at family width under their own imatrix names:
+**+0.18 pp** measured, ~0.085 GB a token and 0.47 ms a step back, and
+`gateOff` means a weight nowhere. The int8 bank is no longer bit-identical
+on those four tensors — the trace tests carry that as `bankTol` at D13's
+measured prices (alpha/beta rms 3.0e-3 = L8a-2's number exactly), the
+fp16-path test stages the fp16 bank explicitly, and `TestGraphLogits`
+accepts an argmax flip only on a measured near-tie (0.107 of a logit
+against drift rms 0.33). Reproducibility: the 8-chunk sim/bank pairs agree
+with the `nll` column identical to six decimals on all rows, twice
+(ple-only and complete plan); the ppl runs are deterministic. Runs:
+`results/l8c_ppl_ple_only.csv`, `results/l8c_ppl_uniform.csv`,
+`results/l8c_ppl_uniform_notail.csv`. Write-up:
+`research/p2-ple-proj.md`; next is P3 (the shipped-widths decision, D18)
+per `LLM2.md`, whose knapsack gains a sixth row and loses additivity as a
+free tool.
+
 ### Session 2026-09-18 — P1c: the decode step recorded once, and the day the machine moved more than the fix
 
 **Result: decode is one pre-recorded command buffer replayed with a fence per

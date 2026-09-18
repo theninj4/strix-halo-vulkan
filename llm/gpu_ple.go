@@ -61,6 +61,33 @@ var pleVariants = []pleVariant{
 	{PLEKVM8, shaders.LLMGEMMPlainM8, 128},
 }
 
+// The same three rungs over the two quantised banks — the identical builds
+// the attention block runs, because both blocks are MODE 2 of llm_gemm.comp.
+// This projection has no fp16 tail: both of its tensors ship as Q8_0, so
+// every row is on the plane whichever bank this is.
+var pleQ8Variants = []pleVariant{
+	{PLEKVM2, shaders.LLMGEMMQ8M2, 32},
+	{PLEKVM4, shaders.LLMGEMMQ8M4, 64},
+	{PLEKVM8, shaders.LLMGEMMQ8M8, 128},
+}
+
+var pleQ4Variants = []pleVariant{
+	{PLEKVM2, shaders.LLMGEMMQ4M2, 32},
+	{PLEKVM4, shaders.LLMGEMMQ4M4, 64},
+	{PLEKVM8, shaders.LLMGEMMQ4M8, 128},
+}
+
+// pleBuildsFor is the table the block builds its bank pipelines from.
+func pleBuildsFor(b DenseBank) []pleVariant {
+	switch b {
+	case BankQ8:
+		return pleQ8Variants
+	case BankQ4K:
+		return pleQ4Variants
+	}
+	return pleVariants
+}
+
 // PLEKernels lists the rungs, narrowest first.
 func PLEKernels() []PLEKernel { return []PLEKernel{PLEKVM2, PLEKVM4, PLEKVM8} }
 
@@ -95,6 +122,19 @@ type PLEOpts struct {
 	// into the residual, so it can be checked against `ple_conv_out-N`. The
 	// residual add does not need the tensor; the trace comparison does.
 	ConvOut bool
+	// Bank is which dense bank the fused key/value projection is staged on.
+	// The zero value is the fp16 bank, which is where L8a left this block —
+	// the one dense matmul in the vertical that never got the int8 stage —
+	// so P2 is two bank stages in one: BankQ8 is bit-identical arithmetic
+	// (both tensors ship as Q8_0), BankQ4K is the 4.5-bit format the plan
+	// names `ple_proj`.
+	Bank DenseBank
+	// Sim is the format the 4.5-bit bank encodes with, exactly as the other
+	// blocks take it; required with BankQ4K and unused otherwise.
+	Sim QuantSim
+	// Layer is the checkpoint layer the weights came from, for the imatrix
+	// lookup — `blk.<Layer>.ple_key.weight` is the published row's name.
+	Layer int
 }
 
 // PLEGPU runs the n-gram block for one layer.
@@ -104,10 +144,15 @@ type PLEGPU struct {
 	rec *recorder
 	dev *vk.Device
 	cfg PLEConfig
+	// bank is which plane the fused projection is staged on, sim the format
+	// the 4.5-bit one encodes with, and layer the imatrix row's `blk.N`.
+	bank  DenseBank
+	sim   QuantSim
+	layer int
 
-	wbuf, abuf, hbuf, bank *vk.Buffer
-	pipes                  map[string]*vk.ComputePipeline
-	mods                   []*vk.ShaderModule
+	wbuf, abuf, hbuf, wbank *vk.Buffer
+	pipes                   map[string]*vk.ComputePipeline
+	mods                    []*vk.ShaderModule
 
 	tokens, arenaRows, rows int
 	lda                     int
@@ -142,6 +187,13 @@ type PLEGPU struct {
 // projection.
 func (g *PLEGPU) kvN() int { return roundUpInt(g.cfg.Wide()+g.cfg.NEmbd, pleKVBN) }
 
+// quant is whether the fused projection reads a quantised bank.
+func (g *PLEGPU) quant() bool { return g.bank != BankFP16 }
+
+// Bank and Format are which, for a header line.
+func (g *PLEGPU) Bank() DenseBank  { return g.bank }
+func (g *PLEGPU) Format() QuantSim { return g.sim }
+
 // NewPLEGPU stages one layer's n-gram block onto the device.
 func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts PLEOpts) (*PLEGPU, error) {
 	if maxTokens <= 0 {
@@ -158,8 +210,12 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 	if !ok {
 		return nil, fmt.Errorf("llm: this device has no 16x16x16 fp16 cooperative matrix")
 	}
+	if opts.Bank == BankQ4K && opts.Sim.Off() {
+		return nil, fmt.Errorf("llm: a q4_k ple bank needs a format to quantise to")
+	}
 	g := &PLEGPU{
 		dev: dev, cfg: cfg,
+		bank: opts.Bank, sim: opts.Sim, layer: opts.Layer,
 		pipes:      make(map[string]*vk.ComputePipeline),
 		tokens:     maxTokens,
 		rows:       maxTokens,
@@ -239,14 +295,27 @@ func (g *PLEGPU) alloc() error {
 	g.hbuf.Zero()
 	g.abuf.Zero()
 
-	if g.bank, err = g.dev.NewBuffer(g.kvN() * c.NEmbd * 2); err != nil {
-		return fmt.Errorf("llm: PLE fp16 weight bank (%d MB): %w", (g.kvN()*c.NEmbd*2)>>20, err)
+	// The fused projection's bank: 65.5 MB of halves, 34.8 of int8 plus
+	// scales, or 18.4 of nibbles plus records. There is no fp16 tail — both
+	// tensors ship as Q8_0 — so a quantised plane holds every row.
+	bankBytes := g.kvN() * c.NEmbd * 2
+	switch g.bank {
+	case BankQ8:
+		bankBytes = q8Align(q8Bytes(g.kvN(), c.NEmbd))
+	case BankQ4K:
+		if err := q4kFits(g.kvN(), c.NEmbd); err != nil {
+			return err
+		}
+		bankBytes = q8Align(q4kBytes(g.kvN(), c.NEmbd))
+	}
+	if g.wbank, err = g.dev.NewBuffer(bankBytes); err != nil {
+		return fmt.Errorf("llm: PLE %s weight bank (%d MB): %w", g.bank, bankBytes>>20, err)
 	}
 	return nil
 }
 
 func (g *PLEGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	feat := g.dev.Features()
 	sgs, err := g.dev.Physical().SubgroupSizeControl()
@@ -270,6 +339,18 @@ func (g *PLEGPU) build() error {
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
 			return err
+		}
+	}
+	// The bank builds, when the bank is quantised: the same MODE 2 arm the
+	// attention block runs, reading the plane at binding 5.
+	if g.quant() {
+		gemmBufs := append(append([]*vk.Buffer{}, bufs...), g.wbank)
+		for _, v := range pleBuildsFor(g.bank) {
+			if err := g.pipeline(bankPipe(g.bank, GEMMKernel(v.name)), v.spirv, vk.PipelineSpec{
+				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -318,10 +399,60 @@ func (g *PLEGPU) stage(w PLEWeights) error {
 	}
 	// Key rows first, then value's: the gate kernel reads the value at column
 	// `wide` of the same row, which is what makes this one dispatch.
+	switch g.bank {
+	case BankQ4K:
+		return g.stageQ4K(w)
+	case BankQ8:
+		// The checkpoint's own width: both tensors ship as Q8_0, so this is
+		// the identity round trip every L8a bank is (bank.go) — the halves
+		// the unpack puts in LDS are the halves tileB would have stored.
+		qs := make([]byte, g.kvN()*c.NEmbd)
+		sc := make([]uint16, g.kvN()*c.NEmbd/q8Group)
+		tileBQ8(qs, sc, w.Key, wide, c.NEmbd, func(i int) int { return i })
+		tileBQ8(qs, sc, w.Value, c.NEmbd, c.NEmbd, func(i int) int { return wide + i })
+		g.wbank.WriteBytesAt(0, qs)
+		g.wbank.WriteUint16At(len(qs)/2, sc)
+		return nil
+	}
 	buf := make([]uint16, g.kvN()*c.NEmbd)
 	tileB(buf, w.Key, wide, c.NEmbd, func(i int) int { return i })
 	tileB(buf, w.Value, c.NEmbd, c.NEmbd, func(i int) int { return wide + i })
-	g.bank.WriteUint16At(0, buf)
+	g.wbank.WriteUint16At(0, buf)
+	return nil
+}
+
+// stageQ4K packs the fused projection onto L8c-4's 4.5-bit bank, each source
+// quantised under its own name for the reason L8c-5 gives: the published
+// imatrix has a row per tensor, and `ple_key` and `ple_value` are two of
+// them. The pad rows the column block adds are left zero, and zero nibbles
+// against a zero record decode to zero.
+func (g *PLEGPU) stageQ4K(w PLEWeights) error {
+	c := g.cfg
+	wide := c.Wide()
+	q4 := make([]byte, g.kvN()*c.NEmbd/2)
+	rec := make([]byte, q4kRecPlane(g.kvN(), c.NEmbd))
+	for _, t := range []struct {
+		name string
+		src  []float32
+		n    int
+		base int
+	}{
+		{"ple_key.weight", w.Key, wide, 0},
+		{"ple_value.weight", w.Value, c.NEmbd, wide},
+	} {
+		name := fmt.Sprintf("blk.%d.%s", g.layer, t.name)
+		q, qw, err := bankImatrix(name, g.sim)
+		if err != nil {
+			return err
+		}
+		base := t.base
+		if err := tileBQ4K(q4, rec, t.src, t.n, c.NEmbd,
+			func(r int) int { return base + r }, q, qw); err != nil {
+			return fmt.Errorf("llm: %s: %w", name, err)
+		}
+	}
+	g.wbank.WriteBytesAt(0, q4)
+	g.wbank.WriteBytesAt(len(q4), rec)
 	return nil
 }
 
@@ -396,7 +527,16 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 	kv := base
 	kv.OutOff = g.aKV
 	kv.GemmM, kv.GemmK = uint32(roundUpInt(g.rows, v.bm)), uint32(c.NEmbd)
-	add(string(g.kv), "kv", uint32(g.kvN()/pleKVBN), uint32(roundUpInt(g.rows, v.bm)/v.bm), kv)
+	kvPipe := string(g.kv)
+	if g.quant() {
+		// No tail: every row of the fused projection is on the plane, so
+		// `lowRank` — the first row that is not — is the whole width, and
+		// `gateOff` goes back to being nothing (it is the gate kernel's
+		// field, not this dispatch's).
+		kvPipe = bankPipe(g.bank, GEMMKernel(g.kv))
+		kv.LowRank, kv.GateOff = uint32(g.kvN()), noW
+	}
+	add(kvPipe, "kv", uint32(g.kvN()/pleKVBN), uint32(roundUpInt(g.rows, v.bm)/v.bm), kv)
 
 	add("gate", "gate", uint32(c.HC), uint32(g.rows), base)
 	add("conv", "conv", uint32((wide+255)/256), uint32(g.rows), base)
@@ -505,7 +645,7 @@ func (g *PLEGPU) kvSlice(col, width int) []float32 {
 
 // WeightBytes is what the block costs on the device and ActivationBytes what
 // its arenas cost.
-func (g *PLEGPU) WeightBytes() int { return g.wbuf.Size() + g.bank.Size() }
+func (g *PLEGPU) WeightBytes() int { return g.wbuf.Size() + g.wbank.Size() }
 
 // Buffers is how many device allocations the block holds. L6a counts them
 // across the whole model: `maxStorageBufferRange` is 4 GiB - 4 here, so the
@@ -521,7 +661,7 @@ func (g *PLEGPU) Destroy() {
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.bank} {
+	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank} {
 		if b != nil {
 			b.Destroy()
 		}

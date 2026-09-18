@@ -40,11 +40,10 @@
 // exact halves is a real f16 instruction whose correctly-rounded result is
 // the same half the GEMM's LDS store holds.
 //
-// **The tail is llm_gemm.comp MODE 2's, and MODE 2's split is the row and not
-// a column block.** A fused matrix whose last rows the checkpoint does not
-// ship as Q8_0 — the DeltaNet's F32 alpha and beta — keeps those rows as
-// halves at `pc.gateOff`, numbered from `pc.lowRank/16`; the host is what
-// guarantees the split falls on a whole n-tile.
+// **There is no fp16 tail.** Every row of a quantised bank is on the plane —
+// the rows the checkpoint does not ship as Q8_0 are quantised at their
+// family's width like everything else (D13's payoff, P2) — so `pc.gateOff`
+// and `pc.lowRank` mean nothing here.
 //
 // **KSLABS is D12's 4 KB rotation and the table moves with the bank.** A
 // workgroup's slab is `(gemmK/16/KSLABS) * 256` bytes on the int8 bank and
@@ -100,11 +99,9 @@ void main() {
 
     float sum = 0.0;
 #ifdef Q4B
-    // MODE 2's split, exactly as the Q8 arm states it: `pc.lowRank` is the
-    // first row that is not in this bank and `pc.gateOff` is where those
-    // rows' halves are, or NO_W for a matrix that is quantised all through.
-    bool tail = (pc.gateOff != NO_W) && (nt * TILE >= pc.lowRank);
-    if (!tail) {
+    // Every row is on the plane: the fp16 tail left with D13's payoff (P2),
+    // so a quantised matrix is quantised all the way through.
+    {
         uint nsb = pc.gemmK >> 8;
         uint rec0 = (pc.bOff + ((pc.gemmN * pc.gemmK) >> 1)) >> 2;
         // A tile is 32 words and a lane owns two of them — the eight k
@@ -137,23 +134,10 @@ void main() {
                 }
             }
         }
-    } else {
-        uint wbase = pc.gateOff + ((nt - pc.lowRank / TILE) * ktiles + kt0) * (TILE * TILE)
-            + lane * TILE;
-        for (uint c = 0u; c < perSlab; c += 4u) {
-            uint w = wbase + c * (TILE * TILE);
-            uint x = xbase + (c + sub) * TILE;
-            [[unroll]] for (uint i = 0u; i < TILE; i++) {
-                sum += float(w16[w + i]) * float(hact[x + i]);
-            }
-        }
     }
 #elif defined(Q8B)
-    // MODE 2's split is `pc.lowRank` itself — the first row that is not int8 —
-    // and `pc.gateOff` is where those rows' halves are, or NO_W for a matrix
-    // that is int8 all the way through.
-    bool tail = (pc.gateOff != NO_W) && (nt * TILE >= pc.lowRank);
-    if (!tail) {
+    // Every row is on the plane here too, as int8 all the way through.
+    {
         uint qbase = (pc.bOff >> 2) + (nt * ktiles + kt0) * 64u + lane * 4u;
         uint sbase = ((pc.bOff + pc.gemmN * pc.gemmK) >> 1) + nt * (pc.gemmK >> 5) * TILE + col;
         // One step is four tiles: 1024 bytes of weight, 64 halves of
@@ -169,16 +153,6 @@ void main() {
                     sum += float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d) *
                         float(hact[x + u * 4u + t]);
                 }
-            }
-        }
-    } else {
-        uint wbase = pc.gateOff + ((nt - pc.lowRank / TILE) * ktiles + kt0) * (TILE * TILE)
-            + lane * TILE;
-        for (uint c = 0u; c < perSlab; c += 4u) {
-            uint w = wbase + c * (TILE * TILE);
-            uint x = xbase + (c + sub) * TILE;
-            [[unroll]] for (uint i = 0u; i < TILE; i++) {
-                sum += float(w16[w + i]) * float(hact[x + i]);
             }
         }
     }

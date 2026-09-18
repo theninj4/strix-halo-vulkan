@@ -71,8 +71,8 @@ func TestDeltaNetGPUFusedProjection(t *testing.T) {
 	}{
 		{"attn_qkv", g.ColQ(), c.ConvWidth(), proj(w.QKV, c.ConvWidth()), 2e-3},
 		{"attn_gate", g.ColZ(), c.Inner, proj(w.Z, c.Inner), 2e-3},
-		{"ssm_alpha", g.ColAlpha(), c.NHeadV, proj(w.Alpha, c.NHeadV), 2e-3},
-		{"ssm_beta", g.ColBeta(), c.NHeadV, proj(w.Beta, c.NHeadV), 2e-3},
+		{"ssm_alpha", g.ColAlpha(), c.NHeadV, proj(w.Alpha, c.NHeadV), bankTol(2e-3, 5e-3)},
+		{"ssm_beta", g.ColBeta(), c.NHeadV, proj(w.Beta, c.NHeadV), bankTol(2e-3, 5e-3)},
 	} {
 		r, err := compare(g.Column(tc.col, tc.width), tc.want)
 		if err != nil {
@@ -143,8 +143,8 @@ func TestDeltaNetGPULayer(t *testing.T) {
 				{"q_conv_predelta", g.NormColumn(g.ColQ(), qk), ref.QNorm, 5e-4},
 				{"k_conv_predelta", g.NormColumn(g.ColK(), qk), ref.KNorm, 5e-4},
 				{"v_conv_predelta", g.NormColumn(g.ColV(), vw), ref.V, 2e-3},
-				{"gate", g.Gate(), ref.Gate, 5e-2},
-				{"beta_sigmoid", g.BetaSig(), ref.BetaSig, 5e-4},
+				{"gate", g.Gate(), ref.Gate, bankTol(5e-2, 8e-2)},
+				{"beta_sigmoid", g.BetaSig(), ref.BetaSig, bankTol(5e-4, 2e-3)},
 				{"attn_output", g.Out(), ref.Out, 2e-4},
 				{"final_output", g.Final(), ref.Final, 2e-3},
 				{"linear_attn_out", g.Result(), ref.Result, 2e-3},
@@ -210,8 +210,23 @@ func TestDeltaNetGPULayer(t *testing.T) {
 // the reference's would be — not that it reproduces one particular fp16
 // evaluation order, which no two implementations share.
 func TestDeltaNetGPUGateIsTheFp16Path(t *testing.T) {
-	g, _, c, w, in, nTok, done := dnGPU(t, dnLayer)
+	// The fp16 bank explicitly, whatever the environment says: this test
+	// prices the fp16 *path*, and on a quantised bank alpha and beta go
+	// through int8 as well (P2), which is a different question — the corpus's
+	// (D13: +0.01%), not this test's.
+	tr, c, w, nTok := dnFixtures(t, dnLayer)
+	in0, err := tr.Get(fmt.Sprintf("hc_mixed-%d", dnLayer), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := in0.Vals
+	dev, done := newTestDevice(t)
 	defer done()
+	g, err := NewDeltaNetGPU(dev, c, nTok, []DeltaNetWeights{w}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
 	if err := g.Upload(in, nTok); err != nil {
 		t.Fatal(err)
 	}
@@ -509,19 +524,17 @@ func TestDeltaNetGPUGemvAgrees(t *testing.T) {
 		if r.rms > 1e-4 {
 			t.Errorf("qkv %s: rms %.3e against the GEMM (%v)", k, r.rms, r)
 		}
-		// And the tail on its own, which is the half of this matrix the two
-		// kernels reach by different arithmetic: 96 F32 rows kept as halves
-		// at `gateOff` and numbered from `lowRank/16`, against 16 416 int8
-		// ones. Folded into the whole-matrix rms above they are 0.6% of the
-		// columns and would hide completely.
-		tail := g.qkvQ8Rows()
+		// And alpha and beta's columns on their own. Folded into the
+		// whole-matrix rms above they are 0.6% of the columns and would
+		// hide completely.
+		tail := g.ColAlpha()
 		rt, err := compare(gotQKV[tail:], refQKV[tail:])
 		if err != nil {
-			t.Fatalf("qkv %s tail: %v", k, err)
+			t.Fatalf("qkv %s alpha/beta: %v", k, err)
 		}
-		t.Logf("    tail (alpha and beta, %d halved rows from %d): %v", len(refQKV)-tail, tail, rt)
+		t.Logf("    alpha and beta (%d rows from %d): %v", len(refQKV)-tail, tail, rt)
 		if rt.rms > 1e-4 {
-			t.Errorf("qkv %s: the fp16 tail is rms %.3e from the GEMM's (%v)", k, rt.rms, rt)
+			t.Errorf("qkv %s: alpha and beta are rms %.3e from the GEMM's (%v)", k, rt.rms, rt)
 		}
 	}
 	for _, k := range GEMVKernels() {
@@ -627,22 +640,20 @@ func TestDeltaNetGPUQ4IsTheSim(t *testing.T) {
 }
 
 // TestDeltaNetGPUQ4BankSize states what L8c-5 stages against what it
-// replaces, and where the 4.500 bits stop being exact.
-//
-// The fused projection's tail is the reason: alpha and beta are the
-// checkpoint's own F32 and stay halves (qkvQ8Rows), and the quantised plane
-// still covers all qkvN rows because the kernel derives the record plane's
-// base from gemmN * gemmK. So the matrix as staged is a little over 4.5 bits
+// replaces, and where the 4.500 bits stop being exact: the plane covers qkvN
+// rows, of which the last few are the column block's padding — staged
+// nibbles nothing reads — so the matrix as staged is a little over 4.5 bits
 // and the test says how much rather than asserting a round number.
 func TestDeltaNetGPUQ4BankSize(t *testing.T) {
 	_, c, _, _ := dnFixtures(t, dnLayer)
-	n, k := roundUpInt(c.ConvWidth()+c.Inner+2*c.NHeadV, dnBN), c.NEmbd
-	tail := n - (c.ConvWidth() + c.Inner)
+	real := c.ConvWidth() + c.Inner + 2*c.NHeadV
+	n, k := roundUpInt(real, dnBN), c.NEmbd
+	pad := n - real
 
-	q4 := q8Align(q4kBytes(n, k)) + tail*k*2 + q8Align(q4kBytes(c.NEmbd, c.Inner))
-	q8 := q8Align(q8Bytes(n, k)) + tail*k*2 + q8Align(q8Bytes(c.NEmbd, c.Inner))
+	q4 := q8Align(q4kBytes(n, k)) + q8Align(q4kBytes(c.NEmbd, c.Inner))
+	q8 := q8Align(q8Bytes(n, k)) + q8Align(q8Bytes(c.NEmbd, c.Inner))
 	half := n*k*2 + c.NEmbd*c.Inner*2
-	weights := (c.ConvWidth()+c.Inner)*k + c.NEmbd*c.Inner + tail*k
+	weights := real*k + c.NEmbd*c.Inner
 
 	t.Logf("a layer: q4_k %.2f MB, q8 %.2f MB, halves %.2f MB — %.3f, %.3f and %.3f bits a weight",
 		float64(q4)/1e6, float64(q8)/1e6, float64(half)/1e6,
@@ -653,12 +664,10 @@ func TestDeltaNetGPUQ4BankSize(t *testing.T) {
 	if q4 >= q8 || q8 >= half {
 		t.Fatalf("the three banks are %d, %d, %d bytes and are not in order", q4, q8, half)
 	}
-	// The quantised half alone is the format's own width to the bit.
-	body := q4kBytes(n, k) - tail*k/2 + q4kBytes(c.NEmbd, c.Inner)
-	bodyW := (c.ConvWidth()+c.Inner)*k + c.NEmbd*c.Inner
-	// The record plane covers the tail's rows too, so subtract only the
-	// nibbles and state the remainder rather than demanding 4.500.
-	if bits := float64(body) * 8 / float64(bodyW); bits < 4.5 || bits > 4.52 {
-		t.Fatalf("the quantised half is %.4f bits a weight, want 4.500 plus the tail's records", bits)
+	// Subtract the pad rows' nibbles and state the remainder rather than
+	// demanding 4.500 — the record plane covers the pad rows too.
+	body := q4kBytes(n, k) - pad*k/2 + q4kBytes(c.NEmbd, c.Inner)
+	if bits := float64(body) * 8 / float64(weights); bits < 4.5 || bits > 4.52 {
+		t.Fatalf("the staged matrix is %.4f bits a weight, want 4.500 plus the padding's records", bits)
 	}
 }

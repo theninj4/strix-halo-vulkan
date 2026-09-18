@@ -154,14 +154,12 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemm
 	if q, ok := llm.DenseBankPlan().For("blk.0.attn_q.weight", true); ok {
 		bank, sim = llm.BankQ4K, q
 	}
-	idxQ := false
 	if _, ok := llm.DenseBankPlan().For("blk.0.indexer.q_proj.weight", false); ok {
 		if bank != llm.BankQ4K {
 			return fmt.Errorf("qsa_indexer shares the fused projection's plane, so it needs full_attn on the same bank")
 		}
-		idxQ = true
 	}
-	g, err := llm.NewAttnGPUBank(dev, cfg, maxTok, nKV, ws, bank, sim, idxQ)
+	g, err := llm.NewAttnGPUBank(dev, cfg, maxTok, nKV, ws, bank, sim)
 	if err != nil {
 		return err
 	}
@@ -180,8 +178,8 @@ func attnBench(model string, tokens []int, ctx, nLayers, iters int, ladder, gemm
 	default:
 		return fmt.Errorf("-sel is auto, on or off, not %q", sel)
 	}
-	fmt.Printf("%d layers staged on the %s bank%s: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks), selection %v\n\n",
-		g.Layers(), bank, map[bool]string{true: " (the indexer on it too)"}[idxQ],
+	fmt.Printf("%d layers staged on the %s bank: %.1f MB of weights, %.1f MB of arenas for %d tokens in %d cells (%d blocks), selection %v\n\n",
+		g.Layers(), bank,
 		float64(g.WeightBytes())/1e6, float64(g.ActivationBytes())/1e6,
 		maxTok, g.NKV(), g.NBlocks(), g.Sparse())
 
