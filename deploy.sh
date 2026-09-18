@@ -11,7 +11,7 @@ set -ex
 
 cd "$(dirname "$0")"
 go build -o ai ./cmd/serve
-cat ./ai.service | sed "s|###|$(pwd)/ai|" > ~/.config/systemd/user/ai.service
+cat ./ai.service | sed "s|###|$(pwd)|" > ~/.config/systemd/user/ai.service
 systemctl --user daemon-reload
 systemctl --user restart ai.service
 journalctl --user -n 100 -f -u ai
