@@ -178,8 +178,8 @@ func reportGraphRun(g *llm.Graph, n int) []string {
 	fmt.Printf("    blocks alone %.1f ms = %.1f tok/s; the moves are %.1f ms (%.1f%%) and the host %.1f ms (%.1f%%)\n",
 		blocks, float64(n)/(blocks/1000), ms(st.Move), 100*ms(st.Move)/total,
 		ms(st.Gather)+ms(st.Glue), 100*(ms(st.Gather)+ms(st.Glue))/total)
-	fmt.Printf("    %d dispatches a pass, one command buffer per %d (L7d)\n",
-		st.Dispatches/max(st.Runs, 1), llm.MaxBatch)
+	fmt.Printf("    %d dispatches a pass, one command buffer per %d (L7d, P0)\n",
+		st.Dispatches/max(st.Runs, 1), llm.BatchFor(n))
 
 	return []string{
 		strconv.Itoa(n), strconv.Itoa(g.Layers()),

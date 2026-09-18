@@ -1,0 +1,2 @@
+tokens,layers,ms,tok_s,against_llama,hc_ms,ple_ms,dn_ms,attn_ms,moe_ms,head_ms,move_ms,gather_ms,glue_ms
+8192,48,6750.6,1213.5,3.100,1300.9,34.7,1451.5,993.0,2824.6,3.7,139.6,67.8,23.0

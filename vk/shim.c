@@ -1,7 +1,10 @@
 #include "shim.h"
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 VkResult shim_create_instance(const char *app_name, VkInstance *out_instance) {
     VkApplicationInfo appInfo = {0};
@@ -684,6 +687,57 @@ VkResult shim_create_compute_pipeline(VkDevice device, VkShaderModule shader,
     return vkCreateQueryPool(device, &queryPoolInfo, NULL, &out->queryPool);
 }
 
+// SHIM_QUERY_TIMEOUT_NS bounds the wait for a pass's timestamps. It is not a
+// performance knob: the fence is already signalled by the time anything below
+// runs, so a slot that is not ready within ten seconds is never going to be.
+#define SHIM_QUERY_TIMEOUT_NS 10000000000ULL
+
+static uint64_t shim_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+// shim_query_results_deadline reads `marks` timestamps, waiting but not
+// forever.
+//
+// VK_QUERY_RESULT_WAIT_BIT looks like a driver-side wait and is not one on
+// RADV: radv_GetQueryPoolResults polls the mapped slot in userspace, with no
+// timeout and no way out, so a slot the GPU never wrote spins a core at 100%
+// on a queue that has gone idle and a fence that has already signalled. That
+// is what >2560 rows did (LLM.md P0) and why the submit's own 20-second fence
+// timeout never fired -- the wait it would have bounded was already over.
+// Polling to a deadline turns that hang into an error, and names the slots.
+static VkResult shim_query_results_deadline(VkDevice device, VkQueryPool pool, uint32_t marks,
+                                             uint64_t *out) {
+    uint64_t deadline = shim_now_ns() + SHIM_QUERY_TIMEOUT_NS;
+    for (;;) {
+        VkResult r = vkGetQueryPoolResults(device, pool, 0, marks, (size_t)marks * sizeof(uint64_t),
+                                            out, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+        if (r != VK_NOT_READY) {
+            return r;
+        }
+        if (shim_now_ns() >= deadline) {
+            uint32_t missing = 0;
+            uint32_t first = UINT32_MAX, last = 0;
+            for (uint32_t i = 0; i < marks; i++) {
+                uint64_t v = 0;
+                if (vkGetQueryPoolResults(device, pool, i, 1, sizeof(v), &v, sizeof(v),
+                                           VK_QUERY_RESULT_64_BIT) == VK_NOT_READY) {
+                    if (first == UINT32_MAX) {
+                        first = i;
+                    }
+                    last = i;
+                    missing++;
+                }
+            }
+            fprintf(stderr, "shim: %u of %u timestamp slots never became ready (first %u, last %u)\n",
+                    missing, marks, first, last);
+            return VK_TIMEOUT;
+        }
+    }
+}
+
 VkResult shim_dispatch_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *p,
                               uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ, uint32_t iterations,
                               const void *pushConstants, uint32_t pushConstantSize,
@@ -750,8 +804,7 @@ VkResult shim_dispatch_timed(VkDevice device, VkQueue queue, const ShimComputePi
     }
 
     uint64_t timestamps[2];
-    r = vkGetQueryPoolResults(device, p->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t),
-                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    r = shim_query_results_deadline(device, p->queryPool, 2, timestamps);
     if (r != VK_SUCCESS) {
         return r;
     }
@@ -835,8 +888,7 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
     }
 
     uint64_t timestamps[2];
-    r = vkGetQueryPoolResults(device, p->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t),
-                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    r = shim_query_results_deadline(device, p->queryPool, 2, timestamps);
     if (r != VK_SUCCESS) {
         return r;
     }
@@ -938,9 +990,7 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
     }
 
     if (marks > 0) {
-        r = vkGetQueryPoolResults(device, rec->queryPool, 0, marks, (size_t)marks * sizeof(uint64_t),
-                                   out_marks, sizeof(uint64_t),
-                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        r = shim_query_results_deadline(device, rec->queryPool, marks, out_marks);
         if (r != VK_SUCCESS) {
             return r;
         }
@@ -950,8 +1000,7 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
     }
 
     uint64_t timestamps[2];
-    r = vkGetQueryPoolResults(device, rec->queryPool, 0, 2, sizeof(timestamps), timestamps, sizeof(uint64_t),
-                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    r = shim_query_results_deadline(device, rec->queryPool, 2, timestamps);
     if (r != VK_SUCCESS) {
         return r;
     }

@@ -909,7 +909,7 @@ func dispatchMulti(dispatches []MultiDispatch, groupsZ, iterations uint32, barri
 		markBuf = make([]C.uint64_t, len(dispatches)+1)
 		markPtr = &markBuf[0]
 	}
-	if err := check("vkQueueSubmit", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
+	if err := check("dispatch sequence", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
 		&handles[0],
 		&groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
 		C.uint32_t(groupsZ), C.uint32_t(iterations), barrierFlag,

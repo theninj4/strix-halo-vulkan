@@ -222,8 +222,9 @@ func reportPhases(st llm.GraphStats, wall time.Duration) {
 	row("glue", st.Glue)
 	row("hand-over", wall-st.GPU-st.Gather-st.Glue)
 	if n := st.Dispatches / max(st.Runs, 1); n > 0 {
+		b := llm.BatchFor(1)
 		fmt.Printf("    %d dispatches a pass, in %d command buffer(s)\n",
-			n, (n+llm.MaxBatch-1)/llm.MaxBatch)
+			n, (n+b-1)/b)
 	}
 }
 

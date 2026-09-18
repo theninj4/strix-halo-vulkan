@@ -24,6 +24,9 @@ package llm
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"strix-halo-vulkan/vk"
@@ -45,16 +48,81 @@ const (
 // on the shim's query pool (SHIM_QUERY_SLOTS) and not a tuning knob: a whole
 // prefill pass is ~1200 dispatches, so this is one submit for a decode token
 // and two for a long prompt, against the ~490 either used to take.
-const maxBatch = 1024
+// LLM_MAX_BATCH overrides it, which is how P0 asked whether a hang was about
+// the size of one submit rather than about any dispatch in it.
+var maxBatch = envInt("LLM_MAX_BATCH", 1024)
 
-// MaxBatch is that bound, exported for a caller reporting how many command
-// buffers a pass took.
-const MaxBatch = maxBatch
+// minBatch keeps the row-scaled bound below from degenerating: a submit costs
+// ~40 us, so even at 32 dispatches the boundary is under 2% of a pass.
+const minBatch = 32
+
+// submitBudget is how much GPU time one command buffer may hold.
+//
+// **P0.** It is not the query pool and it is not the dispatch count: a submit
+// that occupies the gfx ring for more than ~2 s is killed by amdgpu's ring
+// watchdog. The kernel says `ring gfx_0.0.0 timeout, signaled seq=N, emitted
+// seq=N+3`, resets the ring, and the reset *force-signals the fence* -- so
+// vkQueueSubmit returns, vkWaitForFences returns VK_SUCCESS, its own 20-second
+// timeout never fires, and the only trace left is the timestamps the killed
+// dispatches never wrote. Reading those with VK_QUERY_RESULT_WAIT_BIT is an
+// unbounded userspace poll inside RADV, which is the 100%-of-a-core spin that
+// looked like a hang in the submit (see shim_query_results_deadline).
+//
+// Measured at 48 layers, 1024 dispatches a submit: 2560 rows is 1.886 s and
+// runs, 2688 rows is 1.964 s and runs, 2816 rows is 2.033 s and is reset. The
+// same 1273 dispatches in *one* submit are 787 ms at 512 rows and run, and are
+// reset at 2688 rows -- where two submits of 1024 and 249 had just run the same
+// work. So the bound is time, and half the cliff is the budget.
+const submitBudget = 1000 * time.Millisecond
+
+// A pass's cost is affine in the rows, not proportional to them: fitting the
+// whole-pass figures of 789.5 ms at 512 rows, 2342.4 at 2560, 2434.2 at 2688
+// and 2687.5 at 3072 over 1273 dispatches gives 322 us a dispatch plus 582 ns
+// a dispatch-row, and predicts all four to within 1.5%. It puts a 1024-dispatch
+// submit at 2816 rows at 2.008 s, which is the row count that is reset.
+const (
+	usPerDispatch    = 322
+	nsPerDispatchRow = 582
+)
+
+// dispatchCost is what one dispatch of a pass over this many rows costs.
+func dispatchCost(rows int) time.Duration {
+	return usPerDispatch*time.Microsecond + time.Duration(nsPerDispatchRow*rows)*time.Nanosecond
+}
+
+// batchFor is how many dispatches fit in submitBudget at this many rows. At
+// one row -- every decode step -- it is maxBatch, so nothing about decode
+// changes; it starts biting at ~1700 rows and is ~200 at 8192.
+func batchFor(rows int) int {
+	if rows < 1 {
+		rows = 1
+	}
+	n := int(submitBudget / dispatchCost(rows))
+	return min(max(n, minBatch), maxBatch)
+}
+
+// BatchFor is that bound at a given number of rows, exported for a caller
+// reporting how many command buffers a pass took.
+func BatchFor(rows int) int { return batchFor(rows) }
+
+// batchTimes prints each submit's GPU time, which is how the budget above is
+// checked against the ring rather than against the model that predicts it.
+var batchTimes = os.Getenv("LLM_BATCH_TIMES") != ""
+
+func envInt(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil && v > 0 {
+		return v
+	}
+	return def
+}
 
 // recorder collects a pass's dispatches with the block each came from.
 type recorder struct {
 	d     []vk.MultiDispatch
 	owner []string
+	// rows is what the pass is passing, which is what a dispatch's cost --
+	// and so how many of them fit in one submit -- scales with.
+	rows int
 }
 
 // add appends one block's sequence. A nil recorder is the direct path, which
@@ -79,16 +147,21 @@ func (r *recorder) len() int {
 }
 
 // submit runs everything recorded, in order, and returns the GPU time each
-// block's dispatches took. It chunks at maxBatch, which costs one more fence
-// wait per chunk and keeps the marks.
+// block's dispatches took. It chunks at batchFor(rows), which costs one more
+// fence wait per chunk and keeps the marks.
 func (r *recorder) submit() (map[string]time.Duration, time.Duration, error) {
 	byOwner := make(map[string]time.Duration, 8)
 	var total time.Duration
-	for i := 0; i < len(r.d); i += maxBatch {
-		j := minInt(i+maxBatch, len(r.d))
+	r.dumpRange()
+	batch := batchFor(r.rows)
+	for i := 0; i < len(r.d); i += batch {
+		j := minInt(i+batch, len(r.d))
 		el, each, err := vk.DispatchMultiMarked(r.d[i:j], true)
 		if err != nil {
 			return nil, 0, fmt.Errorf("llm: dispatches %d-%d: %w", i, j-1, err)
+		}
+		if batchTimes {
+			fmt.Fprintf(os.Stderr, "batch %d-%d: %v on the GPU\n", i, j-1, el)
 		}
 		total += el
 		if each == nil {
@@ -103,4 +176,31 @@ func (r *recorder) submit() (map[string]time.Duration, time.Duration, error) {
 	}
 	r.d, r.owner = r.d[:0], r.owner[:0]
 	return byOwner, total, nil
+}
+
+// dumpRange prints the block and grid of a slice of the recorded sequence
+// before it is submitted, which is the only moment a dispatch that hangs the
+// GPU can still be named. LLM_DISPATCH_DUMP=lo:hi selects the range; the
+// dispatch a pass stopped at is the one after the last timestamp slot that
+// came back (slot k is written after dispatch k-1).
+func (r *recorder) dumpRange() {
+	spec := os.Getenv("LLM_DISPATCH_DUMP")
+	if spec == "" {
+		return
+	}
+	lo, hi := 0, len(r.d)
+	if a, b, ok := strings.Cut(spec, ":"); ok {
+		if v, err := strconv.Atoi(a); err == nil {
+			lo = v
+		}
+		if v, err := strconv.Atoi(b); err == nil {
+			hi = v
+		}
+	}
+	lo, hi = max(lo, 0), minInt(hi, len(r.d))
+	fmt.Fprintf(os.Stderr, "dispatch dump: %d recorded, showing %d-%d\n", len(r.d), lo, hi-1)
+	for i := lo; i < hi; i++ {
+		fmt.Fprintf(os.Stderr, "  %4d %-5s groups %dx%d pc %d\n",
+			i, r.owner[i], r.d[i].GroupsX, r.d[i].GroupsY, len(r.d[i].PushConstants))
+	}
 }

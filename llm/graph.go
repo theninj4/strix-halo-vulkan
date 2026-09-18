@@ -176,10 +176,11 @@ type Graph struct {
 // to the matching `flush` is recorded rather than submitted. It is idempotent
 // per pass and paired with `flush` on every return path, which is why the
 // callers are the three entry points and not the layer loop.
-func (g *Graph) record() {
+func (g *Graph) record(rows int) {
 	if g.rec == nil {
 		g.rec = &recorder{}
 	}
+	g.rec.rows = rows
 	g.hc.rec = g.rec
 	g.move.rec = g.rec
 	if g.ple != nil {
@@ -654,7 +655,7 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	// layers, the head mixer and the projection are recorded and submitted
 	// once, and the two read-backs below are after the flush because nothing
 	// has run until then.
-	g.record()
+	g.record(len(ids))
 	defer func() {
 		if ferr := g.flush(); ferr != nil && err == nil {
 			logits, norm, err = nil, nil, ferr
@@ -715,7 +716,7 @@ func (g *Graph) ForwardRows(ids []int32, first int, fn func(t int, logits []floa
 		return err
 	}
 	top := time.Now()
-	g.record()
+	g.record(len(ids))
 	if err := g.appendN(ids, g.nLayer); err != nil {
 		_ = g.flush()
 		return err
@@ -736,7 +737,7 @@ func (g *Graph) ForwardRows(ids []int32, first int, fn func(t int, logits []floa
 	slab, vocab := g.head.MaxRows(), g.head.Vocab()
 	for r0 := first; r0 < len(ids); r0 += slab {
 		n := minInt(slab, len(ids)-r0)
-		g.record()
+		g.record(n)
 		err := func() error {
 			if err := g.head.Resize(n); err != nil {
 				return err
@@ -776,7 +777,7 @@ func (g *Graph) Hidden(ids []int32) ([]float32, error) {
 // the graph is already holding.
 func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
 	top := time.Now()
-	g.record()
+	g.record(len(ids))
 	if err := g.hidden(ids); err != nil {
 		_ = g.flush()
 		return nil, err
@@ -872,7 +873,7 @@ func (g *Graph) Append(ids []int32) error { return g.AppendN(ids, g.nLayer) }
 // the whole id list and hashes over all of it.
 func (g *Graph) AppendN(ids []int32, nLayer int) error {
 	top := time.Now()
-	g.record()
+	g.record(len(ids))
 	if err := g.appendN(ids, nLayer); err != nil {
 		_ = g.flush()
 		return err

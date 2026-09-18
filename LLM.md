@@ -11,8 +11,12 @@ the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
 third vertical, and 200x the parameters of the other two put together.
 
 **Status: the model generates, it is served over HTTP, phase 2's kernel half
-is finished, and five of the six dense families are now at a width the
-checkpoint does not ship.** **L9a** put the generation loop behind
+is finished, five of the six dense families are now at a width the checkpoint
+does not ship, and the one correctness cliff is closed.** **P0** found that the
+graph's never returning above ~2560 rows was amdgpu's gfx ring watchdog killing
+any submit that holds the ring past **2 s** — nothing about this model, this
+bank or residency — so the recorder chunks by time and **prefill runs to 8192
+rows at 1213.5 tok/s, 3.10x llama.cpp, still climbing**. **L9a** put the generation loop behind
 `cmd/serve` — the checkpoint's own chat template transcribed and checked
 against Jinja, and three envelopes over one loop (`API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
@@ -508,6 +512,8 @@ the dense half completely.
 
 ## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
 
+**P0 is done** (2026-09-18) and is struck through below; **P1 is next.**
+
 The 2026-09-18 review re-derived the decode budget and found the bank is no
 longer the binding constraint: 31.5 tok/s measured against an honest ~53
 ceiling (the quoted 56.5 counts weights only; DeltaNet state read+write is
@@ -518,7 +524,7 @@ each item's full plan and gate is in `LLM2.md`.
 
 | # | item | why it is where it is |
 |---|---|---|
-| **P0** | **The >2560-row stall** (the open question below) | Blocks the product and every long-context claim — a server that hangs on a 3k-token prompt is not a server. Bisect plan in `LLM2.md`. |
+| ~~**P0**~~ | ~~**The >2560-row stall**~~ — **done**, and it was a 2 s ring watchdog rather than anything about this model: the recorder now chunks a submit by *time*. `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192 (**1213.5, 3.10x**), and `-ppl -ctx 4096` completes at 48 layers at **PPL 3.9392**. | The blocker is gone, so everything long-context below is now measurable. [Write-up](research/p0-ring-watchdog.md) |
 | **P1** | **Re-attribute the decode step** | One day with L8d's own timestamps; names the ~12 ms and re-prices everything below. The likely first fix it names is a pre-recorded decode command buffer (IDEAS §4.2, never carried into this vertical). |
 | **P2** | **`ple_proj`, and close L8c** | Half a day, two bank stages in one, and D13's payoff: delete the two-plane fp16-tail machinery now that the exception list is empty. Ends with the complete plan's 145-chunk number. |
 | **P3** | **The shipped-widths decision (D18)** | The knapsack: additivity + per-family corpus deltas make plans composable, and uniform 4.5 is provably not optimal — `full_attn` costs 5.52 pp/GB where `deltanet` costs 0.87. Sim-grade `q5_k` on `full_attn` first (8 minutes, no kernel), screen the winner on a second corpus. |
@@ -2314,6 +2320,111 @@ to; the incumbents stay because no candidate disagrees.
 
 ---
 
+## What P0 established — a two-second ring, and a poll with no timeout
+
+> **P0-1: the hang was never in the submit, and `[syscall]` was never a
+> syscall.** L8c-7 read a `SIGQUIT` dump as placing the stalled goroutine
+> "inside the driver's submit" and suspected residency. Go writes `[syscall]`
+> for *any cgo call*; the thread's own accounting separates the two, and it is
+> not close — **`utime=5645`, `stime=5`**, 56.45 s of user time against 0.05 s
+> of system time, `wchan` 0, state `R`. Sampled for the length of a hang,
+> `stime` never moves and `utime` climbs exactly 100 jiffies a second. **And it
+> is not residency**: `mem_info_gtt_used` is flat at 80.198 GB, VRAM at 7.423
+> and `VmRSS` at 31.56 for the whole stall — nothing allocates, faults or is
+> evicted. Nor is it the staging: 3072 rows hangs in a staging sized for 3072
+> exactly as it did in L8c-7's sized for 4096.
+
+> **P0-2: the backtrace, and the six lines everyone had walked past.**
+> `ptrace_scope` is 1 here, so gdb has to be the *ancestor* — launch under
+> `gdb --args`, `handle SIGUSR1 stop`, signal the inferior. The frame is
+> `clock_gettime` under three of `libvulkan_radeon.so` under
+> **`shim.c:941`**, which is `vkGetQueryPoolResults` with
+> `VK_QUERY_RESULT_WAIT_BIT` — six lines *past* the `vkWaitForFences` that was
+> supposed to bound it, and which had already returned `VK_SUCCESS`. On RADV
+> that flag is an unbounded **userspace** poll of the mapped slot. So the
+> "20-second fence timeout that never fires" was never going to: the wait it
+> would have bounded was over before the spin began.
+
+> **P0-3: the kernel had been saying it all along.** `journalctl -k` carries
+> `ring gfx_0.0.0 timeout, signaled seq=N, emitted seq=N+3` → `Starting
+> gfx_0.0.0 ring reset` → `Ring gfx_0.0.0 reset succeeded` once for every run
+> that stalled, L8c-7's sessions included. **A ring reset force-signals the
+> fences of the jobs it killed**, which is the whole mechanism: the submit
+> returns, the fence returns, and the only trace is the timestamps the killed
+> dispatches never wrote. Swapping the wait flag for a deadline turns the hang
+> into a sentence — `shim: 2 of 1025 timestamp slots never became ready (first
+> 1023, last 1024)`. The first missing slot moves run to run (1023, 980, 977)
+> because a reset kills everything in flight, not one nominated dispatch, and
+> dumping the recorded sequence shows the grids around it are ordinary and
+> scale cleanly with the rows: `moe 10x952` at 2560 is `moe 10x1040` at 3072.
+> **No dispatch is malformed and nothing overflows.**
+
+> **P0-4: the cliff is a duration, and it is 2.0 s.** Rows in steps of 128 at
+> 48 layers, 1024 dispatches a submit, the first command buffer timed by its
+> own GPU timestamps: **2560 rows 1.886 s, runs; 2688 rows 1.964 s, runs; 2816
+> rows 2.033 s, reset.** The control separates time from everything it is
+> confounded with — same model, same rows, same dispatches, same grids, only
+> the split changes: **1273 dispatches in one submit are 787 ms at 512 rows and
+> run, and are reset at 2688 rows**, where two submits of 1024 and 249 had just
+> run the same work; and 3072 rows in five submits of 256 (510-560 ms each)
+> runs at 1143.1 tok/s. The kernel constant behind the 2 s was not identified —
+> `lockup_timeout` is unset on the command line and debugfs and `dmesg` both
+> want root here — so the number is the measured one, and the budget is half
+> of it.
+
+> **P0-5: so chunk by time, not by count.** `maxBatch = 1024` was a bound on
+> the shim's query pool and the doc said so — "not a tuning knob" — and it
+> happened to be a safe amount of work until 2816 rows. A pass's cost is
+> **affine** in the rows, not proportional: fitting 789.5 ms at 512 rows,
+> 2342.4 at 2560, 2434.2 at 2688 and 2687.5 at 3072 over 1273 dispatches gives
+> **322 us a dispatch plus 582 ns a dispatch-row**, reproduces all four to
+> within 1.5%, and puts a 1024-dispatch submit at 2816 rows at **2.008 s** —
+> the row count that is reset. `batchFor(rows)` fills half the cliff with that
+> model. **At one row it is the full 1024, so decode is untouched**; it starts
+> biting at ~1700 rows and is 196 at 8192. The extra fence waits are ~40 us
+> each and invisible at every shape the vertical measures: 2048 rows is 1037.2
+> tok/s against 1036.3 before, 2560 is 1088.8 against 1090.3, **decode is 24.48
+> against L8e's committed 24.66** on the same widths and prompt — 0.7%, inside
+> the 0.5-0.8% this vertical reproduces to — same text, same two command buffers
+> a token, and `-hc` alone still **4.22x**.
+> `TestBatchForIsUnderTheWatchdog` checks the fit
+> against the four measurements *and* the bound against the cliff, because the
+> constants are a fit in milliseconds feeding a `time.Duration` and a factor of
+> a thousand either way still compiles — which it duly did, once.
+
+> **P0-7: `-ppl -ctx 4096` completes, and the selection does not cost
+> accuracy.** The run that used to hang at 32 and 48 layers now finishes at 48:
+> **PPL = 3.9392 +/- 0.02209** over wikitext-2's 297,193 tokens in **72 chunks
+> of 4096**, scoring 2047 each, in 7m24s, on the checkpoint's own widths. Read
+> it against **4.0289** — the same bank, the same corpus, at n_ctx 2048 — and
+> it is the *context* that moved, not a width: **-2.23%** for twice the
+> context, with the QSA selection live throughout (2048 rows is below the
+> 2051 at which it is still the identity, 4096 is well past it). That is idea
+> 7's first long-context gate, and the instrument prints its 2048-context
+> comparison lines beside it, which are **not** a like-for-like delta across
+> two chunkings and should be read as the context effect only.
+
+> **P0-6: the gate, and prefill does not plateau.** `-graph` at 48 layers now
+> returns at every row count tried, each with its own submit size:
+>
+> | rows | ms | tok/s | vs 391.42 | dispatches a submit |
+> |---:|---:|---:|---:|---:|
+> | 2048 | 1974.6 | 1037.2 | 2.65x | 660 |
+> | 2560 | 2351.2 | 1088.8 | 2.78x | 551 |
+> | 3072 | 2703.2 | 1136.4 | 2.90x | 473 |
+> | 3584 | 3092.6 | 1158.9 | 2.96x | 415 |
+> | 4096 | 3487.0 | **1174.6** | **3.00x** | 369 |
+> | 8192 | 6750.6 | **1213.5** | **3.10x** | 196 |
+>
+> The 8192 row is at `-ctx 8192`, where **the QSA selection does real work for
+> the first time in this vertical**: attention is **14.7%** of the pass against
+> 7.2% at 2560, and the MoE falls from 54.4% to 41.8%. llama.cpp's prefill
+> plateaus — 388.60 at 2048, 392.95 at 8192 — and **ours is still climbing at
+> 8192**. Every figure above 2560 rows is a measurement that could not be taken
+> before. [Write-up](research/p0-ring-watchdog.md)
+
+---
+
 ## The three findings that set the direction
 
 **1. `llama.cpp` already implements this architecture, is built with Vulkan on
@@ -3854,6 +3965,25 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -graph -model $M -tokens 128,512,1024,2048 \
         -csv results/l7d_graph.csv                            # the prefill ladder
     go run ./cmd/llm -graph -model $M -tokens 512 -layers 4    # the shape, in 7 GB
+    # P0: the row counts that used to hang, and the two environment variables
+    # that found out why. A submit may hold the gfx ring for ~2 s before
+    # amdgpu resets it, so the recorder chunks a pass by *time* (batchFor);
+    # LLM_MAX_BATCH caps that from above and LLM_BATCH_TIMES prints each
+    # submit's own GPU time, which is what the 2 s was measured against.
+    go run ./cmd/llm -graph -model $M -tokens 2048,2560,3072,3584,4096 \
+        -csv results/p0_graph_4096.csv
+    go run ./cmd/llm -graph -model $M -tokens 8192 -ctx 8192 \
+        -csv results/p0_graph_8192.csv    # 1213.5 tok/s, and the selection biting
+    LLM_BATCH_TIMES=1 go run ./cmd/llm -graph -model $M -tokens 2816  # 2.033 s, reset
+    LLM_MAX_BATCH=256 LLM_BATCH_TIMES=1 go run ./cmd/llm -graph -model $M -tokens 3072
+    LLM_DISPATCH_DUMP=1010:1030 go run ./cmd/llm -graph -model $M -tokens 3072
+                                             # the block and grid of each
+                                             # dispatch, printed *before* the
+                                             # submit, which is the only moment
+                                             # one that kills the ring can
+                                             # still be named
+    go test ./llm/ -run TestBatchForIsUnderTheWatchdog -v   # the fit, and the bound
+    journalctl -k | grep -A4 'ring gfx_0.0.0 timeout'       # what a reset looks like
     LLM_ARENA_UNCACHED=1 go run ./cmd/llm -graph -model $M -tokens 512
                                              # L6b-4's control: the arenas back
                                              # on the write-combined type
@@ -3985,27 +4115,30 @@ below Q8. Bandwidth is the whole story.
 
 ## Open questions
 
-- **Why does the whole-model graph never return above ~2560 rows?** *(P0 —
-  the top of the priority list; the bisect plan is in `LLM2.md`.)* L8c-7
-  went looking for a context at which the QSA selection bites and found a
-  cliff that is not about any bank. In one staging at 48 layers, `-graph
-  -tokens 2048,2560,3072,3584,4096` runs 2048 at **1039.2 tok/s** and 2560 at
-  **1090.9**, and then 3072 never returns — with no `LLM_DENSE_BANK` set, on
-  the default int8 bank, and with `-ppl` not involved, so it is pre-existing.
-  It is not the shape: the **4-layer prefix** runs 2560, 3072 and 4096 in
-  196/228/297 ms, and the attention block *alone* at 4096 tokens in a
-  4096-cell cache, twelve layers with the selection live, is **325 ms**.
-  It is not the selection and it is not `ForwardRows`: `-ppl -ctx 4096`
-  completes at 4 and 12 layers and hangs at 32 and 48. A `SIGQUIT` puts the
-  stalled goroutine in `Graph.flush → recorder.submit`, in **`[syscall]`**,
-  one thread at **100% of a core** with the GPU at **2-3%**, no disk I/O, and
-  the shim's own **20-second** `vkWaitForFences` timeout never firing — which
-  places it before the wait, inside the driver's submit. The untested
-  suspicion is residency: ~82 GB of pinned buffers, the 28.8 GB mmap'd n-gram
-  table and arenas that double with the context add up to about the machine,
-  and every submit re-validates. **This is the one open item that is not about
-  a width, and a long context is what this model is for** — MTP speculation,
-  batching and the HTTP API all sit behind it.
+- ~~**Why does the whole-model graph never return above ~2560 rows?**~~
+  **Answered at P0, and it was none of the things it looked like.** It is not
+  residency, not the arenas, not a width and not any dispatch: it is **GPU time
+  in one submit**, and amdgpu's gfx ring watchdog kills a command buffer that
+  holds the ring past **2.0 s**. `journalctl -k` has carried the evidence all
+  along — `ring gfx_0.0.0 timeout` then `Starting gfx_0.0.0 ring reset` —
+  once per stalled run, L8c-7's own sessions included. The reset
+  **force-signals the fence**, which is why `vkQueueSubmit` returned, why
+  `vkWaitForFences` returned `VK_SUCCESS` and why its 20-second timeout never
+  fired: the wait it would have bounded was already over. What spun was six
+  lines further on, `vkGetQueryPoolResults` with `VK_QUERY_RESULT_WAIT_BIT`,
+  which on RADV is an unbounded **userspace** poll of a timestamp the killed
+  dispatches never wrote. `[syscall]` in the old goroutine dump was Go's label
+  for *a cgo call*, not for a kernel one, and the thread's own accounting says
+  so: `utime=5645` against `stime=5`, with GTT, VRAM and RSS flat for the whole
+  hang. The cliff is a duration and nothing else — 1024 dispatches is 1.886 s
+  at 2560 rows and runs, 1.964 s at 2688 and runs, **2.033 s at 2816 and is
+  reset** — and the control is exact: the same 1273 dispatches in *one* submit
+  are 787 ms at 512 rows and fine, and reset at 2688 rows, where two submits of
+  1024 and 249 had just run the same work. So the recorder chunks by time
+  rather than by count (`batchFor`), and **`-graph` returns at every row count
+  tried**: 4096 at **1174.6 tok/s (3.00x)** and 8192 at **1213.5 (3.10x)**,
+  which is the best prefill in this vertical and says prefill does **not**
+  plateau where llama.cpp's does. [Write-up](research/p0-ring-watchdog.md)
 - ~~**Why does the MoE's up mode read 93 GB/s of bank where its down mode reads
   136 on the same grid?**~~ **Answered at L8d-4, and the premise was wrong in
   a useful way**: neither number was the kernel's ceiling, because both modes

@@ -14,9 +14,11 @@
   reference's own 4.0340), with five of six dense families at 4.5 bits and
   additivity holding to 0.01 pp.
 - **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse.
-- **One correctness cliff**: the whole-model graph never returns above
-  ~2560 rows at 48 layers, which blocks every long-context claim this model
-  exists to make.
+- ~~**One correctness cliff**~~: **closed at P0 (2026-09-18)**. It was
+  amdgpu's gfx ring watchdog killing any submit that holds the ring past
+  **2 s** — not rows, layers, bytes or residency. The recorder chunks by time
+  now, and prefill runs to **8192 rows at 1213.5 tok/s, 3.10x**, still
+  climbing where llama.cpp's plateaus.
 
 Phase 1 is done, phase 2's kernel half is done, and phase 2's width half is
 one trivial family (`ple_proj`) from done. The plan as originally drawn —
@@ -122,30 +124,45 @@ tooling that already exists (L8d's per-dispatch timestamps).
 
 ## The priority list
 
-### P0 — the >2560-row stall  *(blocker; nothing long-context ships past it)*
+### ~~P0 — the >2560-row stall~~  *(**done**, 2026-09-18)*
 
-A server that hangs on a 3,000-token prompt is not a server, and "a long
-context is what this model is for." Known: `Graph.flush → recorder.submit`
-spins in `[syscall]` at 100% of one core, GPU at 2-3%, fence timeout never
-fires; 4- and 12-layer prefixes are fine at 4096, 32 and 48 layers hang;
-pre-existing, bank-independent. The plan, cheapest observation first:
+**It was amdgpu's gfx ring watchdog, and none of the four hypotheses above.**
+A submit that holds the gfx ring past **2.0 s** is killed and the ring reset;
+the reset *force-signals the fence*, so `vkQueueSubmit` and `vkWaitForFences`
+both return success and the spin is six lines later, in
+`vkGetQueryPoolResults(VK_QUERY_RESULT_WAIT_BIT)` — an unbounded **userspace**
+poll on RADV, of a timestamp the killed dispatches never wrote. `[syscall]` in
+the old dump was Go's label for a cgo call: `utime=5645` against `stime=5`.
+Full write-up: [research/p0-ring-watchdog.md](research/p0-ring-watchdog.md).
 
-- [ ] Reproduce and **look at the kernel side**: `/proc/<pid>/stack` of the
-      spinning thread (names the ioctl loop), `dmesg`, and amdgpu's debugfs
-      GTT/VRAM counters during the hang. One session, likely decisive.
-- [ ] **Bisect the cliff's shape.** Rows in steps of 128 at 48 layers;
-      layers at fixed 3072 rows; and resident bytes at fixed shape (the
-      4.5-bit vs int8 bank is a free 1.7 GB lever). If the cliff tracks
-      (layers × rows)-ish totals it is memory pressure and L6a-4 gains its
-      boundary; if it is pinned near 2560 rows regardless, it is a
-      size/offset bug.
-- [ ] Audit the shim's C ABI for 32-bit offsets/sizes on the paths only a
-      big pass exercises (barriers, copies, arena offsets).
-- [ ] Control: one command buffer per *block* at 3072 rows (L7c's shape) —
-      if that completes, the variable is the submit's size, not the bytes.
-- [ ] Gate: `-graph` returns at 4096 and 8192 rows at 48 layers, `-ppl -ctx
-      4096` completes — then run idea 7's long-context gates and put the
-      numbers in `LLM.md`.
+- [x] Reproduce and look at the kernel side. `/proc/<pid>/stack` and debugfs
+      both want root here; `/proc/<tid>/stat` and `journalctl -k` did the job
+      instead, and a native backtrace needed gdb to be the *ancestor*
+      (`ptrace_scope` 1).
+- [x] Bisect the cliff's shape. It tracks **neither** rows nor layers nor
+      bytes: 1024 dispatches is 1.886 s at 2560 rows and runs, 1.964 s at 2688
+      and runs, **2.033 s at 2816 and is reset**. GTT, VRAM and RSS are flat
+      through the whole stall, so this is **not** L6a-4's boundary and
+      "residency is free" comes out unmarked rather than confirmed.
+- [x] The C ABI audit was not needed: the control settles it. The same 1273
+      dispatches in one submit are 787 ms at 512 rows and fine, and are reset
+      at 2688 rows where two submits of the same work had just run.
+- [x] Control: smaller command buffers complete. 3072 rows in five submits of
+      256 runs at 1143.1 tok/s.
+- [x] **Fix**: the recorder chunks by *time* (`batchFor`), from an affine fit
+      of 322 us a dispatch plus 582 ns a dispatch-row, budgeted at half the
+      cliff. Decode is untouched (1 row still batches at 1024). The shim's
+      query reads all go through a deadline that names the missing slots
+      instead of spinning.
+- [x] **Gate**: `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192
+      (**1213.5, 3.10x**, at `-ctx 8192`); `-ppl -ctx 4096` completes at 48
+      layers at **PPL 3.9392 +/- 0.02209** over 72 chunks of 4096, against
+      4.0289 for the same bank at n_ctx 2048 — twice the context is **-2.23%**
+      with the selection live, which is idea 7's first gate. Prefill **does not
+      plateau** where llama.cpp's does.
+- [ ] Carried forward: idea 7's remaining long-context gates — perplexity at
+      ctx 8192, decode tok/s against context, and a needle test through the
+      API — are now possible and are not yet run.
 
 ### P1 — re-attribute the decode step  *(one day; prices everything below)*
 
@@ -224,7 +241,7 @@ together).
 
 ## Why this order
 
-P0 blocks the product and every long-context claim. P1 is a day and
+**P0 is done; P1 is next.** P1 is a day and
 re-prices everything after it — acting on P4 or P5 before P1 risks
 optimising bytes while 12 ms a token sits in something that is not bytes.
 P2 and P3 close the accuracy story while additivity and the instruments are
