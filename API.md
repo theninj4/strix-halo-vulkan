@@ -20,7 +20,7 @@ features, in Go" — is what this is, and all five verticals are now behind it.
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — z-image-turbo, `-image`, any size the arenas hold, streaming previews with `-preview` |
-| `POST /v1/images/edits` | 501 — needs the VAE's *encoder*: weights in the checkpoint, port not written |
+| `POST /v1/images/edits` | **done** — SDEdit over the VAE's encoder, `-image -edits`, multipart or JSON |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -141,7 +141,9 @@ parakeet, and every smaller image runs in the same arenas. Measured on one
 `-previews` adds 1.0 GB of arena to that and no measurable staging time —
 24.9 GB becomes **25.9** — and the two processes render the same non-streamed
 1024x1024 image in 14.64/14.72 s and 14.72/14.80. A preview decoder that is
-not asked for costs residency and nothing else.
+not asked for costs residency and nothing else. `-edits` is the same bargain
+one size up: 0.21 GB of encoder weights and 1.8 GB of arena at a 1024x1024
+ceiling, and the encoder runs only on a request that carries a picture.
 
 **What bounds a request is each side, and not the area** — which is worth
 stating because the plausible guess is the other one. A diffusion model's cost
@@ -215,6 +217,7 @@ Two things would fix it, and both are measurements rather than arguments:
     -image-max-prompt  512                 longest prompt the image text encoder is built for
     -preview           ""                  a madebyollin/taef1 checkpoint; loads the preview decoder
     -previews          false               shorthand for -preview models/taef1
+    -edits             false               load the VAE's encoder, which is what lets /v1/images/edits answer
 
 **-llm and -image do not fit together.** ~84 GB and ~25 GB against 128 GB of
 unified memory the rest of the machine is also in: they are separate
@@ -350,10 +353,10 @@ landscape picture does not have to know the ceiling to ask for one; `size`
 wins when both are set, because that is the field every other server reads.
 `GET /v1/models` carries an **`image`** object on the image model, alongside
 the speech model's voices and for the same reason: `default_size`, `max_size`,
-`size_multiple`, `default_steps`, `previews` and `max_partial_images`, which
-are decided by what this process staged. The last two are how a client finds
-out that `stream: true` will be answered rather than discovering it from a
-501.
+`size_multiple`, `default_steps`, `previews`, `max_partial_images`, `edits` and
+`default_strength`, which are decided by what this process staged. The last
+four are how a client finds out that `stream: true` and an edit will be
+answered rather than discovering it from a 501.
 
 **Streaming an image** is OpenAI's `stream` and `partial_images`, and it needs
 `-preview`. The frames are `image_generation.partial_image` — `b64_json`,
@@ -387,9 +390,52 @@ are not the same object.
 **Which steps a partial comes from is the backend's decision**, not the
 handler's: the step count may not have been named in the request, and how
 finished a picture looks at step k is the scheduler's business. `backend`
-spreads them evenly and never takes the last step, whose denoised estimate
-*is* the final latent — a frame there would be the finished image sent twice,
-once through each decoder.
+spreads them evenly over *the steps that will actually run* and never takes
+the last, whose denoised estimate *is* the final latent — a frame there would
+be the finished image sent twice, once through each decoder. The "actually
+run" is not pedantry: an edit at strength 0.5 runs the last four steps of
+eight, and frames spread over all eight would every one of them fall before it
+began.
+
+### Editing a picture
+
+`POST /v1/images/edits` needs `-image -edits`, and it takes **both encodings**:
+`multipart/form-data`, which is what OpenAI's clients send and the only thing
+their endpoint accepts, and a JSON body whose `image` is base64 (a `data:` URL
+is fine), which is what curl and a test can write by hand. Both fill the same
+struct.
+
+**What it does is SDEdit** (IMAGE.md I7): the picture is encoded to a latent,
+the latent is mixed with noise at an intermediate point on the schedule, and
+only the tail of the schedule runs. **`strength`** is how far back up the
+schedule that point is and is the whole behaviour of the endpoint — near zero
+returns almost the picture that was sent, 1 discards it and is an ordinary
+generation, and the default is 0.8. It is an extension because OpenAI has no
+such field: their edit endpoint is an inpainting model driven by a mask, which
+is a different mechanism.
+
+Everything else is the generation endpoint's, including streaming, because
+underneath an edit *is* a generation with a different starting latent. At
+1024x1024 an edit is **cheaper** than a generation, and by exactly the steps it
+skips:
+
+| strength | steps run | wall |
+|---|---|---|
+| 1.0 | 8 of 8 | 14.66 s — and bit-identical to a generation from the same seed |
+| 0.8 (default) | 6 | **11.29 s** |
+| 0.5 | 4 | 7.94 s |
+| 0.3 | 2 | 4.63 s |
+
+The encode is a flat 430 ms of that, 3.6% at the default strength. A 512x512
+edit over HTTP including the base64 body is **2.51 s**.
+
+**The size an edit with no `size` gets is the input picture's own shape**,
+fitted inside the ceiling and rounded to a multiple of 16 — not the server's
+default, which would silently reframe what was sent — and it is never scaled
+*up*, because four times the tokens cannot paint detail the input never had. A
+picture whose shape does not match the size being rendered is **cover-cropped**
+rather than stretched, since an edit whose point is to keep the composition
+should not begin by distorting it.
 
 What is refused rather than faked:
 
@@ -407,7 +453,14 @@ What is refused rather than faked:
   all answer, because the timings they need exist.
 - **`stream: true` without `-preview`.** It is a 501 naming the flag rather
   than a 400, because the request is well formed and the server was started
-  without the decoder that answers it. With the flag it streams; see below.
+  without the decoder that answers it. With the flag it streams; see above.
+  `/v1/images/edits` without `-edits` is the same answer about the encoder.
+- **A `mask` on an edit.** A 501 that says what it would be rather than a
+  picture that ignored it: a mask is blended into the latent at *every*
+  denoising step, which is a mechanism and not a parameter, where `strength` is
+  one number over the whole picture. More than one input image is a 400 for
+  the same reason — OpenAI's field is a list because their model composites
+  several, and this one does not.
 
 And on the chat endpoints, the same principle with a longer list: **`n > 1`**
 (n completions are n runs of a model sized to saturate the device), **`min_p`
@@ -430,19 +483,12 @@ nothing.
   which is a measurement rather than an argument.
 - **MTP speculative decoding** (LLM.md L9), which is the next thing worth
   1.5-1.8x on the endpoint that has just been wired.
-- **The VAE's encoder**, which is what `/v1/images/edits` needs. The weights
-  ship with the checkpoint and go unread today, and the port is mostly reuse:
-  the encoder is the decoder's mirror and shares conv2d, group norm, SiLU, the
-  residual add and the mid block with attention. What is genuinely new is a
-  **stride-2 convolution** — `vae.Conv2D` has no stride field at all, and the
-  three downsamplers need one with diffusers' asymmetric `(0,1,0,1)` pad — and
-  the **DiagonalGaussian head**, `conv_out` being `[32, 512, 3, 3]` for a mean
-  and a log-variance over 16 channels. Encoding is not the whole endpoint
-  either: an *edit* also needs a strategy (SDEdit — noise the encoded latent
-  to an intermediate sigma and run the tail — is the cheap one and needs no
-  new weights, but whether an 8-NFE turbo distillation edits acceptably that
-  way is unmeasured), and OpenAI's endpoint also takes a **mask**, which is
-  masked blending per step and a different thing again.
+- **Masked edits.** The encoder is ported and `/v1/images/edits` answers, so
+  the mask is the only piece of that endpoint still missing: a blend into the
+  latent at every denoising step, which is a mechanism rather than a
+  parameter. Nothing in `GOALS.md` asks for it — the endpoint exists because
+  OpenAI's surface does — and `strength` already covers editing the whole
+  picture.
 - **The image adapter holds the device lock for the whole run**, where the
   language model's takes it per forward pass. The same fix applies — between
   two denoising steps there is no work in flight — but it would mean the

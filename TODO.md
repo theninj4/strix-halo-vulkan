@@ -56,8 +56,25 @@ bidirectional LSTMs (73 ms to 6) and T6d the chain between them (17 ms to 8),
 taking an utterance to **74.2x real time**. **T6 is finished: the phoneme side
 is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
 is the vocoder again, whose host-side excitation is now the largest single
-stage in the model at 14 ms. **`PIPELINE.md`** is the z-image-turbo slice, **parked** at 14.26 s an
-image with its resume points stated at the top. **`EMBEDDING.md`** is the
+stage in the model at 14 ms. **`IMAGE.md`** is the z-image-turbo vertical and is **finished as a
+capability**: I1 made the image size a ceiling-and-default rather than a
+fixture and wired `/v1/images/generations`, I2 ported `madebyollin/taef1` and
+turned on streaming previews (87 ms a frame against the full VAE's 876, a first
+picture at 3.6 s instead of fifteen), and **I7 ported the VAE's encoder and
+wired `/v1/images/edits`** over SDEdit — a 1024x1024 edit at the default
+strength is **11.3 s** against a generation's 14.3 and reproduces diffusers to
+1.1e-2, so `API.md` now carries no refusal a flag does not fix. I7's finding is
+worth carrying out of it: **stage 8's "the activations fit fp16" precondition
+is necessary and not sufficient.** The encoder passes it with *more* headroom
+than the decoder (284 against 497, 231x inside fp16) and is still 0.58 out at
+the latent by the decoder's own metric, because it contracts and amplifies a
+perturbation at `conv_in` by ~4e5 — which diffusers' own float32 does too. The
+fast path stayed the default because the *right* metric for a latent is
+relative L2 (2.2e-2, and 4.2e-4 of a range once decoded), and the cheap way to
+ask that question in future is to run the reference in float64 and diff its own
+float32 against it. `research/i7-vae-encoder-and-edits.md` has it;
+`PIPELINE.md` remains the record of how the original slice was built, still
+parked at 14.26 s an image with its resume points stated at the top. **`EMBEDDING.md`** is the
 qwen3-embedding-0.6b vertical, opened and all but finished on 2026-09-18:
 E0-E6 and E8 are closed, a text is **11.5 ms** on the device against 170 ms on
 the host, the model card's own similarity matrix is reproduced to 1.3e-4

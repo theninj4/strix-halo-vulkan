@@ -111,7 +111,7 @@ func main() {
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
 	maxAudio := flag.Float64("max-audio", 60, "longest clip the transcription arenas are sized for, in seconds")
 
-	imgOn := flag.Bool("image", false, "load Z-Image-Turbo and serve /v1/images/generations")
+	imgOn := flag.Bool("image", false, "load Z-Image-Turbo and serve /v1/images/generations and /v1/images/edits")
 	imgModel := flag.String("image-model", "models/Z-Image-Turbo", "z-image checkpoint root")
 	imgSize := flag.String("image-size", "1024x1024",
 		"largest image the arenas are built for, and the size a request that names none gets; both sides a multiple of 16")
@@ -121,6 +121,9 @@ func main() {
 		"a madebyollin/taef1 checkpoint; loads the preview decoder, which is what lets /v1/images/generations stream")
 	imgPreviewOn := flag.Bool("previews", false,
 		"shorthand for -preview models/taef1")
+	imgEdits := flag.Bool("edits", false,
+		"load the VAE's encoder, which is what lets /v1/images/edits answer; it costs 0.2 GB of weights "+
+			"and ~1.8 GB of arena at a 1024x1024 ceiling")
 	flag.Parse()
 
 	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
@@ -219,6 +222,7 @@ func main() {
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
 			Steps: *imgSteps, MaxPrompt: *imgPrompt, Preview: preview,
+			Edits: *imgEdits,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -226,12 +230,17 @@ func main() {
 		defer b.Close()
 		srv.Image = b
 		enc, tr, vaeW, act := b.Residency()
+		geo := b.Geometry()
 		previews := "no previews (-preview)"
-		if b.Geometry().Previews {
+		if geo.Previews {
 			previews = "previews from " + preview
 		}
-		log.Printf("image: %s, to %dx%d, %d steps, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
-			*imgModel, imgW, imgH, *imgSteps, previews,
+		edits := "no edits (-edits)"
+		if geo.Edits {
+			edits = fmt.Sprintf("edits at strength %g", geo.DefaultStrength)
+		}
+		log.Printf("image: %s, to %dx%d, %d steps, %s, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
+			*imgModel, imgW, imgH, *imgSteps, previews, edits,
 			float64(enc+tr+vaeW+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9,
 			time.Since(start).Round(time.Millisecond))
 	}
@@ -312,7 +321,8 @@ func listen(srv *api.Server, addr string) error {
 		log.Printf("listening on http://%s", addr)
 		for _, route := range []string{
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
-			"/v1/audio/speech", "/v1/audio/transcriptions", "/v1/images/generations",
+			"/v1/audio/speech", "/v1/audio/transcriptions",
+			"/v1/images/generations", "/v1/images/edits",
 		} {
 			log.Printf("  %s", route)
 		}

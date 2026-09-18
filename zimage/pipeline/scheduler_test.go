@@ -16,6 +16,7 @@ import (
 const (
 	refDir       = "../../reference/out/zimage"
 	runDir       = "../../reference/out/zimagerun"
+	editDir      = "../../reference/out/zimageedit"
 	schedulerDir = "../../models/Z-Image-Turbo/scheduler"
 )
 
@@ -24,9 +25,14 @@ type manifest struct {
 	Steps int `json:"steps"`
 	// Size and Prompt are dump_zimage_run.py's; dump_zimage.py carries
 	// neither, which is how a test says which dump it wants.
-	Size    int    `json:"size"`
-	Prompt  string `json:"prompt"`
-	Tensors map[string]struct {
+	Size   int    `json:"size"`
+	Prompt string `json:"prompt"`
+	// Strength, Start and Sigma are dump_zimage_edit.py's, and are what say
+	// which part of the schedule its dump covers.
+	Strength float64 `json:"strength"`
+	Start    int     `json:"start"`
+	Sigma    float64 `json:"sigma"`
+	Tensors  map[string]struct {
 		Shape []int `json:"shape"`
 		Count int   `json:"count"`
 	} `json:"tensors"`

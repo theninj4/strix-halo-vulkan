@@ -45,6 +45,15 @@ type ImageOptions struct {
 	// It is a flag rather than always-on because it is residency: 4.9 MB of
 	// weights, but 1.0 GB of activation arena at a 1024x1024 ceiling.
 	Preview string
+	// Edits holds the VAE's *encoder* resident, which is what makes
+	// /v1/images/edits answerable; without it that endpoint is a 501 naming
+	// this flag.
+	//
+	// Residency again, and a larger bill than the preview decoder's: 0.21 GB
+	// of weights and, at a 1024x1024 ceiling, 1.5 GB of fp32 activation arena
+	// and 0.26 GB of fp16. About 7% on top of what the pipeline already
+	// holds, for a capability a server that only generates never uses.
+	Edits bool
 	// ID is the model id this backend answers to in /v1/models.
 	ID string
 }
@@ -59,6 +68,11 @@ const (
 	// against a 14.5 s image, so three of them is 1.8% and a frame per step
 	// would be 4.8%. It is a policy, not a limit of the decoder.
 	maxPartialImages = 3
+	// vaeScale is how much larger the image is than the latent grid, which is
+	// how this adapter reads a resolved size back out of pipeline.LatentFor.
+	// zimage/pipeline states it too, unexported, and the two agreeing is
+	// checked by the pipeline itself refusing a mis-sized init image.
+	vaeScale = 8
 )
 
 // Image is the z-image adapter: an api.ImageBackend over the pipeline
@@ -120,6 +134,7 @@ func NewImage(opt ImageOptions) (*Image, error) {
 		p, err := pipeline.New(dev, pipeline.Options{
 			Model: opt.Model, Width: opt.Width, Height: opt.Height,
 			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt, Preview: opt.Preview,
+			Encoder: opt.Edits,
 		})
 		if err != nil {
 			return err
@@ -154,6 +169,11 @@ func (b *Image) Geometry() api.ImageGeometry {
 	// `previews: false` would reasonably conclude it could ask for three.
 	if geo.Previews {
 		geo.MaxPartials = maxPartialImages
+	}
+	// Same argument as MaxPartials: a client reading a default strength
+	// beside `edits: false` would reasonably conclude it could send one.
+	if geo.Edits = b.pipe.HasEncoder(); geo.Edits {
+		geo.DefaultStrength = pipeline.DefaultStrength
 	}
 	return geo
 }
@@ -218,20 +238,52 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 	// costs a comparison rather than a text encoder run. The handler has
 	// already checked the same thing against Geometry(); this is the check
 	// that is true by construction rather than by agreement.
-	if _, _, _, err := b.pipe.LatentFor(req.Width, req.Height); err != nil {
+	// The latent grid is also how the resolved size is read back: a request
+	// that named one side, or neither, has it filled in by the pipeline, and
+	// an edit's picture has to be fitted to *that* rather than to what the
+	// request said. Deriving it here rather than repeating geomFor's rules is
+	// what stops the two from disagreeing.
+	_, latentH, latentW, err := b.pipe.LatentFor(req.Width, req.Height)
+	if err != nil {
 		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+	}
+	width, height := latentW*vaeScale, latentH*vaeScale
+
+	// The init image, if this is an edit. Fitting it to the geometry is this
+	// adapter's, because a resample is arithmetic on pixels; which geometry
+	// it is fitted *to* was the handler's.
+	var init *vae.Tensor
+	first := 0
+	if req.Init != nil {
+		if !b.pipe.HasEncoder() {
+			return nil, fmt.Errorf("this server holds no VAE encoder, so it cannot edit: %w", api.ErrUnsupported)
+		}
+		if init, err = fitImage(req.Init, width, height); err != nil {
+			return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+		}
+		strength := req.Strength
+		if strength == 0 {
+			strength = pipeline.DefaultStrength
+		}
+		first = pipeline.StartStep(steps, strength)
+	} else if req.Strength != 0 {
+		return nil, fmt.Errorf("strength %g with no image to edit: %w", req.Strength, api.ErrUnsupported)
 	}
 
 	// Which steps a partial comes from. The handler said how many it wants;
 	// this is the half that needs the step count, and it is why the decision
 	// is here (api.ImageRequest.PartialImages says so).
+	//
+	// An edit runs only the tail, so the frames are spread over *that* --
+	// spreading them over the whole schedule would put every one of them
+	// before the run started and send none at all.
 	var (
 		partialAt map[int]int
 		partialN  int
 		perr      error
 	)
 	if req.Partial != nil && req.PartialImages > 0 && b.pipe.HasPreview() {
-		partialAt = partialSteps(steps, min(req.PartialImages, maxPartialImages))
+		partialAt = partialSteps(first, steps, min(req.PartialImages, maxPartialImages))
 		partialN = len(partialAt)
 	}
 	progress := func(st pipeline.Step) {
@@ -255,11 +307,12 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 
 	var img *vae.Tensor
 	var tm *pipeline.Timings
-	err := b.opt.Device.Do(func(*vk.Device) error {
+	err = b.opt.Device.Do(func(*vk.Device) error {
 		var err error
 		img, tm, err = b.pipe.Run(pipeline.Request{
 			Prompt: req.Prompt, Width: req.Width, Height: req.Height,
 			Steps: steps, Seed: seed, Progress: progress,
+			Init: init, Strength: req.Strength,
 		})
 		return err
 	})
@@ -309,8 +362,13 @@ func toRGBA(t *vae.Tensor) image.Image {
 }
 
 // partialSteps picks which denoising steps a partial image comes from: n
-// frames spread evenly over the schedule, as a map from step index to the
-// frame's own index.
+// frames spread evenly over the steps that will run, as a map from step index
+// to the frame's own index.
+//
+// `first` is where the run starts -- 0 for a generation and the SDEdit start
+// for an edit -- and it is a parameter rather than an assumption because an
+// edit at strength 0.5 runs the last four steps of eight, and frames spread
+// over all eight would all fall before it began.
 //
 // The last step is excluded, and that is the only judgement in here. Its
 // denoised estimate *is* the final latent -- the terminal sigma is zero -- so
@@ -318,17 +376,18 @@ func toRGBA(t *vae.Tensor) image.Image {
 // preview decoder and once through the real one, and the two are not quite
 // the same picture. Everything else follows: with fewer steps than frames
 // asked for there are simply fewer frames, and with one step there are none.
-func partialSteps(steps, n int) map[int]int {
-	if steps < 2 || n <= 0 {
+func partialSteps(first, steps, n int) map[int]int {
+	run := steps - first
+	if run < 2 || n <= 0 {
 		return nil
 	}
 	out := make(map[int]int, n)
 	last := steps - 2 // the last step a partial may come from
 	idx := 0
 	for j := 1; j <= n; j++ {
-		k := j*steps/(n+1) - 1
-		if k < 0 {
-			k = 0
+		k := first + j*run/(n+1) - 1
+		if k < first {
+			k = first
 		}
 		if k > last {
 			k = last

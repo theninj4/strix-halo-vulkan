@@ -1,0 +1,33 @@
+#version 450
+// Keep the pixel at (2h+1, 2w+1) of every 2x2 block, halving H and W.
+//
+// This is the second half of the encoder's stride-2 convolution. The filter
+// runs at *stride 1* on the matrix cores -- the same vae_conv_wmma.comp build
+// every other convolution in the graph uses -- and this throws three pixels in
+// four away, because a stride-2 3x3 with diffusers' (0, 1, 0, 1) pad computes
+// exactly what the stride-1 pad-1 form computes at the odd pixels. See
+// zimage/vae's TestStrideTwoIsStrideOneSubsampled, which asserts the identity
+// on the real filter, and builder.downsample for what the discarded three
+// quarters cost.
+//
+// One invocation per *output* element, so the writes are contiguous and the
+// reads are the strided ones. It is the mirror of vae_upsample2x.comp.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint outW = pc.W >> 1;
+    uint outH = pc.H >> 1;
+    uint outHW = outW * outH;
+    if (idx >= pc.C * outHW) {
+        return;
+    }
+    uint ow = idx % outW;
+    uint oh = (idx / outW) % outH;
+    uint c  = idx / outHW;
+    uint src = pc.inOff + c * pc.H * pc.W + (oh * 2u + 1u) * pc.W + (ow * 2u + 1u);
+    act[pc.outOff + idx] = act[src];
+}

@@ -51,6 +51,18 @@ type Options struct {
 	// buys is an 87 ms preview against the 876 ms the full decoder takes
 	// for the same picture.
 	Preview string
+	// Encoder holds the VAE's *encoder* resident, which is what an edit needs:
+	// an edit starts from a picture and bringing a picture into the
+	// transformer's latent space is the encode. Leaving it off makes
+	// Request.Init an error that says so.
+	//
+	// It is a flag rather than always-on because it is residency, and at the
+	// ceiling it is not small: 137 MB of fp32 weights and 69 MB of fp16
+	// copies, but 1.5 GB of fp32 activation arena and 257 MB of fp16 at
+	// 1024x1024 -- about 7% on top of the ~25 GB the pipeline already holds.
+	// The weights themselves have always been in the checkpoint; it is the
+	// arena that costs.
+	Encoder bool
 	// UnfusedLayout keeps the two pure-layout dispatches stage 10 removed --
 	// `pack v` and `narrow ctx` -- as their own passes. Same reason as
 	// CPUHead: the slow path is what the fast one is measured against, and
@@ -123,6 +135,9 @@ type Pipeline struct {
 	gpuHead *dit.GPUHead
 
 	dec *vae.GPUDecoder
+	// vaeEnc is the *image* encoder, nil unless Options.Encoder asked for it;
+	// enc above is the text one. It is what turns Request.Init into a latent.
+	vaeEnc *vae.GPUEncoder
 	// tiny is the preview decoder, nil unless Options.Preview named one.
 	tiny *vae.GPUTiny
 	// x0 is the denoised-estimate buffer a progress callback is handed. It is
@@ -171,7 +186,9 @@ type geom struct {
 // zero, which is what makes `Generate` a one-liner over this. Latents, when
 // given, replaces the seeded noise -- and is written through, because the
 // denoising loop integrates in place and the caller usually wants the final
-// latent as well as the picture.
+// latent as well as the picture. On an edit it is still the noise: what the
+// run starts from is that noise mixed into the encoded picture at the
+// schedule's sigma, so the same field means the same thing either way.
 type Request struct {
 	Prompt        string
 	Width, Height int
@@ -179,6 +196,23 @@ type Request struct {
 	Seed          int64
 	Latents       []float32
 	Progress      func(Step)
+
+	// Init is the image an edit starts from: [3, H, W] in [-1, 1], the same
+	// layout and range the decoder produces, and exactly the size the request
+	// resolves to -- resizing is the caller's, because how a picture is fitted
+	// to a geometry is a policy question and not a model one.
+	//
+	// **Setting it makes this an SDEdit**: the image is encoded to a latent,
+	// the latent is noised to an intermediate sigma, and only the tail of the
+	// schedule runs. Strength is how far back up the schedule that is. It
+	// needs Options.Encoder; without it this is an error rather than a
+	// silently ignored field.
+	Init *vae.Tensor
+	// Strength is how much of the schedule an edit runs, from just above 0
+	// (stay near the input) to 1 (ignore it entirely). Zero takes
+	// DefaultStrength. It is meaningless without Init and is refused there,
+	// because a request that set it has said something the run would not do.
+	Strength float64
 }
 
 // Timings is what one image cost, by stage.
@@ -195,6 +229,16 @@ type Timings struct {
 	// the request's size or the pipeline's default and not necessarily what
 	// the arenas were built for.
 	Width, Height int
+	// VAEEncode is the image encoder, and is zero unless this was an edit.
+	// Encode above is the text encoder, which every run pays.
+	VAEEncode time.Duration
+	// First is the schedule index the run started at: 0 for a generation and
+	// StartStep(steps, strength) for an edit. len(Steps) is how many actually
+	// ran, so the pair says which part of the schedule this image came from.
+	First int
+	// Sigma is the noise level an edit started from, i.e. the schedule's
+	// sigma at First. Zero for a generation, where it is 1 by construction.
+	Sigma float64
 }
 
 // controls are the deliberate breakages the negative control switches on.
@@ -369,6 +413,21 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		return nil, fmt.Errorf("pipeline: vae: %w", err)
 	}
 
+	// The image encoder, which shares the checkpoint file the decoder was
+	// just read from -- 106 encoder tensors beside the decoder's 138 -- and
+	// is loaded only when someone is going to run it.
+	if opt.Encoder {
+		encCPU, err := vae.LoadEncoder(opt.Model+"/vae", vaeCfg)
+		if err != nil {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: vae encoder: %w", err)
+		}
+		if p.vaeEnc, err = vae.NewGPUEncoder(dev, encCPU, p.max.height, p.max.width); err != nil {
+			p.Destroy()
+			return nil, fmt.Errorf("pipeline: vae encoder: %w", err)
+		}
+	}
+
 	// The preview decoder, last because it is the only optional stage and
 	// because its arenas are sized from the same ceiling as the big one's.
 	if opt.Preview != "" {
@@ -403,6 +462,10 @@ func (p *Pipeline) Destroy() {
 	if p.tiny != nil {
 		p.tiny.Destroy()
 		p.tiny = nil
+	}
+	if p.vaeEnc != nil {
+		p.vaeEnc.Destroy()
+		p.vaeEnc = nil
 	}
 	if p.dec != nil {
 		p.dec.Destroy()
@@ -615,6 +678,56 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 	tm := &Timings{Width: g.width, Height: g.height}
 	whole := time.Now()
 
+	// --- the edit, if this is one ---------------------------------------
+	//
+	// SDEdit: encode the picture, noise the latent to an intermediate sigma
+	// and run only the tail of the schedule. Everything after this point is
+	// the ordinary loop with a different starting index, which is the whole
+	// reason an edit is this function and not a second one.
+	first := 0
+	if req.Init != nil {
+		strength := req.Strength
+		if strength == 0 {
+			strength = DefaultStrength
+		}
+		if strength < 0 || strength > 1 {
+			return nil, nil, fmt.Errorf("pipeline: strength %g, outside (0, 1]", strength)
+		}
+		t0 := time.Now()
+		x0, err := p.encodeInit(req.Init, g)
+		if err != nil {
+			return nil, nil, err
+		}
+		tm.VAEEncode = time.Since(t0)
+
+		// The forward process of a flow-matching schedule, which is a
+		// straight line rather than a variance-preserving one:
+		// x_sigma = (1 - sigma) x0 + sigma eps. That is diffusers'
+		// FlowMatchEulerDiscreteScheduler.scale_noise, and it is the exact
+		// inverse of the relation Step.X0 already uses in the other
+		// direction -- x0 = x_t - sigma v -- so the two cannot drift apart
+		// without one of them failing.
+		//
+		// `latents` holds eps -- the seeded noise drawn above, or the one
+		// Request.Latents supplied, which means the same thing in both
+		// directions: for a generation the run *starts* from pure noise, and
+		// for an edit it is the noise mixed into the encoded picture. So an
+		// edit and a generation from the same seed share their eps, and at
+		// strength 1 the schedule's first sigma is exactly 1, the input's
+		// contribution is zero, and the edit *is* that generation --
+		// TestStrengthOneIsAGeneration asserts it, bit for bit.
+		first = StartStep(sched.Steps(), strength)
+		sigma := float32(sched.Sigmas[first])
+		for i := range latents {
+			latents[i] = (1-sigma)*x0[i] + sigma*latents[i]
+		}
+		tm.Sigma = sched.Sigmas[first]
+	} else if req.Strength != 0 {
+		return nil, nil, fmt.Errorf("pipeline: strength %g without an Init image; there is nothing to edit",
+			req.Strength)
+	}
+	tm.First = first
+
 	// --- the caption, once per image ---------------------------------
 	t0 := time.Now()
 	cap, tokens, err := p.Encode(req.Prompt)
@@ -665,7 +778,13 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 	}
 
 	// --- the denoising loop -------------------------------------------
-	for step := 0; step < sched.Steps(); step++ {
+	//
+	// `first` is 0 for a generation and StartStep(...) for an edit; the body
+	// does not know which it is. Step.Index is the *schedule's* index rather
+	// than a count of what has run, because it is what the sigmas and the
+	// timestep are looked up by, and a caller deciding where to put a preview
+	// frame needs the same numbering.
+	for step := first; step < sched.Steps(); step++ {
 		t0 = time.Now()
 		d := Step{Index: step, Latents: latents,
 			Sigma: sched.Sigmas[step], NextSig: sched.Sigmas[step+1]}
@@ -789,13 +908,9 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 
 	// --- the decode ----------------------------------------------------
 	t0 = time.Now()
-	latent := vae.NewTensor(1, p.cfg.InChan, g.latentH, g.latentW)
-	for i, v := range latents {
-		latent.Data[i] = float32(float64(v)/p.scale + p.shift)
-	}
-	img, err := p.dec.Apply(latent)
+	img, err := p.DecodeLatent(latents, g.latentH, g.latentW)
 	if err != nil {
-		return nil, nil, fmt.Errorf("pipeline: vae: %w", err)
+		return nil, nil, err
 	}
 	tm.Decode = time.Since(t0)
 	tm.Total = time.Since(whole)
@@ -810,6 +925,11 @@ func (p *Pipeline) Run(req Request) (*vae.Tensor, *Timings, error) {
 func (p *Pipeline) Residency() (encoder, transformer, vae, activations int) {
 	vaeW32, vaeW16 := p.dec.WeightBytes()
 	act := p.stack.ActivationBytes() + p.dec.ActivationBytes() + p.dec.F16ActivationBytes()
+	if p.vaeEnc != nil {
+		ew32, ew16 := p.vaeEnc.WeightBytes()
+		vaeW32, vaeW16 = vaeW32+ew32, vaeW16+ew16
+		act += p.vaeEnc.ActivationBytes() + p.vaeEnc.F16ActivationBytes()
+	}
 	if p.tiny != nil {
 		tw32, tw16 := p.tiny.WeightBytes()
 		vaeW32, vaeW16 = vaeW32+tw32, vaeW16+tw16
@@ -819,6 +939,110 @@ func (p *Pipeline) Residency() (encoder, transformer, vae, activations int) {
 		p.stack.WeightBytes(),
 		vaeW32 + vaeW16,
 		act
+}
+
+// HasEncoder reports whether Request.Init will be accepted, i.e. whether
+// Options.Encoder held the VAE's encoder resident. A server answering an edit
+// asks this rather than starting a run and finding out.
+func (p *Pipeline) HasEncoder() bool { return p.vaeEnc != nil }
+
+// encodeInit is EncodeImage with the request's geometry checked against the
+// picture first. The check is here rather than at the door because the size a
+// request resolves to is not always the size it named -- "auto", an aspect
+// ratio and a zero side all resolve in geomFor -- so the only place the two
+// can be compared is after that.
+//
+// Resizing is deliberately not done: fitting a picture to a geometry is
+// cropping or letterboxing or stretching, all three are defensible, and a
+// pipeline that picked one silently would be making a policy decision on the
+// caller's behalf in the one place they cannot see it.
+func (p *Pipeline) encodeInit(img *vae.Tensor, g geom) ([]float32, error) {
+	if p.vaeEnc == nil {
+		return nil, fmt.Errorf("pipeline: an edit needs the VAE's encoder, which this pipeline was built without " +
+			"(Options.Encoder)")
+	}
+	if img.N != 1 || img.C != 3 {
+		return nil, fmt.Errorf("pipeline: the init image is %s, want [1 3 H W]", img)
+	}
+	if img.H != g.height || img.W != g.width {
+		return nil, fmt.Errorf("pipeline: the init image is %dx%d and this run renders %dx%d; "+
+			"resize it first, because how a picture is fitted to a size is the caller's decision",
+			img.W, img.H, g.width, g.height)
+	}
+	return p.EncodeImage(img)
+}
+
+// DecodeLatent is EncodeImage's inverse: `z/scale + shift` and then the VAE,
+// producing [3, H, W] in [-1, 1].
+//
+// It is exported and it is the same call the end of Run makes, which is the
+// point: a round trip through EncodeImage and this is the cheapest thing that
+// holds the two scaling conventions against each other, and getting them out
+// of step produces a washed-out picture rather than an error.
+func (p *Pipeline) DecodeLatent(latents []float32, latentH, latentW int) (*vae.Tensor, error) {
+	want := p.cfg.InChan * latentH * latentW
+	if len(latents) != want {
+		return nil, fmt.Errorf("pipeline: %d latents for a %dx%d grid, want %d", len(latents), latentH, latentW, want)
+	}
+	latent := vae.NewTensor(1, p.cfg.InChan, latentH, latentW)
+	copy(latent.Data, latents)
+	vae.Config{ScalingFactor: p.scale, ShiftFactor: p.shift}.FromDiffusion(latent.Data)
+	img, err := p.dec.Apply(latent)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: vae: %w", err)
+	}
+	return img, nil
+}
+
+// EncodeImage brings a picture into the transformer's latent space: the VAE's
+// encoder, then `(z - shift) * scale`.
+//
+// The image is [3, H, W] in [-1, 1], which is what the decoder produces, so
+// EncodeImage and the decode at the end of Run are inverses and a round trip
+// through the pair is the cheapest thing that checks them against each other.
+func (p *Pipeline) EncodeImage(img *vae.Tensor) ([]float32, error) {
+	if p.vaeEnc == nil {
+		return nil, fmt.Errorf("pipeline: no image encoder; Options.Encoder was not set")
+	}
+	z, err := p.vaeEnc.Encode(img)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: vae encoder: %w", err)
+	}
+	cfg := vae.Config{ScalingFactor: p.scale, ShiftFactor: p.shift}
+	cfg.ToDiffusion(z.Data)
+	return z.Data, nil
+}
+
+// DefaultStrength is what an edit that names no strength gets. It is
+// diffusers' img2img default, and on this eight-step schedule it means
+// starting at index 2 of 8 with 90% noise -- six steps, and a picture that
+// keeps the input's composition while repainting its content.
+const DefaultStrength = 0.8
+
+// StartStep is the schedule index an edit of a given strength begins at, and
+// it is diffusers' arithmetic: keep the last `int(steps*strength)` steps.
+//
+// The one thing added to it is the floor. `int(8 * 0.1)` is zero, which would
+// start at the terminal sigma and run *no* steps -- a request that asked for a
+// small edit would get its own picture back through a round trip and no
+// denoising at all. An edit always runs at least one step, so a strength that
+// rounds to nothing gets the smallest one the schedule has rather than none.
+//
+// It is exported because the caller that decides which steps to send preview
+// frames from needs the same number, and re-deriving it there is how the two
+// drift apart.
+func StartStep(steps int, strength float64) int {
+	if steps < 1 {
+		return 0
+	}
+	keep := int(float64(steps) * strength)
+	if keep > steps {
+		keep = steps
+	}
+	if keep < 1 {
+		keep = 1
+	}
+	return steps - keep
 }
 
 // HasPreview reports whether Step.Preview will be set, i.e. whether

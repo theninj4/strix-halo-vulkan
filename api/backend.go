@@ -177,6 +177,26 @@ type ImageRequest struct {
 	// encoding and the writing. That is the same bargain the non-streaming
 	// path already makes, and it is written down in API.md rather than fixed.
 	Partial func(ImagePartial) error
+
+	// Init is the picture an edit starts from, and it is what makes this
+	// request an edit rather than a generation. It is an image.Image at
+	// whatever size the client sent: fitting it to Width and Height is the
+	// *backend's*, because a resample is arithmetic on pixels and the HTTP
+	// layer has no business doing arithmetic on pixels.
+	//
+	// **An edit is the same call as a generation and not a second one**,
+	// which is the whole reason it is a field here rather than a method on
+	// the interface. An SDEdit is a generation whose trajectory starts from
+	// an encoded picture at an intermediate noise level instead of from pure
+	// noise -- so partial frames, seeds, sizes and step counts all mean
+	// exactly what they already meant, and the streaming path did not have to
+	// be written twice.
+	Init image.Image
+	// Strength is how much of the schedule an edit runs, in (0, 1]: near zero
+	// keeps the input, 1 ignores it entirely and is an ordinary generation.
+	// Zero takes the backend's default. It is meaningless without Init and a
+	// backend refuses it there rather than ignoring it.
+	Strength float64
 }
 
 // ImagePartial is one in-progress frame of an image being generated.
@@ -237,6 +257,15 @@ type ImageGeometry struct {
 	// policy rather than a limit of the model: each frame is a decode, and
 	// what makes three reasonable is that it is 5% of the image at 1024x1024.
 	MaxPartials int
+	// Edits reports whether ImageRequest.Init will be accepted, i.e. whether
+	// the VAE's *encoder* is resident. A client reads it to know whether
+	// /v1/images/edits will be answered or refused, for the same reason it
+	// reads Previews.
+	Edits bool
+	// DefaultStrength is what an edit that names no strength gets, so a
+	// client can show the knob's position without sending a request first.
+	// Zero when Edits is false.
+	DefaultStrength float64
 }
 
 // MarshalJSON writes the geometry the way a client reads it: the two pairs
@@ -244,12 +273,14 @@ type ImageGeometry struct {
 // request's `size` without being reassembled first.
 func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		DefaultSize  string `json:"default_size"`
-		MaxSize      string `json:"max_size"`
-		SizeMultiple int    `json:"size_multiple"`
-		DefaultSteps int    `json:"default_steps"`
-		Previews     bool   `json:"previews"`
-		MaxPartials  int    `json:"max_partial_images,omitempty"`
+		DefaultSize  string  `json:"default_size"`
+		MaxSize      string  `json:"max_size"`
+		SizeMultiple int     `json:"size_multiple"`
+		DefaultSteps int     `json:"default_steps"`
+		Previews     bool    `json:"previews"`
+		MaxPartials  int     `json:"max_partial_images,omitempty"`
+		Edits        bool    `json:"edits"`
+		Strength     float64 `json:"default_strength,omitempty"`
 	}{
 		DefaultSize:  formatSize(g.Width, g.Height),
 		MaxSize:      formatSize(g.MaxWidth, g.MaxHeight),
@@ -257,6 +288,8 @@ func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 		DefaultSteps: g.Steps,
 		Previews:     g.Previews,
 		MaxPartials:  g.MaxPartials,
+		Edits:        g.Edits,
+		Strength:     g.DefaultStrength,
 	})
 }
 

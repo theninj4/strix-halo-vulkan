@@ -104,6 +104,9 @@ func deviation(got, want *Tensor) (maxAbs, rms, rel float64, worst int) {
 const relTol = 2e-4
 
 // compare asserts a computed tensor matches the reference.
+//
+// compareTol in gpu_test.go is the same check at a bound the caller names,
+// which the narrowing paths and the encoder both need.
 func compare(t *testing.T, name string, got, want *Tensor) {
 	t.Helper()
 	if got.N != want.N || got.C != want.C || got.H != want.H || got.W != want.W {

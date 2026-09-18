@@ -12,6 +12,15 @@
 // -latents takes an initial latent from a file instead of the seeded RNG,
 // which is what makes an end-to-end comparison against diffusers possible:
 // the two generators do not agree and nothing else in the pipeline is random.
+//
+// -init turns it into an *edit* (IMAGE.md I7): the PNG it names is encoded,
+// noised to the sigma -strength picks out of the schedule, and only the tail
+// of the schedule runs. The picture has to be exactly the size being
+// rendered, because fitting one to the other is a policy question this
+// command has no business deciding; -width and -height default to the input's
+// own size when -init is given, so the ordinary case needs neither.
+//
+//	go run ./cmd/zimage -init fox.png -strength 0.6 -prompt "the same fox, at night"
 package main
 
 import (
@@ -49,10 +58,28 @@ func main() {
 	latentFile := flag.String("latents", "", "read the initial latent from this file instead of the RNG")
 	dumpLatent := flag.String("dumplatent", "", "write the denoised latent here, before the VAE")
 	reps := flag.Int("reps", 1, "generate this many times, reporting each")
+	initPNG := flag.String("init", "", "a PNG to edit rather than generate from noise; see -strength")
+	strength := flag.Float64("strength", 0, "with -init: how much of the schedule to run, (0, 1]; 0 takes the pipeline's default")
 	preview := flag.String("preview", "",
 		"a madebyollin/taef1 checkpoint; writes <out>.preview.<step>.png after every step and times the decode")
 	flag.Parse()
 
+	// An edit's geometry comes from the picture unless it was overridden,
+	// which is the only sensible default: the encoder has to be handed the
+	// image at the size being rendered, so anything else would be a resize
+	// this command refuses to choose.
+	var initImg *vae.Tensor
+	if *initPNG != "" {
+		var err error
+		initImg, err = readPNG(*initPNG)
+		must(err)
+		if !flagSet("width") {
+			*width = initImg.W
+		}
+		if !flagSet("height") {
+			*height = initImg.H
+		}
+	}
 	if *height == 0 {
 		*height = *width
 	}
@@ -80,6 +107,14 @@ func main() {
 
 	fmt.Printf("device: %s\n", phys.Name)
 	fmt.Printf("%dx%d, %d steps, seed %d\n", *width, *height, *steps, *seed)
+	if initImg != nil {
+		st := *strength
+		if st == 0 {
+			st = pipeline.DefaultStrength
+		}
+		fmt.Printf("editing %s (%dx%d) at strength %g: steps %d..%d of %d\n",
+			*initPNG, initImg.W, initImg.H, st, pipeline.StartStep(*steps, st), *steps-1, *steps)
+	}
 
 	t0 := time.Now()
 	p, err := pipeline.New(dev, pipeline.Options{
@@ -87,6 +122,7 @@ func main() {
 		CPUHead:       *cpuHead,
 		UnfusedLayout: *unfusedLayout,
 		Preview:       *preview,
+		Encoder:       initImg != nil,
 	})
 	must(err)
 	defer p.Destroy()
@@ -106,27 +142,29 @@ func main() {
 		}
 		fmt.Printf("prompt: %q\n", *prompt)
 		var previewTotal time.Duration
-		img, tm, err := p.GenerateFrom(*prompt, latents, func(d pipeline.Step) {
-			fmt.Printf("  step %d/%d  sigma %.4f -> %.4f  %8s  blocks %8s  head %7s",
-				d.Index+1, *steps, d.Sigma, d.NextSig, ms(d.Blocks+d.Head), ms(d.Blocks), ms(d.Head))
-			if d.Preview == nil {
-				fmt.Println()
-				return
-			}
-			// Timed and written here rather than inside the pipeline, because
-			// what this flag is for is the *cost*: a preview is only worth
-			// having if it is small beside the step it interrupts, and the
-			// two numbers belong on the same line.
-			t0 := time.Now()
-			frame, err := d.Preview()
-			must(err)
-			dt := time.Since(t0)
-			previewTotal += dt
-			name := fmt.Sprintf("%s.preview.%d.png", strings.TrimSuffix(*out, ".png"), d.Index)
-			must(writePNGOpt(name, frame, true))
-			fmt.Printf("  preview %7s (%.1f%% of the step) -> %s\n",
-				ms(dt), 100*dt.Seconds()/(d.Blocks+d.Head).Seconds(), name)
-		})
+		img, tm, err := p.Run(pipeline.Request{
+			Prompt: *prompt, Latents: latents, Init: initImg, Strength: *strength,
+			Progress: func(d pipeline.Step) {
+				fmt.Printf("  step %d/%d  sigma %.4f -> %.4f  %8s  blocks %8s  head %7s",
+					d.Index+1, *steps, d.Sigma, d.NextSig, ms(d.Blocks+d.Head), ms(d.Blocks), ms(d.Head))
+				if d.Preview == nil {
+					fmt.Println()
+					return
+				}
+				// Timed and written here rather than inside the pipeline, because
+				// what this flag is for is the *cost*: a preview is only worth
+				// having if it is small beside the step it interrupts, and the
+				// two numbers belong on the same line.
+				t0 := time.Now()
+				frame, err := d.Preview()
+				must(err)
+				dt := time.Since(t0)
+				previewTotal += dt
+				name := fmt.Sprintf("%s.preview.%d.png", strings.TrimSuffix(*out, ".png"), d.Index)
+				must(writePNGOpt(name, frame, true))
+				fmt.Printf("  preview %7s (%.1f%% of the step) -> %s\n",
+					ms(dt), 100*dt.Seconds()/(d.Blocks+d.Head).Seconds(), name)
+			}})
 		must(err)
 		if previewTotal > 0 {
 			fmt.Printf("  previews: %d x taef1, %s total, %.1f%% of the image\n",
@@ -156,8 +194,12 @@ func report(tm *pipeline.Timings, name string, previews time.Duration) {
 		fmt.Printf("%-22s %10s  %5.1f%%  %s\n", label, ms(d), 100*d.Seconds()/tm.Total.Seconds(), note)
 	}
 	row("text encoder", tm.Encode, fmt.Sprintf("%d tokens", tm.Tokens))
+	if tm.VAEEncode > 0 {
+		row("vae encode", tm.VAEEncode, fmt.Sprintf("the init image, once; the loop then starts at sigma %.4f", tm.Sigma))
+	}
 	row("caption refiners", tm.Caption, fmt.Sprintf("%d rows, once per image", tm.CapTotal))
-	row("denoising", steps, fmt.Sprintf("%d steps over %d tokens, %s each", len(tm.Steps), tm.Unified, ms(steps/time.Duration(len(tm.Steps)))))
+	row("denoising", steps, fmt.Sprintf("steps %d..%d over %d tokens, %s each",
+		tm.First, tm.First+len(tm.Steps)-1, tm.Unified, ms(steps/time.Duration(len(tm.Steps)))))
 	if previews > 0 {
 		// Inside TOTAL, because the callback runs inside the denoising loop
 		// and the pipeline's clock is around the whole of it. It is its own
@@ -244,4 +286,44 @@ func must(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// flagSet reports whether a flag was given on the command line, which is how
+// -width tells "the caller asked for 1024" from "1024 is the default".
+func flagSet(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// readPNG is writePNG's inverse: an 8-bit image to the [3, H, W] tensor in
+// [-1, 1] that the VAE's encoder takes.
+func readPNG(path string) (*vae.Tensor, error) {
+	fh, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	src, err := png.Decode(fh)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	b := src.Bounds()
+	t := vae.NewTensor(1, 3, b.Dy(), b.Dx())
+	plane := t.H * t.W
+	for y := 0; y < t.H; y++ {
+		for x := 0; x < t.W; x++ {
+			r, g, bl, _ := src.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			for ch, v := range [3]uint32{r, g, bl} {
+				// RGBA() is 16-bit; 65535 maps to +1 and 0 to -1, which is
+				// the inverse of what writePNG does going out.
+				t.Data[ch*plane+y*t.W+x] = float32(v)/32767.5 - 1
+			}
+		}
+	}
+	return t, nil
 }

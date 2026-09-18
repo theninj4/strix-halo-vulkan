@@ -204,10 +204,14 @@ func packTiledB(dst []uint16, w []float32, n, k int) {
 	}
 }
 
-// stageProjections packs the mid block's four projection weights into the
-// fp16 weight arena. Nothing else in the decoder is narrowed: these are the
-// only tensors a matrix-core kernel reads.
-func (g *GPUDecoder) stageProjections(data []uint16, a *Attention) []uint16 {
+// stageProjections packs a mid block's four projection weights into the fp16
+// weight arena. Nothing else in either direction's graph is narrowed this way:
+// these are the only tensors dit_gemm.comp reads.
+//
+// It is on the engine because the encoder's mid block is the decoder's -- the
+// same 512 channels at the same latent resolution -- and both stage it under
+// the same four names.
+func (g *engine) stageProjections(data []uint16, a *Attention) []uint16 {
 	put := func(name string, l *Linear) {
 		off := uint32(len(data))
 		data = append(data, make([]uint16, l.Out*l.In)...)
@@ -242,7 +246,7 @@ func (b *builder) narrow(in tensor, rows, rowsPad, lda int) uint32 {
 // whole tiles, so the rows past the image are part of the allocation and have
 // to be part of what the arena reclaims.
 func (b *builder) proj(name string, l *Linear, aOff uint32, rows, rowsPad, lda int) tensor {
-	v := b.dec.gemm
+	v := b.e.gemm
 	out := tensor{off: b.ar.alloc(rowsPad * l.Out), C: l.Out, H: rowsPad, W: 1}
 	b.label(fmt.Sprintf("gemm %d->%d x%d", l.In, l.Out, rows),
 		2*float64(rowsPad)*float64(l.Out)*float64(l.In))
@@ -313,7 +317,7 @@ func (b *builder) attentionWMMA(name string, a *Attention, x tensor) tensor {
 	ctx := tensor{off: b.ar.alloc(rowsPad * dim), C: dim, H: rowsPad, W: 1}
 	b.label(fmt.Sprintf("attention %d rows x %d", rows, dim),
 		2*2*float64(rows)*float64(rows)*float64(dim))
-	b.add("attn_wmma", uint32((rows+b.dec.attn.qt*coopMatTile-1)/(b.dec.attn.qt*coopMatTile)), pushConstants{
+	b.add("attn_wmma", uint32((rows+b.e.attn.qt*coopMatTile-1)/(b.e.attn.qt*coopMatTile)), pushConstants{
 		InOff: hQ, OutOff: ctx.off, ResOff: hK, Aux2: hV,
 		C:    uint32(dim),
 		Aux0: uint32(rows),

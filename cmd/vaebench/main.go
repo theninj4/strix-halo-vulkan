@@ -11,6 +11,13 @@
 // beside the full one at every size. That pairing is the whole measurement:
 // what a preview costs is only interesting against what it is a preview of,
 // and against the 1.7 s denoising step it has to fit inside.
+//
+// With -encode it times the *encoder* (IMAGE.md I7) on both convolution
+// paths, beside the decode of the same size. Both paths, because unlike every
+// other graph in this package the encoder's choice between them is not a
+// speed question with a free correct answer -- fp16 operands cost it 27x more
+// error than they cost the decoder -- so the table has to put the two next to
+// each other.
 package main
 
 import (
@@ -18,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +48,7 @@ func main() {
 	tiny := flag.Bool("tiny", false, "time taef1, the preview decoder, beside the full one")
 	taef1 := flag.String("taef1", "models/taef1", "taef1 checkpoint directory")
 	profile := flag.Bool("profile", false, "with -tiny, break the preview decode down by dispatch kind")
+	encode := flag.Bool("encode", false, "time the VAE encoder on both convolution paths (IMAGE.md I7)")
 	attn := flag.String("attn", "", "mid-block attention kernel")
 	gemm := flag.String("gemm", "", "mid-block projection kernel")
 	flag.Parse()
@@ -75,6 +84,12 @@ func main() {
 
 	if *tiny {
 		runTiny(dev, cpu, *taef1, *sizes, *conv, *reps, *profile)
+		return
+	}
+	if *encode {
+		enc, err := vae.LoadEncoder(*dir, vae.FluxConfig())
+		must(err)
+		runEncode(dev, enc, cpu, *sizes, *reps, *profile)
 		return
 	}
 	if *ladder {
@@ -377,4 +392,101 @@ func bestOf(reps int, fn func()) time.Duration {
 		}
 	}
 	return best
+}
+
+// runEncode times the encoder at a sweep of sizes on both convolution paths,
+// with the decode of the same size beside it.
+//
+// The sizes are latent sizes, as everywhere else in this command, so the image
+// is 8x each of them and the table reads against the decoder's.
+func runEncode(dev *vk.Device, enc *vae.Encoder, dec *vae.Decoder, sizes string, reps int, profile bool) {
+	fmt.Printf("%-8s %-12s %10s %10s %10s %12s %12s %12s\n",
+		"LATENT", "IMAGE", "DISPATCH", "ACT MB", "F16 MB", "ENC wmma", "ENC fp32", "DECODE")
+	for _, tok := range strings.Split(sizes, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(tok))
+		if err != nil {
+			continue
+		}
+		h, w := n*8, n*8
+		img := vae.NewTensor(1, 3, h, w)
+		rng := rand.New(rand.NewSource(1))
+		for i := range img.Data {
+			img.Data[i] = float32(rng.NormFloat64()) * 0.5
+		}
+
+		var wmmaWall, scalarWall, decWall time.Duration
+		var nd, actMB, f16MB int
+		for _, c := range []struct {
+			opt vae.Options
+			dst *time.Duration
+		}{{vae.Options{}, &wmmaWall}, {vae.Options{Conv: vae.ConvScalar}, &scalarWall}} {
+			g, err := vae.NewGPUEncoderOpts(dev, enc, h, w, c.opt)
+			if err != nil {
+				fmt.Printf("%-8d failed: %v\n", n, err)
+				continue
+			}
+			if c.dst == &wmmaWall {
+				nd, _ = g.Dispatches(h, w)
+				actMB, f16MB = g.ActivationBytes()>>20, g.F16ActivationBytes()>>20
+			}
+			*c.dst = bestOf(reps, func() { _, err := g.Encode(img); must(err) })
+			// Before Destroy, not after: the profile re-records the graph and
+			// reads the arena's size off a buffer this is about to free.
+			if profile && c.dst == &wmmaWall {
+				printEncKinds(g, img)
+			}
+			g.Destroy()
+		}
+
+		if dg, err := vae.NewGPUDecoderOpts(dev, dec, n, n, vae.Options{}); err == nil {
+			latent := randomLatent(n)
+			decWall = bestOf(reps, func() { _, err := dg.Apply(latent); must(err) })
+			dg.Destroy()
+		}
+
+		fmt.Printf("%-8d %-12s %10d %10d %10d %12s %12s %12s\n",
+			n, fmt.Sprintf("%dx%d", w, h), nd, actMB, f16MB,
+			wmmaWall.Round(time.Millisecond), scalarWall.Round(time.Millisecond),
+			decWall.Round(time.Millisecond))
+	}
+}
+
+// printEncKinds sums the encode's dispatches by kind, which is what says where
+// the stride-1-and-subsample downsampler's extra arithmetic actually lands.
+func printEncKinds(g *vae.GPUEncoder, img *vae.Tensor) {
+	st, err := g.Profile(img)
+	must(err)
+	type agg struct {
+		n     int
+		gpu   time.Duration
+		flops float64
+	}
+	by := map[string]*agg{}
+	var total time.Duration
+	for _, s := range st {
+		k := strings.Fields(s.Kind)[0]
+		a := by[k]
+		if a == nil {
+			a = &agg{}
+			by[k] = a
+		}
+		a.n++
+		a.gpu += s.GPU
+		a.flops += s.Flops
+		total += s.GPU
+	}
+	keys := make([]string, 0, len(by))
+	for k := range by {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return by[keys[i]].gpu > by[keys[j]].gpu })
+	for _, k := range keys {
+		a := by[k]
+		tf := ""
+		if a.flops > 0 {
+			tf = fmt.Sprintf("%8.1f TFLOP/s", a.flops/a.gpu.Seconds()/1e12)
+		}
+		fmt.Printf("    %-14s %4d x %10s  %5.1f%% %s\n",
+			k, a.n, a.gpu.Round(10*time.Microsecond), 100*a.gpu.Seconds()/total.Seconds(), tf)
+	}
 }

@@ -980,6 +980,7 @@ var SoftmaxSubgroupW32 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_relu.spv vae_relu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_add.spv vae_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_upsample2x.spv vae_upsample2x.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_downsample2x.spv vae_downsample2x.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_nchw_to_rows.spv vae_nchw_to_rows.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_rows_to_nchw_add.spv vae_rows_to_nchw_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_linear.spv vae_linear.comp
@@ -1005,6 +1006,12 @@ var VAEAdd []byte
 
 //go:embed vae_upsample2x.spv
 var VAEUpsample2x []byte
+
+// The encoder's resolution change (IMAGE.md I7): the stride-2 convolution run
+// as a stride-1 one and subsampled. See vae_downsample2x.comp.
+
+//go:embed vae_downsample2x.spv
+var VAEDownsample2x []byte
 
 //go:embed vae_nchw_to_rows.spv
 var VAENCHWToRows []byte

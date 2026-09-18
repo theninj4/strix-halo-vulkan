@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"log"
 	"math"
 	"net/http"
@@ -70,16 +71,48 @@ type ImageGenerationRequest struct {
 	User          string `json:"user,omitempty"`
 }
 
-// ImageEditRequest is OpenAI's edit request. It is parsed and refused; see
-// handleImageEdit.
+// ImageEditRequest is OpenAI's edit request: a picture, a prompt, and what to
+// do to the one with the other.
+//
+// **Both encodings are accepted**, the same as /v1/audio/transcriptions:
+// multipart/form-data, which is what OpenAI's clients send and the only thing
+// their own endpoint takes, and a JSON body whose `image` is base64, which is
+// what curl and a test can write by hand. The multipart parse fills the same
+// struct, so nothing below the door knows which arrived.
 type ImageEditRequest struct {
 	host        string
-	AspectRatio string   `json:"aspect_ratio,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Image       []string `json:"image"`
-	Prompt      string   `json:"prompt"`
-	Size        string   `json:"size,omitempty"`
-	Stream      bool     `json:"stream,omitempty"`
+	AspectRatio string `json:"aspect_ratio,omitempty"`
+	Model       string `json:"model,omitempty"`
+	// Image is the picture to edit, base64, one element. OpenAI's field is a
+	// list because their model composites several; this one edits a single
+	// image, and two of them is a 400 rather than a silent choice of the
+	// first.
+	Image StringList `json:"image"`
+	// Mask is OpenAI's transparency mask. It is parsed so that a request
+	// carrying one gets told this server does not blend rather than getting a
+	// picture that quietly ignored it; see handleImageEdit.
+	Mask   string `json:"mask,omitempty"`
+	Prompt string `json:"prompt"`
+	Size   string `json:"size,omitempty"`
+	N      int    `json:"n,omitempty"`
+	// Strength is an extension, and it is the knob this endpoint is actually
+	// about: how much of the denoising schedule to run over the encoded
+	// picture. Near zero keeps the input almost unchanged, 1 ignores it
+	// entirely. Zero takes the server's default, which GET /v1/models reports.
+	//
+	// OpenAI has no such field because their edit endpoint is a different
+	// mechanism (an inpainting model with a mask). SDEdit's whole behaviour is
+	// this one number, so it could not be left out.
+	Strength float64 `json:"strength,omitempty"`
+
+	ResponseFormat    string `json:"response_format,omitempty"`
+	OutputFormat      string `json:"output_format,omitempty"`
+	OutputCompression int    `json:"output_compression,omitempty"`
+	Seed              *int64 `json:"seed,omitempty"`
+	Steps             int    `json:"steps,omitempty"`
+	Stream            bool   `json:"stream,omitempty"`
+	PartialImages     int    `json:"partial_images,omitempty"`
+	User              string `json:"user,omitempty"`
 }
 
 // ImageGenerationResponse is OpenAI's image response.
@@ -135,67 +168,15 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	geo := s.Image.Geometry()
-	if req.Stream && !geo.Previews {
-		// A 501 rather than a 400, and the same kind of answer -image itself
-		// gives: the request is well formed and the server was started
-		// without the thing that would answer it. writeError rather than
-		// notLoaded because what is missing is a decoder inside a model that
-		// *is* loaded, which its sentence does not fit.
-		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"streaming image generation needs the preview decoder, which this server was started without; "+
-				"pass -preview with a madebyollin/taef1 checkpoint (it is what makes an in-progress frame "+
-				"cost 87 ms instead of the full VAE's 876)")
+	if !s.checkStreaming(w, geo, req.Stream, req.PartialImages) {
 		return
 	}
-	if req.PartialImages < 0 || req.PartialImages > geo.MaxPartials {
-		badRequest(w, "partial_images is "+strconv.Itoa(req.PartialImages)+"; this server sends 0 to "+
-			strconv.Itoa(geo.MaxPartials)+" in-progress frames, because each one is a decode")
+	n, ok := s.imageCount(w, req.N, req.Stream)
+	if !ok {
 		return
 	}
-	if req.PartialImages > 0 && !req.Stream {
-		badRequest(w, "partial_images needs stream: true; there is nowhere to put an in-progress "+
-			"frame in a single JSON response")
-		return
-	}
-	n := req.N
-	if n == 0 {
-		n = 1
-	}
-	if n < 1 || n > maxImages {
-		badRequest(w, "n is "+strconv.Itoa(n)+"; this server renders 1 to "+strconv.Itoa(maxImages)+
-			" images per request, serially, because each one is a full run of the model")
-		return
-	}
-	switch req.ResponseFormat {
-	case "", "b64_json":
-	case "url":
-		badRequest(w, "response_format \"url\" is not supported; this server has nowhere to host an image, "+
-			"so it returns b64_json")
-		return
-	default:
-		badRequest(w, "response_format "+strconv.Quote(req.ResponseFormat)+
-			" is not supported; this server returns b64_json")
-		return
-	}
-	format := req.OutputFormat
-	if format == "" {
-		format = "png"
-	}
-	switch format {
-	case "png", "jpeg", "jpg":
-	default:
-		badRequest(w, "output_format "+strconv.Quote(format)+
-			" is not supported; this server encodes png and jpeg")
-		return
-	}
-	if req.OutputCompression < 0 || req.OutputCompression > 100 {
-		badRequest(w, "output_compression is "+strconv.Itoa(req.OutputCompression)+", outside [0, 100]")
-		return
-	}
-
-	if req.Stream && n != 1 {
-		badRequest(w, "n is "+strconv.Itoa(n)+" with stream: true; the event stream carries one image, "+
-			"and its frames have no field that would say which")
+	out, ok := s.imageOutput(w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
+	if !ok {
 		return
 	}
 
@@ -205,28 +186,147 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Stream {
-		s.streamImage(w, r, &req, width, height, format)
+	s.render(w, r, &imageRun{
+		prompt: req.Prompt, width: width, height: height, steps: req.Steps, seed: req.Seed,
+		n: n, format: out.format, compression: out.compression,
+		stream: req.Stream, partials: req.PartialImages,
+	})
+}
+
+// imageOutputs is the container a request resolved to.
+type imageOutputs struct {
+	format      string
+	compression int
+}
+
+// imageOutput validates response_format, output_format and
+// output_compression, which are the same three fields on both endpoints.
+func (s *Server) imageOutput(w http.ResponseWriter, responseFormat, outputFormat string, compression int) (imageOutputs, bool) {
+	switch responseFormat {
+	case "", "b64_json":
+	case "url":
+		badRequest(w, "response_format \"url\" is not supported; this server has nowhere to host an image, "+
+			"so it returns b64_json")
+		return imageOutputs{}, false
+	default:
+		badRequest(w, "response_format "+strconv.Quote(responseFormat)+
+			" is not supported; this server returns b64_json")
+		return imageOutputs{}, false
+	}
+	format := outputFormat
+	if format == "" {
+		format = "png"
+	}
+	switch format {
+	case "png", "jpeg", "jpg":
+	default:
+		badRequest(w, "output_format "+strconv.Quote(format)+
+			" is not supported; this server encodes png and jpeg")
+		return imageOutputs{}, false
+	}
+	if compression < 0 || compression > 100 {
+		badRequest(w, "output_compression is "+strconv.Itoa(compression)+", outside [0, 100]")
+		return imageOutputs{}, false
+	}
+	return imageOutputs{format: format, compression: compression}, true
+}
+
+// imageCount resolves and bounds `n`.
+func (s *Server) imageCount(w http.ResponseWriter, n int, stream bool) (int, bool) {
+	if n == 0 {
+		n = 1
+	}
+	if n < 1 || n > maxImages {
+		badRequest(w, "n is "+strconv.Itoa(n)+"; this server renders 1 to "+strconv.Itoa(maxImages)+
+			" images per request, serially, because each one is a full run of the model")
+		return 0, false
+	}
+	if stream && n != 1 {
+		badRequest(w, "n is "+strconv.Itoa(n)+" with stream: true; the event stream carries one image, "+
+			"and its frames have no field that would say which")
+		return 0, false
+	}
+	return n, true
+}
+
+// checkStreaming is the preview decoder's condition, which both endpoints
+// share because a partial frame of an edit is a partial frame.
+func (s *Server) checkStreaming(w http.ResponseWriter, geo ImageGeometry, stream bool, partials int) bool {
+	if stream && !geo.Previews {
+		// A 501 rather than a 400, and the same kind of answer -image itself
+		// gives: the request is well formed and the server was started
+		// without the thing that would answer it. writeError rather than
+		// notLoaded because what is missing is a decoder inside a model that
+		// *is* loaded, which its sentence does not fit.
+		writeError(w, http.StatusNotImplemented, "not_implemented",
+			"streaming image generation needs the preview decoder, which this server was started without; "+
+				"pass -preview with a madebyollin/taef1 checkpoint (it is what makes an in-progress frame "+
+				"cost 87 ms instead of the full VAE's 876)")
+		return false
+	}
+	if partials < 0 || partials > geo.MaxPartials {
+		badRequest(w, "partial_images is "+strconv.Itoa(partials)+"; this server sends 0 to "+
+			strconv.Itoa(geo.MaxPartials)+" in-progress frames, because each one is a decode")
+		return false
+	}
+	if partials > 0 && !stream {
+		badRequest(w, "partial_images needs stream: true; there is nowhere to put an in-progress "+
+			"frame in a single JSON response")
+		return false
+	}
+	return true
+}
+
+// imageRun is one resolved render, and it is what /generations and /edits have
+// in common once their own fields have been read.
+//
+// **An edit is a generation with a picture in front of it**, which is why
+// there is one of these rather than two handlers: SDEdit starts the same
+// trajectory from an encoded image at an intermediate noise level instead of
+// from pure noise, so `n`, the seed, the container, the streaming and the
+// partial frames all mean exactly what they already meant. Everything that
+// differs between the two endpoints is in the two lines at the bottom.
+type imageRun struct {
+	prompt        string
+	width, height int
+	steps         int
+	seed          *int64
+	n             int
+	format        string
+	compression   int
+	stream        bool
+	partials      int
+
+	// init and strength are set on an edit and zero on a generation.
+	init     image.Image
+	strength float64
+}
+
+// render answers one resolved request, buffered or over SSE.
+func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
+	if run.stream {
+		s.streamImage(w, r, run)
 		return
 	}
-
 	resp := ImageGenerationResponse{
 		Created:      time.Now().Unix(),
-		Size:         formatSize(width, height),
-		OutputFormat: format,
-		Data:         make([]ImageData, 0, n),
+		Size:         formatSize(run.width, run.height),
+		OutputFormat: run.format,
+		Data:         make([]ImageData, 0, run.n),
 	}
-	for i := 0; i < n; i++ {
+	for i := 0; i < run.n; i++ {
 		// A request that named a seed and asks for four images means four
 		// different images, so the seed walks. Naming none walks nothing: the
 		// backend draws one per call and reports it.
-		seed := req.Seed
+		seed := run.seed
 		if seed != nil && i > 0 {
 			next := *seed + int64(i)
 			seed = &next
 		}
 		out, err := s.Image.Generate(r.Context(), &ImageRequest{
-			Prompt: req.Prompt, Width: width, Height: height, Steps: req.Steps, Seed: seed,
+			Prompt: run.prompt, Width: run.width, Height: run.height,
+			Steps: run.steps, Seed: seed,
+			Init: run.init, Strength: run.strength,
 		})
 		if err != nil {
 			backendError(w, "images", err)
@@ -236,7 +336,7 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 			serverError(w, "images", errNoImage)
 			return
 		}
-		body, err := encodeImage(out.Image, format, req.OutputCompression)
+		body, err := encodeImage(out.Image, run.format, run.compression)
 		if err != nil {
 			serverError(w, "images", err)
 			return
@@ -295,9 +395,9 @@ const (
 // is what the chat stream does and what a client can act on; an error before
 // any frame is still a 400 or a 500, which is why every check the handler can
 // make happens before newSSE is called.
-func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, req *ImageGenerationRequest,
-	width, height int, format string) {
-	size := formatSize(width, height)
+func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageRun) {
+	size := formatSize(run.width, run.height)
+	format := run.format
 	str := newSSE(w)
 
 	// The partial frames go out from inside the backend's run, on its
@@ -308,7 +408,7 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, req *ImageG
 		if err := r.Context().Err(); err != nil {
 			return err
 		}
-		body, err := encode(p.Image, format, req.OutputCompression, true)
+		body, err := encode(p.Image, format, run.compression, true)
 		if err != nil {
 			return err
 		}
@@ -326,8 +426,10 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, req *ImageG
 	}
 
 	out, err := s.Image.Generate(r.Context(), &ImageRequest{
-		Prompt: req.Prompt, Width: width, Height: height, Steps: req.Steps, Seed: req.Seed,
-		PartialImages: req.PartialImages, Partial: sendPartial,
+		Prompt: run.prompt, Width: run.width, Height: run.height,
+		Steps: run.steps, Seed: run.seed,
+		Init: run.init, Strength: run.strength,
+		PartialImages: run.partials, Partial: sendPartial,
 	})
 	if err != nil {
 		streamError(str, "images", err)
@@ -337,7 +439,7 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, req *ImageG
 		streamError(str, "images", errNoImage)
 		return
 	}
-	body, err := encodeImage(out.Image, format, req.OutputCompression)
+	body, err := encodeImage(out.Image, format, run.compression)
 	if err != nil {
 		streamError(str, "images", err)
 		return
@@ -364,21 +466,244 @@ func streamError(str *sse, where string, err error) {
 	_ = str.send("error", errorResponse{Error: errorBody{Message: err.Error(), Type: "server_error"}})
 }
 
-// handleImageEdit is the one endpoint on this server that no flag fixes.
+// handleImageEdit edits a picture: SDEdit over the VAE's encoder (IMAGE.md
+// I7).
 //
-// An edit starts from a picture, and bringing a picture into the transformer's
-// latent space is the VAE's *encoder*. **Its weights are in the checkpoint** --
-// z-image ships a stock Flux `AutoencoderKL`, and the 34 M encoder parameters
-// are in the same file `-image` already opens for the decoder's 50 M -- so
-// this is a missing *port* and not a missing download. `zimage/vae`
-// implements the decoder only, because generating never needed to go that
-// way. Saying which of the two it is is more use to a caller than a 501 that
-// names a flag they cannot pass.
-func (s *Server) handleImageEdit(w http.ResponseWriter, _ *http.Request) {
-	writeError(w, http.StatusNotImplemented, "not_implemented",
-		"/v1/images/edits is not implemented: an edit needs the VAE's encoder to bring the input image "+
-			"into the latent space, and this server implements the decoder only. The encoder's weights "+
-			"are in the checkpoint; the port is not written, so no flag turns this on")
+// **What an edit is, in three lines.** The image is encoded to a latent, that
+// latent is mixed with noise at an intermediate point on the schedule --
+// `x = (1-sigma) x0 + sigma eps` -- and only the tail of the schedule runs.
+// `strength` is how far back up the schedule that point is, and it is the
+// whole behaviour of this endpoint: near zero returns almost the picture that
+// was sent, 1 discards it and is an ordinary generation. Everything else here
+// is the generation endpoint's, including the streaming, because underneath
+// an edit *is* a generation with a different starting latent.
+//
+// Two things OpenAI's endpoint has that this one refuses rather than ignores:
+// a `mask`, which is masked blending per step and a different mechanism, and
+// more than one input image, which is a compositing model and not this one.
+// Both would otherwise come back as a picture that silently did something
+// else.
+//
+// The size is the one place this differs from /generations in kind. A
+// generation with no `size` takes the server's default; an edit with no `size`
+// takes **the input picture's own shape**, fitted inside the ceiling, because
+// that is the only answer that does not silently reframe what was sent.
+func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
+	if s.Image == nil {
+		notLoaded(w, "image generation", "-image")
+		return
+	}
+	geo := s.Image.Geometry()
+	if !geo.Edits {
+		// A 501 that names the flag, like every other unloaded capability.
+		// Until I7 this was a 501 that named *no* flag, because the encoder
+		// was not ported; now it is resident or it is not.
+		writeError(w, http.StatusNotImplemented, "not_implemented",
+			"editing needs the VAE's encoder, which this server was started without; pass -edits "+
+				"(it holds the encoder's 0.21 GB of weights and its activation arena resident)")
+		return
+	}
+
+	var req ImageEditRequest
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		if !parseImageEditForm(w, r, &req) {
+			return
+		}
+	} else if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if strings.TrimSpace(req.Prompt) == "" {
+		badRequest(w, "prompt is empty; an edit is a prompt applied to a picture, so there is nothing to apply")
+		return
+	}
+	if req.Mask != "" {
+		writeError(w, http.StatusNotImplemented, "not_implemented",
+			"mask is not implemented: a mask is blended into the latent at every denoising step, which is a "+
+				"different mechanism from the SDEdit this endpoint runs. Without one the whole picture is "+
+				"edited, and `strength` is how much")
+		return
+	}
+	switch len(req.Image) {
+	case 1:
+	case 0:
+		badRequest(w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image'")
+		return
+	default:
+		badRequest(w, strconv.Itoa(len(req.Image))+" images; this endpoint edits one picture. "+
+			"OpenAI's field is a list because their model composites several, and this model does not")
+		return
+	}
+	raw, err := decodeImageField(req.Image[0])
+	if err != nil {
+		badRequest(w, "image: "+err.Error())
+		return
+	}
+	init, kind, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		badRequest(w, "image: this server decodes png and jpeg: "+err.Error())
+		return
+	}
+	if req.Strength < 0 || req.Strength > 1 {
+		badRequest(w, "strength is "+strconv.FormatFloat(req.Strength, 'g', -1, 64)+
+			", outside (0, 1]; it is how much of the denoising schedule to run over the picture, so 1 "+
+			"discards the picture entirely and anything near 0 returns it almost unchanged")
+		return
+	}
+
+	out, ok := s.imageOutput(w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
+	if !ok {
+		return
+	}
+	n, ok := s.imageCount(w, req.N, req.Stream)
+	if !ok {
+		return
+	}
+	if !s.checkStreaming(w, geo, req.Stream, req.PartialImages) {
+		return
+	}
+
+	// The geometry. With a `size` this is the generation endpoint's rule; with
+	// none it is the *picture's* aspect, scaled to fit both ceilings and
+	// rounded to the size multiple, which is fitBounds over the input's bounds.
+	b := init.Bounds()
+	var width, height int
+	if (req.Size != "" && req.Size != "auto") || req.AspectRatio != "" {
+		width, height, err = resolveSize(req.Size, req.AspectRatio, geo)
+	} else {
+		width, height, err = fitBounds(b.Dx(), b.Dy(), geo)
+	}
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	log.Printf("api: images/edits: %dx%d %s in, %dx%d out, strength %g",
+		b.Dx(), b.Dy(), kind, width, height, req.Strength)
+
+	s.render(w, r, &imageRun{
+		prompt: req.Prompt, width: width, height: height, steps: req.Steps, seed: req.Seed,
+		n: n, format: out.format, compression: out.compression,
+		stream: req.Stream, partials: req.PartialImages,
+		init: init, strength: req.Strength,
+	})
+}
+
+// decodeImageField reads the base64 an `image` field carries, accepting a
+// `data:` URL as well as the bare payload. A browser that built the field from
+// a FileReader sends the prefix, and stripping it here is cheaper than every
+// client remembering not to.
+func decodeImageField(v string) ([]byte, error) {
+	v = strings.TrimSpace(v)
+	if strings.HasPrefix(v, "data:") {
+		if _, after, ok := strings.Cut(v, ","); ok {
+			v = after
+		}
+	}
+	raw, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return nil, fmt.Errorf("the field is not base64: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("the field is empty")
+	}
+	return raw, nil
+}
+
+// parseImageEditForm reads the multipart encoding OpenAI's clients send into
+// the same struct the JSON one fills.
+func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRequest) bool {
+	// ParseMultipartForm's argument is how much it keeps in memory; the rest
+	// spills to a temporary file, and Server.limitBody is what bounds the
+	// upload.
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		if tooLarge(w, err) {
+			return false
+		}
+		badRequest(w, "malformed multipart body: "+err.Error())
+		return false
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+
+	// OpenAI's clients send the part as `image` and, when there are several,
+	// as `image[]`. Both are read so that a count of two is a 400 saying so
+	// rather than a silently dropped second picture.
+	var parts []string
+	for _, field := range []string{"image", "image[]"} {
+		for _, fh := range r.MultipartForm.File[field] {
+			f, err := fh.Open()
+			if err != nil {
+				badRequest(w, "reading the '"+field+"' part: "+err.Error())
+				return false
+			}
+			raw, err := io.ReadAll(f)
+			_ = f.Close()
+			if err != nil {
+				if tooLarge(w, err) {
+					return false
+				}
+				badRequest(w, "reading the '"+field+"' part: "+err.Error())
+				return false
+			}
+			// Back to base64 so that the two encodings converge on one struct
+			// rather than on two code paths. An image is a few hundred KB and
+			// this is one allocation on a request that is about to spend
+			// seconds on a GPU.
+			parts = append(parts, base64.StdEncoding.EncodeToString(raw))
+		}
+	}
+	req.Image = parts
+	if fh := r.MultipartForm.File["mask"]; len(fh) > 0 {
+		// Only its presence matters: the handler refuses it either way, and
+		// reading a mask it will not use would be a megabyte for nothing.
+		req.Mask = "(a mask part)"
+	}
+
+	req.Model = r.FormValue("model")
+	req.Prompt = r.FormValue("prompt")
+	req.Size = r.FormValue("size")
+	req.AspectRatio = r.FormValue("aspect_ratio")
+	req.ResponseFormat = r.FormValue("response_format")
+	req.OutputFormat = r.FormValue("output_format")
+	req.User = r.FormValue("user")
+	for _, f := range []struct {
+		name string
+		dst  *int
+	}{{"n", &req.N}, {"steps", &req.Steps}, {"output_compression", &req.OutputCompression},
+		{"partial_images", &req.PartialImages}} {
+		if v := r.FormValue(f.name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				badRequest(w, f.name+" is not a number: "+v)
+				return false
+			}
+			*f.dst = n
+		}
+	}
+	if v := r.FormValue("strength"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			badRequest(w, "strength is not a number: "+v)
+			return false
+		}
+		req.Strength = f
+	}
+	if v := r.FormValue("seed"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			badRequest(w, "seed is not a number: "+v)
+			return false
+		}
+		req.Seed = &n
+	}
+	if v := r.FormValue("stream"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			badRequest(w, "stream is not a boolean: "+v)
+			return false
+		}
+		req.Stream = b
+	}
+	return true
 }
 
 // resolveSize turns the request's size or aspect ratio into pixels, and is the
@@ -449,19 +774,43 @@ func fitRatio(ratio string, geo ImageGeometry) (int, int, error) {
 	if errW != nil || errH != nil || rw <= 0 || rh <= 0 {
 		return 0, 0, fmt.Errorf("aspect_ratio %s is not W:H with both sides positive", strconv.Quote(ratio))
 	}
+	width, height, err := fitAspect(rw, rh, geo)
+	if err != nil {
+		return 0, 0, fmt.Errorf("aspect_ratio %s: %w", strconv.Quote(ratio), err)
+	}
+	return width, height, nil
+}
 
+// fitAspect is the arithmetic behind fitRatio: the largest image of that shape
+// that fits inside both ceilings, rounded down to the size multiple.
+func fitAspect(rw, rh float64, geo ImageGeometry) (int, int, error) {
+	return scaleAspect(rw, rh, geo, math.Min(float64(geo.MaxWidth)/rw, float64(geo.MaxHeight)/rh))
+}
+
+// fitBounds is fitAspect for a picture rather than for a ratio: the same shape
+// at the same size, shrunk only as far as the ceiling requires.
+//
+// **It never scales up**, which is the difference and the reason it is its own
+// function. A ratio a client typed carries no size, so "16:9" has to mean the
+// largest 16:9 this server does; a 512x512 picture already has one, and
+// upsampling it to a 1024x1024 ceiling would cost four times the tokens to
+// paint detail the input never had.
+func fitBounds(w, h int, geo ImageGeometry) (int, int, error) {
+	rw, rh := float64(w), float64(h)
+	scale := math.Min(float64(geo.MaxWidth)/rw, float64(geo.MaxHeight)/rh)
+	return scaleAspect(rw, rh, geo, math.Min(scale, 1))
+}
+
+func scaleAspect(rw, rh float64, geo ImageGeometry, scale float64) (int, int, error) {
 	m := geo.Multiple
 	if m < 1 {
 		m = 1
 	}
-	// The largest scale at which neither side is past its ceiling: the
-	// smaller of the two each side would allow on its own.
-	scale := math.Min(float64(geo.MaxWidth)/rw, float64(geo.MaxHeight)/rh)
 	width := int(rw*scale) / m * m
 	height := int(rh*scale) / m * m
 	if width < m || height < m {
-		return 0, 0, fmt.Errorf("aspect_ratio %s does not fit a %s image in steps of %d",
-			strconv.Quote(ratio), formatSize(geo.MaxWidth, geo.MaxHeight), m)
+		return 0, 0, fmt.Errorf("%g:%g does not fit a %s image in steps of %d",
+			rw, rh, formatSize(geo.MaxWidth, geo.MaxHeight), m)
 	}
 	return width, height, nil
 }

@@ -198,6 +198,17 @@ type engine struct {
 	// and the oracle the fp16 path is measured against.
 	conv convVariant
 
+	// attn and gemm are the mid block's kernels. Same convention as conv, and
+	// chosen independently of it: the mid block and the convolutions are
+	// different kernels on different tensors, and a test that wants one
+	// narrowing and not the other has to be able to ask.
+	//
+	// They are on the engine rather than on a decoder because *two* graphs
+	// have a mid block -- the decoder's and the encoder's -- and the block is
+	// the same 512-channel one at the same latent resolution in both.
+	attn attnVariant
+	gemm gemmVariant
+
 	// convs is every convolution in the graph, in the order the weights were
 	// flattened. Both fp16 stagings read it, so the names a dispatch looks up
 	// cannot drift from the names the arena was built with.
@@ -211,13 +222,6 @@ type GPUDecoder struct {
 
 	arena  arena
 	harena arena
-
-	// attn and gemm are the mid block's kernels. Same convention as
-	// engine.conv, and chosen independently of it: the mid block and the
-	// convolutions are different kernels on different tensors, and a test
-	// that wants one narrowing and not the other has to be able to ask.
-	attn attnVariant
-	gemm gemmVariant
 
 	// dispatches accumulates the recorded graph so a decode is one submit.
 	dispatches []vk.MultiDispatch
@@ -273,7 +277,7 @@ func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDeco
 // controls in the tests select.
 func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt Options) (*GPUDecoder, error) {
 	g := &GPUDecoder{engine: newEngine(dev), cpu: cpu}
-	if err := g.chooseKernels(opt); err != nil {
+	if err := g.engine.chooseKernels(opt); err != nil {
 		return nil, err
 	}
 
@@ -393,7 +397,10 @@ func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt O
 // The mid block and the convolutions are resolved separately, so that a
 // caller can narrow one and not the other -- which is what the tests that
 // hold each path to the one it replaced need.
-func (g *GPUDecoder) chooseKernels(opt Options) error {
+//
+// It is on the engine because both graphs with a mid block -- the decoder's
+// and the encoder's -- resolve the same three choices the same way.
+func (g *engine) chooseKernels(opt Options) error {
 	if !hasMatrixCores(g.dev) {
 		if opt.Attn != "" && opt.Attn != AttnScalar {
 			return fmt.Errorf("vae: attention kernel %q needs fp16, cooperative matrices and subgroup size control", opt.Attn)
@@ -437,7 +444,7 @@ func (g *GPUDecoder) chooseKernels(opt Options) error {
 }
 
 // wmma reports whether the mid block runs on the matrix cores.
-func (g *GPUDecoder) wmma() bool { return g.attn.spirv != nil }
+func (e *engine) wmma() bool { return e.attn.spirv != nil }
 
 // convCores reports whether the convolutions do.
 func (e *engine) convCores() bool { return e.conv.spirv != nil }
@@ -446,10 +453,12 @@ func (e *engine) convCores() bool { return e.conv.spirv != nil }
 // are bound to every pipeline either way -- one descriptor layout across the
 // graph is what lets a decode be recorded into one command buffer -- but on
 // the fully scalar path they are placeholders.
-func (g *GPUDecoder) f16() bool { return g.wmma() || g.convCores() }
+func (e *engine) f16() bool { return e.wmma() || e.convCores() }
 
 // Kernels names the graph's three chosen kernels, for a benchmark's output.
-func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel, ConvKernel) {
+func (g *GPUDecoder) Kernels() (AttnKernel, GEMMKernel, ConvKernel) { return g.engine.kernels() }
+
+func (g *engine) kernels() (AttnKernel, GEMMKernel, ConvKernel) {
 	attn, gemm, conv := AttnScalar, GEMMKernel(""), ConvScalar
 	if g.wmma() {
 		attn, gemm = g.attn.name, g.gemm.name
@@ -582,11 +591,7 @@ func (t tensor) elems() int { return t.C * t.H * t.W }
 
 // builder records the decode graph into a dispatch list.
 type builder struct {
-	e *engine
-	// dec is the full decoder's graph and kernels, and is nil for a graph
-	// that is not it -- taef1's, which has no mid block. Everything the two
-	// share reaches the device through e.
-	dec   *GPUDecoder
+	e     *engine
 	ar    *arena
 	har   *arena
 	out   []vk.MultiDispatch
@@ -596,7 +601,29 @@ type builder struct {
 	pendingKind  string
 	pendingFlops float64
 
+	// marks names the tensor a submodule leaves behind, and the dispatch that
+	// finishes it. It is what GPUEncoder.RunTo reads: a graph of 122
+	// dispatches over a bump-allocated arena overwrites every intermediate
+	// long before it ends, so the only way to look at one is to re-run the
+	// prefix and stop. zimage/dit's GPUBlock.RunTo is the same facility for
+	// the same reason, and PIPELINE.md's stagewise rule is why both exist.
+	marks map[string]tensor
+	order []string
+	stops []int
+
 	err error
+}
+
+// mark records the tensor a named submodule produced, at the graph's current
+// length. Recording nothing costs nothing: a builder with no marks map -- the
+// sizing and dispatch-counting passes -- skips it.
+func (b *builder) mark(name string, t tensor) tensor {
+	if b.marks != nil {
+		b.marks[name] = t
+		b.order = append(b.order, name)
+		b.stops = append(b.stops, len(b.out))
+	}
+	return t
 }
 
 // label names the next dispatch for the profiler and records its arithmetic.
@@ -834,12 +861,11 @@ func (b *builder) upsample(name string, c *Conv2D, x tensor) tensor {
 }
 
 // build records the whole decode and returns the output tensor.
-func (b *builder) build(latentH, latentW int) tensor {
-	d := b.dec.cpu
+func (b *builder) build(d *Decoder, latentH, latentW int) tensor {
 	x := tensor{off: b.ar.alloc(d.ConvIn.InC * latentH * latentW), C: d.ConvIn.InC, H: latentH, W: latentW}
 	h := b.conv("conv_in", d.ConvIn, x)
 	h = b.resnet("mid.r1", d.Mid.Resnet1, h)
-	if b.dec.wmma() {
+	if b.e.wmma() {
 		h = b.attentionWMMA("mid.attn", d.Mid.Attn, h)
 	} else {
 		h = b.attention("mid.attn", d.Mid.Attn, h)
@@ -865,8 +891,8 @@ func (b *builder) build(latentH, latentW int) tensor {
 func (g *GPUDecoder) planSize(latentH, latentW int) (uint32, uint32, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{e: &g.engine, dec: g, ar: &arena{}, har: &arena{}}
-	b.build(latentH, latentW)
+	b := &builder{e: &g.engine, ar: &arena{}, har: &arena{}}
+	b.build(g.cpu, latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
 		return 0, 0, b.err
@@ -887,8 +913,8 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 
 	g.arena.reset()
 	g.harena.reset()
-	b := &builder{e: &g.engine, dec: g, ar: &g.arena, har: &g.harena}
-	out := b.build(latent.H, latent.W)
+	b := &builder{e: &g.engine, ar: &g.arena, har: &g.harena}
+	out := b.build(g.cpu, latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err
 	}
@@ -942,8 +968,8 @@ func (g *GPUDecoder) Apply(latent *Tensor) (*Tensor, error) {
 func (g *GPUDecoder) Dispatches(latentH, latentW int) (int, error) {
 	saved := g.pipes
 	g.pipes = map[string]*vk.ComputePipeline{}
-	b := &builder{e: &g.engine, dec: g, ar: &arena{}, har: &arena{}}
-	b.build(latentH, latentW)
+	b := &builder{e: &g.engine, ar: &arena{}, har: &arena{}}
+	b.build(g.cpu, latentH, latentW)
 	g.pipes = saved
 	if b.err != nil {
 		return 0, b.err
@@ -984,8 +1010,8 @@ type Stage struct {
 func (g *GPUDecoder) Profile(latent *Tensor) ([]Stage, error) {
 	g.arena.reset()
 	g.harena.reset()
-	b := &builder{e: &g.engine, dec: g, ar: &g.arena, har: &g.harena}
-	out := b.build(latent.H, latent.W)
+	b := &builder{e: &g.engine, ar: &g.arena, har: &g.harena}
+	out := b.build(g.cpu, latent.H, latent.W)
 	if b.err != nil {
 		return nil, b.err
 	}

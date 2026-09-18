@@ -79,14 +79,41 @@ func parallelFor(n int, fn func(i int)) {
 	wg.Wait()
 }
 
-// Conv2D is a 2-D convolution with stride 1 and symmetric zero padding,
-// weights in PyTorch's [outC, inC, kh, kw] order.
+// Conv2D is a 2-D convolution with zero padding, weights in PyTorch's
+// [outC, inC, kh, kw] order.
+//
+// Stride and PadEnd exist for the encoder's three downsamplers and are zero
+// everywhere else. **They are one shape between them, not two knobs**:
+// diffusers' Downsample2D pads (0, 1, 0, 1) -- nothing on the top and left,
+// one pixel on the bottom and right -- and then convolves with stride 2 and
+// no padding of its own. So Pad stays the symmetric padding every other
+// convolution in this package uses, PadEnd is the extra row and column on the
+// far side, and a zero in either is the ordinary case.
 type Conv2D struct {
 	InC, OutC int
 	KH, KW    int
 	Pad       int
-	Weight    []float32 // [OutC][InC][KH][KW]
-	Bias      []float32 // [OutC], may be nil
+	// PadEnd is extra zero padding on the bottom and right only.
+	PadEnd int
+	// Stride is the step between output pixels; 0 and 1 both mean 1, so that
+	// every Conv2D built before this field existed still means what it did.
+	Stride int
+	Weight []float32 // [OutC][InC][KH][KW]
+	Bias   []float32 // [OutC], may be nil
+}
+
+// stride is Stride with the zero value read as 1.
+func (c *Conv2D) stride() int {
+	if c.Stride < 1 {
+		return 1
+	}
+	return c.Stride
+}
+
+// OutSize is the spatial size this convolution produces from an input side of
+// n, which is PyTorch's formula with the two paddings separated.
+func (c *Conv2D) OutSize(n, k int) int {
+	return (n+2*c.Pad+c.PadEnd-k)/c.stride() + 1
 }
 
 // convTap, when set, is called with every convolution's input before it runs.
@@ -105,8 +132,9 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 	if x.C != c.InC {
 		return nil, fmt.Errorf("vae: conv expects %d input channels, got %d", c.InC, x.C)
 	}
-	outH := x.H + 2*c.Pad - c.KH + 1
-	outW := x.W + 2*c.Pad - c.KW + 1
+	stride := c.stride()
+	outH := c.OutSize(x.H, c.KH)
+	outW := c.OutSize(x.W, c.KW)
 	if outH <= 0 || outW <= 0 {
 		return nil, fmt.Errorf("vae: conv on %s with kernel %dx%d pad %d leaves nothing", x, c.KH, c.KW, c.Pad)
 	}
@@ -135,18 +163,20 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 							continue
 						}
 						for oh := 0; oh < outH; oh++ {
-							ih := oh + kh - c.Pad
+							ih := oh*stride + kh - c.Pad
 							if ih < 0 || ih >= x.H {
 								continue
 							}
 							// Clip the output-column range to where the
 							// input column is in bounds, so the inner loop
-							// carries no branch.
+							// carries no branch. With a stride the two
+							// bounds are the same inequality divided by it:
+							// lo rounds up and hi rounds down.
 							lo, hi := 0, outW
-							if v := c.Pad - kw; v > lo {
+							if v := ceilDiv(c.Pad-kw, stride); v > lo {
 								lo = v
 							}
-							if v := x.W + c.Pad - kw; v < hi {
+							if v := floorDiv(x.W-1+c.Pad-kw, stride) + 1; v < hi {
 								hi = v
 							}
 							if lo >= hi {
@@ -156,7 +186,7 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 							srow := src[ih*x.W : (ih+1)*x.W]
 							base := kw - c.Pad
 							for ow := lo; ow < hi; ow++ {
-								drow[ow] += wv * srow[ow+base]
+								drow[ow] += wv * srow[ow*stride+base]
 							}
 						}
 					}
@@ -265,4 +295,26 @@ func AddInPlace(a, b *Tensor) (*Tensor, error) {
 		}
 	})
 	return a, nil
+}
+
+// Subsample2x keeps the pixel at (2h+1, 2w+1) of every 2x2 block, halving H
+// and W. It is the second half of the device's stride-2 convolution: the
+// filter runs at stride 1 with symmetric padding and this throws three
+// pixels in four away. TestStrideTwoIsStrideOneSubsampled is why that offset
+// and not the other, and builder.downsample is what it costs.
+func Subsample2x(x *Tensor) *Tensor {
+	out := NewTensor(x.N, x.C, x.H/2, x.W/2)
+	for n := 0; n < x.N; n++ {
+		parallelFor(x.C, func(c int) {
+			src, dst := x.Plane(n, c), out.Plane(n, c)
+			for h := 0; h < out.H; h++ {
+				srow := src[(h*2+1)*x.W:]
+				drow := dst[h*out.W : (h+1)*out.W]
+				for w := range drow {
+					drow[w] = srow[w*2+1]
+				}
+			}
+		})
+	}
+	return out
 }
