@@ -318,3 +318,27 @@ const uint NO_W = 0xffffffffu;
 #define SEQ_HIST    pc.injOff
 #define SEQ_SRC     pc.loOff
 #define ATTN_IDXRAW pc.loOff
+
+// **P5c borrows two more, and both exist so that a pass can be thrown away.**
+// A speculative verification pass runs tokens the model may reject, and the
+// two things it mutates that outlive it — the gated DeltaNet's recurrent
+// state and the two convolution rings — are therefore written into a *second*
+// slot while the committed one is left alone. Which slot is which is the
+// host's business (llm/graph.go's Commit and Rewind); what the kernels need
+// is a destination that is allowed to differ from the source.
+//
+//   resOff    SSM_STATE_DST: where llm_dn_scan.comp stores S after its token
+//             loop, in place of the slot it loaded. The scan reads the state
+//             once and writes it once, so a second destination costs no
+//             traffic at all. In ordinary decode the host sets it equal to
+//             `ssmStateOff` and the kernel is exactly what it was. The gated
+//             DeltaNet never uses `resOff` — the wide residual is the
+//             hyper-connection block's and does not reach this one.
+//   outOff    SEQ_HIST_PREV: the ring llm_seq_hist.comp carries the slots it
+//             did not produce over *from*, or NO_W for the pure write this
+//             kernel used to be. The pure write is right when the ring
+//             written is the ring read — a slot this run did not produce is
+//             already in it — and wrong the moment the destination is a
+//             second ring, which starts empty and needs every slot.
+#define SSM_STATE_DST pc.resOff
+#define SEQ_HIST_PREV pc.outOff

@@ -192,8 +192,12 @@ type dnLayerWeights struct {
 	conv      uint32 // fp32 arena: [convWidth][kern], channel-major
 	gamma     uint32 // fp32 arena: ssm_norm, [headDim], shared by all 48 heads
 	a, dtBias uint32 // fp32 arena: [nHeadV] each
-	state     uint32 // fp32 activation arena: [nHeadV][headDim][headDim]
-	win       uint32 // fp32 activation arena: [Conv-1][qkvN], a ring by position
+	// state and win are **slot zero** of a pair (P5c). A pass that may be
+	// thrown away reads one slot and writes the other, so the state and the
+	// ring a rejected verification pass started from are still there when it
+	// is discarded; `stateSlot` and `slotStride` below say which is live.
+	state uint32 // fp32 activation arena: [nHeadV][headDim][headDim]
+	win   uint32 // fp32 activation arena: [Conv-1][qkvN], a ring by position
 }
 
 // DeltaNetGPU runs linear-attention layers on the device. It holds however
@@ -250,6 +254,10 @@ type DeltaNetGPU struct {
 
 	tokens, arenaRows, rows int
 	lda, ldCtx              int
+	// ctxZero is how many rows of the fp16 context arena the last run
+	// dirtied; everything from there to arenaRows is known to be zero. See
+	// Resize.
+	ctxZero int
 
 	// fp32 weight arena: conv taps, the head norm and the two per-head
 	// vectors, per layer.
@@ -265,6 +273,21 @@ type DeltaNetGPU struct {
 	aGate, aBeta, aState, aResult uint32
 	aPart                         uint32
 	actElems                      int
+	// The rollback (P5c, research/p5-mtp-rollback.md §3). Each layer's
+	// recurrent state and convolution ring are allocated twice, and
+	// `stateStride`/`winStride` is the distance from one slot to the other.
+	// `stateSlot` is the committed slot — the one a pass reads — and
+	// `stateSpec` says the pass in flight writes the *other* one, which is
+	// the whole of the rollback: rejecting it is doing nothing.
+	stateStride, winStride int
+	stateSlot              int
+	stateSpec              bool
+	// slots is 2 when this block was staged for speculation and 1 otherwise.
+	// **It is a staging choice and not a runtime one** (P5c): the second slot
+	// is 113.25 MB of state and 7.13 MB of ring across 36 layers, which is
+	// 120.75 MB a product run has no use for, so a graph that will never
+	// speculate does not allocate it and `Speculate(true)` refuses.
+	slots int
 	// past is how many tokens of this sequence are behind the run, which is
 	// what turns the ring's absolute positions into slots. Zero is a fresh
 	// sequence, where a tap reaching before token zero contributes nothing.
@@ -317,8 +340,18 @@ func NewDeltaNetGPU(dev *vk.Device, cfg DeltaNetConfig, maxTokens int, layers []
 
 // NewDeltaNetGPUBank is the same, with the bank named rather than implied —
 // and with the format, for the one bank that has one to choose (L8c-5).
+// DNOption is a staging choice that has to be made before the arenas are
+// sized, on the same precedent as MoEOption.
+type DNOption func(*DeltaNetGPU)
+
+// WithDNSpeculative stages a second slot for every layer's recurrent state and
+// convolution ring, which is what a rewindable verification pass writes (P5c).
+// It is **120.75 MB at 36 layers** and only a speculative loop has any use for
+// it, so it is opt-in and `Speculate(true)` refuses without it.
+func WithDNSpeculative() DNOption { return func(g *DeltaNetGPU) { g.slots = 2 } }
+
 func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
-	layers []DeltaNetWeights, bank DenseBank, sim QuantSim) (*DeltaNetGPU, error) {
+	layers []DeltaNetWeights, bank DenseBank, sim QuantSim, opts ...DNOption) (*DeltaNetGPU, error) {
 	if maxTokens <= 0 {
 		return nil, fmt.Errorf("llm: %d tokens", maxTokens)
 	}
@@ -355,6 +388,10 @@ func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 		gemm:     GEMMKernelFor(maxTokens),
 		outGemm:  OutGEMMKernelFor(maxTokens),
 		autoPlan: true,
+		slots:    1,
+	}
+	for _, o := range opts {
+		o(g)
 	}
 	g.imLayer = make([]int, len(layers))
 	for i, w := range layers {
@@ -415,13 +452,25 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 		return fmt.Errorf("llm: the sequence slot is at %d, and SEQ_PAST is actu[0]", seq)
 	}
 	g.aQKV = alloc(rows * g.qkvN())
-	g.aWin = alloc(nLayers * hist * g.qkvN())
+	// One slot of each carried tensor, or two when this block was staged for
+	// speculation (P5c). The second is what a rewindable verification pass
+	// writes so that a rejection costs nothing — 7.13 MB of ring and 113.25 MB
+	// of state at 36 layers — and a run that will never speculate should not
+	// carry it, which is why `slots` is set before `alloc` and not by a
+	// setter. The slots of one layer are **adjacent**, so a slot is a layer's
+	// base plus a stride and neither the kernels nor the staging notice.
+	if g.slots <= 0 {
+		g.slots = 1
+	}
+	g.winStride = hist * g.qkvN()
+	g.stateStride = c.StateSize()
+	g.aWin = alloc(nLayers * g.slots * g.winStride)
 	g.aNorm = alloc(rows * cw)
 	g.aSilu = alloc(rows * cw)
 	g.aOut = alloc(rows * c.Inner)
 	g.aGate = alloc(rows * c.NHeadV)
 	g.aBeta = alloc(rows * c.NHeadV)
-	g.aState = alloc(nLayers * c.StateSize())
+	g.aState = alloc(nLayers * g.slots * g.stateStride)
 	g.aResult = alloc(rows * c.NEmbd)
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8d-4). The wider
 	// of the two projections is the fused one, so 32 x 16512 x 4 = 2.1 MB —
@@ -448,6 +497,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	// here, and none of these kernels bounds-check.
 	g.hbuf.Zero()
 	g.abuf.Zero()
+	g.ctxZero = 0
 
 	// A layer's two matrices, one after the other. In the fp16 bank an offset
 	// is a half and a matrix is n*k of them; in L8's it is a byte and a
@@ -486,8 +536,8 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 			gamma:  base + uint32(cw*c.Conv),
 			a:      base + uint32(cw*c.Conv+c.HeadDim),
 			dtBias: base + uint32(cw*c.Conv+c.HeadDim+c.NHeadV),
-			state:  g.aState + uint32(i*c.StateSize()),
-			win:    g.aWin + uint32(i*(c.Conv-1)*g.qkvN()),
+			state:  g.aState + uint32(i*g.slots*g.stateStride),
+			win:    g.aWin + uint32(i*g.slots*g.winStride),
 		}
 	}
 	return nil
@@ -916,6 +966,54 @@ func (g *DeltaNetGPU) SetPast(n int) error {
 // constant so the recorded decode step is byte-identical every token (P1c).
 func (g *DeltaNetGPU) writeSeq() { g.abuf.WriteUint32At(0, []uint32{uint32(g.past)}) }
 
+// stateAt and winAt are a layer's two carried tensors in a given slot.
+func (g *DeltaNetGPU) stateAt(layer, slot int) uint32 {
+	return g.layers[layer].state + uint32(slot*g.stateStride)
+}
+
+func (g *DeltaNetGPU) winAt(layer, slot int) uint32 {
+	return g.layers[layer].win + uint32(slot*g.winStride)
+}
+
+// stateDst is the slot the next pass writes: the live one in an ordinary
+// pass, the other one while a speculative pass is in flight.
+func (g *DeltaNetGPU) stateDst() int {
+	if g.stateSpec {
+		return 1 - g.stateSlot
+	}
+	return g.stateSlot
+}
+
+// Speculate makes the next passes rewindable: they read the committed slot of
+// every layer's recurrent state and convolution ring and write the other one,
+// so that discarding a pass is doing nothing at all (P5c). CommitSlot then
+// makes what the pass wrote the committed slot, and nothing else does.
+//
+// It is off in decode and in prefill, where the pass *is* the commit — and it
+// has to be, because the two slots are different push constants and P1c's
+// pre-recorded decode step is the same bytes every token.
+func (g *DeltaNetGPU) Speculate(on bool) error {
+	if on && g.slots < 2 {
+		return fmt.Errorf("llm: this block was staged with one state slot; a rewindable pass needs two " +
+			"(GraphOpts.Speculative)")
+	}
+	g.stateSpec = on
+	return nil
+}
+
+func (g *DeltaNetGPU) Speculating() bool { return g.stateSpec }
+
+// CommitSlot accepts whatever the last speculative pass wrote.
+func (g *DeltaNetGPU) CommitSlot() {
+	if g.stateSpec {
+		g.stateSlot = 1 - g.stateSlot
+	}
+}
+
+// StateSlot is which of the two slots is committed, for a test that wants to
+// see the ping-pong rather than infer it.
+func (g *DeltaNetGPU) StateSlot() int { return g.stateSlot }
+
 // Reset zeroes one layer's recurrent state and the convolution's window,
 // which is what a fresh sequence starts from.
 //
@@ -928,8 +1026,14 @@ func (g *DeltaNetGPU) Reset(layer int) error {
 		return fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
 	c := g.cfg
-	g.abuf.ZeroFloat32At(int(g.layers[layer].state), c.StateSize())
-	g.abuf.ZeroFloat32At(int(g.layers[layer].win), (c.Conv-1)*g.qkvN())
+	// Both slots (P5c), so that a fresh sequence does not depend on which of
+	// them the last one happened to leave committed. Which slot is live is
+	// deliberately *not* touched here: Reset is per layer and the ping-pong
+	// is not, so a caller resetting one layer of 36 must not move it.
+	for slot := 0; slot < g.slots; slot++ {
+		g.abuf.ZeroFloat32At(int(g.stateAt(layer, slot)), c.StateSize())
+		g.abuf.ZeroFloat32At(int(g.winAt(layer, slot)), (c.Conv-1)*g.qkvN())
+	}
 	return nil
 }
 
@@ -948,7 +1052,7 @@ func (g *DeltaNetGPU) SetState(layer int, st *DeltaNetState) error {
 		return fmt.Errorf("llm: state is %d + %d values, want %d + %d",
 			len(st.S), len(st.Conv), c.StateSize(), c.ConvWidth()*(c.Conv-1))
 	}
-	g.abuf.WriteFloat32At(int(g.layers[layer].state), st.S)
+	g.abuf.WriteFloat32At(int(g.stateAt(layer, g.stateSlot)), st.S)
 	// DeltaNetState.Conv is [channel][position] with the token axis fastest,
 	// which is what ggml_ssm_conv slides a window over; the ring is
 	// [position mod hist][channel]. Column 0 is the oldest, and the positions
@@ -965,7 +1069,7 @@ func (g *DeltaNetGPU) SetState(layer int, st *DeltaNetState) error {
 			rows[(pos%hist)*g.qkvN()+ch] = st.Conv[ch*hist+p]
 		}
 	}
-	g.abuf.WriteFloat32At(int(g.layers[layer].win), rows)
+	g.abuf.WriteFloat32At(int(g.winAt(layer, g.stateSlot)), rows)
 	return nil
 }
 
@@ -978,13 +1082,13 @@ func (g *DeltaNetGPU) State(layer int) (*DeltaNetState, error) {
 	c := g.cfg
 	hist := c.Conv - 1
 	st := &DeltaNetState{
-		S:    g.abuf.ReadFloat32At(int(g.layers[layer].state), c.StateSize()),
+		S:    g.abuf.ReadFloat32At(int(g.stateAt(layer, g.stateSlot)), c.StateSize()),
 		Conv: make([]float32, c.ConvWidth()*hist),
 	}
 	// The window after a run is the last hist positions of the sequence so
 	// far — this batch's tail unless the batch is shorter than it, in which
 	// case the ring still holds what an earlier one left.
-	rows := g.abuf.ReadFloat32At(int(g.layers[layer].win), hist*g.qkvN())
+	rows := g.abuf.ReadFloat32At(int(g.winAt(layer, g.stateSlot)), hist*g.qkvN())
 	end := g.past + g.rows
 	for ch := 0; ch < c.ConvWidth(); ch++ {
 		for p := 0; p < hist; p++ {
@@ -1021,7 +1125,7 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		QKVOff: g.aQKV, NormOff: g.aNorm, OutOff: g.aOut, CtxOff: g.hCtx,
 		ConvOff: w.conv, GammaOff: w.gamma, Kern: uint32(c.Conv),
 		ConvOutOff: noW,
-		SSMGateOff: g.aGate, SSMBetaOff: g.aBeta, SSMStateOff: w.state,
+		SSMGateOff: g.aGate, SSMBetaOff: g.aBeta, SSMStateOff: g.stateAt(layer, g.stateSlot),
 		SSMAOff: w.a, SSMDTOff: w.dtBias, SSMNorm: norm,
 		Heads: uint32(c.NHeadV), KVHeads: uint32(c.NHeadK), HeadDim: uint32(c.HeadDim),
 		GemmN: uint32(g.qkvN()),
@@ -1030,7 +1134,17 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// not here any more: SEQ_PAST is dword 0 of the arena (P1c), written
 		// by SetPast, so `lowRank` stays zero and the dispatch is
 		// byte-identical every decode step.
-		InjOff: w.win,
+		//
+		// The ring the convolution *reads* is the committed slot; the ring
+		// the `hist` dispatch below writes is the one this pass is allowed to
+		// throw away, which is the same slot in every pass but a speculative
+		// one (P5c).
+		InjOff: g.winAt(layer, g.stateSlot),
+		// SSM_STATE_DST, the scan's destination. `resOff` is the
+		// hyper-connection block's wide residual and never reaches this one,
+		// so it is spare — the two decode GEMVs below already borrow it for
+		// their partial sums, and they are the only dispatches here that do.
+		ResOff: g.stateAt(layer, g.stateDst()),
 	}
 	if g.keepSilu {
 		base.ConvOutOff = g.aSilu
@@ -1104,8 +1218,20 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	hist := c.Conv - 1
 	win := base
 	win.LoOff = g.aQKV // SEQ_SRC
+	win.InjOff = g.winAt(layer, g.stateDst())
 	win.GemmM, win.GemmK = uint32(hist), uint32(g.qkvN())
-	add("hist", "hist", uint32((g.qkvN()+255)/256), uint32(minInt(g.rows, hist)), win)
+	// SEQ_HIST_PREV, and the grid with it. A pass that writes the ring it
+	// read leaves the slots it did not produce alone — they are already
+	// right, which is what makes this dispatch a pure write and what lets a
+	// one-token decode step store one row. A speculative pass writes the
+	// *other* ring, which is empty, so every slot has to be written and the
+	// ones this pass did not produce are carried over.
+	win.OutOff = noW
+	rings := minInt(g.rows, hist)
+	if g.stateSpec {
+		win.OutOff, rings = g.winAt(layer, g.stateSlot), hist
+	}
+	add("hist", "hist", uint32((g.qkvN()+255)/256), uint32(rings), win)
 	return d, kinds, nil
 }
 
@@ -1351,8 +1477,21 @@ func (g *DeltaNetGPU) Resize(nTok int) error {
 			g.qkvGemv, g.outGemv = DNGemvFor(nTok)
 		}
 	}
-	if pad := g.arenaRows - nTok; pad > 0 {
-		g.hbuf.ZeroUint16At(int(g.hCtx)+nTok*g.ldCtx, pad*g.ldCtx)
+	// The output projection's A operand has to be zero past the run's rows,
+	// because the GEMM reads a whole row block and a fragment store cannot be
+	// masked. **What is not needed is re-zeroing rows that are already zero**
+	// (P5c): `ctxZero` is how many rows the last run dirtied, so a pass only
+	// clears what a *longer* previous pass left behind.
+	//
+	// It matters because `Graph.sublayer` resizes once a layer, so this ran 36
+	// times a pass over `arenaRows - nTok` rows — at a 1024-token prompt that
+	// is 12.6 MB a call and **453 MB of host memset a pass**, which is 5.7 ms
+	// and was the whole of a verification pass's host cost. A prefill never
+	// saw it because there nTok *is* arenaRows; P1c's pre-recorded decode step
+	// never saw it because it resizes once rather than per layer.
+	if g.ctxZero > nTok {
+		g.hbuf.ZeroUint16At(int(g.hCtx)+nTok*g.ldCtx, (g.ctxZero-nTok)*g.ldCtx)
 	}
+	g.ctxZero = nTok
 	return nil
 }

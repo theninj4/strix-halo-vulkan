@@ -120,7 +120,14 @@ void main() {
     uint vcol = 2u * qk + h * S_V;
     float scale = inversesqrt(float(S_V));
 
-    uint sbase = pc.ssmStateOff + h * (S_V * S_V) + col * S_V;
+    uint scol = h * (S_V * S_V) + col * S_V;
+    uint sbase = pc.ssmStateOff + scol;
+    // Where it goes back. Equal to `sbase` in every pass that is committed as
+    // it runs, and the *other* state slot while a speculative verification
+    // pass is in flight (P5c): this kernel loads S into registers once and
+    // stores it once, so a second destination adds no traffic and the slot
+    // the pass started from survives a rejection untouched.
+    uint dbase = SSM_STATE_DST + scol;
     float s[RPL];
     [[unroll]] for (uint r = 0u; r < RPL; r++) {
         s[r] = act[sbase + r * LPC + lane];
@@ -256,6 +263,6 @@ void main() {
 #endif
 
     [[unroll]] for (uint r = 0u; r < RPL; r++) {
-        act[sbase + r * LPC + lane] = s[r];
+        act[dbase + r * LPC + lane] = s[r];
     }
 }

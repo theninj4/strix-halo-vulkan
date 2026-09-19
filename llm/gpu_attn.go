@@ -416,11 +416,73 @@ func (g *AttnGPU) writeSeq() { g.abuf.WriteUint32At(0, []uint32{uint32(g.past)})
 // completed. A fresh sequence rebuilds the whole table, because the blocks
 // past the last complete one pool cell 0 `ratio` times and have to be written
 // once before they can be left alone.
-func (g *AttnGPU) blockRange() (int, int) {
-	if g.past == 0 {
+func (g *AttnGPU) blockRange() (int, int) { return g.blockRangeAt(g.past, g.rows) }
+
+// blockRangeAt is that range for a run that has not been staged yet, which is
+// what the rollback's snapshot needs: it has to know what the *next* pass will
+// overwrite before the pass sets `past` and `rows` (P5c).
+func (g *AttnGPU) blockRangeAt(past, rows int) (int, int) {
+	if past == 0 {
 		return 0, g.NBlocks()
 	}
-	return g.past / g.cfg.Ratio, (g.past + g.rows) / g.cfg.Ratio
+	return past / g.cfg.Ratio, (past + rows) / g.cfg.Ratio
+}
+
+// SnapshotBlocks copies the pooled indexer rows the next run would rewrite
+// into host memory, and RestoreBlocks puts them back. Together they are this
+// block's whole rollback (P5c).
+//
+// **Everything else here rewinds for free and this one does not.** A KV cell
+// past `past + nTok` is masked out of every score, so a rejected token's key
+// is unreadable rather than stale; the indexer's raw per-cell key is
+// overwritten when the position is re-run. The pooled table is different
+// because a block is *final* — it is written the one time a run completes its
+// `ratio` cells and never again — so a pass that completes a block out of a
+// token that is then rejected leaves a row nothing will rebuild until the
+// block's cells are all re-written, and the selection reads it in between.
+//
+// It is small: a run's range is at most `rows/ratio + 1` blocks of
+// `idxDim` halves in each of the staged layers, which is a few kilobytes.
+// `past == 0` is refused rather than snapshotted, because a fresh sequence
+// rebuilds the whole table and is not a pass anybody rewinds.
+func (g *AttnGPU) SnapshotBlocks(past, rows int) ([]uint16, error) {
+	if past == 0 {
+		return nil, fmt.Errorf("llm: a fresh sequence rebuilds the whole pooled table; it is not a rewindable pass")
+	}
+	lo, hi := g.blockRangeAt(past, rows)
+	if hi <= lo {
+		return []uint16{}, nil
+	}
+	n := (hi - lo) * g.cfg.IdxDim
+	out := make([]uint16, 0, len(g.layers)*n)
+	for l := range g.layers {
+		off := int(g.hIdxK) + l*g.idxKStride + lo*g.cfg.IdxDim
+		out = append(out, g.hbuf.ReadUint16At(off, n)...)
+	}
+	return out, nil
+}
+
+// RestoreBlocks writes a snapshot back. The range is recomputed from the same
+// two numbers the snapshot was taken with, so a caller hands back the pass's
+// own `past` and row count rather than whatever the block is holding now.
+func (g *AttnGPU) RestoreBlocks(past, rows int, snap []uint16) error {
+	lo, hi := g.blockRangeAt(past, rows)
+	if hi <= lo {
+		if len(snap) != 0 {
+			return fmt.Errorf("llm: a %d-value pooled snapshot against an empty range", len(snap))
+		}
+		return nil
+	}
+	n := (hi - lo) * g.cfg.IdxDim
+	if len(snap) != len(g.layers)*n {
+		return fmt.Errorf("llm: a %d-value pooled snapshot against %d blocks of %d layers",
+			len(snap), hi-lo, len(g.layers))
+	}
+	for l := range g.layers {
+		off := int(g.hIdxK) + l*g.idxKStride + lo*g.cfg.IdxDim
+		g.hbuf.WriteUint16At(off, snap[l*n:(l+1)*n])
+	}
+	return nil
 }
 
 // NBlocks is the indexer's block count: the cache's cell count over the

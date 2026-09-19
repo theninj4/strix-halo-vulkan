@@ -315,10 +315,8 @@ func (g *MoEGPU) PinGemv(on bool) {
 		return
 	}
 	if on {
-		g.up, g.down, g.routerGemv = MoEN1M1, MoEM1, MoERouterGEMM
-		if g.rows > 1 {
-			g.up, g.down = MoEM2, MoEM2
-		}
+		g.up, g.down = moeGEMMPlanFor(g.rows)
+		g.routerGemv = MoERouterGEMM
 		g.shUp, g.shDown = g.up, g.down
 	} else {
 		g.up, g.down = MoEPlanFor(g.rows)
@@ -331,10 +329,7 @@ func (g *MoEGPU) PinGemv(on bool) {
 // moePlan is the schedule for a batch, honouring the pin.
 func (g *MoEGPU) moePlan(nTok int) (MoEKernel, MoEKernel, MoERouterKernel) {
 	if g.pinGemv {
-		if nTok == 1 {
-			return MoEN1M1, MoEM1, MoERouterGEMM
-		}
-		up, down := MoEPlanFor(nTok)
+		up, down := moeGEMMPlanFor(nTok)
 		return up, down, MoERouterGEMM
 	}
 	up, down := MoEPlanFor(nTok)
@@ -374,11 +369,27 @@ func moeCheckGemv(up, down MoEKernel, rows int) error {
 }
 
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
-	switch {
-	case tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV():
+	if tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV() {
 		return MoEV64W4, MoEV16W4
+	}
+	return moeGEMMPlanFor(tokens)
+}
+
+// moeGEMMPlanFor is that plan with the decode rungs taken out: the cooperative
+// -matrix pair a batch of this length would run if llm_moe_gemv.comp did not
+// exist. `tokens == 1` is L8d's control, the narrow-BN GEMM rung L7d left the
+// plan on.
+//
+// **It is a function because the pin needs it and asking MoEPlanFor stopped
+// being the same question at P5b.** Before then the GEMV was named at one row
+// only, so `moePlan`'s pinned branch could ask MoEPlanFor for any batch past
+// one and be sure of a GEMM; P5b raised the bound to GEMVMaxRows and the pin
+// quietly stopped pinning at two rows — Graph.PinSchedule went on returning
+// nil and the schedule went on changing under it. P5c found it as a two-token
+// chunk split that did not reproduce the whole prompt.
+func moeGEMMPlanFor(tokens int) (MoEKernel, MoEKernel) {
+	switch {
 	case tokens == 1:
-		// L8d's control: the narrow-BN GEMM rung L7d left the plan on.
 		return MoEN1M1, MoEM1
 	case tokens <= 1024:
 		return MoEM2, MoEM2
@@ -1280,6 +1291,31 @@ func (g *MoEGPU) poisonPad(v float32) {
 	g.hbuf.WriteUint16At(int(g.hXn)+g.rows*g.lda, row)
 }
 
+// moeExpertPipe names the pipeline one of the two expert modes runs: the
+// bank's format, the rung, and — for a GEMV rung — **the row count it was
+// specialized to** (P5b).
+//
+// **The last part is what P5c found missing.** P5b made `ROWS` a
+// specialization constant and built one pipeline per row count, but the four
+// expert dispatches went on naming the bare pipeline, which is the one
+// specialized to a single row. So a two-row batch ran the one-row kernel over
+// a two-row schedule and every tile's second row was left holding whatever the
+// arena last had. The router's two dispatches were named correctly, which is
+// why the router was the one arm of the block that agreed.
+//
+// It is invisible to a block test that drives `Run` twice in a row and
+// compares the second run's row 1 against the first's — the arena still holds
+// what the reference pass wrote there — and it is what a whole-graph two-token
+// chunk split sees at once, because the graph's arena holds a 480-token
+// prefill instead.
+func moeExpertPipe(mode string, f moeFmt, k MoEKernel, rows int) string {
+	name := fmt.Sprintf("%s_%s_%s", mode, f, k)
+	if MoEIsGemv(k) {
+		return gemvRowName(name, rows)
+	}
+	return name
+}
+
 func (g *MoEGPU) writeUints(off uint32, src []uint32) {
 	dst := unsafe.Slice((*uint32)(g.abuf.MappedPointer()), int(off)+len(src))
 	copy(dst[off:], src)
@@ -1377,7 +1413,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	up.BOff, up.MoEBOff2 = w.gate, w.up
 	up.CtxOff = g.hSwiglu
 	up.GemmN, up.GemmK = uint32(c.FFNExpert), uint32(c.NEmbd)
-	add(fmt.Sprintf("up_%s_%s", w.gateFmt, g.up), "up",
+	add(moeExpertPipe("up", w.gateFmt, g.up, g.rows), "up",
 		uint32(c.FFNExpert/moeBNOf(g.up)), uint32(g.maxTiles(bmUp, g.rows)), up)
 
 	// 6. down, weighted and scattered to its (token, slot).
@@ -1386,7 +1422,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	down.BOff = w.down
 	down.CtxOff = g.hSwiglu
 	down.GemmN, down.GemmK = uint32(c.NEmbd), uint32(c.FFNExpert)
-	add(fmt.Sprintf("down_%s_%s", w.downFmt, g.down), "down",
+	add(moeExpertPipe("down", w.downFmt, g.down, g.rows), "down",
 		uint32(c.NEmbd/moeBNOf(g.down)), uint32(g.maxTiles(bmDown, g.rows)), down)
 
 	// 7-8. The shared expert: the same two kernels over one group whose
@@ -1397,7 +1433,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
-	add(fmt.Sprintf("up_%s_%s", w.shGateFmt, g.shUp), "shexp.up",
+	add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
 		uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shUp)), shUp)
 
 	shDown := base
@@ -1405,7 +1441,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shDown.BOff = w.shDown
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
-	add(fmt.Sprintf("down_%s_%s", w.shDownFmt, g.shDown), "shexp.down",
+	add(moeExpertPipe("down", w.shDownFmt, g.shDown, g.rows), "shexp.down",
 		uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shDown)), shDown)
 
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.

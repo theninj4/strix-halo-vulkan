@@ -92,6 +92,10 @@ func main() {
 	mtpFree := flag.Bool("mtp-free", false, "for -mtp: advance on the trunk's own argmax instead of the corpus's tokens")
 	mtpPrime := flag.Int("mtp-prime", 64, "for -mtp-free: how many corpus tokens to prime with before generating, so the greedy run does not degenerate from one token")
 	mtpWire := flag.String("mtp-wire", "res,mixed,zero", "for -mtp: which readings of the nextn block to screen — res, res-flip, mixed, mixed-flip, zero (the negative control)")
+	spec := flag.Bool("spec", false, "P5c: generate through the speculative loop and against a same-hour plain one, and report the multiplier")
+	specPasses := flag.Int("spec-passes", 2, "for -spec: how many times to run each arm, interleaved")
+	specWire := flag.String("spec-wire", "res", "for -spec: the nextn wiring — P5a's measured winner is res")
+	specPrefix := flag.Int("spec-prefix", 0, "for -spec: prompt with this many tokens of -ppl-file instead of -prompt, which is the long-context arm")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
 
@@ -135,6 +139,25 @@ func main() {
 		if err := mtpObserve(mtpOpts{
 			model: *model, draft: *mtpDraft, file: *pplFile, n: *mtpN, ctx: *ctx,
 			layers: layers, depth: *mtpDepth, free: *mtpFree, prime: *mtpPrime, wires: *mtpWire, csv: *csvPath,
+		}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *spec {
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		p := specPromptDefault
+		if flagSet("prompt") {
+			p = *prompt
+		}
+		if err := speculate(specOpts{
+			model: *model, draft: *mtpDraft, prompt: p, file: *pplFile, prefix: *specPrefix,
+			n: *nPredict, ctx: *ctx,
+			layers: layers, passes: *specPasses, wire: specWireList(*specWire), chat: *chat, csv: *csvPath,
 		}); err != nil {
 			log.Fatal(err)
 		}

@@ -85,6 +85,17 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 	}{
 		{"128 at a time", even(nTok, 128)},
 		{"9 at a time, the length of the PLE ring", even(nTok, 9)},
+		// **Two, because a verification pass is two rows** (P5c), and three
+		// beside it because two is also the bound `GEMVMaxRows` names and a
+		// gate that only tests the bound tests the wrong thing. These were
+		// not here until P5c and they should have been: P5b's R-row decode
+		// kernels made two rows a *different kernel* from one and from four,
+		// and the schedule this test's other rungs exercise skips straight
+		// over it. Both of P5c's two findings in that kernel family — the pin
+		// that stopped pinning and the pipeline named without its row
+		// specialization — are visible here and nowhere else in the suite.
+		{"2 at a time, which is a verification pass", even(nTok, 2)},
+		{"3 at a time", append(even(nTok-2, 3), 2)},
 		{"a prompt and then one token at a time", append([]int{nTok - 17}, even(17, 1)...)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

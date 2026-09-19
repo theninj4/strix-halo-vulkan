@@ -32,7 +32,39 @@ is now P5a (the draft head as a passive observer — acceptance and the wiring
 for no machinery at all), P5b (the R-row decode kernels, which are **also
 P6's first stage**) and P5c (the loop).
 [research/p5-mtp-rollback.md](research/p5-mtp-rollback.md)
-**P5b is done too**: all four decode GEMVs take **R rows per tile**, so a
+**P5 is now closed, and it closes as a measured loss.** P5c built the
+rollback and the loop — the ping-pong state, the ping-pong rings,
+`Commit`/`Rewind`, and `TestSpeculationRewindIsTheSequence` — and
+**speculation is lossless and runs at 0.95x on the shipped banks**: 34.65
+against 36.38 tok/s short and 28.20 against 31.56 long, two runs each,
+token-for-token identical text at temperature zero. The gap to the projected
+1.33x is three numbers and none of them is the rollback: the verification pass
+is **1.36 decode steps rather than P5b's 24-layer 1.17**, acceptance on the
+loop's own traffic is **65.6% on prose and 46.9% at a long context rather than
+74.0%**, and **at R = 2 a rejection costs a whole extra pass** — its re-run prefix fills the pass and
+displaces the draft, which the design priced as free at general M. Getting
+there cost three defects in P5b, two of which made *every* two-row pass
+silently wrong (`PinSchedule` stopped pinning at two rows; the four MoE expert
+dispatches never named their R-row pipeline) and one of which cost 9% of a
+step (the R-row GEMV re-read the bank per row — "it is in the L1 after the
+first pass" is true on a two-layer fixture and false across 48 layers of
+expert bank). And **453 MB of host memset a pass** in `DeltaNetGPU.Resize`,
+which a prefill cannot see because `nTok == arenaRows` and a pre-recorded
+decode step cannot see because it resizes once rather than per layer. Two
+rungs are now in `TestGraphIsAChunkSplit` — **two tokens at a time and three**
+— because a two-row schedule was exercised by no gate in the suite and all
+three defects are visible there. **And narrowing the trunk makes speculation
+worse, twice**: the draft head stages at the checkpoint's own widths and so
+does not shrink with D19/D20/D21, which takes it from 0.176 of a step to
+0.208, and acceptance at a long context falls 60.9% → 46.9% because the draft
+predicts the checkpoint's next token and the shipped banks move the trunk
+1.74% of perplexity away from it. Break-even acceptance is **~0.72**. **The loop is parked rather than shipped
+and costs nothing off**: the rollback's 120.75 MB is `GraphOpts.Speculative`,
+which only `cmd/llm -spec` sets, and `-gen -n 64` on the shipped banks measures
+**36.09/36.04 tok/s against a pre-stage control's 35.90/35.93 on identical
+795.6 MB arenas**.
+[research/p5c-speculative-loop.md](research/p5c-speculative-loop.md)
+**P5b before it**: all four decode GEMVs take **R rows per tile**, so a
 two-row verification pass is **19.5 ms against 16.6 at one row — 1.17x, where
 it was 54.1** — with one row unregressed, and three of the four blocks come
 out *faster* at two rows than at one on identical weight bytes. Its lasting
@@ -633,11 +665,14 @@ the dense half completely.
 
 ## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
 
-**P0 through P4c are done** (2026-09-18 and -19) and are struck through
-below, and **P5's design pass is done with them** (2026-09-19): the one
-measurement it was blocked on — the M = 2-8 verification pass — says
-speculation **cannot be built on the kernels that exist**, so the stage is
-now three items and the rollback is the smallest of them. P1b was the largest item on the list by a factor of four and
+**P0 through P5 are done** (2026-09-18 and -19) and are struck through below.
+**P5 closed at P5c on 2026-09-19**, and it closed as a measured loss:
+speculation is built, lossless, and **0.95x**. The design pass's one blocking
+measurement — the M = 2-8 verification pass — said it could not be built on
+the kernels that existed; P5b built the kernels, P5c built the loop, and what
+the loop says is that a two-row pass is 1.32 decode steps, a 64% draft head
+does not pay for it, and at R = 2 a rejection costs a whole extra pass.
+**P6 is the only open item on the list.** P1b was the largest item on the list by a factor of four and
 it evaporated on measurement: the rungs were chosen against the MALL but they
 were chosen *right*, so the honest re-screen changes nothing and the 1.9 ms
 it promised does not exist. What it found instead is a **1.33 ms environment
@@ -673,8 +708,8 @@ item's full plan and gate is in `LLM2.md`.
 | ~~**P3a**~~ | ~~**The fifth bit: a `qh` plane for the dense bank**~~ — **done, and it is D19.** ggml's `Q5_K` is its `Q4_K` plus a bit-plane and *the same record*, so the plane is one 32-byte tile per 128-byte nibble tile and **its byte index is the nibble word's index** — every kernel already computes that index, so the unpack gains a load and two bit tests and no second addressing scheme. The gate is an equality: **0 of 145 chunks differ** between the bank and P3's simulation at `full_attn=q5_k`. Measured as four complete plans, the fifth bit is **14.9 pp/GB on `full_attn`, 7.8 on `lm_head`, 5.9 on `hyper_conn` and 1.6 on `deltanet`** — so the three that beat the 4.6 D18 already refused go in and `deltanet` does not. **4.0948 (+1.63%) against D18's 4.1850 (+3.87%), for 1.13 tok/s: 35.70 → 34.57 over two interleaved passes.** P3's simulated estimates held to 6% on the three it simulated and were **1.75x optimistic on the one it inferred**. | The accuracy frontier is flat; what is left on it is a sixth bit nobody expects to rank differently. [Write-up](research/p3a-fifth-bit.md) |
 | ~~**P4**~~ | ~~**The router at fp16 and the experts at ~4.25 bits**~~ **— done 2026-09-19, and both halves were wrong.** | The router has been fp16 since L5b (the +1.5 was spent before it was proposed) and `ffn_down_exps` **cannot be Q4_K** — rows of 640 against a 256-element super-block. What replaced them, **D20**: the four rows at 8.5 bits with a format the kernels already read, **+0.99 tok/s (34.53 → 35.52) for 0.0022 points of perplexity**. The row that matters, `ffn_down_exps` at 0.615 GB a token, is now **P4c** and is a kernel stage. research/p4-moe-bank.md |
 | ~~**P4c**~~ | ~~**`ffn_down_exps` below six bits**~~ **— done 2026-09-19, and the 4.5-bit format beat the 5.0-bit one on both axes.** Both candidates got an arm in both grouped kernels and a complete 145-chunk plan: `q4_1` is **4.1092 (+1.99%)** for 0.098 GB a token, `iq4_nl` **4.0992 (+1.74%)** for **0.148** — half a bit narrower *and* a fifth of the accuracy cost, so there was no trade to make. Paired over the chunks, q4_1's cost is resolvable (t = 4.11) and IQ4_NL's is not (t = 0.79), which answers the question the stage existed to ask. **The kernel is the story**: written the obvious way — ggml's 18-byte record and the codebook in a `uvec4` — the 4.5-bit arm read its bank at **152.7 GB/s against Q4_1's 211.4** and was *slower than the 6-bit format it replaced*. The codebook into LDS is 180.2, and then **ggml's record layout turns out not to be a constraint on a tensor we write ourselves** — but the two kernels want different arrangements of it: a plane of scales and a plane of nibbles is 203.3 GB/s at decode and **costs the prefill GEMM 36%**, because a slab unpack reads one block of sixty-four different rows per K-step and a split scale doubles the lines it opens. **36-byte pairs** are aligned *and* keep a scale beside its nibbles: **204.3 GB/s and 45.11 us a layer against Q5_1's 56.94** at decode, the same 2679 us at prefill on three quarters of the bytes, and output identical to the bit through every layout. **D21.** | The largest row on the throughput frontier, and the only one whose accuracy nobody had measured. [Write-up](research/p4c-down-exps.md) |
-| **P5** | **MTP speculation** — **the design pass is done (2026-09-19) and it re-ordered the stage.** The crossover D15 refuses had never been measured; measured, a **verification pass over M rows costs 3.24x a decode step at M = 2 and 4.32x at M = 8**, so even at *100%* acceptance M = 2 yields 0.93x and speculation is a **net loss at every M and every acceptance rate today**. Every block but the MoE takes one step up at M = 2 and is then **flat to M = 8** on identical weight bytes — `hc` 2.1 → 13.9 → 13.8 ms, `dn` 4.2 → 8.3 → 8.5, `attn` 1.2 → 2.7 → 2.7 — which is D15's refusal and nothing else; only the MoE keeps climbing, and that half is real (**10 experts at M = 1, 17 at 2, 36 at 4, 49 at 8** against a 1.327 GB routed row of D21's 4.132). **The rollback is the easy part**: 120.75 MB, of which the 113.25 MB of recurrent state **ping-pongs for nothing** (`llm_dn_scan.comp` loads S into registers once and stores it once) and the 7.5 MB of convolution rings is **deferred rather than copied** (`llm_seq_hist.comp` is one dispatch at the end of a block) — and a correctness finding beside it: **both rings are corrupted by a single rejected token**, silently, because a ring is addressed by absolute position modulo its length. **P5a** is the draft head as a *passive observer* — acceptance needs no rollback and no kernel — **P5b** the R-row decode kernels, **P5c** the loop. **P5b done 2026-09-19**: all four decode GEMVs carry **R rows per tile**, `ROWS` a specialization constant so the ~130 `.spv` of those families do not double, and a two-row whole-graph pass is **19.5 ms against 16.6 at one row — 1.17x against the 1.16x projected, where it was 54.1**; `hc` 13.9 → **2.0** ms, `moe` 25.5 → **8.2**, and three of the four blocks are *faster* at two rows than at one. One row unregressed. D15's refusal moved to `GEMVMaxRows` rather than going away. [Write-up](research/p5b-r-row-decode.md) | **P5a done 2026-09-19: `a₁ = 74.0%`** (1024 rounds, n_ctx 2048, teacher-forced, against a zeroed-hidden control at 9.8%), E[tokens] 1.74 at depth 1 to 3.02 at 6, **flat in context** and identical over two runs. The wiring had **no oracle** — llama.cpp's `qwen4exp.cpp` has no `nextn` symbol, transformers discards `^mtp.*` — and was settled by racing five readings from one recorded trunk walk: the wide residual per stream wins (73.4%), the collapsed broadcast loses (55.5%), and **the concatenation order is load-bearing** (flipped: 0 of 256). Worth **~1.33x at depth 1** with P5b and a **loss at every depth today**; a depth-1 verify pass is two rows, so **P5b shrinks to R = 2**. The free-running arm's 92.2% was **discarded** — the trunk was looping a paragraph verbatim. [Write-up](research/p5a-draft-head.md) |
-| **P6** | **Batching** | Pending the product question: will the API serve more than one stream? Each sequence owns 113 MB of DeltaNet state. **P5 answered half of the ordering question**: R concurrent sequences are R rows through the same weights, which is exactly P5b's kernel, so the two share a prerequisite and building it is not a bet on either one. |
+| ~~**P5**~~ | ~~**MTP speculation**~~ — **done 2026-09-19, and it closes as a measured loss: lossless, and 0.98x.** P5c built the rollback and the loop and the stage's own gate holds — `result_norm` identical to the last place through rejected passes against a control that moves it by rms 8.5e-01, and the loop's ids identical to the plain loop's at ctx 512 and at 2048 cells with a 1024-token prompt. **34.65 against 36.38 tok/s and 28.20 against 31.56**, two runs each on the shipped banks (0.98x/0.98x on the checkpoint's own widths — narrowing the trunk makes speculation *worse*, because the draft head does not narrow with it and acceptance falls). The gap to 1.33x is three numbers and none is the rollback: the verification pass is **1.32 steps, not P5b's 24-layer 1.17** (at 48 layers the M-independent head, PLE and host are 13% of a step rather than 24%); acceptance on generated prose is **64.1%, not 74.0%**; and the round is a **two-state chain**, because at R = 2 a rejection's re-run prefix fills the pass and displaces the draft — `(pass + draft) + (1−a)·pass` for exactly two tokens, which the design priced as free at general M. **Two of the design's rollback entries were wrong in the cheap direction**: the deferred ring write is *impossible* (`aQKV` is one arena shared by 36 layers, so a pass ends holding layer 47's projection and there is nothing to re-issue the others from — the rings ping-pong instead), and the pooled indexer table does *not* self-heal (a block is written the one time a run completes its cells and never again, so `Rewind` snapshots it). **Three defects in P5b**, two silent: `PinSchedule` stopped pinning at two rows, the four MoE expert dispatches never named their R-row pipeline (a 45x error on the residual, invisible to a block test whose control is a control on the *combine*), and the R-row GEMV re-read the bank per row (`moe.up` at **101 GB/s against 141**), worth **0.91x → 0.98x**. Plus **453 MB of host memset a pass** in `DeltaNetGPU.Resize`, the long context's other 0.91 → 0.98. And a ceiling nobody had priced: **speculation stops at 2048 cells**, because `blk.48` states no compress ratio. [Write-up](research/p5c-speculative-loop.md) — and what would take it past 1.0, priced there. **The design pass (2026-09-19)** before all of it: The crossover D15 refuses had never been measured; measured, a **verification pass over M rows costs 3.24x a decode step at M = 2 and 4.32x at M = 8**, so even at *100%* acceptance M = 2 yields 0.93x and speculation is a **net loss at every M and every acceptance rate today**. Every block but the MoE takes one step up at M = 2 and is then **flat to M = 8** on identical weight bytes — `hc` 2.1 → 13.9 → 13.8 ms, `dn` 4.2 → 8.3 → 8.5, `attn` 1.2 → 2.7 → 2.7 — which is D15's refusal and nothing else; only the MoE keeps climbing, and that half is real (**10 experts at M = 1, 17 at 2, 36 at 4, 49 at 8** against a 1.327 GB routed row of D21's 4.132). **The rollback is the easy part**: 120.75 MB, of which the 113.25 MB of recurrent state **ping-pongs for nothing** (`llm_dn_scan.comp` loads S into registers once and stores it once) and the 7.5 MB of convolution rings is **deferred rather than copied** (`llm_seq_hist.comp` is one dispatch at the end of a block) — and a correctness finding beside it: **both rings are corrupted by a single rejected token**, silently, because a ring is addressed by absolute position modulo its length. **P5a** is the draft head as a *passive observer* — acceptance needs no rollback and no kernel — **P5b** the R-row decode kernels, **P5c** the loop. **P5b done 2026-09-19**: all four decode GEMVs carry **R rows per tile**, `ROWS` a specialization constant so the ~130 `.spv` of those families do not double, and a two-row whole-graph pass is **19.5 ms against 16.6 at one row — 1.17x against the 1.16x projected, where it was 54.1**; `hc` 13.9 → **2.0** ms, `moe` 25.5 → **8.2**, and three of the four blocks are *faster* at two rows than at one. One row unregressed. D15's refusal moved to `GEMVMaxRows` rather than going away. [Write-up](research/p5b-r-row-decode.md) | **P5a done 2026-09-19: `a₁ = 74.0%`** (1024 rounds, n_ctx 2048, teacher-forced, against a zeroed-hidden control at 9.8%), E[tokens] 1.74 at depth 1 to 3.02 at 6, **flat in context** and identical over two runs. The wiring had **no oracle** — llama.cpp's `qwen4exp.cpp` has no `nextn` symbol, transformers discards `^mtp.*` — and was settled by racing five readings from one recorded trunk walk: the wide residual per stream wins (73.4%), the collapsed broadcast loses (55.5%), and **the concatenation order is load-bearing** (flipped: 0 of 256). Worth **~1.33x at depth 1** with P5b and a **loss at every depth today**; a depth-1 verify pass is two rows, so **P5b shrinks to R = 2**. The free-running arm's 92.2% was **discarded** — the trunk was looping a paragraph verbatim. [Write-up](research/p5a-draft-head.md) |
+| **P6** | **Batching** | Pending the product question: will the API serve more than one stream? Each sequence owns 113 MB of DeltaNet state. **P5 answered half of the ordering question**: R concurrent sequences are R rows through the same weights, which is exactly P5b's kernel, so the two share a prerequisite and building it is not a bet on either one. **P5c is the reason to distrust that kernel until it is gated**: R rows were correct in a block test and wrong in the model three separate ways, and the instrument that caught all three is `TestGraphIsAChunkSplit` at two and three tokens. Raise `GEMVMaxRows` and add the rung in the same commit. |
 
 Parked, unchanged: W4A8 with the asymmetric epilogue, the unpack prefetch,
 the fp16 residual, the hot-expert fast path, the float-atomic combine, the
@@ -3992,13 +4027,20 @@ below Q8. Bandwidth is the whole story.
       streamed, with stop sequences on the same holdback and a prefix reuse
       that makes a second turn a continuation. `go run ./cmd/serve -llm`. See
       `API.md`.
-- [ ] MTP speculative decoding (the separate GGUF). Target 1.5-1.8x. *(P5 —
-      **the design pass, P5a and P5b are done**, 2026-09-19: the rollback is
-      120.75 MB and two free mechanisms, the draft head's acceptance rate is
-      **74.0%** against a control at 9.8%, and the verification pass at two
-      rows is **1.17x a decode step** where it was 3.24x — worth **~1.34x at
-      depth 1** against 0.52x before. **P5c**, the rollback and the loop, is
-      what is left. See [research/p5-mtp-rollback.md](research/p5-mtp-rollback.md),
+- [x] MTP speculative decoding (the separate GGUF). Target was 1.5-1.8x.
+      *(P5 — **done 2026-09-19, and the answer is 0.95x.** `cmd/llm -spec`:
+      the draft head, the two-row verification pass, the rollback and the
+      round. It is **lossless** — the plain loop's ids token for token at
+      temperature zero, at ctx 512 and at 2048 cells — and it is a **net loss
+      in rate**, because the pass is 1.32 decode steps, acceptance on real
+      generated text is 64.1%, and at R = 2 a rejected round costs a whole
+      extra pass. It also has a **hard ceiling at 2048 cells**: `blk.48`
+      states no compress ratio, so the draft head refuses any context where
+      the QSA selection is not provably the identity. The three things that
+      would take it past 1.0 are priced in the write-up and the largest of
+      them is the draft head's acceptance on a workload that is not prose.
+      See [research/p5c-speculative-loop.md](research/p5c-speculative-loop.md),
+      [research/p5-mtp-rollback.md](research/p5-mtp-rollback.md),
       [research/p5a-draft-head.md](research/p5a-draft-head.md) and
       [research/p5b-r-row-decode.md](research/p5b-r-row-decode.md).)*
 - [ ] Batching — which is now also "more than one conversation at a time",

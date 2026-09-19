@@ -131,6 +131,12 @@ type PLEOpts struct {
 	// into the residual, so it can be checked against `ple_conv_out-N`. The
 	// residual add does not need the tensor; the trace comparison does.
 	ConvOut bool
+	// Speculative stages a second slot for the convolution's ring, which is
+	// what a rewindable verification pass writes (P5c). It is 368 KB here —
+	// the DeltaNet's is the 120 MB — and it is opt-in for the same reason:
+	// only a speculative loop has any use for it, and `Speculate(true)`
+	// refuses without it.
+	Speculative bool
 	// Bank is which dense bank the fused key/value projection is staged on.
 	// The zero value is the fp16 bank, which is where L8a left this block —
 	// the one dense matmul in the vertical that never got the int8 stage —
@@ -177,8 +183,17 @@ type PLEGPU struct {
 	// aHist is the convolution's ring: (Conv-1)*NGram rows of the normed
 	// gated value, addressed by **position** modulo its length, and the only
 	// tensor in this block that outlives a run (L7b).
-	aHist    uint32
-	actElems int
+	// It is allocated **twice when the block is staged for speculation**
+	// (P5c): a rewindable verification pass writes the slot the committed one
+	// is not in, so discarding it is doing nothing. `histStride` is the
+	// distance between them, `histSlot` the committed one, `histSpec` whether
+	// the pass in flight is rewindable, and `slots` is 1 or 2 — a product run
+	// has no use for the second and does not pay for it.
+	aHist                uint32
+	histStride, histSlot int
+	histSpec             bool
+	slots                int
+	actElems             int
 	// past is how many tokens of this sequence are already behind the run,
 	// which is how far back the convolution may reach. Zero is a fresh
 	// sequence, where anything before token 0 is zero.
@@ -232,6 +247,10 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 		convOut:    opts.ConvOut,
 		kv:         DefaultPLEKernel(),
 		autoKernel: true,
+		slots:      1,
+	}
+	if opts.Speculative {
+		g.slots = 2
 	}
 	align := 1
 	for _, v := range pleVariants {
@@ -286,7 +305,11 @@ func (g *PLEGPU) alloc() error {
 	// 9 rows of 10240 floats — 368 KB — against the 168 MB a whole context's
 	// worth of `aNorm` would be, which is the other way to let a tap reach
 	// behind the run.
-	g.aHist = alloc(c.ConvHist() * wide)
+	if g.slots <= 0 {
+		g.slots = 1
+	}
+	g.histStride = c.ConvHist() * wide
+	g.aHist = alloc(g.slots * g.histStride)
 	g.aConvOut = noW
 	if g.convOut {
 		g.aConvOut = alloc(rows * wide)
@@ -522,7 +545,11 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 		// not here any more: SEQ_PAST is dword 0 of the arena (P1c), written
 		// by SetPast, so `lowRank` stays zero and the dispatch is
 		// byte-identical every decode step.
-		InjOff: g.aHist,
+		//
+		// The ring the convolution reads is the committed slot; the one the
+		// `hist` dispatch writes is the slot a rejected pass is allowed to
+		// leave behind (P5c).
+		InjOff: g.histAt(g.histSlot),
 	}
 
 	var d []vk.MultiDispatch
@@ -553,8 +580,18 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 	// single-shot prefill does not need, and it is nine rows.
 	hist := base
 	hist.LoOff = g.aNorm // SEQ_SRC
+	hist.InjOff = g.histAt(g.histDst())
 	hist.GemmM, hist.GemmK = uint32(c.ConvHist()), uint32(wide)
-	add("hist", "hist", uint32((wide+255)/256), uint32(minInt(g.rows, c.ConvHist())), hist)
+	// SEQ_HIST_PREV: nothing while the ring written is the ring read, because
+	// then the slots this run did not produce are already right. A
+	// speculative pass writes the other ring, which is empty, so it writes
+	// every slot and carries the rest over (llm_seq_hist.comp).
+	hist.OutOff = noW
+	rings := minInt(g.rows, c.ConvHist())
+	if g.histSpec {
+		hist.OutOff, rings = g.histAt(g.histSlot), c.ConvHist()
+	}
+	add("hist", "hist", uint32((wide+255)/256), uint32(rings), hist)
 	return d, kinds
 }
 
@@ -565,7 +602,45 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 // before position zero, so the ring's contents are unreachable rather than
 // merely stale.
 func (g *PLEGPU) Past() int { return g.past }
-func (g *PLEGPU) Reset()    { g.past = 0; g.writeSeq() }
+
+func (g *PLEGPU) Reset() {
+	// The ring is not cleared and does not need to be, in either slot: at
+	// position zero every tap reaches before the sequence and contributes
+	// nothing, whatever the slots hold. Which one is committed is left where
+	// it is for the same reason (P5c).
+	g.past = 0
+	g.writeSeq()
+}
+
+// histAt is the ring in a given slot, and histDst the slot the next pass
+// writes: the live one unless a speculative pass is in flight (P5c).
+func (g *PLEGPU) histAt(slot int) uint32 { return g.aHist + uint32(slot*g.histStride) }
+
+func (g *PLEGPU) histDst() int {
+	if g.histSpec {
+		return 1 - g.histSlot
+	}
+	return g.histSlot
+}
+
+// Speculate makes the next passes rewindable — they read the committed ring
+// and write the other one — and CommitSlot accepts what one of them wrote.
+// See DeltaNetGPU.Speculate: this block carries no recurrent state, so the
+// nine-row ring is the whole of what it has to roll back.
+func (g *PLEGPU) Speculate(on bool) error {
+	if on && g.slots < 2 {
+		return fmt.Errorf("llm: this block was staged with one ring slot; a rewindable pass needs two " +
+			"(GraphOpts.Speculative)")
+	}
+	g.histSpec = on
+	return nil
+}
+
+func (g *PLEGPU) CommitSlot() {
+	if g.histSpec {
+		g.histSlot = 1 - g.histSlot
+	}
+}
 
 // SetPast places the next run's first token at position n.
 func (g *PLEGPU) SetPast(n int) error {

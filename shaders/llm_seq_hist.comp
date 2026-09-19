@@ -28,25 +28,57 @@
 // and at one token a run would be reading `hist - 1` rows to write them back
 // one slot along.
 //
+// **P5c adds a second arm, and the reason is that "already in the slots they
+// belong in" is a claim about one ring.** A speculative verification pass is
+// allowed to be thrown away, so it writes a *second* ring and leaves the one
+// it read intact — and a second ring is empty. There every slot has to be
+// written: the ones this run produced out of the source, and the ones it did
+// not out of SEQ_HIST_PREV, the ring it read. NO_W there is the pure write
+// above, which is what every committed pass and all of decode runs.
+//
 // The push block says the rest, through fields both blocks leave free for the
 // dispatch that carries them (llm_common.glsl): SEQ_SRC the source, SEQ_HIST
-// the ring, gemmM its length in rows, gemmK the row width in floats.
+// the ring, SEQ_HIST_PREV the ring to carry from or NO_W, gemmM its length in
+// rows, gemmK the row width in floats.
 
 #include "llm_common.glsl"
 
 layout(local_size_x = 256) in;
 
 void main() {
-    uint j = gl_WorkGroupID.y;       // which of the run's stored rows
+    uint j = gl_WorkGroupID.y;       // a stored row, or a destination slot
     uint c = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
     uint hist = max(pc.gemmM, 1u);
     uint width = pc.gemmK;
-    // The last min(tokens, hist) rows of the run, oldest first.
-    uint keep = min(pc.tokens, hist);
-    if (j >= keep || c >= width) {
+    if (c >= width) {
         return;
     }
-    uint t = pc.tokens - keep + j;
-    uint pos = SEQ_PAST + t;
-    act[SEQ_HIST + (pos % hist) * width + c] = act[SEQ_SRC + t * width + c];
+    // The last min(tokens, hist) rows of the run, oldest first.
+    uint keep = min(pc.tokens, hist);
+
+    if (SEQ_HIST_PREV == NO_W) {
+        if (j >= keep) {
+            return;
+        }
+        uint t = pc.tokens - keep + j;
+        uint pos = SEQ_PAST + t;
+        act[SEQ_HIST + (pos % hist) * width + c] = act[SEQ_SRC + t * width + c];
+        return;
+    }
+
+    // The ping-pong arm: `j` is a destination slot rather than a stored row,
+    // and the grid is `hist` rather than `keep`. The run's first stored row
+    // sits at position SEQ_PAST + tokens - keep, so the slots it fills are the
+    // `keep` consecutive ones starting there; everything else carries over.
+    if (j >= hist) {
+        return;
+    }
+    uint lo = pc.tokens - keep;
+    uint age = (j + hist - (SEQ_PAST + lo) % hist) % hist;
+    if (age < keep) {
+        uint t = lo + age;
+        act[SEQ_HIST + j * width + c] = act[SEQ_SRC + t * width + c];
+    } else {
+        act[SEQ_HIST + j * width + c] = act[SEQ_HIST_PREV + j * width + c];
+    }
 }

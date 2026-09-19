@@ -77,6 +77,16 @@ type GraphOpts struct {
 	// 0.99 MB of f32 — 2.03 GB for a 2048-token chunk — so it names the
 	// slab it works in here rather than asking for the batch.
 	HeadRows int
+	// Speculative stages the second slot of every carried tensor that P5c's
+	// rollback ping-pongs: each DeltaNet layer's recurrent state and
+	// convolution ring, and the PLE block's ring. **120.75 MB at 48 layers**,
+	// and only a speculative loop has any use for it — a product decode never
+	// rewinds a pass — so it is opt-in and `Speculate(true)` refuses on a
+	// graph that was not built for it. Nothing else about the graph changes:
+	// with it off the scan's destination is the slot it read and
+	// `llm_seq_hist.comp` takes the pure-write arm it always had, which is
+	// why a `-gen` decode measures the same rate either way.
+	Speculative bool
 	// DenseFP16 stages the dense weights as halves, which is what every
 	// block did before L8. It is the control, not the default: the bank L8
 	// stages is the checkpoint's own int8 with an fp16 scale per 32 elements,
@@ -196,6 +206,18 @@ type Graph struct {
 	preOwner []string
 	// capture arms the next flush to build `pre` from what it submits.
 	capture bool
+
+	// Speculation (P5c, research/p5-mtp-rollback.md §3). `spec` is whether
+	// passes are rewindable; the four fields under it are the one pass in
+	// flight, remembered so that Rewind can put the sequence back exactly
+	// where the pass found it. `specBlocks` is the attention block's pooled
+	// indexer rows, the one thing here that does not rewind by itself.
+	spec       bool
+	specArmed  bool
+	specPast   int
+	specRows   int
+	specIds    int
+	specBlocks []uint16
 }
 
 // Prerecord is whether decode replays a recorded command buffer. On by
@@ -534,6 +556,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			}
 			pleOpts.Bank, pleOpts.Sim = b, q
 		}
+		pleOpts.Speculative = opts.Speculative
 		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, pleOpts); err != nil {
 			return fmt.Errorf("llm: ple: %w", err)
 		}
@@ -577,7 +600,11 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			}
 			dnBank, dnSim = b, q
 		}
-		if g.dn, err = NewDeltaNetGPUBank(dev, dnCfg, g.maxTok, dns, dnBank, dnSim); err != nil {
+		var dnOpts []DNOption
+		if opts.Speculative {
+			dnOpts = append(dnOpts, WithDNSpeculative())
+		}
+		if g.dn, err = NewDeltaNetGPUBank(dev, dnCfg, g.maxTok, dns, dnBank, dnSim, dnOpts...); err != nil {
 			return fmt.Errorf("llm: deltanet: %w", err)
 		}
 		mark("deltanet", len(dns), g.dn.Buffers(), g.dn.WeightBytes(), g.dn.ActivationBytes(), start)
@@ -716,6 +743,7 @@ func (g *Graph) Ids() []int32 { return g.ids }
 func (g *Graph) Reset() error {
 	g.past = 0
 	g.ids = g.ids[:0]
+	g.specArmed, g.specBlocks = false, nil
 	if g.attn != nil {
 		g.attn.Reset()
 	}
@@ -732,6 +760,248 @@ func (g *Graph) Reset() error {
 		}
 	}
 	return nil
+}
+
+// Speculate arms the rollback: while it is on, a pass may be thrown away
+// (P5c, research/p5-mtp-rollback.md §3).
+//
+// **What a pass mutates that outlives it is four things, and only two of them
+// need anything.** Every DeltaNet layer's recurrent state and both
+// convolution rings are written into a second slot and the committed one is
+// left alone, so Rewind is *doing nothing* and Commit is flipping a pair of
+// integers. The KV cache and the indexer's raw keys need no rollback at all —
+// a cell past the end of the sequence is masked out of every score, so a
+// rewound cell is unreadable rather than stale — and the host's id list is a
+// slice. The one thing left is the pooled indexer table, whose rows are final
+// once written, and Rewind restores those.
+//
+// Exactly one pass may be in flight: the ping-pong has two slots, so a second
+// uncommitted pass would read the state its predecessor was supposed to leave
+// and find the committed one instead. Commit or Rewind before running another.
+//
+// It also drops the pre-recorded decode step, because a speculative pass has
+// a different destination in its push constants and P1c's buffer is the bytes
+// of a pass that is committed as it runs.
+func (g *Graph) Speculate(on bool) error {
+	if on == g.spec {
+		return nil
+	}
+	if g.specArmed {
+		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
+	}
+	// The blocks first, because a graph that was not staged for it refuses
+	// here and must be left exactly as it was.
+	if g.dn != nil {
+		if err := g.dn.Speculate(on); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.Speculate(on); err != nil {
+			if g.dn != nil {
+				_ = g.dn.Speculate(!on)
+			}
+			return err
+		}
+	}
+	g.dropPrerecorded()
+	g.spec = on
+	return nil
+}
+
+// Speculating is whether passes are rewindable.
+func (g *Graph) Speculating() bool { return g.spec }
+
+// Commit accepts the speculative pass just run, whole.
+//
+// It is the only thing that moves the ping-pong: what the pass wrote becomes
+// the committed state and the committed ring, and the slot it read becomes
+// the scratch the *next* pass writes. `past` and the id list already moved
+// when the pass ran, because a committed pass is an ordinary one.
+func (g *Graph) Commit() error {
+	if !g.specArmed {
+		return fmt.Errorf("llm: nothing to commit; no speculative pass has run")
+	}
+	if g.dn != nil {
+		g.dn.CommitSlot()
+	}
+	if g.ple != nil {
+		g.ple.CommitSlot()
+	}
+	g.specArmed, g.specBlocks = false, nil
+	return nil
+}
+
+// Rewind discards the speculative pass just run: the sequence goes back to
+// the position and the ids it started from, and every carried history with it.
+//
+// The pass's tokens are *not* re-run here. A caller that accepted some of them
+// re-runs the accepted prefix at the front of its next pass, which is what the
+// design pass costs out (§3.3c): the next pass is rows wide whatever happens,
+// so carrying the accepted rows into it is cheaper than snapshotting a
+// recurrent state per token.
+func (g *Graph) Rewind() error {
+	if !g.specArmed {
+		return fmt.Errorf("llm: nothing to rewind; no speculative pass has run")
+	}
+	// The pooled indexer rows first, while `specPast`/`specRows` still say
+	// which ones the pass claimed.
+	if g.attn != nil && g.specBlocks != nil {
+		if err := g.attn.RestoreBlocks(g.specPast, g.specRows, g.specBlocks); err != nil {
+			return err
+		}
+	}
+	g.past = g.specPast
+	g.ids = g.ids[:g.specIds]
+	if g.attn != nil {
+		if err := g.attn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	g.specArmed, g.specBlocks = false, nil
+	return nil
+}
+
+// rewindPosition is Rewind's position half alone: the sequence goes back to
+// where it was and every carried history stays where the pass left it.
+//
+// **Nothing in the product calls it and nothing should.** It exists because
+// TestSpeculationRewindIsTheSequence needs a control that can fail (P5b's
+// finding 2): a rewind that restores the position and not the histories is
+// exactly the bug the ping-pong exists to prevent, and a gate that passes
+// against it is not evidence that anything was rolled back.
+func (g *Graph) rewindPosition(past, ids int) error {
+	if past > g.past || ids > len(g.ids) {
+		return fmt.Errorf("llm: rewinding to %d/%d from %d/%d", past, ids, g.past, len(g.ids))
+	}
+	g.past, g.ids = past, g.ids[:ids]
+	g.specArmed, g.specBlocks = false, nil
+	if g.attn != nil {
+		if err := g.attn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// arm remembers what a speculative pass is about to overwrite. It runs at the
+// top of appendN, before anything has moved.
+func (g *Graph) arm(nTok int) error {
+	if !g.spec {
+		return nil
+	}
+	if g.specArmed {
+		return fmt.Errorf("llm: a speculative pass is already in flight; commit or rewind it first")
+	}
+	g.specPast, g.specRows, g.specIds, g.specBlocks = g.past, nTok, len(g.ids), nil
+	if g.attn != nil && g.past > 0 {
+		snap, err := g.attn.SnapshotBlocks(g.past, nTok)
+		if err != nil {
+			return err
+		}
+		g.specBlocks = snap
+	}
+	g.specArmed = true
+	return nil
+}
+
+// ExtendRows is Extend with every row's logits rather than the last one's, and
+// it is what a speculative verification pass runs.
+//
+// llama.cpp's graph ends with `inp_out_ids`, so `Extend` moves the last row of
+// the residual to the front and runs the final mixer and the head on one row.
+// A verification pass needs them all: row t's logits are what says whether the
+// draft's guess for token t+1 was the trunk's own. The residual comes back
+// beside them — [rows][hc*nEmbd], the same tensor `Residual` returns — because
+// the draft head's next round is seeded from the row the round commits on.
+//
+// Both slices are into mapped arenas the next pass overwrites.
+func (g *Graph) ExtendRows(ids []int32) (logits, res []float32, err error) {
+	if g.head == nil {
+		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
+	}
+	n := len(ids)
+	if n <= 0 || n > g.head.MaxRows() {
+		return nil, nil, fmt.Errorf("llm: %d rows, the head arena holds %d — GraphOpts.HeadRows", n, g.head.MaxRows())
+	}
+	top := time.Now()
+	g.record(n)
+	defer func() {
+		if ferr := g.flush(); ferr != nil && err == nil {
+			logits, res, err = nil, nil, ferr
+		}
+	}()
+	if err := g.appendN(ids, g.nLayer); err != nil {
+		return nil, nil, err
+	}
+	t0 := time.Now()
+	// The final mixer over every row, which is the one line `hidden` does
+	// differently: there it is one row after a move, here it is per token on
+	// nTok times the work.
+	if err := g.hc.Run(2*g.nLayer, false); err != nil {
+		return nil, nil, fmt.Errorf("llm: head mixer: %w", err)
+	}
+	t0 = g.blk(&g.Stats.HC, t0)
+	if err := g.head.Resize(n); err != nil {
+		return nil, nil, err
+	}
+	t0 = since(&g.Stats.Glue, t0)
+	if err := g.move.Move(g.head.InPort(), g.hc.MixedPort(), n); err != nil {
+		return nil, nil, err
+	}
+	t0 = g.blk(&g.Stats.Move, t0)
+	if err := g.head.Run(); err != nil {
+		return nil, nil, err
+	}
+	g.blk(&g.Stats.Head, t0)
+	if err := g.flush(); err != nil {
+		return nil, nil, err
+	}
+	t0 = time.Now()
+	logits, res = g.head.Logits(), g.hc.Res()
+	since(&g.Stats.Glue, t0)
+	g.Stats.Total += time.Since(top)
+	return logits, res, nil
+}
+
+// PassExperts is how many **distinct** experts the last pass's last layer
+// routed to, across every row of it.
+//
+// It is the numerator of the one growth law a multi-row pass has that a
+// one-row pass does not: the dense families read the same bytes whatever the
+// row count and the routed experts do not (research/p5-mtp-rollback.md §1.2).
+// The MoE block's arenas are shared across layers, so what is readable after a
+// pass is layer 47's selection and nothing else — a sample, and the only one
+// available without a read-back per layer.
+func (g *Graph) PassExperts() int {
+	if g.moe == nil {
+		return 0
+	}
+	seen := make(map[int32]bool, 32)
+	for _, e := range g.moe.TopK() {
+		seen[e] = true
+	}
+	return len(seen)
 }
 
 // Forward runs the whole model over a prompt **as a fresh sequence** and
@@ -1127,6 +1397,11 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	}
 	if g.past+nTok > g.nKV {
 		return fmt.Errorf("llm: %d tokens at position %d of a %d-cell context", nTok, g.past, g.nKV)
+	}
+	// What a rewindable pass has to be able to put back (P5c). Before
+	// anything moves, and a no-op unless Speculate is on.
+	if err := g.arm(nTok); err != nil {
+		return err
 	}
 
 	top := time.Now()

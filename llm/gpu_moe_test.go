@@ -1231,6 +1231,22 @@ func TestMoEGPUDecodeTwoRows(t *testing.T) {
 		{MoEN1M1, MoEM1, MoERouterK40},
 	} {
 		name := fmt.Sprintf("%s/%s/%s", plan.up, plan.down, plan.router)
+		// **Dirty the arenas with a different token first, and this is the
+		// control that matters here** (P5c). `rowMoved` below is a control on
+		// the *combine* and not on the GEMV: the router picks a different
+		// expert set for a different token, so `Out()` moves even when the
+		// expert kernels leave a row unwritten. What does not move then is the
+		// intermediate — and comparing the arm's row 1 against the reference's
+		// passes trivially if the reference is the last thing that wrote it.
+		// So the reference pass is pushed one run further away, and the run in
+		// between leaves the swiglu and the scatter holding the *other*
+		// token's values.
+		//
+		// It is not hypothetical. P5b named the pipeline for these four
+		// dispatches without its row specialization, so every two-row batch
+		// ran the one-row kernel; this test passed, and a two-token chunk of
+		// the whole graph came out 45x off.
+		run(2, MoEN1M1, MoEM1, MoERouterGEMM)
 		got := run(1, plan.up, plan.down, plan.router)
 		rowMoved(t, name+" row 1", got[c.NEmbd:], run(2, plan.up, plan.down, plan.router)[c.NEmbd:])
 		for _, arm := range []struct {

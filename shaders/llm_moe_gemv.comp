@@ -422,30 +422,50 @@ void main() {
 #endif
 
     uint nqd = (pc.gemmK / QK) * QSDB;
-    // The row loop is outside the dword loop rather than inside it, because
-    // what is scarce here is registers and not bank traffic: the bank row is
-    // in the L1 after the first pass over it, where MAXROWS pairs of live
-    // accumulators plus the unpack's temporaries are not free. The weight is
-    // still read once per row from DRAM's point of view, which is the claim
-    // that matters.
+    // **The row loop is inside the dword loop, and P5c is why.** P5b put it
+    // outside on the argument that registers were scarcer than bank traffic —
+    // the bank row would be in the L1 by the second pass over it, so the
+    // weight would still be read once from DRAM. On a two-layer fixture that
+    // is true. In the whole model it is not: `moe.up` measured **101 GB/s of
+    // bank at two rows against 141 at one**, which is a second DRAM read and
+    // not an L1 hit, and it cost the block 2.42x a one-row pass where the
+    // expert set only grew 1.74x. Forty-eight layers of expert bank do not
+    // stay in anything.
+    //
+    // So a dword is loaded once and consumed by every row before the next one
+    // is issued. The cost is MAXROWS live accumulators per mode — four floats
+    // at R = 2 — and the unpack's arithmetic repeated per row, which is the
+    // cheap half: this kernel is bound by how many loads it has outstanding,
+    // not by the shifts and multiplies between them (§2.7).
+    float acc0[MAXROWS];
+#if MODE == 0
+    float acc1[MAXROWS];
+#endif
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        acc0[r] = 0.0;
+#if MODE == 0
+        acc1[r] = 0.0;
+#endif
+    }
+    for (uint d = lane; d < nqd; d += LPR) {
+        [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+            if (r >= ROWS) {
+                continue;
+            }
+            acc0[r] += dotDword(rb0, d, r);
+#if MODE == 0
+            acc1[r] += dotDword(rb1, d, r);
+#endif
+        }
+    }
+
     [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
         if (r >= ROWS) {
             continue;
         }
-        float acc0 = 0.0;
+        float s0 = subgroupClusteredAdd(acc0[r], LPR);
 #if MODE == 0
-        float acc1 = 0.0;
-#endif
-        for (uint d = lane; d < nqd; d += LPR) {
-            acc0 += dotDword(rb0, d, r);
-#if MODE == 0
-            acc1 += dotDword(rb1, d, r);
-#endif
-        }
-
-        acc0 = subgroupClusteredAdd(acc0, LPR);
-#if MODE == 0
-        acc1 = subgroupClusteredAdd(acc1, LPR);
+        float s1 = subgroupClusteredAdd(acc1[r], LPR);
 #endif
         if (lane != 0u) {
             continue;
@@ -454,9 +474,9 @@ void main() {
         // `ggml_swiglu_split` on the two sums, so the [rows, 640] pair the
         // reference materialises never exists here either.
         hact[pc.ctxOff + (rowStart + r) * pc.ldCtx + n0] =
-            float16_t(acc0 * sigmoidf(acc0) * acc1);
+            float16_t(s0 * sigmoidf(s0) * s1);
 #else
-        act[pc.gatedOff + (rowStart + r) * pc.nEmbd + n0] = acc0;
+        act[pc.gatedOff + (rowStart + r) * pc.nEmbd + n0] = s0;
 #endif
     }
 }
