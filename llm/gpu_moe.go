@@ -441,7 +441,17 @@ func (f moeFmt) String() string {
 // moeFmtOf maps a GGUF type onto a build of the kernel, and refuses anything
 // else rather than reading it as something it is not.
 func moeFmtOf(t *gguf.Tensor) (moeFmt, error) {
-	switch t.Type {
+	f, err := moeFmtOfType(t.Type)
+	if err != nil {
+		return 0, fmt.Errorf("llm: %s is ggml type %d, which the MoE kernel has no build for", t.Name, t.Type)
+	}
+	return f, nil
+}
+
+// moeFmtOfType is the same map without a tensor to name in the error, for
+// P4's transcode target.
+func moeFmtOfType(t gguf.Type) (moeFmt, error) {
+	switch t {
 	case gguf.Q4_K:
 		return fmtQ4K, nil
 	case gguf.Q5_K:
@@ -451,7 +461,7 @@ func moeFmtOf(t *gguf.Tensor) (moeFmt, error) {
 	case gguf.Q8_0:
 		return fmtQ80, nil
 	}
-	return 0, fmt.Errorf("llm: %s is ggml type %d, which the MoE kernel has no build for", t.Name, t.Type)
+	return 0, fmt.Errorf("llm: ggml type %d has no MoE kernel build", t)
 }
 
 // moeSPIRV is the cross of the two modes with the formats each actually
@@ -552,6 +562,13 @@ type moeLayerWeights struct {
 	shGate, shUp, shDown          uint32
 	gateFmt, upFmt, downFmt       moeFmt
 	shGateFmt, shUpFmt, shDownFmt moeFmt
+	// to is the ggml type each of the six is *staged* in, in the order the
+	// reserve loop lists them (gate, up, down, shGate, shUp, shDown). It
+	// equals the checkpoint's own type unless P4's `LLM_MOE_BANK` narrowed
+	// it, and `stage` transcodes exactly where the two differ — one decision,
+	// made once in `reserve` where the size depends on it, and read back
+	// rather than made again.
+	to [6]gguf.Type
 }
 
 // moeCombineWG is llm_moe_combine.comp's workgroup, and the column block its
@@ -588,6 +605,11 @@ type MoEGPU struct {
 	mods  []*vk.ShaderModule
 
 	layers []moeLayerWeights
+	// bankPlan is P4's `LLM_MOE_BANK`: which of the six MoE families are
+	// staged narrower than the checkpoint ships them. Read once at
+	// construction so that `reserve`'s sizes and `stage`'s bytes cannot
+	// disagree about it, and so a `Formats` line names what actually ran.
+	bankPlan MoEBankPlan
 
 	up, down MoEKernel
 	// The shared expert's own pair. It is the same two kernels over the same
@@ -646,7 +668,17 @@ func (g *MoEGPU) routerN() int { return roundUpInt(g.cfg.NExpert+1, attnBN) }
 // quantised banks are copied byte for byte out of the mmap'd checkpoint, so
 // one layer costs 1.57 GB of device memory and two is the most a 4 GiB
 // buffer holds.
-func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights) (*MoEGPU, error) {
+// MoEOption adjusts a block before it allocates. There is one, and it exists
+// because P4's bank plan has to be varied *within* a process — the gate is
+// two stagings of the same layer compared bit for bit, and `LLM_MOE_BANK` is
+// read through a `sync.Once` like every other plan here.
+type MoEOption func(*MoEGPU)
+
+// WithMoEBankPlan stages this block under an explicit plan rather than the
+// environment's.
+func WithMoEBankPlan(p MoEBankPlan) MoEOption { return func(g *MoEGPU) { g.bankPlan = p } }
+
+func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights, opts ...MoEOption) (*MoEGPU, error) {
 	if maxTokens <= 0 {
 		return nil, fmt.Errorf("llm: %d tokens", maxTokens)
 	}
@@ -690,6 +722,10 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 		router:     GEMMKernelFor(maxTokens),
 		routerGemv: MoERouterFor(maxTokens),
 		autoPlan:   true,
+		bankPlan:   MoEBankPlanFromEnv(),
+	}
+	for _, opt := range opts {
+		opt(g)
 	}
 	g.up, g.down = MoEPlanFor(maxTokens)
 	g.shUp, g.shDown = MoESharedPlanFor(maxTokens)
@@ -846,7 +882,7 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 		g.layers[i].router = uint32(i * perRouter)
 		g.layers[i].bank = i
 		off := 0
-		for _, t := range []struct {
+		for j, t := range []struct {
 			dst  *uint32
 			fmt  *moeFmt
 			name string
@@ -862,19 +898,35 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 			if t.ten == nil {
 				return fmt.Errorf("llm: layer %d has no %s", i, t.name)
 			}
-			f, err := moeFmtOf(t.ten)
+			// P4: the plan may narrow this tensor. The decision is made here
+			// because the *size* depends on it, and `stage` reads it back.
+			typ := t.ten.Type
+			if to, move := g.bankPlan.For(t.ten.Name, typ); move {
+				if int(t.ten.Dims[0])%to.BlockElems() != 0 {
+					return fmt.Errorf("llm: %s has rows of %d and %s blocks are %d elements — "+
+						"there is no such format for this tensor (P4)",
+						t.ten.Name, t.ten.Dims[0], to, to.BlockElems())
+				}
+				typ = to
+			}
+			f, err := moeFmtOfType(typ)
+			if err != nil {
+				return fmt.Errorf("llm: %s staged as %s: %w", t.ten.Name, typ, err)
+			}
+			nbytes, err := typ.SizeOf(t.ten.Elems())
 			if err != nil {
 				return err
 			}
-			if len(t.ten.Data)%4 != 0 {
-				return fmt.Errorf("llm: %s is %d bytes, not a whole number of words", t.ten.Name, len(t.ten.Data))
+			if nbytes%4 != 0 {
+				return fmt.Errorf("llm: %s is %d bytes, not a whole number of words", t.ten.Name, nbytes)
 			}
 			// Sixteen-aligned, because the Q4_K and Q5_K arms read their
 			// nibbles as `uvec4` and a super-block is a multiple of sixteen
 			// bytes only if the row is, and the row only if the tensor is.
 			*t.dst = uint32(off)
 			*t.fmt = f
-			off += roundUpInt(len(t.ten.Data), 16)
+			g.layers[i].to[j] = typ
+			off += roundUpInt(int(nbytes), 16)
 		}
 		buf, err := g.dev.NewBuffer(off)
 		if err != nil {
@@ -975,7 +1027,7 @@ func (g *MoEGPU) stage(layers []MoEWeights) error {
 		tileB(router, w.SharedGate, 1, c.NEmbd, func(int) int { return nE })
 		g.bank.WriteUint16At(int(g.layers[i].router), router)
 
-		for _, t := range []struct {
+		for j, t := range []struct {
 			off uint32
 			ten *gguf.Tensor
 		}{
@@ -986,7 +1038,14 @@ func (g *MoEGPU) stage(layers []MoEWeights) error {
 			{g.layers[i].shUp, w.UpShexpT},
 			{g.layers[i].shDown, w.DownShexpT},
 		} {
-			g.qbufs[g.layers[i].bank].WriteBytesAt(int(t.off), t.ten.Data)
+			data := t.ten.Data
+			if to := g.layers[i].to[j]; to != t.ten.Type {
+				var err error
+				if data, err = TranscodeMoE(t.ten, to, g.bankPlan.Mode()); err != nil {
+					return err
+				}
+			}
+			g.qbufs[g.layers[i].bank].WriteBytesAt(int(t.off), data)
 		}
 	}
 	return nil
@@ -1058,6 +1117,24 @@ func (g *MoEGPU) WeightBytes() int {
 	return n
 }
 func (g *MoEGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
+
+// RouterBytes is what one token's routing reads: the fused router matrix, in
+// the width it is **staged** in rather than the width the checkpoint ships.
+//
+// P4 exists because those two were confused. `ffn_gate_inp` is F32 in the
+// GGUF — 0.252 GB over 48 layers, 4% of the decode budget for 0.06 B of
+// parameters — and every budget line in `LLM.md`, `cmd/gguf`'s re-pricing and
+// P1's attribution table quoted that number. But `stage` has narrowed it to
+// halves since L5b: `g.bank` is `routerN*NEmbd*2` bytes a layer and the two
+// router kernels read no other copy. So the true figure is **0.142 GB a
+// token** (2.95 MB a layer, the 513 columns padded to 576), and D3's "the
+// router to fp16, +1.5 tok/s of ceiling" was banked before it was proposed.
+//
+// It matters twice. The ceiling is under-quoted by 0.11 GB a token, and P1's
+// 329.8 GB/s — excluded from the loss column under D16 as "not a DRAM
+// measurement" — is **205 GB/s** on the right byte count, which is an
+// ordinary streaming rate beside `deltanet`'s 201.5 and `moe.up`'s 200.6.
+func (g *MoEGPU) RouterBytes() int { return g.bank.Size() / len(g.layers) }
 
 // Buffers is how many device allocations the block holds: the four every
 // block here has, and one quantised bank a layer (L6a).
@@ -1579,19 +1656,8 @@ func (g *MoEGPU) Touched() int {
 func (g *MoEGPU) ExpertBytes(layer int) (upPair, down int) {
 	c := g.cfg
 	w := g.layers[layer]
-	rowBytes := func(f moeFmt, k int) int {
-		switch f {
-		case fmtQ4K:
-			return k / 256 * 144
-		case fmtQ5K:
-			return k / 256 * 176
-		case fmtQ51:
-			return k / 32 * 24
-		}
-		return k / 32 * 34
-	}
-	upPair = c.FFNExpert * (rowBytes(w.gateFmt, c.NEmbd) + rowBytes(w.upFmt, c.NEmbd))
-	down = c.NEmbd * rowBytes(w.downFmt, c.FFNExpert)
+	upPair = c.FFNExpert * (moeRowBytes(w.gateFmt, c.NEmbd) + moeRowBytes(w.upFmt, c.NEmbd))
+	down = c.NEmbd * moeRowBytes(w.downFmt, c.FFNExpert)
 	return upPair, down
 }
 
@@ -1599,9 +1665,25 @@ func (g *MoEGPU) ExpertBytes(layer int) (upPair, down int) {
 // token and is the same shape as a routed one.
 func (g *MoEGPU) SharedBytes(layer int) (upPair, down int) {
 	c := g.cfg
-	upPair = c.FFNShared * (c.NEmbd / 32 * 34) * 2
-	down = c.NEmbd * (c.FFNShared / 32 * 34)
+	w := g.layers[layer]
+	// It used to assume Q8_0 on all three, which was true of every
+	// checkpoint width until P4's transcode moved two of them.
+	upPair = c.FFNShared * (moeRowBytes(w.shGateFmt, c.NEmbd) + moeRowBytes(w.shUpFmt, c.NEmbd))
+	down = c.NEmbd * moeRowBytes(w.shDownFmt, c.FFNShared)
 	return upPair, down
+}
+
+// moeRowBytes is one row of k elements in a bank format.
+func moeRowBytes(f moeFmt, k int) int {
+	switch f {
+	case fmtQ4K:
+		return k / 256 * 144
+	case fmtQ5K:
+		return k / 256 * 176
+	case fmtQ51:
+		return k / 32 * 24
+	}
+	return k / 32 * 34
 }
 
 // Formats names the layer's three routed banks, which decide which build of

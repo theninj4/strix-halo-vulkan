@@ -115,6 +115,12 @@ func perplexity(o pplOpts) error {
 		// was measured over.
 		fmt.Printf("dense bank: %s — %v\n\n", p, p.Widths())
 	}
+	if p := llm.MoEBankPlanFromEnv(); !p.Off() {
+		// P4's transcode, for the same reason: a perplexity is only
+		// attributable if the run says which weights it was measured over,
+		// and the MoE bank was the checkpoint's own bytes until now.
+		fmt.Printf("moe bank: %s\n\n", p)
+	}
 	if p := llm.DensePlan(); !p.Off() {
 		// L8c-1: a candidate bank, staged as the halves it would produce.
 		// Printed before staging rather than after, because a run this long

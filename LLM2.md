@@ -3,15 +3,21 @@
 > **Written 2026-09-17**, as a review of `LLM.md` at L8c-7 / L9a. `LLM.md`
 > stays the stage log; this file is the forward-looking list. Same
 > conventions: history to `TODO.md`, closed findings to `research/`.
+>
+> **Every GB-a-token and tok/s-ceiling figure below is P4a-corrected**
+> (2026-09-19): the MoE router has been staged as halves since L5b, so the
+> row is 0.142 GB a token and not the checkpoint's 0.252, and the expert
+> bank splits 0.889 gate+up / 0.615 down by *bytes* rather than 1.003/0.501
+> by parameters. Numbers quoted before that date are 0.110 GB a token high.
 
 ## Where this stands, in five lines
 
-- **Decode 35.89 tok/s** against llama.cpp's 25.15 — **1.43x**, measured
-  the day P2 landed (27.87 ms a step; same-hour ladder 28.40 → 28.34 →
-  27.87) — at a streamed bank of ~4.15 GB a token after P2. **On D19's
-  widths it is 34.57, 1.37x**, measured against a same-hour D18 control at
-  35.70: the fifth bit's 0.237 GB a token is the price of taking the
-  quantisation damage from +3.87% to +1.63%. P1 attributed
+- **Decode 35.52 tok/s on D19's widths plus P4b's MoE bank** — **1.41x**
+  llama.cpp's 25.15, three interleaved pairs against a same-hour D19 control
+  at 34.53 (within-arm spread 0.14 and 0.01). D19 alone is 34.57–34.53,
+  1.37x, against a D18 control at 35.70: the fifth bit's 0.237 GB a token is
+  the price of taking the quantisation damage from +3.87% to +1.63%, and
+  **P4b gives 0.129 GB of it back for nothing measurable**. P1 attributed
   the step to the dispatch and took the n-gram gather's sixteen serialised
   page faults out of it; P1a fused the hyper-connection boundary, 1501
   dispatches a pass to 1407; P1c put the step in one pre-recorded command
@@ -23,18 +29,21 @@
   668.1 at 512. The original L2a target of ~1150 is 95% reached. P1a's fusion
   is +1.7% of it at 2048 and nothing at 512, because the residual crosses the
   MALL in between.
-- **Perplexity 4.0948 against our 4.0289 — +1.63%** since P3a built the
-  fifth bit and set **D19**: D18's plan (uniform 4.5-bit with `ple_proj` on
-  int8, 4.1850, +3.87%) plus ggml's `qh` plane on `full_attn`, `qsa_indexer`,
-  `lm_head` and `hyper_conn` — **38% of D18's accuracy cost for 1.13 tok/s**,
-  35.70 → 34.57 over two interleaved passes. `deltanet`'s fifth bit is
-  refused at 1.6 pp/GB against the 4.6 D18 already declined. 4.518 GB a
-  token, a 53.6 tok/s ceiling. **On a second corpus (Go stdlib) the plans
+- **Perplexity 4.0970 against our 4.0289 — +1.69%**, which is D19 (4.0948,
+  +1.63%) plus P4b's MoE transcode at a cost the instrument cannot resolve.
+  P3a built the fifth bit and set **D19**: D18's plan (uniform 4.5-bit with
+  `ple_proj` on int8, 4.1850, +3.87%) plus ggml's `qh` plane on `full_attn`,
+  `qsa_indexer`, `lm_head` and `hyper_conn` — **38% of D18's accuracy cost
+  for 1.13 tok/s**, 35.70 → 34.57 over two interleaved passes. `deltanet`'s
+  fifth bit is refused at 1.6 pp/GB against the 4.6 D18 already declined.
+  **D20** then sold 0.1288 GB a token back at **0.017 pp/GB**. 4.279 GB a
+  token, a 56.6 tok/s ceiling. **On a second corpus (Go stdlib) the plans
   rank identically at 2.5x smaller magnitudes**, so the wikitext figure is
   the pessimistic end. Additivity leaks **both ways** and both leaks are the
   n-gram block, so a plan is measured and never composed.
 - **Served**: `cmd/serve -llm`, three envelopes over one loop, prefix reuse —
-  and since P3a it stages **D19** by default (`llm.ShippedDenseBank`).
+  and since P3a it stages **D19** by default (`llm.ShippedDenseBank`), since
+  P4b **D20** beside it (`llm.ShippedMoEBank`).
 - ~~**One correctness cliff**~~: **closed at P0 (2026-09-18)**. It was
   amdgpu's gfx ring watchdog killing any submit that holds the ring past
   **2 s** — not rows, layers, bytes or residency. The recorder chunks by time
@@ -53,7 +62,7 @@ both axes. **The competition from here is our own ceiling, not llama.cpp.**
 
 | hypothesis | verdict |
 |---|---|
-| **"Decode is DRAM-bound by weight bytes"** (the premise of D3, L8a-L8c) | **Was true, is now 79% true, and P1 says where the rest is.** Through L8b, measured ≈ ceiling: 14.71 tok/s against 15.4 GB-derived numbers. Today the weight-streaming dispatches are **24.05 ms of a 30.52 ms step, 79%** — but they run at **178 GB/s against the 227 a dispatch reaches**, so 5.54 ms of that is shape rather than bytes, and another 3.46 ms of dispatches stream no weight at all. The binding constraint has moved from *how many bytes* to *how the dispatches are shaped*: `hyper_conn` at 114.6 GB/s and `moe.down` at 147.5 against `moe.up`'s 200.6 off the same bank. |
+| **"Decode is DRAM-bound by weight bytes"** (the premise of D3, L8a-L8c) | **Was true, is now 79% true, and P1 says where the rest is.** Through L8b, measured ≈ ceiling: 14.71 tok/s against 15.4 GB-derived numbers. Today the weight-streaming dispatches are **24.05 ms of a 30.52 ms step, 79%** — but they run at **178 GB/s against the 227 a dispatch reaches**, so 5.54 ms of that is shape rather than bytes, and another 3.46 ms of dispatches stream no weight at all. The binding constraint has moved from *how many bytes* to *how the dispatches are shaped*: `hyper_conn` at **114.6 GB/s** and the shared expert at **136.5** against the routed experts' 178-181 off the same bank. (**P4a corrects this row**: `moe.down`'s 147.5 and `moe.up`'s 200.6 were a parameter-ratio byte split — at the true widths both are ~180, and `moe.down` was never an outlier. The two real ones are `hyper_conn` and the shared expert.) |
 | **"The cost of 4 bits runs inverse to the bytes"** (L8c-1's headline) | **Retired by its own successors.** The pp-per-GB ranking over 145 chunks is bimodal: `deltanet` 0.87, `hyper_conn` 0.93, `lm_head` 2.59, `full_attn` 5.52 — and the split is presence (36 layers / 97 mixers vs 12 layers / 1 matrix), not size. |
 | **"An 8-chunk screen predicts a family's corpus cost"** | **Retired, four ways.** +0.40→+0.82, −0.30→+0.93, +0.90→+0.31, +1.05→+1.65. A screen does not bound, does not fix the sign, does not rank. Every future width call needs a 145-chunk run (8 min — affordable). |
 | **"Corpus deltas add"** (the asymmetric form's additivity) | **Confirmed to 0.01 pp across four families** — where the symmetric form compounded 11.7% into 18.5%. This is now a *tool*: plans are composable from measured per-family deltas (see idea 4). Caveat: only demonstrated on the asymmetric form at 4.5 bits. |
@@ -61,7 +70,7 @@ both axes. **The competition from here is our own ceiling, not llama.cpp.**
 | **D12's 4 KB formulation** | **Weakened at L8c-6** (no rung is a whole multiple and the spread is still 1.65x); the operative half — *re-measure when the width changes* — stands and is what caught it. |
 | **"Residency is free"** (L6a-4) | **Confirmed at ≤2560 rows — and the >2560 stall is plausibly its boundary.** The untested suspicion in the open question is exactly residency (~80 GB pinned + 28.8 GB mmap + arenas that grow with rows). If P0 confirms it, L6a-4 gains a cliff. |
 | **"Context is cheap here"** (the QSA table in `LLM.md`) | **Priced, never demonstrated.** The arithmetic says 6.8 GB of KV at 262k and a capped 2051-cell read per step; the graph has never completed past 2560 rows. Currently an *inference*, not a measurement — P0 gates it. |
-| **D16: a rung above 242 GB/s is not a DRAM measurement** | **Confirmed and generalising**: every one-token ladder screened so far was choosing rungs against an L3 hit. Standing rule: re-screen a ladder before acting on it. |
+| **D16: a rung above 242 GB/s is not a DRAM measurement** | **Confirmed and generalising**: every one-token ladder screened so far was choosing rungs against an L3 hit. Standing rule: re-screen a ladder before acting on it. **P4a adds the other half**: a rate is a *quotient*, and the numerator is as capable of being wrong as the denominator. Three rows of P1's attribution took their bytes from a different source than the bank they were timing, and each landed on a rate that was read as a finding — one of them (`moe.down` at 147.5) cost a whole stage. Screen the byte count the way D16 screens the rate. |
 
 ---
 
@@ -94,10 +103,18 @@ after the gather fix, and it sums:
 **5.54 + 3.46 + 3.01 = 12.01.** The candidates list above was almost exactly
 wrong in its ordering: the sampler and detokenizer are **0.15 ms together**,
 host record and submit are 1.96, and the two real items are dispatches off
-the bus (`hyper_conn` at 114.6 GB/s, `moe.down` at 147.5) and the 3.46 ms of
-dispatches nobody had counted because they read no weights at all. The one
-candidate that was under-rated is the PLE host gather, which was 2.24 ms and
-is now 0.90 — see P1's finding 1.
+the bus and the 3.46 ms of dispatches nobody had counted because they read no
+weights at all. The one candidate that was under-rated is the PLE host
+gather, which was 2.24 ms and is now 0.90 — see P1's finding 1.
+
+**P4a re-reads three rows of that table** and the total becomes **4.171 GB at
+173.4 GB/s**, with 5.68 ms below 227 rather than 5.54. `moe_router` is
+0.1416 GB rather than 0.252 (185 GB/s, and back in the loss column that D16
+had excluded it from); the experts split **0.889 gate+up / 0.615 down** by
+bytes rather than 1.003/0.501 by parameters, which makes them **177.8 and
+181.0 GB/s** — the same rate — where the table said 200.6 and 147.5. **The
+dispatches that are off the bus are `hyper_conn` at 114.6 and the shared
+expert at 136.5, and that is the whole list.**
 
 ---
 
@@ -475,18 +492,116 @@ the one it inferred** — which is `deltanet`, the only one refused.
       227 GB/s a dispatch can reach. Written down; nothing on the list turns
       on it.
 
-### P4 — the last bytes: the router and the experts  *(+4.5 tok/s of ceiling)*
+### ~~P4 — the last bytes: the router and the experts~~  *(**done**, 2026-09-19 — and both bullets were wrong)*
 
-- [ ] The F32 router at fp16 (+1.5 of ceiling; L5a's tie analysis is the
-      named risk — check the top-10 sets over a real prompt, not just ppl).
-- [ ] The expert banks toward ~4.25 bits (+3.0): transcode `ffn_down_exps`'s
-      Q5_1 (27.1 GB) and the five Q8_0 layers to Q4_K with the imatrix —
-      **the existing `llm_moe_gemm/gemv` arms already read Q4_K**, so this
-      is a transcode and a corpus run, not a kernel. L8c-3 is the reason to
-      expect the calibrated form to behave; D4 (nothing below 4 bits) holds.
-- [ ] Gate: 145-chunk ppl for each step separately (additivity says they
-      can be graded independently), decode measured in the whole model
-      (D16: no ladder numbers), same text at temperature zero.
+**Neither half of this item was what it said, and both failed on a fact about
+the checkpoint rather than on a measurement.** What replaced them is smaller,
+buildable and free: **+0.99 tok/s for a perplexity delta the instrument
+cannot resolve.** [Write-up](research/p4-moe-bank.md)
+
+#### P4a — the router row was already fp16, and it moved four numbers
+
+- [x] `MoEGPU.stage` has narrowed `ffn_gate_inp` to halves since **L5b** —
+      `g.bank` is `routerN*NEmbd*2` a layer and the two router kernels read
+      no other copy. The row is **0.1416 GB a token** (576 padded columns),
+      not the checkpoint's 0.252. `TestMoERouterBankIsHalves` is the
+      equality. **The +1.5 tok/s was spent before it was proposed**, and
+      L5a's tie analysis is *retired* rather than owed: every perplexity
+      number in this log, 4.0289 included, was measured on the fp16 router.
+- [x] Every ceiling was 0.110 GB a token pessimistic: **D18 4.281 → 4.171
+      (56.5 → 58.0 tok/s), D19 4.518 → 4.408 (53.6 → 54.9)**. `cmd/gguf`
+      now prints the budget "as this repo stages it" beside the
+      checkpoint's, so the next one does not have to be found.
+- [x] **And P1's "the router reads above the bus" was the same row.** At
+      0.252 GB it is 329.8 GB/s and was excluded from the loss column under
+      D16; at 0.1416 it is **185-203 GB/s**, an ordinary streaming rate
+      beside `deltanet`'s 201.5.
+- [x] **The same error one row over cost a whole stage.** P1 split the
+      expert traffic 1.003/0.501 — the ratio of their *parameters*, where
+      gate/up are 4.52 bits and `down` is 6.26. The bytes are **0.889 and
+      0.615**, so `moe.down`'s "147.5 GB/s, +1.19 ms lost" — the largest
+      item on P1's list after `hyper_conn` — is **181 GB/s, faster than the
+      pair off the same bank**. P1b spent a stage re-screening sixteen cold
+      banks for it and correctly found nothing; its explanation ("the MALL's
+      arithmetic") is wrong and the real one is that there was never a
+      1.19 ms. **D16 one level up: a rate is a quotient, and the numerator
+      is as capable of being wrong as the denominator.**
+
+#### P4b — the transcode that is actually available  *(D20)*
+
+- [x] **`ffn_down_exps` at Q4_K cannot exist.** Its rows are **640** and a
+      ggml K-quant super-block is 256. `llama-quantize`'s
+      `tensor_type_fallback` demotes `Q5_K → Q5_1` and `Q6_K → Q8_0` for
+      exactly this — which is the 43 and the 5 layers. So `LLM.md`'s reading
+      ("unsloth's imatrix telling them the down projection is the sensitive
+      one") is a fact about the row length, and **nobody has measured what
+      narrowing `down` costs.** `cmd/gguf` now carries the row length per
+      group and refuses to price a checkpoint-byte group at a width its rows
+      cannot hold.
+- [x] What *is* a transcode: the four rows at 8.5 bits with a format the
+      kernels already build — `gate_shexp` and `up_shexp` (row 2560) to
+      **Q4_K**, `down_shexp` and the five Q8_0 layers of `down_exps` (row
+      640) to **Q5_1**. `llm/moebank.go`, `LLM_MOE_BANK` with the same
+      grammar and `imatrix` default as `LLM_DENSE_BANK`, plus one rule: a
+      family names a **ceiling**, so a tensor already at or below it is left
+      bit-for-bit alone. `Imatrix.ExpertColumns` reads the published
+      per-expert rows, which this repo had never needed.
+- [x] Gate, format: **the bytes read back equal what the fit stored**,
+      element for element, through `gguf.Dequantize` (`TestPackKRowIsGgmlsLayout`),
+      and `rtn` Q5_1 equals `quantize_row_q5_1_ref`'s own (d, m).
+- [x] Gate, staging: layer 3 staged through the plan against the same layer
+      staged from pre-transcoded bytes with the plan off is **bit-identical**
+      — 115 343 360 routed values, 2 621 440 shared, 10 485 760 `ffn_out`,
+      zero differences.
+- [x] Gate, corpus: **4.0970 ± 0.02325, +1.69%** over 145 chunks against
+      D19's 4.0948 (+1.63%) — **0.0022 points for 0.1288 GB a token, 0.017
+      pp/GB**, where D19 refused to *buy* at 1.6 and took three families
+      above 5.9. Paired, the delta is +0.00054 nll a chunk against a
+      standard error of 0.00059 (**t = 0.91**, worse in 85 and better in
+      60), so it is **not resolvable** and the claim is an upper bound.
+      `results/p4_ppl_all.csv`.
+- [x] Gate, decode: three interleaved pairs, one binary, one hour —
+      **34.48/34.49/34.62 against 35.52/35.52/35.53**, means **34.53 →
+      35.52, +0.99 tok/s, 1.37x → 1.41x llama.cpp**, within-arm spread 0.14
+      and 0.01. The bytes predicted +1.11. Residency **77.41 → 76.00 GB** in
+      the MoE block, the arithmetic to three decimals.
+- [x] **D20**, and `cmd/serve -llm` stages it by default
+      (`llm.ShippedMoEBank`); `cmd/llm` does not, for the reason D18 gave.
+- [x] D12's obligation, discharged: the shared expert's rungs re-screened on
+      the new widths, twice (median ratio 1.0009 over 993 rows). **The up
+      rung does not move** (v64w4 by 1.28x, on Q4_K as on Q8_0) and **the
+      down rung moves to exactly the routed down's** (v32w4 → v16w4), which
+      is the payload-words law working — `down_shexp` and the routed down
+      are both Q5_1 now. Priced at **0.013 ms a token, +0.016 tok/s**, and
+      not taken: it would make `MoESharedPlanFor` a function of the bank
+      plan for a number under the instrument.
+
+### P4c — `ffn_down_exps` below six bits  *(the largest single row left, and it is a kernel)*
+
+**0.615 GB a token, 41% of the expert traffic and 14% of the whole decode
+bank** — and the only reason it sits at 6.26 bits is that ggml had no
+K-quant to offer a 640-wide row. Nobody has measured what narrowing it
+costs, because until P4 the question was thought to be settled by unsloth's
+choice.
+
+- [ ] Pick the format. All three candidates block by 32, so the row divides
+      them: **IQ4_NL** (4.5 bits, −0.125 GB/tok, the calibrated non-linear
+      form llama.cpp itself falls back to, and `gguf.dequantIQ4NL` already
+      reads it for the n-gram table), **Q4_1** (5.0, −0.084, asymmetric and
+      trivial to unpack), **Q4_0** (4.5, −0.125, symmetric — and D4 plus
+      L8c-1's +18.5% are the reasons to expect the symmetric form to lose).
+- [ ] The kernel: a `down_` arm at a new `QFMT`, five GEMM rungs and six
+      GEMV. `llm_moe_gemm.comp`/`gemv.comp` are already parameterised by
+      `QFMT`, so this is an unpack and a `-D`, not a new kernel — but it
+      *is* a kernel stage, which is what P4 got wrong.
+- [ ] Gate: the P4b shape. Format-is-the-fit round trip, a bit-identical
+      staging control, one 145-chunk plan, three interleaved decode pairs.
+      Expect **−0.125 GB a token, about +1.0 tok/s**, against an accuracy
+      cost nobody has bounded — this is the first MoE row where the cost
+      could plausibly be real.
+- [ ] Carried forward from P4a, priced and not taken: **the router's
+      padding**. 576 columns where 513 are real is **0.0118 GB a token,
+      about +0.09 tok/s**, and it is `roundUpInt(NExpert+1, attnBN)`.
 
 ### P5 — MTP speculation  *(×1.5-1.8 on everything above; after P0, with idea 3's design)*
 
@@ -591,8 +706,26 @@ eval**, now more valuable than it was, because a plan at +1.63% of wikitext
 perplexity may be close enough to the unquantised model that perplexity no
 longer separates the arms at all.
 
-**The numbers to beat from here, each on its own day's control: 34.57 tok/s
-on D19's widths (1.37x llama.cpp's 25.15, against a same-hour D18 control at
-35.70), perplexity 4.0948 (+1.63%) on 4.518 GB a token with a 53.6 tok/s
+**P4 is the stage where two items dissolved on inspection and the
+replacement was better than either.** The router had been fp16 since L5b and
+`ffn_down_exps` has no K-quant at any accuracy, so the +4.5 tok/s of ceiling
+P4 promised was 1.5 already spent and 3.0 that cannot be built. What was
+there instead — four rows at 8.5 bits with a format the kernels already
+read — is **+0.99 tok/s for 0.0022 points of perplexity**, which is 0.017
+pp/GB against a frontier that refused to buy at 1.6.
+
+The lasting part is not the tok/s. **Two of P1's nine attribution rows had
+byte counts from a different source than the bank they were timing, and one
+of them sent P1b to spend a stage re-screening sixteen cold banks for a
+1.19 ms that did not exist.** D16 made every *rate* suspect above 242 GB/s;
+P4a makes every rate suspect in its numerator too. And the same confusion
+produced P4 itself: "the routers are F32" and "unsloth's imatrix says the
+down projection is sensitive" are both readings of the **checkpoint** that
+were carried as facts about the **bank** and about the **model**. Checking a
+premise against the code cost an afternoon and retired two stages.
+
+**The numbers to beat from here, each on its own day's control: 35.52 tok/s
+on D19 + D20 (1.41x llama.cpp's 25.15, against a same-hour D19 control at
+34.53), perplexity 4.0970 (+1.69%) on 4.279 GB a token with a 56.6 tok/s
 ceiling — and llama.cpp behind at every ubatch. The accuracy frontier is
-closed; the throughput frontier has P4, P5 and P6.**
+closed; the throughput frontier has P4c, P5 and P6.**

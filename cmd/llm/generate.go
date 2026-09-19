@@ -175,6 +175,9 @@ func generate(o genOpts) error {
 	fmt.Printf("\ndecode %d tokens in %s — %.2f tok/s, %.2fx llama.cpp's %.2f, %.0f%% of the %.1f the bytes allow\n",
 		len(got), decode.Round(time.Millisecond), rate, rate/llamaDecode, llamaDecode,
 		100*rate/llamaCeiling, llamaCeiling)
+	if p := llm.MoEBankPlanFromEnv(); !p.Off() {
+		fmt.Printf("moe bank: %s\n", p)
+	}
 	if p := llm.DenseBankPlan(); !p.Off() {
 		// `llamaCeiling` is the **checkpoint's** width — 6.334 GB a token at
 		// 242 GB/s — and a run on L8c-4's bank does not read that many bytes,

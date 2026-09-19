@@ -613,7 +613,7 @@ item's full plan and gate is in `LLM2.md`.
 | ~~**P2**~~ | ~~**`ple_proj`, and close L8c**~~ — **done, and the stage closes on 4.2010 (+4.27%)**, beside L8c-3's pre-kernel projection of 4.1998 — an identity, not a coincidence, because the fp16 tail is deleted and the bank quantises exactly what the simulation always did. `ple_proj` alone is **+0.59%** for 0.047 GB — the plan's worst trade — and its screen read **−0.11%**; the six deltas no longer add (sum 4.31% against 4.09% measured). Decode the same hour **27.87 ms, 35.89 tok/s, 1.43x**. | The knapsack (P3) inherits a sixth row and loses additivity as a free tool. [Write-up](research/p2-ple-proj.md) |
 | ~~**P3**~~ | ~~**The shipped-widths decision**~~ — **done, and the answer is the small one: D18 is the uniform plan with `ple_proj` on int8**, 0.0165 GB a token for **0.367 pp (4.1850, +3.87%, against 4.2010)** and a decode cost below the instrument's floor over three interleaved pairs. The knapsack was *measured*, not composed, because additivity now leaks both ways and both leaks are the n-gram block. **Everything past D18 needs the `qh` plane** — `bank_q4.go` is nibbles by construction — and the measured case for building it is `full_attn` at `q5_k`: **14.1 pp/GB**, two-thirds of the width's cost for a quarter of its bytes, where the best int8 arm is 4.6 and is strictly dominated. A second corpus (Go stdlib, 145 chunks) leaves **the ranking invariant** and the magnitudes 2.5x smaller, with `ple_proj` a *larger* share of the damage on code (20% against 8.7%). | **P3a, the fifth bit**, is now the accuracy item; the widths themselves are decided. [Write-up](research/p3-widths.md) |
 | ~~**P3a**~~ | ~~**The fifth bit: a `qh` plane for the dense bank**~~ — **done, and it is D19.** ggml's `Q5_K` is its `Q4_K` plus a bit-plane and *the same record*, so the plane is one 32-byte tile per 128-byte nibble tile and **its byte index is the nibble word's index** — every kernel already computes that index, so the unpack gains a load and two bit tests and no second addressing scheme. The gate is an equality: **0 of 145 chunks differ** between the bank and P3's simulation at `full_attn=q5_k`. Measured as four complete plans, the fifth bit is **14.9 pp/GB on `full_attn`, 7.8 on `lm_head`, 5.9 on `hyper_conn` and 1.6 on `deltanet`** — so the three that beat the 4.6 D18 already refused go in and `deltanet` does not. **4.0948 (+1.63%) against D18's 4.1850 (+3.87%), for 1.13 tok/s: 35.70 → 34.57 over two interleaved passes.** P3's simulated estimates held to 6% on the three it simulated and were **1.75x optimistic on the one it inferred**. | The accuracy frontier is flat; what is left on it is a sixth bit nobody expects to rank differently. [Write-up](research/p3a-fifth-bit.md) |
-| **P4** | **The router at fp16 and the experts at ~4.25 bits** | +4.5 tok/s of ceiling. The expert half is a transcode, not a kernel — `llm_moe_gemm/gemv` already read Q4_K — and L8c-3 says the calibrated form behaves. Grade each on 145 chunks separately; D4 holds. |
+| ~~**P4**~~ | ~~**The router at fp16 and the experts at ~4.25 bits**~~ **— done 2026-09-19, and both halves were wrong.** | The router has been fp16 since L5b (the +1.5 was spent before it was proposed) and `ffn_down_exps` **cannot be Q4_K** — rows of 640 against a 256-element super-block. What replaced them, **D20**: the four rows at 8.5 bits with a format the kernels already read, **+0.99 tok/s (34.53 → 35.52) for 0.0022 points of perplexity**. The row that matters, `ffn_down_exps` at 0.615 GB a token, is now **P4c** and is a kernel stage. research/p4-moe-bank.md |
 | **P5** | **MTP speculation** | ×1.5-1.8 on everything above, so it loses nothing by going after P0/P1. Needs the rollback design first: a rejected draft rewinds 36 recurrent states, both rings, the KV and the host id list, and verification runs at M = 2-8 where D15 refuses the GEMV — the crossover has never been measured. |
 | **P6** | **Batching** | Pending the product question: will the API serve more than one stream? Each sequence owns 113 MB of DeltaNet state. If yes, batching may beat MTP for the same effort. |
 
@@ -2967,11 +2967,24 @@ inner 6144; rope mrope interleaved, sections [11,11,10], 64 of 256 dims, theta
 | qsa_indexer | 0.020 B | 0.04 | 16.00 | every tok | BF16 |
 | ple_proj | 0.033 B | 0.04 | 8.55 | every tok | Q8_0 |
 
-Two things worth reading twice. **`ffn_down_exps` is Q5_1 on 43 of 48 layers
-and Q8_0 on the other 5** while gate/up are Q4_K — that is unsloth's imatrix
-telling them the down projection is the sensitive one, and it is 27 GB of the
-77. And **the routers are F32**: 0.25 GB read every single token, 4% of the
-decode budget for 0.06 B of parameters.
+Two things worth reading twice, **and P4 found both readings wrong.**
+
+**`ffn_down_exps` is Q5_1 on 43 of 48 layers and Q8_0 on the other 5** while
+gate/up are Q4_K — read here as "unsloth's imatrix telling them the down
+projection is the sensitive one", 27 GB of the 77. It is not. `ffn_down_exps`
+is `[640, 2560, 512]` and a ggml K-quant super-block is **256 elements**, so
+the row cannot be a K-quant at all; `llama-quantize`'s `tensor_type_fallback`
+demotes `Q5_K → Q5_1` and `Q6_K → Q8_0` for exactly this, which is the two
+types on the table. It is a fact about the **row length**, and the difference
+matters: the sensitivity reading says narrowing `down` would be expensive,
+the format reading says **nobody has measured it** (P4c).
+
+And **the routers are F32** — 0.25 GB read every single token, 4% of the
+decode budget for 0.06 B of parameters. In the *checkpoint*. `MoEGPU.stage`
+has narrowed them to halves since L5b and no kernel reads another copy, so
+the row a decode token actually reads is **0.142 GB** (576 padded columns x
+2560 x 2 x 48), and every budget line below that quotes 0.252 is 0.110 GB a
+token pessimistic. See research/p4-moe-bank.md §1.
 
 ### Where the bytes go at decode
 
@@ -3863,14 +3876,17 @@ below Q8. Bandwidth is the whole story.
       well inside a single side's ±0.024. **And the pp-per-GB ranking is
       bimodal rather than monotone in anything**: `deltanet` 0.87,
       `hyper_conn` 0.93, `lm_head` 2.59, `full_attn` **5.52**.
-- [ ] Then the two the simulation cannot reach *(P4 — after P1's
-      attribution, which is worth more than both together)*: **the router to fp16**
-      (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk) and
-      **the 512 expert banks at ~4.25** (+3.0 tok/s, D4's floor, and they are
-      the *calibrated* part of the checkpoint so naive re-quantisation is the
-      likeliest way to lose — though **L8c-3 makes that the reason to
-      expect them to behave rather than to fear them**, since Q4_K
-      *is* the form calibration works on). Everything
+- [x] ~~Then the two the simulation cannot reach~~ *(P4, done 2026-09-19 —
+      **and neither was what it said**)*. ~~**the router to fp16**
+      (+1.5 tok/s of ceiling, D3's own line, and L5a's ties are the risk)~~ —
+      it has been fp16 since **L5b**, the row is 0.142 GB a token and not
+      0.252, and L5a's ties were priced by every perplexity number in this
+      log. ~~and **the 512 expert banks at ~4.25** (+3.0 tok/s, D4's floor)~~
+      — `ffn_down_exps` has rows of **640** and a K-quant super-block is
+      256, so Q4_K does not exist for it; the width is `llama-quantize`'s
+      fallback, not the imatrix's judgement. **D20** took the four rows a
+      transcode can reach instead, and the real question is **P4c**.
+      Everything
       L8a and L8b stage is still **the checkpoint's arithmetic**: 8.5 bits a
       weight, its own levels, its own scales. D3's ~4.5 bits is where the
       next 1.9x of the dense half is, and it is the first step in this
@@ -4416,10 +4432,28 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
 | D17 | **An accuracy delta is stated against our own number, not against the oracle's.** | L8c-0: at *identical* weights our perplexity is **4.0289** and llama.cpp's **4.0340** — −0.13%, a fifth of either side's standard error, and in the direction L4a-5 predicts, since the reference accumulates every quantised matmul in fp16 above 8 output columns where ours accumulate in f32. That gap is settled, is not the bank, and would be silently charged to the re-quantisation by a delta measured from 4.0340. The reference's number stays as the sanity check that the two implementations are the same model; the *stage's* gate is a delta from ours. |
 | D18 | **Ship the uniform 4.5-bit plan with `ple_proj` on int8 — and stop there until there is a fifth bit.** | P3 solved L8c's knapsack with six 145-chunk arms instead of composing it. **`ple_proj` back to int8 is 0.0165 GB a token for 0.367 pp: 4.1850 (+3.87%) against the uniform plan's 4.2010 (+4.27%)**, 22 pp/GB and five times the return of any other width the current kernel can stage; three interleaved decode pairs put its cost *below the instrument's floor* (means 35.74 against 35.79, within-arm spread 0.31 tok/s, the sign flipping pair to pair). **Everything better needs a kernel**: `bank_q4.go` is nibbles by construction, so `q5_k` is a third stream through the unpack, and the arms that want it are `full_attn` (**14.1 pp/GB** — 1.087 pp for 0.077 GB, two-thirds of the whole width for a quarter of the bytes), `lm_head` (8.0, and it recovers 77% because unsloth's matrix has **no row for `output.weight`** and the family is round-to-nearest), `hyper_conn` (~5.6). **No int8 arm belongs in the plan except `ple_proj`'s**: `full_attn` at int8 measures +2.72% (idea 4 priced it at +2.07% from additivity) and is strictly dominated by L8c-3's `hc + attn` at `q5_k` — +2.70% at 4.419 GB against +2.72% at 4.592. The plan is **4.281 GB a token, a 56.5 tok/s ceiling**, and `cmd/serve -llm` stages it by default (`llm.ShippedDenseBank`) where `cmd/llm` deliberately does not. |
 | D19 | **Ship the fifth bit on every family whose measured return beats the trade D18 already refused — and on no others.** | P3a built ggml's `qh` plane and then measured the four candidates as **complete 145-chunk plans**, in P3's order of estimated return. `full_attn` + `qsa_indexer` is **14.9 pp/GB** (4.1386, +2.72%, for 0.078 GB a token), `lm_head` **7.8** (4.1136, +2.10%), `hyper_conn` **5.9** (4.0948, **+1.63%**) — all above the **4.6 pp/GB** at which D18 refused `full_attn` → int8 — and `deltanet` is **1.6** (4.0780, +1.22% for 0.260 GB, five times the bytes of any other family for the smallest gain on the board), so it stays at `q4_k`. The cut needs no new principle: it is D18's own line, unmoved. **D19 is 4.0948 ± 0.02322, +1.63% against 4.0289 — 38% of D18's accuracy cost — at 4.518 GB a token, a 53.6 tok/s ceiling and 34.57 tok/s measured (D18 35.70 the same hour, two interleaved passes, within-arm spread 0.06-0.28).** `ple_proj` stays on int8: D18's row is amended, not replaced. And the fifth bit costs **less decode than its bytes predict** — 0.078 GB is −0.55 tok/s at P1's measured 178 GB/s and measures −0.21 — because the plane is a second sequential stream at a quarter of the first's width, issued from the same loop. |
+| D20 | **Narrow every MoE row that ships at 8.5 bits and has a format the kernels already read — and stop there, because the row that matters has no such format.** | P4 asked for `ffn_down_exps` at Q4_K and it **cannot exist**: its rows are 640 and a ggml K-quant super-block is 256, which is why `llama-quantize`'s `tensor_type_fallback` demoted unsloth's `Q5_K → Q5_1` on 43 layers and `Q6_K → Q8_0` on five. What *is* buildable is a transcode of the four Q8_0 rows: `ffn_gate_shexp` and `ffn_up_shexp` (row 2560) to **Q4_K**, `ffn_down_shexp` and the five Q8_0 layers of `ffn_down_exps` (row 640) to **Q5_1**, with the published imatrix's per-expert rows. **0.1288 GB a token and 1.414 GB of residency for 0.0022 points of perplexity — 4.0970 (+1.69%) against D19's 4.0948 (+1.63%), which is 0.017 pp/GB** where D19 refused to *buy* a fifth bit at 1.6 and took three families above 5.9. Paired over 145 chunks the delta is +0.00054 nll a chunk against a standard error of 0.00059 (t = 0.91, worse in 85 and better in 60): **not resolvable**, so the accuracy claim is an upper bound rather than a number. Decode over three interleaved pairs: **34.53 → 35.52 tok/s, +0.99, 1.41x llama.cpp** (within-arm spread 0.14 and 0.01, the same sign every pair). 4.279 GB a token, a 56.6 tok/s ceiling. `cmd/serve -llm` stages it by default (`llm.ShippedMoEBank`); `cmd/llm` does not. |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
 
+- **What does `ffn_down_exps` cost below six bits?** 0.615 GB a token, 41%
+  of the expert traffic, and it sits at 6.26 bits only because
+  `llama-quantize` had no K-quant to offer a 640-wide row (P4). Every
+  candidate blocks by 32 and so fits — IQ4_NL at 4.5 bits, Q4_1 at 5.0,
+  Q4_0 at 4.5 — and each needs a `down_` arm at a new `QFMT`. **This is the
+  first MoE row where a narrowing could plausibly cost real accuracy**: the
+  three P4b took are 8.5-bit rows that nothing chose deliberately, where
+  this one is the model's own sensitive projection by every heuristic that
+  is *not* the row-length artefact. P4c.
+- **Why is a dispatch's time not a function of its bytes, in either
+  direction?** P3a's fifth bit cost 17% *less* decode than its bytes
+  predicted (0.497 GB priced at −3.1 tok/s, measured −2.57) and P4b's
+  transcode bought 11% *less* than its bytes predicted (0.129 GB priced at
+  +1.11, measured +0.99). Both are the same size of miss with opposite
+  signs, and the rung re-screen accounts for a tenth of the second one. The
+  common suspect is P1's 5.5 ms of "shape rather than bytes", which nobody
+  has modelled.
 - ~~**Why does the whole-model graph never return above ~2560 rows?**~~
   **Answered at P0, and it was none of the things it looked like.** It is not
   residency, not the arenas, not a width and not any dispatch: it is **GPU time

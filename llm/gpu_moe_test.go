@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"strix-halo-vulkan/gguf"
 )
 
 // L5b: the MoE block on the device, against llama.cpp's own activations at
@@ -790,5 +792,158 @@ func TestMoEGPUSharedPlan(t *testing.T) {
 	}
 	if err := g.SetSharedPlan(MoEV64W4, MoEV32W4); err == nil {
 		t.Error("the shared expert's GEMV rungs were accepted for a batch of two rows")
+	}
+}
+
+// TestMoERouterBankIsHalves is P4a's gate, and the reason it is an equality
+// rather than a comment: the item P4 carried — "the F32 router at fp16,
+// +1.5 tok/s of ceiling" — was already built, and nothing in the repo said
+// so loudly enough for four budget tables to notice.
+//
+// The checkpoint's `ffn_gate_inp` is F32, 512 x 2560 a layer. What `stage`
+// writes is `routerN x NEmbd` **halves**, so a layer's router is 2.95 MB on
+// the device against 5.24 MB in the file, and the whole decode budget's
+// router row is 0.142 GB a token rather than 0.252.
+//
+// The padding is part of the number and is deliberately not hidden: the 513
+// real columns round up to the plain GEMM's 64-wide block, so 12% of what the
+// router streams is zeros. That is 0.0155 GB a token, priced in
+// research/p4a-router-row.md and not taken.
+func TestMoERouterBankIsHalves(t *testing.T) {
+	g, _, c, w, _, _, done := moeGPU4k(t)
+	defer done()
+
+	routerN := roundUpInt(c.NExpert+1, attnBN)
+	want := routerN * c.NEmbd * 2
+	if got := g.RouterBytes(); got != want {
+		t.Fatalf("router is %d bytes a layer, want %d halves-wide (%d x %d x 2)",
+			got, want, routerN, c.NEmbd)
+	}
+	// And it is narrower than the checkpoint's own bytes by exactly the two
+	// the F32 row would have cost, padding aside.
+	file := len(w.Router) * 4
+	if file != c.NExpert*c.NEmbd*4 {
+		t.Fatalf("checkpoint router is %d F32 values, want %d", len(w.Router), c.NExpert*c.NEmbd)
+	}
+	t.Logf("router: %.2f MB a layer staged as halves against %.2f MB of F32 in the checkpoint; "+
+		"%.4f GB a token over %d layers against the %.4f every budget line quotes",
+		float64(want)/1e6, float64(file)/1e6,
+		float64(48*want)/1e9, 48, float64(48*file)/1e9)
+}
+
+// TestMoEBankTranscodeStagesLikeTheCheckpoint is P4b's staging gate, and it
+// is an **equality** rather than a tolerance.
+//
+// A transcode has to be indistinguishable from a checkpoint that had shipped
+// the narrower format in the first place: the same offsets, the same sixteen-
+// byte alignment, the same `moeFmt`, the same pipeline chosen, the same
+// dispatch. So this stages layer 3 twice — once letting the plan narrow the
+// shared expert's three matrices, once with the plan off over tensors whose
+// bytes were transcoded ahead of time — and demands the block's five outputs
+// agree to the last bit. Anything the staging path does differently for a
+// narrowed tensor shows up here and nowhere else, because a whole-model
+// perplexity run would read it as an accuracy cost.
+func TestMoEBankTranscodeStagesLikeTheCheckpoint(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages two expert banks, 3.2 GB")
+	}
+	c, w, in, nTok, _ := moeFixtures4k(t)
+	plan, err := ParseMoEBankPlan("gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1", "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The control's weights: the same three tensors, already narrowed, with
+	// the plan off so nothing in the staging path can treat them specially.
+	pre := w
+	for _, sub := range []struct {
+		dst **gguf.Tensor
+		to  gguf.Type
+	}{
+		{&pre.GateShexpT, gguf.Q4_K},
+		{&pre.UpShexpT, gguf.Q4_K},
+		{&pre.DownShexpT, gguf.Q5_1},
+	} {
+		src := *sub.dst
+		data, err := TranscodeMoE(src, sub.to, "imatrix")
+		if err != nil {
+			t.Fatal(err)
+		}
+		*sub.dst = &gguf.Tensor{Name: src.Name, Type: sub.to, Dims: src.Dims, Data: data}
+	}
+
+	dev, done := newTestDevice(t)
+	defer done()
+	run := func(ws MoEWeights, p MoEBankPlan) ([]float32, []float32, []float32) {
+		g, err := NewMoEGPU(dev, c, nTok, []MoEWeights{ws}, WithMoEBankPlan(p))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer g.Destroy()
+		if gate, up, down := g.Formats(0); testing.Verbose() {
+			shUp, shDown := g.SharedBytes(0)
+			t.Logf("plan %s: routed %s/%s/%s, shared expert %d + %d bytes a layer",
+				p, gate, up, down, shUp, shDown)
+		}
+		if err := g.Upload(in, nTok); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.ShSwiglu()...),
+			append([]float32(nil), g.Out()...),
+			append([]float32(nil), g.Weighted()...)
+	}
+	aSh, aOut, aRouted := run(w, plan)
+	bSh, bOut, bRouted := run(pre, MoEBankPlan{})
+
+	for _, c := range []struct {
+		name string
+		a, b []float32
+	}{
+		{"ffn_swiglu (shared expert)", aSh, bSh},
+		{"ffn_moe_weighted (routed, untouched)", aRouted, bRouted},
+		{"ffn_out", aOut, bOut},
+	} {
+		if len(c.a) != len(c.b) {
+			t.Fatalf("%s: %d values against %d", c.name, len(c.a), len(c.b))
+		}
+		diff, first := 0, -1
+		for i := range c.a {
+			if c.a[i] != c.b[i] {
+				diff++
+				if first < 0 {
+					first = i
+				}
+			}
+		}
+		if diff != 0 {
+			t.Errorf("%s: %d of %d values differ, first at %d (%g against %g)",
+				c.name, diff, len(c.a), first, c.a[first], c.b[first])
+			continue
+		}
+		t.Logf("%-36s %d values identical", c.name, len(c.a))
+	}
+}
+
+// TestMoEBankTranscodeRefusesAnImpossibleFormat is the other half of P4's
+// finding, as a guard rather than a comment: `ffn_down_exps` has rows of 640
+// and a ggml K-quant super-block is 256 elements, so there is no Q4_K for it
+// at any accuracy. The review's P4 asked for exactly this and it cannot be
+// built — see llm/moebank.go.
+func TestMoEBankTranscodeRefusesAnImpossibleFormat(t *testing.T) {
+	_, w, _, _, _ := moeFixtures4k(t)
+	if got := w.Down.T.Dims[0]; got != 640 {
+		t.Fatalf("ffn_down_exps rows are %d; P4's finding is about 640", got)
+	}
+	if _, err := TranscodeMoE(w.Down.T, gguf.Q4_K, "rtn"); err == nil {
+		t.Fatal("a 640-wide row cannot be Q4_K and the transcode should say so")
+	} else {
+		t.Log(err)
+	}
+	// And the same row *is* a Q5_1, because that format blocks by 32.
+	if 640%gguf.Q5_1.BlockElems() != 0 {
+		t.Fatal("Q5_1 blocks by 32; 640 should divide it")
 	}
 }

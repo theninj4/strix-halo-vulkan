@@ -124,6 +124,65 @@ func (im *Imatrix) Columns(weight string) ([]float32, error) {
 	return v, nil
 }
 
+// ExpertColumns is `Columns` for a per-expert entry: the published matrix
+// stores an expert tensor's importance as `[k, nExpert]` against `[1,
+// nExpert]` counts, one row per expert, and this returns expert `e`'s.
+//
+// The comment at the top of this file used to say expert tensors "are not
+// read here: L5b stages the expert banks byte for byte out of the checkpoint,
+// so the simulation never sees them". P4 is where that stops being true —
+// the shared expert's two 2560-wide matrices and the five Q8_0 layers of
+// `ffn_down_exps` are transcoded, and a transcode without the calibration is
+// the thing L8c-3 measured at three times the cost.
+//
+// The normalisation is the same `in_sum2 / counts`, per expert: an expert
+// that the calibration run never routed to has a zero count, and rather than
+// divide by it this falls back to uniform importance, which is exactly what
+// an absent entry does one level up.
+func (im *Imatrix) ExpertColumns(weight string, e int) ([]float32, error) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	key := fmt.Sprintf("%s#%d", weight, e)
+	if v, ok := im.cache[key]; ok {
+		return v, nil
+	}
+	sums, err := im.set.Get(weight + ".in_sum2")
+	if err != nil {
+		im.cache[key] = nil
+		return nil, nil
+	}
+	counts, err := im.set.Get(weight + ".counts")
+	if err != nil {
+		return nil, fmt.Errorf("llm: imatrix %s has in_sum2 but no counts", weight)
+	}
+	c, err := counts.Dequantize(nil)
+	if err != nil {
+		return nil, fmt.Errorf("llm: imatrix %s.counts: %w", weight, err)
+	}
+	if e < 0 || e >= len(c) {
+		return nil, fmt.Errorf("llm: imatrix %s has %d experts, asked for %d", weight, len(c), e)
+	}
+	if int64(len(c)) != sums.Rows() {
+		return nil, fmt.Errorf("llm: imatrix %s has %d counts against %d rows of in_sum2",
+			weight, len(c), sums.Rows())
+	}
+	v, err := sums.DequantizeRow(int64(e), nil)
+	if err != nil {
+		return nil, fmt.Errorf("llm: imatrix %s.in_sum2 row %d: %w", weight, e, err)
+	}
+	if c[e] > 0 {
+		for i := range v {
+			v[i] /= c[e]
+		}
+	} else {
+		for i := range v {
+			v[i] = 1
+		}
+	}
+	im.cache[key] = v
+	return v, nil
+}
+
 var (
 	imatrixOnce sync.Once
 	imatrixOpen *Imatrix

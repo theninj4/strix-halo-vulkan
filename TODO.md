@@ -1009,6 +1009,86 @@ everything else is percents: **I8** (38 ms of an 87 ms preview, the cheapest
 of them and the same pattern as I3), then **I3** (1.6 s of the image), then
 I4, then I5. `IMAGE.md` ranks them and says why.
 
+### Session 2026-09-19 — P4: two premises checked, both wrong, and D20
+
+**Result: both halves of P4 dissolved on inspection, and what replaced them
+is +0.99 tok/s for a perplexity delta the instrument cannot resolve — 34.53
+-> 35.52 over three interleaved pairs, 1.41x llama.cpp, 4.0970 (+1.69%)
+against D19's 4.0948 (+1.63%), 4.279 GB a token and a 56.6 tok/s ceiling.**
+
+**P4a: the router has been fp16 since L5b.** `MoEGPU.stage` narrows
+`ffn_gate_inp` to halves and the two router kernels read no other copy, so
+the row is **0.1416 GB a token** (576 padded columns x 2560 x 2 x 48) and not
+the checkpoint's 0.252. The "+1.5 tok/s of ceiling" was spent before it was
+proposed, and L5a's tie analysis is retired rather than owed — every
+perplexity number in this log was measured on the fp16 router.
+`TestMoERouterBankIsHalves` is the equality; `cmd/gguf` now prints the budget
+"as this repo stages it" beside the checkpoint's. **Every ceiling moves**:
+D18 4.281 -> 4.171 GB (56.5 -> 58.0 tok/s), D19 4.518 -> 4.408 (53.6 ->
+54.9). And **P1's "moe_router reads at 329.8 GB/s, excluded under D16"
+becomes 185-203 GB/s**, an ordinary streaming rate. **The same error one row
+over cost a whole stage**: P1 split the expert traffic 1.003/0.501, the ratio
+of their *parameters*, where gate/up are 4.52 bits and `down` is 6.26 — the
+bytes are **0.889 and 0.615**, so `moe.down`'s 147.5 GB/s and "+1.19 ms lost"
+are **181 GB/s, faster than the pair off the same bank**. P1b re-screened
+sixteen cold banks for that 1.19 ms and correctly found nothing; its
+explanation was wrong and the real one is that the millisecond never existed.
+**D16 one level up: a rate is a quotient, and the numerator is as capable of
+being wrong as the denominator.**
+
+**P4b: `ffn_down_exps` at Q4_K cannot exist.** Its rows are **640** and a
+ggml K-quant super-block is 256. `llama-quantize`'s `tensor_type_fallback`
+demotes `Q5_K -> Q5_1` and `Q6_K -> Q8_0` for exactly this, which is the 43
+and the 5 layers — so `LLM.md`'s reading ("unsloth's imatrix telling them the
+down projection is the sensitive one") is a fact about the row length, and
+**nobody has measured what narrowing `down` costs**. What *is* a transcode is
+the four rows at 8.5 bits with a format the kernels already build:
+`gate_shexp` and `up_shexp` (row 2560) to **Q4_K**, `down_shexp` and the five
+Q8_0 layers of `down_exps` (row 640) to **Q5_1** — **0.1288 GB a token and
+1.414 GB of residency**, three quarters of it off the shared expert, which
+P1 measured at 136.5 GB/s. `llm/moebank.go`, `LLM_MOE_BANK` with
+`LLM_DENSE_BANK`'s grammar and `imatrix` default plus one rule: **a family
+names a ceiling**, so a tensor already at or below it is left bit-for-bit
+alone. The fit is `asymEnc` and the record packer is `packQ4KRecord`, both
+shared with `bank_q4.go`, so the two banks can never differ by quantiser;
+Q5_1 is fitted **with** the imatrix, which ggml does not do, and
+`Imatrix.ExpertColumns` reads the per-expert rows this repo had never needed.
+**Three gates.** The format is the fit: packed bytes read back through
+`gguf.Dequantize` equal what the encoder stored, element for element. The
+staging is indistinguishable from a checkpoint that shipped the narrower
+format: layer 3 through the plan against the same layer from pre-transcoded
+bytes with the plan off is **bit-identical over 128 M values**. And the
+corpus: **4.0970 +/- 0.02325 (+1.69%)** against D19's 4.0948, which is
+**0.0022 points for 0.1288 GB — 0.017 pp/GB**, where D19 refused to *buy* a
+fifth bit at 1.6 and took three families above 5.9. Paired over the 145
+chunks the delta is +0.00054 nll a chunk against a standard error of 0.00059
+(**t = 0.91**, worse in 85 and better in 60), so the accuracy claim is an
+**upper bound**, not a number. **D20**, and `cmd/serve -llm` stages it by
+default (`llm.ShippedMoEBank`); `cmd/llm` still stages nothing.
+
+**D12's obligation, discharged.** Two of the shared expert's three matrices
+changed format, so the rungs were re-screened on the transcoded bank —
+`-moe -tokens 1 -ladder -layers 16 -iters 1`, P1b's honest-floor form, twice.
+**The up rung does not move** (v64w4 by 1.28x, on Q4_K as on Q8_0) and **the
+down rung moves to exactly the routed down's** (v32w4 -> v16w4), which is the
+payload-words law working: `down_shexp` and the routed down are both Q5_1
+now, 120 dwords a row. Priced at 0.013 ms a token, +0.016 tok/s, and **not
+taken** — it would make `MoESharedPlanFor` a function of the bank plan for a
+number under the instrument.
+
+Reproducibility: the ppl runs are deterministic and the paired per-chunk
+analysis is in the write-up; the decode claim is three interleaved pairs on
+one binary within one hour, within-arm spread 0.14 and 0.01 tok/s against a
+0.99 difference, same sign every pair; the two ladder runs agree to a median
+ratio of **1.0009 (p10-p90 0.986-1.020) over 993 rows**, every rate under
+242 GB/s. Runs: `results/p4_ppl_all.csv`, `results/p4_moe_shexp.csv`.
+Write-up: `research/p4-moe-bank.md`; next is **P4c** (`ffn_down_exps` below
+six bits in a block-32 format — IQ4_NL, Q4_1 or Q4_0 — which is a kernel
+stage and the largest single row left at 0.615 GB a token) or **P5** (MTP,
+with idea 3's rollback design first), per `LLM2.md`. Carried forward: the
+router's 576-column padding (0.0118 GB a token, ~+0.09 tok/s), P3a's
+un-re-screened dense GEMV rungs, and idea 5's downstream task eval.
+
 ### Session 2026-09-18 — P3a: the fifth bit built, and D19
 
 **Result: ggml's `qh` plane is in the dense bank, it is exact, and three of

@@ -25,13 +25,17 @@
 // activation arena at a 1024x1024 ceiling. What it buys is a preview at 87 ms
 // against the 870 the full decoder would take for the same frame.
 //
-// **-llm stages D19's widths by default** (P3a): D18's 4.5-bit plan with
-// `ple_proj` on int8, plus P3a's fifth bit on `full_attn`, `qsa_indexer`,
-// `lm_head` and `hyper_conn` -- 4.518 GB a token, 4.0948 perplexity (+1.63%
-// against D18's +3.87%) and 34.57 tok/s. `LLM_DENSE_BANK` overrides it by
-// naming any other plan, and `off` serves L8a's int8 bank instead.
-// `cmd/llm` has no such default on purpose -- a measurement tool should
-// stage only what its command line names.
+// **-llm stages D19's widths and D20's MoE bank by default** (P3a, P4b).
+// D19 is D18's 4.5-bit plan with `ple_proj` on int8, plus P3a's fifth bit on
+// `full_attn`, `qsa_indexer`, `lm_head` and `hyper_conn`. D20 narrows the
+// four MoE rows that ship at 8.5 bits and have a format the kernels already
+// read -- the shared expert's gate and up to Q4_K, its down and the five
+// Q8_0 layers of `ffn_down_exps` to Q5_1. Together: **4.279 GB a token,
+// 4.0970 perplexity (+1.69% against our own 4.0289) and 35.52 tok/s,
+// 1.41x llama.cpp**. `LLM_DENSE_BANK` and `LLM_MOE_BANK` override by naming
+// any other plan, and `off` serves the wider bank instead. `cmd/llm` has no
+// such default on purpose -- a measurement tool should stage only what its
+// command line names.
 //
 // **-llm and -image do not fit together.** The language model is ~84 GB
 // resident and the image pipeline ~25 GB, against 128 GB of unified memory
@@ -149,6 +153,16 @@ func main() {
 			}
 		}
 		log.Printf("llm: dense bank %s", llm.DenseBankPlan())
+		// **P4b/D20**, the same opt-in one block over: four MoE rows that
+		// ship at 8.5 bits and have a format the kernels already read.
+		// 0.129 GB a token and 1.41 GB of residency for a perplexity delta
+		// the instrument cannot resolve.
+		if _, named := os.LookupEnv("LLM_MOE_BANK"); !named {
+			if err := os.Setenv("LLM_MOE_BANK", llm.ShippedMoEBank); err != nil {
+				log.Fatalf("setting the shipped MoE bank: %v", err)
+			}
+		}
+		log.Printf("llm: moe bank %s", llm.MoEBankPlanFromEnv())
 	}
 
 	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies}
