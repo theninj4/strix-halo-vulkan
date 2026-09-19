@@ -54,9 +54,12 @@ corpus in which every branch of its English G2P fires. T6a put PL-BERT on the
 device (104 ms to 4), T6b the F0/N AdaIN stacks (40 ms to 1), T6c the six
 bidirectional LSTMs (73 ms to 6) and T6d the chain between them (17 ms to 8),
 taking an utterance to **74.2x real time**. **T6 is finished: the phoneme side
-is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** What is open
-is the vocoder again, whose host-side excitation is now the largest single
-stage in the model at 14 ms. **`IMAGE.md`** is the z-image-turbo vertical and is **finished as a
+is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** T8 then
+closed the vertical's last open *feature* — a voice may name a **mixture** of
+style packs, in upstream's own comma spelling, checked against
+`KPipeline.load_voice` at every one of the 510 rows. What is open is the
+vocoder again, whose host-side excitation is now the largest single stage in
+the model at 14 ms. **`TTS.md`** is the text-to-speech recap. **`IMAGE.md`** is the z-image-turbo vertical and is **finished as a
 capability**: I1 made the image size a ceiling-and-default rather than a
 fixture and wired `/v1/images/generations`, I2 ported `madebyollin/taef1` and
 turned on streaming previews (87 ms a frame against the full VAE's 876, a first
@@ -3301,6 +3304,81 @@ of the fetch script failed 50 times in one second because of it.
 **Next is L2**, and the first item is not construction: price one
 full-attention layer and one DeltaNet layer against §2.2's kernels, so the 5x
 prefill gap is attributed before anything is designed around it.
+
+### Session 2026-09-19 — stage T8: voice blending, and a spelling that was not ours to choose
+
+**Result: `/v1/audio/speech` and `cmd/tts` take a mixture of voices.
+`af_bella,af_sky` is the equal mean of two style packs; `af_bella:3,af_sky:1`
+is a weighted one. Every one of the 510 rows of six mixed packs is checked
+against `KPipeline.load_voice` itself — two of the six agree bit for bit and
+the rest are inside the N-ulp bound for a float32 sum. That closes the last
+open feature on the kokoro vertical; what is left of it is optimisation.**
+
+**The stage was mostly finding out that the spelling was already decided.**
+`SPEECH.md` had recorded "OpenAI's API has no notion of mixing voices, so
+nothing constrains this" and set about choosing a syntax. It is true about
+OpenAI and false about the constraint: hexgrad's own `KPipeline.load_voice`
+splits a voice on commas and returns `torch.mean(torch.stack(packs), dim=0)`,
+so `af_bella,af_sky` already means the equal mean everywhere else kokoro runs.
+A server free to invent one would have been free to answer that exact request
+with a **different voice** than every other client gives it. **Look for the
+upstream spelling before designing one** — thirty lines of reading in
+`pipeline.py` retired the open design question in the write-up.
+
+**The oracle is upstream's code, not a reading of it.**
+`reference/dump_blend.py` constructs `KPipeline(lang_code='a', model=False)`,
+which builds no `KModel` and downloads nothing, and calls `load_voice` on the
+local `.pt` paths — `load_single_voice` takes a path when the name ends in
+`.pt`. So the dump runs the actual upstream function offline, and the
+by-hand mean is the *self-check* rather than the reference. Six cases:
+three equal mixes (including the three-way that produced the 400 this stage
+began with), two weighted ones spelled differently for the same mix, and a
+blend of one.
+
+**Bound the error in ulps of the terms, not of the answer.** The first
+acceptance test measured the gap per channel in ulps of the channel and read
+**2.18e4** — because three style channels of order 1 cancel to 1e-11, and the
+rounding error of a sum is set by the size of its *terms*. Rewritten as N ulps
+of the largest term at that channel (the textbook float32 summation bound), the
+three-way mix is 0.667 of it and the weighted ones 0.5. The two-way and
+four-way equal mixes are exact, both ways, because their divisor is a power of
+two. A fixed 1e-7 epsilon would have passed too and said nothing.
+
+**Per row, but checked per pack.** A weighted mean is linear, so the row of
+the mean is the mean of the rows: `blendRow` touches 256 numbers rather than
+130560, and `Style`'s single-name path still indexes the checkpoint in place
+and copies nothing. The dump writes the whole `[510, 256]` pack anyway and the
+test walks every row, because linearity holds at every length or it is a bug
+one length would not catch.
+
+**Two decisions that are decisions.** Weights are **normalised by their sum**,
+so `3,1` and `0.75,0.25` are the same mix and bare weights need not add up —
+an error class removed rather than added. And **all components carry a weight
+or none do**: `af_bella:0.7,af_sky` is refused, because it reads as either 0.3
+for the rest or one share before normalising, and a mix that guessed would
+still sound like a voice. That failure mode — plausible, wrong, and silent
+downstream — is the one this vertical keeps meeting.
+
+**The error names the component.** `UnknownVoiceError` carries the name, the
+caller's spelling of the blend and the 54 names, because the two callers want
+different messages from the same fact: `cmd/tts` prints the list, the endpoint
+prints the count and points at `GET /v1/models`. The blend it echoes is what
+the client *wrote*, not the canonical form — `af_bella:0.3333,...` is not a
+string anyone can search their own code for.
+
+**And a blend is not a crossfade.** Half the style vector conditions the
+predictor, so the durations move: the dump sentence is 3.575 s in `af_bella`,
+3.425 s in `af_sky` and **3.450 s in their equal mean**. The path from a style
+vector to samples is unchanged and already measured at 18.2 dB against the
+reference, so what T8 had to check was the vector.
+
+New: `kokoro/blend.go`, `kokoro/blend_test.go` (six reference cases plus the
+parser), `backend/tts_test.go`, `reference/dump_blend.py`,
+`reference/out/blend/`. `go test ./kokoro/ ./backend/ ./api/` passes.
+
+**Next on this vertical is T7**, the excitation: 14 ms on the host, 32% of an
+utterance, and the question is whether the wrapped phase is float32-safe on
+the device.
 
 ### Session 2026-09-15 (twenty-ninth) — stage T6d: the phoneme side resident, and one place fp16 could not go
 

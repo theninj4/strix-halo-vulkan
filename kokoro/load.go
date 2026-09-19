@@ -2,7 +2,6 @@ package kokoro
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"strix-halo-vulkan/audio"
@@ -71,6 +70,11 @@ func Load(dir string) (*Model, error) {
 // the way the model splits it: the first 128 channels condition the decoder
 // and the last 128 the predictor.
 //
+// The voice is a name, or a mixture of names — see ParseBlend, and note that
+// the comma form is upstream's rather than ours. A single name is resolved in
+// place and copies nothing, so it is exactly the tensor it was before blends
+// existed; a mixture allocates one row.
+//
 // The row index is the *phoneme* count minus one, not the token count — the
 // pack has one row per length and KPipeline indexes it before the boundary
 // tokens are added. Getting that off by one picks a neighbouring row, which
@@ -78,20 +82,24 @@ func Load(dir string) (*Model, error) {
 // stating: this is the one index in the model that no downstream shape check
 // would catch.
 func (m *Model) Style(voice string, phonemes int) (decoder, predictor []float32, err error) {
-	v, ok := m.Voices[voice]
-	if !ok {
-		names := make([]string, 0, len(m.Voices))
-		for n := range m.Voices {
-			names = append(names, n)
-		}
-		sort.Strings(names)
-		return nil, nil, fmt.Errorf("kokoro: no voice %q (have %s)", voice, strings.Join(names, ", "))
+	b, err := ParseBlend(voice)
+	if err != nil {
+		return nil, nil, err
 	}
 	row := phonemes - 1
 	if row < 0 || row >= m.voiceRows {
 		return nil, nil, fmt.Errorf("kokoro: %d phonemes outside the pack's %d rows", phonemes, m.voiceRows)
 	}
-	s := v[row*m.voiceDim : (row+1)*m.voiceDim]
+	var s []float32
+	if name, single := b.Single(); single {
+		v, ok := m.Voices[name]
+		if !ok {
+			return nil, nil, m.unknownVoice(name, b)
+		}
+		s = v[row*m.voiceDim : (row+1)*m.voiceDim]
+	} else if s, err = m.blendRow(b, row); err != nil {
+		return nil, nil, err
+	}
 	half := m.voiceDim / 2
 	return s[:half], s[half:], nil
 }

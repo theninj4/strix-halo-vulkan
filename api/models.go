@@ -18,7 +18,9 @@ type Model struct {
 	// Voices is this model's voice names, for a speech model. It is not part
 	// of OpenAI's model object -- clients ignore fields they do not know --
 	// and it is here because the alternative is a second round trip to find
-	// out what /v1/audio/speech will accept.
+	// out what /v1/audio/speech will accept. A request may also name a
+	// mixture of these, comma-joined, so the list is the alphabet rather
+	// than the set.
 	Voices []string `json:"voices,omitempty"`
 	// Image is the geometry an image model will accept, and is here for the
 	// same reason: the sizes /v1/images/generations takes are decided by what

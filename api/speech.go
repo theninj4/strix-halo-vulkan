@@ -14,9 +14,14 @@ import (
 
 // SpeechRequest is the OpenAI Speech Request
 type SpeechRequest struct {
-	host           string
-	Input          string  `json:"input"`
-	Model          string  `json:"model"`
+	host  string
+	Input string `json:"input"`
+	Model string `json:"model"`
+	// Voice is a voice pack name, or a mixture of them: "af_bella,af_sky"
+	// is the equal mean of two packs, which is the spelling and the meaning
+	// hexgrad's own pipeline gives it, and "af_bella:3,af_sky:1" weights the
+	// mix, which is an extension it has no spelling for. Weights are
+	// normalised by their sum. GET /v1/models lists the names.
 	Voice          string  `json:"voice"`
 	ResponseFormat string  `json:"response_format"` // mp3, wav, opus, flac, pcm
 	Speed          float64 `json:"speed"`           // 0.5 - 2.0

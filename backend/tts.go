@@ -2,9 +2,11 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -89,8 +91,10 @@ func NewTTS(opt TTSOptions) (*TTS, error) {
 		t.voices = append(t.voices, name)
 	}
 	sort.Strings(t.voices)
-	if _, ok := model.Voices[opt.Voice]; !ok {
-		return nil, fmt.Errorf("backend: no voice %q in %s", opt.Voice, opt.Model)
+	// A blend is a voice here too, so the default is checked the way a
+	// request's is: the spelling first, then every name in it.
+	if err := model.CheckVoice(opt.Voice); err != nil {
+		return nil, fmt.Errorf("backend: %w (in %s)", err, opt.Model)
 	}
 
 	if opt.Lexicon != "" {
@@ -117,6 +121,10 @@ func (t *TTS) Models() []api.Model {
 }
 
 // Voices are the voice pack names in the checkpoint, sorted.
+//
+// A request may also name a mixture of them, which is every comma-joined
+// subset and not a list anything could enumerate, so what this reports is the
+// alphabet a blend is spelled in rather than everything Speak accepts.
 func (t *TTS) Voices() []string {
 	out := make([]string, len(t.voices))
 	copy(out, t.voices)
@@ -157,9 +165,21 @@ func (t *TTS) Speak(ctx context.Context, req *api.SpeechRequest) (*audio.Clip, e
 	if voice == "" {
 		voice = t.opt.Voice
 	}
-	if _, ok := t.model.Voices[voice]; !ok {
-		return nil, fmt.Errorf("no voice %q; this checkpoint has %d: %w",
-			voice, len(t.voices), api.ErrUnsupported)
+	// The voice may name a mixture -- "af_bella,af_sky" is upstream's
+	// spelling for the equal mean of two packs, and ":weight" is this
+	// server's for an unequal one -- so the error has to name the component
+	// that was not found rather than the whole string.
+	if err := t.model.CheckVoice(voice); err != nil {
+		var unknown *kokoro.UnknownVoiceError
+		if errors.As(err, &unknown) {
+			where := ""
+			if unknown.Blend != "" {
+				where = " in the blend " + strconv.Quote(unknown.Blend)
+			}
+			return nil, fmt.Errorf("no voice %q%s; this checkpoint has %d, and GET /v1/models lists them: %w",
+				unknown.Name, where, len(t.voices), api.ErrUnsupported)
+		}
+		return nil, fmt.Errorf("%w: %w", err, api.ErrUnsupported)
 	}
 
 	phonemes := req.Phonemes

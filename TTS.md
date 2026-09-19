@@ -10,11 +10,12 @@
 no Python on the path and every stage validated against a reference dump
 before it was optimised.
 
-**Status (2026-09-19)**: **done and serving.** `go run ./cmd/tts -gpu -text
+**Status (2026-09-19, T8)**: **done and serving.** `go run ./cmd/tts -gpu -text
 'Hello there.'` speaks; `POST /v1/audio/speech` answers. An utterance is
 **44 ms for 3.25 s of audio — 74.2x real time**, from 3848 ms on the CPU
-reference. The model side is finished through T6d; T7 (the excitation) is the
-next optimisation and T8 (voice blending) the only missing feature.
+reference. The model side is finished through T6d and T8 closed the last missing feature —
+a voice may name a mixture of packs — so what is left is optimisation: T7,
+the excitation.
 
     "The quick brown fox jumps over the lazy dog." (af_heart)
     48 phonemes -> 50 tokens -> 130 frames -> 78000 samples = 3.250 s
@@ -50,7 +51,7 @@ next optimisation and T8 (voice blending) the only missing feature.
 | T6d | The chain between them | **done** — 17 ms → 8 ms, two submits, two readbacks |
 | A | `/v1/audio/speech` and `backend/tts.go` | **done** — wav and pcm, voices in `/v1/models` |
 | T7 | The excitation on the device | **next** — 14 ms, the largest single stage in the model |
-| T8 | Voice blending | open — the cheapest item here; the style packs are already in memory |
+| T8 | Voice blending | **done** — upstream's spelling, checked against `load_voice` at every row |
 
 ## What exists
 
@@ -80,7 +81,13 @@ attention and `gelu_new` build, T6b's `kokoro_proj.comp` (a 256-to-1
 convolution, the one shape the GEMM ladder cannot express), and T6d's gather.
 
 **`cmd/tts`** — phonemes or `-text` in, a WAV and the stage profile out.
-`-gpu`, `-voice` (54), `-speed`, `-noise <seed>`, `-list`.
+`-gpu`, `-voice` (54, or a mixture), `-speed`, `-noise <seed>`, `-list`.
+
+**`kokoro/blend.go`** — a voice specification: one name, `af_bella,af_sky` for
+the equal mean (upstream's spelling and upstream's meaning), or
+`af_bella:3,af_sky:1` for a weighted one (ours). `reference/dump_blend.py` is
+the oracle — `KPipeline.load_voice` run offline over the local packs — and
+`TestBlendAgainstUpstream` checks all 510 rows of six mixes against it.
 
 **`backend/tts.go` + `api/speech.go`** — the server adapter and the endpoint.
 One mutex serialises utterances; `Speak` takes `input` or the non-OpenAI
@@ -106,18 +113,6 @@ ALBERT's `[T, 768]` readback and its host-side embedding stack, the two
 readbacks T6d could not remove, and four submits. Closing any of it means
 moving the vocoder's input boundary, which is one change rather than four, and
 is the thing to do *after* T7.
-
-**T8 — voice blending.** A request for `"voice": "af_alloy,af_bella,af_heart"`
-is a 400 today, because `backend/tts.go:160` looks the name up as a literal
-key. Nothing is missing from the checkpoint: a blend is a weighted mean of the
-`[510, 256]` style packs taken before `Style` picks its row, it is linear, and
-it touches no shader and nothing downstream. What is unsettled is the
-*spelling* — `af_bella,af_sky` as an equal mix, `af_bella:0.7,af_sky:0.3` to
-weight it, and whether bare weights are normalised — and it wants the same
-treatment every other stage got: a reference dump of a known mix to compare
-against, because a blend that is merely plausible sounds like a voice and
-nothing downstream catches that it is the wrong one. The unknown-name error
-should also say *which* component was unknown.
 
 **`-tts-gpu` is off by default**, because the device path **stages per
 request**: kokoro's arenas are sized for one utterance's frame count, the

@@ -18,6 +18,7 @@
 //	go run ./cmd/tts -gpu -text 'Hello there.' -o out.wav
 //	go run ./cmd/tts -gpu -o out.wav
 //	go run ./cmd/tts -voice bm_george -noise 1 -o out.wav
+//	go run ./cmd/tts -voice af_bella,af_sky -o out.wav
 //	go run ./cmd/tts -phonemes 'hɛlˈO wˈɜɹld.' -o out.wav
 //	go run ./cmd/tts -list
 package main
@@ -47,7 +48,7 @@ func main() {
 	phonemes := flag.String("phonemes", defaultPhonemes, "IPA phonemes to speak")
 	text := flag.String("text", "", "English text to speak; needs the lexicon in -lexicon (SPEECH.md T5)")
 	lexdir := flag.String("lexicon", "models/misaki", "misaki lexicon directory, from reference/convert_misaki.py")
-	voice := flag.String("voice", "af_heart", "voice pack name")
+	voice := flag.String("voice", "af_heart", "voice pack name, or a mix: af_bella,af_sky or af_bella:3,af_sky:1")
 	speed := flag.Float64("speed", 1, "duration divisor; >1 is faster and shorter")
 	noise := flag.Int64("noise", 0, "seed for the excitation noise; 0 leaves it off, which is what the reference dump used")
 	out := flag.String("o", "", "write a 24 kHz WAV here")
@@ -70,6 +71,9 @@ func main() {
 		}
 		sort.Strings(names)
 		fmt.Printf("%d voices: %s\n", len(names), strings.Join(names, " "))
+		fmt.Println("a mix is comma-joined: af_bella,af_sky is their equal mean, " +
+			"which is what upstream's own pipeline makes of that spelling; " +
+			"af_bella:3,af_sky:1 weights it, and the weights are normalised by their sum")
 		return
 	}
 	if *noise != 0 {

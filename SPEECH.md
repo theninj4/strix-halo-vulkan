@@ -10,7 +10,7 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-15, T6d)**: **both verticals are on the device, text-to-speech
+**Status (2026-09-19, T8)**: **both verticals are on the device, text-to-speech
 takes text, and an utterance is 74.2x real time.**
 Speech-to-text transcribes an 11 s clip in 43 ms, 257x real time, whole model
 resident, S1–S8 done. **Text-to-speech is 44 ms for 3.25 s of audio.** T6 is
@@ -20,6 +20,8 @@ six bidirectional LSTMs 73 to 6 (T6c) and the chain between them 17 to 8
 utterance, over 1.96 ms of GPU time**. The other 82% is the vocoder, whose
 36 ms T4c already cut from 3626, and whose largest remaining piece is **14 ms
 of float64 phase accumulation on the host** that T3 put there on purpose.
+T8 closed the last open feature: a voice may name a **mixture** of packs, in
+upstream's own spelling.
 
 `go run ./cmd/tts -gpu -text 'Hello there.'` speaks, with no Python on the
 path. T5 opened with a measurement instead of code — **91% of running-text
@@ -101,7 +103,7 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T6c | The six bidirectional LSTMs, 73 ms — 96% of the phoneme side | **done** — 73 ms to 6 ms, durations unchanged |
 | T6d | The chain between them: readbacks, the regulator, the text encoder | **done** — 17 ms to 8 ms, two submits and two readbacks |
 | T7 | The excitation: float64 phase accumulation on the host | **next** — the largest single stage in the model, 14 ms |
-| T8 | Voice blending: a request that names several voices | open — the style packs are already in memory, see below |
+| T8 | Voice blending: a request that names several voices | **done** — upstream's own spelling, checked against `load_voice` at every row |
 
 ## What exists
 
@@ -242,7 +244,7 @@ over 67 word shapes — and the coverage survey above.
 `-gpu` runs the whole model on Vulkan except the embeddings, the duration
 head and the excitation, each of which is on the host for a reason given in
 T6d and T7; `-voice` picks
-one of 54, `-speed` divides the durations, `-noise <seed>` switches the
+one of 54 or a mixture of them (T8), `-speed` divides the durations, `-noise <seed>` switches the
 excitation noise on (off is the reproducible configuration; on is what an
 utterance meant to be listened to wants), `-list` prints the voices.
 
@@ -627,39 +629,65 @@ moving the *vocoder's* input boundary — `asr` currently goes host-side into
 `GPUDecoder.Upload` — which is one change, not four, and is the thing to do
 after T7 rather than before it.
 
-## T8 — voice blending
+## T8 — voice blending, done
 
 A client asked `/v1/audio/speech` for
 `"voice": "af_alloy,af_bella,af_heart"` and got a 400:
 
     api: 400: no voice "af_alloy,af_bella,af_heart"; this checkpoint has 54: unsupported request
 
-Nothing is missing from the checkpoint. All 54 voices load, each of the three
-named exists on its own, and `GET /v1/models` already reports the list so a
-client can populate a menu. What is missing is the **blend**: `backend/tts.go`
-looks the request's voice up in `model.Voices` as a literal key, so a
-comma-joined name is simply a name that is not there.
+It now speaks, and so does `af_bella:3,af_sky:1`. `kokoro/blend.go` parses the
+specification, `Model.Style` resolves it, and `CheckVoice` is what
+`backend/tts.go` validates `-voice` and a request with. The measurement is
+`TestBlendAgainstUpstream`: **every one of the 510 rows of six mixed packs,
+against `KPipeline.load_voice` itself**, dumped by `reference/dump_blend.py`.
 
-It is the cheapest item on this list. `Model.Voices` is
-`map[string][]float32` — one `[510*256]` style pack per name — and
-`Style` (`kokoro/load.go:81`) picks row `phonemes-1` out of the pack and
-splits it into the decoder and predictor halves. A blend is a weighted mean of
-those vectors, taken before the row is picked. It is linear, so per-row and
-whole-pack means are the same number; it touches no shader, no arena and
-nothing downstream of `Style`. The two places that reject it today are the
-lookup at `backend/tts.go:160` and the same lookup at `:92` that validates
-`-voice` at startup.
+**The spelling was not ours to choose, and finding that out was the stage.**
+This file had said "OpenAI's API has no notion of mixing voices, so nothing
+constrains this except that a single name must keep meaning what it means
+now" — and that was true about OpenAI and wrong about the constraint, because
+hexgrad's own `KPipeline.load_voice` splits a voice on commas and returns
+`torch.mean(torch.stack(packs), dim=0)`. So `af_bella,af_sky` already means
+the equal mean of two packs everywhere else kokoro runs; a server free to
+choose would have been free to answer that request with a *different voice*
+than every other client gives it. The weight — `af_bella:3,af_sky:1` — is the
+part upstream has no spelling for, and is where the decisions actually were.
 
-What is not settled is the **spelling**, and it is ours to choose: OpenAI's
-API has no notion of mixing voices, so nothing constrains this except that a
-single name must keep meaning exactly what it means now. `af_bella,af_sky` as
-an equal mix is the obvious reading; `af_bella:0.7,af_sky:0.3` is the obvious
-way to weight it; whether bare weights are normalised or required to sum to
-one is a decision rather than a discovery. The error message for an unknown
-name inside a blend should name *which* component was unknown, since "no
-voice" against a three-part string is the message that started this.
+Four things worth keeping:
 
-And it wants the same treatment every other stage here got: a reference dump
-of a known mix from upstream, and a comparison against it. A blend that is
-merely plausible is the failure mode this document keeps warning about — it
-sounds like a voice, so nothing downstream catches that it is the wrong one.
+  - **Look for the upstream spelling before designing one.** The oracle for
+    this stage is `load_voice` run over the local `.pt` files, offline: its
+    `load_single_voice` takes a path when the name ends in `.pt`, and
+    `KPipeline(lang_code='a', model=False)` builds no model and downloads
+    nothing. That is upstream's own code path rather than a reimplementation
+    of the line quoted from it, which is the difference between checking an
+    implementation and checking a reading.
+  - **Normalise the weights, and require all or none.** `3,1` and
+    `0.75,0.25` are the same mix, so bare weights need not add up — an error
+    class removed rather than added. But `af_bella:0.7,af_sky` is refused,
+    because it reads as either 0.3 for the rest or one share before
+    normalising, and a mix that silently picked one would still sound like a
+    voice. That is this model's failure mode in one sentence, and it is the
+    same argument that put the phoneme count in `Style`'s doc comment.
+  - **The mix is per row, and the whole pack is what checks it.** A weighted
+    mean is linear, so the row of the mean is the mean of the rows: 256
+    numbers rather than 130560. The dump writes the whole `[510, 256]` packs
+    anyway and the test walks every row, because "linear" is a claim that
+    holds at every length or is a bug a single-length check would not see.
+  - **Bound the gap in ulps of the *terms*, not of the answer.** torch sums
+    the packs in float32 and divides; this accumulates in float64 against
+    weights normalised once. The two-way and four-way equal mixes agree **bit
+    for bit** (the divisor is a power of two); the three-way and the weighted
+    ones differ in 21–42% of channels, at up to two thirds of the N-ulp bound
+    for a float32 sum. A per-channel ulp bound was tried first and read
+    **2.18e4 ulp**, because three style channels of order 1 cancel to 1e-11
+    and the error of the sum is set by the size of its terms, not of its
+    result.
+
+And a blend is **not a crossfade of two utterances**: half the style vector
+conditions the predictor, so the durations move with it. The dump sentence is
+3.575 s in `af_bella`, 3.425 s in `af_sky` and **3.450 s in their equal mean**,
+which is a different alignment and not a mix of two waveforms. The path from a
+style vector to samples is unchanged and already measured against the
+reference at 18.2 dB, so what T8 had to check was the vector — and it is
+checked against upstream exactly, at every length.

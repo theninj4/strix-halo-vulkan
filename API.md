@@ -341,6 +341,19 @@ having it guessed. It is also how the endpoint is driven without a lexicon on
 disk. `GET /v1/models` carries a **`voices`** array on the speech model, so a
 client does not need a second call to populate a menu.
 
+Its **`"voice"`** also takes a *mixture*: `"af_bella,af_sky"` is the equal mean
+of two style packs, which is not this server's invention — hexgrad's own
+`KPipeline.load_voice` gives that spelling exactly that meaning, so the same
+request is the same voice here as anywhere else kokoro runs (SPEECH.md T8).
+`"af_bella:3,af_sky:1"` weights the mix, which is ours, and the weights are
+normalised by their sum so they need not add up. Either every component
+carries a weight or none does: `"af_bella:0.7,af_sky"` is a 400, because it
+reads as either 0.3 for the rest or one share before normalising and a mix
+that guessed would still sound like a voice. An unknown name is a 400 naming
+*which component* was unknown, since that is the one thing a three-part string
+does not tell you. The `voices` array stays the list of single names: a blend
+is every comma-joined subset of them and not a list anything could enumerate.
+
 `POST /v1/images/generations` takes three fields that are not OpenAI's, and
 each of them exists because the parameter is real here and there is nowhere
 else to put it. **`"seed"`** names the initial latent's seed, and a response

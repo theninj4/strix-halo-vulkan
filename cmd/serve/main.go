@@ -98,7 +98,7 @@ func main() {
 	lexicon := flag.String("lexicon", "models/misaki", "misaki lexicon directory; empty takes phonemes only")
 	espeak := flag.Bool("espeak", true, "use espeak-ng for words outside the lexicon")
 	british := flag.Bool("british", false, "use the en-GB lexicon and fallback")
-	voice := flag.String("voice", "af_heart", "voice a request that names none gets")
+	voice := flag.String("voice", "af_heart", "voice a request that names none gets; a comma-joined mix is one too")
 	noise := flag.Int64("noise", 0, "seed for the vocoder's excitation noise; 0 leaves it off")
 
 	llmOn := flag.Bool("llm", false, "load qwen3.8-flash-next and serve /v1/chat/completions")
