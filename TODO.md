@@ -53,13 +53,21 @@ no Python on the path, and reproduces misaki character for character on a
 corpus in which every branch of its English G2P fires. T6a put PL-BERT on the
 device (104 ms to 4), T6b the F0/N AdaIN stacks (40 ms to 1), T6c the six
 bidirectional LSTMs (73 ms to 6) and T6d the chain between them (17 ms to 8),
-taking an utterance to **74.2x real time**. **T6 is finished: the phoneme side
-is 222 ms on the CPU, 8 on the device, and 18% of an utterance.** T8 then
+taking an utterance to 74.2x real time. **T6 is finished: the phoneme side
+is 222 ms on the CPU, 8 on the device, and 26% of an utterance.** T8 then
 closed the vertical's last open *feature* — a voice may name a **mixture** of
 style packs, in upstream's own comma spelling, checked against
-`KPipeline.load_voice` at every one of the 510 rows. What is open is the
-vocoder again, whose host-side excitation is now the largest single stage in
-the model at 14 ms. **`TTS.md`** is the text-to-speech recap. **`IMAGE.md`** is the z-image-turbo vertical and is **finished as a
+`KPipeline.load_voice` at every one of the 510 rows — and **T7 put the last
+host-side stage on the device**: the excitation and its forward transform, 14
+ms to 0.2, taking an utterance to **105x real time**. **Every stage of kokoro
+now runs on Vulkan.** **T9 then made the *server* cost what the model costs**:
+kokoro's arenas were staged per request, so `/v1/audio/speech` spent 411 ms of
+host prosody and 88 of staging around 48 ms of utterance. The frame count is
+now a ceiling (`-tts-frames`), the attachment is staged once at startup, and
+the endpoint went **550 ms to 59 for 6.45 s of audio — byte for byte the same
+waveform**. What is open is no longer a stage but a boundary — the
+excitation's remaining 0.2 ms is 88% submit and readback, and the phoneme
+side's 8 ms is none of it arithmetic. **`TTS.md`** is the text-to-speech recap. **`IMAGE.md`** is the z-image-turbo vertical and is **finished as a
 capability**: I1 made the image size a ceiling-and-default rather than a
 fixture and wired `/v1/images/generations`, I2 ported `madebyollin/taef1` and
 turned on streaming previews (87 ms a frame against the full VAE's 876, a first
@@ -149,8 +157,26 @@ full-attention layers with their QSA indexers on **4.5 bits**. **Decode is
 against 391.42, residency 79.85 GB, and perplexity 4.1787 against our own
 4.0289 at identical weights, +3.72%.** One dense family is left (`ple_proj`),
 and the sharpest open item is not a width: **the whole-model graph never
-returns above ~2560 rows at 48 layers.** All three files are rewritten each
-session rather than appended to, and the current one is the file to read
+returns above ~2560 rows at 48 layers.** **The P-stages have since closed all
+of that and more** — P0 found the >2560-row stall to be a 2 s gfx-ring
+watchdog (prefill now 1213.5 tok/s at 8192 rows), P1 attributed a decode step
+to the dispatch, P2 and P3/P3a finished the dense widths at D18/D19, P4/P4b
+narrowed the MoE rows that had a format already, and **P4c put the largest row
+in the bank — `ffn_down_exps`, 41% of the expert traffic — on 4.5 bits (D21):
+decode 36.19 tok/s, 1.44x llama.cpp, perplexity +1.74%, 4.132 GB a token.**
+**P5's design pass then measured the verification
+pass** and found MTP a net loss on today's kernels — 3.24x a decode step at
+M = 2, 4.32x at M = 8 — with the rollback the cheap part (120.75 MB and two
+free mechanisms) and a silent corruption of both convolution rings on a
+single rejected token; **P5a then built the draft head and measured its
+acceptance rate at 74.0%**, settled its wiring by racing five readings, and
+priced the whole stage at **~1.34x at depth 1** — which shrank P5b to an
+`R = 2` arm; **P5b built it**, and a two-row verification pass is now **1.17x
+a decode step where it was 3.24x**, with one row unregressed. Read `LLM.md`
+for the state and `LLM2.md` for the priority list; what is open there is P5c
+(the rollback and the loop) and P6 (batching), whose first stage P5b already
+built. All three files are rewritten
+each session rather than appended to, and the current one is the file to read
 first.
 
 Three documents carry the older analysis: **`IDEAS.md`** is the prioritised
@@ -1011,6 +1037,329 @@ scheduler's business — and the last step never gives one, since its estimate
 everything else is percents: **I8** (38 ms of an 87 ms preview, the cheapest
 of them and the same pattern as I3), then **I3** (1.6 s of the image), then
 I4, then I5. `IMAGE.md` ranks them and says why.
+
+### Session 2026-09-19 — P5b: the decode GEMVs carry two rows, and a control that could not fail
+
+**Result: all four decode GEMVs take R rows per tile, and a two-row
+verification pass is 19.5 ms against 16.6 at one row — 1.17x, against the
+1.16x P5's design pass projected, where it was 54.1 (3.24x).** One row is
+**unregressed** at 16.6 against 16.7, which matters more than the headline
+since that is the product decode path. `shaders/llm_gemv.comp`,
+`llm_hc_gemv.comp`, `llm_moe_gemv.comp`, `llm_moe_router.comp`,
+`GEMVMaxRows` in `llm/bank.go`, `results/p5b_graph_m.csv`. Write-up:
+`research/p5b-r-row-decode.md`.
+
+Per block at two rows: `hc` 13.9 → **2.0** ms, `dn` 8.3 → **4.1**, `attn`
+2.7 → **1.2**, `moe` 25.5 → **8.2**. Rows three and up are unchanged by
+construction — the bound is two — and land within 1% of the baseline, which
+is the cheapest check that nothing else moved.
+
+**Three of the four blocks are *faster* at two rows than at one**: `hc`
+0.51x, `attn` 0.82x, `dn` 0.97x, on identical weight bytes. Not flat —
+faster, because the second row gives a latency-bound dispatch a second
+independent stream of A loads to overlap against the same bank read. Only the
+MoE climbs, at 1.61x, and that half is real: the routing touches 10 experts at
+one token and 17 at two. This is D11's law one step along — at one token a
+dispatch is short of *workgroups*, at two rows on the old kernel it was short
+of *rows*, and the R-row arm has neither problem.
+
+**`ROWS` is a specialization constant rather than a `-D`.** Those four
+families are ~130 `.spv` between them and a compile-time define would have
+doubled every one; one module now serves both row counts and the `r < ROWS`
+guards fold at pipeline build. `MAXROWS` is the compile-time bound the
+accumulators and the 10 KB of LDS are sized by.
+
+**The MoE's ragged tail needed no guard, because the permutation already had
+one.** A tile is (expert, row block) and at two tokens an expert may hold one
+real row or two — but `llm_moe_perm.comp` fills every routed row with a
+sentinel *before* the scatter, a `(token, slot)` pair one token past the batch
+whose activation row is a zero pad, so reading past an expert's real rows
+multiplies by zeros into output slots the combine never reads. Exactly what
+the grouped GEMM already does with the same rows.
+
+**D15's refusal moved rather than went away.** "The host refuses it above one
+token" was about the GEMM's shape — a sixteen-row fragment holding one row —
+and not about a dot product's, so the bound is `GEMVMaxRows` now, in five
+places. Past it the host still refuses, because a GEMV there would silently
+drop rows; and three tests assert **both** halves, since a refusal that
+refused everything would pass the old assertion. Residency cost of the
+widened partial arenas: ~10 MB against 78.5 GB.
+
+**And the finding that matters most, which is about the instrument.** The
+first round of this stage measured the *previous* SPIR-V: `.spv` is generated
+and gitignored, the `.comp` edits were never followed by `go generate`, and a
+hand-compile to `/tmp` to check syntax is not the same thing. It read as a
+triumph — the DeltaNet block 428.5 → 191.8 us at two rows, the attention layer
+420.9 → 197.3 — and **all three new tests passed**, because the old kernel
+computed one row on a two-row grid and was therefore genuinely twice as fast
+per row, at half the work. Comparing the new kernel's second output row
+against the *old* kernel's second output row cannot catch that: the arena
+still holds what the old kernel wrote, which is the value being compared
+against. What caught it was asking a question the comparison could not answer
+— *is row 1 written at all?* — by feeding a different second token and
+requiring the output row to move. It did not. `rowMoved` is now that
+assertion in all four gates. **A control has to be able to fail.**
+
+Gates: `TestDeltaNetGPUGemvTwoRows` (rms 1.2e-5 against the GEMM, every rung,
+both rows), `TestAttnGPUGemvTwoRows`, `TestHCGPUGemvTwoRows` (`lo`, `inject`
+and `mixed`, whose epilogue is not a plain row store), `TestMoEGPUDecodeTwoRows`
+(rms 2.6e-6 over four expert/router plans) — each with `rowMoved` beside it —
+plus the whole `./llm` suite green.
+
+**What it is worth.** A round of depth M verifies in M+1 rows, so with P5a's
+74.0% acceptance and the draft at 0.130-0.166 of a step: **depth 1 is 1.34x**
+against 0.52x before this stage. Raising the bound to three rows buys
+nothing — depth 2 projects to 2.222/(1.42+0.13) = 1.32x, the same number —
+because the MoE's expert growth eats the extra acceptance as fast as it
+arrives. So `R = 2` is matched to P5's optimum rather than merely convenient,
+and **P6 is the reason the shaders are written as a bound**: R concurrent
+sequences are R rows through the same weights, and raising `MAXROWS` plus
+`GEMVMaxRows` is the whole change.
+
+**Next.** **P5c** — the rollback as designed (the ping-pong state slot, the
+deferred `hist` dispatches, `Graph.Commit`/`Rewind`,
+`TestSpeculationRewindIsTheSequence`) and the loop. It is the only thing left
+between here and the 1.34x. Carried forward: a **48-layer decode control**
+against a same-hour baseline before this is quoted as tok/s (the
+no-regression evidence here is the 24-layer M = 1 column and the bit-comparable
+one-row tests), a second whole-graph run (one was taken), and from P5a —
+acceptance on a real workload, `nextn` on the device, a recorded draft step.
+
+### Session 2026-09-19 — P5a: the draft head runs, and its wiring had to be raced rather than read
+
+**Result: the MTP draft head is staged and observed, and its acceptance rate
+is `a_1 = 74.0%` over 1024 rounds at n_ctx 2048 against a zeroed-hidden
+negative control at 9.8%** — E[tokens] 1.74 at depth 1 rising to 3.02 at
+depth 6, **flat in context** (73.4% at ctx 320 over 256 rounds) and identical
+count-for-count over two runs of the five-arm screen. `llm/mtp.go`,
+`go run ./cmd/llm -mtp`, `results/p5a_*.csv`. Write-up:
+`research/p5a-draft-head.md`.
+
+**The wiring had no oracle, so it was measured.** D5 — llama.cpp is the
+oracle — has an answer for every other block in this vertical and none for
+this one: `src/models/qwen4exp.cpp` contains no `nextn` symbol at all, and
+transformers' `models/qwen4_exp/modeling_qwen4_exp.py` carries
+`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`. The checkpoint contradicts
+itself on its face — `nextn.eh_proj` is `[5120, 2560]`, K = 2*n_embd, but
+`nextn.hnorm` is `[10240]` rather than `[2560]` — so five readings were raced
+from **one recorded trunk walk**: the wide 10240 residual with `hnorm` as
+`[2560, 4]` and **`eh_proj` applied once per hyper-connection stream** wins at
+**73.4%**; the collapsed `result_norm` broadcast into four streams (the
+reading `hc_init` would suggest) loses at 55.5%; and **the concatenation order
+is load-bearing** — flipped scores **0 of 256**, not degraded but
+extinguished, so llama.cpp's `ggml_concat(e_norm, h_norm, dim=0)` describes
+this checkpoint too.
+
+**The free-running arm read 92.2% and was thrown away.** Advancing the trunk
+on its own argmax is the mode a speculative loop actually sees, and measured
+that way the head looks spectacular — chained 90-94% to depth 6, E[tokens]
+5.56. Printing what the trunk generated shows why: greedy decoding at
+temperature zero falls into a **verbatim loop**, the same paragraph about
+Robert Boulter three times in 423 tokens, and priming with 96 real tokens does
+not prevent it. A looping trunk is trivially predictable. The rule P5c's gate
+inherits: **a speculation multiplier measured on greedy self-generated text is
+measuring the sampler, not the speculation.**
+
+**What it is worth, and it is less than the carried figure.** A round of depth
+M verifies in **M+1 rows** and emits `j+1` tokens; the draft step is 6.99 ms
+in this harness — **2.21 host `nextn` + 4.63 the layer's thirteen submits**
+against a byte floor of 0.130 of a step. On the measured profile: **depth 1 is
+1.33x and depth 2 is 1.32x with P5b's projected kernel, and every depth is a
+loss today** (0.52-0.64x). The MoE's expert growth and the draft's lm head
+punish depth from opposite ends, so `LLM.md`'s carried **1.5-1.8x is not
+reachable on wikitext**. **And a depth-1 verify pass is two rows, so P5b
+shrinks to an `R = 2` arm** of the four decode GEMVs — a materially smaller
+stage than the design pass assumed. R general is P6's requirement, not P5's.
+
+**Three things fell out of the staging.** The draft's bundled `output` and
+`token_embd` **are** the trunk's at coarser widths — cosine 0.999792 (Q8_0 vs
+Q6_K) and 0.997280 (Q8_0 vs Q4_K), which is their own widths' cost and
+nothing else — so the head is borrowed and the real added residency is 1.92 GB
+of weights. **Q5_0 and Q6_K** had to be added to `gguf/dequant.go`, because
+the draft shard is a stock `Q4_K_M` mix rather than unsloth's `UD-Q4_K_XL`;
+both are gated element-for-element against llama.cpp's own `to_float`
+(`TestDequantMatchesGGML`). And `attention.compress_ratios[48]` is **0** where
+every full-attention layer of the trunk says 4, so `NewMTPHead` borrows the
+trunk's and **refuses to stage above n_ctx 2051**, where the QSA selection
+would stop being the identity and the guess would start to matter.
+
+**Next.** **P5b**, now an `R = 2` arm; then **P5c**, the rollback and the
+loop. Carried forward and priced: acceptance **on a real workload** (74% is
+wikitext continuation, the hard case, and the free-running arm cannot answer
+it — chat or code through the HTTP API can, and it is the one number that
+could still move the stage's value); `nextn` **on the device** (2.21 ms of
+every draft step is four matvecs on the CPU, 32% of it); and a **recorded**
+draft step (thirteen submits where P1c put the trunk's 1407 dispatches in
+one).
+
+### Session 2026-09-19 — P5's design pass: the rollback is easy and the verification pass is the stage
+
+**Result: the one measurement every estimate of MTP speculation rested on has
+been run, and it says speculation cannot be built on the kernels that exist.
+A verification pass over M rows costs 3.24x a decode step at M = 2 and 4.32x
+at M = 8, so even at *100%* acceptance M = 2 yields 0.93x.** `-graph -tokens
+1,2,3,4,6,8 -layers 24` on the D19 + D20 + D21 banks, `results/p5_graph_m_r1.csv`,
+with the four block ladders (`-moe/-hc/-dn/-attn`, 16-32 cold layers,
+`-iters 1`) beside it in `results/p5_*_m_r{1,2}.csv` — two runs, **agreeing to
+0.6% at M >= 2**. Write-up: `research/p5-mtp-rollback.md`.
+
+**The table has only two shapes in it.** Every block but the MoE takes **one
+step up at M = 2 and is then flat to M = 8** on identical weight bytes —
+`hc` 2.1 -> 13.9 -> 13.8 ms, `dn` 4.2 -> 8.3 -> 8.5, `attn` 1.2 -> 2.7 -> 2.7,
+and `head`/`ple`/`move`/host flat throughout. That is D15's refusal and
+nothing else: at M = 2 the cooperative-matrix GEMM takes over from the four
+decode GEMVs and its row block is 16-64 rows wide with two real rows in it.
+The hyper-connection block is the worst at **5.3-6.6x**, for the reason P1a
+found at one token one step along. Only the MoE keeps climbing, and that half
+is **real**: the routing touches **10 experts at M = 1, 17 at 2, 26 at 3, 36
+at 4, 49 at 8**, against a routed row of 1.327 GB of D21's 4.132 — the other
+2.805 GB is M-independent, which is the entire reason speculation could pay
+here at all.
+
+**The rollback the review treated as the hard part is 120.75 MB and two
+mechanisms that cost nothing.** 36 DeltaNet states (113.25 MB), their
+convolution rings (7.13) and the PLE ring (0.37); the KV cache, the pooled
+indexer table and the host id list are free, and `gpu_attn.go` already says
+why (a rewound cell is masked rather than stale; a pooled block is only
+written once complete). The state **ping-pongs for nothing**, because
+`llm_dn_scan.comp` loads S into registers once before the token loop and
+stores it once after — a second destination adds no traffic. The rings are
+**deferred rather than copied**: `llm_seq_hist.comp` is one dispatch at the
+end of a block reading the pass's own arena, so a commit re-issues it with
+the accepted count (37 dispatches, ~40 us a round).
+
+**And a correctness finding the review's inventory would have missed**: both
+convolution rings are corrupted by a **single** rejected token, not only by a
+deep one, and silently. A ring is addressed by absolute position modulo its
+length, so the DeltaNet's -3 tap reads slot `(p-3) mod 3` — which *is* slot
+`p mod 3`, the one position p writes — and the PLE's dilated -6 and -3 taps
+alias at depth 3 and 6 of a nine-slot ring.
+
+**Two things about the draft head, from the GGUF and the config rather than
+from assumption.** It is **one full-attention layer** (`blk.48`,
+`nextn_predict_layers = 1`, `mtp.layer_types = ["full_attention"]`,
+`ple_layer_ids = [2]`), so it carries **no recurrent state and no second
+ring**, and `mtp_use_dedicated_embeddings = false` makes its bundled
+`token_embd`/`output` copies of the trunk's — real added residency **1.90 GB**.
+And **a draft step is four fifths lm head** (0.437 GB of 0.538), not the MTP
+layer, which is under 0.07.
+
+**There is no oracle for the head's wiring.** llama.cpp's
+`src/models/qwen4exp.cpp` has no `nextn` symbol at all and transformers'
+`modeling_qwen4_exp.py` carries `_keys_to_ignore_on_load_unexpected =
+[r"^mtp.*"]`, so D5 has no answer here for the first time in this vertical.
+`nextn.hnorm` is `[10240]` where `eh_proj` wants K = 5120; the reading that
+leaves no tensor unexplained is that `hnorm` is `[2560, 4]` and **`eh_proj`
+runs once per hyper-connection stream**, seeding a fresh `[2560, 4]` state
+for the MTP block. A hypothesis, and the acceptance rate is a sharp enough
+discriminator to test it without a numerical oracle.
+
+**Next.** P5 is now three items, cheapest-decisive first. **P5a** — the draft
+head as a *passive observer*: run it beside an ordinary greedy loop and
+compare its prediction for `x_{t+2}` against what the trunk emits next, which
+needs no rollback and no new kernel and gives `a_1 .. a_8` outright. **P5b** —
+the R-row decode kernels (R accumulators, R A-vectors in LDS, one weight
+read), projected to take the pass to **1.16x at M = 2 and 1.90x at M = 8**,
+and **P6's first stage as well**, since R concurrent sequences are R rows
+through the same weights. **P5c** — the rollback and the loop as designed.
+With P5b's kernel the optimum is **M = 2-3** and the multiplier is 1.37x at
+a = 0.6, **1.53x at 0.7 and 1.71x at 0.8**, so `LLM.md`'s carried 1.5-1.8x is
+reachable — at a shallower M than anyone assumed, and only after the kernel.
+
+### Session 2026-09-19 — P4c: the down projection at 4.5 bits, and a layout that was never a constraint
+
+**Result: `ffn_down_exps` — the largest single row in the decode bank, 41% of
+the expert traffic — is IQ4_NL at 4.5 bits. 4.0992 (+1.74%) against D20's
+4.0970 (+1.69%), 4.132 GB a token against 4.279, and 35.46 -> 36.19 tok/s,
+1.44x llama.cpp, with prefill 1.5% up beside it. D21.** The row sat at 6.26 bits because 640 is two and a half
+K-quant super-blocks and `llama-quantize` had nothing narrower to offer it, so
+nobody had ever measured what narrowing it costs.
+
+**Both candidates were built, and the narrow one won on both axes.** `q4_1`
+(5.0 bits, 0.098 GB a token) is **4.1092, +1.99%**; `iq4_nl` (4.5, **0.148
+GB**) is **4.0992, +1.74%**. Paired over the 145 chunks, q4_1's cost is
+resolvable — mean +0.002978 nll a chunk, **t = 4.11**, worse in 90 of 145 —
+and iq4_nl's is not (+0.000536, **t = 0.79**), which is D20's own result at
+4.5 bits on twenty times the bytes. So there was no trade to make: Q4_1 is
+dominated and was shipped nowhere. **Q4_0 was not built** — IQ4_NL's bytes
+exactly, for a form this vertical has measured as worse twice (D4, L8c-1).
+
+**Two other instruments ranked the two formats the other way round.** The
+imatrix-weighted reconstruction error over 64 real rows favours q4_1 by 1.24x,
+and `ffn_out` against llama.cpp over 4096 tokens by 1.11x (5.47% of the
+tensor's rms against 6.09%). The corpus says iq4_nl by 5.5x. D3's lesson has
+been "reconstruction error does not carry to perplexity"; this is the first
+time the two have **disagreed about which is better**, on the same weights and
+the same matrix.
+
+**Half the stage was the kernel, and the finding is a rule.** Written the
+obvious way — ggml's eighteen-byte record, the codebook packed in a `uvec4` —
+the 4.5-bit arm read its bank at **152.7 GB/s against Q4_1's 211.4** and was
+*slower than the six-bit format it replaced*: three interleaved passes put it
+at 35.31 against a 35.45 control, the byte saving exactly cancelled. Two fixes.
+The codebook is eight divergent lookups a payload dword, so sixteen lanes
+widen it into **LDS** under the barrier the A staging already does (and the
+block's scale multiplies the sum rather than the eight terms, which only a
+scale-only format can do): **152.7 -> 180.2**. Then: eighteen is not a multiple
+of four, which forces Q8_0's two-word rotating window — but **the "bank is the
+checkpoint's own bytes" rule binds only the tensors staged verbatim, and a
+transcoded one is written by us.** The obvious rearrangement — a **planar**
+row, every scale then every block's nibbles — is **180.2 -> 203.3 GB/s** at
+decode and **a 36% loss at prefill** (the `down` GEMM 2673 -> 3637 us a layer
+at 512 tokens, the whole graph 663.6 -> 630.5 tok/s), because a GEMV lane
+group walks one row while a GEMM slab unpack reads one block of sixty-four
+*different* rows per K-step, so a scale 300 bytes from its nibbles doubles the
+lines that opens. **36-byte pairs satisfy both**: two blocks are 4 + 32 bytes,
+a multiple of four, with each scale beside its own payload — **204.3 GB/s and
+45.11 us a layer at decode against Q5_1's 56.94 and Q4_1's 48.45**, **2679 us
+at prefill against Q5_1's 2679** on three quarters of the bytes, and output
+identical to the bit through all three layouts. `pairIQ4NLRow` is a
+permutation and `TestIQ4NLPairIsAPermutation` inverts it byte for byte, so the
+packers stay gated against llama.cpp's own quantiser. **A layout is measured
+on both kernels that read it** — one arrangement was 1.13x at decode and 0.74x
+at prefill, and a decode A/B alone would have shipped it.
+
+**The gates.** `reference/quant_ref.c` is generic over ggml types, so the two
+packers are checked against `ggml_quantize_chunk` itself over 64 real rows of
+`blk.3.ffn_down_exps.weight` and expert 0's imatrix row
+(`llm/testdata/moepack_*.bin`): **iq4_nl's uncalibrated arm is bit-exact,
+0 of 40 960**, its calibrated arm differs in 2, and q4_1's in 99 of 40 960 for
+**0.9982x** ggml's weighted error — D10's stored-half assignment, now measured
+rather than asserted. On the device: every rung exact on a narrowed bank, the
+GEMM and GEMV unpacks **2.6e-06** apart, a transcoded routed bank
+**bit-identical** to a checkpoint that shipped the format (128 M values), and
+the rung does **not** move (v16w4 on all three formats — the row keeps 80
+payload dwords whatever its bytes, which is what the lane group is sized to).
+
+**And P4b's ggml claim was wrong.** "Q5_1 is fitted with the imatrix, which
+ggml does not do" reads `quantize_row_q5_1_ref`; `llama-quantize` reaches
+`quantize_q5_1` -> `quantize_row_q5_1_impl`, which fits
+`make_qkx3_quants(32, 31, ..., -0.9, 0.05, 36)` — our own three constants. The
+two differ in `sigma2`'s scope (block against row) and in D10's stored-half
+levels. D20's bytes are left as they were measured; P4c's packers take ggml's
+normalisation, which is what lets the C oracle gate them.
+
+**Serving it needed one more thing.** The fit is 40 billion weights through a
+sixteen-scale search — **8m50s** of staging — so `cmd/serve` points
+`LLM_BANK_CACHE` at `bank-cache/` beside the checkpoint and the second start
+is **1m5.7s** (D20's was ~34 s). Keyed by tensor, shape, both types, arm and a
+version; a hit is byte-for-byte the transcode (`TestMoEBankCacheIsTheTranscode`,
+with a negative control and a truncated-file case). `cmd/llm` never sets it.
+
+Reproducibility: the ppl runs are deterministic (`results/p4c_ppl_q4_1.csv`,
+`results/p4c_ppl_iq4_nl.csv`, paired against `results/p4_ppl_all.csv`); the
+ladder is P1b's honest form, sixteen cold banks at one iteration
+(`results/p4c_moe_*_r1.csv`), every rate under 242 GB/s; the decode claim is
+three interleaved passes on one binary within one hour, **and one control pass
+of the second block read 33.84 because this session was compiling on the same
+machine** — reported rather than dropped, which is why the gain is stated as
++0.78 to +0.92 depending on which control is taken. Write-up:
+`research/p4c-down-exps.md`; next is **P5** (MTP, rollback design first) or
+**P6** (batching), per `LLM2.md`. Carried forward: the down kernel's last
+8 GB/s (the LDS table's own reads), the GEMM's unpack still reading the
+codebook out of a `uvec4` (prefill was not re-measured), `down_shexp` at
+iq4_nl (+0.07 tok/s, under the instrument), and the note that a knapsack
+should be priced in **pp per tok/s** rather than pp/GB.
 
 ### Session 2026-09-19 — P4: two premises checked, both wrong, and D20
 
@@ -3304,6 +3653,152 @@ of the fetch script failed 50 times in one second because of it.
 **Next is L2**, and the first item is not construction: price one
 full-attention layer and one DeltaNet layer against §2.2's kernels, so the 5x
 prefill gap is attributed before anything is designed around it.
+
+### Session 2026-09-19 — stage T9: one staging for the life of the server
+
+**Result: `POST /v1/audio/speech` goes from 550 ms to 59 for 6.45 s of audio,
+and the bytes are identical to what the old path produced.** The short test
+sentence goes 302 ms to 31. Nothing about the model changed; what changed is
+that the device is staged once at startup instead of once per request.
+
+    utterance            audio     CPU     T4-T8    T9      device alone
+    "Hello there, ..."    3.35 s   3.285   0.302   0.031    0.025
+    "A guy is driving ..." 6.45 s   5.430   0.550   0.059    0.048
+
+**The 550 ms decomposed exactly**, and only the last line was arithmetic:
+411 ms of host prosody to learn the frame count, 88 ms of `AttachGPU` sized by
+it, 48 ms of utterance. Kokoro's arenas were sized for one clip's alignment
+frames and the *durations* decide that, so the phoneme side ran on the host —
+the very 411 ms T6 had moved to the device — to settle a number the device
+then recomputed in 13 ms.
+
+The frame count is now a **ceiling** (`-tts-frames`, 1000 frames = 25 s), every
+shorter utterance is a prefix of the same arenas, and a request costs
+`Vocoder.SetFrames`: a walk down the chain `AttachGPU` already walks, writing a
+frame count into a push constant. A ceiling costs ~150 MB plus 0.7 MB a frame
+and **nothing per request** — the Montana sentence is 48 ms staged for its own
+258 frames and 48 ms staged for 1000 (`cmd/tts -gpu -frames 1000`).
+
+Four things worth keeping:
+
+1. **The obvious implementation would have been quietly wrong.** The note this
+   stage was written from proposed zero-padding the alignment up to the bucket
+   and trimming the tail. But AdaIN normalises over *time*: pad 130 frames of
+   speech out to 1000 of silence and every per-channel mean and variance in
+   ~40 blocks moves, so every sample changes, including the ones inside the
+   utterance. The output would have been a plausible waveform of the right
+   length that nobody asked for, and no shape check would have caught it. The
+   frame count had to become a runtime quantity, not padding.
+2. **The one thing bucketing can break is the zero border**, because kokoro's
+   convolutions are branchless: their padding is in the data. The border at
+   the start of an arena is written once at staging; the border at the *end*
+   moves with the utterance, and a shorter clip finds a longer one's
+   activations there. Restoring it is 8 KB a block from the host.
+3. **A five-frame error came out as a 2.5% error over the whole waveform.**
+   The upsampler's zero row is T_in, not T_in+1 — its GEMM runs T_in+1 rows
+   because the last one reads input rows T_in-1 and T_in, while the rectifier
+   writes only T_in. Getting it wrong dirtied five frames at a seam 2600
+   frames from the start of the utterance, and the first sample was 4% off:
+   the wrong frames enter an AdaIN and the statistics carry them everywhere.
+   In a time-normalised model there is no such thing as a local mistake.
+4. **It found a latent bug from T6d.** The text encoder's fp16 arena is sized
+   by the position embedding's 512 tokens rather than by the utterance — the
+   one thing in the package that was already bucketed — and its 5-tap
+   convolutions read two rows past the last token. Nothing could observe it
+   because no attachment had ever survived two utterances. The first thing
+   bucketing does is make one survive several, and the second utterance of a
+   pair came out wrong.
+
+**The tests bound by equality rather than tolerance.** Two attachments of
+different sizes issue the same dispatches with the same push constants over
+the same weights, so anything reading past the live rows is a wrong number and
+not a rounding error. `TestGPUBucketedFrames` and `TestGPUBucketedSpeak` run
+the clips in the order a server sees them — short, long, short — and require
+the waveforms to agree sample for sample; `TestGPUSetVoice` holds a
+re-conditioned voice to the same bound. From the outside, the redeployed
+endpoint's WAVs `cmp` clean against the old path's.
+
+Also: `-tts-gpu` now defaults **on** (the reason it was off is gone),
+`Model.SetVoice` re-conditions an attachment without restaging, and an
+utterance past the ceiling raises `kokoro.FramesOverflowError`, which carries
+the frame count so the server restages to the next 256 frames and keeps the
+larger arenas (1665 frames became arenas for 1792 in 151 ms).
+
+New: `kokoro/gpubucket_test.go`, `GPUBlocks.SetFrames`/`zeroBorder`,
+`GPUDecoder.SetFrames`, `GPUProsody.SetFrames`, `blockSet.zeroBorders`,
+`decBlock.setFrames`, `GPUPhonemes.setTokens`, `Vocoder.SetFrames`,
+`Model.SetVoice`/`MaxFrames`, `kokoro.FramesOverflowError`,
+`backend.TTSOptions.MaxFrames`, `-tts-frames`, `cmd/tts -frames`. Write-up in
+SPEECH.md T9. `go test ./...` passes.
+
+### Session 2026-09-19 — stage T7: the excitation on the device, and a number that is a lottery
+
+**Result: the excitation is 14 ms to 0.2 ms, of which 23 microseconds is GPU
+and the rest is one submit and one readback. An utterance is 31 ms for 3.25 s
+of audio — 105x real time, from 74.2x — and every stage of kokoro now runs on
+the device.** Two new
+shaders, `kokoro_source.comp` and `kokoro_srcstft.comp`, one new object,
+`kokoro/gpusource.go`, and five tests. Write-up in SPEECH.md T7.
+
+**Built:** `GPUSource` (two dispatches, one submit, one download, its own
+HOST_CACHED arena), the two shaders, `audio.STFT.Window()`, `HarmonicSource.
+Seed`, and the wiring in `AttachGPU`/`Generator.Apply`. `TestGPUTail` and
+`TestGPUVocoder` now run their device-against-CPU comparison with the host
+excitation on both sides, because what they are about is the blocks.
+
+**Six things worth carrying forward:**
+
+1. **Profile the stage before porting it.** SPEECH.md framed T7 as "78000
+   samples times eight harmonics of `sin(2*pi*frac(phi))`". Measured, the sine
+   bank is 6.4 ms of the 14 and the *forward transform* is 8.2 — 15601 frames
+   of a 20-point DFT. Half the stage was a kernel nobody had written down.
+
+2. **Three of the reference's stages were the identity, and the check took
+   ten minutes.** The F0 curve is upsampled 300:1, converted to cycles per
+   sample and decimated back down; the decimation reads coordinate 300t +
+   149.5 and both samples it averages lie in frame t, so half of x plus half
+   of x is x. That collapses a 702000-element float64 intermediate to 260x9
+   and was verified at exactly zero *before* anything was built on it.
+
+3. **The precision worry was about the wrong quantity.** T3 said the phase
+   could not move because upstream accumulates 1.3e5 radians. But the
+   accumulation is 260x9 numbers and takes **8 microseconds** in float64 on
+   the host — 0.06% of the stage — so it never had to move at all. Only what
+   comes *after* the wrap goes to the device, where nothing exceeds 301. The
+   device waveform matches the float64 host to 1.6e-7 rms.
+
+4. **"The device is worse than the host" needed three null models before one
+   of them was right.** The whole-path number is 13.8 dB against the dump
+   where the host gets 18.2. Perturbing every sample of the host excitation by
+   1e-7 made it *better*, because independent noise breaks the exact-constant
+   structure that leaves the phase undefined. Walking the unvoiced constant
+   under the host transform barely moved it. Walking it under the *device*
+   transform spans 0.097 to 0.203 — and the shipping value is the unluckiest
+   of eleven. Each half is fine alone (device excitation through the host
+   transform is 0.118; host excitation through the device transform 0.110);
+   only the combination draws the bad ticket.
+
+5. **So the bound in a test can be a lottery's width, but only if the lottery
+   has been measured.** Everything defined is bounded tightly — waveform 1e-4,
+   magnitude 1e-4, phase 1e-5 *in the complex value*, which is the right
+   quantity because an error e in re/im is an error e/|X| in the angle. The
+   one loose bound is the one whose spread is written down next to it.
+
+6. **A 1.4 MB readback decides where the arena comes from.** kokoro's other
+   arenas are the write-combined type, which this host reads at 0.18 GB/s —
+   7.7 ms, the whole stage. `NewHostCachedBuffer` makes it 74 microseconds.
+   First place in kokoro where L6b's distinction has mattered.
+
+**What it cost elsewhere:** `-noise n` no longer gives sample-identical audio
+on the CPU and GPU paths. The device draws its Gaussians from a hash of
+(seed, sample, harmonic) because 702000 host draws are 7 ms — half of what the
+stage cost before it moved — and 2.8 MB across the bus. Same distribution and
+same rule, different sequence.
+
+**Next is the vocoder's input boundary.** The excitation's remaining 0.2 ms is
+88% submit and readback, and the phoneme side's 8 ms is none of it arithmetic;
+both close by moving where the host hands the device its tensors, which is one
+change rather than several.
 
 ### Session 2026-09-19 — stage T8: voice blending, and a spelling that was not ours to choose
 

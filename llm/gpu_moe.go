@@ -281,7 +281,7 @@ const moeBMMax = 64
 // there anyway: at a 512-token ubatch `ffn_gate_inp` is 512 rows of A and the
 // grid is no longer nine workgroups.
 func MoERouterFor(tokens int) MoERouterKernel {
-	if tokens == 1 && DecodeGEMV() {
+	if tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV() {
 		return MoERouterK40
 	}
 	return MoERouterGEMM
@@ -294,8 +294,9 @@ func (g *MoEGPU) SetRouter(k MoERouterKernel) error {
 	if k != MoERouterGEMM && moeRouterSlabs(k) == 0 {
 		return fmt.Errorf("llm: no MoE router kernel %q (have %v)", k, append([]MoERouterKernel{MoERouterGEMM}, MoERouterKernels()...))
 	}
-	if k != MoERouterGEMM && g.rows > 1 {
-		return fmt.Errorf("llm: the MoE router rung %q reads one token's row; this batch is %d", k, g.rows)
+	if k != MoERouterGEMM && g.rows > GEMVMaxRows {
+		return fmt.Errorf("llm: the MoE router rung %q carries at most %d rows (P5b); this batch is %d",
+			k, GEMVMaxRows, g.rows)
 	}
 	g.routerGemv = k
 	g.autoPlan = false
@@ -352,13 +353,21 @@ func (g *MoEGPU) moeSharedPlan(nTok int) (MoEKernel, MoEKernel) {
 }
 
 // moeCheckGemv is the one thing a GEMV plan needs that a GEMM plan does not.
+//
+// **P5b raised the bound from one row to GEMVMaxRows.** The rung reads ROWS
+// rows from a tile's base and the permutation pads the rest with a sentinel
+// whose activation row is zeros (llm_moe_perm.comp), so a tile that holds
+// fewer real rows computes finite nonsense into output slots the combine does
+// not read — exactly what the GEMM does with the same rows. Past the bound it
+// would still silently drop rows, which is what this refuses.
 func moeCheckGemv(up, down MoEKernel, rows int) error {
-	if rows <= 1 {
+	if rows <= GEMVMaxRows {
 		return nil
 	}
 	for _, k := range []MoEKernel{up, down} {
 		if MoEIsGemv(k) {
-			return fmt.Errorf("llm: the MoE GEMV rung %q reads one row of a tile, so it is a one-token kernel; this batch is %d", k, rows)
+			return fmt.Errorf("llm: the MoE GEMV rung %q carries at most %d rows of a tile (P5b); this batch is %d",
+				k, GEMVMaxRows, rows)
 		}
 	}
 	return nil
@@ -366,7 +375,7 @@ func moeCheckGemv(up, down MoEKernel, rows int) error {
 
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 	switch {
-	case tokens == 1 && DecodeGEMV():
+	case tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV():
 		return MoEV64W4, MoEV16W4
 	case tokens == 1:
 		// L8d's control: the narrow-BN GEMM rung L7d left the plan on.
@@ -407,7 +416,7 @@ func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 // is the same story an order of magnitude smaller: the routed one wants v16w4
 // (34.7) and the shared one v32w4 (5.68 against v16w4's 7.13).
 func MoESharedPlanFor(tokens int) (MoEKernel, MoEKernel) {
-	if tokens == 1 && DecodeGEMV() {
+	if tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV() {
 		return MoEV64W4, MoEV32W4
 	}
 	return MoEPlanFor(tokens)
@@ -424,6 +433,12 @@ const (
 	fmtQ5K
 	fmtQ51
 	fmtQ80
+	// P4c's two. No tensor ships in either; they exist because
+	// `ffn_down_exps` has a row of 640, which no K-quant divides, so the only
+	// way below its 6.26 bits is a block-32 format the bank is transcoded
+	// into (`moebank.go`).
+	fmtQ41
+	fmtIQ4NL
 )
 
 func (f moeFmt) String() string {
@@ -434,6 +449,10 @@ func (f moeFmt) String() string {
 		return "q5k"
 	case fmtQ51:
 		return "q51"
+	case fmtQ41:
+		return "q41"
+	case fmtIQ4NL:
+		return "iq4nl"
 	}
 	return "q80"
 }
@@ -460,6 +479,10 @@ func moeFmtOfType(t gguf.Type) (moeFmt, error) {
 		return fmtQ51, nil
 	case gguf.Q8_0:
 		return fmtQ80, nil
+	case gguf.Q4_1:
+		return fmtQ41, nil
+	case gguf.IQ4_NL:
+		return fmtIQ4NL, nil
 	}
 	return 0, fmt.Errorf("llm: ggml type %d has no MoE kernel build", t)
 }
@@ -501,40 +524,66 @@ var moeSPIRV = map[string][]byte{
 	"down_q80_w2m1": shaders.LLMMoEDownQ80W2M1,
 	"down_q80_w4m1": shaders.LLMMoEDownQ80W4M1,
 
+	// P4c's two down formats, the same five rungs each. They are built
+	// because the *bank* can be transcoded into them, not because the
+	// checkpoint ships one.
+	"down_q41_m1":     shaders.LLMMoEDownQ41M1,
+	"down_q41_m2":     shaders.LLMMoEDownQ41M2,
+	"down_q41_m4":     shaders.LLMMoEDownQ41M4,
+	"down_q41_w2m1":   shaders.LLMMoEDownQ41W2M1,
+	"down_q41_w4m1":   shaders.LLMMoEDownQ41W4M1,
+	"down_iq4nl_m1":   shaders.LLMMoEDownIQ4NLM1,
+	"down_iq4nl_m2":   shaders.LLMMoEDownIQ4NLM2,
+	"down_iq4nl_m4":   shaders.LLMMoEDownIQ4NLM4,
+	"down_iq4nl_w2m1": shaders.LLMMoEDownIQ4NLW2M1,
+	"down_iq4nl_w4m1": shaders.LLMMoEDownIQ4NLW4M1,
+
 	// The decode rungs, which are a different kernel rather than a different
 	// shape of the same one: llm_moe_gemv.comp, LLM.md L8d. Same two modes,
 	// same four formats, same tile list — no LDS slab, no barrier in the K
 	// loop and no cooperative matrix.
-	"up_q4k_v16":     shaders.LLMMoEGVUpQ4KV16,
-	"up_q4k_v32":     shaders.LLMMoEGVUpQ4KV32,
-	"up_q4k_v64":     shaders.LLMMoEGVUpQ4KV64,
-	"up_q4k_v16w4":   shaders.LLMMoEGVUpQ4KV16W4,
-	"up_q4k_v32w4":   shaders.LLMMoEGVUpQ4KV32W4,
-	"up_q4k_v64w4":   shaders.LLMMoEGVUpQ4KV64W4,
-	"up_q5k_v16":     shaders.LLMMoEGVUpQ5KV16,
-	"up_q5k_v32":     shaders.LLMMoEGVUpQ5KV32,
-	"up_q5k_v64":     shaders.LLMMoEGVUpQ5KV64,
-	"up_q5k_v16w4":   shaders.LLMMoEGVUpQ5KV16W4,
-	"up_q5k_v32w4":   shaders.LLMMoEGVUpQ5KV32W4,
-	"up_q5k_v64w4":   shaders.LLMMoEGVUpQ5KV64W4,
-	"up_q80_v16":     shaders.LLMMoEGVUpQ80V16,
-	"up_q80_v32":     shaders.LLMMoEGVUpQ80V32,
-	"up_q80_v64":     shaders.LLMMoEGVUpQ80V64,
-	"up_q80_v16w4":   shaders.LLMMoEGVUpQ80V16W4,
-	"up_q80_v32w4":   shaders.LLMMoEGVUpQ80V32W4,
-	"up_q80_v64w4":   shaders.LLMMoEGVUpQ80V64W4,
-	"down_q51_v16":   shaders.LLMMoEGVDownQ51V16,
-	"down_q51_v32":   shaders.LLMMoEGVDownQ51V32,
-	"down_q51_v64":   shaders.LLMMoEGVDownQ51V64,
-	"down_q51_v16w4": shaders.LLMMoEGVDownQ51V16W4,
-	"down_q51_v32w4": shaders.LLMMoEGVDownQ51V32W4,
-	"down_q51_v64w4": shaders.LLMMoEGVDownQ51V64W4,
-	"down_q80_v16":   shaders.LLMMoEGVDownQ80V16,
-	"down_q80_v32":   shaders.LLMMoEGVDownQ80V32,
-	"down_q80_v64":   shaders.LLMMoEGVDownQ80V64,
-	"down_q80_v16w4": shaders.LLMMoEGVDownQ80V16W4,
-	"down_q80_v32w4": shaders.LLMMoEGVDownQ80V32W4,
-	"down_q80_v64w4": shaders.LLMMoEGVDownQ80V64W4,
+	"up_q4k_v16":       shaders.LLMMoEGVUpQ4KV16,
+	"up_q4k_v32":       shaders.LLMMoEGVUpQ4KV32,
+	"up_q4k_v64":       shaders.LLMMoEGVUpQ4KV64,
+	"up_q4k_v16w4":     shaders.LLMMoEGVUpQ4KV16W4,
+	"up_q4k_v32w4":     shaders.LLMMoEGVUpQ4KV32W4,
+	"up_q4k_v64w4":     shaders.LLMMoEGVUpQ4KV64W4,
+	"up_q5k_v16":       shaders.LLMMoEGVUpQ5KV16,
+	"up_q5k_v32":       shaders.LLMMoEGVUpQ5KV32,
+	"up_q5k_v64":       shaders.LLMMoEGVUpQ5KV64,
+	"up_q5k_v16w4":     shaders.LLMMoEGVUpQ5KV16W4,
+	"up_q5k_v32w4":     shaders.LLMMoEGVUpQ5KV32W4,
+	"up_q5k_v64w4":     shaders.LLMMoEGVUpQ5KV64W4,
+	"up_q80_v16":       shaders.LLMMoEGVUpQ80V16,
+	"up_q80_v32":       shaders.LLMMoEGVUpQ80V32,
+	"up_q80_v64":       shaders.LLMMoEGVUpQ80V64,
+	"up_q80_v16w4":     shaders.LLMMoEGVUpQ80V16W4,
+	"up_q80_v32w4":     shaders.LLMMoEGVUpQ80V32W4,
+	"up_q80_v64w4":     shaders.LLMMoEGVUpQ80V64W4,
+	"down_q51_v16":     shaders.LLMMoEGVDownQ51V16,
+	"down_q51_v32":     shaders.LLMMoEGVDownQ51V32,
+	"down_q51_v64":     shaders.LLMMoEGVDownQ51V64,
+	"down_q51_v16w4":   shaders.LLMMoEGVDownQ51V16W4,
+	"down_q51_v32w4":   shaders.LLMMoEGVDownQ51V32W4,
+	"down_q51_v64w4":   shaders.LLMMoEGVDownQ51V64W4,
+	"down_q80_v16":     shaders.LLMMoEGVDownQ80V16,
+	"down_q80_v32":     shaders.LLMMoEGVDownQ80V32,
+	"down_q80_v64":     shaders.LLMMoEGVDownQ80V64,
+	"down_q80_v16w4":   shaders.LLMMoEGVDownQ80V16W4,
+	"down_q80_v32w4":   shaders.LLMMoEGVDownQ80V32W4,
+	"down_q80_v64w4":   shaders.LLMMoEGVDownQ80V64W4,
+	"down_q41_v16":     shaders.LLMMoEGVDownQ41V16,
+	"down_q41_v32":     shaders.LLMMoEGVDownQ41V32,
+	"down_q41_v64":     shaders.LLMMoEGVDownQ41V64,
+	"down_q41_v16w4":   shaders.LLMMoEGVDownQ41V16W4,
+	"down_q41_v32w4":   shaders.LLMMoEGVDownQ41V32W4,
+	"down_q41_v64w4":   shaders.LLMMoEGVDownQ41V64W4,
+	"down_iq4nl_v16":   shaders.LLMMoEGVDownIQ4NLV16,
+	"down_iq4nl_v32":   shaders.LLMMoEGVDownIQ4NLV32,
+	"down_iq4nl_v64":   shaders.LLMMoEGVDownIQ4NLV64,
+	"down_iq4nl_v16w4": shaders.LLMMoEGVDownIQ4NLV16W4,
+	"down_iq4nl_v32w4": shaders.LLMMoEGVDownIQ4NLV32W4,
+	"down_iq4nl_v64w4": shaders.LLMMoEGVDownIQ4NLV64W4,
 }
 
 // moeRouterSPIRV is the decode router's two dispatches at each split (L8d-3).
@@ -839,7 +888,7 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	// The decode router's partial sums, f32 [KSLABS][routerN] (L8d-3). 92 KB
 	// at the widest rung, and allocated whichever rung runs — the arena plan
 	// is fixed at construction and the rung is not.
-	g.aRouterPart = alloc(moeRouterMaxSlabs * g.routerN())
+	g.aRouterPart = alloc(GEMVMaxRows * moeRouterMaxSlabs * g.routerN())
 	g.aShTilesDown = alloc(shTiles)
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: moe fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
@@ -976,14 +1025,20 @@ func (g *MoEGPU) build() error {
 		return fmt.Errorf("llm: the widest rung needs four %d-wide subgroups a workgroup, this device allows %d",
 			moeWave, sgs.MaxComputeWorkgroupSubgroups)
 	}
-	for name, spirv := range moeSPIRV {
-		if err := g.pipeline(name, spirv, spec); err != nil {
-			return err
-		}
-	}
-	for name, spirv := range moeRouterSPIRV {
-		if err := g.pipeline(name, spirv, spec); err != nil {
-			return err
+	// One module, one pipeline per row count (P5b): `ROWS` is a
+	// specialization constant in llm_moe_gemv.comp and llm_moe_router.comp,
+	// so the seventy-odd `.spv` of these two families do not double. The
+	// grouped GEMM below takes its row block from its own name and needs
+	// none of this.
+	for _, fam := range []map[string][]byte{moeSPIRV, moeRouterSPIRV} {
+		for name, spirv := range fam {
+			for rows := 1; rows <= GEMVMaxRows; rows++ {
+				rspec := spec
+				rspec.SpecConstants = gemvSpec(rows)
+				if err := g.pipeline(gemvRowName(name, rows), spirv, rspec); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	for _, v := range gemmVariants {
@@ -1270,10 +1325,10 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	router.GemmN, router.GemmK = uint32(g.routerN()), uint32(c.NEmbd)
 	if ks := moeRouterSlabs(g.routerGemv); ks > 0 {
 		router.GammaOff = g.aRouterPart
-		add(fmt.Sprintf("router_%s", g.routerGemv), "router",
+		add(gemvRowName(fmt.Sprintf("router_%s", g.routerGemv), g.rows), "router",
 			uint32(ks), uint32(g.routerN()/16), router)
-		add(fmt.Sprintf("router_%s_r", g.routerGemv), "router.sum",
-			uint32(roundUpInt(g.routerN(), moeWave)/moeWave), 1, router)
+		add(gemvRowName(fmt.Sprintf("router_%s_r", g.routerGemv), g.rows), "router.sum",
+			uint32(roundUpInt(g.routerN(), moeWave)/moeWave), uint32(g.rows), router)
 	} else {
 		add(string(g.router), "router", uint32(g.routerN()/attnBN),
 			uint32(roundUpInt(g.rows, rv.bm)/rv.bm), router)
@@ -1682,6 +1737,10 @@ func moeRowBytes(f moeFmt, k int) int {
 		return k / 256 * 176
 	case fmtQ51:
 		return k / 32 * 24
+	case fmtQ41:
+		return k / 32 * 20
+	case fmtIQ4NL:
+		return k / 32 * 18
 	}
 	return k / 32 * 34
 }

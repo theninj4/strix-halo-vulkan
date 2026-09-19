@@ -1,8 +1,11 @@
 package llm
 
 import (
+	"bytes"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"strix-halo-vulkan/gguf"
@@ -208,6 +211,35 @@ func TestMoEBankPlanIsACeiling(t *testing.T) {
 	if _, err := ParseMoEBankPlan("down_exps=q4_k", "imatrix"); err != nil {
 		t.Fatalf("the plan parses; it is the transcode that refuses: %v", err)
 	}
+	// P4c's two, on the same rule. The row that ships at Q5_1 is above both
+	// of them, so `down_exps` moves on all 48 layers where D20's `q5_1`
+	// moved on five — which is the whole of the stage, expressed in the
+	// grammar that was already there.
+	p4c, err := ParseMoEBankPlan("down_exps=iq4_nl", "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		have gguf.Type
+		want gguf.Type
+		move bool
+	}{
+		{"blk.3.ffn_down_exps.weight", gguf.Q5_1, gguf.IQ4_NL, true},
+		{"blk.2.ffn_down_exps.weight", gguf.Q8_0, gguf.IQ4_NL, true},
+		{"blk.3.ffn_down_shexp.weight", gguf.Q8_0, gguf.Q8_0, false},
+		// 4.5 bits is not narrowed to 5.0: the ceiling rule refuses to widen
+		// a tensor, which is what keeps a plan from undoing a bank.
+		{"blk.3.ffn_down_exps.weight", gguf.IQ4_NL, gguf.IQ4_NL, false},
+	} {
+		got, move := p4c.For(c.name, c.have)
+		if got != c.want || move != c.move {
+			t.Errorf("%s at %s: plan says (%s, %v), want (%s, %v)", c.name, c.have, got, move, c.want, c.move)
+		}
+	}
+	if _, err := ParseMoEBankPlan("down_exps=q4_0", "imatrix"); err == nil {
+		t.Error("q4_0 has no arm — it is IQ4_NL's bytes for a worse fit — and the plan should say so")
+	}
 	if _, err := ParseMoEBankPlan("down_exps=q8_0", "imatrix"); err == nil {
 		t.Error("q8_0 is not a format the kernels read as a target, and the plan should say so")
 	}
@@ -235,4 +267,116 @@ func maxF(a, b float32) float32 {
 		return a
 	}
 	return b
+}
+
+// TestIQ4NLPairIsAPermutation is what keeps `TestMoEPackersAgainstGGML`'s
+// bit-exactness against llama.cpp a statement about the bank the device reads.
+//
+// The staged IQ4_NL row is not ggml's records — an eighteen-byte record is
+// not a multiple of four, and the two-word window that forces cost the decode
+// arm 28% of its read rate — so the transcode rearranges each row into
+// 36-byte pairs. That rearrangement must be a **permutation of bytes and
+// nothing else**: same scales, same levels, same bits, in a different order.
+func TestIQ4NLPairIsAPermutation(t *testing.T) {
+	const k = 640 // the down projection's row
+	row := moebankRow(k, 23)
+	qw := moebankRow(k, 29)
+	for i := range qw {
+		qw[i] = float32(math.Abs(float64(qw[i]))) + 1e-6
+	}
+	ggml := make([]byte, k/32*18)
+	packIQ4NLRow(ggml, row, qw)
+
+	paired := append([]byte(nil), ggml...)
+	pairIQ4NLRow(paired)
+	if bytes.Equal(paired, ggml) {
+		t.Fatal("the paired row is byte-identical to ggml's, so the transform did nothing")
+	}
+	// Every byte is still there, and the inverse is exact — which together
+	// are the whole claim.
+	back := append([]byte(nil), paired...)
+	unpairIQ4NLRow(back)
+	if !bytes.Equal(back, ggml) {
+		t.Fatal("unpair(pair(row)) is not the row")
+	}
+	// And each block is where the shaders look for it: within its pair's 36
+	// bytes, the two scales first and then the two nibble groups.
+	nb := k / 32
+	for b := 0; b < nb; b++ {
+		rec := paired[(b/2)*36:]
+		half := (b & 1) * 2
+		if got, want := rec[half:half+2], ggml[b*18:b*18+2]; !bytes.Equal(got, want) {
+			t.Fatalf("block %d scale is at the wrong offset", b)
+		}
+		off := 4 + (b&1)*16
+		if got, want := rec[off:off+16], ggml[b*18+2:(b+1)*18]; !bytes.Equal(got, want) {
+			t.Fatalf("block %d nibbles are at the wrong offset", b)
+		}
+	}
+	// And a pair's record is four-aligned, which is the whole reason for it.
+	if 36%4 != 0 || len(paired)%4 != 0 {
+		t.Fatal("the paired record is not a multiple of four bytes")
+	}
+	t.Logf("%d bytes a row: %d pairs of 36, invertible and four-aligned", len(paired), nb/2)
+}
+
+// TestMoEBankCacheIsTheTranscode is the one property the cache has to have:
+// what it hands back is what the transcode would have computed, byte for
+// byte. A cache that is subtly not the bank would show up as an accuracy
+// number nobody could explain.
+func TestMoEBankCacheIsTheTranscode(t *testing.T) {
+	m, _ := fixtures(t)
+	// A small real tensor: the shared expert's down projection, 640 wide like
+	// the routed one and 1/512th of the rows.
+	tn, err := m.Set.Get("blk.3.ffn_down_shexp.weight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	t.Setenv("LLM_BANK_CACHE", dir)
+
+	first, err := TranscodeMoE(tn, gguf.IQ4_NL, "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := moeCachePath(tn, gguf.IQ4_NL, "imatrix")
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the transcode did not write %s: %v", path, err)
+	}
+	if st.Size() != int64(len(first)) {
+		t.Fatalf("%s is %d bytes, the transcode is %d", path, st.Size(), len(first))
+	}
+	// Poison the fit so a second call that recomputed would be visibly
+	// different, and check it is not: the bytes have to come off disk.
+	second, err := TranscodeMoE(tn, gguf.IQ4_NL, "rtn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first, second) {
+		t.Fatal("the two arms produce the same bytes, so this test cannot tell a hit from a miss")
+	}
+	again, err := TranscodeMoE(tn, gguf.IQ4_NL, "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, again) {
+		t.Error("the cached bytes are not the transcode's")
+	}
+	// The arm is part of the key, so the `rtn` file is its own.
+	if p := moeCachePath(tn, gguf.IQ4_NL, "rtn"); p == path {
+		t.Error("the calibration arm is not in the cache key")
+	}
+	// A truncated file is a miss rather than a wrong answer.
+	if err := os.WriteFile(path, first[:len(first)-16], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	short, err := TranscodeMoE(tn, gguf.IQ4_NL, "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, short) {
+		t.Error("a short cache file was read instead of being recomputed")
+	}
+	t.Logf("%s: %.1f MB cached and re-read", filepath.Base(path), float64(len(first))/1e6)
 }

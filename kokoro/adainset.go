@@ -526,3 +526,53 @@ func (s *blockSet) destroy() {
 	s.pipes, s.convs, s.mods = nil, nil, nil
 	s.wbuf, s.hbuf, s.bank = nil, nil, nil
 }
+
+// setFrames rewrites one block's frame counts for an utterance shorter than
+// the one the arenas were built for. The shapes it does not touch — channel
+// counts, row strides, every offset — are what make this legal: a [T, C]
+// region read as [n, C] with n < T is its own prefix, and nothing in a block
+// addresses a row from the end.
+func (db *decBlock) setFrames(frames int) {
+	db.frames = frames
+	db.conv = frames
+	if db.upsample {
+		db.conv = 2 * frames
+	}
+}
+
+// zeroBorders restores the zero padding past each block's live rows.
+//
+// A sub-arena carries a border at both ends so the convolutions stay
+// branchless (see hArenas). The one at the *start* is written once at staging
+// and never touched again, but the one at the end moves with the utterance:
+// after a shorter run, the rows just past the last live one still hold what a
+// longer utterance left there, and a 3-tap convolution reads one of them.
+//
+// So the invariant is restored here rather than in a kernel: convBorder rows
+// of zeros after every live region, which is the widest tap reach in this
+// package and 8 KB a block from the host. It is only worth doing when the
+// frame count actually changed, which is the owner's call.
+func (s *blockSet) zeroBorders() {
+	var zero []uint16
+	put := func(off uint32, rows, lda int) {
+		if off == noW || lda <= 0 {
+			return
+		}
+		n := convBorder * lda
+		if len(zero) < n {
+			zero = make([]uint16, n)
+		}
+		s.hbuf.WriteUint16At(int(off)+rows*lda, zero[:n])
+	}
+	for i := range s.blocks {
+		db := &s.blocks[i]
+		put(db.hSrc, db.frames, db.inPad)
+		put(db.hMid, db.conv, db.out)
+		if !db.noSC {
+			put(db.hSc, db.conv, db.inPad)
+		}
+		if db.upsample {
+			put(db.hPool, db.conv, db.inPad)
+		}
+	}
+}

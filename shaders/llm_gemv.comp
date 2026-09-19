@@ -65,6 +65,28 @@
 // the split crosses a super-block — 256 k, sixteen k-tiles, four steps of
 // this loop — so the records cost the format's own 12.5% and not eight times
 // that.
+//
+// **ROWS is P5b, and it is the whole of what a verification pass needs.**
+// D15 refuses this kernel above one token because a sixteen-row fragment
+// holding one row is the *reason* it beats the GEMM — but the refusal was
+// about the GEMM's shape, not about a dot product's, and a dot product
+// extends to R rows for nothing: the weight is read once and multiplied into
+// R accumulators against R rows of A. P5 measured what that is worth
+// (research/p5-mtp-rollback.md): at two tokens the GEMM the host falls back
+// to costs this projection **1.9-3.4x** on *identical* weight bytes, because
+// its row block is sixteen to sixty-four rows with two real ones in it.
+//
+// It is a **specialization constant** rather than a `-D`, so one module
+// serves every row count and the thirty-odd `.spv` of this family do not
+// double. `MAXROWS` is the compile-time bound the accumulators are sized by;
+// `ROWS <= MAXROWS` is checked by the host, and the `r < ROWS` guards fold
+// away when the pipeline is specialized. P5a says the speculation optimum is
+// depth 1 — a two-row verification pass — so MAXROWS is 2; P6's batching is
+// the reason it is written as a bound rather than as a second accumulator.
+//
+// The partials are strided **row-major over the slab**: `[r][slab][n]`, so
+// MODE 1 sums a contiguous KSLABS for each row and the arena is
+// MAXROWS times what it was.
 
 #include "llm_common.glsl"
 
@@ -77,6 +99,11 @@
 
 #define TILE 16
 #define WAVE 64
+
+// Rows of A this dispatch carries. See the header: a specialization constant,
+// bounded by MAXROWS so the accumulators stay in registers.
+layout(constant_id = 0) const uint ROWS = 1;
+#define MAXROWS 2
 
 #ifdef Q4B
 #include "llm_q4k.glsl"
@@ -97,7 +124,10 @@ void main() {
     uint sub = lane / TILE;                      // which of the four tiles of a step
     uint xbase = pc.xnOff + kt0 * TILE;
 
-    float sum = 0.0;
+    float sum[MAXROWS];
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        sum[r] = 0.0;
+    }
 #ifdef Q4B
     // Every row is on the plane: the fp16 tail left with D13's payoff (P2),
     // so a quantised matrix is quantised all the way through.
@@ -137,8 +167,17 @@ void main() {
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     uint by = bitfieldExtract(word, int(t * 8u), 8);
                     uint e = u * 8u + t * 2u;
-                    sum += (ds * float(QK_LEVEL_LO(by, hb, t)) - dm) * float(hact[x + e]);
-                    sum += (ds * float(QK_LEVEL_HI(by, hb, t)) - dm) * float(hact[x + e + 1u]);
+                    // The weight is unpacked once and multiplied into every
+                    // row: this is the whole of the R-row arm.
+                    float wlo = ds * float(QK_LEVEL_LO(by, hb, t)) - dm;
+                    float whi = ds * float(QK_LEVEL_HI(by, hb, t)) - dm;
+                    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                        if (r < ROWS) {
+                            uint xr = x + r * pc.lda;
+                            sum[r] += wlo * float(hact[xr + e]);
+                            sum[r] += whi * float(hact[xr + e + 1u]);
+                        }
+                    }
                 }
             }
         }
@@ -158,8 +197,15 @@ void main() {
             [[unroll]] for (uint u = 0u; u < 4u; u++) {
                 uint word = w8[w + u];
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
-                    sum += float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d) *
-                        float(hact[x + u * 4u + t]);
+                    // L8b-2's exactness is a property of this product and is
+                    // unchanged by the row count: the half is formed once and
+                    // widened once, whichever row consumes it.
+                    float wv = float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d);
+                    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                        if (r < ROWS) {
+                            sum[r] += wv * float(hact[x + r * pc.lda + u * 4u + t]);
+                        }
+                    }
                 }
             }
         }
@@ -170,33 +216,47 @@ void main() {
         uint w = wbase + c * (TILE * TILE);
         uint x = xbase + (c + sub) * TILE;
         [[unroll]] for (uint i = 0u; i < TILE; i++) {
-            sum += float(w16[w + i]) * float(hact[x + i]);
+            float wv = float(w16[w + i]);
+            [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                if (r < ROWS) {
+                    sum[r] += wv * float(hact[x + r * pc.lda + i]);
+                }
+            }
         }
     }
 #endif
 
     // The four lanes holding the same column are lane, lane^16, lane^32.
-    sum += subgroupShuffleXor(sum, 16u);
-    sum += subgroupShuffleXor(sum, 32u);
-    if (sub == 0u) {
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        if (r >= ROWS) {
+            continue;
+        }
+        float v = sum[r];
+        v += subgroupShuffleXor(v, 16u);
+        v += subgroupShuffleXor(v, 32u);
+        if (sub == 0u) {
 #if KSLABS == 1
-        act[pc.outOff + nt * TILE + col] = sum;
+            act[pc.outOff + r * pc.gemmN + nt * TILE + col] = v;
 #else
-        // The partials ride `resOff`, which no MODE 2 caller uses: the push
-        // block is 64 uints, this device's whole range, and the wide residual
-        // is the hyper-connection block's tensor alone (llm_common.glsl).
-        act[pc.resOff + slab * pc.gemmN + nt * TILE + col] = sum;
+            // The partials ride `resOff`, which no MODE 2 caller uses: the
+            // push block is 64 uints, this device's whole range, and the wide
+            // residual is the hyper-connection block's tensor alone
+            // (llm_common.glsl). Row-major over the slab, so MODE 1's sum is
+            // contiguous.
+            act[pc.resOff + (r * KSLABS + slab) * pc.gemmN + nt * TILE + col] = v;
 #endif
+        }
     }
 #else
     uint n = gl_GlobalInvocationID.x;
-    if (n >= pc.gemmN) {
+    uint r = gl_WorkGroupID.y;                   // which row of A, P5b
+    if (n >= pc.gemmN || r >= ROWS) {
         return;
     }
     float sum = 0.0;
     [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
-        sum += act[pc.resOff + s * pc.gemmN + n];
+        sum += act[pc.resOff + (r * KSLABS + s) * pc.gemmN + n];
     }
-    act[pc.outOff + n] = sum;
+    act[pc.outOff + r * pc.gemmN + n] = sum;
 #endif
 }

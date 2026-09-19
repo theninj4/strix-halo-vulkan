@@ -1885,6 +1885,23 @@ var KokoroPost []byte
 //go:embed kokoro_istft.spv
 var KokoroISTFT []byte
 
+// The excitation (SPEECH.md T7): the neural source filter's sine bank and the
+// forward transform that turns its waveform into the magnitude-and-phase
+// spectrogram the noise convolutions read. Together they are the largest
+// single stage left in kokoro -- 14 ms of a 44 ms utterance, of which 4 is
+// 702000 float64 sines and 8 is 15601 frames of a 20-point DFT -- and both
+// are embarrassingly parallel once the phase is carried in wrapped cycles
+// rather than in accumulated radians.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_source.spv kokoro_source.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_srcstft.spv kokoro_srcstft.comp
+
+//go:embed kokoro_source.spv
+var KokoroSource []byte
+
+//go:embed kokoro_srcstft.spv
+var KokoroSrcSTFT []byte
+
 // PL-BERT, the phoneme encoder (SPEECH.md T6). Twelve layers sharing one
 // weight group, 768 wide over fifty tokens — 6.7 GFLOP that the CPU
 // reference takes 104 ms over, which is 47% of the phoneme side and 40% of a
@@ -2750,6 +2767,16 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q80_m4.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_q80_w2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_q80_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q41_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q41_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q41_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_q41_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_q41_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_iq4nl_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_iq4nl_w4m1.spv llm_moe_gemm.comp
 
 //go:embed llm_moe_up_q4k_m1.spv
 var LLMMoEUpQ4KM1 []byte
@@ -2844,6 +2871,36 @@ var LLMMoEDownQ80W2M1 []byte
 //go:embed llm_moe_down_q80_w4m1.spv
 var LLMMoEDownQ80W4M1 []byte
 
+//go:embed llm_moe_down_q41_m1.spv
+var LLMMoEDownQ41M1 []byte
+
+//go:embed llm_moe_down_q41_m2.spv
+var LLMMoEDownQ41M2 []byte
+
+//go:embed llm_moe_down_q41_m4.spv
+var LLMMoEDownQ41M4 []byte
+
+//go:embed llm_moe_down_q41_w2m1.spv
+var LLMMoEDownQ41W2M1 []byte
+
+//go:embed llm_moe_down_q41_w4m1.spv
+var LLMMoEDownQ41W4M1 []byte
+
+//go:embed llm_moe_down_iq4nl_m1.spv
+var LLMMoEDownIQ4NLM1 []byte
+
+//go:embed llm_moe_down_iq4nl_m2.spv
+var LLMMoEDownIQ4NLM2 []byte
+
+//go:embed llm_moe_down_iq4nl_m4.spv
+var LLMMoEDownIQ4NLM4 []byte
+
+//go:embed llm_moe_down_iq4nl_w2m1.spv
+var LLMMoEDownIQ4NLW2M1 []byte
+
+//go:embed llm_moe_down_iq4nl_w4m1.spv
+var LLMMoEDownIQ4NLW4M1 []byte
+
 // The **decode** kernel of the same grouped GEMM: llm_moe_gemv.comp, LLM.md
 // L8d. Every rung above is a cooperative-matrix GEMM whose workgroup unpacks
 // a BN x BK slab of the checkpoint's own blocks into LDS per K-step and
@@ -2891,6 +2948,18 @@ var LLMMoEDownQ80W4M1 []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=16 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v16w4.spv llm_moe_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=32 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v32w4.spv llm_moe_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DLPR=64 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q80_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=16 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=32 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=64 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=16 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=32 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DLPR=64 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_q41_v64w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=16 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v16.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=32 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v32.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=64 -DWAVES=1 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v64.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=16 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v16w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=32 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v32w4.spv llm_moe_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DLPR=64 -DWAVES=4 -DAKMAX=640 -DNBANK=48 -o llm_moe_gv_down_iq4nl_v64w4.spv llm_moe_gemv.comp
 
 //go:embed llm_moe_gv_up_q4k_v16.spv
 var LLMMoEGVUpQ4KV16 []byte
@@ -2981,6 +3050,42 @@ var LLMMoEGVDownQ80V32W4 []byte
 
 //go:embed llm_moe_gv_down_q80_v64w4.spv
 var LLMMoEGVDownQ80V64W4 []byte
+
+//go:embed llm_moe_gv_down_q41_v16.spv
+var LLMMoEGVDownQ41V16 []byte
+
+//go:embed llm_moe_gv_down_q41_v32.spv
+var LLMMoEGVDownQ41V32 []byte
+
+//go:embed llm_moe_gv_down_q41_v64.spv
+var LLMMoEGVDownQ41V64 []byte
+
+//go:embed llm_moe_gv_down_q41_v16w4.spv
+var LLMMoEGVDownQ41V16W4 []byte
+
+//go:embed llm_moe_gv_down_q41_v32w4.spv
+var LLMMoEGVDownQ41V32W4 []byte
+
+//go:embed llm_moe_gv_down_q41_v64w4.spv
+var LLMMoEGVDownQ41V64W4 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v16.spv
+var LLMMoEGVDownIQ4NLV16 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v32.spv
+var LLMMoEGVDownIQ4NLV32 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v64.spv
+var LLMMoEGVDownIQ4NLV64 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v16w4.spv
+var LLMMoEGVDownIQ4NLV16W4 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v32w4.spv
+var LLMMoEGVDownIQ4NLV32W4 []byte
+
+//go:embed llm_moe_gv_down_iq4nl_v64w4.spv
+var LLMMoEGVDownIQ4NLV64W4 []byte
 
 // The **decode** router: llm_moe_router.comp, LLM.md L8d. Split-K over the
 // same fragment tiling `llm_gemm.comp` MODE 2 reads, in two dispatches — the

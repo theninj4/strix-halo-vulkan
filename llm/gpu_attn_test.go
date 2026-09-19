@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"unsafe"
@@ -774,6 +775,113 @@ func attnBankGemv(t *testing.T, spec string) {
 		t.Logf("out                   %-4s against the GEMM: %v", k, r)
 		if r.rms > 1e-3 {
 			t.Errorf("out %s is rms %.3e from the GEMM (%v)", k, r.rms, r)
+		}
+	}
+}
+
+// TestAttnGPUGemvTwoRows is P5b's gate on the full-attention layer, and the
+// same assertion TestDeltaNetGPUGemvTwoRows makes on the gated DeltaNet: the
+// decode GEMV carrying two rows of A computes what the GEMM computes, row for
+// row. The kernel is shared, so what this adds over that test is *this*
+// block's wiring — its partial arena, its two grids and its sum's row axis.
+func TestAttnGPUGemvTwoRows(t *testing.T) {
+	g, _, c, _, in, nTok, _, done := attnGPU(t)
+	defer done()
+	if nTok < 2 {
+		t.Skip("the trace has fewer than two tokens")
+	}
+	const rows = 2
+	if rows > GEMVMaxRows {
+		t.Skipf("GEMVMaxRows is %d", GEMVMaxRows)
+	}
+	run := func(qkv, out GEMVKernel) ([]float32, []float32) {
+		t.Helper()
+		if err := g.SetPlan(DefaultAttnKernel(), GEMMKernelFor(rows), OutGEMMKernelFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		g.Reset()
+		if err := g.Upload(in[:rows*c.NEmbd], rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Out()...)
+	}
+
+	// The row-1 control; see rowMoved and the DeltaNet's twin.
+	second := func(tok int, qkv, out GEMVKernel) []float32 {
+		t.Helper()
+		buf := make([]float32, rows*c.NEmbd)
+		copy(buf, in[:c.NEmbd])
+		copy(buf[c.NEmbd:], in[tok*c.NEmbd:(tok+1)*c.NEmbd])
+		if err := g.SetPlan(DefaultAttnKernel(), GEMMKernelFor(rows), OutGEMMKernelFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		g.Reset()
+		if err := g.Upload(buf, rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()[g.qkvN():]...)
+	}
+
+	refQKV, refOut := run(GEMVOff, GEMVOff)
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.NEmbd) {
+			continue
+		}
+		if nTok > 2 {
+			rowMoved(t, fmt.Sprintf("qkv %s row 1", k), second(1, k, GEMVOff), second(2, k, GEMVOff))
+		}
+		gotQKV, _ := run(k, GEMVOff)
+		for _, arm := range []struct {
+			name string
+			got  []float32
+			want []float32
+		}{
+			{"both rows", gotQKV, refQKV},
+			{"row 1", gotQKV[g.qkvN():], refQKV[g.qkvN():]},
+		} {
+			r, err := compare(arm.got, arm.want)
+			if err != nil {
+				t.Fatalf("qkv %s %s: %v", k, arm.name, err)
+			}
+			t.Logf("qkv %-4s at %d rows, %-9s over %d values: %v", k, rows, arm.name, len(arm.want), r)
+			if r.rms > 1e-4 {
+				t.Errorf("qkv %s at %d rows, %s: rms %.3e against the GEMM (%v)", k, rows, arm.name, r.rms, r)
+			}
+		}
+	}
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.GateWidth()) {
+			continue
+		}
+		_, gotOut := run(GEMVOff, k)
+		for _, arm := range []struct {
+			name string
+			got  []float32
+			want []float32
+		}{
+			{"both rows", gotOut, refOut},
+			{"row 1", gotOut[c.NEmbd:], refOut[c.NEmbd:]},
+		} {
+			r, err := compare(arm.got, arm.want)
+			if err != nil {
+				t.Fatalf("out %s %s: %v", k, arm.name, err)
+			}
+			t.Logf("out %-4s at %d rows, %-9s over %d values: %v", k, rows, arm.name, len(arm.want), r)
+			if r.rms > 1e-4 {
+				t.Errorf("out %s at %d rows, %s: rms %.3e against the GEMM (%v)", k, rows, arm.name, r.rms, r)
+			}
 		}
 	}
 }

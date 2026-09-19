@@ -5,6 +5,8 @@ import (
 	"math"
 	"unsafe"
 
+	"strix-halo-vulkan/audio"
+
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
@@ -108,7 +110,8 @@ const DefaultConvKernel = ConvReg32x64W32
 type upWeights struct {
 	inCh, outCh int
 	stride      int
-	inFrames    int // T_in; the GEMM runs T_in+1 rows
+	inFrames    int // T_in the arenas were sized for; the GEMM runs T_in+1 rows
+	runFrames   int // T_in of the utterance running now
 	bOff        uint32
 	bias        uint32
 	pad         bool // the last stage's reflection pad
@@ -134,7 +137,10 @@ type upWeights struct {
 // fragment tile, so it is padded to 32 with zero weight columns.
 type tailWeights struct {
 	nfft, hop, bins int
-	frames, samples int
+	frames, samples int // the ceiling the arenas were sized for
+	runFrames       int // the utterance running now
+	runSamples      int
+	istft           *audio.ISTFT
 	n               int // conv_post's output width, padded to a tile
 	taps, pad       int
 	bank            uint32 // the padded, scaled conv_post weights
@@ -173,7 +179,8 @@ type blockWeights struct {
 type GPUBlocks struct {
 	dev *vk.Device
 
-	frames, framesPad int
+	frames, framesPad int // the ceiling the arenas were sized for
+	run               int // frames of the utterance running now
 	channels, lda     int
 	kernel            ConvKernel
 
@@ -288,6 +295,7 @@ func NewGPUStageWithTail(dev *vk.Device, blocks []*SnakeResBlock, up *ConvTransp
 	return newGPUStage(dev, blocks, up, inFrames, frames, pad, kernel, &tailWeights{
 		nfft: g.ISTFT.NFFT, hop: g.ISTFT.Hop, bins: bins,
 		frames: frames, samples: g.ISTFT.Samples(frames),
+		runFrames: frames, runSamples: g.ISTFT.Samples(frames), istft: g.ISTFT,
 		n:    roundUp(g.ConvPost.Out, coopMatTile*2),
 		taps: g.ConvPost.Kernel, pad: g.ConvPost.Pad,
 		conv: g.ConvPost, window: g.ISTFT.Window(),
@@ -315,8 +323,11 @@ func newGPUBlocks(dev *vk.Device, blocks []*SnakeResBlock, frames int, kernel Co
 	if c&(c-1) != 0 {
 		return nil, fmt.Errorf("kokoro: %d channels is not a power of two", c)
 	}
+	if up != nil {
+		up.runFrames = up.inFrames
+	}
 	g := &GPUBlocks{
-		dev: dev, frames: frames, framesPad: roundUp(frames, framePad),
+		dev: dev, frames: frames, run: frames, framesPad: roundUp(frames, framePad),
 		channels: c, lda: c, kernel: kernel, up: up, tail: tail, shared: sa,
 		pipes: map[string]*vk.ComputePipeline{},
 		convs: map[ConvKernel]*vk.ComputePipeline{},
@@ -354,8 +365,65 @@ func (g *GPUBlocks) finish(blocks []*SnakeResBlock) error {
 	return g.stage(blocks)
 }
 
-// Frames is the geometry this set was built for.
+// Frames is the geometry this set was built for, which is the longest
+// utterance it can run rather than the one it is running.
 func (g *GPUBlocks) Frames() int { return g.frames }
+
+// RunFrames is the utterance currently sized for.
+func (g *GPUBlocks) RunFrames() int { return g.run }
+
+// SetFrames sizes the stage for one utterance: `in` frames into its
+// upsampler and `out` out of it, both within the ceiling the arenas were
+// built for.
+//
+// Nothing moves and nothing is restaged. Every region is [T, C] row-major, so
+// a shorter utterance is a prefix of each one, and what changes is a dispatch
+// extent and a push constant. The exception is the fp16 border past the live
+// rows, which a longer utterance left non-zero and the convolutions read: see
+// zeroBorders, whose argument this repeats one arena at a time.
+func (g *GPUBlocks) SetFrames(in, out int) error {
+	if out <= 0 || out > g.frames {
+		return fmt.Errorf("kokoro: %d frames against a stage staged for %d", out, g.frames)
+	}
+	if g.up != nil && (in <= 0 || in > g.up.inFrames) {
+		return fmt.Errorf("kokoro: %d input frames against a stage staged for %d", in, g.up.inFrames)
+	}
+	if out == g.run && (g.up == nil || in == g.up.runFrames) {
+		return nil
+	}
+	g.run = out
+	if g.up != nil {
+		g.up.runFrames = in
+	}
+	if t := g.tail; t != nil {
+		t.runFrames = out
+		t.runSamples = t.istft.Samples(out)
+	}
+	g.zeroBorder()
+	return nil
+}
+
+// zeroBorder restores the zero padding just past the live rows of both fp16
+// arenas. See blockSet.zeroBorders, which does the same thing for the AdaIN
+// stacks; the reach here is wider — k=11 at dilation 5 is 25 frames — and
+// convBorder covers it.
+func (g *GPUBlocks) zeroBorder() {
+	put := func(off uint32, rows, lda int) {
+		if lda <= 0 {
+			return
+		}
+		g.hbuf.WriteUint16At(int(off)+rows*lda, make([]uint16, convBorder*lda))
+	}
+	put(g.hA, g.run, g.lda)
+	if g.up != nil {
+		// From runFrames, not runFrames+1: the upsampler's GEMM runs T_in+1
+		// rows because its last output row reads input rows T_in-1 and T_in,
+		// and the rectifier that fills this arena writes only T_in of them.
+		// Row T_in is padding that has to be zero, and a longer utterance put
+		// a signal there.
+		put(g.hUp, g.up.runFrames, g.up.ldaIn)
+	}
+}
 
 // Channels is the width this set was built for.
 func (g *GPUBlocks) Channels() int { return g.channels }
@@ -701,8 +769,8 @@ func (g *GPUBlocks) graphAt(block int, aX uint32) ([]vk.MultiDispatch, []string,
 	bw := &g.blocks[block]
 	c := uint32(g.channels)
 	logC := uint32(math.Log2(float64(g.channels)))
-	rows := uint32(g.frames)
-	perChunk := uint32(roundUp(g.frames, statChunks) / statChunks)
+	rows := uint32(g.run)
+	perChunk := uint32(roundUp(g.run, statChunks) / statChunks)
 
 	var d []vk.MultiDispatch
 	var kinds []string
@@ -725,7 +793,7 @@ func (g *GPUBlocks) graphAt(block int, aX uint32) ([]vk.MultiDispatch, []string,
 		pc = base
 		pc.InOff, pc.OutOff, pc.WOff, pc.Aux0 = src, g.hA, alpha, g.aAff
 		pc.LDA = uint32(g.lda)
-		add(g.pipes["snake"], kind+" snake", groups(g.frames*g.channels, 256), pc)
+		add(g.pipes["snake"], kind+" snake", groups(g.run*g.channels, 256), pc)
 	}
 	// One convolution: C[t, o] = sum over taps and input channels, with the
 	// im2col implicit in the A operand's addressing.
@@ -737,7 +805,7 @@ func (g *GPUBlocks) graphAt(block int, aX uint32) ([]vk.MultiDispatch, []string,
 		if g.channels%v.bn != 0 {
 			return fmt.Errorf("kokoro: tile width %d does not divide %d channels", v.bn, g.channels)
 		}
-		m := roundUp(g.frames, v.bm)
+		m := roundUp(g.run, v.bm)
 		pad := (taps - 1) * dilation / 2
 		pc := base
 		// inOff points at the row the first tap reads, which is `pad` frames
@@ -768,7 +836,7 @@ func (g *GPUBlocks) graphAt(block int, aX uint32) ([]vk.MultiDispatch, []string,
 		}
 		pc := base
 		pc.InOff, pc.OutOff, pc.WOff = g.aC, aX, bw.bias2[i]
-		add(g.pipes["residual"], fmt.Sprintf("residual.%d", i), groups(g.frames*g.channels, 256), pc)
+		add(g.pipes["residual"], fmt.Sprintf("residual.%d", i), groups(g.run*g.channels, 256), pc)
 	}
 	return d, kinds, nil
 }
@@ -784,8 +852,8 @@ func convVariantFor(k ConvKernel) (convVariant, bool) {
 
 // Upload writes the stage's input into the fp32 arena.
 func (g *GPUBlocks) Upload(x *Mat) error {
-	if x.Rows != g.frames || x.Cols != g.channels {
-		return fmt.Errorf("kokoro: input %v, want [%d %d]", x, g.frames, g.channels)
+	if x.Rows != g.run || x.Cols != g.channels {
+		return fmt.Errorf("kokoro: input %v, want [%d %d]", x, g.run, g.channels)
 	}
 	g.abuf.WriteFloat32At(int(g.aIn), x.Data)
 	return nil
@@ -793,15 +861,15 @@ func (g *GPUBlocks) Upload(x *Mat) error {
 
 // Download reads the running value back.
 func (g *GPUBlocks) Download() *Mat {
-	return &Mat{Rows: g.frames, Cols: g.channels,
-		Data: g.abuf.ReadFloat32At(int(g.aX), g.frames*g.channels)}
+	return &Mat{Rows: g.run, Cols: g.channels,
+		Data: g.abuf.ReadFloat32At(int(g.aX), g.run*g.channels)}
 }
 
 // elementwise is one dispatch of a pass that walks [T, C] linearly.
 func (g *GPUBlocks) elementwise(pipe string, in, out, w uint32) vk.MultiDispatch {
-	pc := pushConstants{Tokens: uint32(g.frames), Dim: uint32(g.channels), InOff: in, OutOff: out, WOff: w}
+	pc := pushConstants{Tokens: uint32(g.run), Dim: uint32(g.channels), InOff: in, OutOff: out, WOff: w}
 	return vk.MultiDispatch{
-		Pipeline: g.pipes[pipe], GroupsX: groups(g.frames*g.channels, 256), GroupsY: 1,
+		Pipeline: g.pipes[pipe], GroupsX: groups(g.run*g.channels, 256), GroupsY: 1,
 		PushConstants: pc.bytes(),
 	}
 }
@@ -845,8 +913,8 @@ func (g *GPUBlocks) Average(blocks []int) (*Mat, error) {
 	if err := submit(d); err != nil {
 		return nil, err
 	}
-	out := &Mat{Rows: g.frames, Cols: g.channels,
-		Data: g.abuf.ReadFloat32At(int(g.aSum), g.frames*g.channels)}
+	out := &Mat{Rows: g.run, Cols: g.channels,
+		Data: g.abuf.ReadFloat32At(int(g.aSum), g.run*g.channels)}
 	inv := 1 / float32(len(blocks))
 	for i := range out.Data {
 		out.Data[i] *= inv
@@ -928,13 +996,22 @@ func (g *GPUBlocks) Destroy() {
 	g.wbuf, g.abuf, g.hbuf, g.bank = nil, nil, nil, nil
 }
 
-// AttachGPU stages the generator's eight residual blocks onto the device, one
-// set per upsampling stage, and conditions them on a voice.
+// AttachGPU stages the whole model onto the device for utterances of up to
+// `frames` alignment frames, and conditions it on a voice.
 //
-// The frame counts are fixed at construction because the arenas are, so this
-// takes the alignment frame count the prosody predicted and derives the rest —
-// the same chain TestSTFTGeometry pins: 2L frames into the generator, then the
-// upsampling rates, then a reflection pad on the last stage.
+// **The frame count is a ceiling, not the utterance.** The arenas are sized
+// by it and every region in them is [T, C] row-major, so a shorter clip is a
+// prefix of each one and costs a frame count written into a push constant —
+// Vocoder.SetFrames, which Vocoder.Apply calls. That is what lets a server
+// stage once and speak many times: staging is 85 ms and an utterance is 25,
+// and before T9 every request paid both (SPEECH.md T9).
+//
+// The ceiling derives the rest of the geometry, down the same chain
+// TestSTFTGeometry pins: 2L frames into the generator, then the upsampling
+// rates, then a reflection pad on the last stage.
+//
+// A voice is not baked in either: SetVoice re-conditions every staged object
+// without touching a weight.
 func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle, predStyle []float32, kernel ConvKernel) error {
 	g := m.Vocoder.Generator
 	m.DetachGPU()
@@ -979,6 +1056,16 @@ func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle, predStyle []floa
 		return fmt.Errorf("kokoro: staging the decoder: %w", err)
 	}
 	m.Vocoder.GPU = dec
+
+	// The excitation, which is 32% of a CPU utterance and the largest single
+	// stage left (SPEECH.md T7). The F0 curve reaching the generator is at
+	// twice the alignment rate, which is the ceiling its arenas are sized by.
+	src, err := NewGPUSource(dev, g, 2*frames)
+	if err != nil {
+		m.DetachGPU()
+		return fmt.Errorf("kokoro: staging the excitation: %w", err)
+	}
+	g.SrcGPU = src
 
 	n := 2 * frames
 	for i := range g.Ups {
@@ -1051,6 +1138,42 @@ func (m *Model) AttachGPU(dev *vk.Device, frames int, decStyle, predStyle []floa
 	return nil
 }
 
+// MaxFrames is the ceiling the attachment was staged for, or 0 when the model
+// is on the host.
+func (m *Model) MaxFrames() int {
+	if m.PhonemesGPU == nil {
+		return 0
+	}
+	return m.PhonemesGPU.frames
+}
+
+// SetVoice re-conditions every staged object on a voice, which is what an
+// utterance in a different voice costs once the model is attached: two style
+// projections per AdaIN, on the host, into the weight arenas that are already
+// there. No pipeline is rebuilt and no weight is restaged.
+//
+// The two halves of the style vector go to different places and are not
+// interchangeable — see Model.Synthesize.
+func (m *Model) SetVoice(decStyle, predStyle []float32) error {
+	if m.PhonemesGPU == nil {
+		return fmt.Errorf("kokoro: no device attachment to condition")
+	}
+	if err := m.PhonemesGPU.SetStyle(predStyle); err != nil {
+		return err
+	}
+	if m.Vocoder.GPU != nil {
+		if err := m.Vocoder.GPU.SetStyle(decStyle); err != nil {
+			return err
+		}
+	}
+	for i, gb := range m.Vocoder.Generator.GPU {
+		if err := gb.SetStyle(decStyle); err != nil {
+			return fmt.Errorf("kokoro: generator stage %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // DetachGPU releases the staged blocks and puts the vocoder back on the CPU.
 func (m *Model) DetachGPU() {
 	g := m.Vocoder.Generator
@@ -1058,6 +1181,10 @@ func (m *Model) DetachGPU() {
 		gb.Destroy()
 	}
 	g.GPU = nil
+	if g.SrcGPU != nil {
+		g.SrcGPU.Destroy()
+		g.SrcGPU = nil
+	}
 	if m.Vocoder.GPU != nil {
 		m.Vocoder.GPU.Destroy()
 		m.Vocoder.GPU = nil
@@ -1119,8 +1246,8 @@ func (g *GPUBlocks) UploadInput(x *Mat) error {
 	if g.up == nil {
 		return fmt.Errorf("kokoro: this block set has no upsampler")
 	}
-	if x.Rows != g.up.inFrames || x.Cols != g.up.inCh {
-		return fmt.Errorf("kokoro: stage input %v, want [%d %d]", x, g.up.inFrames, g.up.inCh)
+	if x.Rows != g.up.runFrames || x.Cols != g.up.inCh {
+		return fmt.Errorf("kokoro: stage input %v, want [%d %d]", x, g.up.runFrames, g.up.inCh)
 	}
 	g.abuf.WriteFloat32At(int(g.aXin), x.Data)
 	return nil
@@ -1128,8 +1255,8 @@ func (g *GPUBlocks) UploadInput(x *Mat) error {
 
 // UploadNoise writes the excitation projection the host computed.
 func (g *GPUBlocks) UploadNoise(x *Mat) error {
-	if x.Rows != g.frames || x.Cols != g.channels {
-		return fmt.Errorf("kokoro: excitation %v, want [%d %d]", x, g.frames, g.channels)
+	if x.Rows != g.run || x.Cols != g.channels {
+		return fmt.Errorf("kokoro: excitation %v, want [%d %d]", x, g.run, g.channels)
 	}
 	g.abuf.WriteFloat32At(int(g.aNoise), x.Data)
 	return nil
@@ -1147,12 +1274,12 @@ func (g *GPUBlocks) upGraph() ([]vk.MultiDispatch, []string, error) {
 	if n%v.bn != 0 {
 		return nil, nil, fmt.Errorf("kokoro: tile width %d does not divide %d output columns", v.bn, n)
 	}
-	m := roundUp(u.inFrames+1, v.bm)
+	m := roundUp(u.runFrames+1, v.bm)
 	logIn := uint32(math.Log2(float64(u.inCh)))
 	logOut := uint32(math.Log2(float64(g.channels)))
 
 	pcLeaky := pushConstants{
-		Tokens: uint32(u.inFrames), Dim: uint32(u.inCh), Aux2: logIn,
+		Tokens: uint32(u.runFrames), Dim: uint32(u.inCh), Aux2: logIn,
 		InOff: g.aXin, OutOff: g.hUp, LDA: uint32(u.ldaIn),
 		Scale: math.Float32bits(0.1),
 	}
@@ -1163,7 +1290,7 @@ func (g *GPUBlocks) upGraph() ([]vk.MultiDispatch, []string, error) {
 		Aux0: uint32(u.inCh), Aux1: uint32(u.ldaIn), Aux2: logIn,
 	}
 	pcAdd := pushConstants{
-		Tokens: uint32(g.frames), Dim: uint32(g.channels), Aux2: logOut,
+		Tokens: uint32(g.run), Dim: uint32(g.channels), Aux2: logOut,
 		InOff:  g.aUp + uint32(u.stride/2*g.channels),
 		OutOff: g.aIn, WOff: u.bias, Aux0: g.aNoise,
 	}
@@ -1172,11 +1299,11 @@ func (g *GPUBlocks) upGraph() ([]vk.MultiDispatch, []string, error) {
 		add = "upaddpad"
 	}
 	d := []vk.MultiDispatch{
-		{Pipeline: g.pipes["leaky"], GroupsX: groups(u.inFrames*u.inCh, 256), GroupsY: 1,
+		{Pipeline: g.pipes["leaky"], GroupsX: groups(u.runFrames*u.inCh, 256), GroupsY: 1,
 			PushConstants: pcLeaky.bytes()},
 		{Pipeline: g.convs[g.kernel], GroupsX: uint32(n / v.bn), GroupsY: uint32(m / v.bm),
 			PushConstants: pcUp.bytes()},
-		{Pipeline: g.pipes[add], GroupsX: groups(g.frames*g.channels, 256), GroupsY: 1,
+		{Pipeline: g.pipes[add], GroupsX: groups(g.run*g.channels, 256), GroupsY: 1,
 			PushConstants: pcAdd.bytes()},
 	}
 	return d, []string{"leaky", "upsample", "upadd"}, nil
@@ -1229,8 +1356,8 @@ func (g *GPUBlocks) RunStage() (*Mat, error) {
 	if err := submit(d); err != nil {
 		return nil, err
 	}
-	out := &Mat{Rows: g.frames, Cols: g.channels,
-		Data: g.abuf.ReadFloat32At(int(g.aSum), g.frames*g.channels)}
+	out := &Mat{Rows: g.run, Cols: g.channels,
+		Data: g.abuf.ReadFloat32At(int(g.aSum), g.run*g.channels)}
 	inv := 1 / float32(3)
 	for i := range out.Data {
 		out.Data[i] *= inv
@@ -1262,7 +1389,7 @@ func (g *GPUBlocks) Samples() int {
 	if g.tail == nil {
 		return 0
 	}
-	return g.tail.samples
+	return g.tail.runSamples
 }
 
 // RunStageWave runs the stage and its tail, and returns the waveform.
@@ -1286,7 +1413,7 @@ func (g *GPUBlocks) RunStageWave() ([]float32, error) {
 	if err := submit(append(d, t...)); err != nil {
 		return nil, err
 	}
-	return g.abuf.ReadFloat32At(int(g.tail.aWav), g.tail.samples), nil
+	return g.abuf.ReadFloat32At(int(g.tail.aWav), g.tail.runSamples), nil
 }
 
 // tailRung is the widest rung of the ladder whose tile divides conv_post's
@@ -1317,10 +1444,10 @@ func (g *GPUBlocks) tailGraph() ([]vk.MultiDispatch, []string, error) {
 	}
 	c := uint32(g.channels)
 	logC := uint32(math.Log2(float64(g.channels)))
-	m := roundUp(g.frames, v.bm)
+	m := roundUp(g.run, v.bm)
 
 	pcLeaky := pushConstants{
-		Tokens: uint32(g.frames), Dim: c, Aux2: logC,
+		Tokens: uint32(g.run), Dim: c, Aux2: logC,
 		InOff: g.aSum, OutOff: g.hA, LDA: uint32(g.lda),
 		Scale: math.Float32bits(0.01), // F.leaky_relu's default slope
 	}
@@ -1336,17 +1463,17 @@ func (g *GPUBlocks) tailGraph() ([]vk.MultiDispatch, []string, error) {
 	}
 	pcISTFT := pushConstants{
 		InOff: t.aRI, OutOff: t.aWav, WOff: t.tw,
-		Tokens: uint32(t.samples), Dim: uint32(t.bins),
-		Aux0: uint32(t.nfft), Aux1: uint32(t.hop), Aux2: uint32(t.frames),
+		Tokens: uint32(t.runSamples), Dim: uint32(t.bins),
+		Aux0: uint32(t.nfft), Aux1: uint32(t.hop), Aux2: uint32(t.runFrames),
 	}
 	d := []vk.MultiDispatch{
-		{Pipeline: g.pipes["leaky"], GroupsX: groups(g.frames*g.channels, 256), GroupsY: 1,
+		{Pipeline: g.pipes["leaky"], GroupsX: groups(g.run*g.channels, 256), GroupsY: 1,
 			PushConstants: pcLeaky.bytes()},
 		{Pipeline: g.convs[v.name], GroupsX: uint32(t.n / v.bn), GroupsY: uint32(m / v.bm),
 			PushConstants: pcConv.bytes()},
-		{Pipeline: g.pipes["post"], GroupsX: groups(t.bins, 256), GroupsY: uint32(t.frames),
+		{Pipeline: g.pipes["post"], GroupsX: groups(t.bins, 256), GroupsY: uint32(t.runFrames),
 			PushConstants: pcPost.bytes()},
-		{Pipeline: g.pipes["istft"], GroupsX: groups(t.samples, 256), GroupsY: 1,
+		{Pipeline: g.pipes["istft"], GroupsX: groups(t.runSamples, 256), GroupsY: 1,
 			PushConstants: pcISTFT.bytes()},
 	}
 	return d, []string{"leaky", "conv_post", "post", "istft"}, nil

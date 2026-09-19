@@ -22,8 +22,20 @@ package llm
 // the format one is the true one.
 //
 // So the down projection below six bits is a *kernel* stage — a block-32
-// format the down mode has no arm for — and it is written down in `LLM2.md`
-// rather than built here.
+// format the down mode has no arm for. **That stage is P4c, and it is now
+// built**: `q4_1` (5.0 bits) and `iq4_nl` (4.5, the calibrated non-linear
+// form llama-quantize itself falls back to) are targets here and arms of
+// `llm_moe_gemm.comp` and `llm_moe_gemv.comp`, so `down_exps` — 0.615 GB a
+// token, 41% of the expert traffic — can be narrowed by the same grammar
+// that narrowed the shared expert.
+//
+// P4c also found where the "the bank is the checkpoint's own bytes" rule
+// stops: it binds the tensors staged **verbatim**, and a transcoded one is
+// written here. IQ4_NL's eighteen-byte record is not a multiple of four, and
+// leaving it in ggml's layout cost the decode kernel **28% of its read rate**
+// — so `pairIQ4NLRow` rearranges each row into 36-byte pairs. Same bits, same
+// levels, four-aligned, and a block's scale still beside its own nibbles,
+// which is what the prefill kernel needs and a plane of scales destroys.
 //
 // # What is a transcode, and is what this file does
 //
@@ -59,7 +71,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -91,12 +105,22 @@ var moeFamilies = map[string]string{
 
 // moeBankFormats are the ggml types a transcode can target, which is exactly
 // the set `moeSPIRV` has arms for on the mode that reads them. Q4_K and Q5_K
-// are the up mode's; Q5_1 is the down mode's. Asking for a format the kernel
-// cannot read would stage a bank that reads as noise.
+// are the up mode's; Q5_1, and since P4c Q4_1 and IQ4_NL, are the down
+// mode's. Asking for a format the kernel cannot read would stage a bank that
+// reads as noise.
+//
+// **Q4_0 is deliberately absent.** It is IQ4_NL's bytes exactly — 18 for 32
+// weights — with evenly spaced levels instead of the calibrated codebook, and
+// this vertical has measured the symmetric linear form against the asymmetric
+// one twice at the same width (D4, and L8c-1's +18.5%). A row that will take
+// IQ4_NL has no reason to be Q4_0, so building the arm would only add a
+// pipeline nothing should choose.
 var moeBankFormats = map[string]gguf.Type{
-	"q4_k": gguf.Q4_K,
-	"q5_k": gguf.Q5_K,
-	"q5_1": gguf.Q5_1,
+	"q4_k":   gguf.Q4_K,
+	"q5_k":   gguf.Q5_K,
+	"q5_1":   gguf.Q5_1,
+	"q4_1":   gguf.Q4_1,
+	"iq4_nl": gguf.IQ4_NL,
 }
 
 // moeBitsPerWeight is a format's width, for the ceiling comparison. It is
@@ -171,11 +195,20 @@ func ParseMoEBankPlan(spec, mode string) (MoEBankPlan, error) {
 		}
 		t, ok := moeBankFormats[want]
 		if !ok {
-			return MoEBankPlan{}, fmt.Errorf("llm: MoE family %s cannot be staged as %q; the kernels read q4_k, q5_k and q5_1", fam, want)
+			return MoEBankPlan{}, fmt.Errorf("llm: MoE family %s cannot be staged as %q; the kernels read %s", fam, want, moeFormatList())
 		}
 		p.to[fam] = t
 	}
 	return p, nil
+}
+
+func moeFormatList() string {
+	var xs []string
+	for f := range moeBankFormats {
+		xs = append(xs, f)
+	}
+	sort.Strings(xs)
+	return strings.Join(xs, ", ")
 }
 
 func moeFamilyList() string {
@@ -195,7 +228,8 @@ func moeFamilyList() string {
 // complete 145-chunk plan on D19's dense bank:
 //
 //	D19            4.0948   +1.63%   4.408 GB a token
-//	D19 + this     4.0970   +1.69%   4.279
+//	D19 + P4b      4.0970   +1.69%   4.279
+//	D19 + this     4.0992   +1.74%   4.132   (P4c's `down_exps=iq4_nl`)
 //
 // **0.0022 points of perplexity for 0.1288 GB a token — 0.017 pp/GB**, where
 // D19 refused to *buy* a family's fifth bit at 1.6 and took three above 5.9.
@@ -207,7 +241,14 @@ func moeFamilyList() string {
 // Like `ShippedDenseBank` it is deliberately not `MoEBankPlanFromEnv`'s
 // default: `cmd/serve` opts in, `cmd/llm` does not, so no CSV in `results/`
 // is ambiguous about which bank it measured.
-const ShippedMoEBank = "gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1,down_exps=q5_1"
+//
+// **P4c adds the fifth row, and it is the largest: D21.** `down_exps` at
+// `iq4_nl` is 0.148 GB a token more — the row was 41% of the expert traffic —
+// for **+0.05 points** (4.0992 against 4.0970, t = 0.79 paired over the 145
+// chunks, which is not resolvable) and a measured **+0.92 tok/s**. The 5.0-bit
+// `q4_1` arm was built beside it and lost on both axes: fewer bytes freed and
+// +0.0122 points, resolvable at t = 4.11.
+const ShippedMoEBank = "gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1,down_exps=iq4_nl"
 
 var (
 	moeBankOnce sync.Once
@@ -249,6 +290,14 @@ func TranscodeMoE(t *gguf.Tensor, to gguf.Type, mode string) ([]byte, error) {
 		return nil, fmt.Errorf("llm: %s is %dD, a MoE weight is 2 or 3", t.Name, len(t.Dims))
 	}
 	k := int(t.Dims[0])
+	// P4c's IQ4_NL layout pairs blocks, so a row has to hold an even number
+	// of them. Both 640-wide tensors in this model hold twenty; anything
+	// else is refused rather than written in a layout the kernels cannot
+	// address.
+	if to == gguf.IQ4_NL && (k/to.BlockElems())%2 != 0 {
+		return nil, fmt.Errorf("llm: %s has rows of %d, which is %d IQ4_NL blocks — "+
+			"the paired layout needs an even number (P4c)", t.Name, k, k/to.BlockElems())
+	}
 	if k%to.BlockElems() != 0 {
 		return nil, fmt.Errorf("llm: %s has rows of %d and %s blocks are %d elements — "+
 			"there is no such format for this tensor (P4)", t.Name, k, to, to.BlockElems())
@@ -263,6 +312,13 @@ func TranscodeMoE(t *gguf.Tensor, to gguf.Type, mode string) ([]byte, error) {
 	n, err := to.SizeOf(t.Elems())
 	if err != nil {
 		return nil, err
+	}
+	// The cache, if one is configured. A transcode is minutes of CPU for a
+	// bank that is a pure function of (tensor, format, arm) — see
+	// `moeCachePath`.
+	cache := moeCachePath(t, to, mode)
+	if b, ok := readMoECache(cache, n); ok {
+		return b, nil
 	}
 	out := make([]byte, n)
 	rowBytes := k / to.BlockElems() * to.BlockBytes()
@@ -321,13 +377,103 @@ func TranscodeMoE(t *gguf.Tensor, to gguf.Type, mode string) ([]byte, error) {
 				}
 			case gguf.Q5_1:
 				packQ51Row(dst, row, qw)
+			case gguf.Q4_1:
+				packQ41Row(dst, row, qw)
+			case gguf.IQ4_NL:
+				packIQ4NLRow(dst, row, qw)
+				pairIQ4NLRow(dst)
 			}
 		}
 	})
 	if perr != nil {
 		return nil, perr
 	}
+	writeMoECache(cache, out)
 	return out, nil
+}
+
+// moeCacheVersion is bumped whenever a packer here changes what it writes for
+// the same inputs. It is part of every cache file's name, so an old file is
+// never read by new code — it is simply not looked for.
+//
+// v1: P4c, `iq4_nl` in ggml's records and `q4_1` at ggml's normalisation.
+// v2: `iq4_nl` in 36-byte pairs instead — a layout change, so the same fit
+// and different bytes, which is exactly the case this constant exists for.
+const moeCacheVersion = 2
+
+// moeCachePath is where a transcoded tensor is kept, or "" for no cache.
+//
+// **A transcode is expensive and perfectly reproducible**: fitting all 48
+// layers of `ffn_down_exps` to IQ4_NL is 40 billion weights through a
+// sixteen-scale search, about **eight minutes** of a 32-core machine, and it
+// produces the same bytes every time. A measurement tool can pay that; a
+// server that stages in 34 seconds cannot, so `cmd/serve` points
+// `LLM_BANK_CACHE` at the checkpoint's own directory and the second start
+// reads 22.6 GB off disk instead.
+//
+// The key is everything the bytes depend on that is *not* the file's content:
+// the tensor's name and shape, the type it ships in, the type it is being
+// written as, the calibration arm, and `moeCacheVersion`. The one thing it
+// does not hash is the source bytes themselves — hashing 30 GB to save eight
+// minutes of arithmetic would give most of the saving back — so the cache is
+// scoped to a checkpoint by living **inside its directory**, and a checkpoint
+// edited in place under a stable name is the case it cannot see. That is the
+// same assumption `mmap` already makes about the file.
+func moeCachePath(t *gguf.Tensor, to gguf.Type, mode string) string {
+	dir := strings.TrimSpace(os.Getenv("LLM_BANK_CACHE"))
+	if dir == "" {
+		return ""
+	}
+	dims := make([]string, len(t.Dims))
+	for i, d := range t.Dims {
+		dims[i] = strconv.FormatInt(d, 10)
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s.%s.%s-%s.%s.v%d.bin",
+		t.Name, strings.Join(dims, "x"), t.Type, to, mode, moeCacheVersion))
+}
+
+// readMoECache returns the cached bytes if they are there and the right
+// length. A short or unreadable file is a miss, not an error: the transcode
+// that follows is the truth and it will overwrite it.
+func readMoECache(path string, want int64) ([]byte, bool) {
+	if path == "" {
+		return nil, false
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || int64(len(b)) != want {
+		return nil, false
+	}
+	return b, true
+}
+
+// writeMoECache stores a transcode, through a temporary file in the same
+// directory so that a reader never sees a partial one. Every failure is
+// silent by design — a cache that cannot be written costs time and nothing
+// else, and a staging run should not die because a disk is full.
+func writeMoECache(path string, b []byte) {
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return
+	}
+	tmp := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+	}
 }
 
 // packKRow writes one row as ggml `block_q4_K`/`block_q5_K` records.
@@ -389,17 +535,27 @@ func packKRow(dst []byte, row, qw []float32, e *asymEnc, to gguf.Type) error {
 // fp16 scale, an fp16 min, a 32-bit plane of fifth bits and 16 bytes of
 // nibbles. 24 bytes, 6 bits a weight.
 //
-// The fit is **not** ggml's. `quantize_row_q5_1_ref` is plain min/max, which
-// is what llama-quantize does because the legacy quants predate the
-// importance matrix and were never wired to it. Here the matrix is available
-// and the same weighted search the K-quants use applies unchanged to a single
-// block — `makeQkxQuants` fits (scale, min) against a per-element weight —
-// so the calibrated arm uses it and the `rtn` arm is ggml's own path. Both
-// dequantise identically; only the levels differ.
+// The fit is ours, and **P4b's reason for that was wrong**. That stage wrote
+// "Q5_1 is fitted with the imatrix, which ggml does not do", from reading
+// `quantize_row_q5_1_ref`; the entry point `llama-quantize` actually reaches
+// is `ggml_quantize_chunk` -> `quantize_q5_1` -> `quantize_row_q5_1_impl`,
+// which **is** wired to the matrix and fits it with
+// `make_qkx3_quants(32, 31, ..., -0.9, 0.05, 36)` — our three constants
+// exactly. So the arms are not "ours against none" but ours against ggml's,
+// and they differ in two places: `sigma2` is the block's `2*sum/32` here and
+// the row's `sum/n` there, and the levels are chosen against the stored
+// halves here (D10) and against the f32 pair there.
+//
+// It is left as it was measured rather than corrected, because D20 is a
+// shipped bank whose perplexity was measured on these bytes; P4c's two
+// packers below take ggml's normalisation, and what the difference is worth
+// is an open question rather than a claim. The `rtn` arm is
+// `quantize_row_q5_1_ref` and is ggml's on both readings.
 //
 // One asymmetry between the arms is worth stating rather than discovering:
-// `makeQkxQuants` clamps the group's min to zero, which is ggml's *K-quant*
-// convention, where `quantize_row_q5_1_ref` keeps the block's true min. On a
+// `makeQkxQuants` clamps the group's min to zero, which is ggml's convention
+// in every calibrated path, where `quantize_row_q5_1_ref` keeps the block's
+// true min. On a
 // block whose values are all one sign that costs the calibrated arm a level
 // of range — rare in a weight matrix, and the search recovers more than it
 // gives up, but it is why the two arms are not the same fit with a weight
@@ -475,4 +631,324 @@ func packQ51Row(dst []byte, row, qw []float32) {
 		rec[6] = byte(qh >> 16)
 		rec[7] = byte(qh >> 24)
 	}
+}
+
+// moeRowSigma2 is the normalisation ggml's calibrated legacy paths use:
+// `sum(x*x)/n` over the **whole row**, which is not the `2*sum/32` a K-quant
+// computes over a super-block. It is a fact about the entry point rather than
+// about the format — `quantize_row_q4_1_impl` and `quantize_row_q5_1_impl`
+// both take it — and it is a separate function here because getting it wrong
+// is invisible: the weights it scales are a ranking, so a factor that is
+// uniform across a block changes the fit only through `sqrt(sigma2 + x*x)`'s
+// curvature, and the result stays plausible.
+func moeRowSigma2(row []float32) float32 {
+	var sum float32
+	for _, v := range row {
+		sum += v * v
+	}
+	return sum / float32(len(row))
+}
+
+// packQ41Row writes one row as ggml `block_q4_1`: a 32-element block with an
+// fp16 scale, an fp16 min and 16 nibble pairs. 20 bytes, **5.0 bits a
+// weight**, and it is `packQ51Row` with the plane of fifth bits deleted —
+// the same asymmetric `scale*l + min` reconstruction, the same 0..15 / 16..31
+// split of the pairs, fifteen levels instead of thirty-one.
+//
+// **The fit is ggml's own calibrated path**, `quantize_row_q4_1_impl`:
+// `make_qkx3_quants(32, 15, ..., -0.9, 0.05, 36)` against
+// `qw[j]*sqrt(sigma2 + x*x)`, with `sigma2` taken over the row. `makeQkxQuants`
+// is that function (`sim.go` says why qkx2 and qkx3 are one port), and the
+// three constants are the ones every calibrated fit in this vertical already
+// uses, so the transcription is the weights and the normalisation.
+//
+// There is **one departure, and it is D10's**: the levels are chosen against
+// the (d, m) pair *as stored* — halves — where ggml chooses them against the
+// f32 pair it then rounds. A kernel reads the halves, so the level that is
+// nearest under f32 is not always the level that reconstructs nearest to what
+// the shader will compute. `TestPackQ41IsGgmlsQuantiser` is the measurement
+// of that choice rather than an assertion about it: it packs the same rows
+// both ways and reports which reconstructs the row better under the
+// importance weight.
+//
+// `rtn` is `quantize_row_q4_1_ref`, min/max with no clamp of the min to zero,
+// which is what `quantize_q4_1` falls back to when there is no matrix.
+func packQ41Row(dst []byte, row, qw []float32) {
+	const g = 32
+	var lv, laux [g]uint8
+	var w [g]float32
+	sigma2 := moeRowSigma2(row)
+	for b := 0; b*g < len(row); b++ {
+		blk := row[b*g : (b+1)*g]
+		var d, theMin float32
+		if qw != nil {
+			for i, v := range blk {
+				w[i] = qw[b*g+i] * sqrt32(sigma2+v*v)
+			}
+			d, theMin = makeQkxQuants(blk, 15, w[:], lv[:], laux[:], -0.9, 0.05, 36)
+		} else {
+			lo, hi := blk[0], blk[0]
+			for _, v := range blk {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			d, theMin = (hi-lo)/15, -lo
+		}
+		dh, mh := safetensors.F32ToF16(d), safetensors.F32ToF16(-theMin)
+		df, mf := safetensors.F16ToF32(dh), safetensors.F16ToF32(mh)
+		rec := dst[b*20 : (b+1)*20]
+		for i := range rec {
+			rec[i] = 0
+		}
+		binary.LittleEndian.PutUint16(rec[0:], dh)
+		binary.LittleEndian.PutUint16(rec[2:], mh)
+		packAffineNibbles(rec[4:], blk, df, mf, 15)
+	}
+}
+
+// packAffineNibbles is the level assignment and the pair split both affine
+// block-32 formats here share: element j in the low nibble of byte j and
+// element j+16 in its high one, each the nearest level of [0, nmax] under the
+// **stored** (d, m).
+func packAffineNibbles(dst []byte, blk []float32, df, mf float32, nmax int) {
+	for i, v := range blk {
+		var l int
+		if df != 0 {
+			l = int(nearestInt((v - mf) / df))
+		}
+		if l < 0 {
+			l = 0
+		}
+		if l > nmax {
+			l = nmax
+		}
+		if i < 16 {
+			dst[i] |= byte(l & 0xF)
+		} else {
+			dst[i-16] |= byte(l&0xF) << 4
+		}
+	}
+}
+
+// packIQ4NLRow writes one row as ggml `block_iq4_nl`: an fp16 scale and 16
+// nibble pairs indexing the sixteen-level **non-linear codebook**, 18 bytes
+// and 4.5 bits a weight — the same bytes as Q4_0 for a lower error, which is
+// why the symmetric linear form is not built here at all (D4, and L8c-1's
+// +18.5% for the symmetric arm at these bits).
+//
+// **The fit is ggml's, and for a codebook it has to be.** Every affine packer
+// in this file shares its quantiser with `bank_q4.go`, so a difference between
+// the two banks can never be a difference of fit; that argument does not reach
+// here, because with unevenly spaced levels there is no (scale, min) to fit —
+// only a scale, and an assignment that a search has to find. So this is
+// `quantize_row_iq4_nl_impl` transcribed: a first assignment from
+// `d = -max/values[0]`, the least-squares scale it implies, then fifteen more
+// scales swept around it, each scored by the same weighted sum.
+//
+// Both arms go through it, which is the *other* thing to know about this
+// format: `quantize_iq4_nl` passes `ntry = 7` whether or not it has a matrix
+// and only the weights change (`qw*sqrt(sigma2 + x*x)` against `x*x`), so the
+// uncalibrated arm here is that call with a null matrix and **not**
+// `quantize_row_iq4_nl_ref`, which is the deterministic-file path
+// `llama-quantize` never reaches.
+//
+// The block is the whole super-block (QK4_NL = 32), so the scale plane IQ4_XS
+// carries does not exist and `sigma2` is the block's own. D10's departure is
+// the same one `packQ41Row` makes: the final assignment is against the stored
+// half of d.
+//
+// **What this writes is ggml's record**, so that the oracle can compare it
+// with `quantize_iq4_nl` byte for byte; `pairIQ4NLRow` then rearranges the
+// row into the layout the device reads, which is a permutation and is tested
+// as one.
+func packIQ4NLRow(dst []byte, row, qw []float32) {
+	const g = 32
+	const ntry = 7
+	values := gguf.IQ4NLValues()
+	var w [g]float32
+	var lv [g]uint8
+	for b := 0; b*g < len(row); b++ {
+		blk := row[b*g : (b+1)*g]
+		var sum2 float32
+		for _, v := range blk {
+			sum2 += v * v
+		}
+		sigma2 := 2 * sum2 / float32(g)
+		for i, v := range blk {
+			if qw != nil {
+				w[i] = qw[b*g+i] * sqrt32(sigma2+v*v)
+			} else {
+				w[i] = v * v
+			}
+		}
+		var amax, max float32
+		for _, v := range blk {
+			if ax := abs32(v); ax > amax {
+				amax, max = ax, v
+			}
+		}
+		rec := dst[b*18 : (b+1)*18]
+		for i := range rec {
+			rec[i] = 0
+		}
+		// ggml's GROUP_MAX_EPS. A block with no magnitude stores a zero
+		// scale, and every level then reconstructs to zero whichever one it
+		// is; ggml leaves `L` at whatever the previous block wrote, so the
+		// nibbles are the one thing here that is deliberately not ggml's.
+		if amax < 1e-15 {
+			for i := range lv {
+				lv[i] = uint8(bestIQ4NLIndex(values, 0))
+			}
+			packIQ4NLNibbles(rec[2:], lv[:])
+			continue
+		}
+		// The sign convention is ggml's and it is not a typo: `values[0]` is
+		// -127 against a top level of +113, so the codebook is not symmetric
+		// and `-max/values[0]` is a different starting assignment from
+		// `max/values[0]` rather than the same one mirrored.
+		d := -max / float32(values[0])
+		id := 1 / d
+		var sumqx, sumq2 float32
+		for i, v := range blk {
+			q := float32(values[bestIQ4NLIndex(values, id*v)])
+			sumqx += w[i] * q * v
+			sumq2 += w[i] * q * q
+		}
+		if sumq2 > 0 {
+			d = sumqx / sumq2
+		} else {
+			d = 0
+		}
+		best := d * sumqx
+		for itry := -ntry; itry <= ntry; itry++ {
+			id := (float32(itry) + float32(values[0])) / max
+			sumqx, sumq2 = 0, 0
+			for i, v := range blk {
+				q := float32(values[bestIQ4NLIndex(values, id*v)])
+				sumqx += w[i] * q * v
+				sumq2 += w[i] * q * q
+			}
+			if sumq2 > 0 && sumqx*sumqx > best*sumq2 {
+				d = sumqx / sumq2
+				best = d * sumqx
+			}
+		}
+		dh := safetensors.F32ToF16(d)
+		df := safetensors.F16ToF32(dh)
+		id = 0
+		if df != 0 {
+			id = 1 / df
+		}
+		for i, v := range blk {
+			lv[i] = uint8(bestIQ4NLIndex(values, id*v))
+		}
+		binary.LittleEndian.PutUint16(rec[0:], dh)
+		packIQ4NLNibbles(rec[2:], lv[:])
+	}
+}
+
+// packIQ4NLNibbles is the pair split every block-32 format here uses:
+// element j in the low nibble of byte j and element j+16 in its high one.
+func packIQ4NLNibbles(dst []byte, lv []uint8) {
+	for j := 0; j < 16; j++ {
+		dst[j] = lv[j]&0xF | lv[j+16]&0xF<<4
+	}
+}
+
+// pairIQ4NLRow rewrites a row of ggml `block_iq4_nl` records in place into
+// **our** layout: blocks in pairs of 36 bytes — the two scales, then the two
+// blocks' sixteen nibble bytes each.
+//
+// # Why the bank stops being ggml's here, and only here
+//
+// The MoE bank is staged as the checkpoint's own bytes, which is what makes
+// ggml's record layout a constraint on the kernels rather than a choice. A
+// **transcoded** tensor has no such constraint — the bytes are ours the
+// moment we write them — and for this one format the difference is measured
+// and large, in two directions that a single arrangement has to satisfy at
+// once.
+//
+// An IQ4_NL block is eighteen bytes: a scale and sixteen nibble pairs. That
+// is not a multiple of four, so every other block starts two bytes into a
+// word and a payload dword comes out of a **two-word rotating window** — the
+// arrangement Q8_0's 34-byte block already forced on this kernel. With the
+// codebook in LDS the decode arm still read its bank at 180.2 GB/s where
+// Q4_1's 20-byte block reads 211.4, on 10% fewer bytes.
+//
+// The obvious fix is a **planar** row — every scale, then every block's
+// nibbles — and it is worth 180.2 → 203.3 GB/s at decode and **a 36% loss at
+// prefill** (the `down` GEMM 2673 → 3637 us a layer at 512 tokens). The two
+// kernels want opposite things: a GEMV lane group walks one row and reads the
+// scale plane once per four dwords, while the GEMM's slab unpack touches one
+// 32-element block of sixty-four *different* rows per K-step, so splitting a
+// block's scale from its nibbles doubles the cache lines it opens.
+//
+// **Pairs satisfy both.** Two blocks are 4 + 32 = 36 bytes, which is a
+// multiple of four — so every access is aligned, and a block's scale is
+// within the same 36 bytes as its nibbles. Decode reads it at 205.6 GB/s and
+// prefill at 2522 us a layer, both better than either of the other two
+// arrangements and better than the Q5_1 bank this replaces.
+//
+// **It is a permutation, not a re-quantisation.** The levels, the scales and
+// the bits are exactly what `packIQ4NLRow` wrote, and
+// `TestIQ4NLPairIsAPermutation` inverts it back to ggml's records byte for
+// byte — which is what keeps `TestMoEPackersAgainstGGML`'s bit-exactness
+// against llama.cpp meaningful about the bank the device actually reads.
+func pairIQ4NLRow(dst []byte) {
+	const blk = 18
+	nb := len(dst) / blk
+	out := make([]byte, len(dst))
+	for p := 0; p < nb/2; p++ {
+		a, b := dst[p*2*blk:], dst[(p*2+1)*blk:]
+		rec := out[p*36:]
+		copy(rec[0:2], a[0:2])
+		copy(rec[2:4], b[0:2])
+		copy(rec[4:20], a[2:18])
+		copy(rec[20:36], b[2:18])
+	}
+	copy(dst, out)
+}
+
+// unpairIQ4NLRow is the inverse, for the test that the pair is one.
+func unpairIQ4NLRow(dst []byte) {
+	const blk = 18
+	nb := len(dst) / blk
+	out := make([]byte, len(dst))
+	for p := 0; p < nb/2; p++ {
+		rec := dst[p*36:]
+		a, b := out[p*2*blk:], out[(p*2+1)*blk:]
+		copy(a[0:2], rec[0:2])
+		copy(b[0:2], rec[2:4])
+		copy(a[2:18], rec[4:20])
+		copy(b[2:18], rec[20:36])
+	}
+	copy(dst, out)
+}
+
+// bestIQ4NLIndex is ggml's `best_index_int8` over a sorted codebook: the
+// level nearest x, by a binary search rather than a scan.
+func bestIQ4NLIndex(values [16]int8, x float32) int {
+	if x <= float32(values[0]) {
+		return 0
+	}
+	if x >= float32(values[15]) {
+		return 15
+	}
+	ml, mu := 0, 15
+	for mu-ml > 1 {
+		mav := (ml + mu) / 2
+		if x < float32(values[mav]) {
+			mu = mav
+		} else {
+			ml = mav
+		}
+	}
+	if x-float32(values[mu-1]) < float32(values[mu])-x {
+		return mu - 1
+	}
+	return mu
 }

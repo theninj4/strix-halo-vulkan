@@ -685,3 +685,127 @@ func TestDeltaNetGPUQ4BankSize(t *testing.T) {
 		t.Fatalf("the staged matrix is %.4f bits a weight, want 4.500 plus the padding's records", bits)
 	}
 }
+
+// TestDeltaNetGPUGemvTwoRows is P5b's gate on this block: the decode GEMV
+// carrying **two** rows of A computes what the GEMM computes.
+//
+// D15 refused the rung above one token until P5b, on the grounds that a
+// sixteen-row fragment holding one row is the reason the GEMV wins — which is
+// a fact about the GEMM's shape and not about a dot product's. The R-row arm
+// reads the weight once and multiplies it into two accumulators, so the
+// tolerance is the same one the one-row test uses and for the same reason:
+// the two paths associate a 2560- or 6144-long sum differently (PinSchedule),
+// they do not read different weights.
+//
+// The negative control is in the assertion rather than in a second arm: row 1
+// is a *different* token, so a kernel that ignored `ROWS` and wrote row 0's
+// answer twice would fail the comparison against the GEMM's second row.
+func TestDeltaNetGPUGemvTwoRows(t *testing.T) {
+	g, _, c, _, in, nTok, done := dnGPU(t, dnLayer)
+	defer done()
+	if nTok < 2 {
+		t.Skip("the trace has fewer than two tokens")
+	}
+	const rows = 2
+	if rows > GEMVMaxRows {
+		t.Skipf("GEMVMaxRows is %d", GEMVMaxRows)
+	}
+	scan := DefaultDNKernel()
+	run := func(qkv, out GEMVKernel) ([]float32, []float32) {
+		t.Helper()
+		if err := g.SetPlan(scan, GEMMKernelFor(rows), OutGEMMKernelFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Reset(0); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Upload(in[:rows*c.NEmbd], rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()...), append([]float32(nil), g.Result()...)
+	}
+
+	// The row-1 control: a second token that is a *different* token, so a
+	// rung that does not write row 1 is caught rather than flattered. See
+	// rowMoved.
+	second := func(tok int, qkv, out GEMVKernel) []float32 {
+		t.Helper()
+		buf := make([]float32, rows*c.NEmbd)
+		copy(buf, in[:c.NEmbd])
+		copy(buf[c.NEmbd:], in[tok*c.NEmbd:(tok+1)*c.NEmbd])
+		if err := g.SetPlan(scan, GEMMKernelFor(rows), OutGEMMKernelFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Reset(0); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Upload(buf, rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetGemv(qkv, out); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.QKV()[g.qkvN():]...)
+	}
+
+	refQKV, refOut := run(GEMVOff, GEMVOff)
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.NEmbd) {
+			continue
+		}
+		if nTok > 2 {
+			rowMoved(t, fmt.Sprintf("qkv %s row 1", k), second(1, k, GEMVOff), second(2, k, GEMVOff))
+		}
+		gotQKV, _ := run(k, GEMVOff)
+		r, err := compare(gotQKV, refQKV)
+		if err != nil {
+			t.Fatalf("qkv %s: %v", k, err)
+		}
+		t.Logf("qkv %-4s at %d rows against the GEMM over %d values: %v", k, rows, len(refQKV), r)
+		if r.rms > 1e-4 {
+			t.Errorf("qkv %s at %d rows: rms %.3e against the GEMM (%v)", k, rows, r.rms, r)
+		}
+		// The second row on its own. Folded into the whole-matrix rms it is
+		// half the values, but a kernel that wrote row 0 twice would still
+		// show as a large rms only if the two tokens differ a lot — so the
+		// row is compared against its own reference explicitly.
+		w := g.qkvN()
+		r1, err := compare(gotQKV[w:], refQKV[w:])
+		if err != nil {
+			t.Fatalf("qkv %s row 1: %v", k, err)
+		}
+		if r1.rms > 1e-4 {
+			t.Errorf("qkv %s row 1: rms %.3e against the GEMM (%v)", k, r1.rms, r1)
+		}
+	}
+	for _, k := range GEMVKernels() {
+		if !GEMVFits(k, c.Inner) {
+			continue
+		}
+		_, gotOut := run(GEMVOff, k)
+		r, err := compare(gotOut, refOut)
+		if err != nil {
+			t.Fatalf("out %s: %v", k, err)
+		}
+		t.Logf("out %-4s at %d rows against the GEMM over %d values: %v", k, rows, len(refOut), r)
+		if r.rms > 1e-4 {
+			t.Errorf("out %s at %d rows: rms %.3e against the GEMM (%v)", k, rows, r.rms, r)
+		}
+		r1, err := compare(gotOut[c.NEmbd:], refOut[c.NEmbd:])
+		if err != nil {
+			t.Fatalf("out %s row 1: %v", k, err)
+		}
+		if r1.rms > 1e-4 {
+			t.Errorf("out %s row 1: rms %.3e against the GEMM (%v)", k, r1.rms, r1)
+		}
+	}
+}

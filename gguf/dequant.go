@@ -17,6 +17,15 @@ import (
 //	IQ4_NL  28.8 GB   the n-gram table, which is gathered rather than streamed
 //	F32/BF16 0.3 GB   the routers and the QSA indexer
 //
+// **Q5_0 and Q6_K are not in that checkpoint and are here for the draft
+// head** (P5a): `mtp-…-Q4_K_M.gguf` is a `Q4_K_M` mix rather than unsloth's
+// `UD-Q4_K_XL`, so `blk.48` ships its three `hc_*_up` matrices as Q5_0 and
+// `hc_ffn_down`, `attn_v` and its own copy of `output` as Q6_K, where the
+// trunk ships all of them as Q8_0. Q5_0 is Q5_1's record less the min, with
+// the levels centred by subtracting 16 instead; Q6_K is a 256-element
+// super-block of sixteen int8 group scales over six-bit levels, centred the
+// same way.
+//
 // These are transcriptions of ggml-quants.c's `dequantize_row_*`, block
 // layout included, and they are written to be obviously that rather than to
 // be fast: the GPU path dequantises in a shader, and what CPU-side dequant
@@ -25,6 +34,12 @@ import (
 //
 // A block's scale is fp16, so every path starts by widening one; the
 // arithmetic after that is float32, again matching ggml.
+
+// IQ4NLValues is the codebook a nibble of IQ4_NL indexes, for a caller that
+// has to *choose* levels rather than read them — P4c's transcode of
+// `ffn_down_exps` is the one that does. It is a copy: the table is the
+// format's definition and nothing may edit it in place.
+func IQ4NLValues() [16]int8 { return kvaluesIQ4NL }
 
 // kvaluesIQ4NL is IQ4_NL's non-linear codebook — the 16 int8 levels a nibble
 // indexes, which is what makes it "NL" and not Q4_0.
@@ -64,6 +79,10 @@ func Dequantize(typ Type, data []byte, n int64, dst []float32) ([]float32, error
 		}
 	case Q8_0:
 		dst = dequantQ8_0(data, nb, dst)
+	case Q4_1:
+		dst = dequantQ4_1(data, nb, dst)
+	case Q5_0:
+		dst = dequantQ5_0(data, nb, dst)
 	case Q5_1:
 		dst = dequantQ5_1(data, nb, dst)
 	case IQ4_NL:
@@ -72,6 +91,8 @@ func Dequantize(typ Type, data []byte, n int64, dst []float32) ([]float32, error
 		dst = dequantQ4_K(data, nb, dst)
 	case Q5_K:
 		dst = dequantQ5_K(data, nb, dst)
+	case Q6_K:
+		dst = dequantQ6_K(data, nb, dst)
 	default:
 		return nil, fmt.Errorf("gguf: dequantizing %s is not implemented", info.name)
 	}
@@ -82,7 +103,7 @@ func Dequantize(typ Type, data []byte, n int64, dst []float32) ([]float32, error
 // to refuse a checkpoint at open time rather than halfway through a layer.
 func Dequantizable(t Type) bool {
 	switch t {
-	case F32, F16, BF16, Q8_0, Q5_1, IQ4_NL, Q4_K, Q5_K:
+	case F32, F16, BF16, Q8_0, Q4_1, Q5_0, Q5_1, IQ4_NL, Q4_K, Q5_K, Q6_K:
 		return true
 	}
 	return false
@@ -110,6 +131,57 @@ func dequantQ8_0(data []byte, nb int64, dst []float32) []float32 {
 		d := f16At(blk, 0)
 		for j := 0; j < 32; j++ {
 			dst = append(dst, float32(int8(blk[2+j]))*d)
+		}
+	}
+	return dst
+}
+
+// dequantQ4_1 is 32 elements as fp16 scale, fp16 min and 16 nibble pairs: 20
+// bytes, 5.0 bits a weight. It is Q5_1 without the plane of fifth bits, and
+// the same 0..15 / 16..31 split of the pairs — which is why it is the
+// cheapest thing `ffn_down_exps` can be narrowed to (P4c).
+//
+// Nothing in UD-Q4_K_XL ships in it. It is here because P4c transcodes into
+// it, and a transcode needs an independent reader to be checked against.
+func dequantQ4_1(data []byte, nb int64, dst []float32) []float32 {
+	for b := int64(0); b < nb; b++ {
+		blk := data[b*20:]
+		d := f16At(blk, 0)
+		m := f16At(blk, 2)
+		lo := len(dst)
+		dst = append(dst, make([]float32, 32)...)
+		out := dst[lo:]
+		for j := 0; j < 16; j++ {
+			out[j] = float32(blk[4+j]&0x0F)*d + m
+			out[j+16] = float32(blk[4+j]>>4)*d + m
+		}
+	}
+	return dst
+}
+
+// dequantQ5_0 is 32 elements as one fp16 scale, a 32-bit plane of fifth bits
+// and 16 nibble pairs: 22 bytes, 5.5 bits a weight. It is Q5_1's record
+// without the min, and symmetric — the five-bit level is centred by
+// subtracting 16 rather than by an offset the fit chose.
+//
+// The plane is read the same way, and the same way round: the fifth bit of
+// element j is bit j of qh for the low half and bit j+16 for the high one,
+// which `qh >> (j+12)` against a mask of 0x10 selects without a shift back.
+func dequantQ5_0(data []byte, nb int64, dst []float32) []float32 {
+	for b := int64(0); b < nb; b++ {
+		blk := data[b*22:]
+		d := f16At(blk, 0)
+		qh := binary.LittleEndian.Uint32(blk[2:])
+		lo := len(dst)
+		dst = append(dst, make([]float32, 32)...)
+		out := dst[lo:]
+		for j := 0; j < 16; j++ {
+			xh0 := byte((qh >> j << 4) & 0x10)
+			xh1 := byte((qh >> (j + 12)) & 0x10)
+			x0 := int32(blk[6+j]&0x0F|xh0) - 16
+			x1 := int32(blk[6+j]>>4|xh1) - 16
+			out[j] = float32(x0) * d
+			out[j+16] = float32(x1) * d
 		}
 	}
 	return dst
@@ -240,6 +312,44 @@ func dequantQ5_K(data []byte, nb int64, dst []float32) []float32 {
 			is += 2
 			u1 <<= 2
 			u2 <<= 2
+		}
+	}
+	return dst
+}
+
+// dequantQ6_K is a 256-element super-block: 128 bytes of low nibbles, 64 of
+// the pairs of high bits, sixteen **signed int8** group scales and one fp16
+// super-scale — 210 bytes, 6.5625 bits a weight.
+//
+// Two things separate it from the K-quants above and both are in the loop.
+// Its scales are plain int8 rather than `get_scale_min_k4`'s packed six-bit
+// pairs, and there is **no min**: a level is centred by subtracting 32, so
+// the format is symmetric where Q4_K and Q5_K are not. The 128-element pass
+// interleaves four quarters that are 32 apart in the output and take their
+// scales 2 apart in the group, which is the layout the reference walks with
+// four pointers and this walks with offsets.
+func dequantQ6_K(data []byte, nb int64, dst []float32) []float32 {
+	for b := int64(0); b < nb; b++ {
+		blk := data[b*210:]
+		ql, qh, sc := blk[0:128], blk[128:192], blk[192:208]
+		d := f16At(blk, 208)
+		lo := len(dst)
+		dst = append(dst, make([]float32, 256)...)
+		out := dst[lo:]
+		for n := 0; n < 256; n += 128 {
+			for l := 0; l < 32; l++ {
+				is := l / 16
+				h := qh[n/4+l]
+				q1 := int32(ql[n/2+l]&0xF|((h>>0&3)<<4)) - 32
+				q2 := int32(ql[n/2+l+32]&0xF|((h>>2&3)<<4)) - 32
+				q3 := int32(ql[n/2+l]>>4|((h>>4&3)<<4)) - 32
+				q4 := int32(ql[n/2+l+32]>>4|((h>>6&3)<<4)) - 32
+				g := sc[n/16+is:]
+				out[n+l] = d * float32(int8(g[0])) * float32(q1)
+				out[n+l+32] = d * float32(int8(g[2])) * float32(q2)
+				out[n+l+64] = d * float32(int8(g[4])) * float32(q3)
+				out[n+l+96] = d * float32(int8(g[6])) * float32(q4)
+			}
 		}
 	}
 	return dst

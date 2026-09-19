@@ -1,0 +1,82 @@
+#version 450
+
+// The excitation's forward short-time transform, one thread per output *bin*
+// (SPEECH.md T7).
+//
+// The mirror of kokoro_istft.comp, and the larger half of what T7 moves: at
+// n_fft = 20 and hop = 5 a 3.25 s utterance is 15601 frames of 11 bins, and
+// on the host that is 6 ms of direct DFT plus 1.5 of hypot and atan2. Twenty
+// is not a power of two, so there is nothing to factor and the transform is
+// a [n_fft, bins] twiddle table — 220 entries that depend on nothing but the
+// geometry — read as 20 multiply-adds per thread.
+//
+// One thread per (frame, bin) rather than per frame: 171611 threads each
+// doing a 20-point dot product saturates the device better than 15601 doing
+// eleven of them, and the window and the twiddles are the same loads either
+// way.
+//
+// The padding is torch.stft's default, which kokoro's TorchSTFT keeps:
+// center=True, so frame t starts at t*hop - n_fft/2, and reflection at both
+// ends — mirrored *without repeating the edge*, -1 -> 1 and n -> n-2. Only
+// the first and last two frames read outside the signal, but getting the
+// mirror wrong would put a discontinuity in the excitation's spectrum
+// exactly where the utterance starts.
+//
+// The output is the layout the noise convolutions read: magnitude in the
+// first `bins` channels of a row and phase in the rest, not a complex
+// spectrum. Where the magnitude is zero the phase is whatever the rounding
+// says — see Generator.Harmonic, which is a property of the zero-noise
+// configuration rather than of this kernel.
+//
+//   pc.inOff   [samples] fp32
+//   pc.outOff  [frames, 2*bins] fp32, magnitude then phase
+//   pc.wOff    [n_fft*bins] cos, [n_fft*bins] sin, [n_fft] window
+//   pc.tokens  frames*bins
+//   pc.dim     bins
+//   pc.aux0    n_fft
+//   pc.aux1    hop
+//   pc.aux2    samples
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens) {
+        return;
+    }
+    int bins = int(pc.dim);
+    int nfft = int(pc.aux0);
+    int hop = int(pc.aux1);
+    int n = int(pc.aux2);
+
+    int t = int(idx) / bins;
+    int b = int(idx) - t * bins;
+
+    uint twCos = pc.wOff;
+    uint twSin = twCos + uint(nfft * bins);
+    uint win = twSin + uint(nfft * bins);
+
+    int start = t * hop - nfft / 2;
+    float re = 0.0, im = 0.0;
+    for (int j = 0; j < nfft; j++) {
+        int k = start + j;
+        // Folded in a loop so a pad wider than the signal still terminates,
+        // which is what the host's audio.STFT.sample does.
+        while (k < 0 || k >= n) {
+            if (k < 0) {
+                k = -k;
+            }
+            if (k >= n) {
+                k = 2 * (n - 1) - k;
+            }
+        }
+        float x = act[pc.inOff + uint(k)] * wbuf[win + uint(j)];
+        re += x * wbuf[twCos + uint(j * bins + b)];
+        im -= x * wbuf[twSin + uint(j * bins + b)];
+    }
+    uint row = pc.outOff + uint(t * 2 * bins);
+    act[row + uint(b)] = sqrt(re * re + im * im);
+    act[row + uint(bins + b)] = atan(im, re);
+}

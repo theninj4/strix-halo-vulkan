@@ -67,6 +67,13 @@
 #define FMT_Q5_K 1
 #define FMT_Q5_1 2
 #define FMT_Q8_0 3
+// P4c's two, which no tensor *ships* in: `ffn_down_exps` has a row of 640 and
+// no K-quant divides it, so narrowing it below six bits means a block-32
+// format the bank is transcoded into. Q4_1 is Q5_1 with the plane of fifth
+// bits deleted (20 bytes, 5.0 bits a weight); IQ4_NL is 18 bytes and 4.5, its
+// nibbles indexing a non-linear codebook instead of a level.
+#define FMT_Q4_1 4
+#define FMT_IQ4NL 5
 #ifndef QFMT
 #define QFMT FMT_Q4_K
 #endif
@@ -148,9 +155,37 @@ shared float16_t sB0[BN * LDS_ROW];
 #elif QFMT == FMT_Q5_1
 #define QK 32u
 #define QB 24u
+#elif QFMT == FMT_Q4_1
+#define QK 32u
+#define QB 20u
+#elif QFMT == FMT_IQ4NL
+#define QK 32u
+#define QB 18u
 #else
 #define QK 32u
 #define QB 34u
+#endif
+
+#if QFMT == FMT_IQ4NL
+// IQ4_NL's sixteen levels — `kvalues_iq4nl`: -127, -104, -83, -65, -49, -35,
+// -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 — packed one signed byte a level
+// into four dwords.
+//
+// **This is the initialiser, not the lookup**, for the reason the GEMV gives:
+// the index is divergent, so reading a level out of the packed form is a
+// `cndmask` chain, a bitfield extract and a convert where a level format
+// needs one convert — and the slab unpack is most of what this kernel does,
+// so it is the difference between a nibble format and a codebook one. The
+// table is widened into LDS once per workgroup, 64 bytes beside the 12.8 KB
+// the slabs already take, and the one barrier it needs is outside the K
+// loop. Measured on the 512-token prefill graph: **630.5 tok/s against
+// 663.6** without it, where the affine formats are unaffected.
+float iq4nlConst(uint l) {
+    uvec4 tab = uvec4(0xBFAD9881u, 0xF6EADDCFu, 0x26190D01u, 0x71594535u);
+    return float(bitfieldExtract(int(tab[l >> 2]), int((l & 3u) << 3), 8));
+}
+
+shared float kIQ4[16];
 #endif
 
 uint qbyte(uint b) { return (qbank[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
@@ -271,6 +306,50 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
         }                                                                                       \
     }                                                                                           \
   }
+#elif QFMT == FMT_Q4_1
+// Q4_1 asks nothing of the addressing: twenty bytes a block keeps every block
+// four-aligned under a row that is, and the pairs split the way Q5_1's do.
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint hw = (rb + ((k0 + c) >> 5) * 20u) >> 2;                                                \
+    vec2 dm = unpackHalf2x16(qbank[hw]);                                                        \
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {                                                 \
+        uint w = qbank[hw + 1u + t];                                                            \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint j = t * 4u + b;                                                                \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            DST[dst + c + j] = float16_t(float(by & 0xFu) * dm.x + dm.y);                       \
+            DST[dst + c + j + 16u] = float16_t(float(by >> 4) * dm.x + dm.y);                   \
+        }                                                                                       \
+    }                                                                                           \
+  }
+#elif QFMT == FMT_IQ4NL
+// IQ4_NL's rows are **ours rather than ggml's records**: blocks in pairs of
+// 36 bytes — two scales, then two sixteen-byte nibble groups
+// (`pairIQ4NLRow`). An eighteen-byte record is not a multiple of four, so
+// ggml's layout would put every other block two bytes into a word and take
+// Q8_0's two-word window. **A plane of scales is not the answer**: it suits
+// the GEMV, whose lane group walks one row, and costs this kernel 36%,
+// because a slab unpack reads one block of sixty-four *different* rows per
+// K-step and a scale a row away from its nibbles doubles the lines that
+// opens. 36 bytes is aligned and keeps the two together.
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint m = (k0 + c) >> 5;                                                                     \
+    uint pw = (rb + (m >> 1) * 36u) >> 2;                                                       \
+    vec2 dd = unpackHalf2x16(qbank[pw]);                                                        \
+    float d = ((m & 1u) == 0u) ? dd.x : dd.y;                                                   \
+    uint bw = pw + 1u + (m & 1u) * 4u;                                                          \
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {                                                 \
+        uint w = qbank[bw + t];                                                                 \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint j = t * 4u + b;                                                                \
+            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
+            DST[dst + c + j] = float16_t(kIQ4[by & 0xFu] * d);                                  \
+            DST[dst + c + j + 16u] = float16_t(kIQ4[by >> 4] * d);                              \
+        }                                                                                       \
+    }                                                                                           \
+  }
 #else
 // Q8_0 alone is not word-aligned below the row: 34 bytes a block puts the
 // int8s at an offset of 2 mod 4 on every other one, so the 32 bytes come out
@@ -339,6 +418,15 @@ void main() {
 #endif
         }
     }
+
+#if QFMT == FMT_IQ4NL
+    // Before the first slab: the codebook, and the only barrier in this
+    // kernel that is not the K loop's own.
+    if (tid < 16u) {
+        kIQ4[tid] = iq4nlConst(tid);
+    }
+    barrier();
+#endif
 
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
 #if MODE == 0

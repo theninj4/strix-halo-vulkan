@@ -53,6 +53,15 @@
 #define TILE 16
 #define WAVE 64
 
+// Rows of A this dispatch carries: P5b's specialization constant, the same
+// one llm_gemv.comp and llm_hc_gemv.comp take. At two tokens the GEMM the
+// host used to fall back to costs the router **5.9x** — 15.2 us a layer to
+// 89.8, reading a 2.63 MB fp16 matrix at 29.3 GB/s — and the matrix never
+// leaves the MALL, so that is shape and nothing else (D12's stopping
+// condition).
+layout(constant_id = 0) const uint ROWS = 1;
+#define MAXROWS 2
+
 layout(local_size_x = WAVE) in;
 
 void main() {
@@ -69,32 +78,48 @@ void main() {
     uint xbase = pc.xnOff + kt0 * TILE;
     uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE) + lane * TILE;
 
-    float sum = 0.0;
+    float sum[MAXROWS];
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        sum[r] = 0.0;
+    }
     for (uint c = 0u; c < perSlab; c += 4u) {
         uint w = wbase + c * (TILE * TILE);
         uint x = xbase + (c + sub) * TILE;
         [[unroll]] for (uint i = 0u; i < TILE; i++) {
-            sum += float(w16[w + i]) * float(hact[x + i]);
+            float wv = float(w16[w + i]);
+            [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                if (r < ROWS) {
+                    sum[r] += wv * float(hact[x + r * pc.lda + i]);
+                }
+            }
         }
     }
 
-    sum += subgroupShuffleXor(sum, 16u);
-    sum += subgroupShuffleXor(sum, 32u);
-    if (sub == 0u) {
-        // The partials ride `gammaOff`, which is what llm_hc_gemv.comp does
-        // with the same tensor and for the same reason: the push block is 64
-        // uints, this device's whole range, and the MoE reads no norm.
-        act[pc.gammaOff + slab * pc.gemmN + nt * TILE + col] = sum;
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        if (r >= ROWS) {
+            continue;
+        }
+        float v = sum[r];
+        v += subgroupShuffleXor(v, 16u);
+        v += subgroupShuffleXor(v, 32u);
+        if (sub == 0u) {
+            // The partials ride `gammaOff`, which is what llm_hc_gemv.comp
+            // does with the same tensor and for the same reason: the push
+            // block is 64 uints, this device's whole range, and the MoE reads
+            // no norm. Row-major over the slab, as there.
+            act[pc.gammaOff + (r * KSLABS + slab) * pc.gemmN + nt * TILE + col] = v;
+        }
     }
 #else
     uint n = gl_GlobalInvocationID.x;
-    if (n >= pc.gemmN) {
+    uint r = gl_WorkGroupID.y;                   // which row of A, P5b
+    if (n >= pc.gemmN || r >= ROWS) {
         return;
     }
     float sum = 0.0;
     [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
-        sum += act[pc.gammaOff + s * pc.gemmN + n];
+        sum += act[pc.gammaOff + (r * KSLABS + s) * pc.gemmN + n];
     }
-    act[pc.outOff + n] = sum;
+    act[pc.outOff + r * pc.gemmN + n] = sum;
 #endif
 }

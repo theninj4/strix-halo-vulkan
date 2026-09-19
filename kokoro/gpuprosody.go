@@ -34,7 +34,8 @@ import (
 type GPUProsody struct {
 	blockSet
 
-	frames   int // alignment frames in; the curves come out at 2*frames
+	frames   int // alignment frames the arenas were built for
+	run      int // alignment frames of the utterance running now
 	perStack int
 
 	// The arena this object's fp32 space came from, when it is shared with
@@ -52,10 +53,11 @@ type GPUProsody struct {
 	actElems int
 }
 
-// NewGPUProsody stages both stacks for a given alignment frame count.
+// NewGPUProsody stages both stacks for alignment frame counts up to `frames`.
 //
-// The frame count is fixed at construction, as everywhere else in this
-// package: the durations decide it, so the duration head has to have run.
+// That is a ceiling rather than the utterance: every region here is [T, C]
+// row-major and a shorter utterance is a prefix of it, so SetFrames is all
+// that stands between one clip and the next (SPEECH.md T9).
 func NewGPUProsody(dev *vk.Device, p *Predictor, frames int, kernel ConvKernel) (*GPUProsody, error) {
 	return newGPUProsody(dev, p, frames, kernel, nil)
 }
@@ -74,7 +76,7 @@ func newGPUProsody(dev *vk.Device, p *Predictor, frames int, kernel ConvKernel,
 			pipes: map[string]*vk.ComputePipeline{},
 			convs: map[ConvKernel]*vk.ComputePipeline{},
 		},
-		frames: frames, perStack: len(p.F0), shared: sa,
+		frames: frames, run: frames, perStack: len(p.F0), shared: sa,
 	}
 	g.src = append(append([]*AdainResBlk1d{}, p.F0...), p.N...)
 	if err := g.alloc(g.src, p); err != nil {
@@ -259,6 +261,29 @@ func (g *GPUProsody) alloc(src []*AdainResBlk1d, p *Predictor) error {
 	return nil
 }
 
+// SetFrames sizes both stacks for one utterance, which must fit the ceiling
+// the arenas were built for. The frame count walks down each stack the way it
+// did at construction, doubling at the block that upsamples.
+func (g *GPUProsody) SetFrames(frames int) error {
+	if frames <= 0 || frames > g.frames {
+		return fmt.Errorf("kokoro: %d frames against stacks staged for %d", frames, g.frames)
+	}
+	if frames == g.run {
+		return nil
+	}
+	for s := 0; s < 2; s++ {
+		t := frames
+		for i := 0; i < g.perStack; i++ {
+			db := &g.blocks[s*g.perStack+i]
+			db.setFrames(t)
+			t = db.conv
+		}
+	}
+	g.zeroBorders()
+	g.run = frames
+	return nil
+}
+
 // OutFrames is how long the two curves are — twice the alignment rate,
 // 12.5 ms a frame, because the vocoder's F0 conditioning is decimated by a
 // stride-2 convolution on the way in.
@@ -298,8 +323,8 @@ func (g *GPUProsody) graph() ([]vk.MultiDispatch, []string, error) {
 // Upload writes the shared recurrence's output, which is the only thing
 // either stack reads.
 func (g *GPUProsody) Upload(shared *Mat) error {
-	if shared.Rows != g.frames || shared.Cols != g.inCh {
-		return fmt.Errorf("kokoro: prosody input is %v, want [%d %d]", shared, g.frames, g.inCh)
+	if shared.Rows != g.run || shared.Cols != g.inCh {
+		return fmt.Errorf("kokoro: prosody input is %v, want [%d %d]", shared, g.run, g.inCh)
 	}
 	g.abuf.WriteFloat32At(int(g.aIn), shared.Data)
 	return nil

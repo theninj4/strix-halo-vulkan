@@ -112,6 +112,17 @@
 #define TILE 16
 #define WAVE 64
 
+// Rows of A this dispatch carries: P5b's specialization constant, the same
+// one llm_gemv.comp takes and for the same reason. At two tokens the GEMM the
+// host used to fall back to costs this projection **14.3x** — 16.5 us a mixer
+// to 234.4, reading its bank at 10.3 GB/s against this kernel's 145 — because
+// a [10240, 320] matrix at `BM = 1` is a grid of **five workgroups** on a
+// 40-CU device (D11). The weight is read once and multiplied into ROWS
+// accumulators, so the R-row arm costs the second row's A traffic and nothing
+// else.
+layout(constant_id = 0) const uint ROWS = 1;
+#define MAXROWS 2
+
 #ifdef Q4B
 #include "llm_q4k.glsl"
 #endif
@@ -160,7 +171,10 @@ void main() {
     uint wbase = pc.bOff + (nt * ktiles + kt0) * (TILE * TILE);
 #endif
 
-    float sum = 0.0;
+    float sum[MAXROWS];
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        sum[r] = 0.0;
+    }
 #ifdef Q4B
     {
         uint curSB = 0xffffffffu;
@@ -185,8 +199,15 @@ void main() {
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
                     uint by = bitfieldExtract(word, int(t * 8u), 8);
                     uint e = u * 8u + t * 2u;
-                    sum += (ds * float(QK_LEVEL_LO(by, hb, t)) - dm) * float(hact[x + e]);
-                    sum += (ds * float(QK_LEVEL_HI(by, hb, t)) - dm) * float(hact[x + e + 1u]);
+                    float wlo = ds * float(QK_LEVEL_LO(by, hb, t)) - dm;
+                    float whi = ds * float(QK_LEVEL_HI(by, hb, t)) - dm;
+                    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                        if (r < ROWS) {
+                            uint xr = x + r * pc.lda;
+                            sum[r] += wlo * float(hact[xr + e]);
+                            sum[r] += whi * float(hact[xr + e + 1u]);
+                        }
+                    }
                 }
             }
         }
@@ -202,8 +223,12 @@ void main() {
             [[unroll]] for (uint u = 0u; u < 4u; u++) {
                 uint word = w8[w + u];
                 [[unroll]] for (uint t = 0u; t < 4u; t++) {
-                    sum += float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d) *
-                        float(hact[x + u * 4u + t]);
+                    float wv = float(float16_t(bitfieldExtract(int(word), int(t * 8u), 8)) * d);
+                    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                        if (r < ROWS) {
+                            sum[r] += wv * float(hact[x + r * pc.lda + u * 4u + t]);
+                        }
+                    }
                 }
             }
         }
@@ -214,16 +239,29 @@ void main() {
         uint w = wbase + c * (TILE * TILE) + lane * TILE;
         uint x = xbase + (c + sub) * TILE;
         [[unroll]] for (uint i = 0u; i < TILE; i++) {
-            sum += float(w16[w + i]) * float(hact[x + i]);
+            float wv = float(w16[w + i]);
+            [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+                if (r < ROWS) {
+                    sum[r] += wv * float(hact[x + r * pc.lda + i]);
+                }
+            }
         }
     }
 #endif
 
     // The four lanes holding the same column are lane, lane^16, lane^32.
-    sum += subgroupShuffleXor(sum, 16u);
-    sum += subgroupShuffleXor(sum, 32u);
-    if (sub == 0u) {
-        act[pc.gammaOff + slab * pc.gemmN + nt * TILE + col] = sum;
+    // The partials are row-major over the slab — [r][slab][n] — so MODE 1's
+    // sum is contiguous for each row.
+    [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+        if (r >= ROWS) {
+            continue;
+        }
+        float v = sum[r];
+        v += subgroupShuffleXor(v, 16u);
+        v += subgroupShuffleXor(v, 32u);
+        if (sub == 0u) {
+            act[pc.gammaOff + (r * KSLABS + slab) * pc.gemmN + nt * TILE + col] = v;
+        }
     }
 #else
     // The reduction, and llm_gemm.comp MODE 0's epilogue over one row: the
@@ -231,18 +269,22 @@ void main() {
     // the up projection's A operand, inject's tile is written fp32 because
     // the combine reads it as a scalar per stream.
     uint n = gl_GlobalInvocationID.x;
-    if (n >= pc.gemmN) {
+    uint r = gl_WorkGroupID.y;                   // which row of A, P5b
+    if (n >= pc.gemmN || r >= ROWS) {
         return;
     }
     float sum = 0.0;
     [[unroll]] for (uint s = 0u; s < KSLABS; s++) {
-        sum += act[pc.gammaOff + s * pc.gemmN + n];
+        sum += act[pc.gammaOff + (r * KSLABS + s) * pc.gemmN + n];
     }
     if (n < pc.lowRank) {
         float v = sum / float(pc.hc);
-        hact[pc.loOff + n] = float16_t(v * sigmoidf(v));
+        hact[pc.loOff + r * pc.ldaLo + n] = float16_t(v * sigmoidf(v));
     } else {
-        act[pc.injOff + (n - pc.lowRank)] = sum;
+        // `inject`'s row stride is the tile it rides, gemmN - lowRank, which
+        // is what llm_gemm.comp MODE 0's epilogue writes and what the combine
+        // reads (HCGPU.injStride).
+        act[pc.injOff + r * (pc.gemmN - pc.lowRank) + (n - pc.lowRank)] = sum;
     }
 #endif
 }

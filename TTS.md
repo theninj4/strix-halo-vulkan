@@ -10,12 +10,14 @@
 no Python on the path and every stage validated against a reference dump
 before it was optimised.
 
-**Status (2026-09-19, T8)**: **done and serving.** `go run ./cmd/tts -gpu -text
-'Hello there.'` speaks; `POST /v1/audio/speech` answers. An utterance is
-**44 ms for 3.25 s of audio — 74.2x real time**, from 3848 ms on the CPU
-reference. The model side is finished through T6d and T8 closed the last missing feature —
-a voice may name a mixture of packs — so what is left is optimisation: T7,
-the excitation.
+**Status (2026-09-19, T9)**: **done and serving.** `go run ./cmd/tts -gpu -text
+'Hello there.'` speaks; `POST /v1/audio/speech` answers in **59 ms for 6.45 s
+of audio**. An utterance is **31 ms for 3.25 s — 105x real time**, from
+3848 ms on the CPU reference. Every stage of the model runs on the device: T7
+closed the last stage that was still on the host, T8 the last missing feature
+(a voice may name a mixture of packs), and T9 the last place where the
+*server* cost more than the model — it staged the arenas per request, which
+was 499 ms of protocol around 48 ms of arithmetic.
 
     "The quick brown fox jumps over the lazy dog." (af_heart)
     48 phonemes -> 50 tokens -> 130 frames -> 78000 samples = 3.250 s
@@ -26,13 +28,13 @@ the excitation.
     durations       0ms        8ms   the head, on the host, in fp32
     prosody         1ms       66ms   gather, shared, both AdaIN stacks
     text encoder    0ms       15ms   now only a readback
-    phoneme side    8ms      222ms   18% of the utterance, 1.96ms of GPU time
+    phoneme side    8ms      222ms   26% of the utterance, 1.96ms of GPU time
     decoder         1ms      132ms
     generator      12ms     3160ms
-    excitation     14ms       24ms   float64 on the host, see T7
+    excitation      0ms       24ms   0.2ms measured, 23us of it GPU
     tail            8ms       22ms
-    vocoder        36ms     3626ms   82% of the utterance
-    total          44ms     3848ms   74.20x real time
+    vocoder        22ms     3626ms   73% of the utterance
+    total          31ms     3848ms   105x real time
 
 ## The stages
 
@@ -50,8 +52,9 @@ the excitation.
 | T6c | The six bidirectional LSTMs | **done** — 73 ms → 6 ms |
 | T6d | The chain between them | **done** — 17 ms → 8 ms, two submits, two readbacks |
 | A | `/v1/audio/speech` and `backend/tts.go` | **done** — wav and pcm, voices in `/v1/models` |
-| T7 | The excitation on the device | **next** — 14 ms, the largest single stage in the model |
+| T7 | The excitation and its transform on Vulkan | **done** — 14 ms → 0.2 ms, [write-up](SPEECH.md#t7--the-excitation-done) |
 | T8 | Voice blending | **done** — upstream's spelling, checked against `load_voice` at every row |
+| T9 | One staging for the life of the server | **done** — the endpoint 550 ms → 59, the same bytes, [write-up](SPEECH.md#t9--one-staging-for-the-life-of-the-server-done) |
 
 ## What exists
 
@@ -62,8 +65,11 @@ arena: `adainset.go` (`blockSet`, the `AdainResBlk1d` every stack reuses),
 `gpu.go` (a generator upsampling stage, and the tail), `gpudec.go` (the five
 decoder AdaIN blocks), `gpuprosody.go` (the F0/N stacks, 62 dispatches in one
 submit), `gpubert.go` (PL-BERT), `gpulstm.go` (one bidirectional recurrence,
-one dispatch a timestep) and `gpuphonemes.go` (the whole phoneme side, two
-submits and two readbacks). 45 tests.
+one dispatch a timestep), `gpuphonemes.go` (the whole phoneme side, two
+submits and two readbacks) and `gpusource.go` (the excitation and its forward
+transform, two dispatches over the only arena here that is HOST_CACHED).
+Every one of those objects is sized for a *ceiling* rather than for an
+utterance: `SetFrames` takes a clip within it (T9). 60 tests.
 
 **`g2p/`** — English text to kokoro's 178 IPA symbols, ported from misaki:
 `lexicon.go`, `stress.go`, `number.go`, `getnumber.go`, `subtoken.go`,
@@ -78,10 +84,15 @@ overlap-add.
 
 **`shaders/kokoro_*`** — the generator's eight kernels plus T4c's eight, T6a's
 attention and `gelu_new` build, T6b's `kokoro_proj.comp` (a 256-to-1
-convolution, the one shape the GEMM ladder cannot express), and T6d's gather.
+convolution, the one shape the GEMM ladder cannot express), T6d's gather, and
+T7's `kokoro_source.comp` and `kokoro_srcstft.comp` — the sine bank, and the
+forward transform that mirrors `kokoro_istft.comp`.
 
 **`cmd/tts`** — phonemes or `-text` in, a WAV and the stage profile out.
-`-gpu`, `-voice` (54, or a mixture), `-speed`, `-noise <seed>`, `-list`.
+`-gpu`, `-voice` (54, or a mixture), `-speed`, `-noise <seed>`, `-list`, and
+`-frames N` to stage for a ceiling instead of this utterance — which is how
+the claim that a ceiling costs nothing per request is checked from the command
+line.
 
 **`kokoro/blend.go`** — a voice specification: one name, `af_bella,af_sky` for
 the equal mean (upstream's spelling and upstream's meaning), or
@@ -92,40 +103,35 @@ the oracle — `KPipeline.load_voice` run offline over the local packs — and
 **`backend/tts.go` + `api/speech.go`** — the server adapter and the endpoint.
 One mutex serialises utterances; `Speak` takes `input` or the non-OpenAI
 `phonemes` field, and `/v1/models` carries the voice list so a client needs no
-second call.
+second call. Since T9 the device attachment is staged **once at startup** for
+`-tts-frames` (1000 frames, 25 s) and every request is the model alone: a
+request re-conditions the voice, sizes the arenas with `Vocoder.SetFrames`,
+and runs.
 
 ## What is left
 
-**T7 — the excitation, 14 ms and 32% of an utterance.** It is on the host
-because upstream integrates phase in radians and multiplies by 300: three
-seconds holds 1.3e5 radians where one float32 ulp is 0.016, and fp16 cannot
-represent the number at all. But `HarmonicSource` already keeps the phase in
-*cycles* and wraps before the sine, so nothing it computes is ever large —
-which is why it is more accurate than the dump rather than less. The open
-question is therefore not whether upstream's accumulator can move, but
-**whether the wrapped form is float32-safe on the device**, and that is a
-measurement: 78000 samples x eight harmonics of `sin(2*pi*frac(phi))`, the F0
-curve upsampled 300:1 and a uv mask, is embarrassingly parallel if the wrap is
-exact.
+**The generator's 12 ms and the tail's 8**, which T4 left measured and which
+are the only parts of this model that were ever arithmetic-bound. Together
+they are 65% of an utterance.
+
+**The excitation's remaining 0.2 ms is 88% submit and readback** — 23
+microseconds of GPU against 155 of submit and 70 of download. Closing it means
+moving the two noise convolutions that consume the spectrogram onto the device
+too, after which nothing of the stage would touch the bus.
 
 **The remaining 6 ms of the phoneme side's 8, none of it arithmetic** —
 ALBERT's `[T, 768]` readback and its host-side embedding stack, the two
 readbacks T6d could not remove, and four submits. Closing any of it means
-moving the vocoder's input boundary, which is one change rather than four, and
-is the thing to do *after* T7.
+moving the vocoder's input boundary, which is one change rather than four.
 
-**`-tts-gpu` is off by default**, because the device path **stages per
-request**: kokoro's arenas are sized for one utterance's frame count, the
-durations decide that, and so the prosody runs on the host to settle the
-length before anything can be staged — which is why `synthesize` computes it
-twice. Two things would fix it, both measurements rather than arguments:
-**bucketed residency** (size the arenas above the utterance, zero-pad the
-alignment, trim by `Prosody.Samples`; the phoneme side already accepts any
-count up to the one it was built for, and whether the generator's stages
-tolerate the padding is the open question), and **skipping the second prosody
-pass** (the vocoder reads `asr`, `f0` and `energy` from the host anyway, so the
-first pass could feed the device directly and the phoneme side would not need
-staging at all).
+**`-tts-frames` is a memory budget, not a latency one.** The arenas are
+~150 MB plus 0.7 MB a frame, so the 1000-frame default is 848 MB and a
+100-second ceiling would be 3.0 GB. It costs nothing per request: every
+dispatch extent is the utterance's, and the Montana sentence is 48 ms staged
+for its own 258 frames and 48 ms staged for 1000. An utterance past the
+ceiling restages once, rounded up to the next 256 frames, and keeps the larger
+arenas — though the voice packs have only 510 style rows, so only `speed < 1`
+reaches it.
 
 **The style row is indexed by the character count** of the phoneme string minus
 whatever fell outside the vocabulary — which is how `KPipeline` does it, and is
@@ -142,7 +148,15 @@ obvious scored worse than no tagger at all.
 **Serving defaults worth knowing.** `-noise 0` leaves the excitation noise
 *off*, which is the reproducible configuration the reference dump was taken
 with; the noise is worth 13.8 dB and an utterance meant to be listened to
-wants it on. Without libespeak-ng, words outside the lexicon are **dropped**
+wants it on. Since T7 the noise is drawn on the device from a hash of (seed,
+sample, harmonic) rather than from Go's generator, so **`-noise n` is
+reproducible on a given path but the CPU and GPU paths do not produce the same
+samples for the same seed** — the same distribution and the same rule, not the
+same sequence. And with the noise off, the excitation's phase spectrum is
+analytically zero over 27% of its bins, which makes the waveform's agreement
+with the dump a draw spanning 13.8 to 20.2 dB; the device draws 13.8 where the
+host draws 18.2, and neither is more correct than the other. SPEECH.md T7 has
+the measurement. Without libespeak-ng, words outside the lexicon are **dropped**
 with a warning rather than mispronounced — a wrong utterance rather than a
 slow one, which is why `-espeak` defaults on and a failure to open it is a
 warning and not fatal.

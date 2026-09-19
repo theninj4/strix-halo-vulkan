@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=###
-ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -stt -image -previews -edits
+ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -previews -edits
 Restart=always
 RestartSec=1
 

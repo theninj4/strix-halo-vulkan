@@ -427,7 +427,7 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	// of the two projections is the fused one, so 32 x 16512 x 4 = 2.1 MB —
 	// allocated whichever rung runs, because the arena plan is fixed at
 	// construction and the rung is not.
-	g.aPart = alloc(gemvMaxSlabs * g.qkvN())
+	g.aPart = alloc(GEMVMaxRows * gemvMaxSlabs * g.qkvN())
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: deltanet fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -550,10 +550,16 @@ func (g *DeltaNetGPU) build() error {
 	// are built whatever the bank is, because the reduce reads neither and
 	// the fp16 partials arm is what a block on the fp16 bank runs.
 	for name, spirv := range gemvSPIRV {
-		if err := g.pipeline(name, spirv, vk.PipelineSpec{
-			Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
-		}); err != nil {
-			return err
+		// One module, one pipeline per row count (P5b): `ROWS` is a
+		// specialization constant, so the R-row arm costs a pipeline rather
+		// than thirty more `.spv`.
+		for rows := 1; rows <= GEMVMaxRows; rows++ {
+			if err := g.pipeline(gemvRowName(name, rows), spirv, vk.PipelineSpec{
+				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: dnWave,
+				SpecConstants: gemvSpec(rows),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -792,8 +798,9 @@ func (g *DeltaNetGPU) SetGemv(qkv, out GEMVKernel) error {
 				t.k, t.gemmK, t.what)
 		}
 	}
-	if (qkv != GEMVOff || out != GEMVOff) && g.rows != 1 {
-		return fmt.Errorf("llm: the GEMV rungs read one token's row; this batch is %d", g.rows)
+	if (qkv != GEMVOff || out != GEMVOff) && (g.rows < 1 || g.rows > GEMVMaxRows) {
+		return fmt.Errorf("llm: the GEMV rungs carry at most %d rows of A (P5b); this batch is %d",
+			GEMVMaxRows, g.rows)
 	}
 	g.qkvGemv, g.outGemv = qkv, out
 	g.autoPlan = false
@@ -814,11 +821,18 @@ func (g *DeltaNetGPU) PinGemv(on bool) {
 	}
 }
 
-// DNGemvFor is the decode plan: llm_gemv.comp at one token and the GEMM at
-// every other length, where its A operand is a full fragment and its grid is
-// no longer `gemmN/64` workgroups for one row.
+// DNGemvFor is the decode plan: llm_gemv.comp at **up to GEMVMaxRows tokens**
+// and the GEMM at every other length, where its A operand is a full fragment
+// and its grid is no longer `gemmN/64` workgroups for one row.
+//
+// **The upper bound moved from 1 to 2 at P5b.** D15 refused this kernel above
+// one token because a sixteen-row fragment holding one row was the reason it
+// won — but the refusal was about the GEMM's shape rather than a dot
+// product's, and the measurement that forced the question is P5's: at two
+// tokens the GEMM this used to fall back to costs `qkv` 1.94x and `out` 3.4x
+// on **identical weight bytes** (research/p5-mtp-rollback.md §1).
 func DNGemvFor(tokens int) (GEMVKernel, GEMVKernel) {
-	if tokens != 1 || !DecodeGEMV() {
+	if tokens < 1 || tokens > GEMVMaxRows || !DecodeGEMV() {
 		return GEMVOff, GEMVOff
 	}
 	return dnQKVGemv, dnOutGemv
@@ -1041,9 +1055,10 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// from a sixteen-row fragment of which fifteen rows are padding
 		// (L8d-4). The partials ride `resOff`, which this block does not use.
 		qkv.ResOff = g.aPart
-		add(gemvBankPipe(g.qkvGemv, g.bank), "qkv", uint32(ks), uint32(g.qkvN()/16), qkv)
+		add(gemvBankPipeRows(g.qkvGemv, g.bank, g.rows), "qkv", uint32(ks), uint32(g.qkvN()/16), qkv)
 		if ks > 1 {
-			add(gemvSumPipe(g.qkvGemv), "qkv.sum", uint32(roundUpInt(g.qkvN(), dnWave)/dnWave), 1, qkv)
+			add(gemvSumPipeRows(g.qkvGemv, g.rows), "qkv.sum",
+				uint32(roundUpInt(g.qkvN(), dnWave)/dnWave), uint32(g.rows), qkv)
 		}
 	} else if g.quant() {
 		add(bankPipe(g.bank, g.gemm), "qkv", uint32(g.qkvN()/dnBN), gy, qkv)
@@ -1073,9 +1088,10 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 	if ks := gemvSlabs(g.outGemv); ks > 0 {
 		out.ResOff = g.aPart
-		add(gemvBankPipe(g.outGemv, g.bank), "out", uint32(ks), uint32(c.NEmbd/16), out)
+		add(gemvBankPipeRows(g.outGemv, g.bank, g.rows), "out", uint32(ks), uint32(c.NEmbd/16), out)
 		if ks > 1 {
-			add(gemvSumPipe(g.outGemv), "out.sum", uint32(roundUpInt(c.NEmbd, dnWave)/dnWave), 1, out)
+			add(gemvSumPipeRows(g.outGemv, g.rows), "out.sum",
+				uint32(roundUpInt(c.NEmbd, dnWave)/dnWave), uint32(g.rows), out)
 		}
 	} else {
 		add(outPipe, "out", uint32(c.NEmbd/dnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)

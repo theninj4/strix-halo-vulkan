@@ -85,6 +85,13 @@ func main() {
 	headRows := flag.Int("head-rows", 256, "for -ppl: rows of logits the head's arena holds; a row is 0.99 MB")
 	gemmLadder := flag.Bool("gemm-ladder", false, "also cross both GEMM row blocks for -dn and -attn, and at one token the decode GEMV's split per projection")
 	attrib := flag.Bool("attrib", false, "for -gen: attribute a decode step per dispatch label and per host phase (P1)")
+	mtp := flag.Bool("mtp", false, "P5a: run the MTP draft head as a passive observer beside an ordinary decode, and report its acceptance rate")
+	mtpDraft := flag.String("mtp-draft", "models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf", "for -mtp: the draft head's checkpoint")
+	mtpN := flag.Int("mtp-n", 256, "for -mtp: how many draft rounds to observe")
+	mtpDepth := flag.Int("mtp-depth", 4, "for -mtp: how many tokens deep to chain each draft")
+	mtpFree := flag.Bool("mtp-free", false, "for -mtp: advance on the trunk's own argmax instead of the corpus's tokens")
+	mtpPrime := flag.Int("mtp-prime", 64, "for -mtp-free: how many corpus tokens to prime with before generating, so the greedy run does not degenerate from one token")
+	mtpWire := flag.String("mtp-wire", "res,mixed,zero", "for -mtp: which readings of the nextn block to screen — res, res-flip, mixed, mixed-flip, zero (the negative control)")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	flag.Parse()
 
@@ -115,6 +122,20 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := pleBench(*model, toks, *iters, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *mtp {
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		if err := mtpObserve(mtpOpts{
+			model: *model, draft: *mtpDraft, file: *pplFile, n: *mtpN, ctx: *ctx,
+			layers: layers, depth: *mtpDepth, free: *mtpFree, prime: *mtpPrime, wires: *mtpWire, csv: *csvPath,
+		}); err != nil {
 			log.Fatal(err)
 		}
 		return

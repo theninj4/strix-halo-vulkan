@@ -33,7 +33,8 @@ import (
 type GPUDecoder struct {
 	blockSet
 
-	frames int // alignment frames
+	frames int // alignment frames the arenas were built for
+	run    int // alignment frames of the utterance running now
 
 	// The arena this decoder's fp32 space came from, when it is shared with
 	// the generator's stages: then aOut *is* stage 0's input and the
@@ -55,11 +56,13 @@ type GPUDecoder struct {
 	outCh int // the last block's output width
 }
 
-// NewGPUDecoder stages the decoder for a given alignment frame count.
+// NewGPUDecoder stages the decoder for alignment frame counts up to `frames`.
 //
-// The frame count is fixed at construction because the arenas are, exactly as
-// the generator's stages are: the durations decide it, so the prosody has to
-// have run before this is called.
+// The arenas are sized by that ceiling, not by the utterance: every region
+// here is [T, C] row-major, so a shorter utterance is a prefix of each one and
+// SetFrames is the whole of what it takes to run one. Staging is 85 ms and an
+// utterance is 25, which is why the ceiling is a server's to pick once rather
+// than a request's to pay (SPEECH.md T9).
 func NewGPUDecoder(dev *vk.Device, v *Vocoder, frames int, kernel ConvKernel) (*GPUDecoder, error) {
 	return newGPUDecoder(dev, v, frames, kernel, nil)
 }
@@ -84,7 +87,7 @@ func newGPUDecoder(dev *vk.Device, v *Vocoder, frames int, kernel ConvKernel,
 			pipes: map[string]*vk.ComputePipeline{},
 			convs: map[ConvKernel]*vk.ComputePipeline{},
 		},
-		frames: frames, shared: sa, src: blocks,
+		frames: frames, run: frames, shared: sa, src: blocks,
 	}
 	if err := d.alloc(blocks, v.ASRRes.Out); err != nil {
 		d.Destroy()
@@ -115,8 +118,33 @@ func (d *GPUDecoder) finish() error {
 	return err
 }
 
-// Frames is the alignment frame count this decoder was built for.
+// Frames is the alignment frame count this decoder was built for, which is
+// the longest utterance it can run rather than the one it is running.
 func (d *GPUDecoder) Frames() int { return d.frames }
+
+// RunFrames is the utterance currently sized for.
+func (d *GPUDecoder) RunFrames() int { return d.run }
+
+// SetFrames sizes the decoder for one utterance, which must fit the ceiling
+// the arenas were built for.
+//
+// Everything it changes is a dispatch extent or a push constant: the blocks
+// keep their offsets, their strides and their weights, and the only memory
+// touched is the fp16 border the shorter run leaves stale (see zeroBorders).
+func (d *GPUDecoder) SetFrames(frames int) error {
+	if frames <= 0 || frames > d.frames {
+		return fmt.Errorf("kokoro: %d frames against a decoder staged for %d", frames, d.frames)
+	}
+	if frames == d.run {
+		return nil
+	}
+	for i := range d.blocks {
+		d.blocks[i].setFrames(frames)
+	}
+	d.zeroBorders()
+	d.run = frames
+	return nil
+}
 
 // alloc lays out the three arenas and fills in every block's offsets.
 func (d *GPUDecoder) alloc(blocks []*AdainResBlk1d, asrResCh int) error {
@@ -203,7 +231,7 @@ func (d *GPUDecoder) alloc(blocks []*AdainResBlk1d, asrResCh int) error {
 // Upload writes the decoder's two inputs: the `encode` block's operand and the
 // side channels every decode block reads beside its own output.
 func (d *GPUDecoder) Upload(asr, f0c, nc, asrRes *Mat) error {
-	t := d.frames
+	t := d.run
 	enc := &d.blocks[0]
 	cat := &d.blocks[1]
 	if asr.Rows != t || f0c.Rows != t || nc.Rows != t || asrRes.Rows != t {
@@ -232,15 +260,17 @@ func (d *GPUDecoder) Upload(asr, f0c, nc, asrRes *Mat) error {
 		copy(row[asrRes.Cols:], f0c.Row(r))
 		copy(row[asrRes.Cols+f0c.Cols:], nc.Row(r))
 	}
-	d.abuf.WriteFloat32At(int(d.aCat), d.cat)
+	// Only the live rows: the arena is sized for the ceiling, and what lies
+	// past this utterance is read by nothing (see SetFrames).
+	d.abuf.WriteFloat32At(int(d.aCat), d.cat[:t*cat.in])
 	return nil
 }
 
 // Download reads the decoder's output — [2*frames, 512], the generator's
 // input.
 func (d *GPUDecoder) Download() *Mat {
-	return &Mat{Rows: 2 * d.frames, Cols: d.outCh,
-		Data: d.abuf.ReadFloat32At(int(d.aOut), 2*d.frames*d.outCh)}
+	return &Mat{Rows: 2 * d.run, Cols: d.outCh,
+		Data: d.abuf.ReadFloat32At(int(d.aOut), 2*d.run*d.outCh)}
 }
 
 // Resident reports whether the decoder's output stays on the device — which

@@ -284,7 +284,15 @@ func TestGPUTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer model.DetachGPU()
+
+	// With the host's excitation on both sides, which is what makes the
+	// comparison against the CPU path mean the tail. T7 moved the excitation
+	// to the device as well, and it is the one quantity here that is
+	// ill-conditioned -- see the second half of this test.
+	src := model.Vocoder.Generator.SrcGPU
+	model.Vocoder.Generator.SrcGPU = nil
 	got, _, err := model.Vocoder.Apply(asr, f0, energy, decStyle)
+	model.Vocoder.Generator.SrcGPU = src
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,5 +315,26 @@ func TestGPUTail(t *testing.T) {
 	// reference is; the dump's own floor dominates both.
 	if dev0.Rel() > 1.5*cpu.Rel() {
 		t.Errorf("device is %.2fx further from the dump than the CPU path", dev0.Rel()/cpu.Rel())
+	}
+
+	// And now the whole path, excitation included. This number is a *draw*
+	// rather than a tolerance: with the noise off the excitation is a
+	// constant wherever the signal is unvoiced, its windowed spectrum is
+	// analytically zero outside three bins, and the angle of the rounding
+	// residual is one arbitrary value per bin repeated over thousands of
+	// frames. Walking that constant by five ulps under the device's own
+	// transform moves this over 0.097 to 0.203; the CPU path draws 0.123 and
+	// the device draws the unluckiest of the eleven. Each half is fine on its
+	// own -- the device excitation through the host transform is 0.118, the
+	// host excitation through the device transform 0.110 -- so what the bound
+	// below records is the width of the lottery and not an error in either.
+	full, _, err := model.Vocoder.Apply(asr, f0, energy, decStyle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd := compare(t, full, want)
+	t.Logf("device+excitation against dump   relative %.3g (%.1f dB)", fd.Rel(), -20*math.Log10(fd.Rel()))
+	if fd.Rel() > 0.25 {
+		t.Errorf("the whole device path is %.3g from the dump, outside the measured lottery", fd.Rel())
 	}
 }

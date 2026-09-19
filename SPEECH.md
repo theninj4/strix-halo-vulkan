@@ -10,18 +10,21 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-19, T8)**: **both verticals are on the device, text-to-speech
-takes text, and an utterance is 74.2x real time.**
+**Status (2026-09-19, T9)**: **both verticals are on the device, text-to-speech
+takes text, and the endpoint now costs what the model costs.**
+T9 staged kokoro once for the life of the server instead of once per request:
+`POST /v1/audio/speech` went from **550 ms to 59** for 6.45 s of audio, byte
+for byte the same waveform.
 Speech-to-text transcribes an 11 s clip in 43 ms, 257x real time, whole model
-resident, S1–S8 done. **Text-to-speech is 44 ms for 3.25 s of audio.** T6 is
-finished: ALBERT 104 ms to 4 (T6a), the F0/N AdaIN stacks 40 to 1 (T6b), the
-six bidirectional LSTMs 73 to 6 (T6c) and the chain between them 17 to 8
-(T6d) — so **the phoneme side went from 222 ms to 8 and is now 18% of an
-utterance, over 1.96 ms of GPU time**. The other 82% is the vocoder, whose
-36 ms T4c already cut from 3626, and whose largest remaining piece is **14 ms
-of float64 phase accumulation on the host** that T3 put there on purpose.
+resident, S1–S8 done. **Text-to-speech is 31 ms for 3.25 s of audio**, 105x
+real time. T6 is finished: ALBERT 104 ms to 4 (T6a), the F0/N AdaIN stacks 40
+to 1 (T6b), the six bidirectional LSTMs 73 to 6 (T6c) and the chain between
+them 17 to 8 (T6d) — so **the phoneme side went from 222 ms to 8 and is now
+26% of an utterance, over 1.96 ms of GPU time**. The other 74% is the vocoder,
+whose 22 ms T4c and T7 cut from 3626.
 T8 closed the last open feature: a voice may name a **mixture** of packs, in
-upstream's own spelling.
+upstream's own spelling, and T9 closed the last place where the server cost
+more than the model.
 
 `go run ./cmd/tts -gpu -text 'Hello there.'` speaks, with no Python on the
 path. T5 opened with a measurement instead of code — **91% of running-text
@@ -37,23 +40,23 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
        kˈɜɹnᵊlz ænd spˈɛnt θɹˈi pYnt fˈIv mˈɪljᵊn dˈɑləɹz, ˌʌp twˈɛlv pəɹsˈɛnt.
     character for character what misaki gives
 
-    text to speech, T6d (kokoro)
+    text to speech, T7 (kokoro)
     "The quick brown fox jumps over the lazy dog." (af_heart)
     48 phonemes -> 50 tokens -> 130 frames -> 78000 samples = 3.250 s
 
-    stage          gpu    (T6c)   cpu (T3)
+    stage          gpu    (T6d)   cpu (T3)
     bert            4ms      4ms     104ms   12 ALBERT layers, 46.6x
     dur encoder     3ms      3ms      24ms   + the whole text encoder
-    durations       0ms      1ms       8ms   the head, on the host, in fp32
-    prosody         1ms      2ms      66ms   gather, shared, both AdaIN stacks
-    text encoder    0ms      8ms      15ms   now only a readback
-    phoneme side    8ms     17ms     222ms   18% of the utterance
+    durations       0ms      0ms       8ms   the head, on the host, in fp32
+    prosody         1ms      1ms      66ms   gather, shared, both AdaIN stacks
+    text encoder    0ms      0ms      15ms   now only a readback
+    phoneme side    8ms      8ms     222ms   26% of the utterance
     decoder         1ms      1ms     132ms
     generator      12ms     12ms    3160ms
-    excitation     14ms     15ms      24ms   float64 on the host, see T7
+    excitation      0ms     14ms      24ms   0.2ms measured, 23us of it GPU
     tail            8ms      8ms      22ms
-    vocoder        36ms     36ms    3626ms   82% of the utterance
-    total          44ms     53ms    3848ms   74.20x real time, from 61.44x
+    vocoder        22ms     36ms    3626ms   73% of the utterance
+    total          31ms     44ms    3848ms   105x real time, from 74.20x
 
     the phoneme side on the device, by family   1.957 ms of GPU time
       six recurrences, steps only  1.478ms  76%   shared alone is 0.508
@@ -102,8 +105,9 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T6b | The F0/N AdaIN stacks, 40 ms of the prosody predictor's 67 | **done** — 40 ms to 1 ms, one new shader |
 | T6c | The six bidirectional LSTMs, 73 ms — 96% of the phoneme side | **done** — 73 ms to 6 ms, durations unchanged |
 | T6d | The chain between them: readbacks, the regulator, the text encoder | **done** — 17 ms to 8 ms, two submits and two readbacks |
-| T7 | The excitation: float64 phase accumulation on the host | **next** — the largest single stage in the model, 14 ms |
+| T7 | The excitation: float64 phase accumulation on the host | **done** — 14 ms to 0.2 ms, two new shaders; the wrapped phase is float32-safe |
 | T8 | Voice blending: a request that names several voices | **done** — upstream's own spelling, checked against `load_voice` at every row |
+| T9 | The server: one staging for the life of the process | **done** — `/v1/audio/speech` 550 ms to 59, and the bytes are unchanged |
 
 ## What exists
 
@@ -600,34 +604,148 @@ depend on nothing but T and could be cached. The encoder's eight per-head
 position-score GEMMs are the same shape at different offsets, which is §3.5's
 grouped GEMM.
 
-## T7 — the excitation, and what is actually left
+## T7 — the excitation, done
 
-With T6 closed the vocoder is **82% of an utterance** again, and the largest
-single stage in the whole model is the **excitation at 14 ms** — 32% of a
-44 ms utterance, and nearly twice the whole phoneme side.
+With T6 closed the vocoder was **82% of an utterance** and the largest single
+stage in the whole model was the **excitation at 14 ms** — 32% of a 44 ms
+utterance, and nearly twice the whole phoneme side. It is now **0.2 ms**, of
+which 23 microseconds is GPU time and the rest is one submit and one readback,
+and the utterance is **31 ms — 105x real time** (five runs: 30, 31, 31, 32,
+33 ms).
 
-It is on the host on purpose and T3 explains why: upstream integrates the
-excitation's phase in radians and multiplies by 300, so three seconds holds
-**1.3e5 radians, where one float32 ulp is 0.016** and fp16 cannot represent the
-number at all. But that is an argument about *upstream's* formulation.
-`HarmonicSource` already keeps the phase in cycles and wraps before the sine,
-so nothing it computes is ever large — which is why it is more accurate than
-the dump rather than less. The open question is therefore not "can the
-reference's accumulator move to the device" but **"is the wrapped form
-float32-safe, and if so what does it cost there"**, and it is a measurement
-rather than an argument: 78000 samples times eight harmonics of
-`sin(2*pi*frac(phi))`, with the F0 curve upsampled 300:1 and a uv mask, is an
-embarrassingly parallel kernel if the wrap is exact.
+**The first thing measured was what the 14 ms actually was, and it was not
+what this file said.** Half of it is not the sine bank at all:
 
-Beside it: **the generator is 12 ms and the tail 8**, which T4 left measured
-and which are the only parts of this model that were ever arithmetic-bound.
+    Source.Apply    6.4 ms     upsample 0.14, frac 0.75, cumsum 0.008,
+                               interpolate 0.70, sin 4.2, mix 0.6
+    Harmonic        8.2 ms     15601 frames of a 20-point DFT, 6.3;
+                               171611 hypot and atan2, 1.5
 
-And what is left on the phoneme side is 6 ms of the 8, none of it arithmetic:
-ALBERT's [T, 768] readback and its host-side embedding stack, the two
-readbacks T6d could not remove, and four submits. Closing any of it means
-moving the *vocoder's* input boundary — `asr` currently goes host-side into
-`GPUDecoder.Upload` — which is one change, not four, and is the thing to do
-after T7 rather than before it.
+So T7 is two kernels, not one: `kokoro_source.comp` for the sine bank and
+`kokoro_srcstft.comp` for the forward transform, which is the mirror of the
+`kokoro_istft.comp` T4c already had. One submit, one download, and the
+waveform between them never crosses the bus.
+
+### The phase question, answered
+
+T3 said this could not move: upstream integrates the phase in radians and
+multiplies by 300, so three seconds holds 1.3e5 radians where one float32 ulp
+is 0.016. The answer is that **the accumulator never had to move**. The
+cumulative sum is 260 frames by 9 harmonics and takes **8 microseconds** in
+float64 on the host — 0.06% of the stage — so it stays there, and what goes
+to the device is the integral already wrapped into [0, 1) together with its
+forward difference. The largest number any thread evaluates is one frame's
+worth of phase, at most 301, where one ulp is 3e-5 cycles rather than 0.016
+radians.
+
+**And three of the reference's stages turned out to be the identity.** The F0
+curve is upsampled 300:1, converted to cycles per sample, and decimated back
+down — and the decimation reads coordinate 300t + 149.5, so both samples it
+averages lie in F0 frame t and nearest upsampling made them equal. Half of x
+plus half of x is x. So the whole round trip is `frac(f0[t]*(d+1)/sr)` on 260
+frames instead of 702000, the 5.6 MB float64 intermediate is never formed, and
+`TestT7DecimationIsIdentity` measured the gap at exactly zero before anything
+was built on it.
+
+The result: the device waveform agrees with the float64 host to **1.6e-7 rms,
+3.5e-6 worst**, and both land at 50.7 dB against the reference dump. The
+wrapped form is float32-safe, and that is now a measurement rather than an
+argument.
+
+### The phase that is not a question but a lottery
+
+The magnitude spectrum agrees to 7.3e-6 and the phase, wherever the magnitude
+defines it, to 4.9e-6 in the complex value — float32 over twenty windowed
+terms, which is what it should be. But the *waveform* through the rest of the
+vocoder lands at **13.8 dB against the dump where the host path lands at
+18.2**, and that number took most of this stage's work to understand.
+
+It is not an error in either half. Decomposed four ways:
+
+    host src   + host transform      0.123   (18.2 dB)
+    host src   + device transform    0.110   (19.2 dB)
+    device src + host transform      0.118   (18.6 dB)
+    device src + device transform    0.203   (13.8 dB)
+    reference src + host transform   0.116   (18.7 dB)
+    reference src + device transform 0.092   (20.8 dB)
+
+Each half is fine on its own and the device transform is the *better* of the
+two given identical input — which is what one would expect, since torch.stft
+runs on the float32 tensor and the host's float64 is the outlier. Only the
+combination is bad.
+
+The reason is the one `Generator.Harmonic` already names. With the noise off
+the excitation is a **constant** wherever the signal is unvoiced — exactly
+constant, 26100 samples of it, 0 of which differ — and a constant's windowed
+spectrum is analytically zero outside the three bins a Hann window occupies.
+So 27% of this phase spectrum is the angle of a rounding residual, one
+arbitrary value per bin repeated over thousands of frames, and the network
+consumes it as an ordinary number.
+
+That makes the waveform's agreement with the dump a **draw**, and the draw was
+measured rather than assumed. Walking the unvoiced constant by five ulps under
+the device's own transform moves it over **0.097 to 0.203 — 13.8 to 20.2 dB**,
+and the value that ships is the unluckiest of the eleven. Drawing one uniform
+angle per bin instead spans 16.3 to 21.8 dB over eight seeds, with the host's
+own float64 sitting at 18.2 in the middle of it.
+
+Two null models were wrong before the right one was found, and both are worth
+recording. Perturbing every sample of the host excitation by 1e-7 makes the
+number *better* (0.109 to 0.114, tightly clustered) — because independent
+noise breaks the constancy and so defines the phase. Walking the constant
+under the *host* transform barely moves it either (0.118 to 0.130). It is the
+constant and the transform's precision together that select the ticket.
+
+**So the bound in the tests is the lottery's width and not an arithmetic
+tolerance**, and everything that is defined is bounded separately and tightly:
+the waveform at 1e-4 absolute, the magnitude at 1e-4, the phase at 1e-5 in the
+complex value. `TestGPUTail` and `TestGPUVocoder` now run their
+device-against-CPU comparison with the host excitation on both sides, because
+what they are about is the blocks and this would swamp it.
+
+**With the noise on — the configuration an utterance meant to be listened to
+uses — the question does not arise**: 2 bins of 171611 fall below 1e-6 instead
+of 47075, and the phase is defined everywhere.
+
+### The noise, and what it is not
+
+The noise is drawn on the device from a counter-based hash of (seed, sample,
+harmonic) rather than uploaded. Upstream adds a Gaussian to every one of the
+nine sinusoids, so an utterance needs 702000 draws — 7 ms of Go's
+`NormFloat64`, which is half of what this whole stage cost *before* it moved,
+and 2.8 MB across the bus.
+
+What that costs is the sequence: **`-noise n` does not give sample-identical
+audio on the two paths.** It gives the same distribution, the same rule — loud
+where the signal is unvoiced and quiet where it is not — and the same audio
+for the same seed on the same path. `TestGPUSourceNoise` checks it by that
+rule, since the rule is the only thing about it that is defined.
+
+### The arena is HOST_CACHED
+
+The spectrogram is 1.4 MB and comes back every utterance. kokoro's other
+arenas use the write-combined type `NewBuffer` prefers, which this host reads
+at **0.18 GB/s** — 7.7 ms for this download, which would have been the entire
+stage. `vk.NewHostCachedBuffer` reads at 25 and the readback becomes 74
+microseconds. It is the first place in kokoro where that distinction has
+mattered; the other readbacks are small enough not to care.
+
+## What is left after T7
+
+**The generator is 12 ms and the tail 8**, which T4 left measured and which are
+the only parts of this model that were ever arithmetic-bound. Together they
+are now 65% of an utterance.
+
+**The phoneme side's 8 ms, none of it arithmetic** — ALBERT's [T, 768]
+readback and its host-side embedding stack, the two readbacks T6d could not
+remove, and four submits. Closing any of it means moving the *vocoder's* input
+boundary, which is one change rather than four.
+
+**The excitation's remaining 0.2 ms is 88% submit and download**, not
+arithmetic: 23 microseconds of GPU against 155 of submit and 70 of readback.
+The way to close it is to stop reading the spectrogram back at all — the two
+noise convolutions that consume it are host-side, and moving them onto the
+device would leave nothing of this stage on the bus.
 
 ## T8 — voice blending, done
 
@@ -691,3 +809,149 @@ which is a different alignment and not a mix of two waveforms. The path from a
 style vector to samples is unchanged and already measured against the
 reference at 18.2 dB, so what T8 had to check was the vector — and it is
 checked against upstream exactly, at every length.
+
+## T9 — one staging for the life of the server, done
+
+`POST /v1/audio/speech` answered in **3.285 s** for 3.35 s of audio. The model
+had been on the device since T4 and the utterance itself was 48 ms; the
+endpoint was not running it. `-tts-gpu` defaulted **off**, and the reason it
+defaulted off was this file's own note: the device path "stages per request".
+
+It does not any more. The same request is **31 ms**, and the audio is byte for
+byte what the old path produced.
+
+    POST /v1/audio/speech, af_heart, three runs each
+
+    utterance            audio     CPU     T4-T8    T9      device
+    "Hello there, ..."    3.35 s   3.285   0.302   0.031    0.025
+    "A guy is driving     6.45 s   5.430   0.550   0.059    0.048
+     around the
+     backwoods ..."
+
+**The 550 ms was not the model.** It decomposes exactly, and only the last
+row of it was ever arithmetic:
+
+    host prosody, to learn the frame count   411 ms
+    AttachGPU, sized by that count            88 ms
+    the whole utterance on the device         48 ms
+                                             547 ms, and the endpoint measured 550
+
+Kokoro's arenas were sized for one utterance's alignment frames. The
+*durations* decide that count, so the phoneme side had to run on the **host**
+— 411 ms of ALBERT and six recurrences, the very work T6 moved — before the
+device could be built to run the same phoneme side in 13. Then the arenas were
+torn down again, because the next request would be a different length. Every
+request paid 499 ms of protocol to save 502 ms of arithmetic.
+
+**The frame count is now a ceiling.** `Model.AttachGPU` stages for
+`-tts-frames` (1000 frames, 25 s of speech, by default), every shorter
+utterance is a prefix of the same arenas, and what a request costs is
+`Vocoder.SetFrames` — a walk down the chain AttachGPU already walks, writing a
+frame count into a push constant. The server stages once at startup and the
+host prosody pass is gone entirely: `prosodyGPU` computes the durations on the
+device and nothing needs them earlier.
+
+**A ceiling costs memory and nothing else.** The arenas are ~150 MB plus
+0.7 MB a frame — 240 MB at 130 frames, 848 MB at 1000, 3.0 GB at 4000 — and
+staging is 87 ms at the bottom of that range and 230 ms at the top. Per
+utterance the ceiling is free, because every dispatch extent is the
+utterance's: the Montana sentence is **48 ms staged for its own 258 frames and
+48 ms staged for 1000** (`go run ./cmd/tts -gpu -frames 1000`).
+
+### Padding to the bucket would have been wrong
+
+The note this stage was written from proposed sizing "for a frame count above
+the utterance's and zero-pad the alignment up to it, trimming the tail by
+`Prosody.Samples`". That is the obvious way to do it and it would have
+produced a wrong utterance, quietly.
+
+**AdaIN normalises over time.** Every one of the ~40 blocks between the
+durations and the waveform subtracts a per-channel mean and divides by a
+per-channel standard deviation taken over *the whole alignment* — that is what
+`kokoro_stats.comp` is and why it exists. Pad 130 frames of speech out to 1000
+frames of silence and every statistic in the model moves, so every sample
+changes, including the ones inside the utterance. The trimmed output would
+have been a plausible waveform of the right length that was not the utterance
+anybody asked for — and no length check or shape assertion would have caught
+it.
+
+So the frame count is a *runtime* quantity rather than padding: `run` beside
+`frames` in `GPUBlocks`, `GPUDecoder` and `GPUProsody`, and every dispatch
+extent, reduction bound and readback length taken from it. The reductions were
+already clamped (`min(t0 + aux0, pc.tokens)`), which is why this was a change
+of arithmetic in the *host* and of nothing in the shaders.
+
+### The one thing bucketing can break
+
+A shorter utterance leaves the rows past its end holding a longer one's
+activations, and **kokoro's convolutions are branchless because their padding
+is in the data**: a k-tap filter at dilation d reads (k-1)d/2 rows either side
+of its output and those rows are a zero border rather than a bounds check
+(`convBorder`, 32 rows, which covers k=11 at d=5). The border at the start of
+an arena is written once at staging. The border at the *end* moves with the
+utterance.
+
+Restoring it is 8 KB a block from the host, in `zeroBorders` and
+`GPUBlocks.zeroBorder`, and it is the whole of what a shorter utterance costs.
+Getting it right took two corrections, both off-by-one and both found by the
+same test:
+
+  - **The upsampler's zero row is T_in, not T_in+1.** Its GEMM runs T_in+1
+    rows because the last output row reads input rows T_in-1 and T_in, while
+    the rectifier that fills the arena writes only T_in of them. Row T_in is
+    padding that had always been zero because nothing ever wrote it. Getting
+    this wrong moved the *whole* waveform by 2.5% relative, not the five
+    frames at the seam — because five wrong frames enter an AdaIN and the
+    statistics carry them across every other frame. A 4% error at the first
+    sample of an utterance whose seam is 2600 frames away is what a
+    time-normalised model does with a local mistake.
+  - **The text encoder's border was already wrong, and had been since T6d.**
+    Its arena is sized by the position embedding's 512 tokens rather than by
+    the utterance — it is the one thing in this package that was bucketed
+    before T9 — and its convolutions are five taps wide, so they read two rows
+    past the last token. Nothing could observe it: no attachment had ever
+    survived two utterances. The first thing bucketing does is make one
+    survive several, and the second utterance of a pair came out wrong.
+
+### The bound is equality
+
+`TestGPUBucketedFrames` and `TestGPUBucketedSpeak` do not compare against a
+tolerance. Two attachments of different sizes issue **the same dispatches with
+the same push constants over the same weights**; all that differs is where the
+arenas sit. Anything that reads past the live rows is a wrong number and not a
+rounding error, so the test requires the waveforms to agree **sample for
+sample**, and it runs the utterances in the order a server sees them — short,
+long, short — so that the short one runs against arenas full of somebody
+else's activations. The 550-to-59 ms result above is the same claim from the
+outside: the redeployed endpoint's bytes `cmp` clean against the old path's.
+
+### And the voice is not baked in either
+
+`AttachGPU` conditions every AdaIN on a style vector, which is why the server
+used to restage when the voice changed. It does not need to: `Model.SetVoice`
+rewrites gamma and beta in the arenas that are already there, which is two
+projections of one vector per block on the host. `TestGPUSetVoice` holds it to
+the same bound — an utterance in a re-conditioned voice is the one a fresh
+attachment in that voice gives, sample for sample.
+
+The style row is indexed by the **phoneme count** as well as by the voice (see
+`Model.Style`), so it changes with the length of the utterance and not only
+with the name in the request; `backend.TTS.attach` compares the vectors rather
+than the names, and re-conditions when either moves.
+
+### What is left
+
+**An utterance past the ceiling restages once and keeps the larger arenas.**
+`kokoro.FramesOverflowError` carries the frame count the durations came to, so
+`backend.TTS.synthesize` rounds it up to the next 256 frames, restages, and
+runs — 1665 frames became arenas for 1792 in 151 ms, and the next request of
+that length found them already there. It is a rare path: the voice packs have
+**510 style rows**, so 510 phonemes is the model's own ceiling on an utterance
+and only `speed < 1` stretches one past 1000 frames.
+
+**What did not change is the 25 ms.** The endpoint is now the model plus
+~5 ms, and the model is where T4 and T6 left it — the generator at 12 ms, the
+tail at 8, the phoneme side at 8 with 1.96 ms of GPU inside it. The next
+millisecond on this vertical is still the one "What is left after T7" names:
+the noise convolutions are on the host, so the excitation's spectrogram
+crosses the bus for no other reason.

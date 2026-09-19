@@ -316,11 +316,27 @@ func TestGPUVocoder(t *testing.T) {
 		t.Fatal(err)
 	}
 	t0 = time.Now()
-	got, tr, err := model.Vocoder.Apply(asr, f0, energy, decStyle)
+	_, _, err = model.Vocoder.Apply(asr, f0, energy, decStyle)
 	if err != nil {
 		t.Fatal(err)
 	}
 	gpu := time.Since(t0)
+
+	// The comparison below runs with the *host's* excitation on both sides.
+	// T7 put the excitation on the device too, and it is the one part of this
+	// model whose value is ill-conditioned: with the noise off, 27% of its
+	// phase spectrum is analytically zero and the angle there is whatever the
+	// rounding says, so walking the unvoiced constant by five ulps moves the
+	// waveform's agreement with the dump over 13.8 to 20.2 dB. That is a
+	// lottery, it is measured in TestGPUSourceWaveform, and it would swamp
+	// the thing this test is about -- which is the blocks.
+	src := model.Vocoder.Generator.SrcGPU
+	model.Vocoder.Generator.SrcGPU = nil
+	got, tr, err := model.Vocoder.Apply(asr, f0, energy, decStyle)
+	model.Vocoder.Generator.SrcGPU = src
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Against the CPU path's own stages, not against the reference dump: the
 	// dump's `gen_up_*` are 4% and 2% away from *both* paths because the

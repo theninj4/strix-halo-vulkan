@@ -551,17 +551,148 @@ func TestHCGPUGemvAgrees(t *testing.T) {
 	}
 }
 
-// TestHCGPUGemvRefusesABatch is the control for the one thing the decode
-// rungs cannot do. The GEMV writes a single output row and reads a single
-// activation row: there is no M in it at all, so a two-token run through it
-// would not be slow, it would silently drop a token. The plan has to refuse.
+// TestHCGPUGemvTwoRows is P5b's gate on this block: the decode down rungs
+// carrying two rows of A compute what the GEMM computes, in all three of the
+// epilogue's outputs.
+//
+// The block is the one whose epilogue is not a plain row store — the gate's
+// branch is narrowed into fp16 at `ldaLo` and `inject`'s tile is written f32
+// at its own stride — so what this adds over the DeltaNet's and the attention
+// layer's two-row tests is that the *second row* of each lands where the
+// combine reads it. A kernel that wrote both rows at row 0's offset would
+// pass a comparison of row 0 and fail this one.
+func TestHCGPUGemvTwoRows(t *testing.T) {
+	const rows = 2
+	if rows > GEMVMaxRows {
+		t.Skipf("GEMVMaxRows is %d", GEMVMaxRows)
+	}
+	g, _, nTok := gpuFixture(t, 0, "attn")
+	if nTok < rows {
+		t.Skipf("the fixture is %d tokens", nTok)
+	}
+	m, tr := fixtures(t)
+	in := mixerInput(t, m, tr, 0, "attn")
+	if err := g.Upload(in[:rows*g.cfg.Wide()], rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetPlan(HCDownM1, HCUpM1); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(0, false); err != nil {
+		t.Fatal(err)
+	}
+	baseLo, baseInject, baseMixed := append([]float32(nil), g.Lo()...),
+		append([]float32(nil), g.Inject()...), append([]float32(nil), g.Mixed()...)
+
+	// **The control that matters, and the one a weaker test misses.**
+	// Comparing the GEMV's second row against the GEMM's passes trivially
+	// when the GEMV does not write it at all: the arena still holds what the
+	// GEMM put there. So the second token is *changed* and the second output
+	// row has to move. (This caught a real one — the `.spv` are generated and
+	// gitignored, so a kernel edit that is not followed by `go generate`
+	// leaves the old module embedded and every row-against-row comparison
+	// passes on stale bytes.)
+	moved := func(down HCKernel) {
+		t.Helper()
+		row1 := func(second int) []float32 {
+			buf := make([]float32, 2*g.cfg.Wide())
+			copy(buf, in[:g.cfg.Wide()])
+			copy(buf[g.cfg.Wide():], in[second*g.cfg.Wide():(second+1)*g.cfg.Wide()])
+			if err := g.Upload(buf, rows); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.SetPlan(down, HCUpM1); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Run(0, false); err != nil {
+				t.Fatal(err)
+			}
+			inj := g.Inject()
+			return append([]float32(nil), inj[len(inj)/rows:]...)
+		}
+		a, b := row1(1), row1(2)
+		same := true
+		for i := range a {
+			if a[i] != b[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			t.Errorf("%s: the second output row did not move when the second token did — "+
+				"the rung is not writing row 1", down)
+		}
+	}
+
+	for _, down := range GemvKernels() {
+		moved(down)
+		// Back to the pair the comparison below is against.
+		if err := g.Upload(in[:rows*g.cfg.Wide()], rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetPlan(down, HCUpM1); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0, false); err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name   string
+			got    []float32
+			want   []float32
+			maxAbs float64
+		}{
+			{"lo", g.Lo(), baseLo, 1e-2},
+			{"inject", g.Inject(), baseInject, 1e-3},
+			{"mixed", g.Mixed(), baseMixed, 1e-3},
+		} {
+			// Whole tensor, then the second row alone — half the values, and
+			// the half a row-blind kernel would get wrong.
+			for _, half := range []struct {
+				what string
+				got  []float32
+				want []float32
+			}{
+				{"both rows", tc.got, tc.want},
+				{"row 1", tc.got[len(tc.got)/rows:], tc.want[len(tc.want)/rows:]},
+			} {
+				r, err := compare(half.got, half.want)
+				if err != nil {
+					t.Fatalf("%s %s %s: %v", down, tc.name, half.what, err)
+				}
+				t.Logf("%-14s %-7s %-9s %v", down, tc.name, half.what, r)
+				if r.maxAbs > tc.maxAbs {
+					t.Errorf("%s %s (%s) disagrees with down_m1 at %d rows: maxAbs %.3e over %.1e",
+						down, tc.name, half.what, rows, r.maxAbs, tc.maxAbs)
+				}
+			}
+		}
+	}
+}
+
+// TestHCGPUGemvRefusesABatch is D15's refusal, at the bound P5b moved it to.
+//
+// The rung is no longer "one token": it carries up to `GEMVMaxRows` rows of
+// A, because a verification pass is two rows and a dot product extends to
+// them for the price of the second row's operand. What has not changed is
+// that the bound is *enforced* — a batch past it would read one row and
+// silently drop the rest, which is exactly what D15 exists to prevent.
 func TestHCGPUGemvRefusesABatch(t *testing.T) {
 	g, _, nTok := gpuFixture(t, 0, "attn")
-	if nTok < 2 {
-		t.Skip("the fixture is one token")
+	if nTok <= GEMVMaxRows {
+		t.Skipf("the fixture is %d tokens and the rung carries %d", nTok, GEMVMaxRows)
 	}
 	if err := g.SetPlan(HCDownGemv160, HCUpM1); err == nil {
-		t.Fatalf("SetPlan took the decode rung for a %d-token run", nTok)
+		t.Fatalf("SetPlan took the decode rung for a %d-token run, past the %d it carries",
+			nTok, GEMVMaxRows)
+	}
+	// And it is taken at the bound, which is the half of the assertion P5b
+	// adds: a refusal that refused everything would pass the line above.
+	if err := g.Resize(GEMVMaxRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetPlan(HCDownGemv160, HCUpM1); err != nil {
+		t.Fatalf("SetPlan refused the decode rung at %d rows, which is the bound: %v", GEMVMaxRows, err)
 	}
 }
 
@@ -942,4 +1073,27 @@ func TestHCGPUQ4BankSize(t *testing.T) {
 	if ratio := float64(half) / float64(q4); ratio < 3.4 || ratio > 3.6 {
 		t.Fatalf("a token reads %.3fx less than on halves, want ~3.5", ratio)
 	}
+}
+
+// rowMoved is P5b's real control for an R-row kernel, and it is the one a
+// comparison against the GEMM does not provide.
+//
+// Comparing the GEMV's second output row against the GEMM's passes trivially
+// when the GEMV never writes that row: the arena still holds what the GEMM
+// put there on the reference pass. So the *input* row is changed and the
+// output row has to move. It caught a real one — the `.spv` in this repo are
+// generated and gitignored, so a kernel edit not followed by `go generate`
+// leaves the previous module embedded, and every row-against-row comparison
+// then passes on stale bytes while the measurements read as a free speed-up.
+func rowMoved(t *testing.T, what string, a, b []float32) {
+	t.Helper()
+	if len(a) != len(b) {
+		t.Fatalf("%s: %d values against %d", what, len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return
+		}
+	}
+	t.Errorf("%s: the output row did not move when its token did — the rung is not writing it", what)
 }

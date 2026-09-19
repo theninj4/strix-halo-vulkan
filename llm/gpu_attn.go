@@ -562,7 +562,7 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// of the two projections is the fused one, so 40 x 13952 x 4 = 2.2 MB —
 	// allocated whichever rung runs, because the arena plan is fixed at
 	// construction and the rung is not.
-	g.aPart = alloc(gemvMaxSlabs * g.qkvN())
+	g.aPart = alloc(GEMVMaxRows * gemvMaxSlabs * g.qkvN())
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -708,10 +708,15 @@ func (g *AttnGPU) build() error {
 	// are built whatever the bank is, because the reduce reads neither and
 	// the fp16 partials arm is what a block on the fp16 bank runs.
 	for name, spirv := range gemvSPIRV {
-		if err := g.pipeline(name, spirv, vk.PipelineSpec{
-			Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: attnWave,
-		}); err != nil {
-			return err
+		// One module, one pipeline per row count (P5b), as the gated
+		// DeltaNet's build says.
+		for rows := 1; rows <= GEMVMaxRows; rows++ {
+			if err := g.pipeline(gemvRowName(name, rows), spirv, vk.PipelineSpec{
+				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: attnWave,
+				SpecConstants: gemvSpec(rows),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -960,8 +965,9 @@ func (g *AttnGPU) SetGemv(qkv, out GEMVKernel) error {
 				t.k, t.gemmK, t.what)
 		}
 	}
-	if (qkv != GEMVOff || out != GEMVOff) && g.rows != 1 {
-		return fmt.Errorf("llm: the GEMV rungs read one token's row; this batch is %d", g.rows)
+	if (qkv != GEMVOff || out != GEMVOff) && (g.rows < 1 || g.rows > GEMVMaxRows) {
+		return fmt.Errorf("llm: the GEMV rungs carry at most %d rows of A (P5b); this batch is %d",
+			GEMVMaxRows, g.rows)
 	}
 	g.qkvGemv, g.outGemv = qkv, out
 	g.autoPlan = false
@@ -982,11 +988,11 @@ func (g *AttnGPU) PinGemv(on bool) {
 	}
 }
 
-// AttnGemvFor is the decode plan: llm_gemv.comp at one token and the GEMM at
-// every other length, where its A operand is a full fragment and its grid is
-// no longer `gemmN/64` workgroups for one row.
+// AttnGemvFor is the decode plan: llm_gemv.comp at **up to GEMVMaxRows
+// tokens** and the GEMM at every other length. See DNGemvFor for why the
+// bound moved from one to two at P5b.
 func AttnGemvFor(tokens int) (GEMVKernel, GEMVKernel) {
-	if tokens != 1 || !DecodeGEMV() {
+	if tokens < 1 || tokens > GEMVMaxRows || !DecodeGEMV() {
 		return GEMVOff, GEMVOff
 	}
 	return attnQKVGemv, attnOutGemv
@@ -1100,9 +1106,10 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// from a sixteen-row fragment of which fifteen rows are padding
 		// (L8e-1). The partials ride `resOff`, which this block does not use.
 		qkv.ResOff = g.aPart
-		add(gemvBankPipe(g.qkvGemv, g.bank), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
+		add(gemvBankPipeRows(g.qkvGemv, g.bank, g.rows), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
 		if ks > 1 {
-			add(gemvSumPipe(g.qkvGemv), "qkv.sum", uint32(roundUpInt(g.qkvN(), attnWave)/attnWave), 1, qkv)
+			add(gemvSumPipeRows(g.qkvGemv, g.rows), "qkv.sum",
+				uint32(roundUpInt(g.qkvN(), attnWave)/attnWave), uint32(g.rows), qkv)
 		}
 	} else {
 		add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
@@ -1146,9 +1153,10 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 	if ks := gemvSlabs(g.outGemv); ks > 0 {
 		out.ResOff = g.aPart
-		add(gemvBankPipe(g.outGemv, g.bank), "out", uint32(ks), uint32(c.NEmbd/coopMatTile), out)
+		add(gemvBankPipeRows(g.outGemv, g.bank, g.rows), "out", uint32(ks), uint32(c.NEmbd/coopMatTile), out)
 		if ks > 1 {
-			add(gemvSumPipe(g.outGemv), "out.sum", uint32(roundUpInt(c.NEmbd, attnWave)/attnWave), 1, out)
+			add(gemvSumPipeRows(g.outGemv, g.rows), "out.sum",
+				uint32(roundUpInt(c.NEmbd, attnWave)/attnWave), uint32(g.rows), out)
 		}
 	} else {
 		add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)

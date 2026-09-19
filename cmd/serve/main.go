@@ -14,7 +14,7 @@
 //	go run ./cmd/serve -image                       # z-image-turbo, 25 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -image -preview              # and stream in-progress frames
-//	go run ./cmd/serve -tts -gpu=false              # the CPU reference
+//	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //
 // Every endpoint answers today except POST /v1/images/edits, which needs the
 // VAE's encoder and not a flag (see api.Server.handleImageEdit).
@@ -47,9 +47,11 @@
 // nothing in `vk` is externally synchronised -- the server is concurrent at
 // the HTTP layer and serial at the GPU, which is also the only way these
 // models make sense on a part with one 236 GB/s bus. And **-tts-gpu stages
-// per request**: kokoro's arenas are sized for one utterance's frame count,
-// so the device path pays a staging pass every time and is off by default
-// until that is measured (see backend.TTS.synthesize).
+// once**: kokoro's arenas are sized for a ceiling -- -tts-frames, 25 s of
+// speech by default -- and every shorter utterance is a prefix of them, so a
+// request costs the model and not the staging. It was the other way round
+// until T9, which is why the flag used to default off; see
+// backend.TTS.synthesize.
 package main
 
 import (
@@ -62,6 +64,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -94,7 +97,9 @@ func main() {
 
 	tts := flag.Bool("tts", false, "load Kokoro-82M and serve /v1/audio/speech")
 	ttsModel := flag.String("tts-model", "models/Kokoro-82M", "converted kokoro checkpoint directory")
-	ttsGPU := flag.Bool("tts-gpu", false, "run kokoro on the device; it stages per utterance, see the package comment")
+	ttsGPU := flag.Bool("tts-gpu", true, "run kokoro on the device")
+	ttsFrames := flag.Int("tts-frames", 0,
+		"longest utterance the kokoro arenas are staged for, in 25 ms frames; 0 takes the backend's default")
 	lexicon := flag.String("lexicon", "models/misaki", "misaki lexicon directory; empty takes phonemes only")
 	espeak := flag.Bool("espeak", true, "use espeak-ng for words outside the lexicon")
 	british := flag.Bool("british", false, "use the en-GB lexicon and fallback")
@@ -163,6 +168,24 @@ func main() {
 			}
 		}
 		log.Printf("llm: moe bank %s", llm.MoEBankPlanFromEnv())
+		// **P4c/D21 needs one more thing than a plan.** `down_exps=iq4_nl`
+		// re-fits 40 billion weights through a sixteen-scale search, which is
+		// about eight minutes of this machine — fine for a measurement run
+		// and not for a server that otherwise stages in 34 seconds. The
+		// transcode is a pure function of (tensor, format, arm), so the
+		// server keeps it beside the checkpoint and pays it once ever.
+		// `LLM_BANK_CACHE=` (empty) turns it off; `cmd/llm` never sets it.
+		if _, named := os.LookupEnv("LLM_BANK_CACHE"); !named {
+			dir := *llmModel
+			if st, err := os.Stat(dir); err == nil && !st.IsDir() {
+				dir = filepath.Dir(dir)
+			}
+			cache := filepath.Join(dir, "bank-cache")
+			if err := os.Setenv("LLM_BANK_CACHE", cache); err != nil {
+				log.Fatalf("setting the bank cache: %v", err)
+			}
+			log.Printf("llm: bank cache %s (first start writes it; delete it to re-fit)", cache)
+		}
 	}
 
 	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies}
@@ -189,7 +212,7 @@ func main() {
 		}
 		b, err := backend.NewTTS(backend.TTSOptions{
 			Model: *ttsModel, Lexicon: *lexicon, Espeak: *espeak, British: *british,
-			Voice: *voice, Device: ttsDev, Noise: *noise,
+			Voice: *voice, Device: ttsDev, Noise: *noise, MaxFrames: *ttsFrames,
 		})
 		if err != nil {
 			log.Fatal(err)

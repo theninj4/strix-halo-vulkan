@@ -75,6 +75,15 @@ func NewSTFT(nFFT, hop int, window []float64, center bool) (*STFT, error) {
 // Bins is the number of non-redundant frequency bins, n_fft/2 + 1.
 func (s *STFT) Bins() int { return s.NFFT/2 + 1 }
 
+// Window is the zero-padded analysis window. It is returned so that a device
+// port can window a frame with the same numbers rather than reconstructing
+// the centring rule NewSTFT applied.
+func (s *STFT) Window() []float64 {
+	out := make([]float64, len(s.window))
+	copy(out, s.window)
+	return out
+}
+
 // Frames is how many frames a signal of n samples produces.
 func (s *STFT) Frames(n int) int {
 	if s.Center {

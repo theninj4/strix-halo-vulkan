@@ -305,10 +305,17 @@ func PlanFor(tokens int, q8 bool) (HCKernel, HCKernel) { return PlanForBank(toke
 // the 32 MiB MALL there, so only the unpack's ALU is left and this one has
 // more of it. Whether that survives into the graph is a different question
 // and `-graph` answers it.
+// **P5b raises the decode rung's bound from one token to GEMVMaxRows.** The
+// down projection is the block's whole M = 2 problem — measured, 16.5 us a
+// mixer at one token and **234.4 at two**, 14.3x on identical weight bytes,
+// because a [10240, 320] matrix at `BM = 1` is a grid of five workgroups
+// (D11) — and the GEMV carries a second row for the price of its A. `up` is
+// left alone: it is 21.2 us at one token and 28.1 at two, which is the row
+// block doing its job.
 func PlanForBank(tokens int, b DenseBank) (HCKernel, HCKernel) {
 	if _, ok := qkBank(b); ok {
 		switch {
-		case tokens == 1:
+		case tokens >= 1 && tokens <= GEMVMaxRows:
 			return hcQ4DecodePlan()
 		case tokens <= 64:
 			return HCDownM1, HCUpM4
@@ -323,7 +330,7 @@ func PlanForBank(tokens int, b DenseBank) (HCKernel, HCKernel) {
 	q8 := b == BankQ8
 	if !q8 {
 		switch {
-		case tokens == 1:
+		case tokens >= 1 && tokens <= GEMVMaxRows:
 			return HCDownGemv160, HCUpM2
 		case tokens <= 384:
 			return HCDownM1, HCUpM2
@@ -336,7 +343,7 @@ func PlanForBank(tokens int, b DenseBank) (HCKernel, HCKernel) {
 		}
 	}
 	switch {
-	case tokens == 1:
+	case tokens >= 1 && tokens <= GEMVMaxRows:
 		// Decode. The GEMM rung's grid is seven workgroups here whatever its
 		// BM; the GEMV's is 3360, and 32 is the split whose slab stride
 		// misses §5.1b's 4 KB rotation now that a slab is bytes (L8b-2).
@@ -641,7 +648,7 @@ func (g *HCGPU) alloc(nMixers int) error {
 	// tensor in this block that exists because of a grid rather than a
 	// formula. It is allocated whatever the run length, because which rung a
 	// graph names is decided per run and the arena is not.
-	g.aPart = alloc(hcMaxSlabs * g.gemmN())
+	g.aPart = alloc(GEMVMaxRows * hcMaxSlabs * g.gemmN())
 	g.aGate = noW
 	if g.gate {
 		g.aGate = alloc(rows * c.Wide())
@@ -751,10 +758,14 @@ func (g *HCGPU) build() error {
 				return fmt.Errorf("llm: gemv rung %q wants %d slabs, the scratch holds %d",
 					v.name, v.slabs, hcMaxSlabs)
 			}
-			if err := g.pipeline(string(v.name)+"_reduce", v.reduce, vk.PipelineSpec{
-				Buffers: bufs, PushConstantSize: pcSize,
-			}); err != nil {
-				return err
+			// One module, one pipeline per row count (P5b): `ROWS` is a
+			// specialization constant in llm_hc_gemv.comp.
+			for rows := 1; rows <= GEMVMaxRows; rows++ {
+				if err := g.pipeline(gemvRowName(string(v.name)+"_reduce", rows), v.reduce, vk.PipelineSpec{
+					Buffers: bufs, PushConstantSize: pcSize, SpecConstants: gemvSpec(rows),
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		spirv, pipeBufs := v.spirv, bufs
@@ -765,10 +776,17 @@ func (g *HCGPU) build() error {
 			// raw words — so only the SPIR-V differs (llm_common.glsl).
 			spirv, pipeBufs = v.spirvFor(g.dbank), q8bufs
 		}
-		if err := g.pipeline(string(v.name), spirv, vk.PipelineSpec{
-			Buffers: pipeBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
-		}); err != nil {
-			return err
+		rowsMax := 1
+		if v.mode == 2 {
+			rowsMax = GEMVMaxRows
+		}
+		for rows := 1; rows <= rowsMax; rows++ {
+			if err := g.pipeline(gemvRowName(string(v.name), rows), spirv, vk.PipelineSpec{
+				Buffers: pipeBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+				SpecConstants: gemvSpec(rows),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1046,8 +1064,9 @@ func (g *HCGPU) SetPlan(down, up HCKernel) error {
 	if !ok || (dv.mode != 0 && dv.mode != 2) {
 		return fmt.Errorf("llm: %q is not a down-projection kernel (have %v)", down, DownKernelsAt(g.rows))
 	}
-	if dv.mode == 2 && g.rows != 1 {
-		return fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", down, g.rows)
+	if dv.mode == 2 && (g.rows < 1 || g.rows > GEMVMaxRows) {
+		return fmt.Errorf("llm: %q carries at most %d rows (P5b) and this run is %d tokens",
+			down, GEMVMaxRows, g.rows)
 	}
 	uv, ok := hcVariantFor(up)
 	if !ok || uv.mode != 1 {
@@ -1189,15 +1208,20 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 	down.BOff = m.down
 	down.GemmN, down.GemmK = uint32(g.gemmN()), uint32(c.Wide())
 	if dv.mode == 2 {
-		if g.rows != 1 {
-			return nil, nil, fmt.Errorf("llm: %q is the decode rung and this run is %d tokens", g.down, g.rows)
+		// P5b raised the bound from one row to GEMVMaxRows: the rung is still
+		// a decode rung, but a verification pass is two rows and a dot
+		// product extends to them for the price of the second row's A.
+		if g.rows < 1 || g.rows > GEMVMaxRows {
+			return nil, nil, fmt.Errorf("llm: %q carries at most %d rows and this run is %d tokens",
+				g.down, GEMVMaxRows, g.rows)
 		}
 		// `gammaOff` carries the partial sums: the GEMV reads no norm, and
 		// the block is out of push fields (llm_common.glsl).
 		down.GammaOff = g.aPart
-		down.GemmM = 1
-		add(string(g.down), "down", uint32(dv.slabs), uint32(g.gemmN()/coopMatTile), down)
-		add(string(g.down)+"_reduce", "down_reduce", uint32(roundUpInt(g.gemmN(), 64)/64), 1, down)
+		down.GemmM = uint32(g.rows)
+		add(gemvRowName(string(g.down), g.rows), "down", uint32(dv.slabs), uint32(g.gemmN()/coopMatTile), down)
+		add(gemvRowName(string(g.down)+"_reduce", g.rows), "down_reduce",
+			uint32(roundUpInt(g.gemmN(), 64)/64), uint32(g.rows), down)
 	} else {
 		down.GemmM = uint32(roundUpInt(g.rows, dv.bm))
 		add(string(g.down), "down", uint32(g.gemmN()/dv.bn), uint32(roundUpInt(g.rows, dv.bm)/dv.bm), down)

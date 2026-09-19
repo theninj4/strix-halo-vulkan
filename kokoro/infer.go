@@ -186,6 +186,7 @@ func (m *Model) Synthesize(ids []int, decStyle, predStyle []float32, speed float
 // the only configuration in which two runs agree. On is what an utterance
 // meant to be listened to wants: see HarmonicSource.
 func (m *Model) SetExcitationNoise(seed int64) {
+	m.Vocoder.Generator.Source.Seed = seed
 	m.Vocoder.Generator.Source.Noise = rand.New(rand.NewSource(seed))
 }
 

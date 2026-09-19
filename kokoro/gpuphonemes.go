@@ -546,7 +546,7 @@ func (g *GPUPhonemes) Encode(dEn *Mat, emb *Mat) (*Mat, error) {
 		return nil, fmt.Errorf("kokoro: the embedding gives %d channels, want %d",
 			emb.Cols, g.te.Channels)
 	}
-	g.tokens = dEn.Rows
+	g.setTokens(dEn.Rows)
 	g.abuf.WriteFloat32At(int(g.aDEn), dEn.Data)
 	g.abuf.WriteFloat32At(int(g.aTE), emb.Data)
 
@@ -563,6 +563,24 @@ func (g *GPUPhonemes) Encode(dEn *Mat, emb *Mat) (*Mat, error) {
 	}
 
 	return g.read(g.durLST), nil
+}
+
+// setTokens fixes the token count for an utterance and restores the zero
+// padding past it.
+//
+// The text encoder's arena has always been sized for the *longest* utterance
+// the position embedding allows rather than for this one — it is the one
+// thing in this package that was bucketed before T9 — and its convolutions
+// are five taps wide, so they read two rows past the last token. Those rows
+// are zero for the life of a fresh object and hold the previous utterance's
+// tokens after a longer one has run: before T9 no attachment survived two
+// utterances, so nothing could observe it.
+func (g *GPUPhonemes) setTokens(tokens int) {
+	if tokens == g.tokens {
+		return
+	}
+	g.tokens = tokens
+	g.hbuf.WriteUint16At(int(g.hTE)+tokens*g.ldTE, make([]uint16, convBorder*g.ldTE))
 }
 
 // read pulls one recurrence's output back, [T, 2H].
@@ -601,11 +619,13 @@ func (g *GPUPhonemes) Prosody(durations []int) (f0, energy []float32, err error)
 			idx = append(idx, float32(t))
 		}
 	}
-	// The stacks' arenas were sized for exactly this frame count, the way
-	// everything downstream of the length regulator in this package is.
-	if len(idx) != g.frames {
-		return nil, nil, fmt.Errorf("kokoro: the durations sum to %d frames, staged for %d",
-			len(idx), g.frames)
+	// The arenas are sized for a ceiling and the utterance is a prefix of
+	// them, so the durations have only to fit (SPEECH.md T9).
+	if len(idx) > g.frames {
+		return nil, nil, &FramesOverflowError{Frames: len(idx), Staged: g.frames}
+	}
+	if err := g.stacks.SetFrames(len(idx)); err != nil {
+		return nil, nil, err
 	}
 	g.abuf.WriteFloat32At(int(g.aIdx), idx)
 
@@ -625,9 +645,22 @@ func (g *GPUPhonemes) Prosody(durations []int) (f0, energy []float32, err error)
 		g.abuf.ReadFloat32At(int(g.stacks.aOut[1]), n), nil
 }
 
+// FramesOverflowError is an utterance longer than the attachment was staged
+// for. It carries the frame count the durations came to, which is the only
+// thing a caller needs to restage and try again — and the reason this is a
+// type rather than a string.
+type FramesOverflowError struct {
+	Frames int // what the durations summed to
+	Staged int // the ceiling the arenas were built for
+}
+
+func (e *FramesOverflowError) Error() string {
+	return fmt.Sprintf("kokoro: the durations sum to %d frames, staged for %d", e.Frames, e.Staged)
+}
+
 // Profile times every dispatch of the phoneme side, by family.
 func (g *GPUPhonemes) Profile(tokens, frames int) ([]Stage, error) {
-	g.tokens = tokens
+	g.setTokens(tokens)
 	var dis []vk.MultiDispatch
 	var kinds []string
 	for _, f := range []func() ([]vk.MultiDispatch, []string, error){

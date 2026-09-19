@@ -1,0 +1,142 @@
+#version 450
+
+// The neural source filter's excitation, one thread per output *sample*
+// (SPEECH.md T7).
+//
+// This is the kernel T3 said could not exist. Upstream integrates the
+// excitation's phase in radians and then multiplies by 300, so three seconds
+// holds 1.3e5 radians where one float32 ulp is 0.016 — but that is a property
+// of upstream's *ordering*, not of the quantity. What the host reference
+// already does, and what this reproduces, is to keep the phase in **cycles**
+// and hand the device a phase that has been wrapped into [0, 1) at the
+// alignment rate. Nothing evaluated here is ever larger than one frame's
+// worth of phase, which is what makes float32 enough.
+//
+// Three stages of the reference collapse into the table this reads. The F0
+// curve is upsampled 300:1, converted to cycles per sample, and decimated
+// back down by the same factor — and that round trip is the *identity*,
+// because the decimation reads coordinate 300t + 149.5 and both samples it
+// averages lie in F0 frame t. So the low-rate value is just
+// frac(f0[t]*(d+1)/sr), the host integrates those 260*9 numbers in float64,
+// and what arrives is:
+//
+//   base[t,d]   the integrated phase at frame t, wrapped into [0, 1)
+//   delta[t,d]  phase[t+1,d] - phase[t,d], which is 300*frac(...) <= 300
+//               and zero on the last frame, so the clamp at the end of the
+//               interpolation needs no special case here
+//
+// and sample i's phase is frac(base[i0] + w*delta[i0]) — at most 301 before
+// the wrap, where one ulp is 3e-5 cycles rather than 0.016 radians.
+//
+// The interpolation index is computed in **integers**. The source coordinate
+// is (i + 0.5)*frames/samples - 0.5 = (2i + 1 - scale)/(2*scale), so the
+// half-sample offset that T3 warns about is exact rather than a rounding
+// away from picking a neighbouring frame.
+//
+//   pc.wOff    [frames, dim] fp32, the wrapped phase
+//   pc.kOff    [frames, dim] fp32, its forward difference
+//   pc.vOff    [frames] fp32, the F0 curve, for the voiced mask
+//   pc.bOff    [dim] fp32 mixer weights then one bias
+//   pc.outOff  [samples] fp32
+//   pc.tokens  samples
+//   pc.dim     harmonics + 1
+//   pc.aux0    the upsampling scale, 300
+//   pc.aux1    frames
+//   pc.eps     float bits: the sine amplitude
+//   pc.scale   float bits: the voiced threshold, in Hz
+//   pc.heads   the noise seed; zero leaves the noise off
+//   pc.span    float bits: the noise standard deviation, in voiced regions
+//
+// **The noise is drawn here rather than uploaded, and its sequence is not the
+// host's.** Upstream adds a Gaussian to every one of the nine sinusoids, so a
+// three-second utterance needs 702000 draws -- 7 ms of Go's NormFloat64,
+// which is half of what this whole stage cost before it moved, and 2.8 MB
+// across the bus. Drawn from a counter-based hash of (seed, sample,
+// harmonic) instead it is free, reproducible for a given seed, and
+// independent of how the work is divided into threads. What it is not is the
+// same *sequence* the host produces for that seed, which is why -noise n does
+// not give sample-identical audio on the two paths. It gives the same
+// distribution, and the noise is there to be noise: it is what the vocoder
+// makes a fricative out of in an unvoiced region, where the sinusoids carry
+// nothing.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+const float TWO_PI = 6.28318530717958647692;
+
+// A counter-based generator: one round of splitmix-style avalanche over the
+// key, which is all the decorrelation a Gaussian drawn from the result needs
+// and is stateless, so a thread computes its own draws from its own indices.
+uint hashUint(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+// Box-Muller, on two uniforms opened away from zero so the logarithm stays
+// finite.
+float gaussian(uint key) {
+    uint a = hashUint(key);
+    uint b = hashUint(key ^ 0x9e3779b9u);
+    float u1 = (float(a >> 8) + 0.5) * (1.0 / 16777216.0);
+    float u2 = (float(b >> 8) + 0.5) * (1.0 / 16777216.0);
+    return sqrt(-2.0 * log(u1)) * cos(TWO_PI * u2);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens) {
+        return;
+    }
+    int dim = int(pc.dim);
+    int scale = int(pc.aux0);
+    int frames = int(pc.aux1);
+    float amp = uintBitsToFloat(pc.eps);
+    float thresh = uintBitsToFloat(pc.scale);
+
+    // F.interpolate(mode="linear", align_corners=False), clamped at zero.
+    int num = 2 * int(idx) + 1 - scale;
+    int den = 2 * scale;
+    int i0 = 0;
+    float w = 0.0;
+    if (num > 0) {
+        i0 = num / den;
+        w = float(num - i0 * den) / float(den);
+        if (i0 > frames - 1) {
+            i0 = frames - 1;
+            w = 0.0;
+        }
+    }
+
+    // The voiced mask is indexed by the *nearest* upsampling, i/scale, which
+    // is a different frame from the linear interpolation's i0 and has to stay
+    // that way: it is the mask the reference builds from f0_upsampled.
+    float uv = wbuf[pc.vOff + uint(int(idx) / scale)] > thresh ? 1.0 : 0.0;
+
+    // Loud where the signal is unvoiced and quiet where it is not, which is
+    // the reference's rule: the sinusoids carry nothing in an unvoiced
+    // region, so the noise is the whole excitation there.
+    float nAmp = 0.0;
+    if (pc.heads != 0u) {
+        nAmp = uv != 0.0 ? uintBitsToFloat(pc.span) : amp / 3.0;
+    }
+
+    uint b0 = pc.wOff + uint(i0 * dim);
+    uint d0 = pc.kOff + uint(i0 * dim);
+    float acc = 0.0;
+    for (int d = 0; d < dim; d++) {
+        float p = wbuf[b0 + uint(d)] + w * wbuf[d0 + uint(d)];
+        p = p - floor(p);
+        float s = sin(TWO_PI * p) * amp * uv;
+        if (nAmp != 0.0) {
+            s += nAmp * gaussian(hashUint(pc.heads) ^ (idx * uint(dim) + uint(d)));
+        }
+        acc += wbuf[pc.bOff + uint(d)] * s;
+    }
+    act[pc.outOff + idx] = tanh(acc + wbuf[pc.bOff + uint(dim)]);
+}

@@ -103,6 +103,11 @@ type HarmonicSource struct {
 	UpsampleScale   int     // 300 = 10 * 6 * 5
 	Mix             *Linear // 9 -> 1
 
+	// Seed is what Noise was seeded with, so that the device path can draw
+	// the same distribution from its own counter-based generator. It is not
+	// the same *sequence*: see kokoro_source.comp.
+	Seed int64
+
 	// Noise switches the excitation noise on. Nil is the reference dump's
 	// configuration and the only reproducible one; a real utterance wants it,
 	// because the noise is 13.8 dB of what the model was trained to hear.
@@ -259,6 +264,13 @@ type Generator struct {
 	// carrying that stage's three residual blocks and its noise block. It is
 	// nil by default: the CPU path is the reference and stays the reference.
 	GPU []*GPUBlocks
+
+	// SrcGPU is the excitation on the device (SPEECH.md T7). It is separate
+	// from GPU because it is the one part of the generator whose arenas do
+	// not have to be sized per utterance: nothing in either of its kernels
+	// depends on the length but the dispatch extent, so one object serves
+	// every clip up to the ceiling it was built for.
+	SrcGPU *GPUSource
 }
 
 // GeneratorTrace is what a caller wants to look at when the waveform is
@@ -281,8 +293,21 @@ type GeneratorTrace struct {
 // the style vector and driven by the F0 curve at twice the alignment rate.
 func (g *Generator) Apply(x *Mat, style, f0 []float32) ([]float32, *GeneratorTrace, error) {
 	t0 := time.Now()
-	source, f0Up, uv, sines := g.Source.Apply(f0)
-	har := g.Harmonic(source)
+	var source []float32
+	var f0Up, uv []float32
+	var sines, har *Mat
+	var err error
+	if g.SrcGPU != nil {
+		// The device path leaves f0Up, uv and the individual sinusoids
+		// unbuilt: they are 5.6 MB of intermediate that only the trace ever
+		// looked at, and the two kernels never form them.
+		if source, har, err = g.SrcGPU.Apply(f0); err != nil {
+			return nil, &GeneratorTrace{}, err
+		}
+	} else {
+		source, f0Up, uv, sines = g.Source.Apply(f0)
+		har = g.Harmonic(source)
+	}
 	src := time.Since(t0)
 	out, tr, err := g.applyHarmonic(x, style, har, &GeneratorTrace{
 		F0Up: f0Up, UV: uv, Source: source, Sines: sines,
@@ -524,6 +549,38 @@ type VocoderTrace struct {
 	Decoder time.Duration
 }
 
+// SetFrames sizes every staged device object for one utterance.
+//
+// The arenas are built for a ceiling (Model.AttachGPU) and an utterance is a
+// prefix of them, so this is the whole of what a new clip costs on the device:
+// a walk down the same chain AttachGPU laid out — the decoder's blocks, then
+// 2L frames into the generator, the upsampling rates, and the reflection pad
+// on the last stage — writing a frame count into each object.
+//
+// It is called by Apply, so nothing outside this package has to; it is
+// exported because a caller that stages once and speaks many times may want
+// to check a length against the ceiling before it runs.
+func (v *Vocoder) SetFrames(frames int) error {
+	if v.GPU != nil {
+		if err := v.GPU.SetFrames(frames); err != nil {
+			return err
+		}
+	}
+	g := v.Generator
+	n := 2 * frames
+	for i, gb := range g.GPU {
+		in := n
+		n = g.Ups[i].OutFrames(n)
+		if i == len(g.Ups)-1 {
+			n++ // the reflection pad
+		}
+		if err := gb.SetFrames(in, n); err != nil {
+			return fmt.Errorf("kokoro: generator stage %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // Apply runs the whole vocoder: [T, 512] of expanded phonemes and two
 // [2T] curves in, samples out.
 func (v *Vocoder) Apply(asr *Mat, f0, energy, style []float32) ([]float32, *VocoderTrace, error) {
@@ -543,6 +600,15 @@ func (v *Vocoder) Apply(asr *Mat, f0, energy, style []float32) ([]float32, *Voco
 		return nil, tr, fmt.Errorf("kokoro: %d F0 frames against %d phoneme frames", f0c.Rows, asr.Rows)
 	}
 	tr.F0, tr.N = f0c, nc
+
+	// Every staged object is sized for this utterance before anything runs.
+	// A shorter one than the arenas were built for is the common case — see
+	// SetFrames — and one the same length is free.
+	if v.GPU != nil || len(v.Generator.GPU) > 0 {
+		if err := v.SetFrames(asr.Rows); err != nil {
+			return nil, tr, err
+		}
+	}
 
 	tDec := time.Now()
 	var x *Mat

@@ -31,6 +31,7 @@ import (
 
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/shaders"
+	"strix-halo-vulkan/vk"
 )
 
 // DenseBank is which width a dense weight is staged in — the one axis phase 2
@@ -319,21 +320,61 @@ func GEMVFits(k GEMVKernel, gemmK int) bool {
 	return kt%s == 0 && (kt/s)%4 == 0
 }
 
+// GEMVMaxRows is how many rows of A a decode GEMV dispatch may carry: P5b's
+// `MAXROWS`, and the bound every block's partial arena is sized by.
+//
+// **It is two because P5a says the speculation optimum is depth one**, whose
+// verification pass is two rows (research/p5a-draft-head.md §3). Raising it
+// is a `MAXROWS` in four shaders and this constant — which is what P6 would
+// want, since R concurrent sequences are R rows through the same weights —
+// and costs an accumulator and an arena per row at every rung, so it is not
+// raised speculatively.
+const GEMVMaxRows = 2
+
 // gemvBankPipe names the pipeline for a rung: the partials over one bank or
-// another, and the sum.
-func gemvBankPipe(k GEMVKernel, b DenseBank) string {
+// another, and the sum. `rows` is P5b's specialization — one module, one
+// pipeline per row count, because the constant folds at pipeline build.
+func gemvBankPipe(k GEMVKernel, b DenseBank) string { return gemvBankPipeRows(k, b, 1) }
+
+func gemvBankPipeRows(k GEMVKernel, b DenseBank, rows int) string {
+	var base string
 	switch b {
 	case BankQ8:
-		return fmt.Sprintf("gemv_q8_k%d", gemvSlabs(k))
+		base = fmt.Sprintf("gemv_q8_k%d", gemvSlabs(k))
 	case BankQ4K:
-		return fmt.Sprintf("gemv_q4_k%d", gemvSlabs(k))
+		base = fmt.Sprintf("gemv_q4_k%d", gemvSlabs(k))
 	case BankQ5K:
-		return fmt.Sprintf("gemv_q5_k%d", gemvSlabs(k))
+		base = fmt.Sprintf("gemv_q5_k%d", gemvSlabs(k))
+	default:
+		base = fmt.Sprintf("gemv_k%d", gemvSlabs(k))
 	}
-	return fmt.Sprintf("gemv_k%d", gemvSlabs(k))
+	return gemvRowName(base, rows)
 }
 
-func gemvSumPipe(k GEMVKernel) string { return fmt.Sprintf("gemv_sum_k%d", gemvSlabs(k)) }
+func gemvSumPipe(k GEMVKernel) string { return gemvSumPipeRows(k, 1) }
+
+func gemvSumPipeRows(k GEMVKernel, rows int) string {
+	return gemvRowName(fmt.Sprintf("gemv_sum_k%d", gemvSlabs(k)), rows)
+}
+
+// gemvRowName suffixes a pipeline name with its row count. One row keeps the
+// bare name, so every CSV and every test written before P5b still names the
+// same pipeline.
+func gemvRowName(base string, rows int) string {
+	if rows <= 1 {
+		return base
+	}
+	return fmt.Sprintf("%s_r%d", base, rows)
+}
+
+// gemvSpec is the specialization a row count needs: constant 0 is `ROWS` in
+// llm_gemv.comp, llm_hc_gemv.comp and llm_moe_router.comp.
+func gemvSpec(rows int) []vk.SpecConstant {
+	if rows <= 1 {
+		return nil
+	}
+	return []vk.SpecConstant{{ID: 0, Value: uint32(rows)}}
+}
 
 // gemvSPIRV is every rung of both banks plus the reduce, which each block that
 // has a decode path builds.

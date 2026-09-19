@@ -16,6 +16,7 @@
 // bandwidth-bound one.
 //
 //	go run ./cmd/tts -gpu -text 'Hello there.' -o out.wav
+//	go run ./cmd/tts -gpu -frames 1000 -reps 3       # through a server's arenas
 //	go run ./cmd/tts -gpu -o out.wav
 //	go run ./cmd/tts -voice bm_george -noise 1 -o out.wav
 //	go run ./cmd/tts -voice af_bella,af_sky -o out.wav
@@ -55,6 +56,9 @@ func main() {
 	reps := flag.Int("reps", 1, "timed repetitions; the best of each stage is reported")
 	list := flag.Bool("list", false, "print the available voices and exit")
 	gpu := flag.Bool("gpu", false, "run the generator's residual blocks on Vulkan")
+	frames := flag.Int("frames", 0,
+		"stage the device arenas for this many 25 ms frames instead of the utterance's own count; "+
+			"a ceiling above it changes nothing but the memory (SPEECH.md T9)")
 	flag.Parse()
 
 	t0 := time.Now()
@@ -113,11 +117,18 @@ func main() {
 	}
 
 	if *gpu {
-		// The frame count the arenas are sized for comes from the durations,
-		// so the prosody has to run before the device can be staged.
-		p, err := model.Prosody(ids, predStyle, float32(*speed))
-		if err != nil {
-			log.Fatal(err)
+		// The arenas are a ceiling and an utterance is a prefix of them
+		// (SPEECH.md T9), so -frames stages for any length at or above this
+		// one. Without it the ceiling *is* this utterance, which needs the
+		// durations -- so the prosody runs once on the host first, untimed,
+		// to find out what they are.
+		staged := *frames
+		if staged == 0 {
+			p, err := model.Prosody(ids, predStyle, float32(*speed))
+			if err != nil {
+				log.Fatal(err)
+			}
+			staged = p.Frames
 		}
 		t := time.Now()
 		dev, cleanup, err := openDevice()
@@ -125,12 +136,12 @@ func main() {
 			log.Fatal(err)
 		}
 		defer cleanup()
-		if err := model.AttachGPU(dev, p.Frames, decStyle, predStyle, kokoro.DefaultConvKernel); err != nil {
+		if err := model.AttachGPU(dev, staged, decStyle, predStyle, kokoro.DefaultConvKernel); err != nil {
 			log.Fatal(err)
 		}
 		defer model.DetachGPU()
-		fmt.Printf("staged %d generator blocks on %s in %.0fms\n\n",
-			2*4, dev.Physical().Name, ms(time.Since(t)))
+		fmt.Printf("staged %d generator blocks for %d frames on %s in %.0fms\n\n",
+			2*4, staged, dev.Physical().Name, ms(time.Since(t)))
 	}
 
 	var prosody *kokoro.Prosody

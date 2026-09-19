@@ -319,8 +319,17 @@ func printWidths(g map[string]*groupStat, names []string, w widths, nExpert, nUs
 			dense += now
 		}
 		note := ""
-		if now != float64(s.bytes) && checkpointBytes[n] && kquantWidth(now*8/float64(s.params)) && !s.kquantable() {
-			note = fmt.Sprintf("  <- no such format: rows %s are not multiples of %d", joinInts(s.badRows()), qkK)
+		if bits := now * 8 / float64(s.params); now != float64(s.bytes) && checkpointBytes[n] && kquantWidth(bits) && !s.kquantable() {
+			if b32 := block32Format(bits); b32 != "" {
+				// P4c: the row takes no K-quant, but this particular width
+				// is one a block-32 format meets, and the MoE kernels have
+				// an arm for it. So the price is real — it is just not the
+				// format the width's name suggests.
+				note = fmt.Sprintf("  <- rows %s take no K-quant; at this width that is %s (P4c)",
+					joinInts(s.badRows()), b32)
+			} else {
+				note = fmt.Sprintf("  <- no such format: rows %s are not multiples of %d", joinInts(s.badRows()), qkK)
+			}
 		}
 		fmt.Fprintf(tw, "%s\t%.2f\t%.2f\t%.3f\t%.3f\t%s\n", n, now*8/float64(s.params),
 			now/1e9, now*share/1e9, float64(s.bytes)*share/1e9, note)
@@ -367,12 +376,35 @@ func joinInts(xs []int64) string {
 // dense families are 4.5 and 5.5 bits today at rows of 320.
 var checkpointBytes = map[string]bool{"moe_experts": true, "moe_shared": true}
 
-// kquantWidth is whether a bits-per-weight figure can only be met by a ggml
-// K-quant — 4.5 is Q4_K, 5.5 Q5_K, 6.5 Q6_K — as opposed to a block-32 format
-// (Q4_0 4.5, Q4_1 5.0, Q5_0 5.5, Q5_1 6.0, Q8_0 8.5) which any row length
-// divisible by 32 can take. The two overlap at 4.5 and 5.5, so this is a
-// warning on the table and not a refusal: it says *check*, not *impossible*.
+// kquantWidth is whether a bits-per-weight figure is in the range where the
+// question "is this row a multiple of 256" has to be asked at all: between
+// them the K-quants and the block-32 formats cover it, and which of the two a
+// width lands on decides whether a 640-wide row can have it.
 func kquantWidth(bits float64) bool { return bits > 4.0 && bits < 8.0 }
+
+// block32Format names the ggml format at `bits` whose block is 32 elements,
+// so it fits any row a multiple of 32 — which is what the down projection's
+// 640 is. It is the other half of the note on the table: a K-quant width on a
+// 640-wide row is unbuildable, but several *widths* are met by both kinds of
+// format, and at those the re-pricing is honest.
+//
+// P4c built the two that matter. IQ4_NL wins 4.5 over Q4_0 at identical bytes
+// (D4, L8c-1), so it is the one named.
+func block32Format(bits float64) string {
+	switch {
+	case near(bits, 4.5):
+		return "IQ4_NL"
+	case near(bits, 5.0):
+		return "Q4_1"
+	case near(bits, 6.0):
+		return "Q5_1"
+	case near(bits, 8.5):
+		return "Q8_0"
+	}
+	return ""
+}
+
+func near(a, b float64) bool { return a-b < 0.01 && b-a < 0.01 }
 
 func bitsLabel(b float64) string {
 	if b <= 0 {

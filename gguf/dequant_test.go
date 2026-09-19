@@ -27,6 +27,14 @@ var dequantCases = []struct {
 }{
 	{Q4_K, 4}, {Q5_K, 4}, {Q5_1, 8}, {Q8_0, 8}, {IQ4_NL, 8},
 	{F32, 64}, {F16, 64}, {BF16, 64},
+	// Q4_1 is not in the checkpoint; P4c transcodes `ffn_down_exps` into it,
+	// and it is appended rather than filed with the other block-32 formats so
+	// that the committed bytes of every record above it stay what they were.
+	{Q4_1, 8},
+	// Q5_0 and Q6_K are not in the trunk either; the MTP draft head's
+	// `hc_*_up`, `hc_ffn_down` and `attn_v` are (P5a), and they are appended
+	// for the same reason Q4_1 is.
+	{Q5_0, 8}, {Q6_K, 4},
 }
 
 func TestDequantMatchesGGML(t *testing.T) {
@@ -178,9 +186,12 @@ func buildDequantInput() []byte {
 		for b := 0; b < c.blocks; b++ {
 			blk := payload[b*bs:]
 			switch c.typ {
-			case Q8_0, IQ4_NL:
+			case Q8_0, Q5_0, IQ4_NL:
 				putF16(blk[0:], saneF16(rng.next()))
-			case Q5_1, Q4_K, Q5_K:
+			case Q6_K:
+				// Q6_K's super-scale is the last field, not the first.
+				putF16(blk[208:], saneF16(rng.next()))
+			case Q4_1, Q5_1, Q4_K, Q5_K:
 				putF16(blk[0:], saneF16(rng.next()))
 				putF16(blk[2:], saneF16(rng.next()))
 			case F16:

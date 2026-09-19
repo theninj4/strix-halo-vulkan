@@ -2,6 +2,7 @@ package llm
 
 import (
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -694,15 +695,22 @@ func TestMoEGPUDecode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The negative control on the one-row rule: above one token a GEMV rung
+	// The negative control on the row bound: past GEMVMaxRows a GEMV rung
 	// would drop rows, so the host has to refuse it rather than run it.
+	// **P5b moved the bound from one to GEMVMaxRows**, so both halves are
+	// asserted — taken at the bound, refused past it — because a refusal
+	// that refused everything would pass the second half alone.
 	if err := g.SetPlan(MoEV16W4, MoEV16W4); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.Resize(2); err == nil {
-		t.Error("a GEMV plan was accepted for a two-token batch, where a tile may hold two rows")
+	if err := g.Resize(GEMVMaxRows); err != nil {
+		t.Errorf("a GEMV plan was refused at %d rows, which is the bound: %v", GEMVMaxRows, err)
+	}
+	if err := g.Resize(GEMVMaxRows + 1); err == nil {
+		t.Errorf("a GEMV plan was accepted for a %d-token batch, past the %d rows a tile carries",
+			GEMVMaxRows+1, GEMVMaxRows)
 	} else {
-		t.Logf("refused above one token: %v", err)
+		t.Logf("refused past %d rows: %v", GEMVMaxRows, err)
 	}
 }
 
@@ -781,17 +789,36 @@ func TestMoEGPUSharedPlan(t *testing.T) {
 	}
 
 	// The negative control: the GEMV rungs read one row of a tile, so the
-	// shared expert's pair is refused above one token exactly as the routed
+	// shared expert's pair is refused past GEMVMaxRows exactly as the routed
 	// pair is. The routed pair has to come off them first, because Resize
 	// refuses the whole plan and not one half of it.
+	//
+	// **P5b moved the bound from one row to GEMVMaxRows** — the rung reads
+	// ROWS rows of a tile now — so the refusal is checked one past it, and
+	// the acceptance *at* it is checked too: a refusal that refused
+	// everything would pass the first half alone.
 	if err := g.SetPlan(MoEM2, MoEM2); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.Resize(2); err != nil {
+	if err := g.Resize(GEMVMaxRows); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.SetSharedPlan(MoEV64W4, MoEV32W4); err == nil {
-		t.Error("the shared expert's GEMV rungs were accepted for a batch of two rows")
+	if err := g.SetSharedPlan(MoEV64W4, MoEV32W4); err != nil {
+		t.Errorf("the shared expert's GEMV rungs were refused at %d rows, which is the bound: %v",
+			GEMVMaxRows, err)
+	}
+	if err := g.SetPlan(MoEM2, MoEM2); err != nil {
+		t.Fatal(err)
+	}
+	// One past the bound, if the block was staged with room for it. The
+	// fixture is staged for two, which is GEMVMaxRows today.
+	if err := g.Resize(GEMVMaxRows + 1); err == nil {
+		if err := g.SetSharedPlan(MoEV64W4, MoEV32W4); err == nil {
+			t.Errorf("the shared expert's GEMV rungs were accepted for a batch of %d rows, past the %d they carry",
+				GEMVMaxRows+1, GEMVMaxRows)
+		}
+	} else {
+		t.Logf("staged for %d rows, so the past-the-bound half is not reachable here: %v", GEMVMaxRows, err)
 	}
 }
 
@@ -848,82 +875,99 @@ func TestMoEBankTranscodeStagesLikeTheCheckpoint(t *testing.T) {
 		t.Skip("stages two expert banks, 3.2 GB")
 	}
 	c, w, in, nTok, _ := moeFixtures4k(t)
-	plan, err := ParseMoEBankPlan("gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1", "imatrix")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The control's weights: the same three tensors, already narrowed, with
-	// the plan off so nothing in the staging path can treat them specially.
-	pre := w
-	for _, sub := range []struct {
-		dst **gguf.Tensor
-		to  gguf.Type
-	}{
-		{&pre.GateShexpT, gguf.Q4_K},
-		{&pre.UpShexpT, gguf.Q4_K},
-		{&pre.DownShexpT, gguf.Q5_1},
-	} {
-		src := *sub.dst
-		data, err := TranscodeMoE(src, sub.to, "imatrix")
-		if err != nil {
-			t.Fatal(err)
-		}
-		*sub.dst = &gguf.Tensor{Name: src.Name, Type: sub.to, Dims: src.Dims, Data: data}
-	}
-
 	dev, done := newTestDevice(t)
 	defer done()
-	run := func(ws MoEWeights, p MoEBankPlan) ([]float32, []float32, []float32) {
-		g, err := NewMoEGPU(dev, c, nTok, []MoEWeights{ws}, WithMoEBankPlan(p))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer g.Destroy()
-		if gate, up, down := g.Formats(0); testing.Verbose() {
-			shUp, shDown := g.SharedBytes(0)
-			t.Logf("plan %s: routed %s/%s/%s, shared expert %d + %d bytes a layer",
-				p, gate, up, down, shUp, shDown)
-		}
-		if err := g.Upload(in, nTok); err != nil {
-			t.Fatal(err)
-		}
-		if err := g.Run(0); err != nil {
-			t.Fatal(err)
-		}
-		return append([]float32(nil), g.ShSwiglu()...),
-			append([]float32(nil), g.Out()...),
-			append([]float32(nil), g.Weighted()...)
-	}
-	aSh, aOut, aRouted := run(w, plan)
-	bSh, bOut, bRouted := run(pre, MoEBankPlan{})
 
-	for _, c := range []struct {
-		name string
-		a, b []float32
+	// P4b's plan, and P4c's two. The P4c arms narrow a **routed** tensor —
+	// three-dimensional, 0.5 GB a layer, and read by the down mode rather
+	// than the shared expert's — so its offset, its row stride and its
+	// pipeline are a different path through the same code.
+	for _, tc := range []struct {
+		spec string
+		subs []func(*MoEWeights) (**gguf.Tensor, gguf.Type)
 	}{
-		{"ffn_swiglu (shared expert)", aSh, bSh},
-		{"ffn_moe_weighted (routed, untouched)", aRouted, bRouted},
-		{"ffn_out", aOut, bOut},
+		{"gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1", []func(*MoEWeights) (**gguf.Tensor, gguf.Type){
+			func(w *MoEWeights) (**gguf.Tensor, gguf.Type) { return &w.GateShexpT, gguf.Q4_K },
+			func(w *MoEWeights) (**gguf.Tensor, gguf.Type) { return &w.UpShexpT, gguf.Q4_K },
+			func(w *MoEWeights) (**gguf.Tensor, gguf.Type) { return &w.DownShexpT, gguf.Q5_1 },
+		}},
+		{"down_exps=q4_1", []func(*MoEWeights) (**gguf.Tensor, gguf.Type){
+			func(w *MoEWeights) (**gguf.Tensor, gguf.Type) { return &w.Down.T, gguf.Q4_1 },
+		}},
+		{"down_exps=iq4_nl", []func(*MoEWeights) (**gguf.Tensor, gguf.Type){
+			func(w *MoEWeights) (**gguf.Tensor, gguf.Type) { return &w.Down.T, gguf.IQ4_NL },
+		}},
 	} {
-		if len(c.a) != len(c.b) {
-			t.Fatalf("%s: %d values against %d", c.name, len(c.a), len(c.b))
-		}
-		diff, first := 0, -1
-		for i := range c.a {
-			if c.a[i] != c.b[i] {
-				diff++
-				if first < 0 {
-					first = i
-				}
+		t.Run(tc.spec, func(t *testing.T) {
+			plan, err := ParseMoEBankPlan(tc.spec, "imatrix")
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		if diff != 0 {
-			t.Errorf("%s: %d of %d values differ, first at %d (%g against %g)",
-				c.name, diff, len(c.a), first, c.a[first], c.b[first])
-			continue
-		}
-		t.Logf("%-36s %d values identical", c.name, len(c.a))
+			// The control's weights: the same tensors, already narrowed,
+			// with the plan off so nothing in the staging path can treat
+			// them specially.
+			pre := w
+			for _, sel := range tc.subs {
+				dst, to := sel(&pre)
+				src := *dst
+				data, err := TranscodeMoE(src, to, "imatrix")
+				if err != nil {
+					t.Fatal(err)
+				}
+				*dst = &gguf.Tensor{Name: src.Name, Type: to, Dims: src.Dims, Data: data}
+			}
+			run := func(ws MoEWeights, p MoEBankPlan) ([]float32, []float32, []float32) {
+				g, err := NewMoEGPU(dev, c, nTok, []MoEWeights{ws}, WithMoEBankPlan(p))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer g.Destroy()
+				if gate, up, down := g.Formats(0); testing.Verbose() {
+					shUp, shDown := g.SharedBytes(0)
+					t.Logf("plan %s: routed %s/%s/%s, shared expert %d + %d bytes a layer",
+						p, gate, up, down, shUp, shDown)
+				}
+				if err := g.Upload(in, nTok); err != nil {
+					t.Fatal(err)
+				}
+				if err := g.Run(0); err != nil {
+					t.Fatal(err)
+				}
+				return append([]float32(nil), g.ShSwiglu()...),
+					append([]float32(nil), g.Out()...),
+					append([]float32(nil), g.Weighted()...)
+			}
+			aSh, aOut, aRouted := run(w, plan)
+			bSh, bOut, bRouted := run(pre, MoEBankPlan{})
+
+			for _, c := range []struct {
+				name string
+				a, b []float32
+			}{
+				{"ffn_swiglu (shared expert)", aSh, bSh},
+				{"ffn_moe_weighted (routed, untouched)", aRouted, bRouted},
+				{"ffn_out", aOut, bOut},
+			} {
+				if len(c.a) != len(c.b) {
+					t.Fatalf("%s: %d values against %d", c.name, len(c.a), len(c.b))
+				}
+				diff, first := 0, -1
+				for i := range c.a {
+					if c.a[i] != c.b[i] {
+						diff++
+						if first < 0 {
+							first = i
+						}
+					}
+				}
+				if diff != 0 {
+					t.Errorf("%s: %d of %d values differ, first at %d (%g against %g)",
+						c.name, diff, len(c.a), first, c.a[first], c.b[first])
+					continue
+				}
+				t.Logf("%-36s %d values identical", c.name, len(c.a))
+			}
+		})
 	}
 }
 
@@ -945,5 +989,270 @@ func TestMoEBankTranscodeRefusesAnImpossibleFormat(t *testing.T) {
 	// And the same row *is* a Q5_1, because that format blocks by 32.
 	if 640%gguf.Q5_1.BlockElems() != 0 {
 		t.Fatal("Q5_1 blocks by 32; 640 should divide it")
+	}
+}
+
+// TestMoEGPUDownNarrowed is P4c's kernel gate: the two block-32 formats the
+// routed down projection can be transcoded into, each read by a new arm of
+// both grouped kernels.
+//
+// It asks three things, and the third is the only one that is about the
+// shader:
+//
+//   - **The staging is indistinguishable from a checkpoint that shipped the
+//     format.** `TestMoEBankTranscodeStagesLikeTheCheckpoint` makes that
+//     check for the shared expert; here the tensor is a *routed* one, three
+//     dimensions and 0.5 GB a layer, so its offset, its row stride and its
+//     pipeline are all different code paths.
+//   - **Every rung agrees exactly.** A row block changes how many tiles the
+//     schedule holds and nothing else, so two rungs on one bank are an
+//     equality — and on a new unpack that is what says the block base is
+//     computed the same way at every BM.
+//   - **The unpack is the format.** Two independent implementations read
+//     these bytes — the GEMM's slab into LDS and the GEMV's dwords into
+//     registers — and they were written from the same table but not from
+//     each other. Against `ffn_out-3` the narrowed bank is *expected* to be
+//     further from llama.cpp than the shipped one is, because it is a
+//     coarser quantisation of the same weights; what would not be a
+//     quantisation is a factor, a transposition or a block read at the wrong
+//     offset, and those do not land within a few times the shipped rms.
+func TestMoEGPUDownNarrowed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("transcodes and stages a 0.5 GB expert bank per format")
+	}
+	c, w, in, nTok, tr := moeFixtures4k(t)
+	dev, done := newTestDevice(t)
+	defer done()
+
+	want, err := tr.Get("ffn_out-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The shipped bank's own distance from the reference, which is what the
+	// narrowed ones are read against rather than against an absolute bound.
+	base, err := NewMoEGPU(dev, c, nTok, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Upload(in, nTok); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Run(0); err != nil {
+		t.Fatal(err)
+	}
+	shipped, err := compare(base.Out(), want.Vals[:len(base.Out())])
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseBytes := base.WeightBytes()
+	base.Destroy()
+	t.Logf("%-7s %5.2f GB, ffn_out-3 %v", "q5_1", float64(baseBytes)/1e9, shipped)
+
+	for _, fmtName := range []string{"q4_1", "iq4_nl"} {
+		t.Run(fmtName, func(t *testing.T) {
+			plan, err := ParseMoEBankPlan("down_exps="+fmtName, "imatrix")
+			if err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now()
+			g, err := NewMoEGPU(dev, c, nTok, []MoEWeights{w}, WithMoEBankPlan(plan))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer g.Destroy()
+			if err := g.Upload(in, nTok); err != nil {
+				t.Fatal(err)
+			}
+			_, _, downFmt := g.Formats(0)
+			t.Logf("%-7s %5.2f GB (%.2f against the checkpoint's), staged in %v, down arm %s",
+				fmtName, float64(g.WeightBytes())/1e9,
+				float64(g.WeightBytes())/float64(baseBytes), time.Since(start).Round(time.Millisecond), downFmt)
+
+			// 1. The rungs, exactly. The up mode is untouched, so a
+			//    disagreement here is the down mode's new unpack.
+			var ref []float32
+			for _, plan := range [][2]MoEKernel{{MoEM2, MoEM2}, {MoEM1, MoEM4}, {MoEM4, MoEM1}, {MoEM2, MoEW4M1}} {
+				if err := g.SetPlan(plan[0], plan[1]); err != nil {
+					t.Fatal(err)
+				}
+				if err := g.Run(0); err != nil {
+					t.Fatal(err)
+				}
+				out := g.Out()
+				if ref == nil {
+					ref = append([]float32(nil), out...)
+					continue
+				}
+				r, err := compare(out, ref)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if r.maxAbs != 0 {
+					t.Errorf("%s/%s disagrees with m2/m2 by %.3e at %d", plan[0], plan[1], r.maxAbs, r.at)
+				}
+			}
+
+			// 2. Against llama.cpp's own tensor, on the same 4096 tokens.
+			r, err := compare(ref, want.Vals[:len(ref)])
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ss float64
+			for _, v := range want.Vals[:len(ref)] {
+				ss += float64(v) * float64(v)
+			}
+			refRMS := math.Sqrt(ss / float64(len(ref)))
+			t.Logf("ffn_out-3 over %d tokens: %v — %.2f%% of the tensor's own rms %.3e (the shipped bank is %.3e, %.2f%%)",
+				nTok, r, 100*r.rms/refRMS, refRMS, shipped.rms, 100*shipped.rms/refRMS)
+			// A narrower down projection is a real accuracy cost and this is
+			// not the instrument for pricing it — the corpus is. So the bound
+			// is not against the shipped bank's rms, which is a *kernel*
+			// rounding over identical weights (8e-05, 0.4% of the tensor) and
+			// is the wrong scale for a quantisation: it is against the
+			// reference tensor's own magnitude, where the difference between
+			// "coarser" and "decoded wrong" is two orders of magnitude. A
+			// block read at the wrong offset or a codebook indexed wrongly
+			// does not land at a few percent of the signal; it lands at all
+			// of it.
+			if r.rms > 0.1*refRMS {
+				t.Errorf("%s: rms %.3e is %.1f%% of ffn_out's own rms — too far to be the width",
+					fmtName, r.rms, 100*r.rms/refRMS)
+			}
+			g.Destroy()
+
+			// 3. The decode arm, at one token, against the GEMM on the same
+			//    bank. The two unpacks are independent implementations of the
+			//    same table, so this is the one comparison that can catch a
+			//    format read consistently wrongly in one of them.
+			d, err := NewMoEGPU(dev, c, 2, []MoEWeights{w}, WithMoEBankPlan(plan))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Destroy()
+			if err := d.Upload(in[:c.NEmbd], 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.SetPlan(MoEN1M1, MoEM1); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Run(0); err != nil {
+				t.Fatal(err)
+			}
+			gemm := append([]float32(nil), d.Out()...)
+			for _, plan := range [][2]MoEKernel{
+				{MoEV64W4, MoEV16W4}, {MoEV16, MoEV16}, {MoEV32, MoEV32},
+				{MoEV64, MoEV64}, {MoEV32W4, MoEV64W4}, {MoEN1M1, MoEV16W4},
+			} {
+				name := fmt.Sprintf("%s/%s", plan[0], plan[1])
+				if err := d.SetPlan(plan[0], plan[1]); err != nil {
+					t.Fatal(err)
+				}
+				if err := d.Run(0); err != nil {
+					t.Fatal(err)
+				}
+				rk, err := compare(d.Out(), gemm)
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				t.Logf("%-12s against n1m1/m1: %v", name, rk)
+				// The GEMM rounds each unpacked weight to a half on its way
+				// into LDS and the GEMV keeps it an f32 (L8d), which is the
+				// whole of the difference — parts in ten thousand over a
+				// 640-long dot product.
+				if rk.rms > 2e-3 {
+					t.Errorf("%s disagrees with the GEMM by rms %.3e (max %.3e at %d)", name, rk.rms, rk.maxAbs, rk.at)
+				}
+			}
+		})
+	}
+}
+
+// TestMoEGPUDecodeTwoRows is P5b's gate on the block that dominates a
+// verification pass: the expert GEMVs and the split-K router carrying **two**
+// rows compute what the GEMM computes, row for row.
+//
+// This block is the one whose R-row arm needed no guard for the ragged tail,
+// and that is the thing to check rather than assume. A tile is (expert, row
+// block) and at two tokens an expert may hold one real row or two; the kernel
+// reads ROWS of them unconditionally and relies on `llm_moe_perm.comp` having
+// filled the rest with a sentinel whose activation row is a zero pad. If that
+// were wrong the second token's experts would read a neighbour's row and the
+// comparison below would not be close.
+//
+// `rowMoved` is the control that matters — see its comment. Comparing row 1
+// against the GEMM's row 1 passes trivially when row 1 is never written.
+func TestMoEGPUDecodeTwoRows(t *testing.T) {
+	const rows = 2
+	if rows > GEMVMaxRows {
+		t.Skipf("GEMVMaxRows is %d", GEMVMaxRows)
+	}
+	c, w, in, nTok, _ := moeFixtures4k(t)
+	if nTok < 3 {
+		t.Skipf("the trace is %d tokens and the control needs three", nTok)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+	g, err := NewMoEGPU(dev, c, rows+1, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+
+	run := func(second int, up, down MoEKernel, router MoERouterKernel) []float32 {
+		t.Helper()
+		buf := make([]float32, rows*c.NEmbd)
+		copy(buf, in[:c.NEmbd])
+		copy(buf[c.NEmbd:], in[second*c.NEmbd:(second+1)*c.NEmbd])
+		if err := g.Upload(buf, rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetPlan(up, down); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetRouter(router); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.Out()...)
+	}
+
+	gemm := run(1, MoEN1M1, MoEM1, MoERouterGEMM)
+	for _, plan := range []struct {
+		up, down MoEKernel
+		router   MoERouterKernel
+	}{
+		{MoEV64W4, MoEV16W4, MoERouterK40},
+		{MoEV16, MoEV16, MoERouterK40},
+		{MoEV32W4, MoEV64W4, MoERouterGEMM},
+		// The router on its own, so a disagreement can be attributed.
+		{MoEN1M1, MoEM1, MoERouterK40},
+	} {
+		name := fmt.Sprintf("%s/%s/%s", plan.up, plan.down, plan.router)
+		got := run(1, plan.up, plan.down, plan.router)
+		rowMoved(t, name+" row 1", got[c.NEmbd:], run(2, plan.up, plan.down, plan.router)[c.NEmbd:])
+		for _, arm := range []struct {
+			what string
+			got  []float32
+			want []float32
+		}{
+			{"both rows", got, gemm},
+			{"row 1", got[c.NEmbd:], gemm[c.NEmbd:]},
+		} {
+			r, err := compare(arm.got, arm.want)
+			if err != nil {
+				t.Fatalf("%s %s: %v", name, arm.what, err)
+			}
+			t.Logf("%-28s %-9s against the GEMM: %v", name, arm.what, r)
+			// The same bound TestMoEGPUDecode uses at one row, and for the
+			// same reason: the two kernels differ by the fp16 rounding of a
+			// weight over a 2560-long dot product.
+			if r.rms > 2e-3 {
+				t.Errorf("%s (%s) disagrees with the GEMM by rms %.3e (max %.3e at %d)",
+					name, arm.what, r.rms, r.maxAbs, r.at)
+			}
+		}
 	}
 }
