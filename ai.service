@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=###
 ExecStart=###/ai -addr 0.0.0.0:11434 -token= -llm
-;ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -previews -edits
+;ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -previews -edits -wyoming 0.0.0.0:10300
 Restart=always
 RestartSec=1
 

@@ -10,9 +10,15 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-20, T10)**: **both verticals are on the device, the loop
-between them closes over HTTP, and synthesis now costs the same per second of
-audio however long the utterance is.**
+**Status (2026-09-20, W1)**: **both verticals are on the device, the loop
+between them closes over HTTP, synthesis now costs the same per second of
+audio however long the utterance is, and the pair answers Home Assistant on a
+port of its own.**
+W1 added the second door: `-wyoming 0.0.0.0:10300` serves the same two
+backends over the protocol Home Assistant's voice pipeline speaks, out of the
+same process and the same staging — checked against upstream's own client,
+and byte for byte the same waveform as `/v1/audio/speech`.
+See [W1](#w1--the-wyoming-door-done).
 T9 staged kokoro once for the life of the server instead of once per request:
 `POST /v1/audio/speech` went from **550 ms to 59** for 6.45 s of audio, byte
 for byte the same waveform.
@@ -129,8 +135,16 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T9 | The server: one staging for the life of the process | **done** — `/v1/audio/speech` 550 ms to 59, and the bytes are unchanged |
 | R1 | The round trip: `cmd/roundtrip`, text → speech → text over HTTP | **done** — six cases exact, 61.6x real time, and it named what was next |
 | T10 | PL-BERT's attention on the matrix cores | **done** — a layer **56x** at the model's ceiling, an utterance 225 ms → **162**, the loop **70.1x** |
+| W1 | The Wyoming door: both verticals to Home Assistant | **done** — one port, 28 voices, byte-identical to the HTTP door |
 
 ## What exists
+
+**`wyoming/`** — the second door: the two backends over the protocol Home
+Assistant's voice pipeline speaks, on its own TCP port beside the HTTP API
+(W1, below). `event.go` is the framing, `info.go` the events, `voices.go`
+what a kokoro pack's name says about it and `server.go` the conversation.
+It imports `api` for the two backend interfaces and `audio` for the filter,
+and nothing else — no model and no Vulkan.
 
 **`audio/`** — WAV in and out (16-bit PCM only, on purpose), a radix-2 FFT and
 an arbitrary-size direct DFT in float64, a centred STFT that reproduces
@@ -1189,3 +1203,75 @@ A negative intercept is a curve pretending to be a line. The intercept is now
 positive and small, the slope is flat from five seconds to nineteen, and
 `r²` is 0.999 — which is the actual result of this stage: not the 1.4x, but
 that there is no longer a length at which synthesis gets worse.
+
+## W1 — the Wyoming door, done
+
+The two verticals now answer Home Assistant directly, on a TCP port beside
+the HTTP one and out of the same process:
+
+    go run ./cmd/serve -tts -stt -wyoming 0.0.0.0:10300
+
+    Settings -> Devices & services -> Add integration -> Wyoming Protocol
+    -> the host, port 10300
+
+One listener carries both services, because a Wyoming client asks what is
+behind a port rather than inferring it from the number: `describe` is
+answered with one `asr` program and one `tts` program, and Home Assistant
+makes a speech-to-text entity and a text-to-speech entity out of the single
+entry. The protocol itself is a newline-terminated JSON header, an optional
+JSON data block and an optional binary payload, framed by lengths in the
+header because the payload is raw PCM and may contain a newline.
+
+**It is a door, not a second server.** `wyoming.Server` holds the same
+`api.SpeechBackend` and `api.TranscriptionBackend` the HTTP handlers do, so
+there is one staging of kokoro, one residency of parakeet and one GPU queue;
+two clients on the two protocols are two goroutines serialising at the same
+place two HTTP requests would. The check that this is true is that the same
+text and voice through both doors is the same waveform:
+
+    wyoming: 24000 Hz, 78000 frames   http: 24000 Hz, 78000 frames
+    byte for byte the same waveform
+
+Driven by upstream's own Python client rather than by our own reader, with
+the two conversations written the way `homeassistant/components/wyoming`
+writes them:
+
+    describe    1 asr, 1 tts, 28 voices, 25 asr languages
+    synthesize  44 characters -> 77 chunks, 3.25 s of audio at 24000 Hz, 35 ms
+    transcribe  testdata/jfk.wav, 11.00 s -> 108 characters, 46 ms, 236.9x
+    the loop    speech at 24 kHz -> resampled -> "The quick brown fox jumps
+                over the lazy dog." exactly, 140.4x
+
+**28 voices and not 54**, because the front end is the limit rather than the
+checkpoint: misaki's English G2P is the one that is ported (T5), and there is
+no phoneme field in this protocol to route around it with, so only the packs
+whose language can be pronounced are advertised. `-wyoming-all-voices` offers
+the other 26 to a deployment that has a reason to want them. Each is labelled
+for a menu — `af_heart` is "Heart (American English, female)" — while the id
+Home Assistant sends back is the pack's own filename, so a blend still
+reaches the backend by being spelled into the voice field.
+
+**Neither streaming direction is implemented, and both are measurements.**
+`supports_synthesize_streaming` buys the gap between the first sentence of an
+answer and the last; T10 put a nineteen-second utterance at 162 ms, which is
+less than a satellite would take to play the first sentence of a streamed
+one — and the durations for the whole utterance are decided at once, so the
+pieces could not agree about prosody they had not seen. The transcript side
+is 257x real time and the same argument applies. What is left open is what
+another program owns: wake words, intent handling, satellite control, all
+reported as empty lists rather than claimed.
+
+**The conversions happen at the door this time.** `backend.STT` refuses a
+clip at the wrong rate and always has — there the caller chose a file and can
+convert it — but here the caller is a microphone and there is no conversation
+to have, so this side reads 8-, 16- and 32-bit PCM at any rate and any
+channel count and hands over the 16 kHz mono parakeet reads, through
+`audio.Resample` and not an interpolation. The one thing it will not convert
+is a stream that changes format halfway through: two rates concatenated is a
+clip whose timeline is wrong in a way the transcript would not show.
+
+**There is no authentication and there cannot be.** Wyoming has nowhere to
+put a credential, so `-token` does not reach this listener and the startup
+line says so. That is why the flag takes an address instead of a boolean —
+which interface it binds is the whole of the control, and it should be
+something somebody chose.

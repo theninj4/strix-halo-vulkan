@@ -8,6 +8,13 @@ this repository, with one flag per vertical deciding what is resident.
 `GOALS.md`'s last line — "we will ultimately serve up a HTTP API serving these
 features, in Go" — is what this is, and all five verticals are now behind it.
 
+The same process has a **second door** for the two speech verticals, because
+the thing on the other side of a house's microphones does not speak OpenAI:
+
+    go run ./cmd/serve -tts -stt -wyoming 0.0.0.0:10300
+
+See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
+
 ## What answers today
 
 | Endpoint | State |
@@ -205,6 +212,13 @@ Two things would fix it, and both are measurements rather than arguments:
     -stt         false            load parakeet-tdt-0.6b-v3
     -stt-model   models/parakeet-tdt-0.6b-v3
     -max-audio   60               longest clip the arenas are sized for, in seconds
+
+    -wyoming             ""       also serve the Wyoming protocol on this address; empty is off
+    -wyoming-name        strix-halo   program name `info` advertises, and what Home Assistant
+                                      names its entities
+    -wyoming-all-voices  false    advertise all 54 packs, not just the 28 -lexicon can pronounce
+    -wyoming-rate        0        resample synthesised speech before sending it; 0 is the model's
+    -wyoming-max-conns   32       concurrent connections
 
     -embed         false          load Qwen3-Embedding-0.6B
     -embed-model   models/Qwen3-Embedding-0.6B
@@ -484,6 +498,81 @@ block**. Every one of them is a 400 that says what the server
 does instead. The reason is the same each time: a knob accepted and ignored is
 worse than a refused one, because the client never learns that turning it did
 nothing.
+
+## Home Assistant speaks Wyoming, not OpenAI
+
+`-wyoming` opens a second listener on the same process: the two speech
+backends over [Wyoming](https://github.com/rhasspy/wyoming), which is the
+protocol Home Assistant's voice pipeline talks to a microphone and a speaker
+with. It is a door and not a copy — one staging of the weights, one GPU
+queue, one `models/` — so a request that arrives on 10300 and the same
+request on 8080 are the same run of the same model. They are checked against
+each other: the same text and voice through both produces byte-identical
+samples.
+
+    In Home Assistant: Settings -> Devices & services -> Add integration
+    -> Wyoming Protocol -> the host this runs on, port 10300
+
+One port carries both services. Wyoming's convention is 10300 for
+speech-to-text and 10200 for text-to-speech, but a client discovers what is
+behind a port by asking rather than by which port it is, so this answers
+`describe` with both and Home Assistant creates an STT entity and a TTS
+entity from the one entry.
+
+**There is no authentication, and there cannot be.** The protocol has nowhere
+to put a credential: it is a framed JSON conversation over a bare TCP socket,
+and every implementation of it assumes a trusted LAN. `-token` does not reach
+this listener, and the startup line says so. That is why the flag takes an
+address rather than a boolean — which interface it binds is the only control
+there is, and it should be a decision somebody made.
+
+    13:03:47 wyoming: 1 asr, 1 tts (28 voices) as "strix-halo" on 0.0.0.0:10300;
+             the protocol carries no credential, so -token does not apply to this port
+
+**28 voices, not 54.** Kokoro's packs cover nine languages and misaki's
+English grapheme-to-phoneme is the one that is ported (SPEECH.md T5), so
+`jf_alpha` over this protocol would be a Japanese voice reading English
+phonemes. Over HTTP that is the caller's business, because
+`/v1/audio/speech` also takes IPA directly and a caller with its own lexicon
+is entitled to every pack; Wyoming has no phoneme field, so the default is to
+advertise only what can be pronounced. `-wyoming-all-voices` offers the rest.
+Each is described the way a menu wants it — `af_heart` is "Heart (American
+English, female)" — and the name Home Assistant sends back is the pack's own,
+so a blend still reaches `backend.TTS` by being spelled into it.
+
+**What it does not do.** Neither streaming direction is implemented, and both
+are measurements rather than gaps: `supports_synthesize_streaming` would buy
+the time between the first sentence of an answer and the last, and this part
+synthesises nineteen seconds of speech in 162 ms (SPEECH.md T10), so the
+whole utterance is ready before a satellite could have played the first
+sentence of a streamed one — and kokoro decides an utterance's durations all
+at once, so the pieces would have to agree about prosody they cannot see.
+`supports_transcript_streaming` is the same shape at 257x real time. Wake
+word detection, intent handling and satellite control are other people's
+programs; `info` reports empty lists for them rather than claiming them.
+
+**The audio is converted where the protocol says it arrives, not where the
+model wants it.** A `transcribe` stream declares its own rate, width and
+channels, and this side reads 8-, 16- and 32-bit PCM at any rate and any
+channel count and hands parakeet the 16 kHz mono it reads — through
+`audio.Resample`, which is a filter and not an interpolation, because an ASR
+front end with 80 mel filters up to 8 kHz treats aliased energy as a feature.
+The HTTP endpoint still refuses a clip at the wrong rate, and the difference
+is who is calling: there the caller chose a file and can convert it, here the
+caller is a microphone. What is *not* converted is a stream that changes
+format halfway through — concatenating two rates gives a clip whose timeline
+is wrong in a way the transcript would not show.
+
+    wyoming[14]: resampled 3.25 s from 24000 Hz to 16000
+    wyoming[14]: transcribe: 3.25 s of audio at 16000 Hz -> 44 characters,
+                 in 23ms (140.4x real time)
+
+**A failure is an `error` event, not a hang-up.** Home Assistant reports a
+closed socket as "connection lost" and reports an error event with its text,
+so the difference is whether a misspelt voice shows up in the log as
+`no voice "bm_geroge"; this checkpoint has 54` or as nothing at all. The
+connection survives it: a client that asked for the wrong thing can ask
+again.
 
 ## What is left
 

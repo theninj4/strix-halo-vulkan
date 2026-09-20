@@ -109,6 +109,16 @@ func (s *STT) maxEncoderFrames() int {
 	return s.model.Encoder.Subsampling.ValidLength(mel)
 }
 
+// SampleRate is the rate this model's front end reads, which is fixed by the
+// checkpoint's feature extractor.
+//
+// The HTTP endpoint does not need it -- a clip arrives with its own rate in
+// its header and Transcribe refuses a mismatch, because there the caller
+// chose the file and can convert it. It is here for the Wyoming door, where
+// the caller is a microphone sending whatever it has and there is no
+// conversation to have, so that side resamples and has to know the target.
+func (s *STT) SampleRate() int { return s.model.Config.Features.SamplingRate }
+
 // Models reports the one model this backend serves.
 func (s *STT) Models() []api.Model {
 	return []api.Model{{ID: s.id, Object: "model", OwnedBy: "local"}}

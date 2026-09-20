@@ -15,9 +15,18 @@
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -image -preview              # and stream in-progress frames
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
+//	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
 // Every endpoint answers today except POST /v1/images/edits, which needs the
 // VAE's encoder and not a flag (see api.Server.handleImageEdit).
+//
+// **-wyoming is a second door onto the speech backends**, not a second copy
+// of them: one process, one staging, one GPU queue, answering Home
+// Assistant's protocol on its own port beside the HTTP API on -addr. It takes
+// an address rather than a boolean because the address is the decision that
+// matters -- Wyoming has no notion of a credential, so -token does not reach
+// it and anything that can open the port can run the two speech models on
+// it. See the `wyoming` package.
 //
 // **-preview is what makes `stream: true` answerable** on the image endpoint.
 // It loads madebyollin/taef1 beside the full VAE, and the reason it is a flag
@@ -73,6 +82,7 @@ import (
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/backend"
 	"strix-halo-vulkan/llm"
+	"strix-halo-vulkan/wyoming"
 )
 
 // defaultToken is what the API has always used. It is a flag so that a
@@ -120,6 +130,18 @@ func main() {
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
 	maxAudio := flag.Float64("max-audio", 60, "longest clip the transcription arenas are sized for, in seconds")
+
+	wyAddr := flag.String("wyoming", "",
+		"also serve the Wyoming protocol (Home Assistant) on this address, e.g. :10300; empty is off")
+	wyName := flag.String("wyoming-name", wyoming.DefaultName,
+		"program name the Wyoming describe/info message advertises, "+
+			"which is what Home Assistant names its entities")
+	wyAllVoices := flag.Bool("wyoming-all-voices", false,
+		"advertise every kokoro voice pack over Wyoming, not just the ones -lexicon can pronounce")
+	wyRate := flag.Int("wyoming-rate", 0,
+		"resample synthesised speech to this rate before sending it; 0 sends the model's own 24 kHz")
+	wyMaxConns := flag.Int("wyoming-max-conns", 0,
+		"concurrent Wyoming connections; 0 takes the package default")
 
 	imgOn := flag.Bool("image", false, "load Z-Image-Turbo and serve /v1/images/generations and /v1/images/edits")
 	imgModel := flag.String("image-model", "models/Z-Image-Turbo", "z-image checkpoint root")
@@ -283,6 +305,31 @@ func main() {
 			time.Since(start).Round(time.Millisecond))
 	}
 
+	// The Wyoming door is built here, between the speech backends and the
+	// language model, and for the same reason the language model is last: a
+	// misspelt voice or an address something else already holds should be
+	// reported in the first second rather than after 84 GB of staging. The
+	// listener is opened now and served later.
+	var (
+		wy   *wyoming.Server
+		wyLn net.Listener
+	)
+	if *wyAddr != "" {
+		w, err := wyoming.New(wyoming.Options{
+			Speech: srv.Speech, Transcription: srv.Transcription,
+			Name: *wyName, Voice: *voice, AllVoices: *wyAllVoices,
+			MaxSeconds: *maxAudio, OutputRate: *wyRate, MaxConns: *wyMaxConns,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		ln, err := net.Listen("tcp", *wyAddr)
+		if err != nil {
+			log.Fatalf("wyoming: listening on %s: %v", *wyAddr, err)
+		}
+		wy, wyLn = w, ln
+	}
+
 	// The language model is staged last, and on purpose: it is most of this
 	// machine's memory and tens of seconds of staging, so a mistake in a
 	// speech flag is reported before the wait rather than after it.
@@ -327,9 +374,30 @@ func main() {
 			"send %q (set it with -token, or -token= to serve open)",
 			"Authorization: Bearer "+redactToken(*token))
 	}
-	if err := listen(srv, *addr); err != nil {
+	// Wyoming is unauthenticated by design -- the protocol has no place to
+	// put a credential -- so the token line above does not describe it and
+	// this one has to.
+	if wy != nil {
+		info := wy.Info()
+		log.Printf("wyoming: %d asr, %d tts (%d voices) as %q on %s; "+
+			"the protocol carries no credential, so -token does not apply to this port",
+			len(info.ASR), len(info.TTS), wyomingVoices(info), *wyName, wyLn.Addr())
+	}
+
+	if err := listen(srv, *addr, wy, wyLn); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// wyomingVoices counts what the Wyoming door will offer, for the startup
+// line. It is a count rather than a list because 28 voice names is a screen
+// of journal and GET /v1/models already prints them.
+func wyomingVoices(info *wyoming.Info) int {
+	n := 0
+	for _, p := range info.TTS {
+		n += len(p.Voices)
+	}
+	return n
 }
 
 // redactToken shows a token's first and last two characters so the startup
@@ -398,12 +466,19 @@ func where(gpu bool) string {
 // leave the device to the driver to clean up. Shutdown waits for the handler
 // to finish, and the deferred backend teardown in main then runs with nothing
 // dispatching.
-func listen(srv *api.Server, addr string) error {
+//
+// Both doors drain on the same signal and both are waited for, because both
+// dispatch to the same device: returning while a Wyoming client is still
+// mid-utterance would tear the backends down underneath it exactly as
+// killing an HTTP request would. A failure on either listener stops the
+// process, since a server that is half the thing it was started as is worse
+// than one that says why it stopped.
+func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener) error {
 	hs := srv.HTTPServer(addr)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errs := make(chan error, 1)
+	errs := make(chan error, 2)
 	go func() {
 		log.Printf("listening on http://%s", addr)
 		for _, route := range []string{
@@ -416,6 +491,22 @@ func listen(srv *api.Server, addr string) error {
 		errs <- hs.ListenAndServe()
 	}()
 
+	// wyDone is closed when Serve has returned, which is what tells the
+	// shutdown path that every connection has finished rather than merely
+	// that the listener is shut.
+	wyDone := make(chan struct{})
+	if wy != nil {
+		go func() {
+			defer close(wyDone)
+			log.Printf("listening on tcp://%s (wyoming)", wyLn.Addr())
+			if err := wy.Serve(ctx, wyLn); err != nil {
+				errs <- err
+			}
+		}()
+	} else {
+		close(wyDone)
+	}
+
 	select {
 	case err := <-errs:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -426,7 +517,16 @@ func listen(srv *api.Server, addr string) error {
 		log.Printf("shutting down; waiting for requests in flight")
 		shutdown, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := hs.Shutdown(shutdown); err != nil {
+		err := hs.Shutdown(shutdown)
+		// Serve already saw the same cancelled context and is unwinding;
+		// what is left is to wait for the utterance it may be in the
+		// middle of.
+		select {
+		case <-wyDone:
+		case <-shutdown.Done():
+			log.Printf("wyoming: connections still open after 30 s; closing anyway")
+		}
+		if err != nil {
 			return fmt.Errorf("draining: %w", err)
 		}
 		return nil
