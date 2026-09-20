@@ -1,8 +1,11 @@
 # LLM2 — the review, the hypotheses checked, and the next priority list
 
-> **Written 2026-09-17**, as a review of `LLM.md` at L8c-7 / L9a. `LLM.md`
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the LLM vertical's 2026-09-17 review: the hypotheses checked, the decode budget, and the P0–P6 priority list as it closed. It was
+> `LLM2.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> **Written 2026-09-17**, as a review of `llm-vertical.md` at L8c-7 / L9a. `llm-vertical.md`
 > stays the stage log; this file is the forward-looking list. Same
-> conventions: history to `TODO.md`, closed findings to `research/`.
+> conventions: history to `../TODO.md`, closed findings to `research/`.
 >
 > **Every GB-a-token and tok/s-ceiling figure below is P4a-corrected**
 > (2026-09-19): the MoE router has been staged as halves since L5b, so the
@@ -87,7 +90,7 @@ both axes. **The competition from here is our own ceiling, not llama.cpp.**
 | **D14: "a bank that fits the MALL pays only its unpack"** | **Confirmed with its boundary, four blocks, both signs, one rule.** Closed as a hypothesis; it is now a design fact. |
 | **D12's 4 KB formulation** | **Weakened at L8c-6** (no rung is a whole multiple and the spread is still 1.65x); the operative half — *re-measure when the width changes* — stands and is what caught it. |
 | **"Residency is free"** (L6a-4) | **Confirmed at ≤2560 rows — and the >2560 stall is plausibly its boundary.** The untested suspicion in the open question is exactly residency (~80 GB pinned + 28.8 GB mmap + arenas that grow with rows). If P0 confirms it, L6a-4 gains a cliff. |
-| **"Context is cheap here"** (the QSA table in `LLM.md`) | **Priced, never demonstrated.** The arithmetic says 6.8 GB of KV at 262k and a capped 2051-cell read per step; the graph has never completed past 2560 rows. Currently an *inference*, not a measurement — P0 gates it. |
+| **"Context is cheap here"** (the QSA table in `llm-vertical.md`) | **Priced, never demonstrated.** The arithmetic says 6.8 GB of KV at 262k and a capped 2051-cell read per step; the graph has never completed past 2560 rows. Currently an *inference*, not a measurement — P0 gates it. |
 | **D16: a rung above 242 GB/s is not a DRAM measurement** | **Confirmed and generalising**: every one-token ladder screened so far was choosing rungs against an L3 hit. Standing rule: re-screen a ladder before acting on it. **P4a adds the other half**: a rate is a *quotient*, and the numerator is as capable of being wrong as the denominator. Three rows of P1's attribution took their bytes from a different source than the bank they were timing, and each landed on a rate that was read as a finding — one of them (`moe.down` at 147.5) cost a whole stage. Screen the byte count the way D16 screens the rate. |
 
 ---
@@ -216,7 +219,7 @@ both return success and the spin is six lines later, in
 `vkGetQueryPoolResults(VK_QUERY_RESULT_WAIT_BIT)` — an unbounded **userspace**
 poll on RADV, of a timestamp the killed dispatches never wrote. `[syscall]` in
 the old dump was Go's label for a cgo call: `utime=5645` against `stime=5`.
-Full write-up: [research/p0-ring-watchdog.md](research/p0-ring-watchdog.md).
+Full write-up: [p0-ring-watchdog.md](p0-ring-watchdog.md).
 
 - [x] Reproduce and look at the kernel side. `/proc/<pid>/stack` and debugfs
       both want root here; `/proc/<tid>/stat` and `journalctl -k` did the job
@@ -266,7 +269,7 @@ Full write-up: [research/p0-ring-watchdog.md](research/p0-ring-watchdog.md).
 - [x] Gate: the gap is named. **12.01 ms = 5.54 (weight-streaming dispatches
       below 227 GB/s) + 3.46 (dispatches that stream no weight) + 3.01
       (host)**, and idea 2 — the review's favourite for the whole of it — is
-      **1.96 ms** and now ranks fourth. [Write-up](research/p1-decode-attribution.md)
+      **1.96 ms** and now ranks fourth. [Write-up](p1-decode-attribution.md)
 
 ### ~~P1a — the hyper-connection block's 485 dispatches~~  *(**done**, 2026-09-18)*
 
@@ -298,7 +301,7 @@ and the grid is priced rather than rebuilt.**
       streams. A 4x4 block would be 640 workgroups, worth **2.3 us a mixer,
       0.22 ms a token, +0.24 tok/s** — and it is every `up` rung's epilogue
       on the prefill path, so 0.7% of decode does not buy it.
-      [Write-up](research/p1a-hyper-connection-shape.md)
+      [Write-up](p1a-hyper-connection-shape.md)
 
 ### ~~P1b — `moe.down`'s rung, and the shared expert's~~  *(**done**, 2026-09-18 — a ladder, and no rung moves)*
 
@@ -329,7 +332,7 @@ that is not a rung choice.**
       between a dispatch alone with a fence on a bank last read microseconds
       ago and the same dispatch in a 1407-dispatch buffer against a bank last
       read 4.3 GB ago. Bounded under P1c's 1.96 ms; written down, not chased.
-      [Write-up](research/p1b-moe-decode-rescreen.md)
+      [Write-up](p1b-moe-decode-rescreen.md)
 
 ### ~~P1c — the pre-recorded decode command buffer~~  *(**done**, 2026-09-18 — 1.90 ms of the priced 1.96)*
 
@@ -369,7 +372,7 @@ with it in a buffer the step is one command buffer recorded once.**
       one level up: **a whole-model number is only comparable against a
       control staged the same hour.** On P1b's machine state the arithmetic
       says ~28.6 ms, ~34.9 tok/s — the priced +2.2.
-      [Write-up](research/p1c-prerecorded-decode.md)
+      [Write-up](p1c-prerecorded-decode.md)
 
 ### ~~P2 — `ple_proj`, and close L8c~~  *(**done**, 2026-09-18 — and the family is the plan's worst trade)*
 
@@ -405,9 +408,9 @@ because after the deletion the bank *is* the simulation, no carve-outs.**
       `SRC=q8`), 145-chunk number **4.2010 (+4.27%)** in
       `results/l8c_ppl_uniform_notail.csv`, decode the same hour
       28.400 → 28.336 → **27.865 ms, 35.89 tok/s, 1.43x** llama.cpp, and
-      L8c closed in `LLM.md`. Streamed bank ~4.15 GB a token by subtraction;
+      L8c closed in `llm-vertical.md`. Streamed bank ~4.15 GB a token by subtraction;
       the fresh inventory is P3's.
-      [Write-up](research/p2-ple-proj.md)
+      [Write-up](p2-ple-proj.md)
 
 ### ~~P3 — the shipped-widths decision~~  *(**done**, 2026-09-18 — D18, and the answer is the small one)*
 
@@ -446,14 +449,14 @@ worth taking, while everything better needs a fifth bit.**
       the range**. `ple_proj` is a *larger* share of the damage on code (20%
       against 8.7%) and `full_attn`'s fifth bit recovers 41% against 26%:
       both decisions strengthen off wikitext.
-- [x] Gate: **D18** recorded in `LLM.md` with its 145-chunk number, and
+- [x] Gate: **D18** recorded in `llm-vertical.md` with its 145-chunk number, and
       `cmd/serve -llm` stages it by default (`llm.ShippedDenseBank`;
       `LLM_DENSE_BANK` overrides, `off` restores the int8 bank). `cmd/llm`
       deliberately keeps no default — a measurement tool that staged a plan
       nobody named would make every CSV in `results/` ambiguous.
 - [ ] Carried forward: idea 5's **downstream task eval**. There is no
       multiple-choice set on this machine and fetching one was out of scope;
-      the cross-corpus half is done. [Write-up](research/p3-widths.md)
+      the cross-corpus half is done. [Write-up](p3-widths.md)
 
 ### ~~P3a — the fifth bit: a `qh` plane for the dense bank~~  *(**done**, 2026-09-18 — and it is D19)*
 
@@ -493,7 +496,7 @@ the one it inferred** — which is `deltanet`, the only one refused.
       rounding apart on the GEMV. Decode: five plans, two interleaved passes,
       one binary, one hour — **35.70 / 35.49 / 35.11 / 34.57 / 33.13**,
       within-arm spread 0.06-0.28. **D18 amended to D19**, `ple_proj`'s int8
-      row untouched. [Write-up](research/p3a-fifth-bit.md)
+      row untouched. [Write-up](p3a-fifth-bit.md)
 - [ ] Carried forward, priced and not taken: **the GEMV rungs were not
       re-screened at the new width.** D12 says a split's stride must miss the
       4 KB rotation and that the rung moves when the weight's width does — a
@@ -515,7 +518,7 @@ the one it inferred** — which is `deltanet`, the only one refused.
 **Neither half of this item was what it said, and both failed on a fact about
 the checkpoint rather than on a measurement.** What replaced them is smaller,
 buildable and free: **+0.99 tok/s for a perplexity delta the instrument
-cannot resolve.** [Write-up](research/p4-moe-bank.md)
+cannot resolve.** [Write-up](p4-moe-bank.md)
 
 #### P4a — the router row was already fp16, and it moved four numbers
 
@@ -550,7 +553,7 @@ cannot resolve.** [Write-up](research/p4-moe-bank.md)
 - [x] **`ffn_down_exps` at Q4_K cannot exist.** Its rows are **640** and a
       ggml K-quant super-block is 256. `llama-quantize`'s
       `tensor_type_fallback` demotes `Q5_K → Q5_1` and `Q6_K → Q8_0` for
-      exactly this — which is the 43 and the 5 layers. So `LLM.md`'s reading
+      exactly this — which is the 43 and the 5 layers. So `llm-vertical.md`'s reading
       ("unsloth's imatrix telling them the down projection is the sensitive
       one") is a fact about the row length, and **nobody has measured what
       narrowing `down` costs.** `cmd/gguf` now carries the row length per
@@ -598,7 +601,7 @@ cannot resolve.** [Write-up](research/p4-moe-bank.md)
 
 **Built and measured.** Both candidates got an arm in both grouped kernels
 and a complete 145-chunk plan; the write-up is
-[`research/p4c-down-exps.md`](research/p4c-down-exps.md).
+[`p4c-down-exps.md`](p4c-down-exps.md).
 
 | bank | row | PPL | vs 4.0289 | GB/token |
 |---|---:|---:|---:|---:|
@@ -657,7 +660,7 @@ built on the kernels that exist.** A verification pass over M rows costs
 1,2,3,4,6,8 -layers 24`, `results/p5_graph_m_r1.csv`), so even at *100%*
 acceptance M = 2 yields 0.93x and the whole table is under 1.0x at any
 realistic acceptance. Full write-up:
-[research/p5-mtp-rollback.md](research/p5-mtp-rollback.md).
+[p5-mtp-rollback.md](p5-mtp-rollback.md).
 
 - [x] The rollback design doc. **The rollback is the easy part**: 120.75 MB
       — 36 DeltaNet states (113.25 MB), their convolution rings (7.13) and
@@ -713,7 +716,7 @@ realistic acceptance. Full write-up:
       looping trunk is trivially predictable, so the arm is recorded and
       discarded, and P5c's gate inherits the rule: **a speculation multiplier
       measured on greedy self-generated text is measuring the sampler.**
-      [Write-up](research/p5a-draft-head.md)
+      [Write-up](p5a-draft-head.md)
 - [x] **P5b — the R-row decode kernels** *(done 2026-09-19 — 1.17x measured
       against 1.16x projected)*. All four decode GEMVs — `llm_gemv.comp`,
       `llm_hc_gemv.comp`, `llm_moe_gemv.comp`, `llm_moe_router.comp` — take
@@ -746,7 +749,7 @@ realistic acceptance. Full write-up:
       row 1 cannot catch that: the arena still holds what the GEMM wrote.
       The control that can is `rowMoved` — change the second token, require
       the second output row to move — and it is now in all four gates.
-      **A control has to be able to fail.** [Write-up](research/p5b-r-row-decode.md)
+      **A control has to be able to fail.** [Write-up](p5b-r-row-decode.md)
 - [x] **P5c — the rollback and the loop** *(done 2026-09-19 — **lossless,
       and 0.95x**)*. Both gates met: `TestSpeculationRewindIsTheSequence`
       reproduces `result_norm` **to the last place** through rejected passes
@@ -760,7 +763,7 @@ realistic acceptance. Full write-up:
       worse**, because the draft head stages at the checkpoint's own widths and
       does not shrink with it (0.176 of a step → 0.208), and because acceptance
       falls as the trunk moves away from the checkpoint the draft predicts.
-      [Write-up](research/p5c-speculative-loop.md)
+      [Write-up](p5c-speculative-loop.md)
 - [x] **Two of the design's five rollback entries were wrong, and both in the
       cheap direction.** The **deferred ring write is impossible**: `aQKV` is
       one arena shared by all 36 DeltaNet layers, so when a pass ends it holds
@@ -846,7 +849,7 @@ On the measured ctx-2048 profile:
 | **1** | 2 | 1.740 | 0.52x | **1.34x / 1.30x** |
 | 2 | 3 | 2.222 | 0.59x | 0.59x (still the GEMM) |
 
-So **`LLM.md`'s carried 1.5-1.8x is not reachable on wikitext**: the honest
+So **`llm-vertical.md`'s carried 1.5-1.8x is not reachable on wikitext**: the honest
 number is **~1.33x at depth 1**, and every depth was a loss before P5b. The
 MoE's expert growth and the draft's lm head punish depth from opposite ends,
 and a 74% draft is not enough to pay for either. **Raising the bound to three
@@ -869,7 +872,7 @@ wikitext continuation.
 > two tokens, is 0.98x against a measured 0.95x. And **the width work makes it
 > worse**: the draft head stages at the checkpoint's own widths, so narrowing
 > the trunk took it from 0.176 of a step to 0.208 without changing it. See
-> [research/p5c-speculative-loop.md](research/p5c-speculative-loop.md) §3.
+> [p5c-speculative-loop.md](p5c-speculative-loop.md) §3.
 
 ### P6 — batching  *(pending the product question in idea 8 — and P5b built its first stage, which P5c then had to fix three times)*
 
@@ -888,7 +891,7 @@ wikitext continuation.
       in the suite. P6 should raise `GEMVMaxRows` and add the rung it wants to
       that test in the same commit.
 
-### Parked (unchanged from `LLM.md`, in one place)
+### Parked (unchanged from `llm-vertical.md`, in one place)
 
 W4A8 with the asymmetric epilogue (the GEMM arm is unmeasured); the unpack
 prefetch (prefill lead, ~1.1x, "L8d's third lead"); the fp16 residual; the

@@ -1,7 +1,7 @@
 <!-- LLM.md P0. The >2560-row stall: a ring watchdog, a force-signalled fence
      and an unbounded poll. Cited from vk/shim.c, llm/record.go and llm/graph.go. -->
 
-[← LLM.md](../LLM.md) · [← LLM2.md](../LLM2.md) · [research index](README.md) · [L7d](l8d-moe-decode.md) · phase 2
+[← LLM.md](llm-vertical.md) · [← LLM2.md](llm-review.md) · [research index](README.md) · [L7d](l8d-moe-decode.md) · phase 2
 
 # P0 — the stall was a two-second ring watchdog, and the hang was a poll with no timeout
 

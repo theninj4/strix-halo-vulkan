@@ -1,9 +1,12 @@
 # TTS — text to speech, where it stands
 
-> The kokoro slice of `SPEECH.md`, on its own. That file carries both audio
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the kokoro recap: stage table, serving defaults, and what is left. It was
+> `TTS.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> The kokoro slice of `speech-vertical.md`, on its own. That file carries both audio
 > verticals and is the place stage write-ups land; this one is the recap:
 > what is built, what it costs, and what is left. Same rules — rewritten
-> rather than appended to, history in `TODO.md`, closed findings in
+> rather than appended to, history in `../TODO.md`, closed findings in
 > `research/`.
 
 **Target**: `text -> wav` for `Kokoro-82M`, end to end in Go on Vulkan, with
@@ -60,19 +63,19 @@ changing anything here:
 | T1 | `convert_kokoro.py` + `dump_kokoro.py` | **done** — 513 tensors readable from Go, 63 dumped, every self-check 0 |
 | T2 | Phoneme encoder + ALBERT + predictor, CPU | **done** — 5e-7 relative, durations exact |
 | T3 | iSTFTNet decoder, CPU; **first waveform** | **done** — 98 dB against the reference |
-| T4a | The generator's residual blocks on Vulkan | **done** — 385x, 22.4 TFLOP/s, [write-up](research/t4-kokoro-vocoder.md) |
+| T4a | The generator's residual blocks on Vulkan | **done** — 385x, 22.4 TFLOP/s, [write-up](t4-kokoro-vocoder.md) |
 | T4b | The upsamplers | **done** — vocoder 487 → 244 ms |
 | T4c | The decoder, the tail, every readback between | **done** — vocoder 244 → 38 ms |
-| T5a–d | The whole of misaki's English G2P in Go | **done** — corpus 24/24 exact, [write-up](research/t5-kokoro-g2p.md) |
+| T5a–d | The whole of misaki's English G2P in Go | **done** — corpus 24/24 exact, [write-up](t5-kokoro-g2p.md) |
 | T6a | PL-BERT on Vulkan | **done** — 104 ms → 4 ms, no duration changes |
 | T6b | The F0/N AdaIN stacks | **done** — 40 ms → 1 ms, one new shader |
 | T6c | The six bidirectional LSTMs | **done** — 73 ms → 6 ms |
 | T6d | The chain between them | **done** — 17 ms → 8 ms, two submits, two readbacks |
 | A | `/v1/audio/speech` and `backend/tts.go` | **done** — wav and pcm, voices in `/v1/models` |
-| T7 | The excitation and its transform on Vulkan | **done** — 14 ms → 0.2 ms, [write-up](SPEECH.md#t7--the-excitation-done) |
+| T7 | The excitation and its transform on Vulkan | **done** — 14 ms → 0.2 ms, [write-up](speech-vertical.md#t7--the-excitation-done) |
 | T8 | Voice blending | **done** — upstream's spelling, checked against `load_voice` at every row |
-| T9 | One staging for the life of the server | **done** — the endpoint 550 ms → 59, the same bytes, [write-up](SPEECH.md#t9--one-staging-for-the-life-of-the-server-done) |
-| T10 | PL-BERT's attention on the matrix cores | **done** — a layer **56x** at 510 tokens, an utterance 225 ms → **162**, no duration moved, [write-up](SPEECH.md#t10--pl-berts-attention-on-the-matrix-cores-done) |
+| T9 | One staging for the life of the server | **done** — the endpoint 550 ms → 59, the same bytes, [write-up](speech-vertical.md#t9--one-staging-for-the-life-of-the-server-done) |
+| T10 | PL-BERT's attention on the matrix cores | **done** — a layer **56x** at 510 tokens, an utterance 225 ms → **162**, no duration moved, [write-up](speech-vertical.md#t10--pl-berts-attention-on-the-matrix-cores-done) |
 
 ## What exists
 
@@ -174,7 +177,7 @@ samples for the same seed** — the same distribution and the same rule, not the
 same sequence. And with the noise off, the excitation's phase spectrum is
 analytically zero over 27% of its bins, which makes the waveform's agreement
 with the dump a draw spanning 13.8 to 20.2 dB; the device draws 13.8 where the
-host draws 18.2, and neither is more correct than the other. SPEECH.md T7 has
+host draws 18.2, and neither is more correct than the other. speech-vertical.md T7 has
 the measurement. Without libespeak-ng, words outside the lexicon are **dropped**
 with a warning rather than mispronounced — a wrong utterance rather than a
 slow one, which is why `-espeak` defaults on and a failure to open it is a

@@ -1,7 +1,7 @@
 <!-- LLM.md L8c, first item. The instrument L8c's gate is written against.
      Cited from cmd/llm/ppl.go, llm/graph.go and llm/graph_rows_test.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · accuracy
+[← LLM.md](llm-vertical.md) · [research index](README.md) · accuracy
 
 # L8c-0 — perplexity on our own model, and what the bank we run is worth
 

@@ -1,6 +1,9 @@
 # PIPELINE — the z-image-turbo vertical slice
 
-> **SUPERSEDED 2026-09-18 by [`IMAGE.md`](IMAGE.md)**, which is now the file
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the z-image slice as built (stages 1–10): the model inventory, the validation rules, and the measured budget. It was
+> `PIPELINE.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> **SUPERSEDED 2026-09-18 by [`zimage-vertical.md`](zimage-vertical.md)**, which is now the file
 > to read first for this vertical — it carries the current state, the
 > re-checked hypotheses and the priority list (stages I0, I1, …). This file
 > stays as the record of how the slice was built (stages 1-10), the full
@@ -9,7 +12,7 @@
 > image is **14.26 s**, the DiT is **94%** of it.
 
 > **This file is rewritten, not appended.** It states where the pipeline is
-> *now* and what happens next. History belongs in `TODO.md` (session
+> *now* and what happens next. History belongs in `../TODO.md` (session
 > handoffs) and `research/` (closed findings); if a paragraph here is about
 > the past, it is in the wrong file. Keep it under ~200 lines — it earns a
 > few more with each stage that closes, and loses them when a stage's detail
@@ -39,12 +42,12 @@ attention and 12% elementwise. Nothing outside it is worth a percent.
 
 Since I1 the *size* is a ceiling rather than a fixture — `pipeline.Options`
 sizes the arenas, `pipeline.Run` takes a size per image — which moved no
-arithmetic and so changes nothing below. `IMAGE.md` has it.
+arithmetic and so changes nothing below. `zimage-vertical.md` has it.
 
 ## Why this exists
 
 Phase 1 — fifteen-plus sessions of microbenchmarks — ended 2026-09-13 with no
-convergence criterion (`TODO.md` carries the argument). **The unit of work is
+convergence criterion (`../TODO.md` carries the argument). **The unit of work is
 now "a thing that runs", not "an experiment":** a profiler chooses the
 optimisation targets, the backlog does not. Stage 4 is what that looks like —
 it went looking for the kernel `results/shapes.csv` said would win, found it
@@ -242,7 +245,7 @@ weights in two banks: **57.1 ms** at 24 tokens, 71.4 at 128, 170 at 512,
 against 2.08 s and 9.17 s on the CPU. One run walks the roofline — the weights
 are read once whatever T is, so GB/s of weight falling (124, 99, 42) *is*
 GFLOP/s rising (3.0, 12.7, 21.2 T). 0.4% of an image; detail in
-[`research/stage-5-text-encoder.md`](research/stage-5-text-encoder.md).
+[`stage-5-text-encoder.md`](stage-5-text-encoder.md).
 
 ## Where the image budget stands
 
@@ -298,10 +301,10 @@ should carry the dimension it was measured in.
 
 ## What each stage found
 
-One file per stage in `research/`, indexed in `research/README.md`. The ones
+One file per stage in `research/`, indexed in `README.md`. The ones
 that are load-bearing for what is left:
 
-- **[Stage 10, the layout epilogues](research/stage-10-layout-epilogues.md)**
+- **[Stage 10, the layout epilogues](stage-10-layout-epilogues.md)**
   — the two dispatches in the block that moved no information, absorbed into
   the store of the kernel above: **18 a block to 16**, an image 14.49 s to
   14.26. Possible at all because in both cases the data was already in the
@@ -311,27 +314,27 @@ that are load-bearing for what is left:
   (`1.0 ms a block` quoted as `1.0 s an image`), and the old path was doing a
   **double rounding** — which is why 84 halves in 1.2 M of the context differ
   and why every one of them is an exact fp16 tie.
-- **[Stage 2, the VAE](research/stage-2-vae-decoder.md)** — two hard device
+- **[Stage 2, the VAE](stage-2-vae-decoder.md)** — two hard device
   limits that still bind: 4.29 GB per storage buffer, and a reset watchdog
   that kills a multi-second command buffer. Its absmax survey (497 through the
   decoder, 1.16e7 in the mid block's scores) is what stages 7 and 8 narrowed
   against, and is now asserted by `TestConvInputsFitFP16`.
-- **[Stage 3, attention](research/stage-3-dit-attention.md)** — 70% of the WMMA
+- **[Stage 3, attention](stage-3-dit-attention.md)** — 70% of the WMMA
   ceiling, but only once every operand is stored as fragment tiles. Three port
   hazards: RoPE pairs *adjacent* components, the q/k norms are *per head*, and
   v is the operand that needs transposing.
-- **[Stage 4, the block](research/stage-4-dit-graph.md)** — 90.0 ms/block to
+- **[Stage 4, the block](stage-4-dit-graph.md)** — 90.0 ms/block to
   **49.3**, none of it arithmetic. The interactions are the finding: the
   swizzle is worth 1.84x on a tiled weight and 1.16x on a row-major one, the
   hoisted K-slab becomes a *loss* on a tiled weight, and once all of it is
   applied the three shapes that disagreed on a kernel stop disagreeing.
-- **[Stage 5, the text encoder](research/stage-5-text-encoder.md)** — **2.08 s
+- **[Stage 5, the text encoder](stage-5-text-encoder.md)** — **2.08 s
   to 57 ms**, and the encoder sits on the **memory-bound** half of the
   roofline, so unlike the DiT its winning kernel *moves with the prompt
   length* and re-planning per run is free. Three conventions invert between it
   and the DiT — NeoX RoPE, causal attention, grouped heads — and Qwen3's
   massive activations break an RMS-normalised error bound.
-- **[Stage 6, the pipeline](research/stage-6-pipeline.md)** — every bug this
+- **[Stage 6, the pipeline](stage-6-pipeline.md)** — every bug this
   stage had was in the *composition* and invisible to each component's own
   oracle: SwiGLU's product **overflows fp16 on a real prompt and never on a
   random one**, a new push constant on a shared shader silently zeroed the
@@ -339,12 +342,12 @@ that are load-bearing for what is left:
   a time cap that stops being one when the dispatches differ 100x. Also: the
   context refiners take neither the timestep nor the latents, so **two of the
   three phases run once per image rather than once per step**.
-- **[Stage 7, the VAE mid block](research/stage-7-vae-mid-block.md)** —
+- **[Stage 7, the VAE mid block](stage-7-vae-mid-block.md)** —
   attention **1.43 s → 15.1 ms**, the four projections **503 ms → 1.12 ms**.
   The finding that outlives the stage: this block's softmax is so saturated
   that a kernel **dropping three quarters of every dot product decodes the
   same image**, so no end-to-end tolerance can validate it.
-- **[Stage 9, the head and tail](research/stage-9-head-and-tail.md)** — the
+- **[Stage 9, the head and tail](stage-9-head-and-tail.md)** — the
   host's share of a step **59 ms → 5-10 ms**. A bias and a *pad token* become
   extra columns of K, so `y = Wx + b` and `y = x_pad_token` come out of one
   biasless GEMM. And the correction that matters beyond this stage: the
@@ -352,12 +355,12 @@ that are load-bearing for what is left:
   allocation**, where `vk.NewBuffer` still gets the device-local heap; the
   20.5 GB pipeline reads the same arena **83x faster**, which is why the 0.8 s
   an image this stage was partly priced on was never there (`cmd/bus`).
-- **[Stage 8, conv2d](research/stage-8-vae-conv.md)** — the last operator in
+- **[Stage 8, conv2d](stage-8-vae-conv.md)** — the last operator in
   the VAE, **3.02 s → 244 ms** at 41-42 TFLOP/s. The finding is the layout: a
   patch fragment is contiguous only if the **channel** axis is the tiled one,
   because tiling the pixel axis — what every other operand in this engine does
   — makes the `dw = ±1` window straddle two tiles. Also: §2.7's K-slab hoist
   does **nothing** once both operands are fully covered.
-- **[Stage 4c, the stack](research/stage-4c-dit-stack.md)** — splitting a
+- **[Stage 4c, the stack](stage-4c-dit-stack.md)** — splitting a
   12.0 GB weight arena across storage buffers costs **one pipeline per bank
   and nothing per dispatch**; six banks are bit-identical to one.

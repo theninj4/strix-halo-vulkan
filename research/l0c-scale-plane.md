@@ -1,7 +1,7 @@
 <!-- LLM.md L0c. Closes the first of IDEAS §2.2's three open items. Cited from
      shaders/gemm_wmma_q4.comp and bench/ops_moe_q4.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [IDEAS §2.2](2.2-q4-coopmat.md) · prefill path
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [IDEAS §2.2](2.2-q4-coopmat.md) · prefill path
 
 # L0c — the scale plane's layout, and §2.2's unexplained 1.24x
 

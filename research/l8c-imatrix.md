@@ -1,7 +1,7 @@
 <!-- LLM.md L8c-2. The calibration question, answered — and answered no.
      Cited from llm/imatrix.go, llm/sim.go and reference/quant_ref.c. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · accuracy
+[← LLM.md](llm-vertical.md) · [research index](README.md) · accuracy
 
 # L8c-2 — the imatrix, and why calibration makes this model worse
 

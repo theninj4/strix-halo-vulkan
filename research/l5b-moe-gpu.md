@@ -3,7 +3,7 @@
      and four optimisations of which two were worth nothing. Cited from
      llm/gpu_moe.go and shaders/llm_moe_*.comp. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L5a](l5a-moe.md) · [L4b](l4b-qsa-gpu.md) · [L3b](l3b-deltanet-gpu.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L5a](l5a-moe.md) · [L4b](l4b-qsa-gpu.md) · [L3b](l3b-deltanet-gpu.md) · phase 1
 
 # L5b — the MoE block on the device: the last kernel, and the first one whose weights stay quantised
 

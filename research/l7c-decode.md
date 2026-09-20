@@ -4,7 +4,7 @@
      Cited from llm/sample.go, cmd/llm/generate.go, gguf/gguf.go and
      results/l7c_decode.csv. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L7a](l7a-kv-cache.md) · [L7b](l7b-sequence.md) · [L1](l1-baseline.md) · [L5b](l5b-moe-gpu.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L7a](l7a-kv-cache.md) · [L7b](l7b-sequence.md) · [L1](l1-baseline.md) · [L5b](l5b-moe-gpu.md) · phase 1
 
 # L7c — decode: it generates llama.cpp's text, at 7.46 tok/s
 

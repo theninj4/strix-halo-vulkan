@@ -3,7 +3,7 @@
      rows it was priced to remove. Cited from llm/graph.go, llm/record.go,
      vk/engine.go, vk/shim.c and shaders/llm_common.glsl. -->
 
-[← LLM.md](../LLM.md) · [← LLM2.md](../LLM2.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P1a](p1a-hyper-connection-shape.md) · [P1b](p1b-moe-decode-rescreen.md) · phase 2
+[← LLM.md](llm-vertical.md) · [← LLM2.md](llm-review.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P1a](p1a-hyper-connection-shape.md) · [P1b](p1b-moe-decode-rescreen.md) · phase 2
 
 # P1c — the decode step, recorded once: 1.90 ms of the priced 1.96, and the machine moved more than the fix
 

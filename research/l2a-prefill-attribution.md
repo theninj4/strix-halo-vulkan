@@ -1,7 +1,7 @@
 <!-- LLM.md L2a. Where llama.cpp's 393 tok/s prefill actually goes, per op,
      measured with GGML_VK_PERF_LOGGER. Cited from LLM.md's open questions. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L1](l1-baseline.md) · [§2.2](2.2-q4-coopmat.md) · [§3.5](3.5-grouped-moe-gemm.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L1](l1-baseline.md) · [§2.2](2.2-q4-coopmat.md) · [§3.5](3.5-grouped-moe-gemm.md) · phase 1
 
 # L2a — the 5x is attributed: it is not the architecture
 

@@ -1,10 +1,13 @@
 # LLM — the qwen3.8-flash-next vertical
 
-> **Current work from 2026-09-17.** `SPEECH.md` is finished-ish (74.2x real
-> time, T7 open); `PIPELINE.md` (z-image) is parked at 14.26 s an image. Same
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the qwen3.8-flash-next vertical (stages L0–L9a, P0–P5c; decisions D1–D21 and the open questions are at the bottom). It was
+> `LLM.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> **Current work from 2026-09-17.** `speech-vertical.md` is finished-ish (74.2x real
+> time, T7 open); `zimage-pipeline.md` (z-image) is parked at 14.26 s an image. Same
 > rules as both: this file is **rewritten** each session rather than appended
-> to, history goes to `TODO.md`, closed findings to `research/`. Stage numbers
-> are **L0, L1, …**; `§N.M` still addresses `IDEAS.md`.
+> to, history goes to `../TODO.md`, closed findings to `research/`. Stage numbers
+> are **L0, L1, …**; `§N.M` still addresses `ideas.md`.
 
 **Target**: `Qwen/Qwen3.8-Flash-Next` — 180 B params, 6 B active, "a preview of
 the Qwen4 architecture" — generating text end to end in Go on Vulkan. The
@@ -31,7 +34,7 @@ that **both rings are silently corrupted by a single rejected token**. So P5
 is now P5a (the draft head as a passive observer — acceptance and the wiring
 for no machinery at all), P5b (the R-row decode kernels, which are **also
 P6's first stage**) and P5c (the loop).
-[research/p5-mtp-rollback.md](research/p5-mtp-rollback.md)
+[p5-mtp-rollback.md](p5-mtp-rollback.md)
 **P5 is now closed, and it closes as a measured loss.** P5c built the
 rollback and the loop — the ping-pong state, the ping-pong rings,
 `Commit`/`Rewind`, and `TestSpeculationRewindIsTheSequence` — and
@@ -63,7 +66,7 @@ and costs nothing off**: the rollback's 120.75 MB is `GraphOpts.Speculative`,
 which only `cmd/llm -spec` sets, and `-gen -n 64` on the shipped banks measures
 **36.09/36.04 tok/s against a pre-stage control's 35.90/35.93 on identical
 795.6 MB arenas**.
-[research/p5c-speculative-loop.md](research/p5c-speculative-loop.md)
+[p5c-speculative-loop.md](p5c-speculative-loop.md)
 **P5b before it**: all four decode GEMVs take **R rows per tile**, so a
 two-row verification pass is **19.5 ms against 16.6 at one row — 1.17x, where
 it was 54.1** — with one row unregressed, and three of the four blocks come
@@ -89,7 +92,7 @@ and because a depth-1 verify pass is two rows, P5b ships at **R = 2**, which
 raising to three would not improve. The free-running arm read 92.2% and was **thrown away**:
 printing the text shows greedy decoding looping a paragraph verbatim, so it
 measured the sampler.
-[research/p5a-draft-head.md](research/p5a-draft-head.md) **P4c** closed the accuracy-and-bytes
+[p5a-draft-head.md](p5a-draft-head.md) **P4c** closed the accuracy-and-bytes
 frontier's last large row: `ffn_down_exps` — 41% of the expert traffic, and
 at 6.26 bits only because its 640-wide row has no K-quant — is now **IQ4_NL at
 4.5 bits**, which beat the 5.0-bit Q4_1 arm on *both* axes (0.148 GB a token
@@ -136,7 +139,7 @@ machine itself ran every dense-bank kernel 1.6-1.9x slower than P1b's
 its own finding: whole-model numbers now require a same-hour control.
 **L9a** put the generation loop behind
 `cmd/serve` — the checkpoint's own chat template transcribed and checked
-against Jinja, and three envelopes over one loop (`API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
+against Jinja, and three envelopes over one loop (`../API.md`). L0, L1, the whole of L2, L3, L4, L5, L6, **L7 — a
 prompt in, tokens out, one at a time, over a cache the last step extended —
 L8a and L8b, which between them put every dense weight in the model
 on the width the checkpoint already ships, L8d and L8e, which give every block
@@ -644,7 +647,7 @@ the fresh inventory). The int8 bank is no longer bit-identical arithmetic
 on the four re-quantised tensors; the trace tests carry that as `bankTol`
 at D13's measured prices, with the tight bound kept under
 `LLM_DENSE_FP16=1`. Full write-up:
-[research/p2-ple-proj.md](research/p2-ple-proj.md).
+[p2-ple-proj.md](p2-ple-proj.md).
 
 **After it, the bank is not where the decode time is, and has not been since
 L8c-5**: 31.5 tok/s measured against a 56.5 ceiling is 56%. What is left on
@@ -663,7 +666,7 @@ the dense half completely.
 
 ---
 
-## The priority list  *(set 2026-09-18 — the review is `LLM2.md`)*
+## The priority list  *(set 2026-09-18 — the review is `llm-review.md`)*
 
 **P0 through P5 are done** (2026-09-18 and -19) and are struck through below.
 **P5 closed at P5c on 2026-09-19**, and it closed as a measured loss:
@@ -694,21 +697,21 @@ boundary's two weightless dispatches are one (**32.59 → 32.93 tok/s**,
 bit-exact), and the block's low GB/s turns out to be a *grid* — a one-token
 dispatch here is short of workgroups, and 168 of them is 9.26 us where 672 is
 5.54 for identical bytes. The order below follows from that table; each
-item's full plan and gate is in `LLM2.md`.
+item's full plan and gate is in `llm-review.md`.
 
 | # | item | why it is where it is |
 |---|---|---|
-| ~~**P0**~~ | ~~**The >2560-row stall**~~ — **done**, and it was a 2 s ring watchdog rather than anything about this model: the recorder now chunks a submit by *time*. `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192 (**1213.5, 3.10x**), and `-ppl -ctx 4096` completes at 48 layers at **PPL 3.9392**. | The blocker is gone, so everything long-context below is now measurable. [Write-up](research/p0-ring-watchdog.md) |
-| ~~**P1**~~ | ~~**Re-attribute the decode step**~~ — **done**, and the step now sums: 30.52 ms over 36 dispatch labels and six host phases, residual 5 us. The ~12 ms is **5.54 slow + 3.46 weightless + 3.01 host**. The gather was **16.3 serialised major faults a token** and going parallel is 7.0-7.5x, worth **31.51 → 32.72 tok/s** by itself. The pre-recorded command buffer is priced at **1.96 ms** and is *fourth*, not first; the leaders are `hyper_conn` at 114.6 GB/s (485 dispatches a pass) and `moe.down` at 147.5 against `moe.up`'s 200.6. Idea 9 closed with it. | The blocker on every estimate below. [Write-up](research/p1-decode-attribution.md) |
-| ~~**P1a**~~ | ~~**The hyper-connection block's 485 dispatches**~~ — **done**, and it was two answers rather than one. The weightless half fused: the scatter that closes a mixer and the norm that opens the next are the same 2560 values per (token, stream) written and read straight back, so `llm_hc_cn.comp` does both in one pass over registers — **1501 dispatches a pass to 1407, 30.69 ms to 30.37, decode 32.59 → 32.93 tok/s**, and **identical to the last place** on `res`, `xn` and `mixed`. The bank half was not a fusion question: the down projection's decode ladder reads the same 1.94 MB off the same bank at a grid that varies twenty-fold, and **168 workgroups is 9.26 us where 672 is 5.54** — so `up_m1`'s 10.87 us at **160 workgroups** is `down_gemv8`'s number at `down_gemv8`'s width, not MODE 1's M=1 waste. What pins it is the collapse's 64-column block, and unpinning it is priced at **0.22 ms a token** and not taken. | The step's GB/s did not move and the label count did, which is the finding. [Write-up](research/p1a-hyper-connection-shape.md) |
-| ~~**P1b**~~ | ~~**`moe.down`'s rung, and the shared expert's**~~ — **done, and no rung moves.** The whole one-token MoE ladder in `l8e_moe.csv` was an L3 measurement — every GEMV down rung read 267-357 GB/s of a 242 GB/s bus — so it was re-run on **sixteen cold banks at `-iters 1`** (25.6 GB, so `ProfileSweep` never re-reads a bank warm). Two runs agree to a median ratio of 0.9991, no rung reads above the bus, and **the ranking is unchanged on every axis**: v64w4/v16w4 routed, v64w4/v32w4 shared, k40 router — the plan the model already runs. The honest floors are up 99.0 us at 186 GB/s, down 59.3 at 207, shexp 22.7 + 10.9, router 13.4; the whole model sits 8-22% above them (down 72.2, the widest), a **1.33 ms a token** environment gap that is not a rung choice. D16's up-mode contradiction also closes: cold, v16w4 loses to v64w4 by 1.15x, the same side as the whole model. | The 1.19 + 0.73 ms the review priced was the MALL's arithmetic, not a mis-chosen row block. [Write-up](research/p1b-moe-decode-rescreen.md) |
-| ~~**P1c**~~ | ~~**The pre-recorded decode command buffer**~~ — **done**, 1.90 ms of the priced 1.96: the step's whole varying state was one uint (`SEQ_PAST`, now dword 0 of each block's arena), so all 1407 dispatches record once and replay byte-identical. Record **1.127 → 0.16 ms**, hand-over **0.82 → 0.25**. And the machine moved more than the fix — yesterday's binary was 8.7 ms slower a step overnight — so **a whole-model number is only comparable against a control staged the same hour**. | Bit-level gate: 48 greedy tokens and all 48 logit rows identical to the re-recording arm. [Write-up](research/p1c-prerecorded-decode.md) |
-| ~~**P2**~~ | ~~**`ple_proj`, and close L8c**~~ — **done, and the stage closes on 4.2010 (+4.27%)**, beside L8c-3's pre-kernel projection of 4.1998 — an identity, not a coincidence, because the fp16 tail is deleted and the bank quantises exactly what the simulation always did. `ple_proj` alone is **+0.59%** for 0.047 GB — the plan's worst trade — and its screen read **−0.11%**; the six deltas no longer add (sum 4.31% against 4.09% measured). Decode the same hour **27.87 ms, 35.89 tok/s, 1.43x**. | The knapsack (P3) inherits a sixth row and loses additivity as a free tool. [Write-up](research/p2-ple-proj.md) |
-| ~~**P3**~~ | ~~**The shipped-widths decision**~~ — **done, and the answer is the small one: D18 is the uniform plan with `ple_proj` on int8**, 0.0165 GB a token for **0.367 pp (4.1850, +3.87%, against 4.2010)** and a decode cost below the instrument's floor over three interleaved pairs. The knapsack was *measured*, not composed, because additivity now leaks both ways and both leaks are the n-gram block. **Everything past D18 needs the `qh` plane** — `bank_q4.go` is nibbles by construction — and the measured case for building it is `full_attn` at `q5_k`: **14.1 pp/GB**, two-thirds of the width's cost for a quarter of its bytes, where the best int8 arm is 4.6 and is strictly dominated. A second corpus (Go stdlib, 145 chunks) leaves **the ranking invariant** and the magnitudes 2.5x smaller, with `ple_proj` a *larger* share of the damage on code (20% against 8.7%). | **P3a, the fifth bit**, is now the accuracy item; the widths themselves are decided. [Write-up](research/p3-widths.md) |
-| ~~**P3a**~~ | ~~**The fifth bit: a `qh` plane for the dense bank**~~ — **done, and it is D19.** ggml's `Q5_K` is its `Q4_K` plus a bit-plane and *the same record*, so the plane is one 32-byte tile per 128-byte nibble tile and **its byte index is the nibble word's index** — every kernel already computes that index, so the unpack gains a load and two bit tests and no second addressing scheme. The gate is an equality: **0 of 145 chunks differ** between the bank and P3's simulation at `full_attn=q5_k`. Measured as four complete plans, the fifth bit is **14.9 pp/GB on `full_attn`, 7.8 on `lm_head`, 5.9 on `hyper_conn` and 1.6 on `deltanet`** — so the three that beat the 4.6 D18 already refused go in and `deltanet` does not. **4.0948 (+1.63%) against D18's 4.1850 (+3.87%), for 1.13 tok/s: 35.70 → 34.57 over two interleaved passes.** P3's simulated estimates held to 6% on the three it simulated and were **1.75x optimistic on the one it inferred**. | The accuracy frontier is flat; what is left on it is a sixth bit nobody expects to rank differently. [Write-up](research/p3a-fifth-bit.md) |
-| ~~**P4**~~ | ~~**The router at fp16 and the experts at ~4.25 bits**~~ **— done 2026-09-19, and both halves were wrong.** | The router has been fp16 since L5b (the +1.5 was spent before it was proposed) and `ffn_down_exps` **cannot be Q4_K** — rows of 640 against a 256-element super-block. What replaced them, **D20**: the four rows at 8.5 bits with a format the kernels already read, **+0.99 tok/s (34.53 → 35.52) for 0.0022 points of perplexity**. The row that matters, `ffn_down_exps` at 0.615 GB a token, is now **P4c** and is a kernel stage. research/p4-moe-bank.md |
-| ~~**P4c**~~ | ~~**`ffn_down_exps` below six bits**~~ **— done 2026-09-19, and the 4.5-bit format beat the 5.0-bit one on both axes.** Both candidates got an arm in both grouped kernels and a complete 145-chunk plan: `q4_1` is **4.1092 (+1.99%)** for 0.098 GB a token, `iq4_nl` **4.0992 (+1.74%)** for **0.148** — half a bit narrower *and* a fifth of the accuracy cost, so there was no trade to make. Paired over the chunks, q4_1's cost is resolvable (t = 4.11) and IQ4_NL's is not (t = 0.79), which answers the question the stage existed to ask. **The kernel is the story**: written the obvious way — ggml's 18-byte record and the codebook in a `uvec4` — the 4.5-bit arm read its bank at **152.7 GB/s against Q4_1's 211.4** and was *slower than the 6-bit format it replaced*. The codebook into LDS is 180.2, and then **ggml's record layout turns out not to be a constraint on a tensor we write ourselves** — but the two kernels want different arrangements of it: a plane of scales and a plane of nibbles is 203.3 GB/s at decode and **costs the prefill GEMM 36%**, because a slab unpack reads one block of sixty-four different rows per K-step and a split scale doubles the lines it opens. **36-byte pairs** are aligned *and* keep a scale beside its nibbles: **204.3 GB/s and 45.11 us a layer against Q5_1's 56.94** at decode, the same 2679 us at prefill on three quarters of the bytes, and output identical to the bit through every layout. **D21.** | The largest row on the throughput frontier, and the only one whose accuracy nobody had measured. [Write-up](research/p4c-down-exps.md) |
-| ~~**P5**~~ | ~~**MTP speculation**~~ — **done 2026-09-19, and it closes as a measured loss: lossless, and 0.98x.** P5c built the rollback and the loop and the stage's own gate holds — `result_norm` identical to the last place through rejected passes against a control that moves it by rms 8.5e-01, and the loop's ids identical to the plain loop's at ctx 512 and at 2048 cells with a 1024-token prompt. **34.65 against 36.38 tok/s and 28.20 against 31.56**, two runs each on the shipped banks (0.98x/0.98x on the checkpoint's own widths — narrowing the trunk makes speculation *worse*, because the draft head does not narrow with it and acceptance falls). The gap to 1.33x is three numbers and none is the rollback: the verification pass is **1.32 steps, not P5b's 24-layer 1.17** (at 48 layers the M-independent head, PLE and host are 13% of a step rather than 24%); acceptance on generated prose is **64.1%, not 74.0%**; and the round is a **two-state chain**, because at R = 2 a rejection's re-run prefix fills the pass and displaces the draft — `(pass + draft) + (1−a)·pass` for exactly two tokens, which the design priced as free at general M. **Two of the design's rollback entries were wrong in the cheap direction**: the deferred ring write is *impossible* (`aQKV` is one arena shared by 36 layers, so a pass ends holding layer 47's projection and there is nothing to re-issue the others from — the rings ping-pong instead), and the pooled indexer table does *not* self-heal (a block is written the one time a run completes its cells and never again, so `Rewind` snapshots it). **Three defects in P5b**, two silent: `PinSchedule` stopped pinning at two rows, the four MoE expert dispatches never named their R-row pipeline (a 45x error on the residual, invisible to a block test whose control is a control on the *combine*), and the R-row GEMV re-read the bank per row (`moe.up` at **101 GB/s against 141**), worth **0.91x → 0.98x**. Plus **453 MB of host memset a pass** in `DeltaNetGPU.Resize`, the long context's other 0.91 → 0.98. And a ceiling nobody had priced: **speculation stops at 2048 cells**, because `blk.48` states no compress ratio. [Write-up](research/p5c-speculative-loop.md) — and what would take it past 1.0, priced there. **The design pass (2026-09-19)** before all of it: The crossover D15 refuses had never been measured; measured, a **verification pass over M rows costs 3.24x a decode step at M = 2 and 4.32x at M = 8**, so even at *100%* acceptance M = 2 yields 0.93x and speculation is a **net loss at every M and every acceptance rate today**. Every block but the MoE takes one step up at M = 2 and is then **flat to M = 8** on identical weight bytes — `hc` 2.1 → 13.9 → 13.8 ms, `dn` 4.2 → 8.3 → 8.5, `attn` 1.2 → 2.7 → 2.7 — which is D15's refusal and nothing else; only the MoE keeps climbing, and that half is real (**10 experts at M = 1, 17 at 2, 36 at 4, 49 at 8** against a 1.327 GB routed row of D21's 4.132). **The rollback is the easy part**: 120.75 MB, of which the 113.25 MB of recurrent state **ping-pongs for nothing** (`llm_dn_scan.comp` loads S into registers once and stores it once) and the 7.5 MB of convolution rings is **deferred rather than copied** (`llm_seq_hist.comp` is one dispatch at the end of a block) — and a correctness finding beside it: **both rings are corrupted by a single rejected token**, silently, because a ring is addressed by absolute position modulo its length. **P5a** is the draft head as a *passive observer* — acceptance needs no rollback and no kernel — **P5b** the R-row decode kernels, **P5c** the loop. **P5b done 2026-09-19**: all four decode GEMVs carry **R rows per tile**, `ROWS` a specialization constant so the ~130 `.spv` of those families do not double, and a two-row whole-graph pass is **19.5 ms against 16.6 at one row — 1.17x against the 1.16x projected, where it was 54.1**; `hc` 13.9 → **2.0** ms, `moe` 25.5 → **8.2**, and three of the four blocks are *faster* at two rows than at one. One row unregressed. D15's refusal moved to `GEMVMaxRows` rather than going away. [Write-up](research/p5b-r-row-decode.md) | **P5a done 2026-09-19: `a₁ = 74.0%`** (1024 rounds, n_ctx 2048, teacher-forced, against a zeroed-hidden control at 9.8%), E[tokens] 1.74 at depth 1 to 3.02 at 6, **flat in context** and identical over two runs. The wiring had **no oracle** — llama.cpp's `qwen4exp.cpp` has no `nextn` symbol, transformers discards `^mtp.*` — and was settled by racing five readings from one recorded trunk walk: the wide residual per stream wins (73.4%), the collapsed broadcast loses (55.5%), and **the concatenation order is load-bearing** (flipped: 0 of 256). Worth **~1.33x at depth 1** with P5b and a **loss at every depth today**; a depth-1 verify pass is two rows, so **P5b shrinks to R = 2**. The free-running arm's 92.2% was **discarded** — the trunk was looping a paragraph verbatim. [Write-up](research/p5a-draft-head.md) |
+| ~~**P0**~~ | ~~**The >2560-row stall**~~ — **done**, and it was a 2 s ring watchdog rather than anything about this model: the recorder now chunks a submit by *time*. `-graph` returns at 4096 (**1174.6 tok/s, 3.00x**) and 8192 (**1213.5, 3.10x**), and `-ppl -ctx 4096` completes at 48 layers at **PPL 3.9392**. | The blocker is gone, so everything long-context below is now measurable. [Write-up](p0-ring-watchdog.md) |
+| ~~**P1**~~ | ~~**Re-attribute the decode step**~~ — **done**, and the step now sums: 30.52 ms over 36 dispatch labels and six host phases, residual 5 us. The ~12 ms is **5.54 slow + 3.46 weightless + 3.01 host**. The gather was **16.3 serialised major faults a token** and going parallel is 7.0-7.5x, worth **31.51 → 32.72 tok/s** by itself. The pre-recorded command buffer is priced at **1.96 ms** and is *fourth*, not first; the leaders are `hyper_conn` at 114.6 GB/s (485 dispatches a pass) and `moe.down` at 147.5 against `moe.up`'s 200.6. Idea 9 closed with it. | The blocker on every estimate below. [Write-up](p1-decode-attribution.md) |
+| ~~**P1a**~~ | ~~**The hyper-connection block's 485 dispatches**~~ — **done**, and it was two answers rather than one. The weightless half fused: the scatter that closes a mixer and the norm that opens the next are the same 2560 values per (token, stream) written and read straight back, so `llm_hc_cn.comp` does both in one pass over registers — **1501 dispatches a pass to 1407, 30.69 ms to 30.37, decode 32.59 → 32.93 tok/s**, and **identical to the last place** on `res`, `xn` and `mixed`. The bank half was not a fusion question: the down projection's decode ladder reads the same 1.94 MB off the same bank at a grid that varies twenty-fold, and **168 workgroups is 9.26 us where 672 is 5.54** — so `up_m1`'s 10.87 us at **160 workgroups** is `down_gemv8`'s number at `down_gemv8`'s width, not MODE 1's M=1 waste. What pins it is the collapse's 64-column block, and unpinning it is priced at **0.22 ms a token** and not taken. | The step's GB/s did not move and the label count did, which is the finding. [Write-up](p1a-hyper-connection-shape.md) |
+| ~~**P1b**~~ | ~~**`moe.down`'s rung, and the shared expert's**~~ — **done, and no rung moves.** The whole one-token MoE ladder in `l8e_moe.csv` was an L3 measurement — every GEMV down rung read 267-357 GB/s of a 242 GB/s bus — so it was re-run on **sixteen cold banks at `-iters 1`** (25.6 GB, so `ProfileSweep` never re-reads a bank warm). Two runs agree to a median ratio of 0.9991, no rung reads above the bus, and **the ranking is unchanged on every axis**: v64w4/v16w4 routed, v64w4/v32w4 shared, k40 router — the plan the model already runs. The honest floors are up 99.0 us at 186 GB/s, down 59.3 at 207, shexp 22.7 + 10.9, router 13.4; the whole model sits 8-22% above them (down 72.2, the widest), a **1.33 ms a token** environment gap that is not a rung choice. D16's up-mode contradiction also closes: cold, v16w4 loses to v64w4 by 1.15x, the same side as the whole model. | The 1.19 + 0.73 ms the review priced was the MALL's arithmetic, not a mis-chosen row block. [Write-up](p1b-moe-decode-rescreen.md) |
+| ~~**P1c**~~ | ~~**The pre-recorded decode command buffer**~~ — **done**, 1.90 ms of the priced 1.96: the step's whole varying state was one uint (`SEQ_PAST`, now dword 0 of each block's arena), so all 1407 dispatches record once and replay byte-identical. Record **1.127 → 0.16 ms**, hand-over **0.82 → 0.25**. And the machine moved more than the fix — yesterday's binary was 8.7 ms slower a step overnight — so **a whole-model number is only comparable against a control staged the same hour**. | Bit-level gate: 48 greedy tokens and all 48 logit rows identical to the re-recording arm. [Write-up](p1c-prerecorded-decode.md) |
+| ~~**P2**~~ | ~~**`ple_proj`, and close L8c**~~ — **done, and the stage closes on 4.2010 (+4.27%)**, beside L8c-3's pre-kernel projection of 4.1998 — an identity, not a coincidence, because the fp16 tail is deleted and the bank quantises exactly what the simulation always did. `ple_proj` alone is **+0.59%** for 0.047 GB — the plan's worst trade — and its screen read **−0.11%**; the six deltas no longer add (sum 4.31% against 4.09% measured). Decode the same hour **27.87 ms, 35.89 tok/s, 1.43x**. | The knapsack (P3) inherits a sixth row and loses additivity as a free tool. [Write-up](p2-ple-proj.md) |
+| ~~**P3**~~ | ~~**The shipped-widths decision**~~ — **done, and the answer is the small one: D18 is the uniform plan with `ple_proj` on int8**, 0.0165 GB a token for **0.367 pp (4.1850, +3.87%, against 4.2010)** and a decode cost below the instrument's floor over three interleaved pairs. The knapsack was *measured*, not composed, because additivity now leaks both ways and both leaks are the n-gram block. **Everything past D18 needs the `qh` plane** — `bank_q4.go` is nibbles by construction — and the measured case for building it is `full_attn` at `q5_k`: **14.1 pp/GB**, two-thirds of the width's cost for a quarter of its bytes, where the best int8 arm is 4.6 and is strictly dominated. A second corpus (Go stdlib, 145 chunks) leaves **the ranking invariant** and the magnitudes 2.5x smaller, with `ple_proj` a *larger* share of the damage on code (20% against 8.7%). | **P3a, the fifth bit**, is now the accuracy item; the widths themselves are decided. [Write-up](p3-widths.md) |
+| ~~**P3a**~~ | ~~**The fifth bit: a `qh` plane for the dense bank**~~ — **done, and it is D19.** ggml's `Q5_K` is its `Q4_K` plus a bit-plane and *the same record*, so the plane is one 32-byte tile per 128-byte nibble tile and **its byte index is the nibble word's index** — every kernel already computes that index, so the unpack gains a load and two bit tests and no second addressing scheme. The gate is an equality: **0 of 145 chunks differ** between the bank and P3's simulation at `full_attn=q5_k`. Measured as four complete plans, the fifth bit is **14.9 pp/GB on `full_attn`, 7.8 on `lm_head`, 5.9 on `hyper_conn` and 1.6 on `deltanet`** — so the three that beat the 4.6 D18 already refused go in and `deltanet` does not. **4.0948 (+1.63%) against D18's 4.1850 (+3.87%), for 1.13 tok/s: 35.70 → 34.57 over two interleaved passes.** P3's simulated estimates held to 6% on the three it simulated and were **1.75x optimistic on the one it inferred**. | The accuracy frontier is flat; what is left on it is a sixth bit nobody expects to rank differently. [Write-up](p3a-fifth-bit.md) |
+| ~~**P4**~~ | ~~**The router at fp16 and the experts at ~4.25 bits**~~ **— done 2026-09-19, and both halves were wrong.** | The router has been fp16 since L5b (the +1.5 was spent before it was proposed) and `ffn_down_exps` **cannot be Q4_K** — rows of 640 against a 256-element super-block. What replaced them, **D20**: the four rows at 8.5 bits with a format the kernels already read, **+0.99 tok/s (34.53 → 35.52) for 0.0022 points of perplexity**. The row that matters, `ffn_down_exps` at 0.615 GB a token, is now **P4c** and is a kernel stage. p4-moe-bank.md |
+| ~~**P4c**~~ | ~~**`ffn_down_exps` below six bits**~~ **— done 2026-09-19, and the 4.5-bit format beat the 5.0-bit one on both axes.** Both candidates got an arm in both grouped kernels and a complete 145-chunk plan: `q4_1` is **4.1092 (+1.99%)** for 0.098 GB a token, `iq4_nl` **4.0992 (+1.74%)** for **0.148** — half a bit narrower *and* a fifth of the accuracy cost, so there was no trade to make. Paired over the chunks, q4_1's cost is resolvable (t = 4.11) and IQ4_NL's is not (t = 0.79), which answers the question the stage existed to ask. **The kernel is the story**: written the obvious way — ggml's 18-byte record and the codebook in a `uvec4` — the 4.5-bit arm read its bank at **152.7 GB/s against Q4_1's 211.4** and was *slower than the 6-bit format it replaced*. The codebook into LDS is 180.2, and then **ggml's record layout turns out not to be a constraint on a tensor we write ourselves** — but the two kernels want different arrangements of it: a plane of scales and a plane of nibbles is 203.3 GB/s at decode and **costs the prefill GEMM 36%**, because a slab unpack reads one block of sixty-four different rows per K-step and a split scale doubles the lines it opens. **36-byte pairs** are aligned *and* keep a scale beside its nibbles: **204.3 GB/s and 45.11 us a layer against Q5_1's 56.94** at decode, the same 2679 us at prefill on three quarters of the bytes, and output identical to the bit through every layout. **D21.** | The largest row on the throughput frontier, and the only one whose accuracy nobody had measured. [Write-up](p4c-down-exps.md) |
+| ~~**P5**~~ | ~~**MTP speculation**~~ — **done 2026-09-19, and it closes as a measured loss: lossless, and 0.98x.** P5c built the rollback and the loop and the stage's own gate holds — `result_norm` identical to the last place through rejected passes against a control that moves it by rms 8.5e-01, and the loop's ids identical to the plain loop's at ctx 512 and at 2048 cells with a 1024-token prompt. **34.65 against 36.38 tok/s and 28.20 against 31.56**, two runs each on the shipped banks (0.98x/0.98x on the checkpoint's own widths — narrowing the trunk makes speculation *worse*, because the draft head does not narrow with it and acceptance falls). The gap to 1.33x is three numbers and none is the rollback: the verification pass is **1.32 steps, not P5b's 24-layer 1.17** (at 48 layers the M-independent head, PLE and host are 13% of a step rather than 24%); acceptance on generated prose is **64.1%, not 74.0%**; and the round is a **two-state chain**, because at R = 2 a rejection's re-run prefix fills the pass and displaces the draft — `(pass + draft) + (1−a)·pass` for exactly two tokens, which the design priced as free at general M. **Two of the design's rollback entries were wrong in the cheap direction**: the deferred ring write is *impossible* (`aQKV` is one arena shared by 36 layers, so a pass ends holding layer 47's projection and there is nothing to re-issue the others from — the rings ping-pong instead), and the pooled indexer table does *not* self-heal (a block is written the one time a run completes its cells and never again, so `Rewind` snapshots it). **Three defects in P5b**, two silent: `PinSchedule` stopped pinning at two rows, the four MoE expert dispatches never named their R-row pipeline (a 45x error on the residual, invisible to a block test whose control is a control on the *combine*), and the R-row GEMV re-read the bank per row (`moe.up` at **101 GB/s against 141**), worth **0.91x → 0.98x**. Plus **453 MB of host memset a pass** in `DeltaNetGPU.Resize`, the long context's other 0.91 → 0.98. And a ceiling nobody had priced: **speculation stops at 2048 cells**, because `blk.48` states no compress ratio. [Write-up](p5c-speculative-loop.md) — and what would take it past 1.0, priced there. **The design pass (2026-09-19)** before all of it: The crossover D15 refuses had never been measured; measured, a **verification pass over M rows costs 3.24x a decode step at M = 2 and 4.32x at M = 8**, so even at *100%* acceptance M = 2 yields 0.93x and speculation is a **net loss at every M and every acceptance rate today**. Every block but the MoE takes one step up at M = 2 and is then **flat to M = 8** on identical weight bytes — `hc` 2.1 → 13.9 → 13.8 ms, `dn` 4.2 → 8.3 → 8.5, `attn` 1.2 → 2.7 → 2.7 — which is D15's refusal and nothing else; only the MoE keeps climbing, and that half is real (**10 experts at M = 1, 17 at 2, 36 at 4, 49 at 8** against a 1.327 GB routed row of D21's 4.132). **The rollback is the easy part**: 120.75 MB, of which the 113.25 MB of recurrent state **ping-pongs for nothing** (`llm_dn_scan.comp` loads S into registers once and stores it once) and the 7.5 MB of convolution rings is **deferred rather than copied** (`llm_seq_hist.comp` is one dispatch at the end of a block) — and a correctness finding beside it: **both rings are corrupted by a single rejected token**, silently, because a ring is addressed by absolute position modulo its length. **P5a** is the draft head as a *passive observer* — acceptance needs no rollback and no kernel — **P5b** the R-row decode kernels, **P5c** the loop. **P5b done 2026-09-19**: all four decode GEMVs carry **R rows per tile**, `ROWS` a specialization constant so the ~130 `.spv` of those families do not double, and a two-row whole-graph pass is **19.5 ms against 16.6 at one row — 1.17x against the 1.16x projected, where it was 54.1**; `hc` 13.9 → **2.0** ms, `moe` 25.5 → **8.2**, and three of the four blocks are *faster* at two rows than at one. One row unregressed. D15's refusal moved to `GEMVMaxRows` rather than going away. [Write-up](p5b-r-row-decode.md) | **P5a done 2026-09-19: `a₁ = 74.0%`** (1024 rounds, n_ctx 2048, teacher-forced, against a zeroed-hidden control at 9.8%), E[tokens] 1.74 at depth 1 to 3.02 at 6, **flat in context** and identical over two runs. The wiring had **no oracle** — llama.cpp's `qwen4exp.cpp` has no `nextn` symbol, transformers discards `^mtp.*` — and was settled by racing five readings from one recorded trunk walk: the wide residual per stream wins (73.4%), the collapsed broadcast loses (55.5%), and **the concatenation order is load-bearing** (flipped: 0 of 256). Worth **~1.33x at depth 1** with P5b and a **loss at every depth today**; a depth-1 verify pass is two rows, so **P5b shrinks to R = 2**. The free-running arm's 92.2% was **discarded** — the trunk was looping a paragraph verbatim. [Write-up](p5a-draft-head.md) |
 | **P6** | **Batching** | Pending the product question: will the API serve more than one stream? Each sequence owns 113 MB of DeltaNet state. **P5 answered half of the ordering question**: R concurrent sequences are R rows through the same weights, which is exactly P5b's kernel, so the two share a prerequisite and building it is not a bet on either one. **P5c is the reason to distrust that kernel until it is gated**: R rows were correct in a block test and wrong in the model three separate ways, and the instrument that caught all three is `TestGraphIsAChunkSplit` at two and three tokens. Raise `GEMVMaxRows` and add the rung in the same commit. |
 
 Parked, unchanged: W4A8 with the asymmetric epilogue, the unpack prefetch,
@@ -733,7 +736,7 @@ tok/s and coherent text. Reproducibility across two separate runs is 0.5% on
 pp512 and 0.8% on tg128. And the accuracy reference, on the same checkpoint:
 **PPL = 4.0340 ± 0.02283** over wikitext-2's 145 chunks at n_ctx 2048 — the
 figure L8c's re-quantisation has to stay near, at the same corpus, context and
-chunking. [Write-up](research/l1-baseline.md)
+chunking. [Write-up](l1-baseline.md)
 
 **So the target moves.** Phase 1's job is the 38.2 tok/s the bytes allow, not
 llama.cpp's 25.15 — decode leaves a third of the bus unused in the reference
@@ -754,19 +757,19 @@ finding 5 below explains.
 > bits/weight at the size a 180 B model needs, which is what every number
 > below depends on. At `-bankgib 80`: 23 buffers, 85.9 GB, every page written,
 > **237 GB/s at every prefix** — past UD-Q4_K_XL's 82.52 GB resident core.
-> [Write-up](research/l0a-bank-range.md)
+> [Write-up](l0a-bank-range.md)
 >
 > **L0b: neither does the memory type, and the heap sizes are fiction.** All
 > eight types that can back a storage buffer read **236.0-237.4 GB/s** — 0.57%
 > across 32 cells, heap 0 / heap 1 = **1.0004**. Type 3 reserved **105.0 GiB**
 > against a heap RADV calls 83.79. **The ceiling is physical RAM.**
-> [Write-up](research/5.1-memory-types.md) · `results/bank.csv`
+> [Write-up](5.1-memory-types.md) · `results/bank.csv`
 >
 > **L0c: §2.2's unexplained 1.24x was locality in the scale plane, and it is
 > gone.** A k-major scale plane takes `gate_up` at QBLOCK=32 from **4.71 ms to
 > 3.72, 1.27x**, past row-major QBLOCK=128's 3.79. **The fine scale block
 > accuracy wants now costs 1.0% instead of 14.2%.**
-> [Write-up](research/l0c-scale-plane.md) · `results/moe.csv`
+> [Write-up](l0c-scale-plane.md) · `results/moe.csv`
 >
 > **L0d: W4A8 is safe, and above ~5 bits/weight the activations are the
 > floor.** int8-per-token activations cost **1.13x** the error of fp16 ones,
@@ -775,13 +778,13 @@ finding 5 below explains.
 > 3.4e-3, so **W8A8 is 99% activation error**. Asymmetric Q4 is worth 5% at
 > equal bits, not 2x. And a bug fell out: `quantizeQ8`'s fp16 block scale goes
 > subnormal under maxAbs 7.75e-3, worth **14x** on one real tensor in fourteen.
-> [Write-up](research/l0d-quant-error.md)
+> [Write-up](l0d-quant-error.md)
 
 ## What L2a established — the 5x, attributed
 
 `GGML_VK_PERF_LOGGER=1` puts a timestamp query around every dispatch in
 llama.cpp's Vulkan graph. Both of L1's candidates are **wrong**, and the
-answer is better than either. [Write-up](research/l2a-prefill-attribution.md)
+answer is better than either. [Write-up](l2a-prefill-attribution.md)
 · `results/l2a_prefill_ops.csv`
 
 > **L2a-1: the architecture is innocent.** `GATED_DELTA_NET` is **1.6%** of a
@@ -830,7 +833,7 @@ answer is better than either. [Write-up](research/l2a-prefill-attribution.md)
 `llm/` is the vertical's package: a `Config` read from the checkpoint, the
 hyper-connection block, and `reference/eval_dump.c`, which writes **whole**
 tensors of a real llama.cpp pass where `llama-eval-callback` prints three per
-axis. [Write-up](research/l2b-hyper-connections.md) · `reference/out/llm/`
+axis. [Write-up](l2b-hyper-connections.md) · `reference/out/llm/`
 
 > **L2b-1: the block matches, and four of its seven mixers match to f32
 > round-off.** `token_embd`'s gather and `hc_init` are **bit-exact**; the
@@ -870,7 +873,7 @@ axis. [Write-up](research/l2b-hyper-connections.md) · `reference/out/llm/`
 `shaders/llm_hc_norm.comp`, `llm_gemm.comp` (two of its three epilogues) and
 `llm_hc_combine.comp`, driven by `llm/gpu.go`. The first kernel of the
 vertical, and the one L2a put at the front of the queue.
-[Write-up](research/l2c-hc-kernel.md) · `results/l2c_hc.csv`
+[Write-up](l2c-hc-kernel.md) · `results/l2c_hc.csv`
 
 > **L2c-1: four dispatches against sixteen, and 226.6 ms becomes 53.4.** Per
 > 512-token graph, against the lines of llama.cpp's own graph that are nameably
@@ -913,7 +916,7 @@ vertical, and the one L2a put at the front of the queue.
 ## What L2d established — the n-gram block, and a hash that has no tolerance
 
 `per_layer_token_embd` is a quarter of the checkpoint and it is not a matrix.
-[Write-up](research/l2d-ple.md) · `results/l2d_ple.csv`
+[Write-up](l2d-ple.md) · `results/l2d_ple.csv`
 
 > **L2d-1: the trigram hash is bit-exact.** Sixteen rows of a **320 001 536-row**
 > table per token, chosen by a 64-bit mix of the token and its two
@@ -952,7 +955,7 @@ vertical, and the one L2a put at the front of the queue.
 
 `llm/attn.go`: the fused query/gate projection, interleaved M-RoPE, the QSA
 indexer and causal GQA, checked against layer 3 of the dump.
-[Write-up](research/l2e-attention.md)
+[Write-up](l2e-attention.md)
 
 > **L2e-1: it matches, and the chain composes.** The indexer's pooled keys to
 > 1.7e-07 rms, its score to **3.5e-07 relative**, the fused query/gate split to
@@ -990,7 +993,7 @@ indexer and causal GQA, checked against layer 3 of the dump.
 
 `llm/gpu_attn.go`, `shaders/llm_attn_{pack,idx,score,wmma}.comp`: six
 dispatches, the plain GEMM arm twice and four kernels of this layer's own.
-[Write-up](research/l2f-attention-gpu.md) · `results/l2f_attn.csv`
+[Write-up](l2f-attention-gpu.md) · `results/l2f_attn.csv`
 
 > **L2f-1: six dispatches against nineteen, and 66.3 ms becomes 27.6.** Per
 > 512-token graph, against the lines of llama.cpp's own graph that are nameably
@@ -1054,7 +1057,7 @@ dispatches, the plain GEMM arm twice and four kernels of this layer's own.
 `llm/deltanet.go`: the fused qkv projection, the depthwise causal convolution,
 the L2 normalisation, the two F32 gate projections and the delta rule itself,
 against all eighteen tensors llama.cpp names inside layer 0.
-[Write-up](research/l3-deltanet.md)
+[Write-up](l3-deltanet.md)
 
 > **L3a-1: it matches, and the recurrence is at f32 round-off.**
 > `attn_output-0` is **3.11e-09 rms**, the 786 432-value `new_state-0`
@@ -1139,7 +1142,7 @@ against all eighteen tensors llama.cpp names inside layer 0.
 
 `llm/gpu_deltanet.go`, `shaders/llm_dn_{conv,scan,norm}.comp`: five dispatches,
 the plain GEMM arm twice and three kernels of this layer's own.
-[Write-up](research/l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
+[Write-up](l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
 
 > **L3b-1: five dispatches against eleven, and 152.8 ms becomes 111.5.** Per
 > 512-token graph, against the lines of llama.cpp's own graph that are nameably
@@ -1220,7 +1223,7 @@ the plain GEMM arm twice and three kernels of this layer's own.
 The 4k dump: 4096 tokens of wikitext-2 in a 4096-cell cache, one ubatch, the
 same pinned build. 8.0 GB, 116 tensors, ~4 minutes — and the filter takes
 layers 0 and 3, so **the whole MoE block comes with it**.
-[Write-up](research/l4-qsa.md) · `reference/out/llm4k/`
+[Write-up](l4-qsa.md) · `reference/out/llm4k/`
 
 > **L4a-1: the selection is a radix select, and ours is the reference's.**
 > `topk_radix_select.comp` is **not a sort**: four 8-bit radix passes over an
@@ -1294,7 +1297,7 @@ layers 0 and 3, so **the whole MoE block comes with it**.
 
 `llm/gpu_attn.go`, `shaders/llm_attn_select.comp`: a seventh dispatch that
 only exists past 2051 cells, and a bitmask the attention kernel reads beside
-the causal mask. [Write-up](research/l4b-qsa-gpu.md) · `results/l4b_qsa.csv`
+the causal mask. [Write-up](l4b-qsa-gpu.md) · `results/l4b_qsa.csv`
 
 > **L4b-1: one dispatch against twenty-four, and 2.40 ms becomes 1.24.** Per
 > 512-token graph, against the two lines that are the selection: `TOP_K`
@@ -1361,7 +1364,7 @@ the causal mask. [Write-up](research/l4b-qsa-gpu.md) · `results/l4b_qsa.csv`
 `llm/moe.go`: the router, the softmax, the top-10 of 512, the normalised
 weights, the three expert matmuls, the shared expert and its sigmoid gate —
 against all fourteen tensors llama.cpp names inside the FFN half.
-[Write-up](research/l5a-moe.md)
+[Write-up](l5a-moe.md)
 
 > **L5a-1: the selection is the reference's, set for set on all 4096 tokens.**
 > 0 of 40 960 slots differ as a set — which is the number that matters,
@@ -1426,7 +1429,7 @@ against all fourteen tensors llama.cpp names inside the FFN half.
 
 `llm/gpu_moe.go`, `shaders/llm_moe_{gemm,route,perm,combine}.comp`: nine
 dispatches, the plain GEMM arm once and four kernels of this block's own.
-[Write-up](research/l5b-moe-gpu.md) · `results/l5b_moe.csv`,
+[Write-up](l5b-moe-gpu.md) · `results/l5b_moe.csv`,
 `results/l5b_moe_ladder.csv`
 
 > **L5b-1: nine dispatches against about 845, and 567.4 ms becomes 522.3.**
@@ -1527,7 +1530,7 @@ dispatches, the plain GEMM arm once and four kernels of this block's own.
 
 `cmd/llm/resident.go`, `llm/gpu_moe.go`, `vk/shim.c`,
 `shaders/llm_common.glsl`: 84.20 GB in 68 buffers, and binding 5 as an array.
-[Write-up](research/l6a-residency.md) · `results/l6a_resident.csv`
+[Write-up](l6a-residency.md) · `results/l6a_resident.csv`
 
 > **L6a-1: 84.20 GB of weights and 0.87 GB of arenas in 68 buffers, staged in
 > 33 seconds, with 41 GB of the machine left over.** 97 hyper-connection
@@ -1590,7 +1593,7 @@ dispatches, the plain GEMM arm once and four kernels of this block's own.
 
 `llm/graph.go`, `llm/gpu_head.go`, `llm/arena.go`, `vk/engine.go`,
 `cmd/llm/bench_graph.go`: the five blocks in llama.cpp's own order, plus the
-embedding gather and the head. [Write-up](research/l6b-graph.md) ·
+embedding gather and the head. [Write-up](l6b-graph.md) ·
 `results/l6b_graph.csv` · `results/l6b_arena.csv`
 
 > **L6b-1: it picks llama.cpp's token.** On the seven-token prompt the last
@@ -1665,7 +1668,7 @@ embedding gather and the head. [Write-up](research/l6b-graph.md) ·
 
 `shaders/llm_move.comp`, `llm/move.go`, `llm/graph.go`, `vk/engine.go`: the
 activation that crosses a block boundary, as one dispatch.
-[Write-up](research/l6c-moves.md) · `results/l6c_graph.csv`
+[Write-up](l6c-moves.md) · `results/l6c_graph.csv`
 
 > **L6c-1: one dispatch, nine pipelines, and a `Port` a block.** The move
 > declares three bindings of its own rather than llm_common.glsl's five,
@@ -1726,7 +1729,7 @@ activation that crosses a block boundary, as one dispatch.
 
 `llm/gpu_attn.go`, `shaders/llm_attn_{pack,idx,score,wmma}.comp`: the
 full-attention layer over a cache that outlives the batch.
-[Write-up](research/l7a-kv-cache.md)
+[Write-up](l7a-kv-cache.md)
 
 > **L7a-1: the query is a batch and the key is a cache.** They used to be the
 > same object — token `t` was cell `t` — and now the query's geometry is
@@ -1779,7 +1782,7 @@ full-attention layer over a cache that outlives the batch.
 
 `llm/graph.go`, `llm/gpu_ple.go`, `llm/gpu_deltanet.go`,
 `shaders/llm_seq_hist.comp`: the model continuing a sequence.
-[Write-up](research/l7b-sequence.md)
+[Write-up](l7b-sequence.md)
 
 > **L7b-1: five things carry and only one is a KV cache.** The cache and
 > pooled blocks (L7a); the PLE convolution's **9**-row ring; every DeltaNet
@@ -1821,7 +1824,7 @@ full-attention layer over a cache that outlives the batch.
 ## What L7c established — the loop, the text, and where 134 ms goes
 
 `llm/sample.go`, `cmd/llm/generate.go`, `gguf/gguf.go`: generation.
-[Write-up](research/l7c-decode.md) · `results/l7c_decode.csv`
+[Write-up](l7c-decode.md) · `results/l7c_decode.csv`
 
 > **L7c-1: it generates llama.cpp's text, and the one disagreement is
 > priced.** At the divergence our top two are `"." 25.362` against
@@ -1883,7 +1886,7 @@ full-attention layer over a cache that outlives the batch.
 
 `shaders/llm_hc_gemv.comp`, `shaders/llm_moe_gemm.comp`, `llm/record.go`,
 `vk/shim.c`: decode at 11.89 tok/s.
-[Write-up](research/l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
+[Write-up](l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
 `results/l7d_hc_gemv.csv` · `results/l7d_moe_decode.csv`
 
 > **L7d-1: at one token this model is short of workgroups, not of rows, and
@@ -1951,7 +1954,7 @@ full-attention layer over a cache that outlives the batch.
 `llm/bank.go`, `shaders/llm_gemm.comp` (`-DQ8B`), `shaders/llm_common.glsl`,
 `llm/gpu_head.go`, `llm/gpu_deltanet.go`, `llm/gpu_attn.go`,
 `cmd/llm/bench_head.go`: decode at 14.07 tok/s.
-[Write-up](research/l8a-dense-bank.md) · `results/l8a_decode.csv` ·
+[Write-up](l8a-dense-bank.md) · `results/l8a_decode.csv` ·
 `results/l8a_decode_fp16.csv` · `results/l8a_graph.csv` ·
 `results/l8a_head.csv`
 
@@ -2023,7 +2026,7 @@ full-attention layer over a cache that outlives the batch.
 `llm/gpu.go`, `shaders/llm_gemm.comp` (MODE 0 and MODE 1 on `-DQ8B`),
 `shaders/llm_hc_gemv.comp` (`-DQ8B`), `llm/gpu_test.go`, `cmd/llm/bench.go`:
 decode at 14.71 tok/s, the block 2.14x at one token.
-[Write-up](research/l8b-hc-bank.md) · `results/l8b_decode.csv` ·
+[Write-up](l8b-hc-bank.md) · `results/l8b_decode.csv` ·
 `results/l8b_graph.csv` · `results/l8b_graph_fp16.csv` · `results/l8b_hc.csv` ·
 `results/l8b_hc_fp16.csv`
 
@@ -2105,7 +2108,7 @@ decode at 14.71 tok/s, the block 2.14x at one token.
 `shaders/llm_gemv.comp`, `shaders/llm_moe_combine.comp`, `llm/gpu_moe.go`,
 `llm/gpu_deltanet.go`, `llm/bank.go`, `llm/graph.go`: decode at 23.15 tok/s,
 the MoE block 3.06x and the DeltaNet layer 1.87x at one token.
-[Write-up](research/l8d-moe-decode.md) · `results/l8d_decode.csv` ·
+[Write-up](l8d-moe-decode.md) · `results/l8d_decode.csv` ·
 `results/l8d_decode_gemm.csv` · `results/l8d_graph.csv` ·
 `results/l8d_moe.csv` · `results/l8d_dn.csv`
 
@@ -2202,7 +2205,7 @@ the MoE block 3.06x and the DeltaNet layer 1.87x at one token.
 and 655.2 at 512 against 653.9.** No shader changed and no bank moved. The
 full-attention layer is 5.5 ms a token to **3.5**, the MoE 12.1 to **11.7**,
 and a pass is **1501 dispatches at decode and 1261 at prefill**, 48 fewer at
-both. [Write-up](research/l8e-attn-decode.md).
+both. [Write-up](l8e-attn-decode.md).
 
 > **L8e-1: the full-attention layer is D11 a fifth time, and 1.84x.** Its two
 > projections were still `llm_gemm.comp` MODE 2 at one token — 218 and **40**
@@ -2268,7 +2271,7 @@ L8. In the whole model **decode is 25.75 tok/s against L8e's 24.66 — 1.044x, a
 llama.cpp**, the first time this vertical is ahead of it at decode — with a
 token 40.5 ms to **38.8** and the head block 3.5 ms to **1.9****, and **perplexity is 4.0621
 against our own 4.0289 — +0.82%**.
-[Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv` ·
+[Write-up](l8c-dense-bank.md) · `results/l8c_head.csv` ·
 `results/l8c_ppl_head_q4k.csv` · `results/l8c_decode_q4k.csv`.
 
 > **L8c-4-1: one encoder, two callers, and that is the whole correctness
@@ -2600,7 +2603,7 @@ to; the incumbents stay because no candidate disagrees.
 > 7.2% at 2560, and the MoE falls from 54.4% to 41.8%. llama.cpp's prefill
 > plateaus — 388.60 at 2048, 392.95 at 8192 — and **ours is still climbing at
 > 8192**. Every figure above 2560 rows is a measurement that could not be taken
-> before. [Write-up](research/p0-ring-watchdog.md)
+> before. [Write-up](p0-ring-watchdog.md)
 
 ---
 
@@ -2659,7 +2662,7 @@ to; the incumbents stay because no candidate disagrees.
 > rounding, the two partitions reconcile exactly. **Every ceiling is now quoted
 > on one basis: 4.281 GB a token**, 56.5 tok/s at 242 GB/s and **53.0 at the
 > 227 dispatches reach** — against which the measured step is **62%**.
-> [Write-up](research/p1-decode-attribution.md) · `results/p1_decode_attrib.csv`
+> [Write-up](p1-decode-attribution.md) · `results/p1_decode_attrib.csv`
 
 ## What P1a established — a boundary that was two dispatches, and a grid pinned at 160
 
@@ -2716,7 +2719,7 @@ to; the incumbents stay because no candidate disagrees.
 > permutation is baked into the staged bank, so it is every `up` rung's
 > epilogue on the prefill path, and 0.7% of decode does not buy that. Priced
 > so it need not be re-derived.
-> [Write-up](research/p1a-hyper-connection-shape.md) · `results/p1a_hc_grid.csv`
+> [Write-up](p1a-hyper-connection-shape.md) · `results/p1a_hc_grid.csv`
 
 ---
 
@@ -3078,7 +3081,7 @@ decode budget for 0.06 B of parameters. In the *checkpoint*. `MoEGPU.stage`
 has narrowed them to halves since L5b and no kernel reads another copy, so
 the row a decode token actually reads is **0.142 GB** (576 padded columns x
 2560 x 2 x 48), and every budget line below that quotes 0.252 is 0.110 GB a
-token pessimistic. See research/p4-moe-bank.md §1.
+token pessimistic. See p4-moe-bank.md §1.
 
 ### Where the bytes go at decode
 
@@ -3228,7 +3231,7 @@ below Q8. Bandwidth is the whole story.
    TOP_K and its GET_ROWS together**. What the architecture is named for turns
    out to **cost** 1.21x at prefill, because the reference runs dense flash
    attention over a mask and so do we (L4b-3); it is an optimisation at
-   decode, not here. Still not in `IDEAS.md`; it needs a section.
+   decode, not here. Still not in `ideas.md`; it needs a section.
 4. ~~**PLE n-gram**~~ — **done at L2d**: trigram hashing into 16 heads over a
    320 M-row mmap'd table, `layer_multipliers`, conv1d k=4, key/value
    projections, bit-exact and in three dispatches.
@@ -3278,14 +3281,14 @@ below Q8. Bandwidth is the whole story.
 - [x] **L0.0** the inventory without downloading the model —
       `reference/gguf_inventory.py`, 35 MB of range requests.
 - [x] **L0a** *Does the bus survive a 64-82 GB working set?* **It does not
-      notice.** [Write-up](research/l0a-bank-range.md)
+      notice.** [Write-up](l0a-bank-range.md)
 - [x] **L0b** *Is heap 0 as fast as heap 1?* **No type or heap is faster than
       any other, and the heap sizes are not limits.**
-      [Write-up](research/5.1-memory-types.md)
+      [Write-up](5.1-memory-types.md)
 - [x] **L0c** *The blocked scale plane.* **1.27x, and it changes the format.**
-      [Write-up](research/l0c-scale-plane.md)
+      [Write-up](l0c-scale-plane.md)
 - [x] **L0d** *Per-format error metrics* (§7). **W4A8, symmetric, per-token
-      activation scales.** [Write-up](research/l0d-quant-error.md)
+      activation scales.** [Write-up](l0d-quant-error.md)
 
 ### L1 — get the checkpoint, and a baseline  *(done)*
 
@@ -3313,14 +3316,14 @@ below Q8. Bandwidth is the whole story.
       1.6%, attention+QSA 1.5%, and the 5x is MoE (35.7%), dense matmul
       (26.2%), glue (30.6%) and tiny-N F32 (12.2%)**. Against our own kernels
       the chunk is 2.25-2.53x, so **the target is ~1150 tok/s, not ~2000**.
-      [Write-up](research/l2a-prefill-attribution.md) · `results/l2a_prefill_ops.csv`
+      [Write-up](l2a-prefill-attribution.md) · `results/l2a_prefill_ops.csv`
 - [x] **L2b — the hyper-connection block, CPU reference.** `llm/`: the block,
       a `Config` read from the checkpoint, and **`reference/eval_dump.c`**, a
       whole-tensor oracle (143 tensors, 35.7 MB, all of layers 0-3 — enough
       for L2, L3 *and* L4 from one model load). Every mixer and combine of the
       four dumped layers matches; four of seven gates to **6.2e-08 rms**. And
       it found what the oracle is really computing — see L2b-2 above.
-      [Write-up](research/l2b-hyper-connections.md)
+      [Write-up](l2b-hyper-connections.md)
 - [x] **L2c — the fused hyper-connection kernel.** L2a-2's specification,
       built: grouped RMSNorm into the GEMM's fp16 A layout, `hc.down` **with
       `inject`'s four columns fused onto it**, the low-rank gate's sigmoid and
@@ -3328,18 +3331,18 @@ below Q8. Bandwidth is the whole story.
       combine in one pass. **Four dispatches against sixteen, 226.6 ms of
       llama.cpp's 512-token graph against 53.4 — 4.24x**, and it reproduces
       L2b's CPU reference to 1e-04 rms on all eight mixers of layers 0-3.
-      [Write-up](research/l2c-hc-kernel.md) · `results/l2c_hc.csv`
+      [Write-up](l2c-hc-kernel.md) · `results/l2c_hc.csv`
 - [x] **L2d — the PLE gather and the n-gram block.** The host-side trigram
       hash (**bit-exact**, 112 rows of a 320 M-row table), the block in Go
       (**7.7e-08 rms**) and on the device in three dispatches against about
       thirty. Layer 1's mixer, the one L2c could not compare, now matches too.
-      [Write-up](research/l2d-ple.md) · `results/l2d_ple.csv`
+      [Write-up](l2d-ple.md) · `results/l2d_ple.csv`
 - [x] **L2e — one full-attention layer with mrope, and the QSA indexer beside
       it.** The CPU reference: the fused query/gate projection, IMRoPE (which
       is **NeoX on text**, asserted rather than assumed), the block-pooled
       indexer and causal GQA. Every dumped tensor of layer 3 matches, and the
       four-stage chain from `l_last-2` lands at **9.75e-06 rms**. Two more
-      oracle numerics fell out. [Write-up](research/l2e-attention.md)
+      oracle numerics fell out. [Write-up](l2e-attention.md)
 - [x] **L2f — the GPU port of that layer.** Six dispatches against the
       reference's nineteen: one fused `[13952, 2560]` projection for six of its
       matrices, one pass doing the per-head norm, the M-RoPE and the fragment
@@ -3348,7 +3351,7 @@ below Q8. Bandwidth is the whole story.
       cores **with the output gate in its epilogue**. **66.3 ms of llama.cpp's
       512-token graph becomes 27.6 — 2.40x, 1.60x at equal attention work** —
       and the layer's output is 5.9e-05 rms against the f32 model, 19.3x nearer
-      it than the oracle. [Write-up](research/l2f-attention-gpu.md) ·
+      it than the oracle. [Write-up](l2f-attention-gpu.md) ·
       `results/l2f_attn.csv`
 - [x] Gate: layer 3's output matches the reference. **Not "to fp16
       tolerance"** — L2b-3: an rms bound under `llm.RefQ8`, since the
@@ -3369,7 +3372,7 @@ below Q8. Bandwidth is the whole story.
       fix** and reproducing that is worth 15x. Plus L2e-3 sharpened into a
       threshold: the fp16 F32 matmul starts at **8 output columns**, so it is
       absent from this 7-token dump and present at a 512-token ubatch.
-      [Write-up](research/l3-deltanet.md)
+      [Write-up](l3-deltanet.md)
 - [x] Gate: layer 0 matches; state **bit-identical** in fp32 across a chunk
       boundary — 3 + 4 tokens reproduce 7 exactly, output and state, with the
       convolution's window carried beside the recurrent state and a control
@@ -3383,7 +3386,7 @@ below Q8. Bandwidth is the whole story.
       is **413 us against 438**. §3.6's question is answered by a price rather
       than a build: the recurrence is 13% of this layer, the projection 64%,
       and a perfect chunked kernel saves 1.0% of the prefill graph.
-      [Write-up](research/l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
+      [Write-up](l3b-deltanet-gpu.md) · `results/l3b_dn.csv`
 - [x] Gate: layers 0, 1 and 2 match — `attn_output` at **2.4e-06 rms** against
       both the CPU reference and llama.cpp — and 3 + 4 tokens reproduce 7
       **bit-identically** on the device, with the control that zeroes the
@@ -3405,7 +3408,7 @@ below Q8. Bandwidth is the whole story.
       a real ubatch** (so the prefill tolerance is 5e-3, and the reference is
       the side losing precision), and the indexer's **BF16 weights meet a bf16
       activation**, worth 2061x. Plus two subnormal bugs.
-      [Write-up](research/l4-qsa.md)
+      [Write-up](l4-qsa.md)
 - [x] Gate: our selection is the reference's, from the reference's own scores
       — `TestQSASelectionIsARadixSelect`, with
       `TestQSASelectionIsStableAcrossRuns` and
@@ -3420,7 +3423,7 @@ below Q8. Bandwidth is the whole story.
       it. And the thing the architecture is named for is now priced: at
       prefill the selection **costs** the attention kernel 1.21x, because
       `build_attn_qsa` runs dense flash attention over a mask and so do we.
-      [Write-up](research/l4b-qsa-gpu.md) · `results/l4b_qsa.csv`
+      [Write-up](l4b-qsa-gpu.md) · `results/l4b_qsa.csv`
 - [x] Gate: layer 3's `attn_output` matches at 4 k context, on the device,
       where the selection bites — **9.872e-04 rms** against llama.cpp, inside
       the 7-token figure — with the bitmask **cell for cell** the CPU
@@ -3438,7 +3441,7 @@ below Q8. Bandwidth is the whole story.
       reference's int8 activations makes the fit **worse** here (L5a-3), and
       the routing is **not balanced** — 274 of 512 experts at ubatch 512, one
       of them taking 95% of the tokens (L5a-4).
-      [Write-up](research/l5a-moe.md)
+      [Write-up](l5a-moe.md)
 - [x] Gate: layers 3's whole FFN half matches from llama.cpp's own
       `hc_mixed-3` (the **second** occurrence — the block runs twice a layer),
       with three negative controls: the expert bank's row order (175x), the
@@ -3455,7 +3458,7 @@ below Q8. Bandwidth is the whole story.
       straight to global. **567.4 ms of llama.cpp's 512-token graph becomes
       522.3 — 1.09x — and 1758.4 becomes 1131.6 at ubatch 2048, 1.55x.**
       Two optimisations that should have worked did not, and are written down
-      (L5b-4). [Write-up](research/l5b-moe-gpu.md) · `results/l5b_moe.csv`
+      (L5b-4). [Write-up](l5b-moe-gpu.md) · `results/l5b_moe.csv`
 - [x] Gate: the block matches on the device at 4096 tokens — **`ffn_out-3` at
       8.132e-05 rms**, inside L5a's figure over 48 tokens — with the selection
       the reference's set for set *and order for order*, the permutation
@@ -3480,7 +3483,7 @@ below Q8. Bandwidth is the whole story.
       per-binding `descriptorCount` in the shim, a block-instance array in the
       GLSL, NBANK compiled in at 48, and the layer index in the top sixteen
       bits of `moeUsed` because the push block was full. **Residency is free
-      in the bank's size** (L6a-4). [Write-up](research/l6a-residency.md) ·
+      in the bank's size** (L6a-4). [Write-up](l6a-residency.md) ·
       `results/l6a_resident.csv`
 - [x] Gate: the bank index is load-bearing — layer 3 read from bank 3 is
       **8.133e-05 rms** against llama.cpp, the same run with the index forced
@@ -3493,7 +3496,7 @@ below Q8. Bandwidth is the whole story.
       host reads a write-combined one at **0.18 GB/s** against **25.06**
       (L6b-4, 5.0x on the graph for 0.14% on the kernels), and `Upload`'s
       f32→fp16 narrowing was parallelised over rows (L6b-5).
-      [Write-up](research/l6b-graph.md) · `results/l6b_graph.csv` ·
+      [Write-up](l6b-graph.md) · `results/l6b_graph.csv` ·
       `results/l6b_arena.csv`
 - [x] Gate: **the argmax is llama.cpp's** (561), out of llama.cpp's own top
       ten, with the drift priced as a geometric x1.085 a layer at six depths
@@ -3507,7 +3510,7 @@ below Q8. Bandwidth is the whole story.
       is what a shared arena would now buy and why it is priced rather than
       built (L6c-3). Along the way, 113 MB of Go allocation a prefill in
       `DeltaNetGPU.Reset`, flat in the prompt length and so 12% of a
-      128-token pass (L6c-4). [Write-up](research/l6c-moves.md) ·
+      128-token pass (L6c-4). [Write-up](l6c-moves.md) ·
       `results/l6c_graph.csv`
 - [x] Gate: **no host tensor between the embedding gather and the logits**;
       **941.3 tok/s at ubatch 2048, 2.40x llama.cpp's 391.42**, and 572.9 at
@@ -3526,7 +3529,7 @@ below Q8. Bandwidth is the whole story.
       push fields borrowed, because 64 uints is 256 bytes. And **L2e's fp16
       round trip had been folded away by the driver since L2e**: a value that
       models a memory format has to go through memory (L7a-4).
-      [Write-up](research/l7a-kv-cache.md)
+      [Write-up](l7a-kv-cache.md)
 - [x] Gate: a 4096-token prompt in chunks of 512, 64, 7 and one is
       **identical to the last place** — all 10 485 760 floats — and
       `TestAttnGPUCacheKeepsPooledBlocks` asserts the incremental range
@@ -3537,7 +3540,7 @@ below Q8. Bandwidth is the whole story.
       convolutions now read a per-layer ring addressed by absolute position,
       written by one 15-line kernel, which is what makes the store a pure
       write and deletes the host-side `Carry` — which was itself wrong for any
-      run shorter than the window. [Write-up](research/l7b-sequence.md)
+      run shorter than the window. [Write-up](l7b-sequence.md)
 - [x] Gate: 512 tokens in chunks of 128, of 9, and as 495 then seventeen
       single ones give `result_norm` **identical to the last place**; the
       control, every token its own sequence, is 1.785e+00 rms away.
@@ -3547,7 +3550,7 @@ below Q8. Bandwidth is the whole story.
       `madvise(MADV_RANDOM)` on the n-gram table is worth **176x** on the host
       gather; a command buffer a block rather than a submit a dispatch is
       worth 12% and prices a submit at 31 us.
-      [Write-up](research/l7c-decode.md) · `results/l7c_decode.csv`
+      [Write-up](l7c-decode.md) · `results/l7c_decode.csv`
 - [x] Gate: **llama.cpp's text**, diverging at one token where our top two
       logits are 0.161 apart and re-converging within a sentence.
       **7.46 tok/s against 25.15** — 30% of the 25.0 this bank's own 9.67 GB a
@@ -3582,7 +3585,7 @@ below Q8. Bandwidth is the whole story.
       divergence, the same `Lisbon.` — at **11.89 tok/s against 7.46**, 47% of
       the reference's 25.15 and **48% of this bank's own 25.0 ceiling**, with
       prefill at **990.6 tok/s, 2.53x**. Two runs agree to 0.08%.
-      [Write-up](research/l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
+      [Write-up](l7d-decode-kernels.md) · `results/l7d_decode.csv` ·
       `results/l7d_graph.csv` · `results/l7d_hc_gemv.csv` ·
       `results/l7d_moe_decode.csv`
 
@@ -3606,7 +3609,7 @@ below Q8. Bandwidth is the whole story.
       `llm_gemm.comp`'s `-DQ8B` arm. **8.07 GB becomes 5.01 and the token
       6.61; decode 11.90 to 14.07, prefill 990.6 to 1044.8, residency 84.20 GB
       to 82.40 — and the halves the matrix cores multiply are the same
-      halves.** [Write-up](research/l8a-dense-bank.md) ·
+      halves.** [Write-up](l8a-dense-bank.md) ·
       `results/l8a_decode.csv` · `results/l8a_graph.csv` ·
       `results/l8a_head.csv`
 
@@ -3622,7 +3625,7 @@ below Q8. Bandwidth is the whole story.
       the GEMM's half. **Decode 14.07 to 14.71 tok/s, the block 79.2 us a
       mixer to 37.0 at one token, a token 6.61 GB to 6.05, residency 82.40 GB
       to 81.89, prefill 1044.8 to 1041.1 at ubatch 2048.**
-      [Write-up](research/l8b-hc-bank.md) · `results/l8b_decode.csv` ·
+      [Write-up](l8b-hc-bank.md) · `results/l8b_decode.csv` ·
       `results/l8b_graph.csv` · `results/l8b_hc.csv`
 - [x] Gate: **the same text** (`TestGraphLogits`, and `-gen -n 128` down to
       `Lisbon.`), **0.740 GB a token** for the block against the ~0.70
@@ -3645,7 +3648,7 @@ below Q8. Bandwidth is the whole story.
       23.15, the MoE block 27.6 ms a token to 12.05 and 58 GB/s of bank to
       133, the DeltaNet 18.9 to 11.0 and 119 to 205, a token 66.7 ms to 43.0,
       prefill 1041.1 to 1049.8 at ubatch 2048 and 643.4 to 653.9 at 512.**
-      [Write-up](research/l8d-moe-decode.md) · `results/l8d_decode.csv` ·
+      [Write-up](l8d-moe-decode.md) · `results/l8d_decode.csv` ·
       `results/l8d_decode_gemm.csv` · `results/l8d_graph.csv` ·
       `results/l8d_moe.csv` · `results/l8d_dn.csv`
 - [x] Gate: **no bank change**, the MoE at **133 GB/s** at one token against
@@ -3736,7 +3739,7 @@ below Q8. Bandwidth is the whole story.
       against 1049.8, 655.2 at 512 against 653.9) rather than merely no
       slower. `TestGraphLogits` unchanged: argmax **561** out of llama.cpp's
       own top ten, drift 0.881% at 48 layers.
-      [Write-up](research/l8e-attn-decode.md) · `results/l8e_decode.csv` ·
+      [Write-up](l8e-attn-decode.md) · `results/l8e_decode.csv` ·
       `results/l8e_graph.csv` · `results/l8e_attn.csv` · `results/l8e_moe.csv`
 
 ### L8c — the widths that are ours rather than the checkpoint's  *(in progress)*
@@ -3766,7 +3769,7 @@ below Q8. Bandwidth is the whole story.
       ids**. **Ours is 4.0289 ± 0.02279 against 4.0340 ± 0.02283 — −0.13% —
       in 7m58s**, and `TestGraphForwardRows` says row t of the batch is
       identical to the prompt truncated at t **to the last place**.
-      [Write-up](research/l8c-perplexity.md) · `results/l8c_ppl.csv`
+      [Write-up](l8c-perplexity.md) · `results/l8c_ppl.csv`
 - [x] **Choose per-tensor widths — by measuring them, because L0d's ladder is
       a proxy and D3's number came off it.** `llm/sim.go` stages a candidate
       format's own halves through the kernels that exist, checked where the
@@ -3781,7 +3784,7 @@ below Q8. Bandwidth is the whole story.
       the sensitive family wants **levels, not a finer group**; **`q4_0`'s
       sixteen levels beat `q4sym`'s fifteen by 1.13x free**; and the mixed
       plan is **4.2699, +5.98%, for a 52.9 tok/s ceiling**. **A plan is not
-      the sum of its families.** [Write-up](research/l8c-widths.md) ·
+      the sum of its families.** [Write-up](l8c-widths.md) ·
       `results/l8c_widths.csv` · `results/l8c_ppl_mixed.csv`
 - [x] **Settle D13's fp16 tail**, which L8a-2 deferred to here: int8 for
       **+0.01%** over the whole corpus, worth 0.6% of a token, so it is a
@@ -3799,7 +3802,7 @@ below Q8. Bandwidth is the whole story.
       averages out. **What predicts it is the participation ratio inside a
       scale group** — `hc_attn_up`'s scale is fitted to an effective 4.4 of 32
       columns. Forcing the scale unbiased recovers a third.
-      [Write-up](research/l8c-imatrix.md) · `results/l8c_imatrix.csv`
+      [Write-up](l8c-imatrix.md) · `results/l8c_imatrix.csv`
 - [x] **L8c-3 — the asymmetric form, and it reverses D7 and the
       recommendation.** L8c-2's one untested caveat was that every rung in
       this stage was Q4_0's *symmetric* form. The min turns out to cost
@@ -3822,7 +3825,7 @@ below Q8. Bandwidth is the whole story.
       departure from ggml, on the tensor the question is about: K-quants want
       `k % 256 == 0` where `hc_*_up` is 320 wide, so its super-block is the
       whole row — ten groups, 4.475 bits.
-      [Write-up](research/l8c-asymmetric.md) · `results/l8c_asym.csv` ·
+      [Write-up](l8c-asymmetric.md) · `results/l8c_asym.csv` ·
       `results/l8c_ppl_asym.csv` · `results/l8c_ppl_asym_mixed.csv`
 - [x] **L8c-4 — the dense kernel, and the bank is the format.** §2.8's
       fragment tiling with a *nibble* where L8a puts a byte — a `uint` is
@@ -3838,7 +3841,7 @@ below Q8. Bandwidth is the whole story.
       12.5% of record traffic rather than eight times it.
       **The head is 0.675 GB to 0.358, 1.89x at one token at 210 GB/s of a
       242 GB/s bus, and 4.0621 against 4.0289 over the corpus — +0.82%.**
-      [Write-up](research/l8c-dense-bank.md) · `results/l8c_head.csv` ·
+      [Write-up](l8c-dense-bank.md) · `results/l8c_head.csv` ·
       `results/l8c_ppl_head_q4k.csv`
 - [x] **L8c-5 — the gated DeltaNet, the largest of the four.** 36 layers,
       46% of a dense token, and no new kernel: `-DQ4B`'s MODE 2 arm and its
@@ -3852,7 +3855,7 @@ below Q8. Bandwidth is the whole story.
       to 176), a layer 62.28 MB to 33.28 and 36 of them 2.24 GB to 1.20,
       residency 81.57 GB to 80.53, prefill 1052.8 tok/s to 1070.1 at ubatch
       2048 and 655.2 to 667.0 at 512.**
-      [Write-up](research/l8c-dn-bank.md) · `results/l8c_decode_dn.csv` ·
+      [Write-up](l8c-dn-bank.md) · `results/l8c_decode_dn.csv` ·
       `results/l8c_graph_dn.csv` · `results/l8c_ppl_dn_q4k.csv` ·
       `results/l8c_ppl_dn_only.csv` · `results/l8c_dn_gemv.csv`
 - [x] Gate: **the bank is the format**, twice — a whole layer's output off the
@@ -3883,7 +3886,7 @@ below Q8. Bandwidth is the whole story.
       own one-token ladder, a mixer 8.12 MB to 4.76, the block 0.79 GB to
       0.47, residency 80.53 GB to 80.20, prefill 669.7 tok/s at ubatch 512
       against 667.2 and 1065.9 at 2048 against 1069.7.**
-      [Write-up](research/l8c-hc-bank.md) · `results/l8c_decode_hc.csv` ·
+      [Write-up](l8c-hc-bank.md) · `results/l8c_decode_hc.csv` ·
       `results/l8c_graph_hc.csv` · `results/l8c_ppl_hc_only.csv` ·
       `results/l8c_ppl_hc_q4k.csv` · `results/l8c_hc_ladder.csv` ·
       `results/l8c_hc_gemv.csv`
@@ -3918,7 +3921,7 @@ below Q8. Bandwidth is the whole story.
       block at 4.5 bits, against 5.7% at int8), putting it on the plane makes
       the layer **4.500 bits exactly**, and it costs **+0.005%** — 0.028 GB a
       token, decode 31.51 tok/s, residency 79.85 GB.
-      [Write-up](research/l8c-attn-bank.md) · `results/l8c_decode_attn.csv` ·
+      [Write-up](l8c-attn-bank.md) · `results/l8c_decode_attn.csv` ·
       `results/l8c_decode_attn_idx.csv` · `results/l8c_graph_attn.csv` ·
       `results/l8c_ppl_attn_only.csv` · `results/l8c_ppl_attn_q4k.csv` ·
       `results/l8c_ppl_attn_idx.csv` · `results/l8c_ppl_attn_c2560.csv` ·
@@ -4019,14 +4022,14 @@ below Q8. Bandwidth is the whole story.
 
 ### L9 — phase 3, and shipping
 
-- [x] **L9a — the HTTP API `GOALS.md` asks for.** The chat template
+- [x] **L9a — the HTTP API `../GOALS.md` asks for.** The chat template
       transcribed from the checkpoint's own metadata and checked against Jinja
       on 23 cases, the decoder that splits a token stream into reasoning,
       answer and tool calls, and three envelopes over one generation loop:
       `/v1/chat/completions`, `/v1/responses` and `/v1/messages`, buffered and
       streamed, with stop sequences on the same holdback and a prefix reuse
       that makes a second turn a continuation. `go run ./cmd/serve -llm`. See
-      `API.md`.
+      `../API.md`.
 - [x] MTP speculative decoding (the separate GGUF). Target was 1.5-1.8x.
       *(P5 — **done 2026-09-19, and the answer is 0.95x.** `cmd/llm -spec`:
       the draft head, the two-row verification pass, the rollback and the
@@ -4039,10 +4042,10 @@ below Q8. Bandwidth is the whole story.
       the QSA selection is not provably the identity. The three things that
       would take it past 1.0 are priced in the write-up and the largest of
       them is the draft head's acceptance on a workload that is not prose.
-      See [research/p5c-speculative-loop.md](research/p5c-speculative-loop.md),
-      [research/p5-mtp-rollback.md](research/p5-mtp-rollback.md),
-      [research/p5a-draft-head.md](research/p5a-draft-head.md) and
-      [research/p5b-r-row-decode.md](research/p5b-r-row-decode.md).)*
+      See [p5c-speculative-loop.md](p5c-speculative-loop.md),
+      [p5-mtp-rollback.md](p5-mtp-rollback.md),
+      [p5a-draft-head.md](p5a-draft-head.md) and
+      [p5b-r-row-decode.md](p5b-r-row-decode.md).)*
 - [ ] Batching — which is now also "more than one conversation at a time",
       since the served graph is one sequence's. *(P6 — gated on the product
       question; each sequence owns 113 MB of DeltaNet state.)*
@@ -4065,7 +4068,7 @@ below Q8. Bandwidth is the whole story.
     go run ./cmd/llm -gen -model $M -n 16 -layers 4   # the loop, in 7 GB
     go run ./cmd/llm -model $M -chat-template        # the checkpoint's own Jinja
 
-    # the server (API.md): the same loop behind three chat envelopes
+    # the server (../API.md): the same loop behind three chat envelopes
     go run ./cmd/serve -llm                          # 33.5 s to stage, ~84 GB
     go run ./cmd/serve -llm -llm-layers 4            # the HTTP side, in 7 GB
     curl -sH 'Authorization: Bearer womblesofwimbledon' -H 'Content-Type: application/json' \
@@ -4479,7 +4482,7 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
     GGML_VK_PERF_LOGGER=1 $L/build/bin/llama-bench -m $M -p 2048 -n 16 -r 1 -ub 512
 
     # L2b's tool: whole intermediate tensors of a real pass, to reference/out/llm.
-    # See research/l2b-hyper-connections.md for the build line and the filter.
+    # See l2b-hyper-connections.md for the build line and the filter.
     /tmp/eval_dump -m $M -o reference/out/llm -c 64 -p '…' -n '<regex>'
     go test ./llm/ -v                        # the block against that trace,
                                              # CPU and GPU, plus the controls
@@ -4569,7 +4572,7 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
 
 | # | decision | why |
 |---|---|---|
-| D1 | **Consume UD-Q4_K_XL first, don't quantise from bf16.** | 114 GB instead of 360, an imatrix-calibrated checkpoint, and a bit-exact oracle. Phase order: run it, profile it, then optimise (`TODO.md`). |
+| D1 | **Consume UD-Q4_K_XL first, don't quantise from bf16.** | 114 GB instead of 360, an imatrix-calibrated checkpoint, and a bit-exact oracle. Phase order: run it, profile it, then optimise (`../TODO.md`). |
 | D2 | **The n-gram table lives off-heap, mmap'd.** | 28.80 GB of capacity for 1.41 KB/token of bandwidth. **L1: llama.cpp already does this** — `TENSOR_READ_LAZY` — so it is the reference behaviour, not a deviation. |
 | D3 | **Target ~4.5 bits on everything *streamed*, not just the experts.** ~~Retired at L8c-1~~ — **restored at L8c-3, in a different format.** | The premise was always right: 76% of decode bytes are dense. The *width* came off L0d's reconstruction ladder, and measured end to end in **Q4_0's symmetric form** it was +18.5% of perplexity, which is what retired it — and what replaced it was a plan, not a width (L8c-1's mixed table, +5.98% at 5.30 bits). **L8c-3 found the width was not the thing that was wrong; the form was.** At the same 4.500 bits, ggml's asymmetric `q4_k` with unsloth's published imatrix is **4.1998 against our 4.0289, +4.24%**, and a mixed plan at 4.75 bits is **4.1377, +2.70%** — better accuracy than the 5.30-bit symmetric plan at **4.264 GB a token against 4.575** and a **56.7 tok/s ceiling against 52.9**. L0d's finding 2 still stands where it was measured, on weight reconstruction under int8 activations; what L8c-1 established is that it does not carry to perplexity, and what L8c-3 adds is that it does not even rank the *formats* correctly — the reconstruction gap between the two is 1.22-1.30x where the corpus-level gap is **2.06x uncalibrated and 3.69x calibrated**, at identical bits and identical bytes. **A plan is still not the sum of its families** (four families sum to +2.05% where the uniform plan measures +3.92% at eight chunks), but the compounding is much milder than the symmetric form's 11.7% into 18.5%. |
 | D4 | **Do not go below 4 bits on the experts.** | They are 24% of the traffic; Q3 buys ~11% for a real accuracy hit. |
@@ -4588,7 +4591,7 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
 | D18 | **Ship the uniform 4.5-bit plan with `ple_proj` on int8 — and stop there until there is a fifth bit.** | P3 solved L8c's knapsack with six 145-chunk arms instead of composing it. **`ple_proj` back to int8 is 0.0165 GB a token for 0.367 pp: 4.1850 (+3.87%) against the uniform plan's 4.2010 (+4.27%)**, 22 pp/GB and five times the return of any other width the current kernel can stage; three interleaved decode pairs put its cost *below the instrument's floor* (means 35.74 against 35.79, within-arm spread 0.31 tok/s, the sign flipping pair to pair). **Everything better needs a kernel**: `bank_q4.go` is nibbles by construction, so `q5_k` is a third stream through the unpack, and the arms that want it are `full_attn` (**14.1 pp/GB** — 1.087 pp for 0.077 GB, two-thirds of the whole width for a quarter of the bytes), `lm_head` (8.0, and it recovers 77% because unsloth's matrix has **no row for `output.weight`** and the family is round-to-nearest), `hyper_conn` (~5.6). **No int8 arm belongs in the plan except `ple_proj`'s**: `full_attn` at int8 measures +2.72% (idea 4 priced it at +2.07% from additivity) and is strictly dominated by L8c-3's `hc + attn` at `q5_k` — +2.70% at 4.419 GB against +2.72% at 4.592. The plan is **4.281 GB a token, a 56.5 tok/s ceiling**, and `cmd/serve -llm` stages it by default (`llm.ShippedDenseBank`) where `cmd/llm` deliberately does not. |
 | D19 | **Ship the fifth bit on every family whose measured return beats the trade D18 already refused — and on no others.** | P3a built ggml's `qh` plane and then measured the four candidates as **complete 145-chunk plans**, in P3's order of estimated return. `full_attn` + `qsa_indexer` is **14.9 pp/GB** (4.1386, +2.72%, for 0.078 GB a token), `lm_head` **7.8** (4.1136, +2.10%), `hyper_conn` **5.9** (4.0948, **+1.63%**) — all above the **4.6 pp/GB** at which D18 refused `full_attn` → int8 — and `deltanet` is **1.6** (4.0780, +1.22% for 0.260 GB, five times the bytes of any other family for the smallest gain on the board), so it stays at `q4_k`. The cut needs no new principle: it is D18's own line, unmoved. **D19 is 4.0948 ± 0.02322, +1.63% against 4.0289 — 38% of D18's accuracy cost — at 4.518 GB a token, a 53.6 tok/s ceiling and 34.57 tok/s measured (D18 35.70 the same hour, two interleaved passes, within-arm spread 0.06-0.28).** `ple_proj` stays on int8: D18's row is amended, not replaced. And the fifth bit costs **less decode than its bytes predict** — 0.078 GB is −0.55 tok/s at P1's measured 178 GB/s and measures −0.21 — because the plane is a second sequential stream at a quarter of the first's width, issued from the same loop. |
 | D20 | **Narrow every MoE row that ships at 8.5 bits and has a format the kernels already read — and stop there, because the row that matters has no such format.** | P4 asked for `ffn_down_exps` at Q4_K and it **cannot exist**: its rows are 640 and a ggml K-quant super-block is 256, which is why `llama-quantize`'s `tensor_type_fallback` demoted unsloth's `Q5_K → Q5_1` on 43 layers and `Q6_K → Q8_0` on five. What *is* buildable is a transcode of the four Q8_0 rows: `ffn_gate_shexp` and `ffn_up_shexp` (row 2560) to **Q4_K**, `ffn_down_shexp` and the five Q8_0 layers of `ffn_down_exps` (row 640) to **Q5_1**, with the published imatrix's per-expert rows. **0.1288 GB a token and 1.414 GB of residency for 0.0022 points of perplexity — 4.0970 (+1.69%) against D19's 4.0948 (+1.63%), which is 0.017 pp/GB** where D19 refused to *buy* a fifth bit at 1.6 and took three families above 5.9. Paired over 145 chunks the delta is +0.00054 nll a chunk against a standard error of 0.00059 (t = 0.91, worse in 85 and better in 60): **not resolvable**, so the accuracy claim is an upper bound rather than a number. Decode over three interleaved pairs: **34.53 → 35.52 tok/s, +0.99, 1.41x llama.cpp** (within-arm spread 0.14 and 0.01, the same sign every pair). 4.279 GB a token, a 56.6 tok/s ceiling. `cmd/serve -llm` stages it by default (`llm.ShippedMoEBank`); `cmd/llm` does not. |
-| D21 | **`ffn_down_exps` at IQ4_NL — 4.5 bits, paired records, and the byte layout is ours.** | The largest single row in the decode bank (0.590 GB a token at D20's Q5_1) has no K-quant at any width, so P4c built the two block-32 candidates. **IQ4_NL dominates Q4_1**: 0.148 GB a token freed against 0.098, and +0.0022 points of perplexity against +0.0122 — the first not resolvable by the instrument (t = 0.79 paired over 145 chunks), the second resolvable (t = 4.11). 4.0992, **+1.74%**, 4.132 GB a token, and **+0.73 tok/s (35.46 → 36.19, 1.44x llama.cpp)**. The kernel is half the decision: written in ggml's 18-byte record with the codebook in a `uvec4`, the 4.5-bit arm read **152.7 GB/s against Q4_1's 211.4** and was slower than the 6-bit format it replaced. **A transcoded tensor's layout is not the checkpoint's**, and the two kernels disagreed about what to do with that: a plane of scales and a plane of nibbles is 203.3 GB/s at decode and costs the prefill GEMM 36%, because a slab unpack reads one block of sixty-four different rows. **36-byte pairs** suit both — **204.3 GB/s** at decode, the same 2679 us a layer at prefill as the Q5_1 bank on three quarters of the bytes, and bit-identical output through every layout. The eight-minute fit is cached beside the checkpoint (`LLM_BANK_CACHE`), which `cmd/serve` sets: a second start stages in **1m5.7s**. [research/p4c-down-exps.md](research/p4c-down-exps.md) |
+| D21 | **`ffn_down_exps` at IQ4_NL — 4.5 bits, paired records, and the byte layout is ours.** | The largest single row in the decode bank (0.590 GB a token at D20's Q5_1) has no K-quant at any width, so P4c built the two block-32 candidates. **IQ4_NL dominates Q4_1**: 0.148 GB a token freed against 0.098, and +0.0022 points of perplexity against +0.0122 — the first not resolvable by the instrument (t = 0.79 paired over 145 chunks), the second resolvable (t = 4.11). 4.0992, **+1.74%**, 4.132 GB a token, and **+0.73 tok/s (35.46 → 36.19, 1.44x llama.cpp)**. The kernel is half the decision: written in ggml's 18-byte record with the codebook in a `uvec4`, the 4.5-bit arm read **152.7 GB/s against Q4_1's 211.4** and was slower than the 6-bit format it replaced. **A transcoded tensor's layout is not the checkpoint's**, and the two kernels disagreed about what to do with that: a plane of scales and a plane of nibbles is 203.3 GB/s at decode and costs the prefill GEMM 36%, because a slab unpack reads one block of sixty-four different rows. **36-byte pairs** suit both — **204.3 GB/s** at decode, the same 2679 us a layer at prefill as the Q5_1 bank on three quarters of the bytes, and bit-identical output through every layout. The eight-minute fit is cached beside the checkpoint (`LLM_BANK_CACHE`), which `cmd/serve` sets: a second start stages in **1m5.7s**. [p4c-down-exps.md](p4c-down-exps.md) |
 | D10 | **A value that models a memory format goes through memory.** | L7a-4: `float(float16_t(x))` in a register is folded to `x` by RADV's NIR, so L2e's fp16 key cache had never run on the GPU. If a kernel is reproducing a *storage* rounding, the value has to be stored. |
 
 ## Open questions
@@ -4633,7 +4636,7 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
   rather than by count (`batchFor`), and **`-graph` returns at every row count
   tried**: 4096 at **1174.6 tok/s (3.00x)** and 8192 at **1213.5 (3.10x)**,
   which is the best prefill in this vertical and says prefill does **not**
-  plateau where llama.cpp's does. [Write-up](research/p0-ring-watchdog.md)
+  plateau where llama.cpp's does. [Write-up](p0-ring-watchdog.md)
 - ~~**Why does the MoE's up mode read 93 GB/s of bank where its down mode reads
   136 on the same grid?**~~ **Answered at L8d-4, and the premise was wrong in
   a useful way**: neither number was the kernel's ceiling, because both modes
@@ -4892,7 +4895,7 @@ full_attn=q5_k/32,qsa_indexer=q5_k/32 go run ./cmd/llm -ppl -model $M \
   the kernel, which is **L4b**: 1.94x the reference's two ops, exact against
   the CPU selection on all 4096 rows, 0.0381% off llama.cpp's — and a
   selection that costs the attention kernel 1.21x rather than saving it
-  anything. [Write-up](research/l4b-qsa-gpu.md)
+  anything. [Write-up](l4b-qsa-gpu.md)
 - ~~**The recurrent state.**~~ **L3a-6 settles the DeltaNet half and L3b-6
   does it on the device**: both the [128, 128, 48] state and the convolution's
   three-column window carry, and 3 + 4 tokens reproduce 7 bit-identically —

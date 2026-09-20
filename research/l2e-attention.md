@@ -1,7 +1,7 @@
 <!-- LLM.md L2e. The full-attention layer and the QSA indexer, CPU reference,
      against llama.cpp's own activations. Cited from llm/attn.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2d](l2d-ple.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2d](l2d-ple.md) · phase 1
 
 # L2e — the full-attention layer, the QSA indexer, and two more things the oracle does
 

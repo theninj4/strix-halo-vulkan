@@ -2,7 +2,7 @@
      stable identifier cited from shaders/, bench/, cmd/, vk/ and TODO.md.
      Do not renumber it. Edit this file, not a copy in IDEAS.md. -->
 
-[← IDEAS.md](../IDEAS.md) · [research index](README.md) · measurement validity
+[← IDEAS.md](ideas.md) · [research index](README.md) · measurement validity
 
 ## 0. Measurement-validity work — **DONE**, and it changed the answers
 

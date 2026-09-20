@@ -2,7 +2,7 @@
      This is a vertical's stage finding, not a numbered IDEAS experiment, so
      it carries a name; it does however close most of IDEAS §5.2. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [IDEAS §5.2](../IDEAS.md) · decode path
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [IDEAS §5.2](ideas.md) · decode path
 
 # L0a — the DRAM bus does not care how big the weight bank is
 

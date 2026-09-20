@@ -1,14 +1,17 @@
 # EMBEDDING — the qwen3-embedding-0.6b vertical
 
-> **Current work from 2026-09-18.** `LLM.md` (qwen3.8-flash-next) is the other
-> live file; `SPEECH.md` is finished-ish and `PIPELINE.md` (z-image) is parked.
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the qwen3-embedding-0.6b vertical (E0–E8) — its only write-up. It was
+> `EMBEDDING.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> **Current work from 2026-09-18.** `llm-vertical.md` (qwen3.8-flash-next) is the other
+> live file; `speech-vertical.md` is finished-ish and `zimage-pipeline.md` (z-image) is parked.
 > Same rules as all three: this file is **rewritten** each session rather than
-> appended to, history goes to `TODO.md` and closed findings to `research/`.
-> Stage numbers are **E0, E1, …**; `§N.M` still addresses `IDEAS.md`.
+> appended to, history goes to `../TODO.md` and closed findings to `research/`.
+> Stage numbers are **E0, E1, …**; `§N.M` still addresses `ideas.md`.
 
 **Target**: `Qwen/Qwen3-Embedding-0.6B` — text in, a 1024-dimensional unit
 vector out, end to end in Go on Vulkan, served at `POST /v1/embeddings`. The
-fifth and last of `GOALS.md`'s models, and the smallest: 596 M parameters,
+fifth and last of `../GOALS.md`'s models, and the smallest: 596 M parameters,
 1.19 GB of bf16.
 
 **Status (2026-09-18, E8): the vertical is finished except for batching.** It
@@ -56,7 +59,7 @@ the measurement below says what it is worth.
 
 It is the same architecture as a model this repository already runs. Z-Image's
 text encoder is **Qwen3-4B** and lives in `zimage/qwen` — a CPU reference
-(`model.go`) and a Vulkan encoder (`gpu.go`, PIPELINE.md stage 5c) doing
+(`model.go`) and a Vulkan encoder (`gpu.go`, zimage-pipeline.md stage 5c) doing
 causal grouped-query attention, NeoX RoPE, per-head q/k norms and SwiGLU over
 a fragment-tiled fp16 bank. Qwen3-Embedding-0.6B is the *same* `Qwen3Model`,
 narrower and shorter, and `llm/` and `parakeet/` already import `zimage/qwen`,
@@ -101,7 +104,7 @@ are a tensor-name prefix (`Config.Prefix`) and two accessors (`RunIDs`,
 - **A query gets an instruction prefix and a document does not**
   (`Instruct: {task}\nQuery:{query}`, no space after the colon). It is part of
   the input *text*, so it lives at the API layer — the `"instruct"` extension
-  in `API.md` — and not inside `Embed`.
+  in `../API.md` — and not inside `Embed`.
 
 ## What fp16 does to a vector, measured
 
@@ -164,7 +167,7 @@ text of 12. That is the whole finding: at one sequence the run is 0.88 GB of
 weights read once and the arithmetic is nowhere near binding, so *the second
 text in a batch would be nearly free*. The same weights at 602 tokens do 530
 GFLOP in 35.6 ms, so there is an order of magnitude of throughput sitting in
-the M axis — exactly the axis `LLM.md`'s MoE decode kernel found its 1.39-1.66x
+the M axis — exactly the axis `llm-vertical.md`'s MoE decode kernel found its 1.39-1.66x
 in, for the same reason.
 
 What stands in the way is not the GEMMs, which take M as a parameter already.
@@ -192,7 +195,7 @@ rows become a gather of B rows rather than one `ReadRow`.
 
 **Quantisation.** The model is 0.88 GB of fp16, resident with 90 GB to spare,
 and E7 above will move the binding constraint to the matrix cores rather than
-the bus. `LLM.md`'s 4.5-bit machinery exists for a 180 B model; there is
+the bus. `llm-vertical.md`'s 4.5-bit machinery exists for a 180 B model; there is
 nothing here for it to buy until a batch is running and the weights are the
 limit again.
 
@@ -202,4 +205,4 @@ end-of-text token re-appended, which is what HF does. Raising it is a flag and
 some memory, not work.
 
 **The reranker.** `Qwen3-Reranker-0.6B` is the same checkpoint shape with a
-yes/no head. Out of `GOALS.md`'s scope.
+yes/no head. Out of `../GOALS.md`'s scope.

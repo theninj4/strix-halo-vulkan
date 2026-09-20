@@ -2,7 +2,7 @@
      the z-image slice rather than from a numbered experiment. Referenced
      from PIPELINE.md, which stays short by pointing here. -->
 
-[← PIPELINE.md](../PIPELINE.md) · [research index](README.md) · pipeline stage 7
+[← PIPELINE.md](zimage-pipeline.md) · [research index](README.md) · pipeline stage 7
 
 # Stage 7 — the VAE mid block on the matrix cores
 

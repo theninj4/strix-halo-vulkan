@@ -4,7 +4,7 @@
      llm/gpu_ple.go, llm/gpu_deltanet.go, shaders/llm_seq_hist.comp and
      llm/graph_cache_test.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L7a](l7a-kv-cache.md) · [L3](l3-deltanet.md) · [L2d](l2d-ple.md) · [L7c](l7c-decode.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L7a](l7a-kv-cache.md) · [L3](l3-deltanet.md) · [L2d](l2d-ple.md) · [L7c](l7c-decode.md) · phase 1
 
 # L7b — the model continues a sequence
 

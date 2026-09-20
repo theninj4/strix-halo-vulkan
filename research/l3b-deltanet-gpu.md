@@ -2,7 +2,7 @@
      twenty, and the scan-versus-chunk question priced. Cited from
      llm/gpu_deltanet.go and shaders/llm_dn_scan.comp. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L3a](l3-deltanet.md) · [L2c](l2c-hc-kernel.md) · [L2f](l2f-attention-gpu.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L3a](l3-deltanet.md) · [L2c](l2c-hc-kernel.md) · [L2f](l2f-attention-gpu.md) · phase 1
 
 # L3b — the gated DeltaNet on the device, and what the scan actually wants
 

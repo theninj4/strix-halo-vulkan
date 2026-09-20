@@ -2,7 +2,7 @@
      calibration works with, and it is the one to build.
      Cited from llm/sim.go, llm/sim_test.go and reference/quant_ref.c. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · accuracy
+[← LLM.md](llm-vertical.md) · [research index](README.md) · accuracy
 
 # L8c-3 — the asymmetric form, and the calibration that only works on it
 

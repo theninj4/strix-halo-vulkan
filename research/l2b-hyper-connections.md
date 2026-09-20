@@ -1,7 +1,7 @@
 <!-- LLM.md L2b. The hyper-connection block, CPU reference, checked against
      llama.cpp's own activations. Cited from llm/ and reference/eval_dump.c. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L0d](l0d-quant-error.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L0d](l0d-quant-error.md) · phase 1
 
 # L2b — the hyper-connection block, and what the oracle is actually computing
 

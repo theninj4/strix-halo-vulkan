@@ -5,7 +5,7 @@
      llm/gpu.go, llm/gpu_moe.go, llm/graph.go, vk/shim.c and
      results/l7d_decode.csv. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L7c](l7c-decode.md) · [L5b](l5b-moe-gpu.md) · [§5.1b](5.1b-mall-cliff-and-stride.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L7c](l7c-decode.md) · [L5b](l5b-moe-gpu.md) · [§5.1b](5.1b-mall-cliff-and-stride.md) · phase 1
 
 # L7d — the decode kernels: 7.46 → 11.89 tok/s, and the same text
 

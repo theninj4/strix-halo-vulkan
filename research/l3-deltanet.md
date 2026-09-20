@@ -1,7 +1,7 @@
 <!-- LLM.md L3. Gated DeltaNet — three quarters of the layers — CPU reference,
      against llama.cpp's own activations. Cited from llm/deltanet.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2e](l2e-attention.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2e](l2e-attention.md) · phase 1
 
 # L3 — Gated DeltaNet, the thing the reference does instead of chunking, and a bug in the oracle
 

@@ -2,7 +2,7 @@
      llama.cpp has sixteen, checked against L2b's CPU reference and the
      reference's own tensors. Cited from llm/gpu.go and shaders/llm_hc_*. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L2b](l2b-hyper-connections.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L2b](l2b-hyper-connections.md) · phase 1
 
 # L2c — the fused hyper-connection kernel
 

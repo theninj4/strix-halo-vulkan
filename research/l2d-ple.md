@@ -2,7 +2,7 @@
      the block it feeds, and both on the device. Cited from llm/ple.go,
      llm/gpu_ple.go and shaders/llm_ple_*. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2c](l2c-hc-kernel.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2b](l2b-hyper-connections.md) · [L2c](l2c-hc-kernel.md) · phase 1
 
 # L2d — the PLE n-gram block, and the quarter of the checkpoint that is a hash table
 

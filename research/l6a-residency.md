@@ -3,7 +3,7 @@
      measurement that says residency is free. Cited from cmd/llm/resident.go,
      llm/gpu_moe.go, vk/shim.c and shaders/llm_common.glsl. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L5b](l5b-moe-gpu.md) · [L0a](l0a-bank-range.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L5b](l5b-moe-gpu.md) · [L0a](l0a-bank-range.md) · phase 1
 
 # L6a — the whole model on the device: 84.20 GB in 68 buffers, and a bank that is an array
 

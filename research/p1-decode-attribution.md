@@ -2,7 +2,7 @@
      dispatch label. Cited from llm/record.go, llm/graph.go, llm/model.go and
      cmd/llm/generate.go. -->
 
-[← LLM.md](../LLM.md) · [← LLM2.md](../LLM2.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [L8d](l8d-moe-decode.md) · [L8e](l8e-attn-decode.md) · phase 2
+[← LLM.md](llm-vertical.md) · [← LLM2.md](llm-review.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [L8d](l8d-moe-decode.md) · [L8e](l8e-attn-decode.md) · phase 2
 
 # P1 — the decode step, attributed: the 12 ms is three things, and one of them was disk
 

@@ -3,7 +3,7 @@
      took a second context length to grade at all.
      Cited from llm/gpu_attn.go, llm/bank.go, llm/graph.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · bank
+[← LLM.md](llm-vertical.md) · [research index](README.md) · bank
 
 # L8c-7 — the attention layer at 4.5 bits, and a family that took two contexts to grade
 

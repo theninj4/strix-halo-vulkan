@@ -3,7 +3,7 @@
      eight-chunk screen said it was free.
      Cited from llm/gpu_deltanet.go, llm/bank_q4.go, llm/graph.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · bank
+[← LLM.md](llm-vertical.md) · [research index](README.md) · bank
 
 # L8c-5 — the gated DeltaNet at 4.5 bits, and a screen that had the sign wrong
 

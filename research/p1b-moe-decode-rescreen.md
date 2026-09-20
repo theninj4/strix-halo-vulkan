@@ -3,7 +3,7 @@
      rungs were MALL measurements. Cited from llm/gpu_moe.go (ProfileSweep),
      cmd/llm/bench_moe.go and results/p1b_moe.csv. -->
 
-[← LLM.md](../LLM.md) · [← LLM2.md](../LLM2.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P1a](p1a-hyper-connection-shape.md) · phase 2
+[← LLM.md](llm-vertical.md) · [← LLM2.md](llm-review.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P1a](p1a-hyper-connection-shape.md) · phase 2
 
 # P1b — the MoE decode rungs re-screened against DRAM, and a plan that survives its own bad evidence
 

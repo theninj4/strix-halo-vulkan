@@ -3,7 +3,7 @@
      family whose eight-chunk screen was *pessimistic*.
      Cited from llm/gpu.go, llm/quantk.go, llm/bank_q4.go, shaders/llm_q4k.glsl. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · bank
+[← LLM.md](llm-vertical.md) · [research index](README.md) · bank
 
 # L8c-6 — the hyper-connection block at 4.5 bits, and a record that is not ggml's
 

@@ -2,7 +2,7 @@
      experts, the shared expert, and a routing distribution nothing had
      measured. Cited from llm/moe.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L4a](l4-qsa.md) · [L4b](l4b-qsa-gpu.md) · [L3](l3-deltanet.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L4a](l4-qsa.md) · [L4b](l4b-qsa-gpu.md) · [L3](l3-deltanet.md) · phase 1
 
 # L5a — the MoE block: every tensor matches, and the routing is nothing like balanced
 

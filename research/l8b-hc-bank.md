@@ -6,7 +6,7 @@
      shaders/llm_gemm.comp, shaders/llm_hc_gemv.comp, llm/bank.go,
      llm/gpu_test.go, cmd/llm/bench.go and results/l8b_*.csv. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L8a](l8a-dense-bank.md) · [L7d](l7d-decode-kernels.md) · [L2c](l2c-hc-kernel.md) · phase 2
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L8a](l8a-dense-bank.md) · [L7d](l7d-decode-kernels.md) · [L2c](l2c-hc-kernel.md) · phase 2
 
 # L8b — the last dense family: the block is 2.14x at one token, bit for bit
 

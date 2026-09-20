@@ -1,13 +1,16 @@
 # SPEECH — the two audio verticals
 
-> **Current work.** `PIPELINE.md` (the z-image slice) is **parked** at 14.26 s
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the two audio verticals (parakeet S1–S8, kokoro T1–T10, R1, W1 — the T6–T10/R1/W1 write-ups live only here). It was
+> `SPEECH.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+> **Current work.** `zimage-pipeline.md` (the z-image slice) is **parked** at 14.26 s
 > an image; this is what happens next. Same rules as that file: it is
-> rewritten rather than appended to, history goes to `TODO.md` and closed
+> rewritten rather than appended to, history goes to `../TODO.md` and closed
 > findings to `research/`.
 
 **Targets**: `wav → text` for `parakeet-tdt-0.6b-v3` and `text → wav` for
 `Kokoro-82M`, both end to end in Go on Vulkan, both validated against a Python
-reference dump before anything is optimised. Two of `GOALS.md`'s five models,
+reference dump before anything is optimised. Two of `../GOALS.md`'s five models,
 and the two smallest.
 
 **Status (2026-09-20, W1)**: **both verticals are on the device, the loop
@@ -58,7 +61,7 @@ them** — and ended with the whole of misaki's English G2P ported: five
 components exact against their own dumped oracles, twelve measured rules where
 spacy's tagger mattered, and a cgo binding to libespeak-ng for the rest.
 **The designed corpus is exact, 24 of 24; on 400 sentences nobody chose, 92.4%
-of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
+of phoneme words agree.** [Write-up](t5-kokoro-g2p.md).
 
     "In 2024 the team shipped 1,024 kernels and spent $3.5 million, up 12%."
     -> ɪn twˈɛnti twˈɛnti fˈɔɹ ðə tˈim ʃˈɪpt wˈʌn θˈWzᵊnd twˈɛnti fˈɔɹ
@@ -111,15 +114,15 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | S3 | Mel front end in Go, against S2's mel | **done** — 3.1e-4 absolute |
 | S4 | Encoder, CPU reference, layer by layer | **done** — 1.7e-4 relative |
 | S5 | Prediction net + joint + TDT greedy decode; **first transcript** | **done** — exact string |
-| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | **done** — 178x, [write-up](research/s6-parakeet-encoder.md) |
-| S7 | The subsampling stack on Vulkan | **done** — 95x, [write-up](research/s7-parakeet-subsampling.md) |
-| S8 | The projector, the prediction net, the joint and the TDT loop | **done** — 43x, 257x real time, [write-up](research/s8-parakeet-decode.md) |
+| S6 | Encoder on Vulkan (GEMMs, LayerNorm, attention, conv) | **done** — 178x, [write-up](s6-parakeet-encoder.md) |
+| S7 | The subsampling stack on Vulkan | **done** — 95x, [write-up](s7-parakeet-subsampling.md) |
+| S8 | The projector, the prediction net, the joint and the TDT loop | **done** — 43x, 257x real time, [write-up](s8-parakeet-decode.md) |
 | S9 | Long clips: chunking, or full attention at T=3000 | open, see below |
 | S10 | The front end on the device, or a faster one on the host | open — **48% of the pipeline** |
 | T1 | `reference/convert_kokoro.py` + `reference/dump_kokoro.py` | **done** — 513 tensors readable from Go, 63 dumped, every self-check 0 |
 | T2 | Phoneme encoder + ALBERT + predictor, CPU, against T1 | **done** — 5e-7 relative, durations exact |
 | T3 | iSTFTNet decoder, CPU; **first waveform** | **done** — 98 dB against the reference, `cmd/tts` speaks |
-| T4a | The generator's residual blocks on Vulkan | **done** — 385x, 22.4 TFLOP/s, [write-up](research/t4-kokoro-vocoder.md) |
+| T4a | The generator's residual blocks on Vulkan | **done** — 385x, 22.4 TFLOP/s, [write-up](t4-kokoro-vocoder.md) |
 | T4b | The upsamplers; a stage that does not come back | **done** — vocoder 487 → 244 ms |
 | T4c | The decoder, the tail, and every readback between them | **done** — vocoder 244 → 38 ms, 12.90x real time |
 | T5a | The G2P oracle: `convert_misaki.py`, `dump_g2p.py`, the coverage survey | **done** — 91% is a dictionary, a tagger is worth 1.74% |
@@ -402,7 +405,7 @@ is a floor set by the reference and not by any arithmetic here.
 
 `cmd/tts` takes text. The oracle is `misaki.en.G2P`, because it is what kokoro
 was trained on; the full write-up is
-[`research/t5-kokoro-g2p.md`](research/t5-kokoro-g2p.md) and the short version
+[`t5-kokoro-g2p.md`](t5-kokoro-g2p.md) and the short version
 is the table:
 
     the word path         204 corpus tokens, phonemes and rating     0 wrong
@@ -440,7 +443,7 @@ so it is restricted to the entries that carry a VBD key.
 ## T6 — the phoneme side, finished
 
 **Three stages, 222 ms to 17, and the profile decided the order of all three
-of them.** `SPEECH.md` had carried "60% of the phoneme side is recurrences" since
+of them.** `speech-vertical.md` had carried "60% of the phoneme side is recurrences" since
 T2. Timing the six stages put **ALBERT at 104 ms of 222** — 47% of the phoneme
 side and 40% of a whole utterance — against 6.7 GFLOP of arithmetic, which is a
 transformer this repository has had kernels for since stage 3. Then T6b split
@@ -486,7 +489,7 @@ Three things worth keeping:
     per operand to save a tenth of a millisecond over the whole stack.
 
 **T6b took the F0/N stacks from 40 ms to 1**, and the instrument moved the
-number before the kernel did: `SPEECH.md` had carried "~33 ms" for them,
+number before the kernel did: `speech-vertical.md` had carried "~33 ms" for them,
 inferred by subtraction, and splitting `Prosody` measured 24 ms of recurrence
 against **40 ms of stacks** — a third of the whole phoneme side. They are six
 `AdainResBlk1d` at 512 and 256 channels over 130 and 260 frames, which is *the

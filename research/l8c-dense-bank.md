@@ -3,7 +3,7 @@
      Cited from llm/bank_q4.go, llm/quantk.go, shaders/llm_gemm.comp -DQ4B,
      shaders/llm_gemv.comp -DQ4B. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · bank
+[← LLM.md](llm-vertical.md) · [research index](README.md) · bank
 
 # L8c-4 — the 4.5-bit bank, and a simulation it reproduces to the last place
 

@@ -1,7 +1,7 @@
 <!-- Pipeline stage findings, not an IDEAS section. Referenced from
      PIPELINE.md, which stays short by pointing here. -->
 
-[← PIPELINE.md](../PIPELINE.md) · [research index](README.md) · pipeline stage 3
+[← PIPELINE.md](zimage-pipeline.md) · [research index](README.md) · pipeline stage 3
 
 # Stage 3 — the DiT block and its attention
 
@@ -67,7 +67,7 @@ fourth will help:
   ~28 is needed** to saturate 22.9 TFLOP/s against the MALL. Reaching that by
   register blocking alone would need a query block near 32-64, which LDS
   cannot hold.
-- So [IDEAS §3.3](../IDEAS.md)'s original instruction — build attention's two
+- So [IDEAS §3.3](ideas.md)'s original instruction — build attention's two
   matmuls out of the register-blocked WMMA kernel — is now *measured* advice
   rather than a guess. The scalar-FMA path tops out an order of magnitude
   short.

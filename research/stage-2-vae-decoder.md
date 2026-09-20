@@ -2,7 +2,7 @@
      the z-image slice rather than from a numbered experiment. Referenced
      from PIPELINE.md, which stays short by pointing here. -->
 
-[← PIPELINE.md](../PIPELINE.md) · [research index](README.md) · pipeline stage 2
+[← PIPELINE.md](zimage-pipeline.md) · [research index](README.md) · pipeline stage 2
 
 # Stage 2 — the VAE decoder
 

@@ -1,22 +1,25 @@
 # IMAGE — the z-image-turbo vertical
 
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the z-image-turbo vertical (I0–I7): serving, previews, edits, the re-checked hypotheses. It was
+> `IMAGE.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
 > **Rewritten 2026-09-18 (I7), and this is the file to read first for this
 > vertical.**
-> It supersedes [`PIPELINE.md`](PIPELINE.md), which carries a banner saying so
+> It supersedes [`zimage-pipeline.md`](zimage-pipeline.md), which carries a banner saying so
 > and whose stage table (1-10) and validation rules remain the record of how
-> the slice was built. Same rules as `LLM.md`, `SPEECH.md` and `EMBEDDING.md`:
+> the slice was built. Same rules as `llm-vertical.md`, `speech-vertical.md` and `embedding-vertical.md`:
 > this file is **rewritten** each session rather than appended to, history goes
-> to `TODO.md`, closed findings to `research/`. Stage numbers are **I0, I1, …**
+> to `../TODO.md`, closed findings to `research/`. Stage numbers are **I0, I1, …**
 > — the original slice's stages 1-10 keep their bare numbers in
-> `research/stage-*.md` — and `§N.M` still addresses `IDEAS.md`.
+> `stage-*.md` — and `§N.M` still addresses `ideas.md`.
 
 **Target**: `Tongyi-MAI/Z-Image-Turbo` — prompt → PNG at up to 1024x1024, 8
 steps, fp16, end to end in Go on Vulkan, served at
 `POST /v1/images/generations`, with in-progress previews from
 `madebyollin/taef1`.
 
-**Status**: **every capability `GOALS.md` names for this vertical is built and
-served, and `API.md` now carries no refusal that a flag does not fix.** The
+**Status**: **every capability `../GOALS.md` names for this vertical is built and
+served, and `../API.md` now carries no refusal that a flag does not fix.** The
 kernel work was parked 2026-09-14 with the budget below; the serving work
 unparked 2026-09-18. **I1** made width and height a *ceiling and a default
 rather than a fixed size* and wired `/v1/images/generations`. **I2** ported
@@ -29,10 +32,10 @@ four percentage items and one capability nobody has asked for (masks).
 
 | # | Stage | State |
 |---|---|---|
-| I0 | The slice: stages 1-10, prompt → PNG in **14.26 s** | **done** — `PIPELINE.md`, `research/stage-*.md` |
-| I1 | Served: variable geometry + `/v1/images/generations` | **done 2026-09-18** — `API.md` carries the row and the flags |
+| I0 | The slice: stages 1-10, prompt → PNG in **14.26 s** | **done** — `zimage-pipeline.md`, `stage-*.md` |
+| I1 | Served: variable geometry + `/v1/images/generations` | **done 2026-09-18** — `../API.md` carries the row and the flags |
 | I2 | taef1 previews, and `stream: true` | **done 2026-09-18** — measured below |
-| I7 | `/v1/images/edits`: the VAE encoder, and SDEdit | **done 2026-09-18** — `research/i7-vae-encoder-and-edits.md` |
+| I7 | `/v1/images/edits`: the VAE encoder, and SDEdit | **done 2026-09-18** — `i7-vae-encoder-and-edits.md` |
 | I3 | The eight elementwise passes, 1.6 s, fused into their GEMMs | open — the L2c/L2f pattern, proven since parking |
 | I4 | The GEMMs' missing quarter, 2.6 s | open — two new probes since parking, no known lever |
 | I5 | The VAE decoder's elementwise fusions, ~200 ms | open |
@@ -49,7 +52,7 @@ absorb — and together they are 1.9 s of the 14.3.
 ## The model, as the checkpoint describes it
 
 `go run ./cmd/inspect models/Z-Image-Turbo/<part>`; full table in
-`PIPELINE.md`. What the open items rest on:
+`zimage-pipeline.md`. What the open items rest on:
 
 | | |
 |---|---|
@@ -96,10 +99,10 @@ at 0.3 — and everything else is the steps that did not run.
 
 ## I7 — the encoder, and edits
 
-Full write-up in `research/i7-vae-encoder-and-edits.md`. The three things worth
+Full write-up in `i7-vae-encoder-and-edits.md`. The three things worth
 carrying in this file:
 
-**The stride-2 convolution needed no kernel.** `IMAGE.md` listed it as the one
+**The stride-2 convolution needed no kernel.** `zimage-vertical.md` listed it as the one
 genuinely new piece. It is not: a 3x3 stride-2 convolution under diffusers'
 `(0, 1, 0, 1)` pad computes exactly what the **stride-1 pad-1 form computes at
 the odd pixels**, far edge included, because the stride-1 form's own zero
@@ -155,7 +158,7 @@ which is also what llama.cpp's perf logger reports.
 
 ## The hypotheses, re-checked (2026-09-18)
 
-1. **"`aspect_ratio` is a residency question, not a parameter"** (`API.md`) —
+1. **"`aspect_ratio` is a residency question, not a parameter"** (`../API.md`) —
    **disproven, constructively**: I1 made size a per-request parameter under a
    ceiling. **And the ceiling is each side, not the area**, because the VAE's
    fp16 arena holds *blocked* copies padded per axis.
@@ -201,7 +204,7 @@ which `partial_images` already is.
 **Masked edits.** OpenAI's `/v1/images/edits` takes a `mask`, and this one
 refuses it with a 501 that says what it would be: a blend into the latent at
 every denoising step, which is a mechanism rather than a parameter. It is the
-only capability this vertical is missing and `GOALS.md` does not ask for it —
+only capability this vertical is missing and `../GOALS.md` does not ask for it —
 the endpoint exists because OpenAI's surface does. Tongyi's dedicated edit
 checkpoint would be a new vertical and is out of scope.
 
@@ -229,7 +232,7 @@ see an intermediate in a 122-dispatch graph over a bump-allocated arena. It is
 what found that I7's error was smooth compounding rather than one wrong
 dispatch.
 
-The five validation rules are stated in full in `PIPELINE.md` and every one of
+The five validation rules are stated in full in `zimage-pipeline.md` and every one of
 them has caught something. I7 used all five, and leaned hardest on the third:
 its whole finding is that the decoder's denominator and the decoder's bound are
 both wrong for the encoder, in opposite directions.

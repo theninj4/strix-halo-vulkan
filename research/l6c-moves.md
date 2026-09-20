@@ -3,7 +3,7 @@
      was hiding behind it, and the prefill ladder. Cited from llm/move.go,
      shaders/llm_move.comp, llm/graph.go and vk/engine.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L6b](l6b-graph.md) · [L2a](l2a-prefill-attribution.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L6b](l6b-graph.md) · [L2a](l2a-prefill-attribution.md) · phase 1
 
 # L6c — the glue on the device: 941.3 tok/s, 2.40x llama.cpp
 

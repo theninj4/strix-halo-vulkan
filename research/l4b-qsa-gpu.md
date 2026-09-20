@@ -2,7 +2,7 @@
      reads, and what sparsity costs at prefill. Cited from
      llm/gpu_attn.go and shaders/llm_attn_select.comp. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2f](l2f-attention-gpu.md) · [L4a](l4-qsa.md) · [L3b](l3b-deltanet-gpu.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2f](l2f-attention-gpu.md) · [L4a](l4-qsa.md) · [L3b](l3b-deltanet-gpu.md) · phase 1
 
 # L4b — the selection on the device: one dispatch against twenty-four, and what sparsity costs
 

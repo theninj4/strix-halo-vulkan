@@ -3,7 +3,7 @@
      to be worth 5x, and the prefill ladder. Cited from llm/graph.go,
      llm/gpu_head.go, llm/arena.go, vk/engine.go and cmd/llm/bench_graph.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L6a](l6a-residency.md) · [L2a](l2a-prefill-attribution.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L6a](l6a-residency.md) · [L2a](l2a-prefill-attribution.md) · phase 1
 
 # L6b — the graph: llama.cpp's own logits, and 1.82x its prefill
 

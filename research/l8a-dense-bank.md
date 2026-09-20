@@ -5,7 +5,7 @@
      shaders/llm_common.glsl, llm/gpu_head.go, llm/gpu_deltanet.go,
      llm/gpu_attn.go, cmd/llm/bench_head.go and results/l8a_*.csv. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L7d](l7d-decode-kernels.md) · [L7c](l7c-decode.md) · [L6a](l6a-residency.md) · phase 2
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L7d](l7d-decode-kernels.md) · [L7c](l7c-decode.md) · [L6a](l6a-residency.md) · phase 2
 
 # L8a — the dense bank stops being halves: 11.90 → 14.07 tok/s, bit for bit
 

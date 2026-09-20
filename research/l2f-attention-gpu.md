@@ -2,7 +2,7 @@
      dispatches against nineteen, checked against L2e's CPU reference and
      llama.cpp's own tensors. Cited from llm/gpu_attn.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2c](l2c-hc-kernel.md) · [L2d](l2d-ple.md) · [L2e](l2e-attention.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2c](l2c-hc-kernel.md) · [L2d](l2d-ple.md) · [L2e](l2e-attention.md) · phase 1
 
 # L2f — the full-attention layer on the device, and a ladder that inverts
 

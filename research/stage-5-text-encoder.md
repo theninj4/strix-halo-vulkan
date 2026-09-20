@@ -2,7 +2,7 @@
      the z-image slice rather than from a numbered experiment. Referenced
      from PIPELINE.md, which stays short by pointing here. -->
 
-[← PIPELINE.md](../PIPELINE.md) · [research index](README.md) · pipeline stage 5
+[← PIPELINE.md](zimage-pipeline.md) · [research index](README.md) · pipeline stage 5
 
 # Stage 5 — the tokenizer and the text encoder
 

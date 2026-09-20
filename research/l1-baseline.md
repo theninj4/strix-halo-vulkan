@@ -1,7 +1,7 @@
 <!-- LLM.md L1. The checkpoint, the reader, and the number to beat. Cited from
      gguf/, cmd/gguf, cmd/llm and bench/modelshapes.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L0a](l0a-bank-range.md) · [§5.1](5.1-memory-types.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L0a](l0a-bank-range.md) · [§5.1](5.1-memory-types.md) · phase 1
 
 # L1 — the checkpoint, and llama.cpp's number
 

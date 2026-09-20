@@ -3,7 +3,7 @@
      from shaders/llm_hc_cn.comp, llm/gpu.go, llm/graph.go and
      results/p1a_*.csv. -->
 
-[← LLM.md](../LLM.md) · [← LLM2.md](../LLM2.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [L7d](../LLM.md) · phase 2
+[← LLM.md](llm-vertical.md) · [← LLM2.md](llm-review.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [L7d](llm-vertical.md) · phase 2
 
 # P1a — the hyper-connection block: a boundary that was two dispatches, and a grid that is pinned at 160 workgroups
 

@@ -1,7 +1,7 @@
 <!-- LLM.md L0d. Closes the first three items of IDEAS §7. Cited from
      bench/quanterr.go and cmd/quanterr. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [IDEAS §7](../IDEAS.md) · accuracy
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [IDEAS §7](ideas.md) · accuracy
 
 # L0d — what the formats actually cost, on real weights and real activations
 

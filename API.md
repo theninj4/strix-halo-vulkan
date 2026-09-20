@@ -117,7 +117,7 @@ message saying what the server was sized for, rather than being truncated.
 `-embed` stages 0.88 GB of fp16 banks in **1.3 s**, and an input then costs
 **11.5 ms** whatever it says — a 27-token query and an 8-token document take
 the same time, because at these lengths the run is the weights read once
-(EMBEDDING.md E6). `-embed-tokens` sizes the arenas and is therefore where an
+(research/embedding-vertical.md E6). `-embed-tokens` sizes the arenas and is therefore where an
 input is truncated: the front of the text survives and the end-of-text token
 is re-appended, because last-token pooling takes *that* row and an input
 truncated through it would be pooled from an ordinary word.
@@ -168,7 +168,7 @@ the measurement.
 
 **Kokoro is not.** Its arenas are sized for one utterance's frame count, and
 the durations decide that, so nothing can be staged until the phoneme side has
-run (SPEECH.md T2, T4c). `-tts-gpu` therefore stages *per request* — the
+run (research/speech-vertical.md T2, T4c). `-tts-gpu` therefore stages *per request* — the
 sequence `cmd/tts` uses, unchanged, because it is the one T4 and T6 measured —
 and it is **off by default** until that cost is measured against the host
 path, which is what `-tts` alone runs.
@@ -181,7 +181,7 @@ Two things would fix it, and both are measurements rather than arguments:
   (`GPUPhonemes.sharedGraph`); whether the generator's stages tolerate the
   padding is the open question.
 - **Skipping the second prosody pass.** The vocoder still reads `asr`, `f0`
-  and `energy` from the host (SPEECH.md T7), so the host prosody that settles
+  and `energy` from the host (research/speech-vertical.md T7), so the host prosody that settles
   the length could feed the device vocoder directly and the phoneme side would
   not need staging at all.
 
@@ -350,7 +350,7 @@ truncated and renormalised, so a 32-wide vector is still a unit vector.
 `POST /v1/audio/speech` takes a **`"phonemes"`** field that is not OpenAI's: IPA
 to speak directly, winning over `input`. The checkpoint's vocabulary is 178 IPA
 symbols and the front end that reaches them is a separate model's worth of
-rules (SPEECH.md T5), so a caller that has already done that says so instead of
+rules (research/speech-vertical.md T5), so a caller that has already done that says so instead of
 having it guessed. It is also how the endpoint is driven without a lexicon on
 disk. `GET /v1/models` carries a **`voices`** array on the speech model, so a
 client does not need a second call to populate a menu.
@@ -358,7 +358,7 @@ client does not need a second call to populate a menu.
 Its **`"voice"`** also takes a *mixture*: `"af_bella,af_sky"` is the equal mean
 of two style packs, which is not this server's invention — hexgrad's own
 `KPipeline.load_voice` gives that spelling exactly that meaning, so the same
-request is the same voice here as anywhere else kokoro runs (SPEECH.md T8).
+request is the same voice here as anywhere else kokoro runs (research/speech-vertical.md T8).
 `"af_bella:3,af_sky:1"` weights the mix, which is ours, and the weights are
 normalised by their sum so they need not add up. Either every component
 carries a weight or none does: `"af_bella:0.7,af_sky"` is a 400, because it
@@ -407,7 +407,7 @@ they buy is a picture at 3.6 seconds instead of at fifteen. The frames land at
 3.6, 7.1 and 10.7 s, from steps 1, 3 and 5 of the eight.
 
 Two numbers inside that 4.4% are worth separating, because only one of them is
-the model. A preview decode is **87 ms** (`madebyollin/taef1`, IMAGE.md I2);
+the model. A preview decode is **87 ms** (`madebyollin/taef1`, research/zimage-vertical.md I2);
 encoding the frame is the other **60**, and it would have been **344** at Go's
 default PNG compression — four times the decode. Partial frames therefore go
 out at `png.BestSpeed`, 15% more bytes for a fifth of the latency, while the
@@ -432,7 +432,7 @@ their endpoint accepts, and a JSON body whose `image` is base64 (a `data:` URL
 is fine), which is what curl and a test can write by hand. Both fill the same
 struct.
 
-**What it does is SDEdit** (IMAGE.md I7): the picture is encoded to a latent,
+**What it does is SDEdit** (research/zimage-vertical.md I7): the picture is encoded to a latent,
 the latent is mixed with noise at an intermediate point on the schedule, and
 only the tail of the schedule runs. **`strength`** is how far back up the
 schedule that point is and is the whole behaviour of the endpoint — near zero
@@ -471,7 +471,7 @@ What is refused rather than faked:
   body dressed as a stream would be a lie about latency.
 - **`stream: true` on transcription.** The decode loop emits token by token
   and could stream, but the 40 µs submit-and-fence per emission is 38% of it
-  (SPEECH.md), so what that endpoint wants is the persistent kernel, not a
+  (research/speech-vertical.md), so what that endpoint wants is the persistent kernel, not a
   goroutine.
 - **Containers other than WAV, and audio formats other than wav/pcm.**
   `audio/` is 16-bit PCM in and out on purpose. An mp3 request gets a 400
@@ -530,7 +530,7 @@ there is, and it should be a decision somebody made.
              the protocol carries no credential, so -token does not apply to this port
 
 **28 voices, not 54.** Kokoro's packs cover nine languages and misaki's
-English grapheme-to-phoneme is the one that is ported (SPEECH.md T5), so
+English grapheme-to-phoneme is the one that is ported (research/speech-vertical.md T5), so
 `jf_alpha` over this protocol would be a Japanese voice reading English
 phonemes. Over HTTP that is the caller's business, because
 `/v1/audio/speech` also takes IPA directly and a caller with its own lexicon
@@ -543,7 +543,7 @@ so a blend still reaches `backend.TTS` by being spelled into it.
 **What it does not do.** Neither streaming direction is implemented, and both
 are measurements rather than gaps: `supports_synthesize_streaming` would buy
 the time between the first sentence of an answer and the last, and this part
-synthesises nineteen seconds of speech in 162 ms (SPEECH.md T10), so the
+synthesises nineteen seconds of speech in 162 ms (research/speech-vertical.md T10), so the
 whole utterance is ready before a satellite could have played the first
 sentence of a streamed one — and kokoro decides an utterance's durations all
 at once, so the pieces would have to agree about prosody they cannot see.
@@ -583,8 +583,10 @@ again.
   second request waits — and evicts the first's reusable prefix. What would
   change that is a cache per conversation and the residency to hold them,
   which is a measurement rather than an argument.
-- **MTP speculative decoding** (LLM.md L9), which is the next thing worth
-  1.5-1.8x on the endpoint that has just been wired.
+- **MTP speculative decoding is built, lossless, and parked at 0.95x**
+  (research/p5c-speculative-loop.md) — it costs nothing while off. What
+  would make it pay is the draft head's acceptance on a real workload,
+  which is a measurement (`cmd/llm -mtp`), not engineering; see `TODO.md`.
 - **Masked edits.** The encoder is ported and `/v1/images/edits` answers, so
   the mask is the only piece of that endpoint still missing: a blend into the
   latent at every denoising step, which is a mechanism rather than a

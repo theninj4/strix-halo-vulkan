@@ -1,7 +1,7 @@
 <!-- LLM.md L8c, second item. The width question, answered by measurement
      rather than by L0d's proxy. Cited from llm/sim.go and cmd/gguf/main.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · accuracy
+[← LLM.md](llm-vertical.md) · [research index](README.md) · accuracy
 
 # L8c-1 — the widths, measured, and D3 does not survive them
 

@@ -72,7 +72,7 @@ exposed is tiling: a 1 KB-wide panel of a K=4096 fp16 matrix gets a quarter
 of the bus. Pad every row stride to 256 B past a multiple of 4 KB and all
 three effects go away, for every panel width and every traversal — and where
 the stride is not the engine's to choose, depth in the inner loop buys the
-same thing, which is the 2.1x the GEMM above collects. `IDEAS.md`
+same thing, which is the 2.1x the GEMM above collects. `research/ideas.md`
 explains how each kernel gets where it is and what is still on the table.
 
 All of the above was measured on square N x N x N, which no transformer layer

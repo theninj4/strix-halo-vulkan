@@ -4,7 +4,7 @@
      from llm/gpu_attn.go, shaders/llm_attn_*.comp and
      llm/gpu_attn_cache_test.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2e](l2e-attention.md) · [L2f](l2f-attention-gpu.md) · [L4b](l4b-qsa-gpu.md) · [L7b](l7b-sequence.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2e](l2e-attention.md) · [L2f](l2f-attention-gpu.md) · [L4b](l4b-qsa-gpu.md) · [L7b](l7b-sequence.md) · phase 1
 
 # L7a — the KV cache: a chunk split, bit for bit
 

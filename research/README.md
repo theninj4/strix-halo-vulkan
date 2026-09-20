@@ -1,15 +1,34 @@
 # research/ — the findings archive
 
-One file per **completed** experiment. The open backlog, the measured
-roofline, and the order of attack stay in [`../IDEAS.md`](../IDEAS.md);
-this directory is where a finished item's full write-up lives once it is
-closed, so the backlog stays readable and an agent can load one finding
-without loading all of them.
+One file per **completed** experiment, plus (since the 2026-09-20
+consolidation) the frozen per-vertical progress files. The live state of
+play and the open items are in [`../TODO.md`](../TODO.md); this directory
+is where a finished item's full write-up lives once it is closed, so an
+agent can load one finding without loading all of them. The phase-1
+backlog and the measured roofline are archived in [`ideas.md`](ideas.md).
+
+## The vertical archives
+
+The root progress files were consolidated here on 2026-09-20, frozen as
+each vertical's closing record; stage letters (L7d, P4c, T9, S10, I7, E7…)
+resolve inside them.
+
+| file | was | carries |
+|---|---|---|
+| [`llm-vertical.md`](llm-vertical.md) | `LLM.md` | qwen3.8-flash-next: stages L0–L9a summarised, decisions **D1–D21**, open questions, the model/machine tables, how-to-run |
+| [`llm-review.md`](llm-review.md) | `LLM2.md` | the review: hypotheses checked, the honest decode budget, P0–P6 as closed |
+| [`speech-vertical.md`](speech-vertical.md) | `SPEECH.md` | parakeet S1–S8 and kokoro T1–T10, R1, W1 — the **T6–T10/R1/W1 write-ups live only here** |
+| [`tts-recap.md`](tts-recap.md) | `TTS.md` | the kokoro recap: stage table, serving defaults |
+| [`zimage-vertical.md`](zimage-vertical.md) | `IMAGE.md` | z-image I0–I7: serving, previews, edits, re-checked hypotheses |
+| [`zimage-pipeline.md`](zimage-pipeline.md) | `PIPELINE.md` | the slice as built: inventory, the five validation rules, the budget |
+| [`embedding-vertical.md`](embedding-vertical.md) | `EMBEDDING.md` | Qwen3-Embedding E0–E8 — its only write-up |
+| [`ideas.md`](ideas.md) | `IDEAS.md` | the `§N.M` backlog and the measured roofline — **the address space; never renumber** |
+| [`phase1-backlog.md`](phase1-backlog.md) | old `TODO.md` tail | what phase 1 built, the bugs worth remembering, the microbenchmark backlog |
 
 ## The section number is the address — do not renumber
 
 `§N.M` is a stable identifier, cited **972 times** across this repo: in
-`IDEAS.md` and `TODO.md`, and — the part that matters — in **293 comments
+`ideas.md` and the archives here, and — the part that matters — in **293 comments
 across 29 files** in `shaders/`, `bench/`, `cmd/` and `vk/`, where it is the
 only link between a kernel and the experiment that justified its shape. For
 example `shaders/gemv_w4a8.comp` cites §1.1, §1.2 and §1.3 to explain three
@@ -53,7 +72,7 @@ MMA ceiling) is the most-cited of them, at 20 references.
 
 ### Pipeline stage findings
 
-These come from building the z-image slice (PIPELINE.md) rather than from a
+These come from building the z-image slice ([`zimage-pipeline.md`](zimage-pipeline.md)) rather than from a
 numbered experiment, so they carry names instead of section numbers:
 
 | Stage | Findings |
@@ -71,7 +90,7 @@ numbered experiment, so they carry names instead of section numbers:
 
 ### LLM vertical findings
 
-From building the qwen3.8-flash-next vertical (LLM.md).
+From building the qwen3.8-flash-next vertical ([`llm-vertical.md`](llm-vertical.md)).
 
 | Stage | Findings |
 |---|---|
@@ -127,7 +146,7 @@ From building the qwen3.8-flash-next vertical (LLM.md).
 
 ### Speech vertical findings
 
-From building the two audio verticals (SPEECH.md), so they carry stage names
+From building the two audio verticals ([`speech-vertical.md`](speech-vertical.md)), so they carry stage names
 rather than section numbers.
 
 | Stage | Findings |
@@ -142,16 +161,15 @@ rather than section numbers.
 
 `§4.1` (per-dispatch cost: ~300 ns, worry falsified) and `§3.7` (the
 reduction kernels: the 3.3x gap is lane count, closed as a side effect of
-§6.2) are answered in one paragraph each and live in `../IDEAS.md`.
+§6.2) are answered in one paragraph each and live in [`ideas.md`](ideas.md).
 
 ## The three layers, and which file to put a thing in
 
 | Layer | Lives in | Grows |
 |---|---|---|
-| What the chip can do | `../IDEAS.md` — the roofline table | Rarely; only when a ceiling is re-measured |
-| What to try next | `../IDEAS.md` — the open items and the order of attack | Shrinks as items close |
-| What we learned | **here**, one file per § | Forever — which is why it is not in `IDEAS.md` |
-| What happened in a session | `../TODO.md` | Forever; append-only handoffs |
+| What the chip can do | [`ideas.md`](ideas.md) — the roofline table | Rarely; only when a ceiling is re-measured |
+| What to try next | [`../TODO.md`](../TODO.md) — the open items per vertical | Shrinks as items close |
+| What we learned | **here**, one file per § or stage | Forever |
 
-When an item closes: move its body here as `N.M-slug.md`, leave the heading
-in `IDEAS.md` with a one-line result and a link, and add a row above.
+When an item closes: move its body here as its own file, leave one line and
+a link in `../TODO.md`, and add a row above.

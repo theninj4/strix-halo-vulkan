@@ -1,7 +1,7 @@
 <!-- LLM.md L4a. The 4k dump, the QSA selection, and what the reference's
      arithmetic becomes at a real ubatch. Cited from llm/attn.go. -->
 
-[← LLM.md](../LLM.md) · [research index](README.md) · [L2e](l2e-attention.md) · [L2f](l2f-attention-gpu.md) · [L3](l3-deltanet.md) · phase 1
+[← LLM.md](llm-vertical.md) · [research index](README.md) · [L2e](l2e-attention.md) · [L2f](l2f-attention-gpu.md) · [L3](l3-deltanet.md) · phase 1
 
 # L4a — the 4 k dump: the selection settled, and the oracle's arithmetic changes underneath it
 

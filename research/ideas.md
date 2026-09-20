@@ -1,6 +1,9 @@
 # IDEAS — experiments worth running to squeeze more out of Strix Halo
 
-Written after reviewing `TODO.md`, every shader in `shaders/`, the full
+> **ARCHIVED 2026-09-20** — frozen as the closing record of the phase-1 experiment backlog and the measured roofline; §N.M numbers cited from code and research files resolve here. It was
+> `IDEAS.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+
+Written after reviewing `../TODO.md`, every shader in `shaders/`, the full
 `results.csv`, and the device's actual reported capabilities (`vulkaninfo`,
 `/sys/class/drm/card1/device/pp_dpm_sclk`). This is a prioritised
 experiment backlog, not a plan — each item states a *hypothesis*, the
@@ -12,7 +15,7 @@ experiment backlog, not a plan — each item states a *hypothesis*, the
 > `tail -q -n +2 results/*.csv` is the flat table it used to be.
 
 > **Note on where the write-ups live:** a completed item's full write-up has
-> moved to **[`research/`](research/README.md)**, one file per section, and
+> moved to **[`research/`](README.md)**, one file per section, and
 > the heading here keeps a one-line result and a link. This file is the
 > backlog, the roofline and the order of attack; `research/` is the archive.
 > **`§N.M` is still the address** — it is cited 293 times from `shaders/`,
@@ -308,13 +311,13 @@ activations — gets 3.4x the bandwidth of anything that streams.
 
 ## 0. Measurement-validity work — **DONE**, and it changed the answers
 
-**Written up in [`research/0-measurement-validity.md`](research/0-measurement-validity.md).** The harness now measures its own ceilings and records clock and power behind every row. It also falsified three predictions: WMMA int8 is **not** 2x fp16 on this part (both 479-480 ops/clk/CU), packed fp16 FMA is 1.10x scalar and not 2x, and fp32 FMA is power-limited rather than issue-limited.
+**Written up in [`0-measurement-validity.md`](0-measurement-validity.md).** The harness now measures its own ceilings and records clock and power behind every row. It also falsified three predictions: WMMA int8 is **not** 2x fp16 on this part (both 479-480 ops/clk/CU), packed fp16 FMA is 1.10x scalar and not 2x, and fp32 FMA is power-limited rather than issue-limited.
 
 ## 1. Decode path (GEMV / memory-bound) — the tok/s lever
 
 ### 1.1 W4A8: Q4 weights fed to `dotPacked4x8EXT` — **DONE** ✅, **2.4x**
 
-**Written up in [`research/1.1-w4a8-gemv.md`](research/1.1-w4a8-gemv.md).** Q4 weights fed to `dotPacked4x8EXT`: **819 GFLOP/s, 2.4x** the previous best decode kernel and 89% of the DRAM bus — the result that turned decode from a compute problem into a bandwidth one.
+**Written up in [`1.1-w4a8-gemv.md`](1.1-w4a8-gemv.md).** Q4 weights fed to `dotPacked4x8EXT`: **819 GFLOP/s, 2.4x** the previous best decode kernel and 89% of the DRAM bus — the result that turned decode from a compute problem into a bandwidth one.
 
 ### 1.2 Kill the runtime integer divisions in the inner loop
 **Hypothesis**: every quantized kernel does **two runtime integer
@@ -411,7 +414,7 @@ with K=N=4096, and find the crossover.
 switch kernels at. This is exactly the decision llama.cpp encodes as
 separate `mul_mat_vec` vs `mul_mm` kernels.
 **Effort**: low (it's a shape sweep over existing kernels).
-**Value**: high for the serving story in `GOALS.md`.
+**Value**: high for the serving story in `../GOALS.md`.
 
 ### 1.6 Measure the activation-quantization cost that W8A8 currently hides
 **Hypothesis**: W8A8's headline number excludes work a real engine must do
@@ -429,45 +432,45 @@ dispatch's launch + barrier overhead may dominate the quantize itself.
 
 ### 1.7 Match the load width to the weight row — **DONE** ✅, **and decode reaches the bus at every N**
 
-**Written up in [`research/1.7-load-width.md`](research/1.7-load-width.md).** Size the load width so one lane-step covers a whole weight row, `VEC = N/(8*WAVE)`: **99-103% of the bus at N=2048, 4096 and 8192 alike**, and 1.43x at the N=8192 a real model decodes at. Also withdraws §6.2's wave32 pin.
+**Written up in [`1.7-load-width.md`](1.7-load-width.md).** Size the load width so one lane-step covers a whole weight row, `VEC = N/(8*WAVE)`: **99-103% of the bus at N=2048, 4096 and 8192 alike**, and 1.43x at the N=8192 a real model decodes at. Also withdraws §6.2's wave32 pin.
 
 ### 1.8 A grouped GEMV for MoE decode — **DONE** ✅, **1.8-2.0x the GEMM at M=1, and decode reaches 91% of its bus floor**
 
-**Written up in [`research/1.8-grouped-gemv.md`](research/1.8-grouped-gemv.md).** The W4A8 kernel with a table of routed (token, expert) pairs: **1.8-2.0x the grouped GEMM at M=1**, 100% of the bus on gate/up, and a token's MoE FFN at 5.47 ms over 48 layers. An expert bank should **not** be padded at all.
+**Written up in [`1.8-grouped-gemv.md`](1.8-grouped-gemv.md).** The W4A8 kernel with a table of routed (token, expert) pairs: **1.8-2.0x the grouped GEMM at M=1**, 100% of the bus on gate/up, and a token's MoE FFN at 5.47 ms over 48 layers. An expert bank should **not** be padded at all.
 
 ### 1.9 An M block for the grouped GEMV — **DONE** ✅, **1.66x at a serving batch, and what it takes off is the cache, not the bus**
 
-**Written up in [`research/1.9-m-block.md`](research/1.9-m-block.md).** `MROWS` routed pairs of one expert per workgroup: **1.66x at 256 sequences, 0.39x at one**, so the block must be read off the routing. What it removes is cache traffic, not bus traffic.
+**Written up in [`1.9-m-block.md`](1.9-m-block.md).** `MROWS` routed pairs of one expert per workgroup: **1.66x at 256 sequences, 0.39x at one**, so the block must be read off the routing. What it removes is cache traffic, not bus traffic.
 
 ### 1.10 An N block for the grouped GEMV — **DONE** ✅, **the down projection's deficit is a fixed cost per output row, and removing it closes §1.8's last open cell**
 
-**Written up in [`research/1.10-n-block.md`](research/1.10-n-block.md).** `NROWS` consecutive weight rows per subgroup: `down`'s deficit is a **fixed cost per output row**, not a grid or occupancy effect. A single token's FFN reaches 5.14 ms, **195 tok/s, 97% of the bus floor**.
+**Written up in [`1.10-n-block.md`](1.10-n-block.md).** `NROWS` consecutive weight rows per subgroup: `down`'s deficit is a **fixed cost per output row**, not a grid or occupancy effect. A single token's FFN reaches 5.14 ms, **195 tok/s, 97% of the bus floor**.
 
 ### 1.11 The corner: `MROWS` x `NROWS` in one wave — **DONE** ✅, **they compose, and decode's throughput end reaches the bus**
 
-**Written up in [`research/1.11-mn-corner.md`](research/1.11-mn-corner.md).** The two blocks compose: **1.10-1.19x** over the best single-blocked build, `gate_up` at 96% of the bus, and the FFN at **818 tok/s**. `VEC` and `NROWS` come from the model, `MROWS` from the routing.
+**Written up in [`1.11-mn-corner.md`](1.11-mn-corner.md).** The two blocks compose: **1.10-1.19x** over the best single-blocked build, `gate_up` at 96% of the bus, and the FFN at **818 tok/s**. `VEC` and `NROWS` come from the model, `MROWS` from the routing.
 
 ### 1.12 Sizing the M block from the routing histogram — **DONE** ✅, **1.09-1.13x on `down`'s last cell, and a locality law the cost model cannot see**
 
-**Written up in [`research/1.12-m-block-from-histogram.md`](research/1.12-m-block-from-histogram.md).** Size `MROWS` per dispatch from the routing histogram: **1.09-1.13x** on `down`'s last cell, 848 tok/s at a serving batch. The pad-minimal plan *loses*, because an expert belongs to exactly one dispatch — a locality law no cost model written in groups and slots can see.
+**Written up in [`1.12-m-block-from-histogram.md`](1.12-m-block-from-histogram.md).** Size `MROWS` per dispatch from the routing histogram: **1.09-1.13x** on `down`'s last cell, 848 tok/s at a serving batch. The pad-minimal plan *loses*, because an expert belongs to exactly one dispatch — a locality law no cost model written in groups and slots can see.
 
 ## 2. Prefill / batch path (GEMM) — the ~90%-idle matrix cores
 
 ### 2.1 Register-block the coopmat kernels — **DONE** ✅, **6.0x** (6.3x after §2.3)
 
-**Written up in [`research/2.1-register-blocking.md`](research/2.1-register-blocking.md).** Register-blocking the accumulators raised arithmetic intensity from 8 to 32 FLOP/byte: **25.2 TFLOP/s, 6.0x**, 8% to 45% of the matrix cores. LDS staging and multi-wave workgroups both turned out to be **unnecessary** — the 32 MiB MALL already supplies that reuse.
+**Written up in [`2.1-register-blocking.md`](2.1-register-blocking.md).** Register-blocking the accumulators raised arithmetic intensity from 8 to 32 FLOP/byte: **25.2 TFLOP/s, 6.0x**, 8% to 45% of the matrix cores. LDS staging and multi-wave workgroups both turned out to be **unnecessary** — the 32 MiB MALL already supplies that reuse.
 
 ### 2.2 Q4 weights into the coopmat path — **DONE** ✅, **2.10x a MoE block** (and its scale-plane leftover closed by **L0c**, a further **1.17x**)
 
-**Written up in [`research/2.2-q4-coopmat.md`](research/2.2-q4-coopmat.md).** Q4 weights through the coopmat path: **2.10x a whole MoE block**, a prompt chunk's 48 of them from 1.35 s to 0.64 s. The operand must round-trip through LDS (no extension exposes a fragment's lane layout), and that LDS tile's rows must be padded off the 32-bank rotation for 1.68-1.83x.
+**Written up in [`2.2-q4-coopmat.md`](2.2-q4-coopmat.md).** Q4 weights through the coopmat path: **2.10x a whole MoE block**, a prompt chunk's 48 of them from 1.35 s to 0.64 s. The operand must round-trip through LDS (no extension exposes a fragment's lane layout), and that LDS tile's rows must be padded off the 32-bank rotation for 1.68-1.83x.
 
 ### 2.3 B stored [N,K] with a column-major `coopMatLoad` — **RESOLVED** ✅ (it was channel aliasing)
 
-**Written up in [`research/2.3-channel-aliasing.md`](research/2.3-channel-aliasing.md).** The "better instruction stream is 2.8x slower" contradiction was **DRAM channel aliasing**: a power-of-two leading dimension puts all 16 addresses of a K-strided fragment load in one channel. Padding each stride 256 B off a multiple of 4 KB is worth up to 1.35x and took the suite to 28.4 TFLOP/s.
+**Written up in [`2.3-channel-aliasing.md`](2.3-channel-aliasing.md).** The "better instruction stream is 2.8x slower" contradiction was **DRAM channel aliasing**: a power-of-two leading dimension puts all 16 addresses of a K-strided fragment load in one channel. Padding each stride 256 B off a multiple of 4 KB is worth up to 1.35x and took the suite to 28.4 TFLOP/s.
 
 ### 2.4 Workgroup swizzle / tile reordering for MALL locality — **DONE** ✅, **1.84x** on the shape that needed it
 
-**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md).** Walking the grid in bands of 8 columns instead of row by row takes `dit.ff.w13` from 24.2 to **41.1 TFLOP/s** and the whole DiT block from 64.0 to 49.3 ms. The mechanism was worked out before the code was written and the arithmetic predicted the measurement to within 10%: `w13` and `w2` have *identical* tile-level traffic (3.52 GB at M=4096) and reached 264 and 439 GB/s against it, because `gl_WorkGroupID.x` is the fastest axis and `w13`'s grid is 40 columns wide against `w2`'s 15 — so `w2` keeps four grid rows in flight and amortises each B slab four ways, and `w13` keeps 1.6. Three things this item did not predict: **the optimum band is interior** (2/4/8/16 give 36.0/39.2/41.1/38.3 — narrow bands do not amortise B, wide ones push A past the MALL); **it is worth far more against a fragment-tiled weight than a row-major one** (1.84x against 1.16x), so ordering and layout are not separable levers; and with it every shape in the model converges on **one** kernel at 73-76% of the WMMA ceiling, where before they disagreed.
+**Written up in [`stage-4-dit-graph.md`](stage-4-dit-graph.md).** Walking the grid in bands of 8 columns instead of row by row takes `dit.ff.w13` from 24.2 to **41.1 TFLOP/s** and the whole DiT block from 64.0 to 49.3 ms. The mechanism was worked out before the code was written and the arithmetic predicted the measurement to within 10%: `w13` and `w2` have *identical* tile-level traffic (3.52 GB at M=4096) and reached 264 and 439 GB/s against it, because `gl_WorkGroupID.x` is the fastest axis and `w13`'s grid is 40 columns wide against `w2`'s 15 — so `w2` keeps four grid rows in flight and amortises each B slab four ways, and `w13` keeps 1.6. Three things this item did not predict: **the optimum band is interior** (2/4/8/16 give 36.0/39.2/41.1/38.3 — narrow bands do not amortise B, wide ones push A past the MALL); **it is worth far more against a fragment-tiled weight than a row-major one** (1.84x against 1.16x), so ordering and layout are not separable levers; and with it every shape in the model converges on **one** kernel at 73-76% of the WMMA ceiling, where before they disagreed.
 
 ### 2.5 Split-K for skinny shapes
 **Hypothesis**: real transformer GEMMs aren't square. When M·N is small
@@ -482,17 +485,17 @@ combine via a second reduce dispatch (or `atomicAdd` on fp32 C).
 
 ### 2.6 fp16 output, and fuse epilogue work — **DONE for the DiT** ✅, **0.85 ms/block**, and the fusions are worth more
 
-**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md).** Both halves were priced on a real graph rather than a benchmark. **The fp16 C**: the FFN's gate and up projections write fp16 and SwiGLU reads it, halving 320 MB of traffic per block — 2.19 ms to 1.37, and the block's error against diffusers goes 1.7e-2 to 1.8e-2. It is offered per *consumer* and per *tensor*, not as a kernel option: `dit.ff.w2`'s output reaches 6e5 against fp16's 65504 while `w1`'s and `w3`'s peak at 250 and 508, so two of the three projections have the build and the third does not (stage 2's overflow lesson, checked by `TestFFNIntermediatesFitFP16`). **The epilogue/elementwise fusions**: 12.2 ms of a DiT block is norms, narrowings, the rotary embedding and the gated residuals, and fusing each norm into its consumer takes that to 6.7 — the biggest piece being the q/k norm + RoPE + fragment pack in one kernel (3.66 → 1.40 ms), which is possible because all four steps share one natural unit, a head of one token. The fusions are arithmetic-preserving (the fp16 A operand is bit-identical); the fp16 C is not, and is measured separately for it.
+**Written up in [`stage-4-dit-graph.md`](stage-4-dit-graph.md).** Both halves were priced on a real graph rather than a benchmark. **The fp16 C**: the FFN's gate and up projections write fp16 and SwiGLU reads it, halving 320 MB of traffic per block — 2.19 ms to 1.37, and the block's error against diffusers goes 1.7e-2 to 1.8e-2. It is offered per *consumer* and per *tensor*, not as a kernel option: `dit.ff.w2`'s output reaches 6e5 against fp16's 65504 while `w1`'s and `w3`'s peak at 250 and 508, so two of the three projections have the build and the third does not (stage 2's overflow lesson, checked by `TestFFNIntermediatesFitFP16`). **The epilogue/elementwise fusions**: 12.2 ms of a DiT block is norms, narrowings, the rotary embedding and the gated residuals, and fusing each norm into its consumer takes that to 6.7 — the biggest piece being the q/k norm + RoPE + fragment pack in one kernel (3.66 → 1.40 ms), which is possible because all four steps share one natural unit, a head of one token. The fusions are arithmetic-preserving (the fp16 A operand is bit-identical); the fp16 C is not, and is measured separately for it.
 
 **Still open**: the same treatment for the *projections that feed attention* — `gemm v` writing fragment tiles in its epilogue and the attention kernel writing its own fp16 A operand, together another ~1.0 ms/block — and any of this in the benchmark kernel, which still has an fp32-only store.
 
 ### 2.7 Hoist the K-slab's fragment loads — **DONE** ✅, **2.1x**, and it closed §2.3's residue
 
-**Written up in [`research/2.7-kslab-hoist.md`](research/2.7-kslab-hoist.md).** Issuing a whole K-slab's fragment loads before its first MMA — same bytes, same instructions, same intensity, only the scheduling — is worth **2.1x** and takes the best GEMM to **38990 GFLOP/s, 70% of the WMMA ceiling**. Depth is not the variable; concurrency is.
+**Written up in [`2.7-kslab-hoist.md`](2.7-kslab-hoist.md).** Issuing a whole K-slab's fragment loads before its first MMA — same bytes, same instructions, same intensity, only the scheduling — is worth **2.1x** and takes the best GEMM to **38990 GFLOP/s, 70% of the WMMA ceiling**. Depth is not the variable; concurrency is.
 
 ### 2.8 Store the *weight* as 16x16 fragment tiles — **DONE** ✅, **1.46x**, but not universal
 
-**Written up in [`research/stage-4-dit-graph.md`](research/stage-4-dit-graph.md)**, because it was measured on the DiT's own projections rather than as a benchmark family. §3.3 ended on "store every WMMA operand as fragment tiles" and called it a strict improvement on §2.7's hoist; a weight is the case where the retiling is *free*, since it is packed once at upload and read every step. Holding the kernel fixed and changing only the weight's arrangement, it is worth **1.46x on `dit.qkv`/`dit.o` (28.0 → 41.0 TFLOP/s, 74% of the ceiling — past §2.7's 70%)** and **1.43x on `dit.ff.w2`**, and it **loses 5% on `dit.ff.w13`**. Against the fastest natural-layout kernel of any geometry the three are 1.16x, 1.43x and 0.95x; against `results/shapes.csv`, 1.25x, 1.47x and 1.04x. **§2.4 has since changed the picture on the third shape and on the whole claim**: with the grid swizzled, the tiled weight wins `ff.w13` too (41.1 against the row-major layout's 28.0), and the swizzle is itself worth 1.84x against a tiled weight and only 1.16x against a row-major one. Layout and launch order are one lever measured in two places, not two. So "strictly dominates" is withdrawn: it is a shape-dependent lever, and it interacts with §2.7 — with a tiled B, *removing* the hoisted K-slab is worth 1.3-1.5x on `w13`.
+**Written up in [`stage-4-dit-graph.md`](stage-4-dit-graph.md)**, because it was measured on the DiT's own projections rather than as a benchmark family. §3.3 ended on "store every WMMA operand as fragment tiles" and called it a strict improvement on §2.7's hoist; a weight is the case where the retiling is *free*, since it is packed once at upload and read every step. Holding the kernel fixed and changing only the weight's arrangement, it is worth **1.46x on `dit.qkv`/`dit.o` (28.0 → 41.0 TFLOP/s, 74% of the ceiling — past §2.7's 70%)** and **1.43x on `dit.ff.w2`**, and it **loses 5% on `dit.ff.w13`**. Against the fastest natural-layout kernel of any geometry the three are 1.16x, 1.43x and 0.95x; against `results/shapes.csv`, 1.25x, 1.47x and 1.04x. **§2.4 has since changed the picture on the third shape and on the whole claim**: with the grid swizzled, the tiled weight wins `ff.w13` too (41.1 against the row-major layout's 28.0), and the swizzle is itself worth 1.84x against a tiled weight and only 1.16x against a row-major one. Layout and launch order are one lever measured in two places, not two. So "strictly dominates" is withdrawn: it is a shape-dependent lever, and it interacts with §2.7 — with a tiled B, *removing* the hoisted K-slab is worth 1.3-1.5x on `w13`.
 
 ## 3. Kernel fusion and the ops the suite doesn't cover yet
 
@@ -514,7 +517,7 @@ bandwidth and the only win is *not doing them*.
 ### 3.3 Attention is completely absent from the suite — **DONE** ✅, **30.4x**, and the layout mattered more than the tiling
 
 **Written up in
-[`research/stage-3-dit-attention.md`](research/stage-3-dit-attention.md)**,
+[`stage-3-dit-attention.md`](stage-3-dit-attention.md)**,
 because it was built as pipeline stage 3 against Z-Image's real attention
 rather than as a benchmark family. Both matmuls on `coopMatMulAdd`, online
 softmax, fp16 operands and fp32 accumulators: **38.8 TFLOP/s, 70% of the WMMA
@@ -548,11 +551,11 @@ accumulator as a multiply operand.
 
 ### 3.4 Benchmark the *real* shapes from the target models — **DONE** ✅, **and it moved two answers**
 
-**Written up in [`research/3.4-model-shapes.md`](research/3.4-model-shapes.md).** The 60 real weight matrices from the five models in `GOALS.md`, plus the per-model budget table. Retired `VEC=32`, split prefill into **two winners divided by M alone**, and showed the MoE model's prefill is 98% memory-bound.
+**Written up in [`3.4-model-shapes.md`](3.4-model-shapes.md).** The 60 real weight matrices from the five models in `../GOALS.md`, plus the per-model budget table. Retired `VEC=32`, split prefill into **two winners divided by M alone**, and showed the MoE model's prefill is 98% memory-bound.
 
 ### 3.5 Grouped / MoE GEMM — **DONE** ✅, **1.1-4.1x**, and it is occupancy
 
-**Written up in [`research/3.5-grouped-moe-gemm.md`](research/3.5-grouped-moe-gemm.md).** One dispatch covering all 512 experts: **1.08-4.14x**, and the mechanism is **occupancy** — a monotone function of workgroups per expert dispatch — not the 1440 dispatches and not the 62% tile padding it was promoted on.
+**Written up in [`3.5-grouped-moe-gemm.md`](3.5-grouped-moe-gemm.md).** One dispatch covering all 512 experts: **1.08-4.14x**, and the mechanism is **occupancy** — a monotone function of workgroups per expert dispatch — not the 1440 dispatches and not the 62% tile padding it was promoted on.
 
 ### 3.6 Gated DeltaNet / linear-attention chunk kernel
 Qwen3-Next mixes linear attention with full attention. The chunked
@@ -641,7 +644,7 @@ gains on small shapes where a single GEMM can't fill the GPU.
 
 ### 5.1 Which memory type is fastest for GPU-read-only weights? — **DONE** ✅, **none of them**, and the heap sizes are fiction
 
-**Written up in [`research/5.1-memory-types.md`](research/5.1-memory-types.md)** (LLM.md L0b). All eight types that can back a storage buffer read at **236.0-237.4 GB/s**, a 0.57% spread across 32 cells — heap 0 / heap 1 is **1.0004**, and `HOST_CACHED` and `DEVICE_UNCACHED` are worth nothing either way. The property bits describe how the *host* sees the pages; a GPU read never goes through the CPU's cache hierarchy, so on a unified-memory part there is nothing for them to change. Second, negative, and larger: **the reported heap sizes are not limits** — type 3 reserved **105.0 GiB** against a heap advertised as 83.79, and type 2 **101.5 GiB** against 41.89, neither refused by the driver. The ceiling is physical RAM. Two side findings: this reconciles `cmd/bus`'s "the first heap runs out at about 8 GB" (that is the 8 GiB *visible VRAM* carveout, a host-read phenomenon the GPU does not notice), and **freed GPU memory returns to the driver's TTM pool rather than to `MemAvailable`**, so a second capacity probe in the same process reads zero.
+**Written up in [`5.1-memory-types.md`](5.1-memory-types.md)** (llm-vertical.md L0b). All eight types that can back a storage buffer read at **236.0-237.4 GB/s**, a 0.57% spread across 32 cells — heap 0 / heap 1 is **1.0004**, and `HOST_CACHED` and `DEVICE_UNCACHED` are worth nothing either way. The property bits describe how the *host* sees the pages; a GPU read never goes through the CPU's cache hierarchy, so on a unified-memory part there is nothing for them to change. Second, negative, and larger: **the reported heap sizes are not limits** — type 3 reserved **105.0 GiB** against a heap advertised as 83.79, and type 2 **101.5 GiB** against 41.89, neither refused by the driver. The ceiling is physical RAM. Two side findings: this reconciles `cmd/bus`'s "the first heap runs out at about 8 GB" (that is the 8 GiB *visible VRAM* carveout, a host-read phenomenon the GPU does not notice), and **freed GPU memory returns to the driver's TTM pool rather than to `MemAvailable`**, so a second capacity probe in the same process reads zero.
 
 The original text follows.
 
@@ -666,12 +669,12 @@ the weight loader for a possibly free few-percent on everything.
 **[measured] There is no ranking and there is no few percent.** The
 expectation was imported from discrete parts, where `DEVICE_LOCAL` means VRAM
 across a PCIe bus. Delivered as a negative that removes a knob from the
-engine — and, incidentally, as the capacity result that let LLM.md drop a
+engine — and, incidentally, as the capacity result that let llm-vertical.md drop a
 wrong argument.
 
 ### 5.1b The MALL cliff, and the strided-bandwidth probe — **probe DONE** ✅
 
-**Written up in [`research/5.1b-mall-cliff-and-stride.md`](research/5.1b-mall-cliff-and-stride.md).** The probe that measured the memory system directly, and the one item that found something nobody was looking for. The interleave rotation is **4 KB**, not 2 KB, and the achievable fraction of peak is `min(1, C/gcd(stride, 4096))` where C is the contiguous run the requests in flight hold in a row — worth 4x, and up to 8x on a tensor with no padding at all.
+**Written up in [`5.1b-mall-cliff-and-stride.md`](5.1b-mall-cliff-and-stride.md).** The probe that measured the memory system directly, and the one item that found something nobody was looking for. The interleave rotation is **4 KB**, not 2 KB, and the achievable fraction of peak is `min(1, C/gcd(stride, 4096))` where C is the contiguous run the requests in flight hold in a row — worth 4x, and up to 8x on a tensor with no padding at all.
 
 ### 5.2 Heap topology, carveout size and page size — **DONE** ✅ (heap 1), **and there is nothing to lay out for**
 
@@ -685,7 +688,7 @@ effects appear. Also test whether huge/2MB pages are in play. Informs how
 to lay out a multi-GB model.
 
 **[measured] Written up in
-[`research/l0a-bank-range.md`](research/l0a-bank-range.md)** (LLM.md L0a).
+[`l0a-bank-range.md`](l0a-bank-range.md)** (llm-vertical.md L0a).
 A fixed 1 GiB read drawn from a bank swept 1 → 64 GiB, in three selection
 orders, at qwen3.8-flash-next's two real 4-bit expert slab sizes: **flat at
 236-237 GB/s everywhere, and random selection costs exactly nothing**
@@ -745,7 +748,7 @@ every item above gets cheaper to evaluate once we can read the ISA.
 
 ### 6.2 wave32 vs wave64 — **DONE** ✅, and it split three ways
 
-**Written up in [`research/6.2-wave32-vs-wave64.md`](research/6.2-wave32-vs-wave64.md).** Wave size as a per-pipeline knob, and it split three ways: the best GEMM **spills** at wave32 and loses 25%, the fragment-dominated AI-16 grid gains 1.9-2.1x, and W4A8 decode reads 96% of the bus. Also closed §3.7 — the reduction kernels' 3.3x gap is lane count, not `subgroupAdd`.
+**Written up in [`6.2-wave32-vs-wave64.md`](6.2-wave32-vs-wave64.md).** Wave size as a per-pipeline knob, and it split three ways: the best GEMM **spills** at wave32 and loses 25%, the fragment-dominated AI-16 grid gains 1.9-2.1x, and W4A8 decode reads 96% of the bus. Also closed §3.7 — the reduction kernels' 3.3x gap is lane count, not `subgroupAdd`.
 
 **[measured] §3.3's attention kernel is a fourth point, and it behaves like the
 second one**: 1.40x at wave32 (9.30 → 6.64 ms at 4096 tokens) at identical
@@ -777,8 +780,8 @@ degraded number, not the benchmark number.
 
 ## 7. Accuracy work that has to happen before any of this ships — **first three items DONE** ✅
 
-**Written up in [`research/l0d-quant-error.md`](research/l0d-quant-error.md)**
-(LLM.md L0d). Real weights and real activations from a Qwen3-4B forward pass,
+**Written up in [`l0d-quant-error.md`](l0d-quant-error.md)**
+(llm-vertical.md L0d). Real weights and real activations from a Qwen3-4B forward pass,
 14 projections, float64 reference. Four results: **W4A8 costs 1.13x the error
 of W4A16**, so the 3x throughput cliff is bought cheaply; **the activations are
 the floor above ~5 bits/weight** — int8-per-token alone contributes 2.87e-2
@@ -792,7 +795,7 @@ immune (its scale is 18x larger). The last item, real perplexity, still needs
 the model.
 
 Perf work is choosing between formats whose *accuracy* is unmeasured — the
-`TODO.md` working conclusion already flags this. None of these are perf
+`../TODO.md` working conclusion already flags this. None of these are perf
 experiments, but they gate the format decision:
 
 - ~~**Per-format error metrics**~~ **DONE.** The front exists, and the surprise
@@ -820,7 +823,7 @@ experiments, but they gate the format decision:
   acceptance criterion for the format choice, not benchmark GFLOP/s.
   **Still open**, and L0d sharpened why: everything above is one projection's
   output error, which is not a hidden state's error and says nothing about how
-  48 layers compose. It is LLM.md's L9.
+  48 layers compose. It is llm-vertical.md's L9.
 - **New, from L0d: floor `quantizeQ8`'s block scale at fp16's smallest
   normal.** Two lines, but it changes the CPU reference every W8A8 correctness
   check is built from, so it wants its own change with those re-run.
