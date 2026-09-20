@@ -38,6 +38,14 @@ layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
 #define PAIRS (HEAD_DIM / 2)
 #define WG 256
 #define LANES (WG / TILE)   // lanes cooperating on one token's head
+// Token tiles per workgroup, as in dit_pack_f16.comp and for the same reason
+// (IMAGE.md Q9): one tile is 2048 elements over 256 threads, and the DiT's
+// profile measured this pass at 46 GB/s against a ~190 GB/s bus. TPW = 1 is
+// every pre-existing build, unchanged; pc.span carries the tile count so a
+// grid rounded up to TPW cannot overrun into the next head's plane.
+#ifndef TPW
+#define TPW 1
+#endif
 
 layout(local_size_x = WG) in;
 
@@ -46,10 +54,18 @@ shared float partial[WG];
 shared float inv[TILE];
 
 void main() {
-    uint tt = gl_WorkGroupID.x;          // token tile
     uint head = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
+
+  for (uint slab = 0u; slab < uint(TPW); ++slab) {
+    uint tt = gl_WorkGroupID.x * uint(TPW) + slab;
+    if (pc.span != 0u && tt >= pc.span) {
+        return;
+    }
     uint tok0 = tt * TILE;
+    if (slab > 0u) {
+        barrier();
+    }
 
     // Coalesced in: consecutive lanes read consecutive components of one
     // token. Tokens past the sequence are zeroed rather than skipped -- the
@@ -123,4 +139,5 @@ void main() {
         uint rem = o % (TILE * TILE);
         hact[outBase + o] = float16_t(rows[(rem / TILE) * HEAD_DIM + c * TILE + rem % TILE]);
     }
+  }
 }

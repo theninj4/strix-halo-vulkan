@@ -1295,6 +1295,25 @@ var DiTAttentionWMMAQT1KT4W32TailMax []byte
 //go:embed dit_attn_wmma_qt1_kt4_tailmax.spv
 var DiTAttentionWMMAQT1KT4TailMax []byte
 
+// The multi-tile builds of the same pack (IMAGE.md Q9). One token tile a
+// workgroup is eight elements a thread, which the DiT's profile caught moving
+// 102 MB at 44 GB/s where the SwiGLU beside it reaches ~190; TPW tiles a
+// workgroup changes the work per launch and nothing else about the layout.
+// qimage/dit screens them.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=2 -o dit_pack_f16_tpw2.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=4 -o dit_pack_f16_tpw4.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -o dit_pack_f16_tpw8.spv dit_pack_f16.comp
+
+//go:embed dit_pack_f16_tpw2.spv
+var DiTPackF16TPW2 []byte
+
+//go:embed dit_pack_f16_tpw4.spv
+var DiTPackF16TPW4 []byte
+
+//go:embed dit_pack_f16_tpw8.spv
+var DiTPackF16TPW8 []byte
+
 //go:embed dit_pack_f16.spv
 var DiTPackF16 []byte
 
@@ -1382,6 +1401,19 @@ var DiTFinalNormNoMean []byte
 
 //go:embed dit_norm_gate_add.spv
 var DiTNormGateAdd []byte
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=2 -o dit_qk_pack_tpw2.spv dit_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=4 -o dit_qk_pack_tpw4.spv dit_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -o dit_qk_pack_tpw8.spv dit_qk_pack.comp
+
+//go:embed dit_qk_pack_tpw2.spv
+var DiTQKPackTPW2 []byte
+
+//go:embed dit_qk_pack_tpw4.spv
+var DiTQKPackTPW4 []byte
+
+//go:embed dit_qk_pack_tpw8.spv
+var DiTQKPackTPW8 []byte
 
 //go:embed dit_qk_pack.spv
 var DiTQKPack []byte

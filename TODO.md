@@ -26,7 +26,7 @@ here is our own ceiling, not a reference implementation.
 | text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus | batching (P6); context depth; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m38s**, 31.7 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: 2m8s on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; 90% of the decode is two ported kernels away; Q9's percents |
+| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m32s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m59s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; 90% of the decode is two ported kernels away (~6 s); the DiT's remaining percents are fusions |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
@@ -174,13 +174,19 @@ put PL-BERT's attention on the matrix cores so synthesis is a straight
 
 **Where it stands.** The vertical was **replaced 2026-09-20**: Z-Image-Turbo
 out, `Qwen/Qwen-Image-2.1` in, for native RGBA and reference-image editing
-(`GOALS.md` #4). Stages Q0–Q7 are done in one day and the model is served:
-`POST /v1/images/generations` answers at **1m38.2s / 1m41.3s for a
-1024²/40-step image**, 31.7 GB resident, matching the fp32 oracle's own
-picture at mean 3.4e-4, with native RGBA and in-progress previews (a fitted
-64x4 matrix, 159 µs a frame, three partials for 0.3% of a request — no flag,
-because there is nothing to load). **IMAGE.md is the live plan**; this is
-the summary.
+(`GOALS.md` #4). Stages Q0–Q8 are done in one day and both
+endpoints are served: `POST /v1/images/generations` answers at **1m32.3s /
+1m33.5s for a 1024²/40-step image** (31.5 GB resident, matching the fp32
+oracle's own picture at mean 3.4e-4) and `POST /v1/images/edits` at
+**1m58.6s / 1m59.2s for a 1024² edit on one reference image** (39.4 GB,
+matching the oracle's edit at max abs 0.0014), with native RGBA and
+in-progress previews (a fitted 64x4 matrix, 159 µs a frame, three partials
+for 0.3% of a request — no flag, because there is nothing to load).
+**Q9's first pass** is taken: the DiT is attributed dispatch by dispatch,
+the GEMM swizzle re-screen closed with a measurement, and the fragment pack
+— caught at 44 GB/s against a 190 GB/s bus by a launch shape, not a layout —
+went to 131 for a bit-identical 6–7% off both endpoints.
+**IMAGE.md is the live plan**; this is the summary.
 
 **Open, in IMAGE.md's order:**
 

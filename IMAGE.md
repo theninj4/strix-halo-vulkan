@@ -1,15 +1,18 @@
 # IMAGE — the Qwen-Image-2.1 vertical
 
-> **Rewritten through 2026-09-20 — Q0–Q8 are done, and the vertical's last
-> capability is served**: `POST /v1/images/edits` answers from
-> Qwen-Image-2.1 at **2m8s for a 1024² edit on one reference image**, 39.4 GB
-> resident, reproducing the reference edit at **max abs 0.0014** — 24x
-> tighter than the t2i path's own served number, because an edit's trajectory
-> is pinned by its prefix. Only percents (Q9) are left.
+> **Rewritten through 2026-09-20 — Q0–Q8 are done, the vertical's last
+> capability is served, and Q9's first pass has been taken**: `POST
+> /v1/images/generations` answers at **1m32s for a 1024²/40-step image** and
+> `POST /v1/images/edits` at **1m59s for a 1024² edit on one reference**,
+> 31.5 and 39.4 GB resident, reproducing the reference edit at **max abs
+> 0.0014** — 24x tighter than the t2i path's own served number, because an
+> edit's trajectory is pinned by its prefix. Q9 so far: a 6–7% step, bit for
+> bit the same picture, from one badly-shaped launch the profile caught.
 >
 > **Q0–Q7, one day in** and
-> the model is *served*: `POST /v1/images/generations` answers from
-> Qwen-Image-2.1 at **1m38s for a 1024²/40-step image**, 31.7 GB resident,
+> the model was *served*: `POST /v1/images/generations` answered from
+> Qwen-Image-2.1 at **1m38s for a 1024²/40-step image** (Q6's own
+> measurement; Q9 has since taken it to 1m32), 31.7 GB resident,
 > with native RGBA and in-progress previews. On the CPU the port reproduces
 > diffusers' image to under a quarter of an 8-bit quantization step; on the
 > device the served fp16 path reproduces the fp32 oracle's own picture at
@@ -48,7 +51,7 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; Z-Image deletion still owed |
 | Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
-| Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | open, deliberately last |
+| Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports are next |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
 the instrument named beside it. The day's method finding, three times over:
@@ -965,7 +968,53 @@ two-run numbers.
   edit does. Driven over HTTP end to end: a red mug becomes a blue mug on the
   same table with the same grain and the same light, and the streamed form
   sends two 32x32 partials and the finished 512².
-- **Q9 — percents.** Only after capabilities: the I3/I5/I8/I9 fusion lesson
+- **Q9 — percents. First pass done 2026-09-20: the served image is 6% faster
+  and the served edit 7%, bit for bit the same picture.** 1024²/40 goes
+  **1m38.2s/1m41.3s → 1m32.3s/1m33.5s**, an edit **2m7.6s/2m7.9s →
+  1m58.6s/1m59.2s**, and the DiT's cached step **2.27 s → 2.12–2.14 s**.
+  Nothing about the numerics moved: `TestGPUOracle256` and the two served
+  oracles return the same digits they did before (0.001503, max abs 0.0333,
+  mean 3.4e-4).
+  **The attribution came first and is the permanent instrument**
+  (`TestGPUStepProfile`, both regimes at the served shape, one dispatch at a
+  time). A cached step, before: **GEMMs 69% at 35–40 TFLOP/s**, attention
+  10.6% at 37, and 21% in elementwise passes — pack 6.6%, swiglu 3.8%,
+  qkpack 3.1%, gate 3.0%, the rest 4.2%. Q4 had run this graph on z-image's
+  measured winners *uncontested*, and that is what the profile was for.
+  **Two screens, and they disagreed about where the percent was.**
+  - *The GEMM swizzle arm re-screen* — IMAGE.md's own hypothesis, since
+    z-image chose SWZ=8 at M=16384/K=12288 and this model runs M=4096 —
+    **found nothing, and that is the result** (`TestGPUGEMMScreen`, four arms
+    on one staging): SWZ=8 wins here too, by 1.4–1.9% over SWZ=4 and 3.9–6.9%
+    over the others, twice over. The GEMMs are at this kernel's ceiling and
+    the inheritance was right.
+  - *The fragment pack* was not a hypothesis anyone had, and it was the
+    percent. The profile caught it moving **102 MB in 2.3 ms — 44 GB/s —
+    where the SwiGLU dispatch beside it in the same block reaches 194** on
+    the same bus. The layout it writes is why the matrix-core attention is
+    worth using and was never in question; the *shape of the launch* was.
+    One token tile per workgroup is 2048 elements over 256 threads — eight
+    each, with two barriers around them — which is a latency-bound shape and
+    not a bandwidth-bound one. `TPW` tiles per workgroup took the pack to
+    **131 GB/s (3.0x)** and the fused q pack from 69 ms to 20, and the step
+    fell **5.9%** (`TestGPUPackScreen`, 1/2/4/8 arms). The screen asserts the
+    four arms' outputs **bit-identical** rather than close, because a screen
+    that only timed them could pick one that packs wrongly.
+  **What is left is at the bus, which is the next finding.** Re-profiled
+  after the fix, every remaining elementwise pass measures 190–194 GB/s:
+  swiglu 4.0%, gate 3.2%, pack 2.4%, narrow/rope/rmsnorm/ffn/attn 5.5%. None
+  of them is slow; there are simply round trips. So the next percents in the
+  DiT are *fusions* and are priced from the traffic they remove: the
+  attention writing its context straight into the o-projection's A operand
+  (z-image's stage-10 `OUT_F16`, the build already exists) is ~1%, and a
+  gated-accumulate GEMM epilogue that absorbs both residual adds is ~2% and
+  a new kernel. The GEMMs are 73% of what remains and at their ceiling.
+  **The bigger fish is elsewhere**: the VAE decode is 7.5 s of a 92 s image
+  and 68.8% of it is conv3x3 at 3.2 TFLOP/s, against the 38.3 the
+  matrix-core implicit GEMM measured in z-image with kernels already in this
+  tree. That is ~6 s, larger than anything left in the transformer, and it
+  is priced below.
+- **Q9's remaining ledger.** The I3/I5/I8/I9 fusion lesson
   (elementwise passes absorbed into consumers) transfers to a new but
   same-shaped budget; attribute before optimising, same-hour controls, plans
   measured never composed. Two of them are already attributed and priced, by
@@ -985,6 +1034,27 @@ two-run numbers.
   Everything else in the decode is under 4%: attention 250 ms (the latent is
   4096 rows here, not z-image's 16384 — this is *not* the 26% it was there),
   chnorm 1.7% with its SiLU already fused, add 1.0%, the two shuffles 0.4%.
+
+  **What that port has to price first, and it is not in z-image's notes.**
+  Every percent taken on 2026-09-20 was **bit-identical** — a launch shape
+  and a kernel choice, no arithmetic moved. The conv port is not: the
+  matrix-core convolution narrows its *operands* to fp16, and this decoder's
+  convolutions read activations at **absmax 1.1e4** where z-image's peaked
+  at **497**. Both are inside half's 65504, so neither overflows and the
+  measurement that matters is not range but precision: an fp16 operand
+  carries ~5e-4 of relative error, and `vae_test.go`'s conv stages are gated
+  at **2e-4** with the decoded image at max abs 7.3e-4 against the dump.
+  So the port moves the numbers this vertical's tightest gates are written
+  against, and the first thing it owes is the same instrument every other
+  bound here came from — run the CPU decoder with fp16 conv operands and
+  fp32 accumulators, measure what it costs stagewise and on the image, and
+  gate the device at *that* rather than at the fp32 bounds it will not hold.
+  z-image made the same trade and kept its gates, but 20x less input range
+  is 20x less headroom, and assuming it transfers is exactly the composition
+  this file's method refuses. The infrastructure is otherwise ready:
+  `zimage/vae`'s `hbuf`/`w16buf` engine split, `vae_pack_conv.comp`,
+  nine `vae_conv_wmma` builds and `TestGPUConvMatchesScalar` are all in the
+  tree and are why `zimage/vae` was kept past its replacement.
 
 ## Decisions taken now (so future sessions don't relitigate)
 

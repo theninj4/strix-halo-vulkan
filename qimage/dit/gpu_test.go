@@ -8,6 +8,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -472,4 +474,308 @@ func TestGPUEditWallClock(t *testing.T) {
 	mean := cached / (steps - 1)
 	t.Logf("prefill %.3f s; cached step mean %.3f s; a 40-step edit is %.1f s of transformer",
 		prefill.Seconds(), mean.Seconds(), (prefill + 39*mean).Seconds())
+}
+
+// TestGPUStepProfile is where Q9 starts, and it starts here because this is
+// where the time is: Q6 measured an image as 92% denoising steps, and Q4 got
+// that graph running on z-image's measured winners *uncontested* — no shape
+// in this model was ever screened against an alternative.
+//
+// So this attributes before anything is optimised, at the served shape and in
+// both regimes the sampler uses. It reports per-kind totals with the
+// arithmetic each did, and then the slowest individual dispatches, because a
+// kind that is 20% spread over 64 dispatches and a kind that is 20% in two
+// are different problems.
+func TestGPUStepProfile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("profiles the full-size graph one dispatch at a time")
+	}
+	m := loadRun(t, runRef1024)
+	dev, done := newTestDevice(t)
+	defer done()
+
+	side := m.Size / 16
+	embeds := loadMat(t, m, "prompt_embeds")
+	lay, err := dit.NewLayout([]int{embeds.Rows}, [][3]int{{1, side, side}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.BeginImage(embeds, lay, nil); err != nil {
+		t.Fatal(err)
+	}
+	scfg, err := pipeline.LoadSchedConfig(scheduler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scfg.Timesteps(m.Steps, side*side)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latents := loadMat(t, m, "noise").Clone()
+
+	// The prefill first, because it is the one that fills the cache — a
+	// cached step profiled before it would attend over nothing.
+	for _, c := range []struct {
+		name    string
+		prefill bool
+	}{{"prefill", true}, {"cached step", false}} {
+		stages, err := g.Profile(latents, sched.T(0), c.prefill)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reportStages(t, c.name, stages)
+	}
+}
+
+// reportStages aggregates a profile by dispatch kind and prints the
+// distribution, then the individual dispatches at the top of it.
+func reportStages(t *testing.T, what string, stages []dit.Stage) {
+	t.Helper()
+	type agg struct {
+		d     time.Duration
+		flops float64
+		n     int
+	}
+	byOp := map[string]*agg{}
+	var total time.Duration
+	for _, s := range stages {
+		op := s.Kind
+		if i := strings.IndexByte(op, ' '); i > 0 && !strings.HasPrefix(op, "gemm") {
+			op = op[:i]
+		}
+		a := byOp[op]
+		if a == nil {
+			a = &agg{}
+			byOp[op] = a
+		}
+		a.d += s.GPU
+		a.flops += s.Flops
+		a.n++
+		total += s.GPU
+	}
+	ops := make([]string, 0, len(byOp))
+	for op := range byOp {
+		ops = append(ops, op)
+	}
+	sort.Slice(ops, func(i, j int) bool { return byOp[ops[i]].d > byOp[ops[j]].d })
+	t.Logf("%s: %v over %d dispatches", what, total.Round(time.Millisecond), len(stages))
+	for _, op := range ops {
+		a := byOp[op]
+		rate := ""
+		if a.flops > 0 {
+			rate = fmt.Sprintf("%7.1f TFLOP/s", a.flops/a.d.Seconds()/1e12)
+		}
+		t.Logf("  %-18s %4d x  %9v  %5.1f%%  %s",
+			op, a.n, a.d.Round(time.Millisecond), 100*float64(a.d)/float64(total), rate)
+	}
+	sort.Slice(stages, func(i, j int) bool { return stages[i].GPU > stages[j].GPU })
+	t.Log("  slowest dispatches:")
+	for _, s := range stages[:min(6, len(stages))] {
+		t.Logf("    %-24s %9v", s.Kind, s.GPU.Round(time.Microsecond))
+	}
+}
+
+// TestGPUGEMMScreen settles the hypothesis IMAGE.md's Q9 carried from
+// z-image: that the crown GEMM's swizzle arm should be re-screened at this
+// model's shapes.
+//
+// It matters because the profile above says the GEMMs are **69% of a step**,
+// so a percent here is worth more than a percent anywhere else in the graph.
+// z-image chose SWZ=8 at M=16384, K=12288; Qwen-Image-2.1 runs M=4096 with
+// K of 4096 and 12288, and the swizzle is a mapping from workgroup id to
+// tile — the one parameter whose best value depends on how the grid divides.
+//
+// One staging, four arms: every arm reads the same fragment-tiled weight, so
+// SetBigKernel changes which pipeline a dispatch names and nothing else.
+func TestGPUGEMMScreen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages 14 GB of fp16 banks and runs several steps per arm")
+	}
+	m := loadRun(t, runRef1024)
+	dev, done := newTestDevice(t)
+	defer done()
+
+	side := m.Size / 16
+	embeds := loadMat(t, m, "prompt_embeds")
+	lay, err := dit.NewLayout([]int{embeds.Rows}, [][3]int{{1, side, side}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.BeginImage(embeds, lay, nil); err != nil {
+		t.Fatal(err)
+	}
+	scfg, err := pipeline.LoadSchedConfig(scheduler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scfg.Timesteps(m.Steps, side*side)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latents := loadMat(t, m, "noise").Clone()
+	// The prefill once, so every arm is timed on a cached step against a
+	// filled cache — the regime 39 of 40 steps run in.
+	if _, err := g.Step(latents, sched.T(0), true); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		name string
+		wall time.Duration
+	}
+	var results []result
+	for _, k := range dit.BigKernels {
+		if err := g.SetBigKernel(k); err != nil {
+			t.Fatal(err)
+		}
+		// One step to warm, three to measure.
+		if _, err := g.Step(latents, sched.T(1), false); err != nil {
+			t.Fatal(err)
+		}
+		var total time.Duration
+		const runs = 3
+		for i := 0; i < runs; i++ {
+			start := time.Now()
+			if _, err := g.Step(latents, sched.T(1), false); err != nil {
+				t.Fatal(err)
+			}
+			total += time.Since(start)
+		}
+		results = append(results, result{dit.KernelName(k), total / runs})
+	}
+	best := results[0]
+	for _, r := range results[1:] {
+		if r.wall < best.wall {
+			best = r
+		}
+	}
+	for _, r := range results {
+		mark := ""
+		if r.name == best.name {
+			mark = "  <- best"
+		}
+		t.Logf("%-24s %8.3f ms  %+5.1f%%%s", r.name, float64(r.wall.Microseconds())/1000,
+			100*(r.wall.Seconds()/best.wall.Seconds()-1), mark)
+	}
+}
+
+// TestGPUPackScreen is the profile's other question. The fragment pack moves
+// 102 MB in 2.3 ms — **44 GB/s** — where the SwiGLU dispatch beside it in the
+// same block reaches ~190 on the same bus. The layout it writes is the reason
+// the WMMA attention kernel is worth using at all and is not in question;
+// what is, is that one token tile per workgroup is 2048 elements over 256
+// threads, eight each, with two barriers around them. That is a launch-bound
+// shape, not a bandwidth-bound one, and TPW tiles per workgroup is the
+// one-line test of it.
+//
+// It screens the pack and the whole step together: a kernel that is 6.6% of a
+// step can only be worth what the step says it is worth.
+func TestGPUPackScreen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages 14 GB of fp16 banks and runs several steps per arm")
+	}
+	m := loadRun(t, runRef1024)
+	dev, done := newTestDevice(t)
+	defer done()
+
+	side := m.Size / 16
+	embeds := loadMat(t, m, "prompt_embeds")
+	lay, err := dit.NewLayout([]int{embeds.Rows}, [][3]int{{1, side, side}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.BeginImage(embeds, lay, nil); err != nil {
+		t.Fatal(err)
+	}
+	scfg, err := pipeline.LoadSchedConfig(scheduler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scfg.Timesteps(m.Steps, side*side)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latents := loadMat(t, m, "noise").Clone()
+	if _, err := g.Step(latents, sched.T(0), true); err != nil {
+		t.Fatal(err)
+	}
+
+	// The pack's own dispatches, out of a profile, and the step around them.
+	type result struct {
+		tiles int
+		pack  time.Duration
+		wall  time.Duration
+	}
+	var results []result
+	var want *qwen.Mat
+	for _, n := range dit.PackTiles {
+		if err := g.SetPackTiles(n); err != nil {
+			t.Fatal(err)
+		}
+		stages, err := g.Profile(latents, sched.T(1), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var pack time.Duration
+		for _, s := range stages {
+			if strings.HasPrefix(s.Kind, "pack ") {
+				pack += s.GPU
+			}
+		}
+		if _, err := g.Step(latents, sched.T(1), false); err != nil {
+			t.Fatal(err)
+		}
+		var total time.Duration
+		const runs = 3
+		for i := 0; i < runs; i++ {
+			start := time.Now()
+			out, err := g.Step(latents, sched.T(1), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			total += time.Since(start)
+			// Every arm writes the same bytes, so every arm has to produce
+			// the same prediction — bit for bit, not to a tolerance. A
+			// screen that only timed them could pick one that packs wrongly.
+			if want == nil {
+				want = out.Clone()
+			} else if maxAbs, _ := stepRel(out, want); maxAbs != 0 {
+				t.Fatalf("%d tiles a workgroup changed the output by %g; the pack's layout must be identical",
+					n, maxAbs)
+			}
+		}
+		results = append(results, result{n, pack, total / runs})
+	}
+	best := results[0]
+	for _, r := range results[1:] {
+		if r.wall < best.wall {
+			best = r
+		}
+	}
+	// 102 MB read+written per pack dispatch, 64 of them a step.
+	const packBytes = 64 * 102e6
+	for _, r := range results {
+		mark := ""
+		if r.tiles == best.tiles {
+			mark = "  <- best"
+		}
+		t.Logf("%d tile(s)/workgroup: pack %6.1f ms (%5.0f GB/s), step %8.3f ms  %+5.1f%%%s",
+			r.tiles, float64(r.pack.Microseconds())/1000, packBytes/r.pack.Seconds()/1e9,
+			float64(r.wall.Microseconds())/1000, 100*(r.wall.Seconds()/best.wall.Seconds()-1), mark)
+	}
 }

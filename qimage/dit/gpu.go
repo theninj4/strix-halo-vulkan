@@ -3,6 +3,7 @@ package dit
 import (
 	"fmt"
 	"math"
+	"time"
 	"unsafe"
 
 	"strix-halo-vulkan/safetensors"
@@ -74,6 +75,11 @@ type GPU struct {
 	mods  []*vk.ShaderModule
 
 	attn attnVariant
+	// big is the crown-kernel arm every wide projection uses; SetBigKernel
+	// moves it and TestGPUGEMMScreen is why it moves. packTPW is the same
+	// knob for the fragment pack.
+	big     gemmKernel
+	packTPW int
 
 	dim, ffn, heads, headDim      int
 	maxTokens, maxPrefix, maxText int
@@ -170,16 +176,48 @@ func (p pushConstants) bytes() []byte {
 	return out
 }
 
-// gemmKernel names a dit_gemm.comp build. Two are enough here: the crown
-// kernel for every big projection (its 256-wide tile divides 4096 and
-// 12288), and the 64x64 one for proj_out's N=64. Both read fragment-tiled
-// weights, so packB below has one layout.
+// gemmKernel names a dit_gemm.comp build. Two shapes are enough here: the
+// crown kernel for every big projection (its 256-wide tile divides 4096 and
+// 12288), and the 64x64 one for proj_out's N=64. All of them read
+// fragment-tiled weights, so packB below has one layout.
+//
+// The four swizzle arms of the crown kernel are built because they are the
+// screen Q9 owes: z-image chose SWZ=8 at *its* shapes (M=16384, K=12288) and
+// this model's are different (M=4096), so which arm wins here is a
+// measurement and not an inheritance. They cost four pipelines a bank to
+// build and nothing to leave unused; TestGPUGEMMScreen names them.
 type gemmKernel string
 
 const (
+	gemmSWZ2  gemmKernel = "wg128x256_bt16_swz2"
+	gemmSWZ4  gemmKernel = "wg128x256_bt16_swz4"
 	gemmSWZ8  gemmKernel = "wg128x256_bt16_swz8"
+	gemmSWZ16 gemmKernel = "wg128x256_bt16_swz16"
 	gemmReg64 gemmKernel = "reg64_bt16"
 )
+
+// BigKernels are the crown-kernel arms a screen may select between, in the
+// order they are reported.
+var BigKernels = []gemmKernel{gemmSWZ2, gemmSWZ4, gemmSWZ8, gemmSWZ16}
+
+// KernelName is the string form, for a test's log line.
+func KernelName(k gemmKernel) string { return string(k) }
+
+// SetBigKernel selects which arm every big projection uses. It changes which
+// pipeline a dispatch names and nothing else -- every arm reads the same
+// staged weight -- so a screen is one staging and not one per arm.
+func (g *GPU) SetBigKernel(k gemmKernel) error {
+	if _, ok := gemmVariants[k]; !ok {
+		return fmt.Errorf("dit: no GEMM kernel %q", k)
+	}
+	if len(g.gemms) > 0 {
+		if _, ok := g.gemms[0][k]; !ok {
+			return fmt.Errorf("dit: kernel %q is not built", k)
+		}
+	}
+	g.big = k
+	return nil
+}
 
 type gemmVariant struct {
 	name   gemmKernel
@@ -189,7 +227,10 @@ type gemmVariant struct {
 }
 
 var gemmVariants = map[gemmKernel]gemmVariant{
+	gemmSWZ2:  {name: gemmSWZ2, spirv: shaders.DiTGEMMWG128x256TiledSWZ2, bm: 128, bn: 256, waves: 4},
+	gemmSWZ4:  {name: gemmSWZ4, spirv: shaders.DiTGEMMWG128x256TiledSWZ4, bm: 128, bn: 256, waves: 4},
 	gemmSWZ8:  {name: gemmSWZ8, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4},
+	gemmSWZ16: {name: gemmSWZ16, spirv: shaders.DiTGEMMWG128x256TiledSWZ16, bm: 128, bn: 256, waves: 4},
 	gemmReg64: {name: gemmReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1},
 }
 
@@ -212,6 +253,12 @@ const (
 	// into the uploaded MLP gate vectors — see the type comment. A power of
 	// two, so the round trip moves no mantissa bit.
 	ffScale = 1.0 / 16
+	// defaultPackTiles is the fragment pack's token tiles per workgroup.
+	// Measured by TestGPUPackScreen at the served shape: 1 tile is 44 GB/s
+	// and 8 is 131, and the step falls 5.9% with the two packs together.
+	// 4 is within noise of 8 on the step and the pack alone; 8 is taken
+	// because it is not worse and the arm costs nothing to keep.
+	defaultPackTiles = 8
 )
 
 // NewGPU stages the transformer for sequences up to maxTokens (joint rows)
@@ -242,6 +289,8 @@ func NewGPU(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int) (*GPU
 		dim:   cfg.Dim(), ffn: cfg.Dim() * cfg.MLPRatio,
 		heads: cfg.NumHeads, headDim: cfg.HeadDim,
 		maxTokens: maxTokens, maxPrefix: maxPrefix, maxText: maxText,
+		big:         gemmSWZ8,
+		packTPW:     defaultPackTiles,
 		eps:         cfg.Eps,
 		outChannels: cfg.OutChannels,
 	}
@@ -504,7 +553,13 @@ func (g *GPU) build() error {
 		"rmsnorm":    shaders.DiTRMSNorm,
 		"rope":       shaders.DiTRoPE,
 		"qkpack":     shaders.DiTQKPack,
+		"qkpack2":    shaders.DiTQKPackTPW2,
+		"qkpack4":    shaders.DiTQKPackTPW4,
+		"qkpack8":    shaders.DiTQKPackTPW8,
 		"pack":       shaders.DiTPackF16,
+		"pack2":      shaders.DiTPackF16TPW2,
+		"pack4":      shaders.DiTPackF16TPW4,
+		"pack8":      shaders.DiTPackF16TPW8,
 		"swiglu":     shaders.DiTSwiGLUF16,
 		"causal":     shaders.DiTAttnCausal,
 		"copy":       shaders.DiTCopy,
@@ -744,7 +799,7 @@ func (g *GPU) uploadModulation(t float64) error {
 // the whole joint sequence and extracts the prefix KV cache. The result is
 // the model's prediction for the target rows, [T, out_channels].
 func (g *GPU) Step(latents *qwen.Mat, t float64, prefill bool) (*qwen.Mat, error) {
-	d, _, err := g.stepGraph(latents, t, prefill)
+	d, _, _, err := g.stepGraph(latents, t, prefill)
 	if err != nil {
 		return nil, err
 	}
@@ -759,6 +814,41 @@ func (g *GPU) Step(latents *qwen.Mat, t float64, prefill bool) (*qwen.Mat, error
 	out := qwen.NewMat(tTok, g.outChannels)
 	copy(out.Data, g.abuf.ReadFloat32At(int(g.aOut), tTok*g.outChannels))
 	return out, nil
+}
+
+// Stage is one dispatch's measurement: what it was, how long the device took
+// and how much arithmetic it did.
+type Stage struct {
+	Index int
+	Kind  string
+	GPU   time.Duration
+	// Flops is the dispatch's multiply-accumulate count times two, and zero
+	// for the elementwise passes, where a FLOP/s figure would mean nothing.
+	Flops float64
+}
+
+// Profile runs one step's graph a dispatch at a time, timing each on the
+// device.
+//
+// Wall clock around Step is not a measurement of the graph — it batches eight
+// dispatches a submit, so the fences hide inside it — and this deliberately
+// does not batch: submitting separately costs a fence wait per dispatch and
+// the total comes out above what Step measures. What it is for is the
+// distribution, which is what Q9 attributes against.
+func (g *GPU) Profile(latents *qwen.Mat, t float64, prefill bool) ([]Stage, error) {
+	d, kinds, flops, err := g.stepGraph(latents, t, prefill)
+	if err != nil {
+		return nil, err
+	}
+	stages := make([]Stage, 0, len(d))
+	for i := range d {
+		dur, err := vk.DispatchMultiTimed(d[i:i+1], 1, 1, true)
+		if err != nil {
+			return stages, fmt.Errorf("dit: dispatch %d (%s): %w", i, kinds[i], err)
+		}
+		stages = append(stages, Stage{Index: i, Kind: kinds[i], GPU: dur, Flops: flops[i]})
+	}
+	return stages, nil
 }
 
 // ReadRows reads a tensor slice out of the fp32 arena — the bring-up
@@ -794,6 +884,36 @@ func (g *GPU) CacheBytes() int {
 	return n
 }
 
+// PackTiles are the token-tile-per-workgroup arms the pack screen chooses
+// between.
+var PackTiles = []int{1, 2, 4, 8}
+
+// SetPackTiles selects how many token tiles one pack workgroup handles. Like
+// the GEMM arms it changes which pipeline a dispatch names and nothing else —
+// the layout it writes is identical — so a screen is one staging.
+func (g *GPU) SetPackTiles(n int) error {
+	switch n {
+	case 1, 2, 4, 8:
+		g.packTPW = n
+		return nil
+	}
+	return fmt.Errorf("dit: no pack build for %d tiles a workgroup", n)
+}
+
+func (g *GPU) packPipe() string {
+	if g.packTPW == 1 {
+		return "pack"
+	}
+	return fmt.Sprintf("pack%d", g.packTPW)
+}
+
+func (g *GPU) qkpackPipe() string {
+	if g.packTPW == 1 {
+		return "qkpack"
+	}
+	return fmt.Sprintf("qkpack%d", g.packTPW)
+}
+
 // SetNoPrefixRepair switches the prefill's block-causal repair off. It is
 // the negative control for the mask (qimage/dit's TestGPUEditOracle) and has
 // no other use.
@@ -807,17 +927,17 @@ func (g *GPU) TensorAttn() uint32 { return g.aAttn }
 // stepGraph builds the step's dispatch list. Everything before the blocks —
 // the latent upload and its narrowing, the text rows at a prefill — happens
 // here too, so a Step is one function.
-func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiDispatch, []string, error) {
+func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiDispatch, []string, []float64, error) {
 	if g.lay == nil {
-		return nil, nil, fmt.Errorf("dit: Step before BeginImage")
+		return nil, nil, nil, fmt.Errorf("dit: Step before BeginImage")
 	}
 	p, s := g.p, g.s
 	tTok := s - p
 	if latents.Rows != tTok || latents.Cols != 64 {
-		return nil, nil, fmt.Errorf("dit: latents are %s, want [%d 64]", latents, tTok)
+		return nil, nil, nil, fmt.Errorf("dit: latents are %s, want [%d 64]", latents, tTok)
 	}
 	if err := g.uploadModulation(t); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	g.abuf.WriteFloat32At(int(g.aLat), latents.Data)
 
@@ -840,9 +960,15 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 	}
 	var d []vk.MultiDispatch
 	var kinds []string
+	// fl is the arithmetic each dispatch does, 2x the multiply-accumulates,
+	// and it is zero for everything that is not a GEMM or an attention: the
+	// elementwise passes are bandwidth and a FLOP/s figure for them would be
+	// a number that means nothing.
+	var fl []float64
 	add := func(pipe, kind string, gx, gy uint32, pc pushConstants) {
 		d = append(d, vk.MultiDispatch{Pipeline: g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
 		kinds = append(kinds, kind)
+		fl = append(fl, 0)
 	}
 	// gemm issues C[MPad, n] = A * B over the fp16 A at aOff.
 	gemm := func(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, mRows, n, k, lda int) error {
@@ -860,6 +986,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			PushConstants: pc.bytes(),
 		})
 		kinds = append(kinds, kind)
+		// The padded M is what the kernel actually computes, and counting
+		// the unpadded rows would flatter a short prefix's GEMMs.
+		fl = append(fl, 2*float64(mPad)*float64(n)*float64(k))
 		return nil
 	}
 	// normScale is dit_final_norm over a row range: LayerNorm times the
@@ -929,14 +1058,14 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			if r.text {
 				continue
 			}
-			if err := gemm(gemmSWZ8, 0, "gemm img_in cond", g.hLat+uint32((tTok+r.src)*g.ldaLat),
+			if err := gemm(g.big, 0, "gemm img_in cond", g.hLat+uint32((tTok+r.src)*g.ldaLat),
 				g.aX+uint32(r.row*g.dim), g.imgInOff, r.n, g.dim, 64, g.ldaLat); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 	}
-	if err := gemm(gemmSWZ8, 0, "gemm img_in", g.hLat, g.aX+uint32(imgRow*g.dim), g.imgInOff, tTok, g.dim, 64, g.ldaLat); err != nil {
-		return nil, nil, err
+	if err := gemm(g.big, 0, "gemm img_in", g.hLat, g.aX+uint32(imgRow*g.dim), g.imgInOff, tTok, g.dim, 64, g.ldaLat); err != nil {
+		return nil, nil, nil, err
 	}
 	if prefill {
 		for _, r := range g.runs {
@@ -970,8 +1099,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 				// Fresh k/v land under the cached prefix at their global rows.
 				cOff += uint32(p * g.dim)
 			}
-			if err := gemm(gemmSWZ8, w.bank, "gemm "+string(pr.r), g.hA, cOff, w.bOff[pr.r], m, g.dim, g.dim, g.ldaDim); err != nil {
-				return nil, nil, err
+			if err := gemm(g.big, w.bank, "gemm "+string(pr.r), g.hA, cOff, w.bOff[pr.r], m, g.dim, g.dim, g.ldaDim); err != nil {
+				return nil, nil, nil, err
 			}
 		}
 
@@ -988,7 +1117,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pcQ.Aux1 = uint32(g.tokPad)
 		pcQ.Eps = math.Float32bits(float32(g.eps))
 		pcQ.Scale = math.Float32bits(scale * log2e)
-		add("qkpack", "qkpack q", uint32(planePad/coopMatTile), uint32(g.heads), pcQ)
+		qTiles := planePad / coopMatTile
+		pcQ.Span = uint32(qTiles)
+		add(g.qkpackPipe(), "qkpack q", uint32((qTiles+g.packTPW-1)/g.packTPW), uint32(g.heads), pcQ)
 
 		// k: the unfused trio, because the cache wants the fp32 post-RoPE
 		// rows. Both k and the pack work on global rows.
@@ -1021,6 +1152,7 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 				PushConstants: pc.bytes(),
 			})
 			kinds = append(kinds, kind)
+			fl = append(fl, 0)
 		}
 		if prefill {
 			kv("save k", 0, g.aK, cacheK)
@@ -1030,8 +1162,11 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			kv("restore v", 1, cacheV, g.aV)
 		}
 
-		// Pack k and v over the whole key range.
+		// Pack k and v over the whole key range. packTPW token tiles go to a
+		// workgroup: the tile count rides in Aux2 so the grid may round up
+		// without the overrun reaching the next head's plane.
 		kvPad := (kvRows + wmmaTokenAlign - 1) &^ (wmmaTokenAlign - 1)
+		tiles := kvPad / coopMatTile
 		for _, pk := range []struct {
 			kind     string
 			src, dst uint32
@@ -1040,9 +1175,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			pc := base
 			pc.Tokens = uint32(kvRows)
 			pc.InOff, pc.OutOff = pk.src, pk.dst
-			pc.Aux0, pc.Aux1 = pk.mode, uint32(g.tokPad)
+			pc.Aux0, pc.Aux1, pc.Aux2 = pk.mode, uint32(g.tokPad), uint32(tiles)
 			pc.Scale = math.Float32bits(1)
-			add("pack", pk.kind, uint32(kvPad/coopMatTile), uint32(g.heads), pc)
+			add(g.packPipe(), pk.kind, uint32((tiles+g.packTPW-1)/g.packTPW), uint32(g.heads), pc)
 		}
 
 		// Attention: bidirectional over the key range; query rows are the
@@ -1054,6 +1189,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pcA.KOff, pcA.VOff = g.hK, g.hV
 		pcA.Aux1 = uint32(g.tokPad)
 		add(g.attn.name, "attention", uint32((rows+g.attn.rows()-1)/g.attn.rows()), uint32(g.heads), pcA)
+		// Two GEMMs per head over the whole key range: q.k^T and p.v.
+		fl[len(fl)-1] = 4 * float64(rows) * float64(kvRows) * float64(g.headDim) * float64(g.heads)
 		// The prefill's mask is block-causal, and the pass above computed the
 		// prefix's rows bidirectionally over the whole sequence — right for
 		// the target's thousands of rows and wrong for every prefix row. So
@@ -1077,6 +1214,10 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 					pcS.Tokens = uint32(seg.End - seg.Start)
 					pcS.Aux2 = uint32(seg.Start)
 					add("causal", "causal text", uint32(seg.End-seg.Start), uint32(g.heads), pcS)
+					// A triangle: the mean row attends over half the span
+					// between the segment's ends.
+					fl[len(fl)-1] = 2 * float64(seg.End-seg.Start) * float64(seg.Start+seg.End) *
+						float64(g.headDim) * float64(g.heads)
 					continue
 				}
 				// An image block is internally bidirectional and sees
@@ -1084,14 +1225,15 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 				// cut to the block's end.
 				pcS.Tokens = uint32(seg.End)
 				add("prefix_attn", "prefix image", uint32((seg.End+g.attn.rows()-1)/g.attn.rows()), uint32(g.heads), pcS)
+				fl[len(fl)-1] = 4 * float64(seg.End) * float64(seg.End) * float64(g.headDim) * float64(g.heads)
 			}
 		}
 
 		pcN := base
 		pcN.InOff, pcN.OutOff, pcN.LDA = g.aCtx, g.hCtx, uint32(g.ldaDim)
 		add("scale", "narrow ctx", uint32(rows), 1, pcN)
-		if err := gemm(gemmSWZ8, w.bank, "gemm o", g.hCtx, g.aAttn, w.bOff[projO], rows, g.dim, g.dim, g.ldaDim); err != nil {
-			return nil, nil, err
+		if err := gemm(g.big, w.bank, "gemm o", g.hCtx, g.aAttn, w.bOff[projO], rows, g.dim, g.dim, g.ldaDim); err != nil {
+			return nil, nil, nil, err
 		}
 		gateAdd("gate msa", g.aAttn, 1)
 
@@ -1100,8 +1242,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			r   proj
 			out uint32
 		}{{projW1, g.aGate}, {projW3, g.aUp}} {
-			if err := gemm(gemmSWZ8, w.bank, "gemm "+string(pr.r), g.hA, pr.out, w.bOff[pr.r], rows, g.ffn, g.dim, g.ldaDim); err != nil {
-				return nil, nil, err
+			if err := gemm(g.big, w.bank, "gemm "+string(pr.r), g.hA, pr.out, w.bOff[pr.r], rows, g.ffn, g.dim, g.ldaDim); err != nil {
+				return nil, nil, nil, err
 			}
 		}
 		pcGLU := base
@@ -1110,8 +1252,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pcGLU.LDA = uint32(g.ldaFFN)
 		pcGLU.Scale = math.Float32bits(float32(ffScale))
 		add("swiglu", "swiglu", uint32(rows), 1, pcGLU)
-		if err := gemm(gemmSWZ8, w.bank, "gemm w2", g.hFFN, g.aFF, w.bOff[projW2], rows, g.dim, g.ffn, g.ldaFFN); err != nil {
-			return nil, nil, err
+		if err := gemm(g.big, w.bank, "gemm w2", g.hFFN, g.aFF, w.bOff[projW2], rows, g.dim, g.ffn, g.ldaFFN); err != nil {
+			return nil, nil, nil, err
 		}
 		gateAdd("gate mlp", g.aFF, 3)
 	}
@@ -1131,7 +1273,7 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 	pcT.Eps = math.Float32bits(float32(g.eps))
 	add("final_norm", "tail norm", uint32(tTok), 1, pcT)
 	if err := gemm(gemmReg64, 0, "gemm proj_out", g.hA, g.aOut, g.projOutOff, tTok, g.outChannels, g.dim, g.ldaDim); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return d, kinds, nil
+	return d, kinds, fl, nil
 }

@@ -69,6 +69,17 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define QBIAS(head, d)
 #endif
 #define WG 256
+// Token tiles per workgroup (IMAGE.md Q9). One tile is 16 x headDim = 2048
+// elements, which at WG = 256 is eight elements a thread and two barriers --
+// too little to keep the loads in flight, and the DiT's profile said so: this
+// pass moved 102 MB in 2.3 ms, 44 GB/s against the ~190 the SwiGLU beside it
+// reaches. TPW tiles per workgroup multiply the work per thread and divide
+// the launches by the same factor without changing a byte of the layout.
+//
+// TPW = 1 is every pre-existing build, unchanged.
+#ifndef TPW
+#define TPW 1
+#endif
 
 layout(local_size_x = WG) in;
 
@@ -76,38 +87,53 @@ layout(local_size_x = WG) in;
 shared float rows[TILE * HEAD_DIM];
 
 void main() {
-    uint tt = gl_WorkGroupID.x;          // token tile
     uint head = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
-    uint tok0 = tt * TILE;
+    uint plane = pc.outOff + (head * (pc.aux1 / TILE)) * (HDT * TILE * TILE);
 
-    // Coalesced in: consecutive lanes read consecutive components of one
-    // token, so a 128-lane run covers that token's whole head slice. Tokens
-    // past the sequence are zeroed rather than skipped -- the kernel reads the
-    // padding, and a pad key has to score something finite.
-    for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
-        uint m = i / HEAD_DIM, d = i % HEAD_DIM;
-        uint token = tok0 + m;
-        rows[i] = (token < pc.tokens)
-            ? (act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] QBIAS(head, d))
-                * uintBitsToFloat(pc.scale)
-            : 0.0;
-    }
-    barrier();
-
-    // Coalesced out: consecutive lanes write consecutive halves of one tile.
-    uint base = pc.outOff + (head * pc.aux1 / TILE + tt) * (HDT * TILE * TILE);
-    for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
-        uint c = o / (TILE * TILE);      // component tile
-        uint rem = o % (TILE * TILE);
-        uint m, d;
-        if (pc.aux0 == 0u) {
-            m = rem / TILE;             // (token, component)
-            d = c * TILE + rem % TILE;
-        } else {
-            m = rem % TILE;             // transposed: (component, token)
-            d = c * TILE + rem / TILE;
+    for (uint s = 0u; s < uint(TPW); ++s) {
+        uint tt = gl_WorkGroupID.x * uint(TPW) + s; // token tile
+        // pc.aux2 is how many tiles this dispatch covers; past it lies the
+        // next head's plane, so the overrun a grid rounded up to TPW
+        // produces has to stop rather than wrap.
+        if (pc.aux2 != 0u && tt >= pc.aux2) {
+            return;
         }
-        hact[base + o] = float16_t(rows[m * HEAD_DIM + d]);
+        uint tok0 = tt * TILE;
+
+        // Coalesced in: consecutive lanes read consecutive components of one
+        // token, so a 128-lane run covers that token's whole head slice.
+        // Tokens past the sequence are zeroed rather than skipped -- the
+        // kernel reads the padding, and a pad key has to score something
+        // finite.
+        if (s > 0u) {
+            barrier();
+        }
+        for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
+            uint m = i / HEAD_DIM, d = i % HEAD_DIM;
+            uint token = tok0 + m;
+            rows[i] = (token < pc.tokens)
+                ? (act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] QBIAS(head, d))
+                    * uintBitsToFloat(pc.scale)
+                : 0.0;
+        }
+        barrier();
+
+        // Coalesced out: consecutive lanes write consecutive halves of one
+        // tile.
+        uint base = plane + tt * (HDT * TILE * TILE);
+        for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
+            uint c = o / (TILE * TILE);      // component tile
+            uint rem = o % (TILE * TILE);
+            uint m, d;
+            if (pc.aux0 == 0u) {
+                m = rem / TILE;             // (token, component)
+                d = c * TILE + rem % TILE;
+            } else {
+                m = rem % TILE;             // transposed: (component, token)
+                d = c * TILE + rem / TILE;
+            }
+            hact[base + o] = float16_t(rows[m * HEAD_DIM + d]);
+        }
     }
 }
