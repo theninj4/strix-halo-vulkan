@@ -1,0 +1,38 @@
+#version 450
+// DupUp3D, the parameter-free upsampling shortcut around each of the
+// decoder's up blocks: the channel axis is replicated and redistributed into
+// space at 2x, and at T = 1 the reference's frame-axis duplication collapses
+// to "keep the last temporal copy". Which source channel feeds an output
+// pixel still depends on the temporal factor, through the replication
+// layout -- that is what aux0 carries and why this is not a plain
+// channel-to-space shuffle.
+//
+// One thread owns one output element. The read is a broadcast (four output
+// pixels share a source), the write is contiguous.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint outW = pc.W * 2u;
+    uint outH = pc.H * 2u;
+    uint outHW = outW * outH;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.OC * outHW) {
+        return;
+    }
+
+    uint ow = idx % outW;
+    uint oh = (idx / outW) % outH;
+    uint o = idx / outHW;
+
+    uint ft = pc.aux0;
+    uint repeats = pc.OC * ft * 4u / pc.C;
+    // "flat" is a GLSL keyword; this is the flattened (channel, frame, 2, 2)
+    // index the reference's repeat_interleave produces.
+    uint slot = ((o * ft + (ft - 1u)) * 2u + (oh & 1u)) * 2u + (ow & 1u);
+    uint src = slot / repeats;
+
+    act[pc.outOff + idx] = act[pc.inOff + src * pc.H * pc.W + (oh >> 1) * pc.W + (ow >> 1)];
+}

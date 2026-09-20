@@ -1,0 +1,64 @@
+#version 450
+// Bias and activation over a GEMM's fp32 output, in place — the one thing
+// the DiT's kernel set does not have, because Qwen-Image-2.1's transformer
+// has no biases anywhere and this vision tower has one on every projection.
+//
+// aux0 selects the activation, and the tower needs all three:
+//
+//   0 — none. The q/k/v and output projections, and the MLP's second layer.
+//   1 — GELU, tanh approximation. The block MLP's, which is what the vision
+//       config's hidden_act (gelu_pytorch_tanh) names.
+//   2 — GELU, exact (erf). Both patch mergers use nn.GELU(), which is this
+//       one. They differ by ~1e-3 at the knee: small enough to look like
+//       noise, large enough to matter after 27 layers, and qimage/vision's
+//       negative control catches the swap at 221x its bound.
+//
+// wOff is the bias vector, or NO_W for a pass that only applies the
+// activation. One workgroup per row, the same shape as dit_gate_add: the
+// bias is indexed by column, and a flat grid would pay an integer division
+// by a width that is not a power of two on every element.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+const float SQRT_2_OVER_PI = 0.7978845608028654;
+const float SQRT_1_2 = 0.7071067811865476;
+
+// erf, Abramowitz & Stegun 7.1.26: max absolute error 1.5e-7, which is
+// below fp32's own resolution on this range. It is written out rather than
+// approximated more cheaply because the *whole point* of distinguishing the
+// two GELUs is a ~1e-3 difference at the knee — a sloppy erf would put the
+// exact one back within reach of the tanh one and make the distinction this
+// kernel exists to preserve meaningless.
+float erfApprox(float x) {
+    float s = sign(x);
+    float a = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float poly = t * (0.254829592 +
+                 t * (-0.284496736 +
+                 t * (1.421413741 +
+                 t * (-1.453152027 +
+                 t * 1.061405429))));
+    return s * (1.0 - poly * exp(-a * a));
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint base = pc.outOff + r * pc.dim;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = act[base + c];
+        if (pc.wOff != NO_W) {
+            v += wbuf[pc.wOff + c];
+        }
+        if (pc.aux0 == 1u) {
+            v = 0.5 * v * (1.0 + tanh(SQRT_2_OVER_PI * (v + 0.044715 * v * v * v)));
+        } else if (pc.aux0 == 2u) {
+            v = 0.5 * v * (1.0 + erfApprox(v * SQRT_1_2));
+        }
+        act[base + c] = v;
+    }
+}

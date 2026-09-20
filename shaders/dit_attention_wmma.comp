@@ -190,6 +190,24 @@ layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
 #ifndef REL_BIAS
 #define REL_BIAS 0
 #endif
+// TAIL_MAX applies the tail mask to the row *max* as well as to P, which
+// every build already does to P.
+//
+// The plain build does not, and is right not to: it is always run with
+// pc.tokens equal to the packed plane's valid length, and the plane is zeroed
+// past it, so a key that does not exist scores exactly 0 and can only set the
+// scale on a row whose every real score is negative — which the DiT's
+// bidirectional pass never has. Qwen-Image-2.1's *edit* prefill breaks that
+// premise (qimage/dit/gpu.go): repairing a condition image's rows means
+// running this kernel with the key count cut to that block's end, in the
+// middle of a plane whose later rows are real and large. The softmax is
+// shift-invariant, so the result stays mathematically right either way — but
+// P is stored in fp16, and a max set by a key outside the mask shifts every
+// real weight down by that much before it is narrowed. The mask has to reach
+// the max to keep the precision, not to keep the answer.
+#ifndef TAIL_MAX
+#define TAIL_MAX 0
+#endif
 
 #define TILE 16
 #define HDT (HEAD_DIM / TILE)
@@ -343,7 +361,7 @@ void main() {
                         break;      // and every c after it, the row is done
                     }
 #endif
-#if REL_BIAS
+#if REL_BIAS || TAIL_MAX
                     // The tail mask, applied to the *max* and not only to P.
                     //
                     // Every build masks the pad keys out of P, which is what

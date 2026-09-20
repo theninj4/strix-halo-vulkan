@@ -1,0 +1,46 @@
+#version 450
+// The vision tower's axial rotary embedding, applied in place to q or k.
+//
+// It is a different rotation from dit_rope.comp's, and the two live one
+// import apart: this one is **NeoX halves** — component i moves against
+// component i + headDim/2 — where the DiT pairs *adjacent* components. Same
+// rotation, different memory order, and swapping them leaves every norm and
+// magnitude intact while making the attention pattern wrong, which is why
+// qimage/vision carries it as a negative control that fires at 3796x its
+// bound.
+//
+// The tables are built on the host (geometry.go's NewRope) and uploaded per
+// image, because they depend on the patch grid rather than on any weight:
+// cos at pc.wOff and sin at pc.aux0, both [tokens, headDim] in the
+// activation arena. The reference indexes cos twice per pair — once at i and
+// once at i + half — rather than assuming the two halves carry the same
+// value, and so does this.
+//
+// One workgroup per (token, head): the rotation is local to a head's row
+// slice, and a flat grid would pay a division by headDim on every element.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint tok = gl_WorkGroupID.x;
+    uint head = gl_WorkGroupID.y;
+    if (tok >= pc.tokens || head >= pc.heads) {
+        return;
+    }
+    uint half_ = pc.headDim / 2u;
+    uint base = pc.inOff + tok * pc.dim + head * pc.headDim;
+    uint tbl = tok * pc.headDim;
+
+    for (uint i = gl_LocalInvocationID.x; i < half_; i += 64u) {
+        float a = act[base + i];
+        float b = act[base + i + half_];
+        float cosLo = act[pc.wOff + tbl + i];
+        float sinLo = act[pc.aux0 + tbl + i];
+        float cosHi = act[pc.wOff + tbl + i + half_];
+        float sinHi = act[pc.aux0 + tbl + i + half_];
+        act[base + i] = a * cosLo - b * sinLo;
+        act[base + i + half_] = b * cosHi + a * sinHi;
+    }
+}

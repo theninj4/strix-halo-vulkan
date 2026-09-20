@@ -11,14 +11,22 @@
 //	go run ./cmd/serve -tts -voice bm_george -addr :8080
 //	go run ./cmd/serve -stt -max-audio 300          # five-minute clips
 //	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
-//	go run ./cmd/serve -image                       # z-image-turbo, 25 GB resident
+//	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
-//	go run ./cmd/serve -image -preview              # and stream in-progress frames
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
-// Every endpoint answers today except POST /v1/images/edits, which needs the
-// VAE's encoder and not a flag (see api.Server.handleImageEdit).
+// Every endpoint answers today except POST /v1/images/edits: an edit in
+// Qwen-Image-2.1 is a conditional generation over a vision tower rather than
+// an SDEdit, and that tower is unported (IMAGE.md Q8). `-edits` is therefore
+// an error at startup rather than a flag that quietly does nothing.
+//
+// **There is no -preview flag any more, and that is the change rather than
+// an omission.** Under Z-Image it loaded madebyollin/taef1 and cost 1.0 GB
+// of activation arena, so streaming was a residency decision. This model has
+// no distilled decoder to load: its preview is a fitted 64x4 matrix
+// (IMAGE.md Q7), 260 float32s compiled in, so `stream: true` is always
+// answerable and there is nothing to turn on.
 //
 // **-wyoming is a second door onto the speech backends**, not a second copy
 // of them: one process, one staging, one GPU queue, answering Home
@@ -28,11 +36,13 @@
 // it and anything that can open the port can run the two speech models on
 // it. See the `wyoming` package.
 //
-// **-preview is what makes `stream: true` answerable** on the image endpoint.
-// It loads madebyollin/taef1 beside the full VAE, and the reason it is a flag
-// rather than always on is residency: 4.9 MB of weights but 1.0 GB of
-// activation arena at a 1024x1024 ceiling. What it buys is a preview at 87 ms
-// against the 870 the full decoder would take for the same frame.
+// **-image-size is a ceiling and it has a hard limit.** The arenas are
+// allocated once for it and every smaller request runs inside them, so what
+// the number buys is the largest image and nothing else. The limit is
+// 1184x1184 and it is not a budget: the VAE decoder's activation arena is a
+// single storage buffer and this device caps one at 4 GiB - 4, which a
+// 1216x1216 decode is already past. Anything larger is refused at startup
+// with the arithmetic.
 //
 // **-llm stages D19's widths and D20's MoE bank by default** (P3a, P4b).
 // D19 is D18's 4.5-bit plan with `ple_proj` on int8, plus P3a's fifth bit on
@@ -143,19 +153,15 @@ func main() {
 	wyMaxConns := flag.Int("wyoming-max-conns", 0,
 		"concurrent Wyoming connections; 0 takes the package default")
 
-	imgOn := flag.Bool("image", false, "load Z-Image-Turbo and serve /v1/images/generations and /v1/images/edits")
-	imgModel := flag.String("image-model", "models/Z-Image-Turbo", "z-image checkpoint root")
+	imgOn := flag.Bool("image", false, "load Qwen-Image-2.1 and serve /v1/images/generations")
+	imgModel := flag.String("image-model", "models/Qwen-Image-2.1", "Qwen-Image-2.1 checkpoint root")
 	imgSize := flag.String("image-size", "1024x1024",
-		"largest image the arenas are built for, and the size a request that names none gets; both sides a multiple of 16")
-	imgSteps := flag.Int("image-steps", 8, "denoising steps a request that names none gets; the checkpoint's NFE is 8")
+		"largest image the arenas are built for, and the size a request that names none gets; "+
+			"both sides a multiple of 32, and no larger than 1184x1184 (the VAE's single-buffer arena)")
+	imgSteps := flag.Int("image-steps", 40, "denoising steps a request that names none gets; the checkpoint's default is 40")
 	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
-	imgPreview := flag.String("preview", "",
-		"a madebyollin/taef1 checkpoint; loads the preview decoder, which is what lets /v1/images/generations stream")
-	imgPreviewOn := flag.Bool("previews", false,
-		"shorthand for -preview models/taef1")
 	imgEdits := flag.Bool("edits", false,
-		"load the VAE's encoder, which is what lets /v1/images/edits answer; it costs 0.2 GB of weights "+
-			"and ~1.8 GB of arena at a 1024x1024 ceiling")
+		"unported under Qwen-Image-2.1 (IMAGE.md Q8); setting it is an error rather than a no-op")
 	flag.Parse()
 
 	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
@@ -275,14 +281,9 @@ func main() {
 
 	if *imgOn {
 		start := time.Now()
-		preview := *imgPreview
-		if preview == "" && *imgPreviewOn {
-			preview = defaultPreviewModel
-		}
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
-			Steps: *imgSteps, MaxPrompt: *imgPrompt, Preview: preview,
-			Edits: *imgEdits,
+			Steps: *imgSteps, MaxPrompt: *imgPrompt, Edits: *imgEdits,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -291,11 +292,11 @@ func main() {
 		srv.Image = b
 		enc, tr, vaeW, act := b.Residency()
 		geo := b.Geometry()
-		previews := "no previews (-previews)"
+		previews := "no previews"
 		if geo.Previews {
-			previews = "previews from " + preview
+			previews = fmt.Sprintf("previews to %d partial images", geo.MaxPartials)
 		}
-		edits := "no edits (-edits)"
+		edits := "no edits (IMAGE.md Q8)"
 		if geo.Edits {
 			edits = fmt.Sprintf("edits at strength %g", geo.DefaultStrength)
 		}
@@ -429,10 +430,6 @@ func openToNetwork(addr string) bool {
 	}
 	return !ip.IsLoopback()
 }
-
-// defaultPreviewModel is where -previews looks for taef1, matching every other
-// checkpoint's place in models/.
-const defaultPreviewModel = "models/taef1"
 
 // parseSize reads -image-size, which is spelled the way a request spells it so
 // that the flag and the API field are not two notations for one thing.

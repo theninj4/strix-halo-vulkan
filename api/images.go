@@ -24,10 +24,10 @@ import (
 // extensions this model has and OpenAI's does not.
 //
 // `size` is the field that matters here, and it is the reason this endpoint
-// took a pipeline change to wire up rather than a handler: every arena in
-// `zimage/pipeline` used to be built for one width and one height, so a size
-// was a residency question. It is now a ceiling, and a size inside it is a
-// parameter -- see ImageGeometry.
+// took a pipeline change to wire up rather than a handler: every arena used
+// to be built for one width and one height, so a size was a residency
+// question. It is now a ceiling, and a size inside it is a parameter -- see
+// ImageGeometry.
 type ImageGenerationRequest struct {
 	host   string
 	Model  string `json:"model,omitempty"`
@@ -53,10 +53,18 @@ type ImageGenerationRequest struct {
 	// the response says which, so an image a caller liked can be asked for
 	// again.
 	Seed *int64 `json:"seed,omitempty"`
-	// Steps is an extension: the denoising schedule's length. The checkpoint
-	// is a turbo distillation whose NFE is 8, so this is a knob for looking at
-	// the trade rather than one a client should normally turn.
+	// Steps is an extension: the denoising schedule's length. Qwen-Image-2.1
+	// is not a distillation -- its default schedule is 40 -- so unlike under
+	// Z-Image-Turbo this is a knob with real range in it: fewer steps is a
+	// proportionally faster image, and how far down quality holds is the
+	// question IMAGE.md's Q-o1 tracks.
 	Steps int `json:"steps,omitempty"`
+	// Background is OpenAI's "transparent" / "opaque" / "auto". It is
+	// answerable here because this model's VAE is natively RGBA, and it is
+	// not a mode: transparency is asked for *in the prompt* (the checkpoint's
+	// own recommended phrasing), so "transparent" rewrites the prompt and
+	// keeps the alpha plane, and everything else composites over white.
+	Background string `json:"background,omitempty"`
 	// Stream sends the image over Server-Sent Events, with in-progress
 	// frames as it goes. It needs a preview decoder loaded; see
 	// handleImageGeneration.
@@ -185,12 +193,41 @@ func (s *Server) handleImageGeneration(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, err.Error())
 		return
 	}
+	transparent, ok := s.imageBackground(ctx, w, req.Background, out.format)
+	if !ok {
+		return
+	}
 
 	s.render(w, r, &imageRun{
 		prompt: req.Prompt, width: width, height: height, steps: req.Steps, seed: req.Seed,
 		n: n, format: out.format, compression: out.compression,
-		stream: req.Stream, partials: req.PartialImages,
+		stream: req.Stream, partials: req.PartialImages, transparent: transparent,
 	})
+}
+
+// imageBackground validates `background` and says whether the alpha plane
+// survives.
+//
+// JPEG has no alpha, so "transparent" with `output_format: "jpeg"` is a
+// request that cannot be answered as asked -- and answering it by quietly
+// flattening would hand back an opaque picture that the prompt rewrite had
+// also made worse. It is a 400 naming both fields.
+func (s *Server) imageBackground(ctx context.Context, w http.ResponseWriter, background, format string) (transparent, ok bool) {
+	switch background {
+	case "", "auto", "opaque":
+		return false, true
+	case "transparent":
+		if format != "png" {
+			badRequest(ctx, w, "background \"transparent\" needs output_format \"png\"; "+
+				strconv.Quote(format)+" has no alpha channel")
+			return false, false
+		}
+		return true, true
+	default:
+		badRequest(ctx, w, "background "+strconv.Quote(background)+
+			" is not supported; use \"transparent\", \"opaque\" or \"auto\"")
+		return false, false
+	}
 }
 
 // imageOutputs is the container a request resolved to.
@@ -253,15 +290,19 @@ func (s *Server) imageCount(ctx context.Context, w http.ResponseWriter, n int, s
 // share because a partial frame of an edit is a partial frame.
 func (s *Server) checkStreaming(ctx context.Context, w http.ResponseWriter, geo ImageGeometry, stream bool, partials int) bool {
 	if stream && !geo.Previews {
-		// A 501 rather than a 400, and the same kind of answer -image itself
-		// gives: the request is well formed and the server was started
-		// without the thing that would answer it. writeError rather than
-		// notLoaded because what is missing is a decoder inside a model that
-		// *is* loaded, which its sentence does not fit.
+		// A 501 rather than a 400: the request is well formed and the loaded
+		// backend cannot answer it.
+		//
+		// **The image backend this server ships always can**, because its
+		// preview decoder is a fitted 64x4 matrix compiled in rather than a
+		// checkpoint to load (IMAGE.md Q7). So this branch is reached only
+		// by a backend that reports no previews, and the message stays
+		// generic rather than naming a flag that no longer exists: what
+		// would be wrong is a model without one, not a server started
+		// without one.
 		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"streaming image generation needs the preview decoder, which this server was started without; "+
-				"pass -preview with a madebyollin/taef1 checkpoint (it is what makes an in-progress frame "+
-				"cost 87 ms instead of the full VAE's 876)")
+			"streaming an image needs a preview decoder, and the loaded image backend reports none; "+
+				"GET /v1/models says so in image.previews. Send stream: false")
 		return false
 	}
 	if partials < 0 || partials > geo.MaxPartials {
@@ -296,6 +337,7 @@ type imageRun struct {
 	compression   int
 	stream        bool
 	partials      int
+	transparent   bool
 
 	// init and strength are set on an edit and zero on a generation.
 	init     image.Image
@@ -326,7 +368,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
 		}
 		out, err := s.Image.Generate(r.Context(), &ImageRequest{
 			Prompt: run.prompt, Width: run.width, Height: run.height,
-			Steps: run.steps, Seed: seed,
+			Steps: run.steps, Seed: seed, Transparent: run.transparent,
 			Init: run.init, Strength: run.strength,
 		})
 		if err != nil {
@@ -429,7 +471,7 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageR
 
 	out, err := s.Image.Generate(r.Context(), &ImageRequest{
 		Prompt: run.prompt, Width: run.width, Height: run.height,
-		Steps: run.steps, Seed: run.seed,
+		Steps: run.steps, Seed: run.seed, Transparent: run.transparent,
 		Init: run.init, Strength: run.strength,
 		PartialImages: run.partials, Partial: sendPartial,
 	})
@@ -498,12 +540,15 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	geo := s.Image.Geometry()
 	if !geo.Edits {
-		// A 501 that names the flag, like every other unloaded capability.
-		// Until I7 this was a 501 that named *no* flag, because the encoder
-		// was not ported; now it is resident or it is not.
+		// A 501 that names no flag, because there is none. Under
+		// Z-Image-Turbo an edit was SDEdit and `-edits` held the VAE encoder
+		// resident; Qwen-Image-2.1 edits by conditional generation over a
+		// 27-layer vision tower, which is a port and not a residency
+		// decision.
 		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"editing needs the VAE's encoder, which this server was started without; pass -edits "+
-				"(it holds the encoder's 0.21 GB of weights and its activation arena resident)")
+			"this server cannot edit images yet: Qwen-Image-2.1 edits by conditional generation -- the "+
+				"reference images become a prefix of the joint sequence through a vision tower -- and that "+
+				"tower is unported (IMAGE.md Q8). There is no flag that enables it")
 		return
 	}
 
@@ -738,7 +783,7 @@ func resolveSize(size, ratio string, geo ImageGeometry) (width, height int, err 
 	if width > geo.MaxWidth || height > geo.MaxHeight {
 		return 0, 0, fmt.Errorf(
 			"size %s: this server's arenas were built for %s, and neither side may be past it "+
-				"-- the same area in a taller shape does not fit",
+				"-- a ceiling is what was staged, not a budget per request",
 			formatSize(width, height), formatSize(geo.MaxWidth, geo.MaxHeight))
 	}
 	return width, height, nil

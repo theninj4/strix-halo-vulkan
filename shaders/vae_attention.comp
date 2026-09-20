@@ -21,17 +21,27 @@
 // GFLOP/s. Transposed, the same loop reads consecutive keys at consecutive
 // addresses.
 //
-// pc.C is the head dimension (512 here, the full channel width), pc.aux0 is
-// the row count, pc.aux1 holds the scale as a bit pattern, inOff/resOff/aux2
-// point at q, kT and v, and pc.groups carries kT's padded row stride.
+// pc.C is the head dimension (the full channel width), pc.aux0 is the row
+// count, pc.aux1 holds the scale as a bit pattern, inOff/resOff/aux2 point
+// at q, kT and v, and pc.groups carries kT's padded row stride.
+//
+// DIM is that channel width as a compile-time bound, because the query row
+// and the running context live in shared memory and GLSL wants their extent
+// at compile time. It is the only thing that differs between this kernel's
+// builds: 512 for z-image's AutoencoderKL, 1152 for Qwen-Image-2.1's mid
+// block, where the two arrays are 9 KB rather than 4.
 
 #include "vae_common.glsl"
 
+#ifndef DIM
+#define DIM 512
+#endif
+
 layout(local_size_x = 256) in;
 
-shared float shQ[512];      // the query row, reused by every key
+shared float shQ[DIM];      // the query row, reused by every key
 shared float shW[256];      // one chunk of exponentiated weights
-shared float shCtx[512];    // the running context vector
+shared float shCtx[DIM];    // the running context vector
 shared float shRed[256];    // scratch for the max and sum reductions
 
 float reduceMax(float v) {

@@ -156,6 +156,16 @@ type ImageRequest struct {
 	// Seed is the initial latent's. Nil draws one, and the result says which
 	// was drawn, so an image a caller likes can be asked for again.
 	Seed *int64
+	// Transparent asks for an RGBA image with a transparent background, i.e.
+	// OpenAI's `background: "transparent"`.
+	//
+	// It is a request field rather than a post-process because in this model
+	// it is not one: Qwen-Image-2.1's VAE emits four channels whatever the
+	// prompt says, and what makes the background actually transparent is
+	// *asking for it in the prompt*. So a backend that sets this rewrites the
+	// prompt and keeps the alpha plane, and one that leaves it false
+	// composites over white. A backend whose model has no alpha refuses it.
+	Transparent bool
 
 	// PartialImages is how many in-progress frames the caller wants before
 	// the finished one, and Partial is where they go. Zero, or a nil Partial,

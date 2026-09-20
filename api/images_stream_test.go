@@ -18,7 +18,7 @@ var errBoom = errors.New("boom: the device went away")
 
 // previewGeometry is a backend that has a preview decoder. Everything in this
 // file is about what the handler does with `stream` and `partial_images`; that
-// the frames are pictures of anything is zimage/vae's business.
+// the frames are pictures of anything is the VAE's business.
 func previewGeometry() ImageGeometry {
 	return ImageGeometry{Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
 		Multiple: 16, Steps: 8, Previews: true, MaxPartials: 3}
@@ -144,12 +144,15 @@ func TestImageStreamWithoutPartials(t *testing.T) {
 	}
 }
 
-// TestImageStreamNeedsThePreviewDecoder is the refusal that names a flag.
+// TestImageStreamNeedsThePreviewDecoder is the refusal a backend without a
+// preview decoder gets.
 //
-// It is a 501 and not a 400 because it is the same kind of answer as `-image`
-// itself: the request is well formed and the server was started without the
-// thing that would answer it. A client that gets this can either drop
-// `stream` or ask the operator for the flag, and the message says so.
+// It is a 501 and not a 400 because the request is well formed and the
+// loaded backend cannot answer it. The shipped image backend always can --
+// its preview decoder is a matrix compiled in, not a checkpoint to load --
+// so this covers the interface's contract rather than a configuration the
+// server has: `previews: false` in GET /v1/models has to mean `stream: true`
+// is refused, and the refusal has to say which field said so.
 func TestImageStreamNeedsThePreviewDecoder(t *testing.T) {
 	geo := previewGeometry()
 	geo.Previews, geo.MaxPartials = false, 0
@@ -159,8 +162,13 @@ func TestImageStreamNeedsThePreviewDecoder(t *testing.T) {
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "-preview") {
-		t.Errorf("body %s does not name the flag", rec.Body)
+	// It points at the field a client could have read first rather than at a
+	// flag: the shipped image backend always has a preview decoder, so a
+	// backend that reports none is a property of the model, not of how the
+	// server was started.
+	body := rec.Body.String()
+	if !strings.Contains(body, "image.previews") {
+		t.Errorf("body %s, want it to name the capability field", rec.Body)
 	}
 	if len(fake.reqs) != 0 {
 		t.Error("the backend ran anyway")

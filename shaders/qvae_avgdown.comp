@@ -1,0 +1,59 @@
+#version 450
+// AvgDown3D, the parameter-free downsampling shortcut around each of the
+// encoder's down blocks, and the mirror of qvae_dupup.comp: space is folded
+// back into the channel axis and the group averaged. Where DupUp broadcasts
+// one source pixel to four outputs, this averages `group` source values into
+// one -- the same channel-to-space layout read the other way.
+//
+// At T = 1 the temporal factor does not move any data, but it still decides
+// *which* source values an output channel is made of, and more than that: a
+// temporal factor of 2 means the reference averages in a **zero frame**. The
+// group still divides by its full size, so half the contributions are zero
+// and the result is halved. That is not an approximation of the 3-D model at
+// one frame, it is what the 3-D model computes at one frame, and dropping it
+// would scale every temporal block's shortcut by two.
+//
+// One thread owns one output element: the writes are contiguous and the
+// gathered reads are the strided ones.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint fs = pc.aux1;
+    uint outW = pc.W / fs;
+    uint outH = pc.H / fs;
+    uint outHW = outW * outH;
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.OC * outHW) {
+        return;
+    }
+
+    uint ow = idx % outW;
+    uint oh = (idx / outW) % outH;
+    uint o = idx / outHW;
+
+    uint ft = pc.aux0;
+    uint factor = ft * fs * fs;
+    uint group = pc.C * factor / pc.OC;
+
+    float acc = 0.0;
+    for (uint g = 0u; g < group; ++g) {
+        // "flat" is a GLSL keyword; this is the flattened (channel, frame,
+        // fs, fs) index the reference's grouping produces.
+        uint slot = o * group + g;
+        uint rem = slot % factor;
+        // Only the last temporal slot holds the image; the others are the
+        // zero frame and contribute nothing but still count in `group`.
+        if (rem / (fs * fs) != ft - 1u) {
+            continue;
+        }
+        uint c = slot / factor;
+        uint fh = (rem / fs) % fs;
+        uint fw = rem % fs;
+        acc += act[pc.inOff + c * pc.H * pc.W + (oh * fs + fh) * pc.W + (ow * fs + fw)];
+    }
+
+    act[pc.outOff + idx] = acc / float(group);
+}

@@ -1,0 +1,22 @@
+#version 450
+// An offset-to-offset copy within the fp32 activation arena, in the DiT
+// binding layout so it records into the same command buffer as the graph
+// around it. copy.comp is the same operation but binds two buffers from
+// element zero, which cannot express "these rows of that tensor".
+//
+// qimage/dit uses it for the prefix KV cache: at the prefill it saves each
+// block's post-RoPE prefix k and v rows aside, and every cached step copies
+// them back under the freshly computed target rows before the pack rebuilds
+// the fragment planes. pc.tokens * pc.dim elements, pc.inOff to pc.outOff.
+
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    act[pc.outOff + idx] = act[pc.inOff + idx];
+}

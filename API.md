@@ -26,8 +26,8 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/audio/speech` | **done** — kokoro, `-tts` |
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
-| `POST /v1/images/generations` | **done** — z-image-turbo, `-image`, any size the arenas hold, streaming previews with `-preview` |
-| `POST /v1/images/edits` | **done** — SDEdit over the VAE's encoder, `-image -edits`, multipart or JSON |
+| `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
+| `POST /v1/images/edits` | **501** — Z-Image's SDEdit is gone and 2.1's conditional-generation edit is unported (IMAGE.md Q8) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -123,48 +123,60 @@ is re-appended, because last-token pooling takes *that* row and an input
 truncated through it would be pooled from an ordinary word.
 
 **The image pipeline is resident, and its resolution is not part of what is
-resident.** `-image` stages 7.2 GB of text encoder, 12.5 GB of transformer and
-0.3 GB of VAE in **21.2 s**, sizes 4.9 GB of activation arenas for
+resident.** `-image` stages 13.2 GB of text encoder, 13.3 GB of transformer
+and 1.0 GB of VAE in **28 s**, sizes 5.0 GB of activation arenas for
 `-image-size`, and then a request moves no weight. That last clause is what
-this endpoint needed and did not have: `zimage/pipeline` used to fix its width
+this endpoint needed and did not have: the pipeline used to fix its width
 and height at construction, so a size was a residency question.
 
 It is not one, and none of the three graphs had to change to stop it being
-one. The transformer states its run length per upload (`GPUStack.Upload`,
-which the caption phase has always used to run 32 rows in a 4128-row arena),
-the VAE re-records its graph from the latent it is handed and checks the arena
-rather than assuming it, and the rotary table is rebuilt per run anyway. So
-`-image-size` became a *ceiling* and a default, the way `-max-audio` is for
-parakeet, and every smaller image runs in the same arenas. Measured on one
-1024x1024 process, two runs each:
+one. The transformer states its run length per image, the VAE re-records its
+graph from the latent it is handed and checks the arena rather than assuming
+it, and the rotary table is rebuilt per run anyway. So `-image-size` is a
+*ceiling* and a default, the way `-max-audio` is for parakeet, and every
+smaller image runs in the same arenas. Measured on one 1024x1024 process,
+two runs, at the default 40 steps:
 
-| size | image tokens | request |
-|---|---|---|
-| 1024x1024 | 4096 | **14.55 s** / 14.62 |
-| 1024x576 | 2304 | 7.95 s |
-| 512x512 | 1024 | **3.65 s** / 3.64 |
-| 256x256 | 256 | 1.33 s |
+| stage | 1024x1024 |
+|---|---|
+| text encoder | 107 ms / 105 |
+| DiT prefill (step 0, which also fills the prefix KV cache) | 2.275 s / 2.285 |
+| 39 cached steps, mean | 2.261 s / 2.344 |
+| VAE decode | 7.59 s / 7.47 |
+| **request** | **1m38.2 s** / 1m41.3 |
 
-`-previews` adds 1.0 GB of arena to that and no measurable staging time —
-24.9 GB becomes **25.9** — and the two processes render the same non-streamed
-1024x1024 image in 14.64/14.72 s and 14.72/14.80. A preview decoder that is
-not asked for costs residency and nothing else. `-edits` is the same bargain
-one size up: 0.21 GB of encoder weights and 1.8 GB of arena at a 1024x1024
-ceiling, and the encoder runs only on a request that carries a picture.
+**An image is the transformer and almost nothing else**: 92% of that wall
+clock is the 40 denoising steps, 7.6% is the VAE and 0.1% is the text
+encoder. The two levers are therefore the step count — genuinely per request
+here, unlike under a turbo distillation — and the unported percents
+`IMAGE.md`'s Q9 prices.
 
-**What bounds a request is each side, and not the area** — which is worth
-stating because the plausible guess is the other one. A diffusion model's cost
-is its token count, so the same area in another shape should be the same work,
-and for the transformer it is: 512x2048 is the same 4096 rows as the square.
-The decoder disagrees. Stage 8 gave it an fp16 arena of *blocked* copies of
-each convolution's input, and a block is padded on each axis separately, so
-redistributing the same area over a taller grid needs more arena than it has —
-measured at 33 MB against 32. A run that got that far would fail in the VAE
-after the whole denoising loop, so `pipeline.geomFor` refuses it at the door
-and the endpoint refuses it before that. Both sides inside the ceiling makes
-every tensor in all three graphs smaller elementwise, which is the condition
-that actually holds; `zimage/pipeline`'s `TestSameAreaTallerShapeIsRefused` is
-the measurement.
+Over HTTP, on a `-image -image-size 512x512 -image-steps 24` process: a
+512x512 image at 24 steps comes back in **16.8 s then 14.5 s**, base64 body
+included. **The step count is worth sending.** IMAGE.md's sweep (same seed,
+three prompt kinds, 1024x1024) found the answer is prompt-dependent rather
+than a single number:
+
+| steps | wall | photographic | painterly | structured/technical |
+|---|---|---|---|---|
+| 40 (default) | 1m38 | good | good | good |
+| 24 | 1m4 | good | good | good |
+| 16 | 45 s | good | good | washed out, structure fragmenting |
+| 12 | 36 s | good | good | broken |
+
+40 is the default because it is the only count safe across all three; **24
+is the honest fast setting** at −35% with no visible loss on any of them,
+and a client that knows it is asking for a photograph can go to 12 for a
+third of the cost.
+
+**The ceiling is 1184x1184, and it is not a budget.** The VAE decoder's
+activation arena is a single storage buffer, this device caps one at
+`maxStorageBufferRange` = 4 GiB − 4, and a decode needs 3060 MB at 1024²,
+4090 MB at 1184² and 4315 MB at 1216². So `-image-size 2048x2048` — the size
+the model card's own examples use — is refused at startup with the
+arithmetic, rather than failing after 27 GB of staging. Lifting it means
+tiling the decode or splitting that arena across buffers, and is Q6's own
+follow-up.
 
 **Kokoro is not.** Its arenas are sized for one utterance's frame count, and
 the durations decide that, so nothing can be staged until the phoneme side has
@@ -224,16 +236,17 @@ Two things would fix it, and both are measurements rather than arguments:
     -embed-model   models/Qwen3-Embedding-0.6B
     -embed-tokens  512            longest input the arenas hold; longer inputs are truncated
 
-    -image             false               load Z-Image-Turbo
-    -image-model       models/Z-Image-Turbo
-    -image-size        1024x1024           the largest image the arenas hold, and the default
-    -image-steps       8                   what a request that names no steps gets
+    -image             false               load Qwen-Image-2.1
+    -image-model       models/Qwen-Image-2.1
+    -image-size        1024x1024           the largest image the arenas hold, and the default; <= 1184x1184
+    -image-steps       40                  what a request that names no steps gets
     -image-max-prompt  512                 longest prompt the image text encoder is built for
-    -preview           ""                  a madebyollin/taef1 checkpoint; loads the preview decoder
-    -previews          false               shorthand for -preview models/taef1
-    -edits             false               load the VAE's encoder, which is what lets /v1/images/edits answer
+    -edits             false               unported (IMAGE.md Q8); setting it is a startup error
 
-**-llm and -image do not fit together.** ~84 GB and ~25 GB against 128 GB of
+There is no `-preview`/`-previews` flag: this model's preview decoder is a
+fitted 64x4 matrix compiled in, so `stream: true` always answers.
+
+**-llm and -image do not fit together.** ~84 GB and ~32 GB against 128 GB of
 unified memory the rest of the machine is also in: they are separate
 processes on this part, or separate runs.
 
@@ -385,84 +398,100 @@ the speech model's voices and for the same reason: `default_size`, `max_size`,
 four are how a client finds out that `stream: true` and an edit will be
 answered rather than discovering it from a 501.
 
-**Streaming an image** is OpenAI's `stream` and `partial_images`, and it needs
-`-preview`. The frames are `image_generation.partial_image` — `b64_json`,
-`size`, `output_format` and `partial_image_index`, plus a `step`/`steps` pair
-this server adds so a client watching one arrive knows how much is left —
-followed by one `image_generation.completed` carrying the finished image and
-the `seed` and `steps` that produced it. There is **no `[DONE]` sentinel**:
-these events are named, so the terminal one is already unambiguous, and the
-sentinel exists on the chat endpoint only because its frames are not.
+**`background: "transparent"` is OpenAI's field and it is answerable here**,
+because Qwen-Image-2.1's VAE is natively RGBA — four channels out of the
+decoder on every image. It is not a mode, though, and that is the part worth
+knowing: what actually makes a background transparent is *asking for it in
+the prompt*, so the server prepends and appends the checkpoint's own
+recommended phrasing ("This is an RGBA image with transparency. … The image
+has alpha channel and the background is transparent.") and keeps the alpha
+plane. `"opaque"` and `"auto"` leave the prompt alone and composite the
+result over white, which is what an ordinary picture wants — the alpha plane
+exists either way and on an ordinary prompt it is whatever the model painted
+there. `background: "transparent"` with `output_format: "jpeg"` is a 400
+naming both fields rather than a silently flattened image.
 
-Measured on one `-image -previews` process at 1024x1024, two runs each:
+**Streaming an image** is OpenAI's `stream` and `partial_images`. The frames
+are `image_generation.partial_image` — `b64_json`, `size`, `output_format`
+and `partial_image_index`, plus a `step`/`steps` pair this server adds so a
+client watching one arrive knows how much is left — followed by one
+`image_generation.completed` carrying the finished image and the `seed` and
+`steps` that produced it. There is **no `[DONE]` sentinel**: these events are
+named, so the terminal one is already unambiguous, and the sentinel exists on
+the chat endpoint only because its frames are not.
+
+**It needs no flag, and that is the change from Z-Image-Turbo rather than an
+omission.** There, previewing meant loading `madebyollin/taef1` beside the
+full VAE — 1.0 GB of activation arena, so streaming was a residency decision
+and `-preview` was how you made it. Qwen-Image-2.1's 64-channel VAE has no
+distilled decoder in existence, so the preview here is a **fitted linear
+64→RGBA matrix**: 260 float32s compiled into the binary, least-squares
+fitted against the real decoder's own output (IMAGE.md Q7, R² 0.97 on the
+fit and 0.83–0.90 on held-out prompts).
+There is nothing to load and nothing to turn on.
+
+Measured on one `-image -image-size 512x512 -image-steps 16` process, two
+runs each:
 
 | request | wall clock | first picture |
 |---|---|---|
-| no stream | 14.72 s / 14.80 | 14.7 s |
-| `stream: true` | 14.76 s / 14.75 | 14.8 s |
-| `stream: true, partial_images: 3` | **15.40 s** / 15.41 | **3.6 s** |
+| no stream | 10.25 s / 10.23 | 10.3 s |
+| `stream: true` | 10.26 s / 10.28 | 10.3 s |
+| `stream: true, partial_images: 3` | **10.27 s** / 10.28 | **2.27 s** |
 
-So the framing is free and three in-progress frames cost **4.4%** — and what
-they buy is a picture at 3.6 seconds instead of at fifteen. The frames land at
-3.6, 7.1 and 10.7 s, from steps 1, 3 and 5 of the eight.
+So the framing is free and three in-progress frames cost **0.3%** — against
+4.4% through taef1 — and what they buy is a picture at 2.3 seconds instead
+of at ten. The frames land at 2.27, 4.34 and 6.43 s, from steps 3, 7 and 11
+of the sixteen.
 
-Two numbers inside that 4.4% are worth separating, because only one of them is
-the model. A preview decode is **87 ms** (`madebyollin/taef1`, research/zimage-vertical.md I2);
-encoding the frame is the other **60**, and it would have been **344** at Go's
-default PNG compression — four times the decode. Partial frames therefore go
-out at `png.BestSpeed`, 15% more bytes for a fifth of the latency, while the
+A preview decode itself is **159 µs** against a 587 ms step; everything else
+in that 0.3% is encoding the PNG and writing it. Partial frames go out at
+`png.BestSpeed` — 15% more bytes for a fifth of the latency — while the
 finished image keeps the careful encoder. A transient frame and a deliverable
-are not the same object.
+are not the same object. **A frame is 1/16 scale** (32x32 for a 512x512
+image, 64x64 for a 1024x1024 one) and is upscaled by whatever displays it: a
+latent2rgb map carries composition, colour and layout, and cannot carry
+texture the latent does not hold per-pixel.
+
+**What the frame decodes is the denoised estimate, not the current latent**,
+and the distinction is load-bearing. The schedule is flow matching, so the
+sample at step k is an interpolation x_t = (1−σ)·x0 + σ·ε — ten steps into
+forty it is still three quarters noise, and mapping *that* through any
+decoder gives a picture of noise. The estimate x0 = x_t − σ·v is what looks
+like the image, and the loop forms it for nothing because it has the
+velocity in hand.
 
 **Which steps a partial comes from is the backend's decision**, not the
 handler's: the step count may not have been named in the request, and how
 finished a picture looks at step k is the scheduler's business. `backend`
-spreads them evenly over *the steps that will actually run* and never takes
-the last, whose denoised estimate *is* the final latent — a frame there would
-be the finished image sent twice, once through each decoder. The "actually
-run" is not pedantry: an edit at strength 0.5 runs the last four steps of
-eight, and frames spread over all eight would every one of them fall before it
-began.
+spreads them evenly over the steps that will actually run and never takes the
+last, whose denoised estimate *is* the final latent — a frame there would be
+the finished image sent twice, once through each decoder.
 
 ### Editing a picture
 
-`POST /v1/images/edits` needs `-image -edits`, and it takes **both encodings**:
-`multipart/form-data`, which is what OpenAI's clients send and the only thing
-their endpoint accepts, and a JSON body whose `image` is base64 (a `data:` URL
-is fine), which is what curl and a test can write by hand. Both fill the same
-struct.
+`POST /v1/images/edits` answers **501**, and what changed is the mechanism
+rather than a flag. Under Z-Image-Turbo this endpoint did SDEdit: the picture
+was encoded to a latent, the latent mixed with noise at an intermediate point
+on the schedule, and only the tail run — `strength` being how far back up the
+schedule that point was, and the whole behaviour of the endpoint.
 
-**What it does is SDEdit** (research/zimage-vertical.md I7): the picture is encoded to a latent,
-the latent is mixed with noise at an intermediate point on the schedule, and
-only the tail of the schedule runs. **`strength`** is how far back up the
-schedule that point is and is the whole behaviour of the endpoint — near zero
-returns almost the picture that was sent, 1 discards it and is an ordinary
-generation, and the default is 0.8. It is an extension because OpenAI has no
-such field: their edit endpoint is an inpainting model driven by a mask, which
-is a different mechanism.
+**Qwen-Image-2.1 does not edit that way.** An edit is a *conditional
+generation*: the reference images become a prefix of the joint sequence —
+their VAE latents for the pixels, their vision-tower features for what the
+text tokens absorbed — and the target is denoised from pure noise through the
+whole schedule. Three consequences a client sees. `strength` disappears,
+because nothing is being partially renoised. An edit becomes slightly *more*
+expensive than a generation rather than cheaper, because the prefix is
+thousands of tokens rather than tens. And up to **ten** reference images are
+accepted, which is why OpenAI's `image[]` array stops being a list this
+server refuses past the first.
 
-Everything else is the generation endpoint's, including streaming, because
-underneath an edit *is* a generation with a different starting latent. At
-1024x1024 an edit is **cheaper** than a generation, and by exactly the steps it
-skips:
-
-| strength | steps run | wall |
-|---|---|---|
-| 1.0 | 8 of 8 | 14.66 s — and bit-identical to a generation from the same seed |
-| 0.8 (default) | 6 | **11.29 s** |
-| 0.5 | 4 | 7.94 s |
-| 0.3 | 2 | 4.63 s |
-
-The encode is a flat 430 ms of that, 3.6% at the default strength. A 512x512
-edit over HTTP including the base64 body is **2.51 s**.
-
-**The size an edit with no `size` gets is the input picture's own shape**,
-fitted inside the ceiling and rounded to a multiple of 16 — not the server's
-default, which would silently reframe what was sent — and it is never scaled
-*up*, because four times the tokens cannot paint detail the input never had. A
-picture whose shape does not match the size being rendered is **cover-cropped**
-rather than stretched, since an edit whose point is to keep the composition
-should not begin by distorting it.
+The port that owes it is IMAGE.md's Q8, and the large piece is the 27-layer
+vision tower with its deepstack feature injection and 3-D mrope. The
+endpoint's shape — both encodings, `multipart/form-data` for OpenAI's clients
+and a JSON body whose `image` is base64 for curl — is unchanged and already
+written; what is missing is underneath it.
 
 What is refused rather than faked:
 
@@ -478,16 +507,18 @@ What is refused rather than faked:
   naming what the server does encode. *Transcripts* are a different question
   and are no longer refused: `json`, `verbose_json`, `text`, `srt` and `vtt`
   all answer, because the timings they need exist.
-- **`stream: true` without `-preview`.** It is a 501 naming the flag rather
-  than a 400, because the request is well formed and the server was started
-  without the decoder that answers it. With the flag it streams; see above.
-  `/v1/images/edits` without `-edits` is the same answer about the encoder.
-- **A `mask` on an edit.** A 501 that says what it would be rather than a
-  picture that ignored it: a mask is blended into the latent at *every*
-  denoising step, which is a mechanism and not a parameter, where `strength` is
-  one number over the whole picture. More than one input image is a 400 for
-  the same reason — OpenAI's field is a list because their model composites
-  several, and this one does not.
+- **`/v1/images/edits`.** A 501 naming IMAGE.md's Q8: the request is well
+  formed and the vision tower a 2.1 edit runs over is unported. There is no
+  flag that would fix it. It is the one capability the Z-Image migration has
+  not reached — `stream: true`, the other, was closed by Q7 the same day.
+- **A `mask` on an edit.** Still refused, but the reason has moved: 2.1 can
+  do masked and annotated local edits, and how a separate mask is fed is not
+  in the diffusers implementation this port follows (IMAGE.md's open question
+  Q-o3). It is a 501 that says what it would be rather than a picture that
+  ignored it.
+- **`background: "transparent"` with a JPEG container.** A 400 naming both
+  fields. JPEG has no alpha channel, and flattening it silently would hand
+  back an opaque picture that the prompt rewrite had also made worse.
 
 And on the chat endpoints, the same principle with a longer list: **`n > 1`**
 (n completions are n runs of a model sized to saturate the device), **`min_p`
@@ -587,12 +618,11 @@ again.
   (research/p5c-speculative-loop.md) — it costs nothing while off. What
   would make it pay is the draft head's acceptance on a real workload,
   which is a measurement (`cmd/llm -mtp`), not engineering; see `TODO.md`.
-- **Masked edits.** The encoder is ported and `/v1/images/edits` answers, so
-  the mask is the only piece of that endpoint still missing: a blend into the
-  latent at every denoising step, which is a mechanism rather than a
-  parameter. Nothing in `GOALS.md` asks for it — the endpoint exists because
-  OpenAI's surface does — and `strength` already covers editing the whole
-  picture.
+- **Image editing.** Answered under Z-Image-Turbo and not ported to
+  Qwen-Image-2.1 yet: an edit in 2.1 is a conditional generation over a
+  27-layer vision tower (IMAGE.md Q8), not an SDEdit. It is the one
+  remaining regression of the migration, it is named in every refusal, and
+  the endpoint's shape is unchanged underneath.
 - **The image adapter holds the device lock for the whole run**, where the
   language model's takes it per forward pass. The same fix applies — between
   two denoising steps there is no work in flight — but it would mean the

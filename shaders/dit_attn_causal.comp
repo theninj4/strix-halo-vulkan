@@ -1,0 +1,163 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Block-causal self-attention over Qwen-Image-2.1's *prefix*, scalar.
+//
+// The 2.1 prefill's mask is block-causal: text tokens are causal among
+// themselves, every image block is internally bidirectional, and both see
+// everything before them. Written per row that is "attend to keys [0, limit]"
+// with limit = the row's own index for a text token and the row's image
+// block's last index for an image token — a contiguous key prefix either way,
+// which is exactly what diffusers' non-flex processor decomposes the mask
+// into (one attention call per prefix segment).
+//
+// The prefill therefore runs the matrix-core kernel bidirectionally over the
+// whole joint sequence — which is already right for the target rows, the
+// thousands of them — and then repairs the prefix segment by segment. The
+// image segments go back through the matrix-core kernel with a smaller key
+// count; this kernel is for the *text* segments, which are tens of rows
+// against a key range of thousands, and whose per-row triangle the WMMA
+// kernel's query-block causality cannot express at a query offset.
+//
+// It reads the same packed fp16 fragment planes that kernel reads (q at
+// pc.inOff, k at pc.kOff both mode 0, v at pc.vOff mode 1, plane stride
+// pc.aux1 tokens) and writes fp32 rows of the natural-layout context at
+// pc.outOff. q arrives carrying 1/sqrt(headDim)*log2(e) from the pack, so the
+// exponential is exp2, as in the WMMA kernel.
+//
+// One workgroup per (query row, head):
+//
+//   pc.tokens   query rows in this dispatch
+//   pc.aux2     the first query row's index in the joint sequence, so a
+//               segment in the middle of the prefix is addressable
+//   pc.kStride  0 for causal (limit = the row's own global index), otherwise
+//               a fixed key count every row in the dispatch attends over
+//
+// The softmax is **online over chunks of keys** rather than a materialised
+// score row, which is what lifts the 512-key cap this kernel used to carry:
+// an edit's prefix is one condition image's 4096 latent rows and up to ten of
+// them, and a shared array indexed by the key would have to be that long.
+// Chunked, LDS is CHUNK floats however long the prefix is.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define WG 128
+// One chunk of keys in flight. 256 keeps the scores in 1 KB of LDS and gives
+// every lane two dot products per chunk at WG = 128.
+#define CHUNK 256
+
+layout(local_size_x = WG) in;
+
+shared float qrow[HEAD_DIM];
+shared float scores[CHUNK];
+shared float partial[WG];
+shared float acc[HEAD_DIM];
+shared float runMax;
+shared float runSum;
+
+// Element (token m, component d) of a mode-0 fragment-tile plane
+// (dit_pack_f16.comp): tile (m/16, d/16) is 256 contiguous halves, kt-major.
+uint tile0(uint plane, uint m, uint d) {
+    return plane + (m / 16u) * (16u * HEAD_DIM) + (d / 16u) * 256u + (m % 16u) * 16u + (d % 16u);
+}
+
+// Mode 1: the same tiles transposed, v's layout.
+uint tile1(uint plane, uint m, uint d) {
+    return plane + (m / 16u) * (16u * HEAD_DIM) + (d / 16u) * 256u + (d % 16u) * 16u + (m % 16u);
+}
+
+void main() {
+    uint local = gl_WorkGroupID.x;
+    if (local >= pc.tokens) {
+        return;
+    }
+    uint i = pc.aux2 + local; // the row's index in the joint sequence
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    uint keys = pc.kStride != 0u ? pc.kStride : i + 1u;
+    uint plane = h * pc.aux1 * HEAD_DIM;
+
+    for (uint d = t; d < HEAD_DIM; d += WG) {
+        qrow[d] = float(hact[tile0(pc.inOff + plane, i, d)]);
+        acc[d] = 0.0;
+    }
+    if (t == 0u) {
+        runMax = -1.0 / 0.0;
+        runSum = 0.0;
+    }
+    barrier();
+
+    for (uint base = 0u; base < keys; base += CHUNK) {
+        uint cnt = min(uint(CHUNK), keys - base);
+
+        for (uint j = t; j < cnt; j += WG) {
+            float s = 0.0;
+            for (uint d = 0u; d < HEAD_DIM; d++) {
+                s += qrow[d] * float(hact[tile0(pc.kOff + plane, base + j, d)]);
+            }
+            scores[j] = s;
+        }
+        barrier();
+
+        // This chunk's row max, tree-reduced over the lanes.
+        float m = -1.0 / 0.0;
+        for (uint j = t; j < cnt; j += WG) {
+            m = max(m, scores[j]);
+        }
+        partial[t] = m;
+        barrier();
+        for (uint s = WG / 2u; s > 0u; s >>= 1) {
+            if (t < s) {
+                partial[t] = max(partial[t], partial[t + s]);
+            }
+            barrier();
+        }
+        // exp2(-inf - newMax) is 0, which is the right correction for the
+        // first chunk, so the running state needs no special case.
+        float newMax = max(runMax, partial[0]);
+        float corr = exp2(runMax - newMax);
+        barrier();
+
+        float sum = 0.0;
+        for (uint j = t; j < cnt; j += WG) {
+            float p = exp2(scores[j] - newMax);
+            scores[j] = p;
+            sum += p;
+        }
+        partial[t] = sum;
+        barrier();
+        for (uint s = WG / 2u; s > 0u; s >>= 1) {
+            if (t < s) {
+                partial[t] += partial[t + s];
+            }
+            barrier();
+        }
+        float blkSum = partial[0];
+        barrier();
+
+        // One component per lane: rescale what is accumulated and add this
+        // chunk's contribution.
+        for (uint d = t; d < HEAD_DIM; d += WG) {
+            float a = acc[d] * corr;
+            for (uint j = 0u; j < cnt; j++) {
+                a += scores[j] * float(hact[tile1(pc.vOff + plane, base + j, d)]);
+            }
+            acc[d] = a;
+        }
+        if (t == 0u) {
+            runMax = newMax;
+            runSum = runSum * corr + blkSum;
+        }
+        barrier();
+    }
+
+    float inv = 1.0 / runSum;
+    for (uint d = t; d < HEAD_DIM; d += WG) {
+        act[pc.outOff + i * pc.dim + h * HEAD_DIM + d] = acc[d] * inv;
+    }
+}

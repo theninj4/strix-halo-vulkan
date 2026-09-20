@@ -850,7 +850,19 @@ func (g *GPUEncoder) RunIDs(ids []int32) error {
 
 // Run is Forward without the upload or the read-back: it runs every layer
 // over whatever the residual stream already holds.
-func (g *GPUEncoder) Run() error {
+func (g *GPUEncoder) Run() error { return g.RunHooked(nil) }
+
+// RunHooked is Run with a seam between the layers: after is called with each
+// layer's index once that layer's dispatches have completed and before the
+// next layer starts, so it may read the residual stream (Read) or change it
+// (AddRows).
+//
+// It is the device's counterpart of Model.ForwardEmbeds' `after`, and it
+// exists for the same caller: Qwen-Image-2.1's edit path adds a vision
+// tower's deepstack features at the image-pad slots after layers 0, 1 and 2
+// (qimage/textenc). The hook takes no tensor because reading this arena costs
+// 0.2 GB/s and almost every hook wants to write rather than read.
+func (g *GPUEncoder) RunHooked(after func(layer int) error) error {
 	for i := range g.w {
 		d, _, err := g.layerGraph(i)
 		if err != nil {
@@ -858,6 +870,11 @@ func (g *GPUEncoder) Run() error {
 		}
 		if err := submit(d); err != nil {
 			return fmt.Errorf("qwen: layer %d: %w", i, err)
+		}
+		if after != nil {
+			if err := after(i); err != nil {
+				return fmt.Errorf("qwen: after layer %d: %w", i, err)
+			}
 		}
 	}
 	return nil
@@ -946,23 +963,107 @@ func (g *GPUEncoder) upload(ids []int32) error {
 	if len(ids) == 0 || len(ids) > g.tokens {
 		return fmt.Errorf("qwen: %d tokens; the encoder was built for 1 to %d", len(ids), g.tokens)
 	}
+	x, err := g.Embeddings(ids)
+	if err != nil {
+		return err
+	}
+	if err := g.UploadEmbeds(x); err != nil {
+		return err
+	}
+	g.setRoPE(len(ids))
+	return nil
+}
+
+// Embeddings gathers a token sequence's rows out of the resident embedding
+// table, as the CPU model's method of the same name does.
+//
+// It is exported for the caller that has to *edit* the embeddings before they
+// run: an edit scatters the vision tower's merged rows over the image-pad
+// slots, and what the transformer then sees is not a function of the ids
+// alone. upload() below is this gather followed by UploadEmbeds and the plain
+// rotary table.
+func (g *GPUEncoder) Embeddings(ids []int32) (*Mat, error) {
 	c := g.cfg
-	x := make([]float32, len(ids)*c.HiddenSize)
+	out := NewMat(len(ids), c.HiddenSize)
 	for i, id := range ids {
 		if id < 0 || int(id) >= g.embedRows {
-			return fmt.Errorf("qwen: token id %d is outside the %d embedding rows", id, g.embedRows)
+			return nil, fmt.Errorf("qwen: token id %d is outside the %d embedding rows", id, g.embedRows)
 		}
-		copy(x[i*c.HiddenSize:], g.embed[int(id)*c.HiddenSize:(int(id)+1)*c.HiddenSize])
+		copy(out.Row(i), g.embed[int(id)*c.HiddenSize:(int(id)+1)*c.HiddenSize])
 	}
-	g.rows = len(ids)
+	return out, nil
+}
+
+// UploadEmbeds writes caller-supplied embeddings into the residual stream and
+// fixes the run's length.
+//
+// It deliberately does *not* touch the rotary table, which is the one thing
+// upload() also does: an edit's positions are three-dimensional and not
+// 0..T-1, so the table is the caller's (SetRoPE) and the two seams are
+// separate. A caller that sets one and forgets the other runs a t2i table
+// over an edit sequence -- qimage/textenc runs exactly that as a negative
+// control, and it is caught at four orders of magnitude.
+func (g *GPUEncoder) UploadEmbeds(x *Mat) error {
+	if x.Cols != g.cfg.HiddenSize {
+		return fmt.Errorf("qwen: embeddings are %d wide, the model is %d", x.Cols, g.cfg.HiddenSize)
+	}
+	if x.Rows <= 0 || x.Rows > g.tokens {
+		return fmt.Errorf("qwen: %d rows; the encoder was built for 1 to %d", x.Rows, g.tokens)
+	}
+	g.rows = x.Rows
 	if g.AutoPlan {
-		if err := g.SetPlan(PlanFor(len(ids))); err != nil {
+		if err := g.SetPlan(PlanFor(x.Rows)); err != nil {
 			return err
 		}
 	}
-	g.abuf.WriteFloat32At(int(g.aX), x)
-	g.setRoPE(len(ids))
+	g.abuf.WriteFloat32At(int(g.aX), x.Data)
 	return nil
+}
+
+// SetRoPE uploads a rotary table the caller built, for the run UploadEmbeds
+// has already fixed the length of. The table is the distinct half -- [rows,
+// HeadDim/2] cos and sin -- which is what NewRoPE produces and what the
+// shader indexes twice.
+func (g *GPUEncoder) SetRoPE(r *RoPE) error {
+	if r.HeadDim != g.cfg.HeadDim {
+		return fmt.Errorf("qwen: a rotary table of head dim %d for a model of %d", r.HeadDim, g.cfg.HeadDim)
+	}
+	need := g.rows * (g.cfg.HeadDim / 2)
+	if len(r.Cos) < need || len(r.Sin) < need {
+		return fmt.Errorf("qwen: rotary table holds %d positions, the run is %d rows",
+			len(r.Cos)/(g.cfg.HeadDim/2), g.rows)
+	}
+	g.wbuf.WriteFloat32At(int(g.wCos), r.Cos[:need])
+	g.wbuf.WriteFloat32At(int(g.wSin), r.Sin[:need])
+	return nil
+}
+
+// AddRows adds m into the residual stream at row `at` -- x[at:at+m.Rows] += m.
+//
+// The staging tensor is the attention branch's output, which is [rows,
+// hidden] and dead between layers, which is the only place this is called
+// from (RunHooked). One dispatch per call, so a caller with several
+// contiguous runs to add should make one call per run and not one per row.
+func (g *GPUEncoder) AddRows(at int, m *Mat) error {
+	c := g.cfg
+	if m.Cols != c.HiddenSize {
+		return fmt.Errorf("qwen: adding %d-wide rows to a %d-wide stream", m.Cols, c.HiddenSize)
+	}
+	if at < 0 || at+m.Rows > g.rows {
+		return fmt.Errorf("qwen: adding %d rows at %d, the run is %d rows", m.Rows, at, g.rows)
+	}
+	if m.Rows == 0 {
+		return nil
+	}
+	g.abuf.WriteFloat32At(int(g.aAttn), m.Data)
+	pc := pushConstants{
+		Tokens: uint32(m.Rows), Dim: uint32(c.HiddenSize),
+		Heads: uint32(c.NumHeads), HeadDim: uint32(c.HeadDim),
+		InOff: g.aAttn, OutOff: g.aX + uint32(at*c.HiddenSize),
+	}
+	return submit([]vk.MultiDispatch{{
+		Pipeline: g.pipes["add"], GroupsX: uint32(m.Rows), GroupsY: 1, PushConstants: pc.bytes(),
+	}})
 }
 
 // setRoPE rewrites the rotary table for a run's length. It belongs to the

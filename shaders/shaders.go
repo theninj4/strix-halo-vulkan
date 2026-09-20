@@ -1028,6 +1028,59 @@ var VAEAttention []byte
 //go:embed vae_transpose.spv
 var VAETranspose []byte
 
+// Qwen-Image-2.1's VAE decoder (qimage/vae/gpu.go, IMAGE.md Q5g). Most of
+// the graph is the set above -- the convolution, SiLU, add and 2x upsample
+// are the same operators on a different stack -- and only three things in
+// this VAE are not in that one:
+//
+//   - its norm is a per-pixel L2 normalize across channels, not a group
+//     norm, and every one of them is followed by a SiLU that the same pass
+//     can do (qvae_chnorm.comp);
+//   - each up block carries a parameter-free channel-to-space shortcut whose
+//     channel mapping depends on the temporal factor of a video model run at
+//     one frame (qvae_dupup.comp);
+//   - the mid block is 1152 channels wide rather than 512, which the scalar
+//     attention above needs as a compile-time bound on two shared arrays.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvae_chnorm.spv qvae_chnorm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvae_dupup.spv qvae_dupup.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvae_avgdown.spv qvae_avgdown.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvit_bias_act.spv qvit_bias_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvit_rope.spv qvit_rope.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DDIM=1152 -o vae_attention_d1152.spv vae_attention.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DDIM=768 -o vae_attention_d768.spv vae_attention.comp
+
+//go:embed qvae_chnorm.spv
+var QVAEChannelNorm []byte
+
+//go:embed qvae_dupup.spv
+var QVAEDupUp []byte
+
+//go:embed qvae_avgdown.spv
+var QVAEAvgDown []byte
+
+// The vision tower's two kernels that the DiT's set does not cover: a bias
+// and activation over a GEMM's output (2.1's transformer has no biases and
+// this tower has one on every projection), and the NeoX-halves rotation its
+// axial rope uses against the DiT's adjacent-pair one.
+//
+//go:embed qvit_bias_act.spv
+var QViTBiasAct []byte
+
+//go:embed qvit_rope.spv
+var QViTRoPE []byte
+
+//go:embed vae_attention_d1152.spv
+var VAEAttentionDim1152 []byte
+
+// The encoder's mid block is 768 wide where the decoder's is 1152 — base_dim
+// 96 against decoder_base_dim 144 — so it needs its own build of the same
+// kernel: DIM is a shared-array extent, not a loop bound it could read from a
+// push constant.
+//
+//go:embed vae_attention_d768.spv
+var VAEAttentionDim768 []byte
+
 // The mid block on the matrix cores (PIPELINE.md stage 7). The scalar
 // attention above is 26% of a 1024x1024 decode in one dispatch and its four
 // projections another 10% at 62 GFLOP/s, so both move to fp16 operands and
@@ -1227,6 +1280,21 @@ var DiTAttentionFlash []byte
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -o dit_attn_wmma_qt1_kt4_w32_of16.spv dit_attention_wmma.comp
 
+// The tail-max builds of the same variant, for Qwen-Image-2.1's edit prefill
+// (qimage/dit/gpu.go): a condition image's rows are repaired by running this
+// kernel with the key count cut to that block's end, inside a plane whose
+// later rows are real, so the mask has to reach the row max. See TAIL_MAX in
+// dit_attention_wmma.comp.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DTAIL_MAX=1 -o dit_attn_wmma_qt1_kt4_w32_tailmax.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DTAIL_MAX=1 -o dit_attn_wmma_qt1_kt4_tailmax.spv dit_attention_wmma.comp
+
+//go:embed dit_attn_wmma_qt1_kt4_w32_tailmax.spv
+var DiTAttentionWMMAQT1KT4W32TailMax []byte
+
+//go:embed dit_attn_wmma_qt1_kt4_tailmax.spv
+var DiTAttentionWMMAQT1KT4TailMax []byte
+
 //go:embed dit_pack_f16.spv
 var DiTPackF16 []byte
 
@@ -1317,6 +1385,24 @@ var DiTNormGateAdd []byte
 
 //go:embed dit_qk_pack.spv
 var DiTQKPack []byte
+
+// Qwen-Image-2.1's three additions to the DiT set (qimage/dit/gpu.go): the
+// scalar block-causal attention that repairs the prefix's text rows after the
+// bidirectional WMMA pass, an offset copy inside the fp32 activation arena,
+// and the fp16 prefix KV cache an edit's thousands of prefix rows need.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_attn_causal.spv dit_attn_causal.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_copy.spv dit_copy.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_kvcache.spv dit_kvcache.comp
+
+//go:embed dit_attn_causal.spv
+var DiTAttnCausal []byte
+
+//go:embed dit_copy.spv
+var DiTCopy []byte
+
+//go:embed dit_kvcache.spv
+var DiTKVCache []byte
 
 //go:embed dit_adaln.spv
 var DiTAdaLN []byte

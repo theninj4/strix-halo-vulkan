@@ -349,8 +349,11 @@ func TestImageGenerationBackendErrors(t *testing.T) {
 }
 
 // /v1/images/edits on a server whose VAE encoder is not resident. Until I7
-// this was the one 501 no flag could fix; now the encoder is ported and the
-// message names the flag, like every other unloaded capability.
+// it is a 501 that names no flag again, and for a better reason than the
+// first time: under Z-Image an edit was SDEdit over a VAE encoder that
+// `-edits` made resident, and under Qwen-Image-2.1 it is a conditional
+// generation over a vision tower that is not ported. A residency flag cannot
+// fix a missing port, so the message names the stage instead.
 func TestImageEditNeedsTheEncoder(t *testing.T) {
 	s := &Server{Image: &fakeImage{}}
 	rec := do(t, s, jsonRequest("POST", "/v1/images/edits", ImageEditRequest{Prompt: "p"}))
@@ -358,8 +361,8 @@ func TestImageEditNeedsTheEncoder(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "encoder") || !strings.Contains(body, "-edits") {
-		t.Errorf("body %s, want it to name the encoder and the flag that loads it", rec.Body)
+	if !strings.Contains(body, "Q8") || !strings.Contains(body, "no flag") {
+		t.Errorf("body %s, want it to name the stage and say no flag enables it", rec.Body)
 	}
 }
 

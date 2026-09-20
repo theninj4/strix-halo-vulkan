@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The DiT's prefix KV cache, between the fp32 activation arena and a
+// dedicated fp16 bank — IMAGE.md Q8.5.
+//
+// dit_copy.comp does the same job inside the activation arena and is what a
+// t2i prefix of a few dozen rows wants. An *edit's* prefix is a condition
+// image's 4096 latent rows, and 32 blocks of post-RoPE k and v over 4096 rows
+// of 4096 features is 4.34 GB in fp32 — past this device's 4 GiB
+// single-buffer limit before a second reference image is even asked for. So
+// the cache moves out of the arena into banks, like the weights, and is
+// narrowed on the way in.
+//
+// **The narrowing costs nothing.** The cached rows exist only to be read by
+// the attention kernel, which reads the fp16 fragment planes; the pack
+// narrows them to halves whether they were stored as fp32 or not. Storing
+// fp32(fp16(x)) and then packing it gives the same half as packing x, so this
+// is bit-identical to the fp32 cache it replaces and buys half the footprint
+// and half the restore bandwidth.
+//
+// pc.aux0 = 0 saves (act -> bank), 1 restores (bank -> act); pc.tokens *
+// pc.dim elements from pc.inOff to pc.outOff, each offset in its own
+// buffer's elements.
+
+#include "dit_common.glsl"
+
+layout(binding = 3) buffer KVCache { float16_t kv[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    if (pc.aux0 == 0u) {
+        kv[pc.outOff + idx] = float16_t(act[pc.inOff + idx]);
+    } else {
+        act[pc.outOff + idx] = float(kv[pc.inOff + idx]);
+    }
+}

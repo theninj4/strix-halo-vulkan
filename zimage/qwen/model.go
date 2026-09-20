@@ -285,6 +285,11 @@ func (tr Trace) put(name string, m *Mat) {
 	}
 }
 
+// Put records an intermediate a caller formed itself. ForwardEmbeds starts
+// after the embedding lookup, so the caller that did the lookup is the only
+// one that can trace it.
+func (tr Trace) Put(name string, m *Mat) { tr.put(name, m) }
+
 // Layer is one Qwen3 decoder layer.
 type Layer struct {
 	AttnNorm *RMSNorm
@@ -428,6 +433,27 @@ func (m *Model) Forward(ids []int32, tr Trace) (*Mat, error) {
 	}
 	tr.put("embeddings", x)
 	rope := NewRoPE(m.Cfg.HeadDim, len(ids), m.Cfg.RopeTheta)
+	return m.ForwardEmbeds(x, rope, tr, nil)
+}
+
+// ForwardEmbeds runs the loaded layers over embeddings the caller has already
+// formed, against a rotary table the caller supplies, calling `after` with
+// each layer's output.
+//
+// Forward is this with a token lookup and a plain 0..T-1 table in front of
+// it. Qwen-Image-2.1's *edit* path (qimage/textenc) needs all three seams and
+// the model cannot supply any of them for itself: a condition image's rows
+// are scattered into the embeddings before layer 0, the positions are 3-D
+// mrope rather than a counter, and the vision tower's deepstack features are
+// added into the first three layers' outputs. `after` may modify the matrix
+// it is handed, which is exactly what that injection is; the trace records
+// each layer's output before it runs, matching where transformers' own layer
+// hook fires.
+func (m *Model) ForwardEmbeds(x *Mat, rope *RoPE, tr Trace, after func(layer int, x *Mat) error) (*Mat, error) {
+	if x.Cols != m.Cfg.HiddenSize {
+		return nil, fmt.Errorf("qwen: embeddings are %d wide, want %d", x.Cols, m.Cfg.HiddenSize)
+	}
+	var err error
 	for i, l := range m.Layers {
 		prefix := ""
 		if tr != nil {
@@ -438,6 +464,11 @@ func (m *Model) Forward(ids []int32, tr Trace) (*Mat, error) {
 			return nil, fmt.Errorf("qwen: layer %d: %w", i, err)
 		}
 		tr.put(fmt.Sprintf("hidden_%d", i+1), x)
+		if after != nil {
+			if err := after(i, x); err != nil {
+				return nil, fmt.Errorf("qwen: after layer %d: %w", i, err)
+			}
+		}
 	}
 	return x, nil
 }

@@ -1,0 +1,44 @@
+#version 450
+// Qwen-Image-2.1's RMS_norm, which is not a group norm: per pixel, the
+// channel vector is L2-normalized (its norm clamped below at 1e-12), scaled
+// by sqrt(C) and by a per-channel gamma. No mean is subtracted and there is
+// no bias.
+//
+// One thread owns one pixel and walks the channel axis twice -- once for the
+// norm, once to scale -- so consecutive threads read consecutive addresses
+// inside a channel plane and every access is coalesced. Two reads and a
+// write of the tensor, which is what a per-pixel reduction over a
+// channel-planar layout costs; holding the vector in registers is not
+// available at C = 1152.
+//
+// aux0 fuses the SiLU that follows every one of these norms in the model.
+// It is free here -- the value is already in a register -- and it is a whole
+// pass over the largest tensors in the decode that does not happen: at
+// 1024x1024 the tail norm alone moves 1.2 GB that way.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint hw = pc.H * pc.W;
+    uint p = gl_GlobalInvocationID.x;
+    if (p >= hw) {
+        return;
+    }
+
+    float sum = 0.0;
+    for (uint c = 0u; c < pc.C; ++c) {
+        float v = act[pc.inOff + c * hw + p];
+        sum += v * v;
+    }
+    float s = sqrt(float(pc.C)) / max(sqrt(sum), 1e-12);
+
+    for (uint c = 0u; c < pc.C; ++c) {
+        float v = act[pc.inOff + c * hw + p] * s * wbuf[pc.wOff + c];
+        if (pc.aux0 != 0u) {
+            v = v / (1.0 + exp(-v));
+        }
+        act[pc.outOff + c * hw + p] = v;
+    }
+}
