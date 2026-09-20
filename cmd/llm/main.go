@@ -97,6 +97,10 @@ func main() {
 	specWire := flag.String("spec-wire", "res", "for -spec: the nextn wiring — P5a's measured winner is res")
 	specPrefix := flag.Int("spec-prefix", 0, "for -spec: prompt with this many tokens of -ppl-file instead of -prompt, which is the long-context arm")
 	csvPath := flag.String("csv", "", "write the -hc table here")
+	depth := flag.Bool("depth", false, "sweep prompt-processing and token-generation rate against how full the cache already is")
+	depths := flag.String("depths", "0,8000,16000,32000,64000,128000", "for -depth: the cache depths to measure at")
+	ppBatch := flag.Int("pp", 512, "for -depth: tokens in the timed prompt batch, which is also the fill batch")
+	tgTokens := flag.Int("tg", 64, "for -depth: tokens the timed decode run generates")
 	flag.Parse()
 
 	if *chatTemplate {
@@ -172,6 +176,28 @@ func main() {
 		if err := perplexity(pplOpts{
 			model: *model, file: *pplFile, ctx: *ctx, chunks: *chunks,
 			headRows: *headRows, layers: layers, csv: *csvPath,
+		}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *depth {
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		ds, err := parseInts(*depths)
+		if err != nil {
+			log.Fatal(err)
+		}
+		c := 0
+		if flagSet("ctx") {
+			c = *ctx
+		}
+		if err := depthBench(depthOpts{
+			model: *model, file: *pplFile, depths: ds, pp: *ppBatch, tg: *tgTokens,
+			ctx: c, layers: layers, csv: *csvPath,
 		}); err != nil {
 			log.Fatal(err)
 		}

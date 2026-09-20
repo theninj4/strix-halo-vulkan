@@ -3,6 +3,7 @@ package backend
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -13,6 +14,7 @@ import (
 
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/llm"
+	"strix-halo-vulkan/util"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/tokenizer"
 )
@@ -191,7 +193,13 @@ func (l *LLM) Close() {
 // would not be slower, it would be wrong.
 func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	emit func(api.Delta) error,
-) (*api.CompletionResult, error) {
+) (_ *api.CompletionResult, err error) {
+	// enter is what the *client's* clock started at, as near as this side can
+	// see it: everything below -- rendering the template, tokenizing, waiting
+	// for the graph another request is holding, and the prefill -- is time
+	// before the first token arrives, so it is all in the time to first token
+	// this reports.
+	enter := time.Now()
 	msgs, opt, err := chatRequest(req)
 	if err != nil {
 		return nil, err
@@ -226,6 +234,12 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// queued is how long this request sat behind another one's generation.
+	// It is reported separately because it is the one part of a slow time to
+	// first token that is not this request's own work, and without it a turn
+	// that waited eight seconds for the graph looks like a turn whose prefill
+	// was eight seconds.
+	queued := time.Since(enter)
 	if l.g == nil {
 		return nil, fmt.Errorf("the language model is closed")
 	}
@@ -243,9 +257,34 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	var text utf8Stream
 	res := &api.CompletionResult{FinishReason: "length"}
 	gen := 0
+	// ttft is taken at the first token the model produces rather than at the
+	// first delta emitted: a byte-level token can be held back for a rune to
+	// finish and a `<think>` marker is never emitted at all, so timing the
+	// stream would attribute the decoder's own buffering to the model.
+	var ttft, decode time.Duration
 	start = time.Now()
+	// A run that ends in an error is the one whose numbers are hardest to
+	// come by afterwards -- a client that hangs up mid-stream leaves nothing
+	// but "cancelled" in the access log -- so it reports the same line the
+	// successful path does, up to where it stopped.
+	defer func() {
+		if err == nil || gen == 0 {
+			return
+		}
+		if decode == 0 {
+			decode = time.Since(start)
+		}
+		l.logRun(ctx, runStats{
+			prompt: len(ids), reused: reused, gen: gen,
+			queued: queued, prefill: prefill, ttft: ttft, decode: decode,
+			total: time.Since(enter), reason: failureReason(ctx, err),
+		})
+	}()
 	for gen < budget {
 		id := s.Sample(logits)
+		if ttft == 0 {
+			ttft = time.Since(enter)
+		}
 		if l.eog[id] {
 			res.FinishReason = "stop"
 			break
@@ -288,7 +327,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		}
 		l.held = append(l.held, id)
 	}
-	decode := time.Since(start)
+	decode = time.Since(start)
 
 	reasoning, content, calls, err := dec.Close()
 	if err != nil {
@@ -311,11 +350,47 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	res.Usage = api.Usage{
 		PromptTokens: len(ids), CompletionTokens: gen, TotalTokens: len(ids) + gen,
 	}
-	log.Printf("llm: %d prompt tokens in %v (%.0f tok/s%s), %d generated in %v (%.2f tok/s), %s",
-		len(ids), prefill.Round(time.Millisecond), rate(len(ids)-reused, prefill),
-		reusedNote(reused), gen, decode.Round(time.Millisecond), rate(gen, decode),
-		res.FinishReason)
+	l.logRun(ctx, runStats{
+		prompt: len(ids), reused: reused, gen: gen,
+		queued: queued, prefill: prefill, ttft: ttft, decode: decode,
+		total: time.Since(enter), reason: res.FinishReason,
+	})
 	return res, nil
+}
+
+// runStats is what one completion cost. The two rates are the two halves of
+// what this server is: a prefill reads the whole prompt in one pass per batch
+// and is bandwidth against the expert bank, a decode is one pass per token
+// and is latency, and a single "tokens per second" over the pair would be
+// neither number.
+type runStats struct {
+	reason              string
+	prompt, reused, gen int
+	// queued is the wait for the graph, prefill the prompt, ttft the whole
+	// span from the call to the first token -- queue, render, tokenize and
+	// prefill included -- decode the generation after it, and total the
+	// wall clock a client saw.
+	queued, prefill, ttft, decode, total time.Duration
+}
+
+// logRun writes the one line a completion leaves in the journal.
+func (l *LLM) logRun(ctx context.Context, st runStats) {
+	log.Printf("%sllm %s: prompt %d tokens%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
+		logID(ctx), l.id, st.prompt, reusedNote(st.reused),
+		st.prefill.Round(time.Millisecond), rate(st.prompt-st.reused, st.prefill),
+		since(st.ttft), queuedNote(st.queued),
+		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode),
+		st.total.Round(time.Millisecond), st.reason)
+}
+
+// failureReason is what the log calls a run that did not finish. A client
+// that hung up is the common one and is not an error in this server, so it is
+// named rather than printed as one.
+func failureReason(ctx context.Context, err error) string {
+	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		return "cancelled"
+	}
+	return "failed: " + err.Error()
 }
 
 func rate(n int, d time.Duration) float64 {
@@ -323,6 +398,38 @@ func rate(n int, d time.Duration) float64 {
 		return 0
 	}
 	return float64(n) / d.Seconds()
+}
+
+// since prints a duration for the log, or "n/a" for a generation that never
+// reached a first token -- a budget of nothing, or a stop sequence the prompt
+// itself ended on. Zero is not a plausible measurement, so printing it as one
+// would be a lie in the column a reader scans for the number.
+func since(d time.Duration) string {
+	if d <= 0 {
+		return "n/a"
+	}
+	return d.Round(time.Millisecond).String()
+}
+
+// logID is the access log's request id, in the form every other line about a
+// request carries it. A busy server interleaves these lines with the access
+// log's own, and the id is what says which completion a rate belongs to.
+func logID(ctx context.Context) string {
+	if id := util.RequestID(ctx); id != "" {
+		return "[" + id + "] "
+	}
+	return ""
+}
+
+// queuedNote accounts for time spent waiting on the graph, and only when
+// there was some: the device lock is uncontended on a server answering one
+// conversation, and a ", 0s queued" on every line would train the eye to skip
+// the place where the number matters.
+func queuedNote(d time.Duration) string {
+	if d < 10*time.Millisecond {
+		return ""
+	}
+	return fmt.Sprintf(" (%v queued)", d.Round(time.Millisecond))
 }
 
 // prefill runs the prompt, continuing the sequence the graph already holds
@@ -403,11 +510,14 @@ func commonPrefix(a, b []int32) int {
 
 // reusedNote is the log's account of a continued conversation, which is the
 // difference between a turn that costs its own history and one that does not.
+// The prefill rate beside it is over the tokens actually run, so a turn that
+// reused most of its prompt reports the speed of the part that cost anything
+// rather than a figure flattered by the cache.
 func reusedNote(reused int) string {
 	if reused == 0 {
 		return ""
 	}
-	return fmt.Sprintf(", %d reused", reused)
+	return fmt.Sprintf(" (%d cached)", reused)
 }
 
 // extend runs one decode step under the device lock.
