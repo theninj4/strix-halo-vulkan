@@ -10,8 +10,9 @@
 reference dump before anything is optimised. Two of `GOALS.md`'s five models,
 and the two smallest.
 
-**Status (2026-09-19, T9)**: **both verticals are on the device, text-to-speech
-takes text, and the endpoint now costs what the model costs.**
+**Status (2026-09-20, T10)**: **both verticals are on the device, the loop
+between them closes over HTTP, and synthesis now costs the same per second of
+audio however long the utterance is.**
 T9 staged kokoro once for the life of the server instead of once per request:
 `POST /v1/audio/speech` went from **550 ms to 59** for 6.45 s of audio, byte
 for byte the same waveform.
@@ -25,6 +26,24 @@ whose 22 ms T4c and T7 cut from 3626.
 T8 closed the last open feature: a voice may name a **mixture** of packs, in
 upstream's own spelling, and T9 closed the last place where the server cost
 more than the model.
+
+**R1 closed the loop and moved the target.** `cmd/roundtrip` runs text through
+both endpoints and back — six prose cases return exactly — and what it
+measured is that the two verticals scaled in opposite directions:
+transcription amortises its fixed cost away to 257x, while synthesis bottomed
+out at 8.3 ms per second of audio and then got **36% worse per second** by a
+nineteen-second utterance. `cmd/tts` localised that to **PL-BERT, 4 ms at 50
+tokens and 75 at 321**. See [R1](#r1--the-round-trip-and-what-it-says-to-do-next).
+
+**T10 removed it.** PL-BERT's attention was a scalar kernel chosen when the
+sequence was fifty tokens; on the matrix cores it is **216x faster at 321
+tokens and 420x at 510**, which takes the whole encoder from 66.8 ms to
+**2.5** and an ALBERT layer from 16.2 ms to **288 us** at the model's ceiling.
+A nineteen-second utterance is **225 ms → 162** (86.9x → **120.5x** real
+time), the round trip is **61.6x → 70.1x**, and the speech leg is a straight
+line instead of a curve: 8.0 ms per second of audio from five seconds to
+nineteen, where it used to climb to 11.3. Not one duration moved.
+See [T10](#t10--pl-berts-attention-on-the-matrix-cores-done).
 
 `go run ./cmd/tts -gpu -text 'Hello there.'` speaks, with no Python on the
 path. T5 opened with a measurement instead of code — **91% of running-text
@@ -108,6 +127,8 @@ of phoneme words agree.** [Write-up](research/t5-kokoro-g2p.md).
 | T7 | The excitation: float64 phase accumulation on the host | **done** — 14 ms to 0.2 ms, two new shaders; the wrapped phase is float32-safe |
 | T8 | Voice blending: a request that names several voices | **done** — upstream's own spelling, checked against `load_voice` at every row |
 | T9 | The server: one staging for the life of the process | **done** — `/v1/audio/speech` 550 ms to 59, and the bytes are unchanged |
+| R1 | The round trip: `cmd/roundtrip`, text → speech → text over HTTP | **done** — six cases exact, 61.6x real time, and it named what was next |
+| T10 | PL-BERT's attention on the matrix cores | **done** — a layer **56x** at the model's ceiling, an utterance 225 ms → **162**, the loop **70.1x** |
 
 ## What exists
 
@@ -955,3 +976,216 @@ tail at 8, the phoneme side at 8 with 1.96 ms of GPU inside it. The next
 millisecond on this vertical is still the one "What is left after T7" names:
 the noise convolutions are on the host, so the excitation's spectrogram
 crosses the bus for no other reason.
+
+## R1 — the round trip, and what it says to do next
+
+`go run ./cmd/roundtrip` is the loop both verticals have to close and neither
+of them could measure on its own: text → `POST /v1/audio/speech` → resample →
+`POST /v1/audio/transcriptions` → text, with the text that comes back checked
+against the text that went in. It is a client — it imports `audio` and
+`net/http` and nothing else from here — so what it reports is what a caller
+waits on rather than what a stage table says.
+
+    go run ./cmd/serve -tts -stt
+    go run ./cmd/roundtrip -reps 2 -csv results/roundtrip.csv
+
+**Six prose cases, one word to a paragraph, come back exactly.** Two runs
+agree at 61.6x and 62.6x real time over 51.6 s of audio. Each request is
+timed from the last byte written to the first byte read, which is the closest
+a client gets to "what the model cost" — and it is within a millisecond of
+what the handlers log for `Speak` and `Transcribe` themselves (221 against
+222, 73 against 74), so **neither endpoint has protocol left in it**: HTTP,
+JSON, multipart and the WAV container together are 0.2% of the loop.
+
+| | total | ms/s of audio | share |
+|---|---|---|---|
+| speech, server | 530 ms | 10.3 | **63.2%** |
+| transcribe, server | 236 ms | 4.6 | 28.1% |
+| resample, client | 70 ms | 1.4 | 8.4% |
+| http and encoding | 2 ms | 0.0 | 0.2% |
+
+The per-case rows are what the totals hide, and they point in opposite
+directions:
+
+    ms per second of audio     1.35s   3.25s   5.05s   8.80s  13.60s  19.52s
+    speech, server              10.8     8.8     8.3     9.1    10.6    11.3
+    transcribe, server          11.5     6.6     5.8     4.4     4.1     3.9
+    resample, client             1.3     1.5     1.3     1.5     1.3     1.3
+
+**Parakeet amortises and kokoro does not.** Transcription's fixed 11 ms falls
+away as the clip lengthens and it ends at 257x real time; synthesis bottoms
+out at 8.3 ms/s around five seconds and then **gets 36% worse per second of
+audio** by nineteen. A least-squares fit says the same thing in one line: the
+speech leg's intercept is *negative* (-10.7 ms, 11.5 ms/s, r²=0.99), which is
+a curve and not a line.
+
+`cmd/tts -gpu -frames 1000` localises it. The same two utterances, 50 tokens
+and 321:
+
+    stage        3.25 s   19.52 s   growth
+    bert            4ms      75ms     18.8x     ← 6.4x the tokens
+    phoneme side    8ms      96ms     12.0x
+    generator      12ms      64ms      5.3x
+    tail            8ms      59ms      7.4x
+    vocoder        21ms     128ms      6.1x
+    total          29ms     225ms      7.8x
+
+The vocoder scales with its frames, as it has to. **PL-BERT does not** — 6.4x
+the tokens for 18.8x the time — so T6a's 46.6x was measured at the one length
+where the phoneme side was cheap, and at paragraph length the phoneme side is
+**43% of an utterance rather than 26%**. That is where the next millisecond
+on this vertical is, and it displaces "What is left after T7": the excitation
+is 1 ms of a 225 ms utterance.
+
+### It is the attention, and the kernel says so itself
+
+`TestGPUAlbertScaling` profiles one ALBERT layer per dispatch over six
+sequence lengths. Microseconds a layer, on GPU timestamps:
+
+    us a layer           50      100      200      321      410      510
+    q / k / v            34/14/9  11/11/11 13/13/13 17/17/17 18/18/18 22/22/21
+    attention            44      313     1786     5385     9844    16029
+    dense                 9       10       13       17       18       22
+    ffn                  14       17       23       34       41       60
+    ffn out              22       23       31       39       42       47
+    layer               164      412     1915     5560    10039    16266
+    12 layers, ms       2.0      4.9     23.0     66.7    120.5    195.2
+
+Every projection is **flat per token** — 17 us at 321 against 14 at 50, which
+is a GEMM doing T times one row of work — so the tile is not the problem and
+the ladder needs nothing. Attention is **0.87 us a token at 50 and 31.43 at
+510**: 364x the time for 10.2x the sequence, which is O(T^2.5) rather than the
+O(T²) the arithmetic asks for. It goes from **27% of a layer to 98.5%**.
+
+`shaders/kokoro_bert_attn.comp` documents the decision that became wrong:
+
+> It is deliberately scalar rather than a matrix-core flash kernel, and the
+> arithmetic says why: twelve heads over fifty tokens at a head width of 64 is
+> **7.7 MFLOP a layer** … A WMMA attention would spend most of its tiles on
+> padding — a 50-token sequence is four 16-wide tiles with 14 rows of nothing.
+
+That is sound at fifty tokens and false at three hundred. The extra half-power
+above quadratic is in the kernel's shape rather than its work: one workgroup
+per (head, query), and its weighted sum runs `if (t < hd)` — **64 of 256 lanes
+busy, walking every key serially** — while the score loop re-reads the query
+row from global memory once per key. The model's own ceiling is 510 phonemes
+(the voice packs have 510 style rows), and there PL-BERT alone is **195 ms**.
+
+So, in order of what it would buy a round trip:
+
+1. ~~**PL-BERT's attention.**~~ **Done, T10** — 64.6 ms of a 225 ms paragraph
+   and 195 ms at the model's ceiling, against 9.6 GFLOP that stage 3c's
+   matrix-core kernel does in microseconds. It was a build of two existing
+   shaders at `-DHEAD_DIM=64`, and the gate was not the tensor bound but
+   `TestGPUAlbertDurations`: durations are integers and did not move.
+2. **The host embedding stack, now that the attention is gone.** `bert` is 12
+   ms of the paragraph and only **2.5 of it is on the device** —
+   `GPUAlbert.Apply` says the embeddings are "a table lookup, two adds and a
+   128->768 projection over fifty rows, and none of that is worth a dispatch",
+   which is the same sentence the attention kernel had and stale for the same
+   reason. At 321 rows it is 79% of what PL-BERT costs.
+3. **The phoneme side's other 21 ms** — the six recurrences are one dispatch
+   a timestep (T6c), and a timestep is a phoneme.
+4. **A 16 kHz path out of the vocoder.** The client resample is 9.7% of the
+   loop and pure waste in a pipeline whose consumer is a 16 kHz model: it is
+   thirty times what HTTP costs. `audio.Resample` is the filter; the question
+   is whether the iSTFT head can be asked for the lower rate directly.
+5. **Nothing on parakeet.** S10's front end is 48% of *its* pipeline and
+   still only 33% of the loop, and it is the leg that already amortises.
+
+**What T10 did not touch is a short utterance**, and it was never going to.
+At fifty tokens PL-BERT is 2 ms of a 29 ms utterance, so "Hello." is 31 ms
+before and after. The 1.4x is on a paragraph, the 56x is on a layer at the
+ceiling, and what is actually gone is a term that got worse the longer anyone
+dictated.
+
+What the benchmark will not do is rule on **text normalisation**, and
+`-stress` is why: kokoro says "one thousand and twenty four" for 1,024 and
+parakeet writes `1,024` back, which is two correct components disagreeing
+about spelling. Those three cases are measured and never counted as failures.
+
+## T10 — PL-BERT's attention on the matrix cores, done
+
+R1 said synthesis got 36% worse per second of audio as an utterance
+lengthened, and `TestGPUAlbertScaling` said all of it was one dispatch. The
+fix is not a new kernel. `shaders/dit_attention_wmma.comp` is stage 3c's
+flash attention and already carries `HEAD_DIM` as a compile-time define, so
+ALBERT's 768-over-12 head width is a *build* of it — `-DHEAD_DIM=64
+-DQT=1 -DKTIL=4 -DWAVE=32`, with `CAUSAL`, `GQA`, `REL_BIAS` and `OUT_F16`
+all zero — plus the same build of `dit_pack_f16.comp` to lay q, k and v out as
+16x16 fp16 fragment tiles. Two `//go:generate` lines and no new GLSL.
+
+Microseconds per ALBERT layer, per dispatch, on GPU timestamps:
+
+    us a layer          50      100      200      321      410      510
+    scalar attention    43      320     1774     5394    10052    15976
+    wmma attention       3        6       11       25       29       38
+    + three packs        6        6        7       10       12       15
+    scalar, layer      161      420     1903     5569    10247    16218
+    wmma, layer         81      105      148      206      231      288
+    speedup, layer    2.00x    4.01x   12.88x   27.03x   44.44x   56.27x
+
+    PL-BERT, 12 layers, ms
+    scalar             1.9      5.0     22.8     66.8    123.0    194.6
+    wmma               1.0      1.3      1.8      2.5      2.8      3.5
+
+**The kernel that was quadratic now amortises.** Attention was 0.87 us a token
+at fifty and 31.33 at five hundred and ten — 36x the cost per token for 10.2x
+the sequence. On the matrix cores it is **0.19 us a token at fifty and 0.10 at
+510**, packs included: it gets *cheaper* per token, because a flash kernel's
+per-query-tile cost is fixed and the tile is 16 rows whether the utterance
+fills it or not. That is also why there is no crossover and no fallback — at
+the reference fifty tokens, where the tiles are mostly padding and the three
+packs buy nothing, it is still 2.0x faster a layer.
+
+What it cost: 2.4 MB of fp16 arena for three per-head plane sets at the 512
+ceiling, and three pack dispatches a layer at 3-5 us each. `ScalarAttn` keeps
+the old kernel as the oracle.
+
+### The numerics did not move, and that is the whole gate
+
+fp16 operands with fp32 accumulators is what the matrix cores implement, so
+the scores are the exposure. They are also bounded: the running max is folded
+in before every exponential and P is at most 1 by construction.
+
+The measurements, none of which changed from the scalar path:
+
+| | |
+|---|---|
+| Layer by layer against the CPU reference | **4.2e-4** at layer 0 to **2.4e-3** at layer 11, bound 6e-3 |
+| The whole encoder, `Apply` | **2.4e-3** — the same figure the scalar kernel gave |
+| **Durations** | **0 of 50 differ**; largest unrounded drift **0.0048 frames** |
+| The F0 curve the durations feed | 2.6e-4 |
+
+The durations are the one that matters and the reason this stage was safe to
+do: they are a sum of sigmoids rounded to integers, they decide the length of
+every phoneme, and a single flipped rounding shifts the whole waveform after
+it — so no sample-wise comparison downstream would mean anything. 60 kokoro
+tests pass, including T3's reference waveform.
+
+### End to end
+
+    "Speech synthesis and speech recognition are ..." (319 phonemes, 19.525 s)
+
+    stage           T9      T10
+    bert            75ms    12ms     2.5 ms of it on the device
+    phonemes        96ms    33ms     43% of an utterance -> 20%
+    generator       64ms    66ms
+    tail            59ms    57ms
+    vocoder        128ms   129ms     57% -> 80%
+    total          225ms   162ms     86.9x -> 120.5x real time
+
+The vocoder is the majority again, which is where T4 left it and where a
+fixed-cost-per-frame stage belongs. And the round trip, two runs each:
+
+| | T9 | T10 |
+|---|---|---|
+| The loop over 51.6 s of audio | 61.6x / 62.6x | **70.1x / 70.1x** |
+| Speech leg, ms per second of audio | 10.3 | **8.2** |
+| … at 19.5 s specifically | 11.3 | **8.1** |
+| Fit against audio length | -10.5 ms + 11.5 ms/s | **+2.7 ms + 7.9 ms/s** |
+
+A negative intercept is a curve pretending to be a line. The intercept is now
+positive and small, the slope is flat from five seconds to nineteen, and
+`r²` is 0.999 — which is the actual result of this stage: not the 1.4x, but
+that there is no longer a length at which synthesis gets worse.

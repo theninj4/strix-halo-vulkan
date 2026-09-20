@@ -54,17 +54,45 @@ type GPUAlbert struct {
 	pipes                  map[string]*vk.ComputePipeline
 	gemm                   *vk.ComputePipeline
 
+	// ScalarAttn runs shaders/kokoro_bert_attn.comp instead of the
+	// matrix-core pair. It is the oracle the WMMA path was debugged against
+	// and what TestGPUAlbertScaling measures the port against; it is not a
+	// fallback for short utterances, because there is no length at which it
+	// wins. At the reference fifty tokens -- where the tiles are mostly
+	// padding and the three packs are pure overhead -- it is still 2.0x
+	// slower a layer, and at the model's 510-phoneme ceiling 56x (T10).
+	// Set before Apply; the graph reads it per run.
+	ScalarAttn bool
+
 	// Arena offsets, fp32.
 	aX, aQ, aK, aV     uint32
 	aCtx, aTmp, aAttn  uint32
 	aFFN               uint32
 	hA, hB             uint32
+	hQ, hK, hV         uint32 // q, k and v as 16x16 fp16 fragment tiles
 	actElems, hElems   int
 	wAttnG, wAttnB     uint32 // the two LayerNorm affines
 	wOutG, wOutB       uint32
 	bQ, bK, bV, bDense uint32 // fragment-tiled projections, biases included
 	bFFN, bFFNOut      uint32
 }
+
+// The matrix-core attention's two compile-time facts, which the host has to
+// match or the addressing is silently wrong.
+//
+// bertAttnHeadDim is -DHEAD_DIM: 768 over 12 heads. bertAttnQueryBlock is
+// QT*16, the query rows one workgroup owns, and bertTokenAlign is what a
+// sequence is padded to for the planes -- the key block is KTIL*16 = 64, and
+// 128 covers that and every other variant of the kernel, which is what
+// zimage/dit pads to for the same reason.
+const (
+	bertAttnHeadDim    = 64
+	bertAttnQueryBlock = 16
+	bertTokenAlign     = 128
+	// log2e is folded into q by the pack so the kernel's softmax is exp2,
+	// which is one instruction on this ISA.
+	log2e = 1.4426950408889634
+)
 
 // bertVariant is the GEMM rung the projections run on.
 //
@@ -86,6 +114,14 @@ func NewGPUAlbert(dev *vk.Device, a *ALBERT, maxTokens int) (*GPUAlbert, error) 
 	}
 	if a.Layer == nil {
 		return nil, fmt.Errorf("kokoro: albert has no layer group")
+	}
+	// The matrix-core attention has its head width compiled in, and a
+	// mismatch would not fail -- it would read the wrong columns of q and
+	// produce a plausible tensor. So it is checked here, once, against the
+	// checkpoint's own config.
+	if a.Config.HeadDim() != bertAttnHeadDim {
+		return nil, fmt.Errorf("kokoro: albert head width is %d, shaders are built for %d",
+			a.Config.HeadDim(), bertAttnHeadDim)
 	}
 	g := &GPUAlbert{
 		dev: dev, cfg: a.Config, maxTok: maxTokens,
@@ -131,6 +167,13 @@ func (g *GPUAlbert) alloc() error {
 	takeH := func(n int) uint32 { o := offH; offH += uint32(n); return o }
 	g.hA = takeH(rows * g.ldHidden)
 	g.hB = takeH(rows * g.ldFFN)
+	// One fragment-tile plane per head for each of q, k and v. Sized for the
+	// padded ceiling, so a shorter utterance uses a prefix of every plane and
+	// the stride it is addressed at is its own tokPad rather than this one.
+	planes := roundUp(g.maxTok, bertTokenAlign) * g.cfg.NumAttentionHeads * bertAttnHeadDim
+	g.hQ = takeH(planes)
+	g.hK = takeH(planes)
+	g.hV = takeH(planes)
 	g.hElems = int(offH)
 
 	// fp32 weights: two LayerNorm affines and six biases.
@@ -180,6 +223,7 @@ func (g *GPUAlbert) build() error {
 		{"narrow", shaders.KokoroDNarrow},
 		{"gelu", shaders.KokoroGELU},
 		{"attn", shaders.KokoroBertAttn},
+		{"pack", shaders.KokoroBertPackHD64},
 		{"residual", shaders.ParakeetResidual},
 		{"layernorm", shaders.ParakeetLayerNorm},
 	} {
@@ -210,6 +254,19 @@ func (g *GPUAlbert) build() error {
 	g.mods = append(g.mods, mod)
 	if g.gemm, err = g.dev.NewPipeline(mod, s); err != nil {
 		return fmt.Errorf("kokoro: pipeline %s: %w", bertVariant.name, err)
+	}
+	// The matrix-core attention, on the same pinned wave. It shares the GEMM's
+	// spec because it has the same requirement and for the same reason: the
+	// kernel is one wave per workgroup by construction, so a driver that
+	// packed two into a 64-wide subgroup would have them share the LDS the
+	// softmax bookkeeping lives in.
+	amod, err := g.dev.NewShaderModule(shaders.KokoroBertAttnWMMAHD64W32)
+	if err != nil {
+		return fmt.Errorf("kokoro: shader bert attention (wmma): %w", err)
+	}
+	g.mods = append(g.mods, amod)
+	if g.pipes["attnwmma"], err = g.dev.NewPipeline(amod, s); err != nil {
+		return fmt.Errorf("kokoro: pipeline bert attention (wmma): %w", err)
 	}
 	return nil
 }
@@ -296,6 +353,12 @@ func (g *GPUAlbert) graph() ([]vk.MultiDispatch, []string) {
 	t := uint32(g.tokens)
 	m := uint32(roundUp(g.tokens, bertVariant.bm))
 
+	// The fragment-tile planes' stride, derived here rather than held as a
+	// field: the pack and the attention address the planes as
+	// `head * tokPad * headDim`, so the two have to agree, and the only way
+	// they cannot disagree is if neither of them is told.
+	tokPad := roundUp(g.tokens, bertTokenAlign)
+
 	var dis []vk.MultiDispatch
 	var kinds []string
 	add := func(pipe *vk.ComputePipeline, kind string, gx, gy uint32, pc pushConstants) {
@@ -327,13 +390,55 @@ func (g *GPUAlbert) graph() ([]vk.MultiDispatch, []string) {
 	gemm("q", g.hA, g.ldHidden, g.bQ, g.aQ, int(d), int(d))
 	gemm("k", g.hA, g.ldHidden, g.bK, g.aK, int(d), int(d))
 	gemm("v", g.hA, g.ldHidden, g.bV, g.aV, int(d), int(d))
-	pcAttn := pushConstants{
-		InOff: g.aQ, KOff: g.aK, VOff: g.aV, OutOff: g.aCtx,
-		Tokens: t, Dim: d, Heads: uint32(g.cfg.NumAttentionHeads),
-		HeadDim: uint32(g.cfg.HeadDim()),
-		Scale:   math.Float32bits(float32(1 / math.Sqrt(float64(g.cfg.HeadDim())))),
+	heads := uint32(g.cfg.NumAttentionHeads)
+	scale := float32(1 / math.Sqrt(float64(g.cfg.HeadDim())))
+	if g.ScalarAttn {
+		pcAttn := pushConstants{
+			InOff: g.aQ, KOff: g.aK, VOff: g.aV, OutOff: g.aCtx,
+			Tokens: t, Dim: d, Heads: heads,
+			HeadDim: uint32(g.cfg.HeadDim()),
+			Scale:   math.Float32bits(scale),
+		}
+		add(g.pipes["attn"], "attention", heads, t, pcAttn)
+	} else {
+		// Three packs and the kernel. Each pack turns one fp32 [T, 768]
+		// tensor into 12 per-head planes of 16x16 fp16 fragment tiles, which
+		// is the layout a coopMatLoad reads with full coverage --
+		// dit_pack_f16.comp is where the 1.56x-against-an-order-of-magnitude
+		// measurement that justifies the pass lives.
+		//
+		// The grid covers tokPad rather than t: the kernel's key block is 64
+		// rows, so it reads whole tiles past the sequence, and a pad tile has
+		// to hold a finite zero rather than whatever the last utterance left
+		// there.
+		pad := uint32(tokPad)
+		for _, s := range []struct {
+			kind     string
+			src, dst uint32
+			mode     uint32
+			scale    float32
+		}{
+			// q carries the softmax scale and log2(e); v is packed
+			// transposed, because p.v reduces over the token axis.
+			{"pack q", g.aQ, g.hQ, 0, scale * float32(log2e)},
+			{"pack k", g.aK, g.hK, 0, 1},
+			{"pack v", g.aV, g.hV, 1, 1},
+		} {
+			add(g.pipes["pack"], s.kind, groups(tokPad, coopMatTile), heads,
+				pushConstants{
+					InOff: s.src, OutOff: s.dst,
+					Tokens: t, Dim: d,
+					Aux0: s.mode, Aux1: pad,
+					Scale: math.Float32bits(s.scale),
+				})
+		}
+		add(g.pipes["attnwmma"], "attention",
+			groups(g.tokens, bertAttnQueryBlock), heads,
+			pushConstants{
+				InOff: g.hQ, KOff: g.hK, VOff: g.hV, OutOff: g.aCtx,
+				Tokens: t, Dim: d, Heads: heads, Aux1: pad,
+			})
 	}
-	add(g.pipes["attn"], "attention", uint32(g.cfg.NumAttentionHeads), t, pcAttn)
 	narrow("narrow ctx", g.aCtx, int(d), g.ldHidden, g.hA)
 	gemm("dense", g.hA, g.ldHidden, g.bDense, g.aTmp, int(d), int(d))
 	add(g.pipes["residual"], "residual attn", t, 1, pushConstants{

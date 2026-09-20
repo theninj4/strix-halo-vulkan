@@ -1913,12 +1913,46 @@ var KokoroSrcSTFT []byte
 // 1e-12 norm needs), and the residual adds are parakeet's. What is new is the
 // attention, which at 7.7 MFLOP a layer is not worth a matrix-core kernel,
 // and the feed-forward's activation.
+//
+// **The attention clause was true at fifty tokens and false at three hundred**
+// (SPEECH.md R1). 7.7 MFLOP a layer is the arithmetic of the *reference*
+// utterance, and the arithmetic is quadratic in the sequence while the
+// projections are linear: at 510 phonemes -- the model's own ceiling, since a
+// voice pack has 510 style rows -- the scalar kernel is 98.5% of an ALBERT
+// layer and PL-BERT is 195 ms. So the two matrix-core kernels below are the
+// same two the DiT, the text encoder and the conformer all use, at this
+// model's head width.
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o kokoro_bert_attn.spv kokoro_bert_attn.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DNPOT=1 -DNO_AFFINE=1 -DGELU=1 -o kokoro_gelu.spv kokoro_act.comp
 
 //go:embed kokoro_bert_attn.spv
 var KokoroBertAttn []byte
+
+// PL-BERT's attention on the matrix cores, and the pack that feeds it.
+//
+// Both are the existing sources at -DHEAD_DIM=64, which is the only thing
+// about ALBERT that differs from the three attentions already on this kernel:
+// 768 wide over 12 heads is a head width of 64 rather than 128, and 64 is two
+// 16x16 fragment tiles per token rather than four. Everything else is a build
+// this repository has: bidirectional (CAUSAL=0), one kv head per query head
+// (GQA=0), no relative-position term (REL_BIAS=0) and an fp32 context out
+// (OUT_F16=0, because the output projection's A operand is narrowed by the
+// pass that already follows it).
+//
+// QT=1, KTIL=4 at wave32 is stage 3c's winner and is not re-ablated here: the
+// ladder's finding was that arithmetic intensity is inert for attention and
+// the register file decides, and halving HEAD_DIM halves the live
+// accumulators, so the winner cannot have moved *down* the ladder.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -o kokoro_bert_pack_hd64.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DHEAD_DIM=64 -o kokoro_bert_attn_wmma_hd64_w32.spv dit_attention_wmma.comp
+
+//go:embed kokoro_bert_pack_hd64.spv
+var KokoroBertPackHD64 []byte
+
+//go:embed kokoro_bert_attn_wmma_hd64_w32.spv
+var KokoroBertAttnWMMAHD64W32 []byte
 
 //go:embed kokoro_gelu.spv
 var KokoroGELU []byte

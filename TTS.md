@@ -10,14 +10,17 @@
 no Python on the path and every stage validated against a reference dump
 before it was optimised.
 
-**Status (2026-09-19, T9)**: **done and serving.** `go run ./cmd/tts -gpu -text
-'Hello there.'` speaks; `POST /v1/audio/speech` answers in **59 ms for 6.45 s
-of audio**. An utterance is **31 ms for 3.25 s — 105x real time**, from
-3848 ms on the CPU reference. Every stage of the model runs on the device: T7
-closed the last stage that was still on the host, T8 the last missing feature
-(a voice may name a mixture of packs), and T9 the last place where the
-*server* cost more than the model — it staged the arenas per request, which
-was 499 ms of protocol around 48 ms of arithmetic.
+**Status (2026-09-20, T10)**: **done and serving, and it now costs the same
+per second of audio at any length.** `go run ./cmd/tts -gpu -text 'Hello
+there.'` speaks; `POST /v1/audio/speech` answers in **59 ms for 6.45 s of
+audio**. An utterance is **31 ms for 3.25 s — 105x real time**, from 3848 ms
+on the CPU reference, and a nineteen-second one is **162 ms — 120x**. Every
+stage of the model runs on the device: T7 closed the last stage that was still
+on the host, T8 the last missing feature (a voice may name a mixture of
+packs), T9 the last place where the *server* cost more than the model, and
+**T10 the last place where the model's cost depended on how much you said** —
+PL-BERT's attention was a scalar kernel sized for fifty tokens and is now
+stage 3c's matrix-core one, 56x faster a layer at the model's ceiling.
 
     "The quick brown fox jumps over the lazy dog." (af_heart)
     48 phonemes -> 50 tokens -> 130 frames -> 78000 samples = 3.250 s
@@ -35,6 +38,20 @@ was 499 ms of protocol around 48 ms of arithmetic.
     tail            8ms       22ms
     vocoder        22ms     3626ms   73% of the utterance
     total          31ms     3848ms   105x real time
+
+A short utterance is not where the work is any more, because the short one is
+the length every stage was tuned at. The same table at a paragraph — 319
+phonemes, 19.525 s — is what T10 moved, and it is the one to read when
+changing anything here:
+
+    stage           T9      T10
+    bert            75ms    12ms    2.5 ms of it on the device; the rest is
+                                    the host embedding stack
+    phonemes        96ms    33ms    43% of an utterance -> 20%
+    generator       64ms    66ms
+    tail            59ms    57ms
+    vocoder        128ms   129ms    57% -> 80%
+    total          225ms   162ms    86.9x -> 120.5x real time
 
 ## The stages
 
@@ -55,6 +72,7 @@ was 499 ms of protocol around 48 ms of arithmetic.
 | T7 | The excitation and its transform on Vulkan | **done** — 14 ms → 0.2 ms, [write-up](SPEECH.md#t7--the-excitation-done) |
 | T8 | Voice blending | **done** — upstream's spelling, checked against `load_voice` at every row |
 | T9 | One staging for the life of the server | **done** — the endpoint 550 ms → 59, the same bytes, [write-up](SPEECH.md#t9--one-staging-for-the-life-of-the-server-done) |
+| T10 | PL-BERT's attention on the matrix cores | **done** — a layer **56x** at 510 tokens, an utterance 225 ms → **162**, no duration moved, [write-up](SPEECH.md#t10--pl-berts-attention-on-the-matrix-cores-done) |
 
 ## What exists
 
@@ -64,7 +82,8 @@ was 499 ms of protocol around 48 ms of arithmetic.
 arena: `adainset.go` (`blockSet`, the `AdainResBlk1d` every stack reuses),
 `gpu.go` (a generator upsampling stage, and the tail), `gpudec.go` (the five
 decoder AdaIN blocks), `gpuprosody.go` (the F0/N stacks, 62 dispatches in one
-submit), `gpubert.go` (PL-BERT), `gpulstm.go` (one bidirectional recurrence,
+submit), `gpubert.go` (PL-BERT, with stage 3c's matrix-core attention at
+`HEAD_DIM=64` since T10), `gpulstm.go` (one bidirectional recurrence,
 one dispatch a timestep), `gpuphonemes.go` (the whole phoneme side, two
 submits and two readbacks) and `gpusource.go` (the excitation and its forward
 transform, two dispatches over the only arena here that is HOST_CACHED).
