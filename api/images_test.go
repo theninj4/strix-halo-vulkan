@@ -348,21 +348,19 @@ func TestImageGenerationBackendErrors(t *testing.T) {
 	}
 }
 
-// /v1/images/edits on a server whose VAE encoder is not resident. Until I7
-// it is a 501 that names no flag again, and for a better reason than the
-// first time: under Z-Image an edit was SDEdit over a VAE encoder that
-// `-edits` made resident, and under Qwen-Image-2.1 it is a conditional
-// generation over a vision tower that is not ported. A residency flag cannot
-// fix a missing port, so the message names the stage instead.
-func TestImageEditNeedsTheEncoder(t *testing.T) {
+// /v1/images/edits on a server that was not started for editing. It is a 501
+// naming the flag, because under Qwen-Image-2.1 editing is residency: the
+// 27-layer vision tower and the VAE's encoder are staged or they are not, and
+// each reference image costs prefix KV cache besides. A client that gets this
+// knows exactly what to change.
+func TestImageEditNeedsTheFlag(t *testing.T) {
 	s := &Server{Image: &fakeImage{}}
 	rec := do(t, s, jsonRequest("POST", "/v1/images/edits", ImageEditRequest{Prompt: "p"}))
 	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "Q8") || !strings.Contains(body, "no flag") {
-		t.Errorf("body %s, want it to name the stage and say no flag enables it", rec.Body)
+	if !strings.Contains(rec.Body.String(), "-edits") {
+		t.Errorf("body %s, want it to name the flag", rec.Body)
 	}
 }
 
@@ -435,7 +433,7 @@ func editGeo() ImageGeometry {
 	return ImageGeometry{
 		Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
 		Multiple: 16, Steps: 8, Previews: true, MaxPartials: 3,
-		Edits: true, DefaultStrength: 0.8,
+		Edits: true, MaxRefs: 3,
 	}
 }
 
@@ -469,13 +467,14 @@ func edit(t *testing.T, s *Server, body any) (*httptest.ResponseRecorder, ImageG
 }
 
 // TestImageEditPassesThePicture is the whole of what this endpoint owns: the
-// base64 becomes an image.Image, the strength reaches the backend, and the
-// geometry defaults to the picture's own shape rather than to the server's.
+// base64 becomes an image.Image at the size it was sent, several of them
+// arrive in order, and a request that named no size leaves the geometry to
+// the backend rather than inventing one.
 func TestImageEditPassesThePicture(t *testing.T) {
 	fake := &fakeImage{geo: editGeo()}
 	s := &Server{Image: fake}
 	rec, got := edit(t, s, ImageEditRequest{
-		Prompt: "at night", Image: StringList{pngOf(t, 640, 480)}, Strength: 0.5,
+		Prompt: "at night", Image: StringList{pngOf(t, 640, 480), pngOf(t, 128, 256)},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
@@ -484,36 +483,45 @@ func TestImageEditPassesThePicture(t *testing.T) {
 		t.Fatalf("%d backend calls", len(fake.reqs))
 	}
 	req := fake.reqs[0]
-	if req.Init == nil {
-		t.Fatal("the backend was given no init image; this is a generation, not an edit")
+	if len(req.Init) != 2 {
+		t.Fatalf("the backend was given %d reference images, want 2", len(req.Init))
 	}
-	if b := req.Init.Bounds(); b.Dx() != 640 || b.Dy() != 480 {
+	if b := req.Init[0].Bounds(); b.Dx() != 640 || b.Dy() != 480 {
 		t.Errorf("the backend got a %dx%d picture, want the 640x480 that was sent -- "+
 			"resizing is the backend's, so the handler must not have done it", b.Dx(), b.Dy())
 	}
-	if req.Strength != 0.5 {
-		t.Errorf("strength %g reached the backend, want 0.5", req.Strength)
+	if b := req.Init[1].Bounds(); b.Dx() != 128 || b.Dy() != 256 {
+		t.Errorf("the second reference arrived %dx%d, want 128x256 -- the order is the client's",
+			b.Dx(), b.Dy())
 	}
-	// 640x480 inside a 1024x1024 ceiling is not scaled up, and both sides
-	// round down to a multiple of 16: 640x480 exactly.
-	if req.Width != 640 || req.Height != 480 {
-		t.Errorf("rendering at %dx%d; an edit that named no size gets the picture's own shape",
+	// An edit that named no size leaves it at zero for the backend, which
+	// resolves it from the *last* reference image's aspect ratio at the
+	// model's condition area — arithmetic the handler cannot do, because the
+	// condition area is the backend's.
+	if req.Width != 0 || req.Height != 0 {
+		t.Errorf("the handler resolved %dx%d; an edit that named no size leaves it to the backend",
 			req.Width, req.Height)
 	}
-	if got.Size != "640x480" {
-		t.Errorf("echoed size %q", got.Size)
+	// And the echoed size is the one that came *back*, not the one that went
+	// in — which is the only way a client learns what it got.
+	if got.Size != "1024x1024" {
+		t.Errorf("echoed size %q, want the backend's resolved 1024x1024", got.Size)
 	}
 }
 
-// TestImageEditSizeRules covers the three ways a geometry is arrived at, and
-// the one that has to shrink.
+// TestImageEditSizeRules covers the three ways an edit's geometry is arrived
+// at. Two of them are the generation endpoint's rules unchanged; the third is
+// not a rule here at all, and that is the point — under SDEdit the handler
+// fitted the input's own bounds into the ceiling, and under conditional
+// generation the size follows the *condition area*, which only the backend
+// knows.
 func TestImageEditSizeRules(t *testing.T) {
 	for _, c := range []struct {
 		name          string
 		req           ImageEditRequest
 		width, height int
 	}{
-		{"the picture's own shape", ImageEditRequest{}, 640, 480},
+		{"no size is left to the backend", ImageEditRequest{}, 0, 0},
 		{"an explicit size wins", ImageEditRequest{Size: "512x512"}, 512, 512},
 		{"an aspect ratio wins", ImageEditRequest{AspectRatio: "1:1"}, 1024, 1024},
 	} {
@@ -532,19 +540,14 @@ func TestImageEditSizeRules(t *testing.T) {
 		})
 	}
 
-	// A picture larger than the ceiling is shrunk into it, keeping its shape.
-	// The other direction is the interesting one and is covered above: a
-	// small picture is *not* enlarged, because that costs tokens to paint
-	// detail the input never had.
+	// A named size past the ceiling is still the generation endpoint's
+	// refusal, because that one *is* the handler's: it is checked against
+	// Geometry() and not against any picture.
 	fake := &fakeImage{geo: editGeo()}
 	s := &Server{Image: fake}
-	rec, _ := edit(t, s, ImageEditRequest{Prompt: "p", Image: StringList{pngOf(t, 4000, 2000)}})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", rec.Code, rec.Body)
-	}
-	if fake.reqs[0].Width != 1024 || fake.reqs[0].Height != 512 {
-		t.Errorf("a 4000x2000 picture rendered at %dx%d, want 1024x512",
-			fake.reqs[0].Width, fake.reqs[0].Height)
+	rec, _ := edit(t, s, ImageEditRequest{Prompt: "p", Image: StringList{pngOf(t, 64, 64)}, Size: "4096x4096"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d for a size past the ceiling, want 400: %s", rec.Code, rec.Body)
 	}
 }
 
@@ -561,13 +564,13 @@ func TestImageEditRefusals(t *testing.T) {
 	}{
 		{"no image", ImageEditRequest{Prompt: "p"}, 400, "image"},
 		{"no prompt", ImageEditRequest{Image: StringList{good}}, 400, "prompt"},
-		{"two images", ImageEditRequest{Prompt: "p", Image: StringList{good, good}}, 400, "one picture"},
+		{"more references than the server takes",
+			ImageEditRequest{Prompt: "p", Image: StringList{good, good, good, good}}, 400, "reference images"},
 		{"a mask", ImageEditRequest{Prompt: "p", Image: StringList{good}, Mask: good}, 501, "mask"},
 		{"not base64", ImageEditRequest{Prompt: "p", Image: StringList{"not base64!!"}}, 400, "base64"},
 		{"not an image", ImageEditRequest{Prompt: "p", Image: StringList{
 			base64.StdEncoding.EncodeToString([]byte("hello"))}}, 400, "png and jpeg"},
-		{"strength over 1", ImageEditRequest{Prompt: "p", Image: StringList{good}, Strength: 1.5}, 400, "strength"},
-		{"strength below 0", ImageEditRequest{Prompt: "p", Image: StringList{good}, Strength: -0.1}, 400, "strength"},
+		{"a strength", ImageEditRequest{Prompt: "p", Image: StringList{good}, Strength: 0.5}, 400, "strength"},
 		{"a url response", ImageEditRequest{Prompt: "p", Image: StringList{good}, ResponseFormat: "url"}, 400, "b64_json"},
 		{"n past the cap", ImageEditRequest{Prompt: "p", Image: StringList{good}, N: 9}, 400, "n is 9"},
 	} {
@@ -603,7 +606,7 @@ func TestImageEditMultipart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for k, v := range map[string]string{
-		"prompt": "at night", "strength": "0.25", "steps": "6", "seed": "1234",
+		"prompt": "at night", "steps": "6", "seed": "1234",
 		"output_format": "jpeg", "size": "256x256",
 	} {
 		if err := mw.WriteField(k, v); err != nil {
@@ -623,14 +626,14 @@ func TestImageEditMultipart(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 	got := fake.reqs[0]
-	if got.Init == nil {
-		t.Fatal("no init image came out of the multipart body")
+	if len(got.Init) != 1 {
+		t.Fatalf("%d reference images came out of the multipart body, want 1", len(got.Init))
 	}
-	if b := got.Init.Bounds(); b.Dx() != 320 || b.Dy() != 320 {
+	if b := got.Init[0].Bounds(); b.Dx() != 320 || b.Dy() != 320 {
 		t.Errorf("the picture arrived %dx%d, want 320x320", b.Dx(), b.Dy())
 	}
-	if got.Strength != 0.25 || got.Steps != 6 || got.Seed == nil || *got.Seed != 1234 {
-		t.Errorf("strength %g, steps %d, seed %v", got.Strength, got.Steps, got.Seed)
+	if got.Steps != 6 || got.Seed == nil || *got.Seed != 1234 {
+		t.Errorf("steps %d, seed %v", got.Steps, got.Seed)
 	}
 	if got.Width != 256 || got.Height != 256 {
 		t.Errorf("rendered %dx%d, want the 256x256 the form asked for", got.Width, got.Height)
@@ -663,7 +666,7 @@ func TestImageEditStreams(t *testing.T) {
 	if !strings.Contains(body, "event: "+eventImageDone) {
 		t.Error("no completion event")
 	}
-	if fake.reqs[0].Init == nil {
+	if len(fake.reqs[0].Init) == 0 {
 		t.Error("the streamed run was not given the picture")
 	}
 }

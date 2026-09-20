@@ -1,11 +1,11 @@
 # IMAGE — the Qwen-Image-2.1 vertical
 
-> **Rewritten through 2026-09-20 — Q0–Q7 are done for t2i and Q8 is built to
-> the pipeline's door: every stage of an edit now runs on the device**
-> (the vision tower, the edit text encoding, the VAE encoder and the DiT's
-> multi-image prefill), and what is left of the vertical's last capability is
-> composing them and answering `POST /v1/images/edits`. An edit's transformer
-> measures **110.7 s at 1024²** against a generation's 90.7.
+> **Rewritten through 2026-09-20 — Q0–Q8 are done, and the vertical's last
+> capability is served**: `POST /v1/images/edits` answers from
+> Qwen-Image-2.1 at **2m8s for a 1024² edit on one reference image**, 39.4 GB
+> resident, reproducing the reference edit at **max abs 0.0014** — 24x
+> tighter than the t2i path's own served number, because an edit's trajectory
+> is pinned by its prefix. Only percents (Q9) are left.
 >
 > **Q0–Q7, one day in** and
 > the model is *served*: `POST /v1/images/generations` answers from
@@ -13,9 +13,8 @@
 > with native RGBA and in-progress previews. On the CPU the port reproduces
 > diffusers' image to under a quarter of an 8-bit quantization step; on the
 > device the served fp16 path reproduces the fp32 oracle's own picture at
-> **mean 3.4e-4**. What remains for the vertical is Q8's last stage (the edit
-> pipeline and endpoint, Q8.6) and percents (Q9) — plus finishing the Z-Image
-> deletion, which Q6 owes and half did.
+> **mean 3.4e-4**. What remains for the vertical is percents (Q9) — plus
+> finishing the Z-Image deletion, which Q6 owes and half did.
 > This file is live again: the old root
 > `IMAGE.md` was frozen into
 > [`research/zimage-vertical.md`](research/zimage-vertical.md) at the 2026-09-20
@@ -48,7 +47,7 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q5g | VAE decoder on the GPU (`qimage/vae/gpu.go`) | **done 2026-09-20** — stagewise on the dump's own bounds; **1024² in 7.4 s**, 117 dispatches. Encoder stays CPU until Q8 needs it |
 | Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; Z-Image deletion still owed |
 | Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
-| Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **in progress** — the vision tower (≤1.1e-4), the edit text encoding (4.3e-4 / 4.8e-4 for one / two condition images), the **CPU edit pipeline end to end — the edited image at max abs 1.0e-5** — the Lanczos resampler (bit-exact), the **GPU VAE encoder (1024² in 1.7 s)**, the **GPU vision tower (1024² condition in 6.3 s)**, the **GPU edit text encoding (rel 0.059 / 0.064, fp16)** and the **GPU DiT edit path (110.7 s of transformer at 1024², gated at 3.1e-3)** are done, fourteen controls firing; the pipeline and the endpoint (Q8.6) are open |
+| Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
 | Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | open, deliberately last |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
@@ -196,6 +195,9 @@ for free.
   generation (bigger prefix), the `strength` knob disappears, and up to **10
   reference images** arrive (OpenAI's `image[]` array already allows several).
   `/v1/images/edits` keeps its shape; its documentation changes meaning.
+  **Measured, Q8.6**: 2m8s against a generation's 1m38s at 1024² with one
+  reference, `strength` is a 400 explaining the change, and how many
+  references a given server takes is `-edits N` and `max_reference_images`.
 - **RGBA is native.** The VAE emits 4 channels always; transparency is asked
   for in the prompt (the model card's recommended phrasing). Map OpenAI's
   `background: "transparent"` to that prompt prefix + PNG-with-alpha out;
@@ -254,11 +256,13 @@ for it. So, in order:
 | `zimage/vae` (model code, `tiny*`, both GPU paths) | **stayed past its replacement, deliberately** — `gpu_conv.go`'s matrix-core convolution is what Q9 wants and `TestGPUConvMatchesScalar` is the proof it works. It goes when Q9 has taken the packing helpers across, not before. |
 | `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`, `cmd/ditblock` | **deleted 2026-09-20 (Q6)** — `cmd/qimage` is the replacement driver. `cmd/vaebench`/`vaedecode`/`vaeprof` stay while `zimage/vae` does. |
 | `models/Z-Image-Turbo`, `models/taef1` (62 GB) | unreferenced since Q6 and still on disk. One `rm -rf` whenever the space is wanted; not deleted unasked. |
-| serving: `/v1/images/*`, streaming, geometry-under-a-ceiling | **survived, confirmed by Q6** — `api.ImageBackend`, the geometry split, the SSE envelope and `backend.partialSteps` all carried over untouched; the adapter re-wired to `qimage/pipeline` and the two endpoints that lost their mechanism (streaming, edits) refuse with the stage that owes them. One field was added: `background`. |
+| serving: `/v1/images/*`, streaming, geometry-under-a-ceiling | **survived, confirmed by Q6** — `api.ImageBackend`, the geometry split, the SSE envelope and `backend.partialSteps` all carried over untouched; the adapter re-wired to `qimage/pipeline` and the two endpoints that lost their mechanism (streaming, edits) refused with the stage that owed them until Q7 and Q8.6 closed both. Two fields were added and one removed: `background` and `max_reference_images` in, `default_strength` out, because 2.1 has no strength. |
 
-Two-machine deployment holds: image goes ~26 → **~36–40 GB resident**
-(weights 32.3 GB fp16 + activations), sharing a 128 GB box with speech + TTS +
-embeddings (~3 GB). Still no footprint quantisation.
+Two-machine deployment holds: image goes ~26 → **31.7 GB resident for
+generation alone and 39.4 GB with one 1024² reference image's editing**
+(Q8.6's measurement, inside the ~36–40 GB this file estimated before any of
+it was built), sharing a 128 GB box with speech + TTS + embeddings (~3 GB).
+Still no footprint quantisation.
 
 ## The stages
 
@@ -546,9 +550,10 @@ two-run numbers.
   per-pixel: it is 1/16 scale with no texture, upscaled by whatever displays
   it. What it carries is composition, colour and layout — at 512²/16 the
   first frame lands at **2.27 s against a 10.25 s image**.
-- **Q8 — edits. Started 2026-09-20; the reference, the vision tower, the
-  edit text encoding and the CPU pipeline are done, the GPU ports and the
-  endpoint are open.** The
+- **Q8 — edits. Done 2026-09-20**, in six sub-stages: the reference and the
+  vision tower, the edit text encoding, the CPU pipeline with its resampler
+  and GPU VAE encoder and GPU tower, the GPU edit text encoding, the GPU DiT
+  edit path, and the served pipeline with its endpoint. The
   stage is (a) VAE encoder serving reference latents, (b) the vision tower,
   (c) the multi-image template, mrope with real 3-D positions and deepstack
   injection, (d) the pipeline and the endpoint. `/v1/images/edits` drops
@@ -897,18 +902,69 @@ two-run numbers.
   **29x**. And t2i is untouched, re-measured the same hour: 1024²/40 at
   **prefill 2.29 s, cached mean 2.27 s, 1m30.7s total**.
 
-  **Still open in Q8**: the pipeline and the endpoint (Q8.6). What it owes,
-  in order: **a vision tower that is staged for a ceiling rather than for one
-  grid** (`vision.GPU` fixes gridH/gridW at construction and `Forward`
-  refuses anything else, while `CalcDimensions` gives a condition image's
-  grid from its aspect ratio — the VAE's GPU encoder already re-plans per
-  image and needs nothing); `Pipeline.Edit` composing the eight stages the
-  CPU gate already composes (Lanczos resize → 8-bit composite → tower →
-  edit text encoding → VAE encode → layout from the pad mask → DiT → decode);
-  the residency arithmetic for how many references a 128 GB box serves at
-  1024² (the DiT's activation arena is one storage buffer and grows with the
-  joint sequence, so the ceiling is a number like Q6's 1184², not a flag);
-  and `/v1/images/edits`, which today is a startup *error* naming this stage.
+  **Q8.6 — the edit pipeline and the endpoint. Done 2026-09-20**
+  (`qimage/pipeline/edit.go`'s `Pipeline.Edit`, `backend.Image`, and
+  `/v1/images/edits`). **A served edit at 1024² with one reference image is
+  2m7.6s / 2m7.9s at 39.4 GB resident** — against a generation's 1m38s, which
+  is the "slightly more expensive than a generation" this file predicted
+  before any of it was built. By stage: the reference's own encoding 7.8 s
+  (the vision tower 6.3, the VAE encoder 1.7), text encoding 0.73 s, prefill
+  5.49 s, 40 cached steps at 2.70 s, decode 7.5 s.
+  **The one thing that needed new infrastructure was the tower's sizing.**
+  `vision.GPU` fixed its patch grid at construction, and a served edit hands
+  it a different grid every request — `calculate_dimensions` fixes a
+  reference's *area* and lets its sides follow its aspect ratio. It is now
+  staged for a **patch budget** and takes the grid at `Forward`, which is the
+  same split the VAE's graphs already made; `TestGPUTower` runs two
+  differently-shaped cards through one staging and re-runs the first at
+  **rel 0** to catch state left behind. Everything else composed: the VAE's
+  GPU encoder already re-planned per image, and `Pipeline.Edit` is the eight
+  stages the CPU gate composes with the device's versions substituted.
+  **A second bound came out of the tower's sizing, and it is a finding.**
+  `fp16Tol` was 0.25, measured by `TestFP16Ladder` on the square card. Run on
+  the **wide** card the same ladder gives **0.297 / 0.438** — three times as
+  much from the same weights and the same code — and the device lands at
+  0.562 against that 0.438 prediction, the same agreement the square card
+  shows (0.127 against 0.14). That is the fp16 face of what Q8.2 measured in
+  fp32 (the dumped reference is itself 8.9e-4 from float64 on this card
+  against 1.0e-4 on the square one): **some pictures amplify rounding an
+  order of magnitude harder than others**, and a tower gated on one of them
+  would be wrong about the other. Each card is now gated at its own
+  measurement.
+  **Gate** (`TestServedEditOracle256`, the edit twin of Q6's
+  `TestServedOracle256`, both regimes): the whole request — the reference
+  resized by our Lanczos port, composited over white on the 8-bit levels,
+  through the GPU tower and the GPU VAE encoder, positioned by our mrope,
+  injected into the GPU text encoder, laid out from the pad mask, denoised
+  over a real prefix and decoded, only the noise the oracle's — reproduces
+  the reference edit at **max abs 0.0014, mean 1.7e-4**. That is **24x
+  tighter than the served t2i path's 0.0333**, for the reason Q8.3 found on
+  the CPU: an edit's trajectory is pinned by its prefix where a generation's
+  is free. Teacher-forced, the oracle's own latents decode at max abs
+  0.00000. Controls: a blank white reference lands **366x** further out
+  (measured against the run, not the bound), and two references on a
+  one-reference server and an edit with no reference are both refusals.
+  **The geometry needed one deviation from the reference, and it is named**
+  (`targetFor`, `TestTargetFor`): `calculate_dimensions` fixes the *area* and
+  lets the sides run, so at the shipped defaults — condition area and ceiling
+  both 1024² — a 4:3 reference asks for 1184x896, whose long side is outside
+  a 1024x1024 ceiling even though its area is not. Refusing would make every
+  non-square edit a 400 out of the box; enlarging the ceiling would be
+  residency nobody asked for. So the aspect ratio is kept and the area shrunk
+  until both sides fit, and a ceiling above the condition area leaves
+  diffusers' own answer untouched.
+  **The endpoint's shape changed with the mechanism**, which is what Q6 said
+  it would: `-edits` is now `-edits N` (residency — the tower and the VAE
+  encoder are 1.4 GB, and each reference is ~2.1 GB of prefix KV cache at
+  1024²), `image[]` is a real list, `strength` is a **400 that explains what
+  changed** rather than a silently ignored field, `max_reference_images`
+  joins the geometry in `GET /v1/models`, and an edit with no `size` follows
+  the last reference's aspect ratio at the condition area instead of the
+  server's default. Streaming needed no code: `partialSteps(0, …)` was
+  already parameterised for an edit that starts at 0, which under 2.1 every
+  edit does. Driven over HTTP end to end: a red mug becomes a blue mug on the
+  same table with the same grain and the same light, and the streamed form
+  sends two 32x32 partials and the finished 512².
 - **Q9 — percents.** Only after capabilities: the I3/I5/I8/I9 fusion lesson
   (elementwise passes absorbed into consumers) transfers to a new but
   same-shaped budget; attribute before optimising, same-hour controls, plans

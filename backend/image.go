@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
 	"math/rand"
 	"sync"
 
@@ -40,16 +42,26 @@ type ImageOptions struct {
 	Steps int
 	// MaxPrompt is the longest prompt the text encoder is built for.
 	MaxPrompt int
-	// Edits is the one capability this vertical had under Z-Image and does
-	// not have yet under Qwen-Image-2.1. It is kept as a field so that a
-	// server started with the old flag fails at startup with the stage that
-	// owes it, rather than silently serving without.
+	// Refs is how many reference images an edit may carry, and zero means
+	// this server does not answer /v1/images/edits at all.
+	//
+	// It is residency, which is why it is a number and not a bool. Editing
+	// stages two more models -- the 27-layer vision tower and the VAE's
+	// encoder, ~1.4 GB together -- and every reference then adds its latent
+	// rows to the transformer's prefix and its own share of the prefix KV
+	// cache, which at one 1024² reference is ~2.1 GB. Ten of them is the
+	// model's limit and a different machine's decision.
 	//
 	// There is no Preview field any more: previews were residency under
 	// Z-Image (taef1 was 1.0 GB of activation arena) and are 260 float32s
 	// here, so they are always on. A flag that cannot be turned off is not a
 	// flag.
-	Edits bool
+	Refs int
+	// CondSize is the square whose *area* every reference image is resized
+	// to before it is encoded, and the default output size of an edit that
+	// names none. It is diffusers' `output_resolution`; zero takes the
+	// model's own default of 1024.
+	CondSize int
 	// ID is the model id this backend answers to in /v1/models.
 	ID string
 }
@@ -101,20 +113,12 @@ func NewImage(opt ImageOptions) (*Image, error) {
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the image pipeline needs a device; there is no host path for it")
 	}
-	// The one capability Z-Image had and this model's port does not yet.
-	// Refused rather than ignored: a server told to edit would otherwise come
-	// up and answer every edit request with a 501.
-	if opt.Edits {
-		return nil, fmt.Errorf("backend: image editing is not ported to Qwen-Image-2.1 yet " +
-			"(IMAGE.md Q8: 2.1 edits by conditional generation over a vision tower, not by SDEdit, " +
-			"and the tower is unported); start without -edits")
-	}
-
 	b := &Image{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
 	err := opt.Device.Do(func(dev *vk.Device) error {
 		p, err := pipeline.New(dev, pipeline.Options{
 			Model: opt.Model, Width: opt.Width, Height: opt.Height,
 			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt,
+			Refs: opt.Refs, CondSize: opt.CondSize,
 		})
 		if err != nil {
 			return err
@@ -139,9 +143,9 @@ func (b *Image) Geometry() api.ImageGeometry {
 	mw, mh := b.pipe.MaxSize()
 	// Previews are unconditional -- the decoder is a constant matrix, not
 	// residency -- so unlike under Z-Image there is no flag for the two
-	// fields to disagree about. Edits stay false with DefaultStrength zero
-	// beside them, so a client reading a default strength cannot conclude it
-	// may send one.
+	// fields to disagree about. Edits report the *count* rather than a
+	// strength, because 2.1 has no strength: a client reads MaxRefs to know
+	// how many pictures it may send.
 	return api.ImageGeometry{
 		Width: w, Height: h,
 		MaxWidth: mw, MaxHeight: mh,
@@ -149,6 +153,8 @@ func (b *Image) Geometry() api.ImageGeometry {
 		Steps:       b.pipe.Steps(),
 		Previews:    true,
 		MaxPartials: maxPartialImages,
+		Edits:       b.pipe.Refs() > 0,
+		MaxRefs:     b.pipe.Refs(),
 	}
 }
 
@@ -157,6 +163,11 @@ func (b *Image) Geometry() api.ImageGeometry {
 func (b *Image) Residency() (encoder, transformer, vaeWeights, activations int) {
 	return b.pipe.Residency()
 }
+
+// EditResidency is what the edit half holds: the vision tower's and the VAE
+// encoder's weights, and the transformer's prefix KV cache. Zero when this
+// server does not edit.
+func (b *Image) EditResidency() (weights, cache int) { return b.pipe.EditResidency() }
 
 // Close releases the device residency.
 func (b *Image) Close() {
@@ -198,15 +209,9 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 		return nil, fmt.Errorf("the image pipeline is closed")
 	}
 
-	// The two request shapes this model does not yet answer. Both are the
-	// client's to avoid and both name the stage that owes them, which is the
-	// whole of what api.ErrUnsupported means.
-	if req.Init != nil {
-		return nil, fmt.Errorf("this server cannot edit images: Qwen-Image-2.1 edits by conditional "+
-			"generation over a vision tower, which is unported (IMAGE.md Q8): %w", api.ErrUnsupported)
-	}
-	if req.Strength != 0 {
-		return nil, fmt.Errorf("strength %g with no image to edit: %w", req.Strength, api.ErrUnsupported)
+	if len(req.Init) > 0 && b.pipe.Refs() == 0 {
+		return nil, fmt.Errorf("this server was not started for editing; restart it with -edits N: %w",
+			api.ErrUnsupported)
 	}
 
 	seed := int64(0)
@@ -222,11 +227,19 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 	// that is true by construction rather than by agreement, and it is also
 	// how the resolved size is read back for a request that named one side or
 	// neither.
-	_, latentH, latentW, err := b.pipe.LatentFor(req.Width, req.Height)
-	if err != nil {
-		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+	//
+	// An edit may name neither, and then the size is *not* the server's
+	// default: it is the last reference image's aspect ratio at the model's
+	// condition area, which only the pipeline can work out. So zero is
+	// passed through rather than resolved here.
+	width, height := 0, 0
+	if len(req.Init) == 0 || req.Width != 0 || req.Height != 0 {
+		_, latentH, latentW, err := b.pipe.LatentFor(req.Width, req.Height)
+		if err != nil {
+			return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+		}
+		width, height = latentW*pipeline.VAEScale, latentH*pipeline.VAEScale
 	}
-	width, height := latentW*pipeline.VAEScale, latentH*pipeline.VAEScale
 
 	prompt := req.Prompt
 	if req.Transparent {
@@ -279,8 +292,19 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 		img *zvae.Tensor
 		tm  *pipeline.Timings
 	)
+	refs, err := nrgbaRefs(req.Init)
+	if err != nil {
+		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+	}
 	err = b.opt.Device.Do(func(*vk.Device) error {
 		var err error
+		if len(refs) > 0 {
+			img, tm, err = b.pipe.Edit(pipeline.EditRequest{
+				Prompt: prompt, Images: refs, Width: width, Height: height,
+				Steps: req.Steps, Seed: seed, Progress: progress,
+			})
+			return err
+		}
 		img, tm, err = b.pipe.Run(pipeline.Request{
 			Prompt: prompt, Width: width, Height: height,
 			Steps: req.Steps, Seed: seed, Progress: progress,
@@ -323,8 +347,12 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 // up in an image, which is why it has a test of its own. It survived the
 // migration untouched: the policy did not change with the model.
 //
-// `first` is where the run starts. It is 0 for every generation; it is a
-// parameter because Q8's edits do not start at 0.
+// `first` is where the run starts, and under Qwen-Image-2.1 it is 0 for every
+// request: an edit conditions on its references rather than starting part-way
+// up the schedule, so there is no truncated run to offset. It stays a
+// parameter because it is the one thing that would change if a partially
+// renoised path ever came back, and because a constant argument at the two
+// call sites is cheaper to read than a comment explaining its absence.
 //
 // The last step is excluded, and that is the only judgement in here. Its
 // denoised estimate *is* the final latent -- the terminal sigma is the
@@ -353,4 +381,34 @@ func partialSteps(first, steps, n int) map[int]int {
 		idx++
 	}
 	return out
+}
+
+// nrgbaRefs converts the decoded reference images to the 8-bit NRGBA the
+// pipeline's resampler and compositor work in.
+//
+// It is a conversion and not a resize: the resize is the *model's*, exact to
+// the 8-bit level against Pillow's Lanczos (IMAGE.md Q8.3b), and doing any of
+// it here would be a second, worse one. `image.Decode` already hands back
+// NRGBA for a PNG with alpha, and this is a copy for everything else --
+// including the JPEG case, where the alpha it fills in is opaque, which is
+// what a JPEG means.
+func nrgbaRefs(in []image.Image) ([]*image.NRGBA, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]*image.NRGBA, len(in))
+	for i, src := range in {
+		b := src.Bounds()
+		if b.Dx() <= 0 || b.Dy() <= 0 {
+			return nil, fmt.Errorf("reference image %d is empty", i)
+		}
+		if n, ok := src.(*image.NRGBA); ok && n.Bounds().Min == (image.Point{}) {
+			out[i] = n
+			continue
+		}
+		dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(dst, dst.Bounds(), src, b.Min, draw.Src)
+		out[i] = dst
+	}
+	return out, nil
 }

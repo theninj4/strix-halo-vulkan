@@ -110,3 +110,46 @@ func mustNRGBA(t *testing.T, m *qwen.Mat, shape []int) *image.NRGBA {
 	}
 	return img
 }
+
+// TestTargetFor is the output geometry an edit that named no size gets. It is
+// pure arithmetic and needs no device, which is why it is here rather than in
+// the served gate: every non-square edit goes through it, and at the shipped
+// defaults `calculate_dimensions` alone produces sides past the ceiling.
+func TestTargetFor(t *testing.T) {
+	p := &Pipeline{condSize: 1024}
+	p.max = geom{width: 1024, height: 1024}
+	for _, c := range []struct {
+		name  string
+		ratio float64
+		w, h  int
+	}{
+		{"square", 1, 1024, 1024},
+		{"4:3 landscape", 4.0 / 3, 1024, 768},
+		{"3:4 portrait", 3.0 / 4, 768, 1024},
+		{"16:9", 16.0 / 9, 1024, 576},
+		{"a panorama", 4, 1024, 256},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w, h := p.targetFor(c.ratio)
+			if w > p.max.width || h > p.max.height {
+				t.Fatalf("%dx%d is outside the %dx%d ceiling", w, h, p.max.width, p.max.height)
+			}
+			if w%SizeMultiple != 0 || h%SizeMultiple != 0 {
+				t.Fatalf("%dx%d is not a multiple of %d", w, h, SizeMultiple)
+			}
+			if w != c.w || h != c.h {
+				t.Errorf("got %dx%d, want %dx%d", w, h, c.w, c.h)
+			}
+			t.Logf("ratio %.4f -> %dx%d (%.2f Mpx, aspect %.4f)",
+				c.ratio, w, h, float64(w*h)/1e6, float64(w)/float64(h))
+		})
+	}
+
+	// A ceiling above the condition area leaves diffusers' own answer alone,
+	// which is the case the fit must not disturb.
+	wide := &Pipeline{condSize: 1024}
+	wide.max = geom{width: 1184, height: 1184}
+	if w, h := wide.targetFor(4.0 / 3); w != 1184 || h != 896 {
+		t.Errorf("under a 1184 ceiling a 4:3 edit is %dx%d, want diffusers' own 1184x896", w, h)
+	}
+}

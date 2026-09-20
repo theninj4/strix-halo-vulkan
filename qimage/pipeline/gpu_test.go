@@ -74,9 +74,11 @@ func newPipeline(t *testing.T, dev *vk.Device, opt Options) *Pipeline {
 	}
 	t.Cleanup(p.Destroy)
 	enc, dt, vae, act := p.Residency()
-	t.Logf("staged in %v: text encoder %d MB, transformer %d MB, VAE %d MB, activations %d MB (%.1f GB total)",
-		time.Since(start).Round(time.Second), enc>>20, dt>>20, vae>>20, act>>20,
-		float64(enc+dt+vae+act)/(1<<30))
+	edit, cache := p.EditResidency()
+	t.Logf("staged in %v: text encoder %d MB, transformer %d MB, VAE %d MB, edit %d MB "+
+		"(cache %d MB), activations %d MB (%.1f GB total)",
+		time.Since(start).Round(time.Second), enc>>20, dt>>20, vae>>20, edit>>20, cache>>20,
+		act>>20, float64(enc+dt+vae+edit+act)/(1<<30))
 	return p
 }
 

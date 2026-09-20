@@ -10,6 +10,7 @@ import (
 	"strix-halo-vulkan/qimage/dit"
 	"strix-halo-vulkan/qimage/textenc"
 	qvae "strix-halo-vulkan/qimage/vae"
+	"strix-halo-vulkan/qimage/vision"
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
@@ -55,6 +56,19 @@ const (
 	// DefaultMaxPrompt is the text encoder's token ceiling. A t2i prompt is
 	// the template plus the user's text, tens of tokens in practice.
 	DefaultMaxPrompt = 512
+
+	// condMarginNum/condMarginDen is the slack the condition arenas carry
+	// over the square grid of CondSize.
+	//
+	// `calculate_dimensions` fixes a reference image's *area* and lets its
+	// sides follow its aspect ratio, then snaps each to 32 pixels — so the
+	// patch count is the square grid's only for a square image, and the
+	// snapping can round both sides up. The excess is under 1% at 2:1, under
+	// 9% at 30:1, and only passes 25% past roughly 400:1, where one side has
+	// snapped from half a patch to a whole one. A reference beyond that is
+	// refused with the budget named rather than served from an arena it does
+	// not fit.
+	condMarginNum, condMarginDen = 5, 4
 )
 
 // Options is what cmd/serve's flags come to.
@@ -69,6 +83,19 @@ type Options struct {
 	Steps int
 	// MaxPrompt is the longest prompt the text encoder is built for.
 	MaxPrompt int
+	// Refs is how many reference images an edit may carry. Zero means this
+	// pipeline does not edit at all and stages neither the vision tower nor
+	// the VAE encoder; the endpoint then refuses, naming the flag.
+	//
+	// It is residency and not policy: every reference image adds its latent
+	// rows to the transformer's prefix, its own KV cache, and its patches to
+	// the tower's arena, so the number has to be known before anything is
+	// staged. The model itself allows ten.
+	Refs int
+	// CondSize is diffusers' `output_resolution`: the square whose *area*
+	// every reference image is resized to before it is encoded, and the
+	// default output size of an edit that names none. Default DefaultSize.
+	CondSize int
 }
 
 // geom is a resolved size, all the way down to the transformer's row count.
@@ -98,17 +125,28 @@ type Pipeline struct {
 
 	tok  *tokenizer.Tokenizer
 	drop int
+	tcfg *qwen.Config
 	enc  *qwen.GPUEncoder
 	dt   *dit.GPU
 	dec  *qvae.GPUDecoder
 	vcfg *qvae.Config
 	scfg *SchedConfig
 
+	// The edit half, staged only when Options.Refs > 0.
+	tower      *vision.GPU
+	venc       *qvae.GPUEncoder
+	towerCfg   *vision.Config
+	mrope      textenc.MRopeSection
+	refs       int
+	condSize   int
+	condTokens int // the latent/patch budget one reference may occupy
+
 	def, max geom
 	steps    int
 
 	// residency, for the startup banner.
 	encBytes, ditBytes, vaeBytes, actBytes int
+	editBytes                              int
 }
 
 // New stages the whole pipeline on the device.
@@ -128,12 +166,30 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	if opt.MaxPrompt == 0 {
 		opt.MaxPrompt = DefaultMaxPrompt
 	}
+	if opt.CondSize == 0 {
+		opt.CondSize = DefaultSize
+	}
+	if opt.Refs < 0 || opt.Refs > MaxRefs {
+		return nil, fmt.Errorf("pipeline: %d reference images; the model allows %d", opt.Refs, MaxRefs)
+	}
+	if opt.Refs > 0 {
+		if opt.CondSize%SizeMultiple != 0 {
+			return nil, fmt.Errorf("pipeline: a condition size of %d is not a multiple of %d",
+				opt.CondSize, SizeMultiple)
+		}
+	}
 	max, err := newGeom(opt.Width, opt.Height)
 	if err != nil {
 		return nil, err
 	}
 
-	p := &Pipeline{opt: opt, def: max, max: max, steps: opt.Steps}
+	p := &Pipeline{opt: opt, def: max, max: max, steps: opt.Steps, refs: opt.Refs, condSize: opt.CondSize}
+	// One reference image's budget: the square grid of CondSize, plus the
+	// slack an aspect ratio's snapping can add. It is the same number for
+	// the VAE's latent tokens and the tower's patches — a 16x16 pixel tile is
+	// one of each — and a quarter of it is VLM slots.
+	side := opt.CondSize / VAEScale
+	p.condTokens = (side * side * condMarginNum / condMarginDen) &^ 3
 
 	// The tokenizer and the two configs first: they are cheap, and a
 	// checkpoint that is missing a piece should say so before 30 GB of
@@ -148,6 +204,7 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: text encoder config: %w", err)
 	}
+	p.tcfg = tcfg
 	if p.vcfg, err = qvae.LoadConfig(opt.Model + "/vae"); err != nil {
 		return nil, fmt.Errorf("pipeline: VAE config: %w", err)
 	}
@@ -177,15 +234,23 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: text encoder weights: %w", err)
 	}
-	if p.enc, err = qwen.NewGPUEncoder(dev, set, tcfg, tcfg.NumLayers, opt.MaxPrompt, nil); err != nil {
+	// The text encoder's ceiling: an edit's prompt carries one `<|image_pad|>`
+	// per 2x2 group of every reference's latents on top of the user's text.
+	encTokens := opt.MaxPrompt + p.refs*p.condTokens/4
+	if p.enc, err = qwen.NewGPUEncoder(dev, set, tcfg, tcfg.NumLayers, encTokens, nil); err != nil {
 		set.Close()
 		return nil, fmt.Errorf("pipeline: staging the text encoder: %w", err)
 	}
 	set.Close()
 
-	// The DiT's row ceiling is the target's tokens plus the longest prompt:
-	// for t2i the prefix is the prompt and nothing else.
-	if p.dt, err = dit.NewGPU(dev, opt.Model+"/transformer", max.imgTokens+opt.MaxPrompt, opt.MaxPrompt, opt.MaxPrompt); err != nil {
+	// The DiT's row ceiling is the target's tokens plus the prefix. For t2i
+	// the prefix is the prompt and nothing else; an edit adds every
+	// reference's latent rows to it, and those rows are also what the prefix
+	// KV cache is sized by.
+	condRows := p.refs * p.condTokens
+	prefix := condRows + opt.MaxPrompt
+	if p.dt, err = dit.NewGPU(dev, opt.Model+"/transformer",
+		max.imgTokens+prefix, prefix, encTokens); err != nil {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: staging the transformer: %w", err)
 	}
@@ -193,11 +258,21 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: staging the VAE decoder: %w", err)
 	}
+	if p.refs > 0 {
+		if err := p.stageEdit(dev); err != nil {
+			p.Destroy()
+			return nil, err
+		}
+	}
 
 	p.encBytes = p.enc.WeightBytes()
 	p.vaeBytes = p.dec.WeightBytes()
 	p.ditBytes = p.dt.WeightBytes()
-	p.actBytes = p.enc.ActivationBytes() + p.dt.ActivationBytes() + p.dec.ActivationBytes()
+	p.actBytes = p.enc.ActivationBytes() + p.dt.ActivationBytes() + p.dec.ActivationBytes() + p.dt.CacheBytes()
+	if p.tower != nil {
+		p.editBytes = p.tower.WeightBytes() + p.venc.WeightBytes()
+		p.actBytes += p.tower.ActivationBytes() + p.venc.ActivationBytes()
+	}
 	return p, nil
 }
 
@@ -214,6 +289,14 @@ func (p *Pipeline) Destroy() {
 	if p.enc != nil {
 		p.enc.Destroy()
 		p.enc = nil
+	}
+	if p.tower != nil {
+		p.tower.Destroy()
+		p.tower = nil
+	}
+	if p.venc != nil {
+		p.venc.Destroy()
+		p.venc = nil
 	}
 }
 
@@ -313,6 +396,11 @@ type Timings struct {
 
 	Tokens        int // the prompt's length after the template and the drop
 	Width, Height int
+
+	// An edit's own stage: resizing every reference image, running the
+	// vision tower over it and encoding it with the VAE.
+	Condition time.Duration
+	Refs      int
 }
 
 // Generate is Run for the common case.
@@ -412,6 +500,26 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 	if err := p.dt.BeginImage(embeds, lay, nil); err != nil {
 		return nil, nil, err
 	}
+	if err := p.denoise(latents, g, sched, steps, tm, req.Progress); err != nil {
+		return nil, nil, err
+	}
+
+	decodeStart := time.Now()
+	img, err := p.Decode(latents, g.latentH, g.latentW)
+	if err != nil {
+		return nil, nil, err
+	}
+	tm.Decode = time.Since(decodeStart)
+	tm.Total = time.Since(start)
+	return img, tm, nil
+}
+
+// denoise is the sampler, shared by Run and Edit: BeginImage has already
+// fixed the geometry and the prefix, so the loop itself does not know which
+// of the two it is running. latents is integrated in place.
+func (p *Pipeline) denoise(latents *qwen.Mat, g geom, sched *Schedule, steps int,
+	tm *Timings, progress func(Step)) error {
+
 	for i := 0; i < steps; i++ {
 		stepStart := time.Now()
 		// Step 0 is the block-causal prefill, which also extracts every
@@ -419,17 +527,17 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 		// that cache (IMAGE.md decision 2).
 		out, err := p.dt.Step(latents, sched.T(i), i == 0)
 		if err != nil {
-			return nil, nil, fmt.Errorf("pipeline: step %d: %w", i, err)
+			return fmt.Errorf("pipeline: step %d: %w", i, err)
 		}
 		if err := sched.Step(i, latents.Data, out.Data); err != nil {
-			return nil, nil, err
+			return err
 		}
 		wall := time.Since(stepStart)
 		tm.Steps = append(tm.Steps, wall)
 		if i == 0 {
 			tm.Prefill = wall
 		}
-		if req.Progress != nil {
+		if progress != nil {
 			// The denoised estimate, after the Euler move rather than before
 			// it, which is the cheaper of the two identities: the step has
 			// already written x_{t+1} = x_t + (s' - s) v, so
@@ -438,7 +546,7 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 			// s' is zero -- correctly making x0 the latent that gets decoded.
 			sigmaNext := float64(sched.Sigmas[i+1])
 			v := out
-			req.Progress(Step{
+			progress(Step{
 				Index: i, Steps: steps, Wall: wall,
 				Sigma:     float64(sched.Sigmas[i]),
 				NextSigma: sigmaNext,
@@ -456,15 +564,7 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 			})
 		}
 	}
-
-	decodeStart := time.Now()
-	img, err := p.Decode(latents, g.latentH, g.latentW)
-	if err != nil {
-		return nil, nil, err
-	}
-	tm.Decode = time.Since(decodeStart)
-	tm.Total = time.Since(start)
-	return img, tm, nil
+	return nil
 }
 
 // Decode unpacks the DiT's [tokens, z] latents into the VAE's [1, z, h, w],
@@ -526,4 +626,71 @@ func ToImage(t *zvae.Tensor, opaque bool) *image.NRGBA {
 		}
 	}
 	return img
+}
+
+// MaxRefs is how many reference images one edit may carry. It is the model's
+// own limit, quoted from the model card rather than chosen here.
+const MaxRefs = 10
+
+// stageEdit stages the two models only an edit uses: the vision tower, which
+// turns a reference image into the context the *text* absorbs, and the VAE
+// encoder, which turns the same image into the latents the transformer
+// attends over directly.
+//
+// Both are sized by the condition budget rather than by the output ceiling —
+// a reference image's geometry comes from `calculate_dimensions` and has
+// nothing to do with the size being generated.
+func (p *Pipeline) stageEdit(dev *vk.Device) error {
+	var err error
+	if p.towerCfg, err = vision.LoadConfig(p.opt.Model + "/text_encoder"); err != nil {
+		return fmt.Errorf("pipeline: vision config: %w", err)
+	}
+	if p.mrope, err = textenc.LoadMRope(p.opt.Model + "/text_encoder"); err != nil {
+		return fmt.Errorf("pipeline: mrope config: %w", err)
+	}
+	cpuTower, err := vision.Load(p.opt.Model+"/text_encoder", p.towerCfg, 0)
+	if err != nil {
+		return fmt.Errorf("pipeline: vision tower: %w", err)
+	}
+	if p.tower, err = vision.NewGPU(dev, cpuTower, p.condTokens); err != nil {
+		return fmt.Errorf("pipeline: staging the vision tower: %w", err)
+	}
+	cpuEnc, err := qvae.LoadEncoder(p.opt.Model+"/vae", p.vcfg)
+	if err != nil {
+		return fmt.Errorf("pipeline: VAE encoder: %w", err)
+	}
+	// A square of the budget's area covers every aspect ratio of it: the
+	// encoder re-plans per image and only needs the arena to fit.
+	side := condSide(p.condTokens) * VAEScale
+	if p.venc, err = qvae.NewGPUEncoder(dev, cpuEnc, side, side); err != nil {
+		return fmt.Errorf("pipeline: staging the VAE encoder: %w", err)
+	}
+	return nil
+}
+
+// condSide is the side of the square latent grid holding n tokens, rounded
+// up to an even number of rows so the 2x2 grouping still divides it.
+func condSide(n int) int {
+	s := 1
+	for s*s < n {
+		s++
+	}
+	return (s + 1) &^ 1
+}
+
+// Refs is how many reference images this pipeline was staged for; zero means
+// it cannot edit.
+func (p *Pipeline) Refs() int { return p.refs }
+
+// CondSize is the square whose area every reference image is resized to.
+func (p *Pipeline) CondSize() int { return p.condSize }
+
+// EditResidency is what the edit half holds on the device, for the banner:
+// the tower's and the VAE encoder's weights, and the transformer's prefix KV
+// cache, which is the largest single thing an edit adds.
+func (p *Pipeline) EditResidency() (weights, cache int) {
+	if p.refs == 0 {
+		return 0, 0
+	}
+	return p.editBytes, p.dt.CacheBytes()
 }

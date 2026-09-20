@@ -72,9 +72,12 @@ type GPU struct {
 	dev *vk.Device
 	cfg Config
 
-	gridH, gridW int
-	rows         int // patches
-	merged       int // rows / 4
+	// The staged budget, and the grid of the run in progress. The arenas are
+	// sized for the first and every dispatch is bounded by the second.
+	maxRows, maxMerged int
+	gridH, gridW       int
+	rows               int // patches
+	merged             int // rows / 4
 
 	dim, heads, headDim, ffn, ffnPad int
 	mergeIn, mergeOut                int
@@ -150,24 +153,33 @@ const noW = 0xffffffff
 const gemmBN = 64
 const gemmBM = 64
 
-// NewGPU stages the tower for one patch grid and builds its pipelines.
-func NewGPU(dev *vk.Device, cpu *Model, gridH, gridW int) (*GPU, error) {
+// NewGPU stages the tower for patch grids of up to maxRows patches and builds
+// its pipelines.
+//
+// It is a *budget* rather than a grid because a condition image's grid
+// follows its aspect ratio: `calculate_dimensions` fixes the area and lets
+// the sides fall where they will, so a served edit hands this tower a
+// different pair of numbers every request. The arenas are laid out for the
+// budget once and Forward takes the grid, exactly as the VAE's graphs take
+// an image size under a staged ceiling.
+func NewGPU(dev *vk.Device, cpu *Model, maxRows int) (*GPU, error) {
 	cfg := cpu.Cfg
 	if len(cpu.Blocks) != cfg.Depth {
 		return nil, fmt.Errorf("vision: %d blocks loaded, the config has %d", len(cpu.Blocks), cfg.Depth)
 	}
 	merge := cfg.SpatialMergeSize * cfg.SpatialMergeSize
+	if maxRows <= 0 || maxRows%merge != 0 {
+		return nil, fmt.Errorf("vision: a patch budget of %d does not group into %ds", maxRows, merge)
+	}
 	g := &GPU{
-		dev: dev, cfg: cfg, cpu: cpu, gridH: gridH, gridW: gridW,
-		rows: gridH * gridW, merged: gridH * gridW / merge,
+		dev: dev, cfg: cfg, cpu: cpu,
+		maxRows: maxRows, maxMerged: maxRows / merge,
+		rows: maxRows, merged: maxRows / merge,
 		dim: cfg.HiddenSize, heads: cfg.NumHeads, headDim: cfg.HeadDim(),
 		ffn: cfg.IntermediateSize, mergeIn: cfg.HiddenSize * merge, mergeOut: cfg.OutHiddenSize,
 		pipes: map[string]*vk.ComputePipeline{},
 	}
 	g.ffnPad = (g.ffn + ffnAlign - 1) &^ (ffnAlign - 1)
-	if g.rows%merge != 0 {
-		return nil, fmt.Errorf("vision: a %dx%d grid does not group into %ds", gridH, gridW, merge)
-	}
 	if err := g.stageWeights(cpu); err != nil {
 		g.Destroy()
 		return nil, err
@@ -522,8 +534,15 @@ func (g *GPU) build() error {
 
 // rowsPad is the patch count rounded up to the GEMM's M tile: the kernel
 // writes whole tiles, so every row-shaped activation is allocated to it.
+//
+// At construction g.rows is the budget, which is what the arenas are sized
+// by; in a run it is the grid's, which is what packs the deepstack features
+// and the transposed keys more tightly inside the same space.
 func (g *GPU) rowsPad() int   { return (g.rows + gemmBM - 1) &^ (gemmBM - 1) }
 func (g *GPU) mergedPad() int { return (g.merged + gemmBM - 1) &^ (gemmBM - 1) }
+
+// MaxRows is the staged patch budget.
+func (g *GPU) MaxRows() int { return g.maxRows }
 
 // Forward runs the tower over one image's patches on the device.
 //
@@ -532,10 +551,20 @@ func (g *GPU) mergedPad() int { return (g.merged + gemmBM - 1) &^ (gemmBM - 1) }
 // modulation: both are functions of the patch grid rather than of any
 // weight, they cost microseconds, and reproducing a bilinear resample of a
 // learned table in a shader would be a second place for it to be wrong.
-func (g *GPU) Forward(pixels *qwen.Mat) (*Output, error) {
-	if pixels.Rows != g.rows || pixels.Cols != g.cfg.PatchElems() {
-		return nil, fmt.Errorf("vision: pixels are %s, want [%d %d]", pixels, g.rows, g.cfg.PatchElems())
+func (g *GPU) Forward(pixels *qwen.Mat, gridH, gridW int) (*Output, error) {
+	merge := g.cfg.SpatialMergeSize * g.cfg.SpatialMergeSize
+	rows := gridH * gridW
+	if gridH <= 0 || gridW <= 0 || rows%merge != 0 {
+		return nil, fmt.Errorf("vision: a %dx%d grid does not group into %ds", gridH, gridW, merge)
 	}
+	if rows > g.maxRows {
+		return nil, fmt.Errorf("vision: a %dx%d grid is %d patches, staged for %d",
+			gridH, gridW, rows, g.maxRows)
+	}
+	if pixels.Rows != rows || pixels.Cols != g.cfg.PatchElems() {
+		return nil, fmt.Errorf("vision: pixels are %s, want [%d %d]", pixels, rows, g.cfg.PatchElems())
+	}
+	g.gridH, g.gridW, g.rows, g.merged = gridH, gridW, rows, rows/merge
 	pos, err := g.cpu.positionEmbedding(g.gridH, g.gridW)
 	if err != nil {
 		return nil, err

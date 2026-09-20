@@ -190,25 +190,27 @@ type ImageRequest struct {
 	// path already makes, and it is written down in API.md rather than fixed.
 	Partial func(ImagePartial) error
 
-	// Init is the picture an edit starts from, and it is what makes this
-	// request an edit rather than a generation. It is an image.Image at
-	// whatever size the client sent: fitting it to Width and Height is the
-	// *backend's*, because a resample is arithmetic on pixels and the HTTP
-	// layer has no business doing arithmetic on pixels.
+	// Init holds the reference images an edit is conditioned on, in the
+	// order the client sent them, and a non-empty Init is what makes this
+	// request an edit rather than a generation. They are image.Images at
+	// whatever size the client sent: resizing them is the *backend's*,
+	// because a resample is arithmetic on pixels and the HTTP layer has no
+	// business doing arithmetic on pixels -- and in this model the resampler
+	// is part of the model, exact to the 8-bit level.
 	//
 	// **An edit is the same call as a generation and not a second one**,
 	// which is the whole reason it is a field here rather than a method on
-	// the interface. An SDEdit is a generation whose trajectory starts from
-	// an encoded picture at an intermediate noise level instead of from pure
-	// noise -- so partial frames, seeds, sizes and step counts all mean
-	// exactly what they already meant, and the streaming path did not have to
-	// be written twice.
-	Init image.Image
-	// Strength is how much of the schedule an edit runs, in (0, 1]: near zero
-	// keeps the input, 1 ignores it entirely and is an ordinary generation.
-	// Zero takes the backend's default. It is meaningless without Init and a
-	// backend refuses it there rather than ignoring it.
-	Strength float64
+	// the interface: partial frames, seeds, sizes and step counts all mean
+	// exactly what they already meant, and the streaming path did not have
+	// to be written twice.
+	//
+	// It is a *list*, and that is the model's doing rather than OpenAI's.
+	// Under SDEdit an edit had one input and a `strength` saying how much of
+	// it to keep. Qwen-Image-2.1 edits by conditional generation: the
+	// references become rows of the transformer's prefix, up to ten of them,
+	// every step runs, and there is no strength knob to have. A backend
+	// reports how many it will take as ImageGeometry.MaxRefs.
+	Init []image.Image
 }
 
 // ImagePartial is one in-progress frame of an image being generated.
@@ -270,14 +272,15 @@ type ImageGeometry struct {
 	// what makes three reasonable is that it is 5% of the image at 1024x1024.
 	MaxPartials int
 	// Edits reports whether ImageRequest.Init will be accepted, i.e. whether
-	// the VAE's *encoder* is resident. A client reads it to know whether
-	// /v1/images/edits will be answered or refused, for the same reason it
-	// reads Previews.
+	// the vision tower and the VAE's *encoder* are resident. A client reads
+	// it to know whether /v1/images/edits will be answered or refused, for
+	// the same reason it reads Previews.
 	Edits bool
-	// DefaultStrength is what an edit that names no strength gets, so a
-	// client can show the knob's position without sending a request first.
-	// Zero when Edits is false.
-	DefaultStrength float64
+	// MaxRefs is how many reference images one edit may carry. It is
+	// residency and not policy -- every reference adds its latent rows to
+	// the transformer's prefix and its own share of the prefix KV cache, so
+	// the number is fixed when the server starts. Zero when Edits is false.
+	MaxRefs int
 }
 
 // MarshalJSON writes the geometry the way a client reads it: the two pairs
@@ -285,14 +288,14 @@ type ImageGeometry struct {
 // request's `size` without being reassembled first.
 func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		DefaultSize  string  `json:"default_size"`
-		MaxSize      string  `json:"max_size"`
-		SizeMultiple int     `json:"size_multiple"`
-		DefaultSteps int     `json:"default_steps"`
-		Previews     bool    `json:"previews"`
-		MaxPartials  int     `json:"max_partial_images,omitempty"`
-		Edits        bool    `json:"edits"`
-		Strength     float64 `json:"default_strength,omitempty"`
+		DefaultSize  string `json:"default_size"`
+		MaxSize      string `json:"max_size"`
+		SizeMultiple int    `json:"size_multiple"`
+		DefaultSteps int    `json:"default_steps"`
+		Previews     bool   `json:"previews"`
+		MaxPartials  int    `json:"max_partial_images,omitempty"`
+		Edits        bool   `json:"edits"`
+		MaxRefs      int    `json:"max_reference_images,omitempty"`
 	}{
 		DefaultSize:  formatSize(g.Width, g.Height),
 		MaxSize:      formatSize(g.MaxWidth, g.MaxHeight),
@@ -301,7 +304,7 @@ func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 		Previews:     g.Previews,
 		MaxPartials:  g.MaxPartials,
 		Edits:        g.Edits,
-		Strength:     g.DefaultStrength,
+		MaxRefs:      g.MaxRefs,
 	})
 }
 

@@ -26,7 +26,7 @@ here is our own ceiling, not a reference implementation.
 | text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus | batching (P6); context depth; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation | Qwen-Image-2.1 | 1024², 40 steps in **1m38s**, 31.7 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4** | edits (Q8) are built to the pipeline's door — every stage on the GPU, an edit's transformer 110.7 s at 1024² — and owe the pipeline and the endpoint (Q8.6); the 1184² ceiling; 90% of the decode is two ported kernels away |
+| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m38s**, 31.7 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: 2m8s on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; 90% of the decode is two ported kernels away; Q9's percents |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped

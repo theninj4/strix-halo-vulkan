@@ -27,7 +27,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
-| `POST /v1/images/edits` | **501** — Z-Image's SDEdit is gone and 2.1's conditional-generation edit is unported (IMAGE.md Q8) |
+| `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -151,6 +151,13 @@ encoder. The two levers are therefore the step count — genuinely per request
 here, unlike under a turbo distillation — and the unported percents
 `IMAGE.md`'s Q9 prices.
 
+An *edit* at the same size, with one reference image, is **2m7.6 s / 2m7.9**:
+the reference's own encoding 7.8 s (a 27-layer vision tower and a VAE
+encode), text encoding 0.73 s, the prefill 5.49 s against a generation's
+2.29, 40 steps at 2.70 s against 2.27, and the same 7.5 s decode. The extra
+is the prefix — thousands of rows of reference latents that every step
+attends over.
+
 Over HTTP, on a `-image -image-size 512x512 -image-steps 24` process: a
 512x512 image at 24 steps comes back in **16.8 s then 14.5 s**, base64 body
 included. **The step count is worth sending.** IMAGE.md's sweep (same seed,
@@ -241,7 +248,9 @@ Two things would fix it, and both are measurements rather than arguments:
     -image-size        1024x1024           the largest image the arenas hold, and the default; <= 1184x1184
     -image-steps       40                  what a request that names no steps gets
     -image-max-prompt  512                 longest prompt the image text encoder is built for
-    -edits             false               unported (IMAGE.md Q8); setting it is a startup error
+    -edits                   0              reference images an edit may carry; 0 refuses /v1/images/edits
+    -image-condition-size    1024           the area every reference image is resized to, and an edit's
+                                            default output size (diffusers' output_resolution)
 
 There is no `-preview`/`-previews` flag: this model's preview decoder is a
 fitted 64x4 matrix compiled in, so `stream: true` always answers.
@@ -394,9 +403,9 @@ wins when both are set, because that is the field every other server reads.
 `GET /v1/models` carries an **`image`** object on the image model, alongside
 the speech model's voices and for the same reason: `default_size`, `max_size`,
 `size_multiple`, `default_steps`, `previews`, `max_partial_images`, `edits` and
-`default_strength`, which are decided by what this process staged. The last
-four are how a client finds out that `stream: true` and an edit will be
-answered rather than discovering it from a 501.
+`max_reference_images`, which are decided by what this process staged. The
+last four are how a client finds out that `stream: true` and an edit will be
+answered, and with how many pictures, rather than discovering it from a 501.
 
 **`background: "transparent"` is OpenAI's field and it is answerable here**,
 because Qwen-Image-2.1's VAE is natively RGBA — four channels out of the
@@ -470,28 +479,43 @@ the finished image sent twice, once through each decoder.
 
 ### Editing a picture
 
-`POST /v1/images/edits` answers **501**, and what changed is the mechanism
-rather than a flag. Under Z-Image-Turbo this endpoint did SDEdit: the picture
-was encoded to a latent, the latent mixed with noise at an intermediate point
-on the schedule, and only the tail run — `strength` being how far back up the
-schedule that point was, and the whole behaviour of the endpoint.
+`POST /v1/images/edits` answers when the server is started with **`-edits N`**,
+where N is how many reference images an edit may carry. The mechanism changed
+with the model, and so did what a client sends. Under Z-Image-Turbo this
+endpoint did SDEdit: the picture was encoded to a latent, the latent mixed
+with noise at an intermediate point on the schedule, and only the tail run —
+`strength` being how far back up the schedule that point was.
 
 **Qwen-Image-2.1 does not edit that way.** An edit is a *conditional
-generation*: the reference images become a prefix of the joint sequence —
-their VAE latents for the pixels, their vision-tower features for what the
-text tokens absorbed — and the target is denoised from pure noise through the
-whole schedule. Three consequences a client sees. `strength` disappears,
-because nothing is being partially renoised. An edit becomes slightly *more*
-expensive than a generation rather than cheaper, because the prefix is
-thousands of tokens rather than tens. And up to **ten** reference images are
-accepted, which is why OpenAI's `image[]` array stops being a list this
-server refuses past the first.
+generation*: every reference image is resized to the condition area and
+encoded twice — by a 27-layer vision tower into context the prompt's tokens
+absorb, and by the VAE into latents that become rows of the transformer's own
+sequence — and the target is then denoised from pure noise through the whole
+schedule, attending over that prefix at every step. Four consequences a
+client sees:
 
-The port that owes it is IMAGE.md's Q8, and the large piece is the 27-layer
-vision tower with its deepstack feature injection and 3-D mrope. The
-endpoint's shape — both encodings, `multipart/form-data` for OpenAI's clients
-and a JSON body whose `image` is base64 for curl — is unchanged and already
-written; what is missing is underneath it.
+- **`strength` is gone.** Nothing is partially renoised, so there is no knob
+  to have. A request that still sends one is a 400 saying so, rather than
+  having it quietly ignored.
+- **An edit costs slightly *more* than a generation**, not less: the prefix
+  is thousands of tokens rather than tens. Measured at 1024² with one
+  reference, an edit is **2m8s** against a generation's 1m38s — the
+  reference's own encoding is 7.8 s of it (a 27-layer vision tower and a VAE
+  encode), and the rest is the prefix riding along in every denoising step.
+- **`image[]` is a real list.** Up to `max_reference_images` pictures are
+  accepted, in the order they were sent, and the model's own limit is ten.
+  How many *this* server takes is residency — every reference adds its latent
+  rows to the prefix and its share of the prefix KV cache — so it is fixed by
+  `-edits N` at startup and reported in `GET /v1/models`.
+- **An edit with no `size` follows the last reference image's aspect ratio**
+  at the condition area, which is what diffusers does. It is not the server's
+  default size, and it is not the picture's own pixel dimensions either.
+
+`-edits N` is residency and not a feature flag: it stages the vision tower
+and the VAE encoder (~1.4 GB together) and sizes the transformer's prefix KV
+cache, which at one 1024² reference is ~2.1 GB. Both encodings of the request
+are unchanged — `multipart/form-data` for OpenAI's clients, and a JSON body
+whose `image` is base64 for curl.
 
 What is refused rather than faked:
 
@@ -507,10 +531,13 @@ What is refused rather than faked:
   naming what the server does encode. *Transcripts* are a different question
   and are no longer refused: `json`, `verbose_json`, `text`, `srt` and `vtt`
   all answer, because the timings they need exist.
-- **`/v1/images/edits`.** A 501 naming IMAGE.md's Q8: the request is well
-  formed and the vision tower a 2.1 edit runs over is unported. There is no
-  flag that would fix it. It is the one capability the Z-Image migration has
-  not reached — `stream: true`, the other, was closed by Q7 the same day.
+- **`/v1/images/edits` without `-edits N`.** A 501 naming the flag, because
+  editing is residency: the vision tower and the VAE encoder are staged or
+  they are not.
+- **`strength` on an edit.** A 400 explaining that the model conditions on
+  the whole reference rather than seeding a truncated schedule, so there is
+  no fraction of the schedule to name. Ignoring it would be a picture that
+  did something other than what was asked.
 - **A `mask` on an edit.** Still refused, but the reason has moved: 2.1 can
   do masked and annotated local edits, and how a separate mask is fed is not
   in the diffusers implementation this port follows (IMAGE.md's open question
@@ -618,11 +645,12 @@ again.
   (research/p5c-speculative-loop.md) — it costs nothing while off. What
   would make it pay is the draft head's acceptance on a real workload,
   which is a measurement (`cmd/llm -mtp`), not engineering; see `TODO.md`.
-- **Image editing.** Answered under Z-Image-Turbo and not ported to
-  Qwen-Image-2.1 yet: an edit in 2.1 is a conditional generation over a
-  27-layer vision tower (IMAGE.md Q8), not an SDEdit. It is the one
-  remaining regression of the migration, it is named in every refusal, and
-  the endpoint's shape is unchanged underneath.
+- **Image editing costs more than it did**, and that is the model rather
+  than the port: an edit in 2.1 is a conditional generation over a 27-layer
+  vision tower (IMAGE.md Q8), not an SDEdit, so there is no truncated
+  schedule to make it cheap. 2m8s at 1024² against a generation's 1m38s, and
+  no `strength` to trade quality for time with. The endpoint's shape is
+  unchanged underneath; what changed is that `image[]` is a real list.
 - **The image adapter holds the device lock for the whole run**, where the
   language model's takes it per forward pass. The same fix applies — between
   two denoising steps there is no work in flight — but it would mean the

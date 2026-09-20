@@ -28,6 +28,8 @@ type manifest struct {
 	Size              int     `json:"size"`
 	DropIdx           int     `json:"drop_idx"`
 	GridTHW           [][]int `json:"grid_thw"`
+	MultiGridTHW      [][]int `json:"multi_grid_thw"`
+	MultiSizes        [][]int `json:"multi_sizes"`
 	ImagePadPositions []int   `json:"image_pad_positions"`
 	Vision            struct {
 		Depth            int   `json:"depth"`
@@ -365,7 +367,28 @@ func TestFP16Ladder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fp16Ladder(t, cfg, model, pixels, gridH, gridW)
 
+	// The *wide* card, on the tower already staged. It is not a second
+	// reading of the same number: Q8.2 measured this picture amplifying fp32
+	// rounding about ten times harder than the square one (the dumped fp32
+	// tensors are themselves rel 8.9e-4 from float64 on it against 1.0e-4 on
+	// the square card), and a device port is gated on both. Whatever this
+	// says is what the grid-agnostic GPU tower should cost on it.
+	if len(m.MultiSizes) == 2 {
+		card2 := loadRef(t, m, "card2_vision_rgb")
+		sz := m.MultiSizes[1]
+		px2, gh2, gw2, err := cfg.Patchify(card2.Data, sz[0], sz[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("--- the wide card, %dx%d patches", gh2, gw2)
+		fp16Ladder(t, cfg, model, px2, gh2, gw2)
+	}
+}
+
+func fp16Ladder(t *testing.T, cfg *Config, model *Model, pixels *qwen.Mat, gridH, gridW int) {
+	t.Helper()
 	blocks := map[string]*qwen.Mat{}
 	fp32, err := model.Forward(pixels, gridH, gridW, func(name string, x *qwen.Mat) {
 		blocks[name] = x.Clone()

@@ -90,10 +90,12 @@ type ImageEditRequest struct {
 	host        string
 	AspectRatio string `json:"aspect_ratio,omitempty"`
 	Model       string `json:"model,omitempty"`
-	// Image is the picture to edit, base64, one element. OpenAI's field is a
-	// list because their model composites several; this one edits a single
-	// image, and two of them is a 400 rather than a silent choice of the
-	// first.
+	// Image is the reference images an edit is conditioned on, base64, in
+	// the order they should appear in the prompt. OpenAI's field is a list
+	// because their model composites several, and this model takes a list
+	// for its own reason: up to ten references become rows of the
+	// transformer's prefix. How many *this* server takes is residency and is
+	// reported as `max_reference_images`.
 	Image StringList `json:"image"`
 	// Mask is OpenAI's transparency mask. It is parsed so that a request
 	// carrying one gets told this server does not blend rather than getting a
@@ -102,14 +104,15 @@ type ImageEditRequest struct {
 	Prompt string `json:"prompt"`
 	Size   string `json:"size,omitempty"`
 	N      int    `json:"n,omitempty"`
-	// Strength is an extension, and it is the knob this endpoint is actually
-	// about: how much of the denoising schedule to run over the encoded
-	// picture. Near zero keeps the input almost unchanged, 1 ignores it
-	// entirely. Zero takes the server's default, which GET /v1/models reports.
+	// Strength was SDEdit's knob — how much of the denoising schedule to run
+	// over the encoded picture — and Qwen-Image-2.1 has no such quantity: a
+	// reference conditions the whole trajectory instead of seeding a
+	// truncated one, and every step runs.
 	//
-	// OpenAI has no such field because their edit endpoint is a different
-	// mechanism (an inpainting model with a mask). SDEdit's whole behaviour is
-	// this one number, so it could not be left out.
+	// It is still parsed, and that is the point. A field that was removed
+	// from the struct would be ignored by the JSON decoder and the request
+	// would quietly do something else; parsed, a non-zero value is a 400
+	// that explains what changed.
 	Strength float64 `json:"strength,omitempty"`
 
 	ResponseFormat    string `json:"response_format,omitempty"`
@@ -321,12 +324,12 @@ func (s *Server) checkStreaming(ctx context.Context, w http.ResponseWriter, geo 
 // imageRun is one resolved render, and it is what /generations and /edits have
 // in common once their own fields have been read.
 //
-// **An edit is a generation with a picture in front of it**, which is why
-// there is one of these rather than two handlers: SDEdit starts the same
-// trajectory from an encoded image at an intermediate noise level instead of
-// from pure noise, so `n`, the seed, the container, the streaming and the
-// partial frames all mean exactly what they already meant. Everything that
-// differs between the two endpoints is in the two lines at the bottom.
+// **An edit is a generation with reference images in front of it**, which is
+// why there is one of these rather than two handlers: the references become
+// the transformer's prefix and the target still starts from noise, so `n`,
+// the seed, the container, the streaming and the partial frames all mean
+// exactly what they already meant. Everything that differs between the two
+// endpoints is in the one line at the bottom.
 type imageRun struct {
 	prompt        string
 	width, height int
@@ -339,9 +342,8 @@ type imageRun struct {
 	partials      int
 	transparent   bool
 
-	// init and strength are set on an edit and zero on a generation.
-	init     image.Image
-	strength float64
+	// init holds an edit's reference images and is empty on a generation.
+	init []image.Image
 }
 
 // render answers one resolved request, buffered or over SSE.
@@ -369,7 +371,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
 		out, err := s.Image.Generate(r.Context(), &ImageRequest{
 			Prompt: run.prompt, Width: run.width, Height: run.height,
 			Steps: run.steps, Seed: seed, Transparent: run.transparent,
-			Init: run.init, Strength: run.strength,
+			Init: run.init,
 		})
 		if err != nil {
 			backendError(ctx, w, "images", err)
@@ -384,6 +386,10 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, run *imageRun) {
 			serverError(ctx, w, "images", err)
 			return
 		}
+		// The size is read back from the result rather than echoed from the
+		// request: an edit that named none had it resolved by the backend,
+		// from the last reference image's aspect ratio.
+		resp.Size = formatSize(out.Width, out.Height)
 		resp.Data = append(resp.Data, ImageData{
 			B64JSON: base64.StdEncoding.EncodeToString(body),
 			Seed:    out.Seed,
@@ -472,7 +478,7 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageR
 	out, err := s.Image.Generate(r.Context(), &ImageRequest{
 		Prompt: run.prompt, Width: run.width, Height: run.height,
 		Steps: run.steps, Seed: run.seed, Transparent: run.transparent,
-		Init: run.init, Strength: run.strength,
+		Init:          run.init,
 		PartialImages: run.partials, Partial: sendPartial,
 	})
 	if err != nil {
@@ -487,6 +493,9 @@ func (s *Server) streamImage(w http.ResponseWriter, r *http.Request, run *imageR
 	if err != nil {
 		streamError(ctx, str, "images", err)
 		return
+	}
+	if out.Width > 0 && out.Height > 0 {
+		size = formatSize(out.Width, out.Height)
 	}
 	_ = str.send(eventImageDone, ImageStreamEvent{
 		Type:         eventImageDone,
@@ -510,28 +519,35 @@ func streamError(ctx context.Context, str *sse, where string, err error) {
 	_ = str.send("error", errorResponse{Error: errorBody{Message: err.Error(), Type: "server_error"}})
 }
 
-// handleImageEdit edits a picture: SDEdit over the VAE's encoder (IMAGE.md
-// I7).
+// handleImageEdit edits a picture: conditional generation over
+// Qwen-Image-2.1's vision tower (IMAGE.md Q8).
 //
-// **What an edit is, in three lines.** The image is encoded to a latent, that
-// latent is mixed with noise at an intermediate point on the schedule --
-// `x = (1-sigma) x0 + sigma eps` -- and only the tail of the schedule runs.
-// `strength` is how far back up the schedule that point is, and it is the
-// whole behaviour of this endpoint: near zero returns almost the picture that
-// was sent, 1 discards it and is an ordinary generation. Everything else here
-// is the generation endpoint's, including the streaming, because underneath
-// an edit *is* a generation with a different starting latent.
+// **What an edit is, in four lines.** Every reference image is resized to the
+// model's condition area and encoded twice -- by a 27-layer vision tower into
+// context the prompt's tokens absorb, and by the VAE into latents that become
+// rows of the transformer's own sequence. The target then starts from pure
+// noise like any generation and runs the whole schedule, attending over that
+// prefix at every step. Everything else here is the generation endpoint's,
+// including the streaming.
 //
-// Two things OpenAI's endpoint has that this one refuses rather than ignores:
-// a `mask`, which is masked blending per step and a different mechanism, and
-// more than one input image, which is a compositing model and not this one.
-// Both would otherwise come back as a picture that silently did something
-// else.
+// **`strength` is gone, and it is gone because the mechanism is.** Under
+// SDEdit an edit was a truncated generation and `strength` was how much of
+// the schedule to run; here the reference conditions the whole trajectory
+// rather than seeding it, every step runs, and an edit costs slightly *more*
+// than a generation rather than less. A request that still sends one is
+// refused saying so, rather than having it quietly ignored.
+//
+// One thing OpenAI's endpoint has that this one still refuses: a `mask`.
+// This model can do local edits -- that is what its reference images and
+// annotations are for -- but how a separate mask is fed is not in the
+// diffusers implementation (IMAGE.md Q-o3), and answering with a whole-image
+// edit would be a picture that silently did something else.
 //
 // The size is the one place this differs from /generations in kind. A
-// generation with no `size` takes the server's default; an edit with no `size`
-// takes **the input picture's own shape**, fitted inside the ceiling, because
-// that is the only answer that does not silently reframe what was sent.
+// generation with no `size` takes the server's default; an edit with no
+// `size` takes **the last reference image's aspect ratio** at the model's
+// condition area, which is diffusers' own rule and the only answer that does
+// not silently reframe what was sent.
 func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if s.Image == nil {
@@ -540,15 +556,10 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	geo := s.Image.Geometry()
 	if !geo.Edits {
-		// A 501 that names no flag, because there is none. Under
-		// Z-Image-Turbo an edit was SDEdit and `-edits` held the VAE encoder
-		// resident; Qwen-Image-2.1 edits by conditional generation over a
-		// 27-layer vision tower, which is a port and not a residency
-		// decision.
-		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"this server cannot edit images yet: Qwen-Image-2.1 edits by conditional generation -- the "+
-				"reference images become a prefix of the joint sequence through a vision tower -- and that "+
-				"tower is unported (IMAGE.md Q8). There is no flag that enables it")
+		// A 501 naming the flag, because editing is residency: the 27-layer
+		// vision tower and the VAE's encoder are staged or they are not, and
+		// each reference image then costs prefix KV cache besides.
+		notLoaded(ctx, w, "image editing", "-edits N")
 		return
 	}
 
@@ -567,37 +578,44 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Mask != "" {
 		writeError(w, http.StatusNotImplemented, "not_implemented",
-			"mask is not implemented: a mask is blended into the latent at every denoising step, which is a "+
-				"different mechanism from the SDEdit this endpoint runs. Without one the whole picture is "+
-				"edited, and `strength` is how much")
+			"mask is not implemented: Qwen-Image-2.1 conditions on whole reference images, and how a "+
+				"separate mask is fed to it is not in the reference implementation (IMAGE.md Q-o3). "+
+				"Without one the whole picture is edited")
 		return
 	}
-	switch len(req.Image) {
-	case 1:
-	case 0:
+	if req.Strength != 0 {
+		badRequest(ctx, w, "strength is not a knob this model has: Qwen-Image-2.1 edits by conditional "+
+			"generation rather than by SDEdit, so the reference conditions the whole trajectory instead "+
+			"of seeding it, and every denoising step runs. Send the request without it")
+		return
+	}
+	if len(req.Image) == 0 {
 		badRequest(ctx, w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image'")
 		return
-	default:
-		badRequest(ctx, w, strconv.Itoa(len(req.Image))+" images; this endpoint edits one picture. "+
-			"OpenAI's field is a list because their model composites several, and this model does not")
+	}
+	if len(req.Image) > geo.MaxRefs {
+		badRequest(ctx, w, strconv.Itoa(len(req.Image))+" reference images; this server is started for "+
+			strconv.Itoa(geo.MaxRefs)+". Every reference becomes rows of the transformer's prefix and its "+
+			"own share of the prefix KV cache, so the number is fixed when the server starts")
 		return
 	}
-	raw, err := decodeImageField(req.Image[0])
-	if err != nil {
-		badRequest(ctx, w, "image: "+err.Error())
-		return
+	refs := make([]image.Image, 0, len(req.Image))
+	var kind string
+	for i, field := range req.Image {
+		raw, err := decodeImageField(field)
+		if err != nil {
+			badRequest(ctx, w, "image "+strconv.Itoa(i)+": "+err.Error())
+			return
+		}
+		img, k, err := image.Decode(bytes.NewReader(raw))
+		if err != nil {
+			badRequest(ctx, w, "image "+strconv.Itoa(i)+": this server decodes png and jpeg: "+err.Error())
+			return
+		}
+		refs = append(refs, img)
+		kind = k
 	}
-	init, kind, err := image.Decode(bytes.NewReader(raw))
-	if err != nil {
-		badRequest(ctx, w, "image: this server decodes png and jpeg: "+err.Error())
-		return
-	}
-	if req.Strength < 0 || req.Strength > 1 {
-		badRequest(ctx, w, "strength is "+strconv.FormatFloat(req.Strength, 'g', -1, 64)+
-			", outside (0, 1]; it is how much of the denoising schedule to run over the picture, so 1 "+
-			"discards the picture entirely and anything near 0 returns it almost unchanged")
-		return
-	}
+	init := refs[len(refs)-1]
 
 	out, ok := s.imageOutput(ctx, w, req.ResponseFormat, req.OutputFormat, req.OutputCompression)
 	if !ok {
@@ -611,28 +629,29 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The geometry. With a `size` this is the generation endpoint's rule; with
-	// none it is the *picture's* aspect, scaled to fit both ceilings and
-	// rounded to the size multiple, which is fitBounds over the input's bounds.
+	// The geometry. With a `size` this is the generation endpoint's rule;
+	// with none it is left to the backend, which takes the last reference's
+	// aspect ratio at the model's condition area -- diffusers' own rule, and
+	// not something the HTTP layer can compute, since the condition area is
+	// the backend's.
 	b := init.Bounds()
 	var width, height int
 	if (req.Size != "" && req.Size != "auto") || req.AspectRatio != "" {
+		var err error
 		width, height, err = resolveSize(req.Size, req.AspectRatio, geo)
-	} else {
-		width, height, err = fitBounds(b.Dx(), b.Dy(), geo)
+		if err != nil {
+			badRequest(ctx, w, err.Error())
+			return
+		}
 	}
-	if err != nil {
-		badRequest(ctx, w, err.Error())
-		return
-	}
-	logf(ctx, "images/edits: %dx%d %s in, %dx%d out, strength %g",
-		b.Dx(), b.Dy(), kind, width, height, req.Strength)
+	logf(ctx, "images/edits: %d %s reference(s), last %dx%d, out %s",
+		len(refs), kind, b.Dx(), b.Dy(), formatSize(width, height))
 
 	s.render(w, r, &imageRun{
 		prompt: req.Prompt, width: width, height: height, steps: req.Steps, seed: req.Seed,
 		n: n, format: out.format, compression: out.compression,
 		stream: req.Stream, partials: req.PartialImages,
-		init: init, strength: req.Strength,
+		init: refs,
 	})
 }
 

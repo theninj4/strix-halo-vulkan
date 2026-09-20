@@ -16,10 +16,11 @@
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
-// Every endpoint answers today except POST /v1/images/edits: an edit in
+// Every endpoint answers today. POST /v1/images/edits needs `-edits N`, where
+// N is how many reference images an edit may carry: an edit in
 // Qwen-Image-2.1 is a conditional generation over a vision tower rather than
-// an SDEdit, and that tower is unported (IMAGE.md Q8). `-edits` is therefore
-// an error at startup rather than a flag that quietly does nothing.
+// an SDEdit, so the references are rows of the transformer's own sequence and
+// their cost is residency (IMAGE.md Q8).
 //
 // **There is no -preview flag any more, and that is the change rather than
 // an omission.** Under Z-Image it loaded madebyollin/taef1 and cost 1.0 GB
@@ -160,8 +161,12 @@ func main() {
 			"both sides a multiple of 32, and no larger than 1184x1184 (the VAE's single-buffer arena)")
 	imgSteps := flag.Int("image-steps", 40, "denoising steps a request that names none gets; the checkpoint's default is 40")
 	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
-	imgEdits := flag.Bool("edits", false,
-		"unported under Qwen-Image-2.1 (IMAGE.md Q8); setting it is an error rather than a no-op")
+	imgEdits := flag.Int("edits", 0,
+		"reference images an edit may carry, 0 to refuse /v1/images/edits; editing stages the vision "+
+			"tower and the VAE encoder (~1.4 GB) and each reference costs ~2.1 GB of prefix KV cache")
+	imgCond := flag.Int("image-condition-size", 1024,
+		"square whose area every reference image is resized to, and the default output size of an edit "+
+			"that names none; diffusers' output_resolution")
 	flag.Parse()
 
 	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
@@ -283,7 +288,7 @@ func main() {
 		start := time.Now()
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
-			Steps: *imgSteps, MaxPrompt: *imgPrompt, Edits: *imgEdits,
+			Steps: *imgSteps, MaxPrompt: *imgPrompt, Refs: *imgEdits, CondSize: *imgCond,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -296,9 +301,15 @@ func main() {
 		if geo.Previews {
 			previews = fmt.Sprintf("previews to %d partial images", geo.MaxPartials)
 		}
-		edits := "no edits (IMAGE.md Q8)"
+		edits := "no edits (start with -edits N)"
 		if geo.Edits {
-			edits = fmt.Sprintf("edits at strength %g", geo.DefaultStrength)
+			ref := "reference images"
+			if geo.MaxRefs == 1 {
+				ref = "reference image"
+			}
+			edits = fmt.Sprintf("edits with up to %d %s at %d², ", geo.MaxRefs, ref, *imgCond)
+			ew, ec := b.EditResidency()
+			edits += fmt.Sprintf("%.1f GB + %.1f GB of prefix cache", float64(ew)/1e9, float64(ec)/1e9)
 		}
 		log.Printf("image: %s, to %dx%d, %d steps, %s, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
 			*imgModel, imgW, imgH, *imgSteps, previews, edits,
