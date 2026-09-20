@@ -777,10 +777,17 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 // resolveSize turns the request's size or aspect ratio into pixels, and is the
 // whole of this endpoint's geometry policy.
 //
+// **The ceiling is an area, not a box** -- see ImageGeometry, where the
+// measurement is. What that buys a client is the reason it changed: a 16:9
+// request against a 1024x1024 box used to come back 1024x576, 56% of the
+// pixels the same arenas hand a square request, because a landscape picture
+// was being made to fit a square hole. Against the area the same server
+// answers 1344x768.
+//
 // The checks are ordered by how much they tell the client. A side that is not
-// a multiple of 16 is a typo; an area past the ceiling is a server that was
-// started smaller, and the message says which so the operator can be asked for
-// a bigger one.
+// a multiple of the grid is a typo; an area past the budget is a server that
+// was started smaller, and the message says which so the operator can be
+// asked for a bigger one.
 func resolveSize(size, ratio string, geo ImageGeometry) (width, height int, err error) {
 	switch {
 	case size != "" && size != "auto":
@@ -799,11 +806,13 @@ func resolveSize(size, ratio string, geo ImageGeometry) (width, height int, err 
 	if m > 1 && (width%m != 0 || height%m != 0) {
 		return 0, 0, fmt.Errorf("size %s: both sides must be a multiple of %d", formatSize(width, height), m)
 	}
-	if width > geo.MaxWidth || height > geo.MaxHeight {
+	if geo.MaxPixels > 0 && width*height > geo.MaxPixels {
+		sw, sh := geo.MaxSquare()
 		return 0, 0, fmt.Errorf(
-			"size %s: this server's arenas were built for %s, and neither side may be past it "+
-				"-- a ceiling is what was staged, not a budget per request",
-			formatSize(width, height), formatSize(geo.MaxWidth, geo.MaxHeight))
+			"size %s is %.2f megapixels: this server's arenas were built for %.2f (%s square, or any "+
+				"other shape of the same area) -- a ceiling is what was staged, not a budget per request",
+			formatSize(width, height), float64(width*height)/1e6,
+			float64(geo.MaxPixels)/1e6, formatSize(sw, sh))
 	}
 	return width, height, nil
 }
@@ -825,13 +834,12 @@ func parseSize(s string) (int, int, error) {
 	return width, height, nil
 }
 
-// fitRatio is the aspect-ratio extension: the largest image of that shape
-// that fits inside both side ceilings, rounded down to the size multiple.
+// fitRatio is the aspect-ratio extension: the largest image of that shape the
+// server's pixel budget holds.
 //
-// Rounding *down* is what keeps the answer inside the ceiling after the
-// rounding. The ratio is honoured and the size gives, which is the right way
-// round: a client that asked for 16:9 wants 16:9, and how many pixels this
-// particular server has is not something they said anything about.
+// The ratio is honoured and the size gives, which is the right way round: a
+// client that asked for 16:9 wants 16:9, and how many pixels this particular
+// server has is not something they said anything about.
 func fitRatio(ratio string, geo ImageGeometry) (int, int, error) {
 	a, b, ok := strings.Cut(strings.TrimSpace(ratio), ":")
 	if !ok {
@@ -850,37 +858,70 @@ func fitRatio(ratio string, geo ImageGeometry) (int, int, error) {
 }
 
 // fitAspect is the arithmetic behind fitRatio: the largest image of that shape
-// that fits inside both ceilings, rounded down to the size multiple.
-func fitAspect(rw, rh float64, geo ImageGeometry) (int, int, error) {
-	return scaleAspect(rw, rh, geo, math.Min(float64(geo.MaxWidth)/rw, float64(geo.MaxHeight)/rh))
-}
-
-// fitBounds is fitAspect for a picture rather than for a ratio: the same shape
-// at the same size, shrunk only as far as the ceiling requires.
+// the pixel budget holds.
 //
-// **It never scales up**, which is the difference and the reason it is its own
-// function. A ratio a client typed carries no size, so "16:9" has to mean the
-// largest 16:9 this server does; a 512x512 picture already has one, and
-// upsampling it to a 1024x1024 ceiling would cost four times the tokens to
-// paint detail the input never had.
-func fitBounds(w, h int, geo ImageGeometry) (int, int, error) {
-	rw, rh := float64(w), float64(h)
-	scale := math.Min(float64(geo.MaxWidth)/rw, float64(geo.MaxHeight)/rh)
-	return scaleAspect(rw, rh, geo, math.Min(scale, 1))
-}
-
-func scaleAspect(rw, rh float64, geo ImageGeometry, scale float64) (int, int, error) {
+// **The grid is coarse and that is what makes this more than a square root.**
+// Both sides are multiples of 32 pixels -- two latent tokens -- so an exact
+// 16:9 exists only at 512m x 288m, and between 1024x576 and 1536x864 there is
+// nothing. "Largest" therefore has to say what it trades, and what it
+// maximises is the area *of the shape that was asked for*: a candidate whose
+// ratio came out at 1.75 when 1.7778 was requested counts only for what
+// survives a centre-crop back to 16:9. A few more pixels never buy a visibly
+// different picture that way.
+//
+// Among candidates within half a percent of that best -- the grid throws up
+// near-ties, and at 1.40 Mpx three shapes land within 0.01% of each other --
+// the closest ratio wins, which is what puts an exact 1536x864 ahead of a
+// 1536x896 that is a hair larger and visibly wider.
+func fitAspect(rw, rh float64, geo ImageGeometry) (int, int, error) {
 	m := geo.Multiple
 	if m < 1 {
 		m = 1
 	}
-	width := int(rw*scale) / m * m
-	height := int(rh*scale) / m * m
-	if width < m || height < m {
-		return 0, 0, fmt.Errorf("%g:%g does not fit a %s image in steps of %d",
-			rw, rh, formatSize(geo.MaxWidth, geo.MaxHeight), m)
+	budget := geo.MaxPixels
+	if budget < m*m {
+		return 0, 0, fmt.Errorf("%g:%g does not fit an image of %d pixels in steps of %d",
+			rw, rh, budget, m)
 	}
-	return width, height, nil
+	r := rw / rh
+
+	type candidate struct {
+		w, h int
+		// eff is the area that survives a centre-crop to the requested
+		// ratio; off is how far the ratio is from it, in log space so that
+		// too wide and too tall are penalised alike.
+		eff, off float64
+	}
+	var cands []candidate
+	var best float64
+	for h := m; h*m <= budget; h += m {
+		w := int(math.Round(float64(h)*r/float64(m))) * m
+		for w*h > budget {
+			w -= m
+		}
+		if w < m {
+			continue
+		}
+		got := float64(w) / float64(h)
+		c := candidate{w: w, h: h,
+			eff: float64(w*h) * math.Min(got/r, r/got),
+			off: math.Abs(math.Log(got / r))}
+		cands = append(cands, c)
+		if c.eff > best {
+			best = c.eff
+		}
+	}
+	if best == 0 {
+		return 0, 0, fmt.Errorf("%g:%g does not fit an image of %d pixels in steps of %d",
+			rw, rh, budget, m)
+	}
+	pick := candidate{off: math.Inf(1)}
+	for _, c := range cands {
+		if c.eff >= 0.995*best && c.off < pick.off {
+			pick = c
+		}
+	}
+	return pick.w, pick.h, nil
 }
 
 // formatSize is OpenAI's spelling of a size, which is the one a client can

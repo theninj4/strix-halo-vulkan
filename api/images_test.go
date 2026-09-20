@@ -35,7 +35,7 @@ func (f *fakeImage) Models() []Model {
 
 func (f *fakeImage) Geometry() ImageGeometry {
 	if f.geo.Width == 0 {
-		return ImageGeometry{Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
+		return ImageGeometry{Width: 1024, Height: 1024, MaxPixels: 1024 * 1024,
 			Multiple: 16, Steps: 8}
 	}
 	return f.geo
@@ -157,7 +157,13 @@ func TestImageGenerationSizeReachesTheBackend(t *testing.T) {
 		// A non-square out of a server built square, which is the whole of
 		// what the pipeline change bought: half the tokens, the same arenas.
 		{"landscape", ImageGenerationRequest{Prompt: "p", Size: "1024x512"}, 1024, 512},
-		{"aspect ratio", ImageGenerationRequest{Prompt: "p", AspectRatio: "16:9"}, 1024, 576},
+		// A side twice the staged square's, at the staged square's area. It
+		// is served because the arenas are an area and not a box -- the VAE's
+		// is 3060 bytes a pixel for this shape and for 1024x1024 alike
+		// (qimage/vae's TestArenaShape), and the transformer's rows are the
+		// pixel count over 256 either way.
+		{"a long side at the same area", ImageGenerationRequest{Prompt: "p", Size: "512x2048"}, 512, 2048},
+		{"aspect ratio", ImageGenerationRequest{Prompt: "p", AspectRatio: "16:9"}, 1360, 768},
 		// Size wins over aspect_ratio, because one of them is OpenAI's field
 		// and a client that sent both meant the one every other server reads.
 		{"size beats ratio", ImageGenerationRequest{Prompt: "p", Size: "256x256", AspectRatio: "16:9"}, 256, 256},
@@ -189,11 +195,10 @@ func TestImageGenerationRejectsSizes(t *testing.T) {
 		{"no height", "1024x", "not a height"},
 		{"negative", "-16x16", "not a width"},
 		{"off the grid", "1000x1000", "multiple of 16"},
-		{"past the ceiling", "2048x2048", "neither side may be past it"},
-		{"past it on one side only", "1024x1088", "neither side may be past it"},
-		// The same area in a taller shape, which the transformer would take
-		// and the VAE will not -- see pipeline.geomFor, where it is measured.
-		{"same area, wrong shape", "512x2048", "neither side may be past it"},
+		{"past the budget", "2048x2048", "megapixels"},
+		// 6% past it, which the side box would also have caught -- but now
+		// for the reason that is actually true of the arenas.
+		{"past it by 6%", "1024x1088", "megapixels"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			fake := &fakeImage{}
@@ -212,42 +217,90 @@ func TestImageGenerationRejectsSizes(t *testing.T) {
 	}
 }
 
-// A ratio is fitted to the *server's* ceiling, so the same request answers on
+// A ratio is fitted to the *server's* budget, so the same request answers on
 // a server started at a different size. It is the one place this endpoint
-// computes a size rather than checking one, and rounding down on both sides is
-// what keeps the answer inside the budget.
+// computes a size rather than checking one.
+//
+// **These numbers are the whole point of the area ceiling**, so they are
+// written out rather than computed: 16:9 against a 1.05 Mpx budget was
+// 1024x576 under the old side-box rule — 56% of the pixels the same arenas
+// give a square — and is 1360x768 against the area. The pixel count is
+// asserted beside the size for that reason.
 func TestAspectRatioFitsTheCeiling(t *testing.T) {
+	const (
+		sq1024 = 1024 * 1024
+		sq512  = 512 * 512
+	)
 	for _, c := range []struct {
+		name          string
 		ratio         string
 		geo           ImageGeometry
 		width, height int
 	}{
-		{"1:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 1024, 1024},
-		{"16:9", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 1024, 576},
-		{"9:16", ImageGeometry{MaxWidth: 1024, MaxHeight: 1024, Multiple: 16}, 576, 1024},
-		{"2:1", ImageGeometry{MaxWidth: 512, MaxHeight: 512, Multiple: 16}, 512, 256},
-		// The width binds and the height comes out well under its own
-		// ceiling, which is the ratio being honoured rather than the area
-		// being spent.
-		{"3:2", ImageGeometry{MaxWidth: 512, MaxHeight: 512, Multiple: 16}, 512, 336},
-		// A non-square ceiling: the height binds for the first of these and
-		// the width for the second, which is the only way to tell the two
-		// halves of the fit apart.
-		{"1:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 512, Multiple: 16}, 512, 512},
-		{"2:1", ImageGeometry{MaxWidth: 1024, MaxHeight: 512, Multiple: 16}, 1024, 512},
+		{"square, exactly on the grid", "1:1",
+			ImageGeometry{MaxPixels: sq1024, Multiple: 16}, 1024, 1024},
+		// 1.04 Mpx of a 1.05 Mpx budget, against the old rule's 0.59.
+		{"16:9 spends the budget", "16:9",
+			ImageGeometry{MaxPixels: sq1024, Multiple: 16}, 1360, 768},
+		{"9:16 is its transpose", "9:16",
+			ImageGeometry{MaxPixels: sq1024, Multiple: 16}, 768, 1360},
+		// An exact 2:1 exists on this grid at this budget, and the tie-break
+		// takes it: 720x352 is 2% larger and 2% wider, and the effective
+		// area — what survives a crop back to 2:1 — is the same to 0.01%.
+		{"2:1 lands exact", "2:1",
+			ImageGeometry{MaxPixels: sq512, Multiple: 16}, 704, 352},
+		{"3:2 lands exact", "3:2",
+			ImageGeometry{MaxPixels: sq512, Multiple: 16}, 624, 416},
+		// A budget that is not a square number: the shape is still free and
+		// only the area binds.
+		{"1:1 into a landscape budget", "1:1",
+			ImageGeometry{MaxPixels: 1024 * 512, Multiple: 16}, 720, 720},
+		{"2:1 into a landscape budget", "2:1",
+			ImageGeometry{MaxPixels: 1024 * 512, Multiple: 16}, 1024, 512},
 	} {
-		t.Run(c.ratio+" into "+formatSize(c.geo.MaxWidth, c.geo.MaxHeight), func(t *testing.T) {
+		t.Run(c.name, func(t *testing.T) {
 			w, h, err := fitRatio(c.ratio, c.geo)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if w != c.width || h != c.height {
-				t.Fatalf("%s into %dx%d gave %dx%d, want %dx%d", c.ratio,
-					c.geo.MaxWidth, c.geo.MaxHeight, w, h, c.width, c.height)
+				t.Fatalf("%s into %d pixels gave %dx%d, want %dx%d",
+					c.ratio, c.geo.MaxPixels, w, h, c.width, c.height)
 			}
-			if w > c.geo.MaxWidth || h > c.geo.MaxHeight {
-				t.Errorf("%dx%d is outside the ceiling it was fitted to", w, h)
+			if w*h > c.geo.MaxPixels {
+				t.Errorf("%dx%d is %d pixels, outside the %d it was fitted to",
+					w, h, w*h, c.geo.MaxPixels)
 			}
+			if w%c.geo.Multiple != 0 || h%c.geo.Multiple != 0 {
+				t.Errorf("%dx%d is not on the %d grid", w, h, c.geo.Multiple)
+			}
+		})
+	}
+}
+
+// The fit never spends less of the budget than the old side-box rule did, and
+// on every shape but a square it spends materially more. That is the claim
+// the change was made for, so it is a test rather than a comment.
+func TestAspectRatioBeatsTheSideBox(t *testing.T) {
+	geo := ImageGeometry{MaxPixels: 1024 * 1024, Multiple: 32}
+	for _, c := range []struct {
+		ratio string
+		box   int // what fitting inside a 1024x1024 box used to give
+	}{
+		{"1:1", 1024 * 1024}, {"16:9", 1024 * 576}, {"4:3", 1024 * 768},
+		{"3:2", 1024 * 672}, {"21:9", 1024 * 416}, {"2:3", 672 * 1024},
+	} {
+		t.Run(c.ratio, func(t *testing.T) {
+			w, h, err := fitRatio(c.ratio, geo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w*h < c.box {
+				t.Fatalf("%s gave %dx%d (%d px), fewer than the side box's %d",
+					c.ratio, w, h, w*h, c.box)
+			}
+			t.Logf("%-5s %4dx%-4d %.2f Mpx, %.2fx the side box's %.2f",
+				c.ratio, w, h, float64(w*h)/1e6, float64(w*h)/float64(c.box), float64(c.box)/1e6)
 		})
 	}
 }
@@ -378,7 +431,7 @@ func TestModelsCarriesTheImageGeometry(t *testing.T) {
 	s := &Server{
 		Speech: &fakeSpeech{},
 		Image: &fakeImage{geo: ImageGeometry{
-			Width: 768, Height: 768, MaxWidth: 1024, MaxHeight: 1024, Multiple: 16, Steps: 8,
+			Width: 768, Height: 768, MaxPixels: 1024 * 1024, Multiple: 16, Steps: 8,
 		}},
 	}
 	rec := do(t, s, httptest.NewRequest("GET", "/v1/models", http.NoBody))
@@ -431,7 +484,7 @@ func TestModelsCarriesTheImageGeometry(t *testing.T) {
 // resident and previews on, so the streaming cases have something to answer.
 func editGeo() ImageGeometry {
 	return ImageGeometry{
-		Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
+		Width: 1024, Height: 1024, MaxPixels: 1024 * 1024,
 		Multiple: 16, Steps: 8, Previews: true, MaxPartials: 3,
 		Edits: true, MaxRefs: 3,
 	}

@@ -32,11 +32,18 @@ import (
 // z-image's pipeline made and the same one api.ImageBackend's Geometry()
 // expects: a size is a request parameter, a ceiling is residency.
 //
-// **The ceiling is the VAE's, and it is 1184², not 2048².** The decoder's
-// activation arena is one storage buffer and this device caps one at 4 GiB
-// − 4 (qimage/vae's TestArenaCeiling). New refuses a larger ceiling here,
-// naming the number, rather than letting a buffer allocation fail three
-// models into staging.
+// **And the ceiling is an area, not a rectangle.** Every arena here is sized
+// by the pixel count alone — the transformer by its rows, the VAE by a
+// measured 3060 bytes a pixel whatever the shape (qimage/vae's
+// TestArenaShape) — so what a request has to fit inside is the staged
+// *token count*, and `-image-size 1024x1024` serves 1344x768 as readily as
+// it serves its own square. See MaxPixels.
+//
+// **The largest area is the VAE's, and it is 1,403,584 pixels (1184²), not
+// 2048².** The decoder's activation arena is one storage buffer and this
+// device caps one at 4 GiB − 4 (qimage/vae's TestArenaCeiling). New refuses
+// a larger ceiling here, naming the number, rather than letting a buffer
+// allocation fail three models into staging.
 
 const (
 	// SizeMultiple is what both sides of an image must be a multiple of: the
@@ -300,9 +307,23 @@ func (p *Pipeline) Destroy() {
 	}
 }
 
-// Size is the image a request that names none gets; MaxSize is the ceiling.
+// Size is the image a request that names none gets; MaxSize is the rectangle
+// the arenas were staged for.
 func (p *Pipeline) Size() (width, height int)    { return p.def.width, p.def.height }
 func (p *Pipeline) MaxSize() (width, height int) { return p.max.width, p.max.height }
+
+// MaxPixels is the ceiling as a request has to obey it, and it is an *area*
+// rather than a pair of sides.
+//
+// The staged rectangle is one shape of that area and not a limit on the
+// shape: every arena in this pipeline is sized by the pixel count and nothing
+// else. The transformer's rows are the latent tokens, which is the area over
+// 256; the VAE decoder's activation arena is 3060 bytes a pixel for every
+// shape, measured (`qimage/vae`'s TestArenaShape, which is what lets this be
+// a claim rather than an assumption). So a 1344x768 request runs inside
+// arenas staged for 1024x1024 -- fewer bytes, fewer rows -- and refusing it
+// for having a side past 1024 would be refusing it for nothing.
+func (p *Pipeline) MaxPixels() int { return p.max.width * p.max.height }
 
 // Steps is the default schedule length.
 func (p *Pipeline) Steps() int { return p.steps }
@@ -337,9 +358,11 @@ func (p *Pipeline) geomFor(width, height int) (geom, error) {
 	if err != nil {
 		return geom{}, err
 	}
-	if g.width > p.max.width || g.height > p.max.height {
-		return geom{}, fmt.Errorf("pipeline: %dx%d is past this server's %dx%d ceiling",
-			g.width, g.height, p.max.width, p.max.height)
+	if g.imgTokens > p.max.imgTokens {
+		return geom{}, fmt.Errorf(
+			"pipeline: %dx%d is %d latent tokens, past the %d this server staged for (%dx%d, "+
+				"or any other shape of the same area)",
+			g.width, g.height, g.imgTokens, p.max.imgTokens, p.max.width, p.max.height)
 	}
 	return g, nil
 }

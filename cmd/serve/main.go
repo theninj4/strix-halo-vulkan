@@ -37,13 +37,17 @@
 // it and anything that can open the port can run the two speech models on
 // it. See the `wyoming` package.
 //
-// **-image-size is a ceiling and it has a hard limit.** The arenas are
-// allocated once for it and every smaller request runs inside them, so what
-// the number buys is the largest image and nothing else. The limit is
-// 1184x1184 and it is not a budget: the VAE decoder's activation arena is a
-// single storage buffer and this device caps one at 4 GiB - 4, which a
-// 1216x1216 decode is already past. Anything larger is refused at startup
-// with the arithmetic.
+// **-image-size is a ceiling, it is an *area*, and it has a hard limit.** The
+// arenas are allocated once for it and every request inside that many pixels
+// runs in them, so what the number buys is the largest image and nothing
+// else. The shape is free: every arena in the image pipeline is sized by the
+// pixel count alone (`qimage/vae`'s TestArenaShape measures the VAE's at 3060
+// bytes a pixel for every aspect ratio), so `-image-size 1024x1024` answers
+// `aspect_ratio: "16:9"` with 1344x768 rather than with 1024x576. The limit
+// is 1,403,584 pixels -- 1184x1184 square, 1536x864 at 16:9 -- and it is not
+// a budget: the VAE decoder's activation arena is a single storage buffer and
+// this device caps one at 4 GiB - 4, which a 1216x1216 decode is already
+// past. Anything larger is refused at startup with the arithmetic.
 //
 // **-llm stages D19's widths and D20's MoE bank by default** (P3a, P4b).
 // D19 is D18's 4.5-bit plan with `ple_proj` on int8, plus P3a's fifth bit on
@@ -157,8 +161,9 @@ func main() {
 	imgOn := flag.Bool("image", false, "load Qwen-Image-2.1 and serve /v1/images/generations")
 	imgModel := flag.String("image-model", "models/Qwen-Image-2.1", "Qwen-Image-2.1 checkpoint root")
 	imgSize := flag.String("image-size", "1024x1024",
-		"largest image the arenas are built for, and the size a request that names none gets; "+
-			"both sides a multiple of 32, and no larger than 1184x1184 (the VAE's single-buffer arena)")
+		"largest image the arenas are built for, and the size a request that names none gets; its "+
+			"*area* is the ceiling and any shape of that area is served, both sides a multiple of 32, "+
+			"and no more than 1403584 pixels / 1184x1184 (the VAE's single-buffer arena)")
 	imgSteps := flag.Int("image-steps", 40, "denoising steps a request that names none gets; the checkpoint's default is 40")
 	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
 	imgEdits := flag.Int("edits", 0,

@@ -299,6 +299,58 @@ func TestStepSweep(t *testing.T) {
 	}
 }
 
+// TestGeometryShapes is the graph gate the area ceiling needs, and the reason
+// it exists is the project's own rule about a new regime: the arithmetic in
+// TestArenaShape and TestAspectRatioFitsTheCeiling says a request of the
+// staged *area* runs in the staged arenas whatever its shape, and that is a
+// claim about recorded graphs — the DiT's row count, the VAE's re-planned
+// decode, the RoPE grids — which only the device can settle.
+//
+// So: stage one square pipeline, then render the shapes the served geometry
+// now hands out. The square is the control, 1344x768 is what `16:9` resolves
+// to at this ceiling, and 2048x512 has a side twice the staged one at exactly
+// the staged token count. Eight steps, because what is under test is the
+// geometry and not the picture — the PNGs are written anyway, since a graph
+// that ran with a transposed grid would produce a *plausible* tensor and only
+// the eyeball catches that.
+func TestGeometryShapes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages the whole pipeline")
+	}
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	p := newPipeline(t, dev, Options{Model: model, Width: 1024, Height: 1024, Steps: 8})
+	maxTokens := p.MaxPixels() / (VAEScale * VAEScale)
+
+	for _, c := range []struct{ w, h int }{{1024, 1024}, {1344, 768}, {768, 1344}, {2048, 512}} {
+		t.Run(fmt.Sprintf("%dx%d", c.w, c.h), func(t *testing.T) {
+			img, tm, err := p.Run(Request{
+				Prompt: defaultSweepPrompt, Width: c.w, Height: c.h, Steps: 8, Seed: 42,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if img.W != c.w || img.H != c.h {
+				t.Fatalf("asked for %dx%d, decoded %dx%d", c.w, c.h, img.W, img.H)
+			}
+			tokens := (c.w / VAEScale) * (c.h / VAEScale)
+			t.Logf("%dx%d: %d tokens of the staged %d, %v total (prefill %v, step %v, decode %v)",
+				c.w, c.h, tokens, maxTokens, tm.Total.Round(time.Millisecond),
+				tm.Prefill.Round(time.Millisecond), tm.Steps[1].Round(time.Millisecond),
+				tm.Decode.Round(time.Millisecond))
+			writeArtifact(t, fmt.Sprintf("shape_%dx%d_8steps.png", c.w, c.h), img)
+		})
+	}
+
+	// And the refusal is the area, not the side: one step past the staged
+	// token count is a 400 even though both sides are inside the square.
+	if _, _, err := p.Run(Request{Prompt: "p", Width: 1024, Height: 1088, Steps: 1, Seed: 1}); err == nil {
+		t.Error("1024x1088 ran; it is 6% more pixels than the arenas hold")
+	} else {
+		t.Logf("1024x1088 refused: %v", err)
+	}
+}
+
 // TestGeometryCeiling is the ceiling as a served behaviour rather than an
 // arena number: a size past it is refused with a reason, and the refusal
 // happens before anything is staged.

@@ -375,3 +375,45 @@ func TestArenaCeiling(t *testing.T) {
 		t.Logf("%4dx%-4d latent %3dx%-3d  arena %6d MB  %s", side, side, lat, lat, n>>20, verdict)
 	}
 }
+
+// TestArenaShape is what the server's geometry policy rests on, and it is a
+// measurement rather than an argument: **the arena is a function of the pixel
+// count alone**, at exactly 3060 bytes a pixel, whatever shape those pixels
+// are in.
+//
+// It matters because the ceiling used to be a pair of side limits, inherited
+// from z-image — whose blocked fp16 conv copies really are padded per axis,
+// so 128x512 cost it more arena than 256x256. This decoder holds its
+// activations flat, and nothing in the graph pads a row: an 8:1 picture plans
+// to the same byte as the square of its area. A side ceiling would therefore
+// have been charging every landscape request for a constraint that does not
+// exist — 16:9 inside a 1024x1024 box is 1024x576, 56% of the pixels the same
+// arena holds.
+//
+// The two controls are the extreme aspects (256x4096 and 4096x256), because
+// an axis-dependent cost would show up there or nowhere.
+func TestArenaShape(t *testing.T) {
+	_, dec := loadCPU(t)
+	const bytesPerPixel = 3060
+	for _, s := range [][2]int{
+		{1024, 1024}, {1344, 768}, {768, 1344}, {1152, 896}, {2048, 512},
+		{512, 2048}, {256, 4096}, {4096, 256}, {1184, 1184}, {1536, 864},
+	} {
+		w, h := s[0], s[1]
+		n, err := ArenaBytes(dec, h/16, w/16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := n / (w * h); got != bytesPerPixel || n%(w*h) != 0 {
+			t.Errorf("%dx%d plans %d bytes, %g a pixel; want exactly %d",
+				w, h, n, float64(n)/float64(w*h), bytesPerPixel)
+		}
+		t.Logf("%4dx%-4d  %.3f Mpx  arena %6d MB  %s",
+			w, h, float64(w*h)/1e6, n>>20,
+			map[bool]string{true: "fits", false: "OVER maxStorageBufferRange"}[n <= MaxStorageBufferBytes])
+	}
+	// The consequence, spelled out: the largest area this decoder decodes,
+	// and the largest 16:9 inside it.
+	t.Logf("budget %d pixels (%.2f Mpx); largest square 1184x1184, largest exact 16:9 1536x864",
+		MaxStorageBufferBytes/bytesPerPixel, float64(MaxStorageBufferBytes/bytesPerPixel)/1e6)
+}

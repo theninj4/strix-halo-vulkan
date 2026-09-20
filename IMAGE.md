@@ -9,6 +9,14 @@
 > edit's trajectory is pinned by its prefix. Q9 so far: a 6–7% step, bit for
 > bit the same picture, from one badly-shaped launch the profile caught.
 >
+> **2026-09-21 — Q10: the ceiling is an area, not a box.** A served 16:9
+> request was coming back 1024x576 against arenas that hold 1.05 Mpx, because
+> the geometry limited each *side*. The VAE's arena turns out to be **exactly
+> 3060 bytes a pixel for every aspect ratio** (`TestArenaShape`), so the shape
+> was never a constraint: the same server now answers **1344x768**, 1.75x the
+> pixels, at the same wall clock, and `-image-size 1184x1184` reaches
+> **1536x864**. Nothing about residency or the numerics moved.
+>
 > **Q0–Q7, one day in** and
 > the model was *served*: `POST /v1/images/generations` answered from
 > Qwen-Image-2.1 at **1m38s for a 1024²/40-step image** (Q6's own
@@ -52,6 +60,7 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
 | Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports are next |
+| Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
 the instrument named beside it. The day's method finding, three times over:
@@ -500,6 +509,9 @@ two-run numbers.
   or splitting the arena across several buffers bound as a descriptor array —
   `vk.PipelineSpec.Counts` already exists for exactly this, and the LLM's
   77 GB bank is the precedent.
+  **Amended 2026-09-21 (Q10): that ceiling is an *area*, and shipping it as a
+  pair of side limits was costing every non-square request 44% of its
+  pixels** — see the stage below.
   **The Z-Image deletion is half done, on purpose.** Gone: `zimage/dit`,
   `zimage/pipeline`, `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`,
   `cmd/ditblock` — nothing else imported them and `qimage/` replaces all of
@@ -956,6 +968,11 @@ two-run numbers.
   residency nobody asked for. So the aspect ratio is kept and the area shrunk
   until both sides fit, and a ceiling above the condition area leaves
   diffusers' own answer untouched.
+  **Mostly repaired by Q10** (2026-09-21): against an area ceiling only the
+  snap is left to deal with — 1184x896 is 1% past 1024²'s area, not a side
+  outside a box — so a 4:3 edit is **1152x896 rather than 1024x768**, a
+  panorama 2048x512 rather than 1024x256, and the deviation is now one 32-px
+  step instead of a whole shrink.
   **The endpoint's shape changed with the mechanism**, which is what Q6 said
   it would: `-edits` is now `-edits N` (residency — the tower and the VAE
   encoder are 1.4 GB, and each reference is ~2.1 GB of prefix KV cache at
@@ -1055,6 +1072,59 @@ two-run numbers.
   `zimage/vae`'s `hbuf`/`w16buf` engine split, `vae_pack_conv.comp`,
   nine `vae_conv_wmma` builds and `TestGPUConvMatchesScalar` are all in the
   tree and are why `zimage/vae` was kept past its replacement.
+- **Q10 — the ceiling is an area, not a box. Done 2026-09-21**, and it came
+  out of a served complaint rather than a plan: a 16:9 request against the
+  shipped server was answering **1024x576**, 0.59 Mpx, where the same arenas
+  hold 1.05. Nothing was broken — `fitRatio` was fitting the ratio inside
+  `MaxWidth`/`MaxHeight` exactly as written — the *rule* was wrong, and it
+  was wrong because it was inherited.
+  **The measurement first** (`qimage/vae`'s `TestArenaShape`, the permanent
+  instrument): plan the decode for a dozen shapes and the activation arena is
+  **exactly 3060 bytes a pixel for every one of them** — 1024x1024, 1344x768,
+  2048x512, 256x4096, 4096x256, to the byte, with no per-axis term at all.
+  The DiT's rows are the pixel count over 256 by construction and the text
+  encoder does not see the geometry, so **residency in this pipeline is a
+  function of area alone**. The side box came from `api.ImageGeometry`'s
+  z-image-era doc, which argued the opposite and was *right about z-image*:
+  that VAE holds blocked fp16 copies of each convolution's input, padded per
+  axis, so 128x512 genuinely cost it more than 256x256. Q5g's decoder keeps
+  its activations flat. The constraint was carried across with the comment
+  that justified it and never re-measured — the same composition-without-
+  measurement this file's method refuses everywhere else.
+  **What it cost, and it is the largest single number this vertical has
+  moved**: at the shipped 1024² ceiling, `aspect_ratio: "16:9"` goes
+  **1024x576 → 1344x768 (1.75x the pixels)**, 3:2 → 1248x832 (1.51x), 21:9 →
+  1536x672 (2.42x), and an edit that names no size goes 1024x768 → 1152x896
+  on a 4:3 reference. At the hardware's own ceiling (`-image-size 1184x1184`,
+  1,403,584 px) 16:9 is **1536x864**, which is 2.25x what the box gave.
+  **And it is free**, which is the point: a 1344x768 image is 4032 latent
+  tokens against a square's 4096, so it costs *less* than the picture it
+  replaces. Measured on the device at 8 steps, one square staging serving all
+  four shapes: 1024x1024 27.0 s, **1344x768 26.5 s**, 768x1344 26.4 s,
+  2048x512 27.0 s, steps flat at 2.36 s (`TestGeometryShapes`, the graph gate
+  the new regime needed — arithmetic could not have settled whether a
+  re-planned decode and a non-square RoPE grid actually run, and a transposed
+  grid would produce a plausible tensor, so the PNGs are written and looked
+  at). The full article is
+  `out/qi21served/served1344x768_40steps.png`, a photorealistic 16:9 fox at
+  **1m44.5s** (encode 113 ms, prefill 2.41 s, 39 steps at 2.42 s, decode
+  7.38 s) — read against Q9's 1m32 at 1024² with the step at 2.12 s, the 14%
+  is device contention: the `ai` service was resident and serving while this
+  ran, and the per-step number is the tell. Nothing here is per-pixel more
+  expensive than the square.
+  **The fit had to grow a rule**, because the grid is coarse: both sides are
+  multiples of 32 px, so an exact 16:9 exists only at 512m x 288m and there is
+  nothing between 1024x576 and 1536x864. `fitAspect` now maximises the area
+  **of the shape that was asked for** — a candidate's area discounted by what
+  survives a centre-crop back to the requested ratio — with near-ties (within
+  0.5%) broken toward the closer ratio. That is what picks 1344x768 at 1.05
+  Mpx and the *exact* 1536x864 at 1.40, where a plain "largest that fits"
+  would have taken 1568x864 and been 2% wider than asked.
+  Two things deliberately did not change: the hard limit is still the VAE's
+  single storage buffer (now stated as **1,403,584 pixels** rather than
+  1184x1184, which is the same number said correctly), and `-image-size` is
+  still one flag naming both the default size and the ceiling — its *area* is
+  now what the ceiling means.
 
 ## Decisions taken now (so future sessions don't relitigate)
 
@@ -1069,6 +1139,10 @@ two-run numbers.
    at **1184²** on one storage buffer (Q5g), so serving above that needs
    tiling or a multi-buffer arena first. 1024² is the shipped default and
    `-image-size` refuses anything larger than 1184x1184 at startup.
+   Amended again 2026-09-21 (Q10): **the ceiling is that rectangle's area and
+   not its sides** — 1,403,584 pixels, whatever shape they are in — because
+   the arena is 3060 bytes a pixel for every aspect ratio and a side limit
+   was charging landscape requests for a constraint that does not exist.
 5. **No self-trained tiny decoder**; linear preview + watch taehv.
 6. **No CFG path in the Go port** (true_cfg_scale stays a refusal if asked
    for over HTTP) until something demands it — it would double every step.

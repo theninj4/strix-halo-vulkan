@@ -31,10 +31,17 @@ type ImageOptions struct {
 	// arenas are ~27 GB, they are allocated once, and every smaller image runs
 	// inside them -- so what this number buys is the ceiling and nothing else.
 	//
-	// **The ceiling has a hard limit at 1184x1184** and it is not a budget:
-	// the VAE decoder's activation arena is one storage buffer and this device
-	// caps one at 4 GiB - 4 (IMAGE.md Q5g/Q6). Anything larger is refused at
-	// startup, naming the number.
+	// **What a request has to fit inside is this rectangle's area, not its
+	// sides.** Every arena here is sized by the pixel count alone (measured:
+	// `qimage/vae`'s TestArenaShape), so a server started at 1024x1024 serves
+	// 1344x768 and 2048x512 as readily as its own square, and a 16:9 request
+	// gets 16:9's share of the arenas instead of 56% of it.
+	//
+	// **The area has a hard limit of 1,403,584 pixels** -- 1184x1184, or
+	// 1536x864 at 16:9 -- and it is not a budget: the VAE decoder's
+	// activation arena is one storage buffer and this device caps one at
+	// 4 GiB - 4 (IMAGE.md Q5g/Q6). Anything larger is refused at startup,
+	// naming the number.
 	Width, Height int
 	// Steps is the schedule a request that names none gets. Unlike
 	// Z-Image-Turbo's 8, Qwen-Image-2.1 is not a distillation and 40 is what
@@ -140,7 +147,6 @@ func (b *Image) Models() []api.Model {
 // Geometry is what this process was started for.
 func (b *Image) Geometry() api.ImageGeometry {
 	w, h := b.pipe.Size()
-	mw, mh := b.pipe.MaxSize()
 	// Previews are unconditional -- the decoder is a constant matrix, not
 	// residency -- so unlike under Z-Image there is no flag for the two
 	// fields to disagree about. Edits report the *count* rather than a
@@ -148,7 +154,7 @@ func (b *Image) Geometry() api.ImageGeometry {
 	// how many pictures it may send.
 	return api.ImageGeometry{
 		Width: w, Height: h,
-		MaxWidth: mw, MaxHeight: mh,
+		MaxPixels:   b.pipe.MaxPixels(),
 		Multiple:    pipeline.SizeMultiple,
 		Steps:       b.pipe.Steps(),
 		Previews:    true,

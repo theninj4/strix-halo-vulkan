@@ -341,33 +341,32 @@ func flattenNRGBA(img *image.NRGBA) []float32 {
 
 // targetFor is the output size an edit that named none gets: diffusers'
 // `calculate_dimensions` at the condition area, fitted inside this server's
-// ceiling.
+// pixel budget.
 //
-// The fit is necessary and is the one place this leaves the reference. At
-// the shipped defaults the condition area and the ceiling are the same 1024²,
-// and `calculate_dimensions` on anything but a square reference produces
-// *sides* past it — a 4:3 picture becomes 1184x896, whose long side is
-// outside a 1024x1024 ceiling even though its area is not. Refusing would
-// make every non-square edit a 400 at the default settings; enlarging the
-// ceiling would be residency the request did not ask for. So the aspect
-// ratio is kept and the area shrunk until both sides fit, which is what a
-// client that sent no size is asking for.
+// **It is now almost always the reference's own answer**, which is what
+// changed when the ceiling stopped being a box. `calculate_dimensions` fixes
+// the area and lets the sides run, so a 4:3 picture at a 1024² condition
+// area becomes 1184x896 — whose long side used to be outside a 1024x1024
+// ceiling even though its area was 1% past it, and every non-square edit was
+// shrunk a whole step for that. Against an area budget only the 1% is left
+// to deal with: the snap to 32 rounds up, so the result can sit one step
+// over, and the longer side comes down one step to pay for it. That moves
+// the aspect by less than the granularity the model accepts in the first
+// place, and a budget above the condition area leaves diffusers' answer
+// untouched.
 func (p *Pipeline) targetFor(ratio float64) (int, int) {
+	budget := p.MaxPixels()
 	area := p.condSize * p.condSize
+	if area > budget {
+		area = budget
+	}
 	w, h := CalcDimensions(area, ratio)
-	if w <= p.max.width && h <= p.max.height {
-		return w, h
-	}
-	s := math.Min(float64(p.max.width)/float64(w), float64(p.max.height)/float64(h))
-	w, h = CalcDimensions(int(float64(area)*s*s), ratio)
-	// The snap to 32 can still round a side back over the edge; a side that
-	// is over comes down one step, which moves the aspect by less than the
-	// granularity the model accepts in the first place.
-	for w > p.max.width && w > CondMultiple {
-		w -= CondMultiple
-	}
-	for h > p.max.height && h > CondMultiple {
-		h -= CondMultiple
+	for w*h > budget && (w > CondMultiple || h > CondMultiple) {
+		if w >= h && w > CondMultiple {
+			w -= CondMultiple
+		} else {
+			h -= CondMultiple
+		}
 	}
 	return w, h
 }

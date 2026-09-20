@@ -13,9 +13,11 @@
 //
 // **The size is a request parameter, the ceiling is residency.** -width and
 // -height set both here, because a one-shot command has no reason to build
-// arenas larger than the image it was asked for. The ceiling itself stops at
-// 1184x1184: the VAE decoder's activation arena is one storage buffer and
-// this device caps one at 4 GiB - 4.
+// arenas larger than the image it was asked for. The ceiling is an *area*
+// rather than a rectangle -- every arena is sized by the pixel count alone,
+// measured -- and it stops at 1,403,584 pixels (1184x1184 square, 1536x864 at
+// 16:9): the VAE decoder's activation arena is one storage buffer and this
+// device caps one at 4 GiB - 4.
 package main
 
 import (

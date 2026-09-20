@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 
@@ -246,19 +247,24 @@ type ImageResult struct {
 // model object in GET /v1/models for the same reason the voice list is: the
 // alternative is a client discovering the limit from a 400.
 //
-// **MaxWidth and MaxHeight bound each side, and the area is not a second,
-// looser rule.** It is tempting to think it would be -- a diffusion model's
-// cost is its token count, so the same area in another shape should be the
-// same work -- and for the transformer it is. It is not for the decoder: the
-// z-image VAE holds blocked fp16 copies of each convolution's input, padded
-// per axis, so 128x512 needs more arena than the 256x256 it has the same area
-// as. Both sides inside the ceiling makes every tensor smaller elementwise,
-// which is the condition that actually holds.
+// **The ceiling is an area and not a box**, which is a correction: under
+// Z-Image it was a pair of side limits, on the argument that the VAE's
+// blocked fp16 copies are padded per axis so 128x512 costs more arena than
+// the 256x256 it has the same area as. That argument does not survive the
+// Qwen-Image-2.1 decoder, and it was measured rather than reasoned about:
+// `qimage/vae`'s TestArenaShape plans the graph for a dozen shapes and finds
+// the arena is **exactly 3060 bytes a pixel** for every one of them, 256x4096
+// and 1024x1024 included. The transformer's row count is the pixel count over
+// 256 by construction. So residency is a function of the *area* alone, and a
+// side limit taxes every non-square request for nothing: 16:9 inside a
+// 1024x1024 box is 1024x576, 56% of the pixels a square request gets from the
+// same arenas.
 type ImageGeometry struct {
 	// Width and Height are what a request that names no size gets.
 	Width, Height int
-	// MaxWidth and MaxHeight are the largest each side may be.
-	MaxWidth, MaxHeight int
+	// MaxPixels is the area budget: width*height may not exceed it, and the
+	// shape is otherwise free. Zero means unbounded.
+	MaxPixels int
 	// Multiple is what both sides must be a multiple of.
 	Multiple int
 	// Steps is the default denoising schedule's length.
@@ -283,13 +289,35 @@ type ImageGeometry struct {
 	MaxRefs int
 }
 
-// MarshalJSON writes the geometry the way a client reads it: the two pairs
+// MaxSquare is the largest square inside the pixel budget, snapped down to
+// Multiple. It is what `max_size` reports, because a client that wants one
+// number rather than a rule wants this one -- and because a size the server
+// is certain to accept is the useful thing to echo back into a request.
+func (g ImageGeometry) MaxSquare() (int, int) {
+	m := g.Multiple
+	if m < 1 {
+		m = 1
+	}
+	side := int(math.Sqrt(float64(g.MaxPixels))) / m * m
+	if side < m {
+		side = m
+	}
+	return side, side
+}
+
+// MarshalJSON writes the geometry the way a client reads it: the sizes
 // spelled as OpenAI spells a size, so one can be echoed straight back into a
 // request's `size` without being reassembled first.
+//
+// `max_pixels` is the rule and `max_size` is the largest square that obeys
+// it. Both are reported because a client asking for a square only needs the
+// second, and one asking for 16:9 cannot work it out from the second alone.
 func (g ImageGeometry) MarshalJSON() ([]byte, error) {
+	maxW, maxH := g.MaxSquare()
 	return json.Marshal(struct {
 		DefaultSize  string `json:"default_size"`
 		MaxSize      string `json:"max_size"`
+		MaxPixels    int    `json:"max_pixels"`
 		SizeMultiple int    `json:"size_multiple"`
 		DefaultSteps int    `json:"default_steps"`
 		Previews     bool   `json:"previews"`
@@ -298,7 +326,8 @@ func (g ImageGeometry) MarshalJSON() ([]byte, error) {
 		MaxRefs      int    `json:"max_reference_images,omitempty"`
 	}{
 		DefaultSize:  formatSize(g.Width, g.Height),
-		MaxSize:      formatSize(g.MaxWidth, g.MaxHeight),
+		MaxSize:      formatSize(maxW, maxH),
+		MaxPixels:    g.MaxPixels,
 		SizeMultiple: g.Multiple,
 		DefaultSteps: g.Steps,
 		Previews:     g.Previews,

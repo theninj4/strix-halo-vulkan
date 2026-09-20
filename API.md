@@ -403,12 +403,28 @@ genuinely per request. And **`"aspect_ratio"`** — `"16:9"` and the like — is
 fitted to the largest image *this* server holds, so a client wanting a
 landscape picture does not have to know the ceiling to ask for one; `size`
 wins when both are set, because that is the field every other server reads.
+
+**The ceiling is an area and the shape is free**, which is worth knowing
+before reading `max_size`. What a server stages is a number of pixels — the
+image pipeline's arenas are sized by the pixel count alone, the VAE's at a
+measured 3060 bytes a pixel whatever the aspect ratio — so a request is
+accepted when `width x height` fits `max_pixels`, and both 1344x768 and
+2048x512 are served by a box started at `-image-size 1024x1024`. That is why
+`aspect_ratio: "16:9"` answers 1344x768 there rather than 1024x576: a
+landscape picture gets 16:9's share of the arenas instead of what is left of
+a square after it has been flattened. A size past the budget is a 400 naming
+the megapixels.
+
 `GET /v1/models` carries an **`image`** object on the image model, alongside
 the speech model's voices and for the same reason: `default_size`, `max_size`,
-`size_multiple`, `default_steps`, `previews`, `max_partial_images`, `edits` and
-`max_reference_images`, which are decided by what this process staged. The
-last four are how a client finds out that `stream: true` and an edit will be
-answered, and with how many pictures, rather than discovering it from a 501.
+`max_pixels`, `size_multiple`, `default_steps`, `previews`,
+`max_partial_images`, `edits` and `max_reference_images`, which are decided by
+what this process staged. `max_pixels` is the rule and `max_size` is the
+largest *square* obeying it, both reported because a client asking for a
+square needs only the second and one asking for 16:9 cannot derive it from
+the second alone. The last four are how a client finds out that `stream: true`
+and an edit will be answered, and with how many pictures, rather than
+discovering it from a 501.
 
 **`background: "transparent"` is OpenAI's field and it is answerable here**,
 because Qwen-Image-2.1's VAE is natively RGBA — four channels out of the

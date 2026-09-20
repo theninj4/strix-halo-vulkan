@@ -20,7 +20,7 @@ var errBoom = errors.New("boom: the device went away")
 // file is about what the handler does with `stream` and `partial_images`; that
 // the frames are pictures of anything is the VAE's business.
 func previewGeometry() ImageGeometry {
-	return ImageGeometry{Width: 1024, Height: 1024, MaxWidth: 1024, MaxHeight: 1024,
+	return ImageGeometry{Width: 1024, Height: 1024, MaxPixels: 1024 * 1024,
 		Multiple: 16, Steps: 8, Previews: true, MaxPartials: 3}
 }
 
