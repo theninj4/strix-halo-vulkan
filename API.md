@@ -149,7 +149,7 @@ two runs, at the default 40 steps:
 clock is the 40 denoising steps, 4.5% is the VAE and 0.1% is the text
 encoder. The two levers are therefore the step count — genuinely per request
 here, unlike under a turbo distillation — and the unported percents
-`IMAGE.md`'s Q9 prices. (The VAE was 8.1% until Q9b halved its decode, in
+research/qimage-vertical.md's Q9 prices. (The VAE was 8.1% until Q9b halved its decode, in
 fp32: the matrix cores are refused there on precision, so what changed was
 a register block and a GEMM tile, and the output is bit for bit the same.)
 
@@ -162,9 +162,9 @@ attends over.
 
 Over HTTP, on a `-image -image-size 512x512 -image-steps 24` process: a
 512x512 image at 24 steps comes back in **16.8 s then 14.5 s**, base64 body
-included. **The step count is worth sending.** IMAGE.md's sweep (same seed,
-three prompt kinds, 1024x1024) found the answer is prompt-dependent rather
-than a single number:
+included. **The step count is worth sending.** The sweep in
+research/qimage-vertical.md (same seed, three prompt kinds, 1024x1024) found
+the answer is prompt-dependent rather than a single number:
 
 | steps | wall | photographic | painterly | structured/technical |
 |---|---|---|---|---|
@@ -456,7 +456,7 @@ full VAE — 1.0 GB of activation arena, so streaming was a residency decision
 and `-preview` was how you made it. Qwen-Image-2.1's 64-channel VAE has no
 distilled decoder in existence, so the preview here is a **fitted linear
 64→RGBA matrix**: 260 float32s compiled into the binary, least-squares
-fitted against the real decoder's own output (IMAGE.md Q7, R² 0.97 on the
+fitted against the real decoder's own output (research/qimage-vertical.md Q7, R² 0.97 on the
 fit and 0.83–0.90 on held-out prompts).
 There is nothing to load and nothing to turn on.
 
@@ -574,9 +574,9 @@ What is refused rather than faked:
   did something other than what was asked.
 - **A `mask` on an edit.** Still refused, but the reason has moved: 2.1 can
   do masked and annotated local edits, and how a separate mask is fed is not
-  in the diffusers implementation this port follows (IMAGE.md's open question
-  Q-o3). It is a 501 that says what it would be rather than a picture that
-  ignored it.
+  in the diffusers implementation this port follows
+  (research/qimage-vertical.md's open question Q-o3). It is a 501 that says
+  what it would be rather than a picture that ignored it.
 - **`background: "transparent"` with a JPEG container.** A 400 naming both
   fields. JPEG has no alpha channel, and flattening it silently would hand
   back an opaque picture that the prompt rewrite had also made worse.
@@ -681,7 +681,7 @@ again.
   which is a measurement (`cmd/llm -mtp`), not engineering; see `TODO.md`.
 - **Image editing costs more than it did**, and that is the model rather
   than the port: an edit in 2.1 is a conditional generation over a 27-layer
-  vision tower (IMAGE.md Q8), not an SDEdit, so there is no truncated
+  vision tower (research/qimage-vertical.md Q8), not an SDEdit, so there is no truncated
   schedule to make it cheap. 1m54s at 1024² against a generation's 1m28.8s, and
   no `strength` to trade quality for time with. The endpoint's shape is
   unchanged underneath; what changed is that `image[]` is a real list.

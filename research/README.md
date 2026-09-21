@@ -13,13 +13,22 @@ The root progress files were consolidated here on 2026-09-20, frozen as
 each vertical's closing record; stage letters (L7d, P4c, T9, S10, I7, E7…)
 resolve inside them.
 
+**`IMAGE.md` named two different files**, so a citation of it needs one
+extra step: with a **Q-stage, a numbered decision or a Q-o number** it is
+[`qimage-vertical.md`](qimage-vertical.md) (Qwen-Image-2.1, the root file
+from 2026-09-20 to 2026-09-21); with an **I-stage (I0–I7)** it is
+[`zimage-vertical.md`](zimage-vertical.md) (z-image-turbo, the root file
+before that). Both spellings are live in code comments, which were not
+rewritten — same as `LLM.md` and `SPEECH.md`.
+
 | file | was | carries |
 |---|---|---|
 | [`llm-vertical.md`](llm-vertical.md) | `LLM.md` | qwen3.8-flash-next: stages L0–L9a summarised, decisions **D1–D21**, open questions, the model/machine tables, how-to-run |
 | [`llm-review.md`](llm-review.md) | `LLM2.md` | the review: hypotheses checked, the honest decode budget, P0–P6 as closed |
 | [`speech-vertical.md`](speech-vertical.md) | `SPEECH.md` | parakeet S1–S8 and kokoro T1–T10, R1, W1 — the **T6–T10/R1/W1 write-ups live only here** |
 | [`tts-recap.md`](tts-recap.md) | `TTS.md` | the kokoro recap: stage table, serving defaults |
-| [`zimage-vertical.md`](zimage-vertical.md) | `IMAGE.md` | z-image I0–I7: serving, previews, edits, re-checked hypotheses |
+| [`qimage-vertical.md`](qimage-vertical.md) | `IMAGE.md` (2026-09-20–21) | Qwen-Image-2.1 **Q0–Q12**: both endpoints served, decisions **1–7**, open questions **Q-o1–Q-o5** — the vertical's closing record, parked 2026-09-21 |
+| [`zimage-vertical.md`](zimage-vertical.md) | `IMAGE.md` (until 2026-09-20) | z-image I0–I7: serving, previews, edits, re-checked hypotheses |
 | [`zimage-pipeline.md`](zimage-pipeline.md) | `PIPELINE.md` | the slice as built: inventory, the five validation rules, the budget |
 | [`embedding-vertical.md`](embedding-vertical.md) | `EMBEDDING.md` | Qwen3-Embedding E0–E8 — its only write-up |
 | [`ideas.md`](ideas.md) | `IDEAS.md` | the `§N.M` backlog and the measured roofline — **the address space; never renumber** |

@@ -1,19 +1,27 @@
 # TODO — the state of play
 
-> **Rewritten 2026-09-20**, consolidating the per-vertical progress files
-> (`LLM.md`, `LLM2.md`, `SPEECH.md`, `TTS.md`, `IMAGE.md`, `PIPELINE.md`,
-> `EMBEDDING.md`, `IDEAS.md` and the old session-log `TODO.md`) into
-> [`research/`](research/README.md) — see the file map at the bottom. This
-> file is the live one: what each vertical is, what it measures today, and
-> what is open. It is **rewritten**, not appended to; a closed item's
-> write-up goes to `research/` and history lives in git.
+> **Rewritten 2026-09-21.** The per-vertical progress files were
+> consolidated into [`research/`](research/README.md) on 2026-09-20 (`LLM.md`,
+> `LLM2.md`, `SPEECH.md`, `TTS.md`, `IMAGE.md`, `PIPELINE.md`,
+> `EMBEDDING.md`, `IDEAS.md` and the old session-log `TODO.md`) — see the
+> file map at the bottom. The root `IMAGE.md` then came back live for one day
+> to carry the Qwen-Image-2.1 replacement, and was frozen in turn on
+> **2026-09-21** as
+> [`research/qimage-vertical.md`](research/qimage-vertical.md). **No live
+> progress file remains at the root**: this one is it — what each vertical
+> is, what it measures today, and what is open. It is **rewritten**, not
+> appended to; a closed item's write-up goes to `research/` and history
+> lives in git.
 >
 > Addresses: `§N.M` (cited from code) resolves in
 > [`research/ideas.md`](research/ideas.md); stage letters (L7d, T9, S10,
-> I4, E7, P6…) resolve in the vertical archives listed at the bottom;
+> Q9b, E7, P6…) resolve in the vertical archives listed at the bottom;
 > decisions **D1–D21** are in
-> [`research/llm-vertical.md`](research/llm-vertical.md). `GOALS.md` is the
-> target; `API.md` documents the server as it answers today.
+> [`research/llm-vertical.md`](research/llm-vertical.md). A code comment
+> citing `IMAGE.md` resolves by what follows it: **Q-stages, numbered
+> decisions and Q-o numbers** are `research/qimage-vertical.md`, **I-stages**
+> are `research/zimage-vertical.md`. `GOALS.md` is the target; `API.md`
+> documents the server as it answers today.
 
 ## The five verticals, at a glance
 
@@ -26,7 +34,7 @@ here is our own ceiling, not a reference implementation.
 | text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus | batching (P6); context depth; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; the VAE is down to 4.5% of an image and **fp16 is refused there on precision**; the DiT's remaining percents are fusions |
+| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
@@ -39,6 +47,19 @@ is refused with a reason, never faked.
 resident), the other four verticals on the other (image ~32 GB, the rest
 ~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
 purpose — so no footprint quantisation is planned for the small verticals.
+
+**Where the work goes next.** With the image vertical parked, nothing in the
+repo is mid-stage: every open item below is a fresh start, and each vertical's
+list is in its own rough order of value. Across all five, the largest
+**measured regression** is the language model's context depth — decode falls
+**24.27 → 3.98 tok/s between depth 0 and 64k (6.1x) and all of it is
+attention**, with 128k not completing at all. It is also the only open item
+that is a *regression* rather than an unbuilt capability or an unclaimed
+percent, and it still owes a second run before anything is attributed. After
+that the two capability gaps are P6 batching (blocked on a product question:
+will the API serve more than one stream?) and E7's batched embeddings, worth
+up to 10x on short texts; the largest single-vertical percent is S10, the
+speech front end at 48% of its pipeline.
 
 ---
 
@@ -170,98 +191,97 @@ put PL-BERT's attention on the matrix cores so synthesis is a straight
   digits back — the round trip measures those three cases and does not
   count them as failures.
 
-## Image generation — live plan in [`IMAGE.md`](IMAGE.md) (z-image archive: [`research/zimage-vertical.md`](research/zimage-vertical.md), [`research/zimage-pipeline.md`](research/zimage-pipeline.md))
+## Image generation — **parked** (archive: [`research/qimage-vertical.md`](research/qimage-vertical.md))
 
-**Where it stands.** The vertical was **replaced 2026-09-20**: Z-Image-Turbo
-out, `Qwen/Qwen-Image-2.1` in, for native RGBA and reference-image editing
-(`GOALS.md` #4). Stages Q0–Q12 are done and both
-endpoints are served: `POST /v1/images/generations` answers at **1m28.8s /
-1m29.8s for a 1024²/40-step image** (31.5 GB resident, matching the fp32
-oracle's own picture at mean 3.4e-4) and `POST /v1/images/edits` at
-**1m54.2s / 1m56.6s for a 1024² edit on one reference image** (39.4 GB,
-matching the oracle's edit at max abs 0.0014), with native RGBA and
-in-progress previews (a fitted 64x4 matrix, 165 µs a frame, three partials
-for 0.3% of a request — no flag, because there is nothing to load).
-**Q9 is done in two passes, both bit-identical.** The first attributed the
-DiT dispatch by dispatch, closed the GEMM swizzle re-screen with a
-measurement, and caught the fragment pack at 44 GB/s against a 190 GB/s bus
-— a launch shape, not a layout — taking it to 131 for 6–7% off both
-endpoints. The second (Q9b) went after the VAE's two priced ports and
-**refused the route they were priced on**: z-image's matrix-core kernels
-narrow their operands, and in this decoder **one** narrowed convolution
-moves the decoded image by max abs 0.0885 against an fp32 port sitting at
-7.3e-4, because the tail norm divides a per-pixel L2 out of a residual
-stream at absmax 2.6e5. The same percents came out of the *shape* in fp32
-instead — a register block and a 64x64 GEMM tile — for **decode 7.4 → 4.0 s,
-VAE encoder 1.7 → 0.91 s**, and not a digit moved in any gate.
-**IMAGE.md is the live plan**; this is the summary.
+**Where it stands.** Done and **parked 2026-09-21** — parked because the plan
+ran out, not because it stalled. (The superseded z-image-turbo vertical is
+[`research/zimage-vertical.md`](research/zimage-vertical.md) plus
+[`research/zimage-pipeline.md`](research/zimage-pipeline.md); its stages are
+**I0–I7** and none of its code survives except `zimage/qwen` and
+`zimage/tokenizer`, which `embed`, `llm` and `parakeet` import.) The vertical was replaced 2026-09-20
+(Z-Image-Turbo out, `Qwen/Qwen-Image-2.1` in, for native RGBA and
+reference-image editing — `GOALS.md` #4), and **stages Q0–Q12 all closed
+inside two days**. Both endpoints are served: `POST /v1/images/generations`
+answers at **1m28.8s / 1m29.8s for a 1024²/40-step image** (31.5 GB resident,
+matching the fp32 oracle's own picture at mean 3.4e-4) and `POST
+/v1/images/edits` at **1m54.2s / 1m56.6s for a 1024² edit on one reference**
+(39.4 GB, matching the oracle's edit at max abs 0.0014), both with native
+RGBA and unconditional in-progress previews (a fitted 64x4 matrix, 159 µs a
+frame, three partials for 0.3% of a request — no flag, because there is
+nothing to load). Q10 turned the ceiling from a side box into an area, so
+16:9 comes back **1344x768** instead of 1024x576; Q11 put the client's
+hang-up through to the sampler and the VAE's submit batches; Q12 finished the
+Z-Image deletion (**6,839 lines of Go and 895 of GLSL** out, every gate
+re-run with no digit changed). The full write-up, every tolerance with its
+instrument named, is in the archive.
 
-**Open, in IMAGE.md's order:**
+**What to read before touching this code again** — three precision facts,
+each of which has already caught a port:
 
-- **Three precision facts to carry into anything that touches this
-  vertical**, each of which has already caught a port:
-  - **the VAE cannot take fp16 operands anywhere** (Q9b, above). Its tail
-    norm is the amplifier, so the rule is not "watch the range" but "do not
-    narrow". `TestConvFP16Ladder` is the instrument; re-run it before
-    pointing any narrowing kernel at `qimage/vae`.
-  - **the vision tower amplifies an input perturbation by ~10³**, so a
-    condition image must be quantized exactly as the reference's is —
-    compositing alpha over white in float rather than on 8-bit levels moves
-    the prompt embedding by rel 11 (a firing control), which is why the
-    Lanczos resampler is gated on exact 8-bit equality and not a tolerance.
-  - **on a non-square condition image the fp32 dump is the less accurate
-    side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 —
-    so that stage is gated against dumped float64 rows.
-- **The 1184² ceiling.** A capability, not a percent: the VAE decoder's
-  activation arena is one storage buffer against a 4 GiB − 4 device limit,
-  so the model's own 2048² examples do not decode. Tiled decode, or a
-  multi-buffer arena (`vk.PipelineSpec.Counts`, the LLM's 77 GB bank is the
-  precedent).
-- **Q9b — the VAE's two priced ports, done 2026-09-21 and by the opposite
-  route.** conv3x3 was 69.7% of the decode at 3.2 TFLOP/s and the mid
-  block's four projections 19.9% at 35 GFLOP/s, both priced as z-image's
-  matrix-core kernels reused. `TestConvFP16Ladder` — the instrument the
-  ledger itself said to build first — refused that: narrowing every 3x3
-  costs the decoded image **max abs 0.178** (23 of 255 8-bit levels) and
-  narrowing **one** convolution costs 0.0885, against an fp32 port at
-  7.3e-4; the encoder's posterior mode moves 0.23–0.40 against a gate at
-  4.7e-5; narrowing the 1x1 shortcuts as well returns NaN. Taken in fp32
-  instead, as a register block (OC 8→48 over an LDS slab 4x smaller, 5.12 →
-  3.38 s) and a 64x64 tiled GEMM (1.08–1.70 s → **9 ms**), both
-  bit-identical: **decode 7.4 → 4.02 s, encoder 1.7 → 0.91 s**. What is left
-  in the decode is conv3x3 at 85.9% and 4.9 TFLOP/s, whose remaining ceiling
-  is one shared read per multiply-add; a pixel block is priced at ~1.5 s
-  more and is the only one of these that would *not* be bit-identical.
-  Everything past that is the DiT's, which is now 95% of the image.
-- **Q12 — the Z-Image deletion is finished (2026-09-21)**, and closes what
-  Q6 owed. `zimage/vae` was kept past its replacement because `gpu_conv.go`
-  was the validated test bed for the matrix-core convolution Q9 wanted;
-  Q9b refused that kernel, so the package went: `tensor.go` + `math.go`
-  hoisted into `qimage/vae` (the only dependency holding it up — four
-  symbols nothing outside the deleted code called stayed behind), then the
-  decoder, encoder, both GPU paths, `tiny*` and
-  `cmd/vaebench`/`vaedecode`/`vaeprof`, plus the **28 shader builds only
-  that package dispatched** — the whole fp16 matrix-core route Q9b refused,
-  and four scalar builds Qwen's decoder replaced. **6,839 lines of Go and
-  895 of GLSL out, 204 in (nearly all corrected comments)**; every gate
-  re-run and not a digit moved. The 21 other unreferenced shader builds are
-  the DiT's screen catalogue and were left alone. `zimage/` is now `qwen`
-  and `tokenizer`, which stay permanently.
-- **The step count is swept and settled**: 40 stays the default because it
-  is the only count safe across prompt kinds. Photographic and painterly
-  prompts are convincing at **12 steps (36 s, 36% of the cost)**; a
-  structured technical drawing is good at 24 (1m4s) and has come apart by
-  12. `steps` is a request field, so a client that knows its prompt can take
-  the discount. Re-run with `QI21_SWEEP=1 go test ./qimage/pipeline -run
-  TestStepSweep`.
-- **Masked edits**: still a 501, but the reason moved — 2.1 *can* do them and
-  how a mask is fed is not in the diffusers implementation (IMAGE.md Q-o3).
+- **the VAE cannot take fp16 operands anywhere** (Q9b). Its tail norm divides
+  a per-pixel L2 out of a residual stream at absmax 2.6e5, so a 5e-4 relative
+  perturbation becomes an absolute one: **one** narrowed convolution costs the
+  decoded image max abs 0.0885 and the whole 3x3 set costs 0.178, against an
+  fp32 port sitting at 7.3e-4. The rule is not "watch the range", it is "do
+  not narrow". `TestConvFP16Ladder` is the instrument; re-run it before
+  pointing any narrowing kernel at `qimage/vae`. Q12 deleted
+  `vae_conv_wmma`/`vae_attention_wmma` outright, so the shortcut is not in
+  the tree — resurrect from git history only if that ladder says otherwise.
+- **the vision tower amplifies an input perturbation by ~10³**, so a
+  condition image must be quantized exactly as the reference's is —
+  compositing alpha over white in float rather than on 8-bit levels moves the
+  prompt embedding by rel 11 (a firing control). That is why the Lanczos
+  resampler is gated on exact 8-bit equality and not a tolerance.
+- **on a non-square condition image the fp32 dump is the less accurate
+  side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 — so
+  that stage is gated against dumped float64 rows.
+
+**If it is ever unparked**, in the archive's order:
+
+- **The 1184²-area ceiling** — the only remaining *capability*, not a
+  percent. The VAE decoder's activation arena is one storage buffer against a
+  4 GiB − 4 device limit at a measured **3060 bytes a pixel for every aspect
+  ratio** (`TestArenaShape`), which caps a request at 1,403,584 pixels
+  whatever shape they are in, so the model's own 2048² examples do not
+  decode. Two routes: tiled decode, or a multi-buffer arena
+  (`vk.PipelineSpec.Counts`, with the LLM's 77 GB bank as precedent). Tiling
+  is the less attractive of the two against a tail norm that is a per-pixel
+  L2 over the whole feature map.
+- **conv3x3's last ceiling** — after Q9b's register block it is **85.9% of
+  the decode, 3.36 s at 5.0 TFLOP/s**, and its remaining limit is one shared
+  read per multiply-add. A pixel block is priced at ~1.5 s and is the only
+  port here that would **not** be bit-identical. Low value now: the VAE is
+  4.5% of an image, the DiT is 95%.
+- **The DiT's remaining percents are fusions** — that is where the image's
+  time actually is, post-Q9.
+- **Masked edits** (Q-o3) — still a 501, but the reason moved: 2.1 *can* do
+  masked and annotated local edits; how a mask is fed is not in the diffusers
+  implementation this port follows. External research, not a port.
+- **Two watch items**: Q-o2, whether a turbo/distilled 2.1 checkpoint or
+  step-distillation LoRA appears (the examples repo and lightx2v); Q-o4,
+  whether [taehv](https://github.com/madebyollin/taehv) grows a 2.1 variant,
+  which would turn the fitted linear preview from a fallback into an upgrade.
+
+**Settled, so it does not get relitigated**: the step count — 40 stays the
+default because it is the only count safe across prompt kinds. A fox
+photograph and an impasto harbour are convincing at **12 steps**, at 36% of
+the cost; a bicycle drivetrain diagram is coherent at 24 and has
+disintegrated by 12 (floating parts, ghosted tubes, contrast collapsing
+toward white). **24 is the honest fast setting** — −35%, no visible loss on
+any of the three prompt kinds. `steps` is a request field, so a client that
+knows its prompt takes the discount itself. Note the sweep's wall clocks
+(40: 1m38–1m42, 24: 1m4, 16: 44–45 s, 12: 35–36 s) were measured **before
+Q9 and Q9b**, so the seconds are stale by the 6–7% those two took off every
+step while the *ratios* stand; re-run with `QI21_SWEEP=1 go test
+./qimage/pipeline -run TestStepSweep` (~10 minutes of device time) before
+quoting a number from it.
 
 **Not planned**: quantisation (compute-bound at every servable size, §3.4;
 int8 WMMA runs at fp16 rate, §0; and the two-machine deployment removes the
 footprint argument). Sampling the encoder's posterior (breaks seed
-reproducibility). A self-trained tiny decoder for previews — that is a
-training project this repo does not want.
+reproducibility). A self-trained tiny decoder for previews — a training
+project this repo does not want. No CFG path (`true_cfg_scale` stays a
+refusal) — it would double every step.
 
 ## Embeddings (archive: [`research/embedding-vertical.md`](research/embedding-vertical.md))
 
@@ -293,7 +313,7 @@ a batch makes the weights the limit again.
 
 ---
 
-## Where the old files went (2026-09-20 consolidation)
+## Where the old files went (2026-09-20 consolidation, and IMAGE.md again on 2026-09-21)
 
 | was | now |
 |---|---|
@@ -301,7 +321,8 @@ a batch makes the weights the limit again.
 | `LLM2.md` | [`research/llm-review.md`](research/llm-review.md) — hypotheses checked, decode budget, P0–P6 as closed |
 | `SPEECH.md` | [`research/speech-vertical.md`](research/speech-vertical.md) — S1–S8, T1–T10, R1, W1 write-ups |
 | `TTS.md` | [`research/tts-recap.md`](research/tts-recap.md) |
-| `IMAGE.md` | [`research/zimage-vertical.md`](research/zimage-vertical.md) |
+| `IMAGE.md` (z-image, until 2026-09-20) | [`research/zimage-vertical.md`](research/zimage-vertical.md) |
+| `IMAGE.md` (Qwen-Image-2.1, 2026-09-20–21) | [`research/qimage-vertical.md`](research/qimage-vertical.md) — frozen 2026-09-21 with the vertical; **Q-stages, decisions 1–7 and Q-o numbers resolve there** |
 | `PIPELINE.md` | [`research/zimage-pipeline.md`](research/zimage-pipeline.md) — inventory, validation rules, budget |
 | `EMBEDDING.md` | [`research/embedding-vertical.md`](research/embedding-vertical.md) |
 | `IDEAS.md` | [`research/ideas.md`](research/ideas.md) — the `§N.M` backlog and the measured roofline |

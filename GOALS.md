@@ -19,7 +19,8 @@ Ultimately we want to be able to run these tasks:
     * Unified text-to-image and reference-image editing (up to 10 refs), native RGBA transparency
     * In-progress previews: no tiny autoencoder exists yet for its 64-channel VAE,
       so we fit our own linear preview and watch https://github.com/madebyollin/taehv
-      for a proper one (replaced z-image-turbo + taef1 on 2026-09-20; plan in IMAGE.md)
+      for a proper one (replaced z-image-turbo + taef1 on 2026-09-20;
+      the vertical is served and parked — research/qimage-vertical.md)
   5. Compute embeddings via Qwen's `Qwen3-Embedding-0.6B`:
     * https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
     * https://arxiv.org/html/2506.05176v3

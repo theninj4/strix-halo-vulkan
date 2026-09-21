@@ -1,5 +1,30 @@
 # IMAGE — the Qwen-Image-2.1 vertical
 
+> **ARCHIVED 2026-09-21 — the vertical is parked, not unfinished.** This is
+> the closing record of Qwen-Image-2.1 (Q0–Q12): both endpoints served, the
+> Z-Image deletion finished, every gate dump-driven. It was `IMAGE.md` at the
+> repo root; the live state of play is now [`../TODO.md`](../TODO.md), which
+> carries the open items in summary.
+>
+> **Stage letters `Q0…Q12`, decisions `1–7` and open questions `Q-o1…Q-o5`
+> resolve here** — and they are cited from about fifty comments in
+> `qimage/`, `shaders/`, `api/`, `backend/`, `cmd/` and `reference/` that
+> still say `IMAGE.md`, the same way live code still cites `LLM.md` and
+> `SPEECH.md`. A citation of `IMAGE.md` with a **Q-stage, a numbered
+> decision or a Q-o number is this file**; one with an **I-stage (I0–I7) is
+> z-image's** [`zimage-vertical.md`](zimage-vertical.md), which held the root
+> filename before 2026-09-20. Nothing below was rewritten on archiving: the
+> tenses are the working session's.
+>
+> **Where to pick it up** is the "Where the work stands" table (all twelve
+> stages done), then "Open questions" and `../TODO.md`'s image section. The
+> three precision facts — the VAE refuses fp16 anywhere, the vision tower
+> amplifies an input perturbation by ~10³, and a non-square condition image
+> has the fp32 dump as the *less* accurate side — are the ones that have
+> each already caught a port, so they are the ones to read before touching
+> this code again.
+
+
 > **Rewritten through 2026-09-21 — Q0–Q11 are done**: `POST
 > /v1/images/generations` answers at **1m28.8s for a 1024²/40-step image** and
 > `POST /v1/images/edits` at **1m54.2s for a 1024² edit on one reference**,
@@ -62,9 +87,9 @@
 > **mean 3.4e-4**. What remained for the vertical was percents (Q9) — plus
 > finishing the Z-Image deletion, which Q6 owed and half did, and which is
 > Q12 above.
-> This file is live again: the old root
+> This file was live from 2026-09-20 to 2026-09-21: the old root
 > `IMAGE.md` was frozen into
-> [`research/zimage-vertical.md`](research/zimage-vertical.md) at the 2026-09-20
+> [`zimage-vertical.md`](zimage-vertical.md) at the 2026-09-20
 > consolidation, and this one is the **replacement of Z-Image-Turbo by
 > `Qwen/Qwen-Image-2.1`** for both generation and edits. Same rules as every
 > vertical file: rewritten each session, not appended to; closed stages go to
@@ -1049,7 +1074,7 @@ two-run numbers.
   qkpack 3.1%, gate 3.0%, the rest 4.2%. Q4 had run this graph on z-image's
   measured winners *uncontested*, and that is what the profile was for.
   **Two screens, and they disagreed about where the percent was.**
-  - *The GEMM swizzle arm re-screen* — IMAGE.md's own hypothesis, since
+  - *The GEMM swizzle arm re-screen* — this file's own hypothesis, since
     z-image chose SWZ=8 at M=16384/K=12288 and this model runs M=4096 —
     **found nothing, and that is the result** (`TestGPUGEMMScreen`, four arms
     on one staging): SWZ=8 wins here too, by 1.4–1.9% over SWZ=4 and 3.9–6.9%
