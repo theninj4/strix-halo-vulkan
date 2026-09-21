@@ -348,3 +348,102 @@ func TestAttnGPUIndexer4k(t *testing.T) {
 		}
 	}
 }
+
+// TestAttnGPUCacheSizeDoesNotChangeTheAnswer is the gate on the one regime
+// every other test in this file misses, and the one the served model is
+// always in: a cache **larger** than the context it holds.
+//
+// The 4k fixture stages 4096 tokens into a 4096-cell cache, so `nKV` and the
+// live cell count are the same number and nothing distinguishes "the cache is
+// this big" from "the context is this deep". The server stages 131 072 cells
+// and answers a turn at a few thousand, and three kernels used to walk the
+// cache rather than the context there — llm_attn_score.comp scoring all
+// `nKV/ratio` pooled blocks, llm_attn_select.comp running four radix passes
+// and an emit over all `nKV` cells, llm_attn_wmma.comp reading every key block
+// because the selection was only a mask. Cutting all three against the live
+// cells is only sound if it changes nothing, and *nothing* here means bit for
+// bit: a dead cell is an -inf the causal mask wrote, an -inf is the smallest
+// key `f2ui` has, and a dead pooled block holds cell 0 pooled `ratio` times
+// however many of them there are.
+//
+// So this runs the fixture twice, once in its own cache and once in a cache
+// three times too big, and demands the same tensors out. It is the negative
+// control on the depth work the way TestAttnGPUSelectionChangesTheOutput is
+// the negative control on the selection: a kernel that read a stale score, or
+// emitted a bitmask word it had not written, or skipped a key block that had
+// a cell in it, would show up here and nowhere else.
+func TestAttnGPUCacheSizeDoesNotChangeTheAnswer(t *testing.T) {
+	c, w, nTok, nKV, _, tr, _ := qsaFixtures4k(t)
+	in, err := tr.Get("hc_mixed-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(cells int) (out, ctx []float32, sel [][]int32) {
+		t.Helper()
+		dev, done := newTestDevice(t)
+		defer done()
+		g, err := NewAttnGPU(dev, c, nTok, cells, []AttnWeights{w}, denseQ8Test)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer g.Destroy()
+		if !g.Sparse() {
+			t.Fatalf("%d cells: the layer runs dense, so this proves nothing", cells)
+		}
+		if err := g.Upload(in.Vals, nTok); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		mask := g.Selection()
+		sel = make([][]int32, nTok)
+		for i := range sel {
+			sel[i] = g.SelectedCells(mask, i)
+		}
+		return append([]float32(nil), g.Out()...), append([]float32(nil), g.Context()...), sel
+	}
+
+	wantOut, wantCtx, wantSel := run(nKV)
+	gotOut, gotCtx, gotSel := run(3 * nKV)
+
+	// The selection first, because it is the cause: a difference in the
+	// bitmask explains a difference in the output and not the other way
+	// round, and it names the token it happened on.
+	var rows int
+	for i := range wantSel {
+		if len(gotSel[i]) != len(wantSel[i]) {
+			t.Fatalf("token %d selects %d cells in a %d-cell cache and %d in a %d-cell one",
+				i, len(wantSel[i]), nKV, len(gotSel[i]), 3*nKV)
+		}
+		for j := range wantSel[i] {
+			if gotSel[i][j] != wantSel[i][j] {
+				rows++
+				break
+			}
+		}
+	}
+	if rows != 0 {
+		t.Errorf("%d of %d rows select different cells in a cache three times too big", rows, nTok)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		want, got []float32
+	}{
+		{"attn_gated-3", wantCtx, gotCtx},
+		{"attn_output-3", wantOut, gotOut},
+	} {
+		if len(tc.got) != len(tc.want) {
+			t.Fatalf("%s is %d values in one cache and %d in the other", tc.name, len(tc.want), len(tc.got))
+		}
+		for i := range tc.want {
+			if tc.got[i] != tc.want[i] {
+				t.Fatalf("%s value %d: %g in a %d-cell cache, %g in a %d-cell one — "+
+					"the answer depends on how much room the cache has",
+					tc.name, i, tc.want[i], nKV, tc.got[i], 3*nKV)
+			}
+		}
+		t.Logf("%-14s identical to the last bit across a %dx cache", tc.name, 3)
+	}
+}

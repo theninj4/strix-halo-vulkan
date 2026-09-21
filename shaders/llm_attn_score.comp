@@ -66,6 +66,9 @@ layout(local_size_x = WG) in;
 // This token's queries, read once and then hit by every block.
 shared float16_t qs[IDX_HEADS * IDX_DIM];
 
+// The one score every block past the last whole one has. See below.
+shared float deadScore;
+
 void main() {
     uint t = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
@@ -83,7 +86,21 @@ void main() {
     }
     barrier();
 
-    for (uint b = tid; b < nBlocks; b += WG) {
+    // **Only the whole blocks are scored** (P7). Every block at or past `nBid`
+    // pools cell 0 `ratio` times and is unrotated (llm_attn_idx.comp says so,
+    // and TestAttnGPUEmptyBlocksPoolCellZero checks it), so all of them hold
+    // *the same* 128 halves and therefore the same score — one dot product,
+    // not `nBlocks - nBid` of them.
+    //
+    // This is what makes the kernel cost the context's **depth** instead of
+    // the cache's **size**. The table is nKV/ratio rows wide however few cells
+    // exist, so scoring it row by row charged a 131k-cell cache 32 768 dots a
+    // token a layer at every depth, empty or not — 6.94 ns a cell a token a
+    // layer measured at depth zero, which is 11.4 ms of a decode step across
+    // the twelve attention layers before the first cell is real. The tensor
+    // this writes is unchanged: every dead row still gets its value, and the
+    // value is still the one the pooled key implies.
+    for (uint b = tid; b < nBid && b < nBlocks; b += WG) {
         uint kb = pc.idxKOff + b * IDX_DIM;
         float s = 0.0;
         [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
@@ -94,6 +111,25 @@ void main() {
             s += max(d, 0.0);
         }
         act[pc.scoreOff + t * nBlocks + b] = s;
+    }
+    if (nBid < nBlocks) {
+        if (tid == 0u) {
+            uint kb = pc.idxKOff + nBid * IDX_DIM;
+            float s = 0.0;
+            [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
+                float d = 0.0;
+                for (uint j = 0u; j < IDX_DIM; j++) {
+                    d += float(qs[h * IDX_DIM + j]) * float(hact[kb + j]);
+                }
+                s += max(d, 0.0);
+            }
+            deadScore = s;
+        }
+        barrier();
+        float dead = deadScore;
+        for (uint b = nBid + tid; b < nBlocks; b += WG) {
+            act[pc.scoreOff + t * nBlocks + b] = dead;
+        }
     }
     memoryBarrierBuffer();
     barrier();

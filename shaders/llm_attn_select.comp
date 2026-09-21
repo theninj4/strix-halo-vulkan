@@ -85,10 +85,20 @@ void main() {
     if (t >= pc.tokens) {
         return;
     }
-    uint ncols = pc.nKV;
+    // **The row is the cache's stride and the depth's length** (P7). Both arenas
+    // are cut against nKV, so the row offsets below stay nKV's — but every
+    // cell past the SEQ_PAST + T that exist is an -inf the causal mask wrote,
+    // and an -inf is the smallest key `f2ui` has. Walking them is four radix
+    // passes and an emit over cells that can never be picked, and at a 131k
+    // cache with 4k of context that was 97% of this kernel. So the *work* is
+    // cut against the live cells, and the row's remaining words are zeroed
+    // rather than left stale so that `Selection()` still reads as a bitmask
+    // over the whole cache.
+    uint stride = (pc.nKV + 31u) / 32u;
+    uint ncols = min(SEQ_PAST + pc.tokens, pc.nKV);
     uint words = (ncols + 31u) / 32u;
-    uint cellBase = pc.cellOff + t * ncols;
-    uint outBase = pc.selOff + t * words;
+    uint cellBase = pc.cellOff + t * pc.nKV;
+    uint outBase = pc.selOff + t * stride;
     bool cached = ncols <= SEL_LDS;
 
     if (cached) {
@@ -102,8 +112,11 @@ void main() {
     // prefix by eight bits and counting only the keys that already match the
     // bits fixed above it. Four passes over the row where a partial selection
     // sort costs `width` of them — 2051 at this width.
+    // Never ask for more cells than the context holds: below the width the
+    // selection is the identity, and a `desired` the row cannot reach would
+    // leave the bucket search with nothing to find.
     uint prefix = 0u;
-    uint desired = pc.selWidth;
+    uint desired = min(pc.selWidth, ncols);
     [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
         for (uint i = tid; i < RADIX_SIZE; i += WG) {
             histo[i] = 0u;
@@ -221,5 +234,11 @@ void main() {
         }
         taken += total;
         barrier();
+    }
+
+    // The rest of the row: cells the cache has room for and the context has
+    // not reached. No scan and no barrier — they are all zero.
+    for (uint w = words + tid; w < stride; w += WG) {
+        actu[outBase + w] = 0u;
     }
 }

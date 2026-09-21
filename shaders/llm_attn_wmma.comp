@@ -38,14 +38,24 @@
 // straight into the output projection's A layout. Three of llama.cpp's lines
 // and a [T, 6144] round trip through DRAM, deleted.
 //
-// **The selection is a second mask.** `llm_attn_select.comp` writes one bit
-// per cache cell per token, and this kernel reads it exactly where it reads
-// the causal one: out of the block row max, so an unselected cell cannot set
-// the scale, and out of P, which is what removes it from both O and the row
-// sum. That is also what the reference does — `build_attn_qsa` turns `top_k`
-// back into an f16 mask and runs **dense** flash attention over every cell —
-// so the sparsity is semantics at prefill and not a saving, and the cost here
-// is one bit-test per element rather than a gather.
+// **The selection is a second mask, and a skip** (P7). `llm_attn_select.comp`
+// writes one bit per cache cell per token, and this kernel reads it exactly
+// where it reads the causal one: out of the block row max, so an unselected
+// cell cannot set the scale, and out of P, which is what removes it from both
+// O and the row sum. That much is what the reference does — `build_attn_qsa`
+// turns `top_k` back into an f16 mask and runs **dense** flash attention over
+// every cell — and on its own it is semantics and not a saving.
+//
+// So the mask is also read *before* the key block is, and a block with no
+// selected cell in any row is skipped whole. The two are the same answer: an
+// unselected cell contributes nothing to O and nothing to the row sum, so a
+// block of them contributes nothing, and the skip is bit-identical rather
+// than an approximation. What it changes is the **cost**, which is the reason
+// QSA exists: a decode step names 2051 cells however deep the cache is, they
+// fall in ~513 blocks of `ratio`, and at 64k of context four key blocks in
+// five hold none of them. At prefill it is close to inert — at ~50% density a
+// 32-cell block is eight indexer blocks and the chance all eight miss is
+// ~0.4% (L4b-3) — which is why this is a decode optimisation and only that.
 //
 // `selOff == NO_W` is the dense path, and it is the honest one below 2051
 // cells: at any prompt shorter than `top_k + ratio - 1` the selection names
@@ -99,24 +109,34 @@ shared float rowSum[BM];
 // BM*TILE, which is 512 global reads a block where the block's whole mask is
 // BM*BN/32 words. Reading it per element cost the kernel 1.90x.
 shared uint selw[BM * (BN / 32)];
+// Whether any row of this key block has any cell selected at all.
+shared uint blkAny;
 
 // stageSel loads this key block's slice of the QSA bitmask into LDS: one word
-// per (row, 32 cells), read by both the row max and the mask loop below.
+// per (row, 32 cells), read by both the row max and the mask loop below, and
+// returns the OR of the words this lane staged — which is how the skip below
+// learns whether the block has anything in it at all.
 //
 // `base` is a multiple of BN and BN a multiple of 32, so a word of the staged
 // slice is a word of the arena and not a shift of one. A pad row has no
 // selection — llm_attn_select.comp does not run past the prompt — so it stages
-// as all-ones and takes the dense path. Its output is never read; what this
-// avoids is a row with no visible cell at all, whose softmax denominator would
-// be zero.
-void stageSel(uint lane, uint q0, uint base) {
+// as **zero**: nothing of it is visible, its softmax denominator is zero, and
+// the epilogue turns that into a zero row rather than a NaN. (It used to stage
+// all-ones and take the dense path for exactly that denominator; the skip
+// below would then have been defeated by fifteen pad rows on every decode
+// step, which is the one shape where the skip is worth anything.)
+uint stageSel(uint lane, uint q0, uint base) {
     uint words = (pc.nKV + 31u) / 32u;
+    uint acc = 0u;
     for (uint i = lane; i < BM * (BN / 32u); i += WAVE) {
         uint row = i / (BN / 32u), wd = i % (BN / 32u);
         uint token = q0 + row;
-        selw[i] = (token >= pc.tokens) ? 0xffffffffu
-                                       : actu[pc.selOff + token * words + ((base + wd * 32u) >> 5u)];
+        uint w = (token >= pc.tokens) ? 0u
+                                      : actu[pc.selOff + token * words + ((base + wd * 32u) >> 5u)];
+        selw[i] = w;
+        acc |= w;
     }
+    return acc;
 }
 
 // selected reads one bit out of the staged slice.
@@ -173,6 +193,34 @@ void main() {
     for (uint base = 0u; base < last; base += BN) {
         uint cnt = min(BN, n - base);
 
+        // **The selection, before the block is read rather than after** (P7).
+        // QSA names `top_k + ratio - 1` cells however deep the context is —
+        // 2051 of them — and every other cell is masked out of both the row
+        // max and P below, so a key block with nothing selected in it
+        // contributes exactly nothing: blkMax stays -inf, the correction is
+        // 1, and every element of P is zeroed. Skipping it is therefore
+        // bit-identical, and it is the whole point of a sparse attention:
+        // without this the kernel walked all `n` cells at every depth and the
+        // selection bought semantics and no time at all (L4b-3). At a decode
+        // step the 2051 cells fall in ~513 blocks of `ratio`, so at 64k of
+        // context roughly four key blocks in five hold none of them.
+        //
+        // The staging has to move up here for it — it is the test — and it is
+        // work this block was going to do anyway.
+        if (sparse) {
+            if (lane == 0u) {
+                blkAny = 0u;
+            }
+            barrier();
+            if (stageSel(lane, q0, base) != 0u) {
+                atomicOr(blkAny, 1u);
+            }
+            barrier();
+            if (blkAny == 0u) {
+                continue;
+            }
+        }
+
         ACC s[QT][KTIL];
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
@@ -197,9 +245,6 @@ void main() {
         // real key's exp2 underflowing once the gap passed ~24 in log2 units.
         for (uint i = lane; i < BM; i += WAVE) {
             blkMax[i] = -1.0 / 0.0;
-        }
-        if (sparse) {
-            stageSel(lane, q0, base);
         }
         barrier();
         [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
@@ -338,7 +383,12 @@ void main() {
             uint row = i / 4u, part = i % 4u;
             uint token = q0 + row;
             uint qi = row / TILE, r = row % TILE;
-            float inv = 1.0 / rowSum[row];
+            // A pad row sees nothing once the selection is on, and a row
+            // that sees nothing has a zero denominator. Its products are
+            // never read — it is the output projection's padding — but a NaN
+            // there would be a NaN in an arena the next pass reuses, so it is
+            // written as a zero row instead.
+            float inv = (rowSum[row] > 0.0) ? 1.0 / rowSum[row] : 0.0;
             uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
             uint d0 = j * TILE + part * 4u;
             uint dst = pc.ctxOff + token * pc.ldCtx + head * pc.headDim + d0;

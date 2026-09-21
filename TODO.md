@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus | batching (P6); context depth; speculation parked at 0.95x |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus; **16.27 tok/s at 64k of context, 4.02x P7's baseline** | batching (P6); the QSA gather; 128k; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -50,12 +50,14 @@ purpose — so no footprint quantisation is planned for the small verticals.
 
 **Where the work goes next.** With the image vertical parked, nothing in the
 repo is mid-stage: every open item below is a fresh start, and each vertical's
-list is in its own rough order of value. Across all five, the largest
-**measured regression** is the language model's context depth — decode falls
-**24.27 → 3.98 tok/s between depth 0 and 64k (6.1x) and all of it is
-attention**, with 128k not completing at all. It is also the only open item
-that is a *regression* rather than an unbuilt capability or an unclaimed
-percent, and it still owes a second run before anything is attributed. After
+list is in its own rough order of value. The context-depth regression that
+stood at the head of this list was **P7**, closed 2026-09-21: decode at 64k
+is **4.05 → 16.27 tok/s (4.02x)** and the falloff from depth zero **6.9x →
+2.0x**, from three kernels that walked the *cache* rather than the *context*
+plus a QSA selection that was a mask and never a skip
+([`research/p7-context-depth.md`](research/p7-context-depth.md)). What is
+left of it is the **gather** — the only route to a decode rate that does not
+care how long the conversation is — and **128k still not completing**. After
 that the two capability gaps are P6 batching (blocked on a product question:
 will the API serve more than one stream?) and E7's batched embeddings, worth
 up to 10x on short texts; the largest single-vertical percent is S10, the
@@ -94,17 +96,42 @@ from what the draft predicts.
   shipped at R = 2); raising `GEMVMaxRows` must land in the same commit as
   its rung in `TestGraphIsAChunkSplit` — R rows were correct in a block test
   and wrong in the model three separate ways (P5c).
-- **Context depth is now the largest measured regression.** One-run figures
-  from `cmd/llm -depth` (2026-09-19, shipped banks, no reproducibility pair
-  yet): decode **24.27 → 3.98 tok/s between depth 0 and 64k — 6.1x — and it
-  is all attention** (tg attention share 36.4% → 86.1%; MoE flat). Prefill
-  halves. The QSA sparse selection does not stop it. And **128k does not
-  complete**: the fill dies at ~115k cells in the P0 timestamp pathology
-  ("N of 1025 timestamp slots never became ready"), reached by depth instead
-  of row count — the untried route is making `DispatchMultiMarked`'s
-  per-dispatch marks optional, since they are pure instrumentation. Needs a
-  second run, then attribution of the attention growth (the 2051-cell read
-  cap says the *selection* is not the term that grows).
+- ~~**Context depth is the largest measured regression.**~~ **P7, closed
+  2026-09-21** ([write-up](research/p7-context-depth.md)). It was two terms
+  and neither was the selection's width. **Three kernels walked `nKV`, the
+  cells the arenas were *allocated* for, instead of the cells that exist** —
+  `llm_attn_score.comp` scoring every pooled block, `llm_attn_select.comp`
+  running four radix passes and an emit over every cell — which is **6.94 ns
+  per allocated cell a token an attention layer**, charged in full *at depth
+  zero*: **10.9 ms of a decode step** at 131k cells before one cell is real,
+  and most of why the old sweep began at 24.27 where the headline is 36.19.
+  **And QSA was semantics with no saving**: `llm_attn_wmma.comp` read the
+  bitmask beside the causal mask and still walked every key block, so a
+  decode step that names 2051 cells was reading 64 000 (0.25 µs a live cell
+  a token a layer). The fix is three identities — the dead pooled blocks all
+  hold cell 0 pooled `ratio` times so they share one score; a cell past the
+  live count is an `-inf` that can never be selected; a key block with
+  nothing selected in it contributes nothing and is skipped whole — gated on
+  **exact** equality by the new `TestAttnGPUCacheSizeDoesNotChangeTheAnswer`
+  (the 4k fixture in a cache three times too big, bit for bit) and by 48
+  greedy tokens identical across the two binaries. Two passes each, same
+  hour: decode **4.05 → 16.27 tok/s at 64k (4.02x)**, **6.78 → 18.34 at
+  32k**, **27.96 → 33.18 at depth 0**; prefill **313.1 → 441.2 at 64k**;
+  `-gen` at ctx 32768 **32.43 → 35.92 tok/s**, 94% of the byte ceiling.
+  Falloff to 64k: decode **0.14x → 0.49x**, prefill **0.51x → 0.64x**.
+- **The gather is what is left of P7, and it is the whole of it.** The skip
+  prunes key blocks; it does not stop the count of them growing. Compacting
+  the ≤2051 selected cells' K and V into a contiguous scratch and running a
+  2051-cell attention is **flat in depth by construction**, and it is the
+  remaining 1948 ms of a 64k decode step's 3665. L4b declined it because at
+  prefill the density makes it pointless; at decode it is the only route to
+  a rate that does not care how long the conversation is.
+- **128k still does not complete**, and P7 did not touch it: the fill dies
+  at ~115k cells in the P0 timestamp pathology ("N of 1025 timestamp slots
+  never became ready"), reached by depth instead of row count. The untried
+  route is unchanged — make `DispatchMultiMarked`'s per-dispatch marks
+  optional, since they are pure instrumentation and wall-clock tok/s would
+  survive losing the per-block breakdown at that depth.
 - **Long-context gates** (idea 7, enabled by P0): perplexity at ctx 4096 is
   done (3.9392, −2.23% against ctx 2048 — the selection helps); a needle
   test through the API is not run.
