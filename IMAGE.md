@@ -1,13 +1,13 @@
 # IMAGE — the Qwen-Image-2.1 vertical
 
-> **Rewritten through 2026-09-20 — Q0–Q8 are done, the vertical's last
-> capability is served, and Q9's first pass has been taken**: `POST
-> /v1/images/generations` answers at **1m32s for a 1024²/40-step image** and
-> `POST /v1/images/edits` at **1m59s for a 1024² edit on one reference**,
+> **Rewritten through 2026-09-21 — Q0–Q11 are done**: `POST
+> /v1/images/generations` answers at **1m28.8s for a 1024²/40-step image** and
+> `POST /v1/images/edits` at **1m54.2s for a 1024² edit on one reference**,
 > 31.5 and 39.4 GB resident, reproducing the reference edit at **max abs
 > 0.0014** — 24x tighter than the t2i path's own served number, because an
-> edit's trajectory is pinned by its prefix. Q9 so far: a 6–7% step, bit for
-> bit the same picture, from one badly-shaped launch the profile caught.
+> edit's trajectory is pinned by its prefix. Q9 across its two passes: a
+> 10–11% step off both endpoints, bit for bit the same picture, all of it
+> from launch shapes and register blocks the profile caught.
 >
 > **2026-09-21 — Q10: the ceiling is an area, not a box.** A served 16:9
 > request was coming back 1024x576 against arenas that hold 1.05 Mpx, because
@@ -19,14 +19,30 @@
 >
 > **2026-09-21 — Q11: a hung-up client now stops the run.** The context
 > reaches the sampler and the VAE's submit loop, so an abandoned request costs
-> **one step (21% of a short run) or 295 ms of a decode** instead of the whole
+> **one step (23% of a short run) or 152 ms of a decode** instead of the whole
 > picture — and stops holding the process-wide device lock against every other
 > vertical. The run after a cancellation is bit-identical to one before it.
+>
+> **2026-09-21 — Q9b: the VAE's two priced ports, and the price was wrong.**
+> The ledger below had them as z-image's matrix-core kernels reused, worth
+> ~6 s of a 7.5 s decode. **The instrument it said to build first refused the
+> whole route** (`TestConvFP16Ladder`): a single fp16 operand anywhere in this
+> decoder moves the decoded image by **max abs 0.09** against the fp32 path's
+> own 7.3e-4 — narrowing *one* convolution, `conv_in`, which is 0.006% of the
+> arithmetic, costs 0.0885 by itself, because the tail norm divides a
+> per-pixel L2 out of a residual stream running at absmax 2.6e5. So the
+> arithmetic stayed fp32 and only the *shape* changed — a register block the
+> conv kernel had carried since the day 8 beat 1, and a 64x64 tiled fp32 GEMM
+> for four projections that had been re-reading a whole weight per row. The
+> decode goes **7.4 s → 4.02/4.03 s**, the VAE encoder **1.7 s → 0.91 s**, the
+> served image **1m32 → 1m28.8/1m29.8** and the served edit **1m59 →
+> 1m54.2/1m56.6** — and **every output is bit-identical**, asserted rather
+> than assumed, so not one gate in this file moved a digit.
 >
 > **Q0–Q7, one day in** and
 > the model was *served*: `POST /v1/images/generations` answered from
 > Qwen-Image-2.1 at **1m38s for a 1024²/40-step image** (Q6's own
-> measurement; Q9 has since taken it to 1m32), 31.7 GB resident,
+> measurement; Q9 and Q9b have since taken it to 1m28.8), 31.7 GB resident,
 > with native RGBA and in-progress previews. On the CPU the port reproduces
 > diffusers' image to under a quarter of an 8-bit quantization step; on the
 > device the served fp16 path reproduces the fp32 oracle's own picture at
@@ -65,9 +81,10 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; Z-Image deletion still owed |
 | Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
-| Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports are next |
+| Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports became Q9b |
 | Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
-| Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **21% of a run** (one step) or **295 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
+| Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **23% of a run** (one step) or **152 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
+| Q9b | The VAE's two priced ports (`qimage/vae/kernels.go`, two shaders) | **done 2026-09-21** — the fp16 route **refused with a measurement** (`TestConvFP16Ladder`: one narrowed convolution costs the image max abs 0.0885), the same percents taken in fp32 instead: decode **7.4 → 4.02 s**, encoder **1.7 → 0.91 s**, image **1m32 → 1m28.8**, edit **1m59 → 1m54.2**, every output **bit-identical** |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
 the instrument named beside it. The day's method finding, three times over:
@@ -233,8 +250,10 @@ for free.
   said ~70 s; the gap is unported fusions and the full-seq re-pack, priced
   under Q9). **Q6 measured the whole thing served: 1m38.2s / 1m41.3s at
   1024²/40** — 92% the denoising steps, 7.6% the VAE, 0.1% the text encoder.
-  Q9's two priced VAE ports would take the decode from 7.5 s to ~1.3 s, i.e.
-  the image to ~92 s; everything past that is the DiT's.
+  Q9b took the decode from 7.4 s to 4.0 s — the two priced ports, but in
+  fp32 rather than on the matrix cores, which the precision refused — so the
+  VAE is now **4.5%** of a 1m28.8s image and everything past that is the
+  DiT's.
   2048² is not reachable at all today — the VAE's arena ceiling is 1184²
   (Q6) — so the DiT's x4/x16 estimate for it is moot until that is lifted.
   The two levers, in order: **the step count** (sweep 40/24/16/12 for
@@ -270,9 +289,9 @@ for it. So, in order:
 | `zimage/qwen` (Qwen3 text transformer, CPU + GPU) | **survives and grows** — it is shared infra (`embed`, `llm`, `parakeet` import it). Q1 adds: theta as config (5e6), 36-layer/pre-final-norm output mode beside the existing `EncoderLayers()` convention, and (Q8 only) mrope + deepstack + the vision tower. The Qwen3-Embedding caller must keep passing its tests untouched. |
 | `zimage/tokenizer` | **survives** — same BPE family; new `added_tokens.json` (`<image1>`…, vision markers) and the raw template above. |
 | shaders: `dit_gemm_*`, `dit_attention_*` (WMMA), gpu arenas | **survived, confirmed by Q4** — the whole graph runs on z-image's kernels plus two new small shaders (`dit_attn_causal`, `dit_copy`). The new shapes run on z-image's measured winners *uncontested*: the tile re-screen at M=16384/K=12288 is a Q9 percent (hypothesis 5 in `TODO.md`). |
-| `zimage/vae/gpu_conv*` | **survives as infrastructure** — confirmed by Q5g: six of the decoder's ten kernels are z-image's unchanged (conv2d, add, 2x upsample, the row shuffles, the linear, the transposed-K attention), and `gpu_conv`'s matrix-core implicit GEMM is what Q9's 69% is waiting on. Only `qvae_chnorm`, `qvae_dupup` and a `-DDIM=1152` attention build are new. |
+| `zimage/vae/gpu_conv*` | **dead as of Q9b** — six of the decoder's ten kernels are still z-image's unchanged (conv2d, add, 2x upsample, the row shuffles, the linear, the transposed-K attention), but `gpu_conv`'s matrix-core implicit GEMM, which Q9's 69% was said to be waiting on, is refused on precision and will never be called from `qimage/`. The convolution and the projections were fixed in fp32 instead (`qimage/vae/kernels.go`). |
 | `zimage/dit`, `zimage/pipeline` | **deleted 2026-09-20 (Q6)** — replaced by `qimage/dit` and `qimage/pipeline`. New names because almost no line survived: different block, different mask. |
-| `zimage/vae` (model code, `tiny*`, both GPU paths) | **stayed past its replacement, deliberately** — `gpu_conv.go`'s matrix-core convolution is what Q9 wants and `TestGPUConvMatchesScalar` is the proof it works. It goes when Q9 has taken the packing helpers across, not before. |
+| `zimage/vae` (model code, `tiny*`, both GPU paths) | **its reprieve expired 2026-09-21 (Q9b)** — it stayed because `gpu_conv.go`'s matrix-core convolution was what Q9 wanted; Q9b refused that kernel with a measurement, so nothing in `qimage/` will ever call it. All that still blocks the deletion is that `qimage/vae` builds on this package's `Tensor` and `Conv2D`: hoist `tensor.go` + `math.go`, delete the rest and `cmd/vaebench`/`vaedecode`/`vaeprof` with it. Mechanical, ~8 k lines, not done. |
 | `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`, `cmd/ditblock` | **deleted 2026-09-20 (Q6)** — `cmd/qimage` is the replacement driver. `cmd/vaebench`/`vaedecode`/`vaeprof` stay while `zimage/vae` does. |
 | `models/Z-Image-Turbo`, `models/taef1` (62 GB) | unreferenced since Q6 and still on disk. One `rm -rf` whenever the space is wanted; not deleted unasked. |
 | serving: `/v1/images/*`, streaming, geometry-under-a-ceiling | **survived, confirmed by Q6** — `api.ImageBackend`, the geometry split, the SSE envelope and `backend.partialSteps` all carried over untouched; the adapter re-wired to `qimage/pipeline` and the two endpoints that lost their mechanism (streaming, edits) refused with the stage that owed them until Q7 and Q8.6 closed both. Two fields were added and one removed: `background` and `max_reference_images` in, `default_strength` out, because 2.1 has no strength. |
@@ -439,7 +458,10 @@ two-run numbers.
   norm in front of every resnet convolution bounds what it reads, so **43 of
   44 convolutions peak below 1.1e4** and only the `288→144` 1x1 shortcut in
   up_blocks.4 — reading the raw residual at **absmax 2.6e5** — is outside
-  fp16. That is what prices Q9's matrix-core port, below.
+  fp16. That priced Q9's matrix-core port, and **Q9b then found the range
+  was the wrong question**: the 43 convolutions that do fit fp16 still
+  cannot use it, because what this decoder cannot absorb is the *precision*
+  loss rather than the overflow (below).
   **The encoder stayed on the CPU here**: nothing t2i serves needs it, and
   its stride-2 asymmetric-pad downsampler looked like a kernel the decoder's
   graph does not have. It went to the GPU in Q8.3c, which is the first thing
@@ -527,8 +549,10 @@ two-run numbers.
   `gpu_conv.go` is the *validated test bed* for the one kernel Q9 wants —
   `TestGPUConvMatchesScalar` proves the matrix-core convolution against a
   scalar oracle, and deleting it before Q9 has taken the packing helpers
-  across would throw away the proof and keep the problem. It goes when Q9
-  lands. `zimage/qwen` and `zimage/tokenizer` stay permanently (`embed`,
+  across would throw away the proof and keep the problem. **Superseded
+  2026-09-21 (Q9b): Q9 turned out not to want that kernel at all**, so the
+  reason to keep this code is gone and only the `Tensor`/`Conv2D` dependency
+  is left to unpick. `zimage/qwen` and `zimage/tokenizer` stay permanently (`embed`,
   `llm`, `parakeet` and `qimage` all import them).
   **The 62 GB of weights on disk are not deleted** — `models/Z-Image-Turbo`
   and `models/taef1`. Nothing in the tree reads them now, so it is one
@@ -1036,49 +1060,113 @@ two-run numbers.
   **The bigger fish is elsewhere**: the VAE decode is 7.5 s of a 92 s image
   and 68.8% of it is conv3x3 at 3.2 TFLOP/s, against the 38.3 the
   matrix-core implicit GEMM measured in z-image with kernels already in this
-  tree. That is ~6 s, larger than anything left in the transformer, and it
-  is priced below.
-- **Q9's remaining ledger.** The I3/I5/I8/I9 fusion lesson
-  (elementwise passes absorbed into consumers) transfers to a new but
-  same-shaped budget; attribute before optimising, same-hour controls, plans
-  measured never composed. Two of them are already attributed and priced, by
-  `TestGPUDecodeProfile` on a 1024² decode (7.46 s one dispatch at a time):
-  - **conv3x3 is 68.8% — 5.13 s at 3.2 TFLOP/s**, which is z-image's stage-8
-    starting point to three digits (3.18 s, 3.0–3.2 TFLOP/s). That stage's
-    matrix-core implicit GEMM took it to 258 ms and 38.3 TFLOP/s, its
-    kernels and packing pass are already in the tree, and the range
-    measurement above says **every conv3x3 in this graph can feed it** —
-    the one convolution that cannot is a 1x1 shortcut worth a fraction of
-    the 3.8% that all four 1x1s cost together, and it simply stays scalar.
-    Expected: ~7.4 s → ~2.8 s.
-  - **the mid block's four projections are 21.0% — 1.57 s at 35 GFLOP/s** on
-    `vae_linear`, the same naive kernel and nearly the same number (62
-    GFLOP/s) that z-image's stage 7 replaced with `dit_gemm` unmodified.
-    Expected: another ~1.5 s.
-  Everything else in the decode is under 4%: attention 250 ms (the latent is
-  4096 rows here, not z-image's 16384 — this is *not* the 26% it was there),
-  chnorm 1.7% with its SiLU already fused, add 1.0%, the two shuffles 0.4%.
+  tree. That is ~6 s, larger than anything left in the transformer — and
+  **Q9b below went and got 3.4 s of it, by the opposite route from the one
+  priced here**.
+- **Q9b — the VAE's two priced ports. Done 2026-09-21, and the price was
+  wrong.** The ledger had them as z-image's matrix-core kernels reused —
+  conv3x3 at 68.8% and 3.2 TFLOP/s against the 38.3 its implicit GEMM
+  measured, the mid block's four projections at 21.0% and 35 GFLOP/s against
+  the `dit_gemm` that replaced the same naive kernel there. **Both were
+  refused on precision, and the same percents were taken in fp32 instead.**
+  The decode goes **7.39–7.49 s → 4.02/4.03 s**, the VAE encoder
+  **1.65–1.72 s → 0.909/0.915 s**, the served image **1m32.3/1m33.5 →
+  1m28.8/1m29.8** and the served edit **1m58.6/1m59.2 → 1m54.2/1m56.6**.
 
-  **What that port has to price first, and it is not in z-image's notes.**
-  Every percent taken on 2026-09-20 was **bit-identical** — a launch shape
-  and a kernel choice, no arithmetic moved. The conv port is not: the
-  matrix-core convolution narrows its *operands* to fp16, and this decoder's
-  convolutions read activations at **absmax 1.1e4** where z-image's peaked
-  at **497**. Both are inside half's 65504, so neither overflows and the
-  measurement that matters is not range but precision: an fp16 operand
-  carries ~5e-4 of relative error, and `vae_test.go`'s conv stages are gated
-  at **2e-4** with the decoded image at max abs 7.3e-4 against the dump.
-  So the port moves the numbers this vertical's tightest gates are written
-  against, and the first thing it owes is the same instrument every other
-  bound here came from — run the CPU decoder with fp16 conv operands and
-  fp32 accumulators, measure what it costs stagewise and on the image, and
-  gate the device at *that* rather than at the fp32 bounds it will not hold.
-  z-image made the same trade and kept its gates, but 20x less input range
-  is 20x less headroom, and assuming it transfers is exactly the composition
-  this file's method refuses. The infrastructure is otherwise ready:
-  `zimage/vae`'s `hbuf`/`w16buf` engine split, `vae_pack_conv.comp`,
-  nine `vae_conv_wmma` builds and `TestGPUConvMatchesScalar` are all in the
-  tree and are why `zimage/vae` was kept past its replacement.
+  **The refusal came from the instrument the ledger itself said to build
+  first, and it is the day's finding** (`TestConvFP16Ladder`, the permanent
+  instrument: the CPU decoder and encoder run with chosen convolutions
+  narrowing both operands to binary16 and accumulating in fp32 — what a
+  matrix core does — against both the dump and the fp32 CPU port).
+  The prediction in the ledger was "20x less headroom than z-image, measure
+  it". The measurement is far worse than that framing suggests:
+
+  | narrowed | decoded image, max abs | mean |
+  |---|---|---|
+  | nothing (the shipped fp32 device port) | 0.00073 | — |
+  | `conv_in` alone — **one** convolution, 0.006% of the arithmetic | **0.0885** | 9.1e-5 |
+  | the three learned upsamplers | 0.0948 | 9.2e-5 |
+  | every 3x3 (what the port would narrow) | **0.178** | 2.0e-4 |
+  | every convolution | **NaN** — up_blocks.4's shortcut reads absmax 2.6e5 |
+
+  **It is not a range problem and no exclusion rule fixes it.** 0.178 in
+  [-1, 1] is 23 of 255 8-bit levels, 240x the whole device port's distance
+  from the dump; and one narrowed convolution at the very top of the graph
+  costs half of that on its own, which is what says the damage is not
+  located anywhere. **The mechanism is the tail norm.** This decoder's
+  residual stream runs at absmax 1e4–2.6e5 and `norm_out` divides a
+  per-pixel L2 out of it, so a 5e-4 *relative* perturbation upstream is an
+  absolute 1e2 that a quiet pixel's own norm cannot absorb — measured at
+  norm_out as **rel 1.13 against a mean of 6.7e-5**. And it is linear, not
+  chaotic: the fp32 GPU path differs from the CPU one by rel ~1e-7 and lands
+  4.9e-4 from it on the image, so a 5e-4 perturbation predicting ~0.2 is the
+  same amplification read forwards. z-image's decoder peaks at **497** and
+  has a group norm; the inheritance was never a small extrapolation.
+  The **encoder** is worse again and would have been taken along silently:
+  fp16 convolutions move its posterior mode by **max abs 0.23–0.40** against
+  a port gated at 4.7e-5, through the deep middle the dump's own thread-order
+  noise already jumps 47x at.
+
+  **So the arithmetic stayed fp32 and only the shape changed** — which is
+  where both kernels were actually losing, and the profile said so all along:
+
+  - **the convolution is bound by activation loads**, one per `OC_BLOCK`
+    multiply-adds, and `OC_BLOCK` had been 8 since the day it beat 1.
+    `TestGPUKernelScreen` sweeps nine builds of `vae_conv2d.comp` over both
+    blocking axes and the winner is **OC_BLOCK 48 / IC_BLOCK 8: 5.12 s →
+    3.38 s, 3.3 → 4.9 TFLOP/s**.
+    **The map is not the one the argument predicts, and that is the second
+    finding.** Raising the register block *alone* buys nothing — at
+    IC_BLOCK 32, 8 → 16 is 5.12 s → 5.18 — and raising it with the input
+    block left at 32 is the slowest arm in the screen (oc32ic32, 6.85 s).
+    What pays is the **LDS footprint**: at OC_BLOCK 16, ic32 → ic8 alone is
+    5.18 → 3.83. The register block only pays once the staged filter slab is
+    small enough to keep waves resident. 48 also divides every output-channel
+    count in the decoder (1152, 576, 288, 144), which is likely why it beats
+    64 (3.44 s) despite holding more accumulators.
+  - **the projections are bound by weight loads** — one thread per output
+    element re-reads the whole [OC, K] weight per row of A, 21.7 GB a
+    projection. `qvae_gemm_f32.comp` is a 64x64 workgroup tile with a 4x4
+    register tile per thread and a 16-deep shared slab of both operands:
+    **1.08–1.70 s → 9 ms, 0.04 → 5.0 TFLOP/s, a factor of ~150.** This was
+    the larger of the two and the cheaper to write.
+
+  **Everything is bit-identical, and the screen asserts it rather than
+  assuming it.** Neither replacement reorders an accumulation: the conv's
+  loops over input channel and tap are untouched by its blocking, and the
+  GEMM still seeds each accumulator from the bias and still adds its products
+  in ascending k (which is why it starts *from* the bias rather than adding
+  it at the end — float addition is not associative). Every arm is required
+  to decode byte-for-byte identically to `ConvOC8`+`MidLinear`, the pair Q5g
+  shipped, before its timing is read. Downstream, nothing moved a digit:
+  the decoder's stagewise gate is still max abs 7.3e-4 / 7.8e-4, GPU-vs-CPU
+  still 4.9e-4, the encoder's mode still 2.6e-5 / 4.3e-5, the DupUp control
+  still 18443x, `TestServedOracle256` still max abs 0.0333 / mean 3.4e-4 and
+  `TestServedEditOracle256` still max abs 0.0014 / mean 1.7e-4.
+
+  **What is left in the decode, re-profiled** (`TestGPUDecodeProfile`,
+  3.92 s one dispatch at a time): conv3x3 is **85.9% — 3.36 s at 5.0
+  TFLOP/s**, attention 252 ms (6.4%), chnorm 125 ms, add 76 ms, the four 1x1
+  shortcuts 63 ms (they came along for free, 283 → 63 ms, at 4.2 TFLOP/s),
+  the projections 9 ms. The convolution's remaining ceiling has a name: the
+  inner loop still spends **one shared read per multiply-add**, which neither
+  block moves, and 4.9 of this part's ~22.9 TFLOP/s fp32 peak is about what
+  that costs. Falling below it needs a **pixel block** — P pixels per thread
+  sharing one weight read, taking the ratio to 1/P — and the one thing that
+  is not free about it is bit-identity: the current kernel *skips* an
+  out-of-bounds tap where a pixel-blocked one would have to multiply by zero,
+  and `acc + 0.0` is not the identity when `acc` is `-0.0`. Priced at
+  roughly another 1.5 s, and worth taking only with that settled.
+
+  **The consequence for `zimage/vae` is that its reprieve has expired.** It
+  was kept past its replacement because `gpu_conv.go` is "the validated test
+  bed for the one kernel Q9 wants" — and Q9 does not want it. Nothing in
+  `qimage/` will ever call `vae_pack_conv.comp`, the nine `vae_conv_wmma`
+  builds or `TestGPUConvMatchesScalar` now. What still blocks the deletion is
+  only that `qimage/vae` builds on `zimage/vae`'s `Tensor` and `Conv2D`
+  (`tensor.go`, `math.go`), so the removal is: hoist those two files, delete
+  the decoder, encoder, both GPU paths, `tiny*`, and `cmd/vaebench` /
+  `vaedecode` / `vaeprof` with them. Mechanical, ~8 k lines, not done here.
 - **Q10 — the ceiling is an area, not a box. Done 2026-09-21**, and it came
   out of a served complaint rather than a plan: a 16:9 request against the
   shipped server was answering **1024x576**, 0.59 Mpx, where the same arenas
@@ -1144,11 +1232,11 @@ two-run numbers.
   "the whole image"; it was one step and one batch, and nobody had gone and
   taken it.
   **Measured** (`TestCancellation`, the gate, at 512²/8 where a full run is
-  6.27 s): cancelled after step 1, the run returns in **1.30 s — 21% of the
-  full run** — with `pipeline: cancelled at step 2 of 8: context canceled`;
-  cancelled an eighth of the way into a 1.71 s decode, it returns in
-  **295 ms, after 12 of 117 dispatches**. At the served 1024²/40 shape that
-  is ~2.2 s of a 92 s image instead of 92.
+  5.29 s after Q9b): cancelled after step 1, the run returns in **1.23 s —
+  23% of the full run** — with `pipeline: cancelled at step 2 of 8: context
+  canceled`; cancelled an eighth of the way into a 959 ms decode, it returns
+  in **152 ms, after 44 of 117 dispatches**. At the served 1024²/40 shape
+  that is ~2.2 s of an 89 s image instead of 89.
   **The third assertion is the one that would have hurt**: a cancelled run
   leaves a recorded graph half-submitted and the arenas holding an abandoned
   image, so the gate runs a *fourth* generation after the two cancellations
@@ -1188,6 +1276,15 @@ two-run numbers.
 5. **No self-trained tiny decoder**; linear preview + watch taehv.
 6. **No CFG path in the Go port** (true_cfg_scale stays a refusal if asked
    for over HTTP) until something demands it — it would double every step.
+7. **The VAE stays fp32 end to end** — added 2026-09-21 (Q9b), measured, not
+   preferred. Every other graph in this vertical runs fp16 operands on the
+   matrix cores; this one cannot, because its tail norm divides a per-pixel
+   L2 out of a residual stream at absmax 2.6e5 and turns a 5e-4 relative
+   perturbation into an absolute one. One narrowed convolution costs the
+   decoded image **max abs 0.0885** and the whole 3x3 set costs 0.178, against
+   an fp32 port sitting at 7.3e-4 (`TestConvFP16Ladder`). Nothing in
+   `qimage/vae` is to be pointed at `dit_gemm`, `vae_conv_wmma` or any other
+   narrowing kernel without re-running that ladder first.
 
 ## Open questions
 

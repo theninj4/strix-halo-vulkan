@@ -1,0 +1,124 @@
+#version 450
+// The mid block's projections as a tiled fp32 GEMM -- IMAGE.md Q9b.
+//
+// It replaces shaders/vae_linear.comp on Qwen's VAE, where the profiler put
+// those four 1152x1152 projections at **1.46 s of a 7.35 s decode, 19.9%, at
+// 35 GFLOP/s**. z-image reached for shaders/dit_gemm.comp at this point and
+// got 62 GFLOP/s -> matrix cores; that route is closed here, because
+// qimage/vae's TestConvFP16Ladder measures an fp16 operand *anywhere* in this
+// decoder at max abs ~0.09 on the decoded image against the fp32 path's
+// 7.3e-4 -- the tail norm divides a per-pixel L2 out of a residual stream
+// running at absmax 2.6e5, so a relative perturbation upstream arrives as an
+// absolute one at a quiet pixel. So the arithmetic stays fp32 and what gets
+// fixed is the shape.
+//
+// What was wrong with the naive kernel is the weight traffic, and it is the
+// same fault the conv kernel had before its register blocking: one thread per
+// output element reads a whole weight row from global, so the [OC, K] weight
+// is re-read once per row of A -- 21.7 GB per projection at 4096 rows.
+//
+// So: one workgroup owns a BM x BN tile of the output, 256 threads each hold
+// a TM x TN register tile, and a BK-deep slab of both operands is staged in
+// shared memory per step. The weight is then read once per *tile* of rows
+// rather than once per row -- 64x less -- and each thread does TM*TN = 16
+// multiply-adds per TM+TN = 8 shared reads, against the conv kernel's one per
+// one.
+//
+// **Bit-identical to vae_linear.comp, which is what the screen asserts.**
+// Every accumulator still starts from the bias and still adds its products in
+// ascending k, because the k loop is split into slabs but never reordered or
+// split across threads. Nothing about the port moves a number; it moves bytes.
+//
+// A, C and the bias are fp32 in the activation arena; W is the PyTorch
+// [OC, K] weight in the fp32 weight arena, read exactly as vae_linear reads
+// it. Rows are pc.H * pc.W, K is pc.C, N is pc.OC.
+
+#include "vae_common.glsl"
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+
+layout(local_size_x = 256) in;
+
+// k-major, so that the sixteen threads sharing a row group broadcast one
+// address out of shA while their shB reads walk consecutive banks.
+shared float shA[BK][BM];
+shared float shB[BK][BN];
+
+void main() {
+    uint rows = pc.H * pc.W;
+    uint K = pc.C;
+    uint N = pc.OC;
+
+    uint row0 = gl_WorkGroupID.x * BM;
+    uint col0 = gl_WorkGroupID.y * BN;
+
+    uint t = gl_LocalInvocationID.x;
+    uint tr = (t / 16u) * TM;
+    uint tc = (t % 16u) * TN;
+
+    // Start from the bias, not from zero: vae_linear seeds its accumulator
+    // with it and float addition is not associative, so adding it afterwards
+    // would be a different number in the last bit.
+    float acc[TM][TN];
+    for (uint m = 0u; m < TM; ++m) {
+        for (uint n = 0u; n < TN; ++n) {
+            uint c = col0 + tc + n;
+            acc[m][n] = (pc.bOff == NO_BIAS || c >= N) ? 0.0 : wbuf[pc.bOff + c];
+        }
+    }
+
+    for (uint k0 = 0u; k0 < K; k0 += BK) {
+        barrier();
+        // Both stagings read BK consecutive floats of one row per sixteen
+        // consecutive threads, which is a 64 B burst rather than a gather.
+        for (uint i = t; i < BM * BK; i += 256u) {
+            uint r = i / BK, k = i % BK;
+            float v = 0.0;
+            if (row0 + r < rows && k0 + k < K) {
+                v = act[pc.inOff + (row0 + r) * K + k0 + k];
+            }
+            shA[k][r] = v;
+        }
+        for (uint i = t; i < BN * BK; i += 256u) {
+            uint n = i / BK, k = i % BK;
+            float v = 0.0;
+            if (col0 + n < N && k0 + k < K) {
+                v = wbuf[pc.wOff + (col0 + n) * K + k0 + k];
+            }
+            shB[k][n] = v;
+        }
+        barrier();
+
+        for (uint k = 0u; k < BK; ++k) {
+            float a[TM], b[TN];
+            for (uint m = 0u; m < TM; ++m) {
+                a[m] = shA[k][tr + m];
+            }
+            for (uint n = 0u; n < TN; ++n) {
+                b[n] = shB[k][tc + n];
+            }
+            for (uint m = 0u; m < TM; ++m) {
+                for (uint n = 0u; n < TN; ++n) {
+                    acc[m][n] += a[m] * b[n];
+                }
+            }
+        }
+    }
+
+    for (uint m = 0u; m < TM; ++m) {
+        uint r = row0 + tr + m;
+        if (r >= rows) {
+            continue;
+        }
+        for (uint n = 0u; n < TN; ++n) {
+            uint c = col0 + tc + n;
+            if (c < N) {
+                act[pc.outOff + r * N + c] = acc[m][n];
+            }
+        }
+    }
+}

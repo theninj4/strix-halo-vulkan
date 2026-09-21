@@ -26,7 +26,7 @@ here is our own ceiling, not a reference implementation.
 | text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus | batching (P6); context depth; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m32s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m59s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; 90% of the decode is two ported kernels away (~6 s); the DiT's remaining percents are fusions |
+| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | the 1184² ceiling; the VAE is down to 4.5% of an image and **fp16 is refused there on precision**; the DiT's remaining percents are fusions |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
@@ -174,72 +174,73 @@ put PL-BERT's attention on the matrix cores so synthesis is a straight
 
 **Where it stands.** The vertical was **replaced 2026-09-20**: Z-Image-Turbo
 out, `Qwen/Qwen-Image-2.1` in, for native RGBA and reference-image editing
-(`GOALS.md` #4). Stages Q0–Q8 are done in one day and both
-endpoints are served: `POST /v1/images/generations` answers at **1m32.3s /
-1m33.5s for a 1024²/40-step image** (31.5 GB resident, matching the fp32
+(`GOALS.md` #4). Stages Q0–Q11 are done and both
+endpoints are served: `POST /v1/images/generations` answers at **1m28.8s /
+1m29.8s for a 1024²/40-step image** (31.5 GB resident, matching the fp32
 oracle's own picture at mean 3.4e-4) and `POST /v1/images/edits` at
-**1m58.6s / 1m59.2s for a 1024² edit on one reference image** (39.4 GB,
+**1m54.2s / 1m56.6s for a 1024² edit on one reference image** (39.4 GB,
 matching the oracle's edit at max abs 0.0014), with native RGBA and
-in-progress previews (a fitted 64x4 matrix, 159 µs a frame, three partials
+in-progress previews (a fitted 64x4 matrix, 165 µs a frame, three partials
 for 0.3% of a request — no flag, because there is nothing to load).
-**Q9's first pass** is taken: the DiT is attributed dispatch by dispatch,
-the GEMM swizzle re-screen closed with a measurement, and the fragment pack
-— caught at 44 GB/s against a 190 GB/s bus by a launch shape, not a layout —
-went to 131 for a bit-identical 6–7% off both endpoints.
+**Q9 is done in two passes, both bit-identical.** The first attributed the
+DiT dispatch by dispatch, closed the GEMM swizzle re-screen with a
+measurement, and caught the fragment pack at 44 GB/s against a 190 GB/s bus
+— a launch shape, not a layout — taking it to 131 for 6–7% off both
+endpoints. The second (Q9b) went after the VAE's two priced ports and
+**refused the route they were priced on**: z-image's matrix-core kernels
+narrow their operands, and in this decoder **one** narrowed convolution
+moves the decoded image by max abs 0.0885 against an fp32 port sitting at
+7.3e-4, because the tail norm divides a per-pixel L2 out of a residual
+stream at absmax 2.6e5. The same percents came out of the *shape* in fp32
+instead — a register block and a 64x64 GEMM tile — for **decode 7.4 → 4.0 s,
+VAE encoder 1.7 → 0.91 s**, and not a digit moved in any gate.
 **IMAGE.md is the live plan**; this is the summary.
 
 **Open, in IMAGE.md's order:**
 
-- **Q8 — edits**, the one regression still open: 2.1 edits by *conditional
-  generation* over a 27-layer vision tower with deepstack injection and 3-D
-  mrope, not by SDEdit. `strength` disappears; up to ten reference images
-  arrive. **The vision tower is ported and gated** (`qimage/vision`, rel
-  ≤1.1e-4 against `out/qi21vision`, four negative controls firing), the
-  DiT's multi-reference side turned out to be done already — Q2 gated it on
-  a synthetic edit case — and **the edit text encoding is ported and gated**
-  (`qimage/textenc/edit.go`: multi-image template, 3-D mrope, deepstack
-  injection; `prompt_embeds` at **4.3e-4 with one condition image and 4.8e-4
-  with two**, ids and positions exact, two controls at 13315x and 6057x).
-  **The CPU edit pipeline is done and gated end to end**
-  (`qimage/pipeline/edit.go` + `reference/dump_qi21_edit.py`): condition
-  image and prompt through our own tokenizer, tower, text encoder, VAE
-  encoder, DiT, scheduler and decoder reproduce the oracle's edited image at
-  **max abs 1.0e-5, mean 2e-6** — and the condition resampler is ported
-  bit-exactly (Pillow's **Lanczos**, not bicubic: premultiplied RGBa, 22-bit
-  fixed point, uint8 intermediate; down, up and one-axis cases all exact).
-  **The VAE encoder is on the GPU**: 1024² in **1.7 s** over 94 dispatches,
-  stages at 1.1e-6–2.6e-5 against the dump and 4.6e-5 against the CPU port,
-  and its stride-2 downsampler needed no new kernel — z-image's
-  "stride-2 = stride-1 subsampled at the odd pixels" identity covers Qwen's
-  filter unchanged. **The vision tower is on the GPU too**: a 1024²
-  condition image runs its 27 blocks in **6.3 s** against ~20 minutes on the
-  CPU, at fp16 operands with fp32 accumulation — a precision chosen by
-  measuring it first (`TestFP16Ladder` runs the CPU oracle in the matrix
-  core's arithmetic and reports rel 0.14 on the merged rows and no
-  overflow), and the device then landed within a few percent of that
-  prediction at every stage. **Only the endpoint is left.**
-  Two things to carry forward. On a non-square condition image the **fp32
-  dump is the less accurate side** — it sits rel 1.4e-3 from a float64 run
-  where the Go tower sits 2.1e-4 — so that stage is gated against dumped
-  float64 rows, and the fp16 GPU port should be read against those too. And
-  **the condition image must be quantized exactly as the reference's is**:
-  the tower amplifies an input perturbation by ~10³, so compositing alpha
-  over white in float rather than on 8-bit levels moves the prompt embedding
-  by rel 11 (now a firing control) — which is why the resampler is gated on
-  exact 8-bit equality rather than a tolerance.
+- **Three precision facts to carry into anything that touches this
+  vertical**, each of which has already caught a port:
+  - **the VAE cannot take fp16 operands anywhere** (Q9b, above). Its tail
+    norm is the amplifier, so the rule is not "watch the range" but "do not
+    narrow". `TestConvFP16Ladder` is the instrument; re-run it before
+    pointing any narrowing kernel at `qimage/vae`.
+  - **the vision tower amplifies an input perturbation by ~10³**, so a
+    condition image must be quantized exactly as the reference's is —
+    compositing alpha over white in float rather than on 8-bit levels moves
+    the prompt embedding by rel 11 (a firing control), which is why the
+    Lanczos resampler is gated on exact 8-bit equality and not a tolerance.
+  - **on a non-square condition image the fp32 dump is the less accurate
+    side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 —
+    so that stage is gated against dumped float64 rows.
 - **The 1184² ceiling.** A capability, not a percent: the VAE decoder's
   activation arena is one storage buffer against a 4 GiB − 4 device limit,
   so the model's own 2048² examples do not decode. Tiled decode, or a
   multi-buffer arena (`vk.PipelineSpec.Counts`, the LLM's 77 GB bank is the
   precedent).
-- **Q9 — percents, two of them already attributed and priced** by
-  `qimage/vae`'s profiler on a 1024² decode: **conv3x3 is 68.8% at 3.2
-  TFLOP/s** — z-image's stage-8 starting point to three digits, whose
-  matrix-core implicit GEMM took it 12x, and the fp16 range measurement says
-  every conv3x3 here can feed it — and **the mid block's four projections
-  are 21.0% at 35 GFLOP/s** on the naive kernel `dit_gemm` replaced in stage
-  7. Together ~7.5 s of decode → ~1.3 s. Everything past that is the DiT's,
-  which is 92% of the image.
+- **Q9b — the VAE's two priced ports, done 2026-09-21 and by the opposite
+  route.** conv3x3 was 69.7% of the decode at 3.2 TFLOP/s and the mid
+  block's four projections 19.9% at 35 GFLOP/s, both priced as z-image's
+  matrix-core kernels reused. `TestConvFP16Ladder` — the instrument the
+  ledger itself said to build first — refused that: narrowing every 3x3
+  costs the decoded image **max abs 0.178** (23 of 255 8-bit levels) and
+  narrowing **one** convolution costs 0.0885, against an fp32 port at
+  7.3e-4; the encoder's posterior mode moves 0.23–0.40 against a gate at
+  4.7e-5; narrowing the 1x1 shortcuts as well returns NaN. Taken in fp32
+  instead, as a register block (OC 8→48 over an LDS slab 4x smaller, 5.12 →
+  3.38 s) and a 64x64 tiled GEMM (1.08–1.70 s → **9 ms**), both
+  bit-identical: **decode 7.4 → 4.02 s, encoder 1.7 → 0.91 s**. What is left
+  in the decode is conv3x3 at 85.9% and 4.9 TFLOP/s, whose remaining ceiling
+  is one shared read per multiply-add; a pixel block is priced at ~1.5 s
+  more and is the only one of these that would *not* be bit-identical.
+  Everything past that is the DiT's, which is now 95% of the image.
+- **`zimage/vae`'s deletion is unblocked** (Q9b). It was kept past its
+  replacement because `gpu_conv.go` is the validated test bed for the
+  matrix-core convolution Q9 wanted; Q9 turned out not to want it. All that
+  is left to unpick is that `qimage/vae` builds on this package's `Tensor`
+  and `Conv2D`: hoist `tensor.go` + `math.go`, then delete the decoder,
+  encoder, both GPU paths, `tiny*` and `cmd/vaebench`/`vaedecode`/`vaeprof`.
+  Mechanical, ~8 k lines. `zimage/qwen` and `zimage/tokenizer` stay
+  permanently.
 - **The step count is swept and settled**: 40 stays the default because it
   is the only count safe across prompt kinds. Photographic and painterly
   prompts are convincing at **12 steps (36 s, 36% of the cost)**; a

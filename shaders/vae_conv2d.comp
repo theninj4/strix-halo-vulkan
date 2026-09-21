@@ -22,13 +22,34 @@
 // Input-channel blocking keeps the LDS footprint off the occupancy: the full
 // 512-channel filter for eight output channels would be 147 KB, a 32-channel
 // block of it is 9 KB.
+//
+// Both blocks are compile-time (IMAGE.md Q9b), because 8 was never screened
+// past the point where it beat 1 and the argument above does not stop at 8:
+// one activation load still feeds only OC_BLOCK fused multiply-adds, so the
+// loads per FLOP -- which is what binds this kernel, not the weights and not
+// the arithmetic -- fall as 1/OC_BLOCK the whole way. Qwen's decoder measured
+// the default at 3.2 TFLOP/s against a ~15 TFLOP/s LDS-bound ceiling (one
+// shared read per multiply-add is the term that does not fall), and the arms
+// are screened in qimage/vae rather than assumed. Raising OC_BLOCK changes no
+// accumulator's summation order -- the loops over input channel and tap are
+// untouched -- so every arm's output is *bit-identical*, which is what the
+// screen asserts.
+//
+// IC_BLOCK trades LDS footprint against barrier count and changes nothing
+// numerically either; the products are still accumulated in ascending channel
+// order.
 
 #include "vae_common.glsl"
 
 layout(local_size_x = 256) in;
 
-const uint OC_BLOCK = 8u;
-const uint IC_BLOCK = 32u;
+#ifndef OC_BLOCK
+#define OC_BLOCK 8u
+#endif
+#ifndef IC_BLOCK
+#define IC_BLOCK 32u
+#endif
+
 const uint MAX_TAPS = 9u;
 
 shared float shW[OC_BLOCK * IC_BLOCK * MAX_TAPS];

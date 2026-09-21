@@ -67,10 +67,21 @@ type GPUEncoder struct {
 // sizes the activation arena for an imgH x imgW image — the largest the
 // returned encoder will accept, since the arena is allocated once.
 func NewGPUEncoder(dev *vk.Device, cpu *Encoder, imgH, imgW int) (*GPUEncoder, error) {
+	return NewGPUEncoderOpts(dev, cpu, imgH, imgW, Options{})
+}
+
+// NewGPUEncoderOpts is NewGPUEncoder with the two screened kernels named.
+// The encoder gets them for the same reason the decoder does — they are the
+// same convolution and the same 1x1 projections, at 768 channels instead of
+// 1152 — and it is the same bits either way.
+func NewGPUEncoderOpts(dev *vk.Device, cpu *Encoder, imgH, imgW int, opt Options) (*GPUEncoder, error) {
 	if got := cpu.Mid.Attn.QKV.InC; got != encMidDim {
 		return nil, fmt.Errorf("qvae: encoder mid block is %d channels, the attention kernel is built for %d", got, encMidDim)
 	}
 	g := &GPUEncoder{engine: newEngine(), cpu: cpu}
+	if err := g.chooseKernels(opt); err != nil {
+		return nil, err
+	}
 	g.flattenWeights()
 
 	need, err := g.planSize(imgH, imgW)
@@ -78,7 +89,7 @@ func NewGPUEncoder(dev *vk.Device, cpu *Encoder, imgH, imgW int) (*GPUEncoder, e
 		g.Destroy()
 		return nil, err
 	}
-	if err := g.stage(dev, encoderShaderSet, need); err != nil {
+	if err := g.stage(dev, g.kernelSet(encoderShaderSet), need); err != nil {
 		g.Destroy()
 		return nil, err
 	}

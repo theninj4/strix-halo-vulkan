@@ -196,6 +196,11 @@ type engine struct {
 	mods    []*vk.ShaderModule
 	weights *gpuWeights
 
+	// The two kernels Q9b screened; see kernels.go. Both graphs resolve them
+	// the same way, which is why they live here.
+	conv convVariant
+	mid  midVariant
+
 	arena arena
 }
 
@@ -289,12 +294,18 @@ func (e *engine) ActivationBytes() int { return e.abuf.Size() }
 func (e *engine) WeightBytes() int     { return e.wbuf.Size() }
 
 // newEngine is an engine with its maps made but nothing staged, which is also
-// what the sizing passes record against.
+// what the sizing passes record against. The kernels are the screen's winners
+// from the start, so that a sizing pass — which never calls chooseKernels,
+// having no device and no options — records the graph the real one will run.
 func newEngine() engine {
-	return engine{
+	e := engine{
 		pipes:   make(map[string]*vk.ComputePipeline),
 		weights: &gpuWeights{off: make(map[string]uint32)},
 	}
+	if err := e.chooseKernels(Options{}); err != nil {
+		panic(err) // the defaults are constants; this cannot fail at runtime
+	}
+	return e
 }
 
 // GPUDecoder runs the decode graph on a Vulkan device.
@@ -323,10 +334,20 @@ var shaderSet = map[string][]byte{
 // largest the returned decoder will accept, since the arena is allocated
 // once.
 func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDecoder, error) {
+	return NewGPUDecoderOpts(dev, cpu, latentH, latentW, Options{})
+}
+
+// NewGPUDecoderOpts is NewGPUDecoder with the two screened kernels named,
+// which is what TestGPUKernelScreen sweeps and what holds the new graph
+// against the one it replaces.
+func NewGPUDecoderOpts(dev *vk.Device, cpu *Decoder, latentH, latentW int, opt Options) (*GPUDecoder, error) {
 	if got := cpu.Mid.Attn.QKV.InC; got != midDim {
 		return nil, fmt.Errorf("qvae: mid block is %d channels, the attention kernel is built for %d", got, midDim)
 	}
 	g := &GPUDecoder{engine: newEngine(), cpu: cpu}
+	if err := g.chooseKernels(opt); err != nil {
+		return nil, err
+	}
 	g.flattenWeights()
 
 	need, err := g.planSize(latentH, latentW)
@@ -334,7 +355,7 @@ func NewGPUDecoder(dev *vk.Device, cpu *Decoder, latentH, latentW int) (*GPUDeco
 		g.Destroy()
 		return nil, err
 	}
-	if err := g.stage(dev, shaderSet, need); err != nil {
+	if err := g.stage(dev, g.kernelSet(shaderSet), need); err != nil {
 		g.Destroy()
 		return nil, err
 	}
@@ -503,9 +524,10 @@ func (b *builder) conv(name string, c *zvae.Conv2D, x tensor) tensor {
 		2*float64(c.OutC)*float64(x.H)*float64(x.W)*float64(x.C)*float64(c.KH)*float64(c.KW))
 	b.pendingIn = x
 	// The grid's y axis is output-channel blocks: the shader holds OC_BLOCK
-	// accumulators per thread, which is where its arithmetic intensity is.
-	const convOCBlock = 8
-	b.addXY("conv2d", groups(out.H*out.W, 256), groups(c.OutC, convOCBlock), pushConstants{
+	// accumulators per thread, which is where its arithmetic intensity is,
+	// and which build supplies it is the screen's answer (kernels.go).
+	pipe, ocBlock := b.e.convPipe(c.OutC)
+	b.addXY(pipe, groups(out.H*out.W, 256), groups(c.OutC, ocBlock), pushConstants{
 		InOff: x.off, OutOff: out.off,
 		C: uint32(x.C), H: uint32(x.H), W: uint32(x.W),
 		OC: uint32(c.OutC), KH: uint32(c.KH), KW: uint32(c.KW), Pad: uint32(c.Pad),
@@ -574,6 +596,27 @@ func (b *builder) resblock(name string, r *ResBlock, x tensor, keepIn bool) tens
 	return out
 }
 
+// projection records one of the mid block's four 1x1 projections over the
+// pixel rows, on whichever kernel the screen chose. Both read the same push
+// constants — a row-major [rows, inDim] operand, a PyTorch [outDim, inDim]
+// weight and a bias — and differ only in the grid: one thread per output
+// element, or one workgroup per 64x64 output tile.
+func (b *builder) projection(src, dst tensor, h, w, inDim, outDim int, wOff, bOff uint32) {
+	rows := h * w
+	b.label(fmt.Sprintf("linear %d->%d x%d", inDim, outDim, rows),
+		2*float64(rows)*float64(outDim)*float64(inDim))
+	pc := pushConstants{
+		InOff: src.off, OutOff: dst.off,
+		C: uint32(inDim), H: uint32(h), W: uint32(w), OC: uint32(outDim),
+		WOff: wOff, BOff: bOff,
+	}
+	if v := b.e.mid; v.tiled {
+		b.addXY("linear", groups(rows, v.bm), groups(outDim, v.bn), pc)
+		return
+	}
+	b.add("linear", groups(rows*outDim, 64), pc)
+}
+
 // attention records the mid block's single-head spatial attention. The three
 // projections are the three row blocks of to_qkv's [3C, C] weight, read at
 // offsets; the output projection is its own 1x1. Both run on vae_linear over
@@ -596,12 +639,8 @@ func (b *builder) attention(name string, a *Attention, x tensor) tensor {
 	qkvW, qkvB := b.wOff(name+".qkv.weight"), b.wOff(name+".qkv.bias")
 	proj := func(which int) tensor {
 		out := tensor{off: b.ar.alloc(rows * dim), C: dim, H: x.H, W: x.W}
-		b.label(fmt.Sprintf("linear %d->%d x%d", dim, dim, rows), 2*float64(rows)*float64(dim)*float64(dim))
-		b.add("linear", groups(rows*dim, 64), pushConstants{
-			InOff: seq.off, OutOff: out.off,
-			C: uint32(dim), H: uint32(x.H), W: uint32(x.W), OC: uint32(dim),
-			WOff: qkvW + uint32(which*dim*dim), BOff: qkvB + uint32(which*dim),
-		})
+		b.projection(seq, out, x.H, x.W, dim, dim,
+			qkvW+uint32(which*dim*dim), qkvB+uint32(which*dim))
 		return out
 	}
 	q, k, v := proj(0), proj(1), proj(2)
@@ -632,12 +671,8 @@ func (b *builder) attention(name string, a *Attention, x tensor) tensor {
 	b.release(q, kT, v)
 
 	outRows := tensor{off: b.ar.alloc(rows * dim), C: dim, H: x.H, W: x.W}
-	b.label(fmt.Sprintf("linear %d->%d x%d", dim, dim, rows), 2*float64(rows)*float64(dim)*float64(dim))
-	b.add("linear", groups(rows*dim, 64), pushConstants{
-		InOff: ctx.off, OutOff: outRows.off,
-		C: uint32(dim), H: uint32(x.H), W: uint32(x.W), OC: uint32(dim),
-		WOff: b.wOff(name + ".proj.weight"), BOff: b.bOff(name + ".proj.bias"),
-	})
+	b.projection(ctx, outRows, x.H, x.W, dim, dim,
+		b.wOff(name+".proj.weight"), b.bOff(name+".proj.bias"))
 	b.release(ctx)
 
 	res := tensor{off: b.ar.alloc(x.elems()), C: x.C, H: x.H, W: x.W}

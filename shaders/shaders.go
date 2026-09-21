@@ -1053,6 +1053,64 @@ var VAETranspose []byte
 //go:embed qvae_chnorm.spv
 var QVAEChannelNorm []byte
 
+// The convolution's register-blocking ladder (IMAGE.md Q9b). vae_conv2d.comp
+// is 69.7% of Qwen's 1024x1024 decode at 3.2 TFLOP/s, and the fp16 implicit
+// GEMM that took z-image's convolution 12x is refused here on precision
+// (qimage/vae's TestConvFP16Ladder: one narrowed convolution anywhere in this
+// decoder moves the decoded image by max abs 0.09, against the fp32 path's
+// 7.3e-4, because the tail norm divides a per-pixel L2 out of a residual
+// stream at absmax 2.6e5). What is left is the shape of the fp32 kernel, and
+// the block that binds it -- one activation load per OC_BLOCK multiply-adds
+// -- was set to 8 when 8 was only ever compared against 1.
+//
+// The arms pair OC_BLOCK against an IC_BLOCK that keeps the staged filter
+// slab at 18-36 KB of LDS. Every one of them computes each accumulator in
+// exactly the same order, so they are bit-identical by construction and the
+// screen asserts it.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=8u -DIC_BLOCK=8u -o vae_conv2d_oc8ic8.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=16u -DIC_BLOCK=8u -o vae_conv2d_oc16ic8.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=48u -DIC_BLOCK=16u -o vae_conv2d_oc48ic16.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=16u -DIC_BLOCK=32u -o vae_conv2d_oc16.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=32u -DIC_BLOCK=16u -o vae_conv2d_oc32.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=32u -DIC_BLOCK=32u -o vae_conv2d_oc32ic32.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=48u -DIC_BLOCK=8u -o vae_conv2d_oc48.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DOC_BLOCK=64u -DIC_BLOCK=8u -o vae_conv2d_oc64.spv vae_conv2d.comp
+
+//go:embed vae_conv2d_oc8ic8.spv
+var VAEConv2DOC8IC8 []byte
+
+//go:embed vae_conv2d_oc16ic8.spv
+var VAEConv2DOC16IC8 []byte
+
+//go:embed vae_conv2d_oc48ic16.spv
+var VAEConv2DOC48IC16 []byte
+
+//go:embed vae_conv2d_oc16.spv
+var VAEConv2DOC16 []byte
+
+//go:embed vae_conv2d_oc32.spv
+var VAEConv2DOC32 []byte
+
+//go:embed vae_conv2d_oc32ic32.spv
+var VAEConv2DOC32IC32 []byte
+
+//go:embed vae_conv2d_oc48.spv
+var VAEConv2DOC48 []byte
+
+//go:embed vae_conv2d_oc64.spv
+var VAEConv2DOC64 []byte
+
+// The mid block's four projections as a tiled fp32 GEMM, replacing
+// vae_linear.comp's one-thread-per-output-element read of a whole weight row
+// (19.9% of the decode at 35 GFLOP/s). Bit-identical to it, for the reason
+// the source gives.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o qvae_gemm_f32.spv qvae_gemm_f32.comp
+
+//go:embed qvae_gemm_f32.spv
+var QVAEGemmF32 []byte
+
 //go:embed qvae_dupup.spv
 var QVAEDupUp []byte
 

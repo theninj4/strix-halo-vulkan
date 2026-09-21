@@ -140,21 +140,23 @@ two runs, at the default 40 steps:
 | stage | 1024x1024 |
 |---|---|
 | text encoder | 107 ms / 105 |
-| DiT prefill (step 0, which also fills the prefix KV cache) | 2.151 s / 2.163 |
-| 39 cached steps, mean | 2.117 s / 2.140 |
-| VAE decode | 7.48 s / 7.75 |
-| **request** | **1m32.3 s** / 1m33.5 |
+| DiT prefill (step 0, which also fills the prefix KV cache) | 2.136 s / 2.163 |
+| 39 cached steps, mean | 2.117 s / 2.143 |
+| VAE decode | 3.96 s / 3.96 |
+| **request** | **1m28.8 s** / 1m29.8 |
 
-**An image is the transformer and almost nothing else**: 91% of that wall
-clock is the 40 denoising steps, 8.1% is the VAE and 0.1% is the text
+**An image is the transformer and almost nothing else**: 95% of that wall
+clock is the 40 denoising steps, 4.5% is the VAE and 0.1% is the text
 encoder. The two levers are therefore the step count — genuinely per request
 here, unlike under a turbo distillation — and the unported percents
-`IMAGE.md`'s Q9 prices.
+`IMAGE.md`'s Q9 prices. (The VAE was 8.1% until Q9b halved its decode, in
+fp32: the matrix cores are refused there on precision, so what changed was
+a register block and a GEMM tile, and the output is bit for bit the same.)
 
-An *edit* at the same size, with one reference image, is **1m58.6 s /
-1m59.2**: the reference's own encoding 7.8 s (a 27-layer vision tower and a
-VAE encode), text encoding 0.71 s, the prefill 5.19 s against a generation's
-2.15, 40 steps at 2.47 s against 2.12, and the same 7.5 s decode. The extra
+An *edit* at the same size, with one reference image, is **1m54.2 s /
+1m56.6**: the reference's own encoding 7.1 s (a 27-layer vision tower and a
+VAE encode), text encoding 0.73 s, the prefill 5.19 s against a generation's
+2.14, 40 steps at 2.47 s against 2.12, and the same 4.0 s decode. The extra
 is the prefix — thousands of rows of reference latents that every step
 attends over.
 
@@ -171,8 +173,8 @@ than a single number:
 | 16 | 45 s | good | good | washed out, structure fragmenting |
 | 12 | 36 s | good | good | broken |
 
-(The wall clocks are the sweep's own, taken before Q9's 6% — the ratios are
-what it was measuring, and 40 steps is 1m32 today.)
+(The wall clocks are the sweep's own, taken before Q9 and Q9b's 10% — the
+ratios are what it was measuring, and 40 steps is 1m28.8 today.)
 
 40 is the default because it is the only count safe across all three; **24
 is the honest fast setting** at −35% with no visible loss on any of them,
@@ -531,8 +533,8 @@ client sees:
   having it quietly ignored.
 - **An edit costs slightly *more* than a generation**, not less: the prefix
   is thousands of tokens rather than tens. Measured at 1024² with one
-  reference, an edit is **1m59s** against a generation's 1m32s — the
-  reference's own encoding is 7.8 s of it (a 27-layer vision tower and a VAE
+  reference, an edit is **1m54s** against a generation's 1m28.8s — the
+  reference's own encoding is 7.1 s of it (a 27-layer vision tower and a VAE
   encode), and the rest is the prefix riding along in every denoising step.
 - **`image[]` is a real list.** Up to `max_reference_images` pictures are
   accepted, in the order they were sent, and the model's own limit is ten.
@@ -680,7 +682,7 @@ again.
 - **Image editing costs more than it did**, and that is the model rather
   than the port: an edit in 2.1 is a conditional generation over a 27-layer
   vision tower (IMAGE.md Q8), not an SDEdit, so there is no truncated
-  schedule to make it cheap. 1m59s at 1024² against a generation's 1m32s, and
+  schedule to make it cheap. 1m54s at 1024² against a generation's 1m28.8s, and
   no `strength` to trade quality for time with. The endpoint's shape is
   unchanged underneath; what changed is that `image[]` is a real list.
 - **The image adapter holds the device lock for the whole run**, where the

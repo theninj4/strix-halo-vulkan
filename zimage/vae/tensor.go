@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+
+	"strix-halo-vulkan/safetensors"
 )
 
 // Tensor is a dense NCHW float32 tensor.
@@ -123,6 +125,41 @@ func (c *Conv2D) OutSize(n, k int) int {
 // of the decoder's graph in the test. Nothing in the library sets it.
 var convTap func(c *Conv2D, x *Tensor)
 
+// FP16ConvOperands, when set, is asked of each convolution before it runs;
+// the ones it accepts narrow *both* operands to IEEE binary16 and accumulate
+// in float32. That is exactly what a matrix core does, and this is the
+// instrument IMAGE.md's Q9 ledger says the conv port owes before it is
+// written: z-image narrowed its decoder's convolutions on a graph whose
+// activations peak at 497, Qwen's peak at 1.1e4, and "20x less headroom is
+// still inside fp16" is an argument where the project's method wants a
+// measurement.
+//
+// It is a predicate rather than a flag because the port is one too -- Qwen's
+// graph narrows its 3x3 convolutions and leaves the 1x1 shortcuts alone,
+// since those are the only ones reading a tensor the channel norm does not
+// bound -- and an instrument that narrowed a different set from the port
+// would be predicting the wrong thing.
+//
+// It narrows the *tensors*, once each, rather than each product: that is both
+// faster and more faithful, because the device does the same -- the filter is
+// packed to halves at load and shaders/vae_pack_conv.comp narrows the
+// activation once into the blocked layout the fragment loads read.
+//
+// It is a package-level hook, like convTap above, because the port it
+// predicts is a property of the convolution and not of a caller; nothing in
+// the library sets it and it is not safe to change while a decode is running.
+var FP16ConvOperands func(c *Conv2D) bool
+
+// narrowF16 returns a copy of v with every element rounded to binary16 and
+// back.
+func narrowF16(v []float32) []float32 {
+	out := make([]float32, len(v))
+	for i, x := range v {
+		out[i] = safetensors.F16ToF32(safetensors.F32ToF16(x))
+	}
+	return out
+}
+
 // Apply runs the convolution. Output is [N, OutC, H, W] for the 3x3 pad-1 and
 // 1x1 pad-0 cases this decoder uses, both of which preserve spatial size.
 func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
@@ -131,6 +168,11 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 	}
 	if x.C != c.InC {
 		return nil, fmt.Errorf("vae: conv expects %d input channels, got %d", c.InC, x.C)
+	}
+	weight := c.Weight
+	if FP16ConvOperands != nil && FP16ConvOperands(c) {
+		weight = narrowF16(weight)
+		x = &Tensor{N: x.N, C: x.C, H: x.H, W: x.W, Data: narrowF16(x.Data)}
 	}
 	stride := c.stride()
 	outH := c.OutSize(x.H, c.KH)
@@ -158,7 +200,7 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 				wbase := ((oc * c.InC) + ic) * c.KH * c.KW
 				for kh := 0; kh < c.KH; kh++ {
 					for kw := 0; kw < c.KW; kw++ {
-						wv := c.Weight[wbase+kh*c.KW+kw]
+						wv := weight[wbase+kh*c.KW+kw]
 						if wv == 0 {
 							continue
 						}
