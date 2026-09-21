@@ -163,6 +163,7 @@ func depthBench(o depthOpts) error {
 			return err
 		}
 		r.ppWall, r.ppStats, r.ppTok = time.Since(t0), g.Stats.Clone(), o.pp
+		reportSelSkip(g)
 		pos += o.pp
 
 		// Token generation at the depth: a batch of one, -tg times.
@@ -309,4 +310,34 @@ func rate(n int, d time.Duration) float64 {
 		return 0
 	}
 	return float64(n) / d.Seconds()
+}
+
+// reportSelSkip prints how much of the key axis the attention kernel's block
+// skip could skip on the selection the batch just left behind (P11).
+//
+// At prefill this is the whole question. Every other block of the model is
+// flat in depth; attention is not, and what decides *its* slope is not the
+// selection's density — 2051 cells however deep the cache, which at 64k is
+// 3.2% — but the density of the **union** over the sixteen adjacent queries a
+// cooperative-matrix fragment covers, because that is the granularity the
+// kernel can skip at. The two columns are that union and the per-row floor a
+// gather would reach, so the gap between them is what a restructuring is
+// worth before anyone writes one.
+func reportSelSkip(g *llm.Graph) {
+	a := g.Attn()
+	if a == nil || !a.Sparse() {
+		return
+	}
+	mask := a.Selection()
+	fmt.Printf("    selection live %%, (query tile) x (key block):\n")
+	fmt.Printf("      %-6s %8s %8s %8s %8s\n", "bm\\bn", "16", "32", "64", "row")
+	for _, bm := range []int{16, 32, 64} {
+		fmt.Printf("      %-6d", bm)
+		for _, bn := range []int{16, 32, 64} {
+			live, _ := a.SelSkip(mask, bm, bn)
+			fmt.Printf(" %7.1f%%", 100*live)
+		}
+		_, perRow := a.SelSkip(mask, bm, 64)
+		fmt.Printf(" %7.1f%%\n", 100*perRow)
+	}
 }

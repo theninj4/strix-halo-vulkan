@@ -1199,7 +1199,10 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 		cn := base
 		cn.OutOff = g.aOut
 		cn.GemmN = uint32(g.gemmN())
-		add("cn", "cn", uint32(g.rows), uint32(c.HC), cn)
+		// **One workgroup a token, not one a (token, stream)** (P11): the
+		// four streams combine the same block output row, so a grid over
+		// them read it four times. The kernel walks them instead.
+		add("cn", "cn", uint32(g.rows), 1, cn)
 	} else {
 		add("norm", "norm", uint32(g.rows), uint32(c.HC), base)
 	}

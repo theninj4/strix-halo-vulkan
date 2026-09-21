@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1328.5 tok/s at 8192 rows, 3.40x**, still climbing where llama.cpp plateaus, and **1053 tok/s through the server** on a 4128-token prompt against 667 before P11; **27.69 tok/s at 64k of context, 0.79x of its own depth-zero rate**, and 64k **prefills** at 642 tok/s | `hc.cn` at half the bus; the MoE unpack prefetch; batching (P6); the QSA gather; 128k |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1372.2 tok/s at 8192 rows, 3.51x**, still climbing where llama.cpp plateaus, and **~1053 tok/s through the server** on a 4128-token prompt against 667 before P11; **27.69 tok/s at 64k of context, 0.79x of its own depth-zero rate**, and 64k **prefills** at **654 tok/s** against 440 | the attention row max on 16 of 64 lanes; `attn.select`; the MoE unpack prefetch; batching (P6); 128k |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -87,7 +87,7 @@ through P5 is closed. The shipped configuration is **D19 + D20 + D21**
 transcoded, `ffn_down_exps` at IQ4_NL): 4.132 GB a token against a 58.6
 tok/s ceiling, perplexity 4.0992 (+1.74% of our own 4.0289, which is itself
 −0.13% against llama.cpp's at identical weights). Decode 36.19 tok/s,
-prefill **1165 tok/s at ubatch 2048 and 1328.5 at 8192** (P11). Served with
+prefill **1191.8 tok/s at ubatch 2048 and 1372.2 at 8192** (P11). Served with
 prefix reuse; a second turn extends the graph's state rather than
 re-prefilling.
 
@@ -125,13 +125,35 @@ from what the draft predicts.
   prefill this GEMM is bound by its per-tile slab unpack and the row padding is
   very nearly free** — L5b built that padding as a cost to justify and it is not
   one, so the way in is fewer *tiles*, which is a bigger ubatch.
-- **`hc.cn` is the next kernel and it does no arithmetic**: the hyper-connection
-  combine fused with the next mixer's norm, **10.7% of an 8192-row prefill** and
-  9.3% of a 2048 one, moving 901 MB a dispatch at **128 GB/s where a copy gets
-  236**. Two candidates, both cheap: the block output is read once per *stream*,
-  four times a token, where one workgroup a token would read it once; and the
-  norm's tail is an eight-barrier 256-way tree where a subgroup reduction is one
-  barrier (not bit-exact — `llm_hc_norm.comp` would have to move with it).
+  **A second round closed `hc.cn`** — the combine fused with the next mixer's
+  norm, the second largest kernel in a prefill and one that does no arithmetic:
+  the four streams of a token were each reading the *same* block output row, so
+  one workgroup a token instead of one a (token, stream) is **1.37-1.44x** on
+  the kernel and bit-identical, taking the graph to **1191.8 / 1372.2 tok/s
+  (3.51x)** and 64k prefill to **654**. And it measured, for the first time,
+  **how much of the key axis the QSA selection lets the attention kernel skip**
+  — at 64 000 cells the shipped 16x32 tile keeps 25.9% of pairs live against a
+  14.7% floor for a single query row — which priced and then refused a k-tile
+  skip inside the kernel (**1.18x slower, and at 64k slow enough to trip P0's
+  ring watchdog**). Two kernels now say the same thing: **a branch inside an
+  unrolled cooperative-matrix loop costs more than the work it removes**; change
+  the loop's granularity, not what happens inside it.
+- **The attention kernel's row max runs on sixteen of sixty-four lanes**, and
+  only when the selection is on — which is exactly at depth. A max is exact
+  under any reassociation, so spreading it over the whole wave is
+  bit-identical, and it is the first thing to try against the **1.6x** gap
+  between `attn.attn`'s 9.8 TFLOP/s of useful work at 64k and its 16.0 at
+  depth zero.
+- **`attn.select` is 7.4% of a prefill token at 64 000 cells**, four radix
+  passes and an emit each streaming the row out of DRAM. Its keys are *block*
+  scores repeated `ratio` times, so selecting over `nKV/ratio` entries and
+  expanding once is ~2.5x the traffic back — with the causal boundary as the
+  risk, since a partly-masked block is where the reference's tie fill is a
+  block split.
+- **`hc.cn` is still at 134 GB/s** after P11-6, where a copy gets 236. What is
+  left is the norm's tail: an eight-barrier 256-way tree where a subgroup
+  reduction is one barrier — not bit-exact, and `llm_hc_norm.comp` would have
+  to move with it.
 - **The MoE unpack prefetch** — issuing a K-step's bank loads before the unpack
   that consumes them, L8d's third lead. After P11 it is the only idea left that
   attacks the term that actually dominates `moe.up`, which is the *tile's* cost
@@ -176,7 +198,10 @@ from what the draft predicts.
   there too**: at `-pp 2048` every block is flat in depth except attention,
   which is 97% of the falloff and 47% of a prefill token at 64 000 cells
   (`attn.attn` 27x from depth zero, `attn.select` 46x). 64k prefills at
-  **642 tok/s**, 0.57x of the depth-zero rate.
+  **654 tok/s**, 0.57x of the depth-zero rate. **And the prefill side of the
+  gather is now priced**: the union of sixteen adjacent queries' selections is
+  only 1.76x one query's reach, so a per-query gather is worth 1.76x at 64k
+  and not the 31x the 3.2% density suggests — L4b's refusal, with a number.
 - **128k still does not complete**, and P7 did not touch it: the fill dies
   at ~115k cells in the P0 timestamp pathology ("N of 1025 timestamp slots
   never became ready"), reached by depth instead of row count. The untried

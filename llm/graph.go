@@ -763,6 +763,13 @@ func (g *Graph) MaxTokens() int { return g.maxTok }
 // without one.
 func (g *Graph) Head() *HeadGPU { return g.head }
 
+// Attn is the staged full-attention block, or nil when the graph was built
+// without one. It is exported for the **selection**: the QSA bitmask a pass
+// leaves behind is what says how much of the key axis the attention kernel's
+// block skip can actually skip, and at prefill that is the whole of the depth
+// term (P11). `cmd/llm -depth` reads it.
+func (g *Graph) Attn() *AttnGPU { return g.attn }
+
 // Past is how many tokens of the current sequence are behind the graph, and
 // Ids is that sequence.
 func (g *Graph) Past() int    { return g.past }

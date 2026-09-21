@@ -1552,6 +1552,59 @@ func (g *AttnGPU) Selection() []uint32 {
 	return g.abuf.ReadUint32At(int(g.aSel), g.rows*g.selWords())
 }
 
+// SelSkip is what the attention kernel's block skip can skip, measured on the
+// selection a pass actually left behind (P11).
+//
+// `llm_attn_wmma.comp` walks the key axis in blocks of `bn` cells and tests a
+// whole query tile of `bm` rows at once: a block is skipped only when **no**
+// row of the tile has a cell selected in it, because a cooperative-matrix
+// fragment is 16 rows and there is no finer granularity to mask at. So the
+// saving is not the selection's density — 2051 cells of `nKV`, which at 64k
+// is 3.2% — it is the density of the **union** over `bm` adjacent queries,
+// and how those two differ is a fact about the text rather than about the
+// kernel.
+//
+// It returns the fraction of (query tile, key block) pairs that survive, and
+// the same for a tile of one row, which is the floor a per-query gather would
+// reach. Both count only blocks inside the tile's causal extent, since the
+// kernel never walks past that.
+func (g *AttnGPU) SelSkip(mask []uint32, bm, bn int) (tile, perRow float64) {
+	words := g.selWords()
+	var live, total, rowLive, rowTotal int
+	for q0 := 0; q0 < g.rows; q0 += bm {
+		rows := minInt(bm, g.rows-q0)
+		// The kernel's own bound: `min(n, past + q0 + bm)`.
+		last := minInt(g.nKV, g.past+q0+bm)
+		nb := (last + bn - 1) / bn
+		for b := 0; b < nb; b++ {
+			any := false
+			for r := 0; r < rows; r++ {
+				row := mask[(q0+r)*words:]
+				hit := false
+				for c := b * bn; c < minInt((b+1)*bn, g.nKV); c++ {
+					if row[c>>5]&(1<<uint(c&31)) != 0 {
+						hit = true
+						break
+					}
+				}
+				if hit {
+					rowLive++
+					any = true
+				}
+				rowTotal++
+			}
+			if any {
+				live++
+			}
+			total++
+		}
+	}
+	if total == 0 || rowTotal == 0 {
+		return 0, 0
+	}
+	return float64(live) / float64(total), float64(rowLive) / float64(rowTotal)
+}
+
 // SelectedCells unpacks token t's row of the bitmask.
 func (g *AttnGPU) SelectedCells(mask []uint32, t int) []int32 {
 	out := make([]int32, 0, g.selWidth())

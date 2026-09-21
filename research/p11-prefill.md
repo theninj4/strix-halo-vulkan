@@ -7,6 +7,13 @@
 
 # P11 — prefill: the batch was the biggest number in the file, and the padding was not
 
+> **Second round below** (P11-6, P11-7): `hc.cn` one workgroup a token is
+> another **1.37-1.44x on the second largest kernel in a prefill**, and the
+> QSA selection's skip rate at depth is measured for the first time — which
+> priced, and then refused, a finer skip inside the attention kernel.
+> The ladder after both rounds: **681.7 / 925.1 / 1191.8 / 1340.7 / 1372.2
+> tok/s** at 512 / 1024 / 2048 / 4096 / 8192 rows, **3.51x llama.cpp**.
+
 **Result. Served prompt processing is 1.64x for a gigabyte of arenas, and the
 graph itself is 1.06-1.08x on one kernel's load width.** The two are
 independent and they compose: `cmd/serve` prefilled in 512-token chunks
@@ -190,11 +197,11 @@ sequence walked forward (`results/p11_depth.csv`):
 
 | depth | pp tok/s | vs 0 | ms a token | hc | dn | moe | **attn** |
 |---:|---:|---:|---:|---:|---:|---:|---:|
-| 0 | **1119.1** | 1.00x | 0.894 | 0.142 | 0.156 | 0.479 | 0.083 |
-| 8 000 | 930.3 | 0.83x | 1.075 | 0.142 | 0.156 | 0.488 | 0.216 |
-| 16 000 | 866.1 | 0.77x | 1.155 | 0.142 | 0.156 | 0.464 | 0.318 |
-| 32 000 | 775.4 | 0.69x | 1.290 | 0.142 | 0.157 | 0.458 | 0.462 |
-| 64 000 | **642.2** | 0.57x | 1.557 | 0.142 | 0.157 | 0.461 | **0.727** |
+| 0 | **1146.6** | 1.00x | 0.872 | 0.121 | 0.156 | 0.478 | 0.083 |
+| 8 000 | 948.6 | 0.83x | 1.054 | 0.121 | 0.156 | 0.486 | 0.217 |
+| 16 000 | 883.1 | 0.77x | 1.132 | 0.121 | 0.157 | 0.462 | 0.319 |
+| 32 000 | 790.4 | 0.69x | 1.265 | 0.121 | 0.157 | 0.455 | 0.462 |
+| 64 000 | **654.0** | 0.57x | 1.529 | 0.121 | 0.157 | 0.459 | **0.726** |
 
 **Every block is flat in depth except attention, and attention is 97% of the
 falloff** — 0.644 ms a token of the 0.663 a token a prefill gains between
@@ -207,22 +214,126 @@ by label (ms a token, depth 0 → 64 000):
 	attn.expand   0.0180 -> 0.0256
 
 `attn.attn` and `attn.select` are 0.627 of the 0.644. This is the quadratic
-term any dense attention has and llama.cpp has it too; what is *ours* is that
-the QSA selection does not help here the way P7 made it help at decode — at
-2048 queries a batch the union of selected key blocks is very nearly
-everything, which is L4b's reason for declining the gather at prefill, still
-standing. **For a client, 64k of context now prefills at 642 tok/s where it
-was 440**, and the two changes are why.
+term any dense attention has and llama.cpp has it too; what is *ours* is how
+far the QSA selection gets to bite here, which P11-7 measures for the first
+time. **For a client, 64k of context now prefills at 654 tok/s where it was
+440 at the old batch**, and depth zero at 1146.6 where it was 691.
+
+## P11-6: `hc.cn`, one workgroup a token
+
+The hyper-connection combine fused with the next mixer's norm is the **second
+largest kernel in a prefill** — 10.7% of an 8192-row pass — and it does no
+arithmetic: it adds the block output into a four-stream f32 residual and norms
+each stream out to fp16. 901 MB a dispatch in 7.0 ms is **128 GB/s where a
+copy on this machine gets 236** (`results/bandwidth.csv`).
+
+It was one workgroup per **(token, stream)**, and the four streams of a token
+combine *the same* block output row — `out[t]` has no stream index. So those
+2560 floats were read four times: 110 KB a token where 80 would do. One
+workgroup a token, the output row held in the ten registers a thread already
+had spare, and the streams walked one at a time:
+
+| | before | after | |
+|---|---:|---:|---:|
+| `hc.cn` at 2048 rows | 163.7 ms | **119.4** | 1.37x |
+| `hc.cn` at 8192 rows | 661.1 ms | **459.4** | **1.44x** |
+| the graph at 2048 | 1165.1 tok/s | **1191.8** | 1.023x |
+| the graph at 8192 | 1328.5 tok/s | **1372.2** | 1.033x |
+
+**Bit-identical**, and deliberately so: each stream still reduces through the
+same 256-way tree over the same per-thread partials, which is the thing L2c
+and P1a built this kernel's width around. The one new line is a leading
+`barrier()` so `partials` can be reused across the four streams.
+
+What it does *not* fix is the rate: 655 MB in 4.89 ms is **134 GB/s**, so the
+kernel is still at 57% of what a copy gets and the redundancy was not why.
+That is now the cleanest unexplained number in the prefill graph.
+
+## P11-7: how much the QSA selection can actually skip, and why a finer skip loses
+
+Every block of the model is flat in depth except attention (P11-5), so the
+question is what decides *attention's* slope. It is not the selection's
+density — 2051 cells however deep the cache, which at 64k is 3.2% — because
+`llm_attn_wmma.comp` skips at the granularity of a **(query tile, key block)**
+pair, and a cooperative-matrix fragment is sixteen rows. What matters is the
+density of the **union** over the queries a tile covers, and that is a fact
+about the text.
+
+`AttnGPU.SelSkip` measures it on the bitmask a real 2048-token batch leaves
+behind; `cmd/llm -depth` prints it per depth. Live (query tile) x (key block)
+pairs, and the floor a single query row would reach:
+
+| depth | 16x16 | 16x32 | 16x64 | 32x64 | 64x64 | one row |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 100% | 100% | 100% | 100% | 100% | 100% |
+| 8 000 | 75.5 | 86.7 | 94.8 | 98.0 | 99.3 | 70.3 |
+| 32 000 | 39.1 | 51.5 | 65.1 | 75.8 | 85.2 | 30.1 |
+| 64 000 | **18.5** | **25.9** | 35.6 | 45.4 | 56.3 | **14.7** |
+
+Three things fall out. **The shipped rung is already the good one**:
+`DefaultAttnKernel` is `qt1_kt2`, a 16x32 tile, which at 64k keeps 25.9% live
+— the ladder that L2f chose on 512-token prefills happens to be the right
+choice at depth for a different reason. **A per-query gather is worth 1.76x
+and not the 31x the density suggests**, which is L4b's "at prefill the density
+makes it pointless" restated with a number: adjacent queries select nearly the
+same cells, so the union over sixteen of them is only 1.76x their individual
+reach. And **the whole remaining headroom is the 1.40x between a 32-cell block
+and a 16-cell one**.
+
+That last one is a k-tile: a block is `KTIL` cooperative-matrix tiles and each
+has its own K and V fragment and its own `coopMatMulAdd`, so a tile with
+nothing selected can be dropped on its own — bit-identically, by exactly the
+identity the block skip already rests on. It was built: a per-word OR of the
+staged mask down the query tile, one scalar `kLive[kk]` per tile, and a
+`continue` on it in the QK loop, the row max, the exponential, the PV loop and
+the row sum.
+
+**It is 1.18x slower, and at 64k it does not finish.** 866.1 → 737.2 tok/s at
+16 000 and 775.4 → 636.2 at 32 000; at 64 000 the pass got slow enough to hold
+the graphics ring past P0's two-second watchdog and was reset mid-submit.
+
+This is the **same answer P11-4 got in a different kernel**, and two
+independent measurements make it a rule rather than an anecdote:
+
+> **Work removed from inside an unrolled cooperative-matrix loop by a branch
+> costs more than it saves.** The MoE GEMM lost 1.15x to a per-fragment row
+> bound that removed 35% of its rows; the attention kernel lost 1.18x to a
+> per-tile bound that removed 29% of its multiplies. Neither kernel is
+> arithmetic-bound — they are bound by issue and latency — so a branch adds to
+> the term that dominates and subtracts from the one that does not. The way to
+> skip more is to change the **loop's granularity** (a rung), not to add a
+> test inside it.
+
+Which leaves, for the depth term: `attn.attn` runs at **9.8 TFLOP/s of useful
+work at 64 000 cells against 16.0 at depth zero** on the same kernel, so
+there is ~1.6x in it that is not about skipping anything at all. The two
+candidates are the parts that only run when the selection is on — the row
+max's `selected()` scan, which is a serial loop over sixteen cells on
+**sixteen of the wave's sixty-four lanes**, and the mask loop that every live
+block now passes through. The first is a max-reduction and so is exactly
+bit-identical under any reassociation; nobody has tried widening it.
 
 ## What is open, in order
 
-- **`hc.cn` at 128 GB/s** — 10.7% of an 8192-row prefill and 9.3% of a 2048
-  one, elementwise, against 236 GB/s for a copy. Two candidates, both cheap:
-  the block output `act[src]` is read once per *stream*, so four times a
-  token, where one workgroup a token would read it once; and the norm's tail
-  is an eight-barrier 256-way tree where a subgroup reduction is one barrier
-  (that one is not bit-exact and would have to move `llm_hc_norm.comp` with
-  it).
+- **The attention kernel's row-max scan uses sixteen of sixty-four lanes.**
+  `for (i = lane; i < BM; i += WAVE)` with BM 16 and WAVE 64, then a serial
+  walk of TILE cells per row per k-tile with a `selected()` bit test on each —
+  and it only runs at all when the selection is on, which is exactly at depth.
+  A max is associative and exact under any reassociation, so spreading it over
+  all 64 lanes with a clustered subgroup reduce is **bit-identical**. It is the
+  one obviously under-parallelised loop left in the block body, and it is the
+  first thing to try against the 1.6x gap between `attn.attn`'s 9.8 TFLOP/s at
+  64k and its 16.0 at depth zero.
+- **`hc.cn` is still at 134 GB/s** after P11-6 removed the redundancy, where a
+  copy gets 236. The other candidate is the norm's tail: an eight-barrier
+  256-way tree where a subgroup reduction is one barrier. That one is **not**
+  bit-exact and `llm_hc_norm.comp` would have to move with it.
+- **`attn.select` is 7.4% of a prefill token at 64 000 cells** and 46x its
+  depth-zero cost — four radix passes and an emit, each streaming the row out
+  of DRAM. The row's keys are *block* scores repeated `ratio` times, so a
+  select over `nKV/ratio` entries followed by one expanding emit is ~2.5x the
+  traffic back; the risk is the causal boundary, where a block is partly
+  masked and the reference's tie fill is a block split.
 - **`moe.up` is still a third of a 2048-row prefill** and P11-4 says the way
   in is fewer tiles, not fewer rows. The unmeasured one is **the unpack
   prefetch** — issuing a K-step's bank loads before the unpack that consumes
@@ -244,6 +355,10 @@ was 440**, and the two changes are why.
 	/tmp/pp -model $M -graph -tokens 512,1024,2048,4096,8192 -ctx 8192 -csv results/p11_pp.csv
 	/tmp/pp -model $M -moe -tokens 512,2048,4096 -iters 3 -layers 1      # one layer, 228 ms to stage
 	/tmp/pp -model $M -depth -depths 0,8000,16000,32000,64000 -pp 2048 -tg 8 -ctx 76000
+
+`-depth` prints the selection's live-pair table (P11-7) after every timed
+prompt batch, which is the instrument that says what a change to the attention
+kernel's granularity could possibly be worth before anyone writes one.
 
 The `-moe` bench is the loop to work in: it stages one layer in **228 ms**,
 runs the real 4k routing trace, and reports per-mode GFLOP/s and GB/s of bank,
