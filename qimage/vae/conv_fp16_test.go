@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math"
 	"testing"
-
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The instrument the conv port owes before it exists — IMAGE.md's Q9 ledger,
@@ -62,23 +60,23 @@ func TestConvFP16Ladder(t *testing.T) {
 	// at absmax 114 / 159 / 1.0e4 against the normed tensors' ~10
 	// (TestConvInputRanges) — so they are the obvious suspects for where a
 	// narrowing hurts, and an arm that excludes them says whether they are.
-	upconv := map[*zvae.Conv2D]bool{}
+	upconv := map[*Conv2D]bool{}
 	for i := range dec.Ups {
 		if dec.Ups[i].Up != nil {
 			upconv[&dec.Ups[i].Up.Conv] = true
 		}
 	}
-	is3x3 := func(c *zvae.Conv2D) bool { return c.KH == 3 && c.KW == 3 }
+	is3x3 := func(c *Conv2D) bool { return c.KH == 3 && c.KW == 3 }
 
 	arms := []struct {
 		name string
-		pick func(c *zvae.Conv2D) bool
+		pick func(c *Conv2D) bool
 	}{
 		{"3x3", is3x3},
-		{"3x3-noup", func(c *zvae.Conv2D) bool { return is3x3(c) && !upconv[c] }},
-		{"upconv", func(c *zvae.Conv2D) bool { return upconv[c] }},
-		{"convin", func(c *zvae.Conv2D) bool { return c == &dec.ConvIn }},
-		{"all", func(c *zvae.Conv2D) bool { return true }},
+		{"3x3-noup", func(c *Conv2D) bool { return is3x3(c) && !upconv[c] }},
+		{"upconv", func(c *Conv2D) bool { return upconv[c] }},
+		{"convin", func(c *Conv2D) bool { return c == &dec.ConvIn }},
+		{"all", func(c *Conv2D) bool { return true }},
 	}
 
 	for _, arm := range arms {
@@ -93,22 +91,22 @@ func TestConvFP16Ladder(t *testing.T) {
 				z := loadRef(t, m, label+"_z_norm")
 				cfg.Denormalize(z)
 
-				fp32 := map[string]*zvae.Tensor{}
-				dec.Tap = func(name string, x *zvae.Tensor) { fp32[name] = cloneTensor(x) }
+				fp32 := map[string]*Tensor{}
+				dec.Tap = func(name string, x *Tensor) { fp32[name] = cloneTensor(x) }
 				img32, err := dec.Decode(z)
 				dec.Tap = nil
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				zvae.FP16ConvOperands = arm.pick
-				defer func() { zvae.FP16ConvOperands = nil }()
-				dec.Tap = func(name string, x *zvae.Tensor) {
+				FP16ConvOperands = arm.pick
+				defer func() { FP16ConvOperands = nil }()
+				dec.Tap = func(name string, x *Tensor) {
 					report(t, arm.name, name, x, fp32[name], loadRef(t, m, label+"_dec_"+name))
 				}
 				img16, err := dec.Decode(z)
 				dec.Tap = nil
-				zvae.FP16ConvOperands = nil
+				FP16ConvOperands = nil
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -121,22 +119,22 @@ func TestConvFP16Ladder(t *testing.T) {
 			t.Run(arm.name+"/encode/"+label, func(t *testing.T) {
 				card := loadRef(t, m, label+"_card")
 
-				fp32 := map[string]*zvae.Tensor{}
-				enc.Tap = func(name string, x *zvae.Tensor) { fp32[name] = cloneTensor(x) }
+				fp32 := map[string]*Tensor{}
+				enc.Tap = func(name string, x *Tensor) { fp32[name] = cloneTensor(x) }
 				mode32, err := enc.Encode(card)
 				enc.Tap = nil
 				if err != nil {
 					t.Fatal(err)
 				}
 
-				zvae.FP16ConvOperands = arm.pick
-				defer func() { zvae.FP16ConvOperands = nil }()
-				enc.Tap = func(name string, x *zvae.Tensor) {
+				FP16ConvOperands = arm.pick
+				defer func() { FP16ConvOperands = nil }()
+				enc.Tap = func(name string, x *Tensor) {
 					report(t, arm.name, name, x, fp32[name], loadRef(t, m, label+"_enc_"+name))
 				}
 				mode16, err := enc.Encode(card)
 				enc.Tap = nil
-				zvae.FP16ConvOperands = nil
+				FP16ConvOperands = nil
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -146,8 +144,8 @@ func TestConvFP16Ladder(t *testing.T) {
 	}
 }
 
-func cloneTensor(x *zvae.Tensor) *zvae.Tensor {
-	out := zvae.NewTensor(x.N, x.C, x.H, x.W)
+func cloneTensor(x *Tensor) *Tensor {
+	out := NewTensor(x.N, x.C, x.H, x.W)
 	copy(out.Data, x.Data)
 	return out
 }
@@ -155,7 +153,7 @@ func cloneTensor(x *zvae.Tensor) *zvae.Tensor {
 // report prints one stage's distance from both references. A non-finite
 // element fails the 3x3 arm and is reported by the "all" arm, which is there
 // to produce exactly that.
-func report(t *testing.T, arm, name string, got, vsCPU, vsRef *zvae.Tensor) {
+func report(t *testing.T, arm, name string, got, vsCPU, vsRef *Tensor) {
 	t.Helper()
 	for _, v := range got.Data {
 		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
@@ -172,7 +170,7 @@ func report(t *testing.T, arm, name string, got, vsCPU, vsRef *zvae.Tensor) {
 
 // distance is compare()'s two numbers without its assertion: the largest
 // absolute difference, and the largest relative one against an rms floor.
-func distance(got, want *zvae.Tensor) string {
+func distance(got, want *Tensor) string {
 	if want == nil || got.Len() != want.Len() {
 		return "n/a"
 	}

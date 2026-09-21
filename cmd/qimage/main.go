@@ -31,8 +31,8 @@ import (
 	"time"
 
 	"strix-halo-vulkan/qimage/pipeline"
+	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 const strixHaloDeviceID = 0x1586
@@ -146,7 +146,7 @@ func report(tm *pipeline.Timings) {
 		tm.Decode.Round(time.Millisecond))
 }
 
-func writePNG(path string, img *zvae.Tensor, opaque bool) error {
+func writePNG(path string, img *qvae.Tensor, opaque bool) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err

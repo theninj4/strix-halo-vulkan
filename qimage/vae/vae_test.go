@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The reference comes from reference/dump_qi21_vae.py: diffusers' VAE in
@@ -51,7 +49,7 @@ func loadManifest(t *testing.T) *manifest {
 
 // loadRef reads a dumped [1, C, 1, H, W] tensor with the frame axis folded
 // away.
-func loadRef(t *testing.T, m *manifest, name string) *zvae.Tensor {
+func loadRef(t *testing.T, m *manifest, name string) *Tensor {
 	t.Helper()
 	meta, ok := m.Tensors[name]
 	if !ok {
@@ -68,7 +66,7 @@ func loadRef(t *testing.T, m *manifest, name string) *zvae.Tensor {
 	if len(sh) != 5 || sh[0] != 1 || sh[2] != 1 {
 		t.Fatalf("%s: shape %v, want [1 C 1 H W]", name, sh)
 	}
-	out := zvae.NewTensor(1, sh[1], sh[3], sh[4])
+	out := NewTensor(1, sh[1], sh[3], sh[4])
 	for i := range out.Data {
 		out.Data[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
 	}
@@ -116,7 +114,7 @@ func tolFor(name string) float64 {
 	return relTol
 }
 
-func compare(t *testing.T, name string, got, want *zvae.Tensor) {
+func compare(t *testing.T, name string, got, want *Tensor) {
 	t.Helper()
 	if got.C != want.C || got.H != want.H || got.W != want.W {
 		t.Fatalf("%s: shape %s, want %s", name, got, want)
@@ -163,7 +161,7 @@ func TestDecoder(t *testing.T) {
 	for label := range m.Cases {
 		z := loadRef(t, m, label+"_z_norm")
 		cfg.Denormalize(z)
-		dec.Tap = func(name string, x *zvae.Tensor) {
+		dec.Tap = func(name string, x *Tensor) {
 			compare(t, label+"_dec_"+name, x, loadRef(t, m, label+"_dec_"+name))
 		}
 		img, err := dec.Decode(z)
@@ -190,7 +188,7 @@ func TestEncoder(t *testing.T) {
 	}
 	for label := range m.Cases {
 		card := loadRef(t, m, label+"_card")
-		enc.Tap = func(name string, x *zvae.Tensor) {
+		enc.Tap = func(name string, x *Tensor) {
 			compare(t, label+"_enc_"+name, x, loadRef(t, m, label+"_enc_"+name))
 		}
 		mode, err := enc.Encode(card)

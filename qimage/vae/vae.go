@@ -33,8 +33,6 @@ package vae
 import (
 	"fmt"
 	"math"
-
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // ChannelNorm is the reference's RMS_norm: per pixel, the channel vector is
@@ -45,11 +43,11 @@ type ChannelNorm struct {
 }
 
 // Apply returns a normalized copy.
-func (n *ChannelNorm) Apply(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (n *ChannelNorm) Apply(x *Tensor) (*Tensor, error) {
 	if x.C != len(n.Gamma) {
 		return nil, fmt.Errorf("qvae: channel norm of width %d over %d channels", len(n.Gamma), x.C)
 	}
-	out := zvae.NewTensor(x.N, x.C, x.H, x.W)
+	out := NewTensor(x.N, x.C, x.H, x.W)
 	scale := math.Sqrt(float64(x.C))
 	plane := x.H * x.W
 	for i := 0; i < plane; i++ {
@@ -70,11 +68,11 @@ func (n *ChannelNorm) Apply(x *zvae.Tensor) (*zvae.Tensor, error) {
 // identity) shortcut.
 type ResBlock struct {
 	Norm1, Norm2 ChannelNorm
-	Conv1, Conv2 zvae.Conv2D
-	Shortcut     *zvae.Conv2D // nil when in == out
+	Conv1, Conv2 Conv2D
+	Shortcut     *Conv2D // nil when in == out
 }
 
-func (b *ResBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (b *ResBlock) Forward(x *Tensor) (*Tensor, error) {
 	h := x
 	if b.Shortcut != nil {
 		var err error
@@ -86,21 +84,21 @@ func (b *ResBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 	if err != nil {
 		return nil, err
 	}
-	zvae.SiLUInPlace(t)
+	SiLUInPlace(t)
 	if t, err = b.Conv1.Apply(t); err != nil {
 		return nil, err
 	}
 	if t, err = b.Norm2.Apply(t); err != nil {
 		return nil, err
 	}
-	zvae.SiLUInPlace(t)
+	SiLUInPlace(t)
 	if t, err = b.Conv2.Apply(t); err != nil {
 		return nil, err
 	}
 	if b.Shortcut != nil {
-		return zvae.AddInPlace(t, h)
+		return AddInPlace(t, h)
 	}
-	return zvae.AddInPlace(t, x)
+	return AddInPlace(t, x)
 }
 
 // Attention is the mid block's single-head spatial self-attention: channel
@@ -108,10 +106,10 @@ func (b *ResBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 // projection, and the residual.
 type Attention struct {
 	Norm      ChannelNorm
-	QKV, Proj zvae.Conv2D
+	QKV, Proj Conv2D
 }
 
-func (a *Attention) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (a *Attention) Forward(x *Tensor) (*Tensor, error) {
 	normed, err := a.Norm.Apply(x)
 	if err != nil {
 		return nil, err
@@ -126,7 +124,7 @@ func (a *Attention) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 	v := qkv.Data[2*C*plane:]
 	scale := 1 / math.Sqrt(float64(C))
 
-	ctx := zvae.NewTensor(1, C, x.H, x.W)
+	ctx := NewTensor(1, C, x.H, x.W)
 	scores := make([]float64, plane)
 	for qi := 0; qi < plane; qi++ {
 		max := math.Inf(-1)
@@ -157,7 +155,7 @@ func (a *Attention) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return zvae.AddInPlace(out, x)
+	return AddInPlace(out, x)
 }
 
 // Mid is resnet, attention, resnet at the innermost resolution.
@@ -167,7 +165,7 @@ type Mid struct {
 	Res2 ResBlock
 }
 
-func (m *Mid) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (m *Mid) Forward(x *Tensor) (*Tensor, error) {
 	x, err := m.Res1.Forward(x)
 	if err != nil {
 		return nil, err
@@ -187,7 +185,7 @@ type AvgDown struct {
 	FactorT, FactorS int
 }
 
-func (d *AvgDown) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (d *AvgDown) Forward(x *Tensor) (*Tensor, error) {
 	if x.C != d.In {
 		return nil, fmt.Errorf("qvae: avg-down expects %d channels, got %d", d.In, x.C)
 	}
@@ -195,7 +193,7 @@ func (d *AvgDown) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 	factor := ft * fs * fs
 	group := d.In * factor / d.Out
 	outH, outW := x.H/fs, x.W/fs
-	out := zvae.NewTensor(1, d.Out, outH, outW)
+	out := NewTensor(1, d.Out, outH, outW)
 	// At T=1 a temporal factor of 2 pads one zero frame in front: temporal
 	// slot 0 is the zero frame and only slot ft-1 holds the image.
 	for o := 0; o < d.Out; o++ {
@@ -235,14 +233,14 @@ type DupUp struct {
 	FactorT int
 }
 
-func (u *DupUp) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (u *DupUp) Forward(x *Tensor) (*Tensor, error) {
 	if x.C != u.In {
 		return nil, fmt.Errorf("qvae: dup-up expects %d channels, got %d", u.In, x.C)
 	}
 	const fs = 2
 	factor := u.FactorT * fs * fs
 	repeats := u.Out * factor / u.In
-	out := zvae.NewTensor(1, u.Out, x.H*fs, x.W*fs)
+	out := NewTensor(1, u.Out, x.H*fs, x.W*fs)
 	for o := 0; o < u.Out; o++ {
 		dst := out.Plane(0, o)
 		for i := 0; i < fs; i++ {
@@ -265,12 +263,12 @@ func (u *DupUp) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 // down. The 3D variants' time_conv never runs at T=1.
 type Resample struct {
 	Up   bool
-	Conv zvae.Conv2D
+	Conv Conv2D
 }
 
-func (r *Resample) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (r *Resample) Forward(x *Tensor) (*Tensor, error) {
 	if r.Up {
-		return r.Conv.Apply(zvae.UpsampleNearest2x(x))
+		return r.Conv.Apply(UpsampleNearest2x(x))
 	}
 	return r.Conv.Apply(x)
 }
@@ -283,7 +281,7 @@ type DownBlock struct {
 	Shortcut AvgDown
 }
 
-func (b *DownBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (b *DownBlock) Forward(x *Tensor) (*Tensor, error) {
 	short, err := b.Shortcut.Forward(x)
 	if err != nil {
 		return nil, err
@@ -298,7 +296,7 @@ func (b *DownBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 			return nil, err
 		}
 	}
-	return zvae.AddInPlace(x, short)
+	return AddInPlace(x, short)
 }
 
 // UpBlock is one decoder stage: the residual blocks and learned upsampler,
@@ -309,7 +307,7 @@ type UpBlock struct {
 	Shortcut *DupUp
 }
 
-func (b *UpBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
+func (b *UpBlock) Forward(x *Tensor) (*Tensor, error) {
 	in := x
 	var err error
 	for i := range b.Resnets {
@@ -327,7 +325,7 @@ func (b *UpBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 		if err != nil {
 			return nil, err
 		}
-		return zvae.AddInPlace(x, short)
+		return AddInPlace(x, short)
 	}
 	return x, nil
 }
@@ -335,26 +333,26 @@ func (b *UpBlock) Forward(x *zvae.Tensor) (*zvae.Tensor, error) {
 // Decoder decodes denormalized latents [1, z, h, w] to an RGBA image
 // [1, 4, 16h, 16w] in [-1, 1] (the reference clamps).
 type Decoder struct {
-	PostQuant zvae.Conv2D // 1x1, z -> z
-	ConvIn    zvae.Conv2D
+	PostQuant Conv2D // 1x1, z -> z
+	ConvIn    Conv2D
 	Mid       Mid
 	Ups       []UpBlock
 	NormOut   ChannelNorm
-	ConvOut   zvae.Conv2D
+	ConvOut   Conv2D
 
 	// Tap, when set, sees each stage's output by name — the stagewise test
 	// walks the dump's hooks with it. Nil costs nothing.
-	Tap func(name string, t *zvae.Tensor)
+	Tap func(name string, t *Tensor)
 }
 
-func (d *Decoder) tap(name string, t *zvae.Tensor) {
+func (d *Decoder) tap(name string, t *Tensor) {
 	if d.Tap != nil {
 		d.Tap(name, t)
 	}
 }
 
 // Decode runs the decoder.
-func (d *Decoder) Decode(z *zvae.Tensor) (*zvae.Tensor, error) {
+func (d *Decoder) Decode(z *Tensor) (*Tensor, error) {
 	x, err := d.PostQuant.Apply(z)
 	if err != nil {
 		return nil, err
@@ -377,7 +375,7 @@ func (d *Decoder) Decode(z *zvae.Tensor) (*zvae.Tensor, error) {
 		return nil, err
 	}
 	d.tap("norm_out", x)
-	zvae.SiLUInPlace(x)
+	SiLUInPlace(x)
 	d.tap("nonlinearity", x)
 	if x, err = d.ConvOut.Apply(x); err != nil {
 		return nil, err
@@ -397,24 +395,24 @@ func (d *Decoder) Decode(z *zvae.Tensor) (*zvae.Tensor, error) {
 // *mode* [1, z, H/16, W/16] — the pipeline's argmax path; sampling would
 // break seed reproducibility and is not implemented.
 type Encoder struct {
-	ConvIn  zvae.Conv2D
+	ConvIn  Conv2D
 	Downs   []DownBlock
 	Mid     Mid
 	NormOut ChannelNorm
-	ConvOut zvae.Conv2D // -> 2z: mean then logvar
-	Quant   zvae.Conv2D // 1x1, 2z -> 2z
+	ConvOut Conv2D // -> 2z: mean then logvar
+	Quant   Conv2D // 1x1, 2z -> 2z
 
-	Tap func(name string, t *zvae.Tensor)
+	Tap func(name string, t *Tensor)
 }
 
-func (e *Encoder) tap(name string, t *zvae.Tensor) {
+func (e *Encoder) tap(name string, t *Tensor) {
 	if e.Tap != nil {
 		e.Tap(name, t)
 	}
 }
 
 // Encode returns the posterior mode: the mean half of the quantized output.
-func (e *Encoder) Encode(img *zvae.Tensor) (*zvae.Tensor, error) {
+func (e *Encoder) Encode(img *Tensor) (*Tensor, error) {
 	x, err := e.ConvIn.Apply(img)
 	if err != nil {
 		return nil, err
@@ -434,7 +432,7 @@ func (e *Encoder) Encode(img *zvae.Tensor) (*zvae.Tensor, error) {
 		return nil, err
 	}
 	e.tap("norm_out", x)
-	zvae.SiLUInPlace(x)
+	SiLUInPlace(x)
 	e.tap("nonlinearity", x)
 	if x, err = e.ConvOut.Apply(x); err != nil {
 		return nil, err
@@ -443,7 +441,7 @@ func (e *Encoder) Encode(img *zvae.Tensor) (*zvae.Tensor, error) {
 	if x, err = e.Quant.Apply(x); err != nil {
 		return nil, err
 	}
-	mode := zvae.NewTensor(1, x.C/2, x.H, x.W)
+	mode := NewTensor(1, x.C/2, x.H, x.W)
 	copy(mode.Data, x.Data[:len(mode.Data)])
 	return mode, nil
 }

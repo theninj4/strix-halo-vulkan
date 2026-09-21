@@ -3,8 +3,8 @@ package pipeline
 import (
 	"fmt"
 
+	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/zimage/qwen"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The in-progress preview — IMAGE.md Q7.
@@ -43,7 +43,7 @@ import (
 // resolution: [1, 4, h, w] in [-1, 1], which is the range and layout the
 // real decoder produces. Everything downstream (ToImage, the backend, the
 // SSE frame) is therefore identical for a preview and a finished image.
-func PreviewDecode(latents *qwen.Mat, h, w int) (*zvae.Tensor, error) {
+func PreviewDecode(latents *qwen.Mat, h, w int) (*qvae.Tensor, error) {
 	if latents.Rows != h*w {
 		return nil, fmt.Errorf("pipeline: %d latent rows for a %dx%d preview grid", latents.Rows, h, w)
 	}
@@ -51,7 +51,7 @@ func PreviewDecode(latents *qwen.Mat, h, w int) (*zvae.Tensor, error) {
 		return nil, fmt.Errorf("pipeline: preview matrix is fitted for %d channels, latents have %d",
 			previewZDim, latents.Cols)
 	}
-	out := zvae.NewTensor(1, previewChannels, h, w)
+	out := qvae.NewTensor(1, previewChannels, h, w)
 	plane := h * w
 	for p := 0; p < plane; p++ {
 		z := latents.Row(p)

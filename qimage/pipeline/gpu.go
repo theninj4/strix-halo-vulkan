@@ -16,7 +16,6 @@ import (
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The resident text-to-image pipeline — IMAGE.md Q6.
@@ -407,7 +406,7 @@ type Step struct {
 	// wants the wall clock should not pay for it. That it is cheap enough
 	// not to need a flag is the point of Q7; that it is not *free* is why it
 	// is still lazy.
-	Preview func() (*zvae.Tensor, error)
+	Preview func() (*qvae.Tensor, error)
 }
 
 // Timings is what one image cost, by stage.
@@ -428,7 +427,7 @@ type Timings struct {
 }
 
 // Generate is Run for the common case.
-func (p *Pipeline) Generate(ctx context.Context, prompt string, seed int64, progress func(Step)) (*zvae.Tensor, *Timings, error) {
+func (p *Pipeline) Generate(ctx context.Context, prompt string, seed int64, progress func(Step)) (*qvae.Tensor, *Timings, error) {
 	return p.Run(ctx, Request{Prompt: prompt, Seed: seed, Progress: progress})
 }
 
@@ -479,7 +478,7 @@ func (p *Pipeline) noise(g geom, seed int64) *qwen.Mat {
 // Run renders one image: prompt through the text encoder, the DiT's sampler
 // with the prefix KV cache, and the VAE decoder. The returned tensor is
 // [1, 4, H, W] RGBA in [-1, 1], which is the decoder's own range.
-func (p *Pipeline) Run(ctx context.Context, req Request) (*zvae.Tensor, *Timings, error) {
+func (p *Pipeline) Run(ctx context.Context, req Request) (*qvae.Tensor, *Timings, error) {
 	if p.enc == nil || p.dt == nil || p.dec == nil {
 		return nil, nil, fmt.Errorf("pipeline: destroyed")
 	}
@@ -581,7 +580,7 @@ func (p *Pipeline) denoise(ctx context.Context, latents *qwen.Mat, g geom, sched
 				Sigma:     float64(sched.Sigmas[i]),
 				NextSigma: sigmaNext,
 				Latents:   latents,
-				Preview: func() (*zvae.Tensor, error) {
+				Preview: func() (*qvae.Tensor, error) {
 					x0 := latents.Clone()
 					if sigmaNext != 0 {
 						s := float32(sigmaNext)
@@ -600,11 +599,11 @@ func (p *Pipeline) denoise(ctx context.Context, latents *qwen.Mat, g geom, sched
 // Decode unpacks the DiT's [tokens, z] latents into the VAE's [1, z, h, w],
 // denormalizes them and decodes. It is exported because the step sweep and
 // the CPU oracle both want to decode a latent they already have.
-func (p *Pipeline) Decode(ctx context.Context, latents *qwen.Mat, latentH, latentW int) (*zvae.Tensor, error) {
+func (p *Pipeline) Decode(ctx context.Context, latents *qwen.Mat, latentH, latentW int) (*qvae.Tensor, error) {
 	if latents.Rows != latentH*latentW {
 		return nil, fmt.Errorf("pipeline: %d latent rows for a %dx%d grid", latents.Rows, latentH, latentW)
 	}
-	z := zvae.NewTensor(1, latents.Cols, latentH, latentW)
+	z := qvae.NewTensor(1, latents.Cols, latentH, latentW)
 	for tk := 0; tk < latents.Rows; tk++ {
 		row := latents.Row(tk)
 		for c := 0; c < latents.Cols; c++ {
@@ -626,7 +625,7 @@ func (p *Pipeline) Decode(ctx context.Context, latents *qwen.Mat, latentH, laten
 // otherwise the alpha is kept.
 //
 // The clamp is the decoder's and has already happened; this rounds.
-func ToImage(t *zvae.Tensor, opaque bool) *image.NRGBA {
+func ToImage(t *qvae.Tensor, opaque bool) *image.NRGBA {
 	img := image.NewNRGBA(image.Rect(0, 0, t.W, t.H))
 	plane := t.H * t.W
 	hasAlpha := t.C >= 4

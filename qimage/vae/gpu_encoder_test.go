@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // loadGPUEncoder loads the CPU encoder and builds its device graph for one
@@ -190,7 +189,7 @@ func TestGPUEncoderNegativeControls(t *testing.T) {
 
 // control runs a deliberately broken graph to one stage and requires it to
 // land far outside the bound the gate uses.
-func control(t *testing.T, what string, g *GPUEncoder, card *zvae.Tensor, stage string, want *zvae.Tensor) {
+func control(t *testing.T, what string, g *GPUEncoder, card *Tensor, stage string, want *Tensor) {
 	t.Helper()
 	got, err := g.RunTo(card, stage)
 	if err != nil {
@@ -227,7 +226,7 @@ func TestGPUEncodeTiming(t *testing.T) {
 
 	const side = 1024
 	_, _, g := loadGPUEncoder(t, dev, side, side)
-	img := zvae.NewTensor(1, 4, side, side)
+	img := NewTensor(1, 4, side, side)
 	for i := range img.Data {
 		img.Data[i] = float32((i%255))/127.5 - 1
 	}

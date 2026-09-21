@@ -33,9 +33,9 @@ import (
 	"time"
 
 	"strix-halo-vulkan/qimage/pipeline"
+	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 const strixHaloDeviceID = 0x1586
@@ -158,7 +158,7 @@ type sample struct {
 }
 
 // renderPair generates one image and returns the final latents beside it.
-func renderPair(p *pipeline.Pipeline, prompt string, seed int64, size, steps int) (*qwen.Mat, *zvae.Tensor, error) {
+func renderPair(p *pipeline.Pipeline, prompt string, seed int64, size, steps int) (*qwen.Mat, *qvae.Tensor, error) {
 	var final *qwen.Mat
 	img, _, err := p.Run(context.Background(), pipeline.Request{
 		Prompt: prompt, Width: size, Height: size, Steps: steps, Seed: seed,
@@ -185,7 +185,7 @@ func renderPair(p *pipeline.Pipeline, prompt string, seed int64, size, steps int
 // exact, and the least-squares fit is what absorbs the difference. Pretending
 // otherwise by picking a fancier filter would be choosing a number to make
 // the residual look smaller.
-func pairSamples(latents *qwen.Mat, img *zvae.Tensor, side int) []sample {
+func pairSamples(latents *qwen.Mat, img *qvae.Tensor, side int) []sample {
 	const scale = 16
 	out := make([]sample, 0, side*side)
 	plane := img.H * img.W

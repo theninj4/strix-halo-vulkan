@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The screen behind kernels.go's two defaults — IMAGE.md Q9b.
@@ -30,7 +29,7 @@ func TestGPUKernelScreen(t *testing.T) {
 	_, dec := loadCPU(t)
 
 	const lat = 64 // a 1024x1024 image
-	z := zvae.NewTensor(1, 64, lat, lat)
+	z := NewTensor(1, 64, lat, lat)
 	for i := range z.Data {
 		z.Data[i] = float32(math.Sin(float64(i)*0.001)) * 0.5
 	}
@@ -53,7 +52,7 @@ func TestGPUKernelScreen(t *testing.T) {
 // runArm stages one pair of kernels, checks its decode against want (when
 // given), and reports the wall clock of two more decodes plus the two
 // operators' share of a one-dispatch-at-a-time profile.
-func runArm(t *testing.T, dev *vk.Device, dec *Decoder, z *zvae.Tensor, opt Options, want *zvae.Tensor) *zvae.Tensor {
+func runArm(t *testing.T, dev *vk.Device, dec *Decoder, z *Tensor, opt Options, want *Tensor) *Tensor {
 	t.Helper()
 	g, err := NewGPUDecoderOpts(dev, dec, z.H, z.W, opt)
 	if err != nil {

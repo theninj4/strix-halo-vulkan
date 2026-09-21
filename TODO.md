@@ -174,7 +174,7 @@ put PL-BERT's attention on the matrix cores so synthesis is a straight
 
 **Where it stands.** The vertical was **replaced 2026-09-20**: Z-Image-Turbo
 out, `Qwen/Qwen-Image-2.1` in, for native RGBA and reference-image editing
-(`GOALS.md` #4). Stages Q0–Q11 are done and both
+(`GOALS.md` #4). Stages Q0–Q12 are done and both
 endpoints are served: `POST /v1/images/generations` answers at **1m28.8s /
 1m29.8s for a 1024²/40-step image** (31.5 GB resident, matching the fp32
 oracle's own picture at mean 3.4e-4) and `POST /v1/images/edits` at
@@ -233,14 +233,20 @@ VAE encoder 1.7 → 0.91 s**, and not a digit moved in any gate.
   is one shared read per multiply-add; a pixel block is priced at ~1.5 s
   more and is the only one of these that would *not* be bit-identical.
   Everything past that is the DiT's, which is now 95% of the image.
-- **`zimage/vae`'s deletion is unblocked** (Q9b). It was kept past its
-  replacement because `gpu_conv.go` is the validated test bed for the
-  matrix-core convolution Q9 wanted; Q9 turned out not to want it. All that
-  is left to unpick is that `qimage/vae` builds on this package's `Tensor`
-  and `Conv2D`: hoist `tensor.go` + `math.go`, then delete the decoder,
-  encoder, both GPU paths, `tiny*` and `cmd/vaebench`/`vaedecode`/`vaeprof`.
-  Mechanical, ~8 k lines. `zimage/qwen` and `zimage/tokenizer` stay
-  permanently.
+- **Q12 — the Z-Image deletion is finished (2026-09-21)**, and closes what
+  Q6 owed. `zimage/vae` was kept past its replacement because `gpu_conv.go`
+  was the validated test bed for the matrix-core convolution Q9 wanted;
+  Q9b refused that kernel, so the package went: `tensor.go` + `math.go`
+  hoisted into `qimage/vae` (the only dependency holding it up — four
+  symbols nothing outside the deleted code called stayed behind), then the
+  decoder, encoder, both GPU paths, `tiny*` and
+  `cmd/vaebench`/`vaedecode`/`vaeprof`, plus the **28 shader builds only
+  that package dispatched** — the whole fp16 matrix-core route Q9b refused,
+  and four scalar builds Qwen's decoder replaced. **6,839 lines of Go and
+  895 of GLSL out, 204 in (nearly all corrected comments)**; every gate
+  re-run and not a digit moved. The 21 other unreferenced shader builds are
+  the DiT's screen catalogue and were left alone. `zimage/` is now `qwen`
+  and `tokenizer`, which stay permanently.
 - **The step count is swept and settled**: 40 stays the default because it
   is the only count safe across prompt kinds. Photographic and painterly
   prompts are convincing at **12 steps (36 s, 36% of the cost)**; a

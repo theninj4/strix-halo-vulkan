@@ -1,13 +1,13 @@
-// Package vae implements the Z-Image / Flux AutoencoderKL decoder: 16
-// latent channels to RGB at 8x resolution.
+// tensor.go holds the dense-tensor primitives the CPU reference is built
+// from: an NCHW float32 tensor, a direct convolution, and the three
+// elementwise ops the graph needs. They were `zimage/vae`'s, shared by both
+// autoencoders while Z-Image still shipped; that package was deleted once
+// Q9b refused its matrix-core convolution on precision, and these two files
+// are what survived it.
 //
-// This is the CPU reference implementation. It exists before the Vulkan one
-// on purpose: it separates "do I understand the architecture" from "is the
-// shader right", and once it matches diffusers it becomes the oracle the GPU
-// port is debugged against. It is written for clarity over speed — a direct
-// convolution parallelised over output channels, no im2col, no blocking —
-// because the fast version of this is a compute shader and not a smarter
-// Go loop.
+// They are written for clarity over speed — a direct convolution
+// parallelised over output channels, no im2col, no blocking — because the
+// fast version of this is a compute shader and not a smarter Go loop.
 //
 // Layout is NCHW float32 throughout, matching PyTorch, so a tensor here can
 // be compared to a reference dump byte for byte with no transpose in the
@@ -118,13 +118,6 @@ func (c *Conv2D) OutSize(n, k int) int {
 	return (n+2*c.Pad+c.PadEnd-k)/c.stride() + 1
 }
 
-// convTap, when set, is called with every convolution's input before it runs.
-// It is how TestConvInputsFitFP16 measures the headroom the matrix-core
-// convolution depends on -- stage 2's "absmax 497 through the whole decoder"
-// as an assertion rather than as a memory -- without keeping a second copy
-// of the decoder's graph in the test. Nothing in the library sets it.
-var convTap func(c *Conv2D, x *Tensor)
-
 // FP16ConvOperands, when set, is asked of each convolution before it runs;
 // the ones it accepts narrow *both* operands to IEEE binary16 and accumulate
 // in float32. That is exactly what a matrix core does, and this is the
@@ -145,9 +138,9 @@ var convTap func(c *Conv2D, x *Tensor)
 // packed to halves at load and shaders/vae_pack_conv.comp narrows the
 // activation once into the blocked layout the fragment loads read.
 //
-// It is a package-level hook, like convTap above, because the port it
-// predicts is a property of the convolution and not of a caller; nothing in
-// the library sets it and it is not safe to change while a decode is running.
+// It is a package-level hook because the port it predicts is a property of
+// the convolution and not of a caller; nothing in the library sets it and it
+// is not safe to change while a decode is running.
 var FP16ConvOperands func(c *Conv2D) bool
 
 // narrowF16 returns a copy of v with every element rounded to binary16 and
@@ -163,9 +156,6 @@ func narrowF16(v []float32) []float32 {
 // Apply runs the convolution. Output is [N, OutC, H, W] for the 3x3 pad-1 and
 // 1x1 pad-0 cases this decoder uses, both of which preserve spatial size.
 func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
-	if convTap != nil {
-		convTap(c, x)
-	}
 	if x.C != c.InC {
 		return nil, fmt.Errorf("vae: conv expects %d input channels, got %d", c.InC, x.C)
 	}
@@ -239,59 +229,6 @@ func (c *Conv2D) Apply(x *Tensor) (*Tensor, error) {
 	return out, nil
 }
 
-// GroupNorm normalises over (C/groups, H, W) per group, then scales and
-// shifts per channel. The decoder uses 32 groups and eps 1e-6 everywhere.
-type GroupNorm struct {
-	Groups int
-	Eps    float64
-	Weight []float32 // [C]
-	Bias   []float32 // [C]
-}
-
-// ApplyInPlace normalises x and returns it, so a caller can chain without
-// allocating a tensor per norm.
-func (g *GroupNorm) ApplyInPlace(x *Tensor) (*Tensor, error) {
-	if x.C%g.Groups != 0 {
-		return nil, fmt.Errorf("vae: %d channels do not divide into %d groups", x.C, g.Groups)
-	}
-	perGroup := x.C / g.Groups
-	hw := x.H * x.W
-	for n := 0; n < x.N; n++ {
-		parallelFor(g.Groups, func(gi int) {
-			c0 := gi * perGroup
-			// Mean and variance in float64: a group here is up to 512*128*128
-			// elements and a float32 running sum loses the low bits long
-			// before the end of that.
-			var sum, sumSq float64
-			for c := c0; c < c0+perGroup; c++ {
-				p := x.Plane(n, c)
-				for _, v := range p {
-					sum += float64(v)
-					sumSq += float64(v) * float64(v)
-				}
-			}
-			count := float64(perGroup * hw)
-			mean := sum / count
-			variance := sumSq/count - mean*mean
-			if variance < 0 {
-				variance = 0
-			}
-			inv := float32(1 / sqrt64(variance+g.Eps))
-			fmean := float32(mean)
-			for c := c0; c < c0+perGroup; c++ {
-				p := x.Plane(n, c)
-				w, b := g.Weight[c], g.Bias[c]
-				scale := w * inv
-				shift := b - fmean*scale
-				for i, v := range p {
-					p[i] = v*scale + shift
-				}
-			}
-		})
-	}
-	return x, nil
-}
-
 // SiLUInPlace applies x * sigmoid(x).
 func SiLUInPlace(x *Tensor) *Tensor {
 	parallelFor(x.N*x.C, func(p int) {
@@ -337,26 +274,4 @@ func AddInPlace(a, b *Tensor) (*Tensor, error) {
 		}
 	})
 	return a, nil
-}
-
-// Subsample2x keeps the pixel at (2h+1, 2w+1) of every 2x2 block, halving H
-// and W. It is the second half of the device's stride-2 convolution: the
-// filter runs at stride 1 with symmetric padding and this throws three
-// pixels in four away. TestStrideTwoIsStrideOneSubsampled is why that offset
-// and not the other, and builder.downsample is what it costs.
-func Subsample2x(x *Tensor) *Tensor {
-	out := NewTensor(x.N, x.C, x.H/2, x.W/2)
-	for n := 0; n < x.N; n++ {
-		parallelFor(x.C, func(c int) {
-			src, dst := x.Plane(n, c), out.Plane(n, c)
-			for h := 0; h < out.H; h++ {
-				srow := src[(h*2+1)*x.W:]
-				drow := dst[h*out.W : (h+1)*out.W]
-				for w := range drow {
-					drow[w] = srow[w*2+1]
-				}
-			}
-		})
-	}
-	return out
 }

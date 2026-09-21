@@ -968,38 +968,31 @@ var SoftmaxSubgroup []byte
 //go:embed softmax_subgroup_w32.spv
 var SoftmaxSubgroupW32 []byte
 
-// VAE decoder (PIPELINE.md stage 2b). Every one of these is built over the
-// same four bindings and declares the same 88-byte push-constant block,
-// defined in vae_common.glsl, so a whole decode can be recorded into one
-// command buffer by vk.DispatchMultiTimed. All fp32: this is the correctness
-// port, with zimage/vae's CPU implementation as its oracle.
+// The shared VAE operators (PIPELINE.md stage 2b). Every one of these is
+// built over the same four bindings and declares the same 88-byte
+// push-constant block, defined in vae_common.glsl, so a whole decode can be
+// recorded into one command buffer by vk.DispatchMultiTimed. All fp32: this
+// is the correctness port, and qimage/vae's CPU implementation is its oracle.
+//
+// They were written for Z-Image's autoencoder and are Qwen-Image-2.1's now:
+// that decoder is gone (IMAGE.md Q9b), and the builds only it used -- the
+// group norm, the standalone SiLU, taef1's ReLU, the untuned attention, and
+// the whole fp16 matrix-core route (vae_pack_conv, vae_conv_wmma,
+// vae_attention_wmma, vae_pack_f16, vae_narrow_f16) -- went with it. The
+// matrix-core route is not coming back: TestConvFP16Ladder refuses a
+// narrowed operand anywhere in this decoder.
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_conv2d.spv vae_conv2d.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_groupnorm.spv vae_groupnorm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_silu.spv vae_silu.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_relu.spv vae_relu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_add.spv vae_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_upsample2x.spv vae_upsample2x.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_downsample2x.spv vae_downsample2x.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_nchw_to_rows.spv vae_nchw_to_rows.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_rows_to_nchw_add.spv vae_rows_to_nchw_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_linear.spv vae_linear.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_attention.spv vae_attention.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_transpose.spv vae_transpose.comp
 
 //go:embed vae_conv2d.spv
 var VAEConv2D []byte
-
-//go:embed vae_groupnorm.spv
-var VAEGroupNorm []byte
-
-//go:embed vae_silu.spv
-var VAESiLU []byte
-
-// taef1's activation; see vae_relu.comp.
-
-//go:embed vae_relu.spv
-var VAEReLU []byte
 
 //go:embed vae_add.spv
 var VAEAdd []byte
@@ -1021,9 +1014,6 @@ var VAERowsToNCHWAdd []byte
 
 //go:embed vae_linear.spv
 var VAELinear []byte
-
-//go:embed vae_attention.spv
-var VAEAttention []byte
 
 //go:embed vae_transpose.spv
 var VAETranspose []byte
@@ -1139,146 +1129,10 @@ var VAEAttentionDim1152 []byte
 //go:embed vae_attention_d768.spv
 var VAEAttentionDim768 []byte
 
-// The mid block on the matrix cores (PIPELINE.md stage 7). The scalar
-// attention above is 26% of a 1024x1024 decode in one dispatch and its four
-// projections another 10% at 62 GFLOP/s, so both move to fp16 operands and
-// cooperative-matrix multiplies. The pack is what makes a fragment load
-// cover its 512 bytes (§5.1b); TRANSPOSE=1 is the v operand, whose matmul
-// reduces over the row rather than the component.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_narrow_f16.spv vae_narrow_f16.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_pack_f16.spv vae_pack_f16.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DTRANSPOSE=1 -o vae_pack_f16_t.spv vae_pack_f16.comp
-
-//go:embed vae_narrow_f16.spv
-var VAENarrowF16 []byte
-
-//go:embed vae_pack_f16.spv
-var VAEPackF16 []byte
-
-//go:embed vae_pack_f16_t.spv
-var VAEPackF16T []byte
-
-// The attention ladder. QT query tiles per workgroup and KTIL keys tiles per
-// block are the two knobs stage 3c's ablation ended on; what is new here is
-// that the workgroup, not the wave, owns the head, so WAVES is fixed at 4 by
-// the 512-wide head and only the arms that keep the register file under 256
-// are built -- QT=2 with KTIL=4 spills 44 VGPRs into 11 KB of scratch, and so
-// does KTIL=8 at wave32, where an accumulator tile costs 8 registers a lane
-// rather than 4. The wave32 arms are §6.2's, and they win.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o vae_attn_wmma_qt1_kt2.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o vae_attn_wmma_qt1_kt4.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -o vae_attn_wmma_qt1_kt8.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=2 -o vae_attn_wmma_qt2_kt2.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -DWAVE=32 -o vae_attn_wmma_qt1_kt2_w32.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -o vae_attn_wmma_qt1_kt4_w32.spv vae_attention_wmma.comp
-
-//go:embed vae_attn_wmma_qt1_kt2.spv
-var VAEAttentionWMMAQT1KT2 []byte
-
-//go:embed vae_attn_wmma_qt1_kt4.spv
-var VAEAttentionWMMAQT1KT4 []byte
-
-//go:embed vae_attn_wmma_qt1_kt8.spv
-var VAEAttentionWMMAQT1KT8 []byte
-
-//go:embed vae_attn_wmma_qt2_kt2.spv
-var VAEAttentionWMMAQT2KT2 []byte
-
-//go:embed vae_attn_wmma_qt1_kt2_w32.spv
-var VAEAttentionWMMAQT1KT2W32 []byte
-
-//go:embed vae_attn_wmma_qt1_kt4_w32.spv
-var VAEAttentionWMMAQT1KT4W32 []byte
-
-// The two negative controls (zimage/vae/gpu_test.go). NO_CROSS_WAVE drops
-// the three partial score matrices this kernel's structure exists to sum;
-// NO_RESCALE drops the online-softmax correction. Built and dispatchable,
-// deliberately out of the ladder.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DNO_CROSS_WAVE=1 -o vae_attn_wmma_nocross.spv vae_attention_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DNO_RESCALE=1 -o vae_attn_wmma_norescale.spv vae_attention_wmma.comp
-
-//go:embed vae_attn_wmma_nocross.spv
-var VAEAttentionWMMANoCrossWave []byte
-
-//go:embed vae_attn_wmma_norescale.spv
-var VAEAttentionWMMANoRescale []byte
-
-// conv2d on the matrix cores (PIPELINE.md stage 8). Stage 7's profiler left
-// conv3x3 at 85% of a 1024x1024 decode, 3.0-3.2 TFLOP/s against a 55.5
-// TFLOP/s ceiling, and it is the one operator in this pipeline whose implicit
-// GEMM had never been written. The pack is what makes that GEMM's B operand
-// a 512 B contiguous fragment load at an *unaligned* pixel offset, which is
-// what a +-1 tap shift needs; vae_pack_conv.comp is the argument.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o vae_pack_conv.spv vae_pack_conv.comp
-
-//go:embed vae_pack_conv.spv
-var VAEPackConv []byte
-
-// The conv ladder. BM x BN is the workgroup's output tile -- output channels
-// by pixels -- and the two knobs that matter are different ones from the
-// DiT's: BM sets how many times the activation is streamed (once per
-// ceil(OC/BM)), BN how much of the filter slab a workgroup amortises. The
-// wave32 arms are §6.2's, which has won four times.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -o vae_conv_wmma_64x64.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=2 -o vae_conv_wmma_64x64_k2.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_N=2 -o vae_conv_wmma_64x128.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -o vae_conv_wmma_128x64.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -o vae_conv_wmma_128x128.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=4 -o vae_conv_wmma_256x64.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVE=32 -o vae_conv_wmma_64x64_w32.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVE=32 -o vae_conv_wmma_128x64_w32.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DWAVE=32 -o vae_conv_wmma_128x128_w32.spv vae_conv_wmma.comp
-
-//go:embed vae_conv_wmma_64x64.spv
-var VAEConvWMMA64x64 []byte
-
-//go:embed vae_conv_wmma_64x64_k2.spv
-var VAEConvWMMA64x64K2 []byte
-
-//go:embed vae_conv_wmma_64x128.spv
-var VAEConvWMMA64x128 []byte
-
-//go:embed vae_conv_wmma_128x64.spv
-var VAEConvWMMA128x64 []byte
-
-//go:embed vae_conv_wmma_128x128.spv
-var VAEConvWMMA128x128 []byte
-
-//go:embed vae_conv_wmma_256x64.spv
-var VAEConvWMMA256x64 []byte
-
-//go:embed vae_conv_wmma_64x64_w32.spv
-var VAEConvWMMA64x64W32 []byte
-
-//go:embed vae_conv_wmma_128x64_w32.spv
-var VAEConvWMMA128x64W32 []byte
-
-//go:embed vae_conv_wmma_128x128_w32.spv
-var VAEConvWMMA128x128W32 []byte
-
-// The conv path's two negative controls (zimage/vae/gpu_conv_test.go).
-// NO_TAP_SHIFT drops the horizontal tap offset, which is the one thing the
-// blocked layout exists to make free; PAD_CLAMP replicates the edge pixel
-// instead of zeroing the border, which is the padding bug a conv port
-// actually has. Built and dispatchable, deliberately out of the ladder.
-
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=2 -DNO_TAP_SHIFT=1 -o vae_conv_wmma_notapshift.spv vae_conv_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DPAD_CLAMP=1 -o vae_pack_conv_clamp.spv vae_pack_conv.comp
-
-//go:embed vae_conv_wmma_notapshift.spv
-var VAEConvWMMANoTapShift []byte
-
-//go:embed vae_pack_conv_clamp.spv
-var VAEPackConvClamp []byte
-
-// Z-Image DiT (PIPELINE.md stage 3). Same two-arena binding convention as
-// the VAE shaders, defined in dit_common.glsl. fp32; the CPU implementation
-// in zimage/dit is the oracle.
+// DiT (PIPELINE.md stage 3). Same two-arena binding convention as the VAE
+// shaders, defined in dit_common.glsl. fp32; written against Z-Image's
+// stack, inherited unchanged by Qwen-Image-2.1 (IMAGE.md Q4), whose CPU
+// implementation in qimage/dit is now the oracle.
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_rmsnorm.spv dit_rmsnorm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_rope.spv dit_rope.comp

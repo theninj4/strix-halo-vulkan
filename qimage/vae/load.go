@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 
 	"strix-halo-vulkan/safetensors"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // Config mirrors vae/config.json.
@@ -59,7 +58,7 @@ func LoadConfig(dir string) (*Config, error) {
 
 // Normalize maps a raw latent to the DiT's space: (z - mean) / std, per
 // channel. Denormalize is the inverse the decoder wants.
-func (c *Config) Normalize(z *zvae.Tensor) {
+func (c *Config) Normalize(z *Tensor) {
 	for ch := 0; ch < z.C; ch++ {
 		m, s := c.LatentsMean[ch], c.LatentsStd[ch]
 		p := z.Plane(0, ch)
@@ -70,7 +69,7 @@ func (c *Config) Normalize(z *zvae.Tensor) {
 }
 
 // Denormalize maps a DiT-space latent back: z*std + mean.
-func (c *Config) Denormalize(z *zvae.Tensor) {
+func (c *Config) Denormalize(z *Tensor) {
 	for ch := 0; ch < z.C; ch++ {
 		m, s := c.LatentsMean[ch], c.LatentsStd[ch]
 		p := z.Plane(0, ch)
@@ -107,21 +106,21 @@ func (l *loader) f32(name string, want int) []float32 {
 }
 
 // conv reads a Conv2d, validating the full shape.
-func (l *loader) conv(name string, out, in, k, pad, padEnd, stride int) zvae.Conv2D {
+func (l *loader) conv(name string, out, in, k, pad, padEnd, stride int) Conv2D {
 	if l.err != nil {
-		return zvae.Conv2D{}
+		return Conv2D{}
 	}
 	t, err := l.set.Get(name + ".weight")
 	if err != nil {
 		l.err = err
-		return zvae.Conv2D{}
+		return Conv2D{}
 	}
 	sh := t.Shape
 	if len(sh) != 4 || sh[0] != out || sh[1] != in || sh[2] != k || sh[3] != k {
 		l.err = fmt.Errorf("qvae: %s.weight is %v, want [%d %d %d %d]", name, sh, out, in, k, k)
-		return zvae.Conv2D{}
+		return Conv2D{}
 	}
-	return zvae.Conv2D{
+	return Conv2D{
 		InC: in, OutC: out, KH: k, KW: k, Pad: pad, PadEnd: padEnd, Stride: stride,
 		Weight: l.f32(name+".weight", out*in*k*k),
 		Bias:   l.f32(name+".bias", out),

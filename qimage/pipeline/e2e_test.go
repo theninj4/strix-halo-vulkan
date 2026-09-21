@@ -10,7 +10,6 @@ import (
 	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 const (
@@ -104,7 +103,7 @@ func TestEndToEndImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	z := zvae.NewTensor(1, latents.Cols, side, side)
+	z := qvae.NewTensor(1, latents.Cols, side, side)
 	for tk := 0; tk < latents.Rows; tk++ {
 		row := latents.Row(tk)
 		for c := 0; c < latents.Cols; c++ {
@@ -124,7 +123,7 @@ func TestEndToEndImage(t *testing.T) {
 		for w := 0; w < img.W; w++ {
 			for c := 0; c < img.C; c++ {
 				got := (float64(img.Plane(0, c)[h*img.W+w]) + 1) / 2
-				d := math.Abs(got - float64(want.Row(h*img.W+w)[c]))
+				d := math.Abs(got - float64(want.Row(h*img.W + w)[c]))
 				if d > maxAbs {
 					maxAbs = d
 				}

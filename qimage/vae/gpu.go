@@ -9,7 +9,6 @@ import (
 
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The decoder on the device — IMAGE.md Q5g, the stage that stood between
@@ -283,8 +282,8 @@ func (e *engine) runContext(ctx context.Context, ds []vk.MultiDispatch) error {
 }
 
 // read copies one arena tensor back.
-func (e *engine) read(t tensor) *zvae.Tensor {
-	out := zvae.NewTensor(1, t.C, t.H, t.W)
+func (e *engine) read(t tensor) *Tensor {
+	out := NewTensor(1, t.C, t.H, t.W)
 	copy(out.Data, e.abuf.ReadFloat32At(int(t.off), t.elems()))
 	return out
 }
@@ -371,7 +370,7 @@ func (g *GPUDecoder) Destroy() { g.destroy() }
 // offset.
 func (g *GPUDecoder) flattenWeights() {
 	w := g.weights
-	conv := func(name string, c *zvae.Conv2D) {
+	conv := func(name string, c *Conv2D) {
 		w.put(name+".weight", c.Weight)
 		if c.Bias != nil {
 			w.put(name+".bias", c.Bias)
@@ -518,7 +517,7 @@ func (b *builder) bOff(name string) uint32 {
 // conv appends a convolution producing a fresh tensor. Both shapes the
 // decoder uses — 3x3 pad 1 and the 1x1 pad 0 shortcuts and projections —
 // preserve H and W.
-func (b *builder) conv(name string, c *zvae.Conv2D, x tensor) tensor {
+func (b *builder) conv(name string, c *Conv2D, x tensor) tensor {
 	out := tensor{off: b.ar.alloc(c.OutC * x.H * x.W), C: c.OutC, H: x.H, W: x.W}
 	b.label(fmt.Sprintf("conv%dx%d %d->%d @%dx%d", c.KH, c.KW, x.C, c.OutC, x.H, x.W),
 		2*float64(c.OutC)*float64(x.H)*float64(x.W)*float64(x.C)*float64(c.KH)*float64(c.KW))
@@ -690,7 +689,7 @@ func (b *builder) attention(name string, a *Attention, x tensor) tensor {
 
 // upsample is the learned half of an up block's resampling: nearest 2x, then
 // a 3x3 convolution.
-func (b *builder) upsample(name string, c *zvae.Conv2D, x tensor) tensor {
+func (b *builder) upsample(name string, c *Conv2D, x tensor) tensor {
 	up := tensor{off: b.ar.alloc(x.C * x.H * 2 * x.W * 2), C: x.C, H: x.H * 2, W: x.W * 2}
 	b.add("upsample2x", groups(up.elems(), 256), pushConstants{
 		InOff: x.off, OutOff: up.off,
@@ -811,7 +810,7 @@ func (g *GPUDecoder) Dispatches(latentH, latentW int) (int, error) {
 }
 
 // record builds the graph against the real arena and uploads the latent.
-func (g *GPUDecoder) record(z *zvae.Tensor, marks bool) (*builder, tensor, error) {
+func (g *GPUDecoder) record(z *Tensor, marks bool) (*builder, tensor, error) {
 	if z.N != 1 {
 		return nil, tensor{}, fmt.Errorf("qvae: the GPU decoder takes one latent at a time, got N=%d", z.N)
 	}
@@ -834,7 +833,7 @@ func (g *GPUDecoder) record(z *zvae.Tensor, marks bool) (*builder, tensor, error
 
 // Decode decodes one denormalized latent, clamped to [-1, 1] like the
 // reference's. The whole graph is recorded once and submitted in batches.
-func (g *GPUDecoder) Decode(ctx context.Context, z *zvae.Tensor) (*zvae.Tensor, error) {
+func (g *GPUDecoder) Decode(ctx context.Context, z *Tensor) (*Tensor, error) {
 	b, out, err := g.record(z, false)
 	if err != nil {
 		return nil, err
@@ -873,7 +872,7 @@ func (g *GPUDecoder) Stages(latentH, latentW int) ([]string, error) {
 // intermediate long before it ends, so re-running the prefix is the only way
 // to see one — the same facility, for the same reason, as zimage/vae's
 // GPUEncoder.RunTo.
-func (g *GPUDecoder) RunTo(z *zvae.Tensor, stage string) (*zvae.Tensor, error) {
+func (g *GPUDecoder) RunTo(z *Tensor, stage string) (*Tensor, error) {
 	b, _, err := g.record(z, true)
 	if err != nil {
 		return nil, err
@@ -917,7 +916,7 @@ type ConvInputRange struct {
 //
 // It reads a tensor back per convolution over a write-combined buffer, so
 // it is slow by construction and belongs at the reference latent size.
-func (g *GPUDecoder) ConvInputRanges(z *zvae.Tensor) ([]ConvInputRange, error) {
+func (g *GPUDecoder) ConvInputRanges(z *Tensor) ([]ConvInputRange, error) {
 	b, _, err := g.record(z, false)
 	if err != nil {
 		return nil, err
@@ -952,7 +951,7 @@ type Stage struct {
 // Profile runs the graph one dispatch at a time, timing each on the GPU.
 // Submitting separately costs a fence wait per dispatch, so the total is
 // above what Decode measures — what it is for is the distribution.
-func (g *GPUDecoder) Profile(z *zvae.Tensor) ([]Stage, error) {
+func (g *GPUDecoder) Profile(z *Tensor) ([]Stage, error) {
 	b, _, err := g.record(z, false)
 	if err != nil {
 		return nil, err

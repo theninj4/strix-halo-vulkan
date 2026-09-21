@@ -16,7 +16,6 @@ import (
 	"strix-halo-vulkan/qimage/vision"
 	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The edit oracle is reference/dump_qi21_edit.py: the whole diffusers
@@ -179,7 +178,7 @@ func TestEndToEndEdit(t *testing.T) {
 	// the tower reads the same picture flattened over white.
 	rgba := loadEditMat(t, m, "cond_rgba") // [4, H*W] folded to rows
 	cw, ch := m.CondInputSize[0], m.CondInputSize[1]
-	cond := zvae.NewTensor(1, 4, ch, cw)
+	cond := qvae.NewTensor(1, 4, ch, cw)
 	copy(cond.Data, rgba.Data)
 	flat := flattenOverWhite(cond)
 
@@ -349,7 +348,7 @@ func TestEndToEndEdit(t *testing.T) {
 		for w := 0; w < img.W; w++ {
 			for c := 0; c < img.C; c++ {
 				got := (float64(img.Plane(0, c)[h*img.W+w]) + 1) / 2
-				d := math.Abs(got - float64(want.Row(h*img.W+w)[c]))
+				d := math.Abs(got - float64(want.Row(h*img.W + w)[c]))
 				if d > maxAbs {
 					maxAbs = d
 				}
@@ -408,12 +407,12 @@ const latentSpec = 1e-3
 // the difference between reproducing the oracle and not. A served edit is
 // handed an 8-bit PNG, so quantizing here is also what the real input
 // looks like.
-func flattenOverWhite(rgba *zvae.Tensor) *zvae.Tensor {
+func flattenOverWhite(rgba *qvae.Tensor) *qvae.Tensor {
 	return flattenWith(rgba, true)
 }
 
-func flattenWith(rgba *zvae.Tensor, quantize bool) *zvae.Tensor {
-	out := zvae.NewTensor(1, 3, rgba.H, rgba.W)
+func flattenWith(rgba *qvae.Tensor, quantize bool) *qvae.Tensor {
+	out := qvae.NewTensor(1, 3, rgba.H, rgba.W)
 	alpha := rgba.Plane(0, 3)
 	for c := 0; c < 3; c++ {
 		src, dst := rgba.Plane(0, c), out.Plane(0, c)

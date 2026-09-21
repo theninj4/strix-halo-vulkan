@@ -17,6 +17,19 @@
 > pixels, at the same wall clock, and `-image-size 1184x1184` reaches
 > **1536x864**. Nothing about residency or the numerics moved.
 >
+> **2026-09-21 — Q12: the Z-Image deletion is finished.** `zimage/vae` is
+> gone — decoder, encoder, both GPU paths, `tiny*`, and
+> `cmd/vaebench`/`vaedecode`/`vaeprof` with it — after `tensor.go` and
+> `math.go` were hoisted into `qimage/vae`, which was the only thing still
+> holding it up. **6,839 lines of Go and 895 of GLSL**, including the
+> 28 shader builds only that package dispatched: the whole fp16 matrix-core
+> route Q9b refused (`vae_pack_conv`, the nine `vae_conv_wmma` builds, the
+> eight `vae_attention_wmma` builds, `vae_pack_f16`, `vae_narrow_f16`) plus
+> the group norm, the standalone SiLU, taef1's ReLU and the untuned
+> attention. Every gate in this file was re-run and **not one digit moved**
+> — served 0.0333/3.4e-4, edit 0.0014/1.7e-4, cancellation 23% and 44 of
+> 117 dispatches, the arena still 3060 B/px.
+>
 > **2026-09-21 — Q11: a hung-up client now stops the run.** The context
 > reaches the sampler and the VAE's submit loop, so an abandoned request costs
 > **one step (23% of a short run) or 152 ms of a decode** instead of the whole
@@ -46,8 +59,9 @@
 > with native RGBA and in-progress previews. On the CPU the port reproduces
 > diffusers' image to under a quarter of an 8-bit quantization step; on the
 > device the served fp16 path reproduces the fp32 oracle's own picture at
-> **mean 3.4e-4**. What remains for the vertical is percents (Q9) — plus
-> finishing the Z-Image deletion, which Q6 owes and half did.
+> **mean 3.4e-4**. What remained for the vertical was percents (Q9) — plus
+> finishing the Z-Image deletion, which Q6 owed and half did, and which is
+> Q12 above.
 > This file is live again: the old root
 > `IMAGE.md` was frozen into
 > [`research/zimage-vertical.md`](research/zimage-vertical.md) at the 2026-09-20
@@ -78,13 +92,14 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q5 | VAE on CPU (`qimage/vae`) + the end-to-end image gate | **done** — decoder/encoder stagewise; **prompt→image matches diffusers at max abs 9.1e-4** (24x inside the 2.2e-2 precedent) |
 | Q4 | DiT on the GPU (`qimage/dit/gpu.go`) | **done for t2i** — teacher-forced flat ≤8e-3 over 40 steps; **2.27 s/step at 1024²** |
 | Q5g | VAE decoder on the GPU (`qimage/vae/gpu.go`) | **done 2026-09-20** — stagewise on the dump's own bounds; **1024² in 7.4 s**, 117 dispatches. Encoder stays CPU until Q8 needs it |
-| Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; Z-Image deletion still owed |
+| Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; the Z-Image deletion it owed is Q12 |
 | Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
 | Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports became Q9b |
 | Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
 | Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **23% of a run** (one step) or **152 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
 | Q9b | The VAE's two priced ports (`qimage/vae/kernels.go`, two shaders) | **done 2026-09-21** — the fp16 route **refused with a measurement** (`TestConvFP16Ladder`: one narrowed convolution costs the image max abs 0.0885), the same percents taken in fp32 instead: decode **7.4 → 4.02 s**, encoder **1.7 → 0.91 s**, image **1m32 → 1m28.8**, edit **1m59 → 1m54.2**, every output **bit-identical** |
+| Q12 | The Z-Image deletion (`zimage/vae`, three `cmd/`s, 28 shader builds) | **done 2026-09-21** — `tensor.go` + `math.go` hoisted into `qimage/vae`, the rest deleted: **6,839 lines of Go, 895 of GLSL**, every gate re-run with no digit changed |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
 the instrument named beside it. The day's method finding, three times over:
@@ -277,9 +292,10 @@ for it. So, in order:
    *generated* rather than taken from Q0's dumps (`cmd/previewfit`, 24
    prompts spanning colour and content), because a pair the pipeline
    produced itself cannot disagree with it about normalisation or layout.
-2. **Watch taehv** for a 2.1 variant and port it like `zimage/vae/tiny.go`
-   (at T=1 its temporal machinery degenerates; it would be a small 2D conv
-   stack again). Do not build our own distilled decoder — that is a training
+2. **Watch taehv** for a 2.1 variant and port it the way z-image's taef1
+   was ported (`zimage/vae/tiny.go`, now in git history — Q12 deleted it):
+   at T=1 its temporal machinery degenerates and it would be a small 2D conv
+   stack again. Do not build our own distilled decoder — that is a training
    project this repo does not want.
 
 ## What survives, what is new, what dies
@@ -289,10 +305,10 @@ for it. So, in order:
 | `zimage/qwen` (Qwen3 text transformer, CPU + GPU) | **survives and grows** — it is shared infra (`embed`, `llm`, `parakeet` import it). Q1 adds: theta as config (5e6), 36-layer/pre-final-norm output mode beside the existing `EncoderLayers()` convention, and (Q8 only) mrope + deepstack + the vision tower. The Qwen3-Embedding caller must keep passing its tests untouched. |
 | `zimage/tokenizer` | **survives** — same BPE family; new `added_tokens.json` (`<image1>`…, vision markers) and the raw template above. |
 | shaders: `dit_gemm_*`, `dit_attention_*` (WMMA), gpu arenas | **survived, confirmed by Q4** — the whole graph runs on z-image's kernels plus two new small shaders (`dit_attn_causal`, `dit_copy`). The new shapes run on z-image's measured winners *uncontested*: the tile re-screen at M=16384/K=12288 is a Q9 percent (hypothesis 5 in `TODO.md`). |
-| `zimage/vae/gpu_conv*` | **dead as of Q9b** — six of the decoder's ten kernels are still z-image's unchanged (conv2d, add, 2x upsample, the row shuffles, the linear, the transposed-K attention), but `gpu_conv`'s matrix-core implicit GEMM, which Q9's 69% was said to be waiting on, is refused on precision and will never be called from `qimage/`. The convolution and the projections were fixed in fp32 instead (`qimage/vae/kernels.go`). |
+| `zimage/vae/gpu_conv*` | **deleted 2026-09-21 (Q12)**, refused by Q9b before that — six of the decoder's ten kernels are still z-image's unchanged (conv2d, add, 2x upsample, the row shuffles, the linear, the transposed-K attention) and those shaders stay, but `gpu_conv`'s matrix-core implicit GEMM, which Q9's 69% was said to be waiting on, is refused on precision and went with the package. The convolution and the projections were fixed in fp32 instead (`qimage/vae/kernels.go`). |
 | `zimage/dit`, `zimage/pipeline` | **deleted 2026-09-20 (Q6)** — replaced by `qimage/dit` and `qimage/pipeline`. New names because almost no line survived: different block, different mask. |
-| `zimage/vae` (model code, `tiny*`, both GPU paths) | **its reprieve expired 2026-09-21 (Q9b)** — it stayed because `gpu_conv.go`'s matrix-core convolution was what Q9 wanted; Q9b refused that kernel with a measurement, so nothing in `qimage/` will ever call it. All that still blocks the deletion is that `qimage/vae` builds on this package's `Tensor` and `Conv2D`: hoist `tensor.go` + `math.go`, delete the rest and `cmd/vaebench`/`vaedecode`/`vaeprof` with it. Mechanical, ~8 k lines, not done. |
-| `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`, `cmd/ditblock` | **deleted 2026-09-20 (Q6)** — `cmd/qimage` is the replacement driver. `cmd/vaebench`/`vaedecode`/`vaeprof` stay while `zimage/vae` does. |
+| `zimage/vae` (model code, `tiny*`, both GPU paths) | **deleted 2026-09-21 (Q12)** — its reprieve expired when Q9b refused `gpu_conv.go`'s matrix-core convolution with a measurement. `tensor.go` and `math.go` were hoisted into `qimage/vae` (minus `GroupNorm`, `Subsample2x`, `convTap` and `tanh32`, which only the deleted code called); the rest went, with `cmd/vaebench`/`vaedecode`/`vaeprof` and 28 shader builds. `zimage/` is now `qwen` and `tokenizer`. |
+| `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`, `cmd/ditblock` | **deleted 2026-09-20 (Q6)** — `cmd/qimage` is the replacement driver. `cmd/vaebench`/`vaedecode`/`vaeprof` followed them 2026-09-21 (Q12). |
 | `models/Z-Image-Turbo`, `models/taef1` (62 GB) | unreferenced since Q6 and still on disk. One `rm -rf` whenever the space is wanted; not deleted unasked. |
 | serving: `/v1/images/*`, streaming, geometry-under-a-ceiling | **survived, confirmed by Q6** — `api.ImageBackend`, the geometry split, the SSE envelope and `backend.partialSteps` all carried over untouched; the adapter re-wired to `qimage/pipeline` and the two endpoints that lost their mechanism (streaming, edits) refused with the stage that owed them until Q7 and Q8.6 closed both. Two fields were added and one removed: `background` and `max_reference_images` in, `default_strength` out, because 2.1 has no strength. |
 
@@ -416,7 +432,8 @@ two-run numbers.
   breakages the z-image graph carries.
 - **Q5 — the VAE in Go. CPU done 2026-09-20** (`qimage/vae`, on
   `zimage/vae`'s Tensor/Conv2D — whose Pad/PadEnd/Stride already carried the
-  identical downsampler shape): decoder and encoder, stagewise against
+  identical downsampler shape; Q12 hoisted those two files into `qimage/vae`
+  and deleted the rest of that package): decoder and encoder, stagewise against
   `out/qi21vae`, RGBA round trip included. The T=1 semantics are explicit in
   the package doc: causal 3D convs fold to 2D, time_convs never run,
   AvgDown3D *means in a zero frame* on temporal blocks, DupUp3D keeps only
@@ -541,18 +558,20 @@ two-run numbers.
   **Amended 2026-09-21 (Q10): that ceiling is an *area*, and shipping it as a
   pair of side limits was costing every non-square request 44% of its
   pixels** — see the stage below.
-  **The Z-Image deletion is half done, on purpose.** Gone: `zimage/dit`,
+  **The Z-Image deletion was half done, on purpose; Q12 finished it
+  2026-09-21.** Gone at Q6: `zimage/dit`,
   `zimage/pipeline`, `cmd/zimage`, `cmd/ditstack`, `cmd/ditbench`,
   `cmd/ditblock` — nothing else imported them and `qimage/` replaces all of
-  it. **Kept for now: `zimage/vae`** (decoder, encoder, both GPU paths,
+  it. **Kept at Q6: `zimage/vae`** (decoder, encoder, both GPU paths,
   `tiny*`) and `cmd/vaebench`/`vaedecode`/`vaeprof` with it, because
   `gpu_conv.go` is the *validated test bed* for the one kernel Q9 wants —
   `TestGPUConvMatchesScalar` proves the matrix-core convolution against a
   scalar oracle, and deleting it before Q9 has taken the packing helpers
   across would throw away the proof and keep the problem. **Superseded
   2026-09-21 (Q9b): Q9 turned out not to want that kernel at all**, so the
-  reason to keep this code is gone and only the `Tensor`/`Conv2D` dependency
-  is left to unpick. `zimage/qwen` and `zimage/tokenizer` stay permanently (`embed`,
+  reason to keep this code went, and Q12 unpicked the `Tensor`/`Conv2D`
+  dependency and deleted it — stage below.
+  `zimage/qwen` and `zimage/tokenizer` stay permanently (`embed`,
   `llm`, `parakeet` and `qimage` all import them).
   **The 62 GB of weights on disk are not deleted** — `models/Z-Image-Turbo`
   and `models/taef1`. Nothing in the tree reads them now, so it is one
@@ -1162,11 +1181,9 @@ two-run numbers.
   was kept past its replacement because `gpu_conv.go` is "the validated test
   bed for the one kernel Q9 wants" — and Q9 does not want it. Nothing in
   `qimage/` will ever call `vae_pack_conv.comp`, the nine `vae_conv_wmma`
-  builds or `TestGPUConvMatchesScalar` now. What still blocks the deletion is
-  only that `qimage/vae` builds on `zimage/vae`'s `Tensor` and `Conv2D`
-  (`tensor.go`, `math.go`), so the removal is: hoist those two files, delete
-  the decoder, encoder, both GPU paths, `tiny*`, and `cmd/vaebench` /
-  `vaedecode` / `vaeprof` with them. Mechanical, ~8 k lines, not done here.
+  builds or `TestGPUConvMatchesScalar` now. What still blocked the deletion
+  was only that `qimage/vae` builds on `zimage/vae`'s `Tensor` and `Conv2D`
+  (`tensor.go`, `math.go`). **Q12 did it**, below.
 - **Q10 — the ceiling is an area, not a box. Done 2026-09-21**, and it came
   out of a served complaint rather than a plan: a 16:9 request against the
   shipped server was answering **1024x576**, 0.59 Mpx, where the same arenas
@@ -1255,6 +1272,55 @@ two-run numbers.
   One thing came free with it: `cmd/qimage` takes its context from
   `signal.NotifyContext`, so Ctrl-C now unwinds a run through the same path a
   hung-up client takes rather than killing the process mid-submit.
+- **Q12 — the Z-Image deletion, finished. Done 2026-09-21.** Q6 deleted
+  half of Z-Image and said why it kept the rest; Q9b removed the reason;
+  this is the other half. **`zimage/vae` is gone**, and `zimage/` is now
+  `qwen` and `tokenizer`, which stay permanently.
+  **The one real step was the hoist.** `qimage/vae` never used z-image's
+  decoder — it used its `Tensor` and `Conv2D`, and that single dependency
+  was the whole thing holding a 6,800-line package up. `tensor.go` and
+  `math.go` moved into `qimage/vae` (same package name, so the call sites
+  lost a qualifier rather than gaining one), and four symbols did **not**
+  come with them because nothing outside the deleted code ever called them:
+  `GroupNorm` (Qwen's norm is `ChannelNorm`, per-pixel L2, not a group
+  norm), `Subsample2x`, the `convTap` hook — `qimage/vae` has its own
+  `ConvInputRanges` on the GPU decoder, which is the same instrument done
+  properly — and `tanh32`, which existed for taef1's input clamp.
+  `FP16ConvOperands` did come across: `TestConvFP16Ladder` is the
+  instrument Q9b's refusal rests on and decision 7 says to re-run it before
+  anyone points a narrowing kernel at this VAE.
+  **The shaders were the part the ledger had already named and nobody had
+  counted.** 28 builds were dispatched only from `zimage/vae`: the entire
+  fp16 matrix-core route Q9b refused — `vae_pack_conv` and its clamp
+  control, the nine `vae_conv_wmma` builds and their no-tap-shift control,
+  the eight `vae_attention_wmma` builds and their two controls,
+  `vae_pack_f16` (+ transpose) and `vae_narrow_f16` — plus four scalar
+  builds Qwen's decoder replaced: the group norm, the standalone SiLU,
+  taef1's ReLU, and the untuned `vae_attention.spv` (the `-DDIM=768/1152`
+  builds of the same `.comp` are live and stay). Eight `.comp` sources went
+  with them. **The other 21 unreferenced shader builds in the tree were
+  left alone on purpose**: they are the DiT's screen catalogue — measured
+  alternatives to kernels that still run — and a re-screen wants them.
+  **Three stale comments were corrected rather than left to mislead**,
+  which is most of the 204 lines this change *adds*: `vae_common.glsl` said
+  the decoder was fp32 "except in the mid block, where stage 7 put the four
+  projections and the attention on the matrix cores" over two fp16 bindings
+  that no shader declares any more, and described a GEMM push-constant
+  block that no VAE shader reads — it stays only because
+  `vk.DispatchMultiTimed` fixes one push-constant size across a command
+  buffer, and that is now what the comment says.
+  `vae_downsample2x.comp` pointed at `vae_conv_wmma.comp` for the stride-1
+  filter it subsamples (it is `vae_conv2d.comp`) and at a deleted test for
+  the identity's proof (it is `builder.downsample` plus
+  `TestGPUEncoderNegativeControls`).
+  **The gate is that nothing moved, and it is asserted rather than
+  assumed**: `TestServedOracle256` still max abs 0.0333 / mean 3.4e-4,
+  `TestServedEditOracle256` still 0.0014 / 1.7e-4 with the blank-reference
+  control at 366x, `TestCancellation` still 23% of a run and 44 of 117
+  dispatches with the fourth run bit-identical, `TestArenaShape` still
+  3060 B/px, both decoder and encoder stagewise gates and every negative
+  control unchanged, and `go test ./... -short` green. **6,839 lines of Go
+  and 895 of GLSL deleted; 204 added, nearly all of them comments.**
 
 ## Decisions taken now (so future sessions don't relitigate)
 
@@ -1283,8 +1349,11 @@ two-run numbers.
    perturbation into an absolute one. One narrowed convolution costs the
    decoded image **max abs 0.0885** and the whole 3x3 set costs 0.178, against
    an fp32 port sitting at 7.3e-4 (`TestConvFP16Ladder`). Nothing in
-   `qimage/vae` is to be pointed at `dit_gemm`, `vae_conv_wmma` or any other
-   narrowing kernel without re-running that ladder first.
+   `qimage/vae` is to be pointed at `dit_gemm` or any other narrowing kernel
+   without re-running that ladder first. Q12 deleted `vae_conv_wmma` and
+   `vae_attention_wmma` outright, so the tempting shortcut no longer exists
+   in the tree — resurrect them from git history if that ladder ever says
+   something different.
 
 ## Open questions
 

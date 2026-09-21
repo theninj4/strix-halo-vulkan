@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
+	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 const (
@@ -85,7 +85,7 @@ func newPipeline(t *testing.T, dev *vk.Device, opt Options) *Pipeline {
 }
 
 // writeArtifact saves a PNG for the eyeball, and says where.
-func writeArtifact(t *testing.T, name string, img *zvae.Tensor) {
+func writeArtifact(t *testing.T, name string, img *qvae.Tensor) {
 	t.Helper()
 	if err := os.MkdirAll(servedArtifactsDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func writeArtifact(t *testing.T, name string, img *zvae.Tensor) {
 
 // imageDistance is the oracle comparison in the reference's own [0, 1]
 // space, the same instrument TestEndToEndImage uses.
-func imageDistance(got *zvae.Tensor, want *qwen.Mat) (maxAbs, mean float64) {
+func imageDistance(got *qvae.Tensor, want *qwen.Mat) (maxAbs, mean float64) {
 	var sumAbs float64
 	for h := 0; h < got.H; h++ {
 		for w := 0; w < got.W; w++ {
@@ -275,7 +275,7 @@ func TestStepSweep(t *testing.T) {
 		"diagram": sweepPromptThirdText,
 	}
 	for name, prompt := range prompts {
-		var ref *zvae.Tensor
+		var ref *qvae.Tensor
 		for _, steps := range []int{40, 24, 16, 12} {
 			img, tm, err := p.Run(t.Context(), Request{Prompt: prompt, Steps: steps, Seed: 42})
 			if err != nil {
@@ -510,7 +510,7 @@ func TestPreviewFrames(t *testing.T) {
 	const side = 512
 	p := newPipeline(t, dev, Options{Model: model, Width: side, Height: side, Steps: 8})
 
-	var frames, samples []*zvae.Tensor
+	var frames, samples []*qvae.Tensor
 	var at []int
 	img, tm, err := p.Run(t.Context(), Request{
 		Prompt: defaultSweepPrompt, Width: side, Height: side, Steps: 8, Seed: 42,
@@ -592,7 +592,7 @@ func TestPreviewFrames(t *testing.T) {
 	}
 }
 
-func meanAbs(a, b *zvae.Tensor) float64 {
+func meanAbs(a, b *qvae.Tensor) float64 {
 	var sum float64
 	for i := range a.Data {
 		sum += math.Abs(float64(a.Data[i] - b.Data[i]))
@@ -602,8 +602,8 @@ func meanAbs(a, b *zvae.Tensor) float64 {
 
 // boxDown averages n x n blocks, which is how cmd/previewfit paired a latent
 // pixel with the colour it produced.
-func boxDown(t *zvae.Tensor, n int) *zvae.Tensor {
-	out := zvae.NewTensor(1, t.C, t.H/n, t.W/n)
+func boxDown(t *qvae.Tensor, n int) *qvae.Tensor {
+	out := qvae.NewTensor(1, t.C, t.H/n, t.W/n)
 	inPlane, outPlane := t.H*t.W, out.H*out.W
 	for c := 0; c < t.C; c++ {
 		for y := 0; y < out.H; y++ {

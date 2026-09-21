@@ -6,7 +6,6 @@ import (
 
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // The encoder on the device — IMAGE.md Q8, the stage Q5g deferred.
@@ -103,7 +102,7 @@ func (g *GPUEncoder) Destroy() { g.destroy() }
 // order the graph reads them.
 func (g *GPUEncoder) flattenWeights() {
 	w := g.weights
-	conv := func(name string, c *zvae.Conv2D) {
+	conv := func(name string, c *Conv2D) {
 		w.put(name+".weight", c.Weight)
 		if c.Bias != nil {
 			w.put(name+".bias", c.Bias)
@@ -150,7 +149,7 @@ func (g *GPUEncoder) flattenWeights() {
 // second convolution shader. Whether that trade is still right is a Q9
 // question, not this stage's: the same sentence is in zimage/vae, with the
 // same reasoning and the same numbers waiting to be measured.
-func (b *builder) downsample(name string, c *zvae.Conv2D, x tensor) tensor {
+func (b *builder) downsample(name string, c *Conv2D, x tensor) tensor {
 	if c.Stride != 2 || c.KH != 3 || c.KW != 3 || c.Pad != 0 || c.PadEnd != 1 {
 		b.err = fmt.Errorf("qvae: downsample %s is %dx%d stride %d pad %d/%d; the subsampling identity is for a 3x3 stride-2 (0,1,0,1) filter",
 			name, c.KH, c.KW, c.Stride, c.Pad, c.PadEnd)
@@ -272,7 +271,7 @@ func (g *GPUEncoder) Dispatches(imgH, imgW int) (int, error) {
 }
 
 // record builds the graph against the real arena and uploads the image.
-func (g *GPUEncoder) record(img *zvae.Tensor, marks bool) (*builder, tensor, error) {
+func (g *GPUEncoder) record(img *Tensor, marks bool) (*builder, tensor, error) {
 	if img.N != 1 {
 		return nil, tensor{}, fmt.Errorf("qvae: the GPU encoder takes one image at a time, got N=%d", img.N)
 	}
@@ -297,7 +296,7 @@ func (g *GPUEncoder) record(img *zvae.Tensor, marks bool) (*builder, tensor, err
 // mean half of the quantized output and the only half an edit ever reads
 // (IMAGE.md decision 3). The latents come back *raw* — Config.Normalize maps
 // them into the DiT's space, exactly as the CPU encoder's caller does it.
-func (g *GPUEncoder) Encode(ctx context.Context, img *zvae.Tensor) (*zvae.Tensor, error) {
+func (g *GPUEncoder) Encode(ctx context.Context, img *Tensor) (*Tensor, error) {
 	b, out, err := g.record(img, false)
 	if err != nil {
 		return nil, err
@@ -325,7 +324,7 @@ func (g *GPUEncoder) Stages(imgH, imgW int) ([]string, error) {
 // returning what it produced. A bump-allocated graph overwrites every
 // intermediate long before it ends, so re-running the prefix is the only way
 // to see one.
-func (g *GPUEncoder) RunTo(img *zvae.Tensor, stage string) (*zvae.Tensor, error) {
+func (g *GPUEncoder) RunTo(img *Tensor, stage string) (*Tensor, error) {
 	b, _, err := g.record(img, true)
 	if err != nil {
 		return nil, err

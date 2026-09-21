@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 const strixHaloDeviceID = 0x1586
@@ -228,7 +227,7 @@ func TestGPUDecodeTiming(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			z := zvae.NewTensor(1, 64, lat, lat)
+			z := NewTensor(1, 64, lat, lat)
 			for i := range z.Data {
 				z.Data[i] = float32(math.Sin(float64(i)*0.001)) * 0.5
 			}
@@ -255,7 +254,7 @@ func TestGPUDecodeProfile(t *testing.T) {
 
 	const lat = 64 // a 1024x1024 image
 	_, _, g := loadGPU(t, dev, lat, lat)
-	z := zvae.NewTensor(1, 64, lat, lat)
+	z := NewTensor(1, 64, lat, lat)
 	for i := range z.Data {
 		z.Data[i] = float32(math.Sin(float64(i)*0.001)) * 0.5
 	}

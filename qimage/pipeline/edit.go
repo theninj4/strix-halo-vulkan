@@ -27,7 +27,6 @@ import (
 	"strix-halo-vulkan/qimage/textenc"
 	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/zimage/qwen"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // CondMultiple is the pixel granularity every condition image is snapped to.
@@ -53,7 +52,7 @@ func CalcDimensions(targetArea int, ratio float64) (int, int) {
 // PackLatents flattens a [1, C, h, w] latent grid into one row per token, in
 // raster order — diffusers' _pack_latents, which for 2.1 is a plain spatial
 // flatten because the DiT takes latents unpatched.
-func PackLatents(z *zvae.Tensor) *qwen.Mat {
+func PackLatents(z *qvae.Tensor) *qwen.Mat {
 	out := qwen.NewMat(z.H*z.W, z.C)
 	for c := 0; c < z.C; c++ {
 		plane := z.Plane(0, c)
@@ -65,11 +64,11 @@ func PackLatents(z *zvae.Tensor) *qwen.Mat {
 }
 
 // UnpackLatents is the inverse, back to a [1, C, h, w] grid.
-func UnpackLatents(m *qwen.Mat, h, w int) (*zvae.Tensor, error) {
+func UnpackLatents(m *qwen.Mat, h, w int) (*qvae.Tensor, error) {
 	if m.Rows != h*w {
 		return nil, fmt.Errorf("pipeline: %d latent rows for a %dx%d grid", m.Rows, h, w)
 	}
-	z := zvae.NewTensor(1, m.Cols, h, w)
+	z := qvae.NewTensor(1, m.Cols, h, w)
 	for c := 0; c < m.Cols; c++ {
 		plane := z.Plane(0, c)
 		for i := 0; i < m.Rows; i++ {
@@ -88,7 +87,7 @@ func UnpackLatents(m *qwen.Mat, h, w int) (*zvae.Tensor, error) {
 // vision tower reads a copy of the same image flattened over white; this one
 // is not flattened, and a port that flattens once and uses it twice is
 // wrong in a way that only shows on transparent references.
-func EncodeCondition(enc *qvae.Encoder, cfg *qvae.Config, img *zvae.Tensor) (*qwen.Mat, [3]int, error) {
+func EncodeCondition(enc *qvae.Encoder, cfg *qvae.Config, img *qvae.Tensor) (*qwen.Mat, [3]int, error) {
 	if img.H%CondMultiple != 0 || img.W%CondMultiple != 0 {
 		return nil, [3]int{}, fmt.Errorf("pipeline: a %dx%d condition image is not a multiple of %d",
 			img.W, img.H, CondMultiple)
@@ -156,7 +155,7 @@ var ErrNoEdits = fmt.Errorf("this pipeline was not staged for editing")
 // step runs. It is a *conditional* generation: the references are rows of the
 // same sequence, modulated from t = 0 and therefore computed once, and the
 // target starts from pure noise like any other.
-func (p *Pipeline) Edit(ctx context.Context, req EditRequest) (*zvae.Tensor, *Timings, error) {
+func (p *Pipeline) Edit(ctx context.Context, req EditRequest) (*qvae.Tensor, *Timings, error) {
 	if p.refs == 0 {
 		return nil, nil, ErrNoEdits
 	}
@@ -309,10 +308,10 @@ func (p *Pipeline) Edit(ctx context.Context, req EditRequest) (*zvae.Tensor, *Ti
 
 // tensorNRGBA is the VAE's copy of a reference image: all four channels in
 // [-1, 1], which is the range the encoder was trained and gated on.
-func tensorNRGBA(img *image.NRGBA) *zvae.Tensor {
+func tensorNRGBA(img *image.NRGBA) *qvae.Tensor {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
-	t := zvae.NewTensor(1, 4, h, w)
+	t := qvae.NewTensor(1, 4, h, w)
 	for y := 0; y < h; y++ {
 		row := img.Pix[y*img.Stride:]
 		for x := 0; x < w; x++ {

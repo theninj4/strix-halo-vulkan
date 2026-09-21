@@ -5,7 +5,7 @@ import (
 	"image"
 	"math"
 
-	"strix-halo-vulkan/zimage/vae"
+	"strix-halo-vulkan/qimage/vae"
 )
 
 // Fitting a client's picture to the geometry a request resolved to -- the one

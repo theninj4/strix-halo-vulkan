@@ -11,8 +11,8 @@ import (
 
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/qimage/pipeline"
+	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
-	zvae "strix-halo-vulkan/zimage/vae"
 )
 
 // ImageOptions is what cmd/serve's flags come to.
@@ -303,7 +303,7 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 	}
 
 	var (
-		img *zvae.Tensor
+		img *qvae.Tensor
 		tm  *pipeline.Timings
 	)
 	refs, err := nrgbaRefs(req.Init)
