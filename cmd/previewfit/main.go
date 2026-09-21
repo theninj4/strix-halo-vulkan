@@ -23,6 +23,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -159,7 +160,7 @@ type sample struct {
 // renderPair generates one image and returns the final latents beside it.
 func renderPair(p *pipeline.Pipeline, prompt string, seed int64, size, steps int) (*qwen.Mat, *zvae.Tensor, error) {
 	var final *qwen.Mat
-	img, _, err := p.Run(pipeline.Request{
+	img, _, err := p.Run(context.Background(), pipeline.Request{
 		Prompt: prompt, Width: size, Height: size, Steps: steps, Seed: seed,
 		// The last step's latents are the ones that were decoded. Cloning in
 		// the callback rather than reading the request back is what keeps the

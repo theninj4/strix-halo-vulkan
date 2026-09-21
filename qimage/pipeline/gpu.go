@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"math"
@@ -427,8 +428,8 @@ type Timings struct {
 }
 
 // Generate is Run for the common case.
-func (p *Pipeline) Generate(prompt string, seed int64, progress func(Step)) (*zvae.Tensor, *Timings, error) {
-	return p.Run(Request{Prompt: prompt, Seed: seed, Progress: progress})
+func (p *Pipeline) Generate(ctx context.Context, prompt string, seed int64, progress func(Step)) (*zvae.Tensor, *Timings, error) {
+	return p.Run(ctx, Request{Prompt: prompt, Seed: seed, Progress: progress})
 }
 
 // Encode runs the tokenizer and the text encoder, returning the DiT's text
@@ -478,7 +479,7 @@ func (p *Pipeline) noise(g geom, seed int64) *qwen.Mat {
 // Run renders one image: prompt through the text encoder, the DiT's sampler
 // with the prefix KV cache, and the VAE decoder. The returned tensor is
 // [1, 4, H, W] RGBA in [-1, 1], which is the decoder's own range.
-func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
+func (p *Pipeline) Run(ctx context.Context, req Request) (*zvae.Tensor, *Timings, error) {
 	if p.enc == nil || p.dt == nil || p.dec == nil {
 		return nil, nil, fmt.Errorf("pipeline: destroyed")
 	}
@@ -523,12 +524,12 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 	if err := p.dt.BeginImage(embeds, lay, nil); err != nil {
 		return nil, nil, err
 	}
-	if err := p.denoise(latents, g, sched, steps, tm, req.Progress); err != nil {
+	if err := p.denoise(ctx, latents, g, sched, steps, tm, req.Progress); err != nil {
 		return nil, nil, err
 	}
 
 	decodeStart := time.Now()
-	img, err := p.Decode(latents, g.latentH, g.latentW)
+	img, err := p.Decode(ctx, latents, g.latentH, g.latentW)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -540,10 +541,16 @@ func (p *Pipeline) Run(req Request) (*zvae.Tensor, *Timings, error) {
 // denoise is the sampler, shared by Run and Edit: BeginImage has already
 // fixed the geometry and the prefix, so the loop itself does not know which
 // of the two it is running. latents is integrated in place.
-func (p *Pipeline) denoise(latents *qwen.Mat, g geom, sched *Schedule, steps int,
+func (p *Pipeline) denoise(ctx context.Context, latents *qwen.Mat, g geom, sched *Schedule, steps int,
 	tm *Timings, progress func(Step)) error {
 
 	for i := 0; i < steps; i++ {
+		// The cancellation point, and the only one the sampler has: a step
+		// is a submit-and-fence with nothing to abandon inside it, so a
+		// client that hung up pays for the step in flight and no more.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("pipeline: cancelled at step %d of %d: %w", i, steps, err)
+		}
 		stepStart := time.Now()
 		// Step 0 is the block-causal prefill, which also extracts every
 		// block's prefix K/V; the rest decode only the target rows against
@@ -593,7 +600,7 @@ func (p *Pipeline) denoise(latents *qwen.Mat, g geom, sched *Schedule, steps int
 // Decode unpacks the DiT's [tokens, z] latents into the VAE's [1, z, h, w],
 // denormalizes them and decodes. It is exported because the step sweep and
 // the CPU oracle both want to decode a latent they already have.
-func (p *Pipeline) Decode(latents *qwen.Mat, latentH, latentW int) (*zvae.Tensor, error) {
+func (p *Pipeline) Decode(ctx context.Context, latents *qwen.Mat, latentH, latentW int) (*zvae.Tensor, error) {
 	if latents.Rows != latentH*latentW {
 		return nil, fmt.Errorf("pipeline: %d latent rows for a %dx%d grid", latents.Rows, latentH, latentW)
 	}
@@ -605,7 +612,7 @@ func (p *Pipeline) Decode(latents *qwen.Mat, latentH, latentW int) (*zvae.Tensor
 		}
 	}
 	p.vcfg.Denormalize(z)
-	return p.dec.Decode(z)
+	return p.dec.Decode(ctx, z)
 }
 
 // ToImage maps the decoder's [1, 4, H, W] RGBA in [-1, 1] to a picture.

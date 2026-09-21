@@ -201,10 +201,18 @@ const (
 
 // Generate renders one image.
 //
-// **The device lock is held for the whole run.** A denoising step is a
-// submit-and-fence with no cancellation point in it, so the context is
-// checked on the way in and not again: a client that hangs up mid-run still
-// costs the run, and what it stops costing is the encoding and the writing.
+// **The device lock is held for the whole run, and the context is what cuts
+// it short.** A denoising *step* is a submit-and-fence with nothing to
+// abandon inside it, but between two steps there is nothing in flight, and
+// the same is true between the VAE's submit batches. So the context reaches
+// all the way down (`pipeline.Run`, `Edit`, `Decode`, and the vision tower
+// and VAE encoder an edit runs first) and a client that hangs up stops paying
+// within one step — about 2.2 s of a 92 s image, or a quarter-second of the
+// decode — instead of paying for the whole picture.
+//
+// That matters past the wasted arithmetic: Device.Do is one lock for every
+// vertical in the process, so an abandoned image used to block the queued
+// speech and embedding requests behind it for its full duration too.
 func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.ImageResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -305,13 +313,13 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 	err = b.opt.Device.Do(func(*vk.Device) error {
 		var err error
 		if len(refs) > 0 {
-			img, tm, err = b.pipe.Edit(pipeline.EditRequest{
+			img, tm, err = b.pipe.Edit(ctx, pipeline.EditRequest{
 				Prompt: prompt, Images: refs, Width: width, Height: height,
 				Steps: req.Steps, Seed: seed, Progress: progress,
 			})
 			return err
 		}
-		img, tm, err = b.pipe.Run(pipeline.Request{
+		img, tm, err = b.pipe.Run(ctx, pipeline.Request{
 			Prompt: prompt, Width: width, Height: height,
 			Steps: req.Steps, Seed: seed, Progress: progress,
 		})

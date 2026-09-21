@@ -73,7 +73,7 @@ func TestGPUEncoderStages(t *testing.T) {
 				compare(t, label+"_enc_"+name, got, loadRef(t, m, label+"_enc_"+name))
 			}
 
-			mode, err := g.Encode(card)
+			mode, err := g.Encode(t.Context(), card)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -104,7 +104,7 @@ func TestGPUEncoderMatchesCPU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := g.Encode(card)
+	got, err := g.Encode(t.Context(), card)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestGPUEncodeTiming(t *testing.T) {
 	}
 	for run := 0; run < 2; run++ {
 		start := time.Now()
-		if _, err := g.Encode(img); err != nil {
+		if _, err := g.Encode(t.Context(), img); err != nil {
 			t.Fatal(err)
 		}
 		t.Logf("%dx%d encode: %v over %d dispatches, %d MB activations",

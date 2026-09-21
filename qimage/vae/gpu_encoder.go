@@ -1,6 +1,7 @@
 package vae
 
 import (
+	"context"
 	"fmt"
 
 	"strix-halo-vulkan/shaders"
@@ -285,12 +286,12 @@ func (g *GPUEncoder) record(img *zvae.Tensor, marks bool) (*builder, tensor, err
 // mean half of the quantized output and the only half an edit ever reads
 // (IMAGE.md decision 3). The latents come back *raw* — Config.Normalize maps
 // them into the DiT's space, exactly as the CPU encoder's caller does it.
-func (g *GPUEncoder) Encode(img *zvae.Tensor) (*zvae.Tensor, error) {
+func (g *GPUEncoder) Encode(ctx context.Context, img *zvae.Tensor) (*zvae.Tensor, error) {
 	b, out, err := g.record(img, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := g.run(b.out); err != nil {
+	if err := g.runContext(ctx, b.out); err != nil {
 		return nil, err
 	}
 	return g.read(tensor{off: out.off, C: out.C / 2, H: out.H, W: out.W}), nil

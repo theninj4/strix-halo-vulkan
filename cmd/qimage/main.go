@@ -21,11 +21,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"image/png"
 	"log"
 	"os"
+	"os/signal"
 	"time"
 
 	"strix-halo-vulkan/qimage/pipeline"
@@ -37,6 +39,12 @@ const strixHaloDeviceID = 0x1586
 
 func main() {
 	log.SetFlags(0)
+	// Ctrl-C cancels the run rather than only the process: the sampler checks
+	// between steps and the VAE between submit batches, so an interrupt
+	// unwinds through the same path a client that hung up takes and the
+	// device is left clean.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	model := flag.String("model", "models/Qwen-Image-2.1", "checkpoint root")
 	prompt := flag.String("prompt", "a red fox sitting in fresh snow at dawn, photograph, shallow depth of field", "the prompt")
 	out := flag.String("out", "qimage.png", "PNG to write; with -reps > 1 the repetition index is appended")
@@ -103,7 +111,7 @@ func main() {
 					st.Index, st.Steps, float64(st.Wall.Microseconds())/1000, st.Sigma, st.NextSigma)
 			}
 		}
-		img, tm, err := p.Run(pipeline.Request{
+		img, tm, err := p.Run(ctx, pipeline.Request{
 			Prompt: text, Width: *width, Height: *height, Steps: *steps,
 			Seed: *seed + int64(rep), Progress: onStep,
 		})

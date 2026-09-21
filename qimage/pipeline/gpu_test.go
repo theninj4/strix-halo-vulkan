@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"image/png"
 	"math"
@@ -163,7 +165,7 @@ func TestServedOracle256(t *testing.T) {
 
 	// Teacher-forced: the oracle's final latents, our decoder.
 	final := loadRunMat(t, m, fmt.Sprintf("step%d_latents", m.Steps-1))
-	img, err := p.Decode(final.Clone(), side, side)
+	img, err := p.Decode(t.Context(), final.Clone(), side, side)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +180,7 @@ func TestServedOracle256(t *testing.T) {
 	// the models differ.
 	noise := loadRunMat(t, m, "noise").Clone()
 	var latentRel float64
-	img, tm, err := p.Run(Request{
+	img, tm, err := p.Run(t.Context(), Request{
 		Prompt: m.Prompt, Width: m.Size, Height: m.Size, Steps: m.Steps, Latents: noise,
 		Progress: func(st Step) {
 			ref := loadRunMat(t, m, fmt.Sprintf("step%d_latents", st.Index))
@@ -235,7 +237,7 @@ func TestServedWallClock(t *testing.T) {
 	p := newPipeline(t, dev, Options{Model: model})
 
 	for run := 0; run < 2; run++ {
-		img, tm, err := p.Generate(defaultSweepPrompt, 42, nil)
+		img, tm, err := p.Generate(t.Context(), defaultSweepPrompt, 42, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -275,7 +277,7 @@ func TestStepSweep(t *testing.T) {
 	for name, prompt := range prompts {
 		var ref *zvae.Tensor
 		for _, steps := range []int{40, 24, 16, 12} {
-			img, tm, err := p.Run(Request{Prompt: prompt, Steps: steps, Seed: 42})
+			img, tm, err := p.Run(t.Context(), Request{Prompt: prompt, Steps: steps, Seed: 42})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -324,7 +326,7 @@ func TestGeometryShapes(t *testing.T) {
 
 	for _, c := range []struct{ w, h int }{{1024, 1024}, {1344, 768}, {768, 1344}, {2048, 512}} {
 		t.Run(fmt.Sprintf("%dx%d", c.w, c.h), func(t *testing.T) {
-			img, tm, err := p.Run(Request{
+			img, tm, err := p.Run(t.Context(), Request{
 				Prompt: defaultSweepPrompt, Width: c.w, Height: c.h, Steps: 8, Seed: 42,
 			})
 			if err != nil {
@@ -344,11 +346,130 @@ func TestGeometryShapes(t *testing.T) {
 
 	// And the refusal is the area, not the side: one step past the staged
 	// token count is a 400 even though both sides are inside the square.
-	if _, _, err := p.Run(Request{Prompt: "p", Width: 1024, Height: 1088, Steps: 1, Seed: 1}); err == nil {
+	if _, _, err := p.Run(t.Context(), Request{Prompt: "p", Width: 1024, Height: 1088, Steps: 1, Seed: 1}); err == nil {
 		t.Error("1024x1088 ran; it is 6% more pixels than the arenas hold")
 	} else {
 		t.Logf("1024x1088 refused: %v", err)
 	}
+}
+
+// TestCancellation is the gate on what a client that hangs up costs, and it
+// has to be a device test because what is under test is *when* the run stops
+// rather than that it eventually errors.
+//
+// Three things are asserted, and the third is the one that would hurt:
+//
+//   - the sampler stops at the step boundary, so a cancel two steps into
+//     eight costs about two steps and not eight;
+//   - the decoder stops between submit batches, so a cancel during the VAE
+//     costs a fraction of the decode rather than all of it;
+//   - **the pipeline still works afterwards**. A cancelled run leaves a
+//     recorded graph half-submitted and the arenas holding an abandoned
+//     image, so the next request is the real question, and it is answered by
+//     running one and comparing it against the same image generated without
+//     any cancellation in front of it. Bit-identical, not merely plausible.
+//
+// The error identity matters as much as the timing: `errors.Is(err,
+// context.Canceled)` is what api.backendError keys on to answer with nothing
+// instead of a 500, so it is asserted rather than assumed.
+func TestCancellation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages the whole pipeline")
+	}
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	const (
+		side  = 512
+		steps = 8
+	)
+	p := newPipeline(t, dev, Options{Model: model, Width: side, Height: side, Steps: steps})
+
+	// The uncancelled run first: it is both the reference image and the wall
+	// clock everything below is read against.
+	full := time.Now()
+	want, tm, err := p.Run(t.Context(), Request{
+		Prompt: defaultSweepPrompt, Width: side, Height: side, Steps: steps, Seed: 42,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := time.Since(full)
+	t.Logf("uncancelled: %v total (%d steps, decode %v)",
+		baseline.Round(time.Millisecond), len(tm.Steps), tm.Decode.Round(time.Millisecond))
+
+	// ---- Cancelled two steps in.
+	t.Run("sampler", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		var reached int
+		start := time.Now()
+		_, _, err := p.Run(ctx, Request{
+			Prompt: defaultSweepPrompt, Width: side, Height: side, Steps: steps, Seed: 42,
+			Progress: func(st Step) {
+				reached = st.Index
+				if st.Index == 1 {
+					cancel()
+				}
+			},
+		})
+		elapsed := time.Since(start)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err %v, want context.Canceled", err)
+		}
+		// Two steps ran and the third was refused, so the run cost about a
+		// quarter of the schedule. Half the baseline is a loose bound that a
+		// run-to-completion cannot pass.
+		if elapsed > baseline/2 {
+			t.Errorf("cancelled at step 1 of %d but took %v of a %v run",
+				steps, elapsed.Round(time.Millisecond), baseline.Round(time.Millisecond))
+		}
+		t.Logf("cancelled after step %d: %v (%.0f%% of the full run): %v",
+			reached, elapsed.Round(time.Millisecond), 100*float64(elapsed)/float64(baseline), err)
+	})
+
+	// ---- Cancelled inside the VAE, which is one call and 30 submits.
+	t.Run("decoder", func(t *testing.T) {
+		latents := p.noise(geom{latentH: side / VAEScale, latentW: side / VAEScale,
+			imgTokens: (side / VAEScale) * (side / VAEScale)}, 7)
+		clean := time.Now()
+		if _, err := p.Decode(t.Context(), latents.Clone(), side/VAEScale, side/VAEScale); err != nil {
+			t.Fatal(err)
+		}
+		decode := time.Since(clean)
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		time.AfterFunc(decode/8, cancel)
+		start := time.Now()
+		_, err := p.Decode(ctx, latents.Clone(), side/VAEScale, side/VAEScale)
+		elapsed := time.Since(start)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err %v, want context.Canceled", err)
+		}
+		if elapsed > decode/2 {
+			t.Errorf("cancelled an eighth into a %v decode but took %v",
+				decode.Round(time.Millisecond), elapsed.Round(time.Millisecond))
+		}
+		t.Logf("decode %v, cancelled an eighth in after %v: %v",
+			decode.Round(time.Millisecond), elapsed.Round(time.Millisecond), err)
+	})
+
+	// ---- And the device is not left in a state that poisons the next
+	// request, which is the property the two above would be worthless
+	// without.
+	after, _, err := p.Run(t.Context(), Request{
+		Prompt: defaultSweepPrompt, Width: side, Height: side, Steps: steps, Seed: 42,
+	})
+	if err != nil {
+		t.Fatalf("the run after two cancellations failed: %v", err)
+	}
+	for i := range want.Data {
+		if after.Data[i] != want.Data[i] {
+			t.Fatalf("the run after two cancellations differs at element %d: %g against %g",
+				i, after.Data[i], want.Data[i])
+		}
+	}
+	t.Log("the run after two cancellations is bit-identical to the one before them")
 }
 
 // TestGeometryCeiling is the ceiling as a served behaviour rather than an
@@ -391,7 +512,7 @@ func TestPreviewFrames(t *testing.T) {
 
 	var frames, samples []*zvae.Tensor
 	var at []int
-	img, tm, err := p.Run(Request{
+	img, tm, err := p.Run(t.Context(), Request{
 		Prompt: defaultSweepPrompt, Width: side, Height: side, Steps: 8, Seed: 42,
 		Progress: func(st Step) {
 			if st.Preview == nil {

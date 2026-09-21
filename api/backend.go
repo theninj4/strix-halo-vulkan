@@ -184,11 +184,10 @@ type ImageRequest struct {
 	// is the one that happens -- stops any *further* frames and is what
 	// Generate returns.
 	//
-	// It does not stop the run. A denoising step is a submit-and-fence with
-	// no cancellation point in it, so a request that is abandoned halfway
-	// still costs the device the whole image; what it stops costing is the
-	// encoding and the writing. That is the same bargain the non-streaming
-	// path already makes, and it is written down in API.md rather than fixed.
+	// It does not itself stop the run -- what stops the run is the *context*,
+	// which a backend checks between denoising steps and between the VAE's
+	// submit batches. So a client that hangs up mid-stream stops the frames
+	// here and the run there, within about one step either way.
 	Partial func(ImagePartial) error
 
 	// Init holds the reference images an edit is conditioned on, in the

@@ -115,7 +115,7 @@ func TestGPUDecoderStages(t *testing.T) {
 				compare(t, label+"_dec_"+name, got, loadRef(t, m, label+"_dec_"+name))
 			}
 
-			img, err := g.Decode(z)
+			img, err := g.Decode(t.Context(), z)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -147,7 +147,7 @@ func TestGPUDecoderMatchesCPU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := g.Decode(z)
+	got, err := g.Decode(t.Context(), z)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestGPUDecoderNegativeControl(t *testing.T) {
 
 	z := loadRef(t, m, "s256_z_norm")
 	cfg.Denormalize(z)
-	got, err := bad.Decode(z)
+	got, err := bad.Decode(t.Context(), z)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +234,7 @@ func TestGPUDecodeTiming(t *testing.T) {
 			}
 			for run := 0; run < 2; run++ {
 				start := time.Now()
-				if _, err := g.Decode(z); err != nil {
+				if _, err := g.Decode(t.Context(), z); err != nil {
 					t.Fatal(err)
 				}
 				t.Logf("run %d: %v (%d dispatches, %d MB activations)",

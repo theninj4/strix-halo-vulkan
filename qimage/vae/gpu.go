@@ -1,6 +1,7 @@
 package vae
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
@@ -243,9 +244,31 @@ func (e *engine) destroy() {
 	e.abuf, e.wbuf = nil, nil
 }
 
-// run submits a prefix of a recorded graph.
+// run submits a prefix of a recorded graph, to completion.
 func (e *engine) run(ds []vk.MultiDispatch) error {
+	return e.runContext(context.Background(), ds)
+}
+
+// runContext is run with a cancellation point, and the batching this graph
+// already does for the driver's sake is what provides one.
+//
+// A submitted command buffer has no cancellation point inside it — the fence
+// is waited on or the device is left mid-graph — so the finest granularity
+// available is *between* submits. That is already every four dispatches
+// (dispatchesPerSubmit, a watchdog constraint rather than a choice), which
+// puts a 1024² decode's 117 dispatches at 30 batches of ~250 ms. So a client
+// that hangs up during a decode stops paying for it within a quarter of a
+// second instead of 7.5 s, and the device lock is released that much sooner
+// for whoever is queued behind them.
+//
+// The error wraps ctx.Err(), so `errors.Is(err, context.Canceled)` holds all
+// the way up to the handler, which is where it becomes "no answer" rather
+// than a 500.
+func (e *engine) runContext(ctx context.Context, ds []vk.MultiDispatch) error {
 	for i := 0; i < len(ds); i += dispatchesPerSubmit {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("qvae: cancelled after %d of %d dispatches: %w", i, len(ds), err)
+		}
 		j := min(i+dispatchesPerSubmit, len(ds))
 		if _, err := vk.DispatchMultiTimed(ds[i:j], 1, 1, true); err != nil {
 			return fmt.Errorf("qvae: dispatch %d-%d: %w", i, j-1, err)
@@ -776,12 +799,12 @@ func (g *GPUDecoder) record(z *zvae.Tensor, marks bool) (*builder, tensor, error
 
 // Decode decodes one denormalized latent, clamped to [-1, 1] like the
 // reference's. The whole graph is recorded once and submitted in batches.
-func (g *GPUDecoder) Decode(z *zvae.Tensor) (*zvae.Tensor, error) {
+func (g *GPUDecoder) Decode(ctx context.Context, z *zvae.Tensor) (*zvae.Tensor, error) {
 	b, out, err := g.record(z, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := g.run(b.out); err != nil {
+	if err := g.runContext(ctx, b.out); err != nil {
 		return nil, err
 	}
 	img := g.read(out)

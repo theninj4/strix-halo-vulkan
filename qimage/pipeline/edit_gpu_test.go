@@ -56,7 +56,7 @@ func TestServedEditOracle256(t *testing.T) {
 	// Teacher-forced: the oracle's own final latents through our decoder,
 	// which bounds everything downstream of the sampler.
 	final := loadEditMat(t, m, fmt.Sprintf("step%d_latents", m.Steps-1))
-	img, err := p.Decode(final.Clone(), side, side)
+	img, err := p.Decode(t.Context(), final.Clone(), side, side)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestServedEditOracle256(t *testing.T) {
 	src := nrgbaFrom(loadEditMat(t, m, "cond_rgba"), m.CondInputSize[1], m.CondInputSize[0])
 	noise := loadEditMat(t, m, "noise").Clone()
 	var latentRel float64
-	img, tm, err := p.Edit(EditRequest{
+	img, tm, err := p.Edit(t.Context(), EditRequest{
 		Prompt: m.Prompt, Images: []*image.NRGBA{src},
 		Width: m.Size, Height: m.Size, Steps: m.Steps, Latents: noise,
 		Progress: func(st Step) {
@@ -108,7 +108,7 @@ func TestServedEditOracle256(t *testing.T) {
 		for i := range blank.Pix {
 			blank.Pix[i] = 255
 		}
-		out, _, err := p.Edit(EditRequest{
+		out, _, err := p.Edit(t.Context(), EditRequest{
 			Prompt: m.Prompt, Images: []*image.NRGBA{blank},
 			Width: m.Size, Height: m.Size, Steps: m.Steps, Latents: loadEditMat(t, m, "noise").Clone(),
 		})
@@ -130,13 +130,13 @@ func TestServedEditOracle256(t *testing.T) {
 		}
 
 		// Past the staged budget: a refusal naming the number, not a resize.
-		if _, _, err := p.Edit(EditRequest{
+		if _, _, err := p.Edit(t.Context(), EditRequest{
 			Prompt: m.Prompt,
 			Images: []*image.NRGBA{src, src},
 		}); err == nil {
 			t.Error("two references were accepted by a pipeline staged for one")
 		}
-		if _, _, err := p.Edit(EditRequest{Prompt: m.Prompt}); err == nil {
+		if _, _, err := p.Edit(t.Context(), EditRequest{Prompt: m.Prompt}); err == nil {
 			t.Error("an edit with no reference image was accepted")
 		}
 	})
@@ -155,7 +155,7 @@ func TestServedEditWallClock(t *testing.T) {
 
 	// A reference the eye can judge an edit against: a generated image, so
 	// the test needs no fixture on disk.
-	base, _, err := p.Generate("a red fox sitting in fresh snow at dawn, photograph, shallow depth of field",
+	base, _, err := p.Generate(t.Context(), "a red fox sitting in fresh snow at dawn, photograph, shallow depth of field",
 		7, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestServedEditWallClock(t *testing.T) {
 	ref := ToImage(base, true)
 
 	for run := 0; run < 2; run++ {
-		img, tm, err := p.Edit(EditRequest{
+		img, tm, err := p.Edit(t.Context(), EditRequest{
 			Prompt: "make it a summer meadow at noon, keep the fox exactly as it is",
 			Images: []*image.NRGBA{ref}, Seed: 11,
 		})

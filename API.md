@@ -496,6 +496,19 @@ spreads them evenly over the steps that will actually run and never takes the
 last, whose denoised estimate *is* the final latent — a frame there would be
 the finished image sent twice, once through each decoder.
 
+**A client that hangs up stops the run**, streamed or not. A denoising step
+is a submit-and-fence and cannot be abandoned from outside, but between two
+steps nothing is in flight, and that is where the request's context is
+checked — likewise between the VAE's submit batches, and between reference
+images and inside the vision tower on an edit. So an abandoned 1024²/40
+request costs the step it was in (~2.2 s of 92) or a fraction of a second of
+the decode, rather than the whole picture. That is worth more than the
+arithmetic it saves: one lock serialises every model in the process, so an
+abandoned image used to hold the queued speech, transcription and embedding
+requests behind it for its full duration. Text completions have always
+cancelled this way, between tokens; images, speech and transcription checked
+only on the way in, and images now check throughout.
+
 ### Editing a picture
 
 `POST /v1/images/edits` answers when the server is started with **`-edits N`**,

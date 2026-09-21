@@ -1,6 +1,7 @@
 package vision
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"unsafe"
@@ -551,7 +552,7 @@ func (g *GPU) MaxRows() int { return g.maxRows }
 // modulation: both are functions of the patch grid rather than of any
 // weight, they cost microseconds, and reproducing a bilinear resample of a
 // learned table in a shader would be a second place for it to be wrong.
-func (g *GPU) Forward(pixels *qwen.Mat, gridH, gridW int) (*Output, error) {
+func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (*Output, error) {
 	merge := g.cfg.SpatialMergeSize * g.cfg.SpatialMergeSize
 	rows := gridH * gridW
 	if gridH <= 0 || gridW <= 0 || rows%merge != 0 {
@@ -690,7 +691,7 @@ func (g *GPU) Forward(pixels *qwen.Mat, gridH, gridW int) (*Output, error) {
 		return nil, err
 	}
 
-	if err := g.run(d); err != nil {
+	if err := g.run(ctx, d); err != nil {
 		return nil, err
 	}
 	out := &Output{
@@ -745,8 +746,17 @@ func (g *GPU) merger(
 // driver's reset watchdog.
 const dispatchesPerSubmit = 8
 
-func (g *GPU) run(ds []vk.MultiDispatch) error {
+// run submits the recorded graph in batches, with a cancellation point
+// between them — the same bargain qimage/vae's runContext documents. A
+// submitted command buffer cannot be abandoned, so between submits is the
+// finest granularity there is: the tower is 6.3 s of an edit at 1024², and
+// checking every eight dispatches bounds what an abandoned request pays for
+// it to a fraction of a second.
+func (g *GPU) run(ctx context.Context, ds []vk.MultiDispatch) error {
 	for i := 0; i < len(ds); i += dispatchesPerSubmit {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("vision: cancelled after %d of %d dispatches: %w", i, len(ds), err)
+		}
 		j := min(i+dispatchesPerSubmit, len(ds))
 		if _, err := vk.DispatchMultiTimed(ds[i:j], 1, 1, true); err != nil {
 			return fmt.Errorf("vision: dispatch %d-%d: %w", i, j-1, err)

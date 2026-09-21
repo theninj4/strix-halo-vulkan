@@ -17,6 +17,12 @@
 > pixels, at the same wall clock, and `-image-size 1184x1184` reaches
 > **1536x864**. Nothing about residency or the numerics moved.
 >
+> **2026-09-21 — Q11: a hung-up client now stops the run.** The context
+> reaches the sampler and the VAE's submit loop, so an abandoned request costs
+> **one step (21% of a short run) or 295 ms of a decode** instead of the whole
+> picture — and stops holding the process-wide device lock against every other
+> vertical. The run after a cancellation is bit-identical to one before it.
+>
 > **Q0–Q7, one day in** and
 > the model was *served*: `POST /v1/images/generations` answered from
 > Qwen-Image-2.1 at **1m38s for a 1024²/40-step image** (Q6's own
@@ -61,6 +67,7 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
 | Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports are next |
 | Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
+| Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **21% of a run** (one step) or **295 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
 the instrument named beside it. The day's method finding, three times over:
@@ -1125,6 +1132,41 @@ two-run numbers.
   1184x1184, which is the same number said correctly), and `-image-size` is
   still one flag naming both the default size and the ceiling — its *area* is
   now what the ceiling means.
+- **Q11 — a hung-up client stops the run. Done 2026-09-21.** The context now
+  reaches the sampler, the VAE's submit loop, the vision tower and the VAE
+  encoder, instead of being checked once on the way into `backend.Image`.
+  **The granularity argument was half right and that is what made it worth
+  fixing.** A denoising step *is* a submit-and-fence with nothing to abandon
+  inside it — that much was true and is why no kernel changed here — but
+  between two steps nothing is in flight, and the VAE already batches its
+  dispatches four at a time for the driver's watchdog, which is 30 more
+  boundaries in a 1024² decode. So the finest available granularity was never
+  "the whole image"; it was one step and one batch, and nobody had gone and
+  taken it.
+  **Measured** (`TestCancellation`, the gate, at 512²/8 where a full run is
+  6.27 s): cancelled after step 1, the run returns in **1.30 s — 21% of the
+  full run** — with `pipeline: cancelled at step 2 of 8: context canceled`;
+  cancelled an eighth of the way into a 1.71 s decode, it returns in
+  **295 ms, after 12 of 117 dispatches**. At the served 1024²/40 shape that
+  is ~2.2 s of a 92 s image instead of 92.
+  **The third assertion is the one that would have hurt**: a cancelled run
+  leaves a recorded graph half-submitted and the arenas holding an abandoned
+  image, so the gate runs a *fourth* generation after the two cancellations
+  and requires it **bit-identical** to the one before them. It is. Nothing
+  about the device state survives a cancel, because nothing is left in
+  flight to survive it — which is the same property that made the step
+  boundary safe in the first place.
+  **What this is really worth is the lock.** `backend.Device` is one mutex
+  for every vertical in the process (one queue, nothing in `vk` externally
+  synchronised), and it is held for the whole run — so an abandoned image
+  was holding every queued speech, transcription and embedding request
+  behind it for its full duration, not merely wasting its own GPU time.
+  Text completions have always cancelled between tokens; **speech and
+  transcription still check only on the way in**, and are the same shape of
+  fix if an utterance ever gets long enough to care.
+  One thing came free with it: `cmd/qimage` takes its context from
+  `signal.NotifyContext`, so Ctrl-C now unwinds a run through the same path a
+  hung-up client takes rather than killing the process mid-submit.
 
 ## Decisions taken now (so future sessions don't relitigate)
 

@@ -17,6 +17,7 @@ package pipeline
 // has one geometry and not two.
 
 import (
+	"context"
 	"fmt"
 	"image"
 	"math"
@@ -155,7 +156,7 @@ var ErrNoEdits = fmt.Errorf("this pipeline was not staged for editing")
 // step runs. It is a *conditional* generation: the references are rows of the
 // same sequence, modulated from t = 0 and therefore computed once, and the
 // target starts from pure noise like any other.
-func (p *Pipeline) Edit(req EditRequest) (*zvae.Tensor, *Timings, error) {
+func (p *Pipeline) Edit(ctx context.Context, req EditRequest) (*zvae.Tensor, *Timings, error) {
 	if p.refs == 0 {
 		return nil, nil, ErrNoEdits
 	}
@@ -186,8 +187,15 @@ func (p *Pipeline) Edit(req EditRequest) (*zvae.Tensor, *Timings, error) {
 	grids := make([]textenc.Grid, len(req.Images))
 	conds := make([]*qwen.Mat, len(req.Images))
 	shapes := make([][3]int, len(req.Images))
-	ctx := make([]textenc.Condition, len(req.Images))
+	visCtx := make([]textenc.Condition, len(req.Images))
 	for i, src := range req.Images {
+		// Per reference rather than only inside the two towers: a resize is
+		// host work (Lanczos over up to ten pictures) and has no dispatch
+		// boundary of its own to be caught at.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, fmt.Errorf("pipeline: cancelled before reference %d of %d: %w",
+				i, len(req.Images), err)
+		}
 		b := src.Bounds()
 		if b.Dx() <= 0 || b.Dy() <= 0 {
 			return nil, nil, fmt.Errorf("pipeline: reference %d is empty", i)
@@ -206,17 +214,17 @@ func (p *Pipeline) Edit(req EditRequest) (*zvae.Tensor, *Timings, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("pipeline: reference %d: %w", i, err)
 		}
-		out, err := p.tower.Forward(pixels, gridH, gridW)
+		out, err := p.tower.Forward(ctx, pixels, gridH, gridW)
 		if err != nil {
 			return nil, nil, fmt.Errorf("pipeline: reference %d through the vision tower: %w", i, err)
 		}
-		ctx[i] = textenc.Condition{Merged: out.Merged, Deepstack: out.Deepstack}
+		visCtx[i] = textenc.Condition{Merged: out.Merged, Deepstack: out.Deepstack}
 		grids[i] = textenc.Grid{T: 1, H: gridH, W: gridW}
 
 		// The VAE copy keeps all four channels: a port that flattens once and
 		// uses it twice is wrong only on transparent references, which is
 		// exactly what this model exists to serve.
-		z, err := p.venc.Encode(tensorNRGBA(resized))
+		z, err := p.venc.Encode(ctx, tensorNRGBA(resized))
 		if err != nil {
 			return nil, nil, fmt.Errorf("pipeline: reference %d through the VAE encoder: %w", i, err)
 		}
@@ -258,7 +266,7 @@ func (p *Pipeline) Edit(req EditRequest) (*zvae.Tensor, *Timings, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	embeds, padMask, err := prompt.EncodeGPU(p.enc, rope, ctx, p.drop, nil)
+	embeds, padMask, err := prompt.EncodeGPU(p.enc, rope, visCtx, p.drop, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -285,12 +293,12 @@ func (p *Pipeline) Edit(req EditRequest) (*zvae.Tensor, *Timings, error) {
 	if err := p.dt.BeginImage(embeds, lay, cond); err != nil {
 		return nil, nil, err
 	}
-	if err := p.denoise(latents, g, sched, steps, tm, req.Progress); err != nil {
+	if err := p.denoise(ctx, latents, g, sched, steps, tm, req.Progress); err != nil {
 		return nil, nil, err
 	}
 
 	decodeStart := time.Now()
-	img, err := p.Decode(latents, g.latentH, g.latentW)
+	img, err := p.Decode(ctx, latents, g.latentH, g.latentW)
 	if err != nil {
 		return nil, nil, err
 	}

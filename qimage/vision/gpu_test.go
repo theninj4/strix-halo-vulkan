@@ -108,7 +108,7 @@ func TestGPUTower(t *testing.T) {
 	t.Logf("%d-patch budget, %dx%d grid: %d MB weights, %d MB activations",
 		budget, gridH, gridW, g.WeightBytes()>>20, g.ActivationBytes()>>20)
 
-	got, err := g.Forward(pixels, gridH, gridW)
+	got, err := g.Forward(t.Context(), pixels, gridH, gridW)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestGPUTower(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got2, err := g.Forward(px2, gh2, gw2)
+		got2, err := g.Forward(t.Context(), px2, gh2, gw2)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -154,7 +154,7 @@ func TestGPUTower(t *testing.T) {
 		compareAt(t, "card2_merged_vs_dump", got2.Merged, loadRef(t, m, "vis2_merged"), fp16WideTol)
 		// And the first grid again afterwards, which is what catches a run
 		// leaving state behind: the same numbers as above or nothing.
-		again, err := g.Forward(pixels, gridH, gridW)
+		again, err := g.Forward(t.Context(), pixels, gridH, gridW)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -162,7 +162,7 @@ func TestGPUTower(t *testing.T) {
 	}
 
 	// The budget is a refusal, not a silent resize.
-	if _, err := g.Forward(qwen.NewMat(budget+4, cfg.PatchElems()), 2, (budget+4)/2); err == nil {
+	if _, err := g.Forward(t.Context(), qwen.NewMat(budget+4, cfg.PatchElems()), 2, (budget+4)/2); err == nil {
 		t.Error("a grid past the staged budget was accepted")
 	}
 }
@@ -206,7 +206,7 @@ func TestGPUTowerTiming(t *testing.T) {
 		side, side, g.WeightBytes()>>20, g.ActivationBytes()>>20)
 	for run := 0; run < 2; run++ {
 		start := time.Now()
-		if _, err := g.Forward(pixels, side, side); err != nil {
+		if _, err := g.Forward(t.Context(), pixels, side, side); err != nil {
 			t.Fatal(err)
 		}
 		t.Logf("1024x1024 condition: %v", time.Since(start).Round(time.Millisecond))
