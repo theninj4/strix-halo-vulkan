@@ -99,6 +99,18 @@ cache is refused with both numbers rather than truncated at one end; a prompt
 past the batch is prefilled in chunks of it, which is the same computation by
 L7b's gate.
 
+**`-llm-batch` is 4096 and it is a trade, not a free win** (P12). Measured
+through this server on ~4.1-4.5k-token prompts, two interleaved passes
+agreeing to 0.5%: 4096 prefills at **1146 tok/s against 2048's 1021**
+(1.12x, and **0.46 s off the time to first token**) and decodes at **25.8
+against 28.0** — the wider arenas cost **8% of decode**, because a decode
+step streams 4.1 GB of weights a token and the extra 1.5 GB of arenas sits
+in the same memory. The two cross at about **150 generated tokens**: below
+that 4096 is the faster answer, above it 2048 is, and at the 1024 tokens
+`-llm-max-tokens` defaults to, 2048 finishes 6.6% sooner. **Say
+`-llm-batch 2048` if the deployment really generates that much**; keep 4096
+for interactive turns.
+
 **The device lock is taken per forward pass and not per request.** A
 completion is seconds long and the speech models are milliseconds, so holding
 the queue for a whole generation would make a transcription wait behind it for
@@ -220,7 +232,7 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm             false        load qwen3.8-flash-next
     -llm-model       models/Qwen3.8-Flash-Next-GGUF/…-00001-of-00004.gguf
     -llm-ctx         4096         cache cells: the longest conversation, prompt plus completion
-    -llm-batch       512          tokens the prefill arenas hold
+    -llm-batch       4096         tokens the prefill arenas hold (P12; 2048 trades TTFT for decode)
     -llm-max-tokens  1024         what a request that names no max_tokens gets
     -llm-layers      0            stage the first N layers only; a fast start, not an answer
 

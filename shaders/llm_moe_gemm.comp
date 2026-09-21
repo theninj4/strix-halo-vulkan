@@ -197,6 +197,23 @@ shared float kIQ4[16];
 
 uint qbyte(uint b) { return (qbank[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
 
+// **A K-quant block's header and its scales are one sixteen-byte load** (P12).
+//
+// Q4_K and Q5_K open every block with `d`, `dmin` and the twelve packed
+// 6-bit scale/min bytes — sixteen bytes, read as four separate dwords. That
+// is four load instructions a block a row where one `uvec4` does, and this
+// kernel is bound by how many loads its unpack issues (L5b-7, P11-3): at BK
+// 32 a lane unpacks two rows a K-step, so it was eight scalar loads a K-step
+// against the four vector ones the nibbles take.
+//
+// It is legal because **every block of these two formats is sixteen-byte
+// aligned**, and that is three facts rather than an assumption: each of the
+// six bank regions starts at `roundUpInt(nbytes, 16)` (`MoEGPU.reserve`); a
+// Q4_K row is `k/256 * 144` bytes and a Q5_K row `k/256 * 176`, both
+// multiples of 16 (`moeRowBytes`); and the blocks inside a row are 144 and
+// 176 apart. `MoEGPU.build` checks the first of those rather than trusting
+// it, for the same reason P11 checked the gather's.
+
 // The block header, in one load. `d` and its companion are the first four
 // bytes of every one of these formats and the block base is four-aligned, so
 // a pair of halves comes out of a single word rather than four byte reads.
@@ -242,20 +259,20 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
     uint g = within >> 6;                                                                       \
     uint sub = (within >> 5) & 1u;                                                              \
     uint blk = rb + (k0c >> 8) * 144u;                                                          \
-    uint hw = blk >> 2;                                                                         \
-    vec2 dd = unpackHalf2x16(qbank[hw]);                                                        \
+    uvec4 hdr = qbank4[blk >> 4];                                                               \
+    vec2 dd = unpackHalf2x16(hdr.x);                                                            \
     uint sc, mn;                                                                                \
-    scaleMinK4(2u * g + sub, uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]), sc, mn);    \
+    scaleMinK4(2u * g + sub, hdr.yzw, sc, mn);                                                  \
     float ds = dd.x * float(sc);                                                                \
     float dm = dd.y * float(mn);                                                                \
+    uint sh = sub * 4u;                                                                         \
     uint qv = (blk + 16u + g * 32u) >> 4;                                                       \
     uvec4 lo4 = qbank4[qv];                                                                     \
     uvec4 hi4 = qbank4[qv + 1u];                                                                \
     [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                                 \
         uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
         [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
-            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
-            uint nib = (sub == 0u) ? (by & 0xFu) : (by >> 4);                                   \
+            uint nib = (w >> (8u * b + sh)) & 0xFu;                                             \
             DST[dst + c + t * 4u + b] = float16_t(ds * float(nib) - dm);                        \
         }                                                                                       \
     }                                                                                           \
@@ -268,12 +285,13 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
     uint g = within >> 6;                                                                       \
     uint sub = (within >> 5) & 1u;                                                              \
     uint blk = rb + (k0c >> 8) * 176u;                                                          \
-    uint hw = blk >> 2;                                                                         \
-    vec2 dd = unpackHalf2x16(qbank[hw]);                                                        \
+    uvec4 hdr = qbank4[blk >> 4];                                                               \
+    vec2 dd = unpackHalf2x16(hdr.x);                                                            \
     uint sc, mn;                                                                                \
-    scaleMinK4(2u * g + sub, uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]), sc, mn);    \
+    scaleMinK4(2u * g + sub, hdr.yzw, sc, mn);                                                  \
     float ds = dd.x * float(sc);                                                                \
     float dm = dd.y * float(mn);                                                                \
+    uint sh = sub * 4u;                                                                         \
     uint hmask = (sub == 0u ? 1u : 2u) << (2u * g);                                             \
     uint hv = (blk + 16u) >> 4;                                                                 \
     uvec4 h0 = qbank4[hv];                                                                      \
@@ -285,8 +303,7 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
         uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
         uint h = (t < 4u) ? h0[t] : h1[t - 4u];                                                 \
         [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
-            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
-            uint nib = (sub == 0u) ? (by & 0xFu) : (by >> 4);                                   \
+            uint nib = (w >> (8u * b + sh)) & 0xFu;                                             \
             if (((h >> (8u * b)) & hmask) != 0u) {                                              \
                 nib += 16u;                                                                     \
             }                                                                                   \

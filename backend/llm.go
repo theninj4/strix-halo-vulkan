@@ -48,8 +48,34 @@ type LLMOptions struct {
 	//	2048   2.28 GB             1093.3   1.64x
 	//	4096   3.78 GB             1237.0   1.85x
 	//
-	// So the default is **2048**: 1.12 GB buys 64%, and the 1.49 GB after it
-	// buys 13% more. A deployment with the memory to spare should say 4096.
+	// The default is **4096** (P12). Through the server, four distinct
+	// ~4.1-4.5k-token prompts at ctx 8192, two passes of each arm,
+	// interleaved, agreeing to 0.5%:
+	//
+	//	2048   1020.9 tok/s prefill    28.04 tok/s decode
+	//	4096   1146.3          1.12x   25.81          0.92x
+	//
+	// **And the second column is not free**, which is the thing P11 did not
+	// measure and this comment exists to record: the wider arenas cost
+	// **8% of decode**, reproducibly and with no overlap between the arms
+	// across sixteen samples. Decode streams 4.1 GB of weights a token and
+	// the extra 1.5 GB of resident arenas sits in the same memory.
+	//
+	// So the two rates move in opposite directions and the trade has a
+	// break-even. On a 4249-token prompt, 4096 saves **0.46 s of TTFT**
+	// (4.33 → 3.87) and costs **3.1 ms a generated token**:
+	//
+	//	generated     2048      4096
+	//	8           4.60 s    4.17 s     4096 wins
+	//	150        ~9.7 s    ~9.7 s     break-even
+	//	256        13.48 s   13.81 s     2048 wins
+	//	1024       40.9 s    43.5 s     2048 wins by 6.6%
+	//
+	// **4096 is the right default for an interactive server and the wrong
+	// one for a batch summariser**, and `MaxTokens` above defaults to 1024 —
+	// so a deployment whose requests really do generate that much should say
+	// `-llm-batch 2048` and take the TTFT back. Arenas, at ctx 4096:
+	// 2.28 GB at 2048 against 3.78 at 4096.
 	Batch int
 	// MaxTokens is what a request that names no budget gets. A request that
 	// names one still cannot run past the context.
@@ -65,7 +91,7 @@ type LLMOptions struct {
 const (
 	defaultLLMModelID  = "qwen3.8-flash-next"
 	defaultLLMContext  = 4096
-	defaultLLMBatch    = 2048
+	defaultLLMBatch    = 4096
 	defaultLLMMaxToken = 1024
 )
 

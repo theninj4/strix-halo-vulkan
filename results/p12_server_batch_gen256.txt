@@ -1,0 +1,13 @@
+### batch=2048 tag=q1 23:21:10
+23:22:28 [r2] llm qwen3.8-flash-next: prompt 4249 tokens in 4.325s (982.4 tok/s), ttft 4.333s, generated 256 tokens in 9.15s (27.98 tok/s), 13.48s total, length
+23:22:41 [r3] llm qwen3.8-flash-next: prompt 4141 tokens in 4.027s (1028.4 tok/s), ttft 4.034s, generated 256 tokens in 9.133s (28.03 tok/s), 13.165s total, length
+### batch=4096 tag=q1 23:22:47
+23:24:05 [r2] llm qwen3.8-flash-next: prompt 4249 tokens in 3.87s (1098.0 tok/s), ttft 3.877s, generated 256 tokens in 9.964s (25.69 tok/s), 13.839s total, length
+23:24:19 [r3] llm qwen3.8-flash-next: prompt 4141 tokens in 3.564s (1161.8 tok/s), ttft 3.572s, generated 256 tokens in 9.937s (25.76 tok/s), 13.507s total, length
+### batch=2048 tag=q2 23:24:25
+23:25:42 [r2] llm qwen3.8-flash-next: prompt 4249 tokens in 4.337s (979.7 tok/s), ttft 4.345s, generated 256 tokens in 9.128s (28.04 tok/s), 13.471s total, length
+23:25:56 [r3] llm qwen3.8-flash-next: prompt 4141 tokens in 4.019s (1030.3 tok/s), ttft 4.026s, generated 256 tokens in 9.111s (28.10 tok/s), 13.135s total, length
+### batch=4096 tag=q2 23:26:01
+23:27:22 [r2] llm qwen3.8-flash-next: prompt 4249 tokens in 3.868s (1098.5 tok/s), ttft 3.875s, generated 256 tokens in 9.913s (25.82 tok/s), 13.787s total, length
+23:27:35 [r3] llm qwen3.8-flash-next: prompt 4141 tokens in 3.566s (1161.1 tok/s), ttft 3.575s, generated 256 tokens in 9.865s (25.95 tok/s), 13.437s total, length
+### DONE 23:27:41

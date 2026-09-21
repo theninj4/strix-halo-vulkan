@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1372.2 tok/s at 8192 rows, 3.51x**, still climbing where llama.cpp plateaus, and **~1053 tok/s through the server** on a 4128-token prompt against 667 before P11; **27.69 tok/s at 64k of context, 0.79x of its own depth-zero rate**, and 64k **prefills** at **654 tok/s** against 440 | the attention row max on 16 of 64 lanes; `attn.select`; the MoE unpack prefetch; batching (P6); 128k |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus, and **~1053 tok/s through the server** on a 4128-token prompt against 667 before P11; **27.69 tok/s at 64k of context, 0.79x of its own depth-zero rate**, and 64k **prefills** at **668 tok/s** against 440 | the ubatch (1.16x, a memory budget); `attn.select`'s five passes; `hc.cn` at 134 GB/s with no hypothesis left; batching (P6); 128k |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -87,7 +87,7 @@ through P5 is closed. The shipped configuration is **D19 + D20 + D21**
 transcoded, `ffn_down_exps` at IQ4_NL): 4.132 GB a token against a 58.6
 tok/s ceiling, perplexity 4.0992 (+1.74% of our own 4.0289, which is itself
 −0.13% against llama.cpp's at identical weights). Decode 36.19 tok/s,
-prefill **1191.8 tok/s at ubatch 2048 and 1372.2 at 8192** (P11). Served with
+prefill **1207.7 tok/s at ubatch 2048 and 1403.9 at 8192** (P11, P12). Served with
 prefix reuse; a second turn extends the graph's state rather than
 re-prefilling.
 
@@ -138,26 +138,64 @@ from what the draft predicts.
   ring watchdog**). Two kernels now say the same thing: **a branch inside an
   unrolled cooperative-matrix loop costs more than the work it removes**; change
   the loop's granularity, not what happens inside it.
-- **The attention kernel's row max runs on sixteen of sixty-four lanes**, and
-  only when the selection is on — which is exactly at depth. A max is exact
-  under any reassociation, so spreading it over the whole wave is
-  bit-identical, and it is the first thing to try against the **1.6x** gap
-  between `attn.attn`'s 9.8 TFLOP/s of useful work at 64k and its 16.0 at
-  depth zero.
-- **`attn.select` is 7.4% of a prefill token at 64 000 cells**, four radix
-  passes and an emit each streaming the row out of DRAM. Its keys are *block*
-  scores repeated `ratio` times, so selecting over `nKV/ratio` entries and
-  expanding once is ~2.5x the traffic back — with the causal boundary as the
-  risk, since a partly-masked block is where the reference's tie fill is a
-  block split.
-- **`hc.cn` is still at 134 GB/s** after P11-6, where a copy gets 236. What is
-  left is the norm's tail: an eight-barrier 256-way tree where a subgroup
-  reduction is one barrier — not bit-exact, and `llm_hc_norm.comp` would have
-  to move with it.
-- **The MoE unpack prefetch** — issuing a K-step's bank loads before the unpack
-  that consumes them, L8d's third lead. After P11 it is the only idea left that
-  attacks the term that actually dominates `moe.up`, which is the *tile's* cost
-  rather than the tile count.
+- ~~**The attention row max, `attn.select`, `hc.cn`, the MoE unpack.**~~
+  **P12, closed 2026-09-21** ([write-up](research/p12-prefill-round-two.md)).
+  Two changes and four measured refusals; prefill **1.012-1.025x on both
+  axes** (1191.2 → **1207.7** at 2048 rows, 1370.5 → **1403.9** at 8192 —
+  **3.59x** llama.cpp — and 651.3 → **667.7** at 64 000 cells), both passes of
+  each arm agreeing to 1370.5/1370.5 and 651.3/651.2. **The row max did run on
+  sixteen lanes of sixty-four** and now runs on all of them: the whole key
+  block staged at once and RCL = WAVE/BM lanes a row, folded by a clustered
+  subgroup max, **bit-identical** because a max has no rounding and the cells
+  scanned are the same — 1.16x on the kernel at 512 tokens, +1.6-1.8% of a
+  prefill token from 8000 cells on. And **a K-quant block's header is one
+  sixteen-byte load, not four dwords**, which is L5b-7's rule for the third
+  time: `moe.up` 12 118 → 11 755 µs at 2048 tokens with `moe.down` flat as the
+  control. **The four refusals are the valuable half.** Both of `hc.cn`'s
+  named suspects cost **nothing** — deleting the 256-way tree outright is
+  5331.5 µs against 5325.8, and dropping the `gamma` read is 5332.9 — so its
+  57% of copy bandwidth is unexplained *and* out of hypotheses, and the
+  non-bit-exact norm rewrite would have bought zero. The **block skip hoisted
+  out of the loop is 1.00x at every depth**, and the reason is the exact
+  converse of P8: a prefill dispatches 3072 single-wave workgroups where a
+  decode step dispatches 24, so *latency that matters at decode does not
+  matter at prefill, because prefill has occupancy* — it is still live for
+  decode, where it was never built. The selection mask loop is **3.5-8%**, not
+  the rest of the gap. And the MoE's **per-element affine is a floor**: the
+  whole scale path is 1.21x at 2048 tokens, P12-2 takes its loads and integer
+  ops, and the int→float convert, FMA and f16 convert that remain have no
+  bit-exact cheaper form.
+- ~~**The ubatch is the largest prefill number that is left.**~~ **Decided
+  2026-09-21: `-llm-batch` is now 4096** (P12-7), and measuring it *through the
+  server* found the half the graph ladder cannot see. Four distinct
+  4.1-4.5k-token prompts, two interleaved passes agreeing to 0.5%: prefill
+  **1020.9 → 1146.3 tok/s (1.12x)** and **0.46 s off the time to first
+  token** — but decode **28.04 → 25.81 (0.92x)**. **The wider arenas cost 8%
+  of decode**, across sixteen non-overlapping samples at both 8 and 256
+  generated tokens, because a decode step streams 4.1 GB of weights a token
+  and the extra 1.5 GB of arenas sits in the same memory. The two rates cross
+  at **~150 generated tokens**: 4096 is 1.10x at 8 tokens and 2048 is 1.07x at
+  the 1024 `-llm-max-tokens` defaults to. So 4096 ships as the interactive
+  default and `API.md` says outright that a batch summariser should set 2048.
+  **The lesson is P11-1's, a second time: a ubatch measured on the prefill
+  ladder alone is a hypothesis about prefill.**
+- **Why 1.5 GB of arenas a decode step never reads costs it 8% is
+  unexplained**, and it is now the interesting question — if it is layout
+  rather than volume it may be recoverable, which would make 4096 free and
+  8192 worth having (the graph ladder is still climbing at 1.16x from 2048 to
+  8192). The probe that separates *allocated* from *used* is to stage the wide
+  arenas and prefill in narrow chunks anyway. P1c saw this shape once already.
+- **`attn.select` at 64 000 cells** is 7.5% of a prefill token and untouched:
+  it streams the row out of DRAM **five times** — four radix passes and an
+  emit, 1.28 MB a token a layer — at ~133 GB/s. Two routes now: P11's (select
+  over `nKV/ratio` block scores and expand once, ~2.5x the traffic back, with
+  the causal boundary's tie fill as the risk) and a **candidate pass**, which
+  collects the keys matching the winning bucket during pass 2 so passes 3 and
+  4 run out of LDS — five reads become three and no tie semantics move.
+- **`hc.cn` is still at 134 GB/s** where a copy gets 236, and P12-4 spent both
+  of the standing explanations. The next probe is the access pattern itself:
+  it runs four read-modify-write streams plus an fp16 write a token, where a
+  copy runs two.
 - **P6 — batching.** Blocked on the product question: will the API serve
   more than one stream? Each sequence owns 113 MB of DeltaNet state plus
   rings and KV. P5b already built the first stage (R-row decode GEMVs,

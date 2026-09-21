@@ -1032,6 +1032,23 @@ func (g *MoEGPU) build() error {
 		return fmt.Errorf("llm: the gathered operand loads %d halves at a time; lda %d and xn at %d are not whole loads",
 			moeAVec, g.lda, g.hXn)
 	}
+	// **And a K-quant block's header is one sixteen-byte load** (P12): the
+	// unpack reads `d`, `dmin` and the twelve scale bytes as a single `uvec4`
+	// rather than four dwords, which needs every Q4_K and Q5_K block to be
+	// sixteen-byte aligned. A row's length and a block's are multiples of 16
+	// by `moeRowBytes`, so what is left to check is where each region starts.
+	for i, w := range g.layers {
+		for _, r := range [...]struct {
+			off uint32
+			f   moeFmt
+		}{{w.gate, w.gateFmt}, {w.up, w.upFmt}, {w.down, w.downFmt},
+			{w.shGate, w.shGateFmt}, {w.shUp, w.shUpFmt}, {w.shDown, w.shDownFmt}} {
+			if (r.f == fmtQ4K || r.f == fmtQ5K) && r.off%16 != 0 {
+				return fmt.Errorf("llm: layer %d has a %s bank at byte %d, and the unpack reads its block header as a uvec4",
+					i, r.f, r.off)
+			}
+		}
+	}
 	banks := g.bankSet()
 	bufs := append([]*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}, banks...)
 	bufs = append(bufs, banks...)
