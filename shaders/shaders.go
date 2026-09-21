@@ -2614,10 +2614,21 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_pack.spv llm_attn_pack.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_idx.spv llm_attn_idx.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_score.spv llm_attn_score.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_expand.spv llm_attn_expand.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_select.spv llm_attn_select.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -o llm_attn_select_w1024.spv llm_attn_select.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
+
+// P8's split-key builds of the same file, and the combine that closes them.
+// One a rung, because which rung runs is a knob and a split build has to
+// exist for whichever one the block was given.
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_combine.spv llm_attn_combine.comp
 
 //go:embed llm_attn_pack.spv
 var LLMAttnPack []byte
@@ -2628,6 +2639,14 @@ var LLMAttnIdx []byte
 //go:embed llm_attn_score.spv
 var LLMAttnScore []byte
 
+// LLMAttnExpand is the second half of the indexer's score (P9): the pooled
+// block scores expanded to one value a cache cell, with the bias and the
+// causal mask. It is a dispatch of its own so that the scoring in front of it
+// is not pinned to one workgroup by the barrier it used to need.
+//
+//go:embed llm_attn_expand.spv
+var LLMAttnExpand []byte
+
 // LLMAttnSelect is L4b's radix select: llama.cpp's topk_radix_select.comp
 // ported pass for pass, writing a per-cell bitmask instead of an index list
 // and so deleting the GET_ROWS the reference spends turning one into the
@@ -2637,6 +2656,15 @@ var LLMAttnScore []byte
 //go:embed llm_attn_select.spv
 var LLMAttnSelect []byte
 
+// LLMAttnSelectW1024 is the same kernel at sixteen waves instead of four
+// (P10). The selection is one workgroup a token and cannot be anything else —
+// four radix passes over a row are a reduction, not a stripe — so the only
+// parallelism left to give it is waves on the one compute unit it lands on,
+// which is what hides the five streams of the row it makes at depth.
+//
+//go:embed llm_attn_select_w1024.spv
+var LLMAttnSelectW1024 []byte
+
 //go:embed llm_attn_qt1_kt2.spv
 var LLMAttnQT1KT2 []byte
 
@@ -2645,6 +2673,22 @@ var LLMAttnQT1KT4 []byte
 
 //go:embed llm_attn_qt2_kt4.spv
 var LLMAttnQT2KT4 []byte
+
+//go:embed llm_attn_qt1_kt2_split.spv
+var LLMAttnQT1KT2Split []byte
+
+//go:embed llm_attn_qt1_kt4_split.spv
+var LLMAttnQT1KT4Split []byte
+
+//go:embed llm_attn_qt2_kt4_split.spv
+var LLMAttnQT2KT4Split []byte
+
+// LLMAttnCombine assembles the split builds' slices: P8's second half, and
+// the only place the decode attention's softmax divide and output gate happen
+// when the key axis was cut.
+//
+//go:embed llm_attn_combine.spv
+var LLMAttnCombine []byte
 
 // The gated DeltaNet (LLM.md L3b): 36 of the 48 layers, and the only kernel
 // in this model with a loop-carried dependency as long as the prompt.

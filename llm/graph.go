@@ -358,7 +358,10 @@ func (g *Graph) flush() error {
 // instruction in an order the extension does not define, a GEMV lane sums them
 // serially, and a split-K reduce adds the slabs afterwards. So the pin now
 // covers four blocks rather than one — **five with L8e**, which puts the
-// full-attention layer's two projections on the same kernel.
+// full-attention layer's two projections on the same kernel, and **six with
+// P8**, which splits the attention itself the same way and for the same
+// reason: a decode step's key axis is cut across workgroups and folded back
+// together, where a prefill walks it once.
 func (g *Graph) PinSchedule(on bool) error {
 	// The pin changes which pipelines a one-token pass plans, so a captured
 	// decode step no longer matches what the graph would record; the next
@@ -372,6 +375,19 @@ func (g *Graph) PinSchedule(on bool) error {
 	}
 	if g.attn != nil {
 		g.attn.PinGemv(on)
+		// And P8's split decode attention, which is the sixth kernel this
+		// pin covers and reassociates for the plainest reason of all: it
+		// cuts the key axis across workgroups and folds each slice's online
+		// softmax together afterwards, where the unsplit kernel folds them
+		// as it walks. Measured at the layer's own output, the two differ by
+		// 1.3e-04 rms against the 9.2e-04 that layer already sits from
+		// llama.cpp — but "differ" is what matters to an equality, so it
+		// goes off with the rest of them.
+		if on {
+			g.attn.SetSplits(1)
+		} else {
+			g.attn.SetSplits(0)
+		}
 	}
 	if !on {
 		g.hc.AutoPlan()
@@ -445,6 +461,26 @@ type GraphStats struct {
 // Blocks is the time inside the five blocks and the head.
 func (s GraphStats) Blocks() time.Duration {
 	return s.HC + s.PLE + s.DeltaNet + s.Attn + s.MoE + s.Head
+}
+
+// Clone is a snapshot that the next pass cannot change.
+//
+// Every other field is a scalar and copies with the struct, but `Kinds` is a
+// map: `st := g.Stats` shares it, so dispatches recorded *after* the snapshot
+// still land in it while the scalars beside them stay put. A caller that keeps
+// several snapshots — the depth sweep keeps one a depth a phase — then reads
+// per-label times that include work belonging to a later measurement, and the
+// scalar columns next to them disagree. Take this instead of the struct.
+func (s GraphStats) Clone() GraphStats {
+	if s.Kinds == nil {
+		return s
+	}
+	k := make(map[string]DispatchStat, len(s.Kinds))
+	for name, v := range s.Kinds {
+		k[name] = v
+	}
+	s.Kinds = k
+	return s
 }
 
 // StagedBlock is one row of the staging plan.

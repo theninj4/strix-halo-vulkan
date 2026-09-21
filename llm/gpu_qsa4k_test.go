@@ -68,8 +68,12 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%d dispatches: %v", len(d), kinds)
-	if len(d) != 7 || kinds[4] != "select" {
-		t.Errorf("the graph is %v; the selection should be the fifth of seven dispatches", kinds)
+	// Eight since P9 split the indexer's score from its expansion to cells,
+	// which put `expand` between them; the selection reads what `expand`
+	// writes and so has to stay behind it.
+	if len(d) != 8 || kinds[5] != "select" || kinds[4] != "expand" {
+		t.Errorf("the graph is %v; the selection should be the sixth of eight dispatches, "+
+			"behind the expansion it reads", kinds)
 	}
 }
 

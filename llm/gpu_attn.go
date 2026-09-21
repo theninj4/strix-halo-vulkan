@@ -49,6 +49,8 @@ package llm
 import (
 	"fmt"
 	"math"
+	"os"
+	"strconv"
 	"time"
 	"unsafe"
 
@@ -87,13 +89,57 @@ type attnVariant struct {
 	spirv      []byte
 	qt, ktil   int
 	rows, keys int
+	// split is the same rung built with -DSPLITK: the key axis cut across
+	// workgroups, writing partials for llm_attn_combine.comp instead of the
+	// gated context (P8). One a rung, because the rung is a knob.
+	split []byte
 }
 
 var attnVariants = []attnVariant{
-	{AttnQT1KT2, shaders.LLMAttnQT1KT2, 1, 2, 16, 32},
-	{AttnQT1KT4, shaders.LLMAttnQT1KT4, 1, 4, 16, 64},
-	{AttnQT2KT4, shaders.LLMAttnQT2KT4, 2, 4, 32, 64},
+	{AttnQT1KT2, shaders.LLMAttnQT1KT2, 1, 2, 16, 32, shaders.LLMAttnQT1KT2Split},
+	{AttnQT1KT4, shaders.LLMAttnQT1KT4, 1, 4, 16, 64, shaders.LLMAttnQT1KT4Split},
+	{AttnQT2KT4, shaders.LLMAttnQT2KT4, 2, 4, 32, 64, shaders.LLMAttnQT2KT4Split},
 }
+
+// splitPipe names the split build of a rung in the pipeline map.
+func splitPipe(k AttnKernel) string { return string(k) + ".split" }
+
+// The split decode attention's constants (P8).
+//
+// `attnDefaultSplits` is set by the grid the device wants: 24 heads times 16
+// slices is 384 single-wave workgroups over 40 compute units, which is where
+// a CU first holds enough waves to hide a `coopMatLoad`'s latency — the whole
+// finding P8 rests on is that at 24 workgroups it holds one and cannot.
+// `attnSplitBlocks` stops a shallow cache from paying a combine dispatch to
+// parallelise four blocks.
+//
+// **16 is a plateau and it was measured, not guessed.** At 65 536 cells on
+// the 4-layer probe, `attn.attn.split` runs 0.318 / 0.288 / 0.291 / 0.283 ms
+// a token at 8 / 16 / 32 / 64 slices while the combine behind it climbs
+// 0.004 / 0.006 / 0.010 / 0.018 — so past 16 the walk stops getting shorter
+// and only the fold gets longer. The arena bound is left at twice the
+// default so the sweep can be repeated without restaging; it is 25 MB.
+const (
+	// attnMaxSplits is the *arena* bound — what the partial buffer is sized
+	// for and what any pin or override is clamped to. attnDefaultSplits is
+	// what a run actually takes, and the two are separate so the count can be
+	// swept with LLM_ATTN_SPLITS without restaging.
+	attnMaxSplits     = 32
+	attnDefaultSplits = 16
+	attnSplitBlocks   = 4
+	// attnCellSplits is how many ways the indexer's score and its expansion
+	// to cells are striped (P9). Unlike the attention's slice count this one
+	// is free of every constraint — both kernels write one value per output
+	// element and reassociate nothing, so the grid is not observable in the
+	// answer — and it is a constant only so that a decode step's command
+	// buffer stays byte-identical for P1c's prerecording.
+	attnCellSplits = 16
+	// attnSplitMaxRows is the widest batch the split path will take, and so
+	// the row count the partial arena is sized for. It is the widest rung's
+	// query tile: past that the query axis alone already fills the grid and
+	// the split buys nothing.
+	attnSplitMaxRows = 32
+)
 
 // AttnKernels lists the rungs, narrowest first.
 func AttnKernels() []AttnKernel { return []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT2KT4} }
@@ -314,6 +360,13 @@ type AttnGPU struct {
 	// The QSA selection, a bitmask of nKV bits a token, read as uints out of
 	// the same fp32 arena through binding 4. L4b.
 	aSel uint32
+	// The split decode attention's partials (P8), ATTN_SPLIT in the shaders:
+	// [heads][splits][rows][headDim] of unnormalised context and the (row
+	// max, row sum) pair per slice-row behind it.
+	aSplit uint32
+	// pinSplits fixes the slice count where a test needs two run lengths on
+	// one kernel; 0 leaves attnSplits to decide.
+	pinSplits int
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1).
 	aPart    uint32
 	actElems int
@@ -625,6 +678,13 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// allocated whichever rung runs, because the arena plan is fixed at
 	// construction and the rung is not.
 	g.aPart = alloc(GEMVMaxRows * gemvMaxSlabs * g.qkvN())
+	// The split attention's partials, sized for the widest grid it will ever
+	// dispatch rather than for the one this run needs — the arena plan is
+	// fixed at construction and the slice count is chosen per pass. 24 heads
+	// x 16 slices x 32 rows x 256 dims is 12.6 MB beside a cache that is
+	// 708 MB at 131k cells.
+	splitRows := minInt(attnSplitMaxRows, rows)
+	g.aSplit = alloc(c.NHead * attnMaxSplits * splitRows * (c.HeadDim + 2))
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -729,10 +789,20 @@ func (g *AttnGPU) build() error {
 	// The selection's bucket search is a subgroup suffix sum over 256 radix
 	// buckets held four waves wide, so it wants the wave pinned for the same
 	// reason the matrix-core rungs do.
-	if err := g.pipeline("select", shaders.LLMAttnSelect, vk.PipelineSpec{
-		Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+	if err := g.pipeline("expand", shaders.LLMAttnExpand, vk.PipelineSpec{
+		Buffers: bufs, PushConstantSize: pcSize,
 	}); err != nil {
 		return err
+	}
+	for name, spirv := range map[string][]byte{
+		"select":  shaders.LLMAttnSelect,
+		selectW1k: shaders.LLMAttnSelectW1024,
+	} {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
 	}
 	for _, v := range attnVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
@@ -740,6 +810,18 @@ func (g *AttnGPU) build() error {
 		}); err != nil {
 			return err
 		}
+		if err := g.pipeline(splitPipe(v.name), v.split, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
+	}
+	// The combine is one lane a head dim and reads no matrix core, so it
+	// takes the device's own subgroup size rather than pinning one.
+	if err := g.pipeline("combine", shaders.LLMAttnCombine, vk.PipelineSpec{
+		Buffers: bufs, PushConstantSize: pcSize,
+	}); err != nil {
+		return err
 	}
 	// Both builds when the bank is quantised: the two projections read the
 	// narrow plane and the indexer's fp16 tail reads halves out of the same
@@ -1102,6 +1184,104 @@ func (g *AttnGPU) Upload(xn []float32, nTok int) error {
 // graph builds one layer's dispatch sequence, with a label per dispatch, and
 // is shared by Run and Profile so that what the profiler times is what a run
 // executes.
+// attnSplits is how many ways this pass cuts the key axis, and 1 for the
+// unsplit kernel.
+//
+// **The question it answers is how long one wave's walk is**, not how much
+// work the dispatch has. The grid is (query blocks, heads), every workgroup is
+// a single wave, and 24 of them fit on this device's 40 compute units at once
+// — so a decode step's attention costs one wave walking every key block of the
+// cache, and nothing about the other 23 changes that. Measured: cutting the
+// grid from 24 workgroups to 2, which is a twelfth of the work and a twelfth
+// of the traffic, moved the dispatch 1.00x at every depth. Only cutting the
+// walk moves it.
+//
+// So the split is taken on the one thing that says the walk is the cost: a
+// batch no wider than one query tile, which is the decode regime. Past that
+// the query axis already fills the grid — at 512 rows it dispatches 768
+// workgroups — and the unsplit kernel is what runs.
+//
+// **The count is a constant, and every other candidate is a bug.** It must not
+// depend on `SEQ_PAST`, because a decode step's command buffer is recorded
+// once and replayed byte for byte every token (P1c) and a count that moved
+// with the depth would stale it. And it must not depend on `nKV` — which is
+// the tempting one, since a deep arena is where the split pays — because
+// `TestAttnGPUCacheSizeDoesNotChangeTheAnswer` is a gate that the cache's
+// *size* changes nothing about the answer, and a slice count read off `nKV`
+// would change the order the partial softmaxes are folded together and so
+// change the last places of the result. That is the whole class of bug P7
+// closed, re-entered through the rounding rather than through the cost. So
+// the number is fixed here, the slices' *contents* are the live depth, and a
+// slice with no block in it falls through to its epilogue and writes the
+// combine's identity.
+//
+// LLM_ATTN_SPLITS overrides for measurement: 1 is the unsplit kernel, which
+// is the control arm this was measured against.
+func (g *AttnGPU) attnSplits(av attnVariant) int {
+	if g.rows > av.rows || g.rows > attnSplitMaxRows {
+		return 1
+	}
+	if g.pinSplits > 0 {
+		return minInt(g.pinSplits, attnMaxSplits)
+	}
+	if n, err := strconv.Atoi(os.Getenv("LLM_ATTN_SPLITS")); err == nil && n >= 1 {
+		return minInt(n, attnMaxSplits)
+	}
+	return attnDefaultSplits
+}
+
+// cellSplits is how many ways the indexer's score and its expansion to cells
+// are striped, and 1 puts both back on the single workgroup a token they ran
+// on before P9.
+//
+// Nothing about the answer depends on it — every output element is one read,
+// one add and one store, and which lane does it is not observable — so unlike
+// attnSplits this needs no argument about rounding and no place in
+// PinSchedule. It is a constant only because a decode step's command buffer
+// is recorded once and replayed (P1c). LLM_ATTN_CELL_SPLITS is the control
+// arm.
+func (g *AttnGPU) cellSplits() uint32 {
+	if n, err := strconv.Atoi(os.Getenv("LLM_ATTN_CELL_SPLITS")); err == nil && n >= 1 {
+		return uint32(n)
+	}
+	return attnCellSplits
+}
+
+// selectW1k names the sixteen-wave build of the selection in the pipeline map.
+const selectW1k = "select.w1024"
+
+// selectPipe is which build of llm_attn_select.comp this run uses (P10).
+//
+// The selection is **one workgroup a token and there is no second one to
+// give it**: four radix passes over a row are a reduction and not a stripe,
+// so unlike the score beside it (P9) it cannot be spread over the grid
+// without a global barrier between every pass — which at twelve layers is
+// ~96 extra dispatches a step and costs more than it saves. What is left is
+// the width of that one workgroup: at 65 536 cells the row does not fit
+// `SEL_LDS`, so all five passes stream it out of DRAM, and four waves on one
+// compute unit have nothing to hide that behind.
+//
+// LLM_ATTN_SELECT_WG=256 is the narrow control arm.
+func (g *AttnGPU) selectPipe() string {
+	if os.Getenv("LLM_ATTN_SELECT_WG") == "256" {
+		return "select"
+	}
+	return selectW1k
+}
+
+// SetSplits pins how many ways the decode attention cuts its key axis; 1 is
+// the unsplit kernel and 0 gives the default back.
+//
+// It is separate from SetPlan for the reason SetGemv is: it is not a rung of
+// the same ladder but a different kernel with a dispatch behind it. It exists
+// for the same reason SetPlan does, though — the split is chosen from the
+// *run's* length, so a test that compares two run lengths bit for bit has to
+// pin it or it is comparing two kernels.
+func (g *AttnGPU) SetSplits(n int) { g.pinSplits = n }
+
+// Splits reports the pin, or 0 for the default.
+func (g *AttnGPU) Splits() int { return g.pinSplits }
+
 func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	if layer < 0 || layer >= len(g.layers) {
 		return nil, nil, fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
@@ -1189,20 +1369,39 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	units := maxInt(hi-lo, g.rows)
 	add("idx", "idx", uint32(units), uint32(1+c.IdxHeads), base)
 
-	// 4. Its score, the bias, the cells and the causal mask.
-	add("score", "score", uint32(g.rows), 1, base)
+	// 4. Its score, then the bias, the cells and the causal mask — two
+	//    dispatches (P9), because the expansion reads every block's score and
+	//    the barrier that used to enforce that also pinned the scoring to one
+	//    workgroup a token. Both are striped `attnCellSplits` ways over the
+	//    grid's y. Neither sums anything across the stripe, so the tensors
+	//    they write are the same bits however the grid is cut.
+	cells := g.cellSplits()
+	add("score", "score", uint32(g.rows), cells, base)
+	add("expand", "expand", uint32(g.rows), cells, base)
 
 	// 5. The selection: one workgroup a token, four radix passes over the
 	//    cells, a bitmask out. Absent below 2051 cells, where it would name
 	//    every cell and the attention kernel's dense arm is the same
 	//    computation.
 	if g.sparse {
-		add("select", "select", uint32(g.rows), 1, base)
+		add(g.selectPipe(), "select", uint32(g.rows), 1, base)
 	}
 
 	// 6. Causal GQA with the output gate in the epilogue, reading the
-	//    selection beside the causal mask.
-	add(string(g.attn), "attn", uint32(roundUpInt(g.rows, av.rows)/av.rows), uint32(c.NHead), base)
+	//    selection beside the causal mask — or, at decode over a cache deep
+	//    enough to be worth it, the same kernel with its key axis cut across
+	//    workgroups and a combine behind it (P8).
+	qBlocks := uint32(roundUpInt(g.rows, av.rows) / av.rows)
+	if sp := g.attnSplits(av); sp > 1 {
+		split := base
+		split.ResOff, split.InjOff = g.aSplit, uint32(sp)
+		add(splitPipe(g.attn), "attn.split", qBlocks*uint32(sp), uint32(c.NHead), split)
+		// Over the whole query tile and not the prompt: the combine writes
+		// the context's pad rows too, as the unsplit epilogue does.
+		add("combine", "attn.combine", uint32(c.NHead), qBlocks*uint32(av.rows), split)
+	} else {
+		add(string(g.attn), "attn", qBlocks, uint32(c.NHead), base)
+	}
 
 	// 7. The output projection, off the gated context.
 	out := base

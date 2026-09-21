@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The QSA indexer's expansion to cells, split out of llm_attn_score.comp
+// (P9) so that both halves can be cut across workgroups.
+//
+// It is that kernel's last loop, moved and not changed: every cell of the row
+// takes its pooled block's score, plus the bias that block's relationship to
+// this token implies, or the causal mask's -inf. The bias table is
+// llm_attn_score.comp's and is documented there.
+//
+// **Why it is a dispatch of its own.** The loop reads
+// `score[t][blk]` for an arbitrary block, so every block must be scored
+// before any cell is expanded. Inside one workgroup that is a `barrier()`,
+// which is what it used to be — and it is exactly what stopped the scoring
+// from being spread over more than one workgroup. A decode step is one token,
+// so the grid was (1, 1): **one compute unit of forty** scoring every pooled
+// block of the context and then writing every cell of a 131 072-cell row.
+// Two dispatches with a pipeline barrier between them is the same ordering
+// with the workgroup count let go of, and this half then costs what a
+// streaming write costs.
+//
+// Nothing here reassociates anything — every cell is one read, one add and
+// one store, and which lane does it is not observable — so unlike P8's split
+// of the attention itself this is **bit-identical** however the grid is cut,
+// and `PinSchedule` has no business with it.
+
+#include "llm_common.glsl"
+
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint pos = SEQ_PAST + t;
+    uint nCells = SEQ_PAST + pc.tokens;
+    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
+    uint nBid = nCells / pc.ratio;
+    uint deadBid = (nBid >= nBlocks) ? nBlocks - 1u : nBid;
+
+    // The tail is every cell at or after the last whole block this token can
+    // see; `(t+1)/ratio*ratio` is where it starts.
+    uint tailStart = (pos + 1u) / pc.ratio * pc.ratio;
+
+    uint first = gl_WorkGroupID.y * WG + gl_LocalInvocationID.x;
+    uint step = gl_NumWorkGroups.y * WG;
+    for (uint j = first; j < pc.nKV; j += step) {
+        float v;
+        if (j > pos || j >= nCells) {
+            v = -1.0 / 0.0;              // the causal mask, and every empty cell
+        } else {
+            uint blk = (j < nBid * pc.ratio) ? j / pc.ratio : deadBid;
+            float bias;
+            if (blk >= nBid) {
+                bias = (blk == deadBid && nBid < nBlocks) ? 1e9 : -1.0 / 0.0;
+            } else if (blk * pc.ratio >= tailStart) {
+                bias = 1e9;
+            } else {
+                bias = 0.0;
+            }
+            v = act[pc.scoreOff + t * nBlocks + blk] + bias;
+        }
+        act[pc.cellOff + t * pc.nKV + j] = v;
+    }
+}

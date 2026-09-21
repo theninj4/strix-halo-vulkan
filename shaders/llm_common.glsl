@@ -212,6 +212,18 @@ layout(push_constant) uniform PC {
     //             the same field ATTN_IDXRAW is, because the two are never
     //             in the same push block: one is the attention layer's and
     //             the other belongs to the two convolutions.
+    //   resOff    ATTN_SPLIT:  f32 the split decode attention's partials
+    //             (P8), [heads][splits][T][headDim] of unnormalised context
+    //             and then [heads][splits][T][2] of (row max, row sum) behind
+    //             them. `resOff` is the hyper-connection block's wide
+    //             residual and the attention layer has none — it already
+    //             borrows it for the decode GEMV's partial sums, which are a
+    //             different dispatch of the same block.
+    //   injOff    ATTN_SPLITS: how many ways that kernel cut the key axis, 1
+    //             for a build that did not. Both the split kernel and
+    //             llm_attn_combine.comp read it, so the two agree on the
+    //             layout above by reading one field rather than by each
+    //             deriving it.
     //   loOff     ATTN_IDXRAW: fp16 [nKV][idxDim], the indexer's *raw* key
     //             per cell. It is a cache because a pooled block spans
     //             `ratio` cells and at decode those arrive in `ratio`

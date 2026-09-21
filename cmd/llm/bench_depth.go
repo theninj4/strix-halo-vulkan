@@ -31,7 +31,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"strix-halo-vulkan/llm"
@@ -160,7 +162,7 @@ func depthBench(o depthOpts) error {
 		if err := depthRunBatch(g, ids[pos:pos+o.pp], &fresh); err != nil {
 			return err
 		}
-		r.ppWall, r.ppStats, r.ppTok = time.Since(t0), g.Stats, o.pp
+		r.ppWall, r.ppStats, r.ppTok = time.Since(t0), g.Stats.Clone(), o.pp
 		pos += o.pp
 
 		// Token generation at the depth: a batch of one, -tg times.
@@ -171,7 +173,7 @@ func depthBench(o depthOpts) error {
 				return err
 			}
 		}
-		r.tgWall, r.tgStats, r.tgTok = time.Since(t0), g.Stats, o.tg
+		r.tgWall, r.tgStats, r.tgTok = time.Since(t0), g.Stats.Clone(), o.tg
 		pos += o.tg
 
 		runs = append(runs, r)
@@ -182,7 +184,17 @@ func depthBench(o depthOpts) error {
 	if o.csv == "" {
 		return nil
 	}
-	return writeCSV(o.csv, depthCSV(runs))
+	if err := writeCSV(o.csv, depthCSV(runs)); err != nil {
+		return err
+	}
+	return writeCSV(depthLabelPath(o.csv), depthLabelCSV(runs))
+}
+
+// depthLabelPath is the main CSV's name with `-labels` before the extension,
+// so a sweep writes its two tables side by side under one -csv flag.
+func depthLabelPath(csv string) string {
+	ext := filepath.Ext(csv)
+	return strings.TrimSuffix(csv, ext) + "-labels" + ext
 }
 
 // depthRunBatch runs one batch, resetting the sequence for the very first one
@@ -249,6 +261,44 @@ func depthCSV(runs []depthRun) [][]string {
 	for _, r := range runs {
 		rows = append(rows, row(r.depth, "pp", r.ppTok, r.ppWall, r.ppStats))
 		rows = append(rows, row(r.depth, "tg", r.tgTok, r.tgWall, r.tgStats))
+	}
+	return rows
+}
+
+// depthLabelCSV is where a *decode step* went by dispatch label, one row a
+// depth a label, sorted by cost within each depth.
+//
+// The block columns of depthCSV say attention owns the falloff; they cannot
+// say which of the full-attention layer's six dispatches owns it, and after
+// P7 that is the whole remaining question — the indexer scores every block,
+// the selection radix-sorts every live cell, and the flash kernel walks every
+// key block to test it, so three different O(depth) terms hide inside one
+// `attn_ms`. This is the resolution that separates them.
+func depthLabelCSV(runs []depthRun) [][]string {
+	rows := [][]string{{"depth", "phase", "label", "n_per_pass", "ms_per_token", "us_each"}}
+	add := func(d int, phase string, n int, st llm.GraphStats) {
+		type row struct {
+			name string
+			s    llm.DispatchStat
+		}
+		rs := make([]row, 0, len(st.Kinds))
+		for k, v := range st.Kinds {
+			rs = append(rs, row{k, v})
+		}
+		sort.Slice(rs, func(i, j int) bool { return rs[i].s.GPU > rs[j].s.GPU })
+		passes := float64(max(st.Runs, 1))
+		for _, r := range rs {
+			rows = append(rows, []string{
+				fmt.Sprint(d), phase, r.name,
+				fmt.Sprintf("%.1f", float64(r.s.Count)/passes),
+				fmt.Sprintf("%.4f", float64(r.s.GPU.Microseconds())/1000/float64(max(n, 1))),
+				fmt.Sprintf("%.1f", float64(r.s.GPU.Nanoseconds())/1000/float64(max(r.s.Count, 1))),
+			})
+		}
+	}
+	for _, r := range runs {
+		add(r.depth, "pp", r.ppTok, r.ppStats)
+		add(r.depth, "tg", r.tgTok, r.tgStats)
 	}
 	return rows
 }

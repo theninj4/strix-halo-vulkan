@@ -4,9 +4,18 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_control_flow_attributes : require
 
-// The QSA indexer's score, its bias, its expansion to cells and the causal
-// mask — one dispatch, one workgroup per token, for llama.cpp's MUL_MAT f32 +
-// RELU + SUM_ROWS + the adds and the mask around them.
+// The QSA indexer's score: llama.cpp's MUL_MAT f32 + RELU + SUM_ROWS and the
+// adds around them, one workgroup a (token, stripe).
+//
+// **The expansion to cells left here in P9** and is
+// `llm_attn_expand.comp`. It had to: it reads every block's score, so it was
+// a `barrier()` behind this loop, and a barrier is what pinned the whole
+// kernel to one workgroup. A decode step is one token, so the grid was
+// (1, 1) — one compute unit of forty scoring every pooled block of the
+// context, which at 65 536 cells was 0.304 ms a token a layer and the
+// largest kernel left in the block once P8 had split the attention. Two
+// dispatches is the same ordering without that constraint, and the grid's y
+// is now a stripe of the blocks.
 //
 // The scorer is not attention and the difference is the rectifier. Each of the
 // four heads dots its 128-wide query against a block's pooled key and the
@@ -100,7 +109,9 @@ void main() {
     // the twelve attention layers before the first cell is real. The tensor
     // this writes is unchanged: every dead row still gets its value, and the
     // value is still the one the pooled key implies.
-    for (uint b = tid; b < nBid && b < nBlocks; b += WG) {
+    uint first = gl_WorkGroupID.y * WG + tid;
+    uint step = gl_NumWorkGroups.y * WG;
+    for (uint b = first; b < nBid && b < nBlocks; b += step) {
         uint kb = pc.idxKOff + b * IDX_DIM;
         float s = 0.0;
         [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
@@ -127,32 +138,8 @@ void main() {
         }
         barrier();
         float dead = deadScore;
-        for (uint b = nBid + tid; b < nBlocks; b += WG) {
+        for (uint b = nBid + first; b < nBlocks; b += step) {
             act[pc.scoreOff + t * nBlocks + b] = dead;
         }
-    }
-    memoryBarrierBuffer();
-    barrier();
-
-    // The tail is every cell at or after the last whole block this token can
-    // see; `(t+1)/ratio*ratio` is where it starts.
-    uint tailStart = (pos + 1u) / pc.ratio * pc.ratio;
-    for (uint j = tid; j < pc.nKV; j += WG) {
-        float v;
-        if (j > pos || j >= nCells) {
-            v = -1.0 / 0.0;              // the causal mask, and every empty cell
-        } else {
-            uint blk = (j < nBid * pc.ratio) ? j / pc.ratio : deadBid;
-            float bias;
-            if (blk >= nBid) {
-                bias = (blk == deadBid && nBid < nBlocks) ? 1e9 : -1.0 / 0.0;
-            } else if (blk * pc.ratio >= tailStart) {
-                bias = 1e9;
-            } else {
-                bias = 0.0;
-            }
-            v = act[pc.scoreOff + t * nBlocks + blk] + bias;
-        }
-        act[pc.cellOff + t * pc.nKV + j] = v;
     }
 }

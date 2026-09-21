@@ -1,0 +1,103 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The other half of the split decode attention (P8): put the slices of one
+// row back together, then do the softmax divide and the output gate that
+// llm_attn_wmma.comp's own epilogue does when it is not split.
+//
+// `llm_attn_wmma.comp -DSPLITK` cuts the key axis `splits` ways and each
+// slice runs its own online softmax over its own blocks, so what it leaves is
+// `splits` partial contexts, each **unnormalised and relative to its own row
+// max**, beside that max and that slice's denominator. Assembling them is the
+// same identity the block loop already uses on every iteration:
+//
+//     m* = max_s m_s          the row's real max
+//     O  = sum_s O_s * 2^(m_s - m*)
+//     l  = sum_s l_s * 2^(m_s - m*)
+//     out = O / l
+//
+// A slice that was given no block wrote -inf and zero, and 2^(-inf - m*) is
+// zero, so it drops out without a branch. If **every** slice did — a row that
+// sees nothing, which is what a pad row is once the selection is on — then m*
+// is -inf and the row is written as zeros, exactly as the unsplit epilogue
+// writes it, rather than as the NaN a zero denominator would give.
+//
+// One workgroup a (head, token) and one lane a head dim, so a lane owns one
+// output element and the `splits` reads behind it are a strided walk of the
+// partial arena. The row's scale factors are recomputed per lane rather than
+// shared through LDS: `splits` is at most ATTN_MAX_SPLITS and every lane of
+// the workgroup reads the same two floats a slice, which is one cache line
+// hit, against a barrier and a staging tile to avoid it.
+
+#include "llm_common.glsl"
+
+#ifndef HEAD_DIM
+#define HEAD_DIM 256
+#endif
+
+layout(local_size_x = HEAD_DIM) in;
+
+void main() {
+    uint head = gl_WorkGroupID.x;
+    uint token = gl_WorkGroupID.y;
+    uint d = gl_LocalInvocationID.x;
+    if (head >= pc.heads || d >= pc.headDim) {
+        return;
+    }
+    uint dst = pc.ctxOff + token * pc.ldCtx + head * pc.headDim + d;
+
+    // **The pad rows are zeroed, not skipped.** The grid is the query tile
+    // and not the prompt, because the unsplit epilogue writes the whole tile:
+    // a pad row there has a zero softmax denominator, its `inv` is zero and
+    // it stores an exact zero. The output projection reads those rows — its
+    // GemmM is rounded up to the row block — and only their *products* go
+    // unread, so leaving whatever the last pass put there would be a
+    // difference between the two kernels in an arena that outlives the
+    // dispatch. The split kernel writes no partial for them, so this is also
+    // the check that must come before the partials are read at all.
+    if (token >= pc.tokens) {
+        hact[dst] = float16_t(0.0);
+        return;
+    }
+
+    uint splits = max(pc.injOff, 1u);
+    uint mlBase = pc.resOff + pc.heads * splits * pc.tokens * pc.headDim;
+    uint slice0 = head * splits * pc.tokens + token;
+    uint stride = pc.tokens;      // one slice on from the last
+
+    float m = -1.0 / 0.0;
+    for (uint s = 0u; s < splits; ++s) {
+        m = max(m, act[mlBase + (slice0 + s * stride) * 2u]);
+    }
+
+    if (isinf(m)) {
+        // Every slice empty: the row saw nothing. The unsplit kernel writes a
+        // zero row here for the same reason — a NaN left in an arena the next
+        // pass reuses is a NaN in the next pass.
+        hact[dst] = float16_t(0.0);
+        return;
+    }
+
+    float o = 0.0, l = 0.0;
+    for (uint s = 0u; s < splits; ++s) {
+        uint at = mlBase + (slice0 + s * stride) * 2u;
+        float ms = act[at];
+        // exp2(-inf - m) is zero, which is how an empty slice drops out; the
+        // equal test is for the slice that set m*, where the subtraction of
+        // two infinities would otherwise be a NaN if every slice were empty
+        // and we had not already returned.
+        float w = (ms == m) ? 1.0 : exp2(ms - m);
+        if (w == 0.0) {
+            continue;
+        }
+        l += act[at + 1u] * w;
+        o += act[pc.resOff + (slice0 + s * stride) * pc.headDim + d] * w;
+    }
+
+    float inv = (l > 0.0) ? 1.0 / l : 0.0;
+    float g = act[pc.qkvOff + token * pc.gemmN + head * 2u * pc.headDim + pc.headDim + d];
+    hact[dst] = float16_t(o * inv / (1.0 + exp(-g)));
+}

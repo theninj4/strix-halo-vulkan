@@ -62,6 +62,32 @@
 // every cell (research/l2e-attention.md), so running it would be the identity
 // and the branch is not an approximation.
 //
+// **The key range is split across workgroups at decode** (P8, `-DSPLITK`).
+//
+// The grid is (query blocks, heads), so a decode step — one token — dispatches
+// one workgroup a head: 24 of them, each a *single wave*, and each walking
+// every key block of the cache in turn. They all fit on the device at once,
+// so the dispatch's wall clock is **one wave's serial walk** and nothing
+// else: cutting the grid from 24 workgroups to 2 was measured at 1.00x, which
+// is what says the cost is neither the traffic nor the occupancy across heads
+// but the length of that walk. Adding heads cannot shorten it; only cutting
+// the walk can.
+//
+// So this build slices the key axis `pc.injOff` ways (ATTN_SPLITS) and gives
+// each slice its own workgroup — the grid's x becomes (query block, slice) —
+// and each writes its slice's **unnormalised** context beside the two numbers
+// an online softmax needs to be resumed: the slice's row max and its row sum.
+// `llm_attn_combine.comp` puts them back together. That is flash-decoding's
+// split, and it is exact in the same sense the block loop already is: the
+// same partial-softmax identity that lets the loop rescale by exp2(mo - mn)
+// when it meets a bigger max is what lets the combine rescale by
+// exp2(m_s - m*) when it meets the largest of the slices'.
+//
+// It is **not bit-identical** to the unsplit kernel and cannot be: the
+// rescales happen in a different order and fp32 addition is not associative.
+// What it is is the same arithmetic, gated on agreement with the reference
+// rather than with the other kernel — see TestAttnGPUSplitMatchesDense.
+//
 // **The query is a batch, the key and the value are a cache** (L7a). Row i of
 // query block q0 is cell `SEQ_PAST + q0 + i` and the keys run over every cell
 // the cache holds, `SEQ_PAST + tokens` of them, so the two operands no longer
@@ -146,7 +172,15 @@ bool selected(uint row, uint col) {
 
 void main() {
     uint head = gl_WorkGroupID.y;
+#ifdef SPLITK
+    // The grid's x carries both: `splits` slices of every query block, so
+    // that a build which is not split keeps exactly the grid it had.
+    uint splits = max(pc.injOff, 1u);
+    uint sp = gl_WorkGroupID.x % splits;
+    uint q0 = (gl_WorkGroupID.x / splits) * BM;
+#else
     uint q0 = gl_WorkGroupID.x * BM;
+#endif
     uint past = SEQ_PAST;
     uint n = past + pc.tokens;       // cells in the cache, keys to attend over
     uint lane = gl_LocalInvocationID.x;
@@ -190,7 +224,35 @@ void main() {
     // Nothing past this query block's last row can be attended to, so the key
     // blocks beyond it are never read. Its last row is cell `past + q0 + BM - 1`.
     uint last = min(n, past + q0 + BM);
+#ifdef SPLITK
+    // **Every `splits`-th block, not a contiguous run of them**, and that is
+    // a correctness requirement rather than a preference.
+    //
+    // A slice has to be a set of *absolute* key blocks that does not depend
+    // on how the prompt was chunked, because L7a's gate is that it does not:
+    // token at cell `pos` must come back bit for bit whether it arrived alone
+    // or seventh of seven. Cutting `[0, last)` into `splits` contiguous runs
+    // fails that — `last` is `min(n, past + q0 + BM)` and both `n` and `q0`
+    // are the batch's, so a seven-token chunk and a one-token chunk put the
+    // boundaries in different places and fold the partial softmaxes in a
+    // different order. A stride is immune: block b belongs to slice
+    // `b % splits` however the run was cut.
+    //
+    // The blocks past a row's causal extent that the stride then walks cost
+    // nothing and change nothing, for the same reason the unsplit loop can
+    // walk them: blkMax stays -inf, the correction is exactly 1.0, and P is
+    // zeroed, so the accumulators come out untouched. And the stride balances
+    // the slices where a contiguous cut would not — the QSA selection is
+    // clustered (P7), so contiguous runs would hand one slice most of the
+    // live blocks and its neighbours none.
+    //
+    // A slice with no block at all — `sp >= ceil(last/BN)` — falls straight
+    // through to the epilogue, which writes the combine's identity: a row max
+    // of -inf and a row sum of zero.
+    for (uint base = sp * BN; base < last; base += splits * BN) {
+#else
     for (uint base = 0u; base < last; base += BN) {
+#endif
         uint cnt = min(BN, n - base);
 
         // **The selection, before the block is read rather than after** (P7).
@@ -351,6 +413,67 @@ void main() {
         barrier();
     }
 
+#ifdef SPLITK
+    // ---- The split epilogue: this slice's partial, and how to resume it.
+    //
+    // Nothing is normalised and nothing is gated here — `o` is still relative
+    // to this slice's own row max and `lsum` is still this slice's own
+    // denominator, because neither is the row's until every slice has been
+    // seen. The combine does the divide and the gate, once, off the assembled
+    // row. A slice that got no block writes -inf and zero, which is the
+    // identity there.
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        coopMatStore(lsum[qq], stage, qq * (TILE * TILE), TILE,
+            gl_CooperativeMatrixLayoutRowMajor);
+    }
+    barrier();
+    for (uint i = lane; i < BM; i += WAVE) {
+        uint qi = i / TILE, r = i % TILE;
+        rowSum[i] = stage[qi * (TILE * TILE) + r * TILE];
+    }
+    barrier();
+
+    // The partial arena, ATTN_SPLIT (llm_common.glsl): the contexts first,
+    // [heads][splits][tokens][headDim], then the pair per row behind them.
+    uint slice = (head * splits + sp) * pc.tokens;
+    uint mlBase = pc.resOff + pc.heads * splits * pc.tokens * pc.headDim;
+    for (uint i = lane; i < BM; i += WAVE) {
+        uint token = q0 + i;
+        if (token < pc.tokens) {
+            uint at = mlBase + (slice + token) * 2u;
+            act[at] = rowMax[i];
+            act[at + 1u] = rowSum[i];
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+            coopMatStore(o[qq][j], stage, qq * (TILE * TILE), TILE,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        // Four lanes a row, four floats each, as the gated store below. The
+        // pad rows are skipped rather than written: unlike the context arena
+        // this one is read back by a kernel that knows how many rows are
+        // real, so there is nothing for a pad row to keep clean.
+        for (uint i = lane; i < BM * 4u; i += WAVE) {
+            uint row = i / 4u, part = i % 4u;
+            uint token = q0 + row;
+            if (token >= pc.tokens) {
+                continue;
+            }
+            uint qi = row / TILE, r = row % TILE;
+            uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
+            uint dst = pc.resOff + (slice + token) * pc.headDim + j * TILE + part * 4u;
+            [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                act[dst + c] = stage[src + c];
+            }
+        }
+        barrier();
+    }
+}
+#else
     // ---- Epilogue: the softmax divide and the output gate, together.
     //
     // Every column of lsum holds the row sum, so column 0 is read out of a
@@ -400,3 +523,4 @@ void main() {
         barrier();
     }
 }
+#endif

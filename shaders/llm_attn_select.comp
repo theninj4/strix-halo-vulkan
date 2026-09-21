@@ -46,7 +46,16 @@
 
 #include "llm_common.glsl"
 
+// Lanes in the workgroup. **It is no longer tied to the radix size** (P10):
+// at 65 536 cells this kernel streams the row out of DRAM five times — four
+// radix passes and the emit, 1.28 MB — and it does it from **one workgroup**,
+// because the row is one token's and the grid is one workgroup a token. The
+// only thing that hides that latency is having more waves resident on the one
+// compute unit it lands on, so the width is a build knob and 256 is the
+// narrow rung it used to be fixed at.
+#ifndef WG
 #define WG 256
+#endif
 #define RADIX_BITS 8
 #define RADIX_SIZE (1 << RADIX_BITS)
 
@@ -57,10 +66,14 @@
 #define SEL_LDS 4096
 #endif
 
-// The workgroup is exactly one lane per radix bucket, which is what lets the
-// top-down bucket search below be a suffix sum rather than a serial walk.
-#if WG != RADIX_SIZE
-#error "llm_attn_select assumes one lane per radix bucket"
+// The bucket search below is a suffix sum over one lane per radix bucket, so
+// the workgroup has to be **at least** as wide as the radix and a whole
+// number of waves. Lanes past the radix carry a zero count and are held out
+// of the bucket vote — without that, a pass whose `desired` has fallen to
+// zero would elect the highest lane rather than the highest *bucket*, and
+// `prefix` would take a bucket index that does not exist.
+#if WG < RADIX_SIZE || (WG % 64) != 0
+#error "llm_attn_select wants a whole number of waves, at least one lane per radix bucket"
 #endif
 
 layout(local_size_x = WG) in;
@@ -145,7 +158,7 @@ void main() {
         // still reaches `desired` — the suffix is non-increasing in b, so that
         // is an atomicMax over the lanes that satisfy it, and one lane reads
         // its own `acc` back out.
-        uint h = histo[tid];
+        uint h = (tid < RADIX_SIZE) ? histo[tid] : 0u;
         uint waveTotal = subgroupAdd(h);
         uint suffix = waveTotal - subgroupExclusiveAdd(h);
         uint sg = tid / 64u;
@@ -162,7 +175,7 @@ void main() {
             shBucket = 0u;
         }
         barrier();
-        if (suffix >= desired) {
+        if (tid < RADIX_SIZE && suffix >= desired) {
             atomicMax(shBucket, tid);
         }
         barrier();

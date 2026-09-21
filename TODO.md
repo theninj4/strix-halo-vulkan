@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus; **16.27 tok/s at 64k of context, 4.02x P7's baseline** | batching (P6); the QSA gather; 128k; speculation parked at 0.95x |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus; **27.69 tok/s at 64k of context, 6.8x the pre-P7 baseline and 0.79x of its own depth-zero rate** | batching (P6); the QSA gather; 128k; speculation parked at 0.95x |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -51,17 +51,31 @@ purpose — so no footprint quantisation is planned for the small verticals.
 **Where the work goes next.** With the image vertical parked, nothing in the
 repo is mid-stage: every open item below is a fresh start, and each vertical's
 list is in its own rough order of value. The context-depth regression that
-stood at the head of this list was **P7**, closed 2026-09-21: decode at 64k
-is **4.05 → 16.27 tok/s (4.02x)** and the falloff from depth zero **6.9x →
-2.0x**, from three kernels that walked the *cache* rather than the *context*
-plus a QSA selection that was a mask and never a skip
-([`research/p7-context-depth.md`](research/p7-context-depth.md)). What is
-left of it is the **gather** — the only route to a decode rate that does not
-care how long the conversation is — and **128k still not completing**. After
-that the two capability gaps are P6 batching (blocked on a product question:
-will the API serve more than one stream?) and E7's batched embeddings, worth
-up to 10x on short texts; the largest single-vertical percent is S10, the
-speech front end at 48% of its pipeline.
+stood at the head of this list is **closed** — **P7**, **P8**, **P9** and **P10**, all
+2026-09-21, take decode at 64k from **4.05 to 27.69 tok/s (6.8x)** and the
+falloff from depth zero from **6.9x down to 1.3x down** (0.14x → 0.79x of the
+depth-zero rate). P7 was three kernels that walked the *cache* rather than
+the *context* plus a QSA selection that was a mask and never a skip
+([`research/p7-context-depth.md`](research/p7-context-depth.md)); **P8, P9 and P10
+are one finding**
+([`research/p8-decode-attention-split.md`](research/p8-decode-attention-split.md))
+— **at decode this model's kernels are single waves that all fit on the
+device at once, so a dispatch costs one wave's serial walk and neither its
+traffic nor its total work.** The probe: cutting the attention grid from 24
+workgroups to 2, a twelfth of both, measured **1.00x at every depth**. P8
+splits the attention's key axis across workgroups, P9 unpins the indexer —
+which was scoring the whole context on one compute unit of forty — and P10
+widens the selection, the one kernel that cannot be split at all because its
+radix passes are a reduction, from four waves to sixteen. What is left of the
+depth question is **the gather**, which is now the only large item: of the
+5.9 ms a decode step still gains between depth 0 and 64k, the split attention
+is 3.0 of it, because the split shortened the walk sixteenfold without
+stopping it being a walk over every key block. And **128k still does not
+complete**. After that the two capability
+gaps are P6 batching (blocked on a product question: will the API serve more
+than one stream?) and E7's batched embeddings, worth up to 10x on short
+texts; the largest single-vertical percent is S10, the speech front end at
+48% of its pipeline.
 
 ---
 
