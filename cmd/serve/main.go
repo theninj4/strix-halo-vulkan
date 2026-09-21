@@ -134,7 +134,9 @@ func main() {
 	llmOn := flag.Bool("llm", false, "load qwen3.8-flash-next and serve /v1/chat/completions")
 	llmModel := flag.String("llm-model", defaultLLMModel, "GGUF checkpoint, shard or directory")
 	llmCtx := flag.Int("llm-ctx", 4096, "cache cells: the longest conversation, prompt plus completion")
-	llmBatch := flag.Int("llm-batch", 512, "tokens the prefill arenas hold; a longer prompt is prefilled in chunks of it")
+	llmBatch := flag.Int("llm-batch", 2048,
+		"tokens the prefill arenas hold; a longer prompt is prefilled in chunks of it. "+
+			"P11: 512 is 667 tok/s and 1.16 GB of arenas, 2048 is 1093 and 2.28 GB, 4096 is 1237 and 3.78")
 	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
 

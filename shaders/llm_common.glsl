@@ -66,6 +66,20 @@ layout(binding = 6) readonly buffer QBank4 { uvec4 w[]; } qb4[NBANK];
 // the declaration rather than at the 30-odd call sites.
 #define qbank  qb[MOE_BANK].w
 #define qbank4 qb4[MOE_BANK].w
+// The **halves** arena again, as sixteen-byte words, for the grouped GEMM's
+// gathered A operand (P11).
+//
+// `llm_moe_gemm.comp`'s MODE 0 stages BM scattered rows of the block input
+// into LDS per K-step, and it was doing it one half at a time: BM*BK/LANES =
+// 32 loads a lane a K-step at BM 64, each fetching **two bytes**, against the
+// eight the B unpack issues for four times the data. The same reasoning that
+// put the bank at binding 6 applies to the operand — this kernel is bound by
+// how many load instructions it issues, not by the bytes they fetch — and a
+// K-step of 32 halves is four aligned `uvec4` loads a row instead of 32
+// scalar ones. The rows a gather names are the permutation's, so alignment is
+// the *row stride's* to keep: `lda` and `xnOff` are both multiples of eight
+// halves, which `MoEGPU.Upload` asserts rather than assumes.
+layout(binding = 7) readonly buffer HAct4 { uvec4 hact4[]; };
 #endif
 
 // The **dense** weight bank read as raw words: LLM.md L8.

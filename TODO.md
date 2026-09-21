@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1213.5 tok/s at 8192 rows, 3.10x**, still climbing where llama.cpp plateaus; **27.69 tok/s at 64k of context, 6.8x the pre-P7 baseline and 0.79x of its own depth-zero rate** | batching (P6); the QSA gather; 128k; speculation parked at 0.95x |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1328.5 tok/s at 8192 rows, 3.40x**, still climbing where llama.cpp plateaus, and **1053 tok/s through the server** on a 4128-token prompt against 667 before P11; **27.69 tok/s at 64k of context, 0.79x of its own depth-zero rate**, and 64k **prefills** at 642 tok/s | `hc.cn` at half the bus; the MoE unpack prefetch; batching (P6); the QSA gather; 128k |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -87,8 +87,9 @@ through P5 is closed. The shipped configuration is **D19 + D20 + D21**
 transcoded, `ffn_down_exps` at IQ4_NL): 4.132 GB a token against a 58.6
 tok/s ceiling, perplexity 4.0992 (+1.74% of our own 4.0289, which is itself
 −0.13% against llama.cpp's at identical weights). Decode 36.19 tok/s,
-prefill 1089 tok/s at ubatch 2048. Served with prefix reuse; a second turn
-extends the graph's state rather than re-prefilling.
+prefill **1165 tok/s at ubatch 2048 and 1328.5 at 8192** (P11). Served with
+prefix reuse; a second turn extends the graph's state rather than
+re-prefilling.
 
 **Speculation (P5) is built, lossless, and parked at 0.95x.** The rollback
 costs nothing when off. What would take it past 1.0, in order: the draft
@@ -104,6 +105,37 @@ from what the draft predicts.
 
 **Open, in rough order of value:**
 
+- ~~**Prompt processing.**~~ **P11, closed 2026-09-21**
+  ([write-up](research/p11-prefill.md)). Two changes and three measured
+  refusals. **The server prefilled in 512-token chunks and 512 is the worst
+  rung this graph has**: llama.cpp plateaus at its best ubatch and this one
+  does not, because the MoE's arithmetic intensity is the *routing's* — at 512
+  tokens 274 of 512 experts are unpacked whole to serve 5120 rows. `-llm-batch`
+  is now **2048**: 1.12 GB of arenas for **1.64x** (667.4 → 1093.3 tok/s at 48
+  layers, and 667 → **1053 through HTTP** on a 4128-token prompt), where the
+  1.49 GB after it buys 13% more. And **the grouped GEMM's gathered A operand
+  was loaded one half at a time** — 32 two-byte loads a lane a K-step against
+  the eight the B unpack issues for four times the data — so binding the halves
+  arena a second time as `uvec4` is **1.25x on `moe.up`**, the largest kernel in
+  a prefill, bit for bit the same slab. The graph: **1079.6 → 1165.1 tok/s at
+  2048 rows and 1250.1 → 1328.5 at 8192 (3.40x llama.cpp)**, two runs agreeing
+  to 0.2%. What did **not** work, all three reverted and all three the same
+  answer: a 16-row alignment with a row count per record (13.7 ms against 11.9),
+  three sub-lists one dispatch a rung (12.5), and a 128-row block (13.5). **At
+  prefill this GEMM is bound by its per-tile slab unpack and the row padding is
+  very nearly free** — L5b built that padding as a cost to justify and it is not
+  one, so the way in is fewer *tiles*, which is a bigger ubatch.
+- **`hc.cn` is the next kernel and it does no arithmetic**: the hyper-connection
+  combine fused with the next mixer's norm, **10.7% of an 8192-row prefill** and
+  9.3% of a 2048 one, moving 901 MB a dispatch at **128 GB/s where a copy gets
+  236**. Two candidates, both cheap: the block output is read once per *stream*,
+  four times a token, where one workgroup a token would read it once; and the
+  norm's tail is an eight-barrier 256-way tree where a subgroup reduction is one
+  barrier (not bit-exact — `llm_hc_norm.comp` would have to move with it).
+- **The MoE unpack prefetch** — issuing a K-step's bank loads before the unpack
+  that consumes them, L8d's third lead. After P11 it is the only idea left that
+  attacks the term that actually dominates `moe.up`, which is the *tile's* cost
+  rather than the tile count.
 - **P6 — batching.** Blocked on the product question: will the API serve
   more than one stream? Each sequence owns 113 MB of DeltaNet state plus
   rings and KV. P5b already built the first stage (R-row decode GEMVs,
@@ -139,7 +171,12 @@ from what the draft predicts.
   2051-cell attention is **flat in depth by construction**, and it is the
   remaining 1948 ms of a 64k decode step's 3665. L4b declined it because at
   prefill the density makes it pointless; at decode it is the only route to
-  a rate that does not care how long the conversation is.
+  a rate that does not care how long the conversation is. **P11 measured the
+  prefill side of the same question and it is the whole of the depth term
+  there too**: at `-pp 2048` every block is flat in depth except attention,
+  which is 97% of the falloff and 47% of a prefill token at 64 000 cells
+  (`attn.attn` 27x from depth zero, `attn.select` 46x). 64k prefills at
+  **642 tok/s**, 0.57x of the depth-zero rate.
 - **128k still does not complete**, and P7 did not touch it: the fill dies
   at ~115k cells in the P0 timestamp pathology ("N of 1025 timestamp slots
   never became ready"), reached by depth instead of row count. The untried

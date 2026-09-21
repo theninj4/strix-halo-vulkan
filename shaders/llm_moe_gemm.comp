@@ -111,6 +111,13 @@
 #define BK 32
 #endif
 #define BK_TILES (BK / TILE)
+// Halves a `uvec4` of the operand view carries (P11). BK is 32 and a fragment
+// tile is 16, so a K-step is four of them a row and the loop below never has
+// a remainder; a BK that is not a multiple of eight would need one.
+#define A_VEC 8
+#if (BK % A_VEC) != 0
+#error "BK must be a whole number of uvec4 loads"
+#endif
 #define WAVE 64
 #define LANES (WAVES * WAVE)
 
@@ -399,6 +406,11 @@ void main() {
     uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
     uint expert = actu[rec];
     uint rowStart = actu[rec + 1u];
+    // The record's third word is how many rows it covers, and since P11 that
+    // is **always `BM`**: the schedule cuts an expert's rows into one list
+    // per rung, so a record's block is full by construction and this kernel
+    // has no partial tile to mask. Read for the assertion, not for the loop
+    // bounds — a list dispatched on the wrong pipeline would show up here.
     uint n0 = gl_WorkGroupID.x * BN;
     uint slots = MOE_USED + 1u;
 
@@ -432,11 +444,29 @@ void main() {
 #if MODE == 0
         // The A operand is gathered: BM rows of the block input, named by the
         // permutation and belonging to BM different tokens.
-        for (uint idx = tid; idx < BM * BK; idx += LANES) {
-            uint r = idx / BK;
-            uint c = idx - r * BK;
+        //
+        // **Eight halves a load, not one** (P11). This loop used to run
+        // `BM * BK / LANES` times — 32 iterations a lane a K-step at BM 64 —
+        // and each iteration fetched *two bytes*, where the B unpack below
+        // fetches 32 in one `uvec4`. It is the same finding L5b-7 made about
+        // the unpack, on the operand instead of the weight: the kernel is
+        // bound by how many load instructions it issues. A K-step is BK
+        // halves, so a row is `BK / A_VEC` sixteen-byte loads and the
+        // permutation entry behind it is read once per load rather than once
+        // per half. Bit for bit the same slab: `unpackFloat2x16` is a
+        // reinterpretation, the LDS layout is unchanged, and the loop covers
+        // the same (r, c) in the same order.
+        for (uint idx = tid; idx < BM * (BK / A_VEC); idx += LANES) {
+            uint r = idx / (BK / A_VEC);
+            uint c = (idx - r * (BK / A_VEC)) * A_VEC;
             uint p = actu[pc.moePermOff + rowStart + r];
-            sA[r * LDS_ROW + c] = hact[pc.xnOff + (p / slots) * pc.lda + k0 + c];
+            uvec4 v = hact4[(pc.xnOff + (p / slots) * pc.lda + k0 + c) / A_VEC];
+            uint dst = r * LDS_ROW + c;
+            [[unroll]] for (uint w = 0u; w < 4u; ++w) {
+                f16vec2 h = unpackFloat2x16(v[w]);
+                sA[dst + 2u * w] = h.x;
+                sA[dst + 2u * w + 1u] = h.y;
+            }
         }
         // The two matrices are one staging pass, so every lane of every wave
         // has a row to unpack rather than half of them idling.

@@ -19,7 +19,9 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"strix-halo-vulkan/llm"
@@ -74,6 +76,7 @@ func graphBench(model, prompt string, toks []int, nLayers, ctx int, csvPath stri
 
 	rows := [][]string{{"tokens", "layers", "ms", "tok_s", "against_llama",
 		"hc_ms", "ple_ms", "dn_ms", "attn_ms", "moe_ms", "head_ms", "move_ms", "gather_ms", "glue_ms"}}
+	labels := [][]string{{"tokens", "label", "n_per_pass", "ms_per_pass", "us_each", "pct_of_gpu"}}
 	for _, n := range toks {
 		if n > maxTok {
 			continue
@@ -89,11 +92,15 @@ func graphBench(model, prompt string, toks []int, nLayers, ctx int, csvPath stri
 			}
 		}
 		rows = append(rows, reportGraphRun(g, n))
+		labels = append(labels, graphLabelRows(g.Stats.Clone(), n)...)
 	}
 	if csvPath == "" {
 		return nil
 	}
-	return writeCSV(csvPath, rows)
+	if err := writeCSV(csvPath, rows); err != nil {
+		return err
+	}
+	return writeCSV(labelCSVPath(csvPath), labels)
 }
 
 // graphPrompt produces at least n tokens to prefill.
@@ -191,4 +198,51 @@ func reportGraphRun(g *llm.Graph, n int) []string {
 		fmt.Sprintf("%.1f", ms(st.Move)),
 		fmt.Sprintf("%.1f", ms(st.Gather)), fmt.Sprintf("%.1f", ms(st.Glue)),
 	}
+}
+
+// labelCSVPath is where the per-label table goes when -csv names the block
+// one: `x.csv` becomes `x_labels.csv`.
+func labelCSVPath(p string) string {
+	return strings.TrimSuffix(p, ".csv") + "_labels.csv"
+}
+
+// graphLabelRows is where a prefill went by dispatch label rather than by
+// block, sorted by cost.
+//
+// The block columns say the MoE owns 42% of a long prefill; they cannot say
+// whether that is the two projections, the unpack, the routing or the
+// combine, and a plan needs the kernel. This is the same resolution
+// `-depth`'s label CSV gives a decode step, at prefill row counts.
+func graphLabelRows(st llm.GraphStats, n int) [][]string {
+	type row struct {
+		name string
+		s    llm.DispatchStat
+	}
+	rs := make([]row, 0, len(st.Kinds))
+	var gpu time.Duration
+	for k, v := range st.Kinds {
+		rs = append(rs, row{k, v})
+		gpu += v.GPU
+	}
+	sort.Slice(rs, func(i, j int) bool { return rs[i].s.GPU > rs[j].s.GPU })
+	passes := float64(max(st.Runs, 1))
+	out := make([][]string, 0, len(rs))
+	fmt.Printf("    %-28s %6s %10s %10s %7s\n", "label", "n", "ms/pass", "us each", "% gpu")
+	for _, r := range rs {
+		ms := float64(r.s.GPU.Microseconds()) / 1000 / passes
+		pct := 100 * float64(r.s.GPU) / float64(max(gpu, 1))
+		if pct >= 1 {
+			fmt.Printf("    %-28s %6.0f %10.1f %10.1f %6.1f%%\n",
+				r.name, float64(r.s.Count)/passes, ms,
+				float64(r.s.GPU.Nanoseconds())/1000/float64(max(r.s.Count, 1)), pct)
+		}
+		out = append(out, []string{
+			strconv.Itoa(n), r.name,
+			fmt.Sprintf("%.1f", float64(r.s.Count)/passes),
+			fmt.Sprintf("%.2f", ms),
+			fmt.Sprintf("%.1f", float64(r.s.GPU.Nanoseconds())/1000/float64(max(r.s.Count, 1))),
+			fmt.Sprintf("%.2f", pct),
+		})
+	}
+	return out
 }

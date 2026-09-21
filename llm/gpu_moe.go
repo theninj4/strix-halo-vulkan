@@ -64,6 +64,12 @@ const moeBN = 64
 // kernel in this vertical.
 const moeWave = 64
 
+// moeAVec is how many halves one load of the grouped GEMM's gathered A
+// operand carries — `A_VEC` in llm_moe_gemm.comp, a `uvec4` of binding 7.
+// The host's part of the contract is that every offset the shader divides by
+// it is a whole load.
+const moeAVec = 8
+
 // MoEKernel names one rung of the grouped GEMM's ladder. A rung is two
 // numbers: how many accumulator tiles a wave holds in the M direction, and how
 // many **waves** split a tile's rows between them.
@@ -817,6 +823,12 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 // pad is the permuted row space's alignment: the widest row block any of the
 // four expert dispatches runs, because every one of them reads the same
 // permutation and a tile list has to divide the space it indexes.
+//
+// **P11 tried to make it the fragment** — sixteen rows, which is what a store
+// actually cannot mask — so that an expert's last tile could be a short one
+// and a 2048-token ubatch would execute 24 304 rows instead of 38 912 over
+// the same 608 tiles. Every form of it is a wash or a loss, because this
+// kernel is not bound by the rows: see research/p11-prefill.md.
 func (g *MoEGPU) pad() int {
 	return maxInt(maxInt(moeBM(g.up), moeBM(g.down)), maxInt(moeBM(g.shUp), moeBM(g.shDown)))
 }
@@ -1008,11 +1020,23 @@ func (g *MoEGPU) build() error {
 	// never names, which is what lets one sequence mix them.
 	//
 	// The last two bindings are **arrays** of moeMaxBanks descriptors, one a
-	// layer, so the seven bindings are 5 + 2*48 = 101 buffers (L6a).
+	// layer, so the bindings are 5 + 2*48 + 1 = 102 buffers (L6a).
+	//
+	// **Binding 7 is the halves arena again, as sixteen-byte words** (P11):
+	// the grouped GEMM's gathered A operand, eight halves a load instead of
+	// one. The load addresses it by `uvec4` index, so the two offsets it
+	// divides are the row stride and the arena base, and both have to be
+	// whole loads — `lda` is `NEmbd + gemmPad` and every `halloc` rounds to
+	// 64 elements, so they are, and this says so rather than trusting it.
+	if g.lda%moeAVec != 0 || int(g.hXn)%moeAVec != 0 {
+		return fmt.Errorf("llm: the gathered operand loads %d halves at a time; lda %d and xn at %d are not whole loads",
+			moeAVec, g.lda, g.hXn)
+	}
 	banks := g.bankSet()
 	bufs := append([]*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}, banks...)
 	bufs = append(bufs, banks...)
-	counts := []uint32{1, 1, 1, 1, 1, moeMaxBanks, moeMaxBanks}
+	bufs = append(bufs, g.hbuf)
+	counts := []uint32{1, 1, 1, 1, 1, moeMaxBanks, moeMaxBanks, 1}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"route":   shaders.LLMMoERoute,

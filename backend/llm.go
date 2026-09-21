@@ -33,9 +33,23 @@ type LLMOptions struct {
 	// residency decision made once at load, not per request.
 	Context int
 	// Batch is how many tokens the arenas hold, which is the chunk a prompt
-	// is prefilled in. 512 is llama.cpp's own best ubatch on this part and
-	// what every measurement in LLM.md is against; larger arenas cost
-	// memory that the expert bank wants.
+	// is prefilled in.
+	//
+	// **It was 512 — llama.cpp's own best ubatch on this part, and what L1's
+	// baseline is against — and 512 is the worst rung this graph has** (P11).
+	// llama.cpp plateaus at its ubatch; this one does not, because the MoE's
+	// arithmetic intensity is the *routing's*: at 512 tokens 274 of 512
+	// experts are touched to serve 5120 rows, every one of them unpacked
+	// whole, and the schedule pads 5120 rows out to 11 904. Widening the
+	// chunk spreads that same unpack over more rows and costs only arenas.
+	// Measured at 48 layers and ctx 4096, two runs each:
+	//
+	//	512    1.16 GB of arenas    667.4 tok/s
+	//	2048   2.28 GB             1093.3   1.64x
+	//	4096   3.78 GB             1237.0   1.85x
+	//
+	// So the default is **2048**: 1.12 GB buys 64%, and the 1.49 GB after it
+	// buys 13% more. A deployment with the memory to spare should say 4096.
 	Batch int
 	// MaxTokens is what a request that names no budget gets. A request that
 	// names one still cannot run past the context.
@@ -51,7 +65,7 @@ type LLMOptions struct {
 const (
 	defaultLLMModelID  = "qwen3.8-flash-next"
 	defaultLLMContext  = 4096
-	defaultLLMBatch    = 512
+	defaultLLMBatch    = 2048
 	defaultLLMMaxToken = 1024
 )
 
