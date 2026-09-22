@@ -1,0 +1,236 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The per-cell gather (P14-2): per query tile, the **union** of its rows'
+// selections compacted into an ascending cell list, and a per-row bitmask over
+// that list. Two builds of this file, `-DGPASS=1` and `-DGPASS=2`, because the
+// mask reads the list and a pipeline barrier is the only handoff worth trusting
+// between two passes over a buffer.
+//
+// **Why this and not P13's block list.** P13 compacted the *blocks* the
+// selection leaves anything in and measured 1.00x: the attention kernel still
+// read every cell of a live block, and at 128 000 cells a 16-row tile's live
+// blocks hold 24 580 cells to do work on 10 058 of them. The 2.44x between
+// those two numbers is the last large term in a prefill at depth
+// (research/p13-long-context-prefill.md priced the rest), and a list of blocks
+// cannot reach it because the granularity a cooperative-matrix tile can skip at
+// is sixteen cells while the selection's runs are four.
+//
+// So the list is per cell. The attention kernel then runs a **dense** attention
+// over `count` gathered cells — no axis walk, no block skip, no causal
+// comparison — staging each key chunk's sixteen dims a group at a time through
+// LDS, which is what makes the scatter affordable: a selected run is `ratio`
+// consecutive cells and both planes are cell-major (P14-2 moved the value), so
+// a run is one 128-byte line per dim group.
+//
+// **The union and not the row.** One query row selects 2051 cells however deep
+// the cache is, and sixteen adjacent rows select 10 058 between them at 128 000
+// — 4.9x one row's reach, not the 1.76x a 64k measurement suggested. The tile
+// is sixteen rows because the fragment is, so the union is the floor here and
+// the per-row waste inside it is what the mask handles: a cell in the union that
+// this row did not select contributes nothing to O and nothing to the row sum,
+// exactly as an unselected cell did before.
+//
+// **It is not bit-identical to the block kernel and cannot be.** The online
+// softmax folds its partial maxima in the order it meets the cells, and a
+// gathered chunk of BN cells groups different cells than a BN-cell block does,
+// so the rescales happen in a different order and fp32 addition is not
+// associative. That is P8's situation exactly: the same arithmetic over the same
+// set, gated against the reference rather than against the other kernel, and
+// covered by `PinSchedule` with the other reassociating builds. What *is* exact
+// is the set — `TestAttnGPUGatherSelectsTheSameCells` asserts the list and the
+// mask against the bitmask the selection wrote, cell for cell.
+//
+// The arena layout is `gathMax`/`gathStride` in llm_common.glsl, because this
+// kernel and its consumer have to agree on it to the word.
+
+#include "llm_common.glsl"
+
+#ifndef BM
+#define BM 16       // query rows a tile, the consuming kernel's QT * 16
+#endif
+#ifndef WG
+#define WG 256
+#endif
+#ifndef GPASS
+#define GPASS 1
+#endif
+// Mask words the consuming kernel stages per row per key chunk, at the widest
+// gathered rung (`BN = 64`, so `BW = 2`). It only rounds the mask pass's write
+// up; nothing here depends on which rung actually runs.
+#ifndef GATH_BW
+#define GATH_BW 2
+#endif
+#define MAXWAVES 16
+
+layout(local_size_x = WG) in;
+
+#if GPASS == 1
+// One count per wave of this chunk, and the running offset each wave's output
+// starts at: a ballot gives a lane its position inside its own wave, these two
+// give the wave its position inside the workgroup, and `emitted` carries the
+// total across chunks. llm_attn_blocks.comp's arrangement, one granularity down.
+shared uint wcount[MAXWAVES];
+shared uint woff[MAXWAVES];
+shared uint emitted;
+#endif
+
+void main() {
+    uint qt = gl_WorkGroupID.x;
+    uint q0 = qt * BM;
+    if (q0 >= pc.tokens) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+    uint past = SEQ_PAST;
+    uint n = past + pc.tokens;
+
+    // The bound the consuming loop has: nothing at or past this query tile's
+    // last row can be attended to by any of its rows, and that row is cell
+    // `past + q0 + BM - 1`. A cell the loop would never reach must not be in
+    // the list, because the list is what replaces the loop.
+    uint last = min(n, past + q0 + BM);
+
+    uint words = (pc.nKV + 31u) / 32u;
+    uint mx = gathMax(pc.nKV, pc.selWidth, BM);
+    uint mwords = mx >> 5u;
+    uint base = pc.resOff + qt * gathStride(mx, BM);
+    uint idxBase = base + 1u;
+    uint maskBase = idxBase + mx;
+
+#if GPASS == 1
+    // ---- The union, compacted. One lane per 32 cells of the axis: OR the
+    // tile's rows together, and the set bits of that word are cells of the
+    // union in ascending order.
+    uint nw = (last + 31u) / 32u;
+    if (lane == 0u) {
+        emitted = 0u;
+    }
+    barrier();
+
+    for (uint w0 = 0u; w0 < nw; w0 += WG) {
+        uint w = w0 + lane;
+        uint u = 0u;
+        if (w < nw) {
+            // A pad row has no selection — the select does not run past the
+            // prompt — and the rows are ascending, so the first one past
+            // `tokens` ends the walk.
+            for (uint r = 0u; r < BM; ++r) {
+                uint token = q0 + r;
+                if (token >= pc.tokens) {
+                    break;
+                }
+                u |= actu[pc.selOff + token * words + w];
+            }
+            // The last word may reach past `last`. Those cells are outside
+            // every row's causal extent, and a selection can name them — the
+            // width is 2051 cells whether or not that many exist, so a row
+            // early in a batch has the causal mask's -inf cells selected to
+            // fill it. They contribute nothing; gathering them would be work.
+            if (w == nw - 1u && (last & 31u) != 0u) {
+                u &= (1u << (last & 31u)) - 1u;
+            }
+        }
+
+        // The compaction, and it has to preserve order: the consumer folds its
+        // partial softmaxes in the order it meets the cells, and the mask below
+        // is indexed by position in this list.
+        uint c = bitCount(u);
+        uint waveTotal = subgroupAdd(c);
+        uint within = subgroupExclusiveAdd(c);
+        uint wave = gl_SubgroupID;
+        if (subgroupElect()) {
+            wcount[wave] = waveTotal;
+        }
+        barrier();
+        if (lane == 0u) {
+            uint acc = emitted;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) {
+                woff[i] = acc;
+                acc += wcount[i];
+            }
+            emitted = acc;
+        }
+        barrier();
+        uint at = woff[wave] + within;
+        while (u != 0u) {
+            uint b = findLSB(u);
+            actu[idxBase + at] = w * 32u + b;
+            at++;
+            u &= u - 1u;
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        actu[base] = emitted;
+    }
+#else
+    // ---- The per-row mask over the gathered positions, and the causal test
+    // folded into it.
+    //
+    // One lane per output word: it reads 32 consecutive list entries — which
+    // are ascending, so their mask words are a handful of lines — and packs the
+    // bits of the row that selected them. That is the scattered read done
+    // **once for all twenty-four heads**, which is the whole reason it is a
+    // dispatch and not an inner loop: the selection is per token and the
+    // attention grid is (query tile, head).
+    // **Only the words the consumer will read**, which is `ceil(cnt/32)` of the
+    // `mwords` the arena has room for and not all of them. The capacity is the
+    // tight bound on the *union* — `BM * selWidth`, 32 832 words at this model's
+    // width — and a real union is a fraction of it: 315 words of 1026 at 128 000
+    // cells, and a handful at depth zero, where writing the whole capacity was
+    // the largest thing in this dispatch.
+    uint cnt = actu[base];
+    // **Rounded up to GATH_BW words**, which is the widest mask slice any
+    // gathered rung stages at once: `llm_attn_wmma.comp` reads `BW = BN/32`
+    // words a row per key chunk, so a 64-cell rung's last chunk asks for a
+    // second word that a tight `live` would have left holding the previous
+    // pass's bits — and the consuming loop has no `col >= cnt` test any more,
+    // because the mask is what replaced it.
+    uint live = ((cnt + 31u) / 32u + GATH_BW - 1u) / GATH_BW * GATH_BW;
+    uint mask = min(live, mwords);
+    for (uint i = lane; i < BM * mask; i += WG) {
+        uint r = i / mask, w = i % mask;
+        uint p0 = w * 32u;
+        uint bits = 0u;
+        uint token = q0 + r;
+        // **`p0 < cnt` and not only `token < tokens`.** The rounding above hands
+        // out one word past the count at an odd count, and `cnt - p0` is
+        // unsigned: without this the loop reads 32 stale list entries and sets
+        // bits for positions the gather never emitted. The 32-cell rung never
+        // reads that word and the 64-cell one does, which is what
+        // TestAttnGPUGatherRungsAgree is for.
+        if (p0 < cnt && token < pc.tokens) {
+            uint lim = min(32u, cnt - p0);
+            uint limit = past + q0 + r;       // this row's own causal extent
+            uint rowBase = pc.selOff + token * words;
+            // The list is ascending and the selection's runs are `ratio` cells,
+            // so 32 consecutive positions land in a handful of mask words —
+            // eight at this model's ratio if they are contiguous. Holding the
+            // last word turns 32 reads into that handful.
+            uint held = 0xFFFFFFFFu, word = 0u;
+            for (uint b = 0u; b < lim; ++b) {
+                uint cell = actu[idxBase + p0 + b];
+                if (cell > limit) {
+                    break;                    // and every cell after it: ascending
+                }
+                uint w32 = cell >> 5u;
+                if (w32 != held) {
+                    word = actu[rowBase + w32];
+                    held = w32;
+                }
+                if ((word & (1u << (cell & 31u))) != 0u) {
+                    bits |= 1u << b;
+                }
+            }
+        }
+        actu[maskBase + r * mwords + w] = bits;
+    }
+#endif
+}

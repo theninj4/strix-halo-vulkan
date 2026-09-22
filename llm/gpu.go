@@ -115,6 +115,32 @@ func (p push) bytes() []byte {
 // noW marks an optional tensor as absent, as NO_W does in the shader.
 const noW = 0xffffffff
 
+// maxBufferRange is this device's `maxStorageBufferRange`, 4 GiB - 4, and it is
+// the one limit in this vertical that is **silent when it is exceeded**.
+//
+// A VkBuffer larger than this is legal to create; what is not legal is binding
+// more of it than this at a descriptor, and the driver clamps rather than
+// failing — so a kernel reading past the range gets zeros and the model goes on
+// producing plausible, wrong numbers. P13 measured where that bites (the KV
+// planes share one buffer with the attention arenas, which caps the cache at
+// about 148k cells) and documented it; `checkBufferRange` is that note turned
+// into an error, because the failure mode is a run that is *faster* than it
+// should be — an attention over a cache of zeros is a cheap attention — and a
+// benchmark does not notice.
+const maxBufferRange = 4<<30 - 4
+
+// checkBufferRange fails when an arena would not fit in one descriptor's range.
+// `what` names the arena and `hint` says what the caller can reduce.
+func checkBufferRange(what string, bytes int, hint string) error {
+	if bytes <= maxBufferRange {
+		return nil
+	}
+	return fmt.Errorf("llm: the %s is %.2f GB and maxStorageBufferRange is %.2f GB — "+
+		"a descriptor cannot reach past it and the driver clamps instead of failing, "+
+		"so this would run fast and wrong; %s",
+		what, float64(bytes)/(1<<30), float64(maxBufferRange)/(1<<30), hint)
+}
+
 // HCKernel names one build of shaders/llm_gemm.comp. The two projections
 // have different N and different epilogues, so they have separate ladders;
 // within each, the rungs differ only in how many token rows a workgroup

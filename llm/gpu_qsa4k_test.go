@@ -51,6 +51,20 @@ func attnGPU4k(t *testing.T) (*AttnGPU, *Trace, AttnConfig, int, func()) {
 	return g, tr, c, nTok, func() { g.Destroy(); done() }
 }
 
+// attnGPU4kExpanded is the same fixture with the **expansion to cells** on
+// (P14-1): the per-cell score tensor is the reference's
+// `indexer_score_tokens`, so the tests that compare against it — and the CPU
+// `topK` that reads it — need the arm that still computes it. A shipped pass
+// does not, and `Cells()` returns nil there.
+//
+// The env has to be set before the device is built, because the tensor is an
+// arena and the arena plan is fixed at construction.
+func attnGPU4kExpanded(t *testing.T) (*AttnGPU, *Trace, AttnConfig, int, func()) {
+	t.Helper()
+	t.Setenv("LLM_ATTN_EXPAND_CELLS", "1")
+	return attnGPU4k(t)
+}
+
 // TestAttnGPUSelectionEngagesAt4k is the precondition, asserted rather than
 // assumed: the layer decides for itself whether to run the selection, from the
 // cache it was built for, and at 4096 cells against a width of 2051 it has to
@@ -68,11 +82,14 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%d dispatches: %v", len(d), kinds)
-	// The order, not the count: P9 split the indexer's score from its
-	// expansion to cells and P13 put the live-block compaction behind the
-	// selection, so what is worth asserting is the chain each link reads —
-	// `expand` writes the cell scores `select` reads, and `select` writes the
-	// bitmask `blocks` compacts.
+	// The order, not the count, and it is the chain each link reads.
+	//
+	// P9 split the indexer's score from its expansion to cells; P14-1 deleted
+	// the expansion, so `select` now reads the **block** scores `score` writes
+	// and there is no tensor between them. P13 put the live-block compaction
+	// behind the selection and P14-2 replaced it with a per-cell one, which is
+	// two dispatches: `attn.gather` compacts the bitmask `select` wrote and
+	// `attn.gathmask` reads the list `attn.gather` emitted.
 	at := func(k string) int {
 		for i, v := range kinds {
 			if v == k {
@@ -81,11 +98,19 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 		}
 		return -1
 	}
-	expand, sel := at("expand"), at("select")
-	if expand < 0 || sel < 0 || sel < expand {
-		t.Errorf("the graph is %v; the selection should run behind the expansion it reads", kinds)
+	score, sel, attn := at("score"), at("select"), at("attn")
+	if score < 0 || sel < 0 || sel < score {
+		t.Errorf("the graph is %v; the selection should run behind the score it reads", kinds)
 	}
-	if blk := at("blocks"); blk >= 0 && (blk < sel || blk > at("attn")) {
+	if at("expand") >= 0 {
+		t.Errorf("the graph is %v; a shipped pass does not expand the score to cells", kinds)
+	}
+	if gath, mask := at("attn.gather"), at("attn.gathmask"); gath >= 0 {
+		if gath < sel || mask < gath || attn < mask {
+			t.Errorf("the graph is %v; the gather compacts what the selection wrote, "+
+				"the mask reads the gather's list, and the attention reads both", kinds)
+		}
+	} else if blk := at("blocks"); blk >= 0 && (blk < sel || blk > attn) {
 		t.Errorf("the graph is %v; the compaction should sit between the selection "+
 			"it reads and the attention it feeds", kinds)
 	}
@@ -106,7 +131,7 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 // reproducible against itself). A bitmask has no order, so ours is a function
 // of the scores alone, and this test says so.
 func TestAttnGPUSelectionIsTheCPUs(t *testing.T) {
-	g, _, _, nTok, done := attnGPU4k(t)
+	g, _, _, nTok, done := attnGPU4kExpanded(t)
 	defer done()
 
 	if err := g.Run(0); err != nil {

@@ -69,8 +69,10 @@
 // magnitude the matrix cores are worth. Tile (t, c) of a head — token rows
 // 16t.., component columns 16c.. — is 512 contiguous bytes. The query and the
 // key share one mode, because the reduction axis of q.k^T is the component for
-// both operands; the value is stored transposed, because the reduction axis of
-// p.v is the token.
+// both operands; the value is **also** cell-major since P14-2, read as a
+// RowMajor B operand rather than a ColumnMajor one — the same matrix out of a
+// tile permuted, and the permutation that lets a gather read a selected run as
+// one line.
 //
 // The softmax scale folds into the query here, 1/sqrt(headDim) * log2(e), so
 // the attention kernel's exponential is `exp2` and not `exp`.
@@ -151,7 +153,21 @@ void main() {
         outOff = pc.vOff;
         rot = false;
         cached = true;
-        mode = 1u;
+        // **Cell-major, like the key** (P14-2). The value used to be stored
+        // transposed — one dim's sixteen cells contiguous — because the
+        // reduction axis of p.v is the cell and `coopMatLoad`'s ColumnMajor
+        // then read the B operand straight. RowMajor over a cell-major tile
+        // reads the *same matrix*: element (k=cell, n=dim) at `k*16 + n`
+        // rather than at `n*16 + k`, so this is a permutation inside the
+        // 512-byte tile and nothing else — every exact gate stays exact.
+        //
+        // What it buys is the gather. A selected run is `ratio` consecutive
+        // cells, so cell-major puts a run's values in one 128-byte line for
+        // every plane; transposed, a run is four halves out of each of sixteen
+        // 32-byte rows, which is the whole tile read for a quarter of it. K
+        // was already gatherable and V was not, and the value is half the
+        // traffic.
+        mode = 0u;
     }
 
     // Coalesced in: consecutive lanes read consecutive components of one

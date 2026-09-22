@@ -388,8 +388,16 @@ func (g *Graph) PinSchedule(on bool) error {
 		// goes off with the rest of them.
 		if on {
 			g.attn.SetSplits(1)
+			// And P14-2's gather, which is the seventh kernel this pin covers
+			// and the only one that could not have been made chunk-invariant:
+			// its list is the union of a query tile's sixteen rows, so a chunk
+			// that ends inside the tile gathers a different list and the online
+			// softmax folds the same terms in a different order. See
+			// AttnGPU.SetGather.
+			g.attn.SetGather(false)
 		} else {
 			g.attn.SetSplits(0)
+			g.attn.AutoGather()
 		}
 	}
 	if !on {

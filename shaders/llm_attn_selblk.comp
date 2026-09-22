@@ -1,0 +1,324 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The QSA selection over **block** scores instead of cell scores (P14-1), and
+// the dispatch that deletes `llm_attn_expand.comp` altogether.
+//
+// `llm_attn_select.comp` is the same radix select over a tensor
+// `llm_attn_expand.comp` writes: one f32 a cache cell a token, `nKV` of them,
+// which at 128 000 cells and a 2048-row batch is **1.14 GB of arena** and five
+// streams of it per token — four radix passes and the emit. But the tensor has
+// only `nKV/ratio + 1` distinct values in it, because **all `ratio` cells of a
+// pooled block carry one block score** (llm_attn_score.comp) and every cell
+// the causal mask drops carries -inf. So the select can run over the block
+// scores with a per-block **weight** — how many of its cells this token can
+// see — and get the same threshold over a quarter of the traffic, with the
+// expansion not computed at all.
+//
+// `ratio` is 4 in this model, so that is 4x on every pass and the arena goes
+// with it. P13's budget at 128 000 cells put `attn.select` at 0.233 ms a token
+// and `attn.expand` at 0.051 — 16% of a prefill token there — and the freed
+// arena is what a wider ubatch at depth needs, which is the other half of the
+// same change.
+//
+// **It is the same answer, bit for bit, and that is what makes it allowed.**
+// Three things have to hold and all three are arithmetic rather than hope:
+//
+//  1. **The threshold.** A radix select needs the count of keys above a
+//     prefix; a weighted histogram over blocks counts exactly the cells the
+//     per-cell histogram counted, because every cell of block b has key b and
+//     nothing else does. `desired` starts at `min(selWidth, ncols)` as before
+//     and the total weight is exactly `ncols`.
+//  2. **The tie fill.** The reference appends cells equal to the threshold in
+//     ascending cell index (L4a, and the note in llm_attn_select.comp), and the
+//     emit below still walks cells ascending — it is the *keys* that come from
+//     blocks, not the order. Two blocks whose scores happen to be equal are
+//     one bucket in the histogram and two runs in the emit, and the emit takes
+//     the lower run first, which is what the per-cell code did.
+//  3. **The dead cells.** Everything past this token's position is -inf, whose
+//     key `0x007FFFFF` is the smallest there is, and they are all *after* the
+//     live cells — so they enter the histogram as one weighted entry and the
+//     emit fills them from the lowest index, again as before. A block can
+//     never collide with that key: the only bias that makes one -inf is the
+//     `b >= nBid` arm, and those blocks have weight zero.
+//
+// `TestAttnGPUSelectBlocksIsTheCellSelect` asserts the equality against the
+// kernel this replaces, over three depths and both the shallow and the deep
+// regime, and `TestAttnGPUSelectionIsTheCPUs` still holds it to the reference.
+//
+// **What it does not change.** The bias table, the `f2ui` map, the bucket
+// search's suffix sum (P10) and the emit's tie scan are
+// llm_attn_select.comp's, line for line — this file is that kernel with the
+// row it reads replaced by a row a quarter as long and a weight beside each
+// entry. The old kernel stays as the control arm
+// (`LLM_ATTN_EXPAND_CELLS=1`), which is also what `Cells()` needs.
+
+#include "llm_common.glsl"
+
+#ifndef WG
+#define WG 256
+#endif
+#define RADIX_BITS 8
+#define RADIX_SIZE (1 << RADIX_BITS)
+
+// Block keys held in LDS. It is the same 16 KB the cell select cached cells in
+// and it now reaches `ratio` times as deep — 4096 blocks is 16 384 cells — so
+// every prefill from a cold cache is cached and only real depth falls back to
+// re-reading the scores.
+#ifndef SEL_LDS
+#define SEL_LDS 4096
+#endif
+
+#if WG < RADIX_SIZE || (WG % 64) != 0
+#error "llm_attn_selblk wants a whole number of waves, at least one lane per radix bucket"
+#endif
+
+layout(local_size_x = WG) in;
+
+shared uint histo[RADIX_SIZE];
+shared uint shBucket, shAbove;
+shared uint keys[SEL_LDS];
+shared uint shWave[WG / 64];
+
+// The order-preserving float -> uint map, llm_attn_select.comp's exactly.
+uint f2ui(float x) {
+    uint y = floatBitsToUint(x);
+    return ((y & 0x80000000u) != 0u) ? (y ^ 0xFFFFFFFFu) : (y | 0x80000000u);
+}
+
+// f2ui(-inf): 0xFF800000 is negative, so every bit inverts. It is the smallest
+// key there is, which is what lets a row that is mostly causal mask select at
+// all.
+#define NEGINF_KEY 0x007FFFFFu
+
+// The per-token shape, computed once and read by both halves below. Every one
+// of these lines is llm_attn_expand.comp's; see the bias table there.
+uint gRatio, gNBlocks, gNBid, gDeadBid, gTailStart, gPos, gNcols, gScoreBase;
+bool gCached;
+
+// blockKey is the key of every cell of block b: the score the indexer wrote,
+// plus the bias b's relationship to this token implies, mapped. It is an f32
+// add in the same order llm_attn_expand.comp did it, so the key is the same
+// bits.
+uint blockKey(uint b) {
+    if (gCached && b < SEL_LDS) {
+        return keys[b];
+    }
+    float bias;
+    if (b >= gNBid) {
+        bias = (b == gDeadBid && gNBid < gNBlocks) ? 1e9 : -1.0 / 0.0;
+    } else if (b * gRatio >= gTailStart) {
+        bias = 1e9;
+    } else {
+        bias = 0.0;
+    }
+    return f2ui(act[gScoreBase + b] + bias);
+}
+
+// blockWeight is how many cells carry block b's key for this token: the cells
+// of b that exist and that the causal mask lets this token see. It is closed
+// form, which is the point — the per-cell kernel had to read them to count
+// them.
+//
+//   b < nBid                      [b*ratio, b*ratio+ratio) clipped to pos+1
+//   b == deadBid, nBid < nBlocks  the incomplete tail, [nBid*ratio, ncols)
+//   otherwise                     none: the block does not exist
+uint blockWeight(uint b) {
+    uint lo, hi;
+    if (b == gDeadBid && gNBid < gNBlocks) {
+        lo = gNBid * gRatio;
+        hi = min(gNcols, gPos + 1u);
+    } else if (b < gNBid) {
+        lo = b * gRatio;
+        hi = min(lo + gRatio, min(gNcols, gPos + 1u));
+    } else {
+        return 0u;
+    }
+    return (hi > lo) ? hi - lo : 0u;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    gRatio = pc.ratio;
+    gPos = SEQ_PAST + t;
+    uint nCells = SEQ_PAST + pc.tokens;
+    gNBlocks = (pc.nKV + gRatio - 1u) / gRatio;
+    gNBid = nCells / gRatio;
+    gDeadBid = (gNBid >= gNBlocks) ? gNBlocks - 1u : gNBid;
+    gTailStart = (gPos + 1u) / gRatio * gRatio;
+    gNcols = min(nCells, pc.nKV);
+    gScoreBase = pc.scoreOff + t * gNBlocks;
+
+    uint stride = (pc.nKV + 31u) / 32u;
+    uint words = (gNcols + 31u) / 32u;
+    uint outBase = pc.selOff + t * stride;
+
+    // **The blocks that can carry a cell, and no more** (P7's rule, one level
+    // up). Every block past the last one the context reaches has weight zero
+    // and cannot be selected, so the histogram never visits it — which is what
+    // makes this kernel cost the depth and not the cache.
+    uint bLim = min(gNBlocks, (gNcols + gRatio - 1u) / gRatio);
+    gCached = false;
+    if (bLim <= SEL_LDS) {
+        for (uint b = tid; b < bLim; b += WG) {
+            keys[b] = blockKey(b);
+        }
+        barrier();
+        gCached = true;
+    }
+
+    // The cells past this token's position: one weighted entry, key -inf.
+    uint nDead = (gNcols > gPos + 1u) ? gNcols - (gPos + 1u) : 0u;
+
+    // ---- The radix select, four passes over the *blocks*.
+    uint prefix = 0u;
+    uint desired = min(pc.selWidth, gNcols);
+    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+        for (uint i = tid; i < RADIX_SIZE; i += WG) {
+            histo[i] = 0u;
+        }
+        barrier();
+
+        uint hiMask = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        uint prefixHi = prefix & hiMask;
+        for (uint b = tid; b < bLim; b += WG) {
+            uint w = blockWeight(b);
+            if (w == 0u) {
+                continue;
+            }
+            uint key = blockKey(b);
+            if ((key & hiMask) == prefixHi) {
+                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1u)], w);
+            }
+        }
+        if (tid == 0u && nDead != 0u && (NEGINF_KEY & hiMask) == prefixHi) {
+            atomicAdd(histo[(NEGINF_KEY >> uint(shift)) & (RADIX_SIZE - 1u)], nDead);
+        }
+        barrier();
+
+        // The bucket search, P10's suffix sum over one lane a bucket. Not one
+        // line of this differs from llm_attn_select.comp: the counts are
+        // weighted, and a weighted count is still a count.
+        uint h = (tid < RADIX_SIZE) ? histo[tid] : 0u;
+        uint waveTotal = subgroupAdd(h);
+        uint suffix = waveTotal - subgroupExclusiveAdd(h);
+        uint sg = tid / 64u;
+        if (subgroupElect()) {
+            shWave[sg] = waveTotal;
+        }
+        barrier();
+        [[unroll]] for (uint w = 0u; w < WG / 64u; ++w) {
+            if (w > sg) {
+                suffix += shWave[w];
+            }
+        }
+        if (tid == 0u) {
+            shBucket = 0u;
+        }
+        barrier();
+        if (tid < RADIX_SIZE && suffix >= desired) {
+            atomicMax(shBucket, tid);
+        }
+        barrier();
+        if (tid == shBucket) {
+            shAbove = suffix - h;
+        }
+        barrier();
+        prefix |= shBucket << uint(shift);
+        desired -= shAbove;
+        barrier();
+    }
+
+    uint thr = prefix;
+    uint need = desired;
+
+    // ---- The emit, and it is the one pass that is still per cell, because the
+    // output is: one lane a 32-cell word, the word's strictly-above bits and
+    // then as many of its ties as the fill has left.
+    //
+    // What it is not is a read per cell. Cells are grouped `ratio` to a block
+    // and the word is `32/ratio` blocks, so the key is fetched when the block
+    // changes — eight reads a word at this model's ratio rather than
+    // thirty-two, on top of the four passes above being a quarter as long.
+    // And a word wholly past this token's position is every cell -inf with no
+    // read at all, which is most of the row on a batch from a cold cache.
+    uint taken = 0u;
+    for (uint wbase = 0u; wbase < words; wbase += WG) {
+        uint w = wbase + tid;
+        uint above = 0u, eq = 0u;
+        if (w < words) {
+            uint c0 = w * 32u;
+            uint lim = min(32u, gNcols - c0);
+            // Cells [0, nlive) of this word are live and carry a block key;
+            // [nlive, lim) are past `pos` and are the causal mask's -inf.
+            uint nlive = (gPos >= c0) ? min(lim, gPos + 1u - c0) : 0u;
+            uint lastB = 0xFFFFFFFFu, key = 0u;
+            for (uint b = 0u; b < nlive; ++b) {
+                uint j = c0 + b;
+                uint blk = (j < gNBid * gRatio) ? (j / gRatio) : gDeadBid;
+                if (blk != lastB) {
+                    key = blockKey(blk);
+                    lastB = blk;
+                }
+                if (key > thr) {
+                    above |= 1u << b;
+                } else if (key == thr) {
+                    eq |= 1u << b;
+                }
+            }
+            if (nlive < lim) {
+                uint dead = ((lim - nlive) >= 32u) ? 0xFFFFFFFFu
+                                                  : (((1u << (lim - nlive)) - 1u) << nlive);
+                if (NEGINF_KEY > thr) {
+                    above |= dead;
+                } else if (NEGINF_KEY == thr) {
+                    eq |= dead;
+                }
+            }
+        }
+
+        uint c = bitCount(eq);
+        uint cTotal = subgroupAdd(c);
+        uint cIncl = subgroupInclusiveAdd(c);
+        uint sg = tid / 64u;
+        if (subgroupElect()) {
+            shWave[sg] = cTotal;
+        }
+        barrier();
+        uint total = 0u;
+        uint before = 0u;
+        [[unroll]] for (uint ww = 0u; ww < WG / 64u; ++ww) {
+            total += shWave[ww];
+            if (ww < sg) {
+                before += shWave[ww];
+            }
+        }
+        uint rank = taken + before + cIncl - c;
+
+        uint fill = 0u;
+        while (eq != 0u && rank < need) {
+            uint b = findLSB(eq);
+            fill |= 1u << b;
+            eq &= eq - 1u;
+            rank++;
+        }
+        if (w < words) {
+            actu[outBase + w] = above | fill;
+        }
+        taken += total;
+        barrier();
+    }
+
+    for (uint w = words + tid; w < stride; w += WG) {
+        actu[outBase + w] = 0u;
+    }
+}

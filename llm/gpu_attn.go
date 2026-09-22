@@ -49,6 +49,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"os"
 	"strconv"
 	"time"
@@ -449,6 +450,25 @@ type AttnGPU struct {
 	// indices of the key blocks the selection leaves anything in.
 	aBlk     uint32
 	blkTiles int
+	// P14-2's gather: per query tile, the ascending cells its rows select
+	// between them and a per-row bitmask over those positions.
+	aGath     uint32
+	gathTiles int
+	// pinGather fixes whether the gather runs: 0 leaves gather() to decide, 1
+	// forces it on, -1 forces it off. It is what PinSchedule turns off, for
+	// the reason SetGather gives.
+	pinGather int
+	// expandCells is whether the indexer's score is expanded to one f32 a
+	// cache cell (P9's llm_attn_expand.comp) and the selection runs over that
+	// tensor, or whether the selection runs over the **block** scores with a
+	// per-block weight and the expansion is not computed at all (P14-1).
+	//
+	// It is off by default and it is decided at construction, not per pass,
+	// because it is an arena: the expanded tensor is `rows * nKV` floats —
+	// 1.14 GB at 128 000 cells and a 2048-row batch, and 4.6 GB at the 8192
+	// rows a prefill at depth wants. LLM_ATTN_EXPAND_CELLS=1 is the control
+	// arm, and it is also what Cells() reads.
+	expandCells bool
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1).
 	aPart    uint32
 	actElems int
@@ -681,16 +701,20 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 	}
 	g := &AttnGPU{
 		dev: dev, cfg: cfg, bank: bank, sim: sim,
-		pipes:    make(map[string]*vk.ComputePipeline),
-		tokens:   maxTokens,
-		rows:     maxTokens,
-		nKV:      nKV,
-		lda:      cfg.NEmbd + gemmPad,
-		ldCtx:    cfg.GateWidth() + gemmPad,
-		attn:     DefaultAttnKernel(),
-		gemm:     GEMMKernelFor(maxTokens),
-		outGemm:  OutGEMMKernelFor(maxTokens),
-		autoPlan: true,
+		pipes:  make(map[string]*vk.ComputePipeline),
+		tokens: maxTokens,
+		rows:   maxTokens,
+		nKV:    nKV,
+		lda:    cfg.NEmbd + gemmPad,
+		ldCtx:  cfg.GateWidth() + gemmPad,
+		attn:   DefaultAttnKernel(),
+		gemm:   GEMMKernelFor(maxTokens),
+		// P14-1: the expansion to cells is the control arm and the debug read,
+		// not the shipped path. It is an arena decision, so it is taken here
+		// and not per pass.
+		expandCells: os.Getenv("LLM_ATTN_EXPAND_CELLS") == "1",
+		outGemm:     OutGEMMKernelFor(maxTokens),
+		autoPlan:    true,
 	}
 	// The plane is padded up to the widest tile any rung covers, because the
 	// attention kernel reads whole key blocks and the pack writes whole token
@@ -758,7 +782,15 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	}
 	g.aQKV = alloc(rows * g.qkvN())
 	g.aScore = alloc(rows * g.NBlocks())
-	g.aCell = alloc(rows * g.nKV)
+	// The expanded per-cell score, and **only when something reads it**
+	// (P14-1). It is the largest arena in the block by an order — `rows * nKV`
+	// floats, 1.14 GB at a 2048-row batch over 139k cells — and the selection
+	// no longer needs it.
+	if g.expandCells {
+		g.aCell = alloc(rows * g.nKV)
+	} else {
+		g.aCell = noW
+	}
 	// The output gets its own arena rather than being written back over the
 	// projection's. It is 5 MB at 512 tokens against the 27 the fused
 	// projection holds, and aliasing them would cost the layer's own inputs —
@@ -777,6 +809,17 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// expanded cell scores already take.
 	g.blkTiles = (rows + blkListBM - 1) / blkListBM
 	g.aBlk = alloc(g.blkTiles * g.blkStride())
+	// P14-2's gather arena, and it is what the expansion's 1.14 GB paid for.
+	// Per query tile: a count, at most `BM * selWidth` cell indices, and BM
+	// rows of bitmask over them — 197 KB a tile at 139k cells, so 25 MB at a
+	// 2048-row batch and 101 MB at 8192. Sized for the *narrowest* tile any
+	// rung uses, because the rung is a knob and the arena plan is fixed here.
+	if g.sparse {
+		g.gathTiles = (rows + gathBM - 1) / gathBM
+		g.aGath = alloc(g.gathTiles * g.gathStride())
+	} else {
+		g.aGath = noW
+	}
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1). The wider
 	// of the two projections is the fused one, so 40 x 13952 x 4 = 2.2 MB —
 	// allocated whichever rung runs, because the arena plan is fixed at
@@ -789,6 +832,10 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// 708 MB at 131k cells.
 	splitRows := minInt(attnSplitMaxRows, rows)
 	g.aSplit = alloc(c.NHead * attnMaxSplits * splitRows * (c.HeadDim + 2))
+	if err := checkBufferRange("attention fp32 arena", g.actElems*4,
+		"reduce the batch (-llm-batch / -pp), which is what these arenas are cut against"); err != nil {
+		return err
+	}
 	if g.abuf, err = newArena(g.dev, g.actElems*4); err != nil {
 		return fmt.Errorf("llm: attention fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -822,6 +869,19 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.hV = halloc(nLayers * g.kvStride)
 	g.hIdxRaw = halloc(nLayers * g.idxRawStride)
 	g.hIdxK = halloc(nLayers * g.idxKStride)
+	// **The cap, asserted rather than commented** (P14). At 27.7 KB a cell over
+	// twelve layers the paragraph above runs out of descriptor range at about
+	// 148k cells, and the driver clamps the range instead of refusing it — so a
+	// cache past the cap reads as zeros and the model produces plausible, wrong
+	// numbers *faster* than the real thing, which is the one failure a
+	// benchmark cannot see. It cost this vertical a day's sweep once.
+	if err := checkBufferRange("attention fp16 arena", g.hElems*2,
+		fmt.Sprintf("this cache is %d cells over %d layers at %.2f KB a cell a layer, "+
+			"so the cap is about %d cells — past that the KV planes want one buffer a layer (L6a)",
+			g.nKV, nLayers, float64(g.kvStride+g.idxRawStride+g.idxKStride)*2/float64(g.nKV)/1024,
+			maxBufferRange/(2*(g.hElems/maxInt(g.nKV, 1))))); err != nil {
+		return err
+	}
 	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
@@ -901,12 +961,24 @@ func (g *AttnGPU) build() error {
 	for name, spirv := range map[string][]byte{
 		"select":  shaders.LLMAttnSelect,
 		selectW1k: shaders.LLMAttnSelectW1024,
+		// P14-1's build of the same select over block scores. Both are always
+		// compiled — the choice is an arena decision taken at construction and
+		// the control arm has to be reachable from an env var.
+		selBlk:    shaders.LLMAttnSelBlk,
+		selBlkW1k: shaders.LLMAttnSelBlkW1024,
 	} {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
 			return err
 		}
+	}
+	// P14-4's score on the matrix cores: a cooperative matrix wants the wave
+	// pinned for the reason every rung here does.
+	if err := g.pipeline(scoreWMMA, shaders.LLMAttnScoreWMMA, vk.PipelineSpec{
+		Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+	}); err != nil {
+		return err
 	}
 	for _, v := range attnVariants {
 		if err := g.pipeline(string(v.name), v.spirv, vk.PipelineSpec{
@@ -925,6 +997,16 @@ func (g *AttnGPU) build() error {
 	// is a ballot and a prefix over waves, so the wave is pinned for the
 	// reason the selection's bucket search is.
 	for name, spirv := range blkListPipes {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
+	}
+	// P14-2's gather: the two compaction passes and the attention rungs that
+	// read what they write. Wave-pinned for the reason every kernel here with a
+	// ballot or a cooperative matrix in it is.
+	for name, spirv := range gathPipes {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
@@ -1394,6 +1476,195 @@ func (g *AttnGPU) blkStride() int { return 1 + (g.nKV+blkListBN-1)/blkListBN }
 // TestAttnGPUBlockListDoesNotChangeTheAnswer asserts as an equality.
 func (g *AttnGPU) blockList() bool { return os.Getenv("LLM_ATTN_BLOCK_LIST") == "1" }
 
+// ---- P14-2: the per-cell gather, and it is the last large term in a prefill
+// at depth.
+//
+// P13 closed the arithmetic of 900 tok/s at 128k and named one route to it. The
+// selection skips cells; the kernel skips **blocks**; and at 128 000 cells a
+// sixteen-row query tile's live 16-cell blocks hold 24 580 cells to do work on
+// the 10 058 its rows actually selected. P13's block list deleted 83% of the
+// *visits* and measured 1.00x, because the visits were never the cost — the
+// cells were. This deletes the cells: a compaction one granularity finer, and a
+// dense attention over what comes out.
+//
+// The three things that make it affordable, none of which P13 had:
+//
+//   - **The value plane is cell-major** (P14-2's other half). A selected run is
+//     `ratio` consecutive cells, so a run is one 128-byte line per head-dim
+//     group in both planes. Transposed, the value's run was four halves out of
+//     each of sixteen rows — the whole tile read for a quarter of it.
+//   - **The staging is a head-dim group, not a chunk.** 1 KB of LDS, not 32, so
+//     the single-wave workgroups stay twenty-deep on a compute unit. Occupancy
+//     is the one thing a prefill cannot trade (P13-3).
+//   - **The causal test is in the mask.** The gather ANDs each row's own extent
+//     into the bits it writes, so the loop has one predicate where the block
+//     kernel had three.
+//
+// It is **prefill's and not decode's**, on P8's rule: a decode step is one query
+// tile, its 24 single-wave workgroups all fit at once, and what it costs is one
+// wave's serial walk — which a gather in front of it lengthens rather than cuts,
+// on top of two dispatches it cannot amortise over 128 tiles.
+const (
+	// The narrowest query tile any gathered rung uses. The arena is sized for
+	// it because the rung is a knob and the arena plan is fixed at
+	// construction.
+	gathBM = 16
+	// The row count at or below which the gather is not taken: the decode
+	// regime, where the split kernel owns the axis.
+	gathMinRows = attnSplitMaxRows + 1
+	// Head-dim groups staged per barrier, and it is a measured rung — see
+	// gathGroups. 2 is 1.00x and 4 is 1.34x against, because the barriers were
+	// never the cost.
+	gathDefaultGroups = 1
+	// Query heads a workgroup — see gathHeadsPerWG.
+	gathDefaultHeads = 1
+)
+
+var gathPipes = map[string][]byte{
+	"gather":          shaders.LLMAttnGatherBM16,
+	"gathmask":        shaders.LLMAttnGathMaskBM16,
+	"gath.qt1_kt1":    shaders.LLMAttnGathQT1KT1,
+	"gath.qt1_kt2":    shaders.LLMAttnGathQT1KT2,
+	"gath.qt1_kt4":    shaders.LLMAttnGathQT1KT4,
+	"gath.qt1_kt1_g2": shaders.LLMAttnGathQT1KT1G2,
+	"gath.qt1_kt2_g2": shaders.LLMAttnGathQT1KT2G2,
+	"gath.qt1_kt4_g2": shaders.LLMAttnGathQT1KT4G2,
+	"gath.qt1_kt1_g4": shaders.LLMAttnGathQT1KT1G4,
+	"gath.qt1_kt2_g4": shaders.LLMAttnGathQT1KT2G4,
+	"gath.qt1_kt4_g4": shaders.LLMAttnGathQT1KT4G4,
+	"gath.qt1_kt1_h2": shaders.LLMAttnGathQT1KT1H2,
+	"gath.qt1_kt2_h2": shaders.LLMAttnGathQT1KT2H2,
+	"gath.qt1_kt4_h2": shaders.LLMAttnGathQT1KT4H2,
+	"gath.qt1_kt1_h4": shaders.LLMAttnGathQT1KT1H4,
+	"gath.qt1_kt2_h4": shaders.LLMAttnGathQT1KT2H4,
+	"gath.qt1_kt4_h4": shaders.LLMAttnGathQT1KT4H4,
+}
+
+// gathMax is the tight bound on one query tile's union: each of its gathBM rows
+// names at most `selWidth` cells, and never more than the cache holds. Rounded
+// up to 64 so the mask is a whole number of words and the list a whole number of
+// key chunks at every rung — `gathMax` in llm_common.glsl, and the two have to
+// agree to the word.
+func (g *AttnGPU) gathMax() int {
+	return (minInt(g.nKV, gathBM*g.selWidth()) + 63) &^ 63
+}
+
+// gathStride is how many uints one query tile holds: the count, the cell
+// indices, and gathBM rows of bitmask over them.
+func (g *AttnGPU) gathStride() int {
+	mx := g.gathMax()
+	return 1 + mx + gathBM*(mx/32)
+}
+
+// gathPipe names the gathered build for a rung and a staging width, or "" where
+// there is none. `grp` of 1 leaves the suffix off, so the shipped name is the
+// one the ladder started with.
+func gathPipe(av attnVariant, grp, hpw int) string {
+	if av.qt != 1 || av.ktil > 4 {
+		return ""
+	}
+	base := fmt.Sprintf("gath.qt%d_kt%d", av.qt, av.ktil)
+	switch {
+	case hpw > 1 && grp > 1:
+		return "" // not a build; the two knobs are swept one at a time
+	case hpw > 1:
+		return fmt.Sprintf("%s_h%d", base, hpw)
+	case grp > 1:
+		return fmt.Sprintf("%s_g%d", base, grp)
+	}
+	return base
+}
+
+// gathHeadsPerWG is how many query heads share one workgroup, and so one staging
+// of the gathered key and value. It has to divide the head count — every wave of
+// the workgroup reaches every barrier — so a count that does not is refused back
+// to 1 rather than deadlocking.
+//
+// LLM_ATTN_GATHER_HEADS is the ladder.
+func (g *AttnGPU) gathHeadsPerWG() int {
+	n := gathDefaultHeads
+	if v, err := strconv.Atoi(os.Getenv("LLM_ATTN_GATHER_HEADS")); err == nil && v >= 1 {
+		n = v
+	}
+	if n <= 1 || g.cfg.NHead%n != 0 {
+		return 1
+	}
+	return n
+}
+
+// gathGroups is how many head-dim groups the gathered kernel stages per barrier.
+// LLM_ATTN_GATHER_GRP is the ladder.
+func (g *AttnGPU) gathGroups() int {
+	if n, err := strconv.Atoi(os.Getenv("LLM_ATTN_GATHER_GRP")); err == nil && n >= 1 {
+		return n
+	}
+	return gathDefaultGroups
+}
+
+// gathRung is which rung a gathered pass runs, and it is **not the block
+// kernel's**. P13 took the narrow 16-cell block because at depth this kernel was
+// short of cells it was allowed to skip; the gathered axis has nothing left to
+// skip, so the block width is decided by reuse again — a 64-cell chunk loads the
+// same query fragments for four key tiles — which is the ladder L2f measured
+// before depth was in the picture.
+func (g *AttnGPU) gathRung() AttnKernel {
+	if v := os.Getenv("LLM_ATTN_GATHER_KERNEL"); v != "" {
+		return AttnKernel(v)
+	}
+	return AttnQT1KT2
+}
+
+// gather is whether this pass builds the gathered list and runs the kernel over
+// it. LLM_ATTN_GATHER=0 is the control arm — the block kernel P13 shipped.
+func (g *AttnGPU) gather() bool {
+	if g.pinGather != 0 {
+		return g.pinGather > 0
+	}
+	if v := os.Getenv("LLM_ATTN_GATHER"); v != "" {
+		return v == "1"
+	}
+	return g.sparse && g.rows >= gathMinRows
+}
+
+// SetGather pins the gather on (1), off (-1) or back to the default (0).
+//
+// **It exists because the gather is the first kernel in this vertical that is
+// not chunk-invariant, and that cannot be fixed.** L7a's gate is that a token
+// at cell `pos` comes back bit for bit whether it arrived alone or seventh of
+// seven, and every ladder here holds it: a rung tiles the same arithmetic
+// differently, P7's block skip drops blocks that contribute nothing, and P8's
+// split strides *absolute* key blocks precisely so a slice does not depend on
+// how the prompt was cut.
+//
+// A gathered list cannot have that property. It is the union of a query tile's
+// sixteen rows, and a chunk that ends inside the tile has fewer rows to union —
+// so the same absolute tile gathers a different list, the list is partitioned
+// into different key chunks, and the online softmax folds its rescales in a
+// different order. The *set* each row attends over is identical either way, and
+// so is every nonzero term in its accumulators; what moves is the grouping, and
+// fp32 addition is not associative.
+//
+// So it goes off with the other five reassociating kernels under
+// `Graph.PinSchedule`, and the chunk-equality gates pin it. What is left in the
+// shipped path is narrower than it sounds: a prompt prefilled twice at the same
+// ubatch is bit-identical, and decode never takes this kernel at all — only
+// changing the ubatch moves the last places. `TestAttnGPUGatherIsTheBlockKernel`
+// is the tolerance that replaces the equality.
+func (g *AttnGPU) SetGather(on bool) {
+	if on {
+		g.pinGather = 1
+	} else {
+		g.pinGather = -1
+	}
+}
+
+// AutoGather gives the default back.
+func (g *AttnGPU) AutoGather() { g.pinGather = 0 }
+
+// Gathers reports whether the pass this instance would plan now takes the
+// gather.
+func (g *AttnGPU) Gathers() bool { return g.gather() }
+
 func (g *AttnGPU) attnSplits(av attnVariant) int {
 	if g.rows > av.rows || g.rows > attnSplitMaxRows {
 		return 1
@@ -1424,8 +1695,27 @@ func (g *AttnGPU) cellSplits() uint32 {
 	return attnCellSplits
 }
 
-// selectW1k names the sixteen-wave build of the selection in the pipeline map.
-const selectW1k = "select.w1024"
+// selectW1k names the sixteen-wave build of the selection in the pipeline map,
+// and selBlk/selBlkW1k the two builds of P14-1's block-score select.
+const (
+	selectW1k = "select.w1024"
+	selBlk    = "selblk"
+	selBlkW1k = "selblk.w1024"
+	scoreWMMA = "score.wmma"
+)
+
+// scorePipe is which build of the indexer's score this pass runs, and what the
+// grid over it is: the scalar kernel is one workgroup a **token**, the matrix-core
+// one is a workgroup a **token tile** (P14-4).
+//
+// LLM_ATTN_SCORE=scalar is the control arm — the kernel L2e measured, which is
+// also the one every tolerance against llama.cpp was originally set on.
+func (g *AttnGPU) scorePipe() (pipe string, gx uint32) {
+	if os.Getenv("LLM_ATTN_SCORE") == "scalar" {
+		return "score", uint32(g.rows)
+	}
+	return scoreWMMA, uint32(roundUpInt(g.rows, coopMatTile) / coopMatTile)
+}
 
 // selectPipe is which build of llm_attn_select.comp this run uses (P10).
 //
@@ -1439,11 +1729,21 @@ const selectW1k = "select.w1024"
 // compute unit have nothing to hide that behind.
 //
 // LLM_ATTN_SELECT_WG=256 is the narrow control arm.
+// **Which of the two selections** is P14-1's and is not a rung: the block
+// select reads a tensor the cell select's expansion writes, so the arena plan
+// decides it and `expandCells` carries that decision from construction.
 func (g *AttnGPU) selectPipe() string {
-	if os.Getenv("LLM_ATTN_SELECT_WG") == "256" {
-		return "select"
+	narrow := os.Getenv("LLM_ATTN_SELECT_WG") == "256"
+	if g.expandCells {
+		if narrow {
+			return "select"
+		}
+		return selectW1k
 	}
-	return selectW1k
+	if narrow {
+		return selBlk
+	}
+	return selBlkW1k
 }
 
 // SetSplits pins how many ways the decode attention cuts its key axis; 1 is
@@ -1553,8 +1853,14 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//    grid's y. Neither sums anything across the stripe, so the tensors
 	//    they write are the same bits however the grid is cut.
 	cells := g.cellSplits()
-	add("score", "score", uint32(g.rows), cells, base)
-	add("expand", "expand", uint32(g.rows), cells, base)
+	scorer, scoreX := g.scorePipe()
+	add(scorer, "score", scoreX, cells, base)
+	// The expansion, and **only when the cell select is the one running**
+	// (P14-1): the block select reads the scores directly, with a per-block
+	// weight, and gets the same bitmask without this tensor existing.
+	if g.expandCells {
+		add("expand", "expand", uint32(g.rows), cells, base)
+	}
 
 	// 5. The selection: one workgroup a token, four radix passes over the
 	//    cells, a bitmask out. Absent below 2051 cells, where it would name
@@ -1567,6 +1873,37 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	qBlocks := uint32(roundUpInt(g.rows, av.rows) / av.rows)
 	sp := g.attnSplits(av)
 
+	// 5a. P14-2's gather, when this pass takes it: the union of each query
+	//     tile's rows' selections compacted to an ascending cell list, then the
+	//     per-row mask over it. Two dispatches because the mask reads the list,
+	//     and both over the *gathered* rung's tile rather than `av`'s — the
+	//     gathered kernel is its own build and chooses its own block width, for
+	//     the reason gathRung says.
+	//
+	//     It is exclusive with the split (decode) and with P13's block list
+	//     (the coarser compaction it replaces).
+	gath, hpw := "", 1
+	if g.sparse && sp == 1 && g.gather() {
+		gv, ok := attnVariantFor(g.gathRung())
+		if ok {
+			hpw = g.gathHeadsPerWG()
+			gath = gathPipe(gv, g.gathGroups(), hpw)
+			if _, ok := g.pipes[gath]; !ok {
+				gath, hpw = "", 1
+			} else {
+				av = gv
+				qBlocks = uint32(roundUpInt(g.rows, av.rows) / av.rows)
+			}
+		}
+	}
+	if gath != "" {
+		gb := base
+		gb.ResOff = g.aGath
+		gTiles := uint32(roundUpInt(g.rows, gathBM) / gathBM)
+		add("gather", "attn.gather", gTiles, 1, gb)
+		add("gathmask", "attn.gathmask", gTiles, 1, gb)
+	}
+
 	// 5b. The live-block list (P13), when the kernel behind it is the unsplit
 	//     one. The split build strides *absolute* key blocks so that a slice
 	//     does not depend on how the prompt was chunked (L7a's gate), and a
@@ -1574,7 +1911,7 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//     two are exclusive, which costs nothing because the split is decode
 	//     and the list is depth.
 	blkPipe, haveBlk := "", false
-	if g.sparse && sp == 1 && g.blockList() {
+	if g.sparse && sp == 1 && gath == "" && g.blockList() {
 		blkPipe = blkListPipe(av)
 		_, haveBlk = g.pipes[blkPipe]
 	}
@@ -1588,7 +1925,13 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//    selection beside the causal mask — or, at decode over a cache deep
 	//    enough to be worth it, the same kernel with its key axis cut across
 	//    workgroups and a combine behind it (P8).
-	if sp > 1 {
+	if gath != "" {
+		at := base
+		at.ResOff = g.aGath
+		// The grid's y is **head groups**, not heads: one workgroup of `hpw`
+		// waves covers `hpw` heads and stages the gather once for all of them.
+		add(gath, "attn", qBlocks, uint32(c.NHead/hpw), at)
+	} else if sp > 1 {
 		split := base
 		split.ResOff, split.InjOff = g.aSplit, uint32(sp)
 		add(splitPipe(g.attn), "attn.split", qBlocks*uint32(sp), uint32(c.NHead), split)
@@ -1755,6 +2098,42 @@ func (g *AttnGPU) Selection() []uint32 {
 	return g.abuf.ReadUint32At(int(g.aSel), g.rows*g.selWords())
 }
 
+// Gathered reads one query tile's gathered list and its per-row mask out of the
+// arena (P14-2): the cells the tile's sixteen rows selected between them, and
+// which of them each row can actually see.
+//
+// `mask[r][i]` is whether row r attends over `cells[i]`. It is the AND of the
+// selection and the causal extent, because the gather folds the causal test in
+// so the attention loop has none.
+func (g *AttnGPU) Gathered(tile int) (cells []int32, mask [][]bool) {
+	if !g.sparse || g.aGath == noW {
+		return nil, nil
+	}
+	mx := g.gathMax()
+	raw := g.abuf.ReadUint32At(int(g.aGath)+tile*g.gathStride(), g.gathStride())
+	cnt := int(raw[0])
+	if cnt > mx {
+		return nil, nil
+	}
+	cells = make([]int32, cnt)
+	for i := range cells {
+		cells[i] = int32(raw[1+i])
+	}
+	words := mx / 32
+	mask = make([][]bool, gathBM)
+	for r := range mask {
+		row := raw[1+mx+r*words:]
+		mask[r] = make([]bool, cnt)
+		for i := 0; i < cnt; i++ {
+			mask[r][i] = row[i>>5]&(1<<uint(i&31)) != 0
+		}
+	}
+	return cells, mask
+}
+
+// GathTiles is how many query tiles the last pass gathered for.
+func (g *AttnGPU) GathTiles() int { return roundUpInt(g.rows, gathBM) / gathBM }
+
 // SelSkip is what the attention kernel's block skip can skip, measured on the
 // selection a pass actually left behind (P11).
 //
@@ -1808,6 +2187,54 @@ func (g *AttnGPU) SelSkip(mask []uint32, bm, bn int) (tile, perRow float64) {
 	return float64(live) / float64(total), float64(rowLive) / float64(rowTotal)
 }
 
+// SelUnion prices the gather: how many cells a query tile of `bm` rows would
+// have to read if the attention ran over the **union** of its rows'
+// selections, against how many the block-granular kernel reads at key block
+// `bn`, and against the per-row floor.
+//
+// The three numbers are the whole of the gather's arithmetic (P13's "what 900
+// tok/s at 128k still needs"). `blocks` is what the shipped kernel visits —
+// live blocks times bn — `union` is what a per-cell gather would visit, and
+// `row` is the mean of one query's own selection, which a 16-row tile cannot
+// reach because the fragment is sixteen rows wide.
+func (g *AttnGPU) SelUnion(mask []uint32, bm, bn int) (blocks, union, row float64) {
+	words := g.selWords()
+	var nBlk, nUni, nRow, tiles, rows int
+	for q0 := 0; q0 < g.rows; q0 += bm {
+		nr := minInt(bm, g.rows-q0)
+		last := minInt(g.nKV, g.past+q0+bm)
+		u := make([]uint32, (last+31)/32)
+		for r := 0; r < nr; r++ {
+			src := mask[(q0+r)*words:]
+			c := 0
+			for w := range u {
+				u[w] |= src[w]
+				c += bits.OnesCount32(src[w])
+			}
+			nRow += c
+			rows++
+		}
+		for b := 0; b*bn < last; b++ {
+			any := false
+			for c := b * bn; c < minInt((b+1)*bn, last) && !any; c++ {
+				any = u[c>>5]&(1<<uint(c&31)) != 0
+			}
+			if any {
+				nBlk += bn
+			}
+		}
+		for w := range u {
+			nUni += bits.OnesCount32(u[w])
+		}
+		tiles++
+	}
+	if tiles == 0 {
+		return 0, 0, 0
+	}
+	return float64(nBlk) / float64(tiles), float64(nUni) / float64(tiles),
+		float64(nRow) / float64(maxInt(rows, 1))
+}
+
 // SelectedCells unpacks token t's row of the bitmask.
 func (g *AttnGPU) SelectedCells(mask []uint32, t int) []int32 {
 	out := make([]int32, 0, g.selWidth())
@@ -1822,9 +2249,21 @@ func (g *AttnGPU) SelectedCells(mask []uint32, t int) []int32 {
 
 // Cells is the same score biased, expanded over the cache and causally
 // masked, [T][nKV] — `indexer_score_tokens`, infinities and all.
+//
+// **It needs LLM_ATTN_EXPAND_CELLS=1**, because since P14-1 nothing in a
+// shipped pass computes this tensor: the selection reads the block scores with
+// a per-block weight and the arena is not allocated. It returns nil otherwise
+// rather than reading 1.14 GB of somebody else's arena.
 func (g *AttnGPU) Cells() []float32 {
+	if !g.expandCells {
+		return nil
+	}
 	return g.abuf.ReadFloat32At(int(g.aCell), g.rows*g.nKV)
 }
+
+// ExpandsCells reports whether this instance computes the per-cell score
+// tensor Cells() reads.
+func (g *AttnGPU) ExpandsCells() bool { return g.expandCells }
 
 // IdxK is the pooled, normed and rotated indexer key of the layer the last
 // run was for, [nBlocks][idxDim], widened out of the fp16 arena.
@@ -1875,9 +2314,12 @@ func (g *AttnGPU) K() []float32 {
 	return g.unpack(g.hK+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
 }
 
-// V is the same, out of the transposed tiling the value is stored in.
+// V is the same. **It is no longer transposed** (P14-2): the value plane is
+// cell-major like the key, read as a RowMajor B operand rather than a
+// ColumnMajor one, so a selected run of `ratio` cells is one line and a gather
+// can read it.
 func (g *AttnGPU) V() []float32 {
-	return g.unpack(g.hV+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, true)
+	return g.unpack(g.hV+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
 }
 
 // unpack reads g.rows rows out of a packed plane of `plane` rows, starting at

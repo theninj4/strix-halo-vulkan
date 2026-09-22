@@ -2614,9 +2614,12 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_pack.spv llm_attn_pack.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_idx.spv llm_attn_idx.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_score.spv llm_attn_score.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_score_wmma.spv llm_attn_score_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_expand.spv llm_attn_expand.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_select.spv llm_attn_select.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -o llm_attn_select_w1024.spv llm_attn_select.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_selblk.spv llm_attn_selblk.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -o llm_attn_selblk_w1024.spv llm_attn_selblk.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
@@ -2644,6 +2647,23 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=32 -DBN=64 -o llm_attn_blocks_bm32_bn64.spv llm_attn_blocks.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=32 -DBN=32 -o llm_attn_blocks_bm32_bn32.spv llm_attn_blocks.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DBN=16 -o llm_attn_blocks_bm16_bn16.spv llm_attn_blocks.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DGPASS=1 -o llm_attn_gather_bm16.spv llm_attn_gather.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DGPASS=2 -o llm_attn_gathmask_bm16.spv llm_attn_gather.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -DGRP=2 -o llm_attn_gath_qt1_kt1_g2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -DGRP=2 -o llm_attn_gath_qt1_kt2_g2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -DGRP=2 -o llm_attn_gath_qt1_kt4_g2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -DGRP=4 -o llm_attn_gath_qt1_kt1_g4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -DGRP=4 -o llm_attn_gath_qt1_kt2_g4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -DGRP=4 -o llm_attn_gath_qt1_kt4_g4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -DHPW=2 -o llm_attn_gath_qt1_kt1_h2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -DHPW=2 -o llm_attn_gath_qt1_kt2_h2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -DHPW=2 -o llm_attn_gath_qt1_kt4_h2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -DHPW=4 -o llm_attn_gath_qt1_kt1_h4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -DHPW=4 -o llm_attn_gath_qt1_kt2_h4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -DHPW=4 -o llm_attn_gath_qt1_kt4_h4.spv llm_attn_wmma.comp
 
 //go:embed llm_attn_pack.spv
 var LLMAttnPack []byte
@@ -2653,6 +2673,16 @@ var LLMAttnIdx []byte
 
 //go:embed llm_attn_score.spv
 var LLMAttnScore []byte
+
+// LLMAttnScoreWMMA is the same score on the matrix cores (P14-4). It is a GEMM
+// per indexer head with a rectifier on the product — `[T, 128] x [128, nBlocks]`
+// — and the scalar kernel beside it was written where a 2048-row batch scored
+// 512 blocks. After P14-1 and P14-2 it is the second largest label in the
+// attention block at depth, because the indexer scores every pooled block of the
+// context and there are nKV/ratio of them.
+//
+//go:embed llm_attn_score_wmma.spv
+var LLMAttnScoreWMMA []byte
 
 // LLMAttnExpand is the second half of the indexer's score (P9): the pooled
 // block scores expanded to one value a cache cell, with the bias and the
@@ -2679,6 +2709,22 @@ var LLMAttnSelect []byte
 //
 //go:embed llm_attn_select_w1024.spv
 var LLMAttnSelectW1024 []byte
+
+// LLMAttnSelBlk is the same selection over **block** scores with a per-block
+// weight (P14-1). The expanded per-cell tensor it no longer needs was 1.14 GB
+// of arena at 128k cells and a 2048-row batch, and five streams of it a token;
+// `ratio` cells of a pooled block carry one score, so a weighted select over
+// nKV/ratio entries is the same threshold, the same ties and the same bitmask
+// over a quarter of the traffic — and `llm_attn_expand.comp` is then not
+// dispatched at all.
+//
+//go:embed llm_attn_selblk.spv
+var LLMAttnSelBlk []byte
+
+// LLMAttnSelBlkW1024 is that kernel at sixteen waves, for P10's reason.
+//
+//go:embed llm_attn_selblk_w1024.spv
+var LLMAttnSelBlkW1024 []byte
 
 //go:embed llm_attn_qt1_kt2.spv
 var LLMAttnQT1KT2 []byte
@@ -2743,6 +2789,84 @@ var LLMAttnBlocksBM32BN32 []byte
 
 //go:embed llm_attn_blocks_bm16_bn16.spv
 var LLMAttnBlocksBM16BN16 []byte
+
+// LLMAttnGatherBM16 and LLMAttnGathMaskBM16 are P14-2's two compaction passes:
+// per query tile, the ascending **cells** its rows select between them, and then
+// a per-row bitmask over those positions with the causal test folded in.
+//
+// P13's block list was the same idea at sixteen-cell granularity and measured
+// 1.00x, because the kernel it fed still read every cell of a live block: at
+// 128 000 cells a sixteen-row tile's live blocks hold 24 580 cells to do work on
+// 10 058. Two passes and not one because the mask reads the list.
+//
+//go:embed llm_attn_gather_bm16.spv
+var LLMAttnGatherBM16 []byte
+
+//go:embed llm_attn_gathmask_bm16.spv
+var LLMAttnGathMaskBM16 []byte
+
+// LLMAttnGathQT1KT2 and LLMAttnGathQT1KT4 are the attention kernel over that
+// list: a **dense** flash attention over the gathered cells, with no key axis to
+// walk, no block skip and no causal comparison, staging each chunk's key and
+// value a head-dim group at a time through 1 KB of LDS so that the scatter costs
+// no occupancy. The rungs are wider than the block kernel's narrow one on
+// purpose — the gathered axis has nothing left to skip, so reuse decides the
+// block width again, which is what L2f measured in the first place.
+//
+//go:embed llm_attn_gath_qt1_kt1.spv
+var LLMAttnGathQT1KT1 []byte
+
+//go:embed llm_attn_gath_qt1_kt2.spv
+var LLMAttnGathQT1KT2 []byte
+
+//go:embed llm_attn_gath_qt1_kt4.spv
+var LLMAttnGathQT1KT4 []byte
+
+// LLMAttnGath*G2 and *G4 stage two or four head-dim groups per staging barrier
+// instead of one. Double buffering took the gathered loop from two barriers a
+// group to one; this takes it to one per GRP, and pays for it in LDS — which is
+// occupancy, so the ladder decides.
+//
+//go:embed llm_attn_gath_qt1_kt1_g2.spv
+var LLMAttnGathQT1KT1G2 []byte
+
+//go:embed llm_attn_gath_qt1_kt2_g2.spv
+var LLMAttnGathQT1KT2G2 []byte
+
+//go:embed llm_attn_gath_qt1_kt4_g2.spv
+var LLMAttnGathQT1KT4G2 []byte
+
+//go:embed llm_attn_gath_qt1_kt1_g4.spv
+var LLMAttnGathQT1KT1G4 []byte
+
+//go:embed llm_attn_gath_qt1_kt2_g4.spv
+var LLMAttnGathQT1KT2G4 []byte
+
+//go:embed llm_attn_gath_qt1_kt4_g4.spv
+var LLMAttnGathQT1KT4G4 []byte
+
+// LLMAttnGath*H2 and *H4 put two or four query heads in one workgroup, one a
+// wave, sharing the staged key and value. Doubling the gathered kernel's matrix
+// work costs 2.7%, so it is not arithmetic-bound — it is bound by the gather,
+// and the gather is the same bytes for every query head that shares a kv head.
+//
+//go:embed llm_attn_gath_qt1_kt1_h2.spv
+var LLMAttnGathQT1KT1H2 []byte
+
+//go:embed llm_attn_gath_qt1_kt2_h2.spv
+var LLMAttnGathQT1KT2H2 []byte
+
+//go:embed llm_attn_gath_qt1_kt4_h2.spv
+var LLMAttnGathQT1KT4H2 []byte
+
+//go:embed llm_attn_gath_qt1_kt1_h4.spv
+var LLMAttnGathQT1KT1H4 []byte
+
+//go:embed llm_attn_gath_qt1_kt2_h4.spv
+var LLMAttnGathQT1KT2H4 []byte
+
+//go:embed llm_attn_gath_qt1_kt4_h4.spv
+var LLMAttnGathQT1KT4H4 []byte
 
 // LLMAttnCombine assembles the split builds' slices: P8's second half, and
 // the only place the decode attention's softmax divide and output gate happen

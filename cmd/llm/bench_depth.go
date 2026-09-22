@@ -30,6 +30,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -329,6 +330,7 @@ func reportSelSkip(g *llm.Graph) {
 		return
 	}
 	mask := a.Selection()
+	blk16, uni, row := a.SelUnion(mask, 16, 16)
 	fmt.Printf("    selection live %%, (query tile) x (key block):\n")
 	fmt.Printf("      %-6s %8s %8s %8s %8s\n", "bm\\bn", "16", "32", "64", "row")
 	for _, bm := range []int{16, 32, 64} {
@@ -340,4 +342,10 @@ func reportSelSkip(g *llm.Graph) {
 		_, perRow := a.SelSkip(mask, bm, 64)
 		fmt.Printf(" %7.1f%%\n", 100*perRow)
 	}
+	// And the same question in **cells**, which is what the gather is priced
+	// in: the shipped kernel visits `live% x nKV` of them, a per-cell gather
+	// over the tile's union visits `union`, and one query's own selection is
+	// the floor a sixteen-row fragment cannot reach.
+	fmt.Printf("      cells a 16-row tile: blocks(bn=16) %.0f  union %.0f  row %.0f  -> %.2fx\n",
+		blk16, uni, row, blk16/math.Max(uni, 1))
 }

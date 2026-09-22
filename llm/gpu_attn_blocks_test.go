@@ -86,6 +86,11 @@ func TestAttnGPUBlockListIsDispatched(t *testing.T) {
 	defer done()
 	g.SetSplits(1)
 	defer g.SetSplits(0)
+	// And P14-2's gather off: it is the same compaction one granularity finer
+	// and the two are exclusive, so the graph builds this one only where the
+	// gather is not running.
+	g.SetGather(false)
+	defer g.AutoGather()
 	if err := g.SetPast(0); err != nil {
 		t.Fatal(err)
 	}

@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus; **128 000 cells now completes** and prefills at **563.6 tok/s** (P13), 64k at **719.6** against 668, decode **22.27 tok/s at 128k** | the gather (the only route to 900 tok/s at 128k); `attn.select` + `attn.expand`, 0.28 ms a token at 128k and one change; `hc.cn` at 134 GB/s with no hypothesis left; batching (P6) |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and 946.1 at 8192** (P14, against P13's 563.6), 64k at **892.1**, decode **22.18 tok/s at 128k** | `hc.cn` at 134 GB/s with no hypothesis left; batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -48,19 +48,20 @@ resident), the other four verticals on the other (image ~32 GB, the rest
 ~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
 purpose — so no footprint quantisation is planned for the small verticals.
 
-**Where the work goes next.** The live item is **long-context prompt
-processing**: **P13 (2026-09-22)** made a 128 000-cell prefill run at all —
-the submit budget had no depth term in it, so a 2048-row pass at ~115k held
-the gfx ring past P0's 2 s watchdog — and then took it from **471.7 to 563.6
-tok/s** by making the attention kernel's key block 16 cells instead of 32
-([`research/p13-long-context-prefill.md`](research/p13-long-context-prefill.md)).
-**The target is 900 tok/s at 128k and the arithmetic now says exactly what
-is left**: the floor of everything flat in depth is 0.803 ms a token, the
-attention is 0.566 after P13, and the selection plus its expansion are 0.28.
-The selection change and a wider ubatch reach ~700; **only the per-cell
-gather reaches 900**, and it is now priced at 2.8x rather than the 4.9x it
-needed before P13. Beyond that, each vertical's
-list is in its own rough order of value. The context-depth regression that
+**Where the work goes next.** **Long-context prompt processing is closed at
+the target.** **P14 (2026-09-22)** takes a 128 000-cell prefill from P13's
+**563.6** to **826.0 tok/s at ubatch 2048** and
+**946.1 at 8192**, which is the 900 tok/s `GOALS.md` asked for
+([`research/p14-prefill-at-depth.md`](research/p14-prefill-at-depth.md)).
+Four changes: the QSA selection runs over **block** scores with a per-block
+weight instead of the expanded per-cell tensor, which deletes a dispatch and
+1.14 GB of arena and is 13.8x on `attn.select`; the attention kernel runs over
+a **per-cell gather** — the union of a query tile's rows' selections, compacted
+— instead of over the key axis, which is 2.15x on `attn.attn` and needed the
+value plane to become cell-major first; the indexer's score moves onto the
+**matrix cores**, 2.3x; and `maxStorageBufferRange` gets an **error** instead of
+a comment, because exceeding it makes a run *faster* and wrong. Beyond that,
+each vertical's list is in its own rough order of value. The context-depth regression that
 stood at the head of this list is **closed** — **P7**, **P8**, **P9** and **P10**, all
 2026-09-21, take decode at 64k from **4.05 to 27.69 tok/s (6.8x)** and the
 falloff from depth zero from **6.9x down to 1.3x down** (0.14x → 0.79x of the
@@ -77,11 +78,12 @@ splits the attention's key axis across workgroups, P9 unpins the indexer —
 which was scoring the whole context on one compute unit of forty — and P10
 widens the selection, the one kernel that cannot be split at all because its
 radix passes are a reduction, from four waves to sixteen. What is left of the
-depth question is **the gather**, which is now the only large item: of the
-5.9 ms a decode step still gains between depth 0 and 64k, the split attention
-is 3.0 of it, because the split shortened the walk sixteenfold without
-stopping it being a walk over every key block. And **128k still does not
-complete**. After that the two capability
+depth question is **decode's** gather: of the 5.9 ms a decode step still gains
+between depth 0 and 64k, the split attention is 3.0 of it, because the split
+shortened the walk sixteenfold without stopping it being a walk over every key
+block. Prefill's gather is built (P14) and decode deliberately does not take it —
+a decode step is 24 single-wave workgroups that all fit at once, so a gather in
+front of it lengthens the walk rather than cutting it. After that the two capability
 gaps are P6 batching (blocked on a product question: will the API serve more
 than one stream?) and E7's batched embeddings, worth up to 10x on short
 texts; the largest single-vertical percent is S10, the speech front end at
@@ -222,19 +224,60 @@ from what the draft predicts.
   prefill, because prefill has occupancy*. The machinery ships behind
   `LLM_ATTN_BLOCK_LIST=1`, bit-identical, because the decode split and a
   per-cell gather both want it.
-- **`attn.select` and `attn.expand` are 0.284 ms a token at 128 000 cells**
-  (0.233 and 0.051), 16% of a prefill token there, and they are **one
-  change**. The expansion writes `nKV` floats a token so the selection can
-  radix-select over *cells* — but all `ratio` cells of a pooled block carry
-  one block score, so a select over `nKV/ratio` entries with a per-block
-  weight is the same answer over a quarter of the traffic and the expansion
-  is then not needed at all. It also frees **1.14 GB of arena** at ubatch
-  2048, which is what a wider ubatch wants. The risk P11 named is the causal
-  boundary, where a block is partly masked and the reference's tie fill is a
-  block split; `TestAttnGPUSelectionIsTheCPUs` is an exact gate. The other
-  route is a **candidate pass**, which collects the keys matching the winning
-  bucket during pass 2 so passes 3 and 4 run out of LDS — five reads become
-  three and no tie semantics move, for about half the win.
+- ~~**`attn.select` and `attn.expand` are 0.284 ms a token at 128 000 cells.**~~
+  ~~**The gather.**~~ **Both closed by P14, 2026-09-22**
+  ([write-up](research/p14-prefill-at-depth.md)). Four changes and four measured
+  refusals; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and
+  946.1 at 8192**, against P13's 563.6, with the falloff from depth
+  zero **0.50x → 0.72x** and decode unmoved as the control.
+
+  The selection now runs over the **block** scores with a per-block weight
+  instead of the expanded per-cell tensor: `attn.select` **0.281 → 0.020**
+  (13.8x, not the 4x the traffic argument predicts — the histogram is bounded
+  at the last block a cell can reach and the LDS cache now holds `ratio` times
+  as many cells), `attn.expand` deleted, **1.14 GB of arena** freed, and it is
+  bit-identical over four chunk schedules. The attention runs over a **per-cell
+  gather** — the union of a query tile's rows' selections, compacted ascending,
+  with the causal test folded into a per-row mask — for **2.15x on `attn.attn`**;
+  that needed the **value plane to become cell-major** first, which costs the
+  block kernel 7% and decode nothing. And the indexer's score moved to the
+  **matrix cores**, 2.3x.
+
+  **The union was the number that priced all of it and P13's estimate was
+  wrong.** `AttnGPU.SelUnion` measures it: at 128 000 cells a 16-row tile reads
+  15 145 cells where its rows' union is 7 049 and one row selects 2 051 — so the
+  gather is 2.15x, not 3.3x, and the 3.4x between the union and one row is the
+  floor a sixteen-row fragment cannot reach.
+
+  **The gather is the first kernel here that is not chunk-invariant and cannot
+  be made so** (its list is the union of sixteen rows, so a chunk ending inside
+  the tile gathers a different list and the softmax folds the same terms in a
+  different order). It is pinned off under `PinSchedule` with the other
+  reassociating kernels, and the exact chunk gates pin it;
+  `TestAttnGPUGatherSelectsTheSameCells` is exact on the *set* and
+  `TestAttnGPUGatherIsTheBlockKernel` is the tolerance (4.1e-06 rms against
+  9.9e-04 from llama.cpp).
+- **The gathered kernel is at 34% of matrix-core peak and all four bounds are
+  eliminated**, which is P14's most reusable finding. Doubling its matrix work
+  costs **2.7%**; a subgroup staging barrier instead of a workgroup one is
+  1.00x; staging two head-dim groups a barrier is 1.00x and four is 0.75x;
+  sharing the staged key and value across two query heads of one kv head —
+  which halves both the global gather reads and the LDS writes — is **1.04x**,
+  and four heads is 0.75x. So it is not the matrix cores, not latency, not the
+  gather's traffic. What is left is the **LDS round-trip for the fragments and
+  the per-head softmax scaffolding**, both linear in the union, which is why the
+  kernel's cost is linear in the cells it visits. `LLM_ATTN_GATHER_GRP` and
+  `LLM_ATTN_GATHER_HEADS` are the ladders and both ship at 1.
+- **`maxStorageBufferRange` is silent when it is exceeded and `checkBufferRange`
+  now says so.** A VkBuffer over the range is legal to create; binding more of
+  it than the range is not, and the driver **clamps rather than failing**, so a
+  kernel reading past it gets zeros. A five-depth `-depth` sweep at ubatch 4096
+  raises `-ctx` to 148 520 cells, which is a 4.39 GB fp16 arena against a
+  4.29 GB descriptor — and the run came back at **1124 tok/s at 128k against a
+  true 885**, 1.28x too fast, with a degenerate indexer selecting a contiguous
+  window. **The failure mode is a benchmark that gets faster**, which is the one
+  direction nobody audits; the rule it leaves is to price a suspicious win in
+  FLOP/s or bytes/s against the device's peak before believing it.
 - **`hc.cn` is still at 134 GB/s** where a copy gets 236, and P12-4 spent both
   of the standing explanations. The next probe is the access pattern itself:
   it runs four read-modify-write streams plus an fp16 write a token, where a

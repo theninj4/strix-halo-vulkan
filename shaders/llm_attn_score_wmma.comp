@@ -1,0 +1,200 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The QSA indexer's score on the **matrix cores** (P14-4).
+//
+// `llm_attn_score.comp` is a scalar f32 dot product: one lane per pooled block,
+// walking 4 heads x 128 dims with `d += float(q) * float(k)`. It was written
+// where it did not matter — at depth zero a 2048-row batch scores 512 blocks —
+// and after P14-1 and P14-2 it is the **second largest label in the attention
+// block at depth**: 0.078 ms a token at 128 000 cells against the gathered
+// attention's 0.28, because the indexer has to score every pooled block of the
+// context and there are nKV/ratio of them.
+//
+// It is a GEMM and it always was. Per head, the score is
+// `[T, 128] x [128, nBlocks]` with a rectifier on the product and a sum over the
+// four heads behind it — and both operands are already fp16 in the arena, laid
+// out for exactly the two `coopMatLoad` layouts this file uses:
+//
+//	the query   idxQOff + (t * idxHeads + h) * 128 + d     A, RowMajor, stride 512
+//	the key     idxKOff + b * 128 + d                      B, ColumnMajor, stride 128
+//
+// So the query tile's 4 x 8 A-fragments are loaded **once** and held in
+// registers across every block tile — 64 VGPRs, against the 16 A-fragments and
+// 16 accumulators `llm_attn_wmma.comp` already holds — and each block tile is
+// eight `coopMatMulAdd` per head. The rectifier and the sum over heads happen
+// after the accumulate, out of a staging tile, because a cooperative matrix's
+// element order is not defined.
+//
+// **The rectifier is why there are four accumulators and not one.** Each head
+// dots its own 128-wide query against the block's pooled key and the *positive*
+// parts are summed: a head that disagrees contributes nothing rather than
+// cancelling a head that agrees. That is DeepSeek's lightning indexer and it is
+// why there is no softmax anywhere in here — and why the four products cannot be
+// folded into one GEMM over a 512-wide reduction.
+//
+// **It is not bit-identical to the scalar kernel, and it is nearer the
+// reference.** The scalar one accumulates 128 fp16 products into an f32 in
+// index order; the matrix core accumulates them in a hardware order. Neither is
+// the reference's, and research/l2e-attention.md already established what the
+// reference *is*: llama.cpp evaluates this f32 tensor on the fp16 matrix cores,
+// which is why computing it in f32 gives 3.52e-03 rms against it and rounding
+// both operands to halves gives 5.11e-05. This kernel is that arithmetic rather
+// than a model of it.
+//
+// What that costs is a discontinuity downstream: the score feeds a top-k, so a
+// change in the last places can flip which cell is selected.
+// `TestAttnGPUSelectionAgainstTheReference` is the gate and it is a *size*
+// rather than a zero — L4a-4 priced the reference's own disagreement at 138 of
+// 6 298 621 visible cells, 0.0022%, and what must hold is that this stays that
+// size rather than moving whole blocks.
+//
+// **It is chunk-invariant**, which is not obvious and is the reason this can
+// ship where P14-2's gather needs a pin. A matrix product's rows are
+// independent: `C[m][n]` is the same sum over the same k in the same order
+// whichever row of the fragment `m` lands in, so a token at cell `pos` scores
+// the same whether it arrived alone or seventh of seven. The fragment's pad rows
+// read whatever the plane holds and their products are never stored.
+//
+// Everything about the *semantics* — which blocks are scored, the bias table,
+// the one score every block past the last whole one carries — is
+// llm_attn_score.comp's and is documented there.
+
+#include "llm_common.glsl"
+
+#ifndef IDX_DIM
+#define IDX_DIM 128
+#endif
+#ifndef IDX_HEADS
+#define IDX_HEADS 4
+#endif
+#ifndef WAVE
+#define WAVE 64
+#endif
+
+#define TILE 16
+#define KT (IDX_DIM / TILE)
+
+layout(local_size_x = WAVE) in;
+
+#define ACC    coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+// One 16x16 f32 tile per head, because the rectifier is per head and a
+// cooperative matrix's element order is not defined.
+shared float stage[IDX_HEADS * TILE * TILE];
+// The one score every block past the last whole one has, per token of the tile.
+shared float dead[TILE];
+
+void main() {
+    uint t0 = gl_WorkGroupID.x * TILE;
+    uint lane = gl_LocalInvocationID.x;
+    if (t0 >= pc.tokens) {
+        return;
+    }
+    uint nCells = SEQ_PAST + pc.tokens;
+    uint nBlocks = (pc.nKV + pc.ratio - 1u) / pc.ratio;
+    uint nBid = nCells / pc.ratio;
+
+    // The query tile, once for the whole block loop: four heads of eight
+    // fragments, held in registers. A pad row of the tile reads the plane's own
+    // padding — `llm_attn_idx.comp` writes one query a (token, head) and the
+    // rows past the prompt are whatever the last batch left — and nothing of it
+    // is ever stored, because the store below tests the token.
+    FRAG_A fragQ[IDX_HEADS][KT];
+    [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+        [[unroll]] for (uint kt = 0u; kt < KT; ++kt) {
+            coopMatLoad(fragQ[h][kt], hact,
+                pc.idxQOff + t0 * (IDX_HEADS * IDX_DIM) + h * IDX_DIM + kt * TILE,
+                IDX_HEADS * IDX_DIM, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+
+    // **Only the whole blocks are scored** (P7, and llm_attn_score.comp's note):
+    // every block at or past `nBid` pools cell 0 `ratio` times, so all of them
+    // hold the same 128 halves and carry the same score — one dot product, not
+    // `nBlocks - nBid` of them. That is what makes this kernel cost the
+    // context's depth instead of the cache's size.
+    uint bTiles = (nBid + TILE - 1u) / TILE;
+    for (uint bt = gl_WorkGroupID.y; bt < bTiles; bt += gl_NumWorkGroups.y) {
+        ACC acc[IDX_HEADS];
+        [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+            acc[h] = ACC(0.0);
+        }
+        [[unroll]] for (uint kt = 0u; kt < KT; ++kt) {
+            FRAG_B fragK;
+            coopMatLoad(fragK, hact, pc.idxKOff + bt * TILE * IDX_DIM + kt * TILE,
+                IDX_DIM, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+                acc[h] = coopMatMulAdd(fragQ[h][kt], fragK, acc[h]);
+            }
+        }
+        [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+            coopMatStore(acc[h], stage, h * (TILE * TILE), TILE,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+        barrier();
+        for (uint i = lane; i < TILE * TILE; i += WAVE) {
+            uint t = t0 + i / TILE, b = bt * TILE + i % TILE;
+            if (t >= pc.tokens || b >= nBid) {
+                continue;
+            }
+            float s = 0.0;
+            [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+                s += max(stage[h * (TILE * TILE) + i], 0.0);
+            }
+            act[pc.scoreOff + t * nBlocks + b] = s;
+        }
+        barrier();
+    }
+
+    // The tail: block `nBid` and everything past it, all carrying one score.
+    //
+    // It is scalar because it is one dot product a token, not a GEMM — and the
+    // *fill* behind it is a streaming write of `nBlocks - nBid` floats a token,
+    // which is 33 488 of them at depth zero and 2 750 at 128 000 cells. Nothing
+    // in a shipped pass reads those entries any more (P14-1's select bounds its
+    // histogram at the last block a cell can reach, and its emit only ever asks
+    // for `blk <= deadBid`), but the tensor is the reference's
+    // `indexer_score_tokens` and TestAttnGPUIndexer compares all of it.
+    if (nBid >= nBlocks) {
+        return;
+    }
+    for (uint i = lane; i < TILE; i += WAVE) {
+        uint t = t0 + i;
+        if (t >= pc.tokens) {
+            continue;
+        }
+        uint qb = pc.idxQOff + t * (IDX_HEADS * IDX_DIM);
+        uint kb = pc.idxKOff + nBid * IDX_DIM;
+        float s = 0.0;
+        [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
+            float d = 0.0;
+            for (uint j = 0u; j < IDX_DIM; ++j) {
+                d += float(hact[qb + h * IDX_DIM + j]) * float(hact[kb + j]);
+            }
+            s += max(d, 0.0);
+        }
+        dead[i] = s;
+    }
+    barrier();
+    for (uint i = 0u; i < TILE; ++i) {
+        uint t = t0 + i;
+        if (t >= pc.tokens) {
+            break;
+        }
+        float v = dead[i];
+        uint row = pc.scoreOff + t * nBlocks;
+        for (uint b = nBid + gl_WorkGroupID.y * WAVE + lane; b < nBlocks;
+             b += gl_NumWorkGroups.y * WAVE) {
+            act[row + b] = v;
+        }
+    }
+}

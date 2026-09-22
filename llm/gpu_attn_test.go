@@ -127,6 +127,11 @@ func TestAttnGPUFusedProjection(t *testing.T) {
 // arithmetic and not an approximation of it. The tolerances say so: the pooled
 // key lands where `RefQ8` does on the CPU, not where `Exact` does.
 func TestAttnGPUIndexer(t *testing.T) {
+	// The per-cell score is the reference's `indexer_score_tokens` and since
+	// P14-1 a shipped pass does not compute it — the selection reads the block
+	// scores with a per-block weight instead. This test is about that tensor,
+	// so it runs the arm that still writes it.
+	t.Setenv("LLM_ATTN_EXPAND_CELLS", "1")
 	g, tr, c, w, in, nTok, nKV, done := attnGPU(t)
 	defer done()
 

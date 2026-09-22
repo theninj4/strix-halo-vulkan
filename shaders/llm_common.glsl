@@ -176,7 +176,7 @@ layout(push_constant) uniform PC {
                      // query, gate, key, value, indexer query, indexer key
     uint qOff;       // fp16 packed query planes, fragment tiles
     uint kOff;       // fp16 packed key planes, same tiling as the query
-    uint vOff;       // fp16 packed value planes, each tile transposed
+    uint vOff;       // fp16 packed value planes, cell-major like the key (P14-2)
     uint ctxOff;     // fp16 gated context: the output projection's A operand
     uint idxKOff;    // fp16 [nBlocks][idxDim], pooled, normed and rotated
     uint idxQOff;    // fp16 [T][idxHeads][idxDim]
@@ -327,6 +327,33 @@ layout(push_constant) uniform PC {
 #define MOE_BANK (pc.moeUsed >> 16u)
 
 const uint NO_W = 0xffffffffu;
+
+// ---- P14-2's gather arena, and it is declared here because two kernels have
+// to agree on it to the word: `llm_attn_gather.comp` writes it and
+// `llm_attn_wmma.comp` (-DGATHER) reads it.
+//
+// Per query tile of BM rows, the cells the tile's rows select **between them** —
+// the union, ascending — and a per-row bitmask over those positions:
+//
+//	word 0                     how many cells the union holds
+//	[1, 1 + max)               the cell indices, ascending
+//	[1 + max, + BM*max/32)     BM rows of mask, one bit a gathered position
+//
+// The mask has the causal test already folded in, so the attention kernel over
+// this list has no causal comparison in it at all: a bit is set where the row
+// selected that cell *and* can see it.
+//
+// `max` is the tight bound — each of BM rows names at most `selWidth` cells, so
+// their union is at most `BM * selWidth`, and never more than the cache holds.
+// Rounding it up to 64 makes the mask a whole number of words and the list a
+// whole number of key chunks at every rung, which is what lets the consumer
+// read a tail chunk without a bounds test on every element.
+uint gathMax(uint nkv, uint width, uint bm) {
+    uint m = min(nkv, bm * width);
+    return (m + 63u) & ~63u;
+}
+
+uint gathStride(uint mx, uint bm) { return 1u + mx + bm * (mx >> 5u); }
 
 // The fields a *continuing* run borrows (L7). See the notes in the push
 // block: 64 uints is 256 bytes and there was no room for a 65th.

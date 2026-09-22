@@ -84,7 +84,18 @@ func TestAttnGPUCacheIsAChunkSplit(t *testing.T) {
 	// partial softmaxes together in a different order. The split path has its
 	// own chunk gate below — this one is about the cache.
 	g.SetSplits(1)
-	t.Logf("plan pinned at %s / %s / %s, splits off, sparse %v", attn, gemm, outGemm, g.Sparse())
+	// And P14-2's gather off, for a reason that is *not* the same: the split
+	// could have been made chunk-invariant and was (it strides absolute key
+	// blocks); a gathered list cannot be, because it is the union of a query
+	// tile's sixteen rows and a chunk that ends inside the tile has fewer rows
+	// to union. See AttnGPU.SetGather — it is pinned off with the rest of the
+	// reassociating kernels under Graph.PinSchedule, and
+	// TestAttnGPUGatherIsTheBlockKernel is the tolerance that replaces this
+	// equality for it.
+	g.SetGather(false)
+	defer g.AutoGather()
+	t.Logf("plan pinned at %s / %s / %s, splits and gather off, sparse %v",
+		attn, gemm, outGemm, g.Sparse())
 
 	want := runChunks(t, g, in, c.NEmbd, []int{nTok})
 
@@ -339,7 +350,7 @@ func bitsSet(x uint32) int {
 // 2051 selected cells, which moves the answer by almost nothing and moves the
 // *selection* by a cell.
 func TestAttnGPUCellStripeDoesNotChangeTheAnswer(t *testing.T) {
-	g, tr, c, nTok, done := attnGPU4k(t)
+	g, tr, c, nTok, done := attnGPU4kExpanded(t)
 	defer done()
 	src, err := tr.Get("hc_mixed-3", 0)
 	if err != nil {

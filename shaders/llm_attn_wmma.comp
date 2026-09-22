@@ -134,7 +134,31 @@
 #define BW ((BN + 31) / 32)
 #define SELBIT(base) ((BN < 32) ? ((base) & 31u) : 0u)
 
-layout(local_size_x = WAVE) in;
+// **Query heads a workgroup** (P14-2, fourth pass), and it is the gathered
+// kernel's only structural knob.
+//
+// The probe that motivates it: doubling the QK matrix work costs **2.7%**, so
+// the gathered kernel is not arithmetic-bound at all — it is bound by the gather
+// itself. A key chunk moves 32 KB of global reads, 32 KB of LDS writes and 32 KB
+// of LDS reads per wave, and the first two are **the same bytes for every query
+// head that shares a kv head**: the grid is (query tile, head), the selection is
+// per token, and this model has twelve query heads to a kv head. Putting HPW
+// heads in one workgroup stages once for all of them.
+//
+// Each wave still owns one head and its own registers, so nothing about the
+// fragments or the online softmax changes; what becomes per wave is the LDS the
+// softmax uses, and what becomes shared is the staged key, the cell list and the
+// mask. `HPW = 1` is the arrangement this kernel had, and every offset below
+// folds to zero there — which is what keeps the block and split builds, which
+// have no business with this, byte for byte what they were.
+#ifndef HPW
+#define HPW 1
+#endif
+#if HPW > 1 && !defined(GATHER)
+#error "HPW is the gathered kernel's knob; the block and split builds are one wave"
+#endif
+
+layout(local_size_x = WAVE * HPW) in;
 
 #define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
 #define ACCH coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
@@ -146,12 +170,18 @@ layout(local_size_x = WAVE) in;
 // the row max below is one pass over BM x BN with one barrier in front of it
 // instead of KTIL passes with two each. Everything after the row max uses only
 // the first QT tiles of it, exactly as it did when that was all there was.
-shared float stage[QT * KTIL * TILE * TILE];
-shared float16_t pbuf[BM * BN];
-shared float bcorr[QT * TILE * TILE];
-shared float rowMax[BM];
-shared float blkMax[BM];
-shared float rowSum[BM];
+// Per **wave**, not per workgroup: at HPW > 1 each wave is a different head with
+// its own softmax, so these are sharded and `sBase`/`pBase`/`bBase`/`rBase` in
+// main() are the wave's slice. At HPW = 1 every base is zero and folds away.
+#define SSTAGE (QT * KTIL * TILE * TILE)
+#define SPBUF  (BM * BN)
+#define SBCORR (QT * TILE * TILE)
+shared float stage[HPW * SSTAGE];
+shared float16_t pbuf[HPW * SPBUF];
+shared float bcorr[HPW * SBCORR];
+shared float rowMax[HPW * BM];
+shared float blkMax[HPW * BM];
+shared float rowSum[HPW * BM];
 // This key block's slice of the QSA bitmask, one word per (row, 32 cells).
 // It is staged once a block rather than bit-tested out of the arena per
 // element: the mask loop below touches BM*BN elements and the row max another
@@ -161,7 +191,70 @@ shared uint selw[BM * BW];
 // Whether any row of this key block has any cell selected at all.
 shared uint blkAny;
 
-#ifndef SPLITK
+#ifdef GATHER
+// The staging barrier, and it is **a workgroup barrier and not a subgroup one**
+// — which is a measurement and then a correctness requirement.
+//
+// The measurement: at HPW = 1 this kernel's workgroup is exactly one subgroup, so
+// `subgroupMemoryBarrierShared()` gives the double-buffered loop the LDS ordering
+// it needs without the `s_barrier` that `barrier()` also emits. A key chunk
+// carries 32 of these against 66 matrix ops, so it looked worth having — and it
+// is **1.00x**, as is staging two head-dim groups per barrier (GRP=2) and as is
+// P13-3's compaction and P11-4's hoist before it. *Latency that matters at decode
+// does not matter at prefill, because prefill has occupancy.* Fourth time.
+//
+// The requirement: at HPW > 1 the staging loop spans every wave of the
+// workgroup, and a subgroup barrier orders none of it. So it is `barrier()`,
+// which is what the measurement says it may as well be.
+#define GSTAGE_BARRIER() barrier()
+
+// P14-2's gathered key chunk, one head-dim group at a time.
+//
+// **It is 512 halves and that is the whole design.** A gathered cell's sixteen
+// dims for group `kt` are 32 contiguous bytes in the plane and the plane is not
+// contiguous in the *cells*, so a fragment over scattered cells cannot be a
+// `coopMatLoad` from the arena — it has to be staged. Staging the chunk's whole
+// 256 dims at once would be 16 KB at BN=32 and 32 KB at BN=64, and a
+// single-wave workgroup that takes 32 KB of LDS is two workgroups resident per
+// 64 KB where this kernel today gets twenty — which is the one thing a prefill
+// cannot give up (P13-3: *latency and redundant reads that matter at decode do
+// not matter at prefill, because prefill has occupancy*). Staged a group at a
+// time it is `KTIL * 256` halves, 1 KB at the shipped rung, and the QK loop was
+// already iterating the groups.
+//
+// Both planes read it: the key as a ColumnMajor B operand — element (dim, cell)
+// at `cell*TILE + dim` — and the value as a RowMajor one, element (cell, dim)
+// at the same address, because P14-2 made the value plane cell-major too. One
+// layout, one staging loop.
+// **Two of them** (P14-2's second pass): group `g` is staged while the matrix
+// cores are still working on group `g-1`, so the QK and PV loops carry one
+// barrier each per group instead of two — one to say the buffer being read is
+// complete, where a single buffer also needed one to say it had been read before
+// it was overwritten. A key chunk is 32 groups of staging and two barriers a
+// group was comparable with the mma it was feeding.
+// **GRP head-dim groups a staging call** (P14-2, third pass). Double buffering
+// took the barriers from two a group to one; staging GRP groups at a time takes
+// them to one per GRP. It costs LDS — `2 * GRP * KTIL * 256` halves, 2 KB at
+// GRP=1 and 4 KB at GRP=2 on the shipped rung — and LDS is occupancy, so it is a
+// build knob and the ladder decides.
+#ifndef GRP
+#define GRP 1
+#endif
+#if (HDT % GRP) != 0
+#error "GRP must divide the head-dim groups"
+#endif
+#define GSTAGE (KTIL * TILE * TILE)
+shared float16_t kvs[2][GRP * GSTAGE];
+// The mask pass rounds its write up to GATH_BW words a row, so a rung that
+// staged more than that per chunk would read words nothing wrote.
+#if BW > 2
+#error "a gathered rung stages more mask words a chunk than llm_attn_gather.comp writes (GATH_BW)"
+#endif
+// This chunk's cell indices, staged once for both planes and all HDT groups.
+shared uint glist[BN];
+#endif
+
+#if !defined(SPLITK) && !defined(GATHER)
 // P13's live-block list, a chunk at a time. `pc.resOff` names an ascending
 // list of the key blocks this query tile has anything selected in, with the
 // count in front of it, and this kernel then iterates the list instead of the
@@ -181,6 +274,42 @@ shared uint blkAny;
 // already established contribute nothing.
 #define LCHUNK 256
 shared uint blist[LCHUNK];
+#endif
+
+#ifdef GATHER
+// stagePlane loads one head-dim group of this chunk's gathered cells into LDS:
+// cell `c` of the chunk takes its sixteen halves from
+// `plane + (cell/16 * HDT + grp) * 256 + (cell%16) * 16`, and lands at
+// `c * TILE` — the layout both `coopMatLoad`s above want.
+//
+// Eight halves a lane, unrolled over constant offsets so the load is one
+// 16-byte transfer and the store one LDS write. A selected run is `ratio`
+// consecutive cells, so consecutive `c` are consecutive 32-byte pieces of the
+// same tile and a run of four is one 128-byte line — which is the reason the
+// value plane moved to cell-major.
+//
+// Positions past the chunk's own count stage as **zero**: their mask bits are
+// zero so nothing reads the score they produce, and a zero is cheaper to be
+// sure about than a bounds test inside the fragment.
+void stagePlane(uint tid, uint buf, uint planeBase, uint grp0, uint cnt) {
+    for (uint i = tid; i < GRP * BN * 2u; i += WAVE * HPW) {
+        uint g = i / (BN * 2u), rem = i % (BN * 2u);
+        uint c = rem >> 1u, half8 = (rem & 1u) * 8u;
+        uint dst = g * GSTAGE + c * TILE + half8;
+        if (c >= cnt) {
+            [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+                kvs[buf][dst + d] = float16_t(0.0);
+            }
+            continue;
+        }
+        uint cell = glist[c];
+        uint src = planeBase + ((cell / TILE) * HDT + grp0 + g) * (TILE * TILE)
+            + (cell % TILE) * TILE + half8;
+        [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+            kvs[buf][dst + d] = hact[src + d];
+        }
+    }
+}
 #endif
 
 // stageSel loads this key block's slice of the QSA bitmask into LDS: one word
@@ -239,14 +368,28 @@ void main() {
 #endif
     uint past = SEQ_PAST;
     uint n = past + pc.tokens;       // cells in the cache, keys to attend over
-    uint lane = gl_LocalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
+#if HPW > 1
+    // Each wave is a head; the workgroup shares the gather. `heads % HPW == 0`
+    // is the host's promise (gathHeadsPerWG), so no wave falls off the end and
+    // every barrier below is reached by all of them.
+    uint wv = tid / WAVE;
+    uint lane = tid % WAVE;
+    head = gl_WorkGroupID.y * HPW + wv;
+#else
+    const uint wv = 0u;
+    uint lane = tid;
+#endif
+    // The wave's slice of the LDS the softmax uses. Zero at HPW = 1.
+    uint sBase = wv * SSTAGE, pBase = wv * SPBUF, bBase = wv * SBCORR, rBase = wv * BM;
     if (q0 >= pc.tokens || head >= pc.heads) {
         return;
     }
     bool sparse = pc.selOff != NO_W;
-#ifdef SPLITK
+#if defined(SPLITK) || defined(GATHER)
     // The split build strides *absolute* key blocks on purpose (see the loop
-    // below), so it never takes P13's list and `useList` is a constant here.
+    // below), so it never takes P13's list and `useList` is a constant here;
+    // the gather build has no key axis to walk at all.
     const bool useList = false;
 #else
     bool useList;
@@ -278,7 +421,7 @@ void main() {
         lsum[qq] = ACC(0.0);
     }
     for (uint i = lane; i < BM; i += WAVE) {
-        rowMax[i] = -1.0 / 0.0;
+        rowMax[rBase + i] = -1.0 / 0.0;
     }
     barrier();
 
@@ -314,6 +457,25 @@ void main() {
     // of -inf and a row sum of zero.
     for (uint base = sp * BN; base < last; base += splits * BN) {
       {
+#elif defined(GATHER)
+    // ---- P14-2: there is no key axis here. `pc.resOff` names this query
+    // tile's gathered cell list and the per-row mask behind it
+    // (`gathMax`/`gathStride`, llm_common.glsl), and the loop is a **dense**
+    // attention over `nGath` cells — no block skip, no `blkAny` vote, and no
+    // causal comparison anywhere, because the mask the gather wrote already has
+    // the causal test folded in.
+    //
+    // At 128 000 cells a sixteen-row tile's live blocks hold 24 580 cells and
+    // its union holds 10 058, so this loop is 2.44x shorter than the one it
+    // replaces — which is the last large term in a prefill at depth.
+    uint gmx = gathMax(pc.nKV, pc.selWidth, BM);
+    uint gmwords = gmx >> 5u;
+    uint gbase = pc.resOff + (q0 / BM) * gathStride(gmx, BM);
+    uint nGath = actu[gbase];
+    uint gidx = gbase + 1u;
+    uint gmask = gidx + gmx;
+    for (uint g0 = 0u; g0 < nGath; g0 += BN) {
+      {
 #else
     // The list, when there is one: `pc.resOff` is NO_W on every pass that did
     // not build one (the dense arm, and every rung the block dispatch was not
@@ -332,8 +494,16 @@ void main() {
       for (uint bi = 0u; bi < cn; ++bi) {
         uint base = useList ? blist[bi] * BN : (c0 + bi) * BN;
 #endif
+#ifdef GATHER
+        uint cnt = min(uint(BN), nGath - g0);
+        // The compacted mask is a bitmask over *positions*, so a chunk narrower
+        // than a word is the half of one at `g0 & 31` — exactly SELBIT's job on
+        // the block kernel's 16-cell rung, one axis over.
+        uint selBit = SELBIT(g0);
+#else
         uint cnt = min(BN, n - base);
         uint selBit = SELBIT(base);
+#endif
 
         // **The selection, before the block is read rather than after** (P7).
         // QSA names `top_k + ratio - 1` cells however deep the context is —
@@ -349,6 +519,21 @@ void main() {
         //
         // The staging has to move up here for it — it is the test — and it is
         // work this block was going to do anyway.
+#ifdef GATHER
+        // This chunk's cell indices and its slice of the compacted mask, both
+        // coalesced: the mask's row stride is the gathered capacity, so a
+        // chunk's words sit `g0/32` into each row. There is nothing to vote on
+        // — every cell in the list is selected by *some* row of the tile — so
+        // the two barriers the block skip needed are gone with it.
+        for (uint i = tid; i < BN; i += WAVE * HPW) {
+            glist[i] = (i < cnt) ? actu[gidx + g0 + i] : 0u;
+        }
+        for (uint i = tid; i < BM * BW; i += WAVE * HPW) {
+            uint row = i / BW, wd = i % BW;
+            selw[i] = actu[gmask + row * gmwords + (g0 >> 5u) + wd];
+        }
+        barrier();
+#else
         if (sparse && useList) {
             // Every block in the list is live — that is what the list is —
             // so the test and the two barriers around it are gone and what
@@ -368,6 +553,7 @@ void main() {
                 continue;
             }
         }
+#endif
 
         ACC s[QT][KTIL];
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
@@ -375,18 +561,43 @@ void main() {
                 s[qq][kk] = ACC(0.0);
             }
         }
+#ifdef GATHER
+        // The first batch of groups, so the loop below can always be staging the
+        // *next* one while the matrix cores work on this one.
+        stagePlane(tid, 0u, kBase, 0u, cnt);
+#endif
         [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
             FRAG_B fragK[KTIL];
+#ifdef GATHER
+            // The gathered cells' sixteen dims for these groups, through LDS —
+            // the loop was already over the groups, so the staging rides it. Both
+            // divisions fold: HDT and GRP are compile-time and the loop unrolls.
+            if (kt % GRP == 0u) {
+                GSTAGE_BARRIER();
+                if (kt + GRP < HDT) {
+                    stagePlane(tid, ((kt / GRP) + 1u) & 1u, kBase, kt + GRP, cnt);
+                }
+            }
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                coopMatLoad(fragK[kk], kvs[(kt / GRP) & 1u],
+                    (kt % GRP) * GSTAGE + kk * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
+            }
+#else
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
                 coopMatLoad(fragK[kk], hact, kBase + ((base / TILE + kk) * HDT + kt) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutColumnMajor);
             }
+#endif
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
                 [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
                     s[qq][kk] = coopMatMulAdd(fragQ[qq][kt], fragK[kk], s[qq][kk]);
                 }
             }
         }
+#ifdef GATHER
+        GSTAGE_BARRIER();              // the last group's staging is read
+#endif
 
         // The whole block's scores into LDS, one barrier for all of them. A
         // cooperative matrix's element order is not defined, so the row max
@@ -395,7 +606,7 @@ void main() {
         // rung) and buys the single pass below.
         [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-                coopMatStore(s[qq][kk], stage, (kk * QT + qq) * (TILE * TILE), TILE,
+                coopMatStore(s[qq][kk], stage, sBase + (kk * QT + qq) * (TILE * TILE), TILE,
                     gl_CooperativeMatrixLayoutRowMajor);
             }
         }
@@ -436,18 +647,20 @@ void main() {
             uint c0 = (lane % RCL) * RCPL;
             float mx = -1.0 / 0.0;
             for (uint c = c0; c < c0 + RCPL; ++c) {
+#ifndef GATHER
                 if (base + c > past + q0 + row) {
                     break;      // and every c after it, the row is done
                 }
+#endif
                 if (sparse && !selected(row, c, selBit)) {
                     continue;   // unselected: it must not set the scale
                 }
-                mx = max(mx, stage[((c / TILE) * QT + qi) * (TILE * TILE) +
+                mx = max(mx, stage[sBase + ((c / TILE) * QT + qi) * (TILE * TILE) +
                     r * TILE + (c % TILE)]);
             }
             mx = subgroupClusteredMax(mx, RCL);
             if (lane % RCL == 0u) {
-                blkMax[row] = mx;
+                blkMax[rBase + row] = mx;
             }
         }
 #else
@@ -455,47 +668,49 @@ void main() {
             uint qi = i / TILE, r = i % TILE;
             float mx = -1.0 / 0.0;
             for (uint c = 0u; c < BN; ++c) {
+#ifndef GATHER
                 if (base + c > past + q0 + i) {
                     break;
                 }
+#endif
                 if (sparse && !selected(i, c, selBit)) {
                     continue;
                 }
-                mx = max(mx, stage[((c / TILE) * QT + qi) * (TILE * TILE) +
+                mx = max(mx, stage[sBase + ((c / TILE) * QT + qi) * (TILE * TILE) +
                     r * TILE + (c % TILE)]);
             }
-            blkMax[i] = mx;
+            blkMax[rBase + i] = mx;
         }
 #endif
         barrier();
 
         for (uint i = lane; i < BM; i += WAVE) {
             uint qi = i / TILE, r = i % TILE;
-            float mo = rowMax[i];
-            float mn = max(mo, blkMax[i]);
-            rowMax[i] = mn;
+            float mo = rowMax[rBase + i];
+            float mn = max(mo, blkMax[rBase + i]);
+            rowMax[rBase + i] = mn;
             // exp2(-inf - m) is 0, so there is no first-block case. The equal
             // test is for the selection: a key block with nothing selected in
             // it leaves both maxima at -inf, and exp2(-inf - -inf) is a NaN
             // that would poison the accumulators for the rest of the row.
             float corr = (mo == mn) ? 1.0 : exp2(mo - mn);
             for (uint c = 0u; c < TILE; ++c) {
-                stage[qi * (TILE * TILE) + r * TILE + c] = mn;
-                bcorr[qi * (TILE * TILE) + r * TILE + c] = corr;
+                stage[sBase + qi * (TILE * TILE) + r * TILE + c] = mn;
+                bcorr[bBase + qi * (TILE * TILE) + r * TILE + c] = corr;
             }
         }
         barrier();
 
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
             ACC mrow, ccorr;
-            coopMatLoad(mrow, stage, qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(ccorr, bcorr, qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(mrow, stage, sBase + qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(ccorr, bcorr, bBase + qq * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
                 ACC p = s[qq][kk] - mrow;
                 [[unroll]] for (uint e = 0u; e < p.length(); ++e) {
                     p[e] = exp2(p[e]);
                 }
-                coopMatStore(ACCH(p), pbuf, (qq * TILE) * BN + kk * TILE, BN,
+                coopMatStore(ACCH(p), pbuf, pBase + (qq * TILE) * BN + kk * TILE, BN,
                     gl_CooperativeMatrixLayoutRowMajor);
             }
             [[unroll]] for (uint j = 0u; j < HDT; ++j) {
@@ -510,31 +725,65 @@ void main() {
         // the diagonal block needs it — every earlier block is entirely in the
         // past of every row — but the selection drops cells anywhere, so with
         // it on every block passes through here.
+#ifdef GATHER
+        // **One predicate, and it is the mask** (P14-2). The causal test is
+        // already in it — the gather ANDed each row's own extent into the bits
+        // it wrote — and the positions past this chunk's count carry a zero bit
+        // for every row, so the `col >= cnt` test goes with it.
+        for (uint i = lane; i < BM * BN; i += WAVE) {
+            if (!selected(i / BN, i & (BN - 1u), selBit)) {
+                pbuf[pBase + i] = float16_t(0.0);
+            }
+        }
+        barrier();
+#else
         if (sparse || cnt < BN || base + BN > past + q0) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 uint col = i & (BN - 1u);
                 uint row = i / BN;
                 if (col >= cnt || base + col > past + q0 + row ||
                     (sparse && !selected(row, col, selBit))) {
-                    pbuf[i] = float16_t(0.0);
+                    pbuf[pBase + i] = float16_t(0.0);
                 }
             }
             barrier();
         }
+#endif
 
         FRAG_A fragP[QT][KTIL];
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                coopMatLoad(fragP[qq][kk], pbuf, (qq * TILE) * BN + kk * TILE, BN,
+                coopMatLoad(fragP[qq][kk], pbuf, pBase + (qq * TILE) * BN + kk * TILE, BN,
                     gl_CooperativeMatrixLayoutRowMajor);
             }
         }
+#ifdef GATHER
+        stagePlane(tid, 0u, vBase, 0u, cnt);
+#endif
         [[unroll]] for (uint j = 0u; j < HDT; ++j) {
             FRAG_B fragV[KTIL];
-            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                coopMatLoad(fragV[kk], hact, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
-                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
+#ifdef GATHER
+            if (j % GRP == 0u) {
+                GSTAGE_BARRIER();
+                if (j + GRP < HDT) {
+                    stagePlane(tid, ((j / GRP) + 1u) & 1u, vBase, j + GRP, cnt);
+                }
             }
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                coopMatLoad(fragV[kk], kvs[(j / GRP) & 1u],
+                    (j % GRP) * GSTAGE + kk * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+#else
+            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+                // **RowMajor, because the value plane is cell-major** (P14-2):
+                // element (k=cell, n=dim) at `k*TILE + n`. It was ColumnMajor
+                // over a transposed tile and is the same matrix either way —
+                // see the note in llm_attn_pack.comp for why the layout moved.
+                coopMatLoad(fragV[kk], hact, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
+                    TILE, gl_CooperativeMatrixLayoutRowMajor);
+            }
+#endif
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
                 [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
                     o[qq][j] = coopMatMulAdd(fragP[qq][kk], fragV[kk], o[qq][j]);
@@ -560,13 +809,13 @@ void main() {
     // row. A slice that got no block writes -inf and zero, which is the
     // identity there.
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-        coopMatStore(lsum[qq], stage, qq * (TILE * TILE), TILE,
+        coopMatStore(lsum[qq], stage, sBase + qq * (TILE * TILE), TILE,
             gl_CooperativeMatrixLayoutRowMajor);
     }
     barrier();
     for (uint i = lane; i < BM; i += WAVE) {
         uint qi = i / TILE, r = i % TILE;
-        rowSum[i] = stage[qi * (TILE * TILE) + r * TILE];
+        rowSum[rBase + i] = stage[sBase + qi * (TILE * TILE) + r * TILE];
     }
     barrier();
 
@@ -578,15 +827,15 @@ void main() {
         uint token = q0 + i;
         if (token < pc.tokens) {
             uint at = mlBase + (slice + token) * 2u;
-            act[at] = rowMax[i];
-            act[at + 1u] = rowSum[i];
+            act[at] = rowMax[rBase + i];
+            act[at + 1u] = rowSum[rBase + i];
         }
     }
     barrier();
 
     [[unroll]] for (uint j = 0u; j < HDT; ++j) {
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-            coopMatStore(o[qq][j], stage, qq * (TILE * TILE), TILE,
+            coopMatStore(o[qq][j], stage, sBase + qq * (TILE * TILE), TILE,
                 gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();
@@ -604,7 +853,7 @@ void main() {
             uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
             uint dst = pc.resOff + (slice + token) * pc.headDim + j * TILE + part * 4u;
             [[unroll]] for (uint c = 0u; c < 4u; ++c) {
-                act[dst + c] = stage[src + c];
+                act[dst + c] = stage[sBase + src + c];
             }
         }
         barrier();
@@ -619,20 +868,20 @@ void main() {
     // cooperative matrix's element order is not defined — which is the same
     // reason the row max needed a staging tile.
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-        coopMatStore(lsum[qq], stage, qq * (TILE * TILE), TILE,
+        coopMatStore(lsum[qq], stage, sBase + qq * (TILE * TILE), TILE,
             gl_CooperativeMatrixLayoutRowMajor);
     }
     barrier();
     for (uint i = lane; i < BM; i += WAVE) {
         uint qi = i / TILE, r = i % TILE;
-        rowSum[i] = stage[qi * (TILE * TILE) + r * TILE];
+        rowSum[rBase + i] = stage[sBase + qi * (TILE * TILE) + r * TILE];
     }
     barrier();
 
     uint gateCol = pc.qkvOff + head * 2u * pc.headDim + pc.headDim;
     [[unroll]] for (uint j = 0u; j < HDT; ++j) {
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-            coopMatStore(o[qq][j], stage, qq * (TILE * TILE), TILE,
+            coopMatStore(o[qq][j], stage, sBase + qq * (TILE * TILE), TILE,
                 gl_CooperativeMatrixLayoutRowMajor);
         }
         barrier();
@@ -648,13 +897,13 @@ void main() {
             // never read — it is the output projection's padding — but a NaN
             // there would be a NaN in an arena the next pass reuses, so it is
             // written as a zero row instead.
-            float inv = (rowSum[row] > 0.0) ? 1.0 / rowSum[row] : 0.0;
+            float inv = (rowSum[rBase + row] > 0.0) ? 1.0 / rowSum[rBase + row] : 0.0;
             uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
             uint d0 = j * TILE + part * 4u;
             uint dst = pc.ctxOff + token * pc.ldCtx + head * pc.headDim + d0;
             [[unroll]] for (uint c = 0u; c < 4u; ++c) {
                 float g = act[gateCol + token * pc.gemmN + d0 + c];
-                hact[dst + c] = float16_t(stage[src + c] * inv / (1.0 + exp(-g)));
+                hact[dst + c] = float16_t(stage[sBase + src + c] * inv / (1.0 + exp(-g)));
             }
         }
         barrier();
