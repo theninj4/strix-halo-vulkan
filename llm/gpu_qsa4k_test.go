@@ -68,12 +68,26 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%d dispatches: %v", len(d), kinds)
-	// Eight since P9 split the indexer's score from its expansion to cells,
-	// which put `expand` between them; the selection reads what `expand`
-	// writes and so has to stay behind it.
-	if len(d) != 8 || kinds[5] != "select" || kinds[4] != "expand" {
-		t.Errorf("the graph is %v; the selection should be the sixth of eight dispatches, "+
-			"behind the expansion it reads", kinds)
+	// The order, not the count: P9 split the indexer's score from its
+	// expansion to cells and P13 put the live-block compaction behind the
+	// selection, so what is worth asserting is the chain each link reads —
+	// `expand` writes the cell scores `select` reads, and `select` writes the
+	// bitmask `blocks` compacts.
+	at := func(k string) int {
+		for i, v := range kinds {
+			if v == k {
+				return i
+			}
+		}
+		return -1
+	}
+	expand, sel := at("expand"), at("select")
+	if expand < 0 || sel < 0 || sel < expand {
+		t.Errorf("the graph is %v; the selection should run behind the expansion it reads", kinds)
+	}
+	if blk := at("blocks"); blk >= 0 && (blk < sel || blk > at("attn")) {
+		t.Errorf("the graph is %v; the compaction should sit between the selection "+
+			"it reads and the attention it feeds", kinds)
 	}
 }
 

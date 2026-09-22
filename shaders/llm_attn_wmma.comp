@@ -126,6 +126,14 @@
 #define RCL (WAVE / BM)
 #define RCPL (BN / RCL)
 
+// Mask words a row a key block. **It is not BN/32**, because BN may be
+// narrower than a word: a 16-cell key block (KTIL=1) is half of one, so the
+// staged slice is still one word a row and the block's cells start at bit
+// `base & 31` inside it. Every wider rung has `base` a multiple of 32 and
+// `SELBIT` is zero, which is exactly the addressing this had before.
+#define BW ((BN + 31) / 32)
+#define SELBIT(base) ((BN < 32) ? ((base) & 31u) : 0u)
+
 layout(local_size_x = WAVE) in;
 
 #define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
@@ -149,17 +157,43 @@ shared float rowSum[BM];
 // element: the mask loop below touches BM*BN elements and the row max another
 // BM*TILE, which is 512 global reads a block where the block's whole mask is
 // BM*BN/32 words. Reading it per element cost the kernel 1.90x.
-shared uint selw[BM * (BN / 32)];
+shared uint selw[BM * BW];
 // Whether any row of this key block has any cell selected at all.
 shared uint blkAny;
+
+#ifndef SPLITK
+// P13's live-block list, a chunk at a time. `pc.resOff` names an ascending
+// list of the key blocks this query tile has anything selected in, with the
+// count in front of it, and this kernel then iterates the list instead of the
+// axis — which is what makes a prefill flat in depth, because the live count
+// is (515, 518, 696) at (32k, 64k, 128k) where the axis is (1000, 2000,
+// 4000).
+//
+// It is staged rather than read per iteration for the reason the mask was
+// (L4b-3): the loop below is one wave, so a scalar load at the top of every
+// block is a dependent global read on the critical path. A chunk of LCHUNK
+// is one coalesced read per LCHUNK blocks.
+//
+// **Bit-identical, and not merely close.** The list holds exactly the blocks
+// the `blkAny` skip would not have skipped, in the order the loop would have
+// met them, so the same partial softmaxes are folded in the same order. What
+// is deleted is the visit to the blocks that contributed nothing — which P7
+// already established contribute nothing.
+#define LCHUNK 256
+shared uint blist[LCHUNK];
+#endif
 
 // stageSel loads this key block's slice of the QSA bitmask into LDS: one word
 // per (row, 32 cells), read by both the row max and the mask loop below, and
 // returns the OR of the words this lane staged — which is how the skip below
 // learns whether the block has anything in it at all.
 //
-// `base` is a multiple of BN and BN a multiple of 32, so a word of the staged
-// slice is a word of the arena and not a shift of one. A pad row has no
+// `base` is a multiple of BN; where BN is a multiple of 32 a word of the
+// staged slice is a word of the arena, and where it is not (KTIL=1, a 16-cell
+// block) the row's word is the one containing `base` and the block is the
+// half of it at `SELBIT`. Either way nothing is shifted: the bit index does
+// the work, so a rung change costs no extra instruction on the rungs that
+// were already word-aligned. A pad row has no
 // selection — llm_attn_select.comp does not run past the prompt — so it stages
 // as **zero**: nothing of it is visible, its softmax denominator is zero, and
 // the epilogue turns that into a zero row rather than a NaN. (It used to stage
@@ -168,21 +202,28 @@ shared uint blkAny;
 // step, which is the one shape where the skip is worth anything.)
 uint stageSel(uint lane, uint q0, uint base) {
     uint words = (pc.nKV + 31u) / 32u;
+    // The bits of the staged word this key block actually covers: all of them
+    // on a word-aligned rung, the 16 at SELBIT on a 16-cell one. The skip
+    // below must not be defeated by a neighbouring block's bits.
+    uint keep = (BN < 32) ? (((1u << BN) - 1u) << SELBIT(base)) : 0xFFFFFFFFu;
     uint acc = 0u;
-    for (uint i = lane; i < BM * (BN / 32u); i += WAVE) {
-        uint row = i / (BN / 32u), wd = i % (BN / 32u);
+    for (uint i = lane; i < BM * BW; i += WAVE) {
+        uint row = i / BW, wd = i % BW;
         uint token = q0 + row;
         uint w = (token >= pc.tokens) ? 0u
                                       : actu[pc.selOff + token * words + ((base + wd * 32u) >> 5u)];
         selw[i] = w;
-        acc |= w;
+        acc |= w & keep;
     }
     return acc;
 }
 
-// selected reads one bit out of the staged slice.
-bool selected(uint row, uint col) {
-    return (selw[row * (BN / 32u) + (col >> 5u)] & (1u << (col & 31u))) != 0u;
+// selected reads one bit out of the staged slice. `bit0` is the block's first
+// bit inside its row's first staged word, which is zero on every rung whose
+// key block is a whole number of words.
+bool selected(uint row, uint col, uint bit0) {
+    uint b = bit0 + col;
+    return (selw[row * BW + (b >> 5u)] & (1u << (b & 31u))) != 0u;
 }
 
 void main() {
@@ -203,6 +244,13 @@ void main() {
         return;
     }
     bool sparse = pc.selOff != NO_W;
+#ifdef SPLITK
+    // The split build strides *absolute* key blocks on purpose (see the loop
+    // below), so it never takes P13's list and `useList` is a constant here.
+    const bool useList = false;
+#else
+    bool useList;
+#endif
 
     uint qTiles = pc.plane / TILE;
     uint kvTiles = pc.nKV / TILE;
@@ -265,10 +313,27 @@ void main() {
     // through to the epilogue, which writes the combine's identity: a row max
     // of -inf and a row sum of zero.
     for (uint base = sp * BN; base < last; base += splits * BN) {
+      {
 #else
-    for (uint base = 0u; base < last; base += BN) {
+    // The list, when there is one: `pc.resOff` is NO_W on every pass that did
+    // not build one (the dense arm, and every rung the block dispatch was not
+    // compiled for), and then this is exactly the axis walk it was.
+    useList = sparse && pc.resOff != NO_W;
+    uint listBase = pc.resOff + (q0 / BM) * (1u + (pc.nKV + BN - 1u) / BN);
+    uint nblk = useList ? actu[listBase] : (last + BN - 1u) / BN;
+    for (uint c0 = 0u; c0 < nblk; c0 += LCHUNK) {
+      uint cn = min(uint(LCHUNK), nblk - c0);
+      if (useList) {
+          for (uint i = lane; i < cn; i += WAVE) {
+              blist[i] = actu[listBase + 1u + c0 + i];
+          }
+          barrier();
+      }
+      for (uint bi = 0u; bi < cn; ++bi) {
+        uint base = useList ? blist[bi] * BN : (c0 + bi) * BN;
 #endif
         uint cnt = min(BN, n - base);
+        uint selBit = SELBIT(base);
 
         // **The selection, before the block is read rather than after** (P7).
         // QSA names `top_k + ratio - 1` cells however deep the context is —
@@ -284,7 +349,13 @@ void main() {
         //
         // The staging has to move up here for it — it is the test — and it is
         // work this block was going to do anyway.
-        if (sparse) {
+        if (sparse && useList) {
+            // Every block in the list is live — that is what the list is —
+            // so the test and the two barriers around it are gone and what
+            // is left is the staging the block needed anyway.
+            stageSel(lane, q0, base);
+            barrier();
+        } else if (sparse) {
             if (lane == 0u) {
                 blkAny = 0u;
             }
@@ -368,7 +439,7 @@ void main() {
                 if (base + c > past + q0 + row) {
                     break;      // and every c after it, the row is done
                 }
-                if (sparse && !selected(row, c)) {
+                if (sparse && !selected(row, c, selBit)) {
                     continue;   // unselected: it must not set the scale
                 }
                 mx = max(mx, stage[((c / TILE) * QT + qi) * (TILE * TILE) +
@@ -387,7 +458,7 @@ void main() {
                 if (base + c > past + q0 + i) {
                     break;
                 }
-                if (sparse && !selected(i, c)) {
+                if (sparse && !selected(i, c, selBit)) {
                     continue;
                 }
                 mx = max(mx, stage[((c / TILE) * QT + qi) * (TILE * TILE) +
@@ -444,7 +515,7 @@ void main() {
                 uint col = i & (BN - 1u);
                 uint row = i / BN;
                 if (col >= cnt || base + col > past + q0 + row ||
-                    (sparse && !selected(row, col))) {
+                    (sparse && !selected(row, col, selBit))) {
                     pbuf[i] = float16_t(0.0);
                 }
             }
@@ -476,6 +547,7 @@ void main() {
             }
         }
         barrier();
+      }
     }
 
 #ifdef SPLITK

@@ -82,6 +82,8 @@ const (
 	AttnQT1KT2 AttnKernel = "qt1_kt2"
 	AttnQT1KT4 AttnKernel = "qt1_kt4"
 	AttnQT2KT4 AttnKernel = "qt2_kt4"
+	AttnQT2KT2 AttnKernel = "qt2_kt2"
+	AttnQT1KT1 AttnKernel = "qt1_kt1"
 )
 
 type attnVariant struct {
@@ -99,6 +101,26 @@ var attnVariants = []attnVariant{
 	{AttnQT1KT2, shaders.LLMAttnQT1KT2, 1, 2, 16, 32, shaders.LLMAttnQT1KT2Split},
 	{AttnQT1KT4, shaders.LLMAttnQT1KT4, 1, 4, 16, 64, shaders.LLMAttnQT1KT4Split},
 	{AttnQT2KT4, shaders.LLMAttnQT2KT4, 2, 4, 32, 64, shaders.LLMAttnQT2KT4Split},
+	// P13's probe rung. It is the one shape the ladder never had, and at
+	// depth it is the interesting one: a 32-row query tile over a 32-cell key
+	// block loads the same K and V for **twice** the queries, so K/V traffic
+	// a query falls 1.46x at 128 000 cells while the work a query rises 1.37x
+	// (the union over 32 adjacent queries is wider than over 16 — P11-7's
+	// table, 23.9% against 17.4%). Which way that trades is exactly the
+	// question of whether this kernel is bound by its arithmetic or by its
+	// cache reads, and nothing else in the ladder separates the two.
+	{AttnQT2KT2, shaders.LLMAttnQT2KT2, 2, 2, 32, 32, shaders.LLMAttnQT2KT2Split},
+	// The **narrow** rung, and at depth it is the one with a number behind
+	// it. P11-7 measured what the QSA selection lets a tile skip and found
+	// "the whole remaining headroom is the 1.40x between a 32-cell block and
+	// a 16-cell one" — at 128 000 cells a 16x16 tile keeps 11.7% of the pairs
+	// live against 17.4% for the shipped 16x32, which is **1.49x fewer cells
+	// a query**. P11-7 then tried to get that by branching on a per-k-tile
+	// flag *inside* the unrolled loop and lost 1.18x, and drew the rule: a
+	// branch inside a cooperative-matrix loop costs more than the work it
+	// removes, so change the loop's granularity instead. This is that change
+	// of granularity — a build, not a branch.
+	{AttnQT1KT1, shaders.LLMAttnQT1KT1, 1, 1, 16, 16, shaders.LLMAttnQT1KT1Split},
 }
 
 // splitPipe names the split build of a rung in the pipeline map.
@@ -142,7 +164,9 @@ const (
 )
 
 // AttnKernels lists the rungs, narrowest first.
-func AttnKernels() []AttnKernel { return []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT2KT4} }
+func AttnKernels() []AttnKernel {
+	return []AttnKernel{AttnQT1KT2, AttnQT1KT4, AttnQT2KT4, AttnQT2KT2, AttnQT1KT1}
+}
 
 // DefaultAttnKernel is the measured winner, and the ladder turned over from
 // where every other attention kernel in this repo sits.
@@ -155,7 +179,61 @@ func AttnKernels() []AttnKernel { return []AttnKernel{AttnQT1KT2, AttnQT1KT4, At
 // loop before KTIL adds a score accumulator per key tile. Arithmetic intensity
 // is inert here exactly as §3.3 found it — the register file decides, and at
 // this head dim it decides sooner.
-func DefaultAttnKernel() AttnKernel { return AttnQT1KT2 }
+func DefaultAttnKernel() AttnKernel { return AttnKernelFor(false, 0) }
+
+// AttnKernelFor is the rung, and **the selection decides it** (P13).
+//
+// L2f chose qt1_kt2 on 512-token prefills from cell zero, where the key loop
+// is dense and a 32-cell block is two cooperative-matrix tiles of reuse
+// against one. That is still the right rung for a dense causal attention and
+// it is what the `sparse == false` arm returns.
+//
+// Where the selection is live it is the wrong one, and P11-7 said so with a
+// number before anything was built: what the kernel can skip is a (query
+// tile, key block) pair, so the cost is the *union* of sixteen adjacent
+// queries' selections at the block's width — 17.4% of the axis at a 32-cell
+// block and 11.7% at a 16-cell one at 128 000 cells, which is **1.49x fewer
+// cells a query**. P11-7 tried to collect that by branching on a per-k-tile
+// flag inside the unrolled loop and lost 1.18x instead, and drew the rule:
+// change the loop's granularity, not what happens inside it. A narrower rung
+// is that change, and it is a build rather than a branch.
+//
+// Measured, 4 layers, `-pp 2048`, attention block in ms (two passes of the
+// control agreeing to 0.2%):
+//
+//	rung       depth 0    64 000   128 000
+//	qt1_kt4      16.9      280.1     597.4
+//	qt1_kt2      16.0      186.3     379.3
+//	qt1_kt1      16.3      127.2     250.1     1.46x / 1.52x
+//
+// The ladder is monotone in the block width at depth and flat at depth zero,
+// which is the shape the live-pair table predicts and not the shape L2f's
+// reuse argument predicts — because at depth this kernel is not short of
+// reuse, it is short of cells it is allowed to skip.
+//
+// **And it is prefill's rung, not decode's**, which is the same split P8
+// drew and for the same reason. At decode the kernel is 24 single-wave
+// workgroups that all fit on the device at once, so the dispatch costs one
+// wave's *serial walk* and neither its traffic nor its work
+// (research/p8-decode-attention-split.md) -- and halving the key block
+// doubles the walk. Measured at 48 layers and 128 000 cells: prefill
+// 471.7 -> 563.6 tok/s and decode 22.94 -> 22.27, which is the trade in both
+// directions on one change. So the narrow rung runs where the query axis
+// fills the grid and the wide one runs where it does not, which is exactly
+// the `attnSplitMaxRows` boundary the split already turns on.
+//
+// LLM_ATTN_KERNEL pins a rung for measurement.
+func AttnKernelFor(sparse bool, rows int) AttnKernel {
+	if k := AttnKernel(os.Getenv("LLM_ATTN_KERNEL")); k != "" {
+		if _, ok := attnVariantFor(k); ok {
+			return k
+		}
+	}
+	if sparse && rows > attnSplitMaxRows {
+		return AttnQT1KT1
+	}
+	return AttnQT1KT2
+}
 
 func attnVariantFor(k AttnKernel) (attnVariant, bool) {
 	for _, v := range attnVariants {
@@ -367,6 +445,10 @@ type AttnGPU struct {
 	// pinSplits fixes the slice count where a test needs two run lengths on
 	// one kernel; 0 leaves attnSplits to decide.
 	pinSplits int
+	// P13's live-block list: per query tile, a count and then the ascending
+	// indices of the key blocks the selection leaves anything in.
+	aBlk     uint32
+	blkTiles int
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1).
 	aPart    uint32
 	actElems int
@@ -431,8 +513,18 @@ func (g *AttnGPU) selWords() int { return (g.nKV + 31) / 32 }
 // either way: on where it is the identity, to price the kernel against
 // llama.cpp's TOP_K, and off where it bites, which is the negative control
 // that says the selection changes the attention output at all.
-func (g *AttnGPU) Sparse() bool     { return g.sparse }
-func (g *AttnGPU) SetSparse(v bool) { g.sparse = v }
+func (g *AttnGPU) Sparse() bool { return g.sparse }
+
+// SetSparse takes the rung with it unless a plan has been pinned, because
+// which rung is right is a fact about whether the selection is live (P13) --
+// so a dense control arm must run the dense ladder's winner or it is two
+// changes at once.
+func (g *AttnGPU) SetSparse(v bool) {
+	g.sparse = v
+	if g.autoPlan {
+		g.attn = AttnKernelFor(v, g.rows)
+	}
+}
 
 // Past is how many cells the cache holds before the next run, SetPast moves
 // it, and Reset starts a fresh sequence.
@@ -616,6 +708,10 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 	// kernel takes its dense arm. That is a fact about the cache rather than
 	// about the prompt, and the cache is fixed here.
 	g.sparse = cfg.TopK > 0 && g.selWidth() < nKV
+	// And the rung follows it (P13): the narrow key block is only worth
+	// anything where there is something to skip, and `sparse` is exactly
+	// where there is.
+	g.attn = AttnKernelFor(g.sparse, maxTokens)
 
 	if err := g.alloc(len(layers)); err != nil {
 		g.Destroy()
@@ -673,6 +769,14 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// rather than branching, and an unallocated row would be a read past the
 	// buffer.
 	g.aSel = alloc(rows * g.selWords())
+	// P13's live-block list, one run per query tile: a count and then at most
+	// one index per key block of the cache. It is sized for the *narrowest*
+	// tile and the *narrowest* block any rung uses -- the rung is a knob and
+	// the arena plan is fixed at construction -- so at 139k cells and a 2048-
+	// row batch it is 128 tiles x 4345 uints, 2.2 MB beside the 1.1 GB the
+	// expanded cell scores already take.
+	g.blkTiles = (rows + blkListBM - 1) / blkListBM
+	g.aBlk = alloc(g.blkTiles * g.blkStride())
 	// The decode GEMV's partial sums, f32 [KSLABS][gemmN] (L8e-1). The wider
 	// of the two projections is the fused one, so 40 x 13952 x 4 = 2.2 MB —
 	// allocated whichever rung runs, because the arena plan is fixed at
@@ -811,6 +915,17 @@ func (g *AttnGPU) build() error {
 			return err
 		}
 		if err := g.pipeline(splitPipe(v.name), v.split, vk.PipelineSpec{
+			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+		}); err != nil {
+			return err
+		}
+	}
+	// P13's compaction, one build per (query tile, key block) shape, because
+	// both extents are compiled into the kernel whose loop will read it. It
+	// is a ballot and a prefix over waves, so the wave is pinned for the
+	// reason the selection's bucket search is.
+	for name, spirv := range blkListPipes {
+		if err := g.pipeline(name, spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
 		}); err != nil {
 			return err
@@ -1168,6 +1283,7 @@ func (g *AttnGPU) Upload(xn []float32, nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
+		g.attn = AttnKernelFor(g.sparse, nTok)
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
 		if g.pinGemv {
 			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff
@@ -1217,6 +1333,67 @@ func (g *AttnGPU) Upload(xn []float32, nTok int) error {
 //
 // LLM_ATTN_SPLITS overrides for measurement: 1 is the unsplit kernel, which
 // is the control arm this was measured against.
+// P13's live-block list: the compaction between the selection and the
+// attention kernel, and the arena it writes.
+//
+// `llm_attn_wmma.comp` skips a key block the selection left empty, and has
+// since P7; what it could not do is stop walking the axis to find out. The
+// walk is what makes a prefill's attention grow with depth even though the
+// *live* count does not -- 515 blocks at 32 000 cells, 518 at 64 000, 696 at
+// 128 000 against an axis of 1000, 2000 and 4000 -- and it is paid once per
+// head, on sixteen scattered cache lines a block. This turns the question
+// into an answer computed once for all twenty-four heads.
+const (
+	// The narrowest query tile and the narrowest key block any rung uses.
+	// The arena is sized for those because the rung is a knob and the arena
+	// plan is fixed at construction: every other rung indexes fewer tiles of
+	// fewer entries into the same allocation.
+	blkListBM = 16
+	blkListBN = 16
+)
+
+var blkListPipes = map[string][]byte{
+	"blocks.bm16_bn32": shaders.LLMAttnBlocksBM16BN32,
+	"blocks.bm16_bn64": shaders.LLMAttnBlocksBM16BN64,
+	"blocks.bm32_bn64": shaders.LLMAttnBlocksBM32BN64,
+	"blocks.bm32_bn32": shaders.LLMAttnBlocksBM32BN32,
+	"blocks.bm16_bn16": shaders.LLMAttnBlocksBM16BN16,
+}
+
+// blkListPipe names the build for a rung: the list is the OR of the bitmask
+// down BM query rows over BN key cells, and both are compiled into the
+// kernel that reads it, so the producer has to be compiled the same way.
+func blkListPipe(av attnVariant) string {
+	return fmt.Sprintf("blocks.bm%d_bn%d", av.rows, av.keys)
+}
+
+// blkStride is how many uints one query tile's run holds: the count, then at
+// most one index per key block of the cache.
+func (g *AttnGPU) blkStride() int { return 1 + (g.nKV+blkListBN-1)/blkListBN }
+
+// blockList is whether this pass builds one, and it is **off by default,
+// because it is measured inert at prefill** (P13-3).
+//
+// The hypothesis was that the axis walk is the depth slope: at 128 000 cells
+// the kernel visits 4000 key blocks to do real work in 696, staging sixteen
+// scattered mask words at each, once per head. The compaction deletes 83% of
+// those visits and costs a thousandth of a millisecond a token -- and
+// `attn.attn` does not move, at any depth. The same sixteen lines are read by
+// all twenty-four heads of a query tile, a tile's whole mask is 128 KB, and
+// the MALL serves it.
+//
+// That is P11-4's answer a third time and it is the engine's rather than this
+// kernel's: *latency and redundant reads that matter at decode do not matter
+// at prefill, because prefill has occupancy* -- 3072 single-wave workgroups
+// against a decode step's 24.
+//
+// It is kept rather than reverted for the two places that are not prefill:
+// the split decode kernel walks the same axis with no occupancy to hide
+// behind, and a per-cell gather would be built on this compaction.
+// LLM_ATTN_BLOCK_LIST=1 turns it on; it is bit-identical either way, which
+// TestAttnGPUBlockListDoesNotChangeTheAnswer asserts as an equality.
+func (g *AttnGPU) blockList() bool { return os.Getenv("LLM_ATTN_BLOCK_LIST") == "1" }
+
 func (g *AttnGPU) attnSplits(av attnVariant) int {
 	if g.rows > av.rows || g.rows > attnSplitMaxRows {
 		return 1
@@ -1387,12 +1564,31 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		add(g.selectPipe(), "select", uint32(g.rows), 1, base)
 	}
 
+	qBlocks := uint32(roundUpInt(g.rows, av.rows) / av.rows)
+	sp := g.attnSplits(av)
+
+	// 5b. The live-block list (P13), when the kernel behind it is the unsplit
+	//     one. The split build strides *absolute* key blocks so that a slice
+	//     does not depend on how the prompt was chunked (L7a's gate), and a
+	//     stride over a compacted list would not have that property — so the
+	//     two are exclusive, which costs nothing because the split is decode
+	//     and the list is depth.
+	blkPipe, haveBlk := "", false
+	if g.sparse && sp == 1 && g.blockList() {
+		blkPipe = blkListPipe(av)
+		_, haveBlk = g.pipes[blkPipe]
+	}
+	if haveBlk {
+		bl := base
+		bl.ResOff = g.aBlk
+		add(blkPipe, "blocks", qBlocks, 1, bl)
+	}
+
 	// 6. Causal GQA with the output gate in the epilogue, reading the
 	//    selection beside the causal mask — or, at decode over a cache deep
 	//    enough to be worth it, the same kernel with its key axis cut across
 	//    workgroups and a combine behind it (P8).
-	qBlocks := uint32(roundUpInt(g.rows, av.rows) / av.rows)
-	if sp := g.attnSplits(av); sp > 1 {
+	if sp > 1 {
 		split := base
 		split.ResOff, split.InjOff = g.aSplit, uint32(sp)
 		add(splitPipe(g.attn), "attn.split", qBlocks*uint32(sp), uint32(c.NHead), split)
@@ -1400,7 +1596,14 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// the context's pad rows too, as the unsplit epilogue does.
 		add("combine", "attn.combine", uint32(c.NHead), qBlocks*uint32(av.rows), split)
 	} else {
-		add(string(g.attn), "attn", qBlocks, uint32(c.NHead), base)
+		at := base
+		// NO_W and not zero when there is no list: zero is a valid arena
+		// offset, and the kernel decides on this field.
+		at.ResOff = noW
+		if haveBlk {
+			at.ResOff = g.aBlk
+		}
+		add(string(g.attn), "attn", qBlocks, uint32(c.NHead), at)
 	}
 
 	// 7. The output projection, off the gated context.
@@ -1745,6 +1948,7 @@ func (g *AttnGPU) Resize(nTok int) error {
 	}
 	g.rows = nTok
 	if g.autoPlan {
+		g.attn = AttnKernelFor(g.sparse, nTok)
 		g.gemm, g.outGemm = GEMMKernelFor(nTok), OutGEMMKernelFor(nTok)
 		if g.pinGemv {
 			g.qkvGemv, g.outGemv = GEMVOff, GEMVOff

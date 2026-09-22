@@ -2620,6 +2620,8 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=2 -o llm_attn_qt2_kt2.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=1 -o llm_attn_qt1_kt1.spv llm_attn_wmma.comp
 
 // P8's split-key builds of the same file, and the combine that closes them.
 // One a rung, because which rung runs is a knob and a split build has to
@@ -2628,7 +2630,20 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2_split.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4_split.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=2 -DKTIL=2 -o llm_attn_qt2_kt2_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLITK -DQT=1 -DKTIL=1 -o llm_attn_qt1_kt1_split.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_combine.spv llm_attn_combine.comp
+
+// P13's live-block list, one build per (query tile, key block) shape the
+// attention rungs have, because the list is the OR of the bitmask down a
+// query tile over a key block and both extents are compiled into the kernel
+// that will read it.
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DBN=32 -o llm_attn_blocks_bm16_bn32.spv llm_attn_blocks.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DBN=64 -o llm_attn_blocks_bm16_bn64.spv llm_attn_blocks.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=32 -DBN=64 -o llm_attn_blocks_bm32_bn64.spv llm_attn_blocks.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=32 -DBN=32 -o llm_attn_blocks_bm32_bn32.spv llm_attn_blocks.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DBN=16 -o llm_attn_blocks_bm16_bn16.spv llm_attn_blocks.comp
 
 //go:embed llm_attn_pack.spv
 var LLMAttnPack []byte
@@ -2674,6 +2689,20 @@ var LLMAttnQT1KT4 []byte
 //go:embed llm_attn_qt2_kt4.spv
 var LLMAttnQT2KT4 []byte
 
+// LLMAttnQT2KT2 is the rung the ladder never had: 32 query rows over a 32-cell
+// key block. At depth it is the control that separates arithmetic from cache
+// reads — see the note beside it in gpu_attn.go.
+//
+//go:embed llm_attn_qt2_kt2.spv
+var LLMAttnQT2KT2 []byte
+
+// LLMAttnQT1KT1 is the narrow rung: a 16-cell key block, which is the one
+// P11-7 priced at 1.49x fewer cells a query at 128 000 and could not have as
+// a branch inside the loop.
+//
+//go:embed llm_attn_qt1_kt1.spv
+var LLMAttnQT1KT1 []byte
+
 //go:embed llm_attn_qt1_kt2_split.spv
 var LLMAttnQT1KT2Split []byte
 
@@ -2682,6 +2711,38 @@ var LLMAttnQT1KT4Split []byte
 
 //go:embed llm_attn_qt2_kt4_split.spv
 var LLMAttnQT2KT4Split []byte
+
+//go:embed llm_attn_qt2_kt2_split.spv
+var LLMAttnQT2KT2Split []byte
+
+//go:embed llm_attn_qt1_kt1_split.spv
+var LLMAttnQT1KT1Split []byte
+
+// LLMAttnBlocks* are P13's compaction: per query tile, the ascending indices
+// of the key blocks the QSA selection leaves anything in.
+//
+// The attention kernel already skips a block with nothing selected in it
+// (P7), bit-identically; what it could not do is stop *walking* the axis to
+// find out, and at depth that walk is the slope. It stages sixteen words of
+// the bitmask a block — sixteen separate cache lines, because a row's mask is
+// nKV/32 dwords from the next row's — and it does it once per head. This does
+// the same OR once for all twenty-four, coalesced, and hands the kernel the
+// answer instead of the question.
+//
+//go:embed llm_attn_blocks_bm16_bn32.spv
+var LLMAttnBlocksBM16BN32 []byte
+
+//go:embed llm_attn_blocks_bm16_bn64.spv
+var LLMAttnBlocksBM16BN64 []byte
+
+//go:embed llm_attn_blocks_bm32_bn64.spv
+var LLMAttnBlocksBM32BN64 []byte
+
+//go:embed llm_attn_blocks_bm32_bn32.spv
+var LLMAttnBlocksBM32BN32 []byte
+
+//go:embed llm_attn_blocks_bm16_bn16.spv
+var LLMAttnBlocksBM16BN16 []byte
 
 // LLMAttnCombine assembles the split builds' slices: P8's second half, and
 // the only place the decode attention's softmax divide and output gate happen

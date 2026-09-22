@@ -234,6 +234,9 @@ func (g *Graph) record(rows int) {
 		g.rec = &recorder{}
 	}
 	g.rec.rows = rows
+	// The depth the attention dispatches of this pass will run at, which is
+	// the other half of what one command buffer may hold (nsPerRowCell).
+	g.rec.past = g.past
 	g.hc.rec = g.rec
 	g.move.rec = g.rec
 	if g.ple != nil {

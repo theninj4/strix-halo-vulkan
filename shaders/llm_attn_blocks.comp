@@ -1,0 +1,167 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The QSA selection's live key blocks, compacted into a list per query tile:
+// the dispatch that makes a prefill's attention flat in depth (P13).
+//
+// **What it does.** `llm_attn_wmma.comp` skips a key block with nothing
+// selected in it (P7), and that skip is bit-identical — an unselected cell
+// contributes nothing to O and nothing to the row sum, so a block of them
+// contributes nothing. What it does *not* do is stop the kernel walking every
+// block to find out: at 128 000 cells it visits 4000 to do real work in 696,
+// staging BM words of the bitmask at each — sixteen separate 64-byte lines,
+// because a row's mask is nKV/32 dwords from the next row's — and doing it
+// **once per head**, because the mask is per token and the grid is (query
+// block, head). This does the OR once for all twenty-four heads, coalesced,
+// and hands the kernel an ascending list of the blocks that have anything in
+// them, so the loop iterates the list instead of the axis.
+//
+// **It is measured inert at prefill and it is off by default** (P13-3,
+// LLM_ATTN_BLOCK_LIST=1). `attn.attn` does not move at any depth — 0.9107 ms
+// a token against 0.9281 at 128 000 cells — and the compaction itself costs
+// 0.001, three orders below what it was meant to save. The mask read was
+// never the cost: the same sixteen lines serve all twenty-four heads of a
+// query tile, a tile's whole mask is 128 KB, and the MALL holds it. At the
+// 16-cell rung, where there are twice as many dead blocks to delete, it is
+// 1.05x *against*.
+//
+// That is P11-4's answer a third time and it is the engine's rather than this
+// kernel's: **latency and redundant reads that matter at decode do not matter
+// at prefill, because prefill has occupancy** — 3072 single-wave workgroups
+// against a decode step's 24.
+//
+// It is kept for the two places that are not prefill. The split decode kernel
+// walks the same axis with 24 workgroups and nothing to hide a serial walk
+// behind, which is the regime where this is supposed to pay; and a per-cell
+// gather — the only route left to 900 tok/s at 128k — is this compaction at a
+// finer granularity.
+//
+// **It changes no arithmetic.** The list is ascending and holds exactly the
+// blocks the skip would not have skipped, so the attention kernel visits the
+// same blocks in the same order and folds the same partial softmaxes the same
+// way. It is bit-identical rather than close, and
+// TestAttnGPUBlockListDoesNotChangeTheAnswer is the gate that says so.
+//
+// **Prefill only.** The split decode kernel (P8) strides *absolute* key
+// blocks precisely so that a slice does not depend on how the prompt was
+// chunked; striding a compacted list instead would put the slice boundaries
+// somewhere that does depend on it, which is the bug L7a's gate exists to
+// catch. The list is built when the graph is not splitting, which is every
+// pass wider than one query tile.
+
+#include "llm_common.glsl"
+
+#ifndef BM
+#define BM 16       // query rows a tile, the consuming kernel's QT * 16
+#endif
+#ifndef BN
+#define BN 32       // cells a key block, the consuming kernel's KTIL * 16
+#endif
+#ifndef WG
+#define WG 256
+#endif
+
+// Mask words a row a key block, and which bits of the first of them the
+// block covers. **BN may be narrower than a word**: a 16-cell key block
+// (KTIL=1) is half of one, and ORing the whole word would call a block live
+// because its neighbour has something in it.
+#define BWORDS ((BN + 31) / 32)
+#define MAXWAVES 16
+
+layout(local_size_x = WG) in;
+
+// One count per wave of this chunk, and the running offset each wave's
+// output starts at. A ballot gives a lane its position inside its own wave;
+// these two give the wave its position inside the workgroup.
+shared uint wcount[MAXWAVES];
+shared uint woff[MAXWAVES];
+// How many blocks have been emitted so far, carried across the chunks.
+shared uint emitted;
+
+void main() {
+    uint qt = gl_WorkGroupID.x;
+    uint q0 = qt * BM;
+    if (q0 >= pc.tokens) {
+        return;
+    }
+    uint lane = gl_LocalInvocationID.x;
+    uint past = SEQ_PAST;
+    uint n = past + pc.tokens;
+
+    // Exactly the bound the attention kernel's loop has: nothing past this
+    // query tile's last row can be attended to, and its last row is cell
+    // `past + q0 + BM - 1`. A block the loop would never reach must not be in
+    // the list, because the list is what replaces the loop.
+    uint last = min(n, past + q0 + BM);
+    uint nb = (last + BN - 1u) / BN;
+
+    uint words = (pc.nKV + 31u) / 32u;
+    uint stride = 1u + (pc.nKV + BN - 1u) / BN;
+    uint outBase = pc.resOff + qt * stride;
+
+    if (lane == 0u) {
+        emitted = 0u;
+    }
+    barrier();
+
+    for (uint b0 = 0u; b0 < nb; b0 += WG) {
+        uint b = b0 + lane;
+        bool live = false;
+        if (b < nb) {
+            // The OR down the tile's rows, which is what "any row of this key
+            // block has any cell selected" means and is what `blkAny` was.
+            // A pad row has no selection — llm_attn_select.comp does not run
+            // past the prompt — and the rows are ascending, so the first one
+            // past `tokens` ends the walk.
+            uint cell0 = b * BN;
+            uint w0 = cell0 >> 5u;
+            uint keep = (BN < 32) ? (((1u << BN) - 1u) << (cell0 & 31u)) : 0xFFFFFFFFu;
+            uint acc = 0u;
+            for (uint r = 0u; r < BM; ++r) {
+                uint token = q0 + r;
+                if (token >= pc.tokens) {
+                    break;
+                }
+                for (uint w = 0u; w < BWORDS; ++w) {
+                    uint word = actu[pc.selOff + token * words + w0 + w];
+                    acc |= (w == 0u) ? (word & keep) : word;
+                }
+            }
+            live = acc != 0u;
+        }
+
+        // The compaction, and it has to preserve order: the attention kernel
+        // folds its partial softmaxes in the order it meets the blocks, so a
+        // list that holds the same blocks in a different order is a different
+        // rounding. A ballot is the position inside a wave and the two
+        // shared arrays are the position of the wave.
+        uvec4 vote = subgroupBallot(live);
+        uint within = subgroupBallotExclusiveBitCount(vote);
+        uint wave = gl_SubgroupID;
+        if (subgroupElect()) {
+            wcount[wave] = subgroupBallotBitCount(vote);
+        }
+        barrier();
+        if (lane == 0u) {
+            uint acc = emitted;
+            for (uint w = 0u; w < gl_NumSubgroups; ++w) {
+                woff[w] = acc;
+                acc += wcount[w];
+            }
+            emitted = acc;
+        }
+        barrier();
+        if (live) {
+            actu[outBase + 1u + woff[wave] + within] = b;
+        }
+        barrier();
+    }
+
+    if (lane == 0u) {
+        actu[outBase] = emitted;
+    }
+}
