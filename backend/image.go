@@ -391,6 +391,14 @@ func drawProgress(img *image.NRGBA, done, steps int) {
 // n frames spread evenly over the steps that will run, as a map from step
 // index to the frame's own index.
 //
+// **The first frame is always the first step's.** A client should see
+// something as soon as there is something to see, and step 0's denoised
+// estimate already carries the composition and colour, only fuzzy. Nothing
+// earlier is worth a frame: before the first step the latent is the seeded
+// noise, and the preview matrix maps that to grey static. The rest follow at
+// run/n intervals, so with the finished image counted as frame n+1 the
+// spacing is even all the way to the end.
+//
 // It is host arithmetic with three edges -- fewer steps than frames asked
 // for, a one-step schedule, and the last step -- and none of them would show
 // up in an image, which is why it has a test of its own. It survived the
@@ -415,11 +423,8 @@ func partialSteps(first, steps, n int) map[int]int {
 	out := make(map[int]int, n)
 	last := steps - 2 // the last step a partial may come from
 	idx := 0
-	for j := 1; j <= n; j++ {
-		k := first + j*run/(n+1) - 1
-		if k < first {
-			k = first
-		}
+	for j := 0; j < n; j++ {
+		k := first + j*run/n
 		if k > last {
 			k = last
 		}

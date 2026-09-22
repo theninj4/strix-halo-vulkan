@@ -10,7 +10,7 @@ WorkingDirectory=###
 ; batches, which cost decode nothing (P16) and are the fastest prefill for a
 ; long prompt. ~83 GB resident, ~66 s to come up.
 ;ExecStart=###/ai -addr 0.0.0.0:11434 -token= -llm -llm-ctx 262144 -llm-batch 8192
-ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 1 -wyoming 0.0.0.0:10300
+ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 3 -wyoming 0.0.0.0:10300
 Restart=always
 RestartSec=1
 

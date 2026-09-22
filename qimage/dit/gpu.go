@@ -468,7 +468,19 @@ func (g *GPU) allocActivations() error {
 	// rows write whole 128-row tiles and so overrun into whatever follows
 	// them, and a host write cannot be ordered after a dispatch that has not
 	// been submitted yet. One copy dispatch per text run does order.
-	g.aTxt = alloc(g.maxText * g.dim)
+	//
+	// **It aliases the FFN gate rather than taking space of its own.** The
+	// copy is its only reader and runs at the prefill before the first
+	// block, and the gate is first written by that block's FFN, so the two
+	// are never live at once. "Text" here is every VLM row, a reference's
+	// ~1280 slots included, so at three 1024² references it is 71 MB -- and
+	// as its own region at the end of the arena that was the 71 MB past the
+	// 4 GiB binding limit: the driver clamps, rows from 257 on read as
+	// zeros, and every edit prompt (which follows its images) vanished.
+	if g.maxText*g.dim > rows*g.ffn {
+		return fmt.Errorf("dit: %d text rows do not fit the %d-row FFN gate they alias", g.maxText, rows)
+	}
+	g.aTxt = g.aGate
 
 	halloc := func(n int) uint32 {
 		off := uint32(g.hElems)
@@ -483,6 +495,20 @@ func (g *GPU) allocActivations() error {
 	g.hCtx = halloc(rows * g.ldaDim)
 	g.hFFN = halloc(rows * g.ldaFFN)
 	g.hLat = halloc(rows * g.ldaLat)
+
+	// A buffer past the storage-buffer range is legal to create and is
+	// clamped where it is bound, so a kernel reading its tail gets zeros and
+	// no error. Refuse at staging instead, with the numbers that set it.
+	for _, a := range []struct {
+		name  string
+		bytes int
+	}{{"fp32", g.actElems * 4}, {"fp16", g.hElems * 2}} {
+		if a.bytes > maxBankBytes {
+			return fmt.Errorf("dit: the %s activation arena for %d rows (%d-row prefix) is %d MB, "+
+				"past the %d MB storage-buffer limit; stage fewer reference images or a smaller target",
+				a.name, g.maxTokens, g.maxPrefix, a.bytes>>20, maxBankBytes>>20)
+		}
+	}
 
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {

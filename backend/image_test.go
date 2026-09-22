@@ -18,11 +18,11 @@ func TestPartialSteps(t *testing.T) {
 		first, steps, n int
 		want            []int
 	}{
-		// The default: three frames over the checkpoint's eight steps, evenly
-		// spread, the last two steps clear of the end.
-		{0, 8, 3, []int{1, 3, 5}},
-		{0, 8, 2, []int{1, 4}},
-		{0, 8, 1, []int{3}},
+		// Three frames over eight steps: the first from step 0, so the client
+		// sees the fuzzy composition at once, the rest evenly after it.
+		{0, 8, 3, []int{0, 2, 5}},
+		{0, 8, 2, []int{0, 4}},
+		{0, 8, 1, []int{0}},
 		{0, 8, 0, nil},
 		// More frames than there is room for. Each is clamped to the last
 		// step a partial may come from and the duplicates collapse, so four
@@ -36,15 +36,15 @@ func TestPartialSteps(t *testing.T) {
 		{0, 0, 3, nil},
 		// And a long schedule, to show the spacing is a fraction rather than
 		// a fixed offset.
-		{0, 20, 3, []int{4, 9, 14}},
+		{0, 20, 3, []int{0, 6, 13}},
 		// The ceiling over the default 40 steps: sixteen distinct frames,
-		// none from the last step.
-		{0, 40, 16, []int{1, 3, 6, 8, 10, 13, 15, 17, 20, 22, 24, 27, 29, 31, 34, 36}},
+		// 2.5 steps apart, none from the last step.
+		{0, 40, 16, []int{0, 2, 5, 7, 10, 12, 15, 17, 20, 22, 25, 27, 30, 32, 35, 37}},
 		// An edit runs only the tail, and the frames spread over *that*.
 		// Spread over the whole schedule instead, every one of these would
 		// fall before the run started and the client would get none.
 		{4, 8, 3, []int{4, 5, 6}},
-		{2, 8, 3, []int{2, 4, 5}},
+		{2, 8, 3, []int{2, 4, 6}},
 		{6, 8, 3, []int{6}},
 		{7, 8, 3, nil},
 	} {
@@ -62,6 +62,13 @@ func TestPartialSteps(t *testing.T) {
 				// what OpenAI's partial_image_index means.
 				if got[k] != i {
 					t.Errorf("step %d is frame %d, want %d", k, got[k], i)
+				}
+			}
+			// The first frame is the run's first step, so a client sees
+			// something as soon as there is anything to see.
+			if len(got) > 0 {
+				if i, ok := got[c.first]; !ok || i != 0 {
+					t.Errorf("frame 0 is not from step %d: %v", c.first, got)
 				}
 			}
 			// Nothing may come from the last step, whatever the counts, and
