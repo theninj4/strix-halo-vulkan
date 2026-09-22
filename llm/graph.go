@@ -47,6 +47,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"strix-halo-vulkan/vk"
@@ -166,6 +167,10 @@ type Graph struct {
 
 	pleCfg PLEConfig
 	hasPLE bool
+	// pleAhead is a PrefetchPLE still faulting pages in (P17). A gather waits
+	// for it rather than faulting the same pages beside it, and Destroy waits
+	// for it because it reads the model's mapping.
+	pleAhead sync.WaitGroup
 
 	kinds  []blockKind
 	nLayer int
@@ -1404,6 +1409,39 @@ func (g *Graph) hidden(ids []int32) error {
 // other 44 layers need.
 func (g *Graph) Residual() []float32 { return g.hc.Res() }
 
+// PrefetchPLE faults in the n-gram table's pages for `next`, the batch that
+// will follow `prev`, on a goroutine of its own, and returns at once (P17).
+//
+// A prompt's rows are 16 a token at random offsets into a 28.80 GB mapping
+// that is mostly not in the page cache, so a fresh 2048-token chunk is ~32 000
+// major faults: **16 ms of host gather a chunk at depth 0, where the bench's
+// warm-up pass has touched the same text, and 93 ms at 32 000 cells, where it
+// has not** — 3-4% of a prefill pass, spent with the GPU idle. But a prompt's
+// tokens are all known before its first chunk runs, so the next chunk's faults
+// can be taken while the device works on this one, when the host is otherwise
+// waiting on a fence. The gather it does is discarded; what it leaves behind is
+// warm pages, and the real gather then reads them at ~12 µs a token.
+//
+// It changes no value anywhere — the rows are the table's, whoever faulted
+// them — and a wrong guess costs page cache and nothing else. `prev` supplies
+// the n-gram's predecessors; only its last NGram-1 tokens are read.
+// LLM_PLE_PREFETCH=0 is the control arm.
+func (g *Graph) PrefetchPLE(prev, next []int32) {
+	if !g.hasPLE || len(next) == 0 || os.Getenv("LLM_PLE_PREFETCH") == "0" {
+		return
+	}
+	keep := minInt(len(prev), g.pleCfg.NGram-1)
+	ids := make([]int32, 0, keep+len(next))
+	ids = append(ids, prev[len(prev)-keep:]...)
+	ids = append(ids, next...)
+	rows := PLERowsFrom(g.pleCfg, ids, keep)
+	g.pleAhead.Add(1)
+	go func() {
+		defer g.pleAhead.Done()
+		_, _ = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
+	}()
+}
+
 // Prefill runs every layer over a prompt **as a fresh sequence**, leaving the
 // wide residual in the hyper-connection block's arena.
 func (g *Graph) Prefill(ids []int32) error {
@@ -1493,6 +1531,7 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 		// whole-sequence form returned and, at 128 000 cells, 2.05 million
 		// fewer of them (P15-1).
 		rows := PLERowsFrom(g.pleCfg, g.ids, g.past)
+		g.pleAhead.Wait()
 		pleEmbd, err = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
 		if err != nil {
 			return fmt.Errorf("llm: per_layer_token_embd: %w", err)
@@ -1703,6 +1742,7 @@ func (g *Graph) dropPrerecorded() {
 
 // Destroy releases every block.
 func (g *Graph) Destroy() {
+	g.pleAhead.Wait()
 	g.dropPrerecorded()
 	if g.move != nil {
 		g.move.Destroy()

@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 834 tok/s at ubatch 2048, 905 at 4096 and 946 at 8192** (P14), decode **31.5 tok/s at 128k** and **34.4 at depth zero** (P16, against P15's 27.20/29.73), falloff to 128k **0.92x** | batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -48,7 +48,22 @@ resident), the other four verticals on the other (image ~32 GB, the rest
 ~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
 purpose — so no footprint quantisation is planned for the small verticals.
 
-**Where the work goes next.** **Long-context prompt processing is closed at
+**Where the work goes next.** **P17 (2026-09-22): heads on the fragment's
+rows.** A 128 000-cell prefill at ubatch 2048 goes **833.5 → 1011.4 tok/s**
+(64 000: 896.4 → 1048.6), and decode at depth gains ~2%, exactly
+([`research/p17-heads-on-rows.md`](research/p17-heads-on-rows.md)). The QSA
+selection is per token and twelve query heads share each kv head, so the
+gathered attention now puts a token's heads on the fragment's M axis and reads
+that token's 2 051 cells instead of a sixteen-token union of 7 049; the mask
+dispatch is gone. P17-2 faults the next prompt chunk's n-gram pages in while
+the current one runs (+3% at depth). At the served ubatch 4096, 128k goes
+**899.7 → 1175.7 tok/s**. The attention's depth terms are 0.14 ms of a 0.99 ms
+prefill token at 128k; what is left of the falloff is the flat floor. **Open
+for decode:** the host n-gram gather is ~1 ms of every token (16 dependent
+major faults; residency of the 29 GB table is a deployment decision), and
+`attn.select` at 128k is 54 µs a layer, of which the first radix pass is 17
+(its top 8 bits are the exponent, so its atomics collide) and each other pass 8.
+**Long-context prompt processing is closed at
 the target.** **P14 (2026-09-22)** takes a 128 000-cell prefill from P13's
 **563.6** to **826.0 tok/s at ubatch 2048** and
 **946.1 at 8192**, which is the 900 tok/s `GOALS.md` asked for

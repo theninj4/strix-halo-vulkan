@@ -42,9 +42,11 @@ type Model struct {
 	Config Config
 	Set    *gguf.Set
 
-	// pleAdvised is whether the n-gram table's mapping has been told it is
-	// read at random (L7c). Once a Model, on the first gather.
-	pleAdvised bool
+	// pleAdvise tells the n-gram table's mapping it is read at random (L7c).
+	// Once a Model, on the first gather — a sync.Once and not a flag since
+	// P17, because Graph.PrefetchPLE gathers on a second goroutine.
+	pleAdvise    sync.Once
+	pleAdviseErr error
 }
 
 // Open maps a checkpoint: a directory, or any one of its shards.
@@ -293,11 +295,9 @@ func (m *Model) PLEGather(rows []int32, nHeads, headDim int) ([]float32, error) 
 	// each of them with 128 KB (L7c). It is set here rather than at open,
 	// because it is a fact about how *this* tensor is read and the rest of
 	// the shard is read exactly once, sequentially, and wants the readahead.
-	if !m.pleAdvised {
-		m.pleAdvised = true
-		if err := t.AdviseRandom(); err != nil {
-			return nil, fmt.Errorf("llm: per_layer_token_embd madvise: %w", err)
-		}
+	m.pleAdvise.Do(func() { m.pleAdviseErr = t.AdviseRandom() })
+	if m.pleAdviseErr != nil {
+		return nil, fmt.Errorf("llm: per_layer_token_embd madvise: %w", m.pleAdviseErr)
 	}
 	for i, r := range rows {
 		if int64(r) < 0 || int64(r) >= t.Dims[1] {

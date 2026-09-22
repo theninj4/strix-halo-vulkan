@@ -478,6 +478,8 @@ type AttnGPU struct {
 	// forces it on, -1 forces it off. It is what PinSchedule turns off, for
 	// the reason SetGather gives.
 	pinGather int
+	// pinHRows fixes the heads-on-rows kernel the same way (P17).
+	pinHRows int
 	// expandCells is whether the indexer's score is expanded to one f32 a
 	// cache cell (P9's llm_attn_expand.comp) and the selection runs over that
 	// tensor, or whether the selection runs over the **block** scores with a
@@ -837,7 +839,8 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	// rung uses, because the rung is a knob and the arena plan is fixed here.
 	if g.sparse {
 		g.gathTiles = (rows + gathBM - 1) / gathBM
-		g.aGath = alloc(g.gathTiles * g.gathStride())
+		// Either layout fits: the tile one (P14-2) or P17's one list a token.
+		g.aGath = alloc(maxInt(g.gathTiles*g.gathStride(), rows*g.gathStride1()))
 	} else {
 		g.aGath = noW
 	}
@@ -1539,6 +1542,9 @@ const (
 	gathDefaultGroups = 1
 	// Query heads a workgroup — see gathHeadsPerWG.
 	gathDefaultHeads = 1
+	// attnHeadRowsDefault is whether the gathered kernel puts heads on the
+	// fragment's rows (P17) when nothing pins it.
+	attnHeadRowsDefault = true
 )
 
 var gathPipes = map[string][]byte{
@@ -1564,6 +1570,91 @@ var gathPipes = map[string][]byte{
 	"gath.qt1_kt1_h4":    shaders.LLMAttnGathQT1KT1H4,
 	"gath.qt1_kt2_h4":    shaders.LLMAttnGathQT1KT2H4,
 	"gath.qt1_kt4_h4":    shaders.LLMAttnGathQT1KT4H4,
+	// P17: heads on the fragment's rows, over a per-token list.
+	gatherBM1:                  shaders.LLMAttnGatherBM1,
+	"gath.qt1_kt1_hrows":       shaders.LLMAttnGathQT1KT1HRows,
+	"gath.qt1_kt2_hrows":       shaders.LLMAttnGathQT1KT2HRows,
+	"gath.qt1_kt4_hrows":       shaders.LLMAttnGathQT1KT4HRows,
+	"gath.qt1_kt1_hrows_split": shaders.LLMAttnGathQT1KT1HRowsSplit,
+	"gath.qt1_kt2_hrows_split": shaders.LLMAttnGathQT1KT2HRowsSplit,
+	"gath.qt1_kt4_hrows_split": shaders.LLMAttnGathQT1KT4HRowsSplit,
+}
+
+// gatherBM1 is the gather's one-row build: each token's own selection,
+// compacted, which is the list the heads-on-rows kernel reads (P17).
+const gatherBM1 = "gather.bm1"
+
+// headRows is whether the gathered attention puts a token's query heads on the
+// fragment's rows instead of sixteen tokens of one head (P17, `-DHROWS` in
+// llm_attn_wmma.comp).
+//
+// The selection is per token and twelve query heads share each kv head, so the
+// twelve rows of one token select the same cells against the same key: the
+// list is that token's 2051 cells rather than a sixteen-token union (7049 at
+// 128 000 cells), the per-row mask pass is gone, and the kv plane is staged
+// once for twelve heads. It needs `rep <= 16` and `heads >= 16` — a fragment is
+// sixteen rows and the clamp `h0 = min(g*rep, heads-16)` keeps every Q load
+// inside the plane — and it is refused back to the token-row kernel otherwise.
+//
+// LLM_ATTN_GATHER_HROWS=0 is the control arm.
+func (g *AttnGPU) headRows() bool {
+	if g.pinHRows != 0 {
+		return g.pinHRows > 0 && g.hrowsFits()
+	}
+	if v := os.Getenv("LLM_ATTN_GATHER_HROWS"); v != "" {
+		return v == "1" && g.hrowsFits()
+	}
+	if !attnHeadRowsDefault || !g.hrowsFits() {
+		return false
+	}
+	// Decode: one row, where the token fragment's union *is* the token's
+	// selection, so the two builds are the same bits and this one skips the
+	// mask pass (TestAttnGPUHeadRowsIsTheGather).
+	if g.rows <= attnSplitMaxRows {
+		return true
+	}
+	// Prefill: only once there is past to be sparse over. From a cold cache
+	// the selection names every live cell, a token tile's union is one row's,
+	// and twelve heads on sixteen rows is a quarter of the fragment wasted for
+	// nothing. Measured on the 4-layer probe at ubatch 2048 (tok/s, two runs):
+	//
+	//	past        0     2048    4096    8192   16384  128000
+	//	tokens  11109   10406   10162    9818    9424    7817
+	//	heads   11076   10504   10590   10529   10500   10271
+	return g.past >= g.hrowsMinPast()
+}
+
+// hrowsMinPast is the prefill bound above; LLM_ATTN_GATHER_HROWS_MIN overrides.
+func (g *AttnGPU) hrowsMinPast() int {
+	if n, err := strconv.Atoi(os.Getenv("LLM_ATTN_GATHER_HROWS_MIN")); err == nil && n >= 0 {
+		return n
+	}
+	return g.selWidth()
+}
+
+func (g *AttnGPU) hrowsFits() bool {
+	c := g.cfg
+	return c.NHeadKV > 0 && c.NHead%c.NHeadKV == 0 && c.NHead/c.NHeadKV <= coopMatTile && c.NHead >= coopMatTile
+}
+
+// SetHeadRows pins the heads-on-rows kernel on or off; AutoHeadRows gives the
+// default back. Tests that read the tile-layout gather arena pin it off.
+func (g *AttnGPU) SetHeadRows(on bool) {
+	if on {
+		g.pinHRows = 1
+	} else {
+		g.pinHRows = -1
+	}
+}
+
+// AutoHeadRows undoes SetHeadRows.
+func (g *AttnGPU) AutoHeadRows() { g.pinHRows = 0 }
+
+// gathStride1 is gathStride for the one-row build: a count, at most selWidth
+// cells, and one row of (unused) mask words — llm_common.glsl's gathStride(mx, 1).
+func (g *AttnGPU) gathStride1() int {
+	mx := (minInt(g.nKV, g.selWidth()) + 63) &^ 63
+	return 1 + mx + mx/32
 }
 
 // gathMax is the tight bound on one query tile's union: each of its gathBM rows
@@ -1609,6 +1700,18 @@ func gathPipe(av attnVariant, grp, hpw, splits int) string {
 		return fmt.Sprintf("%s_g%d", base, grp)
 	}
 	return base
+}
+
+// hrowsPipe names P17's heads-on-rows build for a rung, split or not.
+func hrowsPipe(av attnVariant, splits int) string {
+	if av.qt != 1 || av.ktil > 4 {
+		return ""
+	}
+	name := fmt.Sprintf("gath.qt%d_kt%d_hrows", av.qt, av.ktil)
+	if splits > 1 {
+		name += "_split"
+	}
+	return name
 }
 
 // gathHeadsPerWG is how many query heads share one workgroup, and so one staging
@@ -1987,25 +2090,43 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//     together, because they cut different things and a decode step wants
 	//     both. See gathSplit.
 	gath, hpw := "", 1
+	hrows := false
 	if g.sparse && g.gather() {
 		gv, ok := attnVariantFor(g.gathRung())
 		if ok {
 			hpw = g.gathHeadsPerWG()
 			gath = gathPipe(gv, g.gathGroups(), hpw, sp)
+			if g.headRows() {
+				gath, hpw, hrows = hrowsPipe(gv, sp), 1, true
+			}
 			if _, ok := g.pipes[gath]; !ok {
-				gath, hpw = "", 1
+				gath, hpw, hrows = "", 1, false
 			} else {
 				av = gv
 				qBlocks = uint32(roundUpInt(g.rows, av.rows) / av.rows)
+				if hrows {
+					// One token a workgroup, the kv heads on y.
+					qBlocks = uint32(g.rows)
+				}
 			}
 		}
 	}
-	if gath != "" {
+	if gath != "" && hrows {
+		gb := base
+		gb.ResOff = g.aGath
+		add(gatherBM1, "attn.gather", uint32(g.rows), 1, gb)
+	} else if gath != "" {
 		gb := base
 		gb.ResOff = g.aGath
 		gTiles := uint32(roundUpInt(g.rows, gathBM) / gathBM)
 		add("gather", "attn.gather", gTiles, 1, gb)
 		add("gathmask", "attn.gathmask", gTiles, 1, gb)
+	}
+	// The attention grid's y: query heads, or head groups at hpw > 1, or kv
+	// heads when the heads are on the fragment's rows.
+	gy := uint32(c.NHead / hpw)
+	if hrows {
+		gy = uint32(c.NHeadKV)
 	}
 
 	// 5b. The live-block list (P13), when the kernel behind it is the unsplit
@@ -2036,14 +2157,14 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// split's, so the combine that follows is the one P8 already wrote.
 		at := base
 		at.CellOff, at.ResOff, at.InjOff = g.aGath, g.aSplit, uint32(sp)
-		add(gath, "attn.split", qBlocks*uint32(sp), uint32(c.NHead/hpw), at)
+		add(gath, "attn.split", qBlocks*uint32(sp), gy, at)
 		add("combine", "attn.combine", uint32(c.NHead), qBlocks*uint32(av.rows), at)
 	} else if gath != "" {
 		at := base
 		at.ResOff = g.aGath
 		// The grid's y is **head groups**, not heads: one workgroup of `hpw`
 		// waves covers `hpw` heads and stages the gather once for all of them.
-		add(gath, "attn", qBlocks, uint32(c.NHead/hpw), at)
+		add(gath, "attn", qBlocks, gy, at)
 	} else if sp > 1 {
 		split := base
 		split.ResOff, split.InjOff = g.aSplit, uint32(sp)

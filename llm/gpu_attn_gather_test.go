@@ -35,6 +35,10 @@ func TestAttnGPUGatherSelectsTheSameCells(t *testing.T) {
 	}
 	g.SetGather(true)
 	defer g.AutoGather()
+	// The token-tile layout is what Gathered reads; P17's per-token one is
+	// TestAttnGPUHeadRowsIsTheGather's.
+	g.SetHeadRows(false)
+	defer g.AutoHeadRows()
 
 	// Two shapes: the whole prompt from a cold cache, and a second chunk on top
 	// of it, so the causal extent the gather folds in is exercised at a
@@ -413,5 +417,129 @@ func TestAttnGPUGatherSplitIsTheGather(t *testing.T) {
 		if rms > 1e-3 {
 			t.Errorf("%d slices: rms %.3g against the unsplit gather", splits, rms)
 		}
+	}
+}
+
+// TestAttnGPUHeadRowsIsTheGather is P17's gate: the gathered attention with a
+// token's query heads on the fragment's rows (`-DHROWS`) against the token-row
+// gathered kernel it replaces, at both of its shapes — a prompt (unsplit, one
+// workgroup a token and kv head) and decode steps (split, over the same
+// per-token list).
+//
+// The two read the same set: every row of a heads fragment selected exactly the
+// cells of its token's list, where a token fragment masked the tile's union down
+// to them. So the bar is the rounding between two orders of the same online
+// softmax, and it is set by the gathered kernel's own distance from the block
+// kernel — well under llama.cpp's. **Zero is a failure**, because it is what a
+// build that never engaged looks like; the split's sibling test cannot see this
+// arm at all, since its noise is the fp16 store of the unsplit output.
+func TestAttnGPUHeadRowsIsTheGather(t *testing.T) {
+	g, tr, c, nTok, done := attnGPU4k(t)
+	defer done()
+	if !g.Sparse() {
+		t.Skip("the selection does not bite at this cache size")
+	}
+	if !g.hrowsFits() {
+		t.Skip("this head geometry does not fit a sixteen-row fragment")
+	}
+	src, err := tr.Get("hc_mixed-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := tr.Get("attn_output-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := src.Vals
+	attn, gemm, outGemm := g.Plan()
+	if err := g.SetPlan(attn, gemm, outGemm); err != nil {
+		t.Fatal(err)
+	}
+	g.SetGather(true)
+	defer g.AutoGather()
+	defer g.AutoHeadRows()
+	defer g.SetSplits(0)
+
+	cmp := func(a, b []float32, from int) (rms, worst float64) {
+		var s2, r2 float64
+		for i := from; i < len(a); i++ {
+			d := float64(a[i]) - float64(b[i])
+			s2 += d * d
+			r2 += float64(b[i]) * float64(b[i])
+			worst = math.Max(worst, math.Abs(d))
+		}
+		return math.Sqrt(s2 / math.Max(r2, 1e-30)), worst
+	}
+
+	// The prompt, whole: the unsplit build.
+	prompt := []int{nTok}
+	g.SetSplits(1)
+	g.SetHeadRows(false)
+	tokRows := runChunks(t, g, in, c.NEmbd, prompt)
+	g.SetHeadRows(true)
+	if !g.headRows() {
+		t.Fatal("asked for heads on the rows and the pass refused it")
+	}
+	headRows := runChunks(t, g, in, c.NEmbd, prompt)
+	pair, worst := cmp(headRows, tokRows, 0)
+	vsRef, _ := cmp(headRows, ref.Vals[:len(headRows)], 0)
+	vsRefTok, _ := cmp(tokRows, ref.Vals[:len(tokRows)], 0)
+	if math.IsNaN(pair) || math.IsNaN(vsRef) {
+		t.Fatalf("heads on the rows produced NaN (pair %v, vs reference %v)", pair, vsRef)
+	}
+	if pair == 0 {
+		t.Fatal("heads on the rows came back bit-identical to the token rows — the build never engaged")
+	}
+	t.Logf("prompt: heads vs tokens %.3e rel rms (worst %.3e); vs llama.cpp %.3e heads, %.3e tokens",
+		pair, worst, vsRef, vsRefTok)
+	if pair > 1e-3 || vsRef > vsRefTok+pair {
+		t.Errorf("prompt: heads on the rows is %.3e from the token rows and %.3e from llama.cpp (tokens %.3e)",
+			pair, vsRef, vsRefTok)
+	}
+
+	// Decode steps over a cache past the selection's width: the split build.
+	//
+	// **Here the two are the same bits, and that is the assertion.** At one row
+	// the token fragment's union *is* the token's selection, so both kernels
+	// fold the same cells in the same chunks in the same order, and a matrix
+	// product's rows are independent — which row of the fragment a head lands
+	// in does not change its sums. So engagement cannot be read off the answer
+	// at decode; it is read off the dispatch list instead, below.
+	chunks := append([]int{nTok - 64}, even(64, 1)...)
+	from := (nTok - 64) * c.NEmbd
+	for _, splits := range []int{1, 3, attnDefaultSplits} {
+		g.SetSplits(splits)
+		g.SetHeadRows(false)
+		want := runChunks(t, g, in, c.NEmbd, chunks)
+		g.SetHeadRows(true)
+		got := runChunks(t, g, in, c.NEmbd, chunks)
+		rms, worst := cmp(got, want, from)
+		if math.IsNaN(rms) {
+			t.Fatalf("%d slices: heads on the rows produced NaN", splits)
+		}
+		t.Logf("decode, %2d slices: heads vs tokens %.3e rel rms, worst %.3e", splits, rms, worst)
+		if rms != 0 {
+			t.Errorf("%d slices: a one-row pass is %.3e from the token rows, want the same bits", splits, rms)
+		}
+	}
+
+	// Engagement at one row: the heads build reads the per-token list and has
+	// no mask pass behind it.
+	g.SetSplits(attnDefaultSplits)
+	g.SetHeadRows(true)
+	if err := g.Upload(in[:c.NEmbd], 1); err != nil {
+		t.Fatal(err)
+	}
+	_, kinds, err := g.graph(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := map[string]int{}
+	for _, k := range kinds {
+		n[k]++
+	}
+	if n["attn.gather"] != 1 || n["attn.gathmask"] != 0 || n["attn.split"] != 1 {
+		t.Errorf("a one-row heads-on-rows pass dispatches %d gathers, %d masks, %d splits; want 1, 0, 1",
+			n["attn.gather"], n["attn.gathmask"], n["attn.split"])
 	}
 }

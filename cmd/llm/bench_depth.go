@@ -157,6 +157,10 @@ func depthBench(o depthOpts) error {
 		t0 := time.Now()
 		for pos < d {
 			n := min(o.pp, d-pos)
+			// As a long prompt's chunk loop does (backend.LLM.chunks): the
+			// next batch's n-gram pages while this one runs — and the last
+			// fill batch's next is the timed one.
+			g.PrefetchPLE(ids[pos:pos+n], ids[pos+n:pos+n+o.pp])
 			if err := depthRunBatch(g, ids[pos:pos+n], &fresh); err != nil {
 				return err
 			}

@@ -2649,6 +2649,13 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DBN=16 -o llm_attn_blocks_bm16_bn16.spv llm_attn_blocks.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DGPASS=1 -o llm_attn_gather_bm16.spv llm_attn_gather.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=16 -DGPASS=2 -o llm_attn_gathmask_bm16.spv llm_attn_gather.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBM=1 -DGPASS=1 -o llm_attn_gather_bm1.spv llm_attn_gather.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1_hrows.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DSPLITK -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1_hrows_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2_hrows.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DSPLITK -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2_hrows_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4_hrows.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DHROWS -DSPLITK -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4_hrows_split.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4.spv llm_attn_wmma.comp
@@ -2807,6 +2814,29 @@ var LLMAttnGatherBM16 []byte
 
 //go:embed llm_attn_gathmask_bm16.spv
 var LLMAttnGathMaskBM16 []byte
+
+// P17: the per-token gather and the heads-on-rows gathered attention.
+//
+//go:embed llm_attn_gather_bm1.spv
+var LLMAttnGatherBM1 []byte
+
+//go:embed llm_attn_gath_qt1_kt1_hrows.spv
+var LLMAttnGathQT1KT1HRows []byte
+
+//go:embed llm_attn_gath_qt1_kt1_hrows_split.spv
+var LLMAttnGathQT1KT1HRowsSplit []byte
+
+//go:embed llm_attn_gath_qt1_kt2_hrows.spv
+var LLMAttnGathQT1KT2HRows []byte
+
+//go:embed llm_attn_gath_qt1_kt2_hrows_split.spv
+var LLMAttnGathQT1KT2HRowsSplit []byte
+
+//go:embed llm_attn_gath_qt1_kt4_hrows.spv
+var LLMAttnGathQT1KT4HRows []byte
+
+//go:embed llm_attn_gath_qt1_kt4_hrows_split.spv
+var LLMAttnGathQT1KT4HRowsSplit []byte
 
 // LLMAttnGathQT1KT2 and LLMAttnGathQT1KT4 are the attention kernel over that
 // list: a **dense** flash attention over the gathered cells, with no key axis to

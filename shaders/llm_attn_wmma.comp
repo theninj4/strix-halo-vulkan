@@ -158,6 +158,41 @@
 #error "HPW is the gathered kernel's knob; the block and split builds are one wave"
 #endif
 
+// **Heads on the fragment's rows, not tokens** (P17, `-DHROWS`).
+//
+// Every other build puts sixteen consecutive *tokens* of one head on the
+// fragment's M axis, and the gathered one then pays for the **union** of their
+// selections: at 128 000 cells a 16-row tile reads 7 049 cells where one row
+// selects 2 051, 3.4x (P14's floor, "the shape of the hardware against the shape
+// of QSA"). But the selection is per *token*, and this model has twelve query
+// heads to a kv head — so the twelve heads of one token are twelve rows that
+// select **exactly the same cells** against **exactly the same key and value**.
+// Put them on M instead and the union is one row's selection, the per-row mask
+// is gone (every row of the fragment wants every gathered cell), and the kv
+// plane is staged once for twelve heads rather than once a head.
+//
+// The grid is (token, kv head) — (token * splits + slice, kv head) split. The
+// fragment's rows are heads `h0 .. h0+15` with `h0 = min(g * rep, heads - 16)`:
+// the rows that belong to another kv head are computed against the wrong key
+// and never stored, which is cheaper than any bounds test inside the fragment
+// and keeps every Q load inside the plane. The host refuses this build where
+// `rep > 16` or `heads < 16` (hrowsFits).
+//
+// The query needs no repack. The plane is head-major, tiled sixteen tokens by
+// sixteen dims, so row `r` of (token t, dim group kt) is sixteen contiguous
+// halves at `qOff + (h0+r)*headStride + ((t/16)*HDT + kt)*256 + (t%16)*16` —
+// a RowMajor `coopMatLoad` whose stride is one head's plane.
+//
+// It is not bit-identical to the token-row gathered kernel: the chunks group
+// different cells (one token's list, not a tile's union), so the online softmax
+// rescales in a different order. It is the same set and the same arithmetic,
+// gated against the reference as P14-2 was.
+#ifdef HROWS
+#if !defined(GATHER) || QT != 1 || HPW != 1
+#error "HROWS is a gathered, one-tile, one-wave build"
+#endif
+#endif
+
 layout(local_size_x = WAVE * HPW) in;
 
 #define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
@@ -372,16 +407,34 @@ bool selected(uint row, uint col, uint bit0) {
     return (selw[row * BW + (b >> 5u)] & (1u << (b & 31u))) != 0u;
 }
 
+// Which (token, query head) fragment row `r` is, and whether this workgroup
+// stores it. Token rows by default; heads on the rows under HROWS.
+#ifdef HROWS
+#define ROW_TOKEN(r) (q0)
+#define ROW_HEAD(r) (h0 + (r))
+#define ROW_OK(r) ((h0 + (r)) / rep == kvh)
+#else
+#define ROW_TOKEN(r) (q0 + (r))
+#define ROW_HEAD(r) (head)
+#define ROW_OK(r) (q0 + (r) < pc.tokens)
+#endif
+
 void main() {
     uint head = gl_WorkGroupID.y;
+#ifdef HROWS
+    // One token a workgroup: x is the token (or token, slice), y the kv head.
+    const uint QSTEP = 1u;
+#else
+    const uint QSTEP = BM;
+#endif
 #ifdef SPLITK
     // The grid's x carries both: `splits` slices of every query block, so
     // that a build which is not split keeps exactly the grid it had.
     uint splits = max(pc.injOff, 1u);
     uint sp = gl_WorkGroupID.x % splits;
-    uint q0 = (gl_WorkGroupID.x / splits) * BM;
+    uint q0 = (gl_WorkGroupID.x / splits) * QSTEP;
 #else
-    uint q0 = gl_WorkGroupID.x * BM;
+    uint q0 = gl_WorkGroupID.x * QSTEP;
 #endif
     uint past = SEQ_PAST;
     uint n = past + pc.tokens;       // cells in the cache, keys to attend over
@@ -399,9 +452,19 @@ void main() {
 #endif
     // The wave's slice of the LDS the softmax uses. Zero at HPW = 1.
     uint sBase = wv * SSTAGE, pBase = wv * SPBUF, bBase = wv * SBCORR, rBase = wv * BM;
+#ifdef HROWS
+    // `head` is the kv head here; the fragment's rows are query heads h0 + r.
+    uint kvh = head;
+    uint rep = max(pc.heads / max(pc.kvHeads, 1u), 1u);
+    uint h0 = min(kvh * rep, pc.heads - TILE);
+    if (q0 >= pc.tokens || kvh >= pc.kvHeads) {
+        return;
+    }
+#else
     if (q0 >= pc.tokens || head >= pc.heads) {
         return;
     }
+#endif
     bool sparse = pc.selOff != NO_W;
 #if defined(SPLITK) || defined(GATHER)
     // The split build strides *absolute* key blocks on purpose (see the loop
@@ -414,10 +477,19 @@ void main() {
 
     uint qTiles = pc.plane / TILE;
     uint kvTiles = pc.nKV / TILE;
-    uint plane = head * qTiles * (HDT * TILE * TILE);
+    uint headStride = qTiles * (HDT * TILE * TILE);
+#ifdef HROWS
+    uint kvPlane = kvh * kvTiles * (HDT * TILE * TILE);
+    // Row r is head h0 + r at this token: one head's plane apart.
+    uint qBase = pc.qOff + h0 * headStride + (q0 / TILE) * (HDT * TILE * TILE) + (q0 % TILE) * TILE;
+    uint qStride = headStride;
+#else
+    uint plane = head * headStride;
     uint rep = max(pc.heads / max(pc.kvHeads, 1u), 1u);
     uint kvPlane = (head / rep) * kvTiles * (HDT * TILE * TILE);
     uint qBase = pc.qOff + plane + (q0 / TILE) * (HDT * TILE * TILE);
+    uint qStride = TILE;
+#endif
     uint kBase = pc.kOff + kvPlane;
     uint vBase = pc.vOff + kvPlane;
 
@@ -425,7 +497,7 @@ void main() {
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
         [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
             coopMatLoad(fragQ[qq][kt], hact, qBase + (qq * HDT + kt) * (TILE * TILE),
-                TILE, gl_CooperativeMatrixLayoutRowMajor);
+                qStride, gl_CooperativeMatrixLayoutRowMajor);
         }
     }
 
@@ -462,9 +534,17 @@ void main() {
     // At 128 000 cells a sixteen-row tile's live blocks hold 24 580 cells and
     // its union holds 10 058, so this loop is 2.44x shorter than the one it
     // replaces — which is the last large term in a prefill at depth.
+#ifdef HROWS
+    // The per-token list (the gather's BM=1 build): the token's own
+    // selection, no mask behind it that this build reads.
+    uint gmx = gathMax(pc.nKV, pc.selWidth, 1u);
+    uint gmwords = gmx >> 5u;
+    uint gbase = GATH_BASE + q0 * gathStride(gmx, 1u);
+#else
     uint gmx = gathMax(pc.nKV, pc.selWidth, BM);
     uint gmwords = gmx >> 5u;
     uint gbase = GATH_BASE + (q0 / BM) * gathStride(gmx, BM);
+#endif
     uint nGath = actu[gbase];
     uint gidx = gbase + 1u;
     uint gmask = gidx + gmx;
@@ -580,10 +660,12 @@ void main() {
         for (uint i = tid; i < BN; i += WAVE * HPW) {
             glist[i] = (i < cnt) ? actu[gidx + g0 + i] : 0u;
         }
+#ifndef HROWS
         for (uint i = tid; i < BM * BW; i += WAVE * HPW) {
             uint row = i / BW, wd = i % BW;
             selw[i] = actu[gmask + row * gmwords + (g0 >> 5u) + wd];
         }
+#endif
         barrier();
 #else
         if (sparse && useList) {
@@ -704,9 +786,15 @@ void main() {
                     break;      // and every c after it, the row is done
                 }
 #endif
+#ifdef HROWS
+                if (c >= cnt) {
+                    break;      // past the list: every row selected every cell before it
+                }
+#else
                 if (sparse && !selected(row, c, selBit)) {
                     continue;   // unselected: it must not set the scale
                 }
+#endif
                 mx = max(mx, stage[sBase + ((c / TILE) * QT + qi) * (TILE * TILE) +
                     r * TILE + (c % TILE)]);
             }
@@ -782,12 +870,25 @@ void main() {
         // already in it — the gather ANDed each row's own extent into the bits
         // it wrote — and the positions past this chunk's count carry a zero bit
         // for every row, so the `col >= cnt` test goes with it.
+#ifdef HROWS
+        // Heads on the rows: a gathered cell is every row's, so the only
+        // columns to clear are the ones past a short last chunk.
+        if (cnt < BN) {
+            for (uint i = lane; i < BM * BN; i += WAVE) {
+                if ((i & (BN - 1u)) >= cnt) {
+                    pbuf[pBase + i] = float16_t(0.0);
+                }
+            }
+            barrier();
+        }
+#else
         for (uint i = lane; i < BM * BN; i += WAVE) {
             if (!selected(i / BN, i & (BN - 1u), selBit)) {
                 pbuf[pBase + i] = float16_t(0.0);
             }
         }
         barrier();
+#endif
 #else
         if (sparse || cnt < BN || base + BN > past + q0) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
@@ -873,12 +974,11 @@ void main() {
 
     // The partial arena, ATTN_SPLIT (llm_common.glsl): the contexts first,
     // [heads][splits][tokens][headDim], then the pair per row behind them.
-    uint slice = (head * splits + sp) * pc.tokens;
     uint mlBase = pc.resOff + pc.heads * splits * pc.tokens * pc.headDim;
     for (uint i = lane; i < BM; i += WAVE) {
-        uint token = q0 + i;
-        if (token < pc.tokens) {
-            uint at = mlBase + (slice + token) * 2u;
+        uint token = ROW_TOKEN(i);
+        if (ROW_OK(i)) {
+            uint at = mlBase + ((ROW_HEAD(i) * splits + sp) * pc.tokens + token) * 2u;
             act[at] = rowMax[rBase + i];
             act[at + 1u] = rowSum[rBase + i];
         }
@@ -897,12 +997,13 @@ void main() {
         // real, so there is nothing for a pad row to keep clean.
         for (uint i = lane; i < BM * 4u; i += WAVE) {
             uint row = i / 4u, part = i % 4u;
-            uint token = q0 + row;
-            if (token >= pc.tokens) {
+            uint token = ROW_TOKEN(row);
+            if (!ROW_OK(row)) {
                 continue;
             }
             uint qi = row / TILE, r = row % TILE;
             uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
+            uint slice = (ROW_HEAD(row) * splits + sp) * pc.tokens;
             uint dst = pc.resOff + (slice + token) * pc.headDim + j * TILE + part * 4u;
             [[unroll]] for (uint c = 0u; c < 4u; ++c) {
                 act[dst + c] = stage[sBase + src + c];
@@ -930,7 +1031,6 @@ void main() {
     }
     barrier();
 
-    uint gateCol = pc.qkvOff + head * 2u * pc.headDim + pc.headDim;
     [[unroll]] for (uint j = 0u; j < HDT; ++j) {
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
             coopMatStore(o[qq][j], stage, sBase + qq * (TILE * TILE), TILE,
@@ -942,8 +1042,15 @@ void main() {
         // output projection's pad rows, whose products nothing reads.
         for (uint i = lane; i < BM * 4u; i += WAVE) {
             uint row = i / 4u, part = i % 4u;
-            uint token = q0 + row;
+            uint token = ROW_TOKEN(row);
+#ifdef HROWS
+            // A row of another kv head's heads: computed, never stored.
+            if (!ROW_OK(row)) {
+                continue;
+            }
+#endif
             uint qi = row / TILE, r = row % TILE;
+            uint gateCol = pc.qkvOff + ROW_HEAD(row) * 2u * pc.headDim + pc.headDim;
             // A pad row sees nothing once the selection is on, and a row
             // that sees nothing has a zero denominator. Its products are
             // never read — it is the output projection's padding — but a NaN
@@ -952,7 +1059,7 @@ void main() {
             float inv = (rowSum[rBase + row] > 0.0) ? 1.0 / rowSum[rBase + row] : 0.0;
             uint src = qi * (TILE * TILE) + r * TILE + part * 4u;
             uint d0 = j * TILE + part * 4u;
-            uint dst = pc.ctxOff + token * pc.ldCtx + head * pc.headDim + d0;
+            uint dst = pc.ctxOff + token * pc.ldCtx + ROW_HEAD(row) * pc.headDim + d0;
             [[unroll]] for (uint c = 0u; c < 4u; ++c) {
                 float g = act[gateCol + token * pc.gemmN + d0 + c];
                 hact[dst + c] = float16_t(stage[sBase + src + c] * inv / (1.0 + exp(-g)));

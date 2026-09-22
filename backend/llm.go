@@ -511,6 +511,9 @@ func (l *LLM) chunks(ctx context.Context, ids []int32, fresh bool) ([]float32, e
 		}
 		end := min(i+l.opt.Batch, len(ids))
 		chunk := ids[i:end]
+		// The next chunk's n-gram pages, faulted in while this one runs on
+		// the device (P17).
+		l.g.PrefetchPLE(chunk, ids[end:min(end+l.opt.Batch, len(ids))])
 		err := l.opt.Device.Do(func(*vk.Device) error {
 			var err error
 			if i == 0 && fresh {
