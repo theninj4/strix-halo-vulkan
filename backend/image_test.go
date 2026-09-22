@@ -2,6 +2,8 @@ package backend
 
 import (
 	"fmt"
+	"image"
+	"image/color"
 	"sort"
 	"testing"
 )
@@ -35,6 +37,9 @@ func TestPartialSteps(t *testing.T) {
 		// And a long schedule, to show the spacing is a fraction rather than
 		// a fixed offset.
 		{0, 20, 3, []int{4, 9, 14}},
+		// The ceiling over the default 40 steps: sixteen distinct frames,
+		// none from the last step.
+		{0, 40, 16, []int{1, 3, 6, 8, 10, 13, 15, 17, 20, 22, 24, 27, 29, 31, 34, 36}},
 		// An edit runs only the tail, and the frames spread over *that*.
 		// Spread over the whole schedule instead, every one of these would
 		// fall before the run started and the client would get none.
@@ -82,4 +87,40 @@ func keys(m map[int]int) []int {
 	}
 	sort.Ints(out)
 	return out
+}
+
+// TestDrawProgress pins the preview's progress bar: red, on the bottom rows
+// only, and done/steps of the width -- step 20 of 40 is half.
+func TestDrawProgress(t *testing.T) {
+	red := color.NRGBA{R: 255, A: 255}
+	grey := color.NRGBA{R: 128, G: 128, B: 128, A: 255}
+	for _, c := range []struct {
+		size, done, steps, wantW, wantH int
+	}{
+		{1024, 20, 40, 512, 8},
+		{1024, 40, 40, 1024, 8},
+		{1024, 1, 40, 25, 8},
+		{256, 3, 4, 192, 4}, // the height's floor
+		{1024, 0, 40, 0, 0},
+	} {
+		t.Run(fmt.Sprintf("%d_%dof%d", c.size, c.done, c.steps), func(t *testing.T) {
+			img := image.NewNRGBA(image.Rect(0, 0, c.size, c.size))
+			for i := 0; i < len(img.Pix); i += 4 {
+				copy(img.Pix[i:], []uint8{grey.R, grey.G, grey.B, grey.A})
+			}
+			drawProgress(img, c.done, c.steps)
+			for y := 0; y < c.size; y++ {
+				for x := 0; x < c.size; x++ {
+					in := x < c.wantW && y >= c.size-c.wantH
+					want := grey
+					if in {
+						want = red
+					}
+					if got := img.NRGBAAt(x, y); got != want {
+						t.Fatalf("(%d,%d) is %v, want %v", x, y, got, want)
+					}
+				}
+			}
+		})
+	}
 }

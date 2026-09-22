@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	"math/rand"
 	"sync"
@@ -75,14 +76,15 @@ type ImageOptions struct {
 
 const (
 	defaultImageModelID = "qwen-image-2.1"
-	// maxPartialImages is OpenAI's bound on `partial_images`, kept because
-	// the cost argument agrees with it -- though for a different reason than
-	// it did under Z-Image. There a frame was 87 ms of taef1 against a
-	// 1.67 s step, so three were 1.8% of the image. Here the decode is 260
+	// maxPartialImages bounds `partial_images`, and it is past OpenAI's 3 on
+	// purpose. Under Z-Image a frame was 87 ms of taef1 against a 1.67 s
+	// step, so three were 1.8% of the image. Here the decode is 260
 	// multiply-adds a latent pixel on the host, and what actually costs
-	// anything is *encoding* the PNG and writing it to a client. Three is a
-	// policy about the stream, not a limit of the decoder.
-	maxPartialImages = 3
+	// anything is resizing (19 ms), encoding the PNG (60 ms) and writing it
+	// to a client -- ~80-100 ms a frame at 1024², serial with the steps, so
+	// sixteen are ~1.5 s of an 89 s image (~1.7%). A client written against
+	// OpenAI never asks for more than 3 and pays nothing for the headroom.
+	maxPartialImages = 16
 )
 
 // Image is the Qwen-Image-2.1 adapter: an api.ImageBackend over
@@ -305,9 +307,11 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 			// against a 2.3 s step.
 			small := pipeline.ToImage(t, true)
 			w, h := t.W*pipeline.VAEScale, t.H*pipeline.VAEScale
+			frame := pipeline.Resize(small, w, h)
+			drawProgress(frame, st.Index+1, steps)
 			perr = req.Partial(api.ImagePartial{
 				Index: idx, Step: st.Index, Steps: steps,
-				Image: pipeline.Resize(small, w, h),
+				Image: frame,
 				Width: w, Height: h,
 			})
 		}
@@ -361,6 +365,26 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 		Steps:  len(tm.Steps),
 		Seed:   seed,
 	}, nil
+}
+
+// drawProgress paints a red bar along the bottom edge of an in-progress
+// frame, done/steps of the way across -- step 20 of 40 is half the width.
+// done counts completed steps, so a frame from step index k passes k+1.
+//
+// It is drawn on the partial only, never on the finished image, and at the
+// frame's full size after the resize so its edge stays hard. The height
+// scales with the image (8 px at 1024) so it reads at any size a client
+// shows the frame at, with a floor so a small request still gets a visible
+// line.
+func drawProgress(img *image.NRGBA, done, steps int) {
+	if steps <= 0 || done <= 0 {
+		return
+	}
+	b := img.Rect
+	width := b.Dx() * min(done, steps) / steps
+	height := max(4, b.Dy()/128)
+	bar := image.Rect(b.Min.X, b.Max.Y-height, b.Min.X+width, b.Max.Y).Intersect(b)
+	draw.Draw(img, bar, image.NewUniform(color.NRGBA{R: 255, A: 255}), image.Point{}, draw.Src)
 }
 
 // partialSteps picks which denoising steps an in-progress frame comes from:

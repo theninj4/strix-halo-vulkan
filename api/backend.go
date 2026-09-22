@@ -272,9 +272,9 @@ type ImageGeometry struct {
 	// whether a preview decoder is loaded. A client reads it to know whether
 	// `stream: true` will be answered or refused.
 	Previews bool
-	// MaxPartials bounds `partial_images`. It is OpenAI's 3 and it is a
-	// policy rather than a limit of the model: each frame is a decode, and
-	// what makes three reasonable is that it is 5% of the image at 1024x1024.
+	// MaxPartials bounds `partial_images`. It is a policy rather than a limit
+	// of the model: each frame is a decode, a resize and an encode, serial
+	// with the steps, so it is priced in the backend that sets it.
 	MaxPartials int
 	// Edits reports whether ImageRequest.Init will be accepted, i.e. whether
 	// the vision tower and the VAE's *encoder* are resident. A client reads
