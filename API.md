@@ -99,17 +99,15 @@ cache is refused with both numbers rather than truncated at one end; a prompt
 past the batch is prefilled in chunks of it, which is the same computation by
 L7b's gate.
 
-**`-llm-batch` is 4096 and it is a trade, not a free win** (P12). Measured
-through this server on ~4.1-4.5k-token prompts, two interleaved passes
-agreeing to 0.5%: 4096 prefills at **1146 tok/s against 2048's 1021**
-(1.12x, and **0.46 s off the time to first token**) and decodes at **25.8
-against 28.0** — the wider arenas cost **8% of decode**, because a decode
-step streams 4.1 GB of weights a token and the extra 1.5 GB of arenas sits
-in the same memory. The two cross at about **150 generated tokens**: below
-that 4096 is the faster answer, above it 2048 is, and at the 1024 tokens
-`-llm-max-tokens` defaults to, 2048 finishes 6.6% sooner. **Say
-`-llm-batch 2048` if the deployment really generates that much**; keep 4096
-for interactive turns.
+**`-llm-batch` is 4096, and a wider batch costs memory and nothing else**
+(P16). Measured through this server on four ~3.9-4.3k-token prompts, 256
+generated tokens, two passes agreeing to 0.1%: 2048 prefills at **1052
+tok/s**, 4096 at **1199** (1.14x, ~0.5 s off the time to first token) and
+8192 at **1233**, and all three **decode at 34.2 tok/s**. (P12 measured 4096
+costing 8% of decode; that was a bug, fixed in P16.) 8192 is only faster on
+prompts longer than 4096 tokens, holds ~3 GB more arena, and lowers the
+longest `-llm-ctx` the attention cache can reach, so it is the setting for a
+deployment whose prompts are long.
 
 **The device lock is taken per forward pass and not per request.** A
 completion is seconds long and the speech models are milliseconds, so holding
@@ -232,7 +230,7 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm             false        load qwen3.8-flash-next
     -llm-model       models/Qwen3.8-Flash-Next-GGUF/…-00001-of-00004.gguf
     -llm-ctx         4096         cache cells: the longest conversation, prompt plus completion
-    -llm-batch       4096         tokens the prefill arenas hold (P12; 2048 trades TTFT for decode)
+    -llm-batch       4096         tokens the prefill arenas hold (P16: wider costs memory only)
     -llm-max-tokens  1024         what a request that names no max_tokens gets
     -llm-layers      0            stage the first N layers only; a fast start, not an answer
 

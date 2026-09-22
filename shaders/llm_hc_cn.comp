@@ -74,7 +74,20 @@ void main() {
         blk[j] = (i < n) ? act[src + i] : 0.0;
     }
 
-    for (uint c = 0u; c < pc.hc; c++) {
+    // **At a handful of rows the grid goes back to one workgroup a (token,
+    // stream)** (P16). P11's walk is right where a prefill has thousands of
+    // workgroups to hide one another behind, and wrong at decode, where it is
+    // the *one* workgroup of the dispatch and the four streams are four
+    // serial trips through the tree on one compute unit — the P8 rule. A
+    // grid with `y == hc` walks only its own stream; every stream's sum is
+    // the same per-thread partials through the same tree either way, so the
+    // two grids are the same bits.
+    uint c0 = 0u, c1 = pc.hc;
+    if (gl_NumWorkGroups.y > 1u) {
+        c0 = gl_WorkGroupID.y;
+        c1 = c0 + 1u;
+    }
+    for (uint c = c0; c < c1; c++) {
         uint dst = pc.resOff + (t * pc.hc + c) * n;
         uint xn = pc.xnOff + t * pc.lda + c * n;
         uint g = pc.gammaOff + c * n;

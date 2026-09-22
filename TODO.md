@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and 946.1 at 8192** (P14, against P13's 563.6), 64k at **892.1**, decode **27.20 tok/s at 128k** and **28.14 at 64k** (P15, against P14's 22.58/24.27), falloff to 128k **0.76x → 0.91x** | `hc.cn` at 134 GB/s with three hypotheses spent (P15 added the memory type); batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `attn.select` is the last unstriped kernel |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 834 tok/s at ubatch 2048, 905 at 4096 and 946 at 8192** (P14), decode **31.5 tok/s at 128k** and **34.4 at depth zero** (P16, against P15's 27.20/29.73), falloff to 128k **0.92x** | batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -78,6 +78,26 @@ splits the attention's key axis across workgroups, P9 unpins the indexer —
 which was scoring the whole context on one compute unit of forty — and P10
 widens the selection, the one kernel that cannot be split at all because its
 radix passes are a reduction, from four waves to sixteen.
+
+**P16 (2026-09-22): the wide batch never cost decode anything.** Decode is
+**1.16x at every depth** — 29.73 → **34.4 tok/s** at depth zero and 27.20 →
+**31.5** at 128 000 cells, ubatch 2048 — and through the server it is **34.2
+tok/s at `-llm-batch` 2048, 4096 and 8192 alike**, where P12-7 measured 28.04
+and 25.81 ([`research/p16-decode-arena-width.md`](research/p16-decode-arena-width.md)).
+The cost P12-7 and P15 priced for a wide batch, and could not explain, was
+**`DeltaNetGPU.InPort` and `AttnGPU.InPort` advertising the arena's rows**:
+every decode step zero-filled the whole prefill arena of both blocks' A
+operand, once a layer, and the qkv projection after each move stalled behind
+the writes draining. `cmd/llm -depth -ubatch` found it by staging wide arenas
+and prefilling narrow — the cost followed the arena, not the prefill — and the
+per-label diff put all of it on `move`, `dn.qkv` and `attn.qkv`. The port now
+pads to the row block, as the MoE's always did, and
+`TestInPortPadsTheRunNotTheArena` asserts it, because the old padding was
+*correct* and no tolerance could see it. Two smaller exact changes ride along:
+**`hc.cn` is a workgroup a (token, stream) again at ≤ 64 rows** (25.0 → 7.0 µs,
+1.06x of a token — P11's workgroup a token is one workgroup on forty CUs at
+decode), and **`attn.select`'s emit walks blocks rather than cells** (68 → 55
+µs at 128k). `-llm-batch` stays 4096; 8192 is now purely a memory decision.
 
 **Decode's side of the depth question is now closed too. P15 (2026-09-22)**
 takes a decode step at 128 000 cells from **22.58 to 27.20 tok/s** and the
@@ -209,44 +229,29 @@ from what the draft predicts.
   the 1024 `-llm-max-tokens` defaults to. So 4096 ships as the interactive
   default and `API.md` says outright that a batch summariser should set 2048.
   **The lesson is P11-1's, a second time: a ubatch measured on the prefill
-  ladder alone is a hypothesis about prefill.**
-- **`attn.select` is the last kernel in a decode step that is not striped**,
-  0.862 ms a token at 128 000 cells and **unmoved by P15 — it was that pass's
-  control**. P10 widened it from four waves to sixteen and said why it can go
-  no further: four radix passes over a row are a *reduction*, so it cannot be
-  spread over the grid without a global barrier between every pass, which at
-  twelve layers is ~96 extra dispatches a step. What it has never had is a
-  **two-level** arrangement — per-stripe histograms and a merge — which is one
-  extra dispatch a layer and not ninety-six. It is now the largest single
-  depth-scaling term left on the device.
+  ladder alone is a hypothesis about prefill.** **Superseded by P16**: the decode
+  cost was a padding bug, and decode is now 34.2 tok/s at every batch.
+- **`attn.select` at decode is 55 µs a dispatch at 128 000 cells** (P16-3,
+  from 68), ~0.66 ms of a 31.7 ms token. A probe split it: ~8 µs a radix pass,
+  ~12 µs of emit after P16 took it from 25, ~10 fixed. Two guesses are measured
+  dead — the passes are **not** a chain of load latencies (four keys in flight a
+  lane is 0.96x) and **not** LDS-atomic contention (a per-wave bucket fold is
+  0.69x). What is left is P10's reduction, and the two-level arrangement
+  (per-stripe histograms and a merge) is the only idea not yet priced; at ~2%
+  of a deep token it is low on the list.
 - **What is left of decode's falloff after P15 is ~2 ms of 36.8**, and the
   shape of it has changed: the gathered list is 2051 cells at *every* depth, so
   `attn.attn.split` being 1.571 against 1.092 at depth zero is no longer a cell
   count — it is those same 2051 cells scattered over a deeper cache, where each
   128-byte line costs more to reach. That is a locality question and not a work
   one, and nothing in this vertical has asked it yet.
-- **Why 1.5 GB of arenas a decode step never reads costs it 8% is
-  unexplained**, and **P15 re-priced it at a deep cache and it is worse than
-  8%**: at `-ctx 139000` and depth zero the ladder is **2048 → 1153.8 pp /
-  30.20 tg, 4096 → 1286.7 (1.12x) / 26.75 (0.886x), 8192 → 1327.5 (1.15x) /
-  23.43 (0.776x)**. So 8192 costs 22% of decode for 2.6% more prefill than 4096
-  and is not a candidate at this depth; 4096's decode side is 0.886x here
-  against the 0.92x P12-7 measured at a shallower cache. P15 also **eliminated
-  one of the two explanations** — it is not the arenas' HOST_CACHED memory type,
-  which costs the kernels nothing (see the `hc.cn` bullet) — and **answered half
-  of "allocated versus used" with no new code**: `-ctx` moves only what is
-  reserved, and at depth zero with the ubatch fixed at 2048, decode is
-  **30.23 / 30.28 / 30.17 tok/s at `-ctx` 4096 / 32768 / 139000**. So **3.85 GB
-  of extra allocated arena costs decode 0.2%** — reserving memory a decode step
-  never reads is free, and the ubatch's 11% is **not volume**. The decode
-  dispatches are identical across the ubatch ladder (`aSplit` is sized for
-  `attnSplitMaxRows`, `aPart` for `GEMVMaxRows`), so what is left is the
-  residency the wide prefill leaves behind it — which is the recoverable shape,
-  and would make 4096 free and 8192 worth having (the graph ladder is still
-  climbing at 1.16x from 2048 to 8192). The remaining probe is therefore
-  narrower than it was: stage the wide arenas and prefill in **narrow** chunks
-  anyway, and see whether the cost follows the arena's width or the prefill's
-  footprint. P1c saw this shape once already.
+- ~~**Why 1.5 GB of arenas a decode step never reads costs it 8%.**~~ **P16,
+  closed 2026-09-22** ([write-up](research/p16-decode-arena-width.md)). It was
+  not the memory: the block input ports padded a decode step's one row out to
+  the arena, so a wider arena was more zeros written a layer. At an 8192 arena
+  decode goes 23.55 → 33.87 tok/s; through the server decode is 34.2 at every
+  batch. What remains between an 8192 and a 2048 sweep is depth — the wider
+  prefill leaves a deeper cache — not width.
 - ~~**Prompt processing at 128k.**~~ **P13, closed 2026-09-22**
   ([write-up](research/p13-long-context-prefill.md)). Two changes and one
   refusal. **128 000 cells completes**: `batchFor(rows)` was P0's fit and

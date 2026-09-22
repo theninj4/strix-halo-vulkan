@@ -113,11 +113,16 @@ func TestHCFusionIsTheCombineThenTheNorm(t *testing.T) {
 			append([]float32(nil), g.Mixed()...)
 	}
 
-	fRes, fXn, fMixed := arm(true)
 	pRes, pXn, pMixed := arm(false)
-	identical(t, "res", fRes, pRes)
-	identical(t, "xn", fXn, pXn)
-	identical(t, "mixed", fMixed, pMixed)
+	// Both of `cn`'s grids (P16): P11's workgroup a token, and the workgroup
+	// a (token, stream) it runs at decode widths. Each must be the pair.
+	for _, split := range []string{"0", "1000000"} {
+		t.Setenv("LLM_HC_CN_SPLIT_ROWS", split)
+		fRes, fXn, fMixed := arm(true)
+		identical(t, "res split="+split, fRes, pRes)
+		identical(t, "xn split="+split, fXn, pXn)
+		identical(t, "mixed split="+split, fMixed, pMixed)
+	}
 }
 
 // TestHCFusionRunsThePass is the same equality through the graph, where the

@@ -253,7 +253,10 @@ type DeltaNetGPU struct {
 	keepSilu bool
 
 	tokens, arenaRows, rows int
-	lda, ldCtx              int
+	// rowAlign is the widest row block any GEMM rung here reads, which
+	// arenaRows is a multiple of and InPort pads the run's rows up to.
+	rowAlign   int
+	lda, ldCtx int
 	// ctxZero is how many rows of the fp16 context arena the last run
 	// dirtied; everything from there to arenaRows is known to be zero. See
 	// Resize.
@@ -401,6 +404,7 @@ func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 	for _, v := range gemmBuildsFor(bank) {
 		align = maxInt(align, v.bm)
 	}
+	g.rowAlign = align
 	g.arenaRows = roundUpInt(maxTokens, align)
 
 	if err := g.alloc(len(layers)); err != nil {
@@ -1446,12 +1450,19 @@ func DNPrefetches(k DNKernel) bool {
 }
 
 // InPort is the layer's input as the fused projection's A operand wants it:
-// fp16 [T][lda], `hc_mixed` narrowed. The row count is the arena's, not the
-// run's, because the GEMM rungs have no bounds check and the rows between the
-// prompt and the row block have to carry the products of zeros.
+// fp16 [T][lda], `hc_mixed` narrowed. The row count is the run's rounded up to
+// the widest row block, because the GEMM rungs have no bounds check and the
+// rows between the prompt and the row block have to carry the products of
+// zeros.
+//
+// **It was the arena's row count until P16**, which is correct and was a
+// decode step writing zeros over the whole arena twice a layer: at an 8192-row
+// arena the moves went 5.5 -> 19.7 µs and the qkv projection after each one
+// 120 -> 233 µs, 8.6 ms of a 41 ms token, and that was the whole of what a
+// wide `-llm-batch` cost decode. No rung reads past `roundUp(rows, rowAlign)`.
 func (g *DeltaNetGPU) InPort() Port {
 	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
-		Rows: g.arenaRows, Half: true}
+		Rows: roundUpInt(g.rows, g.rowAlign), Half: true}
 }
 
 // OutPort is the layer's output, `linear_attn_out`: fp32 [T][nEmbd].

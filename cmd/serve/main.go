@@ -136,8 +136,8 @@ func main() {
 	llmCtx := flag.Int("llm-ctx", 4096, "cache cells: the longest conversation, prompt plus completion")
 	llmBatch := flag.Int("llm-batch", 4096,
 		"tokens the prefill arenas hold; a longer prompt is prefilled in chunks of it. "+
-			"P12, through this server: 2048 is 1021 tok/s prefill and 28.0 decode, 4096 is 1146 (1.12x) and 25.8 (0.92x). "+
-			"The wider arenas cost 8% of decode, so 4096 wins total latency below ~150 generated tokens and loses above it")
+			"P16, through this server: 2048 is 1052 tok/s prefill, 4096 is 1199 (1.14x), 8192 is 1233, and decode is 34.2 at all three. "+
+			"Wider costs only memory: 8192 helps prompts past 4096 tokens and holds ~3 GB more")
 	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
 

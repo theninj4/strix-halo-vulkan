@@ -101,6 +101,7 @@ func main() {
 	depths := flag.String("depths", "0,8000,16000,32000,64000,128000", "for -depth: the cache depths to measure at")
 	ppBatch := flag.Int("pp", 512, "for -depth: tokens in the timed prompt batch, which is also the fill batch")
 	tgTokens := flag.Int("tg", 64, "for -depth: tokens the timed decode run generates")
+	ubatch := flag.Int("ubatch", 0, "for -depth: the rows the arenas are sized for, when it is not -pp — separates the arena's width from the prefill's")
 	flag.Parse()
 
 	if *chatTemplate {
@@ -197,7 +198,7 @@ func main() {
 		}
 		if err := depthBench(depthOpts{
 			model: *model, file: *pplFile, depths: ds, pp: *ppBatch, tg: *tgTokens,
-			ctx: c, layers: layers, csv: *csvPath,
+			ubatch: *ubatch, ctx: c, layers: layers, csv: *csvPath,
 		}); err != nil {
 			log.Fatal(err)
 		}

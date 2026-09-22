@@ -74,6 +74,11 @@
 #define SEL_LDS 4096
 #endif
 
+// Block keys the emit fetches before it compares any of them.
+#ifndef EMIT_BATCH
+#define EMIT_BATCH 8
+#endif
+
 #if WG < RADIX_SIZE || (WG % 64) != 0
 #error "llm_attn_selblk wants a whole number of waves, at least one lane per radix bucket"
 #endif
@@ -140,6 +145,12 @@ uint blockWeight(uint b) {
         return 0u;
     }
     return (hi > lo) ? hi - lo : 0u;
+}
+
+// spanBits is bits [a, e) of a word, 0 <= a <= e <= 32.
+uint spanBits(uint a, uint e) {
+    uint n = e - a;
+    return (n >= 32u) ? 0xFFFFFFFFu : (((1u << n) - 1u) << a);
 }
 
 void main() {
@@ -261,18 +272,50 @@ void main() {
             // Cells [0, nlive) of this word are live and carry a block key;
             // [nlive, lim) are past `pos` and are the causal mask's -inf.
             uint nlive = (gPos >= c0) ? min(lim, gPos + 1u - c0) : 0u;
-            uint lastB = 0xFFFFFFFFu, key = 0u;
-            for (uint b = 0u; b < nlive; ++b) {
-                uint j = c0 + b;
-                uint blk = (j < gNBid * gRatio) ? (j / gRatio) : gDeadBid;
-                if (blk != lastB) {
-                    key = blockKey(blk);
-                    lastB = blk;
+            //
+            // **The live cells are walked a block at a time, not a cell at a
+            // time** (P16). The cell walk divided by the runtime `ratio` once
+            // a cell and fetched each block's key behind a branch on the one
+            // before, so at decode — where this is the one workgroup and at
+            // 128 000 cells four trips a lane — the emit was ~25 µs of the
+            // kernel's 68, more than any radix pass. A block's cells all carry
+            // its key, so a block is one compare and a run of bits; the keys
+            // of EMIT_BATCH blocks are fetched before any is compared. Cells
+            // from `nBid*ratio` on are the incomplete tail and carry
+            // `gDeadBid`'s key, as the per-cell walk had it.
+            uint hiC = c0 + nlive;
+            uint tailC = gNBid * gRatio;
+            uint segHi = min(hiC, tailC);
+            if (c0 < segHi) {
+                uint bFirst = c0 / gRatio;
+                uint bEnd = (segHi - 1u) / gRatio + 1u;
+                for (uint bb = bFirst; bb < bEnd; bb += EMIT_BATCH) {
+                    uint ks[EMIT_BATCH];
+                    [[unroll]] for (uint u = 0u; u < EMIT_BATCH; ++u) {
+                        ks[u] = (bb + u < bEnd) ? blockKey(bb + u) : 0u;
+                    }
+                    [[unroll]] for (uint u = 0u; u < EMIT_BATCH; ++u) {
+                        if (bb + u < bEnd) {
+                            uint a = max((bb + u) * gRatio, c0);
+                            uint e = min((bb + u) * gRatio + gRatio, segHi);
+                            uint m = spanBits(a - c0, e - c0);
+                            if (ks[u] > thr) {
+                                above |= m;
+                            } else if (ks[u] == thr) {
+                                eq |= m;
+                            }
+                        }
+                    }
                 }
+            }
+            uint tailLo = max(c0, tailC);
+            if (tailLo < hiC) {
+                uint key = blockKey(gDeadBid);
+                uint m = spanBits(tailLo - c0, hiC - c0);
                 if (key > thr) {
-                    above |= 1u << b;
+                    above |= m;
                 } else if (key == thr) {
-                    eq |= 1u << b;
+                    eq |= m;
                 }
             }
             if (nlive < lim) {

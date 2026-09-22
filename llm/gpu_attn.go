@@ -437,8 +437,11 @@ type AttnGPU struct {
 	autoPlan bool
 
 	tokens, arenaRows, rows int
-	nKV                     int
-	lda, ldCtx              int
+	// rowAlign is the widest row block any GEMM rung here reads, which
+	// arenaRows is a multiple of and InPort pads the run's rows up to.
+	rowAlign   int
+	nKV        int
+	lda, ldCtx int
 	// past is how many cells the cache already holds: token t of the next run
 	// is cell past+t and its position is past+t (L7a). Zero is a fresh
 	// sequence, which is every run before L7 and every test above L4.
@@ -743,6 +746,7 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 	for _, v := range gemmBuildsFor(bank) {
 		align = maxInt(align, v.bm)
 	}
+	g.rowAlign = align
 	g.arenaRows = roundUpInt(maxTokens, align)
 	// The selection is the identity wherever it asks for at least as many
 	// cells as the cache holds, so below that it is not run and the attention
@@ -1538,28 +1542,28 @@ const (
 )
 
 var gathPipes = map[string][]byte{
-	"gather":          shaders.LLMAttnGatherBM16,
-	"gathmask":        shaders.LLMAttnGathMaskBM16,
-	"gath.qt1_kt1":    shaders.LLMAttnGathQT1KT1,
-	"gath.qt1_kt2":    shaders.LLMAttnGathQT1KT2,
-	"gath.qt1_kt4":    shaders.LLMAttnGathQT1KT4,
+	"gather":       shaders.LLMAttnGatherBM16,
+	"gathmask":     shaders.LLMAttnGathMaskBM16,
+	"gath.qt1_kt1": shaders.LLMAttnGathQT1KT1,
+	"gath.qt1_kt2": shaders.LLMAttnGathQT1KT2,
+	"gath.qt1_kt4": shaders.LLMAttnGathQT1KT4,
 	// P15's split-gather, the decode arm: the gathered axis cut `splits` ways
 	// with `llm_attn_combine.comp` behind it.
 	"gath.qt1_kt1_split": shaders.LLMAttnGathQT1KT1Split,
 	"gath.qt1_kt2_split": shaders.LLMAttnGathQT1KT2Split,
 	"gath.qt1_kt4_split": shaders.LLMAttnGathQT1KT4Split,
-	"gath.qt1_kt1_g2": shaders.LLMAttnGathQT1KT1G2,
-	"gath.qt1_kt2_g2": shaders.LLMAttnGathQT1KT2G2,
-	"gath.qt1_kt4_g2": shaders.LLMAttnGathQT1KT4G2,
-	"gath.qt1_kt1_g4": shaders.LLMAttnGathQT1KT1G4,
-	"gath.qt1_kt2_g4": shaders.LLMAttnGathQT1KT2G4,
-	"gath.qt1_kt4_g4": shaders.LLMAttnGathQT1KT4G4,
-	"gath.qt1_kt1_h2": shaders.LLMAttnGathQT1KT1H2,
-	"gath.qt1_kt2_h2": shaders.LLMAttnGathQT1KT2H2,
-	"gath.qt1_kt4_h2": shaders.LLMAttnGathQT1KT4H2,
-	"gath.qt1_kt1_h4": shaders.LLMAttnGathQT1KT1H4,
-	"gath.qt1_kt2_h4": shaders.LLMAttnGathQT1KT2H4,
-	"gath.qt1_kt4_h4": shaders.LLMAttnGathQT1KT4H4,
+	"gath.qt1_kt1_g2":    shaders.LLMAttnGathQT1KT1G2,
+	"gath.qt1_kt2_g2":    shaders.LLMAttnGathQT1KT2G2,
+	"gath.qt1_kt4_g2":    shaders.LLMAttnGathQT1KT4G2,
+	"gath.qt1_kt1_g4":    shaders.LLMAttnGathQT1KT1G4,
+	"gath.qt1_kt2_g4":    shaders.LLMAttnGathQT1KT2G4,
+	"gath.qt1_kt4_g4":    shaders.LLMAttnGathQT1KT4G4,
+	"gath.qt1_kt1_h2":    shaders.LLMAttnGathQT1KT1H2,
+	"gath.qt1_kt2_h2":    shaders.LLMAttnGathQT1KT2H2,
+	"gath.qt1_kt4_h2":    shaders.LLMAttnGathQT1KT4H2,
+	"gath.qt1_kt1_h4":    shaders.LLMAttnGathQT1KT1H4,
+	"gath.qt1_kt2_h4":    shaders.LLMAttnGathQT1KT2H4,
+	"gath.qt1_kt4_h4":    shaders.LLMAttnGathQT1KT4H4,
 }
 
 // gathMax is the tight bound on one query tile's union: each of its gathBM rows
@@ -2484,7 +2488,7 @@ func (g *AttnGPU) Destroy() {
 // fp16 [T][lda], `hc_mixed` narrowed.
 func (g *AttnGPU) InPort() Port {
 	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
-		Rows: g.arenaRows, Half: true}
+		Rows: roundUpInt(g.rows, g.rowAlign), Half: true}
 }
 
 // OutPort is the layer's output, `attn_output`: fp32 [T][nEmbd].

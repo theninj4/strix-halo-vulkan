@@ -48,34 +48,24 @@ type LLMOptions struct {
 	//	2048   2.28 GB             1093.3   1.64x
 	//	4096   3.78 GB             1237.0   1.85x
 	//
-	// The default is **4096** (P12). Through the server, four distinct
-	// ~4.1-4.5k-token prompts at ctx 8192, two passes of each arm,
-	// interleaved, agreeing to 0.5%:
+	// The default is **4096** (P12), and since P16 it is **free**. P12-7
+	// measured it through the server as a trade — 1.12x on prefill for 0.92x
+	// on decode, breaking even at ~150 generated tokens — and that decode
+	// cost was a bug: the DeltaNet and attention input ports padded a decode
+	// step's one row with zeros out to the whole arena, once a layer. With
+	// the port padded to its row block, the same measurement (four distinct
+	// ~3.9-4.3k-token prompts at ctx 8192, 256 generated, two passes
+	// agreeing to 0.1%) reads:
 	//
-	//	2048   1020.9 tok/s prefill    28.04 tok/s decode
-	//	4096   1146.3          1.12x   25.81          0.92x
+	//	2048   1052.2 tok/s prefill    34.19 tok/s decode
+	//	4096   1198.5          1.14x   34.20
+	//	8192   1232.5          1.17x   34.16
 	//
-	// **And the second column is not free**, which is the thing P11 did not
-	// measure and this comment exists to record: the wider arenas cost
-	// **8% of decode**, reproducibly and with no overlap between the arms
-	// across sixteen samples. Decode streams 4.1 GB of weights a token and
-	// the extra 1.5 GB of resident arenas sits in the same memory.
-	//
-	// So the two rates move in opposite directions and the trade has a
-	// break-even. On a 4249-token prompt, 4096 saves **0.46 s of TTFT**
-	// (4.33 → 3.87) and costs **3.1 ms a generated token**:
-	//
-	//	generated     2048      4096
-	//	8           4.60 s    4.17 s     4096 wins
-	//	150        ~9.7 s    ~9.7 s     break-even
-	//	256        13.48 s   13.81 s     2048 wins
-	//	1024       40.9 s    43.5 s     2048 wins by 6.6%
-	//
-	// **4096 is the right default for an interactive server and the wrong
-	// one for a batch summariser**, and `MaxTokens` above defaults to 1024 —
-	// so a deployment whose requests really do generate that much should say
-	// `-llm-batch 2048` and take the TTFT back. Arenas, at ctx 4096:
-	// 2.28 GB at 2048 against 3.78 at 4096.
+	// So a wider batch is now a question of memory and nothing else: 8192
+	// helps only prompts longer than 4096 tokens (946 against 886 tok/s at
+	// 128k, P14), costs ~3 GB more arena than 4096, and lowers the
+	// maxStorageBufferRange cap on the context. Arenas, at ctx 4096: 2.28 GB
+	// at 2048 against 3.78 at 4096.
 	Batch int
 	// MaxTokens is what a request that names no budget gets. A request that
 	// names one still cannot run past the context.

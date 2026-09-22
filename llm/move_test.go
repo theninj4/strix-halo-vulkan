@@ -175,3 +175,56 @@ func srcAt(in []float32, row, i, width, rows int) any {
 	v := in[row*width+i]
 	return [2]any{v, safetensors.F32ToF16(v)}
 }
+
+// TestInPortPadsTheRunNotTheArena is P16's mechanism, asserted because no
+// tolerance can see it: a port that pads to the arena's rows is *correct*, and
+// it was a decode step writing zeros over the whole prefill arena twice a
+// layer — 21% of decode at an 8192-row `-llm-batch`, and the whole of what a
+// wide batch was measured to cost it (P12-7, P15). One row must pad to one
+// row block, not to the arena.
+func TestInPortPadsTheRunNotTheArena(t *testing.T) {
+	// The fixtures' own arenas are one row block deep, which cannot tell the
+	// two paddings apart, so both blocks are staged four times as wide.
+	const maxTok = 512
+	_, dc, dw, _ := dnFixtures(t, dnLayer)
+	_, _, ac, aw, _, _ := attnFixtures(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	dn, err := NewDeltaNetGPU(dev, dc, maxTok, []DeltaNetWeights{dw}, denseQ8Test)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dn.Destroy()
+	at, err := NewAttnGPU(dev, ac, maxTok, maxTok, []AttnWeights{aw}, denseQ8Test)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer at.Destroy()
+
+	for _, b := range []struct {
+		name                 string
+		resize               func(int) error
+		port                 func() Port
+		align, arena, maxTok int
+	}{
+		{"deltanet", dn.Resize, dn.InPort, dn.rowAlign, dn.arenaRows, dn.tokens},
+		{"attention", at.Resize, at.InPort, at.rowAlign, at.arenaRows, at.tokens},
+	} {
+		if b.arena <= b.align {
+			t.Fatalf("%s: arena of %d rows is one row block of %d — the fixture cannot tell the two paddings apart",
+				b.name, b.arena, b.align)
+		}
+		if err := b.resize(1); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.port().Rows; got != b.align {
+			t.Errorf("%s: one row pads to %d rows, want the row block %d (arena %d)", b.name, got, b.align, b.arena)
+		}
+		if err := b.resize(b.maxTok); err != nil {
+			t.Fatal(err)
+		}
+		if got := b.port().Rows; got != b.arena {
+			t.Errorf("%s: a full batch pads to %d rows, want the arena's %d", b.name, got, b.arena)
+		}
+	}
+}

@@ -45,6 +45,7 @@ type depthOpts struct {
 	model, file string
 	depths      []int
 	pp, tg      int
+	ubatch      int // arena rows; 0 means -pp
 	ctx, layers int
 	csv         string
 }
@@ -114,8 +115,17 @@ func depthBench(o depthOpts) error {
 	fmt.Printf("%s\n%d layers, %d cells of context, pp %d, tg %d, depths %v\n",
 		o.model, m.Config.NLayer, ctx, o.pp, o.tg, depths)
 
+	ubatch := o.pp
+	if o.ubatch > 0 {
+		if o.ubatch < o.pp {
+			return fmt.Errorf("-ubatch %d is narrower than -pp %d", o.ubatch, o.pp)
+		}
+		ubatch = o.ubatch
+		fmt.Printf("arenas sized for %d rows\n", ubatch)
+	}
+
 	start := time.Now()
-	g, err := llm.NewGraph(dev, m, llm.GraphOpts{MaxTokens: o.pp, NKV: ctx, Layers: o.layers})
+	g, err := llm.NewGraph(dev, m, llm.GraphOpts{MaxTokens: ubatch, NKV: ctx, Layers: o.layers})
 	if err != nil {
 		return err
 	}
