@@ -219,3 +219,82 @@ func TestDecodeDispatchDiff(t *testing.T) {
 		t.Logf("  %-16s %3d dispatches differ: %v", k, dd.count, fields)
 	}
 }
+
+// TestPrerecordedDecodeCrossesTheGatherBound is P15's gate on the one thing
+// that arrangement adds to P1c: **a decode plan that moves with the depth.**
+//
+// Every knob in a decode step was constant until the gather, so the first
+// one-token Extend could capture its command buffer and every later one could
+// replay it without asking whether it was still the right buffer. The gathered
+// arm is not constant — it turns on once the cache is deeper than twice the
+// selection's width, because below that the selection excludes nothing and the
+// compaction is pure overhead (gathersAtDepth) — so the graph compares
+// `decodeEpoch` before each replay and re-records the step that crosses.
+//
+// **What this asserts is the re-recording and not the answer, and that is
+// deliberate.** The obvious test — drive a sequence across the bound with the
+// replay on and off and diff the logits — cannot fail at any depth a short
+// fixture can reach: below the selection's 2051-cell width every live cell is
+// selected, so the gathered list *is* the key axis in the same order, the two
+// kernels fold the same partials the same way, and a replay carrying the wrong
+// one is bit-identical to the right one. That version of this test was written
+// first and passed with the epoch comparison deleted. So the assertion here is
+// on `preEpoch` itself: the buffer the graph is replaying must be the buffer
+// the current depth asks for, checked after every step.
+//
+// `LLM_ATTN_GATHER_MIN` puts the bound where a short fixture can cross it. The
+// cache has to be deeper than 2051 cells for the block to be sparse at all,
+// which is why NKV is set here and nowhere else in this file.
+func TestPrerecordedDecodeCrossesTheGatherBound(t *testing.T) {
+	const steps = 24
+	const bound = 12
+	t.Setenv("LLM_ATTN_GATHER_MIN", fmt.Sprint(bound))
+	t.Setenv("LLM_NO_PRERECORD", "")
+	g, _, ids := graphFixture(t, GraphOpts{Layers: 4, NKV: 4096})
+	if g.attn == nil {
+		t.Skip("no attention layer in this prefix")
+	}
+	if !g.attn.Sparse() {
+		t.Skip("the selection does not bite at this cache size")
+	}
+	// The crossing has to be *inside* the run, or this test is the one above.
+	if lo, hi := len(ids)+1, len(ids)+steps; bound < lo || bound > hi {
+		t.Fatalf("the bound is %d cells and the run covers %d..%d — nothing crosses", bound, lo, hi)
+	}
+
+	logits, _, err := g.Forward(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int]int{}
+	for i := 0; i < steps; i++ {
+		id := int32(0)
+		for j := range logits {
+			if logits[j] > logits[id] {
+				id = int32(j)
+			}
+		}
+		if logits, _, err = g.Extend([]int32{id}); err != nil {
+			t.Fatal(err)
+		}
+		// After the step, the cache holds `past` cells and the buffer that just
+		// ran has to have been the one that depth asks for.
+		want := g.attn.DecodeEpoch(g.past)
+		if g.pre == nil {
+			t.Fatalf("step %d (cell %d): no buffer was captured", i, g.past)
+		}
+		if g.preEpoch != want {
+			t.Fatalf("step %d (cell %d): replayed the epoch-%d buffer where the depth "+
+				"asks for epoch %d — the plan moved and the recording did not",
+				i, g.past, g.preEpoch, want)
+		}
+		seen[want]++
+	}
+	if len(seen) < 2 {
+		t.Fatalf("only epoch %v occurred over %d steps — the bound is not being crossed "+
+			"and this test asserted nothing", seen, steps)
+	}
+	t.Logf("%d steps across a gather bound at %d cells: epoch 0 on %d of them, epoch 1 on %d, "+
+		"and the replayed buffer matched the depth on every one",
+		steps, bound, seen[0], seen[1])
+}

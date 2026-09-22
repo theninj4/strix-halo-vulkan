@@ -575,3 +575,43 @@ func pleBankIsTheSim(t *testing.T, spec string) {
 	pleBankEqual(t, "the value projection", q4Val, simVal)
 	pleBankEqual(t, "the residual", q4Res, simRes)
 }
+
+// TestPLERowsFromIsTheTail is the gate on the tail form: for every cut point of
+// a sequence, PLERowsFrom is exactly the suffix PLERows would have returned.
+//
+// It is an *equality* test and not a tolerance one, for TestPLEGather's reason:
+// these are row indices into a 28.80 GB table, so one wrong index is a
+// plausible embedding from somewhere else and nothing downstream would flinch.
+//
+// The cut points that matter are the ones inside the n-gram window — 0, 1 and 2
+// for a trigram — because those are where a position's predecessors are not all
+// in the suffix. The loop covers them and the interior alike.
+func TestPLERowsFromIsTheTail(t *testing.T) {
+	_, _, c, ids := pleFixtures(t)
+	if len(ids) < 4 {
+		t.Fatalf("the fixture is %d tokens, which is too few to cut", len(ids))
+	}
+	// Long enough that most cut points are well past the n-gram window, which
+	// the fixture alone is not. An EOS in the middle as well: the `cut` flag is
+	// the one piece of per-position state, and a suffix must reproduce it.
+	var seq []int32
+	for i := 0; i < 5; i++ {
+		seq = append(seq, ids...)
+	}
+	seq[len(seq)/2] = int32(c.EOS)
+	all := PLERows(c, seq)
+	for from := 0; from <= len(seq); from++ {
+		got := PLERowsFrom(c, seq, from)
+		want := all[from*c.NHeads:]
+		if len(got) != len(want) {
+			t.Fatalf("from %d: %d rows, want %d", from, len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("from %d: row %d (token %d head %d) is %d, want %d",
+					from, i, from+i/c.NHeads, i%c.NHeads, got[i], want[i])
+			}
+		}
+	}
+	t.Logf("%d cut points of a %d-token sequence, every row identical", len(seq)+1, len(seq))
+}

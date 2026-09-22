@@ -277,6 +277,23 @@ shared uint blist[LCHUNK];
 #endif
 
 #ifdef GATHER
+// Where this build reads the gathered list from, and it is not the same field
+// in both builds because the split needs `resOff` for something else.
+//
+// The unsplit gathered kernel writes its answer straight out and reads the list
+// through `resOff`, as P14-2 left it. The split one writes *partials*, and the
+// partial arena is what `resOff` means to every SPLITK build and to
+// `llm_attn_combine.comp` behind them — so the list moves to `cellOff`, which
+// is free here: it is the indexer's expanded per-cell score, which P14-1
+// deleted and which no attention build has ever read. The push block is full at
+// 64 uints (TestAttnGPUPushBlockFits), so a spare field is the whole budget
+// there is.
+#ifdef SPLITK
+#define GATH_BASE pc.cellOff
+#else
+#define GATH_BASE pc.resOff
+#endif
+
 // stagePlane loads one head-dim group of this chunk's gathered cells into LDS:
 // cell `c` of the chunk takes its sixteen halves from
 // `plane + (cell/16 * HDT + grp) * 256 + (cell%16) * 16`, and lands at
@@ -430,7 +447,61 @@ void main() {
     // Nothing past this query block's last row can be attended to, so the key
     // blocks beyond it are never read. Its last row is cell `past + q0 + BM - 1`.
     uint last = min(n, past + q0 + BM);
+    // **GATHER is tested before SPLITK and not after**: a build can now be
+    // both (P15), and when it is, the axis it walks is the gathered list. The
+    // key-axis stride below is the arrangement for a build that is split and
+    // *not* gathered, which is every rung above one row.
+#if defined(GATHER)
+    // ---- P14-2: there is no key axis here. The gathered cell list for this
+    // query tile and the per-row mask behind it (`gathMax`/`gathStride`,
+    // llm_common.glsl), and the loop is a **dense** attention over `nGath`
+    // cells — no block skip, no `blkAny` vote, and no causal comparison
+    // anywhere, because the mask the gather wrote already has the causal test
+    // folded in.
+    //
+    // At 128 000 cells a sixteen-row tile's live blocks hold 24 580 cells and
+    // its union holds 10 058, so this loop is 2.44x shorter than the one it
+    // replaces — which is the last large term in a prefill at depth.
+    uint gmx = gathMax(pc.nKV, pc.selWidth, BM);
+    uint gmwords = gmx >> 5u;
+    uint gbase = GATH_BASE + (q0 / BM) * gathStride(gmx, BM);
+    uint nGath = actu[gbase];
+    uint gidx = gbase + 1u;
+    uint gmask = gidx + gmx;
 #ifdef SPLITK
+    // ---- P15: the gathered axis, **split**, which is the arrangement decode
+    // wants and the one neither P13 nor P14 built.
+    //
+    // The two compose because they cut different things. The split cuts the
+    // *walk* — a decode step is 24 single-wave workgroups that all fit on the
+    // device at once, so what a dispatch costs is one wave's serial trip
+    // (research/p8-decode-attention-split.md) — and the gather cuts the
+    // *cells*, because one query row selects 2051 of them however deep the
+    // cache is while the block kernel reads every cell of every block that
+    // holds one. Measured alone at 128 000 cells and one row, per dispatch:
+    // the unsplit block walk is 2948.7 us, the split 413.9, the unsplit gather
+    // 986.7 — so the split is 7.12x on the walk and the gather 2.99x on the
+    // work, and neither had the other's factor.
+    //
+    // Striding the gathered list is sound where striding a *block* list would
+    // not have been. P13 refused that one because a slice has to be a set of
+    // absolute key blocks that does not depend on how the prompt was chunked
+    // (L7a's gate), and a compacted list moves under rechunking. This list
+    // does too — but a gathered pass is already outside that gate by
+    // construction, for the reason `SetGather` gives, and is already pinned
+    // with the other reassociating kernels. What is *not* given up is the
+    // shape of a decode step: it is one row, so the tile's union is that row's
+    // own selection and there is no second row for a chunk boundary to fall
+    // between.
+    //
+    // A slice with no chunk — `sp * BN >= nGath` — falls straight through to
+    // the epilogue, which writes the combine's identity.
+    for (uint g0 = sp * BN; g0 < nGath; g0 += splits * BN) {
+#else
+    for (uint g0 = 0u; g0 < nGath; g0 += BN) {
+#endif
+      {
+#elif defined(SPLITK)
     // **Every `splits`-th block, not a contiguous run of them**, and that is
     // a correctness requirement rather than a preference.
     //
@@ -456,25 +527,6 @@ void main() {
     // through to the epilogue, which writes the combine's identity: a row max
     // of -inf and a row sum of zero.
     for (uint base = sp * BN; base < last; base += splits * BN) {
-      {
-#elif defined(GATHER)
-    // ---- P14-2: there is no key axis here. `pc.resOff` names this query
-    // tile's gathered cell list and the per-row mask behind it
-    // (`gathMax`/`gathStride`, llm_common.glsl), and the loop is a **dense**
-    // attention over `nGath` cells — no block skip, no `blkAny` vote, and no
-    // causal comparison anywhere, because the mask the gather wrote already has
-    // the causal test folded in.
-    //
-    // At 128 000 cells a sixteen-row tile's live blocks hold 24 580 cells and
-    // its union holds 10 058, so this loop is 2.44x shorter than the one it
-    // replaces — which is the last large term in a prefill at depth.
-    uint gmx = gathMax(pc.nKV, pc.selWidth, BM);
-    uint gmwords = gmx >> 5u;
-    uint gbase = pc.resOff + (q0 / BM) * gathStride(gmx, BM);
-    uint nGath = actu[gbase];
-    uint gidx = gbase + 1u;
-    uint gmask = gidx + gmx;
-    for (uint g0 = 0u; g0 < nGath; g0 += BN) {
       {
 #else
     // The list, when there is one: `pc.resOff` is NO_W on every pass that did

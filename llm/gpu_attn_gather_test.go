@@ -330,3 +330,88 @@ func TestAttnGPUGatherIsDispatched(t *testing.T) {
 		g.gathTiles, g.gathStride(), float64(g.gathTiles*g.gathStride()*4)/1e6,
 		g.arenaRows, g.NKV(), float64(g.arenaRows*g.NKV()*4)/1e6)
 }
+
+// TestAttnGPUGatherSplitIsTheGather is P15's gate: the gathered kernel with its
+// axis cut across workgroups is the gathered kernel.
+//
+// It is the same argument TestAttnGPUGatherIsTheBlockKernel makes one level up,
+// and for the same reason — a split folds the online softmax's partial maxima
+// in a different order, so the two are the same arithmetic over the same set
+// and not the same bits. The bar is the arithmetic's own noise, exactly as
+// TestAttnGPUSplitMatchesUnsplit sets it for the block kernel.
+//
+// **It has to be run as decode steps and not as a prompt**, because
+// `attnSplits` refuses any batch wider than `attnSplitMaxRows` — a wide batch
+// fills the grid on the query axis alone and the split buys nothing there. A
+// version of this test that uploaded the whole fixture at once passed
+// instantly with a 0.000e+00 rms on every arm, which is what a split that never
+// engaged looks like. So the shape below is the cache 4032 cells deep and then
+// 64 single-token steps, and `from` reads only those.
+//
+// The slice counts are swept rather than sampled because the failure this is
+// really watching for is a *boundary* one: a slice whose first chunk starts
+// past `nGath` has to fall through to the epilogue and write the combine's
+// identity, and a count that divides the chunk count evenly would never
+// produce such a slice.
+func TestAttnGPUGatherSplitIsTheGather(t *testing.T) {
+	g, tr, c, nTok, done := attnGPU4k(t)
+	defer done()
+	if !g.Sparse() {
+		t.Skip("the selection does not bite at this cache size")
+	}
+	src, err := tr.Get("hc_mixed-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := src.Vals
+	attn, gemm, outGemm := g.Plan()
+	if err := g.SetPlan(attn, gemm, outGemm); err != nil {
+		t.Fatal(err)
+	}
+	// 64 decode steps over a cache already past the 2051-cell selection width,
+	// so the selection bites on every one of them and the gather has something
+	// to compact.
+	chunks := append([]int{nTok - 64}, even(64, 1)...)
+	from := (nTok - 64) * c.NEmbd
+
+	g.SetGather(true)
+	defer g.AutoGather()
+	defer g.SetSplits(0)
+
+	g.SetSplits(1)
+	want := runChunks(t, g, in, c.NEmbd, chunks)
+
+	for _, splits := range []int{2, 3, 5, 8, 16, attnMaxSplits} {
+		g.SetSplits(splits)
+		got := runChunks(t, g, in, c.NEmbd, chunks)
+		if len(got) != len(want) {
+			t.Fatalf("%d values, want %d", len(got), len(want))
+		}
+		var maxAbs, sum2, ref2 float64
+		for i := from; i < len(got); i++ {
+			d := math.Abs(float64(got[i]) - float64(want[i]))
+			maxAbs = math.Max(maxAbs, d)
+			sum2 += d * d
+			ref2 += float64(want[i]) * float64(want[i])
+		}
+		rms := math.Sqrt(sum2 / ref2)
+		// NaN first: every comparison below is false against one, and a slice
+		// that read LDS a barrier did not cover produces exactly that. The
+		// sibling test reported PASS on a NaN once.
+		if math.IsNaN(rms) {
+			t.Fatalf("%d slices produced NaN — something is read before it is written", splits)
+		}
+		// And zero is a failure too, here: it means the split did not engage,
+		// which is how the first draft of this test passed without testing
+		// anything.
+		if rms == 0 {
+			t.Fatalf("%d slices came back bit-identical to the unsplit gather, "+
+				"which means the split never engaged — check attnSplits against "+
+				"the row count", splits)
+		}
+		t.Logf("%2d slices: rms %.3g, max abs %.3g", splits, rms, maxAbs)
+		if rms > 1e-3 {
+			t.Errorf("%d slices: rms %.3g against the unsplit gather", splits, rms)
+		}
+	}
+}

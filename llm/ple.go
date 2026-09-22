@@ -116,10 +116,37 @@ type PLEWeights struct {
 // ids[i-1] and ids[i-2]; before the start there are none, which reads as EOS
 // and cuts everything earlier — the same as an EOS in the window.
 func PLERows(c PLEConfig, ids []int32) []int32 {
-	rows := make([]int32, len(ids)*c.NHeads)
+	return PLERowsFrom(c, ids, 0)
+}
+
+// PLERowsFrom is PLERows for the tail of a sequence: the rows of positions
+// `from` onwards, which is `(len(ids)-from)*NHeads` of them, and exactly what
+// `PLERows(c, ids)[from*c.NHeads:]` returns.
+//
+// **It exists because the whole-sequence form is O(context) on a hot path.**
+// Every run of the graph gathers the n-gram rows of the tokens it is about to
+// push and throws the rest away, so a decode step at 128 000 cells hashed
+// 128 000 positions and allocated 8.2 MB of them to use sixteen — 5.2 ms of a
+// 44.3 ms token, and 4.2 of the 10.6 ms that token gains over one at depth
+// zero. It was the largest *host* term in a deep decode step and it did not
+// belong to the device at all.
+//
+// The rows are identical and not merely close, by construction: a position's
+// row depends on `ids[i-NGram+1 .. i]` and nothing else — the `cut` flag is
+// reset at the top of each position, so no state carries between them — and
+// this walks the same positions with the same window. `from` below the window
+// simply starts earlier. TestPLERowsFromIsTheTail is the gate.
+func PLERowsFrom(c PLEConfig, ids []int32, from int) []int32 {
+	if from < 0 {
+		from = 0
+	}
+	if from > len(ids) {
+		from = len(ids)
+	}
+	rows := make([]int32, (len(ids)-from)*c.NHeads)
 	ctx := make([]uint64, c.NGram)
 	eos := uint64(c.EOS)
-	for i := range ids {
+	for i := from; i < len(ids); i++ {
 		ctx[0] = uint64(ids[i])
 		cut := false
 		for s := 1; s < c.NGram; s++ {
@@ -144,7 +171,7 @@ func PLERows(c PLEConfig, ids []int32) []int32 {
 			base := (n - 2) * c.PerGram
 			for g := 0; g < c.PerGram; g++ {
 				h := base + g
-				rows[i*c.NHeads+h] = int32(mixed%uint64(c.Vocabs[h]) + uint64(c.Offsets[h]))
+				rows[(i-from)*c.NHeads+h] = int32(mixed%uint64(c.Vocabs[h]) + uint64(c.Offsets[h]))
 			}
 		}
 	}

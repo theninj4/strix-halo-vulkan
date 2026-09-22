@@ -204,6 +204,15 @@ type Graph struct {
 	pre      *vk.Prerecorded
 	preKinds []string
 	preOwner []string
+	// preEpoch is the decode plan `pre` was captured under, and capEpoch the
+	// one the armed capture is for. **A recorded buffer is only replayable
+	// while the plan that built it still holds**, and since P15 one knob in
+	// that plan moves with the depth: the attention block takes its gathered
+	// arm once the cache is deeper than twice the selection's width, which is
+	// two more dispatches and a different grid. So the epoch is compared
+	// before every replay and the one step that crosses is re-recorded. It
+	// crosses at most once in a sequence, because the depth only grows.
+	preEpoch, capEpoch int
 	// capture arms the next flush to build `pre` from what it submits.
 	capture bool
 
@@ -317,6 +326,7 @@ func (g *Graph) flush() error {
 			fmt.Fprintf(os.Stderr, "llm: decode prerecord failed, re-recording each token: %v\n", perr)
 		} else {
 			g.pre, g.preKinds, g.preOwner = pre, capK, capO
+			g.preEpoch = g.capEpoch
 		}
 	}
 	g.Stats.Dispatches += n
@@ -1092,10 +1102,14 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	// rebuilds its whole pooled table, so its grid is NBlocks rather than
 	// one (blockRange).
 	if len(ids) == 1 && g.past > 0 && Prerecord() {
-		if g.pre != nil {
+		epoch := g.decodeEpoch()
+		if g.pre != nil && g.preEpoch == epoch {
 			return g.extendPrerecorded(ids[0])
 		}
-		g.capture = true
+		// The plan moved under the buffer (or there is no buffer yet). One
+		// step pays the ordinary path and captures the new one.
+		g.dropPrerecorded()
+		g.capture, g.capEpoch = true, epoch
 	}
 	// One command buffer for the whole of it, head included (L7d): the
 	// layers, the head mixer and the projection are recorded and submitted
@@ -1162,7 +1176,7 @@ func (g *Graph) extendPrerecorded(id int32) (logits, norm []float32, err error) 
 	g.ids = append(g.ids, id)
 	var pleEmbd []float32
 	if g.hasPLE {
-		rows := PLERows(g.pleCfg, g.ids)[g.past*g.pleCfg.NHeads:]
+		rows := PLERowsFrom(g.pleCfg, g.ids, g.past)
 		pleEmbd, err = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
 		if err != nil {
 			return nil, nil, fmt.Errorf("llm: per_layer_token_embd: %w", err)
@@ -1473,9 +1487,12 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	g.ids = append(g.ids, ids...)
 	var pleEmbd []float32
 	if g.hasPLE {
-		// Hashed over the whole sequence, gathered for its tail: the trigram
-		// of the first token of this run reaches two tokens behind it.
-		rows := PLERows(g.pleCfg, g.ids)[g.past*g.pleCfg.NHeads:]
+		// The tail's rows only. A position's n-gram depends on the two tokens
+		// behind it and nothing further, so `PLERowsFrom` walks from `past`
+		// and reads back across the boundary — which is the same rows the
+		// whole-sequence form returned and, at 128 000 cells, 2.05 million
+		// fewer of them (P15-1).
+		rows := PLERowsFrom(g.pleCfg, g.ids, g.past)
 		pleEmbd, err = g.m.PLEGather(rows, g.pleCfg.NHeads, g.pleCfg.HeadDim)
 		if err != nil {
 			return fmt.Errorf("llm: per_layer_token_embd: %w", err)
@@ -1664,6 +1681,16 @@ func (g *Graph) sublayer(l, nTok int, t0 time.Time) (time.Time, error) {
 // Prerecorded reports whether a captured decode step is live — the P1c fast
 // path, engaged from the second one-token Extend on.
 func (g *Graph) Prerecorded() bool { return g.pre != nil }
+
+// decodeEpoch names the decode plan a one-token Extend would record right now.
+// Only the attention block has a depth-dependent plan (P15's gather); every
+// other block's decode step is the same dispatches at every position.
+func (g *Graph) decodeEpoch() int {
+	if g.attn == nil {
+		return 0
+	}
+	return g.attn.DecodeEpoch(g.past + 1)
+}
 
 // dropPrerecorded releases the captured decode step, if any; the next
 // one-token Extend records and captures a fresh one.

@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and 946.1 at 8192** (P14, against P13's 563.6), 64k at **892.1**, decode **22.18 tok/s at 128k** | `hc.cn` at 134 GB/s with no hypothesis left; batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.19 tok/s, 1.44x** llama.cpp at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1146 through the server** at the new 4096 batch, against 1021), still climbing where llama.cpp plateaus; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and 946.1 at 8192** (P14, against P13's 563.6), 64k at **892.1**, decode **27.20 tok/s at 128k** and **28.14 at 64k** (P15, against P14's 22.58/24.27), falloff to 128k **0.76x → 0.91x** | `hc.cn` at 134 GB/s with three hypotheses spent (P15 added the memory type); batching (P6); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `attn.select` is the last unstriped kernel |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -77,13 +77,32 @@ workgroups to 2, a twelfth of both, measured **1.00x at every depth**. P8
 splits the attention's key axis across workgroups, P9 unpins the indexer —
 which was scoring the whole context on one compute unit of forty — and P10
 widens the selection, the one kernel that cannot be split at all because its
-radix passes are a reduction, from four waves to sixteen. What is left of the
-depth question is **decode's** gather: of the 5.9 ms a decode step still gains
-between depth 0 and 64k, the split attention is 3.0 of it, because the split
-shortened the walk sixteenfold without stopping it being a walk over every key
-block. Prefill's gather is built (P14) and decode deliberately does not take it —
-a decode step is 24 single-wave workgroups that all fit at once, so a gather in
-front of it lengthens the walk rather than cutting it. After that the two capability
+radix passes are a reduction, from four waves to sixteen.
+
+**Decode's side of the depth question is now closed too. P15 (2026-09-22)**
+takes a decode step at 128 000 cells from **22.58 to 27.20 tok/s** and the
+falloff from depth zero from **0.76x to 0.91x**, with prefill and depth-zero
+decode flat as the controls
+([`research/p15-decode-at-depth.md`](research/p15-decode-at-depth.md)). Three
+changes, and the largest was not on the device: **`PLERows` hashed the whole
+sequence on every token** to use sixteen of its rows, which at 128k is 8.2 MB
+allocated and 2.05 M rows per step — **5.18 ms of a 44.3 ms token and 39% of
+the whole falloff**, deleted exactly by `PLERowsFrom`. Then **`attn.score`
+was striped sixteen ways on a forty-CU device**: P9 unpinned it and stopped at
+16, the stripe is a grid and not a reduction, and 64 is **2.61x** (211.6 → 80.9
+µs) and better at *every* depth. And **the gather and the split compose, which
+P14 said they would not** — that argument is right about the gather alone and
+is measured (unsplit gather 986.7 µs against the split's 419.8), but the two
+cut different things: the split is 7.12x on the *walk* and the gather 2.99x on
+the *work*, so `GATHER`+`SPLITK` together is **3.23x** (419.8 → 129.9). A
+decode tile is one real row, so the union that costs prefill 4.9x costs decode
+nothing. It turns on at `2*selWidth` **live** cells, which makes it the first
+decode knob that is a function of the depth — so P1c's prerecorded buffer now
+carries an epoch and re-records the one step that crosses. The refusal:
+**the arenas' HOST_CACHED memory type costs the kernels nothing** even at the
+3.85 GB the KV planes now put in that buffer — every kernel within 1% under
+`LLM_ARENA_UNCACHED=1` while host glue moves 29x — which confirms L6b at the
+new scale and spends a third hypothesis for `hc.cn`. After that the two capability
 gaps are P6 batching (blocked on a product question: will the API serve more
 than one stream?) and E7's batched embeddings, worth up to 10x on short
 texts; the largest single-vertical percent is S10, the speech front end at
@@ -191,12 +210,43 @@ from what the draft predicts.
   default and `API.md` says outright that a batch summariser should set 2048.
   **The lesson is P11-1's, a second time: a ubatch measured on the prefill
   ladder alone is a hypothesis about prefill.**
+- **`attn.select` is the last kernel in a decode step that is not striped**,
+  0.862 ms a token at 128 000 cells and **unmoved by P15 — it was that pass's
+  control**. P10 widened it from four waves to sixteen and said why it can go
+  no further: four radix passes over a row are a *reduction*, so it cannot be
+  spread over the grid without a global barrier between every pass, which at
+  twelve layers is ~96 extra dispatches a step. What it has never had is a
+  **two-level** arrangement — per-stripe histograms and a merge — which is one
+  extra dispatch a layer and not ninety-six. It is now the largest single
+  depth-scaling term left on the device.
+- **What is left of decode's falloff after P15 is ~2 ms of 36.8**, and the
+  shape of it has changed: the gathered list is 2051 cells at *every* depth, so
+  `attn.attn.split` being 1.571 against 1.092 at depth zero is no longer a cell
+  count — it is those same 2051 cells scattered over a deeper cache, where each
+  128-byte line costs more to reach. That is a locality question and not a work
+  one, and nothing in this vertical has asked it yet.
 - **Why 1.5 GB of arenas a decode step never reads costs it 8% is
-  unexplained**, and it is now the interesting question — if it is layout
-  rather than volume it may be recoverable, which would make 4096 free and
-  8192 worth having (the graph ladder is still climbing at 1.16x from 2048 to
-  8192). The probe that separates *allocated* from *used* is to stage the wide
-  arenas and prefill in narrow chunks anyway. P1c saw this shape once already.
+  unexplained**, and **P15 re-priced it at a deep cache and it is worse than
+  8%**: at `-ctx 139000` and depth zero the ladder is **2048 → 1153.8 pp /
+  30.20 tg, 4096 → 1286.7 (1.12x) / 26.75 (0.886x), 8192 → 1327.5 (1.15x) /
+  23.43 (0.776x)**. So 8192 costs 22% of decode for 2.6% more prefill than 4096
+  and is not a candidate at this depth; 4096's decode side is 0.886x here
+  against the 0.92x P12-7 measured at a shallower cache. P15 also **eliminated
+  one of the two explanations** — it is not the arenas' HOST_CACHED memory type,
+  which costs the kernels nothing (see the `hc.cn` bullet) — and **answered half
+  of "allocated versus used" with no new code**: `-ctx` moves only what is
+  reserved, and at depth zero with the ubatch fixed at 2048, decode is
+  **30.23 / 30.28 / 30.17 tok/s at `-ctx` 4096 / 32768 / 139000**. So **3.85 GB
+  of extra allocated arena costs decode 0.2%** — reserving memory a decode step
+  never reads is free, and the ubatch's 11% is **not volume**. The decode
+  dispatches are identical across the ubatch ladder (`aSplit` is sized for
+  `attnSplitMaxRows`, `aPart` for `GEMVMaxRows`), so what is left is the
+  residency the wide prefill leaves behind it — which is the recoverable shape,
+  and would make 4096 free and 8192 worth having (the graph ladder is still
+  climbing at 1.16x from 2048 to 8192). The remaining probe is therefore
+  narrower than it was: stage the wide arenas and prefill in **narrow** chunks
+  anyway, and see whether the cost follows the arena's width or the prefill's
+  footprint. P1c saw this shape once already.
 - ~~**Prompt processing at 128k.**~~ **P13, closed 2026-09-22**
   ([write-up](research/p13-long-context-prefill.md)). Two changes and one
   refusal. **128 000 cells completes**: `batchFor(rows)` was P0's fit and
@@ -278,10 +328,16 @@ from what the draft predicts.
   window. **The failure mode is a benchmark that gets faster**, which is the one
   direction nobody audits; the rule it leaves is to price a suspicious win in
   FLOP/s or bytes/s against the device's peak before believing it.
-- **`hc.cn` is still at 134 GB/s** where a copy gets 236, and P12-4 spent both
-  of the standing explanations. The next probe is the access pattern itself:
-  it runs four read-modify-write streams plus an fp16 write a token, where a
-  copy runs two.
+- **`hc.cn` is still at 134 GB/s** where a copy gets 236, and there are now
+  **three** spent explanations, not two. P12-4 spent the 256-way tree (deleting
+  it outright is 5331.5 µs against 5325.8) and the `gamma` read (5332.9). P15
+  spent the **memory type**, which was the most plausible of the three and had
+  never been tested: the arenas are HOST_CACHED and this kernel is pure arena
+  traffic, so it looked like the whole answer — and `LLM_ARENA_UNCACHED=1`
+  moves it 1272.2 → 1260.4 µs, inside the noise, while host glue moves 29x as
+  the evidence the knob was really thrown. The next probe is the access pattern
+  itself: it runs four read-modify-write streams plus an fp16 write a token,
+  where a copy runs two.
 - **P6 — batching.** Blocked on the product question: will the API serve
   more than one stream? Each sequence owns 113 MB of DeltaNet state plus
   rings and KV. P5b already built the first stage (R-row decode GEMVs,
@@ -327,13 +383,18 @@ from what the draft predicts.
   expansion's 1.14 GB is freed, and the alternative is chunking the gathered
   axis and folding the partials through P8's combine, which already exists.
   P13's `llm_attn_blocks.comp` is the compaction it would be built on.
-- **What the gather replaces, from P7's side.** The skip
-  prunes key blocks; it does not stop the count of them growing. Compacting
-  the ≤2051 selected cells' K and V into a contiguous scratch and running a
-  2051-cell attention is **flat in depth by construction**, and it is the
-  remaining 1948 ms of a 64k decode step's 3665. L4b declined it because at
-  prefill the density makes it pointless; at decode it is the only route to
-  a rate that does not care how long the conversation is. **P11 measured the
+- ~~**What the gather replaces, from P7's side.**~~ **Closed by P15-3,
+  2026-09-22.** The skip prunes key blocks; it does not stop the count of them
+  growing — so decode now runs the **gathered** kernel with its axis split,
+  `GATHER`+`SPLITK`, and `attn.attn` at 128 000 cells is **419.8 → 129.9 µs**
+  a dispatch. P14 wrote down that decode should not take the gather and the
+  argument is *right about the gather alone*: unsplit, it is 986.7 µs against
+  the split's 419.8. What it missed is that the split cuts the **walk** (7.12x)
+  and the gather cuts the **work** (2.99x), and neither had the other's factor.
+  The bound is `2*selWidth` **live** cells, below which every live cell is
+  selected and the compaction is overhead — 1.09 → 1.56 ms a token the wrong
+  way at depth zero. That bound is the first decode knob that moves with the
+  depth, so the prerecorded buffer carries an epoch now. **P11 measured the
   prefill side of the same question and it is the whole of the depth term
   there too**: at `-pp 2048` every block is flat in depth except attention,
   which is 97% of the falloff and 47% of a prefill token at 64 000 cells

@@ -156,7 +156,24 @@ const (
 	// element and reassociate nothing, so the grid is not observable in the
 	// answer — and it is a constant only so that a decode step's command
 	// buffer stays byte-identical for P1c's prerecording.
-	attnCellSplits = 16
+	//
+	// **Sixteen was not enough of a forty-CU device** (P15). P9 unpinned this
+	// kernel from the one workgroup it ran on and stopped there; the stripe is
+	// a grid and not a reduction, so the only thing that bounds it is having
+	// blocks left to give a workgroup. Measured at decode and 128 000 cells,
+	// `attn.score` against the stripe count with `attn.attn.split` flat to
+	// 0.4% as the control:
+	//
+	//	splits    16      32      64     128     256
+	//	us     211.6   118.5    80.9    78.5    86.5
+	//
+	// 64 is the knee — 128 is inside the noise of it and 256 is past it, where
+	// a stripe has too few blocks to pay for its workgroup. It is **better at
+	// every depth and not only at the deep end** (0.126 -> 0.106 ms a token at
+	// depth zero, 2.553 -> 0.992 at 128 000), so there is no crossover to pick
+	// a default around, which is why this is a constant and not a function of
+	// the cache.
+	attnCellSplits = 64
 	// attnSplitMaxRows is the widest batch the split path will take, and so
 	// the row count the partial arena is sized for. It is the widest rung's
 	// query tile: past that the query axis alone already fills the grid and
@@ -1526,6 +1543,11 @@ var gathPipes = map[string][]byte{
 	"gath.qt1_kt1":    shaders.LLMAttnGathQT1KT1,
 	"gath.qt1_kt2":    shaders.LLMAttnGathQT1KT2,
 	"gath.qt1_kt4":    shaders.LLMAttnGathQT1KT4,
+	// P15's split-gather, the decode arm: the gathered axis cut `splits` ways
+	// with `llm_attn_combine.comp` behind it.
+	"gath.qt1_kt1_split": shaders.LLMAttnGathQT1KT1Split,
+	"gath.qt1_kt2_split": shaders.LLMAttnGathQT1KT2Split,
+	"gath.qt1_kt4_split": shaders.LLMAttnGathQT1KT4Split,
 	"gath.qt1_kt1_g2": shaders.LLMAttnGathQT1KT1G2,
 	"gath.qt1_kt2_g2": shaders.LLMAttnGathQT1KT2G2,
 	"gath.qt1_kt4_g2": shaders.LLMAttnGathQT1KT4G2,
@@ -1559,11 +1581,21 @@ func (g *AttnGPU) gathStride() int {
 // gathPipe names the gathered build for a rung and a staging width, or "" where
 // there is none. `grp` of 1 leaves the suffix off, so the shipped name is the
 // one the ladder started with.
-func gathPipe(av attnVariant, grp, hpw int) string {
+func gathPipe(av attnVariant, grp, hpw, splits int) string {
 	if av.qt != 1 || av.ktil > 4 {
 		return ""
 	}
 	base := fmt.Sprintf("gath.qt%d_kt%d", av.qt, av.ktil)
+	// The split arm is built at the plain staging widths only: it is decode's,
+	// where one query tile is one row, and `grp`/`hpw` are prefill ladders that
+	// both measured 1.00x or worse (P14). Crossing them would be six more
+	// builds of a kernel nothing would dispatch.
+	if splits > 1 {
+		if grp > 1 || hpw > 1 {
+			return ""
+		}
+		return base + "_split"
+	}
 	switch {
 	case hpw > 1 && grp > 1:
 		return "" // not a build; the two knobs are swept one at a time
@@ -1623,7 +1655,73 @@ func (g *AttnGPU) gather() bool {
 	if v := os.Getenv("LLM_ATTN_GATHER"); v != "" {
 		return v == "1"
 	}
-	return g.sparse && g.rows >= gathMinRows
+	if !g.sparse {
+		return false
+	}
+	// Prefill: one query tile is sixteen rows and the grid is full, so the
+	// gather runs unsplit (P14-2).
+	if g.rows >= gathMinRows {
+		return true
+	}
+	// Decode: gathered *and* split (P15), but only once the cache is deep
+	// enough to pay for it.
+	return g.rows <= attnSplitMaxRows && g.gathersAtDepth(g.past+g.rows)
+}
+
+// gathersAtDepth is the decode arm's depth test, split out because the graph
+// has to be able to ask it about a depth it has not reached yet — see
+// DecodeEpoch.
+//
+// **The bound is on the cells that exist, not on the cells the cache was
+// allocated for**, which is P7's rule and the reason this is not simply
+// `g.nKV`. A gathered pass compacts what the selection named — 2051 cells
+// however deep the cache is — so it wins exactly where the block kernel is
+// reading more than that, and at a shallow depth it is not: every live cell is
+// selected, the gathered list *is* the axis, and the two extra dispatches and
+// the scattered read are paid for nothing.
+//
+// Measured at 48 layers, ctx 139 000, against the block split:
+//
+//	depth        0     8 000    32 000    64 000   128 000
+//	tok/s    29.17     29.06     28.85     27.77     27.36
+//	block    29.86     28.59     27.45     26.97     25.72
+//
+// — so it loses 2.3% at depth zero and wins from 8 000 on, and `attn.attn`
+// itself is 1.09 -> 1.56 ms a token at depth zero against 4.11 -> 1.30 at
+// 128 000. Twice the selection's width is the bound because that is the
+// shallowest cache in which the selection is skipping half of what the block
+// kernel would read.
+func (g *AttnGPU) gathersAtDepth(live int) bool {
+	return g.sparse && live >= g.gathMinCells()
+}
+
+// gathMinCells is that bound. `LLM_ATTN_GATHER_MIN` overrides it — it is the
+// ladder the 2x was chosen off, and it is also what lets a small fixture cross
+// the threshold, which is the only way to test the re-recording.
+func (g *AttnGPU) gathMinCells() int {
+	if n, err := strconv.Atoi(os.Getenv("LLM_ATTN_GATHER_MIN")); err == nil && n >= 0 {
+		return n
+	}
+	return 2 * g.selWidth()
+}
+
+// DecodeEpoch names which decode plan a one-row pass at `live` cells would
+// record, and it exists for P1c's prerecorded command buffer.
+//
+// A decode step is recorded once and replayed, so anything the plan depends on
+// has to be either constant or *watched*. Every earlier knob here was constant;
+// P15's gather is the first that is a function of the depth, because that is
+// what it has to be — see gathersAtDepth. So the graph asks for this before it
+// replays, and re-records the one step where the answer changes. It changes at
+// most once in a sequence, since the depth only grows.
+func (g *AttnGPU) DecodeEpoch(live int) int {
+	if g.pinGather != 0 || os.Getenv("LLM_ATTN_GATHER") != "" {
+		return 0 // pinned: the plan does not move with the depth
+	}
+	if g.gathersAtDepth(live) {
+		return 1
+	}
+	return 0
 }
 
 // SetGather pins the gather on (1), off (-1) or back to the default (0).
@@ -1880,14 +1978,16 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//     gathered kernel is its own build and chooses its own block width, for
 	//     the reason gathRung says.
 	//
-	//     It is exclusive with the split (decode) and with P13's block list
-	//     (the coarser compaction it replaces).
+	//     It is exclusive with P13's block list (the coarser compaction it
+	//     replaces) and **not** with the split any more: P15 builds the two
+	//     together, because they cut different things and a decode step wants
+	//     both. See gathSplit.
 	gath, hpw := "", 1
-	if g.sparse && sp == 1 && g.gather() {
+	if g.sparse && g.gather() {
 		gv, ok := attnVariantFor(g.gathRung())
 		if ok {
 			hpw = g.gathHeadsPerWG()
-			gath = gathPipe(gv, g.gathGroups(), hpw)
+			gath = gathPipe(gv, g.gathGroups(), hpw, sp)
 			if _, ok := g.pipes[gath]; !ok {
 				gath, hpw = "", 1
 			} else {
@@ -1925,7 +2025,16 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	//    selection beside the causal mask — or, at decode over a cache deep
 	//    enough to be worth it, the same kernel with its key axis cut across
 	//    workgroups and a combine behind it (P8).
-	if gath != "" {
+	if gath != "" && sp > 1 {
+		// P15: gathered *and* split. The list comes in through `cellOff` —
+		// `resOff` is the partial arena, which is what every split build and
+		// `llm_attn_combine.comp` behind them mean by it — and the grid is the
+		// split's, so the combine that follows is the one P8 already wrote.
+		at := base
+		at.CellOff, at.ResOff, at.InjOff = g.aGath, g.aSplit, uint32(sp)
+		add(gath, "attn.split", qBlocks*uint32(sp), uint32(c.NHead/hpw), at)
+		add("combine", "attn.combine", uint32(c.NHead), qBlocks*uint32(av.rows), at)
+	} else if gath != "" {
 		at := base
 		at.ResOff = g.aGath
 		// The grid's y is **head groups**, not heads: one workgroup of `hpw`

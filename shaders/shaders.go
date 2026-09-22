@@ -2652,6 +2652,9 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DSPLITK -DQT=1 -DKTIL=1 -o llm_attn_gath_qt1_kt1_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DSPLITK -DQT=1 -DKTIL=2 -o llm_attn_gath_qt1_kt2_split.spv llm_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DSPLITK -DQT=1 -DKTIL=4 -o llm_attn_gath_qt1_kt4_split.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=1 -DGRP=2 -o llm_attn_gath_qt1_kt1_g2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=2 -DGRP=2 -o llm_attn_gath_qt1_kt2_g2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DGATHER -DQT=1 -DKTIL=4 -DGRP=2 -o llm_attn_gath_qt1_kt4_g2.spv llm_attn_wmma.comp
@@ -2821,6 +2824,31 @@ var LLMAttnGathQT1KT2 []byte
 
 //go:embed llm_attn_gath_qt1_kt4.spv
 var LLMAttnGathQT1KT4 []byte
+
+// LLMAttnGath*Split are that same kernel with the gathered axis **cut across
+// workgroups** and `llm_attn_combine.comp` behind it — P15, and the arrangement
+// a decode step wants.
+//
+// The two factors are independent and neither build had the other's. The split
+// (P8) cuts the *walk*, because a decode step's 24 single-wave workgroups all
+// fit on the device at once and what a dispatch costs is one wave's serial
+// trip; the gather (P14-2) cuts the *cells*, because one query row selects 2051
+// of them however deep the cache is while the block kernel reads every cell of
+// every block that holds one. Measured alone at 128 000 cells and one row, per
+// dispatch: the unsplit block walk 2948.7 us, the split 413.9, the unsplit
+// gather 986.7.
+//
+// These builds read the gathered list through `cellOff` rather than `resOff`,
+// because `resOff` is the partial arena to every split build — see GATH_BASE.
+//
+//go:embed llm_attn_gath_qt1_kt1_split.spv
+var LLMAttnGathQT1KT1Split []byte
+
+//go:embed llm_attn_gath_qt1_kt2_split.spv
+var LLMAttnGathQT1KT2Split []byte
+
+//go:embed llm_attn_gath_qt1_kt4_split.spv
+var LLMAttnGathQT1KT4Split []byte
 
 // LLMAttnGath*G2 and *G4 stage two or four head-dim groups per staging barrier
 // instead of one. Double buffering took the gathered loop from two barriers a
