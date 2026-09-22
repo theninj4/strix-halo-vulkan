@@ -343,7 +343,7 @@ shared uint blist[LCHUNK];
 // Positions past the chunk's own count stage as **zero**: their mask bits are
 // zero so nothing reads the score they produce, and a zero is cheaper to be
 // sure about than a bounds test inside the fragment.
-void stagePlane(uint tid, uint buf, uint planeBase, uint grp0, uint cnt) {
+void stagePlane(uint tid, uint buf, bool isV, uint planeBase, uint grp0, uint cnt) {
     for (uint i = tid; i < GRP * BN * 2u; i += WAVE * HPW) {
         uint g = i / (BN * 2u), rem = i % (BN * 2u);
         uint c = rem >> 1u, half8 = (rem & 1u) * 8u;
@@ -357,8 +357,15 @@ void stagePlane(uint tid, uint buf, uint planeBase, uint grp0, uint cnt) {
         uint cell = glist[c];
         uint src = planeBase + ((cell / TILE) * HDT + grp0 + g) * (TILE * TILE)
             + (cell % TILE) * TILE + half8;
-        [[unroll]] for (uint d = 0u; d < 8u; ++d) {
-            kvs[buf][dst + d] = hact[src + d];
+        // The key or the value cache (P18): two bindings now, not the arena.
+        if (isV) {
+            [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+                kvs[buf][dst + d] = vcache[src + d];
+            }
+        } else {
+            [[unroll]] for (uint d = 0u; d < 8u; ++d) {
+                kvs[buf][dst + d] = kcache[src + d];
+            }
         }
     }
 }
@@ -698,7 +705,7 @@ void main() {
 #ifdef GATHER
         // The first batch of groups, so the loop below can always be staging the
         // *next* one while the matrix cores work on this one.
-        stagePlane(tid, 0u, kBase, 0u, cnt);
+        stagePlane(tid, 0u, false, kBase, 0u, cnt);
 #endif
         [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
             FRAG_B fragK[KTIL];
@@ -709,7 +716,7 @@ void main() {
             if (kt % GRP == 0u) {
                 GSTAGE_BARRIER();
                 if (kt + GRP < HDT) {
-                    stagePlane(tid, ((kt / GRP) + 1u) & 1u, kBase, kt + GRP, cnt);
+                    stagePlane(tid, ((kt / GRP) + 1u) & 1u, false, kBase, kt + GRP, cnt);
                 }
             }
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
@@ -719,7 +726,7 @@ void main() {
             }
 #else
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                coopMatLoad(fragK[kk], hact, kBase + ((base / TILE + kk) * HDT + kt) * (TILE * TILE),
+                coopMatLoad(fragK[kk], kcache, kBase + ((base / TILE + kk) * HDT + kt) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutColumnMajor);
             }
 #endif
@@ -911,7 +918,7 @@ void main() {
             }
         }
 #ifdef GATHER
-        stagePlane(tid, 0u, vBase, 0u, cnt);
+        stagePlane(tid, 0u, true, vBase, 0u, cnt);
 #endif
         [[unroll]] for (uint j = 0u; j < HDT; ++j) {
             FRAG_B fragV[KTIL];
@@ -919,7 +926,7 @@ void main() {
             if (j % GRP == 0u) {
                 GSTAGE_BARRIER();
                 if (j + GRP < HDT) {
-                    stagePlane(tid, ((j / GRP) + 1u) & 1u, vBase, j + GRP, cnt);
+                    stagePlane(tid, ((j / GRP) + 1u) & 1u, true, vBase, j + GRP, cnt);
                 }
             }
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
@@ -933,7 +940,7 @@ void main() {
                 // element (k=cell, n=dim) at `k*TILE + n`. It was ColumnMajor
                 // over a transposed tile and is the same matrix either way —
                 // see the note in llm_attn_pack.comp for why the layout moved.
-                coopMatLoad(fragV[kk], hact, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
+                coopMatLoad(fragV[kk], vcache, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutRowMajor);
             }
 #endif

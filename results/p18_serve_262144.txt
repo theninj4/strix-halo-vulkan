@@ -1,0 +1,8 @@
+21:38:59 llm: dense bank deltanet=q4_k/32,hyper_conn=q5_k/32,lm_head=q5_k/32,full_attn=q5_k/32,qsa_indexer=q5_k/32+imatrix
+21:38:59 llm: moe bank gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1,down_exps=iq4_nl (imatrix)
+21:38:59 llm: bank cache models/Qwen3.8-Flash-Next-GGUF/bank-cache (first start writes it; delete it to re-fit)
+21:40:04 llm: models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf, every layer, 262144 cells of context, 8192-token batches, in 1m5.708s
+21:40:04 listening on http://127.0.0.1:11999
+21:40:16 [r1] llm qwen3.8-flash-next: prompt 64 tokens in 363ms (176.1 tok/s), ttft 365ms, generated 16 tokens in 455ms (35.16 tok/s), 819ms total, length
+21:40:21 [r2] llm qwen3.8-flash-next: prompt 64 tokens in 323ms (198.4 tok/s), ttft 325ms, generated 37 tokens in 1.109s (33.37 tok/s), 1.432s total, stop
+21:44:29 [r3] llm qwen3.8-flash-next: prompt 237286 tokens in 3m52.103s (1022.3 tok/s), ttft 3m52.312s (208ms queued), generated 41 tokens in 1.373s (29.86 tok/s), 3m53.684s total, stop

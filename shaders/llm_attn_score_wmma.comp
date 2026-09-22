@@ -130,7 +130,7 @@ void main() {
         }
         [[unroll]] for (uint kt = 0u; kt < KT; ++kt) {
             FRAG_B fragK;
-            coopMatLoad(fragK, hact, pc.idxKOff + bt * TILE * IDX_DIM + kt * TILE,
+            coopMatLoad(fragK, icache, pc.idxKOff + bt * TILE * IDX_DIM + kt * TILE,
                 IDX_DIM, gl_CooperativeMatrixLayoutColumnMajor);
             [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
                 acc[h] = coopMatMulAdd(fragQ[h][kt], fragK, acc[h]);
@@ -178,7 +178,7 @@ void main() {
         [[unroll]] for (uint h = 0u; h < IDX_HEADS; ++h) {
             float d = 0.0;
             for (uint j = 0u; j < IDX_DIM; ++j) {
-                d += float(hact[qb + h * IDX_DIM + j]) * float(hact[kb + j]);
+                d += float(hact[qb + h * IDX_DIM + j]) * float(icache[kb + j]);
             }
             s += max(d, 0.0);
         }

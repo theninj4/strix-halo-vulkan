@@ -1,7 +1,8 @@
 # P17 — heads on the fragment's rows: 128k prefills past 1000 tok/s
 
-**2026-09-22.** Two changes: P17-1, the kernel below, and P17-2, a prefetch
-worth another 3% at depth. A 128 000-cell prefill at ubatch 2048 goes
+**2026-09-22.** Three changes: P17-1, the kernel below; P17-2, a prefetch
+worth another 3% of prefill at depth; and P17-3, the decode select, +0.7% of
+decode at 128k. A 128 000-cell prefill at ubatch 2048 goes
 **833.5 → 1011.4 tok/s (1.21x)**, 64 000 cells **896.4 → 1048.6 (1.17x)**, and
 the prefill falloff from depth zero goes from **0.72x to 0.88x**. Decode at depth gains
 **~2%** because the mask pass is gone (31.62 → 32.21 tok/s at 128k), and a
@@ -160,14 +161,66 @@ does not survive staging**: reading all 28.8 GB into the cache (6.1 s) and
 then staging the model left 43 GB of cache where there had been 68. Staging
 streams ~71 GB of weights through it.
 
-**Open: decode's host gather.** It is **~0.9-1.3 ms of a 29-31 ms decode
-token at every depth**, 16 dependent major faults a step that nothing can
-prefetch, because the rows are functions of the token just sampled. In
-isolation a cold step is 216 µs and a warm one 12 µs, so it is not all
-faults, but most of it is. The fix is residency: the table held in the page
-cache after staging, which is 29 GB on a machine holding ~84 GB of model. That
-is a deployment decision , not a kernel one, and it
-is worth ~3-4% of decode.
+**Open: decode's host gather, and it is a tail.** Traced per step at 64 000
+cells (an env-gated trace in a scratch build, not committed): the median step
+is **236 µs** with 7-16 major faults, but **two of 32 steps take ~8.7 ms**, and
+those two are **75%** of the line. They fall at the *same* token positions in two
+separate runs (the 10th and 27th of the timed decode). Their fault counts
+(14, 16) are the same as the fast steps', and no GC cycle falls anywhere in the
+decode run (`GODEBUG=gctrace=1`). So it is one fault taking milliseconds, not
+more faults. An isolated replay of random tokens has no tail (0 of 200 steps
+over 2 ms). Replaying the bench's exact tokens reads warm, because the bench
+has just faulted them, so it cannot reproduce the cold case. Pinning it down
+needs a trace inside the kernel's fault path, which this account cannot take.
+It is worth ~0.5 ms a token (~1.8% of decode). Residency of the 29 GB table would
+remove it along with the median, and that is a deployment decision.
+
+## P17-3: the decode select, keys in registers and a 10-bit digit
+
+`attn.select` at decode is one 1024-lane workgroup a token. At 128 000 cells
+it was **54.0 µs a layer**, priced by compiling scratch copies with the
+pass loop cut (a timing, not an answer): ~13 µs of emit and setup, **~17 µs
+for the first radix pass and ~8 µs for each of the other three**. Two causes,
+two changes, and both leave the bitmask exact:
+
+- **Past `SEL_LDS` (4096 blocks) every pass re-read every score from global
+  memory.** Now each lane holds its blocks' keys in registers, `KREG = 40` a
+  lane, 40 960 blocks, past the cache's buffer-range cap. The row is read once.
+- **The first digit was the exponent.** An `f2ui` key's top 8 bits are sign
+  plus seven exponent bits, and a row of block scores shares one or two of
+  them, so pass 1's atomics collided. The 1024-lane build now takes a 10-bit
+  digit (10+10+10+2), which adds three mantissa bits to the first. The P10
+  bucket search is one lane a bucket, and still fits.
+
+4-layer probe, 128 000 cells, one layer, µs, two runs each:
+
+	            decode        prefill (2048 rows)
+	8-bit      53.9  54.0     2935  2944
+	10-bit     48.7  47.8     2923  2921
+	regs       54.7  49.4     3212  3077
+	regs+10    43.6  43.9     3701  2774
+
+Neither half pays alone and together they are 1.23x. Prefill is noisy with
+the registers and does not need them (2048 workgroups have occupancy to hide
+the loads), so **decode takes regs+10 and prefill takes 10-bit**
+(`AttnGPU.selectPipe`).
+
+48 layers, shipped banks, two interleaved runs each
+(`results/p17_select_{base,def}_r{1,2}.csv`):
+
+	            128k select (ms a token)   128k decode tok/s
+	base         0.687  0.687               32.90  32.96
+	P17-3        0.544  0.544               33.19  33.12      1.007x
+
+Depth 0 is +0.004 ms a token of select (the 10-bit digit where the LDS
+cache already holds the row), 0.01%, and prefill is flat.
+
+**Exactness** is the existing gate, `TestAttnGPUSelectBlocksIsTheCellSelect`,
+the block select's bitmask against the cell select's, bit for bit. Its 4k
+fixture is 1024 blocks and would never leave the LDS cache, so a test-only
+build with `SEL_LDS=64` (`LLM_ATTN_SELECT_VARIANT=kreg_r10_lds64`) sends it down
+the register path. A copy of that build with every register key zeroed
+**fails** the gate, so the gate sees the path.
 
 ## Control arms
 
@@ -175,3 +228,5 @@ is worth ~3-4% of decode.
 	LLM_ATTN_GATHER_HROWS=1        # forced, at every depth (bypasses the rule)
 	LLM_ATTN_GATHER_HROWS_MIN=<n>  # the prefill past bound, default selWidth
 	LLM_PLE_PREFETCH=0             # P17-2's control
+	LLM_ATTN_SELECT_VARIANT=base   # P17-3's control (P14-1's 8-bit select)
+	LLM_ATTN_SELECT_VARIANT=r10|kreg|kreg_r10|kreg_r10_lds64

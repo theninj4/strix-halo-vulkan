@@ -2620,6 +2620,10 @@ var LLMSeqHist []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -o llm_attn_select_w1024.spv llm_attn_select.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_attn_selblk.spv llm_attn_selblk.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -o llm_attn_selblk_w1024.spv llm_attn_selblk.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -DRADIX_BITS=10 -o llm_attn_selblk_w1024_r10.spv llm_attn_selblk.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -DKREG=40 -o llm_attn_selblk_w1024_kreg.spv llm_attn_selblk.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -DKREG=40 -DRADIX_BITS=10 -o llm_attn_selblk_w1024_kreg_r10.spv llm_attn_selblk.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWG=1024 -DKREG=40 -DRADIX_BITS=10 -DSEL_LDS=64 -o llm_attn_selblk_w1024_kreg_r10_lds64.spv llm_attn_selblk.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=2 -o llm_attn_qt1_kt2.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -o llm_attn_qt1_kt4.spv llm_attn_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o llm_attn_qt2_kt4.spv llm_attn_wmma.comp
@@ -2735,6 +2739,18 @@ var LLMAttnSelBlk []byte
 //
 //go:embed llm_attn_selblk_w1024.spv
 var LLMAttnSelBlkW1024 []byte
+
+//go:embed llm_attn_selblk_w1024_r10.spv
+var LLMAttnSelBlkW1024R10 []byte
+
+//go:embed llm_attn_selblk_w1024_kreg.spv
+var LLMAttnSelBlkW1024KReg []byte
+
+//go:embed llm_attn_selblk_w1024_kreg_r10.spv
+var LLMAttnSelBlkW1024KRegR10 []byte
+
+//go:embed llm_attn_selblk_w1024_kreg_r10_lds64.spv
+var LLMAttnSelBlkW1024KRegR10LDS64 []byte
 
 //go:embed llm_attn_qt1_kt2.spv
 var LLMAttnQT1KT2 []byte

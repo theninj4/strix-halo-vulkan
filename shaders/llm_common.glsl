@@ -30,6 +30,20 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 // one command buffer; only llm_attn_select.comp writes it and only
 // llm_attn_wmma.comp reads it.
 layout(binding = 4) buffer ActU { uint actu[]; };
+
+// **The attention block's cache, in buffers of its own** (P18). The key and
+// value planes and the indexer's raw and pooled keys used to live in the fp16
+// arena above, and `maxStorageBufferRange` (4 GiB - 4) capped that arena —
+// and so the context — at about 148k cells. The model is trained to 262 144.
+// Each plane now has a binding of its own: at 262 144 cells over twelve layers
+// the key and the value are 3.22 GB apiece and the indexer 0.81 GB, each under
+// the range, and the layout reaches ~349k cells before K or V hits it.
+// kOff/vOff are offsets into kcache/vcache, and ATTN_IDXRAW/idxKOff into
+// icache. Only the five kernels that touch the cache use these bindings; the
+// host binds them for every attention pipeline and pads 5-7 with the bank.
+layout(binding = 8) buffer KCache { float16_t kcache[]; };
+layout(binding = 9) buffer VCache { float16_t vcache[]; };
+layout(binding = 10) buffer ICache { float16_t icache[]; };
 // The quantised expert bank, read as raw words. **Only the MoE block
 // declares it** (`-DMOE_QBANK`), because every other kernel in this vertical
 // is built over five buffers and a shader that names a binding its descriptor

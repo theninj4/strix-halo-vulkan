@@ -63,8 +63,28 @@
 #ifndef WG
 #define WG 256
 #endif
+// Bits a radix digit. 8 is the P10 kernel; the 1024-lane build takes 10
+// (P17-3), because the top eight bits of an f2ui key are the sign and seven
+// exponent bits and a row of block scores shares one or two of them, so the
+// first pass's atomics all land on a couple of buckets. Ten bits adds three
+// of mantissa to the first digit. A digit may be narrower at the bottom —
+// 32 is not a multiple of 10 — and the threshold is the same either way: a
+// radix select finds the exact k-th key whatever the digit schedule.
+#ifndef RADIX_BITS
 #define RADIX_BITS 8
+#endif
 #define RADIX_SIZE (1 << RADIX_BITS)
+
+// Block keys held in **registers**, KREG a lane (P17-3). Past SEL_LDS blocks
+// the row does not fit LDS and every pass re-read every score from global
+// memory; at decode this is one workgroup, so each of those reads was a
+// latency the kernel sat through four times. KREG * WG blocks fit here —
+// 40 x 1024 = 40 960, 163 840 cells, past the buffer-range cap on the cache —
+// so the row is read once and the passes are register work. Lane `tid` holds
+// blocks `tid + k*WG`, the order the global loop visited them in. 0 is off.
+#ifndef KREG
+#define KREG 0
+#endif
 
 // Block keys held in LDS. It is the same 16 KB the cell select cached cells in
 // and it now reaches `ratio` times as deep — 4096 blocks is 16 384 cells — so
@@ -186,6 +206,16 @@ void main() {
         barrier();
         gCached = true;
     }
+#if KREG > 0
+    uint kreg[KREG];
+    bool inReg = !gCached && bLim <= uint(KREG * WG);
+    if (inReg) {
+        [[unroll]] for (uint k = 0u; k < KREG; ++k) {
+            uint b = tid + k * WG;
+            kreg[k] = (b < bLim) ? blockKey(b) : 0u;
+        }
+    }
+#endif
 
     // The cells past this token's position: one weighted entry, key -inf.
     uint nDead = (gNcols > gPos + 1u) ? gNcols - (gPos + 1u) : 0u;
@@ -193,14 +223,30 @@ void main() {
     // ---- The radix select, four passes over the *blocks*.
     uint prefix = 0u;
     uint desired = min(pc.selWidth, gNcols);
-    [[unroll]] for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
+    [[unroll]] for (int dhi = 32; dhi > 0; dhi -= RADIX_BITS) {
+        int shift = max(dhi - RADIX_BITS, 0);
+        uint dmask = (1u << uint(dhi - shift)) - 1u;
         for (uint i = tid; i < RADIX_SIZE; i += WG) {
             histo[i] = 0u;
         }
         barrier();
 
-        uint hiMask = (shift + RADIX_BITS >= 32) ? 0u : (0xFFFFFFFFu << uint(shift + RADIX_BITS));
+        uint hiMask = (dhi >= 32) ? 0u : (0xFFFFFFFFu << uint(dhi));
         uint prefixHi = prefix & hiMask;
+#if KREG > 0
+        if (inReg) {
+            [[unroll]] for (uint k = 0u; k < KREG; ++k) {
+                uint b = tid + k * WG;
+                if (b < bLim) {
+                    uint w = blockWeight(b);
+                    uint key = kreg[k];
+                    if (w != 0u && (key & hiMask) == prefixHi) {
+                        atomicAdd(histo[(key >> uint(shift)) & dmask], w);
+                    }
+                }
+            }
+        } else
+#endif
         for (uint b = tid; b < bLim; b += WG) {
             uint w = blockWeight(b);
             if (w == 0u) {
@@ -208,11 +254,11 @@ void main() {
             }
             uint key = blockKey(b);
             if ((key & hiMask) == prefixHi) {
-                atomicAdd(histo[(key >> uint(shift)) & (RADIX_SIZE - 1u)], w);
+                atomicAdd(histo[(key >> uint(shift)) & dmask], w);
             }
         }
         if (tid == 0u && nDead != 0u && (NEGINF_KEY & hiMask) == prefixHi) {
-            atomicAdd(histo[(NEGINF_KEY >> uint(shift)) & (RADIX_SIZE - 1u)], nDead);
+            atomicAdd(histo[(NEGINF_KEY >> uint(shift)) & dmask], nDead);
         }
         barrier();
 

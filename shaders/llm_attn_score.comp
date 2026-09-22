@@ -117,7 +117,7 @@ void main() {
         [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
             float d = 0.0;
             for (uint j = 0u; j < IDX_DIM; j++) {
-                d += float(qs[h * IDX_DIM + j]) * float(hact[kb + j]);
+                d += float(qs[h * IDX_DIM + j]) * float(icache[kb + j]);
             }
             s += max(d, 0.0);
         }
@@ -130,7 +130,7 @@ void main() {
             [[unroll]] for (uint h = 0u; h < IDX_HEADS; h++) {
                 float d = 0.0;
                 for (uint j = 0u; j < IDX_DIM; j++) {
-                    d += float(qs[h * IDX_DIM + j]) * float(hact[kb + j]);
+                    d += float(qs[h * IDX_DIM + j]) * float(icache[kb + j]);
                 }
                 s += max(d, 0.0);
             }

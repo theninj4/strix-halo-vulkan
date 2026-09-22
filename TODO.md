@@ -48,7 +48,14 @@ resident), the other four verticals on the other (image ~32 GB, the rest
 ~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
 purpose — so no footprint quantisation is planned for the small verticals.
 
-**Where the work goes next.** **P17 (2026-09-22): heads on the fragment's
+**Where the work goes next.** **P18 (2026-09-22): the full trained context.**
+The server now holds all **262 144** cells the model was trained for (it capped
+at ~148k: the KV cache shared a 4 GiB descriptor range with the arena). The
+cache has a buffer a plane. Perplexity is 4.0344 over positions 131k-262k, and
+a 237k-token prompt through HTTP recalls its first line at 1022 tok/s prefill
+and 29.9 tok/s decode. `ai.service`'s LLM line is `-llm-ctx 262144 -llm-batch 8192`
+([`research/p18-full-context.md`](research/p18-full-context.md)).
+**P17 (2026-09-22): heads on the fragment's
 rows.** A 128 000-cell prefill at ubatch 2048 goes **833.5 → 1011.4 tok/s**
 (64 000: 896.4 → 1048.6), and decode at depth gains ~2%, exactly
 ([`research/p17-heads-on-rows.md`](research/p17-heads-on-rows.md)). The QSA
@@ -61,8 +68,11 @@ the current one runs (+3% at depth). At the served ubatch 4096, 128k goes
 prefill token at 128k; what is left of the falloff is the flat floor. **Open
 for decode:** the host n-gram gather is ~1 ms of every token (16 dependent
 major faults; residency of the 29 GB table is a deployment decision), and
-`attn.select` at 128k is 54 µs a layer, of which the first radix pass is 17
-(its top 8 bits are the exponent, so its atomics collide) and each other pass 8.
+its median step is 236 µs and two steps in 32 take ~8.7 ms at fixed token
+positions with ordinary fault counts, which is 75% of the line and needs a
+kernel-side trace to explain. **P17-3** takes decode's `attn.select` at 128k
+from 54.0 to 43.8 µs a layer (keys in registers, 10-bit digit, exact): decode
+at 128k 32.93 → 33.16 tok/s.
 **Long-context prompt processing is closed at
 the target.** **P14 (2026-09-22)** takes a 128 000-cell prefill from P13's
 **563.6** to **826.0 tok/s at ubatch 2048** and

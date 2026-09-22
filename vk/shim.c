@@ -477,7 +477,7 @@ void shim_destroy_shader_module(VkDevice device, VkShaderModule module) {
     vkDestroyShaderModule(device, module, NULL);
 }
 
-#define SHIM_MAX_BINDINGS 8
+#define SHIM_MAX_BINDINGS 16
 // A binding may hold an *array* of storage buffers, so the flat buffer list is
 // far longer than the binding list: LLM.md L6a binds the MoE bank one buffer a
 // layer, because `maxStorageBufferRange` is 4 GiB - 4 and the bank is 77.

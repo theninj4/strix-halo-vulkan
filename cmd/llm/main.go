@@ -101,7 +101,7 @@ func main() {
 	depths := flag.String("depths", "0,8000,16000,32000,64000,128000", "for -depth: the cache depths to measure at")
 	ppBatch := flag.Int("pp", 512, "for -depth: tokens in the timed prompt batch, which is also the fill batch")
 	tgTokens := flag.Int("tg", 64, "for -depth: tokens the timed decode run generates")
-	ubatch := flag.Int("ubatch", 0, "for -depth: the rows the arenas are sized for, when it is not -pp — separates the arena's width from the prefill's")
+	ubatch := flag.Int("ubatch", 0, "for -depth: the rows the arenas are sized for, when it is not -pp — separates the arena's width from the prefill's; for -ppl: the prefill batch when it is narrower than -ctx (a window wider than any arena)")
 	flag.Parse()
 
 	if *chatTemplate {
@@ -176,7 +176,7 @@ func main() {
 		}
 		if err := perplexity(pplOpts{
 			model: *model, file: *pplFile, ctx: *ctx, chunks: *chunks,
-			headRows: *headRows, layers: layers, csv: *csvPath,
+			headRows: *headRows, layers: layers, csv: *csvPath, ubatch: *ubatch,
 		}); err != nil {
 			log.Fatal(err)
 		}

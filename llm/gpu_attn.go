@@ -407,6 +407,10 @@ type AttnGPU struct {
 	cfg AttnConfig
 
 	wbuf, abuf, hbuf, wbank *vk.Buffer
+	// The cache, a buffer a plane (P18): key, value, and the indexer's raw
+	// and pooled keys together. Bindings 8, 9 and 10 of every attention
+	// pipeline — see llm_common.glsl.
+	kbuf, vbuf, ibuf *vk.Buffer
 	pipes                   map[string]*vk.ComputePipeline
 	mods                    []*vk.ShaderModule
 
@@ -644,7 +648,7 @@ func (g *AttnGPU) SnapshotBlocks(past, rows int) ([]uint16, error) {
 	out := make([]uint16, 0, len(g.layers)*n)
 	for l := range g.layers {
 		off := int(g.hIdxK) + l*g.idxKStride + lo*g.cfg.IdxDim
-		out = append(out, g.hbuf.ReadUint16At(off, n)...)
+		out = append(out, g.ibuf.ReadUint16At(off, n)...)
 	}
 	return out, nil
 }
@@ -667,7 +671,7 @@ func (g *AttnGPU) RestoreBlocks(past, rows int, snap []uint16) error {
 	}
 	for l := range g.layers {
 		off := int(g.hIdxK) + l*g.idxKStride + lo*g.cfg.IdxDim
-		g.hbuf.WriteUint16At(off, snap[l*n:(l+1)*n])
+		g.ibuf.WriteUint16At(off, snap[l*n:(l+1)*n])
 	}
 	return nil
 }
@@ -882,36 +886,58 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	//
 	// It is 2.31 KB a cell a layer — 1 KB of key, 1 KB of value, 256 B of the
 	// indexer's raw key and 64 B of its pooled block — so twelve layers are
-	// 27.7 KB a cell: 57 MB at 2048 cells, 906 MB at 32768. The one structural
-	// limit is that it shares a buffer with the arenas above and
-	// `maxStorageBufferRange` is 4 GiB - 4, which caps this at about 148k
-	// cells; past that the cache wants L6a's array-of-buffers, one a layer.
+	// 27.7 KB a cell: 57 MB at 2048 cells, 906 MB at 32768, 7.26 GB at the
+	// model's trained 262 144.
+	//
+	// **It is three buffers and not a region of the fp16 arena** (P18). It
+	// used to share that arena, and `maxStorageBufferRange` is 4 GiB - 4, so
+	// the context was capped at about 148k cells. Now the key, the value and
+	// the indexer each have a buffer: 12 KB, 12 KB and 3.8 KB a cell over
+	// twelve layers, so the key and value reach the range at ~349k cells and
+	// the trained context is 3.22 GB apiece.
 	g.kvStride = c.NHeadKV * g.nKV * c.HeadDim
 	g.idxRawStride = g.nKV * c.IdxDim
 	g.idxKStride = g.NBlocks() * c.IdxDim
-	g.hK = halloc(nLayers * g.kvStride)
-	g.hV = halloc(nLayers * g.kvStride)
-	g.hIdxRaw = halloc(nLayers * g.idxRawStride)
-	g.hIdxK = halloc(nLayers * g.idxKStride)
-	// **The cap, asserted rather than commented** (P14). At 27.7 KB a cell over
-	// twelve layers the paragraph above runs out of descriptor range at about
-	// 148k cells, and the driver clamps the range instead of refusing it — so a
-	// cache past the cap reads as zeros and the model produces plausible, wrong
-	// numbers *faster* than the real thing, which is the one failure a
-	// benchmark cannot see. It cost this vertical a day's sweep once.
-	if err := checkBufferRange("attention fp16 arena", g.hElems*2,
-		fmt.Sprintf("this cache is %d cells over %d layers at %.2f KB a cell a layer, "+
-			"so the cap is about %d cells — past that the KV planes want one buffer a layer (L6a)",
-			g.nKV, nLayers, float64(g.kvStride+g.idxRawStride+g.idxKStride)*2/float64(g.nKV)/1024,
-			maxBufferRange/(2*(g.hElems/maxInt(g.nKV, 1))))); err != nil {
-		return err
+	g.hK, g.hV, g.hIdxRaw = 0, 0, 0
+	g.hIdxK = uint32((nLayers*g.idxRawStride + 63) &^ 63)
+	kvBytes := nLayers * g.kvStride * 2
+	idxBytes := (int(g.hIdxK) + nLayers*g.idxKStride) * 2
+	// **The cap, asserted rather than commented** (P14). The driver clamps a
+	// descriptor's range instead of refusing it, so a cache past the cap reads
+	// as zeros and the model produces plausible, wrong numbers *faster* than
+	// the real thing, which is the one failure a benchmark cannot see.
+	perCell := float64(c.NHeadKV*c.HeadDim*nLayers) * 2
+	hint := fmt.Sprintf("this cache is %d cells over %d layers; one plane is %.1f KB a cell, "+
+		"so the cap is about %d cells", g.nKV, nLayers, perCell/1024, int(float64(maxBufferRange)/perCell))
+	for _, b := range []struct {
+		what  string
+		bytes int
+	}{{"attention fp16 arena", g.hElems * 2}, {"attention key cache", kvBytes},
+		{"attention value cache", kvBytes}, {"attention indexer cache", idxBytes}} {
+		if err := checkBufferRange(b.what, b.bytes, hint); err != nil {
+			return err
+		}
 	}
 	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
+	if g.kbuf, err = newArena(g.dev, kvBytes); err != nil {
+		return fmt.Errorf("llm: attention key cache (%d MB): %w", kvBytes>>20, err)
+	}
+	if g.vbuf, err = newArena(g.dev, kvBytes); err != nil {
+		return fmt.Errorf("llm: attention value cache (%d MB): %w", kvBytes>>20, err)
+	}
+	if g.ibuf, err = newArena(g.dev, idxBytes); err != nil {
+		return fmt.Errorf("llm: attention indexer cache (%d MB): %w", idxBytes>>20, err)
+	}
 	// Zeroed once: every A operand's pad columns and every short run's pad
-	// rows come from here, and none of these kernels bounds-check.
+	// rows come from here, and none of these kernels bounds-check. The cache
+	// is zeroed for the reason the arena always was: a key that does not
+	// exist yet has to score something finite.
 	g.hbuf.Zero()
+	g.kbuf.Zero()
+	g.vbuf.Zero()
+	g.ibuf.Zero()
 	g.abuf.Zero()
 
 	// A layer's two matrices, one after the other. An offset into a
@@ -955,7 +981,11 @@ func (g *AttnGPU) alloc(nLayers int) error {
 }
 
 func (g *AttnGPU) build() error {
-	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf}
+	// Bindings 0-4 as they were; 5 is the bank (what the quantised GEMMs and
+	// the decode GEMV read there), 6 and 7 are padding — no attention kernel
+	// uses them — and 8-10 are the cache (P18).
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf,
+		g.wbank, g.wbank, g.wbank, g.kbuf, g.vbuf, g.ibuf}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"pack":  shaders.LLMAttnPack,
@@ -990,6 +1020,14 @@ func (g *AttnGPU) build() error {
 		// the control arm has to be reachable from an env var.
 		selBlk:    shaders.LLMAttnSelBlk,
 		selBlkW1k: shaders.LLMAttnSelBlkW1024,
+		// P17-3's builds of the wide block select: keys held in registers
+		// past the LDS cache, and a 10-bit digit. The _lds64 one is the test
+		// build — a 64-block LDS cache sends a small fixture down the
+		// register path.
+		selBlkW1k + ".r10":            shaders.LLMAttnSelBlkW1024R10,
+		selBlkW1k + ".kreg":           shaders.LLMAttnSelBlkW1024KReg,
+		selBlkW1k + ".kreg_r10":       shaders.LLMAttnSelBlkW1024KRegR10,
+		selBlkW1k + ".kreg_r10_lds64": shaders.LLMAttnSelBlkW1024KRegR10LDS64,
 	} {
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{
 			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
@@ -1060,7 +1098,7 @@ func (g *AttnGPU) build() error {
 	// attention kernel are unchanged.
 	gemmBufs := bufs
 	if g.quant() {
-		gemmBufs = append(append([]*vk.Buffer{}, bufs...), g.wbank)
+		gemmBufs = bufs // binding 5 is already the bank
 		for _, v := range gemmBuildsFor(g.bank) {
 			if err := g.pipeline(bankPipe(g.bank, v.name), v.spirv, vk.PipelineSpec{
 				Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
@@ -1375,7 +1413,9 @@ func (g *AttnGPU) WeightBytes() int { return g.wbuf.Size() + g.wbank.Size() }
 
 // Buffers is how many device allocations the layer holds (L6a).
 func (g *AttnGPU) Buffers() int         { return 4 }
-func (g *AttnGPU) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
+func (g *AttnGPU) ActivationBytes() int {
+	return g.abuf.Size() + g.hbuf.Size() + g.kbuf.Size() + g.vbuf.Size() + g.ibuf.Size()
+}
 
 // Upload writes the layer's input: the hyper-connection block's output
 // `hc_mixed`, [T][nEmbd], narrowed into the fused projection's A layout.
@@ -1948,6 +1988,30 @@ func (g *AttnGPU) selectPipe() string {
 	if narrow {
 		return selBlk
 	}
+	// P17-3: the digit is 10 bits everywhere, and the keys are held in
+	// registers at decode — where this is one workgroup a token and the row
+	// was re-read from memory four times — but not at prefill, where 2048
+	// workgroups want the occupancy more than 40 registers a lane. Both are
+	// the same threshold and the same bitmask (a radix select is exact under
+	// any digit schedule). Measured at 128 000 cells, one layer, µs:
+	//
+	//	            decode   prefill (2048 rows)
+	//	8-bit        54.0     2939
+	//	10-bit       48.3     2922
+	//	regs         52.1     3144
+	//	regs+10      43.8     2773 / 3700 (two runs)
+	//
+	// LLM_ATTN_SELECT_VARIANT names a build (base = P14-1's) and overrides.
+	v := "r10"
+	if g.rows <= attnSplitMaxRows {
+		v = "kreg_r10"
+	}
+	if e := os.Getenv("LLM_ATTN_SELECT_VARIANT"); e != "" {
+		v = e
+	}
+	if _, ok := g.pipes[selBlkW1k+"."+v]; ok {
+		return selBlkW1k + "." + v
+	}
 	return selBlkW1k
 }
 
@@ -2502,19 +2566,19 @@ func (g *AttnGPU) ExpandsCells() bool { return g.expandCells }
 // IdxK is the pooled, normed and rotated indexer key of the layer the last
 // run was for, [nBlocks][idxDim], widened out of the fp16 arena.
 func (g *AttnGPU) IdxK() []float32 {
-	return g.readF16(g.hIdxK+uint32(g.layer*g.idxKStride), g.NBlocks()*g.cfg.IdxDim)
+	return g.readF16(g.ibuf, g.hIdxK+uint32(g.layer*g.idxKStride), g.NBlocks()*g.cfg.IdxDim)
 }
 
 // IdxRaw is the indexer's raw key cache, [nKV][idxDim] — the halves the
 // pooling above averages, which is where the reference's fp16 round trip
 // happens.
 func (g *AttnGPU) IdxRaw() []float32 {
-	return g.readF16(g.hIdxRaw+uint32(g.layer*g.idxRawStride), g.nKV*g.cfg.IdxDim)
+	return g.readF16(g.ibuf, g.hIdxRaw+uint32(g.layer*g.idxRawStride), g.nKV*g.cfg.IdxDim)
 }
 
 // IdxQ is the indexer's query, [T][idxHeads][idxDim].
 func (g *AttnGPU) IdxQ() []float32 {
-	return g.readF16(g.hIdxQ, g.rows*g.cfg.IdxHeads*g.cfg.IdxDim)
+	return g.readF16(g.hbuf, g.hIdxQ, g.rows*g.cfg.IdxHeads*g.cfg.IdxDim)
 }
 
 // Context is the gated attention output, [T][nHead*headDim] — `attn_gated`,
@@ -2538,14 +2602,14 @@ func (g *AttnGPU) Context() []float32 {
 // attributed to the kernel that consumed them.
 func (g *AttnGPU) Q() []float32 {
 	av, _ := attnVariantFor(g.attn)
-	return g.unpack(g.hQ, g.cfg.NHead, roundUpInt(g.rows, maxInt(av.rows, av.keys)), 0, false)
+	return g.unpack(g.hbuf, g.hQ, g.cfg.NHead, roundUpInt(g.rows, maxInt(av.rows, av.keys)), 0, false)
 }
 
 // K and V are the *cache's* rows for this run's tokens: cells past..past+T of
 // the layer the last run was for, which on a fresh sequence is 0..T and is
 // what every test above L4 compares.
 func (g *AttnGPU) K() []float32 {
-	return g.unpack(g.hK+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
+	return g.unpack(g.kbuf, g.hK+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
 }
 
 // V is the same. **It is no longer transposed** (P14-2): the value plane is
@@ -2553,16 +2617,16 @@ func (g *AttnGPU) K() []float32 {
 // ColumnMajor one, so a selected run of `ratio` cells is one line and a gather
 // can read it.
 func (g *AttnGPU) V() []float32 {
-	return g.unpack(g.hV+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
+	return g.unpack(g.vbuf, g.hV+uint32(g.layer*g.kvStride), g.cfg.NHeadKV, g.nKV, g.past, false)
 }
 
 // unpack reads g.rows rows out of a packed plane of `plane` rows, starting at
 // row `first`, and un-tiles them into the CPU reference's [T][heads][headDim].
-func (g *AttnGPU) unpack(off uint32, heads, plane, first int, transposed bool) []float32 {
+func (g *AttnGPU) unpack(buf *vk.Buffer, off uint32, heads, plane, first int, transposed bool) []float32 {
 	const tile = coopMatTile
 	c := g.cfg
 	hdt := c.HeadDim / tile
-	raw := g.hbuf.ReadUint16At(int(off), heads*plane*c.HeadDim)
+	raw := buf.ReadUint16At(int(off), heads*plane*c.HeadDim)
 	out := make([]float32, g.rows*heads*c.HeadDim)
 	for h := 0; h < heads; h++ {
 		for t := 0; t < g.rows; t++ {
@@ -2581,8 +2645,8 @@ func (g *AttnGPU) unpack(off uint32, heads, plane, first int, transposed bool) [
 	return out
 }
 
-func (g *AttnGPU) readF16(off uint32, n int) []float32 {
-	raw := g.hbuf.ReadUint16At(int(off), n)
+func (g *AttnGPU) readF16(buf *vk.Buffer, off uint32, n int) []float32 {
+	raw := buf.ReadUint16At(int(off), n)
 	out := make([]float32, n)
 	for i, h := range raw {
 		out[i] = safetensors.F16ToF32(h)
@@ -2598,7 +2662,7 @@ func (g *AttnGPU) Destroy() {
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank} {
+	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank, g.kbuf, g.vbuf, g.ibuf} {
 		if b != nil {
 			b.Destroy()
 		}

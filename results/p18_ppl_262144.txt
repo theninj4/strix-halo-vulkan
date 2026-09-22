@@ -1,0 +1,26 @@
+device: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
+models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+models/wikitext-2-raw/wiki.test.raw: 297193 tokens, 1 chunks of 262144, scoring 131071 each from position 131072
+dense bank: deltanet=q4_k/32,hyper_conn=q5_k/32,lm_head=q5_k/32,full_attn=q5_k/32,qsa_indexer=q5_k/32+imatrix — [deltanet=q4_k/32 (4.500 bits) full_attn=q5_k/32 (5.500 bits) hyper_conn=q5_k/32 (5.500 bits) lm_head=q5_k/32 (5.500 bits) qsa_indexer=q5_k/32 (5.500 bits)]
+
+moe bank: gate_shexp=q4_k,up_shexp=q4_k,down_shexp=q5_1,down_exps=iq4_nl (imatrix)
+
+window 262144 in batches of 4096, scored 2048 rows at a time
+
+block         layers  buffers      weights      arenas   staged in
+hyper-conn        97        4      0.45 GB    341.0 MB     11.296s
+ple n-gram         1        4      0.04 GB    735.5 MB       182ms
+deltanet          36        4      1.18 GB    949.3 MB     19.383s
+attention         12        4      0.49 GB   9152.5 MB      7.166s
+lm head            1        4      0.44 GB   2045.2 MB      2.937s
+moe               48       52     68.45 GB    991.4 MB     22.898s
+total             48       72     71.04 GB  14214.9 MB     1m4.02s
+dense bank: deltanet=q4_k/32,hyper_conn=q5_k/32,lm_head=q5_k/32,full_attn=q5_k/32,qsa_indexer=q5_k/32+imatrix — [deltanet=q4_k/32 (4.500 bits) full_attn=q5_k/32 (5.500 bits) hyper_conn=q5_k/32 (5.500 bits) lm_head=q5_k/32 (5.500 bits) qsa_indexer=q5_k/32 (5.500 bits)]
+
+[  1/1] ppl   4.0344  nll  1.3948  +/- 0.0236  327.4s (33.0s reduce)  (eta 0s)
+
+Final estimate: PPL = 4.0344 +/- 0.02357  over 131071 tokens in 5m27s
+llama.cpp on the same corpus, context and chunking: PPL = 4.0340 +/- 0.02283
+delta: +0.0004 (+0.01%)
+ours on the checkpoint's own widths (L8c-0):        PPL = 4.0289
+delta: +0.0055 (+0.14%)  <- the number a width is graded on

@@ -67,6 +67,10 @@ type pplOpts struct {
 	chunks      int
 	headRows    int
 	layers      int
+	// ubatch, when it is narrower than ctx, is the prefill arena's width: a
+	// window longer than any arena is walked in batches (P18), which is the
+	// only way a 262 144-token window can be scored at all.
+	ubatch int
 	csv         string
 }
 
@@ -89,9 +93,15 @@ func perplexity(o pplOpts) error {
 	if err != nil {
 		return err
 	}
-	if len(ids) < 2*o.ctx {
+	// llama.cpp's rule is two windows; an explicit -chunks N screen needs N
+	// (P18: a 262 144-token window over a 297 193-token corpus is one).
+	need := 2 * o.ctx
+	if o.chunks > 0 {
+		need = o.chunks * o.ctx
+	}
+	if len(ids) < need {
 		return fmt.Errorf("%s tokenizes to %d tokens, a %d-cell context needs %d",
-			o.file, len(ids), o.ctx, 2*o.ctx)
+			o.file, len(ids), o.ctx, need)
 	}
 	nChunk := len(ids) / o.ctx
 	if o.chunks > 0 && o.chunks < nChunk {
@@ -132,8 +142,14 @@ func perplexity(o pplOpts) error {
 	}
 
 	start := time.Now()
+	chunked := o.ubatch > 0 && o.ubatch < o.ctx
+	maxTok := o.ctx
+	if chunked {
+		maxTok = o.ubatch
+		fmt.Printf("window %d in batches of %d, scored %d rows at a time\n", o.ctx, o.ubatch, minInt(o.ubatch, o.headRows))
+	}
 	g, err := llm.NewGraph(dev, m, llm.GraphOpts{
-		MaxTokens: o.ctx, NKV: o.ctx, Layers: o.layers, HeadRows: o.headRows,
+		MaxTokens: maxTok, NKV: o.ctx, Layers: o.layers, HeadRows: o.headRows,
 	})
 	if err != nil {
 		return err
@@ -162,7 +178,13 @@ func perplexity(o pplOpts) error {
 		// The last row predicts a token in the next chunk, which llama.cpp
 		// does not score, so it is computed and dropped rather than asked
 		// for: the head's slab is a whole number of rows either way.
-		err := g.ForwardRows(chunk, first, func(t int, logits []float32) error {
+		forward := g.ForwardRows
+		if chunked {
+			forward = func(ids []int32, first int, fn func(int, []float32) error) error {
+				return forwardRowsBatched(g, ids, first, o.ubatch, o.headRows, fn)
+			}
+		}
+		err := forward(chunk, first, func(t int, logits []float32) error {
 			if t+1 >= len(chunk) {
 				return nil
 			}
@@ -214,6 +236,44 @@ func perplexity(o pplOpts) error {
 	fmt.Printf("delta: %+.4f (%+.2f%%)  <- the number a width is graded on\n",
 		ppl-oursPPL, 100*(ppl-oursPPL)/oursPPL)
 	return writePPL(o.csv, rows)
+}
+
+// forwardRowsBatched is Graph.ForwardRows for a window wider than the
+// arenas (P18): the unscored first half is prefilled in `ubatch` batches as a
+// long prompt is (with the next batch's n-gram pages prefetched), and the
+// scored half goes through ExtendRows `piece` rows at a time, which is what
+// hands back every row's logits. It is the same sequence as one pass — the
+// cache and the carried histories are what TestGraphIsAChunkSplit asserts —
+// so it scores the same tokens against the same context.
+func forwardRowsBatched(g *llm.Graph, ids []int32, first, ubatch, piece int, fn func(int, []float32) error) error {
+	if err := g.Reset(); err != nil {
+		return err
+	}
+	pos := 0
+	for pos < first {
+		n := minInt(ubatch, first-pos)
+		g.PrefetchPLE(ids[pos:pos+n], ids[pos+n:minInt(pos+n+ubatch, len(ids))])
+		if _, _, err := g.Extend(ids[pos : pos+n]); err != nil {
+			return err
+		}
+		pos += n
+	}
+	piece = minInt(piece, ubatch)
+	for pos < len(ids) {
+		n := minInt(piece, len(ids)-pos)
+		logits, _, err := g.ExtendRows(ids[pos : pos+n])
+		if err != nil {
+			return err
+		}
+		vocab := len(logits) / n
+		for i := 0; i < n; i++ {
+			if err := fn(pos+i, logits[i*vocab:(i+1)*vocab]); err != nil {
+				return err
+			}
+		}
+		pos += n
+	}
+	return nil
 }
 
 func writePPL(path string, rows [][]string) error {

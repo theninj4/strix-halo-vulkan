@@ -118,7 +118,7 @@ void main() {
             if (token >= pc.tokens) {
                 continue;
             }
-            hact[ATTN_IDXRAW + (past + token) * pc.idxDim + d] =
+            icache[ATTN_IDXRAW + (past + token) * pc.idxDim + d] =
                 float16_t(act[pc.qkvOff + token * pc.gemmN + idxKCol + d]);
         }
         return;
@@ -263,6 +263,10 @@ void main() {
             + c * (TILE * TILE)
             + ((mode == 0u) ? (cell % TILE) * TILE + rem % TILE
                             : (rem / TILE) * TILE + cell % TILE);
-        hact[dst] = float16_t(v);
+        if (p < pc.heads + pc.kvHeads) {
+            kcache[dst] = float16_t(v);
+        } else {
+            vcache[dst] = float16_t(v);
+        }
     }
 }

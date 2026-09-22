@@ -88,7 +88,7 @@ void main() {
         float sum = 0.0;
         for (uint s = 0u; s < pc.ratio; s++) {
             uint cell = (b < nBid) ? b * pc.ratio + s : 0u;
-            sum += float(hact[ATTN_IDXRAW + cell * pc.idxDim + i]);
+            sum += float(icache[ATTN_IDXRAW + cell * pc.idxDim + i]);
         }
         val[i] = sum / float(pc.ratio);
         gamma = pc.gammaIKOff;
@@ -130,5 +130,10 @@ void main() {
     }
     barrier();
 
-    hact[dst + i] = float16_t(val[i]);
+    // The pooled key is the cache's (icache); the query is this batch's.
+    if (kind == 0u) {
+        icache[dst + i] = float16_t(val[i]);
+    } else {
+        hact[dst + i] = float16_t(val[i]);
+    }
 }
