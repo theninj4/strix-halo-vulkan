@@ -152,6 +152,8 @@ func main() {
 	llmReserve := flag.Int("llm-reserve", 1, "with more than one slot, how many only interactive requests may take")
 	llmClass := flag.String("llm-class", "background", "priority of a request that names none (X-Priority header, "+
 		"or service_tier \"priority\"/\"flex\"): interactive or background")
+	llmProgress := flag.Duration("llm-progress", 10*time.Second, "how often to log each in-flight completion's "+
+		"prefill/generation progress and rates; 0 turns it off")
 
 	embedOn := flag.Bool("embed", false, "load Qwen3-Embedding-0.6B and serve /v1/embeddings")
 	embedModel := flag.String("embed-model", "models/Qwen3-Embedding-0.6B", "embedding checkpoint directory")
@@ -371,7 +373,7 @@ func main() {
 			Model: *llmModel, Device: dev, Context: *llmCtx, Batch: *llmBatch,
 			MaxTokens: *llmMax, Layers: *llmLayers,
 			Slots: *llmSlots, PreemptChunk: *llmPreempt, Reserve: *llmReserve, Class: *llmClass,
-			NoCheckpoints: !*llmCheckpoints, NoBatchDecode: !*llmBatchDecode,
+			NoCheckpoints: !*llmCheckpoints, NoBatchDecode: !*llmBatchDecode, Progress: *llmProgress,
 		})
 		if err != nil {
 			log.Fatal(err)

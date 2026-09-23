@@ -140,6 +140,8 @@ type llmJob struct {
 	// no unit queued is a moment it is sampling, and a batched step is worth
 	// waiting a little for it.
 	stepping bool
+	// progress is what the periodic progress line reads (llm_progress.go).
+	progress jobProgress
 }
 
 // llmUnit is a pending run of tokens for one job: a prefill, which the
@@ -195,7 +197,7 @@ type llmSched struct {
 	restores, batches, batchRows int
 }
 
-func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int, noBatch bool) *llmSched {
+func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int, noBatch bool, progress time.Duration) *llmSched {
 	s := &llmSched{
 		g: g, dev: dev, batch: batch, preempt: preempt, reserve: reserve, noBatch: noBatch,
 		slots: make([]llmSlot, g.Slots()), stopped: make(chan struct{}),
@@ -203,6 +205,9 @@ func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int, noBatch
 	}
 	s.wake = sync.NewCond(&s.mu)
 	go s.loop()
+	if progress > 0 {
+		go s.reportProgress(progress)
+	}
 	return s
 }
 
@@ -216,7 +221,7 @@ func (s *llmSched) acquire(ctx context.Context, class llmClass, ids []int32, mar
 	}
 	s.arrival++
 	j := &llmJob{ctx: ctx, class: class, slot: -1, arrival: s.arrival, prompt: ids, mark: mark,
-		granted: make(chan struct{})}
+		granted: make(chan struct{}), progress: jobProgress{enter: time.Now()}}
 	s.waiting = append(s.waiting, j)
 	s.grant()
 	s.mu.Unlock()
@@ -341,6 +346,9 @@ func (s *llmSched) claim(j *llmJob, slot int) {
 			j.served, first = o.served, false
 		}
 	}
+	p := &j.progress
+	p.granted, p.prefilled = time.Now(), j.reused
+	p.lastAt, p.lastPrefilled, p.lastServed = p.granted, j.reused, j.served
 	s.slots[slot].job = j
 	close(j.granted)
 }
@@ -389,8 +397,9 @@ func (s *llmSched) submit(u *llmUnit) ([]float32, time.Duration, error) {
 	start := time.Now()
 	j := u.job
 	s.mu.Lock()
-	if u.step {
+	if u.step && !j.stepping {
 		j.stepping = true
+		j.progress.decoding = time.Now()
 	}
 	u.restore, j.restore = j.restore, false
 	if s.closed {
@@ -560,6 +569,13 @@ func (s *llmSched) loop() {
 		}
 		u.busy += took
 		u.job.served += took
+		if err == nil {
+			if u.step {
+				u.job.progress.steps++
+			} else {
+				u.job.progress.prefilled += n
+			}
+		}
 		u.ids, u.fresh, u.restore = u.ids[n:], false, false
 		if err != nil || len(u.ids) == 0 {
 			u.logits, u.err = logits, err
@@ -656,6 +672,7 @@ func (s *llmSched) runSteps(batch []*llmUnit) {
 		} else {
 			sl.held = append(sl.held, u.ids[0])
 			u.logits = logits[i*vocab : (i+1)*vocab]
+			u.job.progress.steps++
 		}
 		// Each row had the whole pass's latency, and a share of its cost.
 		u.busy += took

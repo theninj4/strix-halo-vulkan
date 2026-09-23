@@ -99,6 +99,11 @@ type LLMOptions struct {
 	// NoBatchDecode runs every decode step alone rather than batching the
 	// steps of concurrent conversations into one pass (C5): the control.
 	NoBatchDecode bool
+	// Progress is how often the journal gets a line for every request in
+	// flight -- where its prefill or generation has got to and at what rate
+	// -- so a long prefill is not silence until its one line at the end.
+	// Zero turns it off.
+	Progress time.Duration
 }
 
 const (
@@ -218,7 +223,7 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		_ = m.Close()
 		return nil, fmt.Errorf("backend: staging %s: %w", opt.Model, err)
 	}
-	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve, opt.NoBatchDecode)
+	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve, opt.NoBatchDecode, opt.Progress)
 	return l, nil
 }
 
