@@ -41,7 +41,8 @@ answer, so every command re-reads the system prompt.
 
 ### The numbers this plan is priced against
 
-- **Decode: 34.2 tok/s through the server** (~29 ms a step), and the step is
+- **Decode: 34.2 tok/s through the server** (~29 ms a step; 35.6 since the
+  MoE GEMV's quad loads, below), and the step is
   *latency, not bandwidth*: single-wave workgroups that all fit at once (P8).
   That is why rows are cheap. **A two-row pass costs 1.32 steps at 48 layers**
   (P5c), and the MoE is the part that keeps growing (10 experts touched at
@@ -360,9 +361,11 @@ scheduler.
   steps. **All 13 logit rows are bit-identical** to prefix + tail run
   directly. The detour runs further than the real continuation, so stale
   pooled blocks are present at the decode frontier, and they still change
-  nothing. Controls: a restore without the DeltaNet state moves row 0 (logit
-  0 −0.8748 against −0.8638), and one without the PLE ring moves row 0 too
-  (−0.8640). `Restore` refuses a slot that has since been re-run from token
+  nothing. The stale *values* past the frontier did change something, one
+  ulp at one row in twelve, until the pack started clearing them ("Stale
+  values past the frontier", below). Controls: a restore without the
+  DeltaNet state moves row 0 (logit 0 −0.8748 against −0.8638), and one
+  without the PLE ring moves row 0 too (−0.8640). `Restore` refuses a slot that has since been re-run from token
   zero.
 - `TestLLMCheckpointIsTheSystemPrompt` (backend, 4 layers): a voice-shaped
   request restores the system prompt's checkpoint (566 of 585 tokens,
@@ -664,8 +667,27 @@ is four runs from two sweeps of the final configuration:
 | 2 | 42.5 | **39.0-40.0** | 23.5 → 25.3 | 47.1 → **50.6** | 12.6 → 10.0 | 1.12 → 0.92 |
 | 3 | 53.6 | **48.3-48.7** | 18.7 → 20.6 | 56.0 → **61.9** | 18.9 → 14.3 | 1.55 → 1.15 |
 
-**Single-stream decode gains too, about 1.6 ms a step (+6%).** That is not
-yet measured through the server or `ai.service`.
+**Single-stream decode gains too, about 1.6 ms a step (+6%).** Through the
+server it is +7%.
+
+**Through the server** (C0's harness, the served `-llm-ctx 262144
+-llm-batch 8192 -llm-slots 3`, `ai.service` stopped). A is `8a2b175`,
+before this change, and B is the tree, which also carries the stale-value
+fix. The arms ran A/B/A/B in one half hour, with two concurrent runs each:
+
+| | A (two arms) | B (two arms) |
+|---|---:|---:|
+| solo decode | 33.20-33.60 tok/s | **35.51-35.62** |
+| solo voice TTFT (from the checkpoint) | 0.187-0.192 s | 0.188-0.189 |
+| agents' decode in the mix, each | 22.8 / 21.9 - 23.1 / 22.2 | **25.1 / 24.1** |
+| agents done | 49.1 / 48.5 s | **45.9 / 45.8** |
+| aggregate | 32.58 / 32.93 | **34.89 / 34.93** |
+| voice TTFT in the mix (2 s / 9 s / 25 s / 40 s) | 1.77-1.79 / 0.98-1.05 / 0.24-0.25 / 0.21-0.24 | 1.77-1.78 / 0.96-0.99 / 0.22-0.25 / 0.20-0.22 |
+
+The gap is the same in both pairs, and the within-arm spread (0.4 tok/s solo
+in A, 0.1 in B) is a fifth of it. Voice latency does not move, because it is
+the prefill chunk the command lands behind. Prefill TTFT is 7.2 s for a
+7.3k-token agent prompt in both arms.
 
 **Measured and dropped:** unpacking each Q4_K weight once and applying it to
 every row inside the element loop, which keeps the shared expert's
@@ -674,48 +696,144 @@ one row, `shexp.up` 1.25 against 0.72): P11's rule again, a branch inside an
 unrolled loop. So a three-row shared expert gives back 0.17 ms of the first
 change's gain (0.98 → 1.15).
 
-### A gate this exposed: `TestGraphCheckpointIsThePrefill` fails
+### A gate this exposed: `TestGraphCheckpointIsThePrefill` failed
 
-**Any change to decode arithmetic makes C4's gate fail**, and the evidence
-says the defect predates this change. The restored run matches prefix +
-tail for rows 0-10 and moves at **row 11 by 3.5e-4** (logit 0 −2.00677
-against −2.00712), deterministically. What is known:
+The quad change made C4's gate fail at row 11 by 3.5e-4. The defect was
+older than the change, and it is written up in the next section.
 
-- **The quad kernel fails it, and so does HEAD's kernel with only the
-  routed rung changed** (at row 11 again, different digits). HEAD's own
-  arithmetic passes at every detour length tried (299-600 tokens, 0 or 12
-  steps). So it is not the quad, and HEAD passes by luck.
-- **It depends on the detour's length and nothing else found.** The failure
-  begins exactly at a 300-token detour, which is the continuation's own
-  length and the first detour that writes cell 2899 (pooled block 724, ratio
-  4). At 299 or fewer it passes. `LLM_NO_PRERECORD=1` does not change it.
-- **Not the pooled table's tail row.** The tail score reads the first
-  partial block's pooled row, and an abandoned continuation can leave stale
-  keys there. That is real, but writing the fill row back on `Restore` made
-  the pooled region byte-identical between the runs, and the logits still
-  moved. Reverted.
-- Both reference runs differ from each other *and* from the restored run in
-  the K/V cache at cells 2896-2911 (by ~4 in value, so masked or stale cells,
-  not live keys; the test already notes the first reference is not
-  bit-repeatable). Not followed further.
+## Stale values past the frontier (done 2026-09-23)
 
-So C4's "bit-identical" claim is unproven on this kernel. The size (3.5e-4 on
-one logit, at the 13th row) looks like a summation-order effect, not a wrong
-answer, but that is unexplained, not established. **Open.**
+**A decode pass's context depended on the sign of stale values in cells it
+cannot see.** The split block kernel (`qt1_kt2.split`, BN = 32) loads whole
+16-cell tiles of the value plane straight into a fragment. On a cell past
+the row's extent P is +0, so a stale value there is multiplied by zero. The
+product should add nothing, but it does not: **the WMMA's sum comes out one
+ulp different when one of its zero products is −0**, which is what a
+negative stale value makes. How it was found, on the 4-layer gate:
+
+- **Only the value plane.** Writing back the reference's K, raw-indexer
+  or pooled planes changed nothing. Writing back its V plane fixed it, and
+  so did writing back **one cell (2911, position + 1 at row 11)**, then one
+  kv head's one element (dim 138).
+- **The sign and not the magnitude.** That element at +0, 1.0, 1000 or
+  any positive value passes bit for bit. At −0, −6e-8, −0.17, −2048 or any
+  negative value it fails, and with the same digits every time. −Inf gives
+  NaN, which shows that the cell is read and multiplied by zero.
+- **It depends on where the slices fall.** `LLM_ATTN_SPLITS=1` and 2 and 8
+  pass. 4 fails at row 7 (cell 2907, again position + 1), and 64 fails at
+  row 11. The split partials show it: only slice 10 (the block 2880-2911)
+  differs, with its row max and sum bit-identical and its context off in
+  a few dims per head. **The two reference runs already differed there**
+  (V = 0 in the first, the real value in the second), just not by enough
+  to reach the logits.
+- So HEAD passed only because of the values that happened to be there, and
+  why the failure began at exactly a 300-token detour is now explained. That
+  detour is the first to leave its own value in cell 2911.
+
+**The fix is in `llm_attn_pack.comp`.** One workgroup per value head writes
++0 over cells `[n, roundUp(n, 64))` (64 is the widest key block, KTIL = 4)
+before any attention reads the plane. Nothing past `n` is a cell of this
+sequence yet, and the next run to reach one writes it before any row can
+see it. The gathered kernels were already immune: they stage through LDS
+and zero anything past the list. The key needs nothing, because a masked
+score is replaced rather than summed.
+
+**Gates:** `TestGraphCheckpointIsThePrefill` passes again at 16 (default),
+4 and 64 splits. **`TestGraphStaleValuesAreUnread`** (new, 5 s) decodes 48
+steps from 2600 cells twice, with every value cell past the frontier set to
+−0 before each step in one arm and +0 in the other. The arms must agree bit
+for bit. With the old pack both tests fail: the new one at step 11 (−1.764984
+against −1.764973).
+
+**It re-scoped L7a's chunk gate.** `TestAttnGPUCacheIsAChunkSplit` said a
+token's output is bit-identical whether it arrived alone or inside a bigger
+chunk. That held only because each subtest reran the same prompt over the
+last one's cells, so the stale values were the real ones. With the V plane
+cleared first, HEAD's own shader failed at 7 at a time (34 726 values) and
+one at a time (4891). The gate is now exact for every token whose 64-cell
+key block its chunk closes, which covers all of the 512- and 64-token
+schedules. A token whose block the chunk leaves open is held to 1e-4 of its
+row's largest output. Measured: 2.17e-5 at 7 at a time, 7.29e-6 at one at a
+time. A cache off by one position is ~1e-1.
+
+What it covers in production: any restore, speculative rewind or slot reuse
+could shift a decode by an ulp at some positions. That is harmless to
+quality but broke every bit-exact comparison across a rewind. Prefill is
+unaffected, because its future cells in the diagonal block are this pass's
+own.
+
+## Rows side by side (done 2026-09-23)
+
+**A batched pass ran its rows' per-sequence work one after another, and
+most of it is too small to fill the device.** At three rows, going from one
+row to three added 19.1 ms. The profile (`cmd/llm -batch 1,2,3
+-batch-depth 7000`, shipped banks, two runs agreeing to 0.4 ms) splits it:
+
+| | added, 1 → 3 rows | what it is |
+|---|---:|---|
+| `moe.up` | +9.75 ms | 2.64x the experts. The bytes alone predict +7.5, so ~2.2 ms is excess (below) |
+| `moe.down` | +3.62 | 2.4x for 2.64x the experts: nothing to take, so the IQ4_NL layout item is closed |
+| attention, per row | +2.6 | `attn.split` 1.79, then score, select, combine, pack, idx, gather |
+| DeltaNet, per row | +2.0 | `dn.scan` 1.40, then conv, norm, hist |
+| host | ~+1.5 | a batched pass is recorded every step; the one-row step is replayed |
+
+**The change: `vk.MultiDispatch.Overlap`**, meaning no barrier between a
+dispatch and the one before it. It goes to both recording paths (the shim's
+per-dispatch byte array). A group's timestamps are written together after
+its last dispatch, so every query slot is still written and the group's
+time is reported on its first dispatch. The per-sequence blocks now emit
+their rows **stage by stage** (every row's conv, then every row's scan, and
+so on), with the rows of a stage overlapped:
+
+- **DeltaNet** needed only the reorder. Its rows already touch only their own
+  rows of the per-token tensors and their own slot's state and ring.
+- **Attention** shared its scratch across rows (query plane, indexer query,
+  scores, selection, gathered list, split partials, block list). So each
+  row now takes its own 64-row slice of every one of them
+  (`AttnGPU.rowScratchFor`). The arenas are cut for the prompt batch, so a
+  decode batch fits many times over, and anything that does not fit falls
+  back to the old order. **The combine stays serialized in ascending row
+  order**, because it writes the context's pad rows past its own row, and
+  those are the next rows' real ones.
+- PLE's per-row conv and hist are left as they were (0.1 ms).
+
+`LLM_BATCH_OVERLAP=0` is the control: the same order with every barrier.
+
+**Measured** (48 layers, control/overlap/control/overlap, same binary):
+
+| | 1 row | 2 rows | 3 rows | attention at 3 | DeltaNet at 3 |
+|---|---:|---:|---:|---:|---:|
+| control | 27.7 ms | 39.8-39.9 | 48.4 (62.0 tok/s) | 6.1 | 8.8-8.9 |
+| **overlap** | 27.6 | **38.5-38.6** | **46.2 (65.0 tok/s)** | **4.1** | **8.2** |
+
+DeltaNet alone (the first version) was 0.7 ms of this. The scan streams a
+slot's recurrent state, ~3.1 MB a layer, so three rows are bandwidth and
+not latency, and an overlapped group of three scans still takes ~3x one.
+Attention's split is 24 single-wave workgroups, and three of those side by
+side cost about what one did.
+
+**Gates:** `TestGraphDecodeRowsIsEachSlot` now runs dense (2048 cells, as
+before) and **sparse** (4096 cells, prompts of 2600, 2200 and 2400 tokens,
+so every row scores, selects and gathers). It asserts the rows really got
+their own scratch, and every row stays bit-identical to its solo step.
+Its negative control was run by hand: with every row given row 0's scratch
+and the overlap left on, the sparse case failed 3 of 3 times at 0.25-0.27
+rms, a different figure each run, which is a race and shows the rows really
+do run at once. The full `llm` and `backend` suites pass.
 
 ## Next
 
-- **`TestGraphCheckpointIsThePrefill` is red** (above): find what a
-  300-token detour leaves behind that `Restore` does not undo. Check this
-  first, because the gate cannot currently vouch for C4.
-- **Re-measure through the server:** single-stream decode (was 34.2 tok/s)
-  and C0's mix, now that one-row passes are ~1.6 ms shorter.
-- **What is left in a batched pass (48.5 ms at three rows):** `moe.up` is
-  14.3 ms and ~3x its one-row cost for 2.7x the experts. The IQ4_NL down
-  mode's 36-byte pair records are not 16-aligned and still take scalar
-  loads. Row-aware attention and DeltaNet kernels would save up to ~2 ms a
-  row. A batched pass is recorded every step (~1-2 ms of host time) rather
-  than replayed like P1c's one-row step.
+- **What is left in a batched pass (46.2 ms at three rows):**
+  - `moe.up` is ~2.2 ms over what its bytes predict at three rows (163 GB/s
+    against 192 at one). It is **not** occupancy: the shipped v16w4 Q4_K
+    build is 96 VGPRs and 16 waves a SIMD at 1, 2 and 3 rows (RADV
+    shaderstats). The multi-row tiles repeat the nibble unpack per row, and
+    holding it unpacked is measured dead (above), so this wants a new idea.
+  - The host: a batched pass is recorded every step, ~1.5 ms more than the
+    replayed one-row step. Replaying it needs the per-row slots and offsets
+    out of the push constants, as P1c did for the position.
+  - DeltaNet's per-row scan is bandwidth (a slot's state each), and PLE's
+    per-row work is 0.1 ms.
 - **C7 (mixed passes)** stays conditional on background decode starving
   behind prefill, which C0's numbers have not shown.
 
@@ -743,3 +861,17 @@ answer, but that is unexplained, not established. **Open.**
   aggregate) and a one-row step 29.2 → 27.6 ms (36.2 tok/s). It exposed
   `TestGraphCheckpointIsThePrefill` as arithmetic-fragile: it fails at row
   11 by 3.5e-4, cause open.
+- **2026-09-23**: **the checkpoint gate is green again**, and the cause was
+  not the checkpoint. A masked value cell with a negative stale value makes
+  a −0 product, and the WMMA's sum differs by an ulp when one of its zero
+  products is −0. `llm_attn_pack.comp` now writes +0 over the value cells
+  past `n` to the end of a 64-cell block, and `TestGraphStaleValuesAreUnread`
+  is the gate.
+- **2026-09-23**: **re-measured through the server**, A/B/A/B against
+  `8a2b175`: solo decode 33.2-33.6 → 35.5-35.6 tok/s, C0's mix aggregate
+  32.6-32.9 → 34.9, agents done 48.5-49.1 → 45.8 s. Voice TTFT unchanged.
+- **2026-09-23**: **batched rows side by side**: `vk.MultiDispatch.Overlap`,
+  per-row attention scratch, and the per-sequence stages emitted row-major
+  within a stage. A three-row pass goes 48.4 → 46.2 ms (62.0 → 65.0 tok/s
+  aggregate) and two rows 39.9 → 38.5, bit-identical. `moe.down` and the
+  IQ4_NL layout are closed as not worth it.

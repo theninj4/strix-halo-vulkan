@@ -21,7 +21,10 @@ import (
 // carried over, and the flash-attention key loop walks the same absolute
 // blocks in the same order. Every dispatch is therefore the *same arithmetic
 // on the same values*, and the output has to come back bit for bit. A
-// tolerance here would pass a cache that was subtly off by a position.
+// tolerance here would pass a cache that was subtly off by a position. The
+// one exception is a token whose key block its chunk leaves open, which is an
+// ulp and the hardware's (TestAttnGPUCacheIsAChunkSplit says why). Everything
+// else is still an equality.
 //
 // The fixture is the 4 k one, because at 256 cells a chunk boundary can only
 // fall in one place and the selection never bites. At 4096 tokens the
@@ -50,6 +53,16 @@ func runChunks(t *testing.T, g *AttnGPU, in []float32, nEmbd int, chunks []int) 
 	}
 	return out
 }
+
+// staleBlock is the widest key block an attention build reads (KTIL = 4,
+// KV_BLOCK in llm_attn_pack.comp). staleTol is what a block left open by its
+// chunk may cost a token's output, relative to that token's largest
+// component. Measured over 4096 tokens: 2.17e-05 at 7 a time and 7.29e-06 at
+// one a time. A cache off by one position is ~1e-1.
+const (
+	staleBlock = 64
+	staleTol   = 1e-4
+)
 
 // even cuts n into chunks of size k, with whatever is left over last.
 func even(n, k int) []int {
@@ -156,6 +169,23 @@ func TestAttnGPUSlotsHaveTheirOwnCache(t *testing.T) {
 }
 
 // TestAttnGPUCacheIsAChunkSplit is L7a's gate.
+//
+// **It is exact except where a chunk ends inside a key block**, and that
+// exception is the hardware's, not the cache's (CONCURRENCY.md, "Stale values
+// past the frontier"). A token's masked columns run to the end of its key
+// block. In the one-chunk run those cells hold later tokens' real values; in
+// a chunk that ends inside the block they are the +0 llm_attn_pack.comp writes
+// past `n`. P is +0 on them either way, but the WMMA's sum sees the sign of a
+// zero product, so a negative value there moves the context by an ulp. Until
+// the pack cleared those cells this test passed only because each subtest
+// reran the same prompt over the last one's cells, so the stale values were
+// the real ones. With the V plane cleared first, HEAD failed 7-at-a-time and
+// one-at-a-time too.
+//
+// So every token whose block its chunk closes (and every token of the 512-
+// and 64-token schedules, which end on a block) must still come back bit for
+// bit. The tokens of a block the chunk leaves open are held to staleTol,
+// relative to their row: an ulp of the context, after the output projection.
 func TestAttnGPUCacheIsAChunkSplit(t *testing.T) {
 	g, tr, c, nTok, done := attnGPU4k(t)
 	defer done()
@@ -208,21 +238,48 @@ func TestAttnGPUCacheIsAChunkSplit(t *testing.T) {
 			if len(got) != len(want) {
 				t.Fatalf("%d values over %d chunks, want %d", len(got), len(tc.chunks), len(want))
 			}
-			bad, first := 0, -1
+			// open[p] is whether token p's key block reaches past the end of
+			// its own chunk, which is the one place the two runs may differ.
+			open := make([]bool, nTok)
+			end := 0
+			for _, n := range tc.chunks {
+				for p := end; p < end+n; p++ {
+					open[p] = (p/staleBlock+1)*staleBlock > end+n && end+n < nTok
+				}
+				end += n
+			}
+			bad, first, nOpen, worst := 0, -1, 0, 0.0
 			for i := range got {
-				if got[i] != want[i] {
-					bad++
-					if first < 0 {
-						first = i
+				if got[i] == want[i] {
+					continue
+				}
+				if open[i/c.NEmbd] {
+					nOpen++
+					tok := i / c.NEmbd
+					scale := 0.0
+					for _, v := range want[tok*c.NEmbd : (tok+1)*c.NEmbd] {
+						scale = math.Max(scale, math.Abs(float64(v)))
 					}
+					worst = math.Max(worst, math.Abs(float64(got[i]-want[i]))/scale)
+					continue
+				}
+				bad++
+				if first < 0 {
+					first = i
 				}
 			}
 			if bad != 0 {
-				t.Errorf("%d of %d values differ, first at token %d component %d: %v against %v",
+				t.Errorf("%d of %d values differ in tokens whose block the chunk closes, first at token %d component %d: %v against %v",
 					bad, len(got), first/c.NEmbd, first%c.NEmbd, got[first], want[first])
 				return
 			}
-			t.Logf("%d chunks, %d tokens: identical to the last place", len(tc.chunks), nTok)
+			if worst > staleTol {
+				t.Errorf("tokens whose block runs past their chunk: %d values differ, the largest by %.3g of its row (the tolerance is %.3g)",
+					nOpen, worst, staleTol)
+				return
+			}
+			t.Logf("%d chunks, %d tokens: identical to the last place except %d values in blocks the chunk left open, "+
+				"within %.3g of their row", len(tc.chunks), nTok, nOpen, worst)
 		})
 	}
 }

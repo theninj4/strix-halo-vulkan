@@ -837,6 +837,28 @@ type MultiDispatch struct {
 	GroupsX       uint32
 	GroupsY       uint32
 	PushConstants []byte
+	// Overlap drops the barrier between this dispatch and the one before
+	// it, so the two may run at once (CONCURRENCY.md, after C6). It is for
+	// dispatches that touch disjoint memory: a batched pass's per-row work
+	// on different sequences. A group of them is timed as one, and its time
+	// lands on its first dispatch. On the first dispatch of a sequence it
+	// means nothing.
+	Overlap bool
+}
+
+// overlapFlags is the shim's per-dispatch byte array, or nil when no
+// dispatch asks for it, which leaves the recording exactly what it was.
+func overlapFlags(dispatches []MultiDispatch) []C.uint8_t {
+	var flags []C.uint8_t
+	for i, d := range dispatches {
+		if d.Overlap && i > 0 {
+			if flags == nil {
+				flags = make([]C.uint8_t, len(dispatches))
+			}
+			flags[i] = 1
+		}
+	}
+	return flags
 }
 
 // DispatchMultiTimed is DispatchSequenceTimed for a sequence whose dispatches
@@ -925,10 +947,14 @@ func dispatchMulti(dispatches []MultiDispatch, groupsZ, iterations uint32, barri
 		markBuf = make([]C.uint64_t, len(dispatches)+1)
 		markPtr = &markBuf[0]
 	}
+	var ovPtr *C.uint8_t
+	if ov := overlapFlags(dispatches); ov != nil {
+		ovPtr = &ov[0]
+	}
 	if err := check("dispatch sequence", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
 		&handles[0],
 		&groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
-		C.uint32_t(groupsZ), C.uint32_t(iterations), barrierFlag,
+		C.uint32_t(groupsZ), C.uint32_t(iterations), barrierFlag, ovPtr,
 		pcPtr, C.uint32_t(pcSize), &start, &end, markPtr)); err != nil {
 		return 0, nil, err
 	}
@@ -1001,10 +1027,14 @@ func NewPrerecorded(dispatches []MultiDispatch, barriers, marks bool) (*Prerecor
 	if marks {
 		markFlag = 1
 	}
+	var ovPtr *C.uint8_t
+	if ov := overlapFlags(dispatches); ov != nil {
+		ovPtr = &ov[0]
+	}
 	p := &Prerecorded{dev: dev, count: len(dispatches)}
 	if err := check("prerecord sequence", C.shim_prerecord_multi(dev.handle, C.uint32_t(dev.queueFamily),
 		&handles[0], &groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
-		barrierFlag, markFlag, pcPtr, C.uint32_t(pcSize), &p.handle)); err != nil {
+		barrierFlag, ovPtr, markFlag, pcPtr, C.uint32_t(pcSize), &p.handle)); err != nil {
 		p.Destroy()
 		return nil, err
 	}

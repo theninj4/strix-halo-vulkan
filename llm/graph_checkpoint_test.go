@@ -6,6 +6,7 @@ package llm
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 )
 
@@ -219,4 +220,104 @@ func TestGraphCheckpointIsThePrefill(t *testing.T) {
 	if err := g.Restore(ck); err == nil {
 		t.Error("Restore accepted a checkpoint after the slot was re-run from token zero with other tokens")
 	}
+}
+
+// TestGraphStaleValuesAreUnread is the gate for what made the checkpoint gate
+// fail at one row in twelve. A cell past a pass's last one is masked, so its
+// value is multiplied by a +0 in P. The WMMA's sum still came out differently
+// when that product was -0, so the *sign* of a stale value there changed the
+// context by an ulp now and then. A restore, a rewind or a slot's previous
+// conversation leaves exactly such values, and llm_attn_pack.comp now writes
+// +0 over them to the end of the widest key block before any attention reads
+// the plane.
+//
+// So: decode the same steps twice from the same prefill, with every value
+// cell past the frontier set to -0 before each step in one run and to +0 in
+// the other. The logits must agree bit for bit. Without the pack's clear the
+// -0 run moves: at 2600 cells in a 4096-cell cache it first moved at step 11,
+// which is why it takes this many steps.
+func TestGraphStaleValuesAreUnread(t *testing.T) {
+	const (
+		layers = 4
+		chunk  = 1024
+		nKV    = 4096
+		prefix = 2600
+		steps  = 48
+	)
+	m, tr := fixtures4k(t)
+	all, _, err := tr.Tokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < prefix+steps {
+		t.Skipf("the 4k trace has %d tokens", len(all))
+	}
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: chunk, NKV: nKV, Layers: layers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(g.Destroy)
+	if !g.attn.sparse {
+		t.Fatalf("a %d-cell cache is not sparse, so decode is not the split block kernel under test", nKV)
+	}
+
+	// fill sets every value cell from `from` to the end of the cache, in
+	// every staged layer and kv head, to one half's bits.
+	a := g.attn
+	hd := a.cfg.HeadDim
+	fill := func(from int, bits uint16) {
+		run := slices.Repeat([]uint16{bits}, coopMatTile)
+		for l := range a.layers {
+			for h := 0; h < a.cfg.NHeadKV; h++ {
+				for c := from; c < nKV; c++ {
+					for d := 0; d < hd; d += coopMatTile {
+						off := int(a.hV) + l*a.kvStride + (h*(nKV/coopMatTile)+c/coopMatTile)*(hd*coopMatTile) +
+							(d/coopMatTile)*(coopMatTile*coopMatTile) + (c%coopMatTile)*coopMatTile
+						a.vbuf.WriteUint16At(off, run)
+					}
+				}
+			}
+		}
+	}
+	decode := func(bits uint16) [][]float32 {
+		var logits []float32
+		for at := 0; at < prefix; at += chunk {
+			c := all[at:min(at+chunk, prefix)]
+			var err error
+			if at == 0 {
+				logits, _, err = g.Forward(c)
+			} else {
+				logits, _, err = g.Extend(c)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		rows := [][]float32{append([]float32(nil), logits...)}
+		for i := range steps {
+			fill(g.Past(), bits)
+			var err error
+			if logits, _, err = g.Extend([]int32{all[prefix+i]}); err != nil {
+				t.Fatal(err)
+			}
+			rows = append(rows, append([]float32(nil), logits...))
+		}
+		return rows
+	}
+
+	// Once to warm the arenas (TestPrerecordedDecodeIsTheRecordedDecode), then
+	// the two arms.
+	decode(0)
+	pos, neg := decode(0x0000), decode(0x8000)
+	for r := range pos {
+		for j := range pos[r] {
+			if pos[r][j] != neg[r][j] {
+				t.Fatalf("step %d at cell %d, logit %d: %g with -0 past the frontier against %g with +0",
+					r, prefix+r-1, j, neg[r][j], pos[r][j])
+			}
+		}
+	}
+	t.Logf("%d decode steps from %d cells: bit-identical with -0 or +0 in every value cell past the frontier", steps, prefix)
 }

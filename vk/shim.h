@@ -228,10 +228,16 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
 // (SHIM_QUERY_SLOTS); anything else leaves it untouched and returns the two
 // ends alone.
 #define SHIM_QUERY_SLOTS 2048
-
+//
+// `overlap`, when not NULL, is one byte a dispatch: non-zero on dispatch i
+// means no barrier between it and dispatch i-1, so the two may run at once
+// (CONCURRENCY.md, after C6). Byte 0 is ignored. The marks of such a group
+// are written together after its last dispatch, so every query slot is still
+// written and the group's whole time lands on its first dispatch.
 VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *pipes,
                                     const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
                                     uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
+                                    const uint8_t *overlap,
                                     const void *pushConstants, uint32_t pushConstantSize,
                                     uint64_t *out_start, uint64_t *out_end, uint64_t *out_marks);
 
@@ -261,7 +267,7 @@ typedef struct {
 // submit and the per-dispatch attribution survives the replay.
 VkResult shim_prerecord_multi(VkDevice device, uint32_t queueFamily, const ShimComputePipeline *pipes,
                                const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
-                               uint32_t barriers, uint32_t wantMarks,
+                               uint32_t barriers, const uint8_t *overlap, uint32_t wantMarks,
                                const void *pushConstants, uint32_t pushConstantSize,
                                ShimPrerecorded *out);
 

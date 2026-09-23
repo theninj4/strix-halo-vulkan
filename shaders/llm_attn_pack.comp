@@ -85,6 +85,9 @@
 #endif
 #define HDT (HEAD_DIM / TILE)
 #define WG 256
+// The widest key block any llm_attn_wmma.comp build reads (KTIL = 4); the
+// value cells past the run are cleared to the end of one (below).
+#define KV_BLOCK 64u
 
 layout(local_size_x = WG) in;
 
@@ -267,6 +270,29 @@ void main() {
             kcache[dst] = float16_t(v);
         } else {
             vcache[dst] = float16_t(v);
+        }
+    }
+
+    // **The value cells past the run, to the end of the widest key block,
+    // are written as +0** (CONCURRENCY.md, the checkpoint gate). The block
+    // kernels read whole 16-cell tiles of the value plane straight into a
+    // fragment, and P is +0 on a cell past a row's extent, so a stale value
+    // there is multiplied by zero. The result was supposed to be exactly nothing,
+    // and it is not: the WMMA's sum comes out differently when one of its zero
+    // products is -0, which is what a negative stale value makes. Magnitude
+    // does not matter and the sign does. So a pass's context depended on what
+    // an earlier run left past `n`: a restored checkpoint, a rewound
+    // speculative pass, or a slot's previous conversation. Only the value needs
+    // this, because a masked key's score is replaced, not summed. Nothing
+    // past `n` is a cell of this sequence yet, and the next run to reach one
+    // writes it before any row can see it.
+    if (p >= pc.heads + pc.kvHeads && tt == 0u) {
+        uint n = past + pc.tokens;
+        uint end = min((n + KV_BLOCK - 1u) / KV_BLOCK * KV_BLOCK, pc.nKV);
+        for (uint i = tid; i < (end - n) * HEAD_DIM; i += WG) {
+            uint cell = n + i / HEAD_DIM, d = i % HEAD_DIM;
+            vcache[outOff + (head * cellTiles + cell / TILE) * (HDT * TILE * TILE)
+                + (d / TILE) * (TILE * TILE) + (cell % TILE) * TILE + d % TILE] = float16_t(0.0);
         }
     }
 }

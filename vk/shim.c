@@ -901,6 +901,7 @@ VkResult shim_dispatch_seq_timed(VkDevice device, VkQueue queue, const ShimCompu
 VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimComputePipeline *pipes,
                                     const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
                                     uint32_t groupsZ, uint32_t iterations, uint32_t barriers,
+                                    const uint8_t *overlap,
                                     const void *pushConstants, uint32_t pushConstantSize,
                                     uint64_t *out_start, uint64_t *out_end, uint64_t *out_marks) {
     if (iterations == 0) {
@@ -946,14 +947,23 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
                                     pushConstantSize, pc + (size_t)i * pushConstantSize);
             }
             vkCmdDispatch(rec->cmdBuf, groupsX[i], groupsY[i], groupsZ);
-            if (marks > 0) {
-                vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, i + 1);
+            int last = (i + 1 == count);
+            // The next dispatch runs beside this one: no barrier, and the
+            // marks wait for the group's end.
+            int joined = !last && overlap != NULL && overlap[i + 1];
+            if (marks > 0 && !joined) {
+                uint32_t g = i;
+                while (g > 0 && overlap != NULL && overlap[g]) {
+                    g--;
+                }
+                for (uint32_t m = g; m <= i; m++) {
+                    vkCmdWriteTimestamp(rec->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, rec->queryPool, m + 1);
+                }
             }
             // Within an iteration the barrier is the caller's choice; between
             // iterations it is not, since the next iteration overwrites what
             // this one wrote.
-            int last = (i + 1 == count);
-            if ((!last && barriers) || (last && it + 1 < iterations)) {
+            if ((!last && barriers && !joined) || (last && it + 1 < iterations)) {
                 vkCmdPipelineBarrier(rec->cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
             }
@@ -1012,7 +1022,7 @@ VkResult shim_dispatch_multi_timed(VkDevice device, VkQueue queue, const ShimCom
 
 VkResult shim_prerecord_multi(VkDevice device, uint32_t queueFamily, const ShimComputePipeline *pipes,
                                const uint32_t *groupsX, const uint32_t *groupsY, uint32_t count,
-                               uint32_t barriers, uint32_t wantMarks,
+                               uint32_t barriers, const uint8_t *overlap, uint32_t wantMarks,
                                const void *pushConstants, uint32_t pushConstantSize,
                                ShimPrerecorded *out) {
     if (count == 0) {
@@ -1084,10 +1094,17 @@ VkResult shim_prerecord_multi(VkDevice device, uint32_t queueFamily, const ShimC
                                 pushConstantSize, pc + (size_t)i * pushConstantSize);
         }
         vkCmdDispatch(out->cmdBuf, groupsX[i], groupsY[i], 1);
-        if (wantMarks) {
-            vkCmdWriteTimestamp(out->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, out->queryPool, i + 1);
+        int joined = i + 1 < count && overlap != NULL && overlap[i + 1];
+        if (wantMarks && !joined) {
+            uint32_t g = i;
+            while (g > 0 && overlap != NULL && overlap[g]) {
+                g--;
+            }
+            for (uint32_t m = g; m <= i; m++) {
+                vkCmdWriteTimestamp(out->cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, out->queryPool, m + 1);
+            }
         }
-        if (barriers && i + 1 < count) {
+        if (barriers && i + 1 < count && !joined) {
             vkCmdPipelineBarrier(out->cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
         }

@@ -25,24 +25,42 @@ import (
 // Each control overwrites one block's per-row position table after
 // DecodeRows has written it: every row reads row 0's position. Each must move
 // the logits, or the gate cannot see that block's per-row position.
+//
+// **Twice: dense and sparse.** At 2048 cells the selection names every cell
+// and the attention runs dense. At 4096 cells, with every prompt past the
+// selection's 2051, each row's pass scores, selects and gathers, and those
+// are the scratch tensors a batched pass gives each row its own slice of so
+// that the rows can run side by side (AttnGPU.rowScratchFits). A slice that
+// overlapped another row's would be a race, and this is where it would show.
 func TestGraphDecodeRowsIsEachSlot(t *testing.T) {
-	const steps = 8
 	m, tr := fixtures4k(t)
 	all, _, err := tr.Tokens()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(all) < 2000 {
+	if len(all) < 3400 {
 		t.Skipf("the 4k trace has %d tokens", len(all))
 	}
+	t.Run("dense", func(t *testing.T) {
+		decodeRowsIsEachSlot(t, m, 2048, false, [][]int32{all[:700], all[800:1100], all[1200:1700]})
+	})
+	t.Run("sparse", func(t *testing.T) {
+		decodeRowsIsEachSlot(t, m, 4096, true, [][]int32{all[:2600], all[500:2700], all[1000:3400]})
+	})
+}
+
+func decodeRowsIsEachSlot(t *testing.T, m *Model, nKV int, sparse bool, prompts [][]int32) {
+	const steps = 8
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
-	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: 1024, NKV: 2048, Layers: 4, Slots: 3})
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: 1024, NKV: nKV, Layers: 4, Slots: 3})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(g.Destroy)
-	prompts := [][]int32{all[:700], all[800:1100], all[1200:1700]}
+	if g.attn.sparse != sparse {
+		t.Fatalf("a %d-cell cache: sparse %v, want %v", nKV, g.attn.sparse, sparse)
+	}
 
 	argmax := func(l []float32) int32 {
 		id := int32(0)
@@ -60,9 +78,18 @@ func TestGraphDecodeRowsIsEachSlot(t *testing.T) {
 	}
 	prefill := func(s int) []float32 {
 		use(s)
-		l, _, err := g.Forward(prompts[s])
-		if err != nil {
-			t.Fatal(err)
+		var l []float32
+		for at := 0; at < len(prompts[s]); at += 1024 {
+			c := prompts[s][at:min(at+1024, len(prompts[s]))]
+			var err error
+			if at == 0 {
+				l, _, err = g.Forward(c)
+			} else {
+				l, _, err = g.Extend(c)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 		return append([]float32(nil), l...)
 	}
@@ -106,6 +133,9 @@ func TestGraphDecodeRowsIsEachSlot(t *testing.T) {
 			l, err := g.DecodeRows(slots, in)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if i == 0 && batchOverlap && sparse && !g.attn.rowScratchFor(len(slots)) {
+				t.Fatalf("%d rows do not get their own attention scratch, so they are not side by side", len(slots))
 			}
 			for r, s := range slots {
 				row := l[r*vocab : (r+1)*vocab]

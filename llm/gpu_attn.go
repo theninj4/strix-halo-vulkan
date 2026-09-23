@@ -51,6 +51,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"slices"
 	"strconv"
 	"time"
 	"unsafe"
@@ -2172,6 +2173,64 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// itself, which the next row's pass then overwrites.
 	if g.batch == nil {
 		g.core(base, add)
+	} else if g.rowScratchFits() {
+		// **Side by side** (batchOverlap): each row's pass gets its own
+		// slice of every scratch tensor, so no row reads what another
+		// writes, and the rows' dispatches go out stage by stage with no
+		// barrier between the rows of a stage. The one exception is the
+		// combine: it writes the context's pad rows past its own row, which
+		// are the next rows' real ones, so those stay in ascending order
+		// with a barrier between them, as they always were.
+		slot, past, rows, attn := g.slot, g.past, g.rows, g.attn
+		scr := g.scratch()
+		var perD [][]vk.MultiDispatch
+		var perK [][]string
+		for r, br := range g.batch {
+			if err := g.UseSlot(br.slot); err != nil {
+				return nil, nil, err
+			}
+			g.past, g.rows = br.past, 1
+			if g.autoPlan {
+				g.attn = AttnKernelFor(g.sparse, 1)
+			}
+			g.setScratch(scr.row(r, g))
+			rb := g.push(layer)
+			rb.QKVOff += uint32(r * g.qkvN())
+			rb.CtxOff += uint32(r * g.ldCtx)
+			rb.LowRank = uint32(1 + r)
+			var rd []vk.MultiDispatch
+			var rk []string
+			g.core(rb, func(pipe, kind string, gx, gy uint32, pc push) {
+				rd = append(rd, vk.MultiDispatch{Pipeline: g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
+				rk = append(rk, kind)
+			})
+			perD, perK = append(perD, rd), append(perK, rk)
+		}
+		g.setScratch(scr)
+		if err := g.UseSlot(slot); err != nil {
+			return nil, nil, err
+		}
+		g.past, g.rows, g.attn = past, rows, attn
+		same := true
+		for r := range perK {
+			same = same && slices.Equal(perK[r], perK[0])
+		}
+		if same {
+			for k, kind := range perK[0] {
+				for r := range perD {
+					md := perD[r][k]
+					md.Overlap = r > 0 && kind != "attn.combine"
+					d, kinds = append(d, md), append(kinds, kind)
+				}
+			}
+		} else {
+			// Rows that planned different passes cannot be interleaved
+			// stage by stage; their own scratch still keeps them apart, so
+			// they run one after another as before.
+			for r := range perD {
+				d, kinds = append(d, perD[r]...), append(kinds, perK[r]...)
+			}
+		}
 	} else {
 		slot, past, rows, attn := g.slot, g.past, g.rows, g.attn
 		for r, br := range g.batch {
@@ -2214,6 +2273,61 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
 	}
 	return d, kinds, nil
+}
+
+// attnScratch is where a pass's per-pass tensors start: the query plane, the
+// indexer's query, its scores, the selection, the gathered list, the split
+// partials, P13's block list and the expanded cell scores.
+type attnScratch struct {
+	hQ, hIdxQ                                uint32
+	aScore, aSel, aGath, aSplit, aBlk, aCell uint32
+}
+
+// rowScratchRows is how many arena rows a batched pass's row takes for its
+// own scratch: the widest plane a one-token pass pads to and every sixteen-row
+// tile it reads, with room to spare.
+const rowScratchRows = 64
+
+func (g *AttnGPU) scratch() attnScratch {
+	return attnScratch{g.hQ, g.hIdxQ, g.aScore, g.aSel, g.aGath, g.aSplit, g.aBlk, g.aCell}
+}
+
+func (g *AttnGPU) setScratch(s attnScratch) {
+	g.hQ, g.hIdxQ, g.aScore, g.aSel, g.aGath, g.aSplit, g.aBlk, g.aCell =
+		s.hQ, s.hIdxQ, s.aScore, s.aSel, s.aGath, s.aSplit, s.aBlk, s.aCell
+}
+
+// row is batched row r's slice of every scratch tensor (rowScratchFits says
+// whether the arenas hold it).
+func (s attnScratch) row(r int, g *AttnGPU) attnScratch {
+	c := g.cfg
+	n := uint32(r * rowScratchRows)
+	o := s
+	o.hQ += uint32(r*c.NHead*rowScratchRows) * uint32(c.HeadDim)
+	o.hIdxQ += n * uint32(c.IdxHeads*c.IdxDim)
+	o.aScore += n * uint32(g.NBlocks())
+	o.aSel += n * uint32(g.selWords())
+	if s.aGath != noW {
+		o.aGath += uint32(r * maxInt(g.gathStride(), g.gathStride1()))
+	}
+	o.aSplit += uint32(r * c.NHead * attnMaxSplits * (c.HeadDim + 2))
+	o.aBlk += uint32(r * g.blkStride())
+	if s.aCell != noW {
+		o.aCell += n * uint32(g.nKV)
+	}
+	return o
+}
+
+// rowScratchFits is whether this batch's rows each get their own scratch
+// and run side by side: the arenas are cut for the prompt batch, so a
+// decode batch fits many times over, and the split partials hold
+// attnSplitMaxRows rows.
+func (g *AttnGPU) rowScratchFits() bool { return g.rowScratchFor(len(g.batch)) }
+
+func (g *AttnGPU) rowScratchFor(n int) bool {
+	return batchOverlap && n > 1 && n*rowScratchRows <= g.arenaRows &&
+		n <= minInt(attnSplitMaxRows, g.arenaRows) &&
+		n <= g.blkTiles && (g.aGath == noW || n <= g.gathTiles)
 }
 
 // push is the layer's push block for the live slot, position and row count.

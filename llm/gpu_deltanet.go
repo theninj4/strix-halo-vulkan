@@ -1285,6 +1285,15 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// dword 1+r, its rows of every per-token tensor. The scan carries
 		// state from token to token, so rows of different sequences cannot
 		// share one.
+		//
+		// **Stage by stage, and the rows of a stage side by side.** Every
+		// row's dispatches touch only its own rows of the per-token tensors
+		// and its own slot's state and ring, so no row reads what another
+		// writes, and each is a one-token dispatch too small to fill the
+		// device. So all the rows' convolutions go out as one group with no
+		// barrier between them, then all their scans, and so on
+		// (batchOverlap; the barrier between stages keeps each row's order).
+		rbs := make([]push, len(g.batch))
 		for r, br := range g.batch {
 			rb := base
 			rb.Tokens, rb.LowRank = 1, uint32(1+r)
@@ -1300,14 +1309,32 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 			rb.SSMStateOff = g.stateAt(layer, br.slot)
 			rb.ResOff = rb.SSMStateOff
 			rb.InjOff = g.winAt(layer, br.slot)
+			rbs[r] = rb
+		}
+		beside := func(r int) {
+			if r > 0 && batchOverlap {
+				d[len(d)-1].Overlap = true
+			}
+		}
+		for r, rb := range rbs {
 			add("conv", "conv", planes, 1, rb)
+			beside(r)
+		}
+		for r, rb := range rbs {
 			add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), rb)
+			beside(r)
+		}
+		for r, rb := range rbs {
 			add("norm", "norm", uint32(c.NHeadV), 1, rb)
+			beside(r)
+		}
+		for r, rb := range rbs {
 			win := rb
 			win.LoOff = rb.QKVOff // SEQ_SRC
 			win.GemmM, win.GemmK = uint32(hist), uint32(g.qkvN())
 			win.OutOff = noW
 			add("hist", "hist", uint32((g.qkvN()+255)/256), 1, win)
+			beside(r)
 		}
 	}
 

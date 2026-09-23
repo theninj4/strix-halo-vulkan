@@ -18,7 +18,17 @@ package llm
 // dword 0, the position SetPast writes, so nothing about a single-sequence
 // pass or its recorded replay changed.
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
+
+// batchOverlap lets a batched pass run its rows' per-sequence dispatches side
+// by side, with no barrier between rows of one stage (vk.MultiDispatch's
+// Overlap). The rows touch disjoint memory, so it changes no arithmetic, only
+// when each dispatch may start. LLM_BATCH_OVERLAP=0 is the control: the same
+// order with a barrier after every dispatch.
+var batchOverlap = os.Getenv("LLM_BATCH_OVERLAP") != "0"
 
 // batchRow is one row of a batched pass: the sequence slot it advances and
 // that sequence's position before it.
