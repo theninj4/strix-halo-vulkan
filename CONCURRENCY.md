@@ -622,13 +622,100 @@ because a later pass's dead block reads that fill. `select` is 0.21 →
 0.38 ms a layer, probably the score rows' wider stride. Together they are
 the 8 ms above.
 
+## The MoE GEMV's load count (done 2026-09-23)
+
+**The expert GEMV issued one scalar load per four bytes of Q4_K nibbles,
+plus four more for the block header, and it was bound by the load count.**
+`moe.up` and `moe.down` run over the same tiles, but at three rows `moe.up`
+streamed its Q4_K gate and up banks at ~128 GB/s while `moe.down` read its
+IQ4_NL bank at ~190 (1.84 and 0.92 MB an expert). This is P12's finding
+about the GEMM's slab, made again for `llm_moe_gemv.comp`, which never got
+it. Two changes:
+
+- **The load is outside the row loop.** `dotDword` had loaded, decoded and
+  dotted one row, and the row loop called it once per row. So a tile with R
+  real rows issued every load R times. The shared expert is the same bytes at
+  any row count, and it showed this most clearly: `shexp.up` took 15.6 /
+  23.4 / 32.2 µs a dispatch at 1/2/3 rows. Now `unpackDword` loads once and
+  `dotRow` is the per-row half, and every product and sum stays in the order
+  it had. Three rows: `shexp.up` 1.55 → 0.98 ms, `shexp.down` 0.73 → 0.54,
+  and the pass 53.6 → 53.0 ms.
+- **Q4_K is walked a quad at a time.** Four consecutive payload dwords are 16
+  bytes of one 64-element group and share both scale pairs, so a quad is one
+  `uvec4` header load plus one `uvec4` payload load, where the dword walk
+  issued twenty scalar loads. Every Q4_K block is 16-byte aligned (P12
+  checks it). The sum is now grouped by quad, so the decode path is **not**
+  bit-identical to before. `TestMoEGPUDecode` still reads rms 2.54e-06
+  against the GEMM, the batched-rows gate is still bit-identical row for
+  row, and prefill (`TestGraphLogits`) is untouched to the digit.
+- **The routed up mode moved from v64w4 to v16w4.** A row is 80 quads, which
+  16 divides and 64 does not. L8e-2 once measured v16w4 42 ms worse in the
+  whole model on the dword kernel, so the choice was made in the graph, not
+  on the cache-hot block ladder: v16w4 < v32w4 < v64w4, two runs each. The
+  shared expert's rung (v64w4) was within 0.04 ms of the alternatives and
+  stays.
+
+`cmd/llm -batch 1,2,3 -batch-depth 7000`, 48 layers, shipped banks; "after"
+is four runs from two sweeps of the final configuration:
+
+| rows | before | after | a row | aggregate | `moe.up` | `shexp.up` |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 29.2 ms | **27.6-27.7** | 34.2 → **36.2 tok/s** | | 6.02 → 4.60 | 0.75 → 0.72 |
+| 2 | 42.5 | **39.0-40.0** | 23.5 → 25.3 | 47.1 → **50.6** | 12.6 → 10.0 | 1.12 → 0.92 |
+| 3 | 53.6 | **48.3-48.7** | 18.7 → 20.6 | 56.0 → **61.9** | 18.9 → 14.3 | 1.55 → 1.15 |
+
+**Single-stream decode gains too, about 1.6 ms a step (+6%).** That is not
+yet measured through the server or `ai.service`.
+
+**Measured and dropped:** unpacking each Q4_K weight once and applying it to
+every row inside the element loop, which keeps the shared expert's
+three-row gain. It cost more than it saved at every row count (29.0 ms at
+one row, `shexp.up` 1.25 against 0.72): P11's rule again, a branch inside an
+unrolled loop. So a three-row shared expert gives back 0.17 ms of the first
+change's gain (0.98 → 1.15).
+
+### A gate this exposed: `TestGraphCheckpointIsThePrefill` fails
+
+**Any change to decode arithmetic makes C4's gate fail**, and the evidence
+says the defect predates this change. The restored run matches prefix +
+tail for rows 0-10 and moves at **row 11 by 3.5e-4** (logit 0 −2.00677
+against −2.00712), deterministically. What is known:
+
+- **The quad kernel fails it, and so does HEAD's kernel with only the
+  routed rung changed** (at row 11 again, different digits). HEAD's own
+  arithmetic passes at every detour length tried (299-600 tokens, 0 or 12
+  steps). So it is not the quad, and HEAD passes by luck.
+- **It depends on the detour's length and nothing else found.** The failure
+  begins exactly at a 300-token detour, which is the continuation's own
+  length and the first detour that writes cell 2899 (pooled block 724, ratio
+  4). At 299 or fewer it passes. `LLM_NO_PRERECORD=1` does not change it.
+- **Not the pooled table's tail row.** The tail score reads the first
+  partial block's pooled row, and an abandoned continuation can leave stale
+  keys there. That is real, but writing the fill row back on `Restore` made
+  the pooled region byte-identical between the runs, and the logits still
+  moved. Reverted.
+- Both reference runs differ from each other *and* from the restored run in
+  the K/V cache at cells 2896-2911 (by ~4 in value, so masked or stale cells,
+  not live keys; the test already notes the first reference is not
+  bit-repeatable). Not followed further.
+
+So C4's "bit-identical" claim is unproven on this kernel. The size (3.5e-4 on
+one logit, at the 13th row) looks like a summation-order effect, not a wrong
+answer, but that is unexplained, not established. **Open.**
+
 ## Next
 
-- **What is left in a batched pass:** the MoE is 28.7 of 53.4 ms at three
-  rows. Its bytes grow 2.7x with the experts, and `moe.up` still grows 3.1x,
-  so a little remains there. Row-aware attention and DeltaNet kernels would
-  save up to ~2 ms a row. A batched pass is recorded every step (~1-2 ms of
-  host time) rather than replayed like P1c's one-row step.
+- **`TestGraphCheckpointIsThePrefill` is red** (above): find what a
+  300-token detour leaves behind that `Restore` does not undo. Check this
+  first, because the gate cannot currently vouch for C4.
+- **Re-measure through the server:** single-stream decode (was 34.2 tok/s)
+  and C0's mix, now that one-row passes are ~1.6 ms shorter.
+- **What is left in a batched pass (48.5 ms at three rows):** `moe.up` is
+  14.3 ms and ~3x its one-row cost for 2.7x the experts. The IQ4_NL down
+  mode's 36-byte pair records are not 16-aligned and still take scalar
+  loads. Row-aware attention and DeltaNet kernels would save up to ~2 ms a
+  row. A batched pass is recorded every step (~1-2 ms of host time) rather
+  than replayed like P1c's one-row step.
 - **C7 (mixed passes)** stays conditional on background decode starving
   behind prefill, which C0's numbers have not shown.
 
@@ -650,3 +737,9 @@ the 8 ms above.
   score filled its dead tail across the whole cache. Bit-exact, and prefill
   at the served 262k cache goes from 1037 to 1172 tok/s at depth zero and
   985 to 1047 at 64k. Decode does not move.
+- **2026-09-23**: **the MoE GEMV loads once per quad**: Q4_K takes `uvec4`
+  header and payload loads, the load is out of the row loop, and the routed
+  up mode is v16w4. A three-row pass goes 53.6 → 48.5 ms (61.9 tok/s
+  aggregate) and a one-row step 29.2 → 27.6 ms (36.2 tok/s). It exposed
+  `TestGraphCheckpointIsThePrefill` as arithmetic-fragile: it fails at row
+  11 by 3.5e-4, cause open.

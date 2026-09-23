@@ -374,9 +374,17 @@ func moeCheckGemv(up, down MoEKernel, rows int) error {
 	return nil
 }
 
+// MoEPlanFor is the routed pair's rungs for a batch of this length.
+//
+// **The routed up mode is v16w4 since the Q4_K quad** (CONCURRENCY.md, after
+// C6). L8e-2 measured v16w4 42 ms worse over 64 tokens than v64w4 in the whole
+// model, on the dword-a-lane kernel. The quad makes a Q4_K row 80 units, which
+// v64 walks in a full pass and a quarter, and in the whole model (`cmd/llm
+// -batch 1,2,3`, two runs each) v16w4 is `moe.up` 4.83 → 4.60 ms at one row
+// and 15.2 → 14.3 at three, with v32w4 between them.
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 	if tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV() {
-		return MoEV64W4, MoEV16W4
+		return MoEV16W4, MoEV16W4
 	}
 	return moeGEMMPlanFor(tokens)
 }
@@ -414,7 +422,7 @@ func moeGEMMPlanFor(tokens int) (MoEKernel, MoEKernel) {
 // is already past this machine's 242 GB/s bus and so cannot be a DRAM rate).
 // In the whole model each expert is read once from DRAM, and there the same
 // change is **42.1 ms worse over 64 tokens** where the micro-bench predicted
-// 43.6 better. So the routed pair keeps v64w4/v16w4.
+// 43.6 better. So the routed pair kept v64w4/v16w4 (until the quad: MoEPlanFor).
 //
 // The two are the same grouped GEMM over the same [2560, 640] and [640, 2560]
 // shapes, and they ran on one field until now. But a GEMV rung is LPR — how
