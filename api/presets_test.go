@@ -115,6 +115,45 @@ func TestPresetsAreDefaults(t *testing.T) {
 	}
 }
 
+// TestPresetThinkingOffWins: the top-level reasoning_effort a client sends to
+// every model does not make a non-thinking preset think, in either API's
+// spelling of it.
+func TestPresetThinkingOffWins(t *testing.T) {
+	ps, err := LoadPresets("testdata/models.ini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &fakeLLM{pieces: []Delta{{Content: "hi"}}}
+	s := &Server{Completion: b, Presets: ps}
+	// The top-level reasoning_effort a client sends to every model does
+	// not make a non-thinking preset think; each API's spelling of it.
+	for _, c := range []struct {
+		path string
+		body map[string]any
+	}{
+		{"/v1/chat/completions", map[string]any{"model": "instruct", "messages": []any{user("hi")},
+			"reasoning_effort": "medium"}},
+		{"/v1/responses", map[string]any{"model": "chatting", "input": "hi",
+			"reasoning": map[string]any{"effort": "high"}}},
+	} {
+		rec := do(t, s, jsonRequest("POST", c.path, c.body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status %d: %s", c.path, rec.Code, rec.Body)
+		}
+		if th, _ := b.req.Thinking(); !th.Off {
+			t.Errorf("%s: a non-thinking preset thinks: %+v", c.path, th)
+		}
+	}
+	// A thinking preset still takes the client's effort.
+	body := chatBody(user("hi"))
+	body["model"] = "coding"
+	body["reasoning_effort"] = "low"
+	do(t, s, jsonRequest("POST", "/v1/chat/completions", body))
+	if th, _ := b.req.Thinking(); th.Off || th.Effort != "low" {
+		t.Errorf("coding with reasoning_effort low: %+v", th)
+	}
+}
+
 func TestThinkingResolution(t *testing.T) {
 	kw := func(s string) map[string]json.RawMessage {
 		var m map[string]json.RawMessage

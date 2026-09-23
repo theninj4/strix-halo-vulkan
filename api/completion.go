@@ -330,9 +330,10 @@ type Thinking struct {
 
 // Thinking resolves the request's reasoning switches.
 //
-// The top-level `reasoning_effort` is always the client's own -- a preset
-// only ever fills in `chat_template_kwargs` -- so when it is set it decides
-// on and off outright. Otherwise `enable_thinking` does, and a
+// The top-level `reasoning_effort` is the client's own -- a preset only ever
+// fills in `chat_template_kwargs`, and a preset that turns thinking off
+// clears it (see Preset.Apply) -- so when it is set it decides on and off
+// outright. Otherwise `enable_thinking` does, and a
 // `reasoning_effort` of "none" in the kwargs means off only when
 // `enable_thinking` is absent: a client that sends `enable_thinking: true`
 // to a non-thinking preset gets thinking, whatever effort the preset named.

@@ -188,6 +188,16 @@ func (p *Preset) Apply(req *CompletionRequest) {
 		v := *p.TopK
 		req.TopK = &v
 	}
+	// A preset that turns thinking off is the one default the top-level
+	// `reasoning_effort` does not get to undo: clients send that field on
+	// every request whatever model they are pointed at, so letting it win
+	// makes `chatting` think. Only the template's own `enable_thinking`
+	// turns it back on.
+	if _, explicit := req.ChatTemplateKwargs["enable_thinking"]; !explicit && req.ReasoningEffort != "" {
+		if th, _ := (&CompletionRequest{ChatTemplateKwargs: p.Kwargs}).Thinking(); th.Off {
+			req.ReasoningEffort = ""
+		}
+	}
 	for k, v := range p.Kwargs {
 		if _, ok := req.ChatTemplateKwargs[k]; ok {
 			continue

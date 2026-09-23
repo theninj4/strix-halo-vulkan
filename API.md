@@ -669,8 +669,11 @@ The sampler takes llama.cpp's **`min_p`, `repeat_penalty` and
 as llama-server does). **`chat_template_kwargs`** is llama-server's request
 field; the template reads `enable_thinking`, `preserve_thinking` and
 `reasoning_effort`, and any other is a 400. A top-level `reasoning_effort` is
-the client's own and decides thinking outright; otherwise `enable_thinking`
-does, so `enable_thinking: true` sent to `chatting` thinks.
+the client's own and decides thinking outright -- except against a preset that
+turns thinking off (`chatting`, `instruct`), where it is dropped: clients send
+it on every request whatever model they name, and `reasoning.effort` from the
+Responses API is the same field. Only `enable_thinking: true` (or Anthropic's
+`thinking: {type: enabled}`) makes `chatting` think.
 
 ## Home Assistant speaks Wyoming, not OpenAI
 
