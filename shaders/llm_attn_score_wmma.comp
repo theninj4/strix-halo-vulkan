@@ -90,8 +90,6 @@ layout(local_size_x = WAVE) in;
 // One 16x16 f32 tile per head, because the rectifier is per head and a
 // cooperative matrix's element order is not defined.
 shared float stage[IDX_HEADS * TILE * TILE];
-// The one score every block past the last whole one has, per token of the tile.
-shared float dead[TILE];
 
 void main() {
     uint t0 = gl_WorkGroupID.x * TILE;
@@ -155,16 +153,19 @@ void main() {
         barrier();
     }
 
-    // The tail: block `nBid` and everything past it, all carrying one score.
+    // The tail: block `nBid`, whose one score every block past it shares.
     //
-    // It is scalar because it is one dot product a token, not a GEMM — and the
-    // *fill* behind it is a streaming write of `nBlocks - nBid` floats a token,
-    // which is 33 488 of them at depth zero and 2 750 at 128 000 cells. Nothing
-    // in a shipped pass reads those entries any more (P14-1's select bounds its
-    // histogram at the last block a cell can reach, and its emit only ever asks
-    // for `blk <= deadBid`), but the tensor is the reference's
-    // `indexer_score_tokens` and TestAttnGPUIndexer compares all of it.
-    if (nBid >= nBlocks) {
+    // It is scalar because it is one dot product a token, not a GEMM, and it is
+    // written **once**, at `nBid`, and not across `nBlocks - nBid` entries. That
+    // fill was a streaming write of every block the cache could hold and not the
+    // context: 65 535 floats a token at depth zero in a 262 144-cell cache, 512 MB
+    // a layer for a 2048-row chunk, and 16 ms of a 33 ms attention layer
+    // (CONCURRENCY.md, "the cache-size cost"). Nothing on the device reads past
+    // `deadBid` — P14-1's select bounds its blocks at the last one a cell can
+    // reach, and the expansion maps every tail cell to `deadBid` — so the
+    // tensor's reference shape is rebuilt on the host by `AttnGPU.Score`, which
+    // is the only reader of the rest.
+    if (nBid >= nBlocks || gl_WorkGroupID.y != 0u) {
         return;
     }
     for (uint i = lane; i < TILE; i += WAVE) {
@@ -182,19 +183,6 @@ void main() {
             }
             s += max(d, 0.0);
         }
-        dead[i] = s;
-    }
-    barrier();
-    for (uint i = 0u; i < TILE; ++i) {
-        uint t = t0 + i;
-        if (t >= pc.tokens) {
-            break;
-        }
-        float v = dead[i];
-        uint row = pc.scoreOff + t * nBlocks;
-        for (uint b = nBid + gl_WorkGroupID.y * WAVE + lane; b < nBlocks;
-             b += gl_NumWorkGroups.y * WAVE) {
-            act[row + b] = v;
-        }
+        act[pc.scoreOff + t * nBlocks + nBid] = s;
     }
 }

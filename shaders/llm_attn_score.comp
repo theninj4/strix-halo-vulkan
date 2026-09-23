@@ -75,9 +75,6 @@ layout(local_size_x = WG) in;
 // This token's queries, read once and then hit by every block.
 shared float16_t qs[IDX_HEADS * IDX_DIM];
 
-// The one score every block past the last whole one has. See below.
-shared float deadScore;
-
 void main() {
     uint t = gl_WorkGroupID.x;
     uint tid = gl_LocalInvocationID.x;
@@ -106,9 +103,9 @@ void main() {
     // exist, so scoring it row by row charged a 131k-cell cache 32 768 dots a
     // token a layer at every depth, empty or not — 6.94 ns a cell a token a
     // layer measured at depth zero, which is 11.4 ms of a decode step across
-    // the twelve attention layers before the first cell is real. The tensor
-    // this writes is unchanged: every dead row still gets its value, and the
-    // value is still the one the pooled key implies.
+    // the twelve attention layers before the first cell is real. Since the
+    // cache-size fix the dead rows are not written either, only `nBid`'s
+    // (below); `AttnGPU.Score` gives them their value on the host.
     uint first = gl_WorkGroupID.y * WG + tid;
     uint step = gl_NumWorkGroups.y * WG;
     for (uint b = first; b < nBid && b < nBlocks; b += step) {
@@ -123,6 +120,9 @@ void main() {
         }
         act[pc.scoreOff + t * nBlocks + b] = s;
     }
+    // One entry, at `nBid`, and not the `nBlocks - nBid` of them the tensor's
+    // reference shape has: llm_attn_score_wmma.comp says why, and
+    // `AttnGPU.Score` rebuilds the rest on the host.
     if (nBid < nBlocks) {
         if (tid == 0u) {
             uint kb = pc.idxKOff + nBid * IDX_DIM;
@@ -134,12 +134,7 @@ void main() {
                 }
                 s += max(d, 0.0);
             }
-            deadScore = s;
-        }
-        barrier();
-        float dead = deadScore;
-        for (uint b = nBid + first; b < nBlocks; b += step) {
-            act[pc.scoreOff + t * nBlocks + b] = dead;
+            act[pc.scoreOff + t * nBlocks + nBid] = s;
         }
     }
 }

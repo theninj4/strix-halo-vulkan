@@ -2524,8 +2524,26 @@ func (g *AttnGPU) ColIQ() int { return g.colIQ() }
 func (g *AttnGPU) ColIK() int { return g.colIK() }
 
 // Score is the indexer's rectified per-block score, [T][nBlocks].
+//
+// The device writes each row only as far as `nBid`, the first block that is
+// not whole: every block past it pools cell 0 and so shares its score, and
+// nothing on the device reads them. Filling them there was a write of every
+// block the *cache* holds (CONCURRENCY.md, "the cache-size cost"), so this
+// fills them here instead, and the tensor keeps the reference's shape.
 func (g *AttnGPU) Score() []float32 {
-	return g.abuf.ReadFloat32At(int(g.aScore), g.rows*g.NBlocks())
+	nb := g.NBlocks()
+	out := g.abuf.ReadFloat32At(int(g.aScore), g.rows*nb)
+	nBid := (g.past + g.rows) / g.cfg.Ratio
+	if nBid >= nb {
+		return out
+	}
+	for t := 0; t < g.rows; t++ {
+		row := out[t*nb : (t+1)*nb]
+		for b := nBid + 1; b < nb; b++ {
+			row[b] = row[nBid]
+		}
+	}
+	return out
 }
 
 // Selection is the QSA bitmask a run left behind: one bit a cell, 32 cells a
