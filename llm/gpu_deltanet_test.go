@@ -354,6 +354,12 @@ func TestDeltaNetGPUStateCarries(t *testing.T) {
 		t.Skipf("the trace has %d tokens, which does not split", nTok)
 	}
 	split := nTok / 2
+	// The GEMM whatever the batch: at 7 tokens the first half is 3, which is
+	// a decode GEMV's row count since GEMVMaxRows went to 3 (CONCURRENCY.md
+	// C5), and a GEMV reassociates the projection's sum. What is under test
+	// is what crosses the boundary, so the projection is held to one kernel.
+	g.PinGemv(true)
+	defer g.PinGemv(false)
 
 	if err := g.Reset(0); err != nil {
 		t.Fatal(err)

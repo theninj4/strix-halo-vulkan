@@ -31,7 +31,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): slots and a priority scheduler done, batched decode next); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
@@ -370,8 +370,13 @@ from what the draft predicts.
   where a copy runs two.
 - **P6 — batching. Unblocked 2026-09-23 and moved to
   [`CONCURRENCY.md`](CONCURRENCY.md)**: the answer is three concurrent
-  streams with a priority lane for voice. C1 (sequence slots) and C2 (the
-  scheduler, `-llm-slots`) are done; the text below is the old framing.
+  streams with a priority lane for voice. C1 (sequence slots), C2 (the
+  scheduler, `-llm-slots`), C0 (`cmd/loadgen`), C3 (chunk curve) and C4
+  (per-slot checkpoints: a voice command's TTFT goes 1.83 → 0.19 s at 48
+  layers) and C5 (batched decode: three agents at 18 tok/s each instead of
+  11, a three-row pass at 1.83 steps) and C6 (every slot at the full 262k)
+  are done; `ai.service`'s LLM line is `-llm-slots 3`. The text below is the
+  old framing.
   Blocked on the product question: will the API serve
   more than one stream? Each sequence owns 113 MB of DeltaNet state plus
   rings and KV. P5b already built the first stage (R-row decode GEMVs,

@@ -60,6 +60,101 @@ func even(n, k int) []int {
 	return out
 }
 
+// TestAttnGPUSlotsHaveTheirOwnCache is C6's block gate (CONCURRENCY.md):
+// each sequence slot's cache is buffers of its own, bound to pipelines of its
+// own. Slot 2 prefills the first half of the prompt, slot 0 then runs a
+// different prompt from cell zero, and slot 2 continues with the second half.
+// The continuation reads every cell of its first half, so it has to come out
+// bit for bit what the same two chunks give with nothing in between.
+//
+// The control switches slot 2 back onto slot 0's pipelines for the
+// continuation, which reads slot 0's keys, and it has to differ. A fresh run
+// cannot show this: it writes every cell it then reads, so a shared cache is
+// invisible to it.
+func TestAttnGPUSlotsHaveTheirOwnCache(t *testing.T) {
+	c, w, nTok, nKV, _, tr, _ := qsaFixtures4k(t)
+	src, err := tr.Get("hc_mixed-3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := src.Vals
+	other := make([]float32, len(in))
+	for i, v := range in {
+		other[i] = -0.5 * v
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+	g, err := NewAttnGPUBank(dev, c, nTok, nKV, []AttnWeights{w}, bankOf(denseQ8Test), QuantSim{},
+		WithAttnSlots(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	// Pinned as TestAttnGPUCacheIsAChunkSplit pins it, so the two runs below
+	// are the same kernels over the same chunks.
+	attn, gemm, outGemm := g.Plan()
+	if err := g.SetPlan(attn, gemm, outGemm); err != nil {
+		t.Fatal(err)
+	}
+	g.SetSplits(1)
+	g.SetGather(false)
+	defer g.AutoGather()
+
+	half := nTok / 2
+	use := func(s int) {
+		if err := g.UseSlot(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(vals []float32, past, n int) []float32 {
+		if err := g.SetPast(past); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Upload(vals[past*c.NEmbd:(past+n)*c.NEmbd], n); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.Out()...)
+	}
+
+	use(2)
+	run(in, 0, half)
+	want := run(in, half, nTok-half)
+
+	interleaved := func(share bool) []float32 {
+		use(2)
+		run(in, 0, half)
+		use(0)
+		run(other, 0, nTok)
+		use(2)
+		if share {
+			g.pipes = g.slotPipes[0]
+			defer use(2)
+		}
+		return run(in, half, nTok-half)
+	}
+	firstDiff := func(got []float32) int {
+		for i := range want {
+			if got[i] != want[i] {
+				return i
+			}
+		}
+		return -1
+	}
+	if i := firstDiff(interleaved(false)); i >= 0 {
+		t.Fatalf("slot 2's continuation moved when slot 0 ran between its chunks, first at token %d component %d",
+			half+i/c.NEmbd, i%c.NEmbd)
+	}
+	t.Logf("slot 2 continued past slot 0's %d-token run: %d tokens identical to the last place", nTok, nTok-half)
+	if i := firstDiff(interleaved(true)); i < 0 {
+		t.Error("control: slot 2 continuing on slot 0's buffers gave the same output, so the gate cannot see the separation")
+	} else {
+		t.Logf("control, slot 2 on slot 0's buffers: differs from token %d", half+i/c.NEmbd)
+	}
+}
+
 // TestAttnGPUCacheIsAChunkSplit is L7a's gate.
 func TestAttnGPUCacheIsAChunkSplit(t *testing.T) {
 	g, tr, c, nTok, done := attnGPU4k(t)

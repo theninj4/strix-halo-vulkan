@@ -205,6 +205,9 @@ type PLEGPU struct {
 	// which is how far back the convolution may reach. Zero is a fresh
 	// sequence, where anything before token 0 is zero.
 	past int
+	// batch is the rows of a batched decode pass, one sequence each, or nil
+	// for an ordinary pass of the live slot (CONCURRENCY.md C5, SetBatch).
+	batch []batchRow
 	// fp16 activations: the gathered n-gram embedding, the GEMM's A operand.
 	hEmb   uint32
 	hElems int
@@ -588,6 +591,30 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 	add(kvPipe, "kv", uint32(g.kvN()/pleKVBN), uint32(roundUpInt(g.rows, v.bm)/v.bm), kv)
 
 	add("gate", "gate", uint32(c.HC), uint32(g.rows), base)
+	if g.batch != nil {
+		// A batched decode pass (CONCURRENCY.md C5, batch.go): the
+		// convolution and the ring write once per row, on that row's ring at
+		// its position (dword 1+r). The projection and the gate are per row
+		// already.
+		for r, br := range g.batch {
+			rb := base
+			rb.Tokens, rb.LowRank = 1, uint32(1+r)
+			for _, off := range []*uint32{&rb.ResOff, &rb.GatedOff, &rb.NormOff} {
+				*off += uint32(r * wide)
+			}
+			if rb.ConvOutOff != noW {
+				rb.ConvOutOff += uint32(r * wide)
+			}
+			rb.InjOff = g.histAt(br.slot)
+			add("conv", "conv", uint32((wide+255)/256), 1, rb)
+			hist := rb
+			hist.LoOff = rb.NormOff // SEQ_SRC
+			hist.GemmM, hist.GemmK = uint32(c.ConvHist()), uint32(wide)
+			hist.OutOff = noW
+			add("hist", "hist", uint32((wide+255)/256), 1, hist)
+		}
+		return d, kinds
+	}
 	add("conv", "conv", uint32((wide+255)/256), uint32(g.rows), base)
 	// The ring, for whatever runs next. It is the only dispatch here that a
 	// single-shot prefill does not need, and it is nine rows.
@@ -628,6 +655,26 @@ func (g *PLEGPU) Reset() {
 // histAt is the ring in a given slot, and histDst the slot the next pass
 // writes: the live one unless a speculative pass is in flight (P5c).
 func (g *PLEGPU) histAt(slot int) uint32 { return g.aHist + uint32(slot*g.histStride) }
+
+// CarriedLen, SaveCarried and RestoreCarried are the live slot's ring as a
+// sequence checkpoint sees it (CONCURRENCY.md C4; DeltaNetGPU.CarriedLen).
+func (g *PLEGPU) CarriedLen() int { return g.histStride }
+
+func (g *PLEGPU) SaveCarried(dst []float32) error {
+	if len(dst) != g.histStride {
+		return fmt.Errorf("llm: %d values against a %d-value ple checkpoint", len(dst), g.histStride)
+	}
+	g.abuf.ReadFloat32Into(int(g.histAt(g.histSlot)), dst)
+	return nil
+}
+
+func (g *PLEGPU) RestoreCarried(src []float32) error {
+	if len(src) != g.histStride {
+		return fmt.Errorf("llm: a %d-value ple checkpoint against %d", len(src), g.histStride)
+	}
+	g.abuf.WriteFloat32At(int(g.histAt(g.histSlot)), src)
+	return nil
+}
 
 func (g *PLEGPU) histDst() int {
 	if g.histSpec {

@@ -60,7 +60,7 @@
 // leaves the MALL, so that is shape and nothing else (D12's stopping
 // condition).
 layout(constant_id = 0) const uint ROWS = 1;
-#define MAXROWS 2
+#define MAXROWS 3
 
 layout(local_size_x = WAVE) in;
 

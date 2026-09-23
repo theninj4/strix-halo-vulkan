@@ -178,8 +178,10 @@ void main() {
         actu[invPerm + tok * slots + k] = idx;
     }
 
-    // ---- The tile records: expert, first row, and the row block, which is
-    // now always full because the range was padded to it.
+    // ---- The tile records: expert, first row, and how many of the block's
+    // rows are real. The range is padded to the block, so a block is always
+    // whole; the third word is what lets the decode GEMV skip the padding
+    // (llm_moe_gemv.comp, CONCURRENCY.md C5). The GEMM does not read it.
     for (uint e = tid; e < nE; e += WG) {
         uint cnt = shCnt[e];
         uint padded = ((cnt + pad - 1u) / pad) * pad;
@@ -189,7 +191,7 @@ void main() {
             uint rec = pc.moeTileOff + 2u + 3u * (tb + mb);
             actu[rec] = e;
             actu[rec + 1u] = off + mb * bm;
-            actu[rec + 2u] = bm;
+            actu[rec + 2u] = (cnt > mb * bm) ? min(cnt - mb * bm, bm) : 0u;
         }
     }
 }

@@ -98,11 +98,9 @@ Scheduling rules (C2, tuned in C3):
    because by then the chunk it waits behind has already started. So the worst
    wait an interactive request sees is one short chunk rather than 6-7 s, and
    what that costs background prefill is C3's measurement.
-4. Once batching exists (C5), background decode rows **ride along** in the
-   interactive request's decode pass whenever that costs the interactive
-   stream less than a set fraction of its rate. Whether 1.32x a step for a
-   free second stream is acceptable in a voice reply is a measurement and a
-   knob, not a decision to make now.
+4. Decode steps of one class share a pass (C5, done). Background rows do
+   **not** ride in an interactive pass: one rider would cost the voice
+   stream 1.47x and two 1.83x, and a voice reply's latency is its TTFT.
 5. At most `S` requests hold slots. A fourth waits for one, and it is logged
    as queued, as today.
 
@@ -113,13 +111,13 @@ the change.
 
 | # | stage | what it is | gate |
 |---|---|---|---|
-| **C0** | **Instrument** | A load generator (`cmd/bench -llm-concurrent` or similar) that fires one voice-shaped request (a fixed ~2k-token system prompt + a short utterance, short answer) against two agent-shaped ones (long prompts, long answers). It records per-stream TTFT, token rate and total throughput. Run it against today's server for the baseline. | Numbers in this file, two runs agreeing. |
+| ~~**C0**~~ | ~~**Instrument**~~ **done 2026-09-23** (below): `cmd/loadgen` | A load generator (`cmd/bench -llm-concurrent` or similar) that fires one voice-shaped request (a fixed ~2k-token system prompt + a short utterance, short answer) against two agent-shaped ones (long prompts, long answers). It records per-stream TTFT, token rate and total throughput. Run it against today's server for the baseline. | Numbers in this file, two runs agreeing. |
 | ~~**C1**~~ | ~~**Sequence slots in the graph**~~ **done 2026-09-23** (below) | `GraphOpts.Slots`, `Graph.UseSlot(s)`. Attention allocates `S×` the cache and offsets it by slot; DeltaNet and PLE allocate `S` state/ring slots, and the *committed slot* is the sequence slot. The graph keeps `past`, `ids` and the recorded decode step per slot. Refused together with `Speculative` (the ping-pong and the slots share an index). | `TestGraphSlotsAreSequences`: two sequences interleaved token by token through one graph give **bit-identical** logits to each run alone, prerecorded decode included. Its control (the same interleave without switching slots) must differ. |
 | ~~**C2**~~ | ~~**The scheduler**~~ **done 2026-09-23** (below); `-llm-slots` stays 1 in `ai.service` until C0/C3 are measured | `backend.LLM` gets a scheduler goroutine that owns the graph. `Complete` submits work and receives tokens. Slot choice: longest reusable held prefix, else the least recently used idle slot. `held` becomes per slot. Priority from `service_tier`/header/flag. `-llm-slots N` (default 1 until C3 lands). | An `api`-level test with three concurrent requests on the 4-layer prefix: each one's output equals its solo run at temperature 0. The interactive one's TTFT is bounded by one unit, not by the other requests' generations. |
-| **C3** | **Bounded work units** | Price prefill against chunk size at depth (512 / 1024 / 2048 / 4096 / 8192). While an interactive request is live, cap background chunks at the chosen size. Measure the switch cost between slots (per-slot recorded decode steps should make it ~0). | C0's harness: interactive TTFT and token rate with two background streams live, against the same request alone. |
-| **C4** | **Checkpoints: prefix caching across threads** | Snapshot a slot's carried state at a **stable boundary**: the end of everything before the last user message. That is DeltaNet state + rings (~120 MB, ~1 ms on-device), the PLE ring, the pooled indexer block that straddles the boundary, and the position. KV cells below the boundary are never rewritten by a continuation, so within a slot they need no copy. A request whose prompt shares the checkpointed prefix restores it and prefills only the tail. That fixes the voice case (same system prompt, new utterance) and agents that retry or branch. Cross-slot restore copies the KV cells too (27.8 KB a cell, ~0.11 GB for 4k). | Restore-then-continue is **bit-identical** to a fresh prefill of the whole prompt, and a control that skips the DeltaNet restore differs. |
-| **C5** | **Batched decode** | R decoding slots advance one token each in one pass. Per-row position and slot come from an arena table (P1c's trick again: the recorded buffer stays byte-identical). The row-aware kernels are attention (`pack`, `idx`, `score`, `select`, the gathered `wmma`), DeltaNet (`conv`, `scan`, `seq_hist`) and PLE's `hist`. Raise `GEMVMaxRows` 2 → 3 with its rung in `TestGraphIsAChunkSplit` in the same commit (see the memory note on new row counts). **C5a prices it first**: a 3-row pass at 48 layers against a 1-row one, which needs the machine (stop `ai.service`). | Each row of a batched pass equals that slot's solo step (to the R-row GEMV's documented tolerance), whole graph, at R = 2 and 3. |
-| **C6** | **Full context in every slot** | K, V and indexer planes as a descriptor array of per-slot buffers (`PipelineSpec.Counts`, as the MoE bank does), which lifts the `slots × ctx ≤ ~349k` cap to 3 × 262k (~22 GB of KV). | `TestAttnGPUCacheSizeDoesNotChangeTheAnswer` extended across slots; P18's recall at 237k in a non-zero slot. |
+| ~~**C3**~~ | ~~**Bounded work units**~~ **measured 2026-09-23** (below); chunk stays 2048 until C4 | Price prefill against chunk size at depth (512 / 1024 / 2048 / 4096 / 8192). While an interactive request is live, cap background chunks at the chosen size. Measure the switch cost between slots (per-slot recorded decode steps should make it ~0). | C0's harness: interactive TTFT and token rate with two background streams live, against the same request alone. |
+| ~~**C4**~~ | ~~**Checkpoints: prefix caching across threads**~~ **done 2026-09-23** within a slot (below); cross-slot restore not built | Snapshot a slot's carried state at a **stable boundary**: the end of everything before the last user message. That is DeltaNet state + rings (~120 MB, ~1 ms on-device), the PLE ring, the pooled indexer block that straddles the boundary, and the position. KV cells below the boundary are never rewritten by a continuation, so within a slot they need no copy. A request whose prompt shares the checkpointed prefix restores it and prefills only the tail. That fixes the voice case (same system prompt, new utterance) and agents that retry or branch. Cross-slot restore copies the KV cells too (27.8 KB a cell, ~0.11 GB for 4k). | Restore-then-continue is **bit-identical** to a fresh prefill of the whole prompt, and a control that skips the DeltaNet restore differs. |
+| ~~**C5**~~ | ~~**Batched decode**~~ **done 2026-09-23** (below): per-row passes rather than row-aware kernels, and `moe.up` skips padding rows | R decoding slots advance one token each in one pass. Per-row position and slot come from an arena table (P1c's trick again: the recorded buffer stays byte-identical). The row-aware kernels are attention (`pack`, `idx`, `score`, `select`, the gathered `wmma`), DeltaNet (`conv`, `scan`, `seq_hist`) and PLE's `hist`. Raise `GEMVMaxRows` 2 → 3 with its rung in `TestGraphIsAChunkSplit` in the same commit (see the memory note on new row counts). **C5a prices it first**: a 3-row pass at 48 layers against a 1-row one, which needs the machine (stop `ai.service`). | Each row of a batched pass equals that slot's solo step (to the R-row GEMV's documented tolerance), whole graph, at R = 2 and 3. |
+| ~~**C6**~~ | ~~**Full context in every slot**~~ **done 2026-09-23** (below): a buffer set and a pipeline set a slot, no descriptor array | K, V and indexer planes as a descriptor array of per-slot buffers (`PipelineSpec.Counts`, as the MoE bank does), which lifts the `slots × ctx ≤ ~349k` cap to 3 × 262k (~22 GB of KV). | `TestAttnGPUCacheSizeDoesNotChangeTheAnswer` extended across slots; P18's recall at 237k in a non-zero slot. |
 | C7 | *Mixed passes* (maybe) | Decode rows riding in another slot's prefill chunk, so a background prefill does not stall the other streams' decode. Only worth building if C3's numbers leave background decode visibly starved. | — |
 
 Not planned: a second Vulkan queue or global-priority queues to preempt a
@@ -129,11 +127,19 @@ of them, and C3's short chunks bound the same latency far more cheaply.
 ## Open questions for later stages
 
 - **How long is Home Assistant's system prompt?** C4's value and C3's chunk
-  cap both depend on it. One real request in the journal answers it.
-- **Default slot count and context per slot.** Until C6, `3 × 112k` or
-  `2 × 174k` against today's `1 × 262k`. What do the agents actually use?
-- **Does a background stream riding in a voice decode pass (rule 4) cost the
-  voice reply too much?** This waits on C5a's number.
+  cap both depend on it. One real request in the journal answers it. The
+  harness assumes 1.94k tokens (40 devices).
+- ~~**The preempt chunk, 2048 or 1024?**~~ **Decided 2026-09-23: 2048.**
+  A voice command's worst wait of ~2 s while an agent prefills is fine;
+  what is not fine is minutes, so prefill speed wins over a second of
+  latency.
+- ~~**Default slot count and context per slot.**~~ **Decided 2026-09-23:
+  three slots**, and with C6 each holds the full 262 144 cells
+  (`ai.service`'s LLM line, `-llm-slots 3`).
+- ~~**Does a background stream riding in a voice decode pass (rule 4) cost
+  the voice reply too much?**~~ C5's numbers: one rider costs it 1.47x and
+  two cost 1.83x. It stays off, because a voice reply is short and its
+  latency is its TTFT, which riding does not help.
 
 ## C1 — sequence slots (done 2026-09-23)
 
@@ -167,10 +173,15 @@ visible to the gate. The existing gates (`TestAttnGPU`,
 `TestSnapshot`, `TestGraphPrefix`, `TestDeltaNetGPU`, `TestPLE`) pass
 unchanged at one slot.
 
-*Not covered yet:* the 4-layer fixture's cache is 256 cells, so the attention
-is dense and the gathered arm (P15's depth epoch) never ran in a non-zero
-slot. That arm reads the same four offsets, but it is owed a run at depth
-(C3's measurements will exercise it).
+*At depth (2026-09-23, 48 layers):* the 4-layer fixture's cache is 256
+cells, so the gate's attention is dense and never takes P15's gathered arm.
+That arm was checked through the server instead: `-llm-slots 2 -llm-ctx
+131072 -llm-reserve 0`, and the same **98 937-token** prompt at temperature 0
+sent three times, which lands in slot 1, slot 0 and slot 1 (`[slot N]` in the
+log). All three answers are byte-identical, and they are P18's recall ("Robert
+Boulter", plus the corpus's last heading). The gathered prefill and the
+gathered, split decode both run above ~4k live cells, so C0's 7-8k agents
+exercised them in slots 1 and 2 as well.
 
 ## C2 — the scheduler (done 2026-09-23)
 
@@ -202,16 +213,370 @@ log line gains `[slot N, class, Xs stalled]` when there is more than one slot.
   one took the reserved slot 2, a 42 ms TTFT and 126 ms total, and the two
   background lines report ~1.2 s `stalled`.
 
+## C0 + C3 — the harness and the chunk curve (measured 2026-09-23)
+
+**The harness is `cmd/loadgen`.** It sends two background agents at t=0
+(a 7.3k/7.8k-token wikitext document each, "summarise it at length",
+`max_tokens` 768, thinking on) and four interactive voice commands at 2, 9,
+25 and 40 s. Each voice command is a Home-Assistant-shaped system prompt of 40
+devices (**1.94k tokens**), a short utterance, `reasoning_effort: none` and
+`max_tokens` 32. The voice commands at 2 s and 9 s land while the agents are
+prefilling, and the ones at 25 s and 40 s land while they are decoding.
+Before each concurrent phase it runs every stream alone as the same-hour
+control. Every arm below ran the concurrent phase twice, and **the two runs
+agree within 0.03 s on every TTFT and 0.3 tok/s on every rate** (the
+baseline's within 0.07 s). The server was the 48-layer model at
+`-llm-ctx 65536 -llm-batch 8192`, with `ai.service` stopped. The sweep script
+restarts the server per arm from one binary.
+
+| arm | voice TTFT at 2 s / 9 s (in prefill) | at 25 s / 40 s (in decode) | agent decode, each | agent prefill alone (7338 tok) | aggregate |
+|---|---|---|---|---|---|
+| alone (control) | 1.84 / 1.79 | 1.80 / 1.79 | 34.8 | — | — |
+| **1 slot (before C2)** | **27.4 / 22.7** | 9.0 / 24.1 | 35.4, but agent1 waits 40.6 s for its first token | 6.32 s (8192 chunk) | 24.8 tok/s |
+| 3 slots, chunk 512 | 2.05 / 1.83 | 1.90 / 1.79 | 16.8 | 11.71 s (**+85%**) | 21.3 |
+| 3 slots, chunk 1024 | 2.09 / 2.01 | 1.81 / 1.79 | 16.1 | 9.10 s (+44%) | 22.9 |
+| **3 slots, chunk 2048** (the default) | 3.41 / 2.44 | 1.81 / 1.79 | 16.2 / 15.7 | 7.29 s (+15%) | 24.2 |
+| 3 slots, chunk 4096 | 3.11 / 4.80 | 1.82 / 1.81 | 16.2 / 14.6 | 6.43 s (+2%) | 24.7 |
+| 3 slots, chunk 8192 | 5.74 / 7.35 | 1.83 / 1.79 | 13.1 / 15.4 | 6.32 s | 24.8 |
+
+(TTFTs in seconds and rates in tok/s, all as the client sees them.)
+
+What it says:
+
+1. **C2 does what it was for.** A voice command that arrives while the agents
+   are decoding gets its solo TTFT and its solo rate (35.4 tok/s against 34.4
+   alone) at every chunk size. The agents stall for those ~2 s and nothing
+   else happens to them. One that arrives during an agent's prefill waits for
+   the chunk on the device and no longer. Before C2 it waited for a whole
+   generation, 9-27 s.
+2. **Switching slots costs nothing measurable.** The two agents' decode
+   windows (~48.8 s for 768 tokens each, minus ~4.4 s of voice turns inside
+   them) come to 34.6 tok/s combined, which is the solo rate. Aggregate
+   throughput is the same as one slot's to within the prefill-chunk cost, as
+   the design said: C2 buys fairness, not tokens. C5 buys tokens.
+3. **A prefill chunk has a fixed cost of ~0.39 s**, and it is the MoE bank.
+   Fitting chunk time = c0 + n·c1 over the solo prefills gives c0 ≈ 0.39 s
+   and c1 ≈ 0.80 ms a token. 0.39 s is one read of the ~76 GB expert bank at
+   ~200 GB/s: every chunk of 512 or more rows touches essentially every
+   expert. So a chunk under ~2k is mostly bank reading. At 512 the cost is
+   +85% on background prefill, and the aggregate falls 14%.
+4. **The worst voice wait is one chunk's duration**, not what the two sample
+   arrivals happened to hit: ~0.8 s at 512, **~1.3 s at 1024, ~2.0 s at
+   2048**, ~3.3 s at 4096 and ~6.3 s at 8192.
+
+**Decision: the default stays 2048.** Going to 1024 saves ~0.7 s of worst-case
+voice wait and costs every background prefill 25% (whenever there is more than
+one slot, whether or not a voice command ever comes). The larger part of a
+voice command's TTFT today is its **own** 1.8 s prefill of a system prompt
+that is identical every time, and C4 removes that. Revisit the chunk after C4,
+when the chunk wait will be most of what is left. A different lever is the
+chunk's fixed cost: if an MoE pass over 1024 rows read less than the whole
+bank, small chunks would be cheap, but at 1024 rows × 8 experts of 256 it
+does not.
+
+## C5a — what a three-row pass costs (measured 2026-09-23)
+
+`cmd/llm -graph -tokens 1,2,3 -layers 48 -ctx 2048` on the shipped banks
+(`LLM_DENSE_BANK`/`LLM_MOE_BANK` as `cmd/serve` sets them, plus
+`LLM_BANK_CACHE`). Two builds, interleaved A/B/A/B: HEAD, where
+`GEMVMaxRows` is 2 and a three-row pass falls back to the GEMM, and a scratch
+worktree with `MAXROWS 3` in the four GEMV shaders and `GEMVMaxRows = 3`.
+The two pairs agree within 1 ms.
+
+| rows | HEAD | MAXROWS 3 | hc | dn | attn | **moe** | head |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 29.3 ms | 29.3 ms | 3.9 | 7.2 | 2.5 | 11.0 | 2.4 |
+| 2 | 38.9 (1.33x) | 41.2 (1.41x) | 4.0 | 7.6 | 2.5 | 22.3 | 2.4 |
+| 3 | 106.3 (3.6x) | **52.2 (1.78x)** | 4.2 | 7.7 | 2.6 | **33.1** | 2.4 |
+
+(block columns are the MAXROWS 3 build)
+
+- **Three rows cost 1.78 steps, not the ~1.5 the plan hoped for**, and C5
+  found that even this was optimistic. **These three rows are three
+  consecutive tokens of one sequence, and consecutive tokens share
+  experts.** Three conversations touch 26.8 distinct experts a layer, not
+  ~24, and at C5's first build their pass was 64.2 ms (2.22 steps). The
+  `moe.up` fix below brought it to 53.4 ms (1.83). See C5 for the numbers
+  that stand.
+- **Everything but the MoE is flat in rows**, as P5b found at two: hc, dn,
+  attn, ple and head are all within 0.4 ms from one row to three. **The MoE
+  is the whole cost**, and `moe.up` alone goes 6.0 → 14.8 → 24.0 ms. More
+  rows touch more distinct experts, so some of that growth is bytes that must
+  be read. But `moe.up` grows 4.0x over three rows, while `moe.down` over the
+  same expert set grows 2.3x (2.6 → 6.0 ms). `moe.up` at R rows was the
+  kernel to look at, and C5 did: most of it was padding rows.
+- **Raising MAXROWS costs two rows 2.3 ms** (38.9 → 41.2, mostly `moe.up`'s
+  extra accumulator). Nothing ships two-row passes today (the speculative
+  loop is parked), and one row is unchanged, so C5 can raise it. It has to
+  land with its rungs.
+- **Correctness in the scratch build:** `TestGraphIsAChunkSplit` passes, and
+  new *unpinned* "2 / 3 at a time, on the decode schedule" subtests read
+  result_norm at 5.2e-4 and 6.2e-4 rms (one row: 4.5e-4; the gate's bound is
+  1e-3). The existing "3 at a time" rung runs on the pinned schedule, so it
+  would not see a broken three-row GEMV. **C5's commit should carry these two
+  subtests.**
+- **Rule 4 (background rows riding in a voice decode):** one rider costs the
+  voice stream 1.33x (35 → ~26 tok/s) and two cost it 1.78x (→ ~20 tok/s). A
+  spoken reply is consumed at speech rate, which is well under either, so
+  riding is plausible for TTS-bound replies. It stays a knob, and it defaults
+  to off, until C5 exists.
+
+## C4 — checkpoints (done 2026-09-23)
+
+`llm.Graph.Checkpoint` / `Restore`, and a checkpoint per slot in the
+scheduler.
+
+- **What a checkpoint is.** It holds the live slot's DeltaNet state and rings
+  for every layer (~120 MB at 36 layers), the PLE ring, the position and the
+  ids, copied on the host. The arenas are host-cached and mapped, so this is
+  a memcpy, not a readback. The KV cells and raw indexer keys below the
+  position stay on the device, because a continuation from there never
+  rewrites them. So a checkpoint restores only into its own slot, and only
+  while that slot's ids still start with the checkpoint's. `Restore` checks
+  both and refuses otherwise.
+- **The pooled indexer table needs no restore**, although P5c's rollback
+  snapshots it. The first version restored it, and its control did not
+  move. The reason is in `llm_attn_score.comp`: a pass rebuilds the blocks it
+  completes before it scores any. Every block at or past the last whole one
+  is scored as one broadcast value under a −inf or 1e9 bias (P7), and no
+  stored row can change that selection. So the restore was dropped, and the
+  gate keeps the case that could have disproved this (below).
+- **Where the checkpoint goes.** It sits at the end of everything before the
+  last `<|im_start|>user` (`backend.checkpointAt`). That point is found on
+  the rendered text and re-encoded, and refused if the result is not a token
+  prefix of the prompt. A prefix under 256 tokens is not checkpointed. The
+  scheduler cuts the prefill chunk at the boundary and checkpoints after it,
+  reusing the slot's host buffers. Slot choice counts a restorable checkpoint
+  as reuse, and among slots that save a job nothing it overwrites the one
+  with the least checkpointed first. Without that, agents arriving after a
+  voice command take its slot by LRU. `-llm-checkpoints=false` is the
+  control. The log says `(N from a checkpoint)` where it said `(N cached)`.
+
+**Gates:**
+- `TestGraphCheckpointIsThePrefill` (4 layers, 7 s): a 2600-token prefix in
+  a 4096-cell cache (sparse: the selection is past its width), checkpointed
+  in slot 1. The slot then runs a 600-token detour and 12 steps, slot 0 runs
+  another conversation, and slot 1 restores and runs a 300-token tail and 12
+  steps. **All 13 logit rows are bit-identical** to prefix + tail run
+  directly. The detour runs further than the real continuation, so stale
+  pooled blocks are present at the decode frontier, and they still change
+  nothing. Controls: a restore without the DeltaNet state moves row 0 (logit
+  0 −0.8748 against −0.8638), and one without the PLE ring moves row 0 too
+  (−0.8640). `Restore` refuses a slot that has since been re-run from token
+  zero.
+- `TestLLMCheckpointIsTheSystemPrompt` (backend, 4 layers): a voice-shaped
+  request restores the system prompt's checkpoint (566 of 585 tokens,
+  prefill 148 → 24 ms) and streams exactly the text of a fresh prefill. The
+  scheduler's restore counter is asserted, so a run that never restored
+  cannot pass.
+
+**At 48 layers** (C0's harness, 3 slots, same hour, two runs agreeing within
+0.02 s):
+
+| | voice alone | voice during agent prefill (2 s / 9 s) | during agent decode (25 s / 40 s) | agents done | aggregate |
+|---|---|---|---|---|---|
+| chunk 2048, checkpoints off | 1.83 s | 3.41 / 2.44 | 1.80 / 1.79 | 66.3 s | 24.1 tok/s |
+| **chunk 2048, checkpoints on** | **0.19 s** | 1.82 / 1.11 | **0.22 / 0.20** | 59.9 s | 26.7 |
+| chunk 1024, checkpoints on | 0.19 s | **0.50 / 1.14** | 0.22 / 0.21 | 63.5 s | 25.2 |
+
+- **A voice command's TTFT goes from 1.83 s to 0.19 s**: 1917 of its ~1940
+  tokens come from the checkpoint, and what is left is a ~22-token pass plus
+  the restore. The first command after a start pays **+0.2 s once** (2.03 s):
+  the checkpoint copy and the extra chunk the cut makes.
+- Voice turns are cheaper, so the agents finish 6.4 s sooner and the aggregate
+  rises 11%.
+- **The chunk wait is now nearly all of a voice command's latency while an
+  agent prefills.** At 2048 the wait is up to ~2.0 s, plus ~0.2 s. At 1024
+  it is up to ~1.3 s, and the price is the +25% background prefill C3
+  measured (agents 3.6 s later here, aggregate −6%). **Decided: 2048**:
+  prefill speed over a second of voice latency.
+
+**Not built: cross-slot restore.** A checkpoint restores only into its own
+slot. Copying the KV cells too (27.8 KB a cell, ~53 MB for a 1.9k system
+prompt) would let a voice command use a checkpoint while another voice
+command holds its slot. It is not needed while one slot is reserved for the
+interactive class and commands arrive one at a time.
+
+## C5 — batched decode (done 2026-09-23)
+
+`llm.Graph.DecodeRows(slots, ids)` advances several sequences one token each
+in one pass. The scheduler batches the pending decode steps of one class into
+it.
+
+**How, and why not row-aware kernels.** The plan was to make attention,
+DeltaNet and PLE read a per-row slot and position from an arena table. The
+build runs **those three blocks' per-sequence kernels once per row instead**,
+as a one-token pass of that row's sequence: its slot's cache, state and
+ring, its row of the projection in and its row of the context out. The
+projections, the hyper-connections, the MoE and the head run over all R rows
+at once. Three things make this nearly free:
+
+- **The position was the only thing a push field had no room for.**
+  `SEQ_PAST` is now `actu[pc.lowRank]`: dword 1+r of the block's arena for
+  row r, and dword 0 for every ordinary dispatch, whose `lowRank` was
+  already zero. None of the thirteen kernels that read the position uses
+  `lowRank` as itself. So a single-sequence pass and its recorded replay are
+  the same bytes as before. `TestGraphLogits` reproduces P16's diagnostics
+  to the digit (maxAbs 1.987e+00 at 19208, rms 3.314e-01).
+- **The recorded pass fences every dispatch**, so every scratch arena
+  between the projection and the context is reused row after row. A row's
+  pass may write the context's pad rows past itself, and the next row's pass
+  overwrites them, because rows run in ascending order.
+- **Per-row cost is small at decode**: attention and DeltaNet add ~2.4 ms a
+  row at 48 layers (the batch profile below). Row-aware kernels would win
+  back part of that, and it is the smaller lever.
+
+**`moe.up` computed padding rows.** The GEMV rung computes `ROWS` rows of
+every expert tile, and the permutation's sentinel makes the extra ones
+harmless. At P5b's two rows of one sequence that was nearly free, because
+most tiles had two real rows. With three conversations most of the ~27
+experts serve one row, so two-thirds of `moe.up`'s arithmetic was padding.
+The tile record's third word (the block size, which nothing read) is now the
+real row count (`llm_moe_perm.comp`, and on the host for the shared expert's
+list), and `llm_moe_gemv.comp` stops at it. `moe.up` at three rows went from
+**28.9 to 18.8 ms**, and a three-row pass from **64.2 to 53.4 ms**. The
+shared expert reads ~0.25 ms slower at three rows in both runs, which is not
+explained.
+
+**The instrument is `cmd/llm -batch 1,2,3 -batch-depth 7000`.** It uses one
+slot a row, each prefilled with its own wikitext, and decodes greedily. A
+fixed token per row would read the same experts every step and understate
+the MoE; that was C5a's error in another form. `-batch-chunk 8192 -batch-ctx
+65536` gives the server's shape, which costs the same to 0.6 ms.
+
+| rows | pass | a row | aggregate | moe | dn | attn | distinct experts (layer 47) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 29.2 ms | 34.2 tok/s | 34.2 | 11.1 | 6.8 | 3.4 | 10.0 |
+| 2 | 42.9 (1.47x) | 23.3 | 46.6 | 20.5 | 7.8 | 4.8 | 19.2 |
+| 3 | **53.4 (1.83x)** | 18.7 | **56.2** | 28.7 | 8.9 | 6.1 | 26.8 |
+
+**Gates:**
+- `TestGraphDecodeRowsIsEachSlot` (4 layers, 5 s): three sequences of 700,
+  300 and 500 tokens decode 8 steps batched. Every row's logits are
+  **bit-identical** to that sequence stepped alone, at three rows and at two
+  (slots 0 and 2). There is nothing to reassociate: the R-row GEMV sums each
+  row in the one-row order, and the per-sequence kernels run a row as a
+  one-token pass. The three controls each make row 1 read row 0's position
+  in one block, and each moves the logits: attention 0.169 rms, DeltaNet
+  0.127, PLE 0.055.
+- `GEMVMaxRows` 3 with its rungs: `TestGraphIsAChunkSplit` gained the
+  unpinned "2 / 3 at a time, on the decode schedule" subtests (C5a's).
+  `TestDeltaNetGPUStateCarries` now pins the GEMM, because its 3 + 4 split
+  made the first half a GEMV. `TestMoEGPUDecode` and `TestMoEGPUSharedPlan`
+  now stage one past the bound. They staged a literal two, so their
+  "refused past the bound" control was passing on the staging's refusal and
+  not the plan's.
+- `TestLLMConcurrentIsSolo` (backend) now asserts that batching happened:
+  23 batched passes of 2.91 rows each, and every conversation streams
+  exactly its solo text.
+
+**At 48 layers** (C0's harness, same hour, two runs agreeing within 0.7
+tok/s):
+
+| | agents' decode, each | agents done | aggregate | voice |
+|---|---|---|---|---|
+| 3 agents, batching off | 11.0-11.5 tok/s | 88.0 s | 26.2 tok/s | — |
+| **3 agents, batching on** | **17.6-18.8** | **62.0 s** | **37.1** | — |
+| C0's mix, batching off | 16.9 / 16.4 | 61.1 s | 26.2 | as C4 |
+| **C0's mix, batching on** | **23.2 / 22.3** | **48.6 s** | **32.9** | as C4 (0.20 s in decode) |
+
+- The loop's gap between batched steps is **0.3 ms** (an env-gated trace in
+  a scratch build). The coalescing wait (up to 5 ms for peers that are still
+  sampling) costs nothing measurable, and without it the first conversation
+  back from sampling would run alone.
+- **Background rows still do not ride in an interactive pass** (rule 4).
+  Per the table, one rider would cost a voice stream 1.47x and two 1.83x.
+  That stays off: a voice reply is 10-30 tokens, and its latency is its TTFT.
+- `-llm-batch-decode=false` is the control.
+- **Solo decode is 33.8 tok/s this afternoon against 34.7 this morning, and
+  the same-hour A/B/C says that is not this work.** The one-row pass is 29.0
+  ms before today's changes, 29.3 with `MAXROWS` 3 and 29.5 now, inside the
+  0.5 ms spread.
+
+## C6 — full context in every slot (done 2026-09-23)
+
+**Each slot's cache is its own three buffers (key, value, indexer), and each
+slot has its own attention pipelines.** A pipeline's descriptor set names its
+buffers, so a slot with buffers of its own needs pipelines of its own. The
+plan's descriptor array (`PipelineSpec.Counts`, as the MoE bank does) would
+have needed the slot index in every cache-reading kernel, and the push block
+has no room for it. Instead `AttnGPU.build` runs once per slot against that
+slot's buffers, and `UseSlot` swaps the buffers and the pipeline map. The
+cache offsets no longer depend on the slot, **no shader changed**, and a
+recorded pass was already mixing pipelines of different blocks. So:
+
+- `maxStorageBufferRange` caps a slot's cells (~349k), not all slots'
+  together. **3 × 262 144 cells**, where C1's shared buffers allowed
+  ~349k in total.
+- The pipeline builds cost nothing measurable. The 48-layer server came up
+  in 68 s against P18's ~66, because identical SPIR-V hits Mesa's shader
+  cache. Residency is **~98 GB, with 19 GB available** on this 117.7 GiB
+  machine.
+- Batched decode (C5) needed nothing: a row's per-sequence core already
+  calls `UseSlot` for its slot.
+
+**Gates:**
+- `TestAttnGPUSlotsHaveTheirOwnCache` (block, 0.5 s): slot 2 prefills half
+  the 4k fixture, slot 0 runs a different input from cell zero, and slot 2
+  continues. The continuation is **bit-identical** to the same two chunks
+  with nothing in between. The control puts slot 2's continuation on slot
+  0's pipelines, and it moves from the first continued token. A fresh run
+  cannot see a shared cache, because it writes every cell it reads; the
+  first version of this control put one inside
+  `TestAttnGPUCacheSizeDoesNotChangeTheAnswer` and passed unchanged, which
+  is how that was found.
+- `TestAttnGPUCacheSizeDoesNotChangeTheAnswer` now also runs slot 2 of a
+  3-slot block with a 3x cache, after slot 0 ran something else, and demands
+  the same bits.
+- **At 48 layers**, `-llm-slots 3 -llm-ctx 262144 -llm-batch 8192`: two short
+  requests take slots 0 and 1, and a **237 231-token** prompt lands in slot
+  2 and recalls P18's "Robert Boulter" (plus the last heading, "IRA
+  resurgence"). The same prompt again lands in slot 0, and **the two answers
+  are byte-identical**. Decode at 237k is 30.1 tok/s in both slots (P18:
+  29.9).
+- C0's mix on the same server gives agents 21.4-22.9 tok/s each and voice as
+  before (0.20-0.26 s TTFT outside an agent's prefill chunk).
+
+**Two costs, and neither is C6's:**
+- **The 237k prefill runs at 901 tok/s, against P18's ~1022.** With more
+  than one slot a background prefill is cut into `-llm-preempt-chunk` (2048)
+  chunks, and at this length that is ~116 chunks of C3's ~0.39 s fixed
+  cost. It is the trade decided above. A client that wants P18's rate for
+  one long prompt can send it as interactive, which is not chunked.
+- **A 262k-cell cache makes prefill attention twice as dear, at any
+  depth.** A 2048-token pass at depth zero costs 366 ms of attention against
+  178 ms in a 65k-cell cache (1926 against 1729 ms a pass). This morning's
+  binary measures the same to 3 ms (1923 / 1728), so it predates C6, and
+  every 262k configuration since P18 has paid it. P7 made *decode* cost the
+  depth rather than the cache; some prefill kernel still costs the cache.
+  That is the next prefill lever (below): agent prefill is 8.0 s at 262k
+  cells against 7.3 at 65k.
+
 ## Next
 
-- **C0 + C3 need the machine** (a 48-layer server is ~83 GB, and `ai.service`
-  currently holds the image/speech side on this box). The load generator is
-  the first thing to write, then the preempt-chunk curve at depth, then the
-  gathered arm in a non-zero slot at 128k.
-- **C4 (checkpoints)** can be built and gated on the 4-layer prefix now.
-- **C5a** (price a 3-row pass at 48 layers) needs the machine. C5 itself is
-  kernel work in attention, DeltaNet and PLE, and its gate runs at 4 layers.
+- **The cache-size cost in prefill attention** (C6 above): find the kernel
+  that still scales with `nKV` rather than the live cells at prefill. The
+  labels of `cmd/llm -graph -tokens 2048 -ctx 262144` against `-ctx 65536`
+  will name it. It is ~10% of every prefill at the served context.
+- **What is left in a batched pass:** the MoE is 28.7 of 53.4 ms at three
+  rows. Its bytes grow 2.7x with the experts, and `moe.up` still grows 3.1x,
+  so a little remains there. Row-aware attention and DeltaNet kernels would
+  save up to ~2 ms a row. A batched pass is recorded every step (~1-2 ms of
+  host time) rather than replayed like P1c's one-row step.
+- **C7 (mixed passes)** stays conditional on background decode starving
+  behind prefill, which C0's numbers have not shown.
 
 ## Log
 
 - **2026-09-23**: file opened; plan above. **C1 and C2 done** the same day.
+- **2026-09-23**: C0 (`cmd/loadgen`), C3's chunk curve, C1's depth check at
+  99k in slot 1, and C5a, all on the 48-layer model with `ai.service`
+  stopped. The chunk stays at 2048.
+- **2026-09-23**: **C4 done** (within a slot). The voice TTFT goes from 1.83
+  to 0.19 s at 48 layers.
+- **2026-09-23**: **C6 done**, three slots of the full 262 144 cells, and
+  `ai.service`'s LLM line is `-llm-slots 3`.
+- **2026-09-23**: chunk decided at 2048 (prefill speed over a second of
+  voice latency). **C5 done**: batched decode, per-row passes for the three
+  per-sequence blocks, and `moe.up` skipping padding rows. Three agents get
+  18 tok/s each instead of 11 and finish in 62 s instead of 88.

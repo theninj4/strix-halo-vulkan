@@ -299,6 +299,9 @@ type DeltaNetGPU struct {
 	// what turns the ring's absolute positions into slots. Zero is a fresh
 	// sequence, where a tap reaching before token zero contributes nothing.
 	past int
+	// batch is the rows of a batched decode pass, one sequence each, or nil
+	// for an ordinary pass of the live slot (CONCURRENCY.md C5, SetBatch).
+	batch []batchRow
 	// fp16 activations.
 	hXn, hCtx uint32
 	hElems    int
@@ -1054,6 +1057,41 @@ func (g *DeltaNetGPU) CommitSlot() {
 // see the ping-pong rather than infer it.
 func (g *DeltaNetGPU) StateSlot() int { return g.stateSlot }
 
+// CarriedLen is how many float32s one sequence carries through this block
+// from pass to pass: every layer's recurrent state and convolution ring.
+// SaveCarried and RestoreCarried copy the live slot's to and from the host,
+// which is what a sequence checkpoint is made of (CONCURRENCY.md C4). The
+// arena is host-cached, so this is a memcpy and not a readback.
+func (g *DeltaNetGPU) CarriedLen() int { return len(g.layers) * (g.stateStride + g.winStride) }
+
+func (g *DeltaNetGPU) SaveCarried(dst []float32) error {
+	if len(dst) != g.CarriedLen() {
+		return fmt.Errorf("llm: %d values against a %d-value deltanet checkpoint", len(dst), g.CarriedLen())
+	}
+	o := 0
+	for l := range g.layers {
+		g.abuf.ReadFloat32Into(int(g.stateAt(l, g.stateSlot)), dst[o:o+g.stateStride])
+		o += g.stateStride
+		g.abuf.ReadFloat32Into(int(g.winAt(l, g.stateSlot)), dst[o:o+g.winStride])
+		o += g.winStride
+	}
+	return nil
+}
+
+func (g *DeltaNetGPU) RestoreCarried(src []float32) error {
+	if len(src) != g.CarriedLen() {
+		return fmt.Errorf("llm: a %d-value deltanet checkpoint against %d", len(src), g.CarriedLen())
+	}
+	o := 0
+	for l := range g.layers {
+		g.abuf.WriteFloat32At(int(g.stateAt(l, g.stateSlot)), src[o:o+g.stateStride])
+		o += g.stateStride
+		g.abuf.WriteFloat32At(int(g.winAt(l, g.stateSlot)), src[o:o+g.winStride])
+		o += g.winStride
+	}
+	return nil
+}
+
 // Reset zeroes one layer's recurrent state and the convolution's window,
 // which is what a fresh sequence starts from.
 //
@@ -1231,13 +1269,47 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// 2. The convolution, its SiLU, the two L2 norms and the two per-head
 	//    scalars. One plane per head, plus one for the scalars.
 	planes := uint32(2*c.NHeadK + c.NHeadV + 1)
-	add("conv", "conv", planes, uint32(g.rows), base)
+	hist := c.Conv - 1
+	if g.batch == nil {
+		add("conv", "conv", planes, uint32(g.rows), base)
 
-	// 3. The delta rule.
-	add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), base)
+		// 3. The delta rule.
+		add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), base)
 
-	// 4. The gated output norm, into the output projection's A operand.
-	add("norm", "norm", uint32(c.NHeadV), uint32(g.rows), base)
+		// 4. The gated output norm, into the output projection's A operand.
+		add("norm", "norm", uint32(c.NHeadV), uint32(g.rows), base)
+	} else {
+		// A batched decode pass (CONCURRENCY.md C5, batch.go): steps 2-4
+		// and the ring write of step 6, once per row, as a one-token pass
+		// of that row's sequence — its state and ring, its position at
+		// dword 1+r, its rows of every per-token tensor. The scan carries
+		// state from token to token, so rows of different sequences cannot
+		// share one.
+		for r, br := range g.batch {
+			rb := base
+			rb.Tokens, rb.LowRank = 1, uint32(1+r)
+			rb.QKVOff += uint32(r * g.qkvN())
+			rb.NormOff += uint32(r * c.ConvWidth())
+			if rb.ConvOutOff != noW {
+				rb.ConvOutOff += uint32(r * c.ConvWidth())
+			}
+			rb.OutOff += uint32(r * c.Inner)
+			rb.CtxOff += uint32(r * g.ldCtx)
+			rb.SSMGateOff += uint32(r * c.NHeadV)
+			rb.SSMBetaOff += uint32(r * c.NHeadV)
+			rb.SSMStateOff = g.stateAt(layer, br.slot)
+			rb.ResOff = rb.SSMStateOff
+			rb.InjOff = g.winAt(layer, br.slot)
+			add("conv", "conv", planes, 1, rb)
+			add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), rb)
+			add("norm", "norm", uint32(c.NHeadV), 1, rb)
+			win := rb
+			win.LoOff = rb.QKVOff // SEQ_SRC
+			win.GemmM, win.GemmK = uint32(hist), uint32(g.qkvN())
+			win.OutOff = noW
+			add("hist", "hist", uint32((g.qkvN()+255)/256), 1, win)
+		}
+	}
 
 	// 5. The output projection.
 	out := base
@@ -1262,8 +1334,10 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// 6. The convolution's window, for whatever runs next: the last Conv-1
 	//    rows of the projection into this layer's ring. Three rows of 16512
 	//    floats — 198 KB — and the only dispatch here a single-shot prefill
-	//    does not need.
-	hist := c.Conv - 1
+	//    does not need. A batched pass wrote each row's above.
+	if g.batch != nil {
+		return d, kinds, nil
+	}
 	win := base
 	win.LoOff = g.aQKV // SEQ_SRC
 	win.InjOff = g.winAt(layer, g.stateDst())

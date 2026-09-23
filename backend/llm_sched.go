@@ -29,11 +29,30 @@ package backend
 // Slots are handed out on the same order, and a slot is reserved for the
 // interactive class when there is more than one, so that background agents
 // can never occupy every slot and lock a voice command out.
+//
+// **Decode steps of different conversations share a pass** (C5). When the
+// unit picked is a decode step, every other pending decode step of the same
+// class rides with it, a row each (llm.Graph.DecodeRows): three rows cost
+// ~1.8 steps, so three streams get ~19 tok/s each instead of ~11. After a
+// batched step every conversation samples its token and submits the next
+// step within a millisecond or so, so the loop waits up to `coalesce` for
+// the ones still sampling rather than running the first one back alone.
+// Background rows do not ride in an interactive pass: a rider costs the
+// voice stream a third of its rate (C5a), and rule 1 already says who waits.
+//
+// **Each slot also keeps a checkpoint** (C4): its carried state at the end of
+// everything before the last user turn of the last request it ran. The next
+// voice command on the same system prompt, or the next turn of a
+// conversation whose re-rendered history no longer matches what was
+// generated, restores it and prefills only what follows. The prefill chunk
+// is cut at that boundary so the checkpoint can be taken there.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -77,6 +96,23 @@ type llmSlot struct {
 	job *llmJob
 	// used is when it was last released, for least-recently-used.
 	used time.Time
+	// ckpt is the slot's checkpoint, or nil. It is usable only while held
+	// still starts with its tokens: that is what says the cache cells below
+	// it are still the ones it was taken over (llm.Graph.Restore).
+	ckpt *llm.Checkpoint
+}
+
+// reuse is how much of a prompt the slot saves, and whether that is by
+// restoring its checkpoint rather than continuing what it holds.
+func (sl *llmSlot) reuse(prompt []int32) (int, bool) {
+	n := usablePrefix(sl.held, prompt)
+	if c := sl.ckpt; c != nil {
+		b := c.Past()
+		if b > n && b < len(prompt) && commonPrefix(sl.held, c.Ids()) == b && commonPrefix(prompt, c.Ids()) == b {
+			return b, true
+		}
+	}
+	return n, false
 }
 
 // llmJob is one request's claim on the scheduler.
@@ -84,8 +120,13 @@ type llmJob struct {
 	ctx   context.Context
 	class llmClass
 	slot  int
-	// reused is how many leading tokens of the prompt the slot already held.
-	reused int
+	// reused is how many leading tokens of the prompt the slot already held,
+	// and restore whether that is its checkpoint rather than its sequence.
+	reused  int
+	restore bool
+	// mark is where to take the slot's checkpoint during the prefill, as a
+	// position in the prompt, or 0 for nowhere.
+	mark int
 	// arrival breaks ties, oldest first.
 	arrival uint64
 	// served is the device time its units have taken, which is what rule 2
@@ -95,6 +136,10 @@ type llmJob struct {
 	// the longest prefix of it wins.
 	prompt  []int32
 	granted chan struct{}
+	// stepping is set by its first decode step: from then on, a moment with
+	// no unit queued is a moment it is sampling, and a batched step is worth
+	// waiting a little for it.
+	stepping bool
 }
 
 // llmUnit is a pending run of tokens for one job: a prefill, which the
@@ -103,6 +148,10 @@ type llmUnit struct {
 	job   *llmJob
 	ids   []int32
 	fresh bool
+	// restore takes the slot back to its checkpoint before the first chunk.
+	restore bool
+	// step is a decode step, which may share a pass with other slots' (C5).
+	step bool
 	// busy is the device time spent on it, and logits/err its result once
 	// done is closed.
 	busy   time.Duration
@@ -126,17 +175,31 @@ type llmSched struct {
 	waiting []*llmJob
 	pending []*llmUnit
 	// running is the unit on the device, which a cancelled caller must not
-	// take out of the queue from under the loop.
-	running *llmUnit
+	// take out of the queue from under the loop, and inflight the units of a
+	// batched step on it.
+	running  *llmUnit
+	inflight []*llmUnit
+	// coalesce is how long a decode step waits for the other decoding
+	// conversations of its class to submit theirs, measured from the end of
+	// the last step (C5). lastStep is that end.
+	coalesce time.Duration
+	lastStep time.Time
+	// noBatch is LLMOptions.NoBatchDecode.
+	noBatch bool
 	arrival uint64
 	closed  bool
 	stopped chan struct{}
+	// restores counts checkpoint restores, and batches and batchRows the
+	// batched decode passes and the rows they carried, for a test that has
+	// to know one happened rather than infer it from a matching answer.
+	restores, batches, batchRows int
 }
 
-func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int) *llmSched {
+func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int, noBatch bool) *llmSched {
 	s := &llmSched{
-		g: g, dev: dev, batch: batch, preempt: preempt, reserve: reserve,
+		g: g, dev: dev, batch: batch, preempt: preempt, reserve: reserve, noBatch: noBatch,
 		slots: make([]llmSlot, g.Slots()), stopped: make(chan struct{}),
+		coalesce: 5 * time.Millisecond,
 	}
 	s.wake = sync.NewCond(&s.mu)
 	go s.loop()
@@ -145,14 +208,14 @@ func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int) *llmSch
 
 // acquire waits for a slot and claims it. The job it returns must be
 // released, whatever happens after.
-func (s *llmSched) acquire(ctx context.Context, class llmClass, ids []int32) (*llmJob, error) {
+func (s *llmSched) acquire(ctx context.Context, class llmClass, ids []int32, mark int) (*llmJob, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("the language model is closed")
 	}
 	s.arrival++
-	j := &llmJob{ctx: ctx, class: class, slot: -1, arrival: s.arrival, prompt: ids,
+	j := &llmJob{ctx: ctx, class: class, slot: -1, arrival: s.arrival, prompt: ids, mark: mark,
 		granted: make(chan struct{})}
 	s.waiting = append(s.waiting, j)
 	s.grant()
@@ -201,8 +264,9 @@ func (s *llmSched) bestWaiter() *llmJob {
 	return best
 }
 
-// freeSlot picks the slot for a job of this class: the one already holding
-// the longest usable prefix of its prompt, else the least recently used.
+// freeSlot picks the slot for a job of this class: the one that saves the
+// most of its prompt (a held prefix or a checkpoint), else the least recently
+// used.
 // It is -1 when there is none the class may take.
 func (s *llmSched) freeSlot(class llmClass, prompt []int32) int {
 	free, bgBusy := 0, 0
@@ -226,12 +290,31 @@ func (s *llmSched) freeSlot(class llmClass, prompt []int32) int {
 		if sl.job != nil {
 			continue
 		}
-		reuse := usablePrefix(sl.held, prompt)
-		if best < 0 || reuse > bestReuse || (reuse == bestReuse && sl.used.Before(s.slots[best].used)) {
+		reuse, _ := sl.reuse(prompt)
+		if best < 0 || reuse > bestReuse || (reuse == bestReuse && s.cheaper(sl, &s.slots[best])) {
 			best, bestReuse = i, reuse
 		}
 	}
 	return best
+}
+
+// cheaper is whether a is the better slot to overwrite than b, when neither
+// saves the new job anything: the one with less checkpointed, then the least
+// recently used. Without the first rule, background agents arriving after a
+// voice command take its slot by LRU and the next command re-reads the whole
+// system prompt (C4).
+func (s *llmSched) cheaper(a, b *llmSlot) bool {
+	if ca, cb := ckptLen(a), ckptLen(b); ca != cb {
+		return ca < cb
+	}
+	return a.used.Before(b.used)
+}
+
+func ckptLen(sl *llmSlot) int {
+	if sl.ckpt == nil {
+		return 0
+	}
+	return sl.ckpt.Past()
 }
 
 // usablePrefix is how much of a prompt a slot's held sequence saves. The
@@ -248,7 +331,7 @@ func usablePrefix(held, prompt []int32) int {
 func (s *llmSched) claim(j *llmJob, slot int) {
 	s.dropWaiter(j)
 	j.slot = slot
-	j.reused = usablePrefix(s.slots[slot].held, j.prompt)
+	j.reused, j.restore = s.slots[slot].reuse(j.prompt)
 	// A newcomer starts level with the least-served job of its class rather
 	// than at zero, or it would hold the device until it had caught up with
 	// a conversation that has been running for a minute.
@@ -293,9 +376,23 @@ func (s *llmSched) releaseLocked(j *llmJob) {
 // (fresh starts the slot's sequence over) or one decode step. It returns the
 // last token's logits, and how long the unit sat behind other jobs' work.
 func (s *llmSched) run(j *llmJob, ids []int32, fresh bool) ([]float32, time.Duration, error) {
+	return s.submit(&llmUnit{job: j, ids: ids, fresh: fresh, done: make(chan struct{})})
+}
+
+// step is run for one decode token, which the loop may batch with other
+// conversations' steps.
+func (s *llmSched) step(j *llmJob, id int32) ([]float32, time.Duration, error) {
+	return s.submit(&llmUnit{job: j, ids: []int32{id}, step: true, done: make(chan struct{})})
+}
+
+func (s *llmSched) submit(u *llmUnit) ([]float32, time.Duration, error) {
 	start := time.Now()
-	u := &llmUnit{job: j, ids: ids, fresh: fresh, done: make(chan struct{})}
+	j := u.job
 	s.mu.Lock()
+	if u.step {
+		j.stepping = true
+	}
+	u.restore, j.restore = j.restore, false
 	if s.closed {
 		s.mu.Unlock()
 		return nil, 0, fmt.Errorf("the language model is closed")
@@ -310,7 +407,7 @@ func (s *llmSched) run(j *llmJob, ids []int32, fresh bool) ([]float32, time.Dura
 		// an interactive request for seconds — and one on the device is
 		// waited out, because the loop is writing its result.
 		s.mu.Lock()
-		if s.running != u {
+		if s.running != u && !slices.Contains(s.inflight, u) {
 			s.dropUnit(u)
 			select {
 			case <-u.done:
@@ -340,6 +437,7 @@ func (s *llmSched) loop() {
 	for {
 		s.mu.Lock()
 		var u *llmUnit
+		var steps []*llmUnit
 		for {
 			if s.closed {
 				for _, p := range s.pending {
@@ -351,16 +449,49 @@ func (s *llmSched) loop() {
 				return
 			}
 			if u = s.pick(); u != nil {
-				break
+				if !u.step {
+					break
+				}
+				steps = s.steps(u)
+				wait := s.coalesceWait(u, len(steps))
+				if wait <= 0 {
+					break
+				}
+				time.AfterFunc(wait, func() {
+					s.mu.Lock()
+					s.wake.Broadcast()
+					s.mu.Unlock()
+				})
 			}
 			s.wake.Wait()
+		}
+		if len(steps) > 1 {
+			s.runSteps(steps)
+			continue
 		}
 		n := min(len(u.ids), s.batch)
 		if u.job.class == classBackground && s.preempt > 0 && len(u.ids) > 1 {
 			n = min(n, s.preempt)
 		}
+		slot, fresh, restore := u.job.slot, u.fresh, u.restore
+		sl := &s.slots[slot]
+		var ck *llm.Checkpoint
+		pos := len(sl.held)
+		switch {
+		case fresh:
+			pos = 0
+		case restore:
+			ck = sl.ckpt
+			pos = ck.Past()
+		}
+		// The chunk that reaches the checkpoint's boundary ends there.
+		mark := u.job.mark
+		if mark > pos && mark < pos+n {
+			n = mark - pos
+		}
+		take := mark > 0 && pos+n == mark
 		chunk, next := u.ids[:n], u.ids[n:min(len(u.ids), 2*n)]
-		slot, fresh := u.job.slot, u.fresh
+		keep := sl.ckpt
 		s.running = u
 		s.mu.Unlock()
 
@@ -379,11 +510,24 @@ func (s *llmSched) loop() {
 					// one runs (P17).
 					s.g.PrefetchPLE(chunk, next)
 				}
+				if restore {
+					if err := s.g.Restore(ck); err != nil {
+						return err
+					}
+				}
 				var err error
 				if fresh {
 					logits, _, err = s.g.Forward(chunk)
 				} else {
 					logits, _, err = s.g.Extend(chunk)
+				}
+				if err == nil && take {
+					// A checkpoint that cannot be taken costs the next
+					// request its prefix, not this one its answer.
+					if keep, err = s.g.Checkpoint(keep); err != nil {
+						log.Printf("llm: slot %d: no checkpoint at %d: %v", slot, mark, err)
+						keep, err = nil, nil
+					}
 				}
 				return err
 			})
@@ -392,23 +536,31 @@ func (s *llmSched) loop() {
 
 		s.mu.Lock()
 		s.running = nil
-		sl := &s.slots[slot]
 		switch {
 		case err != nil && ran:
 			// Whatever the slot held is no longer something this can
 			// describe; the next request on it starts over.
-			sl.held = nil
+			sl.held, sl.ckpt = nil, nil
 		case err != nil:
 			// Cancelled before the chunk ran: the device is where the held
 			// sequence says it is.
 		case fresh:
 			sl.held = append(sl.held[:0], chunk...)
+		case restore:
+			sl.held = append(sl.held[:ck.Past()], chunk...)
+			s.restores++
 		default:
 			sl.held = append(sl.held, chunk...)
 		}
+		if err == nil && take {
+			sl.ckpt = keep
+		}
+		if u.step {
+			s.lastStep = time.Now()
+		}
 		u.busy += took
 		u.job.served += took
-		u.ids, u.fresh = u.ids[n:], false
+		u.ids, u.fresh, u.restore = u.ids[n:], false, false
 		if err != nil || len(u.ids) == 0 {
 			u.logits, u.err = logits, err
 			s.dropUnit(u)
@@ -416,6 +568,105 @@ func (s *llmSched) loop() {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// steps is the batch a picked decode step runs in: it and every other
+// pending decode step of its class, up to one a slot (C5).
+func (s *llmSched) steps(u *llmUnit) []*llmUnit {
+	b := []*llmUnit{u}
+	if s.noBatch {
+		return b
+	}
+	for _, p := range s.pending {
+		if p != u && p.step && p.job.class == u.job.class {
+			b = append(b, p)
+		}
+	}
+	return b
+}
+
+// coalesceWait is how much longer a batch of n steps should wait for the
+// conversations of its class that are decoding but sampling right now, or 0
+// to run it as it is.
+func (s *llmSched) coalesceWait(u *llmUnit, n int) time.Duration {
+	if s.noBatch {
+		return 0
+	}
+	peers := 0
+	for i := range s.slots {
+		if j := s.slots[i].job; j != nil && j.class == u.job.class && j.stepping {
+			peers++
+		}
+	}
+	if n >= peers {
+		return 0
+	}
+	return time.Until(s.lastStep.Add(s.coalesce))
+}
+
+// runSteps runs a batch of decode steps on different slots as one pass. It is
+// called with the lock held and returns with it released.
+func (s *llmSched) runSteps(batch []*llmUnit) {
+	// A conversation that hung up while queued is not run.
+	live := batch[:0]
+	for _, u := range batch {
+		if err := u.job.ctx.Err(); err != nil {
+			u.err = err
+			s.dropUnit(u)
+			close(u.done)
+			continue
+		}
+		live = append(live, u)
+	}
+	batch = live
+	if len(batch) == 0 {
+		s.mu.Unlock()
+		return
+	}
+	slots := make([]int, len(batch))
+	ids := make([]int32, len(batch))
+	for i, u := range batch {
+		slots[i], ids[i] = u.job.slot, u.ids[0]
+	}
+	s.inflight = batch
+	s.batches++
+	s.batchRows += len(batch)
+	s.mu.Unlock()
+
+	var logits []float32
+	t0 := time.Now()
+	err := s.dev.Do(func(*vk.Device) error {
+		var err error
+		logits, err = s.g.DecodeRows(slots, ids)
+		return err
+	})
+	took := time.Since(t0)
+
+	s.mu.Lock()
+	s.inflight = nil
+	vocab := 0
+	if err == nil {
+		vocab = len(logits) / len(batch)
+	}
+	for i, u := range batch {
+		sl := &s.slots[u.job.slot]
+		if err != nil {
+			// Which rows' states moved is not something this can say.
+			sl.held, sl.ckpt = nil, nil
+		} else {
+			sl.held = append(sl.held, u.ids[0])
+			u.logits = logits[i*vocab : (i+1)*vocab]
+		}
+		// Each row had the whole pass's latency, and a share of its cost.
+		u.busy += took
+		u.job.served += took / time.Duration(len(batch))
+		u.err = err
+		u.ids = nil
+		s.dropUnit(u)
+		close(u.done)
+	}
+	s.lastStep = time.Now()
+	s.mu.Unlock()
 }
 
 // pick is the scheduling policy: the next unit to run, or nil to wait. See

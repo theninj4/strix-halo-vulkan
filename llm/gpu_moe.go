@@ -1312,8 +1312,10 @@ func (g *MoEGPU) syncShared() {
 		rec[0] = uint32(n)
 		rec[1] = uint32(reserve)
 		for mb := 0; mb < n; mb++ {
+			// The block's real rows, as llm_moe_perm.comp writes them for
+			// the routed experts (C5): every token is the shared expert's.
 			rec[2+3*mb+1] = uint32(mb * t.bm)
-			rec[2+3*mb+2] = uint32(t.bm)
+			rec[2+3*mb+2] = uint32(min(max(g.rows-mb*t.bm, 0), t.bm))
 		}
 		g.writeUints(t.off, rec)
 	}

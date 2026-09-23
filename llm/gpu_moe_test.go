@@ -575,9 +575,11 @@ func TestMoEGPUDecode(t *testing.T) {
 	c, w, in, _, tr := moeFixtures4k(t)
 	dev, done := newTestDevice(t)
 	defer done()
-	// Staged for two so that the negative control at the end has somewhere to
-	// resize to; run at one.
-	g, err := NewMoEGPU(dev, c, 2, []MoEWeights{w})
+	// Staged one past GEMVMaxRows so that the negative control at the end
+	// has somewhere to resize to, and is refused by the plan rather than by
+	// the staging (it was staged for a literal two, which stopped being one
+	// past the bound when the bound went to three); run at one.
+	g, err := NewMoEGPU(dev, c, GEMVMaxRows+1, []MoEWeights{w})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +731,7 @@ func TestMoEGPUSharedPlan(t *testing.T) {
 	c, w, in, _, _ := moeFixtures4k(t)
 	dev, done := newTestDevice(t)
 	defer done()
-	g, err := NewMoEGPU(dev, c, 2, []MoEWeights{w})
+	g, err := NewMoEGPU(dev, c, GEMVMaxRows+1, []MoEWeights{w})
 	if err != nil {
 		t.Fatal(err)
 	}

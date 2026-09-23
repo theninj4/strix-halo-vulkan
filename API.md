@@ -117,12 +117,15 @@ the length of a request is a *slot* of the graph, whose cache, PLE ring and
 DeltaNet state are one sequence's.
 
 **`-llm-slots N` holds N conversations at once** (CONCURRENCY.md, C1/C2). Each
-slot is its own KV cache (27.8 KB a cell), DeltaNet state and rings (120 MB);
-the cache planes' 4 GiB range caps `slots x -llm-ctx` at ~349k cells. A
+slot is its own KV cache (27.8 KB a cell, in buffers of its own since C6, so
+every slot can hold the full 262 144 cells), DeltaNet state and rings (120
+MB). The served line is `-llm-slots 3 -llm-ctx 262144`, ~98 GB resident. A
 request holds one slot for its life, and a scheduler interleaves every live
 request's work a **unit** at a time — one prefill chunk or one decode step.
-This is concurrency and not throughput: three streams share one stream's
-~34 tok/s until batched decode (C5) lands. The order is:
+The decode steps of concurrent conversations of one class **share a pass**,
+a row each (C5, `-llm-batch-decode`). Rows cost less than passes: three
+streams get ~18 tok/s each rather than a third of ~34 each, 56 tok/s in
+total at 48 layers. The order is:
 
 1. **Interactive before background, strictly.** A request is interactive if
    it sends `X-Priority: interactive` or `service_tier: "priority"`, and
@@ -260,10 +263,12 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm-batch       4096         tokens the prefill arenas hold (P16: wider costs memory only)
     -llm-max-tokens  1024         what a request that names no max_tokens gets
     -llm-layers      0            stage the first N layers only; a fast start, not an answer
-    -llm-slots       1            conversations held at once; slots x ctx <= ~349k cells
+    -llm-slots       1            conversations held at once, each of -llm-ctx cells
     -llm-preempt-chunk 2048       longest background prefill chunk, with more than one slot
     -llm-reserve     1            slots only interactive requests may take, with more than one
     -llm-class       background   priority of a request that names none
+    -llm-checkpoints true         keep each slot's state before the last user turn (C4)
+    -llm-batch-decode true        decode concurrent conversations a row each in one pass (C5)
 
     -tts         false            load Kokoro-82M
     -tts-model   models/Kokoro-82M
@@ -329,8 +334,21 @@ With `-llm-slots 1` **the graph is one conversation's**: two clients are
 served correctly — the second waits, and re-prefills — but they take turns
 evicting each other's prefix. With more slots each holds its own, and a
 request is given the free slot already holding the longest prefix of its
-prompt, else the least recently used one. The reuse is still all-or-nothing
-within a slot; checkpoints that survive a divergence are CONCURRENCY.md's C4.
+prompt, else the least recently used one.
+
+**Each slot also keeps a checkpoint** (CONCURRENCY.md C4,
+`-llm-checkpoints`, on by default). It is the slot's state at the end of
+everything before the last user turn: the system prompt and the history. A
+request that shares that prefix but diverges after it restores the
+checkpoint and prefills only the rest. That is the voice case, the same
+system prompt with a new utterance: at 48 layers a 1.94k-token Home-Assistant
+prompt goes from a **1.83 s** time to first token to **0.19 s**. It also
+covers a conversation whose re-rendered history no longer matches the tokens
+that were generated. A checkpoint is ~120 MB of host memory a slot, and the
+first request on a new prefix pays ~0.2 s once to take it. The log line says
+`(N from a checkpoint)` where a continued prefix says `(N cached)`. A
+checkpoint is restored only in the slot that took it, so between two slots
+the reuse is still all-or-nothing.
 
 ## One prompt, three envelopes, and a template that is not ours
 

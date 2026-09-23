@@ -409,10 +409,16 @@ type AttnGPU struct {
 	wbuf, abuf, hbuf, wbank *vk.Buffer
 	// The cache, a buffer a plane (P18): key, value, and the indexer's raw
 	// and pooled keys together. Bindings 8, 9 and 10 of every attention
-	// pipeline — see llm_common.glsl.
-	kbuf, vbuf, ibuf *vk.Buffer
-	pipes                   map[string]*vk.ComputePipeline
-	mods                    []*vk.ShaderModule
+	// pipeline — see llm_common.glsl. kbuf, vbuf and ibuf are the live
+	// slot's; kbufs, vbufs and ibufs hold every slot's (C6).
+	kbuf, vbuf, ibuf    *vk.Buffer
+	kbufs, vbufs, ibufs []*vk.Buffer
+	// pipes is the live slot's pipelines and slotPipes every slot's: a
+	// pipeline's descriptor set names its buffers, so a slot with buffers of
+	// its own has pipelines of its own (C6).
+	pipes     map[string]*vk.ComputePipeline
+	slotPipes []map[string]*vk.ComputePipeline
+	mods      []*vk.ShaderModule
 
 	// bank is which width the two projections are staged in, and sim the
 	// format the 4.5-bit one encodes with (L8c-7). Twelve of the 48 layers
@@ -450,6 +456,9 @@ type AttnGPU struct {
 	// is cell past+t and its position is past+t (L7a). Zero is a fresh
 	// sequence, which is every run before L7 and every test above L4.
 	past int
+	// batch is the rows of a batched decode pass, one sequence each, or nil
+	// for an ordinary pass of the live slot (CONCURRENCY.md C5, SetBatch).
+	batch []batchRow
 	// layer is the one the last graph was built for, so that the read-back
 	// accessors below reach into that layer's cache rather than layer 0's.
 	layer int
@@ -517,13 +526,13 @@ type AttnGPU struct {
 	hK, hV, hIdxRaw, hIdxK             uint32
 	kvStride, idxRawStride, idxKStride int
 	hElems                             int
-	// slots is how many sequences' caches the three planes hold, and slot the
-	// one the four offsets above currently point at (CONCURRENCY.md C1). A
-	// slot is every layer's cache for one sequence, laid end to end, so a
-	// slot is a base offset and neither the kernels nor the staging notice:
-	// UseSlot moves hK, hV, hIdxRaw and hIdxK and everything that reads them
-	// follows. idxK0 is where the pooled region starts, after every slot's
-	// raw keys.
+	// slots is how many sequences' caches this block holds, and slot the live
+	// one (CONCURRENCY.md C1, C6). Each slot has its own three buffers, so
+	// the four offsets above are the same in every slot and `maxStorageBufferRange`
+	// caps a slot's cells rather than all slots' together: three slots of the
+	// full 262 144 cells, where a shared buffer held ~349k in total. UseSlot
+	// swaps the buffers and the pipelines bound to them. idxK0 is where the
+	// pooled region starts in an indexer buffer, after the raw keys.
 	slots, slot int
 	idxK0       uint32
 }
@@ -546,19 +555,19 @@ func WithAttnSlots(n int) AttnOption {
 func (g *AttnGPU) Slots() int { return g.slots }
 func (g *AttnGPU) Slot() int  { return g.slot }
 
-// UseSlot points every cache offset at sequence slot s. The position is the
-// caller's to set afterwards (SetPast): it is per sequence, and the graph
-// keeps it.
+// UseSlot makes sequence slot s's cache the live one: its three buffers, and
+// the pipelines whose descriptor sets name them. The offsets do not move.
+// The position is the caller's to set afterwards (SetPast): it is per
+// sequence, and the graph keeps it.
 func (g *AttnGPU) UseSlot(s int) error {
 	if s < 0 || s >= g.slots {
 		return fmt.Errorf("llm: attention cache slot %d of %d", s, g.slots)
 	}
-	n := len(g.layers)
 	g.slot = s
-	g.hK = uint32(s * n * g.kvStride)
-	g.hV = g.hK
-	g.hIdxRaw = uint32(s * n * g.idxRawStride)
-	g.hIdxK = g.idxK0 + uint32(s*n*g.idxKStride)
+	g.kbuf, g.vbuf, g.ibuf = g.kbufs[s], g.vbufs[s], g.ibufs[s]
+	if g.slotPipes != nil {
+		g.pipes = g.slotPipes[s]
+	}
 	return nil
 }
 
@@ -945,21 +954,21 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.kvStride = c.NHeadKV * g.nKV * c.HeadDim
 	g.idxRawStride = g.nKV * c.IdxDim
 	g.idxKStride = g.NBlocks() * c.IdxDim
-	// With more than one sequence slot (CONCURRENCY.md C1) each plane holds
-	// `slots` of these end to end, so the range below caps slots x cells
-	// rather than cells.
+	// With more than one sequence slot each has its own three buffers
+	// (CONCURRENCY.md C6), so the range below caps one slot's cells and the
+	// offsets are the same in every slot.
 	g.hK, g.hV, g.hIdxRaw = 0, 0, 0
-	g.idxK0 = uint32((g.slots*nLayers*g.idxRawStride + 63) &^ 63)
+	g.idxK0 = uint32((nLayers*g.idxRawStride + 63) &^ 63)
 	g.hIdxK = g.idxK0
-	kvBytes := g.slots * nLayers * g.kvStride * 2
-	idxBytes := (int(g.idxK0) + g.slots*nLayers*g.idxKStride) * 2
+	kvBytes := nLayers * g.kvStride * 2
+	idxBytes := (int(g.idxK0) + nLayers*g.idxKStride) * 2
 	// **The cap, asserted rather than commented** (P14). The driver clamps a
 	// descriptor's range instead of refusing it, so a cache past the cap reads
 	// as zeros and the model produces plausible, wrong numbers *faster* than
 	// the real thing, which is the one failure a benchmark cannot see.
 	perCell := float64(c.NHeadKV*c.HeadDim*nLayers) * 2
-	hint := fmt.Sprintf("this cache is %d slots of %d cells over %d layers; one plane is %.1f KB a cell, "+
-		"so the cap is about %d cells over all slots", g.slots, g.nKV, nLayers, perCell/1024,
+	hint := fmt.Sprintf("this cache is %d cells a slot over %d layers; one plane is %.1f KB a cell, "+
+		"so the cap is about %d cells a slot", g.nKV, nLayers, perCell/1024,
 		int(float64(maxBufferRange)/perCell))
 	for _, b := range []struct {
 		what  string
@@ -973,23 +982,32 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	if g.hbuf, err = newArena(g.dev, g.hElems*2); err != nil {
 		return fmt.Errorf("llm: attention fp16 activation arena (%d MB): %w", (g.hElems*2)>>20, err)
 	}
-	if g.kbuf, err = newArena(g.dev, kvBytes); err != nil {
-		return fmt.Errorf("llm: attention key cache (%d MB): %w", kvBytes>>20, err)
+	for s := 0; s < g.slots; s++ {
+		k, err := newArena(g.dev, kvBytes)
+		if err != nil {
+			return fmt.Errorf("llm: attention key cache, slot %d (%d MB): %w", s, kvBytes>>20, err)
+		}
+		g.kbufs = append(g.kbufs, k)
+		v, err := newArena(g.dev, kvBytes)
+		if err != nil {
+			return fmt.Errorf("llm: attention value cache, slot %d (%d MB): %w", s, kvBytes>>20, err)
+		}
+		g.vbufs = append(g.vbufs, v)
+		i, err := newArena(g.dev, idxBytes)
+		if err != nil {
+			return fmt.Errorf("llm: attention indexer cache, slot %d (%d MB): %w", s, idxBytes>>20, err)
+		}
+		g.ibufs = append(g.ibufs, i)
+		k.Zero()
+		v.Zero()
+		i.Zero()
 	}
-	if g.vbuf, err = newArena(g.dev, kvBytes); err != nil {
-		return fmt.Errorf("llm: attention value cache (%d MB): %w", kvBytes>>20, err)
-	}
-	if g.ibuf, err = newArena(g.dev, idxBytes); err != nil {
-		return fmt.Errorf("llm: attention indexer cache (%d MB): %w", idxBytes>>20, err)
-	}
+	g.kbuf, g.vbuf, g.ibuf = g.kbufs[0], g.vbufs[0], g.ibufs[0]
 	// Zeroed once: every A operand's pad columns and every short run's pad
 	// rows come from here, and none of these kernels bounds-check. The cache
 	// is zeroed for the reason the arena always was: a key that does not
 	// exist yet has to score something finite.
 	g.hbuf.Zero()
-	g.kbuf.Zero()
-	g.vbuf.Zero()
-	g.ibuf.Zero()
 	g.abuf.Zero()
 
 	// A layer's two matrices, one after the other. An offset into a
@@ -1032,12 +1050,27 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	return nil
 }
 
+// build builds every pipeline once per sequence slot, each set bound to that
+// slot's cache (C6), and leaves the live slot's in g.pipes.
 func (g *AttnGPU) build() error {
+	g.slotPipes = make([]map[string]*vk.ComputePipeline, g.slots)
+	for s := range g.slotPipes {
+		g.pipes = make(map[string]*vk.ComputePipeline)
+		g.slotPipes[s] = g.pipes
+		if err := g.buildFor(s); err != nil {
+			return err
+		}
+	}
+	g.pipes = g.slotPipes[g.slot]
+	return nil
+}
+
+func (g *AttnGPU) buildFor(slot int) error {
 	// Bindings 0-4 as they were; 5 is the bank (what the quantised GEMMs and
 	// the decode GEMV read there), 6 and 7 are padding — no attention kernel
-	// uses them — and 8-10 are the cache (P18).
+	// uses them — and 8-10 are the cache (P18), this slot's.
 	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.wbank, g.abuf,
-		g.wbank, g.wbank, g.wbank, g.kbuf, g.vbuf, g.ibuf}
+		g.wbank, g.wbank, g.wbank, g.kbufs[slot], g.vbufs[slot], g.ibufs[slot]}
 	pcSize := uint32(unsafe.Sizeof(push{}))
 	for name, spirv := range map[string][]byte{
 		"pack":  shaders.LLMAttnPack,
@@ -1463,10 +1496,15 @@ func (g *AttnGPU) NKV() int    { return g.nKV }
 // ActivationBytes what the shared arenas cost.
 func (g *AttnGPU) WeightBytes() int { return g.wbuf.Size() + g.wbank.Size() }
 
-// Buffers is how many device allocations the layer holds (L6a).
-func (g *AttnGPU) Buffers() int         { return 4 }
+// Buffers is how many device allocations the layer holds (L6a): the four
+// arenas and banks, and a key, value and indexer buffer a slot (P18, C6).
+func (g *AttnGPU) Buffers() int { return 4 + 3*len(g.kbufs) }
 func (g *AttnGPU) ActivationBytes() int {
-	return g.abuf.Size() + g.hbuf.Size() + g.kbuf.Size() + g.vbuf.Size() + g.ibuf.Size()
+	n := g.abuf.Size() + g.hbuf.Size()
+	for s := range g.kbufs {
+		n += g.kbufs[s].Size() + g.vbufs[s].Size() + g.ibufs[s].Size()
+	}
+	return n
 }
 
 // Upload writes the layer's input: the hyper-connection block's output
@@ -2084,15 +2122,105 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	if layer < 0 || layer >= len(g.layers) {
 		return nil, nil, fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
-	if g.past < 0 || g.past+g.rows > g.nKV {
+	if g.batch == nil && (g.past < 0 || g.past+g.rows > g.nKV) {
 		return nil, nil, fmt.Errorf("llm: %d tokens at cell %d of a %d-cell cache", g.rows, g.past, g.nKV)
 	}
 	g.layer = layer
 	c := g.cfg
 	w := g.layers[layer]
-	av, _ := attnVariantFor(g.attn)
 	gv, _ := gemmVariantFor(g.gemm)
 	ov, _ := gemmVariantFor(g.outGemm)
+	base := g.push(layer)
+
+	var d []vk.MultiDispatch
+	var kinds []string
+	add := func(pipe, kind string, gx, gy uint32, pc push) {
+		d = append(d, vk.MultiDispatch{Pipeline: g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
+		kinds = append(kinds, kind)
+	}
+
+	// 1. The one fused projection: six of llama.cpp's matrices, one matmul.
+	qkv := base
+	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
+	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
+	qkvPipe := string(g.gemm)
+	if g.quant() {
+		qkvPipe = bankPipe(g.bank, g.gemm)
+	}
+	if ks := gemvSlabs(g.qkvGemv); ks > 0 {
+		// The decode kernel: one row, so the parallelism comes from K and not
+		// from a sixteen-row fragment of which fifteen rows are padding
+		// (L8e-1). The partials ride `resOff`, which this block does not use.
+		qkv.ResOff = g.aPart
+		add(gemvBankPipeRows(g.qkvGemv, g.bank, g.rows), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
+		if ks > 1 {
+			add(gemvSumPipeRows(g.qkvGemv, g.rows), "qkv.sum",
+				uint32(roundUpInt(g.qkvN(), attnWave)/attnWave), uint32(g.rows), qkv)
+		}
+	} else {
+		add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
+	}
+
+	// 2-6, the part of the layer that reads and writes one sequence's cache.
+	// A batched decode pass (CONCURRENCY.md C5) runs it once per row, as a
+	// one-token pass of that row's sequence: its slot's cache, its position
+	// in dword 1+r (SEQ_PAST is actu[pc.lowRank]), its row of the projection
+	// in and its row of the context out. Every scratch tensor between those
+	// two is reused row after row, which is safe because the recorded pass
+	// fences every dispatch against the one before it. The context rows are
+	// written in ascending order, and a row's pass may write pad rows past
+	// itself, which the next row's pass then overwrites.
+	if g.batch == nil {
+		g.core(base, add)
+	} else {
+		slot, past, rows, attn := g.slot, g.past, g.rows, g.attn
+		for r, br := range g.batch {
+			if err := g.UseSlot(br.slot); err != nil {
+				return nil, nil, err
+			}
+			g.past, g.rows = br.past, 1
+			if g.autoPlan {
+				g.attn = AttnKernelFor(g.sparse, 1)
+			}
+			rb := g.push(layer)
+			rb.QKVOff += uint32(r * g.qkvN())
+			rb.CtxOff += uint32(r * g.ldCtx)
+			rb.LowRank = uint32(1 + r)
+			g.core(rb, add)
+		}
+		if err := g.UseSlot(slot); err != nil {
+			return nil, nil, err
+		}
+		g.past, g.rows, g.attn = past, rows, attn
+	}
+
+	// 7. The output projection, off the gated context.
+	out := base
+	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
+	out.OutOff, out.BOff = g.aOut, w.out
+	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.GateWidth())
+	outPipe := string(g.outGemm)
+	if g.quant() {
+		outPipe = bankPipe(g.bank, g.outGemm)
+	}
+	if ks := gemvSlabs(g.outGemv); ks > 0 {
+		out.ResOff = g.aPart
+		add(gemvBankPipeRows(g.outGemv, g.bank, g.rows), "out", uint32(ks), uint32(c.NEmbd/coopMatTile), out)
+		if ks > 1 {
+			add(gemvSumPipeRows(g.outGemv, g.rows), "out.sum",
+				uint32(roundUpInt(c.NEmbd, attnWave)/attnWave), uint32(g.rows), out)
+		}
+	} else {
+		add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
+	}
+	return d, kinds, nil
+}
+
+// push is the layer's push block for the live slot, position and row count.
+func (g *AttnGPU) push(layer int) push {
+	c := g.cfg
+	w := g.layers[layer]
+	av, _ := attnVariantFor(g.attn)
 	// The packed planes are padded to the widest tile, so a short run never
 	// reads what a longer one left behind.
 	plane := roundUpInt(g.rows, maxInt(av.rows, av.keys))
@@ -2125,35 +2253,15 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	if g.sparse {
 		base.SelOff = g.aSel
 	}
+	return base
+}
 
-	var d []vk.MultiDispatch
-	var kinds []string
-	add := func(pipe, kind string, gx, gy uint32, pc push) {
-		d = append(d, vk.MultiDispatch{Pipeline: g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
-		kinds = append(kinds, kind)
-	}
-
-	// 1. The one fused projection: six of llama.cpp's matrices, one matmul.
-	qkv := base
-	qkv.XnOff, qkv.OutOff, qkv.BOff = g.hXn, g.aQKV, w.qkv
-	qkv.GemmM, qkv.GemmK = uint32(roundUpInt(g.rows, gv.bm)), uint32(c.NEmbd)
-	qkvPipe := string(g.gemm)
-	if g.quant() {
-		qkvPipe = bankPipe(g.bank, g.gemm)
-	}
-	if ks := gemvSlabs(g.qkvGemv); ks > 0 {
-		// The decode kernel: one row, so the parallelism comes from K and not
-		// from a sixteen-row fragment of which fifteen rows are padding
-		// (L8e-1). The partials ride `resOff`, which this block does not use.
-		qkv.ResOff = g.aPart
-		add(gemvBankPipeRows(g.qkvGemv, g.bank, g.rows), "qkv", uint32(ks), uint32(g.qkvN()/coopMatTile), qkv)
-		if ks > 1 {
-			add(gemvSumPipeRows(g.qkvGemv, g.rows), "qkv.sum",
-				uint32(roundUpInt(g.qkvN(), attnWave)/attnWave), uint32(g.rows), qkv)
-		}
-	} else {
-		add(qkvPipe, "qkv", uint32(g.qkvN()/attnBN), uint32(roundUpInt(g.rows, gv.bm)/gv.bm), qkv)
-	}
+// core is steps 2-6 of a layer: everything from the projection's output to
+// the gated context, over the live slot's cache at its position.
+func (g *AttnGPU) core(base push, add func(pipe, kind string, gx, gy uint32, pc push)) {
+	c := g.cfg
+	av, _ := attnVariantFor(g.attn)
+	plane := int(base.Plane)
 
 	// 2. Norm, rotary and the fragment tiling for q, k and v together, plus
 	//    the one plane that is not a head: the indexer's raw key into its own
@@ -2298,27 +2406,6 @@ func (g *AttnGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		}
 		add(string(g.attn), "attn", qBlocks, uint32(c.NHead), at)
 	}
-
-	// 7. The output projection, off the gated context.
-	out := base
-	out.XnOff, out.LDA = g.hCtx, uint32(g.ldCtx)
-	out.OutOff, out.BOff = g.aOut, w.out
-	out.GemmM, out.GemmN, out.GemmK = uint32(roundUpInt(g.rows, ov.bm)), uint32(c.NEmbd), uint32(c.GateWidth())
-	outPipe := string(g.outGemm)
-	if g.quant() {
-		outPipe = bankPipe(g.bank, g.outGemm)
-	}
-	if ks := gemvSlabs(g.outGemv); ks > 0 {
-		out.ResOff = g.aPart
-		add(gemvBankPipeRows(g.outGemv, g.bank, g.rows), "out", uint32(ks), uint32(c.NEmbd/coopMatTile), out)
-		if ks > 1 {
-			add(gemvSumPipeRows(g.outGemv, g.rows), "out.sum",
-				uint32(roundUpInt(c.NEmbd, attnWave)/attnWave), uint32(g.rows), out)
-		}
-	} else {
-		add(outPipe, "out", uint32(c.NEmbd/attnBN), uint32(roundUpInt(g.rows, ov.bm)/ov.bm), out)
-	}
-	return d, kinds, nil
 }
 
 // Run executes one layer over whatever Upload left in the arenas.
@@ -2708,13 +2795,23 @@ func (g *AttnGPU) readF16(buf *vk.Buffer, off uint32, n int) []float32 {
 
 // Destroy releases every Vulkan object.
 func (g *AttnGPU) Destroy() {
-	for _, p := range g.pipes {
-		p.Destroy()
+	sets := g.slotPipes
+	if sets == nil {
+		sets = []map[string]*vk.ComputePipeline{g.pipes}
+	}
+	for _, ps := range sets {
+		for _, p := range ps {
+			p.Destroy()
+		}
 	}
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank, g.kbuf, g.vbuf, g.ibuf} {
+	bufs := []*vk.Buffer{g.hbuf, g.abuf, g.wbuf, g.wbank}
+	bufs = append(bufs, g.kbufs...)
+	bufs = append(bufs, g.vbufs...)
+	bufs = append(bufs, g.ibufs...)
+	for _, b := range bufs {
 		if b != nil {
 			b.Destroy()
 		}

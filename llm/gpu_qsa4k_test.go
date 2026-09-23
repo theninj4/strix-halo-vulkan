@@ -415,23 +415,47 @@ func TestAttnGPUIndexer4k(t *testing.T) {
 // the negative control on the selection: a kernel that read a stale score, or
 // emitted a bitmask word it had not written, or skipped a key block that had
 // a cell in it, would show up here and nowhere else.
+//
+// **And across slots (CONCURRENCY.md C6).** A third run stages three slots,
+// each with its own cache buffers, fills slot 0 with a different input, and
+// reads the answer from slot 2 of the big cache: it must be the same bits
+// too. That shows each slot's pipelines are whole; that slot 2 reads its
+// *own* cells is TestAttnGPUSlotsHaveTheirOwnCache, which needs a
+// continuation to see it.
 func TestAttnGPUCacheSizeDoesNotChangeTheAnswer(t *testing.T) {
 	c, w, nTok, nKV, _, tr, _ := qsaFixtures4k(t)
 	in, err := tr.Get("hc_mixed-3", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := func(cells int) (out, ctx []float32, sel [][]int32) {
+	other := make([]float32, len(in.Vals))
+	for i, v := range in.Vals {
+		other[i] = -0.5 * v
+	}
+	run := func(cells, slots int) (out, ctx []float32, sel [][]int32) {
 		t.Helper()
 		dev, done := newTestDevice(t)
 		defer done()
-		g, err := NewAttnGPU(dev, c, nTok, cells, []AttnWeights{w}, denseQ8Test)
+		g, err := NewAttnGPUBank(dev, c, nTok, cells, []AttnWeights{w}, bankOf(denseQ8Test), QuantSim{},
+			WithAttnSlots(slots))
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer g.Destroy()
 		if !g.Sparse() {
 			t.Fatalf("%d cells: the layer runs dense, so this proves nothing", cells)
+		}
+		if slots > 1 {
+			// Something else in slot 0 first, then the answer from the last.
+			if err := g.Upload(other, nTok); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Run(0); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.UseSlot(slots - 1); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := g.Upload(in.Vals, nTok); err != nil {
 			t.Fatal(err)
@@ -447,46 +471,49 @@ func TestAttnGPUCacheSizeDoesNotChangeTheAnswer(t *testing.T) {
 		return append([]float32(nil), g.Out()...), append([]float32(nil), g.Context()...), sel
 	}
 
-	wantOut, wantCtx, wantSel := run(nKV)
-	gotOut, gotCtx, gotSel := run(3 * nKV)
+	wantOut, wantCtx, wantSel := run(nKV, 1)
+	for _, slots := range []int{1, 3} {
+		gotOut, gotCtx, gotSel := run(3*nKV, slots)
+		where := fmt.Sprintf("slot %d of %d", slots-1, slots)
 
-	// The selection first, because it is the cause: a difference in the
-	// bitmask explains a difference in the output and not the other way
-	// round, and it names the token it happened on.
-	var rows int
-	for i := range wantSel {
-		if len(gotSel[i]) != len(wantSel[i]) {
-			t.Fatalf("token %d selects %d cells in a %d-cell cache and %d in a %d-cell one",
-				i, len(wantSel[i]), nKV, len(gotSel[i]), 3*nKV)
-		}
-		for j := range wantSel[i] {
-			if gotSel[i][j] != wantSel[i][j] {
-				rows++
-				break
+		// The selection first, because it is the cause: a difference in the
+		// bitmask explains a difference in the output and not the other way
+		// round, and it names the token it happened on.
+		var rows int
+		for i := range wantSel {
+			if len(gotSel[i]) != len(wantSel[i]) {
+				t.Fatalf("token %d selects %d cells in a %d-cell cache and %d in a %d-cell one (%s)",
+					i, len(wantSel[i]), nKV, len(gotSel[i]), 3*nKV, where)
+			}
+			for j := range wantSel[i] {
+				if gotSel[i][j] != wantSel[i][j] {
+					rows++
+					break
+				}
 			}
 		}
-	}
-	if rows != 0 {
-		t.Errorf("%d of %d rows select different cells in a cache three times too big", rows, nTok)
-	}
+		if rows != 0 {
+			t.Errorf("%d of %d rows select different cells in a cache three times too big (%s)", rows, nTok, where)
+		}
 
-	for _, tc := range []struct {
-		name      string
-		want, got []float32
-	}{
-		{"attn_gated-3", wantCtx, gotCtx},
-		{"attn_output-3", wantOut, gotOut},
-	} {
-		if len(tc.got) != len(tc.want) {
-			t.Fatalf("%s is %d values in one cache and %d in the other", tc.name, len(tc.want), len(tc.got))
-		}
-		for i := range tc.want {
-			if tc.got[i] != tc.want[i] {
-				t.Fatalf("%s value %d: %g in a %d-cell cache, %g in a %d-cell one — "+
-					"the answer depends on how much room the cache has",
-					tc.name, i, tc.want[i], nKV, tc.got[i], 3*nKV)
+		for _, tc := range []struct {
+			name      string
+			want, got []float32
+		}{
+			{"attn_gated-3", wantCtx, gotCtx},
+			{"attn_output-3", wantOut, gotOut},
+		} {
+			if len(tc.got) != len(tc.want) {
+				t.Fatalf("%s is %d values in one cache and %d in the other", tc.name, len(tc.want), len(tc.got))
 			}
+			for i := range tc.want {
+				if tc.got[i] != tc.want[i] {
+					t.Fatalf("%s value %d: %g in a %d-cell cache, %g in a %d-cell one — "+
+						"the answer depends on how much room the cache has",
+						tc.name, i, tc.want[i], nKV, tc.got[i], 3*nKV)
+				}
+			}
+			t.Logf("%-14s identical to the last bit across a %dx cache, %s", tc.name, 3, where)
 		}
-		t.Logf("%-14s identical to the last bit across a %dx cache", tc.name, 3)
 	}
 }

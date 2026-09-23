@@ -381,7 +381,16 @@ uint gathStride(uint mx, uint bm) { return 1u + mx + bm * (mx >> 5u); }
 // buffer is byte-identical every step, so it can be recorded once and
 // replayed. Only the seven kernels that read SEQ_PAST care; everything else
 // still sees `lowRank` as whatever its own block says it is.
-#define SEQ_PAST    actu[0]
+//
+// **Which dword is `lowRank` (CONCURRENCY.md C5).** A batched decode pass
+// advances several sequences one token each, and each is at its own
+// position, so the per-sequence kernels run once per row and read row r's
+// position from dword 1 + r. Every other dispatch leaves `lowRank` at zero,
+// which is dword 0 as before, so a single-sequence pass and its recorded
+// replay are the same bytes they were. None of the kernels that read SEQ_PAST
+// uses `lowRank` as itself; the hyper-connection kernels that do never read
+// a position.
+#define SEQ_PAST    actu[pc.lowRank]
 #define SEQ_HIST    pc.injOff
 #define SEQ_SRC     pc.loOff
 #define ATTN_IDXRAW pc.loOff

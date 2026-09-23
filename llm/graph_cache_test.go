@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -184,6 +185,40 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 	// the same dispatches, the same weights, the same order, and none of the
 	// four histories. If the equalities above were passing because nothing
 	// carried, this would match too.
+	for _, rows := range []int{2, 3} {
+		t.Run(fmt.Sprintf("%d at a time, on the decode schedule", rows), func(t *testing.T) {
+			if err := g.PinSchedule(false); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := g.PinSchedule(true); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			if err := g.Reset(); err != nil {
+				t.Fatal(err)
+			}
+			tail := 8 * rows
+			if err := g.Append(ids[:nTok-tail]); err != nil {
+				t.Fatal(err)
+			}
+			var got []float32
+			for i := nTok - tail; i < nTok; i += rows {
+				if got, err = g.HiddenExtend(ids[i : i+rows]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			r, err := compare(got, wantNorm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("result_norm, %d-row decode kernels: %v", rows, r)
+			if r.rms > 1e-3 {
+				t.Errorf("%d-row decode moves result_norm by %.3e rms (%v)", rows, r.rms, r)
+			}
+		})
+	}
+
 	t.Run("control, every token a fresh sequence", func(t *testing.T) {
 		var got []float32
 		for i := range ids {

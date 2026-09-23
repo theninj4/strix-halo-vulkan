@@ -323,13 +323,14 @@ func GEMVFits(k GEMVKernel, gemmK int) bool {
 // GEMVMaxRows is how many rows of A a decode GEMV dispatch may carry: P5b's
 // `MAXROWS`, and the bound every block's partial arena is sized by.
 //
-// **It is two because P5a says the speculation optimum is depth one**, whose
-// verification pass is two rows (research/p5a-draft-head.md §3). Raising it
-// is a `MAXROWS` in four shaders and this constant — which is what P6 would
-// want, since R concurrent sequences are R rows through the same weights —
-// and costs an accumulator and an arena per row at every rung, so it is not
-// raised speculatively.
-const GEMVMaxRows = 2
+// **It is three because three sequences decode at once** (CONCURRENCY.md
+// C5): a batched pass is a row a sequence through the same weights. It was
+// two, for P5a's depth-one verification pass. Raising it is a `MAXROWS` in
+// four shaders and this constant, and it costs an accumulator per row at
+// every rung: C5a measured a two-row pass at 41.2 ms against 38.9 with
+// MAXROWS 2, and one row unchanged. A new count lands with its rungs in
+// TestGraphIsAChunkSplit (the decode-schedule subtests at 2 and 3).
+const GEMVMaxRows = 3
 
 // gemvBankPipe names the pipeline for a rung: the partials over one bank or
 // another, and the sum. `rows` is P5b's specialization — one module, one

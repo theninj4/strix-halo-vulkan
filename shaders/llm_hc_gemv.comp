@@ -121,7 +121,7 @@
 // accumulators, so the R-row arm costs the second row's A traffic and nothing
 // else.
 layout(constant_id = 0) const uint ROWS = 1;
-#define MAXROWS 2
+#define MAXROWS 3
 
 #ifdef Q4B
 #include "llm_q4k.glsl"

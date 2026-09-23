@@ -78,8 +78,8 @@ type LLMOptions struct {
 	ID string
 	// Slots is how many conversations the graph holds at once
 	// (CONCURRENCY.md C1/C2). Each is its own KV cache, DeltaNet state and
-	// rings — ~27.8 KB a cell plus 120 MB — and the cache planes' 4 GiB
-	// range caps Slots x Context at ~349k cells. One is today's server.
+	// rings — ~27.8 KB a cell plus 120 MB. Each slot's cache is its own
+	// buffers (C6), so every slot can hold the full trained context.
 	Slots int
 	// PreemptChunk is the longest prefill chunk a background request runs,
 	// so an interactive request that arrives mid-prefill waits one of these
@@ -93,6 +93,12 @@ type LLMOptions struct {
 	// Class is the priority of a request that names none: "interactive" or
 	// "background" (the default).
 	Class string
+	// NoCheckpoints turns off each slot's checkpoint at the last user turn
+	// (C4), which is the control for measuring what it saves.
+	NoCheckpoints bool
+	// NoBatchDecode runs every decode step alone rather than batching the
+	// steps of concurrent conversations into one pass (C5): the control.
+	NoBatchDecode bool
 }
 
 const (
@@ -212,7 +218,7 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		_ = m.Close()
 		return nil, fmt.Errorf("backend: staging %s: %w", opt.Model, err)
 	}
-	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve)
+	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve, opt.NoBatchDecode)
 	return l, nil
 }
 
@@ -313,7 +319,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	if sched == nil {
 		return nil, fmt.Errorf("the language model is closed")
 	}
-	job, err := sched.acquire(ctx, class, ids)
+	job, err := sched.acquire(ctx, class, ids, l.checkpointAt(prompt, ids))
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +332,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	// wait: time its own units spent queued behind other conversations'
 	// units once it had a slot (CONCURRENCY.md C2).
 	queued := time.Since(enter)
-	reused := job.reused
+	reused, restored := job.reused, job.restore
 
 	start := time.Now()
 	logits, stalled, err := sched.run(job, ids[reused:], reused == 0)
@@ -359,7 +365,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			decode = time.Since(start)
 		}
 		l.logRun(ctx, runStats{
-			prompt: len(ids), reused: reused, gen: gen, class: class, slot: job.slot,
+			prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 			queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 			total: time.Since(enter), reason: failureReason(ctx, err),
 		})
@@ -405,7 +411,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			return nil, err
 		}
 		var wait time.Duration
-		if logits, wait, err = sched.run(job, []int32{id}, false); err != nil {
+		if logits, wait, err = sched.step(job, id); err != nil {
 			return nil, err
 		}
 		stalled += wait
@@ -434,7 +440,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		PromptTokens: len(ids), CompletionTokens: gen, TotalTokens: len(ids) + gen,
 	}
 	l.logRun(ctx, runStats{
-		prompt: len(ids), reused: reused, gen: gen, class: class, slot: job.slot,
+		prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 		queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 		total: time.Since(enter), reason: res.FinishReason,
 	})
@@ -449,8 +455,11 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 type runStats struct {
 	reason              string
 	prompt, reused, gen int
-	class               llmClass
-	slot                int
+	// restored is whether the reused tokens came from the slot's checkpoint
+	// (CONCURRENCY.md C4) rather than from what it held.
+	restored bool
+	class    llmClass
+	slot     int
 	// queued is the wait for a slot, prefill the prompt, ttft the whole
 	// span from the call to the first token -- queue, render, tokenize and
 	// prefill included -- decode the generation after it, and total the
@@ -470,7 +479,7 @@ func (l *LLM) logRun(ctx context.Context, st runStats) {
 		where = fmt.Sprintf(" [slot %d, %s%s]", st.slot, st.class, stalledNote(st.stalled))
 	}
 	log.Printf("%sllm %s%s: prompt %d tokens%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
-		logID(ctx), l.id, where, st.prompt, reusedNote(st.reused),
+		logID(ctx), l.id, where, st.prompt, reusedNote(st.reused, st.restored),
 		st.prefill.Round(time.Millisecond), rate(st.prompt-st.reused, st.prefill),
 		since(st.ttft), queuedNote(st.queued),
 		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode),
@@ -566,11 +575,44 @@ func commonPrefix(a, b []int32) int {
 // The prefill rate beside it is over the tokens actually run, so a turn that
 // reused most of its prompt reports the speed of the part that cost anything
 // rather than a figure flattered by the cache.
-func reusedNote(reused int) string {
-	if reused == 0 {
+func reusedNote(reused int, restored bool) string {
+	switch {
+	case reused == 0:
 		return ""
+	case restored:
+		return fmt.Sprintf(" (%d from a checkpoint)", reused)
 	}
 	return fmt.Sprintf(" (%d cached)", reused)
+}
+
+// minCheckpoint is the shortest prefix worth a checkpoint. Taking one copies
+// every DeltaNet layer's state (~120 MB at 48 layers), so a prefix that
+// prefills in less time than that copy takes is not worth it.
+const minCheckpoint = 256
+
+// checkpointAt is where this request's slot takes its checkpoint
+// (CONCURRENCY.md C4): the end of everything before the last user turn, or 0
+// for nowhere. That is the part the next request is likely to share, whether
+// it is the next voice command on the same system prompt or the next turn of
+// this conversation.
+//
+// It is found on the rendered text and then re-encoded rather than searched
+// for in the ids. A special token splits the text before BPE runs, so the
+// prefix's ids must be a prefix of the whole prompt's, and a re-encoding that
+// is not one is refused rather than trusted.
+func (l *LLM) checkpointAt(prompt string, ids []int32) int {
+	if l.opt.NoCheckpoints {
+		return 0
+	}
+	i := strings.LastIndex(prompt, "<|im_start|>user")
+	if i <= 0 {
+		return 0
+	}
+	pre, err := l.tok.Encode(prompt[:i])
+	if err != nil || len(pre) < minCheckpoint || len(pre) >= len(ids) || commonPrefix(pre, ids) != len(pre) {
+		return 0
+	}
+	return len(pre)
 }
 
 // sampler is the request's sampling, or the checkpoint's own where the

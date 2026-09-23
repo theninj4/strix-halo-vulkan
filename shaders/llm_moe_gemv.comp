@@ -54,13 +54,19 @@
 // is read once for all of them, which is the whole point, since the bank is
 // what the block is made of.
 //
-// **The padded rows need no guard, because the permutation already has one.**
-// `llm_moe_perm.comp` fills every routed row with a sentinel — `(token, slot)`
-// one token past the batch, whose activation row is a zero pad — before the
-// scatter overwrites the real ones. So reading ROWS rows from a tile that
-// holds fewer real ones multiplies by zeros and writes into output slots the
-// combine does not read, which is exactly what the GEMM does with the same
-// rows.
+// **The padded rows are safe to compute, because the permutation guards
+// them**, and since CONCURRENCY.md C5 they are not computed. `llm_moe_perm.comp`
+// fills every routed row with a sentinel — `(token, slot)` one token past the
+// batch, whose activation row is a zero pad — before the scatter overwrites
+// the real ones, so a padding row multiplies by zeros and writes into output
+// slots the combine does not read. That made them harmless and, at P5b's two
+// rows of one sequence, nearly free: consecutive tokens share experts, so
+// most tiles had two real rows. Three *conversations* do not: of the ~27
+// experts a three-row pass touches, most serve one row, so two-thirds of the
+// work was padding, and `moe.up` grew 4.9x from one row to three where its
+// bank grew 2.7x. The tile record's third word is now the tile's real row
+// count, and every loop below stops at it — a branch that is uniform across
+// the workgroup, because a workgroup is a tile.
 //
 // It is a **specialization constant**, so the seventy-odd `.spv` of this
 // family do not double; MAXROWS is the compile-time bound the LDS and the
@@ -120,7 +126,7 @@
 
 // Rows of A this dispatch carries: P5b. See the header.
 layout(constant_id = 0) const uint ROWS = 1;
-#define MAXROWS 2
+#define MAXROWS 3
 
 #define WAVE 64
 #define LANES (WAVES * WAVE)
@@ -386,13 +392,17 @@ void main() {
     uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
     uint expert = actu[rec];
     uint rowStart = actu[rec + 1u];
+    // The real rows; the rest of the tile is padding (see the header). Every
+    // guard below tests ROWS as well, which is a constant, so that a one-row
+    // build still compiles to one row's code.
+    uint real = actu[rec + 2u];
     uint slots = MOE_USED + 1u;
 
     // The row. MODE 0's is some token's row of the block input, named by the
     // permutation; MODE 1's is the permutation position itself, which is what
     // MODE 0 wrote. One row per tile — see the header.
     [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
-        if (r >= ROWS) {
+        if (r >= ROWS || r >= real) {
             continue;
         }
 #if MODE == 0
@@ -449,7 +459,7 @@ void main() {
     }
     for (uint d = lane; d < nqd; d += LPR) {
         [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
-            if (r >= ROWS) {
+            if (r >= ROWS || r >= real) {
                 continue;
             }
             acc0[r] += dotDword(rb0, d, r);
@@ -460,7 +470,7 @@ void main() {
     }
 
     [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
-        if (r >= ROWS) {
+        if (r >= ROWS || r >= real) {
             continue;
         }
         float s0 = subgroupClusteredAdd(acc0[r], LPR);

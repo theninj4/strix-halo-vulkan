@@ -61,6 +61,11 @@ func main() {
 	moe := flag.Bool("moe", false, "benchmark the MoE block")
 	head := flag.Bool("head", false, "benchmark the lm head on both dense banks, L8's int8 and the halves it replaces")
 	graph := flag.Bool("graph", false, "run the whole model end to end, tokens to logits, and report tok/s")
+	batch := flag.String("batch", "", "C5: time a batched decode pass at these row counts (one slot a row, each prefilled to -batch-depth), e.g. 1,2,3")
+	batchDepth := flag.Int("batch-depth", 7000, "for -batch: tokens each slot is prefilled with before the timed steps")
+	batchChunk := flag.Int("batch-chunk", 2048, "for -batch: the arenas' token count and the prefill chunk; the server's is -llm-batch")
+	batchCtx := flag.Int("batch-ctx", 0, "for -batch: cache cells a slot, 0 for just enough; the server's is -llm-ctx")
+	batchCorpus := flag.String("batch-corpus", "models/wikitext-2-raw/wiki.test.raw", "for -batch: the text each slot's prompt is cut from")
 	gen := flag.Bool("gen", false, "generate: prefill the prompt, then decode one token at a time")
 	nPredict := flag.Int("n", 64, "for -gen: how many tokens to generate")
 	temp := flag.Float64("temp", 0, "for -gen: sampling temperature; 0 is greedy, which is what a comparison needs")
@@ -230,6 +235,21 @@ func main() {
 			layers = *attnLayers
 		}
 		if err := graphBench(*model, *prompt, toks, layers, *ctx, *csvPath); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *batch != "" {
+		rows, err := parseInts(*batch)
+		if err != nil {
+			log.Fatal(err)
+		}
+		layers := 0
+		if flagSet("layers") {
+			layers = *attnLayers
+		}
+		if err := batchBench(*model, *batchCorpus, rows, *batchDepth, *batchChunk, *batchCtx, layers, *csvPath); err != nil {
 			log.Fatal(err)
 		}
 		return

@@ -142,9 +142,13 @@ func main() {
 	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
 	llmSlots := flag.Int("llm-slots", 1, "conversations held at once, interleaved a prefill chunk or decode step at a time (CONCURRENCY.md). "+
-		"Each is its own cache: slots x -llm-ctx is capped at ~349k cells")
+		"Each is its own cache of -llm-ctx cells, ~27.8 KB a cell")
 	llmPreempt := flag.Int("llm-preempt-chunk", 2048, "with more than one slot, the longest prefill chunk a background request runs "+
 		"before an interactive one may take the device; 0 is -llm-batch")
+	llmBatchDecode := flag.Bool("llm-batch-decode", true, "with more than one slot, advance the decoding conversations one token each "+
+		"in one pass rather than a pass each (CONCURRENCY.md C5)")
+	llmCheckpoints := flag.Bool("llm-checkpoints", true, "keep each slot's state at the end of everything before the last user turn, "+
+		"so the next request sharing that prefix (a voice command on the same system prompt) prefills only the rest (CONCURRENCY.md C4)")
 	llmReserve := flag.Int("llm-reserve", 1, "with more than one slot, how many only interactive requests may take")
 	llmClass := flag.String("llm-class", "background", "priority of a request that names none (X-Priority header, "+
 		"or service_tier \"priority\"/\"flex\"): interactive or background")
@@ -367,6 +371,7 @@ func main() {
 			Model: *llmModel, Device: dev, Context: *llmCtx, Batch: *llmBatch,
 			MaxTokens: *llmMax, Layers: *llmLayers,
 			Slots: *llmSlots, PreemptChunk: *llmPreempt, Reserve: *llmReserve, Class: *llmClass,
+			NoCheckpoints: !*llmCheckpoints, NoBatchDecode: !*llmBatchDecode,
 		})
 		if err != nil {
 			log.Fatal(err)

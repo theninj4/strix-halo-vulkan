@@ -494,6 +494,14 @@ func (b *Buffer) ReadFloat32At(off, n int) []float32 {
 	return out
 }
 
+// ReadFloat32Into is ReadFloat32At into a slice the caller keeps, for a
+// tensor read over and over: a sequence checkpoint is 120 MB of recurrent
+// state, and allocating it per read would be the same cost ZeroFloat32At
+// exists to avoid (CONCURRENCY.md C4).
+func (b *Buffer) ReadFloat32Into(off int, dst []float32) {
+	copy(dst, unsafe.Slice((*float32)(b.mapped), off+len(dst))[off:])
+}
+
 // ZeroFloat32At clears n float32s at an element offset, in place in the
 // mapped memory.
 //

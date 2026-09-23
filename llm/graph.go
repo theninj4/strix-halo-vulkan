@@ -47,6 +47,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"time"
 
@@ -93,8 +94,9 @@ type GraphOpts struct {
 	// graph can hold several conversations and switch between them with
 	// UseSlot (CONCURRENCY.md C1). Zero and one are one sequence. It is the
 	// ping-pong's allocation used for sequences, so it refuses Speculative.
-	// At the served context a slot is ~7.4 GB, nearly all of it KV, and the
-	// cache planes' 4 GiB descriptor range caps slots x NKV at ~349k cells.
+	// At the served context a slot is ~7.4 GB, nearly all of it KV. Each slot
+	// has its own cache buffers (C6), so the 4 GiB descriptor range caps a
+	// slot's NKV at ~349k cells, not all slots' together.
 	Slots int
 	// DenseFP16 stages the dense weights as halves, which is what every
 	// block did before L8. It is the control, not the default: the bank L8
@@ -772,7 +774,9 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		}
 		headRows := opts.HeadRows
 		if headRows <= 0 {
-			headRows = 1
+			// One, or a row a slot, so that DecodeRows can advance every
+			// sequence the graph holds in one pass (CONCURRENCY.md C5).
+			headRows = max(1, opts.Slots)
 		}
 		// L8c-4's bank, where the plan names this family. Everything else
 		// is still the checkpoint's own width (D13): the 4.5-bit bank has a
@@ -898,6 +902,107 @@ func (g *Graph) UseSlot(s int) error {
 		}
 	}
 	return nil
+}
+
+// Checkpoint is one sequence's carried state at one position, held on the
+// host: what Graph.Restore needs to take a slot back there after it has run
+// on (CONCURRENCY.md C4).
+//
+// A DeltaNet state has no inverse, so without one a conversation that
+// diverges from what its slot holds anywhere before the end is prefilled
+// from token zero. A voice command is the same long system prompt with a new
+// utterance, and every one of them re-read the prompt.
+//
+// **It is the recurrences and not the cache.** What is copied is every
+// DeltaNet layer's state and ring (~120 MB at 36 layers) and the PLE ring.
+// The KV cells and raw indexer keys below `past` are never rewritten by a run
+// that continues from there, so they stay on the device. That is why a
+// checkpoint can only be restored into the slot it was taken in, and only
+// while that slot still holds its tokens (Restore checks both). Cells at or
+// past `past` are masked out of every score until they are rewritten.
+//
+// **The pooled indexer table needs nothing either, though the rollback
+// snapshots it (P5c).** A continuation's pass rebuilds the blocks it
+// completes before it scores any, and every block at or past the last whole
+// one is scored as one broadcast value under a -inf or 1e9 bias
+// (llm_attn_score.comp, P7), which no stored row can change the selection of.
+// So the blocks an abandoned continuation completed are never read.
+// TestGraphCheckpointIsThePrefill measured it: a restore that also put the
+// frontier row back over them gave the same logits bit for bit, with the
+// detour reaching past the real continuation.
+type Checkpoint struct {
+	past int
+	ids  []int32
+	dn   []float32
+	ple  []float32
+}
+
+// Past is the position the checkpoint was taken at, and Ids the tokens it
+// holds.
+func (c *Checkpoint) Past() int    { return c.past }
+func (c *Checkpoint) Ids() []int32 { return c.ids }
+
+// Checkpoint copies the live slot's carried state out. A non-nil `into` is
+// reused, buffers and all, so that a slot re-checkpointing every request does
+// not allocate 120 MB a time.
+func (g *Graph) Checkpoint(into *Checkpoint) (*Checkpoint, error) {
+	if g.specArmed {
+		return nil, fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
+	}
+	if g.past == 0 || len(g.ids) != g.past {
+		return nil, fmt.Errorf("llm: nothing to checkpoint at position %d with %d ids", g.past, len(g.ids))
+	}
+	c := into
+	if c == nil {
+		c = &Checkpoint{}
+	}
+	c.past = g.past
+	c.ids = append(c.ids[:0], g.ids...)
+	if g.dn != nil {
+		c.dn = resized(c.dn, g.dn.CarriedLen())
+		if err := g.dn.SaveCarried(c.dn); err != nil {
+			return nil, err
+		}
+	}
+	if g.ple != nil {
+		c.ple = resized(c.ple, g.ple.CarriedLen())
+		if err := g.ple.SaveCarried(c.ple); err != nil {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// Restore takes the live slot back to a checkpoint taken in it. It refuses
+// unless the slot's sequence still starts with the checkpoint's tokens,
+// because that is what says the cache cells below it were written by those
+// tokens and not by some other conversation since.
+func (g *Graph) Restore(c *Checkpoint) error {
+	if g.specArmed {
+		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
+	}
+	if c == nil || c.past == 0 || len(g.ids) != g.past || c.past > g.past ||
+		!slices.Equal(g.ids[:c.past], c.ids) {
+		return fmt.Errorf("llm: this slot no longer holds the checkpoint's tokens")
+	}
+	if g.dn != nil {
+		if err := g.dn.RestoreCarried(c.dn); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.RestoreCarried(c.ple); err != nil {
+			return err
+		}
+	}
+	return g.rewindPosition(c.past, c.past)
+}
+
+func resized(b []float32, n int) []float32 {
+	if cap(b) < n {
+		return make([]float32, n)
+	}
+	return b[:n]
 }
 
 // Reset starts a fresh sequence: the attention cache from cell zero, the PLE
@@ -1153,6 +1258,159 @@ func (g *Graph) ExtendRows(ids []int32) (logits, res []float32, err error) {
 	since(&g.Stats.Glue, t0)
 	g.Stats.Total += time.Since(top)
 	return logits, res, nil
+}
+
+// batchSabotage, when set, runs after DecodeRows has written the blocks'
+// position tables. Nothing in the product sets it; it is how
+// TestGraphDecodeRowsIsEachSlot's controls break one block's table to show
+// the gate can see it (the same arrangement as rewindPosition).
+var batchSabotage func(g *Graph)
+
+// DecodeRows advances several sequences one token each in one pass
+// (CONCURRENCY.md C5): row r is token ids[r] of the sequence in slot
+// slots[r]. It returns every row's logits, [len(slots)][vocab], and leaves
+// the live slot live.
+//
+// The rows share every weight read — the projections, the MoE and the head
+// run over all of them at once, which is what makes a three-row pass cost
+// 1.78 steps rather than three — and each row's attention, DeltaNet and PLE
+// run on its own sequence's cache, state and ring at its own position
+// (batch.go). A single row is an ordinary Extend on that slot, recorded
+// decode step and all.
+func (g *Graph) DecodeRows(slots []int, ids []int32) (logits []float32, err error) {
+	n := len(slots)
+	switch {
+	case n == 0 || n != len(ids):
+		return nil, fmt.Errorf("llm: %d slots and %d tokens", n, len(ids))
+	case g.head == nil:
+		return nil, fmt.Errorf("llm: this graph was staged without a head")
+	case n > g.head.MaxRows():
+		return nil, fmt.Errorf("llm: %d rows, the head arena holds %d — GraphOpts.HeadRows", n, g.head.MaxRows())
+	case g.spec:
+		return nil, fmt.Errorf("llm: a speculating graph cannot batch sequences")
+	}
+	if n == 1 {
+		live := g.slot
+		if err := g.UseSlot(slots[0]); err != nil {
+			return nil, err
+		}
+		l, _, err := g.Extend(ids)
+		if err == nil {
+			// Extend's logits are a view of an arena the next pass writes.
+			l = append([]float32(nil), l...)
+		}
+		if uerr := g.UseSlot(live); uerr != nil && err == nil {
+			err = uerr
+		}
+		return l, err
+	}
+
+	// Every row's sequence where the others are: the live one's position and
+	// ids go into its parked entry for the length of the pass, and back.
+	live := g.slot
+	g.parked[live].past, g.parked[live].ids = g.past, g.ids
+	defer func() {
+		g.past, g.ids = g.parked[live].past, g.parked[live].ids
+		g.parked[live].past, g.parked[live].ids = 0, nil
+	}()
+	rows := make([]batchRow, n)
+	for r, s := range slots {
+		if s < 0 || s >= g.slots {
+			return nil, fmt.Errorf("llm: sequence slot %d of %d", s, g.slots)
+		}
+		rows[r] = batchRow{slot: s, past: g.parked[s].past}
+	}
+	if err := checkBatch(rows, g.slots, g.nKV); err != nil {
+		return nil, err
+	}
+
+	top := time.Now()
+	t0 := top
+	embd, err := g.m.Embeddings(ids)
+	if err != nil {
+		return nil, fmt.Errorf("llm: token_embd: %w", err)
+	}
+	var pleEmbd []float32
+	if g.hasPLE {
+		// Each row's n-gram is its own sequence's, and reaches NGram-1
+		// tokens behind it.
+		var rowsPLE []int32
+		for r, s := range slots {
+			h := g.parked[s].ids
+			tail := append(append([]int32(nil), h[max(0, len(h)-g.pleCfg.NGram):]...), ids[r])
+			rowsPLE = append(rowsPLE, PLERowsFrom(g.pleCfg, tail, len(tail)-1)...)
+		}
+		g.pleAhead.Wait()
+		if pleEmbd, err = g.m.PLEGather(rowsPLE, g.pleCfg.NHeads, g.pleCfg.HeadDim); err != nil {
+			return nil, fmt.Errorf("llm: per_layer_token_embd: %w", err)
+		}
+	}
+	t0 = since(&g.Stats.Gather, t0)
+	if err := g.hc.UploadInit(embd, n); err != nil {
+		return nil, err
+	}
+	type batcher interface{ SetBatch([]batchRow) error }
+	var set []batcher
+	if g.attn != nil {
+		set = append(set, g.attn)
+	}
+	if g.dn != nil {
+		set = append(set, g.dn)
+	}
+	if g.ple != nil {
+		set = append(set, g.ple)
+	}
+	defer func() {
+		for _, b := range set {
+			_ = b.SetBatch(nil)
+		}
+	}()
+	for _, b := range set {
+		if err := b.SetBatch(rows); err != nil {
+			return nil, err
+		}
+	}
+	if batchSabotage != nil {
+		batchSabotage(g)
+	}
+	t0 = since(&g.Stats.Glue, t0)
+
+	g.record(n)
+	defer func() {
+		if ferr := g.flush(); ferr != nil && err == nil {
+			logits, err = nil, ferr
+		}
+	}()
+	if t0, err = g.layers(n, g.nLayer, pleEmbd, t0); err != nil {
+		return nil, err
+	}
+	if err := g.hc.Run(2*g.nLayer, false); err != nil {
+		return nil, fmt.Errorf("llm: head mixer: %w", err)
+	}
+	t0 = g.blk(&g.Stats.HC, t0)
+	if err := g.head.Resize(n); err != nil {
+		return nil, err
+	}
+	if err := g.move.Move(g.head.InPort(), g.hc.MixedPort(), n); err != nil {
+		return nil, err
+	}
+	t0 = g.blk(&g.Stats.Move, t0)
+	if err := g.head.Run(); err != nil {
+		return nil, err
+	}
+	g.blk(&g.Stats.Head, t0)
+	if err := g.flush(); err != nil {
+		return nil, err
+	}
+	for r, s := range slots {
+		st := &g.parked[s]
+		st.ids = append(st.ids, ids[r])
+		st.past++
+	}
+	g.Stats.Runs++
+	logits = g.head.Logits()
+	g.Stats.Total += time.Since(top)
+	return logits, nil
 }
 
 // PassExperts is how many **distinct** experts the last pass's last layer
@@ -1669,6 +1927,19 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	}
 	t0 = since(&g.Stats.Glue, t0)
 
+	if _, err := g.layers(nTok, nLayer, pleEmbd, t0); err != nil {
+		return err
+	}
+	g.past += nTok
+	g.Stats.Runs++
+	return nil
+}
+
+// layers is a pass's layer loop, over whatever the embedding upload and the
+// blocks' positions (or batch rows) have set up: nTok rows through the first
+// nLayer layers, ending with the last combine flushed. It returns the clock
+// it left off at.
+func (g *Graph) layers(nTok, nLayer int, pleEmbd []float32, t0 time.Time) (time.Time, error) {
 	// P1a's fusion, as a scheduling rule rather than a kernel choice. A
 	// combine and the next mixer's norm are the same 2560 values per
 	// (token, stream) read, written and read again, so `RunCombineMix` does
@@ -1709,69 +1980,66 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 			// only place the 10240-wide tensor crosses a boundary — twice,
 			// once a graph.
 			if err := flushHC(); err != nil {
-				return fmt.Errorf("llm: layer %d ple combine: %w", l, err)
+				return t0, fmt.Errorf("llm: layer %d ple combine: %w", l, err)
 			}
 			t0 = g.blk(&g.Stats.HC, t0)
 			if err := g.ple.UploadEmbd(pleEmbd, nTok); err != nil {
-				return err
+				return t0, err
 			}
 			t0 = since(&g.Stats.Glue, t0)
 			if err := g.move.Move(g.ple.ResPort(), g.hc.ResPort(), nTok); err != nil {
-				return err
+				return t0, err
 			}
 			t0 = g.blk(&g.Stats.Move, t0)
 			if err := g.ple.Run(); err != nil {
-				return err
+				return t0, err
 			}
 			t0 = g.blk(&g.Stats.PLE, t0)
 			if err := g.move.Move(g.hc.ResPort(), g.ple.ResPort(), nTok); err != nil {
-				return err
+				return t0, err
 			}
 			t0 = g.blk(&g.Stats.Move, t0)
 		}
 
 		// The attention half.
 		if err := mixHC(2 * l); err != nil {
-			return fmt.Errorf("llm: layer %d attn mix: %w", l, err)
+			return t0, fmt.Errorf("llm: layer %d attn mix: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.HC, t0)
 		t1, err := g.sublayer(l, nTok, t0)
 		if err != nil {
-			return err
+			return t0, err
 		}
 		t0 = t1
 		pending = 2 * l
 
 		// The FFN half, which every layer has.
 		if err := mixHC(2*l + 1); err != nil {
-			return fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
+			return t0, fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.HC, t0)
 		if err := g.moe.Resize(nTok); err != nil {
-			return err
+			return t0, err
 		}
 		t0 = since(&g.Stats.Glue, t0)
 		if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), nTok); err != nil {
-			return err
+			return t0, err
 		}
 		t0 = g.blk(&g.Stats.Move, t0)
 		if err := g.moe.Run(l); err != nil {
-			return fmt.Errorf("llm: layer %d moe: %w", l, err)
+			return t0, fmt.Errorf("llm: layer %d moe: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.MoE, t0)
 		if err := g.move.Move(g.hc.BlockOutPort(), g.moe.OutPort(), nTok); err != nil {
-			return err
+			return t0, err
 		}
 		t0 = g.blk(&g.Stats.Move, t0)
 		pending = 2*l + 1
 	}
 	if err := flushHC(); err != nil {
-		return fmt.Errorf("llm: last combine: %w", err)
+		return t0, fmt.Errorf("llm: last combine: %w", err)
 	}
-	t0 = g.blk(&g.Stats.HC, t0)
-	g.past += nTok
-	g.Stats.Runs++
-	return nil
+	return g.blk(&g.Stats.HC, t0), nil
 }
 
 // sublayer runs one layer's attention half — the gated DeltaNet in 36 layers

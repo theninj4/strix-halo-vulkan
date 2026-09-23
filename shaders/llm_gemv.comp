@@ -103,7 +103,7 @@
 // Rows of A this dispatch carries. See the header: a specialization constant,
 // bounded by MAXROWS so the accumulators stay in registers.
 layout(constant_id = 0) const uint ROWS = 1;
-#define MAXROWS 2
+#define MAXROWS 3
 
 #ifdef Q4B
 #include "llm_q4k.glsl"
