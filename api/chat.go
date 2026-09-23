@@ -36,12 +36,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(ctx, w, r, &req) {
 		return
 	}
+	model := s.completionModel(&req)
 	if !validCompletion(ctx, w, &req) {
 		return
 	}
 
 	id := "chatcmpl-" + randomID()
-	model := modelID(s.Completion, req.Model)
 	created := time.Now().Unix()
 	if req.Stream {
 		s.streamCompletion(w, r, &req, id, model, created)
@@ -169,8 +169,20 @@ func validCompletion(ctx context.Context, w http.ResponseWriter, req *Completion
 			return false
 		}
 	}
-	if req.MinP != nil || req.RepeatPenalty != nil {
-		badRequest(ctx, w, "min_p and repeat_penalty are not implemented; this server's sampler is temperature, top_k and top_p")
+	if req.MinP != nil && (*req.MinP < 0 || *req.MinP > 1) {
+		badRequest(ctx, w, "min_p must be between 0 and 1")
+		return false
+	}
+	if req.RepeatPenalty != nil && *req.RepeatPenalty <= 0 {
+		badRequest(ctx, w, "repeat_penalty must be positive; 1 is off")
+		return false
+	}
+	if req.PresencePenalty != nil && (*req.PresencePenalty < -2 || *req.PresencePenalty > 2) {
+		badRequest(ctx, w, "presence_penalty must be between -2 and 2")
+		return false
+	}
+	if _, err := req.Thinking(); err != nil {
+		badRequest(ctx, w, err.Error())
 		return false
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type != "" && req.ResponseFormat.Type != "text" {

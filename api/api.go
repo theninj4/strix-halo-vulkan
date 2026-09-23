@@ -46,6 +46,11 @@ type Server struct {
 	// the duration and the sizes.
 	LogBodies bool
 
+	// Presets are the virtual models a chat request's `model` may name
+	// (presets.go). Empty serves the checkpoint's own defaults to every
+	// request, whatever model it names.
+	Presets []Preset
+
 	// The backends, any of which may be nil.
 	Speech        SpeechBackend
 	Transcription TranscriptionBackend

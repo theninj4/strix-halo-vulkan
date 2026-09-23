@@ -347,6 +347,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	prefill := time.Since(start)
 
 	s := l.sampler(req)
+	s.Accept(ids...)
 	dec := llm.NewChatDecoder(opt.Tools, !opt.NoThinking)
 	dec.StopAt(req.Stop)
 	var text utf8Stream
@@ -377,6 +378,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	}()
 	for gen < budget {
 		id := s.Sample(logits)
+		s.Accept(id)
 		if ttft == 0 {
 			ttft = time.Since(enter)
 		}
@@ -644,7 +646,17 @@ func (l *LLM) sampler(req *api.CompletionRequest) *llm.Sampler {
 	if req.Seed != nil {
 		seed = *req.Seed
 	}
-	return llm.NewSampler(float32(temp), topK, float32(topP), seed)
+	s := llm.NewSampler(float32(temp), topK, float32(topP), seed)
+	if req.MinP != nil {
+		s.MinP = float32(*req.MinP)
+	}
+	if req.RepeatPenalty != nil {
+		s.RepeatPenalty = float32(*req.RepeatPenalty)
+	}
+	if req.PresencePenalty != nil {
+		s.PresencePenalty = float32(*req.PresencePenalty)
+	}
+	return s
 }
 
 // chatRequest translates an HTTP request into the conversation the
@@ -652,15 +664,13 @@ func (l *LLM) sampler(req *api.CompletionRequest) *llm.Sampler {
 // the model's meet.
 func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, error) {
 	var opt llm.ChatOpts
-	switch strings.ToLower(req.ReasoningEffort) {
-	case "":
-	case "none", "minimal":
-		// OpenAI's two spellings for "do not think". The template has one
-		// too, and it enforces it in the prompt rather than asking.
-		opt.NoThinking = true
-	default:
-		opt.Effort = strings.ToLower(req.ReasoningEffort)
+	// "Do not think" is enforced by the template in the prompt rather than
+	// asked for.
+	think, err := req.Thinking()
+	if err != nil {
+		return nil, opt, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
+	opt.NoThinking, opt.Effort, opt.DropThinking = think.Off, think.Effort, think.DropHistory
 
 	choice, err := toolChoice(req.ToolChoice)
 	if err != nil {

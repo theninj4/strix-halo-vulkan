@@ -145,12 +145,12 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, err.Error())
 		return
 	}
+	model := s.completionModel(comp)
 	if !validCompletion(ctx, w, comp) {
 		return
 	}
 
 	id := "msg_" + randomID()
-	model := modelID(s.Completion, req.Model)
 	if req.Stream {
 		s.streamMessages(w, r, comp, id, model)
 		return
@@ -364,6 +364,10 @@ func completionFromMessages(req *MessagesRequest) (*CompletionRequest, error) {
 		// OpenAI's spelling of the same instruction, which is what the
 		// backend reads. The template enforces it in the prompt.
 		out.ReasoningEffort = "none"
+	}
+	if req.Thinking != nil && req.Thinking.Type == "enabled" {
+		// Said explicitly, so it outranks a non-thinking preset.
+		out.ChatTemplateKwargs = map[string]json.RawMessage{"enable_thinking": json.RawMessage("true")}
 	}
 	for _, t := range req.Tools {
 		tool, err := toolFromAnthropic(t)

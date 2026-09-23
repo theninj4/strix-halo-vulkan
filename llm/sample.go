@@ -20,8 +20,9 @@ import (
 	"sort"
 )
 
-// Sampler is the chain llama.cpp calls `top_k -> top_p -> temp -> dist`,
-// with temperature zero short-circuiting the lot into an argmax.
+// Sampler is the chain llama.cpp calls `penalties -> top_k -> top_p -> min_p
+// -> temp -> dist`, with temperature zero short-circuiting everything after
+// the penalties into an argmax.
 type Sampler struct {
 	// Temp scales the logits before the softmax. Zero — the default — is
 	// greedy, and is what a comparison against another implementation needs.
@@ -31,13 +32,74 @@ type Sampler struct {
 	// TopP keeps the smallest prefix of the sorted distribution whose mass
 	// reaches p, or every token at zero or one.
 	TopP float32
-	rng  *rand.Rand
+	// MinP drops every token whose probability is below MinP times the most
+	// likely one's, after TopP. Zero keeps them all.
+	MinP float32
+	// RepeatPenalty and PresencePenalty are llama.cpp's penalties, over the
+	// last PenaltyWindow tokens Accept was given: a token in the window has
+	// a positive logit divided by RepeatPenalty (a negative one multiplied),
+	// then PresencePenalty subtracted. They apply before the argmax too, so a
+	// greedy run with a penalty is not a plain argmax. One and zero are off.
+	RepeatPenalty   float32
+	PresencePenalty float32
+	history         []int32
+	rng             *rand.Rand
 }
+
+// PenaltyWindow is how many trailing tokens the penalties look at. It is
+// llama.cpp's default `penalty_last_n`, which is what the presets this server
+// takes from llama-server were tuned against.
+const PenaltyWindow = 64
 
 // NewSampler builds one. A seed of zero is still deterministic — this is a
 // reproducibility-first repo — and callers that want variety pass a clock.
 func NewSampler(temp float32, topK int, topP float32, seed int64) *Sampler {
-	return &Sampler{Temp: temp, TopK: topK, TopP: topP, rng: rand.New(rand.NewSource(seed))}
+	return &Sampler{Temp: temp, TopK: topK, TopP: topP, RepeatPenalty: 1, rng: rand.New(rand.NewSource(seed))}
+}
+
+// Accept records tokens for the penalties' window: the prompt before the
+// first Sample, as llama-server does, and each sampled token after it.
+func (s *Sampler) Accept(ids ...int32) {
+	if !s.penalised() {
+		return
+	}
+	s.history = append(s.history, ids...)
+	if n := len(s.history); n > PenaltyWindow {
+		s.history = append(s.history[:0], s.history[n-PenaltyWindow:]...)
+	}
+}
+
+func (s *Sampler) penalised() bool {
+	return s != nil && ((s.RepeatPenalty != 1 && s.RepeatPenalty > 0) || s.PresencePenalty != 0)
+}
+
+// penalise applies the penalties to logits in place and returns a function
+// that undoes it, so the caller's row is left as the graph wrote it.
+func (s *Sampler) penalise(logits []float32) func() {
+	if !s.penalised() || len(s.history) == 0 {
+		return func() {}
+	}
+	saved := make(map[int32]float32, len(s.history))
+	for _, id := range s.history {
+		if _, done := saved[id]; done || int(id) >= len(logits) {
+			continue
+		}
+		v := logits[id]
+		saved[id] = v
+		if s.RepeatPenalty > 0 && s.RepeatPenalty != 1 {
+			if v > 0 {
+				v /= s.RepeatPenalty
+			} else {
+				v *= s.RepeatPenalty
+			}
+		}
+		logits[id] = v - s.PresencePenalty
+	}
+	return func() {
+		for id, v := range saved {
+			logits[id] = v
+		}
+	}
 }
 
 // Greedy reports whether this sampler is an argmax.
@@ -45,6 +107,9 @@ func (s *Sampler) Greedy() bool { return s == nil || s.Temp <= 0 }
 
 // Sample picks a token from one row of logits.
 func (s *Sampler) Sample(logits []float32) int32 {
+	if s != nil {
+		defer s.penalise(logits)()
+	}
 	if s.Greedy() {
 		return Argmax(logits)
 	}
@@ -88,6 +153,23 @@ func (s *Sampler) Sample(logits []float32) int32 {
 				break
 			}
 		}
+		var re float32
+		for _, p := range probs {
+			re += p
+		}
+		for i := range probs {
+			probs[i] /= re
+		}
+	}
+
+	if s.MinP > 0 && s.MinP < 1 {
+		// probs is sorted descending, so the survivors are a prefix.
+		cut := s.MinP * probs[0]
+		n := 1
+		for n < len(probs) && probs[n] >= cut {
+			n++
+		}
+		probs, idx = probs[:n], idx[:n]
 		var re float32
 		for _, p := range probs {
 			re += p

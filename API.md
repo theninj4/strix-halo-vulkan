@@ -269,6 +269,7 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm-class       background   priority of a request that names none
     -llm-checkpoints true         keep each slot's state before the last user turn (C4)
     -llm-batch-decode true        decode concurrent conversations a row each in one pass (C5)
+    -llm-presets     models.ini   llama-server preset file: virtual models over the same weights
 
     -tts         false            load Kokoro-82M
     -tts-model   models/Kokoro-82M
@@ -643,14 +644,33 @@ What is refused rather than faked:
   back an opaque picture that the prompt rewrite had also made worse.
 
 And on the chat endpoints, the same principle with a longer list: **`n > 1`**
-(n completions are n runs of a model sized to saturate the device), **`min_p`
-and `repeat_penalty`** (the sampler is temperature, top_k and top_p),
+(n completions are n runs of a model sized to saturate the device),
 **`response_format` and `text.format`** other than text, a **`tool_choice`**
 that names a function, **`thinking.budget_tokens`**, and any **image content
 block**. Every one of them is a 400 that says what the server
 does instead. The reason is the same each time: a knob accepted and ignored is
 worse than a refused one, because the client never learns that turning it did
 nothing.
+
+### Presets: one set of weights, several model names
+
+`models.ini` is llama-server's preset file, read at startup (`-llm-presets`;
+the default is skipped if it is missing, and a key the server does not apply
+fails the start). Each section is a model name a chat request can put in
+`model` -- `chatting`, `instruct`, `thinking`, `coding` -- and `GET
+/v1/models` lists them beside the checkpoint. A preset is **a default and
+never an override**: it fills in `temperature`, `top_p`, `top_k`, `min_p`,
+`repeat_penalty`, `presence_penalty` and `chat_template_kwargs` only where
+the request left them out, and the response's `model` is the preset's name. A
+model name that is not a preset gets the checkpoint's own defaults, as before.
+
+The sampler takes llama.cpp's **`min_p`, `repeat_penalty` and
+`presence_penalty`**, the penalties over the last 64 tokens (prompt included,
+as llama-server does). **`chat_template_kwargs`** is llama-server's request
+field; the template reads `enable_thinking`, `preserve_thinking` and
+`reasoning_effort`, and any other is a 400. A top-level `reasoning_effort` is
+the client's own and decides thinking outright; otherwise `enable_thinking`
+does, so `enable_thinking: true` sent to `chatting` thinks.
 
 ## Home Assistant speaks Wyoming, not OpenAI
 

@@ -152,6 +152,9 @@ func main() {
 	llmReserve := flag.Int("llm-reserve", 1, "with more than one slot, how many only interactive requests may take")
 	llmClass := flag.String("llm-class", "background", "priority of a request that names none (X-Priority header, "+
 		"or service_tier \"priority\"/\"flex\"): interactive or background")
+	llmPresets := flag.String("llm-presets", "models.ini", "llama-server preset file: each section is a model name a "+
+		"chat request can ask for, with its own sampling and thinking defaults over the same weights. "+
+		"The default is skipped if it does not exist; empty turns presets off")
 	llmProgress := flag.Duration("llm-progress", 10*time.Second, "how often to log each in-flight completion's "+
 		"prefill/generation progress and rates; 0 turns it off")
 
@@ -206,6 +209,27 @@ func main() {
 	// in `results/` ambiguous. A *product* run wants the opposite default, so
 	// the opt-in is here and nowhere else: set the variable to any other plan
 	// to override it, or to `off` to serve L8a's int8 bank.
+	// The presets are read before anything is staged, so a typo in the file
+	// fails in a second rather than after the model's minute of loading.
+	var presets []api.Preset
+	if *llmOn && *llmPresets != "" {
+		explicit := false
+		flag.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "llm-presets" })
+		ps, err := api.LoadPresets(*llmPresets)
+		switch {
+		case err == nil:
+			presets = ps
+			names := make([]string, len(ps))
+			for i, p := range ps {
+				names[i] = p.Name
+			}
+			log.Printf("llm: presets %s from %s", strings.Join(names, ", "), *llmPresets)
+		case errors.Is(err, os.ErrNotExist) && !explicit:
+			log.Printf("llm: no presets (%s does not exist)", *llmPresets)
+		default:
+			log.Fatal(err)
+		}
+	}
 	if *llmOn {
 		if _, named := os.LookupEnv("LLM_DENSE_BANK"); !named {
 			if err := os.Setenv("LLM_DENSE_BANK", llm.ShippedDenseBank); err != nil {
@@ -243,7 +267,7 @@ func main() {
 		}
 	}
 
-	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies}
+	srv := &api.Server{Token: *token, MaxUploadBytes: *maxUpload << 20, LogBodies: *logBodies, Presets: presets}
 
 	// The device is opened once and shared. Only the models that were asked
 	// for decide whether it is needed at all: a CPU-only run should not fail

@@ -69,6 +69,16 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			resp.Data = append(resp.Data, m)
 		}
 	}
+	// The presets are models too, as far as a client can tell: each is a
+	// name it can put in `model` and get different answers from.
+	if s.Completion != nil {
+		for _, p := range s.Presets {
+			if !seen[p.Name] {
+				seen[p.Name] = true
+				resp.Data = append(resp.Data, Model{ID: p.Name, Object: "model", OwnedBy: "local"})
+			}
+		}
+	}
 	if s.Speech != nil {
 		voices := s.Speech.Voices()
 		sort.Strings(voices)

@@ -132,3 +132,44 @@ func TestSamplerDistribution(t *testing.T) {
 		}
 	}
 }
+
+// TestSamplerPenalties: a token in the window loses to one just below it once
+// the presence penalty is larger than the gap, the row comes back untouched,
+// and a token that has slid out of the window is not penalised any more.
+func TestSamplerPenalties(t *testing.T) {
+	v := []float32{0, 2.0, 1.5, -1}
+	s := NewSampler(0, 0, 0, 1)
+	s.PresencePenalty = 1
+	s.Accept(1)
+	if got := s.Sample(v); got != 2 {
+		t.Fatalf("with token 1 penalised, sampled %d; want 2", got)
+	}
+	if v[1] != 2.0 {
+		t.Fatalf("the row was left penalised: %v", v)
+	}
+	for i := 0; i < PenaltyWindow; i++ {
+		s.Accept(3)
+	}
+	if got := s.Sample(v); got != 1 {
+		t.Fatalf("token 1 is out of the window, sampled %d; want 1", got)
+	}
+
+	r := NewSampler(0, 0, 0, 1)
+	r.RepeatPenalty = 2
+	r.Accept(1)
+	if got := r.Sample(v); got != 2 { // 2.0/2 = 1.0 < 1.5
+		t.Fatalf("with repeat penalty 2 on token 1, sampled %d; want 2", got)
+	}
+}
+
+// TestSamplerMinP: a token below min_p times the best one never comes out.
+func TestSamplerMinP(t *testing.T) {
+	v := []float32{0, 0, 3} // probabilities ~0.045, 0.045, 0.91
+	s := NewSampler(1, 0, 0, 5)
+	s.MinP = 0.1
+	for i := 0; i < 500; i++ {
+		if id := s.Sample(v); id != 2 {
+			t.Fatalf("sampled %d, below min_p", id)
+		}
+	}
+}

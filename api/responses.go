@@ -151,18 +151,18 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, err.Error())
 		return
 	}
+	model := s.completionModel(comp)
 	if !validCompletion(ctx, w, comp) {
 		return
 	}
 
 	id := "resp_" + randomID()
-	model := modelID(s.Completion, req.Model)
 	created := time.Now().Unix()
 	base := func() *ResponsesResponse {
 		return &ResponsesResponse{
 			ID: id, Object: "response", CreatedAt: created, Model: model,
 			Status: "in_progress", Output: []ResponsesOutputItem{},
-			Temperature: req.Temperature, TopP: req.TopP,
+			Temperature: comp.Temperature, TopP: comp.TopP,
 			MaxOutputTokens: req.MaxOutputTokens, Tools: req.Tools,
 		}
 	}

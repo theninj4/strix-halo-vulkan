@@ -307,8 +307,10 @@ func TestChatRefusals(t *testing.T) {
 			[]string{"a", "b", "c", "d", "e"}), "at most 4"},
 		{"an empty stop sequence", withField(chatBody(user("hi")), "stop",
 			[]string{""}), "empty"},
-		{"min_p", withField(chatBody(user("hi")), "min_p", 0.1), "min_p"},
-		{"repeat_penalty", withField(chatBody(user("hi")), "repeat_penalty", 1.1), "repeat_penalty"},
+		{"min_p above one", withField(chatBody(user("hi")), "min_p", 1.5), "min_p"},
+		{"repeat_penalty of zero", withField(chatBody(user("hi")), "repeat_penalty", 0), "repeat_penalty"},
+		{"an unknown template kwarg", withField(chatBody(user("hi")), "chat_template_kwargs",
+			map[string]any{"add_vision_id": true}), "add_vision_id"},
 		{"json mode", withField(chatBody(user("hi")), "response_format",
 			map[string]any{"type": "json_object"}), "response_format"},
 		{"an image block", chatBody(map[string]any{"role": "user", "content": []any{

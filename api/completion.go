@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"strix-halo-vulkan/util"
@@ -28,11 +29,17 @@ type CompletionRequest struct {
 	Stop            StringList      `json:"stop,omitempty"`
 	MinP            *float64        `json:"min_p,omitempty"`
 	RepeatPenalty   *float64        `json:"repeat_penalty,omitempty"`
-	Temperature     *float64        `json:"temperature,omitempty"`
-	TopP            *float64        `json:"top_p,omitempty"`
-	TopK            *int            `json:"top_k,omitempty"`
-	Seed            *int64          `json:"seed,omitempty"`
-	MaxTokens       int             `json:"max_tokens,omitempty"`
+	PresencePenalty *float64        `json:"presence_penalty,omitempty"`
+	// ChatTemplateKwargs is llama-server's field: variables handed to the
+	// chat template. The ones this checkpoint's template reads are
+	// `enable_thinking`, `preserve_thinking` and `reasoning_effort`; any other
+	// is refused, since the template here is Go and not Jinja.
+	ChatTemplateKwargs map[string]json.RawMessage `json:"chat_template_kwargs,omitempty"`
+	Temperature        *float64                   `json:"temperature,omitempty"`
+	TopP               *float64                   `json:"top_p,omitempty"`
+	TopK               *int                       `json:"top_k,omitempty"`
+	Seed               *int64                     `json:"seed,omitempty"`
+	MaxTokens          int                        `json:"max_tokens,omitempty"`
 	// MaxCompletionTokens is OpenAI's newer spelling of MaxTokens and wins
 	// when both are sent, which is what their own clients do during the
 	// migration.
@@ -306,4 +313,66 @@ func (c MessageContent) NonText() string {
 		}
 	}
 	return ""
+}
+
+// Thinking is a request's reasoning switches, resolved from the two
+// vocabularies it can arrive in: OpenAI's `reasoning_effort` and the
+// template's own variables in `chat_template_kwargs`.
+type Thinking struct {
+	// Off is `enable_thinking=false`.
+	Off bool
+	// Effort is "", "low", "medium", "high" or "xhigh"; empty is the
+	// template's default.
+	Effort string
+	// DropHistory is `preserve_thinking=false`.
+	DropHistory bool
+}
+
+// Thinking resolves the request's reasoning switches.
+//
+// The top-level `reasoning_effort` is always the client's own -- a preset
+// only ever fills in `chat_template_kwargs` -- so when it is set it decides
+// on and off outright. Otherwise `enable_thinking` does, and a
+// `reasoning_effort` of "none" in the kwargs means off only when
+// `enable_thinking` is absent: a client that sends `enable_thinking: true`
+// to a non-thinking preset gets thinking, whatever effort the preset named.
+func (r *CompletionRequest) Thinking() (Thinking, error) {
+	var t Thinking
+	var enable *bool
+	var effort string
+	for k, v := range r.ChatTemplateKwargs {
+		var err error
+		switch k {
+		case "enable_thinking":
+			var b bool
+			err = json.Unmarshal(v, &b)
+			enable = &b
+		case "preserve_thinking":
+			var b bool
+			err = json.Unmarshal(v, &b)
+			t.DropHistory = !b
+		case "reasoning_effort":
+			err = json.Unmarshal(v, &effort)
+		default:
+			return t, fmt.Errorf("chat_template_kwargs.%s is not a variable this checkpoint's template reads; "+
+				"it takes enable_thinking, preserve_thinking and reasoning_effort", k)
+		}
+		if err != nil {
+			return t, fmt.Errorf("chat_template_kwargs.%s: %v", k, err)
+		}
+	}
+	effort = strings.ToLower(effort)
+	off := effort == "none" || effort == "minimal"
+	if enable != nil {
+		off = !*enable
+	}
+	if r.ReasoningEffort != "" {
+		effort = strings.ToLower(r.ReasoningEffort)
+		off = effort == "none" || effort == "minimal"
+	}
+	t.Off = off
+	if !off && effort != "none" && effort != "minimal" {
+		t.Effort = effort
+	}
+	return t, nil
 }
