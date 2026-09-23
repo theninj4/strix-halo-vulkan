@@ -88,6 +88,14 @@ type GraphOpts struct {
 	// `llm_seq_hist.comp` takes the pure-write arm it always had, which is
 	// why a `-gen` decode measures the same rate either way.
 	Speculative bool
+	// Slots stages that many sequences' carried state — the KV cache, every
+	// DeltaNet layer's recurrent state and ring, the PLE ring — so that one
+	// graph can hold several conversations and switch between them with
+	// UseSlot (CONCURRENCY.md C1). Zero and one are one sequence. It is the
+	// ping-pong's allocation used for sequences, so it refuses Speculative.
+	// At the served context a slot is ~7.4 GB, nearly all of it KV, and the
+	// cache planes' 4 GiB descriptor range caps slots x NKV at ~349k cells.
+	Slots int
 	// DenseFP16 stages the dense weights as halves, which is what every
 	// block did before L8. It is the control, not the default: the bank L8
 	// stages is the checkpoint's own int8 with an fp16 scale per 32 elements,
@@ -232,6 +240,25 @@ type Graph struct {
 	specRows   int
 	specIds    int
 	specBlocks []uint16
+
+	// Sequence slots (CONCURRENCY.md C1). `slot` is the live one; `past`,
+	// `ids` and the recorded decode step above are its, and `parked` holds
+	// every other slot's copy of them. The recorded step is per slot because
+	// its push constants carry the slot's cache, state and ring offsets.
+	slots  int
+	slot   int
+	parked []seqState
+}
+
+// seqState is the host's half of a sequence that is not the live one: what
+// UseSlot puts away and brings back. The device's half stays where it is,
+// in the slot's own region of each block's arenas.
+type seqState struct {
+	past               int
+	ids                []int32
+	pre                *vk.Prerecorded
+	preKinds, preOwner []string
+	preEpoch           int
 }
 
 // Prerecord is whether decode replays a recorded command buffer. On by
@@ -540,7 +567,12 @@ func NewGraph(dev *vk.Device, m *Model, opts GraphOpts) (*Graph, error) {
 	if nKV < roundUpInt(opts.MaxTokens, 256) {
 		nKV = roundUpInt(opts.MaxTokens, 256)
 	}
-	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV}
+	slots := max(opts.Slots, 1)
+	if slots > 1 && opts.Speculative {
+		return nil, fmt.Errorf("llm: GraphOpts.Slots and Speculative share the carried state's slot index; pick one")
+	}
+	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV,
+		slots: slots, parked: make([]seqState, slots)}
 
 	if err := g.stage(dev, opts); err != nil {
 		g.Destroy()
@@ -619,6 +651,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			pleOpts.Bank, pleOpts.Sim = b, q
 		}
 		pleOpts.Speculative = opts.Speculative
+		pleOpts.Slots = g.slots
 		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, pleOpts); err != nil {
 			return fmt.Errorf("llm: ple: %w", err)
 		}
@@ -663,6 +696,9 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			dnBank, dnSim = b, q
 		}
 		var dnOpts []DNOption
+		if g.slots > 1 {
+			dnOpts = append(dnOpts, WithDNSlots(g.slots))
+		}
 		if opts.Speculative {
 			dnOpts = append(dnOpts, WithDNSpeculative())
 		}
@@ -716,7 +752,8 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 				return fmt.Errorf("llm: full_attn is %s and qsa_indexer is %s, and they share one plane", atSim, q)
 			}
 		}
-		if g.attn, err = NewAttnGPUBank(dev, atCfg, g.maxTok, g.nKV, ats, atBank, atSim); err != nil {
+		if g.attn, err = NewAttnGPUBank(dev, atCfg, g.maxTok, g.nKV, ats, atBank, atSim,
+			WithAttnSlots(g.slots)); err != nil {
 			return fmt.Errorf("llm: attn: %w", err)
 		}
 		mark("attention", len(ats), g.attn.Buffers(), g.attn.WeightBytes(), g.attn.ActivationBytes(), start)
@@ -801,6 +838,68 @@ func (g *Graph) Attn() *AttnGPU { return g.attn }
 func (g *Graph) Past() int    { return g.past }
 func (g *Graph) Ids() []int32 { return g.ids }
 
+// Slots is how many sequences the graph was staged to hold, and Slot the one
+// every call below runs on.
+func (g *Graph) Slots() int { return g.slots }
+func (g *Graph) Slot() int  { return g.slot }
+
+// UseSlot makes sequence slot s the live one (CONCURRENCY.md C1): every
+// Forward, Extend, Reset, Past and Ids after it is that sequence's, and the
+// one that was live is left exactly where it stood, to be picked up by a
+// later UseSlot.
+//
+// **Switching moves nothing on the device.** Each slot's KV cache, DeltaNet
+// states and rings live in their own region of the blocks' arenas, so a
+// switch is four blocks re-pointing their offsets, the position written to
+// three arena dwords, and the host swapping its id list and recorded decode
+// step. That is what makes interleaving conversations a token at a time
+// cost nothing but the interleaving.
+func (g *Graph) UseSlot(s int) error {
+	if s < 0 || s >= g.slots {
+		return fmt.Errorf("llm: sequence slot %d of %d", s, g.slots)
+	}
+	if s == g.slot {
+		return nil
+	}
+	if g.specArmed {
+		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
+	}
+	g.parked[g.slot] = seqState{
+		past: g.past, ids: g.ids,
+		pre: g.pre, preKinds: g.preKinds, preOwner: g.preOwner, preEpoch: g.preEpoch,
+	}
+	in := g.parked[s]
+	g.parked[s] = seqState{}
+	g.past, g.ids = in.past, in.ids
+	g.pre, g.preKinds, g.preOwner, g.preEpoch = in.pre, in.preKinds, in.preOwner, in.preEpoch
+	g.slot = s
+	if g.attn != nil {
+		if err := g.attn.UseSlot(s); err != nil {
+			return err
+		}
+		if err := g.attn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.UseSlot(s); err != nil {
+			return err
+		}
+		if err := g.ple.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.UseSlot(s); err != nil {
+			return err
+		}
+		if err := g.dn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Reset starts a fresh sequence: the attention cache from cell zero, the PLE
 // convolution from position zero, and every DeltaNet layer's recurrent state
 // and window cleared (L7b).
@@ -854,6 +953,9 @@ func (g *Graph) Reset() error {
 func (g *Graph) Speculate(on bool) error {
 	if on == g.spec {
 		return nil
+	}
+	if on && g.slots > 1 {
+		return fmt.Errorf("llm: this graph's slots are sequences (GraphOpts.Slots); it cannot also speculate")
 	}
 	if g.specArmed {
 		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
@@ -1744,6 +1846,12 @@ func (g *Graph) dropPrerecorded() {
 func (g *Graph) Destroy() {
 	g.pleAhead.Wait()
 	g.dropPrerecorded()
+	for i := range g.parked {
+		if g.parked[i].pre != nil {
+			g.parked[i].pre.Destroy()
+			g.parked[i].pre = nil
+		}
+	}
 	if g.move != nil {
 		g.move.Destroy()
 	}

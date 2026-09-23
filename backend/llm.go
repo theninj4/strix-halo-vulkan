@@ -76,6 +76,23 @@ type LLMOptions struct {
 	Layers int
 	// ID is the model id this backend answers to in /v1/models.
 	ID string
+	// Slots is how many conversations the graph holds at once
+	// (CONCURRENCY.md C1/C2). Each is its own KV cache, DeltaNet state and
+	// rings — ~27.8 KB a cell plus 120 MB — and the cache planes' 4 GiB
+	// range caps Slots x Context at ~349k cells. One is today's server.
+	Slots int
+	// PreemptChunk is the longest prefill chunk a background request runs,
+	// so an interactive request that arrives mid-prefill waits one of these
+	// rather than a whole -llm-batch (C2 rule 3). Zero takes Batch, i.e. no
+	// cap. It applies only with more than one slot.
+	PreemptChunk int
+	// Reserve is how many slots only interactive requests may take, so
+	// background work can never lock a voice command out. Ignored with one
+	// slot.
+	Reserve int
+	// Class is the priority of a request that names none: "interactive" or
+	// "background" (the default).
+	Class string
 }
 
 const (
@@ -96,10 +113,12 @@ const (
 // **The device lock is taken per forward pass and not per request.** A
 // completion is seconds long and the speech models are milliseconds; holding
 // the queue for a whole generation would make a transcription wait behind it
-// for no gain, since nothing is in flight between two decode steps. What one
-// mutex here does guard for the length of a request is the *graph*, whose
-// cache and recurrent state are one sequence's: two conversations interleaved
-// in it would be one conversation.
+// for no gain, since nothing is in flight between two decode steps.
+//
+// **The graph belongs to the scheduler** (llm_sched.go, CONCURRENCY.md C2).
+// It holds Slots conversations, a request holds one slot for its life, and
+// the scheduler interleaves every live request's prefill chunks and decode
+// steps on the device by priority and then by fair share of device time.
 type LLM struct {
 	opt   LLMOptions
 	id    string
@@ -111,14 +130,11 @@ type LLM struct {
 	temp, topP float64
 	topK       int
 
-	mu sync.Mutex
-	g  *llm.Graph
-	// held is the token sequence the graph's state is for: the last
-	// request's prompt and everything generated after it. It is what makes a
-	// second turn of the same conversation a continuation rather than a
-	// re-read, and it is set to nil the moment anything leaves the graph in
-	// a state this cannot describe.
-	held []int32
+	class llmClass
+
+	closeMu sync.Mutex
+	g       *llm.Graph
+	sched   *llmSched
 }
 
 // NewLLM loads the checkpoint and stages the whole model on the device.
@@ -142,6 +158,27 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 	if opt.Batch > opt.Context {
 		opt.Batch = opt.Context
 	}
+	if opt.Slots <= 0 {
+		opt.Slots = 1
+	}
+	if opt.PreemptChunk <= 0 || opt.PreemptChunk > opt.Batch || opt.Slots == 1 {
+		opt.PreemptChunk = opt.Batch
+	}
+	if opt.Slots == 1 {
+		opt.Reserve = 0
+	}
+	if opt.Reserve < 0 || opt.Reserve >= opt.Slots {
+		return nil, fmt.Errorf("backend: %d of %d slots reserved for interactive requests leaves background none",
+			opt.Reserve, opt.Slots)
+	}
+	class := classBackground
+	if opt.Class != "" {
+		c, ok := parseClass(opt.Class)
+		if !ok {
+			return nil, fmt.Errorf("backend: priority class %q; want interactive or background", opt.Class)
+		}
+		class = c
+	}
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the language model has no host path; -gpu is required")
 	}
@@ -155,7 +192,7 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		return nil, fmt.Errorf("backend: %w", err)
 	}
 	l := &LLM{
-		opt: opt, id: opt.ID, model: m, tok: tok,
+		opt: opt, id: opt.ID, model: m, tok: tok, class: class,
 		eog:  llm.EndOfGeneration(m.Set, tok),
 		temp: metaFloat(m, "general.sampling.temp", 1),
 		topP: metaFloat(m, "general.sampling.top_p", 0.95),
@@ -163,7 +200,7 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 	}
 	err = opt.Device.Do(func(dev *vk.Device) error {
 		g, err := llm.NewGraph(dev, m, llm.GraphOpts{
-			MaxTokens: opt.Batch, NKV: opt.Context, Layers: opt.Layers,
+			MaxTokens: opt.Batch, NKV: opt.Context, Layers: opt.Layers, Slots: opt.Slots,
 		})
 		if err != nil {
 			return err
@@ -175,6 +212,7 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		_ = m.Close()
 		return nil, fmt.Errorf("backend: staging %s: %w", opt.Model, err)
 	}
+	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve)
 	return l, nil
 }
 
@@ -195,10 +233,17 @@ func (l *LLM) Models() []api.Model {
 // Context is the cache's cell count, for the startup banner.
 func (l *LLM) Context() int { return l.opt.Context }
 
-// Close releases the device residency.
+// Slots is how many conversations it holds at once, for the same banner.
+func (l *LLM) Slots() int { return l.opt.Slots }
+
+// Close releases the device residency. Requests still running fail.
 func (l *LLM) Close() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+	if l.sched != nil {
+		l.sched.close()
+		l.sched = nil
+	}
 	if l.g != nil {
 		_ = l.opt.Device.Do(func(*vk.Device) error {
 			l.g.Destroy()
@@ -210,7 +255,6 @@ func (l *LLM) Close() {
 		_ = l.model.Close()
 		l.model = nil
 	}
-	l.held = nil
 }
 
 // Complete renders the conversation, prefills it and decodes until something
@@ -262,20 +306,30 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		budget = room
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	// queued is how long this request sat behind another one's generation.
-	// It is reported separately because it is the one part of a slow time to
-	// first token that is not this request's own work, and without it a turn
-	// that waited eight seconds for the graph looks like a turn whose prefill
-	// was eight seconds.
-	queued := time.Since(enter)
-	if l.g == nil {
+	class := l.classOf(ctx, req)
+	l.closeMu.Lock()
+	sched := l.sched
+	l.closeMu.Unlock()
+	if sched == nil {
 		return nil, fmt.Errorf("the language model is closed")
 	}
+	job, err := sched.acquire(ctx, class, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer sched.release(job)
+	// queued is how long this request waited for a slot: every slot held by
+	// another conversation. It is reported separately because it is the one
+	// part of a slow time to first token that is not this request's own
+	// work, and without it a turn that waited eight seconds looks like a
+	// turn whose prefill was eight seconds. stalled is the other kind of
+	// wait: time its own units spent queued behind other conversations'
+	// units once it had a slot (CONCURRENCY.md C2).
+	queued := time.Since(enter)
+	reused := job.reused
 
 	start := time.Now()
-	logits, reused, err := l.prefill(ctx, ids)
+	logits, stalled, err := sched.run(job, ids[reused:], reused == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -305,8 +359,8 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			decode = time.Since(start)
 		}
 		l.logRun(ctx, runStats{
-			prompt: len(ids), reused: reused, gen: gen,
-			queued: queued, prefill: prefill, ttft: ttft, decode: decode,
+			prompt: len(ids), reused: reused, gen: gen, class: class, slot: job.slot,
+			queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 			total: time.Since(enter), reason: failureReason(ctx, err),
 		})
 	}()
@@ -348,14 +402,13 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			break
 		}
 		if err := ctx.Err(); err != nil {
-			l.held = nil
 			return nil, err
 		}
-		if logits, err = l.extend(ctx, []int32{id}); err != nil {
-			l.held = nil
+		var wait time.Duration
+		if logits, wait, err = sched.run(job, []int32{id}, false); err != nil {
 			return nil, err
 		}
-		l.held = append(l.held, id)
+		stalled += wait
 	}
 	decode = time.Since(start)
 
@@ -381,8 +434,8 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		PromptTokens: len(ids), CompletionTokens: gen, TotalTokens: len(ids) + gen,
 	}
 	l.logRun(ctx, runStats{
-		prompt: len(ids), reused: reused, gen: gen,
-		queued: queued, prefill: prefill, ttft: ttft, decode: decode,
+		prompt: len(ids), reused: reused, gen: gen, class: class, slot: job.slot,
+		queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 		total: time.Since(enter), reason: res.FinishReason,
 	})
 	return res, nil
@@ -396,21 +449,56 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 type runStats struct {
 	reason              string
 	prompt, reused, gen int
-	// queued is the wait for the graph, prefill the prompt, ttft the whole
+	class               llmClass
+	slot                int
+	// queued is the wait for a slot, prefill the prompt, ttft the whole
 	// span from the call to the first token -- queue, render, tokenize and
 	// prefill included -- decode the generation after it, and total the
-	// wall clock a client saw.
-	queued, prefill, ttft, decode, total time.Duration
+	// wall clock a client saw. stalled is the part of prefill and decode its
+	// units spent behind other conversations' units.
+	queued, stalled, prefill, ttft, decode, total time.Duration
 }
 
 // logRun writes the one line a completion leaves in the journal.
+//
+// With more than one slot it also says which slot and class the request ran
+// in and how long its units stalled behind other conversations', since a
+// rate read off an interleaved run is the device's share and not its speed.
 func (l *LLM) logRun(ctx context.Context, st runStats) {
-	log.Printf("%sllm %s: prompt %d tokens%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
-		logID(ctx), l.id, st.prompt, reusedNote(st.reused),
+	where := ""
+	if l.opt.Slots > 1 {
+		where = fmt.Sprintf(" [slot %d, %s%s]", st.slot, st.class, stalledNote(st.stalled))
+	}
+	log.Printf("%sllm %s%s: prompt %d tokens%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
+		logID(ctx), l.id, where, st.prompt, reusedNote(st.reused),
 		st.prefill.Round(time.Millisecond), rate(st.prompt-st.reused, st.prefill),
 		since(st.ttft), queuedNote(st.queued),
 		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode),
 		st.total.Round(time.Millisecond), st.reason)
+}
+
+// stalledNote is the time a request's units waited behind other
+// conversations', when there was any worth printing.
+func stalledNote(d time.Duration) string {
+	if d < 10*time.Millisecond {
+		return ""
+	}
+	return fmt.Sprintf(", %v stalled", d.Round(time.Millisecond))
+}
+
+// classOf is a request's priority: the X-Priority header, then the body's
+// service_tier, then the server's default (CONCURRENCY.md, "Priority").
+func (l *LLM) classOf(ctx context.Context, req *api.CompletionRequest) llmClass {
+	if c, ok := parseClass(strings.ToLower(api.Priority(ctx))); ok {
+		return c
+	}
+	switch strings.ToLower(req.ServiceTier) {
+	case "priority":
+		return classInteractive
+	case "flex":
+		return classBackground
+	}
+	return l.class
 }
 
 // failureReason is what the log calls a run that did not finish. A client
@@ -462,74 +550,6 @@ func queuedNote(d time.Duration) string {
 	return fmt.Sprintf(" (%v queued)", d.Round(time.Millisecond))
 }
 
-// prefill runs the prompt, continuing the sequence the graph already holds
-// when this one is a continuation of it, and reports how many tokens that
-// saved.
-//
-// **A chat client re-sends the whole conversation every turn**, so without
-// this a ten-turn conversation is prefilled ten times and the tenth turn
-// re-reads nine turns of history it has already read. The graph is built for
-// the alternative: `Extend` is what a generated token already does, and L7b's
-// gate is that a sequence in chunks is the sequence whole.
-//
-// The reuse is all-or-nothing, and the reason is the gated DeltaNet. A
-// divergence part way through would mean rewinding to the fork, and while the
-// attention cache is masked by position and the two convolution rings are
-// addressed by it -- both of which would survive -- a DeltaNet layer's
-// recurrent state is a running product with no inverse. So the prefix has to
-// be the whole of what is held, or the sequence starts again.
-func (l *LLM) prefill(ctx context.Context, ids []int32) (logits []float32, reused int, err error) {
-	// Held must also be shorter than the prompt: a request identical to the
-	// last one has nothing left to run, and the logits of a pass that has
-	// already finished are not kept.
-	if n := commonPrefix(l.held, ids); n > 0 && n == len(l.held) && n < len(ids) {
-		l.held = append(l.held, ids[n:]...)
-		logits, err = l.chunks(ctx, ids[n:], false)
-		if err != nil {
-			l.held = nil
-			return nil, 0, err
-		}
-		return logits, n, nil
-	}
-	l.held = append(l.held[:0], ids...)
-	logits, err = l.chunks(ctx, ids, true)
-	if err != nil {
-		l.held = nil
-		return nil, 0, err
-	}
-	return logits, 0, nil
-}
-
-// chunks runs a run of tokens in batches the arenas hold. A prompt longer
-// than Batch is not a longer batch, it is several: the first resets the graph
-// when the sequence is a fresh one, and every batch after it extends.
-func (l *LLM) chunks(ctx context.Context, ids []int32, fresh bool) ([]float32, error) {
-	var logits []float32
-	for i := 0; i < len(ids); i += l.opt.Batch {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		end := min(i+l.opt.Batch, len(ids))
-		chunk := ids[i:end]
-		// The next chunk's n-gram pages, faulted in while this one runs on
-		// the device (P17).
-		l.g.PrefetchPLE(chunk, ids[end:min(end+l.opt.Batch, len(ids))])
-		err := l.opt.Device.Do(func(*vk.Device) error {
-			var err error
-			if i == 0 && fresh {
-				logits, _, err = l.g.Forward(chunk)
-			} else {
-				logits, _, err = l.g.Extend(chunk)
-			}
-			return err
-		})
-		if err != nil {
-			return nil, err
-		}
-	}
-	return logits, nil
-}
-
 // commonPrefix is how many leading tokens two sequences share.
 func commonPrefix(a, b []int32) int {
 	n := min(len(a), len(b))
@@ -551,17 +571,6 @@ func reusedNote(reused int) string {
 		return ""
 	}
 	return fmt.Sprintf(" (%d cached)", reused)
-}
-
-// extend runs one decode step under the device lock.
-func (l *LLM) extend(_ context.Context, ids []int32) ([]float32, error) {
-	var logits []float32
-	err := l.opt.Device.Do(func(*vk.Device) error {
-		var err error
-		logits, _, err = l.g.Extend(ids)
-		return err
-	})
-	return logits, err
 }
 
 // sampler is the request's sampling, or the checkpoint's own where the

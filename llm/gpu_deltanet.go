@@ -291,6 +291,10 @@ type DeltaNetGPU struct {
 	// 120.75 MB a product run has no use for, so a graph that will never
 	// speculate does not allocate it and `Speculate(true)` refuses.
 	slots int
+	// seqSlots says the slots are sequences rather than P5c's ping-pong
+	// (WithDNSlots): `stateSlot` is then the live conversation, a pass reads
+	// and writes it, and Reset clears it alone.
+	seqSlots bool
 	// past is how many tokens of this sequence are behind the run, which is
 	// what turns the ring's absolute positions into slots. Zero is a fresh
 	// sequence, where a tap reaching before token zero contributes nothing.
@@ -352,6 +356,35 @@ type DNOption func(*DeltaNetGPU)
 // It is **120.75 MB at 36 layers** and only a speculative loop has any use for
 // it, so it is opt-in and `Speculate(true)` refuses without it.
 func WithDNSpeculative() DNOption { return func(g *DeltaNetGPU) { g.slots = 2 } }
+
+// WithDNSlots stages n sequences' recurrent states and rings rather than one
+// (CONCURRENCY.md C1). It is the ping-pong's allocation put to a second use:
+// P5c's two slots are the committed state and a scratch one, and here the n
+// slots are n conversations, the committed slot is whichever one UseSlot
+// named, and a pass writes the slot it read. The two uses share the index,
+// so they do not combine: a block staged this way refuses Speculate.
+func WithDNSlots(n int) DNOption {
+	return func(g *DeltaNetGPU) {
+		if n > 1 {
+			g.slots, g.seqSlots = n, true
+		}
+	}
+}
+
+// UseSlot makes sequence slot s the one every pass reads and writes. The
+// position is per sequence and the caller's to set afterwards (SetPast).
+func (g *DeltaNetGPU) UseSlot(s int) error {
+	if !g.seqSlots && s != 0 {
+		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
+	}
+	if s < 0 || s >= g.slots {
+		return fmt.Errorf("llm: deltanet sequence slot %d of %d", s, g.slots)
+	}
+	if g.seqSlots {
+		g.stateSlot = s
+	}
+	return nil
+}
 
 func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 	layers []DeltaNetWeights, bank DenseBank, sim QuantSim, opts ...DNOption) (*DeltaNetGPU, error) {
@@ -997,6 +1030,9 @@ func (g *DeltaNetGPU) stateDst() int {
 // has to be, because the two slots are different push constants and P1c's
 // pre-recorded decode step is the same bytes every token.
 func (g *DeltaNetGPU) Speculate(on bool) error {
+	if on && g.seqSlots {
+		return fmt.Errorf("llm: this block's slots are sequences (GraphOpts.Slots); it cannot also speculate")
+	}
 	if on && g.slots < 2 {
 		return fmt.Errorf("llm: this block was staged with one state slot; a rewindable pass needs two " +
 			"(GraphOpts.Speculative)")
@@ -1034,7 +1070,15 @@ func (g *DeltaNetGPU) Reset(layer int) error {
 	// them the last one happened to leave committed. Which slot is live is
 	// deliberately *not* touched here: Reset is per layer and the ping-pong
 	// is not, so a caller resetting one layer of 36 must not move it.
-	for slot := 0; slot < g.slots; slot++ {
+	//
+	// Sequence slots are the exception (CONCURRENCY.md C1): each is another
+	// conversation, live in some other request, so only the one being
+	// started is cleared.
+	lo, hi := 0, g.slots
+	if g.seqSlots {
+		lo, hi = g.stateSlot, g.stateSlot+1
+	}
+	for slot := lo; slot < hi; slot++ {
 		g.abuf.ZeroFloat32At(int(g.stateAt(layer, slot)), c.StateSize())
 		g.abuf.ZeroFloat32At(int(g.winAt(layer, slot)), (c.Conv-1)*g.qkvN())
 	}

@@ -15,6 +15,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -99,7 +100,30 @@ func (s *Server) Handler() http.Handler {
 // The body limit is outside the logger on purpose: the logger reads small
 // bodies so it can print them, and it must never be handed an unbounded one.
 func (s *Server) route(h http.HandlerFunc) http.Handler {
-	return s.limitBody(s.log(s.authorize(addHeaders(h))))
+	return s.limitBody(s.log(s.authorize(addHeaders(priority(h)))))
+}
+
+type priorityKey struct{}
+
+// priority carries a request's X-Priority header to the backend, which reads
+// it with Priority. It is a header as well as a body field (`service_tier`)
+// because the caller that most needs it — a voice assistant's OpenAI
+// integration — builds its own bodies and will not add a field, but can be
+// pointed through a proxy or given extra headers (CONCURRENCY.md).
+func priority(h http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if p := r.Header.Get("X-Priority"); p != "" {
+			r = r.WithContext(context.WithValue(r.Context(), priorityKey{}, p))
+		}
+		h.ServeHTTP(w, r)
+	}
+}
+
+// Priority is the request's X-Priority header, or "". The backend decides
+// what the values mean.
+func Priority(ctx context.Context) string {
+	p, _ := ctx.Value(priorityKey{}).(string)
+	return p
 }
 
 // log is the access log, with or without the bodies.

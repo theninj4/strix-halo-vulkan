@@ -113,9 +113,36 @@ deployment whose prompts are long.
 completion is seconds long and the speech models are milliseconds, so holding
 the queue for a whole generation would make a transcription wait behind it for
 nothing: between two decode steps there is no work in flight. What is held for
-the length of a request is the *graph*, whose cache, PLE ring and DeltaNet
-state are one sequence's — two conversations interleaved in them would not be
-slower, they would be one conversation.
+the length of a request is a *slot* of the graph, whose cache, PLE ring and
+DeltaNet state are one sequence's.
+
+**`-llm-slots N` holds N conversations at once** (CONCURRENCY.md, C1/C2). Each
+slot is its own KV cache (27.8 KB a cell), DeltaNet state and rings (120 MB);
+the cache planes' 4 GiB range caps `slots x -llm-ctx` at ~349k cells. A
+request holds one slot for its life, and a scheduler interleaves every live
+request's work a **unit** at a time — one prefill chunk or one decode step.
+This is concurrency and not throughput: three streams share one stream's
+~34 tok/s until batched decode (C5) lands. The order is:
+
+1. **Interactive before background, strictly.** A request is interactive if
+   it sends `X-Priority: interactive` or `service_tier: "priority"`, and
+   background with `X-Priority: background` or `service_tier: "flex"`;
+   otherwise `-llm-class` decides (background by default). While an
+   interactive request holds a slot no background unit starts, so a voice
+   command decodes at the full single-stream rate. Measured on the 4-layer
+   prefix: a 16-token interactive request beside two decoding background ones
+   finished in 166 ms, against 419 ms sharing with them as an equal.
+2. **Within a class, the least device time served goes first**, so a long
+   prompt cannot take the device from a conversation that is decoding.
+3. **A background prefill runs in `-llm-preempt-chunk` pieces** (2048), because
+   a unit cannot be interrupted once it is on the device and an interactive
+   request can arrive at any moment.
+
+`-llm-reserve` (1) slots are only for interactive requests, so background
+agents can never occupy every slot. A request that finds no slot it may take
+waits for one, and the log line says `(Ns queued)`. With more than one slot the
+line also names the slot, the class and how long the request's units
+`stalled` behind other conversations'.
 
 **Parakeet is resident.** `-stt` stages the encoder and the transducer tail
 once, sized for `-max-audio` seconds (60 by default), and every shorter clip
@@ -233,6 +260,10 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm-batch       4096         tokens the prefill arenas hold (P16: wider costs memory only)
     -llm-max-tokens  1024         what a request that names no max_tokens gets
     -llm-layers      0            stage the first N layers only; a fast start, not an answer
+    -llm-slots       1            conversations held at once; slots x ctx <= ~349k cells
+    -llm-preempt-chunk 2048       longest background prefill chunk, with more than one slot
+    -llm-reserve     1            slots only interactive requests may take, with more than one
+    -llm-class       background   priority of a request that names none
 
     -tts         false            load Kokoro-82M
     -tts-model   models/Kokoro-82M
@@ -294,10 +325,12 @@ running product with no inverse. So the prefix has to be the whole of what is
 held, or the sequence starts again. A miss costs one comparison; a hit costs
 nothing and saves the history.
 
-It also means **the graph is one conversation's**. Two clients are served
-correctly — the second waits, and re-prefills — but they take turns evicting
-each other's prefix, which is the first thing a cache per conversation would
-fix.
+With `-llm-slots 1` **the graph is one conversation's**: two clients are
+served correctly — the second waits, and re-prefills — but they take turns
+evicting each other's prefix. With more slots each holds its own, and a
+request is given the free slot already holding the longest prefix of its
+prompt, else the least recently used one. The reuse is still all-or-nothing
+within a slot; checkpoints that survive a divergence are CONCURRENCY.md's C4.
 
 ## One prompt, three envelopes, and a template that is not ours
 
@@ -681,10 +714,11 @@ again.
 - **Constrained decoding**, which is the one refusal above that is a missing
   capability rather than a missing shape. It would close `response_format`,
   `text.format` and a `tool_choice` that names a function in one go.
-- **More than one conversation at a time.** The graph is one sequence's, so a
-  second request waits — and evicts the first's reusable prefix. What would
-  change that is a cache per conversation and the residency to hold them,
-  which is a measurement rather than an argument.
+- **More than one conversation at a time is interleaved, not batched.**
+  `-llm-slots` holds several and a scheduler shares the device between them
+  (above), but each pass is still one sequence's single row, so N streams
+  split one stream's rate. Batched decode — the decoding slots' tokens as rows
+  of one pass — is CONCURRENCY.md's C5.
 - **MTP speculative decoding is built, lossless, and parked at 0.95x**
   (research/p5c-speculative-loop.md) — it costs nothing while off. What
   would make it pay is the draft head's acceptance on a real workload,

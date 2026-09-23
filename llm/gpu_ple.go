@@ -137,6 +137,10 @@ type PLEOpts struct {
 	// only a speculative loop has any use for it, and `Speculate(true)`
 	// refuses without it.
 	Speculative bool
+	// Slots stages that many sequences' rings (CONCURRENCY.md C1): the
+	// ping-pong's allocation, with the committed slot the live sequence.
+	// It does not combine with Speculative.
+	Slots int
 	// Bank is which dense bank the fused key/value projection is staged on.
 	// The zero value is the fp16 bank, which is where L8a left this block —
 	// the one dense matmul in the vertical that never got the int8 stage —
@@ -193,7 +197,10 @@ type PLEGPU struct {
 	histStride, histSlot int
 	histSpec             bool
 	slots                int
-	actElems             int
+	// seqSlots says the slots are sequences (PLEOpts.Slots) and histSlot the
+	// live one, which a pass both reads and writes.
+	seqSlots bool
+	actElems int
 	// past is how many tokens of this sequence are already behind the run,
 	// which is how far back the convolution may reach. Zero is a fresh
 	// sequence, where anything before token 0 is zero.
@@ -251,6 +258,12 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 	}
 	if opts.Speculative {
 		g.slots = 2
+	}
+	if opts.Slots > 1 {
+		if opts.Speculative {
+			return nil, fmt.Errorf("llm: a ple block's slots are sequences or a rollback, not both")
+		}
+		g.slots, g.seqSlots = opts.Slots, true
 	}
 	align := 1
 	for _, v := range pleVariants {
@@ -628,6 +641,9 @@ func (g *PLEGPU) histDst() int {
 // See DeltaNetGPU.Speculate: this block carries no recurrent state, so the
 // nine-row ring is the whole of what it has to roll back.
 func (g *PLEGPU) Speculate(on bool) error {
+	if on && g.seqSlots {
+		return fmt.Errorf("llm: this block's slots are sequences (GraphOpts.Slots); it cannot also speculate")
+	}
 	if on && g.slots < 2 {
 		return fmt.Errorf("llm: this block was staged with one ring slot; a rewindable pass needs two " +
 			"(GraphOpts.Speculative)")
@@ -640,6 +656,21 @@ func (g *PLEGPU) CommitSlot() {
 	if g.histSpec {
 		g.histSlot = 1 - g.histSlot
 	}
+}
+
+// UseSlot makes sequence slot s's ring the one every pass reads and writes
+// (CONCURRENCY.md C1). The position is the caller's to set afterwards.
+func (g *PLEGPU) UseSlot(s int) error {
+	if !g.seqSlots && s != 0 {
+		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
+	}
+	if s < 0 || s >= g.slots {
+		return fmt.Errorf("llm: ple sequence slot %d of %d", s, g.slots)
+	}
+	if g.seqSlots {
+		g.histSlot = s
+	}
+	return nil
 }
 
 // SetPast places the next run's first token at position n.

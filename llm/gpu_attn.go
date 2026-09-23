@@ -517,6 +517,49 @@ type AttnGPU struct {
 	hK, hV, hIdxRaw, hIdxK             uint32
 	kvStride, idxRawStride, idxKStride int
 	hElems                             int
+	// slots is how many sequences' caches the three planes hold, and slot the
+	// one the four offsets above currently point at (CONCURRENCY.md C1). A
+	// slot is every layer's cache for one sequence, laid end to end, so a
+	// slot is a base offset and neither the kernels nor the staging notice:
+	// UseSlot moves hK, hV, hIdxRaw and hIdxK and everything that reads them
+	// follows. idxK0 is where the pooled region starts, after every slot's
+	// raw keys.
+	slots, slot int
+	idxK0       uint32
+}
+
+// AttnOption configures an AttnGPU before its arenas are laid out.
+type AttnOption func(*AttnGPU)
+
+// WithAttnSlots stages n sequences' caches rather than one (CONCURRENCY.md
+// C1). It multiplies the three cache planes by n and nothing else: the
+// activation arenas are a pass's, and a pass is one slot's.
+func WithAttnSlots(n int) AttnOption {
+	return func(g *AttnGPU) {
+		if n > 1 {
+			g.slots = n
+		}
+	}
+}
+
+// Slots is how many sequence caches this block holds, and Slot the live one.
+func (g *AttnGPU) Slots() int { return g.slots }
+func (g *AttnGPU) Slot() int  { return g.slot }
+
+// UseSlot points every cache offset at sequence slot s. The position is the
+// caller's to set afterwards (SetPast): it is per sequence, and the graph
+// keeps it.
+func (g *AttnGPU) UseSlot(s int) error {
+	if s < 0 || s >= g.slots {
+		return fmt.Errorf("llm: attention cache slot %d of %d", s, g.slots)
+	}
+	n := len(g.layers)
+	g.slot = s
+	g.hK = uint32(s * n * g.kvStride)
+	g.hV = g.hK
+	g.hIdxRaw = uint32(s * n * g.idxRawStride)
+	g.hIdxK = g.idxK0 + uint32(s*n*g.idxKStride)
+	return nil
 }
 
 // qkvN is the fused projection's output width: the query and its gate, the key,
@@ -695,7 +738,7 @@ func NewAttnGPU(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []Att
 // format the 4.5-bit one encodes with. The indexer's two BF16 projections go
 // on a quantised bank's plane with the rest of the fused matrix (P2).
 func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers []AttnWeights,
-	bank DenseBank, sim QuantSim) (*AttnGPU, error) {
+	bank DenseBank, sim QuantSim, opts ...AttnOption) (*AttnGPU, error) {
 	if maxTokens <= 0 || nKV < maxTokens {
 		return nil, fmt.Errorf("llm: %d tokens in a %d-cell cache", maxTokens, nKV)
 	}
@@ -741,6 +784,10 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 		expandCells: os.Getenv("LLM_ATTN_EXPAND_CELLS") == "1",
 		outGemm:     OutGEMMKernelFor(maxTokens),
 		autoPlan:    true,
+		slots:       1,
+	}
+	for _, o := range opts {
+		o(g)
 	}
 	// The plane is padded up to the widest tile any rung covers, because the
 	// attention kernel reads whole key blocks and the pack writes whole token
@@ -898,17 +945,22 @@ func (g *AttnGPU) alloc(nLayers int) error {
 	g.kvStride = c.NHeadKV * g.nKV * c.HeadDim
 	g.idxRawStride = g.nKV * c.IdxDim
 	g.idxKStride = g.NBlocks() * c.IdxDim
+	// With more than one sequence slot (CONCURRENCY.md C1) each plane holds
+	// `slots` of these end to end, so the range below caps slots x cells
+	// rather than cells.
 	g.hK, g.hV, g.hIdxRaw = 0, 0, 0
-	g.hIdxK = uint32((nLayers*g.idxRawStride + 63) &^ 63)
-	kvBytes := nLayers * g.kvStride * 2
-	idxBytes := (int(g.hIdxK) + nLayers*g.idxKStride) * 2
+	g.idxK0 = uint32((g.slots*nLayers*g.idxRawStride + 63) &^ 63)
+	g.hIdxK = g.idxK0
+	kvBytes := g.slots * nLayers * g.kvStride * 2
+	idxBytes := (int(g.idxK0) + g.slots*nLayers*g.idxKStride) * 2
 	// **The cap, asserted rather than commented** (P14). The driver clamps a
 	// descriptor's range instead of refusing it, so a cache past the cap reads
 	// as zeros and the model produces plausible, wrong numbers *faster* than
 	// the real thing, which is the one failure a benchmark cannot see.
 	perCell := float64(c.NHeadKV*c.HeadDim*nLayers) * 2
-	hint := fmt.Sprintf("this cache is %d cells over %d layers; one plane is %.1f KB a cell, "+
-		"so the cap is about %d cells", g.nKV, nLayers, perCell/1024, int(float64(maxBufferRange)/perCell))
+	hint := fmt.Sprintf("this cache is %d slots of %d cells over %d layers; one plane is %.1f KB a cell, "+
+		"so the cap is about %d cells over all slots", g.slots, g.nKV, nLayers, perCell/1024,
+		int(float64(maxBufferRange)/perCell))
 	for _, b := range []struct {
 		what  string
 		bytes int

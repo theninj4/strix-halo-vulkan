@@ -39,6 +39,11 @@ type CompletionRequest struct {
 	MaxCompletionTokens int  `json:"max_completion_tokens,omitempty"`
 	N                   int  `json:"n,omitempty"`
 	Stream              bool `json:"stream"`
+	// ServiceTier is OpenAI's field, read as this server's priority class
+	// (CONCURRENCY.md): "priority" is interactive — a voice command, served
+	// ahead of everything else — and "flex" is background. Anything else
+	// takes the server's default. The X-Priority header overrides it.
+	ServiceTier string `json:"service_tier,omitempty"`
 }
 
 // Budget is how many tokens the completion may run to, under either of

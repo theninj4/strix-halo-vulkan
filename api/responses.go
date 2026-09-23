@@ -36,6 +36,7 @@ type ResponsesRequest struct {
 	Input           json.RawMessage     `json:"input"`
 	ToolChoice      json.RawMessage     `json:"tool_choice,omitempty"`
 	Text            json.RawMessage     `json:"text,omitempty"`
+	ServiceTier     string              `json:"service_tier,omitempty"`
 	Tools           []ResponsesTool     `json:"tools,omitempty"`
 	MaxOutputTokens int                 `json:"max_output_tokens,omitempty"`
 	Stream          bool                `json:"stream"`
@@ -433,6 +434,7 @@ func completionFromResponses(req *ResponsesRequest) (*CompletionRequest, error) 
 		Temperature: req.Temperature, TopP: req.TopP,
 		MaxCompletionTokens: req.MaxOutputTokens,
 		ToolChoice:          req.ToolChoice,
+		ServiceTier:         req.ServiceTier,
 	}
 	if req.Reasoning != nil {
 		out.ReasoningEffort = req.Reasoning.Effort

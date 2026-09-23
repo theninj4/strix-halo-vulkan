@@ -141,6 +141,13 @@ func main() {
 			"Wider costs only memory: 8192 helps prompts past 4096 tokens and holds ~3 GB more")
 	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
+	llmSlots := flag.Int("llm-slots", 1, "conversations held at once, interleaved a prefill chunk or decode step at a time (CONCURRENCY.md). "+
+		"Each is its own cache: slots x -llm-ctx is capped at ~349k cells")
+	llmPreempt := flag.Int("llm-preempt-chunk", 2048, "with more than one slot, the longest prefill chunk a background request runs "+
+		"before an interactive one may take the device; 0 is -llm-batch")
+	llmReserve := flag.Int("llm-reserve", 1, "with more than one slot, how many only interactive requests may take")
+	llmClass := flag.String("llm-class", "background", "priority of a request that names none (X-Priority header, "+
+		"or service_tier \"priority\"/\"flex\"): interactive or background")
 
 	embedOn := flag.Bool("embed", false, "load Qwen3-Embedding-0.6B and serve /v1/embeddings")
 	embedModel := flag.String("embed-model", "models/Qwen3-Embedding-0.6B", "embedding checkpoint directory")
@@ -359,6 +366,7 @@ func main() {
 		b, err := backend.NewLLM(backend.LLMOptions{
 			Model: *llmModel, Device: dev, Context: *llmCtx, Batch: *llmBatch,
 			MaxTokens: *llmMax, Layers: *llmLayers,
+			Slots: *llmSlots, PreemptChunk: *llmPreempt, Reserve: *llmReserve, Class: *llmClass,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -369,8 +377,8 @@ func main() {
 		if *llmLayers > 0 {
 			layers = fmt.Sprintf("the first %d layers only", *llmLayers)
 		}
-		log.Printf("llm: %s, %s, %d cells of context, %d-token batches, in %v",
-			*llmModel, layers, b.Context(), *llmBatch, time.Since(start).Round(time.Millisecond))
+		log.Printf("llm: %s, %s, %d slots of %d cells of context, %d-token batches, in %v",
+			*llmModel, layers, b.Slots(), b.Context(), *llmBatch, time.Since(start).Round(time.Millisecond))
 	}
 
 	// Say which it is, every time. Only logging the open case meant the
