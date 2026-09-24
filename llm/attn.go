@@ -125,10 +125,20 @@ type AttnTrace struct {
 // 256-cell cache there is exactly *one* full block of 4 and 63 empty ones,
 // and reproducing that is most of what the tests here check.
 func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTrace {
+	return AttnLayerAt(c, w, xn, nTok, nKV, nil)
+}
+
+// AttnLayerAt is AttnLayer with every cell's rotary position given, which is
+// what a sequence holding an image needs (LLM-VISION.md V5). nil is the text
+// positions 0..nTok-1. A pooled indexer block is roped at its first cell's
+// position, as HF ropes it with that cell's cos/sin row.
+func AttnLayerAt(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int, pos []Pos3) *AttnTrace {
 	t := &AttnTrace{}
-	pos := make([]int32, nTok)
-	for i := range pos {
-		pos[i] = int32(i)
+	if pos == nil {
+		pos = make([]Pos3, nTok)
+		for i := range pos {
+			pos[i] = TextPos(i)
+		}
 	}
 
 	// The fused query projection, split per head into a query and a gate.
@@ -161,8 +171,8 @@ func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTr
 	// Per-head RMS norm, then the rotary.
 	headNorm(t.Q, w.QNorm, c.HeadDim, c.NHead*nTok, c.Eps)
 	headNorm(t.K, w.KNorm, c.HeadDim, c.NHeadKV*nTok, c.Eps)
-	RoPEMulti(c, t.Q, pos, c.NHead, c.HeadDim, nTok)
-	RoPEMulti(c, t.K, pos, c.NHeadKV, c.HeadDim, nTok)
+	RoPEMulti3(c, t.Q, pos, c.NHead, c.HeadDim, nTok)
+	RoPEMulti3(c, t.K, pos, c.NHeadKV, c.HeadDim, nTok)
 	if c.Act == RefQ8 {
 		// Into the fp16 cache, which is what attention then reads.
 		for i, v := range t.K {
@@ -174,7 +184,7 @@ func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTr
 	}
 
 	if c.Ratio > 0 {
-		t.indexer(c, w, xn, nTok, nKV)
+		t.indexerAt(c, w, xn, nTok, nKV, pos)
 	}
 
 	// The attention itself. The mask is causal over the prompt, and the top-k
@@ -219,6 +229,17 @@ func AttnLayer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) *AttnTr
 // `indexer_k_pooled` rows 1..63 are all exactly the raw key of token 0, and
 // why that is a check rather than a curiosity.
 func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int) {
+	t.indexerAt(c, w, xn, nTok, nKV, nil)
+}
+
+// indexerAt is indexer at given cell positions; nil is text, 0..nTok-1.
+func (t *AttnTrace) indexerAt(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV int, cellPos []Pos3) {
+	if cellPos == nil {
+		cellPos = make([]Pos3, nTok)
+		for i := range cellPos {
+			cellPos[i] = TextPos(i)
+		}
+	}
 	nBlocks := (nKV + c.Ratio - 1) / c.Ratio
 	nBid := nTok / c.Ratio // whole blocks only
 
@@ -287,23 +308,21 @@ func (t *AttnTrace) indexer(c AttnConfig, w AttnWeights, xn []float32, nTok, nKV
 	// covers, and every block that does not exist keeps the zero fill.
 	t.IdxK = append([]float32(nil), t.IdxKPooled...)
 	headNorm(t.IdxK, w.IdxKNorm, c.IdxDim, nBlocks, c.Eps)
-	blkPos := make([]int32, nBlocks)
+	blkPos := make([]Pos3, nBlocks) // a block that does not exist: position 0, unrotated
 	for b := 0; b < nBid; b++ {
-		blkPos[b] = int32(b * c.Ratio)
+		blkPos[b] = cellPos[b*c.Ratio]
 	}
-	RoPEMulti(c, t.IdxK, blkPos, 1, c.IdxDim, nBlocks)
+	RoPEMulti3(c, t.IdxK, blkPos, 1, c.IdxDim, nBlocks)
 
 	t.IdxQ = make([]float32, nTok*c.IdxHeads*c.IdxDim)
-	pos := make([]int32, nTok)
 	parallel(nTok, func(lo, hi int) {
 		for i := lo; i < hi; i++ {
-			pos[i] = int32(i)
 			matvec(t.IdxQ[i*c.IdxHeads*c.IdxDim:(i+1)*c.IdxHeads*c.IdxDim], w.IdxQ,
 				idxIn[i*c.NEmbd:(i+1)*c.NEmbd], c.IdxHeads*c.IdxDim, c.NEmbd)
 		}
 	})
 	headNorm(t.IdxQ, w.IdxQNorm, c.IdxDim, c.IdxHeads*nTok, c.Eps)
-	RoPEMulti(c, t.IdxQ, pos, c.IdxHeads, c.IdxDim, nTok)
+	RoPEMulti3(c, t.IdxQ, cellPos, c.IdxHeads, c.IdxDim, nTok)
 
 	// Rectify each head's dot product before summing, as the DeepSeek
 	// lightning indexer does: a head that disagrees contributes nothing
@@ -512,6 +531,17 @@ func headNorm(x, gamma []float32, dim, n int, eps float32) {
 // the interleaved section rule — sector i%3 picks t, h or w, with a fourth
 // section for an extra position that the text path never reaches.
 func RoPEMulti(c AttnConfig, x []float32, pos []int32, nHeads, headDim, nTok int) {
+	p3 := make([]Pos3, nTok)
+	for t := range p3 {
+		p3[t] = TextPos(int(pos[t]))
+	}
+	RoPEMulti3(c, x, p3, nHeads, headDim, nTok)
+}
+
+// RoPEMulti3 is RoPEMulti with a (t, h, w) position per token, which is what
+// an image's tokens carry (llm/position.go). On text it is the same
+// arithmetic, operation for operation.
+func RoPEMulti3(c AttnConfig, x []float32, pos []Pos3, nHeads, headDim, nTok int) {
 	rot := c.RopeDims
 	if rot > headDim {
 		rot = headDim
@@ -525,7 +555,7 @@ func RoPEMulti(c AttnConfig, x []float32, pos []int32, nHeads, headDim, nTok int
 	for t := 0; t < nTok; t++ {
 		// A text batch carries the same position in t, h and w, and zero in
 		// the fourth; an image batch is where they differ.
-		p := [4]float64{float64(pos[t]), float64(pos[t]), float64(pos[t]), 0}
+		p := [4]float64{float64(pos[t][0]), float64(pos[t][1]), float64(pos[t][2]), 0}
 		theta := p
 		for i := 0; i < half; i++ {
 			sector := i % sect

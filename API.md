@@ -20,9 +20,9 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | Endpoint | State |
 |---|---|
 | `GET /v1/models` | **done** — lists what the process actually loaded, with the speech model's voices |
-| `POST /v1/chat/completions` | **done** — qwen3.8-flash-next, `-llm`, buffered and SSE |
-| `POST /v1/responses` | **done** — the same generation, OpenAI's newer envelope |
-| `POST /v1/messages` | **done** — the same generation, Anthropic's envelope |
+| `POST /v1/chat/completions` | **done** — qwen3.8-flash-next, `-llm`, buffered and SSE; images with `-llm-mmproj` |
+| `POST /v1/responses` | **done** — the same generation, OpenAI's newer envelope, `input_image` included |
+| `POST /v1/messages` | **done** — the same generation, Anthropic's envelope, `image` blocks included |
 | `POST /v1/audio/speech` | **done** — kokoro, `-tts` |
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
@@ -270,6 +270,9 @@ Two things would fix it, and both are measurements rather than arguments:
     -llm-checkpoints true         keep each slot's state before the last user turn (C4)
     -llm-batch-decode true        decode concurrent conversations a row each in one pass (C5)
     -llm-presets     models.ini   llama-server preset file: virtual models over the same weights
+    -llm-mmproj      ""           the vision tower (…/mmproj-BF16.gguf); empty serves text and refuses images
+    -llm-vision-tokens 4096       the most tokens one image becomes (32x32 px a token); capped at -llm-batch
+    -llm-vision-images 8          the most images one request may carry
 
     -tts         false            load Kokoro-82M
     -tts-model   models/Kokoro-82M
@@ -380,7 +383,7 @@ has never been shown — which does not fail, it answers slightly wrong,
 everywhere, with nothing to point at. So `llm.RenderChat` reproduces it, and
 the acceptance criterion is Jinja's own output: `reference/dump_chat_template.py`
 renders the template out of the checkpoint with the environment transformers
-builds, and `TestRenderChat` diffs 23 cases character for character. The cases
+builds, and `TestRenderChat` diffs 28 cases character for character. The cases
 that made it worth doing are the small ones — Python's `json.dumps` writes a
 space after every separator where Go's encoder writes none, and escapes
 neither `<` nor `&` where Go escapes both, so the tool block was four
@@ -401,6 +404,45 @@ argument raw between its tags and everything else as JSON, so rebuilding
 integer parameter and the text `"123"` for a string one. They are also the one
 thing that is not streamed — a call is not a call until it has closed, and a
 client sent half of one would have to be told to take it back.
+
+### Images in a conversation
+
+With `-llm-mmproj` the three chat endpoints read images, which this
+checkpoint was trained on (LLM-VISION.md is the vertical's record). The
+shapes, each landing as the same `image_url` block of `api.CompletionRequest`
+in its place between the texts:
+
+- chat: `{"type": "image_url", "image_url": {"url": "data:image/png;base64,…"}}`
+- responses: `{"type": "input_image", "image_url": "data:…"}`
+- messages: `{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "…"}}`
+
+**Only `data:` URLs.** This server fetches nothing on a client's behalf, so an
+`http(s)` URL is a 400 that says to send the bytes instead, and a Responses
+`file_id` is refused because there are no files. PNG, JPEG and GIF (the first
+frame) decode; **WebP is refused**, because the module takes no dependencies
+and the standard library has no decoder. Images are read in **user turns**:
+the template itself refuses one in a system message, and one inside a tool
+result is not wired. Audio, video and files are refused as before.
+
+**What the model sees is what HF's processor gives it.** The picture is
+resized with smart-resize to 32-pixel multiples (alpha dropped, not
+composited) using torch's own antialiased bicubic, bit for bit. It goes
+through the 27-layer vision tower on the matrix cores and is placed at the
+image's `<|image_pad|>` with 3-D rotary positions. An image of *W x H* pixels
+is about *W·H/1024* tokens, counted in `prompt_tokens`, with at least 64.
+`-llm-vision-tokens` caps it (4096 is a 2048² picture), and an image always
+runs in one prefill pass, so the cap is also held under `-llm-batch`.
+Measured through this server: a 500² photo is 256 tokens and **53 ms** of
+tower, a 1920×1080 one 2 040 tokens and **0.77 s**. The tower runs before the
+request takes a slot, so it is never time a slot sits idle. JPEG decodes a
+level or two apart from libjpeg on ~2% of samples (Go's IDCT), which this
+tower turns into what invisible noise would.
+
+**A second turn continues the first, picture and all**, and a checkpoint
+reaches past an image. Reuse is keyed on the picture and not on the ids:
+every image cell holds the same pad token, so two different pictures of one
+size would otherwise be one prefix. The per-request `llm:` line says how many
+images a prompt held and the tower's time on them.
 
 ## Transcripts have times in them
 
@@ -658,22 +700,23 @@ nothing.
 the default is skipped if it is missing, and a key the server does not apply
 fails the start). Each section is a model name a chat request can put in
 `model` -- `chatting`, `instruct`, `thinking`, `coding` -- and `GET
-/v1/models` lists them beside the checkpoint. A preset is **a default and
-never an override**: it fills in `temperature`, `top_p`, `top_k`, `min_p`,
-`repeat_penalty`, `presence_penalty` and `chat_template_kwargs` only where
-the request left them out, and the response's `model` is the preset's name. A
+/v1/models` lists them beside the checkpoint. A preset is **an override**:
+whatever it sets of `temperature`, `top_p`, `top_k`, `min_p`,
+`repeat_penalty`, `presence_penalty` and `chat_template_kwargs` replaces what
+the request sent, and what it leaves out is still the request's. The
+response's `model` is the preset's name. A
 model name that is not a preset gets the checkpoint's own defaults, as before.
 
 The sampler takes llama.cpp's **`min_p`, `repeat_penalty` and
 `presence_penalty`**, the penalties over the last 64 tokens (prompt included,
 as llama-server does). **`chat_template_kwargs`** is llama-server's request
 field; the template reads `enable_thinking`, `preserve_thinking` and
-`reasoning_effort`, and any other is a 400. A top-level `reasoning_effort` is
-the client's own and decides thinking outright -- except against a preset that
-turns thinking off (`chatting`, `instruct`), where it is dropped: clients send
-it on every request whatever model they name, and `reasoning.effort` from the
-Responses API is the same field. Only `enable_thinking: true` (or Anthropic's
-`thinking: {type: enabled}`) makes `chatting` think.
+`reasoning_effort`, and any other is a 400. A top-level `reasoning_effort`
+(and the Responses API's `reasoning.effort`, which is the same field) decides
+thinking outright -- except under a preset that sets `enable_thinking` or
+`reasoning_effort`, where it is dropped. All four shipped presets set both, so
+`chatting` and `instruct` never think and `thinking` and `coding` always do,
+whatever the client sends.
 
 ## Home Assistant speaks Wyoming, not OpenAI
 

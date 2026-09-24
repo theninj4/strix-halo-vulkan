@@ -22,8 +22,12 @@ type chatRef struct {
 	Cases []struct {
 		Name     string `json:"name"`
 		Messages []struct {
-			Role      string `json:"role"`
-			Content   string `json:"content"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			Parts   []struct {
+				Text  string `json:"text"`
+				Image bool   `json:"image"`
+			} `json:"parts"`
 			Reasoning string `json:"reasoning"`
 			ToolCalls []struct {
 				Name string `json:"name"`
@@ -39,6 +43,7 @@ type chatRef struct {
 			NoThinking         bool   `json:"no_thinking"`
 			DropThinking       bool   `json:"drop_thinking"`
 			NoGenerationPrompt bool   `json:"no_generation_prompt"`
+			AddVisionID        bool   `json:"add_vision_id"`
 		} `json:"opts"`
 		Rendered string `json:"rendered"`
 	} `json:"cases"`
@@ -70,6 +75,9 @@ func TestRenderChat(t *testing.T) {
 		msgs := make([]ChatMessage, 0, len(c.Messages))
 		for _, m := range c.Messages {
 			msg := ChatMessage{Role: m.Role, Content: m.Content, Reasoning: m.Reasoning}
+			for _, p := range m.Parts {
+				msg.Parts = append(msg.Parts, ChatPart{Text: p.Text, Image: p.Image})
+			}
 			for _, call := range m.ToolCalls {
 				out := ChatToolCall{Name: call.Name}
 				for _, a := range call.Args {
@@ -84,6 +92,7 @@ func TestRenderChat(t *testing.T) {
 			NoThinking:         c.Opts.NoThinking,
 			DropThinking:       c.Opts.DropThinking,
 			NoGenerationPrompt: c.Opts.NoGenerationPrompt,
+			AddVisionID:        c.Opts.AddVisionID,
 		}
 		for _, raw := range c.Tools {
 			opt.Tools = append(opt.Tools, ChatTool{JSON: raw})
@@ -132,6 +141,9 @@ func TestRenderChatRefuses(t *testing.T) {
 		}, ChatOpts{}},
 		{"unknown role", []ChatMessage{{Role: "narrator", Content: "hi"}}, ChatOpts{}},
 		{"unknown effort", []ChatMessage{{Role: "user", Content: "hi"}}, ChatOpts{Effort: "ultra"}},
+		{"an image in a system message", []ChatMessage{
+			{Role: "system", Parts: []ChatPart{{Text: "see "}, {Image: true}}}, {Role: "user", Content: "hi"},
+		}, ChatOpts{}},
 		{"nameless tool call", []ChatMessage{
 			{Role: "user", Content: "hi"},
 			{Role: "assistant", ToolCalls: []ChatToolCall{{}}},

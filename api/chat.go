@@ -147,9 +147,9 @@ func validCompletion(ctx context.Context, w http.ResponseWriter, req *Completion
 		return false
 	}
 	for i, m := range req.Messages {
-		if kind := m.Content.NonText(); kind != "" {
+		if kind := m.Content.Unreadable(); kind != "" {
 			badRequest(ctx, w, "message "+strconv.Itoa(i)+" carries a "+strconv.Quote(kind)+
-				" content block; this server has no vision model and would answer about the text alone")
+				" content block; this server reads text and images (image_url), and would answer about the rest alone")
 			return false
 		}
 	}

@@ -167,6 +167,34 @@ CASES = [
         {"role": U, "content": "<tool_response>\n18 °C\n</tool_response>"},
         {"role": A, "content": "18 degrees.", "reasoning_content": "It came back."},
     ], [WEATHER_TOOL], {"preserve_thinking": False, "add_generation_prompt": False}),
+    # LLM-VISION.md V7: content lists with images in them.
+    ("image_then_text", [
+        {"role": U, "content": [{"type": "image"}, {"type": "text", "text": "What is in this picture?"}]},
+    ], None, {}),
+    ("images_between_text", [
+        {"role": U, "content": [
+            {"type": "text", "text": "  Compare "}, {"type": "image"},
+            {"type": "text", "text": " with "}, {"type": "image_url", "image_url": {"url": "x"}},
+            {"type": "text", "text": ".  \n"}]},
+    ], None, {}),
+    ("vision_ids_across_turns", [
+        {"role": S, "content": "Describe pictures."},
+        {"role": U, "content": [{"type": "image"}, {"type": "text", "text": "This one?"}]},
+        {"role": A, "content": "A barn.", "reasoning_content": "Look."},
+        {"role": U, "content": [{"type": "text", "text": "And these: "}, {"type": "image"}, {"type": "image"}]},
+    ], None, {"add_vision_id": True}),
+    ("image_in_tool_response", [
+        {"role": U, "content": "Take a screenshot."},
+        {"role": A, "content": "", "reasoning_content": "Call it.",
+         "tool_calls": [{"type": "function", "function": {
+             "name": "search", "arguments": {"query": "screen"}}}]},
+        {"role": U, "content": [
+            {"type": "text", "text": "<tool_response>\n"}, {"type": "image"},
+            {"type": "text", "text": "\n</tool_response>"}]},
+    ], [SEARCH_TOOL], {"preserve_thinking": False, "add_vision_id": True}),
+    ("image_no_thinking", [
+        {"role": U, "content": [{"type": "image"}, {"type": "text", "text": "Caption?"}]},
+    ], None, {"enable_thinking": False}),
 ]
 
 
@@ -197,7 +225,13 @@ def go_case(name, messages, tools, kwargs, rendered):
     """The same case in the shape llm.ChatMessage and llm.ChatOpts read."""
     out_msgs = []
     for m in messages:
-        gm = {"role": m["role"], "content": m.get("content") or ""}
+        content = m.get("content")
+        if isinstance(content, list):
+            gm = {"role": m["role"], "content": "", "parts": [
+                {"image": True} if (it.get("type") in ("image", "image_url")) else {"text": it["text"]}
+                for it in content]}
+        else:
+            gm = {"role": m["role"], "content": content or ""}
         if m.get("reasoning_content"):
             gm["reasoning"] = m["reasoning_content"]
         calls = []
@@ -219,6 +253,8 @@ def go_case(name, messages, tools, kwargs, rendered):
         opts["drop_thinking"] = True
     if kwargs.get("add_generation_prompt") is False:
         opts["no_generation_prompt"] = True
+    if kwargs.get("add_vision_id"):
+        opts["add_vision_id"] = True
     return {
         "name": name,
         "messages": out_msgs,

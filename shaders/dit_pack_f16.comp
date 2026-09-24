@@ -53,6 +53,15 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define HEAD_DIM 128
 #endif
 #define HDT (HEAD_DIM / TILE)
+// SRC_HEAD_DIM is the head width in the fp32 source when it is not a
+// multiple of the tile: qwen3.8-flash-next's vision tower has 72-wide heads,
+// packed here as 80 with the last eight components zero (LLM-VISION.md V4).
+// Zero columns contribute nothing to q.k and produce zero context columns
+// from v, which the output projection's zero weight columns then ignore. The
+// source row stride is still pc.dim. Every other build leaves it at HEAD_DIM.
+#ifndef SRC_HEAD_DIM
+#define SRC_HEAD_DIM HEAD_DIM
+#endif
 // A per-head bias vector added to every token before the scale, which is what
 // parakeet's Transformer-XL attention wants of q: it adds a learned bias_u to
 // the query before the content score (parakeet/encoder.go), and this pass is
@@ -112,10 +121,17 @@ void main() {
         for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
             uint m = i / HEAD_DIM, d = i % HEAD_DIM;
             uint token = tok0 + m;
+#if SRC_HEAD_DIM != HEAD_DIM
+            // A narrower source head, zero-extended to the tile width.
+            rows[i] = (token < pc.tokens && d < SRC_HEAD_DIM)
+                ? act[pc.inOff + token * pc.dim + head * SRC_HEAD_DIM + d] * uintBitsToFloat(pc.scale)
+                : 0.0;
+#else
             rows[i] = (token < pc.tokens)
                 ? (act[pc.inOff + token * pc.dim + head * HEAD_DIM + d] QBIAS(head, d))
                     * uintBitsToFloat(pc.scale)
                 : 0.0;
+#endif
         }
         barrier();
 

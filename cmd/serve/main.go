@@ -155,6 +155,11 @@ func main() {
 	llmPresets := flag.String("llm-presets", "models.ini", "llama-server preset file: each section is a model name a "+
 		"chat request can ask for, with its own sampling and thinking defaults over the same weights. "+
 		"The default is skipped if it does not exist; empty turns presets off")
+	llmMMProj := flag.String("llm-mmproj", "", "the vision tower's mmproj GGUF, e.g. "+
+		"models/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf; empty serves text only and refuses images (LLM-VISION.md)")
+	llmVisionTokens := flag.Int("llm-vision-tokens", 4096, "the most tokens one image becomes (32x32 pixels a token, "+
+		"so 4096 is a 2048x2048 picture); capped at -llm-batch")
+	llmVisionImages := flag.Int("llm-vision-images", 8, "the most images one request may carry")
 	llmProgress := flag.Duration("llm-progress", 10*time.Second, "how often to log each in-flight completion's "+
 		"prefill/generation progress and rates; 0 turns it off")
 
@@ -398,6 +403,7 @@ func main() {
 			MaxTokens: *llmMax, Layers: *llmLayers,
 			Slots: *llmSlots, PreemptChunk: *llmPreempt, Reserve: *llmReserve, Class: *llmClass,
 			NoCheckpoints: !*llmCheckpoints, NoBatchDecode: !*llmBatchDecode, Progress: *llmProgress,
+			MMProj: *llmMMProj, VisionTokens: *llmVisionTokens, VisionImages: *llmVisionImages,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -408,8 +414,12 @@ func main() {
 		if *llmLayers > 0 {
 			layers = fmt.Sprintf("the first %d layers only", *llmLayers)
 		}
-		log.Printf("llm: %s, %s, %d slots of %d cells of context, %d-token batches, in %v",
-			*llmModel, layers, b.Slots(), b.Context(), *llmBatch, time.Since(start).Round(time.Millisecond))
+		vision := "text only"
+		if *llmMMProj != "" {
+			vision = fmt.Sprintf("images up to %d tokens, %d a request", *llmVisionTokens, *llmVisionImages)
+		}
+		log.Printf("llm: %s, %s, %d slots of %d cells of context, %d-token batches, %s, in %v",
+			*llmModel, layers, b.Slots(), b.Context(), *llmBatch, vision, time.Since(start).Round(time.Millisecond))
 	}
 
 	// Say which it is, every time. Only logging the open case meant the

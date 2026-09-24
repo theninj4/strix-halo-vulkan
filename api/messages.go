@@ -64,6 +64,32 @@ type AnthropicBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
+	// Source is an `image` block's picture: base64 bytes with their media
+	// type, or a URL.
+	Source *AnthropicImageSource `json:"source,omitempty"`
+}
+
+// AnthropicImageSource is where an `image` block's picture is.
+type AnthropicImageSource struct {
+	Type      string `json:"type"` // "base64" or "url"
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+// imageURL is the source as the one form the backend reads: a data: URL
+// for base64, the URL itself otherwise (which the backend refuses unless it
+// is a data: URL, because it fetches nothing).
+func (s *AnthropicImageSource) imageURL() (string, error) {
+	switch {
+	case s == nil:
+		return "", fmt.Errorf("an image block has no source")
+	case s.Type == "base64":
+		return "data:" + s.MediaType + ";base64," + s.Data, nil
+	case s.Type == "url":
+		return s.URL, nil
+	}
+	return "", fmt.Errorf("an image source of type %s; this server reads base64 and url", strconv.Quote(s.Type))
 }
 
 type AnthropicTool struct {
@@ -366,7 +392,7 @@ func completionFromMessages(req *MessagesRequest) (*CompletionRequest, error) {
 		out.ReasoningEffort = "none"
 	}
 	if req.Thinking != nil && req.Thinking.Type == "enabled" {
-		// Said explicitly, so it outranks a non-thinking preset.
+		// The template's own switch; a preset that sets it still wins.
 		out.ChatTemplateKwargs = map[string]json.RawMessage{"enable_thinking": json.RawMessage("true")}
 	}
 	for _, t := range req.Tools {
@@ -425,11 +451,25 @@ func messageFromAnthropic(m AnthropicMessage) ([]Message, error) {
 
 	var out []Message
 	msg := Message{Role: m.Role}
-	var text strings.Builder
+	// The turn's text and images in order. Consecutive text blocks join into
+	// one part, which renders the same.
+	var parts MessageContent
 	for _, b := range blocks {
 		switch b.Type {
 		case "text", "":
-			text.WriteString(b.Text)
+			if n := len(parts); n > 0 && parts[n-1].Type == "text" {
+				parts[n-1].Text += b.Text
+			} else {
+				parts = append(parts, Content{Type: "text", Text: b.Text})
+			}
+		case "image":
+			url, err := b.Source.imageURL()
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, Content{Type: "image_url", ImageURL: &struct {
+				URL string `json:"url"`
+			}{URL: url}})
 		case "thinking":
 			msg.ReasoningContent += b.Thinking
 		case "redacted_thinking":
@@ -453,12 +493,15 @@ func messageFromAnthropic(m AnthropicMessage) ([]Message, error) {
 				Content: MessageContent{{Type: "text", Text: result}},
 			})
 		default:
-			return nil, fmt.Errorf("a %s block cannot be read by this server, which has no vision model",
+			return nil, fmt.Errorf("a %s block cannot be read by this server, which reads text and images",
 				strconv.Quote(b.Type))
 		}
 	}
-	if text.Len() > 0 || len(msg.ToolCalls) > 0 || msg.ReasoningContent != "" {
-		msg.Content = MessageContent{{Type: "text", Text: text.String()}}
+	if len(parts) > 0 || len(msg.ToolCalls) > 0 || msg.ReasoningContent != "" {
+		if len(parts) == 0 {
+			parts = MessageContent{{Type: "text"}}
+		}
+		msg.Content = parts
 		out = append(out, msg)
 	}
 	return out, nil
@@ -486,7 +529,9 @@ func blocksText(raw json.RawMessage) (string, error) {
 		case "text", "":
 			b.WriteString(block.Text)
 		default:
-			return "", fmt.Errorf("a %s block cannot be read by this server, which has no vision model",
+			// An image in a tool result or the system prompt: the template
+			// refuses the second, and the first is not wired (LLM-VISION.md).
+			return "", fmt.Errorf("a %s block cannot be read here: this server takes images in user turns only",
 				strconv.Quote(block.Type))
 		}
 	}

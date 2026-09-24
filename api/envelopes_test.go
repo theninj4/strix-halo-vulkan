@@ -195,9 +195,12 @@ func TestResponsesRefusals(t *testing.T) {
 		want string
 	}{
 		{"no input", map[string]any{"model": "x"}, "input is empty"},
-		{"an image part", map[string]any{"input": []any{map[string]any{
-			"role": "user", "content": []any{map[string]any{"type": "input_image", "image_url": "data:,"}},
-		}}}, "vision"},
+		{"an image by file id", map[string]any{"input": []any{map[string]any{
+			"role": "user", "content": []any{map[string]any{"type": "input_image", "file_id": "file-1"}},
+		}}}, "keeps no files"},
+		{"a file part", map[string]any{"input": []any{map[string]any{
+			"role": "user", "content": []any{map[string]any{"type": "input_file", "file_id": "file-1"}},
+		}}}, "input_file"},
 		{"an unknown item", map[string]any{"input": []any{
 			map[string]any{"type": "web_search_call"},
 		}}, "web_search_call"},
@@ -368,11 +371,16 @@ func TestMessagesRefusals(t *testing.T) {
 			"messages": msg, "max_tokens": 16,
 			"thinking": map[string]any{"type": "enabled", "budget_tokens": 1024},
 		}, "budget_tokens"},
-		{"an image block", map[string]any{"max_tokens": 16, "messages": []any{
+		{"an image with no source type", map[string]any{"max_tokens": 16, "messages": []any{
 			map[string]any{"role": "user", "content": []any{
 				map[string]any{"type": "image", "source": map[string]any{"data": ""}},
 			}},
-		}}, "vision"},
+		}}, "base64 and url"},
+		{"a document block", map[string]any{"max_tokens": 16, "messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "document", "source": map[string]any{"type": "base64"}},
+			}},
+		}}, "document"},
 	}
 	for _, c := range cases {
 		s := &Server{Completion: &fakeLLM{pieces: []Delta{{Content: "4."}}}}
@@ -447,5 +455,49 @@ func TestMessagesThinkingDisabled(t *testing.T) {
 	}))
 	if b.req.ReasoningEffort != "none" {
 		t.Errorf("reasoning_effort %q", b.req.ReasoningEffort)
+	}
+}
+
+// TestImagesReachTheBackend: each door hands an image to the backend as the
+// one form it reads, an image_url block holding a data: URL, in its place
+// between the texts (LLM-VISION.md V8).
+func TestImagesReachTheBackend(t *testing.T) {
+	const png = "data:image/png;base64,iVBORw0KGgo="
+	cases := []struct {
+		name, path string
+		body       map[string]any
+	}{
+		{"chat", "/v1/chat/completions", chatBody(map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "what is "},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": png}},
+			map[string]any{"type": "text", "text": " this?"},
+		}})},
+		{"responses", "/v1/responses", map[string]any{"input": []any{map[string]any{
+			"role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": "what is "},
+				map[string]any{"type": "input_image", "image_url": png},
+				map[string]any{"type": "input_text", "text": " this?"},
+			}}}}},
+		{"messages", "/v1/messages", map[string]any{"max_tokens": 16, "messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "what is "},
+				map[string]any{"type": "image", "source": map[string]any{
+					"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+				map[string]any{"type": "text", "text": " this?"},
+			}}}}},
+	}
+	for _, c := range cases {
+		b := &fakeLLM{pieces: []Delta{{Content: "a barn"}}}
+		rec := do(t, &Server{Completion: b}, jsonRequest("POST", c.path, c.body))
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status %d: %s", c.name, rec.Code, rec.Body)
+			continue
+		}
+		msgs := b.req.Messages
+		got := msgs[len(msgs)-1].Content
+		if len(got) != 3 || got[0].Text != "what is " || got[1].Type != "image_url" ||
+			got[1].ImageURL == nil || got[1].ImageURL.URL != png || got[2].Text != " this?" {
+			t.Errorf("%s: the backend saw %+v", c.name, got)
+		}
 	}
 }

@@ -15,10 +15,11 @@ import (
 // llama-server's `--models-preset` file is an INI of sections, one a model,
 // and this server reads the same file. A section here carries no weights of
 // its own: it is a name a request's `model` field can ask for, and a set of
-// sampling and template defaults that request then gets. Whatever the
-// request names itself wins, field by field, so a preset is a default and
-// never an override -- a client that sends `temperature: 0` to "coding" gets
-// greedy decoding, not the preset's 1.0.
+// sampling and template settings that request then gets. What the file sets
+// wins over the request, field by field -- a client that sends
+// `reasoning_effort: "medium"` or `enable_thinking: true` to "chatting" still
+// gets no thinking, since choosing the model is choosing its settings -- and
+// what the file leaves out is still the request's to set.
 //
 // A key this server does not know is refused when the file is loaded rather
 // than ignored, for the reason every other refusal in this package is there:
@@ -171,37 +172,33 @@ func (p *Preset) kwarg(k string, v json.RawMessage) error {
 	return nil
 }
 
-// Apply fills in whatever the request left unset.
+// Apply overrides the request with every value the preset sets; what the
+// preset leaves out stays the request's own.
 func (p *Preset) Apply(req *CompletionRequest) {
-	fill := func(dst **float64, src *float64) {
-		if *dst == nil && src != nil {
+	set := func(dst **float64, src *float64) {
+		if src != nil {
 			v := *src
 			*dst = &v
 		}
 	}
-	fill(&req.Temperature, p.Temperature)
-	fill(&req.TopP, p.TopP)
-	fill(&req.MinP, p.MinP)
-	fill(&req.RepeatPenalty, p.RepeatPenalty)
-	fill(&req.PresencePenalty, p.PresencePenalty)
-	if req.TopK == nil && p.TopK != nil {
+	set(&req.Temperature, p.Temperature)
+	set(&req.TopP, p.TopP)
+	set(&req.MinP, p.MinP)
+	set(&req.RepeatPenalty, p.RepeatPenalty)
+	set(&req.PresencePenalty, p.PresencePenalty)
+	if p.TopK != nil {
 		v := *p.TopK
 		req.TopK = &v
 	}
-	// A preset that turns thinking off is the one default the top-level
-	// `reasoning_effort` does not get to undo: clients send that field on
-	// every request whatever model they are pointed at, so letting it win
-	// makes `chatting` think. Only the template's own `enable_thinking`
-	// turns it back on.
-	if _, explicit := req.ChatTemplateKwargs["enable_thinking"]; !explicit && req.ReasoningEffort != "" {
-		if th, _ := (&CompletionRequest{ChatTemplateKwargs: p.Kwargs}).Thinking(); th.Off {
-			req.ReasoningEffort = ""
-		}
+	// A preset that says whether or how hard to think decides it: the
+	// top-level `reasoning_effort` outranks the kwargs in Thinking, and
+	// clients send it on every request whatever model they name.
+	_, on := p.Kwargs["enable_thinking"]
+	_, effort := p.Kwargs["reasoning_effort"]
+	if on || effort {
+		req.ReasoningEffort = ""
 	}
 	for k, v := range p.Kwargs {
-		if _, ok := req.ChatTemplateKwargs[k]; ok {
-			continue
-		}
 		if req.ChatTemplateKwargs == nil {
 			req.ChatTemplateKwargs = map[string]json.RawMessage{}
 		}

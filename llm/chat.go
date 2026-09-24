@@ -19,10 +19,10 @@ package llm
 // the checkpoint with the same environment transformers uses, and
 // TestRenderChat diffs against it.
 //
-// The pieces the template can express and this file refuses are the ones the
-// model behind it cannot serve: an image or a video content part renders a
-// `<|vision_start|>` pad that nothing in this repository computes, so a
-// caller sending one is told so rather than having it dropped.
+// An image content part renders as the template renders it (LLM-VISION.md
+// V7): `<|vision_start|><|image_pad|><|vision_end|>` in place, optionally
+// "Picture N: " before it, one pad that ExpandImages then widens to the
+// image's grid. A video part is still the caller's to refuse.
 
 import (
 	"encoding/json"
@@ -38,12 +38,54 @@ type ChatMessage struct {
 	Role string
 	// Content is the turn's text.
 	Content string
+	// Parts is the turn as the template's content list, text and images in
+	// order. When it is set Content is not read. A system turn may not hold
+	// an image, as the template says.
+	Parts []ChatPart
 	// Reasoning is an assistant turn's `<think>` block, which this
 	// checkpoint keeps in the history rather than dropping. A client that
 	// replays a previous completion's `reasoning_content` puts it here.
 	Reasoning string
 	// ToolCalls are an assistant turn's calls, in the order they were made.
 	ToolCalls []ChatToolCall
+}
+
+// ChatPart is one item of a content list: its text, or an image.
+type ChatPart struct {
+	Text  string
+	Image bool
+}
+
+// ImageMarkup is what the template writes for an image part, before the
+// processor widens its one pad to the image's tokens.
+const ImageMarkup = "<|vision_start|><|image_pad|><|vision_end|>"
+
+// content is the template's `render_content(message.content,
+// do_vision_count, is_system_content)`, untrimmed. `counting` is
+// do_vision_count: whether an image advances *seen, the conversation's image
+// counter, whose value is what "Picture N: " prints either way.
+func (m ChatMessage) content(counting bool, seen *int, addID, system bool) (string, error) {
+	if m.Parts == nil {
+		return m.Content, nil
+	}
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if !p.Image {
+			b.WriteString(p.Text)
+			continue
+		}
+		if system {
+			return "", fmt.Errorf("llm: a system message cannot contain images")
+		}
+		if counting {
+			*seen++
+		}
+		if addID {
+			fmt.Fprintf(&b, "Picture %d: ", *seen)
+		}
+		b.WriteString(ImageMarkup)
+	}
+	return b.String(), nil
 }
 
 // ChatToolCall is one call: the function's name and its arguments **in
@@ -92,6 +134,9 @@ type ChatOpts struct {
 	// NoGenerationPrompt leaves off the trailing `<|im_start|>assistant`,
 	// which is what a caller scoring an existing conversation wants.
 	NoGenerationPrompt bool
+	// AddVisionID is the template's `add_vision_id`: "Picture N: " before
+	// each image, numbered across the conversation.
+	AddVisionID bool
 }
 
 // The reasoning instructions, one per effort. "medium" has none, which is
@@ -150,7 +195,11 @@ func RenderChat(msgs []ChatMessage, opt ChatOpts) (string, error) {
 		if numSys != i || (m.Role != "system" && m.Role != "developer") {
 			break
 		}
-		if c := strings.TrimSpace(m.Content); c != "" {
+		raw, err := m.content(false, new(int), opt.AddVisionID, true)
+		if err != nil {
+			return "", err
+		}
+		if c := strings.TrimSpace(raw); c != "" {
 			if merged.Len() > 0 {
 				merged.WriteByte('\n')
 			}
@@ -196,13 +245,21 @@ func RenderChat(msgs []ChatMessage, opt ChatOpts) (string, error) {
 		b.WriteString("<|im_start|>system\n" + instructions + "<|im_end|>\n")
 	}
 
-	lastQuery := lastQueryIndex(msgs)
+	lastQuery, err := lastQueryIndex(msgs, opt.AddVisionID)
+	if err != nil {
+		return "", err
+	}
 
+	images := 0
 	for i, m := range msgs {
 		if i < numSys {
 			continue
 		}
-		content := strings.TrimSpace(m.Content)
+		raw, err := m.content(true, &images, opt.AddVisionID, false)
+		if err != nil {
+			return "", err
+		}
+		content := strings.TrimSpace(raw)
 		switch m.Role {
 		case "system", "developer":
 			return "", fmt.Errorf("llm: a system message must be at the beginning of the conversation")
@@ -298,18 +355,25 @@ func reasoningInstructions(opt ChatOpts) (string, error) {
 // result, which is what decides whether an assistant turn keeps its
 // reasoning under DropThinking: everything after the user's last real message
 // is this answer's own working, and everything before it is history.
-func lastQueryIndex(msgs []ChatMessage) int {
+//
+// The template's scan renders without counting images, so a "Picture N: "
+// here always reads 0, which only matters in that it is not a tool response.
+func lastQueryIndex(msgs []ChatMessage, addID bool) (int, error) {
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if msgs[i].Role != "user" {
 			continue
 		}
-		c := strings.TrimSpace(msgs[i].Content)
+		raw, err := msgs[i].content(false, new(int), addID, false)
+		if err != nil {
+			return 0, err
+		}
+		c := strings.TrimSpace(raw)
 		if strings.HasPrefix(c, "<tool_response>") && strings.HasSuffix(c, "</tool_response>") {
 			continue
 		}
-		return i
+		return i, nil
 	}
-	return len(msgs) - 1
+	return len(msgs) - 1, nil
 }
 
 // renderArg writes one argument the way the template does: a JSON string

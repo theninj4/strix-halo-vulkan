@@ -1118,6 +1118,27 @@ var QViTBiasAct []byte
 //go:embed qvit_rope.spv
 var QViTRoPE []byte
 
+// The vision tower's attention on the matrix cores (LLM-VISION.md V4): the
+// DiT's WMMA flash kernel and its fragment pack at a head width of 80, the
+// tower's 72 zero-extended to the tile (the pack's SRC_HEAD_DIM). The
+// attention writes its context as the output projection's fp16 A operand
+// (OUT_F16), 80 columns a head, and that projection's weight carries zero
+// columns at each head's eight pads. QT=1 KTIL=4 is the DiT's measured best;
+// the w32 build needs RequiredSubgroupSize 32 on the host.
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=80 -DSRC_HEAD_DIM=72 -DTPW=8 -o qvit_pack_hd80.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=80 -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -o qvit_attn_wmma_hd80_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=80 -DQT=1 -DKTIL=4 -DOUT_F16=1 -o qvit_attn_wmma_hd80.spv dit_attention_wmma.comp
+
+//go:embed qvit_pack_hd80.spv
+var QViTPackHD80 []byte
+
+//go:embed qvit_attn_wmma_hd80_w32.spv
+var QViTAttnWMMAHD80W32 []byte
+
+//go:embed qvit_attn_wmma_hd80.spv
+var QViTAttnWMMAHD80 []byte
+
 //go:embed vae_attention_d1152.spv
 var VAEAttentionDim1152 []byte
 

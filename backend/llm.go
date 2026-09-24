@@ -104,6 +104,16 @@ type LLMOptions struct {
 	// -- so a long prefill is not silence until its one line at the end.
 	// Zero turns it off.
 	Progress time.Duration
+	// MMProj is the vision tower's mmproj GGUF (LLM-VISION.md). Empty
+	// serves text only and refuses an image with the flag to set.
+	MMProj string
+	// VisionTokens is the most merged tokens one image becomes, which sets
+	// the largest picture the processor keeps (32x32 pixels a token) and
+	// the tower's staged budget. Zero is 4096; it is capped at Batch,
+	// because an image runs in one pass.
+	VisionTokens int
+	// VisionImages is the most images one request may carry. Zero is 8.
+	VisionImages int
 }
 
 const (
@@ -146,6 +156,8 @@ type LLM struct {
 	closeMu sync.Mutex
 	g       *llm.Graph
 	sched   *llmSched
+	// vision is the tower, or nil for a text-only server.
+	vision *llmVision
 }
 
 // NewLLM loads the checkpoint and stages the whole model on the device.
@@ -223,6 +235,21 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		_ = m.Close()
 		return nil, fmt.Errorf("backend: staging %s: %w", opt.Model, err)
 	}
+	if opt.MMProj != "" {
+		if opt.VisionTokens <= 0 {
+			opt.VisionTokens = defaultVisionTokens
+		}
+		opt.VisionTokens = min(opt.VisionTokens, opt.Batch)
+		if opt.VisionImages <= 0 {
+			opt.VisionImages = defaultVisionImages
+		}
+		l.opt = opt
+		if l.vision, err = newLLMVision(opt.Device, opt.MMProj, opt.VisionTokens, opt.VisionImages); err != nil {
+			l.closeGraph()
+			_ = m.Close()
+			return nil, err
+		}
+	}
 	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve, opt.NoBatchDecode, opt.Progress)
 	return l, nil
 }
@@ -255,17 +282,27 @@ func (l *LLM) Close() {
 		l.sched.close()
 		l.sched = nil
 	}
-	if l.g != nil {
-		_ = l.opt.Device.Do(func(*vk.Device) error {
-			l.g.Destroy()
-			return nil
-		})
-		l.g = nil
-	}
+	l.closeGraph()
 	if l.model != nil {
 		_ = l.model.Close()
 		l.model = nil
 	}
+}
+
+// closeGraph releases what NewLLM staged on the device: the graph and the
+// vision tower.
+func (l *LLM) closeGraph() {
+	if l.g == nil && l.vision == nil {
+		return
+	}
+	_ = l.opt.Device.Do(func(*vk.Device) error {
+		if l.g != nil {
+			l.g.Destroy()
+		}
+		l.vision.close()
+		return nil
+	})
+	l.g, l.vision = nil, nil
 }
 
 // Complete renders the conversation, prefills it and decodes until something
@@ -285,21 +322,61 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	// before the first token arrives, so it is all in the time to first token
 	// this reports.
 	enter := time.Now()
-	msgs, opt, err := chatRequest(req)
+	msgs, opt, images, err := chatRequest(req)
 	if err != nil {
 		return nil, err
 	}
+	// The template before the pixels: a conversation it refuses (an image in
+	// a system turn) costs nothing to refuse.
 	prompt, err := llm.RenderChat(msgs, opt)
 	if err != nil {
 		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
-	ids, err := l.tok.Encode(prompt)
+	// The images before a slot is taken: each is a tower pass on the
+	// device, and holding a slot through them would keep a conversation
+	// out for nothing.
+	var prompted []llm.PromptImage
+	var tower time.Duration
+	class := l.classOf(ctx, req)
+	l.closeMu.Lock()
+	sched := l.sched
+	l.closeMu.Unlock()
+	if sched == nil {
+		return nil, fmt.Errorf("the language model is closed")
+	}
+	if len(images) > 0 {
+		if l.vision == nil {
+			return nil, fmt.Errorf("this server was started without the vision tower, so an image would be "+
+				"answered about as though it had not been sent; start it with -llm-mmproj: %w", api.ErrUnsupported)
+		}
+		if len(images) > l.opt.VisionImages {
+			return nil, fmt.Errorf("%d images in one request; this server takes at most %d: %w",
+				len(images), l.opt.VisionImages, api.ErrUnsupported)
+		}
+		done := sched.towerBegin(class)
+		for _, im := range images {
+			p, took, err := l.vision.encode(ctx, l.opt.Device, im)
+			if err != nil {
+				done()
+				return nil, err
+			}
+			prompted, tower = append(prompted, p), tower+took
+		}
+		done()
+	}
+	short, err := l.tok.Encode(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
-	if len(ids) == 0 {
+	if len(short) == 0 {
 		return nil, fmt.Errorf("the conversation tokenizes to nothing: %w", api.ErrUnsupported)
 	}
+	in, err := llm.ExpandImages(short, imagePad, prompted)
+	if err != nil {
+		return nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+	}
+	ids := in.IDs
+	keys := promptKeys(in)
 	// The cache is the residency this process was started with, so a
 	// conversation past it is refused with the number rather than truncated
 	// at one end or the other -- both of which change the answer without
@@ -317,14 +394,8 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		budget = room
 	}
 
-	class := l.classOf(ctx, req)
-	l.closeMu.Lock()
-	sched := l.sched
-	l.closeMu.Unlock()
-	if sched == nil {
-		return nil, fmt.Errorf("the language model is closed")
-	}
-	job, err := sched.acquire(ctx, class, ids, l.checkpointAt(prompt, ids))
+	wait := time.Now()
+	job, err := sched.acquire(ctx, class, keys, l.checkpointAt(prompt, short, prompted))
 	if err != nil {
 		return nil, err
 	}
@@ -336,11 +407,20 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	// turn whose prefill was eight seconds. stalled is the other kind of
 	// wait: time its own units spent queued behind other conversations'
 	// units once it had a slot (CONCURRENCY.md C2).
-	queued := time.Since(enter)
+	// Measured from here rather than from enter since images: the tower's
+	// time before it is this request's own work, reported beside it.
+	queued := time.Since(wait)
 	reused, restored := job.reused, job.restore
 
 	start := time.Now()
-	logits, stalled, err := sched.run(job, ids[reused:], reused == 0)
+	var rest []llm.InputImage
+	for _, im := range in.Images {
+		if im.At >= reused {
+			im.At -= reused
+			rest = append(rest, im)
+		}
+	}
+	logits, stalled, err := sched.run(job, keys[reused:], rest, reused == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +453,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		l.logRun(ctx, runStats{
 			prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 			queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
-			total: time.Since(enter), reason: failureReason(ctx, err),
+			total: time.Since(enter), reason: failureReason(ctx, err), images: len(prompted), tower: tower,
 		})
 	}()
 	for gen < budget {
@@ -449,7 +529,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	l.logRun(ctx, runStats{
 		prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 		queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
-		total: time.Since(enter), reason: res.FinishReason,
+		total: time.Since(enter), reason: res.FinishReason, images: len(prompted), tower: tower,
 	})
 	return res, nil
 }
@@ -473,6 +553,10 @@ type runStats struct {
 	// wall clock a client saw. stalled is the part of prefill and decode its
 	// units spent behind other conversations' units.
 	queued, stalled, prefill, ttft, decode, total time.Duration
+	// images is how many the prompt held and tower the vision tower's time
+	// on them, which is part of ttft and not of prefill.
+	images int
+	tower  time.Duration
 }
 
 // logRun writes the one line a completion leaves in the journal.
@@ -485,8 +569,13 @@ func (l *LLM) logRun(ctx context.Context, st runStats) {
 	if l.opt.Slots > 1 {
 		where = fmt.Sprintf(" [slot %d, %s%s]", st.slot, st.class, stalledNote(st.stalled))
 	}
-	log.Printf("%sllm %s%s: prompt %d tokens%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
-		logID(ctx), l.id, where, st.prompt, reusedNote(st.reused, st.restored),
+	pics := ""
+	if st.images > 0 {
+		pics = fmt.Sprintf(" (%d image%s, %v of tower)", st.images, map[bool]string{true: "s"}[st.images > 1],
+			st.tower.Round(time.Millisecond))
+	}
+	log.Printf("%sllm %s%s: prompt %d tokens%s%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
+		logID(ctx), l.id, where, st.prompt, pics, reusedNote(st.reused, st.restored),
 		st.prefill.Round(time.Millisecond), rate(st.prompt-st.reused, st.prefill),
 		since(st.ttft), queuedNote(st.queued),
 		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode),
@@ -607,7 +696,11 @@ const minCheckpoint = 256
 // for in the ids. A special token splits the text before BPE runs, so the
 // prefix's ids must be a prefix of the whole prompt's, and a re-encoding that
 // is not one is refused rather than trusted.
-func (l *LLM) checkpointAt(prompt string, ids []int32) int {
+//
+// With images it is found on the prompt's single pads (ids is the unexpanded
+// prompt) and expandedMark moves it past each image's other cells. The size
+// threshold is the expanded one, because that is the prefill it saves.
+func (l *LLM) checkpointAt(prompt string, ids []int32, images []llm.PromptImage) int {
 	if l.opt.NoCheckpoints {
 		return 0
 	}
@@ -616,10 +709,29 @@ func (l *LLM) checkpointAt(prompt string, ids []int32) int {
 		return 0
 	}
 	pre, err := l.tok.Encode(prompt[:i])
-	if err != nil || len(pre) < minCheckpoint || len(pre) >= len(ids) || commonPrefix(pre, ids) != len(pre) {
+	if err != nil || len(pre) >= len(ids) || commonPrefix(pre, ids) != len(pre) {
 		return 0
 	}
-	return len(pre)
+	if mark := expandedMark(len(pre), ids, images); mark >= minCheckpoint {
+		return mark
+	}
+	return 0
+}
+
+// expandedMark is a position in the unexpanded ids (one pad an image) as a
+// position in the prompt with every image widened to its tokens.
+func expandedMark(mark int, short []int32, images []llm.PromptImage) int {
+	if mark <= 0 || len(images) == 0 {
+		return mark
+	}
+	k := 0
+	for _, id := range short[:mark] {
+		if id == imagePad {
+			mark += images[k].GridH*images[k].GridW - 1
+			k++
+		}
+	}
+	return mark
 }
 
 // sampler is the request's sampling, or the checkpoint's own where the
@@ -662,19 +774,20 @@ func (l *LLM) sampler(req *api.CompletionRequest) *llm.Sampler {
 // chatRequest translates an HTTP request into the conversation the
 // checkpoint's template reads. It is the one place the API's vocabulary and
 // the model's meet.
-func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, error) {
+func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, []requestImage, error) {
 	var opt llm.ChatOpts
+	var images []requestImage
 	// "Do not think" is enforced by the template in the prompt rather than
 	// asked for.
 	think, err := req.Thinking()
 	if err != nil {
-		return nil, opt, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
+		return nil, opt, nil, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
 	opt.NoThinking, opt.Effort, opt.DropThinking = think.Off, think.Effort, think.DropHistory
 
 	choice, err := toolChoice(req.ToolChoice)
 	if err != nil {
-		return nil, opt, err
+		return nil, opt, nil, err
 	}
 	if choice != "none" {
 		for i := range req.Tools {
@@ -695,13 +808,28 @@ func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, e
 			Content:   m.Content.Text(),
 			Reasoning: m.ReasoningContent,
 		}
+		// A message with an image is the template's content list, text and
+		// images in the order they came; one without keeps its joined text,
+		// which renders the same and is every request before images.
+		if m.Content.HasImage() {
+			out.Content = ""
+			for _, part := range m.Content {
+				switch {
+				case part.Type == "" || part.Type == "text":
+					out.Parts = append(out.Parts, llm.ChatPart{Text: part.Text})
+				case part.Type == "image_url" && part.ImageURL != nil:
+					out.Parts = append(out.Parts, llm.ChatPart{Image: true})
+					images = append(images, requestImage{url: part.ImageURL.URL})
+				}
+			}
+		}
 		for _, call := range m.ToolCalls {
 			if call == nil {
 				continue
 			}
 			args, err := llm.ParseToolArguments(call.Function.Arguments)
 			if err != nil {
-				return nil, opt, fmt.Errorf(
+				return nil, opt, nil, fmt.Errorf(
 					"message %d: tool call %q has arguments that are not a JSON object: %v: %w",
 					i, call.Function.Name, err, api.ErrUnsupported)
 			}
@@ -709,7 +837,7 @@ func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, e
 		}
 		msgs = append(msgs, out)
 	}
-	return msgs, opt, nil
+	return msgs, opt, images, nil
 }
 
 // toolChoice reads OpenAI's `tool_choice`, which is a string or an object.

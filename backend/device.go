@@ -36,7 +36,52 @@ const strixHaloDeviceID = 0x1586
 type Device struct {
 	inst *vk.Instance
 	dev  *vk.Device
-	mu   sync.Mutex
+	mu   fifoLock
+}
+
+// fifoLock is a mutex that hands off in arrival order. Device holds one
+// rather than a sync.Mutex because of yield: a sync.Mutex lets an unlocking
+// goroutine take the lock straight back, and lets a caller finishing one Do
+// barge in ahead of an older waiter for its next, so a yield would usually
+// hand nothing over, or hand over more than one unit.
+type fifoLock struct {
+	mu    sync.Mutex
+	held  bool
+	queue []chan struct{}
+}
+
+func (l *fifoLock) Lock() {
+	l.mu.Lock()
+	if !l.held {
+		l.held = true
+		l.mu.Unlock()
+		return
+	}
+	ch := make(chan struct{})
+	l.queue = append(l.queue, ch)
+	l.mu.Unlock()
+	<-ch // the lock is handed over held
+}
+
+func (l *fifoLock) Unlock() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.held {
+		panic("backend: unlock of an unlocked device")
+	}
+	if len(l.queue) == 0 {
+		l.held = false
+		return
+	}
+	close(l.queue[0])
+	l.queue = l.queue[1:]
+}
+
+// waiters is how many callers are queued for the lock.
+func (l *fifoLock) waiters() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queue)
 }
 
 // OpenDevice picks this machine's iGPU, or the first device with a compute
@@ -90,6 +135,21 @@ func (d *Device) Do(fn func(*vk.Device) error) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return fn(d.dev)
+}
+
+// yield is called only from inside Do, by a long run that has nothing on the
+// device and holds nothing another caller could touch (the vision tower
+// between two submits). It lets one waiting Do run before this caller
+// continues, and reports whether anyone was waiting. The lock is FIFO, so the
+// waiters queued now run first, one Do each, and then this caller, ahead of
+// any of theirs that queue again.
+func (d *Device) yield() bool {
+	if d.mu.waiters() == 0 {
+		return false
+	}
+	d.mu.Unlock()
+	d.mu.Lock()
+	return true
 }
 
 // Name is the physical device's name, for the startup banner.

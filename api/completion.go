@@ -302,13 +302,24 @@ func (c MessageContent) Text() string {
 	return b.String()
 }
 
-// NonText is the first content block that is not text, or the empty string.
-// It is what the chat handler refuses on: there is no vision tower in this
-// repository, so an image block would be dropped silently and answered about
-// as though it had never been sent.
-func (c MessageContent) NonText() string {
+// HasImage is whether any block is an image (`image_url`), which is what
+// makes a message the template's content list rather than one string.
+func (c MessageContent) HasImage() bool {
 	for _, part := range c {
-		if part.Type != "" && part.Type != "text" {
+		if part.Type == "image_url" {
+			return true
+		}
+	}
+	return false
+}
+
+// Unreadable is the first content block that is neither text nor an image,
+// or the empty string. It is what the chat handler refuses on: a block the
+// model cannot read would be dropped silently and answered about as though it
+// had never been sent (audio, video, a file).
+func (c MessageContent) Unreadable() string {
+	for _, part := range c {
+		if part.Type != "" && part.Type != "text" && part.Type != "image_url" {
 			return part.Type
 		}
 	}
@@ -330,10 +341,9 @@ type Thinking struct {
 
 // Thinking resolves the request's reasoning switches.
 //
-// The top-level `reasoning_effort` is the client's own -- a preset only ever
-// fills in `chat_template_kwargs`, and a preset that turns thinking off
-// clears it (see Preset.Apply) -- so when it is set it decides on and off
-// outright. Otherwise `enable_thinking` does, and a
+// The top-level `reasoning_effort` is the client's own -- a preset writes
+// `chat_template_kwargs` and clears it (see Preset.Apply) -- so when it is
+// set it decides on and off outright. Otherwise `enable_thinking` does, and a
 // `reasoning_effort` of "none" in the kwargs means off only when
 // `enable_thinking` is absent: a client that sends `enable_thinking: true`
 // to a non-thinking preset gets thinking, whatever effort the preset named.

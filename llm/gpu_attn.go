@@ -841,11 +841,12 @@ func NewAttnGPUBank(dev *vk.Device, cfg AttnConfig, maxTokens, nKV int, layers [
 func (g *AttnGPU) alloc(nLayers int) error {
 	c := g.cfg
 	rows := g.arenaRows
-	rotHalf := c.RopeDims / 2
 
-	// fp32 weights: four gammas a layer, then one rotary table for all of them.
+	// fp32 weights: four gammas a layer, then a rotary table a sequence slot
+	// (LLM-VISION.md V5): row c is cell c's angles, which is position c
+	// until the slot's sequence holds an image.
 	perLayer := 2*c.HeadDim + 2*c.IdxDim
-	g.wElems = nLayers*perLayer + 2*g.nKV*rotHalf
+	g.wElems = nLayers*perLayer + g.slots*g.ropeElems()
 	g.wRope = uint32(nLayers * perLayer)
 	var err error
 	if g.wbuf, err = g.dev.NewBuffer(g.wElems * 4); err != nil {
@@ -1313,7 +1314,39 @@ func (g *AttnGPU) stage(layers []AttnWeights) error {
 		tileB(out, w.O, c.NEmbd, c.GateWidth(), func(r int) int { return r })
 		g.wbank.WriteUint16At(int(g.layers[i].out), out)
 	}
-	g.wbuf.WriteFloat32At(int(g.wRope), ropeTable(g.cfg, g.nKV))
+	table := ropeTable(g.cfg, g.nKV)
+	for s := 0; s < g.slots; s++ {
+		g.wbuf.WriteFloat32At(int(g.wRope)+s*g.ropeElems(), table)
+	}
+	return nil
+}
+
+// ropeElems is one slot's rotary table: [nKV][rot/2] cosines, then sines.
+func (g *AttnGPU) ropeElems() int { return 2 * g.nKV * (g.cfg.RopeDims / 2) }
+
+// SetRopeRows writes cells [from, from+len(pos)) of slot's rotary table with
+// the angles of the given positions (LLM-VISION.md V5). Every kernel reads
+// the table by cell (the pack at SEQ_PAST + t, the indexer's pooled block at
+// its first cell), so this is the whole of what an image asks of the device.
+// A run must write its rows before it is dispatched, and it is synchronous
+// with the host, so a row is never rewritten under a pass reading it.
+func (g *AttnGPU) SetRopeRows(slot, from int, pos []Pos3) error {
+	if slot < 0 || slot >= g.slots || from < 0 || from+len(pos) > g.nKV {
+		return fmt.Errorf("llm: rotary rows [%d, %d) of slot %d, a %d-cell table of %d slots",
+			from, from+len(pos), slot, g.nKV, g.slots)
+	}
+	if len(pos) == 0 {
+		return nil
+	}
+	rotHalf := g.cfg.RopeDims / 2
+	cos := make([]float32, len(pos)*rotHalf)
+	sin := make([]float32, len(pos)*rotHalf)
+	for i, p := range pos {
+		ropeRow(g.cfg, p, cos[i*rotHalf:(i+1)*rotHalf], sin[i*rotHalf:(i+1)*rotHalf])
+	}
+	base := int(g.wRope) + slot*g.ropeElems()
+	g.wbuf.WriteFloat32At(base+from*rotHalf, cos)
+	g.wbuf.WriteFloat32At(base+g.nKV*rotHalf+from*rotHalf, sin)
 	return nil
 }
 
@@ -1390,24 +1423,25 @@ func (g *AttnGPU) stageQ4K(i int, w AttnWeights) error {
 func ropeTable(c AttnConfig, nKV int) []float32 {
 	rotHalf := c.RopeDims / 2
 	out := make([]float32, 2*nKV*rotHalf)
-	// A unit vector in dim i and zero in dim i+rotHalf rotates to
-	// (cos, sin), so one pass over a [1][rot] probe per position reads the
-	// whole row of angles off the reference implementation itself.
-	probe := make([]float32, c.RopeDims)
 	for pos := 0; pos < nKV; pos++ {
-		for i := range probe {
-			probe[i] = 0
-		}
-		for i := 0; i < rotHalf; i++ {
-			probe[i] = 1
-		}
-		RoPEMulti(c, probe, []int32{int32(pos)}, 1, c.RopeDims, 1)
-		for i := 0; i < rotHalf; i++ {
-			out[pos*rotHalf+i] = probe[i]                     // cos
-			out[nKV*rotHalf+pos*rotHalf+i] = probe[i+rotHalf] // sin
-		}
+		ropeRow(c, TextPos(pos), out[pos*rotHalf:(pos+1)*rotHalf], out[(nKV+pos)*rotHalf:(nKV+pos+1)*rotHalf])
 	}
 	return out
+}
+
+// ropeRow is one row of the table: the angles at position p. A unit vector
+// in dim i and zero in dim i+rotHalf rotates to (cos, sin), so one [1][rot]
+// probe reads the whole row off the reference implementation itself, and an
+// image's (t, h, w) row follows from the same call.
+func ropeRow(c AttnConfig, p Pos3, cos, sin []float32) {
+	rotHalf := c.RopeDims / 2
+	probe := make([]float32, c.RopeDims)
+	for i := 0; i < rotHalf; i++ {
+		probe[i] = 1
+	}
+	RoPEMulti3(c, probe, []Pos3{p}, 1, c.RopeDims, 1)
+	copy(cos, probe[:rotHalf])
+	copy(sin, probe[rotHalf:])
 }
 
 // SetPlan chooses the three rungs: the attention tile, and one row block for
@@ -2354,7 +2388,7 @@ func (g *AttnGPU) push(layer int) push {
 		// arena (P1c), written by SetPast, so `lowRank` stays zero and the
 		// dispatch is byte-identical every decode step.
 		LoOff:    g.hIdxRaw + uint32(layer*g.idxRawStride),
-		ScoreOff: g.aScore, CellOff: g.aCell, RopeOff: g.wRope,
+		ScoreOff: g.aScore, CellOff: g.aCell, RopeOff: g.wRope + uint32(g.slot*g.ropeElems()),
 		GammaOff: w.gQ, GammaKOff: w.gK, GammaIQOff: w.gIQ, GammaIKOff: w.gIK,
 		Heads: uint32(c.NHead), KVHeads: uint32(c.NHeadKV), HeadDim: uint32(c.HeadDim),
 		NKV: uint32(g.nKV), Plane: uint32(plane), LDCtx: uint32(g.ldCtx),

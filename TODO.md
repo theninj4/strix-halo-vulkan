@@ -37,6 +37,13 @@ here is our own ceiling, not a reference implementation.
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 
+**Vision (2026-09-24): the text vertical reads images.** `-llm-mmproj`
+stages the checkpoint's 27-layer vision tower beside the LLM, and all three
+chat doors take images, gated against HF (processor bit-exact, positions,
+PLE) and llama.cpp (the whole model's argmax). Live record and handoff:
+root [`LLM-VISION.md`](LLM-VISION.md) (V-stages). V10's eval and video are
+open.
+
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant

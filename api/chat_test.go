@@ -313,10 +313,10 @@ func TestChatRefusals(t *testing.T) {
 			map[string]any{"add_vision_id": true}), "add_vision_id"},
 		{"json mode", withField(chatBody(user("hi")), "response_format",
 			map[string]any{"type": "json_object"}), "response_format"},
-		{"an image block", chatBody(map[string]any{"role": "user", "content": []any{
+		{"an audio block", chatBody(map[string]any{"role": "user", "content": []any{
 			map[string]any{"type": "text", "text": "what is this?"},
-			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:,"}},
-		}}), "vision"},
+			map[string]any{"type": "input_audio", "input_audio": map[string]any{"data": "", "format": "wav"}},
+		}}), "input_audio"},
 	}
 	for _, c := range cases {
 		s := &Server{Completion: &fakeLLM{pieces: []Delta{{Content: "4."}}}}

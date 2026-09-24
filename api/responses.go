@@ -562,11 +562,11 @@ func messagesFromInput(raw json.RawMessage) ([]Message, error) {
 				Content: MessageContent{{Type: "text", Text: text}},
 			})
 		case it.Role != "":
-			text, err := inputText(it.Content)
+			content, err := inputContent(it.Content)
 			if err != nil {
 				return nil, fmt.Errorf("input item %d: %v", i, err)
 			}
-			m := Message{Role: it.Role, Content: MessageContent{{Type: "text", Text: text}}}
+			m := Message{Role: it.Role, Content: content}
 			if it.Role == "assistant" {
 				m.ReasoningContent = pending
 				pending = ""
@@ -583,10 +583,54 @@ func messagesFromInput(raw json.RawMessage) ([]Message, error) {
 	return out, nil
 }
 
+// inputContent is a message item's content as text and image parts in
+// order: `input_image` becomes the image_url block the backend reads, from its
+// `image_url` (a data: URL; the backend fetches nothing). A `file_id` image is
+// refused, because this server keeps no files.
+func inputContent(raw json.RawMessage) (MessageContent, error) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || raw[0] != '[' {
+		text, err := inputText(raw)
+		if err != nil {
+			return nil, err
+		}
+		return MessageContent{{Type: "text", Text: text}}, nil
+	}
+	var parts []InputContentPart
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil, err
+	}
+	var out MessageContent
+	for _, p := range parts {
+		switch p.Type {
+		case "", "input_text", "output_text", "text", "summary_text", "refusal":
+			if n := len(out); n > 0 && out[n-1].Type == "text" {
+				out[n-1].Text += p.Text
+			} else {
+				out = append(out, Content{Type: "text", Text: p.Text})
+			}
+		case "input_image":
+			if p.ImageURL == "" {
+				return nil, fmt.Errorf("an input_image with no image_url; this server keeps no files, " +
+					"so send the image as a data: URL")
+			}
+			out = append(out, Content{Type: "image_url", ImageURL: &struct {
+				URL string `json:"url"`
+			}{URL: p.ImageURL}})
+		default:
+			return nil, fmt.Errorf("a %s content part cannot be read by this server, which reads text and images",
+				strconv.Quote(p.Type))
+		}
+	}
+	if len(out) == 0 {
+		out = MessageContent{{Type: "text"}}
+	}
+	return out, nil
+}
+
 // inputText flattens an item's content, which the Responses API allows as a
-// string or as a list of parts. A part that is not text is refused for the
-// same reason the chat endpoint refuses an image block: there is no vision
-// model here, and answering about the text alone would look like an answer.
+// string or as a list of parts. A part that is neither text nor an image is
+// refused: answering about the text alone would look like an answer.
 func inputText(raw json.RawMessage) (string, error) {
 	raw = json.RawMessage(strings.TrimSpace(string(raw)))
 	if len(raw) == 0 || string(raw) == "null" {
@@ -607,7 +651,7 @@ func inputText(raw json.RawMessage) (string, error) {
 		case "", "input_text", "output_text", "text", "summary_text", "refusal":
 			b.WriteString(p.Text)
 		default:
-			return "", fmt.Errorf("a %s content part cannot be read by this server, which has no vision model",
+			return "", fmt.Errorf("a %s content part cannot be read here: this server takes images in message items only",
 				strconv.Quote(p.Type))
 		}
 	}

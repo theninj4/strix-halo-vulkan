@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"unsafe"
 
 	"strix-halo-vulkan/safetensors"
@@ -49,11 +50,19 @@ import (
 //     bytes four rows at a time, while the three deepstack mergers normalise
 //     the 4608 directly.
 //
-// Attention is the *scalar* kernel, which takes its head width from a push
-// constant and so runs this tower's 72 unchanged. The matrix-core one is
-// built per head dim and 72 does not divide its 16-wide tile; padding to 80
-// would work and is a percent, not a capability — measured in
-// TestGPUTowerTiming before it is worth doing.
+// Attention runs on the matrix cores (LLM-VISION.md V4): the DiT's WMMA
+// flash kernel, which is built per head dim, at 80. The tower's heads are
+// 72 wide, which does not divide the 16-wide tile, so the fragment pack
+// zero-extends each head to 80 (SRC_HEAD_DIM). The kernel writes its context
+// straight into the fp16 A operand, 80 columns a head, and the output
+// projection's weight is staged with zero columns at each head's pads. The
+// zero components add nothing to q.k, and v's give zero context columns,
+// so the padding is exact.
+//
+// It was the *scalar* kernel until the language model needed this tower. The
+// scalar kernel is quadratic in patches at a few percent of the device, which
+// was 6.0 s of a 1024² image, and a 2048² image outran the driver's timeout.
+// VISION_ATTN=scalar at construction still builds it as the control.
 
 const (
 	// ffnAlign is the GEMM tile's N granularity. The MLP is 4304 wide, which
@@ -73,6 +82,10 @@ type GPU struct {
 	dev *vk.Device
 	cfg Config
 
+	// Between is called between two of a Forward's submits (see run). It is
+	// set by the tower's one caller, between Forwards.
+	Between func()
+
 	// The staged budget, and the grid of the run in progress. The arenas are
 	// sized for the first and every dispatch is bounded by the second.
 	maxRows, maxMerged int
@@ -82,6 +95,14 @@ type GPU struct {
 
 	dim, heads, headDim, ffn, ffnPad int
 	mergeIn, mergeOut                int
+
+	// The matrix-core attention (see the file comment). hdPad is the head
+	// width in the fragment planes, planeTok their token stride, and hQ, hK,
+	// hV their offsets in the fp16 arena. scalar keeps the old kernel.
+	scalar          bool
+	hdPad, planeTok int
+	hQ, hK, hV      uint32
+	attnWave        uint32
 
 	wbuf  *vk.Buffer // fp32: biases
 	abuf  *vk.Buffer // fp32 activations
@@ -181,6 +202,13 @@ func NewGPU(dev *vk.Device, cpu *Model, maxRows int) (*GPU, error) {
 		pipes: map[string]*vk.ComputePipeline{},
 	}
 	g.ffnPad = (g.ffn + ffnAlign - 1) &^ (ffnAlign - 1)
+	g.hdPad = (g.headDim + coopMatTile - 1) &^ (coopMatTile - 1)
+	// The packed planes are built for exactly one pad, 72 -> 80. Anything
+	// else, or the explicit control, runs the scalar kernel.
+	g.scalar = os.Getenv("VISION_ATTN") == "scalar" || g.headDim != 72 || g.hdPad != 80
+	if g.scalar {
+		g.hdPad = g.headDim
+	}
 	if err := g.stageWeights(cpu); err != nil {
 		g.Destroy()
 		return nil, err
@@ -280,6 +308,22 @@ func padWeight(w []float32, out, in, outPad, inPad int) []float32 {
 	return dst
 }
 
+// padHeads spreads a [out, heads*headDim] weight's input columns to
+// [out, heads*hdPad], with zeros at each head's pads: the output projection
+// read by an attention whose context is hdPad wide a head.
+func padHeads(w []float32, out, heads, headDim, hdPad int) []float32 {
+	if headDim == hdPad {
+		return w
+	}
+	dst := make([]float32, out*heads*hdPad)
+	for o := 0; o < out; o++ {
+		for h := 0; h < heads; h++ {
+			copy(dst[(o*heads+h)*hdPad:][:headDim], w[(o*heads+h)*headDim:][:headDim])
+		}
+	}
+	return dst
+}
+
 func (g *GPU) stageWeights(cpu *Model) error {
 	var w32 f32arena
 	// The gammas live in the *activation* arena, because dit_final_norm
@@ -355,7 +399,7 @@ func (g *GPU) stageWeights(cpu *Model) error {
 				blk.bV = w32.put(folded)
 			}
 		}
-		_, blk.wO = place(g.dim, g.dim, b.Attn.Proj.Weight)
+		_, blk.wO = place(g.dim, g.heads*g.hdPad, padHeads(b.Attn.Proj.Weight, g.dim, g.heads, g.headDim, g.hdPad))
 		blk.bO = w32.put(b.Attn.Proj.Bias)
 
 		fc1 := padWeight(b.MLP.FC1.Weight, g.ffn, g.dim, g.ffnPad, g.dim)
@@ -407,6 +451,16 @@ func (g *GPU) stageWeights(cpu *Model) error {
 	return nil
 }
 
+// The matrix-core attention's geometry: the pack's token tiles per
+// workgroup (qvit_pack_hd80 is built with TPW=8), the key block the kernel
+// reads whole (KTIL=4 tiles), and the plane's token alignment.
+const (
+	packTPW        = 8
+	wmmaKeyBlock   = 64
+	wmmaTokenAlign = 128
+	log2e          = 1.4426950408889634
+)
+
 // maxBankBytes is the device's storage-buffer ceiling, as in qimage/dit.
 const maxBankBytes = 0xfffffffc
 
@@ -447,13 +501,19 @@ func (g *GPU) allocActivations() error {
 	g.aQ = alloc(rows * g.dim)
 	g.aK = alloc(rows * g.dim)
 	g.aV = alloc(rows * g.dim)
-	g.aCtx = alloc(rows * g.dim)
+	if g.scalar {
+		g.aCtx = alloc(rows * g.dim)
+	}
 	g.aY = alloc(rows * g.dim)
 	// aH holds both the MLP's hidden rows and, during a merger, its 4608-wide
 	// first layer over a quarter as many rows — which is the smaller of the
 	// two at every grid this tower runs.
 	g.aH = alloc(max(rows*g.ffnPad, mrg*g.mergeIn))
-	g.aKT = alloc(g.heads * g.headDim * (g.rows + attnTokenPad))
+	if g.scalar {
+		// The scalar kernel's transposed keys; the matrix-core path packs
+		// into the fp16 arena instead.
+		g.aKT = alloc(g.heads * g.headDim * (g.rows + attnTokenPad))
+	}
 	g.aCos = alloc(g.rows * g.headDim)
 	g.aSin = alloc(g.rows * g.headDim)
 	g.aGamma = alloc(len(g.gammas))
@@ -462,7 +522,7 @@ func (g *GPU) allocActivations() error {
 
 	// One fp16 A operand, sized for the widest reduction any GEMM makes.
 	kMax := g.cfg.PatchElems()
-	for _, k := range []int{g.dim, g.ffnPad, g.mergeIn} {
+	for _, k := range []int{g.dim, g.ffnPad, g.mergeIn, g.heads * g.hdPad} {
 		if k > kMax {
 			kMax = k
 		}
@@ -470,7 +530,30 @@ func (g *GPU) allocActivations() error {
 	g.ldaA = kMax + ldaPad
 	g.hA = 0
 	g.hElems = rows * g.ldaA
+	if !g.scalar {
+		// Three fragment planes a head, each wmmaTokenAlign-rounded: the
+		// kernel reads whole key blocks, and the pack zeroes what lies
+		// past the patches.
+		g.planeTok = (g.rows + wmmaTokenAlign - 1) &^ (wmmaTokenAlign - 1)
+		plane := g.heads * g.planeTok * g.hdPad
+		g.hQ = uint32(g.hElems)
+		g.hK = g.hQ + uint32(plane)
+		g.hV = g.hK + uint32(plane)
+		g.hElems += 3 * plane
+	}
 
+	// A binding past maxStorageBufferRange is not an error on this driver:
+	// the run comes back fast and wrong. So a budget whose arena would cross
+	// it is refused here, where the number is known.
+	for _, a := range []struct {
+		name  string
+		bytes int
+	}{{"fp32 activation", g.actElems * 4}, {"fp16 activation", g.hElems * 2}} {
+		if a.bytes > maxBankBytes {
+			return fmt.Errorf("vision: a %d-patch budget needs a %.2f GB %s arena, past the %.2f GB a binding can address",
+				g.maxRows, float64(a.bytes)/1e9, a.name, float64(maxBankBytes)/1e9)
+		}
+	}
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("vision: fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)
@@ -484,15 +567,17 @@ func (g *GPU) allocActivations() error {
 	return nil
 }
 
-func (g *GPU) pipeline(name string, spirv []byte, bufs []*vk.Buffer) error {
+func (g *GPU) pipeline(name string, spirv []byte, bufs []*vk.Buffer, wave ...uint32) error {
 	mod, err := g.dev.NewShaderModule(spirv)
 	if err != nil {
 		return fmt.Errorf("vision: shader %s: %w", name, err)
 	}
 	g.mods = append(g.mods, mod)
-	pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers: bufs, PushConstantSize: uint32(unsafe.Sizeof(pushConstants{})),
-	})
+	spec := vk.PipelineSpec{Buffers: bufs, PushConstantSize: uint32(unsafe.Sizeof(pushConstants{}))}
+	if len(wave) > 0 {
+		spec.RequiredSubgroupSize = wave[0]
+	}
+	pipe, err := g.dev.NewPipeline(mod, spec)
 	if err != nil {
 		return fmt.Errorf("vision: pipeline %s: %w", name, err)
 	}
@@ -512,6 +597,22 @@ func (g *GPU) build() error {
 		"rope":      shaders.QViTRoPE,
 	} {
 		if err := g.pipeline(name, spirv, base); err != nil {
+			return err
+		}
+	}
+	if !g.scalar {
+		if err := g.pipeline("pack", shaders.QViTPackHD80, base); err != nil {
+			return err
+		}
+		// wave32 where the size can be pinned, wave64 otherwise: the DiT's
+		// ladder, first and second place.
+		spirv, wave := shaders.QViTAttnWMMAHD80, uint32(0)
+		if sgs, err := g.dev.Physical().SubgroupSizeControl(); err == nil && g.dev.Features().SubgroupSizeControl &&
+			sgs.Supported && sgs.MinSubgroupSize <= 32 && 32 <= sgs.MaxSubgroupSize {
+			spirv, wave = shaders.QViTAttnWMMAHD80W32, 32
+		}
+		g.attnWave = wave
+		if err := g.pipeline("wmma", spirv, base, wave); err != nil {
 			return err
 		}
 	}
@@ -651,18 +752,43 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 				WOff: g.aCos, Aux0: g.aSin,
 			})
 		}
-		add("transpose", uint32((g.rows*g.heads*g.headDim+255)/256), 1, pushConstants{
-			InOff: g.aK, OutOff: g.aKT, Tokens: uint32(g.rows), Dim: uint32(g.dim),
-			Heads: uint32(g.heads), HeadDim: uint32(g.headDim), KStride: uint32(kStride),
-		})
-		add("attention", uint32(g.rows), uint32(g.heads), pushConstants{
-			InOff: g.aQ, OutOff: g.aCtx, KOff: g.aKT, VOff: g.aV,
-			Tokens: uint32(g.rows), Dim: uint32(g.dim),
-			Heads: uint32(g.heads), HeadDim: uint32(g.headDim),
-			KStride: uint32(kStride), Scale: scale,
-		})
-		narrow(g.aCtx, g.rows, g.dim, g.ldaA)
-		if err := gemm(b.bank, g.hA, g.aY, b.wO, g.rows, g.dim, g.dim, g.ldaA); err != nil {
+		if g.scalar {
+			add("transpose", uint32((g.rows*g.heads*g.headDim+255)/256), 1, pushConstants{
+				InOff: g.aK, OutOff: g.aKT, Tokens: uint32(g.rows), Dim: uint32(g.dim),
+				Heads: uint32(g.heads), HeadDim: uint32(g.headDim), KStride: uint32(kStride),
+			})
+			add("attention", uint32(g.rows), uint32(g.heads), pushConstants{
+				InOff: g.aQ, OutOff: g.aCtx, KOff: g.aKT, VOff: g.aV,
+				Tokens: uint32(g.rows), Dim: uint32(g.dim),
+				Heads: uint32(g.heads), HeadDim: uint32(g.headDim),
+				KStride: uint32(kStride), Scale: scale,
+			})
+			narrow(g.aCtx, g.rows, g.dim, g.ldaA)
+		} else {
+			// q carries 1/sqrt(72)*log2(e): the kernel's softmax is exp2,
+			// and the scale is the *source* head's, not the padded one.
+			tiles := ((g.rows + wmmaKeyBlock - 1) &^ (wmmaKeyBlock - 1)) / coopMatTile
+			for _, pk := range []struct {
+				src, dst, mode uint32
+				scale          float64
+			}{
+				{g.aQ, g.hQ, 0, log2e / math.Sqrt(float64(g.headDim))},
+				{g.aK, g.hK, 0, 1},
+				{g.aV, g.hV, 1, 1},
+			} {
+				add("pack", uint32((tiles+packTPW-1)/packTPW), uint32(g.heads), pushConstants{
+					InOff: pk.src, OutOff: pk.dst, Tokens: uint32(g.rows), Dim: uint32(g.dim),
+					Heads: uint32(g.heads), Aux0: pk.mode, Aux1: uint32(g.planeTok), Aux2: uint32(tiles),
+					Scale: math.Float32bits(float32(pk.scale)),
+				})
+			}
+			add("wmma", uint32((g.rows+coopMatTile-1)/coopMatTile), uint32(g.heads), pushConstants{
+				InOff: g.hQ, KOff: g.hK, VOff: g.hV, OutOff: g.hA, LDA: uint32(g.ldaA),
+				Tokens: uint32(g.rows), Dim: uint32(g.dim), Heads: uint32(g.heads),
+				Aux1: uint32(g.planeTok),
+			})
+		}
+		if err := gemm(b.bank, g.hA, g.aY, b.wO, g.rows, g.dim, g.heads*g.hdPad, g.ldaA); err != nil {
 			return nil, err
 		}
 		biasact(g.aY, b.bO, g.rows, g.dim, 0)
@@ -749,11 +875,19 @@ const dispatchesPerSubmit = 8
 // run submits the recorded graph in batches, with a cancellation point
 // between them — the same bargain qimage/vae's runContext documents. A
 // submitted command buffer cannot be abandoned, so between submits is the
-// finest granularity there is: the tower is 6.3 s of an edit at 1024², and
+// finest granularity there is. The tower was 6.3 s of an edit at 1024² on the
+// scalar attention and is 0.76 s on the matrix cores (LLM-VISION.md V4), and
 // checking every eight dispatches bounds what an abandoned request pays for
-// it to a fraction of a second.
+// it to a fraction of that.
+//
+// Between, when set, is called between two submits, when nothing of this
+// tower's is on the device. A server uses it to let other work run in the
+// middle of a long image (backend's tower slices).
 func (g *GPU) run(ctx context.Context, ds []vk.MultiDispatch) error {
 	for i := 0; i < len(ds); i += dispatchesPerSubmit {
+		if i > 0 && g.Between != nil {
+			g.Between()
+		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("vision: cancelled after %d of %d dispatches: %w", i, len(ds), err)
 		}

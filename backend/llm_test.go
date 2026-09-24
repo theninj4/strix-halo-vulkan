@@ -90,7 +90,7 @@ func TestChatRequestTranslation(t *testing.T) {
 			{Role: "tool", Content: api.MessageContent{{Type: "text", Text: "18 C"}}},
 		},
 	}
-	msgs, opt, err := chatRequest(req)
+	msgs, opt, _, err := chatRequest(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestChatRequestTranslation(t *testing.T) {
 // the template's, which enforces it in the prompt rather than asking.
 func TestChatRequestEffortNone(t *testing.T) {
 	for _, effort := range []string{"none", "minimal", "None"} {
-		_, opt, err := chatRequest(&api.CompletionRequest{
+		_, opt, _, err := chatRequest(&api.CompletionRequest{
 			ReasoningEffort: effort,
 			Messages:        []api.Message{{Role: "user", Content: api.MessageContent{{Text: "hi"}}}},
 		})
@@ -144,7 +144,7 @@ func TestChatRequestToolChoice(t *testing.T) {
 	msgs := []api.Message{{Role: "user", Content: api.MessageContent{{Text: "hi"}}}}
 
 	for _, choice := range []string{``, `null`, `"auto"`} {
-		_, opt, err := chatRequest(&api.CompletionRequest{
+		_, opt, _, err := chatRequest(&api.CompletionRequest{
 			Tools: tools, Messages: msgs, ToolChoice: json.RawMessage(choice),
 		})
 		if err != nil {
@@ -155,7 +155,7 @@ func TestChatRequestToolChoice(t *testing.T) {
 		}
 	}
 
-	_, opt, err := chatRequest(&api.CompletionRequest{
+	_, opt, _, err := chatRequest(&api.CompletionRequest{
 		Tools: tools, Messages: msgs, ToolChoice: json.RawMessage(`"none"`),
 	})
 	if err != nil {
@@ -166,7 +166,7 @@ func TestChatRequestToolChoice(t *testing.T) {
 	}
 
 	for _, choice := range []string{`"required"`, `{"type":"function","function":{"name":"f"}}`} {
-		if _, _, err := chatRequest(&api.CompletionRequest{
+		if _, _, _, err := chatRequest(&api.CompletionRequest{
 			Tools: tools, Messages: msgs, ToolChoice: json.RawMessage(choice),
 		}); err == nil {
 			t.Errorf("%s was accepted", choice)
@@ -183,7 +183,7 @@ func TestChatRequestKeepsTheClientsToolJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &tool); err != nil {
 		t.Fatal(err)
 	}
-	_, opt, err := chatRequest(&api.CompletionRequest{
+	_, opt, _, err := chatRequest(&api.CompletionRequest{
 		Tools:    []api.Tool{tool},
 		Messages: []api.Message{{Role: "user", Content: api.MessageContent{{Text: "hi"}}}},
 	})

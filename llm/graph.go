@@ -195,6 +195,12 @@ type Graph struct {
 	// two predecessors.
 	past int
 	ids  []int32
+	// spans are the sequence's images, in cell order (LLM-VISION.md V5):
+	// what makes a cell's rotary position differ from the cell. ropeHW is,
+	// per slot, the end of the rotary rows that may not be a text table's,
+	// so a sequence without images rewrites rows only below it.
+	spans  []ImageSpan
+	ropeHW []int
 
 	// Staged is what each block cost to put on the device, in the order they
 	// were staged, for the caller that wants to print a plan.
@@ -241,6 +247,7 @@ type Graph struct {
 	specPast   int
 	specRows   int
 	specIds    int
+	specSpans  int
 	specBlocks []uint16
 
 	// Sequence slots (CONCURRENCY.md C1). `slot` is the live one; `past`,
@@ -258,6 +265,7 @@ type Graph struct {
 type seqState struct {
 	past               int
 	ids                []int32
+	spans              []ImageSpan
 	pre                *vk.Prerecorded
 	preKinds, preOwner []string
 	preEpoch           int
@@ -412,8 +420,17 @@ func (g *Graph) flush() error {
 func (g *Graph) PinSchedule(on bool) error {
 	// The pin changes which pipelines a one-token pass plans, so a captured
 	// decode step no longer matches what the graph would record; the next
-	// one-token Extend captures afresh.
+	// one-token Extend captures afresh. **Every slot's**, not only the live
+	// one's: a parked slot's step was recorded under the old plan too, and
+	// replaying it after the pin is a run on the schedule the pin was meant
+	// to exclude (found by TestGraphImageDecode, LLM-VISION.md V5).
 	g.dropPrerecorded()
+	for i := range g.parked {
+		if g.parked[i].pre != nil {
+			g.parked[i].pre.Destroy()
+			g.parked[i].pre, g.parked[i].preKinds, g.parked[i].preOwner = nil, nil, nil
+		}
+	}
 	if g.moe != nil {
 		g.moe.PinGemv(on)
 	}
@@ -574,7 +591,7 @@ func NewGraph(dev *vk.Device, m *Model, opts GraphOpts) (*Graph, error) {
 		return nil, fmt.Errorf("llm: GraphOpts.Slots and Speculative share the carried state's slot index; pick one")
 	}
 	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV,
-		slots: slots, parked: make([]seqState, slots)}
+		slots: slots, parked: make([]seqState, slots), ropeHW: make([]int, slots)}
 
 	if err := g.stage(dev, opts); err != nil {
 		g.Destroy()
@@ -869,12 +886,12 @@ func (g *Graph) UseSlot(s int) error {
 		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
 	}
 	g.parked[g.slot] = seqState{
-		past: g.past, ids: g.ids,
+		past: g.past, ids: g.ids, spans: g.spans,
 		pre: g.pre, preKinds: g.preKinds, preOwner: g.preOwner, preEpoch: g.preEpoch,
 	}
 	in := g.parked[s]
 	g.parked[s] = seqState{}
-	g.past, g.ids = in.past, in.ids
+	g.past, g.ids, g.spans = in.past, in.ids, in.spans
 	g.pre, g.preKinds, g.preOwner, g.preEpoch = in.pre, in.preKinds, in.preOwner, in.preEpoch
 	g.slot = s
 	if g.attn != nil {
@@ -931,10 +948,11 @@ func (g *Graph) UseSlot(s int) error {
 // frontier row back over them gave the same logits bit for bit, with the
 // detour reaching past the real continuation.
 type Checkpoint struct {
-	past int
-	ids  []int32
-	dn   []float32
-	ple  []float32
+	past  int
+	ids   []int32
+	spans []ImageSpan
+	dn    []float32
+	ple   []float32
 }
 
 // Past is the position the checkpoint was taken at, and Ids the tokens it
@@ -958,6 +976,7 @@ func (g *Graph) Checkpoint(into *Checkpoint) (*Checkpoint, error) {
 	}
 	c.past = g.past
 	c.ids = append(c.ids[:0], g.ids...)
+	c.spans = append(c.spans[:0], g.spans...)
 	if g.dn != nil {
 		c.dn = resized(c.dn, g.dn.CarriedLen())
 		if err := g.dn.SaveCarried(c.dn); err != nil {
@@ -984,6 +1003,12 @@ func (g *Graph) Restore(c *Checkpoint) error {
 	if c == nil || c.past == 0 || len(g.ids) != g.past || c.past > g.past ||
 		!slices.Equal(g.ids[:c.past], c.ids) {
 		return fmt.Errorf("llm: this slot no longer holds the checkpoint's tokens")
+	}
+	// An image's cells are all the same pad id, so the ids alone cannot say
+	// the slot holds the checkpoint's pictures: the spans, hashes and all,
+	// have to agree too.
+	if kept, err := truncateSpans(g.spans, c.past); err != nil || !slices.Equal(kept, c.spans) {
+		return fmt.Errorf("llm: this slot no longer holds the checkpoint's images")
 	}
 	if g.dn != nil {
 		if err := g.dn.RestoreCarried(c.dn); err != nil {
@@ -1016,6 +1041,7 @@ func resized(b []float32, n int) []float32 {
 func (g *Graph) Reset() error {
 	g.past = 0
 	g.ids = g.ids[:0]
+	g.spans = nil
 	g.specArmed, g.specBlocks = false, nil
 	if g.attn != nil {
 		g.attn.Reset()
@@ -1061,6 +1087,13 @@ func (g *Graph) Speculate(on bool) error {
 	}
 	if on && g.slots > 1 {
 		return fmt.Errorf("llm: this graph's slots are sequences (GraphOpts.Slots); it cannot also speculate")
+	}
+	// The draft head (llm/mtp.go) has a one-layer cache of its own with a
+	// text rotary table, so behind an image it would rope 176 or 1 000
+	// positions off. It is parked (spec-loop 0.95x); refuse rather than port
+	// it (LLM-VISION.md Q5).
+	if on && len(g.spans) > 0 {
+		return fmt.Errorf("llm: this sequence holds an image, and the draft head has no image positions")
 	}
 	if g.specArmed {
 		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
@@ -1129,6 +1162,7 @@ func (g *Graph) Rewind() error {
 	}
 	g.past = g.specPast
 	g.ids = g.ids[:g.specIds]
+	g.spans = g.spans[:g.specSpans]
 	if g.attn != nil {
 		if err := g.attn.SetPast(g.past); err != nil {
 			return err
@@ -1160,7 +1194,11 @@ func (g *Graph) rewindPosition(past, ids int) error {
 	if past > g.past || ids > len(g.ids) {
 		return fmt.Errorf("llm: rewinding to %d/%d from %d/%d", past, ids, g.past, len(g.ids))
 	}
-	g.past, g.ids = past, g.ids[:ids]
+	spans, err := truncateSpans(g.spans, past)
+	if err != nil {
+		return err
+	}
+	g.past, g.ids, g.spans = past, g.ids[:ids], spans
 	g.specArmed, g.specBlocks = false, nil
 	if g.attn != nil {
 		if err := g.attn.SetPast(g.past); err != nil {
@@ -1190,6 +1228,7 @@ func (g *Graph) arm(nTok int) error {
 		return fmt.Errorf("llm: a speculative pass is already in flight; commit or rewind it first")
 	}
 	g.specPast, g.specRows, g.specIds, g.specBlocks = g.past, nTok, len(g.ids), nil
+	g.specSpans = len(g.spans)
 	if g.attn != nil && g.past > 0 {
 		snap, err := g.attn.SnapshotBlocks(g.past, nTok)
 		if err != nil {
@@ -1308,10 +1347,10 @@ func (g *Graph) DecodeRows(slots []int, ids []int32) (logits []float32, err erro
 	// Every row's sequence where the others are: the live one's position and
 	// ids go into its parked entry for the length of the pass, and back.
 	live := g.slot
-	g.parked[live].past, g.parked[live].ids = g.past, g.ids
+	g.parked[live].past, g.parked[live].ids, g.parked[live].spans = g.past, g.ids, g.spans
 	defer func() {
-		g.past, g.ids = g.parked[live].past, g.parked[live].ids
-		g.parked[live].past, g.parked[live].ids = 0, nil
+		g.past, g.ids, g.spans = g.parked[live].past, g.parked[live].ids, g.parked[live].spans
+		g.parked[live].past, g.parked[live].ids, g.parked[live].spans = 0, nil, nil
 	}()
 	rows := make([]batchRow, n)
 	for r, s := range slots {
@@ -1322,6 +1361,11 @@ func (g *Graph) DecodeRows(slots []int, ids []int32) (logits []float32, err erro
 	}
 	if err := checkBatch(rows, g.slots, g.nKV); err != nil {
 		return nil, err
+	}
+	for _, r := range rows {
+		if err := g.prepRope(r.slot, r.past, 1, g.parked[r.slot].spans); err != nil {
+			return nil, err
+		}
 	}
 
 	top := time.Now()
@@ -1455,6 +1499,14 @@ func (g *Graph) Forward(ids []int32) (logits, norm []float32, err error) {
 // the two the same computation is L7a's cache and L7b's two carried
 // histories, and what asserts it is TestGraphIsAChunkSplit.
 func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
+	return g.ExtendInput(Input{IDs: ids})
+}
+
+// ExtendInput is Extend over an Input, which may carry images
+// (LLM-VISION.md V5, V6). A pass with an image is never a one-token decode
+// step, so it never takes the recorded path.
+func (g *Graph) ExtendInput(in Input) (logits, norm []float32, err error) {
+	ids := in.IDs
 	if g.head == nil {
 		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
 	}
@@ -1466,7 +1518,7 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 	// sequence is a different shape: at position zero the attention block
 	// rebuilds its whole pooled table, so its grid is NBlocks rather than
 	// one (blockRange).
-	if len(ids) == 1 && g.past > 0 && Prerecord() {
+	if len(ids) == 1 && len(in.Images) == 0 && g.past > 0 && Prerecord() {
 		epoch := g.decodeEpoch()
 		if g.pre != nil && g.preEpoch == epoch {
 			return g.extendPrerecorded(ids[0])
@@ -1486,7 +1538,7 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 			logits, norm, err = nil, nil, ferr
 		}
 	}()
-	if err := g.hidden(ids); err != nil {
+	if err := g.hiddenIn(in); err != nil {
 		return nil, nil, err
 	}
 	top := time.Now()
@@ -1531,6 +1583,9 @@ func (g *Graph) Extend(ids []int32) (logits, norm []float32, err error) {
 func (g *Graph) extendPrerecorded(id int32) (logits, norm []float32, err error) {
 	if g.past+1 > g.nKV {
 		return nil, nil, fmt.Errorf("llm: a token at position %d of a %d-cell context", g.past, g.nKV)
+	}
+	if err := g.prepRope(g.slot, g.past, 1, g.spans); err != nil {
+		return nil, nil, err
 	}
 	top := time.Now()
 	t0 := top
@@ -1711,9 +1766,15 @@ func (g *Graph) Hidden(ids []int32) ([]float32, error) {
 // HiddenExtend is Hidden without the reset: the next tokens of the sequence
 // the graph is already holding.
 func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
+	return g.HiddenExtendInput(Input{IDs: ids})
+}
+
+// HiddenExtendInput is HiddenExtend over an Input, which may carry images.
+func (g *Graph) HiddenExtendInput(in Input) ([]float32, error) {
+	ids := in.IDs
 	top := time.Now()
 	g.record(len(ids))
-	if err := g.hidden(ids); err != nil {
+	if err := g.hiddenIn(in); err != nil {
 		_ = g.flush()
 		return nil, err
 	}
@@ -1731,8 +1792,11 @@ func (g *Graph) HiddenExtend(ids []int32) ([]float32, error) {
 // submit: every layer, then the final mixer over the last token alone. It is
 // separate so that Extend can go on recording through the head rather than
 // flushing twice (L7d).
-func (g *Graph) hidden(ids []int32) error {
-	if err := g.appendN(ids, g.nLayer); err != nil {
+func (g *Graph) hidden(ids []int32) error { return g.hiddenIn(Input{IDs: ids}) }
+
+func (g *Graph) hiddenIn(in Input) error {
+	ids := in.IDs
+	if err := g.appendIn(in, g.nLayer); err != nil {
 		return err
 	}
 	top := time.Now()
@@ -1840,9 +1904,15 @@ func (g *Graph) Append(ids []int32) error { return g.AppendN(ids, g.nLayer) }
 // run still reads two tokens that are not in it, which is why the graph keeps
 // the whole id list and hashes over all of it.
 func (g *Graph) AppendN(ids []int32, nLayer int) error {
+	return g.AppendInputN(Input{IDs: ids}, nLayer)
+}
+
+// AppendInputN is AppendN over an Input, which may carry images.
+func (g *Graph) AppendInputN(in Input, nLayer int) error {
+	ids := in.IDs
 	top := time.Now()
 	g.record(len(ids))
-	if err := g.appendN(ids, nLayer); err != nil {
+	if err := g.appendIn(in, nLayer); err != nil {
 		_ = g.flush()
 		return err
 	}
@@ -1854,6 +1924,12 @@ func (g *Graph) AppendN(ids []int32, nLayer int) error {
 // appendN is that body without the record/flush pair, for the entry points
 // that go on recording past the layers (L7d).
 func (g *Graph) appendN(ids []int32, nLayer int) error {
+	return g.appendIn(Input{IDs: ids}, nLayer)
+}
+
+// appendIn is appendN over an Input, which may carry images.
+func (g *Graph) appendIn(in Input, nLayer int) error {
+	ids := in.IDs
 	if nLayer <= 0 || nLayer > g.nLayer {
 		return fmt.Errorf("llm: %d layers, this graph staged %d", nLayer, g.nLayer)
 	}
@@ -1864,9 +1940,20 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	if g.past+nTok > g.nKV {
 		return fmt.Errorf("llm: %d tokens at position %d of a %d-cell context", nTok, g.past, g.nKV)
 	}
+	spans, err := g.inputSpans(in)
+	if err != nil {
+		return err
+	}
+	if len(in.Images) > 0 && g.spec {
+		return fmt.Errorf("llm: a speculating graph takes text only")
+	}
 	// What a rewindable pass has to be able to put back (P5c). Before
 	// anything moves, and a no-op unless Speculate is on.
 	if err := g.arm(nTok); err != nil {
+		return err
+	}
+	// The rotary rows this pass reads, while nothing is in flight.
+	if err := g.prepRope(g.slot, g.past, nTok, spans); err != nil {
 		return err
 	}
 
@@ -1881,6 +1968,13 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 	embd, err := g.m.Embeddings(ids)
 	if err != nil {
 		return fmt.Errorf("llm: token_embd: %w", err)
+	}
+	// The images' rows over the pads' (V6). The hyper-connection init reads
+	// nothing else of the input, so this is the whole of the scatter.
+	for _, im := range in.Images {
+		if im.Embd != nil {
+			copy(embd[im.At*g.m.Config.NEmbd:], im.Embd)
+		}
 	}
 	g.ids = append(g.ids, ids...)
 	var pleEmbd []float32
@@ -1931,7 +2025,93 @@ func (g *Graph) appendN(ids []int32, nLayer int) error {
 		return err
 	}
 	g.past += nTok
+	g.spans = spans
 	g.Stats.Runs++
+	return nil
+}
+
+// Input is one pass's rows: token ids and, among them, images
+// (LLM-VISION.md V5, V6).
+type Input struct {
+	IDs    []int32
+	Images []InputImage
+}
+
+// InputImage is one image's run of rows in Input.IDs: GridH x GridW merged
+// tokens from row At, in raster order, every one of whose ids must be the
+// image-pad token, because that is what the PLE hashes at an image's cells
+// (HF's rule; TestPLEImagePrompt). Hash identifies the pixels.
+type InputImage struct {
+	At           int
+	GridH, GridW int
+	Hash         uint64
+	// Embd is the vision tower's merged rows, [GridH*GridW][NEmbd], which
+	// replace the pad's token embedding at the image's rows (V6): the rows
+	// HF scatters into `inputs_embeds` at the image-pad slots. nil keeps the
+	// pad's own embedding, which only a test that is about positions wants.
+	Embd []float32
+
+	// textPositions ropes the image's rows as text, 0..n-1 past the last
+	// position, which is what vLLM's qwen4_exp does. It is the control
+	// LLM-VISION.md V0 ruled against (TestGraphImagePrefix) and nothing else.
+	textPositions bool
+}
+
+// inputSpans is the sequence's spans once `in` has run, checked.
+func (g *Graph) inputSpans(in Input) ([]ImageSpan, error) {
+	if len(in.Images) == 0 {
+		return g.spans, nil
+	}
+	spans := slices.Clip(g.spans)
+	next := 0
+	for _, im := range in.Images {
+		s := ImageSpan{Start: g.past + im.At, End: g.past + im.At + im.GridH*im.GridW,
+			GridH: im.GridH, GridW: im.GridW, Hash: im.Hash}
+		if err := s.valid(); err != nil {
+			return nil, err
+		}
+		if im.At < next || im.At+im.GridH*im.GridW > len(in.IDs) {
+			return nil, fmt.Errorf("llm: an image at rows [%d, %d) of a %d-row pass, after row %d",
+				im.At, im.At+im.GridH*im.GridW, len(in.IDs), next)
+		}
+		for r := im.At; r < im.At+im.GridH*im.GridW; r++ {
+			if g.hasPLE && in.IDs[r] != g.pleCfg.Image {
+				return nil, fmt.Errorf("llm: row %d of an image holds id %d, not the image pad %d",
+					r, in.IDs[r], g.pleCfg.Image)
+			}
+		}
+		if w := g.m.Config.NEmbd; im.Embd != nil && len(im.Embd) != im.GridH*im.GridW*w {
+			return nil, fmt.Errorf("llm: an image's rows are %d values, want %dx%d rows of %d",
+				len(im.Embd), im.GridH, im.GridW, w)
+		}
+		next = im.At + im.GridH*im.GridW
+		if im.textPositions {
+			continue
+		}
+		spans = append(spans, s)
+	}
+	return spans, nil
+}
+
+// prepRope writes the rotary rows of cells [from, from+n) of a slot's table
+// when they are not the text table's: when the sequence has an image, or when
+// an earlier sequence in the slot left image rows there. A text-only
+// sequence in a clean slot writes nothing, which is every run before V5.
+func (g *Graph) prepRope(slot, from, n int, spans []ImageSpan) error {
+	if g.attn == nil || (len(spans) == 0 && from >= g.ropeHW[slot]) {
+		return nil
+	}
+	if err := g.attn.SetRopeRows(slot, from, cellPositions(spans, from, n)); err != nil {
+		return err
+	}
+	switch {
+	case len(spans) > 0:
+		g.ropeHW[slot] = max(g.ropeHW[slot], from+n)
+	case from+n >= g.ropeHW[slot]:
+		// A text sequence wrote every row it holds as it ran, so what is
+		// below `from` is clean already.
+		g.ropeHW[slot] = from
+	}
 	return nil
 }
 

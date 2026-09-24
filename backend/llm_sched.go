@@ -100,6 +100,10 @@ type llmSlot struct {
 	// still starts with its tokens: that is what says the cache cells below
 	// it are still the ones it was taken over (llm.Graph.Restore).
 	ckpt *llm.Checkpoint
+	// ckptKeys is the checkpoint's sequence as keys: its ids, with an
+	// image's cells named by the picture rather than by the pad every one of
+	// them holds (llm_vision.go). held is keys too.
+	ckptKeys []int32
 }
 
 // reuse is how much of a prompt the slot saves, and whether that is by
@@ -108,7 +112,7 @@ func (sl *llmSlot) reuse(prompt []int32) (int, bool) {
 	n := usablePrefix(sl.held, prompt)
 	if c := sl.ckpt; c != nil {
 		b := c.Past()
-		if b > n && b < len(prompt) && commonPrefix(sl.held, c.Ids()) == b && commonPrefix(prompt, c.Ids()) == b {
+		if b > n && b < len(prompt) && commonPrefix(sl.held, sl.ckptKeys) == b && commonPrefix(prompt, sl.ckptKeys) == b {
 			return b, true
 		}
 	}
@@ -147,9 +151,13 @@ type llmJob struct {
 // llmUnit is a pending run of tokens for one job: a prefill, which the
 // scheduler cuts into chunks, or a decode step.
 type llmUnit struct {
-	job   *llmJob
-	ids   []int32
-	fresh bool
+	job *llmJob
+	// ids are keys (llm_vision.go): token ids, and a negative key at every
+	// image cell. images are those images, At counted from ids[0], each run
+	// whole in one chunk.
+	ids    []int32
+	images []llm.InputImage
+	fresh  bool
 	// restore takes the slot back to its checkpoint before the first chunk.
 	restore bool
 	// step is a decode step, which may share a pass with other slots' (C5).
@@ -188,6 +196,10 @@ type llmSched struct {
 	lastStep time.Time
 	// noBatch is LLMOptions.NoBatchDecode.
 	noBatch bool
+	// towers counts interactive requests whose images are on the tower. The
+	// tower yields the device between slices, and rule 1 treats each of
+	// these as an interactive job, so no background unit starts in a gap.
+	towers  int
 	arrival uint64
 	closed  bool
 	stopped chan struct{}
@@ -383,8 +395,8 @@ func (s *llmSched) releaseLocked(j *llmJob) {
 // run queues tokens on the job's slot and waits for them: a whole prefill
 // (fresh starts the slot's sequence over) or one decode step. It returns the
 // last token's logits, and how long the unit sat behind other jobs' work.
-func (s *llmSched) run(j *llmJob, ids []int32, fresh bool) ([]float32, time.Duration, error) {
-	return s.submit(&llmUnit{job: j, ids: ids, fresh: fresh, done: make(chan struct{})})
+func (s *llmSched) run(j *llmJob, ids []int32, images []llm.InputImage, fresh bool) ([]float32, time.Duration, error) {
+	return s.submit(&llmUnit{job: j, ids: ids, images: images, fresh: fresh, done: make(chan struct{})})
 }
 
 // step is run for one decode token, which the loop may batch with other
@@ -498,8 +510,32 @@ func (s *llmSched) loop() {
 		if mark > pos && mark < pos+n {
 			n = mark - pos
 		}
+		// An image runs whole in one chunk (llm.Input): a cut inside one
+		// moves back to its start, or out to its end when it starts the
+		// chunk. Its rows fit a batch, which Complete checked.
+		for _, im := range u.images {
+			if end := im.At + im.GridH*im.GridW; im.At < n && end > n {
+				if im.At > 0 {
+					n = im.At
+				} else {
+					n = end
+				}
+			}
+		}
 		take := mark > 0 && pos+n == mark
-		chunk, next := u.ids[:n], u.ids[n:min(len(u.ids), 2*n)]
+		var in llm.Input
+		var rest []llm.InputImage
+		for _, im := range u.images {
+			if im.At < n {
+				in.Images = append(in.Images, im)
+			} else {
+				im.At -= n
+				rest = append(rest, im)
+			}
+		}
+		keys := u.ids[:n]
+		chunk, next := keyIDs(keys), keyIDs(u.ids[n:min(len(u.ids), 2*n)])
+		in.IDs = chunk
 		keep := sl.ckpt
 		s.running = u
 		s.mu.Unlock()
@@ -525,9 +561,17 @@ func (s *llmSched) loop() {
 					}
 				}
 				var err error
-				if fresh {
+				switch {
+				case len(in.Images) > 0:
+					if fresh {
+						if err = s.g.Reset(); err != nil {
+							return err
+						}
+					}
+					logits, _, err = s.g.ExtendInput(in)
+				case fresh:
 					logits, _, err = s.g.Forward(chunk)
-				} else {
+				default:
 					logits, _, err = s.g.Extend(chunk)
 				}
 				if err == nil && take {
@@ -554,15 +598,16 @@ func (s *llmSched) loop() {
 			// Cancelled before the chunk ran: the device is where the held
 			// sequence says it is.
 		case fresh:
-			sl.held = append(sl.held[:0], chunk...)
+			sl.held = append(sl.held[:0], keys...)
 		case restore:
-			sl.held = append(sl.held[:ck.Past()], chunk...)
+			sl.held = append(sl.held[:ck.Past()], keys...)
 			s.restores++
 		default:
-			sl.held = append(sl.held, chunk...)
+			sl.held = append(sl.held, keys...)
 		}
 		if err == nil && take {
 			sl.ckpt = keep
+			sl.ckptKeys = append(sl.ckptKeys[:0], sl.held...)
 		}
 		if u.step {
 			s.lastStep = time.Now()
@@ -576,7 +621,7 @@ func (s *llmSched) loop() {
 				u.job.progress.prefilled += n
 			}
 		}
-		u.ids, u.fresh, u.restore = u.ids[n:], false, false
+		u.ids, u.images, u.fresh, u.restore = u.ids[n:], rest, false, false
 		if err != nil || len(u.ids) == 0 {
 			u.logits, u.err = logits, err
 			s.dropUnit(u)
@@ -689,7 +734,7 @@ func (s *llmSched) runSteps(batch []*llmUnit) {
 // pick is the scheduling policy: the next unit to run, or nil to wait. See
 // the file comment for the three rules.
 func (s *llmSched) pick() *llmUnit {
-	interactive := false
+	interactive := s.towers > 0
 	for i := range s.slots {
 		if j := s.slots[i].job; j != nil && j.class == classInteractive {
 			interactive = true
@@ -711,6 +756,25 @@ func (s *llmSched) pick() *llmUnit {
 	// Rule 1: an interactive job holds the device between its own units.
 	// Only when every interactive slot-holder is gone does background run.
 	return nil
+}
+
+// towerBegin says a request of this class is about to run its images through
+// the tower, and returns the call that says it has finished. Only the
+// interactive class is counted: a background request's tower is interleaved
+// with background units like any other background work.
+func (s *llmSched) towerBegin(class llmClass) func() {
+	if class != classInteractive {
+		return func() {}
+	}
+	s.mu.Lock()
+	s.towers++
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.towers--
+		s.wake.Broadcast()
+		s.mu.Unlock()
+	}
 }
 
 func (s *llmSched) dropUnit(u *llmUnit) {

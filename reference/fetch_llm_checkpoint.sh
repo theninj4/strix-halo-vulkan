@@ -55,4 +55,21 @@ if [ ! -f "$W/wiki.test.raw" ]; then
 fi
 echo "$(date -Is) ok   wikitext-2-raw/wiki.test.raw $(stat -c%s "$W/wiki.test.raw" 2>/dev/null || echo missing)"
 
+# The vision tower (LLM-VISION.md V0): llama.cpp's mmproj, which is what
+# serves, and the HF checkpoint's first shard, which holds all 333
+# `model.visual.*` tensors and is the fp32 oracle's weights
+# (reference/dump_llm_vision.py) along with the processor's configs.
+want "mmproj-BF16.gguf" 907542944 || exit 1
+V=$(dirname "$D")/Qwen3.8-Flash-Next-HF-vision
+mkdir -p "$V"
+for f in config.json preprocessor_config.json video_preprocessor_config.json \
+  tokenizer.json tokenizer_config.json chat_template.jinja; do
+  [ -f "$V/$f" ] || curl -sSL --fail -o "$V/$f" "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/$f"
+done
+H=model-00001-of-00131.safetensors
+if [ "$(stat -c%s "$V/$H" 2>/dev/null)" != 1040155944 ]; then
+  curl -sSL -C - --fail -o "$V/$H" "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/$H"
+fi
+echo "$(date -Is) ok   $(basename "$V")/$H $(stat -c%s "$V/$H" 2>/dev/null || echo missing)"
+
 echo "$(date -Is) ALL DONE"

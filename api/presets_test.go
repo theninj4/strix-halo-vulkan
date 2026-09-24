@@ -64,9 +64,9 @@ func TestPresetsRefuse(t *testing.T) {
 	}
 }
 
-// TestPresetsAreDefaults: the preset fills what the request left out and
-// nothing else, and the response names the preset.
-func TestPresetsAreDefaults(t *testing.T) {
+// TestPresetsOverride: what the preset sets replaces the request's, what it
+// leaves out stays the request's, and the response names the preset.
+func TestPresetsOverride(t *testing.T) {
 	ps, err := LoadPresets("testdata/models.ini")
 	if err != nil {
 		t.Fatal(err)
@@ -76,19 +76,23 @@ func TestPresetsAreDefaults(t *testing.T) {
 	body := chatBody(user("hi"))
 	body["model"] = "chatting"
 	body["temperature"] = 0
+	body["seed"] = 7
 	body["chat_template_kwargs"] = map[string]any{"enable_thinking": true}
 	rec := do(t, s, jsonRequest("POST", "/v1/chat/completions", body))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
-	if *b.req.Temperature != 0 {
-		t.Errorf("the preset overrode the request's temperature: %v", *b.req.Temperature)
+	if *b.req.Temperature != 0.7 {
+		t.Errorf("the request's temperature beat the preset's: %v", *b.req.Temperature)
 	}
 	if b.req.TopP == nil || *b.req.TopP != 0.8 || b.req.PresencePenalty == nil || *b.req.PresencePenalty != 1.5 {
-		t.Errorf("the preset's defaults did not arrive: top_p %v presence %v", b.req.TopP, b.req.PresencePenalty)
+		t.Errorf("the preset's values did not arrive: top_p %v presence %v", b.req.TopP, b.req.PresencePenalty)
 	}
-	if th, _ := b.req.Thinking(); th.Off {
-		t.Errorf("the request asked to think and the preset turned it off")
+	if b.req.Seed == nil || *b.req.Seed != 7 {
+		t.Errorf("the request's seed, which the preset does not set, was lost: %v", b.req.Seed)
+	}
+	if th, _ := b.req.Thinking(); !th.Off {
+		t.Errorf("the request's enable_thinking beat the preset's: %+v", th)
 	}
 	var got CompletionResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
@@ -115,9 +119,8 @@ func TestPresetsAreDefaults(t *testing.T) {
 	}
 }
 
-// TestPresetThinkingOffWins: the top-level reasoning_effort a client sends to
-// every model does not make a non-thinking preset think, in either API's
-// spelling of it.
+// TestPresetThinkingOffWins: nothing a client sends makes a non-thinking
+// preset think, in any API's spelling of it.
 func TestPresetThinkingOffWins(t *testing.T) {
 	ps, err := LoadPresets("testdata/models.ini")
 	if err != nil {
@@ -133,8 +136,12 @@ func TestPresetThinkingOffWins(t *testing.T) {
 	}{
 		{"/v1/chat/completions", map[string]any{"model": "instruct", "messages": []any{user("hi")},
 			"reasoning_effort": "medium"}},
+		{"/v1/chat/completions", map[string]any{"model": "chatting", "messages": []any{user("hi")},
+			"reasoning_effort": "high", "chat_template_kwargs": map[string]any{"enable_thinking": true}}},
 		{"/v1/responses", map[string]any{"model": "chatting", "input": "hi",
 			"reasoning": map[string]any{"effort": "high"}}},
+		{"/v1/messages", map[string]any{"model": "instruct", "max_tokens": 16,
+			"messages": []any{user("hi")}, "thinking": map[string]any{"type": "enabled"}}},
 	} {
 		rec := do(t, s, jsonRequest("POST", c.path, c.body))
 		if rec.Code != http.StatusOK {
@@ -144,12 +151,12 @@ func TestPresetThinkingOffWins(t *testing.T) {
 			t.Errorf("%s: a non-thinking preset thinks: %+v", c.path, th)
 		}
 	}
-	// A thinking preset still takes the client's effort.
+	// A thinking preset keeps its own effort too.
 	body := chatBody(user("hi"))
 	body["model"] = "coding"
 	body["reasoning_effort"] = "low"
 	do(t, s, jsonRequest("POST", "/v1/chat/completions", body))
-	if th, _ := b.req.Thinking(); th.Off || th.Effort != "low" {
+	if th, _ := b.req.Thinking(); th.Off || th.Effort != "xhigh" {
 		t.Errorf("coding with reasoning_effort low: %+v", th)
 	}
 }
