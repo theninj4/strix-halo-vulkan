@@ -27,7 +27,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
-| `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`) |
+| `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -648,6 +648,11 @@ client sees:
 - **An edit with no `size` follows the last reference image's aspect ratio**
   at the condition area, which is what diffusers does. It is not the server's
   default size, and it is not the picture's own pixel dimensions either.
+- **`background` means what it means on a generation.** `"transparent"`
+  rewrites the prompt and keeps the result's alpha plane; anything else
+  composites it over white. A reference image's own alpha reaches the model
+  either way, because the VAE encodes all four channels, so a transparent
+  PNG sent in is seen as transparent whatever `background` says.
 
 `-edits N` is residency and not a feature flag: it stages the vision tower
 and the VAE encoder (~1.4 GB together) and sizes the transformer's prefix KV

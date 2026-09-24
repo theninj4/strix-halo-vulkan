@@ -114,6 +114,12 @@ type ImageEditRequest struct {
 	// would quietly do something else; parsed, a non-zero value is a 400
 	// that explains what changed.
 	Strength float64 `json:"strength,omitempty"`
+	// Background is the generation endpoint's field with the generation
+	// endpoint's meaning: "transparent" rewrites the prompt and keeps the
+	// alpha plane of the result, and anything else composites it over white.
+	// A reference image's own alpha is fed to the model either way -- the VAE
+	// encodes all four channels -- so this is about the output only.
+	Background string `json:"background,omitempty"`
 
 	ResponseFormat    string `json:"response_format,omitempty"`
 	OutputFormat      string `json:"output_format,omitempty"`
@@ -628,6 +634,10 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	if !s.checkStreaming(ctx, w, geo, req.Stream, req.PartialImages) {
 		return
 	}
+	transparent, ok := s.imageBackground(ctx, w, req.Background, out.format)
+	if !ok {
+		return
+	}
 
 	// The geometry. With a `size` this is the generation endpoint's rule;
 	// with none it is left to the backend, which takes the last reference's
@@ -650,7 +660,7 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, &imageRun{
 		prompt: req.Prompt, width: width, height: height, steps: req.Steps, seed: req.Seed,
 		n: n, format: out.format, compression: out.compression,
-		stream: req.Stream, partials: req.PartialImages,
+		stream: req.Stream, partials: req.PartialImages, transparent: transparent,
 		init: refs,
 	})
 }
@@ -732,6 +742,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 	req.AspectRatio = r.FormValue("aspect_ratio")
 	req.ResponseFormat = r.FormValue("response_format")
 	req.OutputFormat = r.FormValue("output_format")
+	req.Background = r.FormValue("background")
 	req.User = r.FormValue("user")
 	for _, f := range []struct {
 		name string

@@ -626,6 +626,10 @@ func TestImageEditRefusals(t *testing.T) {
 		{"a strength", ImageEditRequest{Prompt: "p", Image: StringList{good}, Strength: 0.5}, 400, "strength"},
 		{"a url response", ImageEditRequest{Prompt: "p", Image: StringList{good}, ResponseFormat: "url"}, 400, "b64_json"},
 		{"n past the cap", ImageEditRequest{Prompt: "p", Image: StringList{good}, N: 9}, 400, "n is 9"},
+		{"a transparent jpeg", ImageEditRequest{Prompt: "p", Image: StringList{good},
+			Background: "transparent", OutputFormat: "jpeg"}, 400, "no alpha channel"},
+		{"an unknown background", ImageEditRequest{Prompt: "p", Image: StringList{good},
+			Background: "checkered"}, 400, "background"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := &Server{Image: &fakeImage{geo: editGeo()}}
@@ -722,4 +726,64 @@ func TestImageEditStreams(t *testing.T) {
 	if len(fake.reqs[0].Init) == 0 {
 		t.Error("the streamed run was not given the picture")
 	}
+}
+
+// TestImageEditBackground is `background` on an edit, which means what it
+// means on a generation: "transparent" is the one value that keeps the
+// result's alpha plane, and it arrives the same over either encoding.
+func TestImageEditBackground(t *testing.T) {
+	for _, c := range []struct {
+		background string
+		want       bool
+	}{{"", false}, {"auto", false}, {"opaque", false}, {"transparent", true}} {
+		t.Run("json "+c.background, func(t *testing.T) {
+			fake := &fakeImage{geo: editGeo()}
+			s := &Server{Image: fake}
+			rec, _ := edit(t, s, ImageEditRequest{
+				Prompt: "p", Image: StringList{pngOf(t, 64, 64)}, Background: c.background,
+			})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if fake.reqs[0].Transparent != c.want {
+				t.Errorf("background %q reached the backend as Transparent=%v, want %v",
+					c.background, fake.reqs[0].Transparent, c.want)
+			}
+		})
+	}
+
+	t.Run("multipart", func(t *testing.T) {
+		raw, err := base64.StdEncoding.DecodeString(pngOf(t, 64, 64))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		part, err := mw.CreateFormFile("image", "in.png")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write(raw); err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range map[string]string{"prompt": "p", "background": "transparent"} {
+			if err := mw.WriteField(k, v); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := mw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fake := &fakeImage{geo: editGeo()}
+		s := &Server{Image: fake}
+		req := httptest.NewRequest("POST", "/v1/images/edits", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		rec := do(t, s, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body)
+		}
+		if !fake.reqs[0].Transparent {
+			t.Error("the form's background \"transparent\" did not reach the backend")
+		}
+	})
 }
