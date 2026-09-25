@@ -24,5 +24,8 @@ Ultimately we want to be able to run these tasks:
   5. Compute embeddings via Qwen's `Qwen3-Embedding-0.6B`:
     * https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
     * https://arxiv.org/html/2506.05176v3
+  6. Classification via `kev-4b`:
+    * https://huggingface.co/jaredpalmer/kev-4b
+    * https://archerhume.com/posts/jevs-architecture-unmasked
 
 We will ultimately serve up a HTTP API serving these features, in Go.
