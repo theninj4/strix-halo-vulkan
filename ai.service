@@ -5,17 +5,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=###
-; The LLM machine's line (research/p18-full-context.md, CONCURRENCY.md): three
-; conversations at once, each with the model's whole trained context, 262 144
-; cells (7.3 GB of KV cache a slot, C6). Arenas hold 8192-token batches, which
-; cost decode nothing (P16); a background prefill is cut into 2048-token chunks
-; so a voice command waits at most ~2 s (C3, decided over 1024). One slot is
-; reserved for interactive requests (X-Priority: interactive or service_tier
-; "priority"), which restore their system prompt's checkpoint (C4); unmarked
-; requests are background, and concurrent decodes share a pass (C5).
-; ~98 GB resident, ~68 s to come up.
 ;ExecStart=###/ai -addr 0.0.0.0:11434 -token= -llm -llm-ctx 262144 -llm-batch 8192 -llm-slots 3 -llm-preempt-chunk 2048 -llm-reserve 1 -llm-class background -llm-mmproj models/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf
-ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 3 -wyoming 0.0.0.0:10300
+ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 3 -kev -wyoming 0.0.0.0:10300
 Restart=always
 RestartSec=1
 

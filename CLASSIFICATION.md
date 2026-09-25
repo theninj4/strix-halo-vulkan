@@ -762,4 +762,9 @@ GEMM rung. Where things are:
 - Next: nothing is known to be wrong. The open levers are the int8 bank's
   −0.19 pp (K8) against its 1.2–1.4x, and speed: a long pass is ~70% GEMMs
   at ~35 TFLOPS, and the README ticket is 52 ms, bounded by the int8 GEMMs'
-  read rate. `-kev` is not in ai.service yet.
+  read rate.
+- **Deployed 2026-09-25:** `-kev` is on the live `ai.service` line
+  (small-verticals machine, beside embed/tts/stt/image). Kev stages in
+  9.5 s of the ~54 s startup. Over HTTP the README ticket is 54 ms new and
+  47 ms again, within 0.0018 of Kev's fp32, and `/v1/models` lists
+  `kev-latest` and `jev-latest`.
