@@ -26,6 +26,7 @@ Ultimately we want to be able to run these tasks:
     * https://arxiv.org/html/2506.05176v3
   6. Classification via `kev-4b`:
     * https://huggingface.co/jaredpalmer/kev-4b
+    * https://github.com/jaredpalmer/kev
     * https://archerhume.com/posts/jevs-architecture-unmasked
 
 We will ultimately serve up a HTTP API serving these features, in Go.
