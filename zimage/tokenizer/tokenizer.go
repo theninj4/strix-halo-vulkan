@@ -51,6 +51,14 @@ type tokenizerJSON struct {
 		ID      int32  `json:"id"`
 		Content string `json:"content"`
 	} `json:"added_tokens"`
+	PreTokenizer struct {
+		Type          string       `json:"type"`
+		Pattern       splitPattern `json:"pattern"`
+		Pretokenizers []struct {
+			Type    string       `json:"type"`
+			Pattern splitPattern `json:"pattern"`
+		} `json:"pretokenizers"`
+	} `json:"pre_tokenizer"`
 	Normalizer struct {
 		Type string `json:"type"`
 	} `json:"normalizer"`
@@ -84,7 +92,13 @@ func Load(dir string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("tokenizer: ignore_merges/byte_fallback are set and unimplemented")
 	}
 
+	marks, err := preTokenizerMarks(raw)
+	if err != nil {
+		return nil, err
+	}
+
 	t := &Tokenizer{
+		marks:      marks,
 		vocab:      raw.Model.Vocab,
 		ranks:      make(map[string]int, len(raw.Model.Merges)),
 		specialID:  make(map[string]int32, len(raw.AddedTokens)),
@@ -122,6 +136,45 @@ func Load(dir string) (*Tokenizer, error) {
 
 	t.buildByteAlphabet()
 	return t, nil
+}
+
+type splitPattern struct {
+	Regex string `json:"Regex"`
+}
+
+// The two Split regexes split() implements, as tokenizer.json states them.
+const (
+	qwen2Regex  = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+	qwen35Regex = `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
+)
+
+// preTokenizerMarks reads which of split()'s two pre-tokenizers the file asks
+// for. Until CLASSIFICATION.md K2 this was never read, and every file got
+// qwen2's: right for Z-Image, Qwen3-Embedding and Qwen-Image, which all
+// carry it, and silently wrong on combining marks for Qwen3.5's, which is the
+// qwen35 regex. A Split regex that is neither is an error, for the reason
+// FromVocab gives; a file with no Split regex at all keeps the old default.
+func preTokenizerMarks(raw tokenizerJSON) (bool, error) {
+	var regexes []string
+	if raw.PreTokenizer.Pattern.Regex != "" {
+		regexes = append(regexes, raw.PreTokenizer.Pattern.Regex)
+	}
+	for _, p := range raw.PreTokenizer.Pretokenizers {
+		if p.Type == "Split" && p.Pattern.Regex != "" {
+			regexes = append(regexes, p.Pattern.Regex)
+		}
+	}
+	marks := false
+	for _, r := range regexes {
+		switch r {
+		case qwen2Regex:
+		case qwen35Regex:
+			marks = true
+		default:
+			return false, fmt.Errorf("tokenizer: pre-tokenizer regex %q is not implemented (qwen2, qwen35)", r)
+		}
+	}
+	return marks, nil
 }
 
 // buildByteAlphabet is GPT-2's bytes_to_unicode: the 188 bytes that are

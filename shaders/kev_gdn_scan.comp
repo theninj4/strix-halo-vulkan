@@ -1,0 +1,126 @@
+// Kev (CLASSIFICATION.md K4/K5, K7.4): the gated delta rule, sequential over
+// one segment's tokens.
+//
+// Per token, HF's torch_recurrent_gated_delta_rule for v-head h, which reads
+// q/k head h / 2 (repeat_interleave: 32 v-heads over 16 k-heads, grouped):
+//
+//	S  <- S * exp(g)
+//	d  <- (v - k^T S) * beta
+//	S  <- S + k d^T
+//	o  <- q^T S                     (q already carries 1/sqrt(128))
+//
+// with S [k=128][v=128].
+//
+// **The shape is the LLM's `l8` (llm_dn_scan.comp), K7.4.** K4's version gave
+// one thread a whole column of S and walked 128-long dot products, 32
+// workgroups for a whole layer on a 40-CU device: 81 ms of a 2,439-token pass.
+// Here LPC lanes share a column, each holding 128/LPC of its elements in
+// registers, so a 64-lane wave owns 64/LPC columns, a head is 128*LPC/64
+// workgroups, and the two dot products are a short per-lane loop and a
+// clustered subgroup sum. Each lane loads its own q and k elements from
+// memory every token -- no LDS, no barrier -- which is the LLM's measured
+// winner (QKREG). LPC is compiled in; the host ladders it.
+//
+// **Segments.** Kev's row form runs each question from a copy of the state's
+// cache; here the state is segment 0 and a branch reads the state's final S
+// as its starting point without copying it. Dispatch 1 runs segment 0 from
+// zero (or from a cached S) and writes its final S; dispatch 2 runs every
+// branch at once from that S and throws its own final state away.
+//
+// Fields (dit_common.glsl):
+//
+//	inOff   kev_gdn_prep's planes (q, k, v, g, beta), stride span rows
+//	outOff  o [rows][4096]
+//	aux1    segment table, 4 uints a segment: first row, length, state slot, _
+//	dim     the stride between state slots (K7.5)
+//	aux0    first segment this dispatch runs (the grid's y is added to it)
+//	kOff    S for this layer, [32][128][128] as [head][k][v] (act arena)
+//	aux2    bit 0: start from S at kOff (else zero); bit 1: write the final S to kOff
+//
+// Grid: x = head * (128 / COLS) + column group, y = segment.
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "dit_common.glsl"
+
+#ifndef LPC
+#define LPC 8
+#endif
+
+#define DK 128u
+#define QK 2048u
+#define NV 32u
+#define WAVE 64u
+#define COLS (WAVE / LPC)        // columns a workgroup owns
+#define GROUPS (DK / COLS)       // workgroups a head
+#define RPL (DK / LPC)           // state elements a lane holds
+
+layout(local_size_x = 64) in;
+
+void main() {
+    uint h = gl_WorkGroupID.x / GROUPS;
+    uint col = (gl_WorkGroupID.x % GROUPS) * COLS + gl_LocalInvocationID.x / LPC; // v index j
+    uint lane = gl_LocalInvocationID.x % LPC;
+    uint seg = pc.aux0 + gl_WorkGroupID.y;
+    uint first = floatBitsToUint(act[pc.aux1 + seg * 4u]);
+    uint len = floatBitsToUint(act[pc.aux1 + seg * 4u + 1u]);
+    uint slot = floatBitsToUint(act[pc.aux1 + seg * 4u + 2u]); // the request's state slot (K7.5)
+
+    uint S = pc.span;
+    uint qIn = pc.inOff, kIn = qIn + S * QK, vIn = kIn + S * QK;
+    uint gIn = vIn + S * 4096u, bIn = gIn + S * NV;
+    uint kh = h / 2u;
+    uint st = pc.kOff + slot * pc.dim + h * DK * DK + col; // element (i, col) at st + i * DK; dim is the slot stride
+
+    // This lane's rows of the column: i = r * LPC + lane.
+    float s[RPL];
+    if ((pc.aux2 & 1u) != 0u) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] = act[st + (r * LPC + lane) * DK];
+        }
+    } else {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] = 0.0;
+        }
+    }
+
+    for (uint n = 0u; n < len; n++) {
+        uint t = first + n;
+        uint qb = qIn + t * QK + kh * DK + lane, kb = kIn + t * QK + kh * DK + lane;
+        float qr[RPL], kr[RPL];
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            qr[r] = act[qb + r * LPC];
+            kr[r] = act[kb + r * LPC];
+        }
+        float decay = exp(act[gIn + t * NV + h]);
+        float beta = act[bIn + t * NV + h];
+        float v = act[vIn + t * 4096u + h * DK + col];
+
+        float kv = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] *= decay;
+            kv += s[r] * kr[r];
+        }
+        kv = subgroupClusteredAdd(kv, LPC);
+        float d = (v - kv) * beta;
+        float o = 0.0;
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            s[r] += kr[r] * d;
+            o += s[r] * qr[r];
+        }
+        o = subgroupClusteredAdd(o, LPC);
+        if (lane == 0u) {
+            act[pc.outOff + t * 4096u + h * DK + col] = o;
+        }
+    }
+
+    if ((pc.aux2 & 2u) != 0u) {
+        [[unroll]] for (uint r = 0u; r < RPL; r++) {
+            act[st + (r * LPC + lane) * DK] = s[r];
+        }
+    }
+}

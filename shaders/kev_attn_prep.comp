@@ -1,0 +1,147 @@
+// Kev (CLASSIFICATION.md K4): the gated full-attention layer's front end, one
+// token a workgroup.
+//
+// Input is the fused projection P = x @ [q_proj | k_proj | v_proj]^T, row
+// stride aux0. q_proj emits a query *and* a gate per head, interleaved by
+// head (HF's view(..., -1, head_dim * 2) then chunk):
+//
+//	[h*512, h*512+256)       query head h, 16 heads
+//	[h*512+256, h*512+512)   gate head h, read by kev_attention
+//	[8192, 9216)             k, 4 heads of 256
+//	[9216, 10240)            v
+//
+// q and k get the per-head RMS norm with the zero-centred weight, which the
+// loader stores as (1 + w), then NeoX rope on the **first 64** of their 256
+// dims (partial_rotary_factor 0.25): for i < 32, (x_i, x_{i+32}) rotates by
+// pos * theta^(-i/32), theta = 1e7. Qwen3.5's M-RoPE collapses to this on
+// text: all three position rows are the same. The cos/sin table is the
+// host's, [pos][32] each, built as HF builds it (fp32 inv_freq times fp32
+// position), because a GPU cos of an 8k-radian argument is not HF's.
+//
+// Fields:
+//
+//	inOff  P                     aux0  P's row stride
+//	outOff q, fp32 [rows][16][256], pre-scaled by 1/sqrt(256), for kev_attention
+//	bOff   q again, fp16 in the fp16 arena, pre-scaled by log2(e)/sqrt(256), for
+//	       kev_attn_wmma (which exponentiates with exp2)
+//	kOff   the layer's key cache, fp16 [cells][4][256] in the fp16 arena (K7.3)
+//	vOff   its value cache, the same
+//	wOff   q_norm (1+w) [256], then k_norm (1+w) [256]
+//	aux0   P stride     aux1  token metadata (pos, seg, start, cell)
+//	aux2   cos table (fp32 arena), sin table follows at +span*32
+//	span   the table's rows (positions)
+//	(each row's cache cell is the fourth word of its metadata: K7.3 lays
+//	branches out at 64-aligned cells)
+//	eps    tokens
+//
+// **The padding after a segment is zeroed in V** (K7.7). A segment ends
+// short of a 64-cell boundary, and kev_attn_wmma's key block then holds the
+// segment's last keys and cells up to the boundary that only an earlier pass
+// wrote. The row masks them -- P is exactly 0 there -- but 0 x a stale V
+// still moves the matrix cores' sum: an fp16 ulp of one output, which is
+// how a request's answers came to depend on what ran before it. Zero is
+// what those cells hold on a fresh device. So the last row of a segment
+// clears V from its cell to the boundary, and the first branch row of a
+// request whose state is resident (restored from the cache, or left by an
+// earlier pass) clears the state's padding. K needs nothing: a masked
+// key's score never reaches P.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 256u
+#define NQ 16u
+#define NKV 4u
+
+layout(local_size_x = 256) in;
+
+shared float red[256];
+shared float xs[HD];
+
+float headSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+// norm + rope of one 256-wide head held one value a thread; returns this
+// thread's output value.
+float normRope(float x, uint wOff, uint pos) {
+    uint t = gl_LocalInvocationID.x;
+    float inv = inversesqrt(headSum(x * x) / float(HD) + uintBitsToFloat(pc.eps));
+    float y = x * inv * wbuf[wOff + t];
+    xs[t] = y;
+    barrier();
+    float out_ = y;
+    if (t < 64u) {
+        uint i = t % 32u;
+        float c = wbuf[pc.aux2 + pos * 32u + i];
+        float s = wbuf[pc.aux2 + pc.span * 32u + pos * 32u + i];
+        if (t < 32u) {
+            out_ = y * c - xs[t + 32u] * s;
+        } else {
+            out_ = y * c + xs[t - 32u] * s;
+        }
+    }
+    barrier();
+    return out_;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint pos = floatBitsToUint(act[pc.aux1 + r * 8u]);
+    uint p = pc.inOff + r * pc.aux0;
+    uint cell = floatBitsToUint(act[pc.aux1 + r * 8u + 3u]); // this row's cache cell (K7.3)
+
+    for (uint h = 0u; h < NQ; h++) {
+        float y = normRope(act[p + h * 512u + t], pc.wOff, pos);
+        act[pc.outOff + (r * NQ + h) * HD + t] = y * 0.0625; // 1/sqrt(256)
+        hact[pc.bOff + (r * NQ + h) * HD + t] = float16_t(y * 0.0625 * 1.4426950408889634);
+    }
+    for (uint g = 0u; g < NKV; g++) {
+        float y = normRope(act[p + 8192u + g * HD + t], pc.wOff + HD, pos);
+        hact[pc.kOff + (cell * NKV + g) * HD + t] = float16_t(y);
+        hact[pc.vOff + (cell * NKV + g) * HD + t] = float16_t(act[p + 9216u + g * HD + t]);
+    }
+
+    // V padding (K7.7, above): [lo, hi) cells, 4 heads of 256 a cell.
+    uint seg = floatBitsToUint(act[pc.aux1 + r * 8u + 2u]);
+    uint lo = 0u, hi = 0u;
+    if (r + 1u >= pc.tokens || floatBitsToUint(act[pc.aux1 + (r + 1u) * 8u + 2u]) != seg) {
+        lo = cell + 1u; // the last row of its segment
+        hi = (lo + 63u) & ~63u;
+    }
+    for (uint i = lo * NKV * HD + t; i < hi * NKV * HD; i += 256u) {
+        hact[pc.vOff + i] = float16_t(0.0);
+    }
+    uint branch = floatBitsToUint(act[pc.aux1 + r * 8u + 1u]);
+    uint sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);
+    uint slot = floatBitsToUint(act[pc.aux1 + r * 8u + 6u]);
+    bool resident = floatBitsToUint(act[pc.aux1 + r * 8u + 7u]) == 0u;
+    // The first branch row of its request (a request's branches are
+    // contiguous and its state rows, when present, are not its neighbours).
+    bool first = r == seg && (r == 0u || floatBitsToUint(act[pc.aux1 + (r - 1u) * 8u + 6u]) != slot);
+    if (branch != 0u && resident && first && sHi > floatBitsToUint(act[pc.aux1 + r * 8u + 4u])) {
+        for (uint i = sHi * NKV * HD + t; i < ((sHi + 63u) & ~63u) * NKV * HD; i += 256u) {
+            hact[pc.vOff + i] = float16_t(0.0);
+        }
+    }
+}

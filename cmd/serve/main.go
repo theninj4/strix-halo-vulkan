@@ -11,6 +11,7 @@
 //	go run ./cmd/serve -tts -voice bm_george -addr :8080
 //	go run ./cmd/serve -stt -max-audio 300          # five-minute clips
 //	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
+//	go run ./cmd/serve -kev                         # System One classification (Kev-4B), ~9 GB resident
 //	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
@@ -167,6 +168,15 @@ func main() {
 	embedModel := flag.String("embed-model", "models/Qwen3-Embedding-0.6B", "embedding checkpoint directory")
 	embedTokens := flag.Int("embed-tokens", 512, "longest input the embedding arenas hold; longer inputs are truncated")
 
+	kevOn := flag.Bool("kev", false, "load Kev-4B and serve POST /v1/systemone (TypeSafe's System One, CLASSIFICATION.md)")
+	kevModel := flag.String("kev-model", "models/kev-4b", "Kev checkpoint directory: adapter, converted head, tokenizer")
+	kevBase := flag.String("kev-base", "models/Qwen3.5-4B-Base", "the Qwen3.5 base the Kev checkpoint was trained on")
+	kevTokens := flag.Int("kev-tokens", 8192, "the longest request one pass holds, in packed tokens (the state once plus every question)")
+	kevCache := flag.Int("kev-cache", 4, "states the prefix cache keeps, so a repeated text pays for its questions only; 0 turns it off")
+	kevCacheTokens := flag.Int("kev-cache-tokens", 4096, "the longest state the prefix cache keeps (32 KB of KV a token, plus 52.7 MB a state)")
+	kevBatch := flag.Int("kev-batch", 8, "the most requests one pass answers: a burst shares passes, a lone request waits for nothing (K7.5)")
+	kevFP16 := flag.Bool("kev-fp16", false, "stage Kev's weights as fp16 instead of int8: the control, 1.27x slower and 3.3 GB more")
+
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
 	maxAudio := flag.Float64("max-audio", 60, "longest clip the transcription arenas are sized for, in seconds")
@@ -199,7 +209,7 @@ func main() {
 			"that names none; diffusers' output_resolution")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn {
+	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -278,7 +288,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || (*tts && *ttsGPU)) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -333,6 +343,26 @@ func main() {
 		srv.Embedding = b
 		log.Printf("embed: %s, inputs to %d tokens, %s, in %v", *embedModel, b.MaxTokens(),
 			where(dev != nil), time.Since(start).Round(time.Millisecond))
+	}
+
+	if *kevOn {
+		if dev == nil {
+			log.Fatal("-kev needs the device; it has no CPU path")
+		}
+		start := time.Now()
+		b, err := backend.NewKev(backend.KevOptions{
+			Model: *kevModel, Base: *kevBase, Device: dev, MaxTokens: *kevTokens, FP16: *kevFP16,
+			CacheStates: cacheStates(*kevCache), CacheTokens: *kevCacheTokens, MaxBatch: *kevBatch,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		srv.SystemOne = b
+		slots, cached := b.Cache()
+		log.Printf("kev: %s on %s, %s weights, passes of %d tokens, %d cached states of up to %d tokens, in %v",
+			*kevModel, *kevBase, b.Bank(), b.MaxTokens(), slots, cached,
+			time.Since(start).Round(time.Millisecond))
 	}
 
 	if *imgOn {
@@ -550,7 +580,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 		for _, route := range []string{
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
-			"/v1/images/generations", "/v1/images/edits",
+			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
 		} {
 			log.Printf("  %s", route)
 		}
@@ -597,4 +627,13 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 		}
 		return nil
 	}
+}
+
+// cacheStates maps -kev-cache onto backend.KevOptions, where zero means the
+// default: 0 on the command line is "off".
+func cacheStates(n int) int {
+	if n <= 0 {
+		return -1
+	}
+	return n
 }

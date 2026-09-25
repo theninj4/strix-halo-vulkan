@@ -182,6 +182,18 @@ func Open(path string) (*File, error) {
 }
 
 // Close unmaps the file. Every Tensor.Data from it dangles afterwards.
+// Get returns one tensor of a single file, as Set.Get does for a checkpoint.
+func (f *File) Get(name string) (*Tensor, error) {
+	t, ok := f.tensors[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: no tensor %q in %s", name, f.Path)
+	}
+	return t, nil
+}
+
+// Names lists the file's tensors in header order.
+func (f *File) Names() []string { return f.order }
+
 func (f *File) Close() error {
 	if f.mapping == nil {
 		return nil

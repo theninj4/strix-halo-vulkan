@@ -1,0 +1,61 @@
+// Kev (CLASSIFICATION.md K4): the Gated DeltaNet's output norm, into the
+// fp16 A operand of out_proj.
+//
+// HF's Qwen3_5RMSNormGated over each v-head's 128 values:
+//
+//	y = o * rsqrt(mean(o^2) + 1e-6) * w * silu(z)
+//
+// **silu, not sigmoid**, and w is the plain weight (initialised to ones), not
+// the zero-centred (1 + w) the block norms use. qwen3.8-flash-next's layer
+// gates with a sigmoid (llm/deltanet.go), which is the one place this layer
+// differs from that one.
+//
+// Fields: inOff o [rows][4096]; kOff P (z at column 8192, row stride aux0);
+// wOff the norm weight [128]; outOff the fp16 A operand, row stride lda;
+// eps; tokens.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+shared float part[256];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    // 8 threads a head, 16 values a thread.
+    uint h = t / 8u, lane = t % 8u;
+    uint base = pc.inOff + r * 4096u + h * 128u;
+    float o[16];
+    float ss = 0.0;
+    for (uint i = 0u; i < 16u; i++) {
+        o[i] = act[base + lane * 16u + i];
+        ss += o[i] * o[i];
+    }
+    part[t] = ss;
+    barrier();
+    if (lane == 0u) {
+        float sum = 0.0;
+        for (uint i = 0u; i < 8u; i++) {
+            sum += part[t + i];
+        }
+        part[t] = sum;
+    }
+    barrier();
+    float inv = inversesqrt(part[h * 8u] / 128.0 + uintBitsToFloat(pc.eps));
+    for (uint i = 0u; i < 16u; i++) {
+        uint c = lane * 16u + i;
+        float z = act[pc.kOff + r * pc.aux0 + 8192u + h * 128u + c];
+        float y = o[i] * inv * wbuf[pc.wOff + c] * (z / (1.0 + exp(-z)));
+        hact[pc.outOff + r * pc.lda + h * 128u + c] = float16_t(y);
+    }
+}

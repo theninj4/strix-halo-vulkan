@@ -57,6 +57,7 @@ type Server struct {
 	Completion    CompletionBackend
 	Embedding     EmbeddingBackend
 	Image         ImageBackend
+	SystemOne     SystemOneBackend
 }
 
 // Handler builds the mux. It is a fresh *http.ServeMux rather than
@@ -85,6 +86,10 @@ func (s *Server) Handler() http.Handler {
 
 	// Input: EmbeddingRequest{}, Output: EmbeddingResponse{}
 	mux.Handle("POST /v1/embeddings", s.route(s.handleEmbeddings))
+
+	// TypeSafe's System One: typed questions about a text, answered with
+	// calibrated probabilities (systemone.go, CLASSIFICATION.md).
+	mux.Handle("POST /v1/systemone", s.route(s.handleSystemOne))
 
 	// Input: SpeechRequest{}, Output: SpeechResponse{}
 	mux.Handle("POST /v1/audio/speech", s.route(s.handleSpeech))

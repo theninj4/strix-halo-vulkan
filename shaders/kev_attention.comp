@@ -1,0 +1,91 @@
+// Kev (CLASSIFICATION.md K4/K5): gated full attention over a packed pass of
+// segments, with Kev's block-causal mask.
+//
+// A query in the state (segment 0) sees state keys up to itself. A query in
+// branch k sees **every state key** and its own branch's keys up to itself,
+// and nothing of any other branch. That is `kev.model.branch_mask`, and on
+// this hybrid backbone it is also exactly what Kev's row form computes, since
+// a row is `state + branch k` and nothing else.
+//
+// One workgroup a (query row, kv head): four 64-lane waves, one per query
+// head of the group (16 q heads over 4 kv heads), each lane holding 4 of the
+// 256 dims. A key's score is a subgroup sum; the softmax is online, in fp32,
+// natural base. The output is multiplied by sigmoid(gate) and written as fp16
+// into o_proj's A operand. This is the correctness kernel: it walks keys one
+// at a time. kev_attn_wmma is the fast one (K7.3); this stays as its control,
+// reading the same fp16 cache.
+//
+// Fields:
+//
+//	inOff   q fp32 [rows][16][256], pre-scaled      outOff  fp16 A operand, row stride lda
+//	kOff    key cache, fp16 [cells][4][256]         vOff    value cache (fp16 arena)
+//	aux1    token metadata (pos, seg, start row, cell)
+//	aux2    the state's cells are [0, aux2)
+//	gemmK   P (gates), row stride aux0              tokens
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 256u
+#define NQ 16u
+#define NKV 4u
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint g = gl_WorkGroupID.y;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint wave = gl_LocalInvocationID.x / 64u;
+    uint lane = gl_LocalInvocationID.x % 64u;
+    uint h = g * (NQ / NKV) + wave;
+    uint d0 = lane * 4u;
+
+    uint start = floatBitsToUint(act[pc.aux1 + r * 8u + 2u]);
+    uint cell = floatBitsToUint(act[pc.aux1 + r * 8u + 3u]); // this row's cache cell
+    uint sLo = floatBitsToUint(act[pc.aux1 + r * 8u + 4u]);   // its request's state cells
+    uint sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);   // (empty for a state row)
+
+    vec4 q = vec4(act[pc.inOff + (r * NQ + h) * HD + d0], act[pc.inOff + (r * NQ + h) * HD + d0 + 1u],
+                  act[pc.inOff + (r * NQ + h) * HD + d0 + 2u], act[pc.inOff + (r * NQ + h) * HD + d0 + 3u]);
+
+    float m = -1.0 / 0.0, l = 0.0;
+    vec4 acc = vec4(0.0);
+
+    // Two key ranges: the state's cells (a branch sees all of them, a state
+    // query those up to itself), then the query's own branch up to itself.
+    // Two key ranges (K7.5): the request's state cells, then the row's own
+    // segment up to itself. A state row's first range is empty.
+    for (uint pass = 0u; pass < 2u; pass++) {
+        uint lo = pass == 0u ? sLo : cell - (r - start);
+        uint hi = pass == 0u ? sHi : cell + 1u;
+        for (uint j = lo; j < hi; j++) {
+            uint kb = (j * NKV + g) * HD + d0;
+            vec4 k = vec4(hact[pc.kOff + kb], hact[pc.kOff + kb + 1u], hact[pc.kOff + kb + 2u], hact[pc.kOff + kb + 3u]);
+            float sc = subgroupAdd(dot(q, k));
+            float mNew = max(m, sc);
+            float corr = exp(m - mNew);
+            float p = exp(sc - mNew);
+            vec4 v = vec4(hact[pc.vOff + kb], hact[pc.vOff + kb + 1u], hact[pc.vOff + kb + 2u], hact[pc.vOff + kb + 3u]);
+            acc = acc * corr + p * v;
+            l = l * corr + p;
+            m = mNew;
+        }
+    }
+
+    vec4 o = acc / l;
+    uint gb = pc.gemmK + r * pc.aux0 + h * 512u + 256u + d0;
+    uint ob = pc.outOff + r * pc.lda + h * HD + d0;
+    for (uint i = 0u; i < 4u; i++) {
+        float gt = act[gb + i];
+        hact[ob + i] = float16_t(o[i] / (1.0 + exp(-gt)));
+    }
+}

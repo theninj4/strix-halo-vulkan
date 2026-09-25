@@ -3532,3 +3532,87 @@ var LLMMoECombine []byte
 
 //go:embed llm_move.spv
 var LLMMove []byte
+
+// Kev-4B, the classification vertical (CLASSIFICATION.md K4/K5). They share
+// dit_common.glsl's bindings and push block so that dit_gemm's fp16 ladder,
+// the RMS-norm pack, SwiGLU and the residual add record into the same command
+// buffers unchanged. What is new is the hybrid backbone's: the Gated DeltaNet
+// front end, its recurrence over a pass of segments, its SiLU-gated output
+// norm, and a head-256 gated attention under Kev's block-causal mask.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_gdn_prep.spv kev_gdn_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=1 -o kev_gdn_scan_l1.spv kev_gdn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=2 -o kev_gdn_scan_l2.spv kev_gdn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -o kev_gdn_scan_l4.spv kev_gdn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -o kev_gdn_scan_l8.spv kev_gdn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -o kev_gdn_scan_l16.spv kev_gdn_scan.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_gdn_norm.spv kev_gdn_norm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attn_prep.spv kev_attn_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attention.spv kev_attention.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_copy.spv kev_copy.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attn_wmma.spv kev_attn_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -o kev_gemm_q8_glu_m2.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DPLAIN -o kev_gemm_q8_rb_m2.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -o kev_gemm_q8_glu_m4.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DPLAIN -o kev_gemm_q8_rb_m4.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=8 -o kev_gemm_q8_glu_m8.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=8 -DPLAIN -o kev_gemm_q8_rb_m8.spv kev_gemm_q8_glu.comp
+
+//go:embed kev_gdn_prep.spv
+var KevGDNPrep []byte
+
+// KevGDNScan is kev_gdn_scan.comp by LPC, lanes a state column (K7.4).
+var KevGDNScan = map[int][]byte{1: kevGDNScanL1, 2: kevGDNScanL2, 4: kevGDNScanL4, 8: kevGDNScanL8, 16: kevGDNScanL16}
+
+//go:embed kev_gdn_scan_l1.spv
+var kevGDNScanL1 []byte
+
+//go:embed kev_gdn_scan_l2.spv
+var kevGDNScanL2 []byte
+
+//go:embed kev_gdn_scan_l4.spv
+var kevGDNScanL4 []byte
+
+//go:embed kev_gdn_scan_l8.spv
+var kevGDNScanL8 []byte
+
+//go:embed kev_gdn_scan_l16.spv
+var kevGDNScanL16 []byte
+
+//go:embed kev_gdn_norm.spv
+var KevGDNNorm []byte
+
+//go:embed kev_attn_prep.spv
+var KevAttnPrep []byte
+
+//go:embed kev_attention.spv
+var KevAttention []byte
+
+//go:embed kev_copy.spv
+var KevCopy []byte
+
+//go:embed kev_attn_wmma.spv
+var KevAttnWMMA []byte
+
+// The MLP's gate and up as one int8 GEMM with a SwiGLU epilogue (K7.6), and
+// the same kernel with a plain fp32 store (rb: row-block-fastest grid), at
+// BM = 32, 64, 128.
+
+//go:embed kev_gemm_q8_glu_m2.spv
+var KevGEMMQ8GLUM2 []byte
+
+//go:embed kev_gemm_q8_rb_m2.spv
+var KevGEMMQ8RBM2 []byte
+
+//go:embed kev_gemm_q8_glu_m4.spv
+var KevGEMMQ8GLUM4 []byte
+
+//go:embed kev_gemm_q8_rb_m4.spv
+var KevGEMMQ8RBM4 []byte
+
+//go:embed kev_gemm_q8_glu_m8.spv
+var KevGEMMQ8GLUM8 []byte
+
+//go:embed kev_gemm_q8_rb_m8.spv
+var KevGEMMQ8RBM8 []byte
+

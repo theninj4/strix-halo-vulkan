@@ -28,6 +28,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
+| `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](CLASSIFICATION.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -256,6 +257,15 @@ Two things would fix it, and both are measurements rather than arguments:
     -gpu         true             use the device where an adapter has a resident path
     -max-upload  128              largest body carrying a file, in MB
     -log-bodies  false            print request and response bodies in the access log
+
+    -kev             false        load Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) and serve /v1/systemone
+    -kev-model       models/kev-4b                 adapter, converted head (reference/convert_kev_head.py), tokenizer
+    -kev-base        models/Qwen3.5-4B-Base        the base, at the revision head.json names (1001bb4d)
+    -kev-tokens      8192         the longest request one pass holds: the state once plus every question
+    -kev-cache       4            states kept, so a repeated text pays for its questions only; 0 is off
+    -kev-cache-tokens 4096        the longest state kept (32 KB of KV a token, plus 52.7 MB a state)
+    -kev-batch       8            the most requests one pass answers; a lone request waits for nothing
+    -kev-fp16        false        stage the weights as fp16 instead of int8 (K7.1's control: 1.27x slower, 3.3 GB more)
 
     -llm             false        load qwen3.8-flash-next
     -llm-model       models/Qwen3.8-Flash-Next-GGUF/…-00001-of-00004.gguf
@@ -797,6 +807,64 @@ so the difference is whether a misspelt voice shows up in the log as
 `no voice "bm_geroge"; this checkpoint has 54` or as nothing at all. The
 connection survives it: a client that asked for the wrong thing can ask
 again.
+
+## System One is not an OpenAI envelope
+
+`POST /v1/systemone` is TypeSafe's contract, as
+[Kev](https://github.com/jaredpalmer/kev) serves it, and it is answered the
+way Kev answers it rather than translated into anything of ours:
+
+```json
+{"state": "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card.",
+ "model": "kev-latest",
+ "questions": {
+   "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                   "criteria": {"returns": "Exchanges, refunds, wrong or damaged items",
+                                "shipping": "Delivery status, delays, lost packages",
+                                "billing": "Charges, invoices, payment problems"}},
+   "escalate":    {"type": "noul",  "instructions": "Does this need urgent human attention?"},
+   "frustration": {"type": "score", "instructions": "How frustrated is the customer?",
+                   "criteria": ["Calm", "Frustrated", "Very angry"]}}}
+```
+
+gets `answers` keyed by question id, with a `noul` answer as p(yes), a `choice`
+as its argmax, `probabilities` and `confidence`, and a `score` as the expected
+level index with `legend`, `probabilities` and `confidence`. The response also
+carries `usage` and `latency_ms`, the model time. `usage.output_tokens` counts
+the serialised answers, not generated tokens (none are generated). The
+`x-typesafe-request-id` header is echoed, or minted when the caller sends
+none.
+
+- **The body is not decoded by `api`.** Key order in an object state, and
+  int-against-float in a number, both change the text the model reads, and
+  criteria order decides the option slots. So the bytes go to the backend,
+  which parses them by Kev's rules (`kev/value.go`).
+- **Invalid is 422**, as TypeSafe and Kev answer it: an unknown `type`,
+  missing criteria, 0 or more than 255 options, a question whose row (state
+  plus branch) is over 8,192 tokens, or a state or single question longer
+  than `-kev-tokens`. A longer *request* runs as several passes, which
+  answer bit-identically to one. A state over 8,191 tokens is truncated
+  silently, as Kev does.
+- **A repeated text is cached.** The last four states' KV and recurrent
+  state (up to 4096 tokens each, `-kev-cache`/`-kev-cache-tokens`) are kept
+  by token ids. A new question about a text already sent pays for its
+  question only, and gets the bits it would have got without the cache.
+  `latency_ms` shows it: a 2,269-token text is ~0.76 s new and ~0.09 s again.
+- **Concurrent requests share passes.** One worker takes whatever is
+  queued when the device frees up, up to `-kev-batch`, and runs it as one
+  pass, each request in its own state slot. Sixteen concurrent short
+  requests run at ~29/s against ~19.5/s one after another. `latency_ms` is
+  the pass's model time, so it grows with the batch. Answers can move by up
+  to ~6e-4 with the batch's composition (the matrix-core attention); no
+  argmax changed over 764 suite questions.
+- **`kev-latest` and `jev-latest`** both name this model. The second is the
+  SDK's default, so an unconfigured client works. `GET /v1/models` lists
+  both. TypeSafe's own `{"models": [...]}` card is not served, since the SDK
+  does not read it.
+- The questions are **isolated**. Rewriting or removing one leaves every
+  other answer bit-identical (`TestGPUQuestionsAreIsolated`). Options inside
+  one question are *not* independent, and reordering them can move the
+  answer. That is Kev's and Jev's behaviour, not a defect of this server.
 
 ## What is left
 

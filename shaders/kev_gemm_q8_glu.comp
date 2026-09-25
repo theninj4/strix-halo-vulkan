@@ -1,0 +1,151 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Kev (CLASSIFICATION.md K7.6): the MLP's gate and up projections as one
+// int8 GEMM whose epilogue is SwiGLU.
+//
+// Unfused, gate and up were two GEMMs writing [rows, 9216] fp32 each, and
+// dit_swiglu_f16 read both back to write silu(gate) * up as fp16 for down:
+// 40 ms of a 2,439-token pass for the swiglu pass alone, besides the two
+// fp32 writes. Here the host interleaves the weights -- every 64-column
+// group of the fused [18432, 2560] projection is 32 gate rows then the same
+// 32 up rows -- so a workgroup's four accumulator tiles are gate tiles 0-1
+// and up tiles 0-1 of the same 32 outputs, and the epilogue is element-wise
+// on two accumulators of one layout. It computes the same fp32 expression
+// dit_swiglu_f16 does, g / (1 + exp(-g)) * u, so the answer is the same
+// bits.
+//
+// Everything before the epilogue is llm_gemm.comp's plain int8 arm (-DQ8B,
+// MODE 2), line for line: int8 in the 16x16 fragment tiling with an fp16
+// scale per 32 k, the slab unpacked through LDS (see that file's header).
+//
+// **The grid is row-block fastest** (x = row block, y = column tile), the
+// other way round from llm_gemm.comp, and that is K7.6's second finding. At
+// 101 rows a BM = 64 kernel has two row blocks, and each reads the column's
+// int8 slab. llm_gemm runs every column of row block 0 before any of row
+// block 1, so the second read hits the 32 MB MALL only if the whole matrix
+// fits in it. Gate and up alone (23.6 MB each) did; fused (47 MB) they did
+// not, and the fused GEMM was 0.58 ms a layer against 0.48 for the pair.
+// With a column's row blocks adjacent, each slab comes from DRAM once
+// whatever the matrix's size.
+//
+// -DPLAIN drops the SwiGLU epilogue and stores C as fp32 (row stride gemmN),
+// so the same grid order serves the other projections.
+//
+// Fields (llm_common.glsl): xnOff A (fp16), lda; bOff the weight (bytes);
+// gemmM/N/K (N = 2 x 9216 for the GLU); outOff the fp16 A operand of down
+// (halves), row stride ldaLo -- or, PLAIN, C in the fp32 arena.
+
+#define DENSE_Q8 1
+#include "llm_common.glsl"
+
+#ifndef WM
+#define WM 4
+#endif
+#define WN 4                // two gate tiles, then their two up tiles
+#define BK_TILES 2
+
+#define TILE 16
+#define BM (WM * TILE)
+#define BN (WN * TILE)
+#define BK (BK_TILES * TILE)
+#define WAVE 64
+
+layout(local_size_x = WAVE) in;
+
+#define LDS_PAD 8
+#define LDS_ROW (BK + LDS_PAD)
+shared float16_t sQB[BN * LDS_ROW];
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+#define ACC_T coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ACC16_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+
+void main() {
+    uint wm0 = gl_WorkGroupID.x * BM;   // row block: the fast axis
+    uint wn0 = gl_WorkGroupID.y * BN;
+
+    ACC_T acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = ACC_T(0.0);
+        }
+    }
+
+    uint ktiles = pc.gemmK / TILE;
+    uint qw0 = pc.bOff >> 2;
+    uint sc0 = (pc.bOff + pc.gemmN * pc.gemmK) >> 1;
+    uint kgroups = pc.gemmK >> 5;
+    uint lane = gl_LocalInvocationID.x;
+    uint nt0 = wn0 / TILE;
+
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+        uint kt0 = k0 / TILE;
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            uint wbase = qw0 + ((nt0 + j) * ktiles + kt0) * 64u;
+            uint sbase = sc0 + (nt0 + j) * kgroups * TILE;
+            for (uint u = lane; u < BK_TILES * 64u; u += WAVE) {
+                uint kt = u >> 6;
+                uint b = (u & 63u) << 2;
+                uint n = b >> 4;
+                uint kk = b & 15u;
+                uint word = w8[wbase + u];
+                float d = float(w16[sbase + ((kt0 + kt) >> 1) * TILE + n]);
+                uint dst = (j * TILE + n) * LDS_ROW + kt * TILE + kk;
+                [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                    sQB[dst + t] = float16_t(float(bitfieldExtract(int(word), int(t * 8u), 8)) * d);
+                }
+            }
+        }
+        barrier();
+        [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
+            FRAG_A_T fragA[WM];
+            FRAG_B_T fragB[WN];
+            [[unroll]] for (uint i = 0u; i < WM; i++) {
+                coopMatLoad(fragA[i], hact, pc.xnOff + (wm0 + i * TILE) * pc.lda + k0 + kt * TILE,
+                    pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0u; j < WN; j++) {
+                coopMatLoad(fragB[j], sQB, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
+                    gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint i = 0u; i < WM; i++) {
+                [[unroll]] for (uint j = 0u; j < WN; j++) {
+                    acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+#ifdef PLAIN
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            coopMatStore(acc[i][j], act, pc.outOff + (wm0 + i * TILE) * pc.gemmN + wn0 + j * TILE, pc.gemmN,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#else
+    // SwiGLU: output column o0 + j*16 + c is gate tile j, up tile j + 2.
+    uint o0 = wn0 / 2u;
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < 2u; j++) {
+            ACC_T g = acc[i][j];
+            ACC_T u = acc[i][j + 2u];
+            ACC16_T h;
+            [[unroll]] for (uint e = 0u; e < g.length(); e++) {
+                h[e] = float16_t(g[e] / (1.0 + exp(-g[e])) * u[e]);
+            }
+            coopMatStore(h, hact, pc.outOff + (wm0 + i * TILE) * pc.ldaLo + o0 + j * TILE, pc.ldaLo,
+                gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#endif
+}

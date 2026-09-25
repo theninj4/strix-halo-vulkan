@@ -1,0 +1,165 @@
+// Kev (CLASSIFICATION.md K4): the Gated DeltaNet front end, one token a
+// workgroup, over a packed pass of segments.
+//
+// Input is the fused projection P = x @ [qkv | z | a | b]^T, row stride aux0:
+//
+//	[0, 8192)       mixed qkv, the depthwise conv's 8192 channels
+//	[8192, 12288)   z, read later by kev_gdn_norm
+//	[12288, 12320)  a, 32 v-heads
+//	[12320, 12352)  b
+//
+// Per token this is HF's Qwen3_5GatedDeltaNet up to the recurrence:
+// causal_conv1d (kernel 4, no bias) then SiLU, l2-normalised q and k heads
+// (rsqrt(sum x^2 + 1e-6), FLA's form) with q also scaled by 1/sqrt(128),
+// g = -exp(A_log) * softplus(a + dt_bias) and beta = sigmoid(b).
+//
+// **The conv's history is the segment's, not the pass's.** A state token
+// reads the three tokens before it (zeros before the state's start: a fresh
+// sequence). A branch token reads its own branch and then, across its start,
+// the *state's* last tokens -- never the previous branch, which is what sits
+// before it in the packed pass. That is Kev's row form, where every question
+// is `state + branch` and nothing else. The state's rows are rows
+// [0, aux2) of this pass; when aux2 is 0 (the state is cached, K7.2) the
+// history comes from the saved tail at vOff instead.
+//
+// **And the tail is written here.** A pass that holds the state stores its
+// last three conv *inputs* (P's first 8192 columns, oldest first) at vOff, so
+// a later pass of branches alone can read them. A state shorter than three
+// tokens leaves the leading rows as the host zeroed them.
+//
+// **Layout.** Consecutive threads take consecutive channels (a channel every
+// 256), so a wave's loads and stores are coalesced; the conv goes through
+// LDS, and the l2-norms are eight threads a head and a clustered sum. K7.6
+// measured the alternative -- 32 contiguous channels a thread, the norm a
+// 4-lane sum with no LDS -- at 5x slower (217 ms against 42 at 2,439
+// tokens): a lane walking its own cache line is uncoalesced.
+//
+// Bindings and push block are dit_common.glsl's. Fields:
+//
+//	inOff   P             aux0  P's row stride
+//	outOff  outputs, planes of span rows: q [2048] k [2048] v [4096] g [32] beta [32]
+//	wOff    conv taps [8192][4] (fp32 arena)      kOff  -exp(A_log) [32], then dt_bias [32] (fp32 arena)
+//	aux1    token metadata, 4 uints a row: pos, seg, segment start row, unused
+//	aux2    stateHi: the state's rows are [0, aux2) of this pass
+//	vOff    the conv tail [3][8192], oldest first: read when aux2 == 0, written when it is not
+//	tokens  rows in this pass          span  the plane stride (arena rows)
+
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "dit_common.glsl"
+
+#define CH 8192u
+#define QK 2048u
+#define NV 32u
+#define WG 256u
+
+layout(local_size_x = 256) in;
+
+shared float conv[CH];
+shared float inv[32];
+
+float silu(float x) { return x / (1.0 + exp(-x)); }
+
+float softplus(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
+
+// row of P holding the input `back` tokens before token r (back >= 1), or -1
+// for a zero, or -2 - i for row i of the cached tail.
+// Token metadata (K7.5), 8 words a row: pos, branch (0 a state row, 1 a
+// branch row), segment start row, cache cell, the request's state cells
+// [sLo, sHi), its state slot, and its state's end row in this pass + 0 (0 when
+// the state is not in the pass; a state row's is its own).
+uint meta(uint r, uint w) { return floatBitsToUint(act[pc.aux1 + r * 8u + w]); }
+
+int historyRow(uint r, uint back) {
+    uint start = meta(r, 2u);
+    int local = int(r - start) - int(back);
+    if (local >= 0) {
+        return int(start) + local;
+    }
+    if (meta(r, 1u) == 0u) {
+        return -1; // before the state: a fresh sequence
+    }
+    // Continue into this request's state, counting back from its end: its
+    // rows in this pass, or its slot's saved tail.
+    uint end = meta(r, 7u);
+    if (end > 0u) {
+        int s = int(end) + local;
+        return s >= int(end - (meta(r, 5u) - meta(r, 4u))) ? s : -1;
+    }
+    return local >= -3 ? -2 - (3 + local) : -1;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint rs = pc.aux0;
+    int h1 = historyRow(r, 1u), h2 = historyRow(r, 2u), h3 = historyRow(r, 3u);
+
+    uint tail = pc.vOff + meta(r, 6u) * pc.dim; // this request's slot: dim is the slot stride
+    uint end = meta(r, 7u);
+    if (meta(r, 1u) == 0u && r + 3u >= end) {
+        uint row = r + 3u - end;
+        for (uint c = t; c < CH; c += WG) {
+            act[tail + row * CH + c] = act[pc.inOff + r * rs + c];
+        }
+    }
+
+    for (uint c = t; c < CH; c += WG) {
+        // taps: w[c][0] is the oldest (x[r-3]) and w[c][3] this token.
+        float s = act[pc.inOff + r * rs + c] * wbuf[pc.wOff + c * 4u + 3u];
+        int hs[3] = int[3](h1, h2, h3);
+        for (uint j = 0u; j < 3u; j++) {
+            int h = hs[j];
+            float x = 0.0;
+            if (h >= 0) {
+                x = act[pc.inOff + uint(h) * rs + c];
+            } else if (h <= -2) {
+                x = act[tail + uint(-2 - h) * CH + c];
+            }
+            s += x * wbuf[pc.wOff + c * 4u + 2u - j];
+        }
+        conv[c] = silu(s);
+    }
+    barrier();
+
+    // 16 q heads then 16 k heads, 128 channels each: eight threads a head,
+    // sixteen channels a thread, then a clustered sum.
+    {
+        uint head = t / 8u, part = t % 8u;
+        float ss = 0.0;
+        for (uint i = 0u; i < 16u; i++) {
+            float v = conv[head * 128u + part + 8u * i];
+            ss += v * v;
+        }
+        ss = subgroupClusteredAdd(ss, 8u);
+        if (part == 0u) {
+            inv[head] = inversesqrt(ss + 1e-6);
+        }
+    }
+    barrier();
+
+    uint S = pc.span;
+    uint qOut = pc.outOff, kOut = qOut + S * QK, vOut = kOut + S * QK;
+    uint gOut = vOut + S * 4096u, bOut = gOut + S * NV;
+    const float qScale = 0.08838834764831845; // 1/sqrt(128)
+    for (uint c = t; c < QK; c += WG) {
+        act[qOut + r * QK + c] = conv[c] * inv[c / 128u] * qScale;
+        act[kOut + r * QK + c] = conv[QK + c] * inv[16u + c / 128u];
+    }
+    for (uint c = t; c < 4096u; c += WG) {
+        act[vOut + r * 4096u + c] = conv[2u * QK + c];
+    }
+    if (t < NV) {
+        float a = act[pc.inOff + r * rs + 12288u + t];
+        float b = act[pc.inOff + r * rs + 12320u + t];
+        act[gOut + r * NV + t] = wbuf[pc.kOff + t] * softplus(a + wbuf[pc.kOff + NV + t]);
+        act[bOut + r * NV + t] = 1.0 / (1.0 + exp(-b));
+    }
+}

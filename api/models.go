@@ -48,6 +48,9 @@ func (s *Server) backends() []Backend {
 	if s.Image != nil {
 		out = append(out, s.Image)
 	}
+	if s.SystemOne != nil {
+		out = append(out, s.SystemOne)
+	}
 	return out
 }
 

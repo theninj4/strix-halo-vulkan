@@ -1,0 +1,34 @@
+// Kev (CLASSIFICATION.md K7.2): move a cached state between the activation
+// arena, where a pass reads it, and the prefix cache's own buffer.
+//
+// The copy is on the device because the host reads these mapped arenas at
+// ~0.2 GB/s (research: the arena's reads), and a state is ~50 MB of
+// recurrent state plus its keys and values.
+//
+// Fields (dit_common.glsl): inOff the source, outOff the destination, dim
+// the word count, aux0 the direction: 0 fp32 arena -> cache, 1 cache -> fp32
+// arena, 2 fp16 arena -> cache, 3 cache -> fp16 arena (K7.3's KV). Offsets
+// are in 32-bit words everywhere, so an fp16 tensor moves as pairs of halves.
+// Everything is a bit copy -- floats move as their bits, never through
+// arithmetic. A grid-stride loop, so any length takes the same grid.
+
+#version 450
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HActU { uint hactu[]; };
+layout(binding = 4) buffer Cache { uint cache[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.dim; i += stride) {
+        switch (pc.aux0) {
+        case 0u: cache[pc.outOff + i] = floatBitsToUint(act[pc.inOff + i]); break;
+        case 1u: act[pc.outOff + i] = uintBitsToFloat(cache[pc.inOff + i]); break;
+        case 2u: cache[pc.outOff + i] = hactu[pc.inOff + i]; break;
+        default: hactu[pc.outOff + i] = cache[pc.inOff + i]; break;
+        }
+    }
+}
