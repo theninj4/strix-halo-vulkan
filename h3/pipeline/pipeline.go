@@ -1,13 +1,16 @@
-// Package pipeline runs a MiniMax-H3 t2va request end to end (VIDEO.md M8):
-// a prompt goes in, and 24 fps frames with a 32 kHz stereo soundtrack come
-// out, muxed to mp4 by ffmpeg.
+// Package pipeline runs a MiniMax-H3 request end to end (VIDEO.md M8, M10):
+// a prompt, and optionally a first and/or last keyframe (fl2va), go in, and
+// 24 fps frames with a 32 kHz stereo soundtrack come out, muxed to mp4 by
+// ffmpeg.
 //
 // It composes what M1–M7 built, and its own job is the order in which they
 // hold the machine. Everything resident at once is ~106 GB, so a request
 // runs as three stagings, each freed before the next is allocated
 // (decision 2):
 //
-//	text encoder  50 GB  staged, one forward, freed
+//	keyframes    0.4 GB  (fl2va) the video VAE's encoder, freed
+//	text encoder  50 GB  staged with the vision tower for fl2va, one
+//	                     forward, freed
 //	transformer   44 GB  staged (weights + arenas), N − 1 forwards, freed
 //	video VAE      7 GB  staged, the decode — the audio decode runs beside
 //	                     it on the CPU
@@ -22,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
 	"math/rand/v2"
 	"path/filepath"
 	"sync"
@@ -32,16 +36,24 @@ import (
 	"strix-halo-vulkan/h3/plan"
 	"strix-halo-vulkan/h3/textenc"
 	"strix-halo-vulkan/h3/vae"
+	qtextenc "strix-halo-vulkan/qimage/textenc"
+	"strix-halo-vulkan/qimage/vision"
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
 )
 
-// Request is one t2va generation. Zero values take the served defaults
-// (decision 6): 16:9 at a 480 short edge (864×480), 5 s, 20 steps.
+// Request is one t2va or fl2va generation. Zero values take the served
+// defaults (decision 6): 16:9 at a 480 short edge (864×480), 5 s, 20 steps.
 type Request struct {
 	Prompt string
+	// First and Last are fl2va's keyframes: the picture the video starts
+	// from and the one it ends on, either, both or neither (t2va). The
+	// first of them present sets the canvas's aspect ratio unless the
+	// request gives one, and is stretched onto the canvas; a second is
+	// cover-cropped onto it.
+	First, Last image.Image
 	// AspectW:AspectH and ShortEdge resolve the canvas as the pipeline's
 	// resolve_canvas_size does; Height and Width, when both are set, are
 	// taken as they are (multiples of 32).
@@ -56,9 +68,10 @@ type Request struct {
 	Steps int
 	Seed  uint64
 	// VideoNoise and AudioNoise replace the seeded draws — the transformer's
-	// video rows [rows, 96] and audio rows [2·n, 32] — so a gate can start
-	// from an oracle's noise (decision 8).
-	VideoNoise, AudioNoise []float32
+	// generated video rows [rows, 96] and audio rows [2·n, 32] — so a gate
+	// can start from an oracle's noise (decision 8). CondNoise does the same
+	// for the keyframe rows' noise augmentation, patchified like them.
+	VideoNoise, AudioNoise, CondNoise []float32
 }
 
 const (
@@ -78,7 +91,19 @@ type Resolved struct {
 	Steps         int
 	Tokens        []int32
 	Layout        *plan.Layout
+	// Keyframes are fl2va's pictures on the canvas, H·W·3 RGB in packed
+	// order, and Presentation is the conditioner's input with their vision
+	// blocks; both are nil for t2va.
+	Keyframes    [][]byte
+	Presentation *textenc.Presentation
 }
+
+// fl2va's vision blocks are laid out for the processor's 16-pixel patches
+// merged 2×2 before anything is staged; New checks the checkpoint agrees.
+const (
+	visionPatch = 16
+	visionMerge = 2
+)
 
 // Resolve validates a request and works out its shape.
 func Resolve(tok *tokenizer.Tokenizer, req *Request) (*Resolved, error) {
@@ -92,8 +117,14 @@ func Resolve(tok *tokenizer.Tokenizer, req *Request) (*Resolved, error) {
 	if r.Steps < 2 || r.Steps > 100 {
 		return nil, fmt.Errorf("h3: %d steps; 2–100", r.Steps)
 	}
+	keys, anchors := req.keyframeList()
 	if r.Height == 0 || r.Width == 0 {
 		aw, ah, se := req.AspectW, req.AspectH, req.ShortEdge
+		if (aw == 0 || ah == 0) && len(keys) > 0 {
+			// The canvas follows the geometry anchor's own aspect.
+			b := keys[0].Bounds()
+			aw, ah = float64(b.Dx()), float64(b.Dy())
+		}
 		if aw == 0 || ah == 0 {
 			aw, ah = 16, 9
 		}
@@ -128,15 +159,34 @@ func Resolve(tok *tokenizer.Tokenizer, req *Request) (*Resolved, error) {
 	}
 	r.LatentFrames = plan.LatentFrames(r.Frames)
 	r.AudioLatents = plan.AudioLatents(r.Frames)
-	if r.Tokens, err = textenc.EncodePrompt(tok, req.Prompt); err != nil {
-		return nil, err
-	}
-	tags := make([]int32, len(r.Tokens))
-	for i := range tags {
-		tags[i] = plan.TextTag
+	var tags []int32
+	if len(keys) == 0 {
+		if r.Tokens, err = textenc.EncodePrompt(tok, req.Prompt); err != nil {
+			return nil, err
+		}
+		tags = make([]int32, len(r.Tokens))
+		for i := range tags {
+			tags[i] = plan.TextTag
+		}
+	} else {
+		for i, k := range keys {
+			rgb, err := PlaceKeyframe(k, i, r.Height, r.Width)
+			if err != nil {
+				return nil, err
+			}
+			r.Keyframes = append(r.Keyframes, rgb)
+		}
+		grids := make([]qtextenc.Grid, len(keys))
+		for i := range grids {
+			grids[i] = textenc.ImageGrid(r.Height, r.Width, visionPatch)
+		}
+		if r.Presentation, err = textenc.NewPresentation(tok, req.Prompt, grids, visionMerge); err != nil {
+			return nil, err
+		}
+		r.Tokens, tags = r.Presentation.IDs, r.Presentation.Tags
 	}
 	lh, lw := r.Height/plan.SpatialCompression, r.Width/plan.SpatialCompression
-	if r.Layout, err = plan.NewLayout(tags, r.LatentFrames, lh, lw, r.AudioLatents, nil); err != nil {
+	if r.Layout, err = plan.NewLayout(tags, r.LatentFrames, lh, lw, r.AudioLatents, anchors); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -178,13 +228,15 @@ const DefaultMaxPrompt = 4096
 // Pipeline holds the checkpoint's host-side pieces and, when resident, its
 // device stagings.
 type Pipeline struct {
-	dir  string
-	dev  *vk.Device
-	opt  Options
-	tok  *tokenizer.Tokenizer
-	dcfg *dit.Config
-	pqc  *vae.PostQuantConv
-	avae *audiovae.Decoder
+	dir   string
+	dev   *vk.Device
+	opt   Options
+	tok   *tokenizer.Tokenizer
+	dcfg  *dit.Config
+	vcfg  *vision.Config
+	mrope qtextenc.MRopeSection
+	pqc   *vae.PostQuantConv
+	avae  *audiovae.Decoder
 
 	mu      sync.Mutex // one request holds the stagings at a time
 	dit     *dit.GPU
@@ -212,6 +264,18 @@ func New(dev *vk.Device, dir string, opt Options) (*Pipeline, error) {
 		return nil, err
 	}
 	if p.dcfg, err = dit.LoadConfig(filepath.Join(dir, "transformer")); err != nil {
+		return nil, err
+	}
+	// fl2va's conditioner: the vision tower's geometry, which Resolve
+	// assumes, and the interleaved mrope an image block needs.
+	if p.vcfg, err = vision.LoadConfig(filepath.Join(dir, "text_encoder")); err != nil {
+		return nil, err
+	}
+	if p.vcfg.PatchSize != visionPatch || p.vcfg.SpatialMergeSize != visionMerge {
+		return nil, fmt.Errorf("h3: the vision tower patches %d merged %d; fl2va is built for %d merged %d",
+			p.vcfg.PatchSize, p.vcfg.SpatialMergeSize, visionPatch, visionMerge)
+	}
+	if p.mrope, err = qtextenc.LoadMRope(filepath.Join(dir, "text_encoder")); err != nil {
 		return nil, err
 	}
 	if p.pqc, err = vae.LoadPostQuantConv(filepath.Join(dir, "vae")); err != nil {
@@ -384,7 +448,17 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	}()
 	start := time.Now()
 	progress(StageEncode, 0, 1)
-	cond, err := p.encode(ctx, r.Tokens)
+	var anchors *qwen.Mat
+	cond, err := func() (*qwen.Mat, error) {
+		if len(r.Keyframes) == 0 {
+			return p.encode(ctx, r)
+		}
+		var err error
+		if anchors, err = p.encodeKeyframes(ctx, between, r); err != nil {
+			return nil, err
+		}
+		return p.encode(ctx, r)
+	}()
 	res.Timings[StageEncode] = time.Since(start)
 	tabWG.Wait()
 	res.Timings[StageTables] = tabTook
@@ -413,7 +487,13 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		return nil, err
 	}
 	res.Timings[StageTransform] = time.Since(start)
-	video, audio := p.noise(req, lay)
+	video, audio, err := p.noise(req, lay, anchors)
+	if err != nil {
+		return nil, err
+	}
+	// The keyframe rows lead the video rows and are never stepped: the
+	// loop only writes the generated ones.
+	gen := lay.CondVideoRows * video.Cols
 	start = time.Now()
 	for f := range vs.Timesteps {
 		if err := ctx.Err(); err != nil {
@@ -430,12 +510,12 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 			return nil, err
 		}
 		res.StepDevice += took
-		vs.Step(f, v.Data, video.Data)
+		vs.Step(f, v.Data[gen:], video.Data[gen:])
 		as.Step(f, a.Data, audio.Data)
 		progress(StageStep, f+1, len(vs.Timesteps))
 	}
 	res.Timings[StageStep] = time.Since(start)
-	res.VideoLatents, res.AudioLatents = video.Data, audio.Data
+	res.VideoLatents, res.AudioLatents = video.Data[gen:], audio.Data
 	if !p.opt.Resident {
 		p.freeDiT()
 	}
@@ -451,7 +531,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		defer audioWG.Done()
 		res.Left, res.Right, audioErr = p.avae.Decode(audio.Data)
 	}()
-	frames, err := p.decodeVideo(ctx, between, r, video.Data)
+	frames, err := p.decodeVideo(ctx, between, r, video.Data[gen:])
 	audioWG.Wait()
 	if err != nil {
 		return nil, err
@@ -466,7 +546,12 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 }
 
 // encode stages the text encoder, runs the prompt through it and frees it.
-func (p *Pipeline) encode(ctx context.Context, ids []int32) (*qwen.Mat, error) {
+// An fl2va presentation first runs its keyframes through the vision tower,
+// staged beside it, and the encoder then reads them as a Qwen-Image edit
+// reads its references: merged rows in the pads, deepstack after layers
+// 0–2, 3-D positions.
+func (p *Pipeline) encode(ctx context.Context, r *Resolved) (*qwen.Mat, error) {
+	ids := r.Tokens
 	dir := filepath.Join(p.dir, "text_encoder")
 	cfg, err := textenc.LoadConfig(dir)
 	if err != nil {
@@ -477,6 +562,12 @@ func (p *Pipeline) encode(ctx context.Context, ids []int32) (*qwen.Mat, error) {
 		return nil, err
 	}
 	defer set.Close()
+	var conds []qtextenc.Condition
+	if r.Presentation != nil {
+		if conds, err = p.towerKeyframes(ctx, dir, r); err != nil {
+			return nil, err
+		}
+	}
 	enc, err := qwen.NewGPUEncoder(p.dev, set, cfg, textenc.Layers, len(ids), nil)
 	if err != nil {
 		return nil, err
@@ -488,10 +579,107 @@ func (p *Pipeline) encode(ctx context.Context, ids []int32) (*qwen.Mat, error) {
 	var cond *qwen.Mat
 	err = p.opt.Hold(func() error {
 		var err error
-		cond, err = enc.Forward(ids)
+		if r.Presentation == nil {
+			cond, err = enc.Forward(ids)
+			return err
+		}
+		rope, err := r.Presentation.MRope(cfg.HeadDim, cfg.RopeTheta, p.mrope)
+		if err != nil {
+			return err
+		}
+		cond, _, err = r.Presentation.EncodeGPU(enc, rope, conds, 0, nil)
 		return err
 	})
 	return cond, err
+}
+
+// towerKeyframes stages the vision tower, runs every keyframe through it
+// and frees it.
+func (p *Pipeline) towerKeyframes(ctx context.Context, dir string, r *Resolved) ([]qtextenc.Condition, error) {
+	cpu, err := vision.Load(dir, p.vcfg, 0)
+	if err != nil {
+		return nil, err
+	}
+	g := textenc.ImageGrid(r.Height, r.Width, visionPatch)
+	tower, err := vision.NewGPU(p.dev, cpu, g.H*g.W)
+	if err != nil {
+		return nil, err
+	}
+	defer tower.Destroy()
+	var conds []qtextenc.Condition
+	for _, rgb := range r.Keyframes {
+		planes, err := textenc.VisionPixels(rgb, r.Height, r.Width)
+		if err != nil {
+			return nil, err
+		}
+		pix, gh, gw, err := p.vcfg.Patchify(planes, r.Height, r.Width)
+		if err != nil {
+			return nil, err
+		}
+		var out *vision.Output
+		err = p.opt.Hold(func() error {
+			var err error
+			out, err = tower.Forward(ctx, pix, gh, gw)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		conds = append(conds, qtextenc.Condition{Merged: out.Merged, Deepstack: out.Deepstack})
+	}
+	return conds, nil
+}
+
+// encodeKeyframes stages the video VAE's encoder, encodes every keyframe to
+// its anchor latent (the posterior drawn under vae.KeyframeSeed, fp16,
+// normalised) and frees it. The result is the keyframe rows, patchified and
+// clean, [condRows, 96] in packed order.
+func (p *Pipeline) encodeKeyframes(ctx context.Context, between func() error, r *Resolved) (*qwen.Mat, error) {
+	dir := filepath.Join(p.dir, "vae")
+	cfg, err := vae.LoadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	th, tw := vae.TileExtent(r.Height, r.Width)
+	enc, err := vae.NewEncoder(p.dev, dir, th, tw, "")
+	if err != nil {
+		return nil, err
+	}
+	defer enc.Destroy()
+	enc.Between = between
+	var rows []float32
+	for _, rgb := range r.Keyframes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		x, err := vae.NormalizePixels(rgb, r.Height, r.Width)
+		if err != nil {
+			return nil, err
+		}
+		var moments *vae.Tensor
+		err = p.opt.Hold(func() error {
+			var err error
+			moments, _, err = enc.Encode(x)
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		z, err := cfg.SampleLatent(moments, vae.KeyframeSeed, nil)
+		if err != nil {
+			return nil, err
+		}
+		patched, err := vae.Patchify(z)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, patched...)
+	}
+	cols := 4 * cfg.LatentChannels
+	if len(rows) != r.Layout.CondVideoRows*cols {
+		return nil, fmt.Errorf("h3: %d keyframe values for %d keyframe rows", len(rows), r.Layout.CondVideoRows)
+	}
+	return &qwen.Mat{Rows: len(rows) / cols, Cols: cols, Data: rows}, nil
 }
 
 // stageDiT returns a transformer staged for at least rows rows and text
@@ -514,15 +702,25 @@ func (p *Pipeline) stageDiT(rows, text int) (*dit.GPU, error) {
 }
 
 // noise is the request's starting rows: the injected ones, or seeded
-// Gaussians, video first then audio, as the pipeline draws them.
-func (p *Pipeline) noise(req *Request, lay *plan.Layout) (video, audio *qwen.Mat) {
+// Gaussians drawn in the pipeline's order — the keyframes' augmentation,
+// then the video, then the audio. The keyframe rows are the anchors noised
+// to t = 0.999 (`scale_noise`: t·x + (1 − t)·n, in float32), and they stay
+// that way for the whole run.
+func (p *Pipeline) noise(req *Request, lay *plan.Layout, anchors *qwen.Mat) (video, audio *qwen.Mat, err error) {
 	video = qwen.NewMat(len(lay.Video), 96)
 	audio = qwen.NewMat(len(lay.Audio), 32)
+	nc := lay.CondVideoRows * video.Cols
+	if (anchors == nil) != (nc == 0) || (anchors != nil && len(anchors.Data) != nc) {
+		return nil, nil, fmt.Errorf("h3: keyframe latents %v for %d keyframe rows", anchors, lay.CondVideoRows)
+	}
 	rng := rand.New(rand.NewPCG(req.Seed, 0x4833))
 	for _, m := range []struct {
 		dst, inj []float32
-	}{{video.Data, req.VideoNoise}, {audio.Data, req.AudioNoise}} {
+	}{{video.Data[:nc], req.CondNoise}, {video.Data[nc:], req.VideoNoise}, {audio.Data, req.AudioNoise}} {
 		if m.inj != nil {
+			if len(m.inj) != len(m.dst) {
+				return nil, nil, fmt.Errorf("h3: %d injected noise values for %d", len(m.inj), len(m.dst))
+			}
 			copy(m.dst, m.inj)
 			continue
 		}
@@ -530,7 +728,11 @@ func (p *Pipeline) noise(req *Request, lay *plan.Layout) (video, audio *qwen.Mat
 			m.dst[i] = float32(rng.NormFloat64())
 		}
 	}
-	return video, audio
+	t := float32(plan.KeyframeNoiseAug)
+	for i := 0; i < nc; i++ {
+		video.Data[i] = float32(t*anchors.Data[i]) + float32((1-t)*video.Data[i])
+	}
+	return video, audio, nil
 }
 
 // decodeVideo unpatchifies and denormalises the video rows and decodes

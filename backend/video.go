@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -107,15 +108,35 @@ func (b *Video) Close() {
 // refused. OpenAI's default is 4 s and its clients send "4"; what they get
 // is 5.17 s, and the job's `seconds` says so. Past 15 s is refused: that is
 // a clip of a different length, not a rounding.
-func request(req *api.VideoRequest, seed int64) *pipeline.Request {
+//
+// A keyframe's frame_index is read against the requested length: 0 is the
+// first frame, and -1 or any index at or past the last requested frame is
+// the last (a client counting in the aligned 17n + 5 frames lands past it,
+// which is the same frame). fl2va pins nothing in between.
+func request(req *api.VideoRequest, seed int64) (*pipeline.Request, error) {
 	secs := req.Seconds
 	if secs != 0 && secs < plan.MinDuration {
 		secs = plan.MinDuration
 	}
-	return &pipeline.Request{
+	p := &pipeline.Request{
 		Prompt: req.Prompt, AspectW: req.AspectW, AspectH: req.AspectH, ShortEdge: req.ShortEdge,
 		Seconds: secs, Steps: req.Steps, Seed: uint64(seed),
 	}
+	last := int((cmp.Or(secs, pipeline.DefaultSeconds))*plan.FPS) - 1
+	for i, k := range req.Keyframes {
+		switch {
+		case k.FrameIndex == 0 && p.First == nil:
+			p.First = k.Image
+		case (k.FrameIndex == -1 || k.FrameIndex >= last) && p.Last == nil:
+			p.Last = k.Image
+		case k.FrameIndex == 0 || k.FrameIndex == -1 || k.FrameIndex >= last:
+			return nil, fmt.Errorf("two keyframes for the same end of the video: %w", api.ErrUnsupported)
+		default:
+			return nil, fmt.Errorf("keyframe %d pins frame %d; fl2va pins the first (0) and the last (-1, or %d here): %w",
+				i, k.FrameIndex, last, api.ErrUnsupported)
+		}
+	}
+	return p, nil
 }
 
 // PlanVideo resolves a request on the host: tokenises the prompt, fixes the
@@ -132,7 +153,11 @@ func (b *Video) PlanVideo(req *api.VideoRequest) (*api.VideoPlan, error) {
 	if seed < 0 {
 		return nil, fmt.Errorf("seed %d is negative: %w", seed, api.ErrUnsupported)
 	}
-	r, err := b.pipe.Resolve(request(req, seed))
+	preq, err := request(req, seed)
+	if err != nil {
+		return nil, err
+	}
+	r, err := b.pipe.Resolve(preq)
 	if err != nil {
 		// Every Resolve failure is the request's: steps, canvas, duration,
 		// a prompt past the cap, rows past the arenas.
@@ -162,12 +187,18 @@ func (c cost) total() time.Duration {
 // 38,247 (7.7 s predicted at 5,095, where 7.4 was measured). The fixed costs
 // are M8's: the encoder staged and run beside the tables (82 s), the
 // transformer's staging (53 s), and the VAE's (7 s) plus 2.5 ms a video row
-// of decode (38 s at 480p).
+// of decode (38 s at 480p). fl2va's keyframes add the VAE encoder and the
+// vision tower to the encode (M10: 88 s against 82 with one keyframe); their
+// rows are already in L.
 func estimate(r *pipeline.Resolved) cost {
 	L := float64(len(r.Layout.Pos))
 	fwd := 1.159e-3*L + 6.745e-8*L*L
+	encode := 82 * time.Second
+	if len(r.Keyframes) > 0 {
+		encode += 6 * time.Second
+	}
 	return cost{
-		encode:   82 * time.Second,
+		encode:   encode,
 		stage:    53 * time.Second,
 		forward:  time.Duration(fwd * float64(time.Second)),
 		forwards: r.Steps - 1,
@@ -177,7 +208,10 @@ func estimate(r *pipeline.Resolved) cost {
 
 // GenerateVideo runs a planned request and muxes it to dst.
 func (b *Video) GenerateVideo(ctx context.Context, req *api.VideoRequest, vp *api.VideoPlan, dst string, progress func(api.VideoProgress)) error {
-	preq := request(req, vp.Seed)
+	preq, err := request(req, vp.Seed)
+	if err != nil {
+		return err
+	}
 	r, err := b.pipe.Resolve(preq)
 	if err != nil {
 		return fmt.Errorf("%v: %w", err, api.ErrUnsupported)

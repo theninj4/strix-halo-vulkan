@@ -3675,3 +3675,26 @@ var H3VAEPackHD64 []byte
 
 //go:embed h3vae_attn_hd64.spv
 var H3VAEAttnHD64 []byte
+
+// MiniMax-H3's video encoder (VIDEO.md M10), which turns an fl2va keyframe
+// into its anchor latents: a causal 3-D CNN that, at one frame, is a 2-D CNN
+// on each filter's last temporal tap. Its convolutions pad by reflection,
+// so they are vae_conv2d.comp's REFLECT builds, and its norms are group
+// norms, which nothing else here has.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DREFLECT -DOC_BLOCK=32u -DIC_BLOCK=16u -o h3enc_conv_oc32.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DREFLECT -DOC_BLOCK=48u -DIC_BLOCK=8u -o h3enc_conv_oc48.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DREFLECT -DOC_BLOCK=16u -DIC_BLOCK=32u -o h3enc_conv_oc16.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o h3_groupnorm.spv h3_groupnorm.comp
+
+//go:embed h3enc_conv_oc32.spv
+var H3EncConvOC32 []byte
+
+//go:embed h3enc_conv_oc48.spv
+var H3EncConvOC48 []byte
+
+//go:embed h3enc_conv_oc16.spv
+var H3EncConvOC16 []byte
+
+//go:embed h3_groupnorm.spv
+var H3GroupNorm []byte

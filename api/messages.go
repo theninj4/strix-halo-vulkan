@@ -78,8 +78,8 @@ type AnthropicImageSource struct {
 }
 
 // imageURL is the source as the one form the backend reads: a data: URL
-// for base64, the URL itself otherwise (which the backend refuses unless it
-// is a data: URL, because it fetches nothing).
+// for base64, the URL itself otherwise, which the backend fetches as
+// Anthropic's API does.
 func (s *AnthropicImageSource) imageURL() (string, error) {
 	switch {
 	case s == nil:

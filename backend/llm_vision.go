@@ -22,11 +22,9 @@ package backend
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -166,37 +164,12 @@ func (v *llmVision) close() {
 	}
 }
 
-// requestImage is one image as the request sent it, in conversation order.
+// requestImage is one image as the request sent it, in conversation order:
+// its URL, and once fetched (util.FetchImage, before the tower is taken)
+// its bytes.
 type requestImage struct {
-	url string
-}
-
-// decodeDataURL reads `data:<type>;base64,<payload>`. A remote URL is
-// refused: this server does not fetch on a client's behalf (LLM-VISION.md
-// Q3), and an image that arrives as a link is one the client can send as
-// bytes.
-func decodeDataURL(url string) ([]byte, error) {
-	if !strings.HasPrefix(url, "data:") {
-		kind := url
-		if i := strings.Index(kind, ":"); i > 0 && i < 10 {
-			kind = kind[:i]
-		} else {
-			kind = "a non-data"
-		}
-		return nil, fmt.Errorf("an image given as a %s URL; this server does not fetch images, "+
-			"so send it inline as a data: URL (base64)", kind)
-	}
-	meta, payload, ok := strings.Cut(url[len("data:"):], ",")
-	if !ok || !strings.HasSuffix(meta, ";base64") {
-		return nil, fmt.Errorf("an image data: URL that is not base64")
-	}
-	b, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		if b, err = base64.RawStdEncoding.DecodeString(payload); err != nil {
-			return nil, fmt.Errorf("an image data: URL whose payload is not base64: %v", err)
-		}
-	}
-	return b, nil
+	url  string
+	data []byte
 }
 
 // encode turns one image into the prompt's rows. It returns the tower time
@@ -209,10 +182,7 @@ func decodeDataURL(url string) ([]byte, error) {
 // so what runs in its gaps is another interactive unit and never a
 // background prefill chunk.
 func (v *llmVision) encode(ctx context.Context, dev *Device, img requestImage) (llm.PromptImage, time.Duration, error) {
-	data, err := decodeDataURL(img.url)
-	if err != nil {
-		return llm.PromptImage{}, 0, fmt.Errorf("%v: %w", err, api.ErrUnsupported)
-	}
+	data := img.data
 	sum := sha256.Sum256(data)
 	hash := binary.LittleEndian.Uint64(sum[:8])
 	if p, ok := v.lookup(hash); ok {

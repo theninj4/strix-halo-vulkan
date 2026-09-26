@@ -47,8 +47,9 @@ open.
 
 **Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
 stereo sound** (`GOALS.md` item 7). The live plan and handoff is the root
-[`VIDEO.md`](VIDEO.md) (M-stages). M0–M9 are done: a prompt becomes an
-mp4 with sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
+[`VIDEO.md`](VIDEO.md) (M-stages). M0–M10 are done: a prompt, and
+optionally a first and/or last keyframe (`fl2va`, M10), becomes an mp4 with
+sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
 OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
 runs (speech beside it ≤ 0.27 s). It takes **35.6 s a forward at the served
 480p** (~14 min a request) and 143 s at the trained 768p (~2 h for 50 steps).
@@ -56,8 +57,8 @@ Deployed in `ai.service` beside the image model (2026-09-26), but **a
 request does not fit there yet**: at rest the service leaves ~35 GB
 available (image is 49.7 GB with `-edits 3`), and a video request peaks at
 50 GB (text encoder) and 44 GB (transformer), so it would fail or wake the
-OOM killer. Open: staging cost, keyframes (M10), performance (M11), a
-Context-IR stand-in (M12).
+OOM killer. Open: staging cost, performance (M11), a Context-IR stand-in
+(M12).
 
 - [ ] **Video in int8, to fit beside the image model.** Stage the Qwen3-VL-32B
   text encoder as an int8 bank (Kev K7.1's route: 50 → ~25 GB) *and* the

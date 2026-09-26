@@ -361,9 +361,11 @@ upload.
   - chat `image_url`;
   - Responses `input_image` (`image_url` string; `file_id` refused, no files);
   - Messages `image` (base64 source becomes a data URL; a url source passes
-    through and is refused).
+    through).
   **Q3 decided (default): remote URLs are refused** with the fix in the message
-  (send the bytes). Audio, video, files and documents stay refused with
+  (send the bytes). *Superseded 2026-09-26: the API follows OpenAI's
+  standard, which fetches an `image_url`, so http(s) URLs are fetched
+  (`util.FetchImage`, before the tower is taken); see Q3 below.* Audio, video, files and documents stay refused with
   specific reasons. So do images in a tool result or a system prompt (the
   template refuses the latter), and WebP (Q6). `MessageContent.Unreadable`
   replaced `NonText`. **Gates:** `TestImagesReachTheBackend` (all three doors
@@ -533,8 +535,10 @@ upload.
 - **Q2** Server default max-pixels. HF allows 16 384 tokens an image.
   **Defaulted to 4096** (`-llm-vision-tokens`, a 2048² picture, 3.1 s of tower)
   from V4's curve; yours to change.
-- **Q3** Remote image URLs: fetch or refuse? **Refused by default** (V8); a
-  fetch would be a flag with size and time caps.
+- ~~**Q3** Remote image URLs: fetch or refuse?~~ **Fetched** (2026-09-26,
+  the user's rule: the API does what OpenAI's does, and OpenAI fetches an
+  `image_url`). `util.FetchImage`: http(s) and data: URLs, 50 MB, 60 s,
+  5 redirects, 2xx; no flag. It was refused from V8 until then.
 - **Q4** Is the torchvision bicubic path actually what the *fast* processor
   runs on a uint8 PIL input, or does it go through Pillow first? Settled by
   reading `image_processing_qwen2_vl_fast.py` in V3.

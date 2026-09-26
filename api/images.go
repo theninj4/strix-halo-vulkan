@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -97,13 +98,19 @@ type ImageEditRequest struct {
 	// transformer's prefix. How many *this* server takes is residency and is
 	// reported as `max_reference_images`.
 	Image StringList `json:"image"`
-	// Mask is OpenAI's transparency mask. It is parsed so that a request
-	// carrying one gets told this server does not blend rather than getting a
-	// picture that quietly ignored it; see handleImageEdit.
-	Mask   string `json:"mask,omitempty"`
-	Prompt string `json:"prompt"`
-	Size   string `json:"size,omitempty"`
-	N      int    `json:"n,omitempty"`
+	// Images is OpenAI's JSON form of the same list: {"image_url": …} each,
+	// a fully qualified URL (fetched, as OpenAI fetches it) or a data: URL,
+	// or {"file_id": …}, refused because there are no files here. They
+	// follow Image's in the order given.
+	Images []json.RawMessage `json:"images,omitempty"`
+	// Mask is OpenAI's transparency mask, as base64 or as its
+	// {"image_url": …} object. It is parsed so that a request carrying one
+	// gets told this server does not blend rather than getting a picture that
+	// quietly ignored it; see handleImageEdit.
+	Mask   json.RawMessage `json:"mask,omitempty"`
+	Prompt string          `json:"prompt"`
+	Size   string          `json:"size,omitempty"`
+	N      int             `json:"n,omitempty"`
 	// Strength was SDEdit's knob — how much of the denoising schedule to run
 	// over the encoded picture — and Qwen-Image-2.1 has no such quantity: a
 	// reference conditions the whole trajectory instead of seeding a
@@ -582,7 +589,7 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, "prompt is empty; an edit is a prompt applied to a picture, so there is nothing to apply")
 		return
 	}
-	if req.Mask != "" {
+	if len(req.Mask) > 0 && string(req.Mask) != "null" && string(req.Mask) != `""` {
 		writeError(w, http.StatusNotImplemented, "not_implemented",
 			"mask is not implemented: Qwen-Image-2.1 conditions on whole reference images, and how a "+
 				"separate mask is fed to it is not in the reference implementation (IMAGE.md Q-o3). "+
@@ -595,20 +602,34 @@ func (s *Server) handleImageEdit(w http.ResponseWriter, r *http.Request) {
 			"of seeding it, and every denoising step runs. Send the request without it")
 		return
 	}
-	if len(req.Image) == 0 {
-		badRequest(ctx, w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image'")
+	if len(req.Image)+len(req.Images) == 0 {
+		badRequest(ctx, w, "no image: send multipart/form-data with an 'image' part, or JSON with a base64 'image' "+
+			"or OpenAI's 'images': [{\"image_url\": …}]")
 		return
 	}
-	if len(req.Image) > geo.MaxRefs {
-		badRequest(ctx, w, strconv.Itoa(len(req.Image))+" reference images; this server is started for "+
+	if n := len(req.Image) + len(req.Images); n > geo.MaxRefs {
+		badRequest(ctx, w, strconv.Itoa(n)+" reference images; this server is started for "+
 			strconv.Itoa(geo.MaxRefs)+". Every reference becomes rows of the transformer's prefix and its "+
 			"own share of the prefix KV cache, so the number is fixed when the server starts")
 		return
 	}
-	refs := make([]image.Image, 0, len(req.Image))
+	refs := make([]image.Image, 0, len(req.Image)+len(req.Images))
 	var kind string
-	for i, field := range req.Image {
-		raw, err := decodeImageField(field)
+	sources := make([]func() ([]byte, error), 0, len(req.Image)+len(req.Images))
+	for _, field := range req.Image {
+		sources = append(sources, func() ([]byte, error) { return decodeImageField(field) })
+	}
+	for _, ref := range req.Images {
+		sources = append(sources, func() ([]byte, error) {
+			u, err := imageRef(ref)
+			if err != nil {
+				return nil, err
+			}
+			return readImageRef(ctx, u)
+		})
+	}
+	for i, source := range sources {
+		raw, err := source()
 		if err != nil {
 			badRequest(ctx, w, "image "+strconv.Itoa(i)+": "+err.Error())
 			return
@@ -733,7 +754,7 @@ func parseImageEditForm(w http.ResponseWriter, r *http.Request, req *ImageEditRe
 	if fh := r.MultipartForm.File["mask"]; len(fh) > 0 {
 		// Only its presence matters: the handler refuses it either way, and
 		// reading a mask it will not use would be a megabyte for nothing.
-		req.Mask = "(a mask part)"
+		req.Mask = json.RawMessage(`"(a mask part)"`)
 	}
 
 	req.Model = r.FormValue("model")

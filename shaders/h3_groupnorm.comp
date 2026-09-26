@@ -1,0 +1,65 @@
+#version 450
+// GroupNorm over one frame of a channel-planar tensor, then an optional SiLU:
+// MiniMax-H3's video encoder (VIDEO.md M10), where every norm is a
+// torch.nn.GroupNorm(32, C, eps 1e-6, affine) applied per frame and all but
+// none are followed by a SiLU.
+//
+// One workgroup per group. A group's channels are adjacent planes, so its
+// C/groups * H * W values are one contiguous run: the statistics are two
+// strided passes over it (the mean, then the centred sum of squares, as
+// torch's two-pass CPU kernel computes them rather than E[x^2] - E[x]^2),
+// and a third pass writes the normalised, affine, activated values.
+//
+// wOff/bOff are gamma and beta, aux0 fuses the SiLU, aux1 is eps's bits.
+
+#include "vae_common.glsl"
+
+layout(local_size_x = 256) in;
+
+shared float red[256];
+
+float reduce(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint hw = pc.H * pc.W;
+    uint cpg = pc.C / pc.groups;
+    uint n = cpg * hw;
+    uint base = g * n;
+
+    float s = 0.0;
+    for (uint i = t; i < n; i += 256u) {
+        s += act[pc.inOff + base + i];
+    }
+    float mean = reduce(s) / float(n);
+
+    float q = 0.0;
+    for (uint i = t; i < n; i += 256u) {
+        float d = act[pc.inOff + base + i] - mean;
+        q += d * d;
+    }
+    float rstd = inversesqrt(reduce(q) / float(n) + uintBitsToFloat(pc.aux1));
+
+    for (uint i = t; i < n; i += 256u) {
+        uint c = g * cpg + i / hw;
+        float v = (act[pc.inOff + base + i] - mean) * rstd * wbuf[pc.wOff + c] + wbuf[pc.bOff + c];
+        if (pc.aux0 != 0u) {
+            v = v / (1.0 + exp(-v));
+        }
+        act[pc.outOff + base + i] = v;
+    }
+}

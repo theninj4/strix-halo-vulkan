@@ -3,9 +3,12 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -192,8 +195,15 @@ func TestVideoRejects(t *testing.T) {
 	s := newVideoServer(t, &fakeVideo{}, VideoJobsOptions{})
 	for name, body := range map[string]map[string]any{
 		"no prompt":     {"seconds": "8"},
-		"keyframes":     {"prompt": "p", "task": "fl2va"},
-		"conditions":    {"prompt": "p", "conditions": []any{map[string]any{"type": "image"}}},
+		"uri 404s":      {"prompt": "p", "task": "fl2va", "conditions": []any{map[string]any{"type": "image", "uri": missingURL(t)}}},
+		"file_id":       {"prompt": "p", "input_reference": map[string]any{"file_id": "file-abc"}},
+		"file uri":      {"prompt": "p", "conditions": []any{map[string]any{"type": "image", "uri": "file:///etc/passwd"}}},
+		"not an image":  {"prompt": "p", "conditions": []any{map[string]any{"type": "image", "uri": "data:image/png;base64,aGVsbG8="}}},
+		"video cond":    {"prompt": "p", "conditions": []any{map[string]any{"type": "video", "uri": pngDataURL(8, 8)}}},
+		"three frames":  {"prompt": "p", "conditions": []any{pngCond(0), pngCond(-1), pngCond(-1)}},
+		"t2va + frame":  {"prompt": "p", "task": "t2va", "conditions": []any{pngCond(0)}},
+		"ref2va":        {"prompt": "p", "task": "ref2va"},
+		"bad index":     {"prompt": "p", "conditions": []any{pngCond(-3)}},
 		"bad size":      {"prompt": "p", "size": "wide"},
 		"bad aspect":    {"prompt": "p", "target": map[string]any{"aspect_ratio": "16x9"}},
 		"bad seconds":   {"prompt": "p", "seconds": "eight"},
@@ -297,5 +307,89 @@ func TestVideoModelGeometry(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || len(resp.Data) != 1 ||
 		resp.Data[0].Video == nil || resp.Data[0].Video.DefaultSize != "864x480" {
 		t.Errorf("models: %v %s", err, rec.Body)
+	}
+}
+
+// pngBytes is a w×h PNG.
+func pngBytes(w, h int) []byte {
+	var buf bytes.Buffer
+	png.Encode(&buf, image.NewNRGBA(image.Rect(0, 0, w, h)))
+	return buf.Bytes()
+}
+
+func pngDataURL(w, h int) string {
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngBytes(w, h))
+}
+
+func pngCond(frame int) map[string]any {
+	return map[string]any{"type": "image", "uri": pngDataURL(16, 9), "role": "keyframe", "frame_index": frame}
+}
+
+// TestVideoKeyframes: fl2va's keyframes, from SGLang's conditions (the
+// README's shape) and from OpenAI's input_reference, reach the backend
+// decoded and with the frame they pin.
+func TestVideoKeyframes(t *testing.T) {
+	f := &fakeVideo{}
+	s := newVideoServer(t, f, VideoJobsOptions{})
+	decodeJob(t, do(t, s, jsonRequest("POST", "/v1/videos", map[string]any{
+		"prompt": "p", "task": "fl2va", "conditions": []any{pngCond(0), pngCond(-1)},
+		"target": map[string]any{"short_edge": 256, "aspect_ratio": "auto", "duration_seconds": 8},
+	})))
+	// No frame_index: the first condition is the first frame, a second the last.
+	decodeJob(t, do(t, s, jsonRequest("POST", "/v1/videos", map[string]any{
+		"prompt": "p", "conditions": []any{
+			map[string]any{"type": "image", "uri": pngDataURL(4, 3)},
+			map[string]any{"type": "image", "uri": pngDataURL(3, 4)},
+		},
+	})))
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	mw.WriteField("prompt", "a fox")
+	fw, _ := mw.CreateFormFile("input_reference", "first.png")
+	fw.Write(pngBytes(32, 18))
+	mw.Close()
+	req := httptest.NewRequest("POST", "/v1/videos", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	decodeJob(t, do(t, s, req))
+	decodeJob(t, do(t, s, jsonRequest("POST", "/v1/videos", map[string]any{
+		"prompt": "p", "input_reference": base64.StdEncoding.EncodeToString(pngBytes(9, 16)),
+	})))
+	// OpenAI's JSON form, fetched; and SGLang's README shape, a remote uri.
+	decodeJob(t, do(t, s, jsonRequest("POST", "/v1/videos", map[string]any{
+		"prompt": "p", "input_reference": map[string]any{"image_url": servePNG(t, pngBytes(20, 10))},
+	})))
+	decodeJob(t, do(t, s, jsonRequest("POST", "/v1/videos", map[string]any{
+		"prompt": "p", "task": "fl2va", "conditions": []any{
+			map[string]any{"type": "image", "uri": servePNG(t, pngBytes(12, 12)), "role": "keyframe", "frame_index": 0}},
+	})))
+
+	want := []struct {
+		sizes  [][2]int
+		frames []int
+	}{
+		{[][2]int{{16, 9}, {16, 9}}, []int{0, -1}},
+		{[][2]int{{4, 3}, {3, 4}}, []int{0, -1}},
+		{[][2]int{{32, 18}}, []int{0}},
+		{[][2]int{{9, 16}}, []int{0}},
+		{[][2]int{{20, 10}}, []int{0}},
+		{[][2]int{{12, 12}}, []int{0}},
+	}
+	if len(f.reqs) != len(want) {
+		t.Fatalf("%d requests reached the backend", len(f.reqs))
+	}
+	for i, w := range want {
+		k := f.reqs[i].Keyframes
+		if len(k) != len(w.frames) {
+			t.Fatalf("request %d: %d keyframes", i, len(k))
+		}
+		for j := range k {
+			b := k[j].Image.Bounds()
+			if [2]int{b.Dx(), b.Dy()} != w.sizes[j] || k[j].FrameIndex != w.frames[j] {
+				t.Errorf("request %d keyframe %d: %dx%d at %d, want %v at %d", i, j, b.Dx(), b.Dy(), k[j].FrameIndex, w.sizes[j], w.frames[j])
+			}
+		}
+	}
+	if f.reqs[0].ShortEdge != 256 || f.reqs[0].AspectW != 0 || f.reqs[0].Seconds != 8 {
+		t.Errorf("the README envelope: %+v", f.reqs[0])
 	}
 }

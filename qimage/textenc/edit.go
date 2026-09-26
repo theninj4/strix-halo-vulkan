@@ -170,15 +170,32 @@ func NewEditPrompt(tok *tokenizer.Tokenizer, prompt string, grids []Grid, merge 
 	if err != nil {
 		return nil, err
 	}
+	return NewPromptIDs(ids, grids, merge, padID)
+}
+
+// NewPromptIDs positions a prompt that is already tokenized with its image
+// runs expanded in place, one `padID` per merged patch group: a
+// presentation some other pipeline defines (MiniMax-H3's fl2va puts a
+// label and a vision block per keyframe ahead of the bare prompt, with no
+// template). The positions are get_rope_index's, as for an edit.
+func NewPromptIDs(ids []int32, grids []Grid, merge int, padID int32) (*EditPrompt, error) {
+	want := 0
+	for i, g := range grids {
+		if g.T <= 0 || g.H%merge != 0 || g.W%merge != 0 {
+			return nil, fmt.Errorf("textenc: image %d has grid %v, which does not merge by %d", i, g, merge)
+		}
+		want += g.Tokens(merge)
+	}
 	p := &EditPrompt{IDs: ids, Grids: grids, Merge: merge, PadID: padID}
 	for i, id := range ids {
 		if id == padID {
 			p.Pads = append(p.Pads, i)
 		}
 	}
-	if want := sum(pads); len(p.Pads) != want {
+	if len(p.Pads) != want {
 		return nil, fmt.Errorf("textenc: tokenized %d image slots, the grids want %d", len(p.Pads), want)
 	}
+	var err error
 	if p.Pos, err = p.positions(); err != nil {
 		return nil, err
 	}

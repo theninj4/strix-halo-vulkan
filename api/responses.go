@@ -585,8 +585,9 @@ func messagesFromInput(raw json.RawMessage) ([]Message, error) {
 
 // inputContent is a message item's content as text and image parts in
 // order: `input_image` becomes the image_url block the backend reads, from its
-// `image_url` (a data: URL; the backend fetches nothing). A `file_id` image is
-// refused, because this server keeps no files.
+// `image_url` (a data: URL, or an http(s) URL the backend fetches, as
+// OpenAI's does). A `file_id` image is refused, because this server keeps no
+// files.
 func inputContent(raw json.RawMessage) (MessageContent, error) {
 	raw = json.RawMessage(strings.TrimSpace(string(raw)))
 	if len(raw) == 0 || raw[0] != '[' {

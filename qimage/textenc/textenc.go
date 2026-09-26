@@ -94,9 +94,13 @@ func EncodePrompt(tok *tokenizer.Tokenizer, prompt string) ([]int32, error) {
 }
 
 // Drop returns the rows of a forward pass after the system prefix — the
-// prompt embedding the DiT's txt_in consumes.
+// prompt embedding the DiT's txt_in consumes. A drop of zero is a
+// presentation with no prefix (MiniMax-H3's fl2va reuses the edit path).
 func Drop(m *qwen.Mat, drop int) (*qwen.Mat, error) {
-	if drop <= 0 || drop >= m.Rows {
+	if drop == 0 {
+		return m, nil
+	}
+	if drop < 0 || drop >= m.Rows {
 		return nil, fmt.Errorf("textenc: dropping %d of %d rows", drop, m.Rows)
 	}
 	return &qwen.Mat{Rows: m.Rows - drop, Cols: m.Cols, Data: m.Data[drop*m.Cols:]}, nil

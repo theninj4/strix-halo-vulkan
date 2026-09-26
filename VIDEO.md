@@ -272,7 +272,7 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M7 | DiT on the GPU: GEMMs and WMMA attention at 5k–105k rows, the 4 GiB plan, per-step profile | **done 2026-09-26** (`h3/dit/gpu.go`): a forward at ≤ 6.7e-3 of the fp32 oracle, teacher-forced steps ≤ 1.7e-3 rms; **35.6 s a forward at 480p, 143 s at the trained 768p** |
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
-| M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | |
+| M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | **done 2026-09-26** (`h3/vae/encoder.go`, `h3/textenc` Presentation, `h3/pipeline/keyframe.go`, `-first`/`-last`, `input_reference` / `conditions`): encoder moments at ≤ 1.6e-5 of fp32, torch's seed-42 draw reproduced; conditioner 9.3e-4 teacher-forced (bf16: 1.2e-2); teacher-forced steps ≤ 1.3e-4 rms; frame 0 of a served run lands on the keyframe at **27.1 dB** |
 | M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | |
 | M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | |
 | M13 | `ref2va` (optional) | |
@@ -630,8 +630,7 @@ jobs*): `POST /v1/videos` → a queued job, `GET /v1/videos[/{id}]`,
 `GET /v1/videos/{id}/content` → the mp4, `DELETE` to cancel and forget. It
 also reads SGLang's H3 envelope (`task`, `target.{short_edge, aspect_ratio,
 duration_seconds}`, `seed`), so the README's request scripts work against it
-unchanged but for the host. `t2va` only: `fl2va`, `conditions` and
-`input_reference` are 400s until M10. The pieces:
+unchanged but for the host (M10 added keyframes; see there). The pieces:
 
 - **The queue is in `api`** (`VideoJobs`): one job at a time, 16 waiting at
   most (429 past it), jobs in memory, files in `-video-dir` for `-video-ttl`
@@ -684,6 +683,107 @@ process then ran in 3 m 17 s, and its mp4 is **byte-identical** to the
 first's (same seed). So an abandoned forward leaves nothing behind, and a
 served request reproduces from its seed.
 
+### M10 — keyframes, fl2va (2026-09-26)
+
+A keyframe reaches the transformer **twice**, and both routes had to be
+reproduced (diffusers' `MiniMaxH3ResizeStep`, `FL2VATextEncoderStep`,
+`KeyframeVaeEncoderStep`, `PrepareConditionLatentsStep`):
+
+1. **In the prompt.** The presentation is `"<Picture i>: "` + a Qwen3-VL
+   vision block per keyframe, then the prompt verbatim, still with no
+   template. The block's rows are tagged **video**, not text, which is what
+   the transformer's AdaLN keys off. The conditioner reads the picture
+   exactly as a Qwen-Image edit reads a reference: the tower's merged rows in
+   the pads, deepstack after layers 0–2, 3-D mrope positions. So this is
+   `qimage/vision` and `qimage/textenc`'s edit path, unchanged but for a
+   constructor that takes already-built ids (`NewPromptIDs`) and a zero
+   system-prefix drop.
+2. **As anchor rows.** The picture through the video VAE's **encoder**, a
+   posterior *draw*, rounded to fp16, normalised, noised to t = 0.999 with
+   the request's generator, patchified and packed ahead of the generated
+   video rows. They sit at `max(t_video, 0.999)` in every forward and are
+   never stepped. M1 already laid them out; `dit.GPU` needed no change (the
+   four modulation keys — text, vision-as-video, keyframe, audio — fit its
+   eight).
+
+**The encoder** (`h3/vae/encoder.go`) is a causal 3-D CNN, and at one frame
+it *is* 2-D: every temporal filter is front-padded with two zero frames, so
+only its last tap ever meets the picture, and diffusers runs a single frame
+through `_encode_clip` alone. It runs on the device in fp32 on the image
+VAE's direct-convolution kernel, with two additions: a `REFLECT` build
+(the checkpoint pads by reflection; the non-reflect SPIR-V is byte-identical
+to before), and a GroupNorm(32)+SiLU kernel (`h3_groupnorm.comp`). The
+reflect-padded (0, 1, 0, 1) stride-2 downsampler is the stride-1 filter read
+at the odd pixels, as with zeros. 256-pixel tiles, widened overlaps and the
+blend are the decoder's `splitTiles`/`stitch` in latents. 0.24 GB of weights
+(one tap in three), **~100 ms a tile**: 0.2 s at 448×256, 1.4 s at 864×480.
+
+**The posterior draw is load-bearing.** Sampling moves the normalised
+anchor by up to 0.16–0.33 against the posterior mean (`sample_vs_mode`), so
+torch's CPU `randn` under seed 42 is reproduced (`vae.TorchRandn`: mt19937,
+24-bit uniforms, Box–Muller in blocks of 16 with the tail redrawn) to ≤ 1
+float32 ulp, and the sample, fp16 rounding and normalisation are then
+**bit-exact** on the oracle's moments. The request's own noise (the
+augmentation, then video, then audio, in the pipeline's order) stays our
+PCG (decision 8) and is injectable (`Request.CondNoise`).
+
+**Placement** (`h3/pipeline/keyframe.go`) is `MiniMaxH3ResizeStep`: with no
+canvas given, the canvas takes the first keyframe's aspect; that keyframe is
+*stretched* onto it with PIL's LANCZOS (qimage's port), and a second one is
+cover-cropped (Python rounding, `(size − canvas) // 2`). Alpha is dropped,
+as `convert("RGB")` drops it. Byte-identical to PIL on all three dumped
+placements.
+
+**Gates** (`reference/dump_h3_fl2va.py`: the README fl2va request's keyframe
+and prompt at 256×448 × 124, 1,039 presentation tokens, 5,709 rows):
+
+| what | result |
+|---|---|
+| placement, presentation ids + tags, processor pixel_values, auto canvas, keyframe rows from latent + noise | bit-exact |
+| encoder, first tile, 15 stages | rel 1.3e-7 … 5.6e-6 (norm_out 2.8e-4: a small group variance divided out) |
+| moments, 256×448 (2 tiles) and 480×864 (15) | rel ≤ 1.6e-5; anchor latents ≤ 5e-4 (fp16 roundings that flip) |
+| `TorchRandn(42)` against torch | ≤ 4.8e-7 |
+| vision tower (fp16, unchanged) | merged 3.9e-2, deepstack 4.5e-3 … 3.0e-2 of absmax |
+| conditioner, oracle tower rows fed in | **9.3e-4** (f), 3.3e-4 (fl); 1-D positions control: 0.93 / 0.11 |
+| conditioner, device tower | 7.4e-3 (f), 1.0e-3 (fl); the official bf16 pipeline: **1.2e-2 / 1.1e-2** |
+| transformer blocks 0 / 49, teacher-forced | rel 1.2e-4 / 2.5e-4 |
+| forwards 0–1, teacher-forced | velocity rel 2.8e-2 (rms 5.6e-3); **latents rms 1.1e-4, 1.3e-4**; keyframe rows unchanged |
+
+The conditioner's teacher-forced figure is 8× t2va's 1.1e-4 (the image rows
+enter fp16 activations at the tower's scale); the control shows a wrong
+mechanism lands 100–1000× further off. The velocity's rel is ~3× M7's t2va
+figure at the same shape, and the steps it produces are inside M7's bound.
+
+**End to end** (`cmd/h3 -first … -short 256 -steps 8`, the README prompt):
+3 m 32 s, against t2va's 3 m 28 s at the same shape. The encode is 88 s
+against 82 (the VAE encoder and the tower staged and run inside it). **Frame
+0 matches the keyframe at 27.1 dB PSNR**, letterbox bars and all, and the
+clip then does what the prompt says: steam rises, the family eats, the bowl
+holds its place (21.0, 18.7, 18.5 dB at frames 40, 80, 123 against the
+keyframe). **First and last** (the dump's portrait crop around the bowl as
+the last keyframe, cover-cropped into a close-up): 3 m 22 s; frame 0 is the
+first keyframe at **27.8 dB** and frame 123 the last at **28.2 dB**
+(11.2–11.6 dB against the other one). The model gets there by a cut to the
+close-up about two thirds in, not a push-in, which is a fair reading of two
+keyframes and a prompt that says nothing about the camera moving.
+
+**Served** (`serve -video`, the README fl2va request with its keyframe
+inlined as a data: URI, `short_edge 256`, 5 s, N = 8): the canvas resolves
+to 448×256 from the keyframe (`aspect_ratio: "auto"`), estimated 220 s, run
+in 3 m 21 s, and the mp4 is **byte-identical** to the CLI's at the same
+seed. (The README's own request, CDN link and all, was a 400 that day; it
+is fetched now, below.)
+
+**Served:** OpenAI's `input_reference` (multipart, or OpenAI's JSON
+`{"image_url": …}`, or a bare string) is the first frame; SGLang's
+`conditions` are up to two images with `frame_index` 0 (first) and -1 or ≥
+the last requested frame (last). **URLs are fetched, as OpenAI and SGLang
+fetch them** (the API follows OpenAI's standard: `util.FetchImage`, 50 MB,
+60 s), at submit, so the README scripts' CDN links work unchanged and an
+unreadable picture is a 400. `file_id` is a 400 (no Files API). `task:
+fl2va` with no keyframe is t2va, as the model card has it; `t2va` with one
+and `ref2va` are 400s.
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -717,10 +817,14 @@ projections are folded out.
 
 ## Handoff
 
-**2026-09-26, session 3: M9 done.** The vertical is served:
+**2026-09-26, session 4: M10 done.** `fl2va` is served: a first and/or last
+keyframe through `input_reference` or SGLang's `conditions` (URLs fetched,
+as OpenAI's API does),
+and `cmd/h3 -first/-last`. M11 onward is open.
+
+**Session 3: M9 done.** The vertical is served:
 `serve -video` answers `/v1/videos` as OpenAI's async jobs (and SGLang's H3
 envelope), and shares the device with the other verticals while it runs.
-M10 onward is open.
 
 - Weights: `models/MiniMax-H3` (135 GB, gitignored): `transformer/`,
   `text_encoder/`, `vae/`, `audio_vae/`, plus configs, tokenizers, docs and
@@ -728,13 +832,20 @@ M10 onward is open.
 - Code: `h3/plan` (M1), `h3/textenc` (M2), `h3/dit` (M3 CPU, `Tables`, M7
   GPU `gpu.go`, `CheckArenas`), `h3/vae` (M5), `h3/audiovae` (M6, CPU fp32),
   `h3/pipeline` (M8: staging order, `Generate`, `WriteMP4`; M9: `Resolve`
-  with limits, `Options.Hold`/`Between`), `cmd/h3` (CLI), and for serving
+  with limits, `Options.Hold`/`Between`; M10: `keyframe.go`, keyframes in
+  `Resolve`/`Generate`), M10's `h3/vae/encoder.go` + `posterior.go` and
+  `h3/textenc`'s `Presentation`, `cmd/h3` (CLI), and for serving
   `backend/video.go` + `api/videos.go` + the `-video*` flags in `cmd/serve`.
-- Oracles: `reference/dump_h3_{plan,tokens,textenc,dit_block,dit,ranges,vae,audio}.py`,
-  outputs in `reference/out/h3*`.
+- Oracles: `reference/dump_h3_{plan,tokens,textenc,dit_block,dit,ranges,vae,audio,fl2va}.py`,
+  outputs in `reference/out/h3*`. `dump_h3_fl2va.py` runs in phases
+  (`prep vae text dit`) and reads `models/MiniMax-H3/assets/fl2va_keyframe.png`,
+  the README fl2va request's keyframe (fetched from its CDN link; gitignored).
 - Tests: `go test -short ./h3/...` and `go test ./api/` are quick. Without
   `-short`: `TestGPUDecoder` (h3/vae, 10 s), `TestStages`/`TestDecode`
-  (h3/audiovae, ~10 s), `TestE2E` (h3/pipeline, ~3.5 min, 50 GB peak). The
+  (h3/audiovae, ~10 s), `TestE2E` (h3/pipeline, ~3.5 min, 50 GB peak), and
+  M10's `TestGPUEncoder*` (h3/vae, seconds), `TestGPUPresentation`
+  (h3/textenc, ~70 s, 51 GB), `TestGPUFL2VA` (h3/dit, ~100 s, 44 GB;
+  `H3_ENC_SCREEN=1` times the encoder's conv builds). The
   opt-ins are `H3_VAE_FULL=1`, `H3_VAE_SHAPES=1` (+`H3_VAE_SEQS`),
   `H3_AUDIO_RAW=path`, `H3_E2E_MP4=path`, and M7's (`H3_SHAPES`,
   `H3_PROFILE`, `H3_CHUNK`, `H3_SCREEN`, `H3_SENSITIVITY`, `H3_FREE`).
@@ -757,11 +868,10 @@ M10 onward is open.
    fp16 banks on disk for the encoder and transformer (decision 2), and cache
    `Tables` by schedule. Since M9 the stagings no longer block other
    verticals, so this is now about the video's own latency only.
-3. **M10, `fl2va`**: the VAE encoder (a CNN), the vision tower for keyframes,
-   keyframe rows in the layout (M1 already plans them), and in the API
-   `input_reference` / SGLang's `conditions` (both 400 today).
-4. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
+3. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
    55.5 peak; 68% of a trained forward), the down projection's GEMM (22
    against 37), and the audio decode on the device (7 s on the CPU against
    torch's 1.1).
-5. M12: a Context-IR stand-in, since plain prompts are what users will send.
+4. M12: a Context-IR stand-in, since plain prompts are what users will send.
+   For fl2va it has to write the `<Picture 1>` references the README's
+   prompts carry ("at 0.00 seconds … <Picture 1> … is fully referenced").

@@ -619,7 +619,12 @@ func TestImageEditRefusals(t *testing.T) {
 		{"no prompt", ImageEditRequest{Image: StringList{good}}, 400, "prompt"},
 		{"more references than the server takes",
 			ImageEditRequest{Prompt: "p", Image: StringList{good, good, good, good}}, 400, "reference images"},
-		{"a mask", ImageEditRequest{Prompt: "p", Image: StringList{good}, Mask: good}, 501, "mask"},
+		{"a mask", ImageEditRequest{Prompt: "p", Image: StringList{good}, Mask: json.RawMessage(`"` + good + `"`)}, 501, "mask"},
+		{"a mask object", ImageEditRequest{Prompt: "p", Image: StringList{good},
+			Mask: json.RawMessage(`{"image_url": "data:image/png;base64,` + good + `"}`)}, 501, "mask"},
+		{"a file_id", ImageEditRequest{Prompt: "p", Images: []json.RawMessage{json.RawMessage(`{"file_id": "file-abc"}`)}}, 400, "Files API"},
+		{"a url that 404s", ImageEditRequest{Prompt: "p", Images: []json.RawMessage{
+			json.RawMessage(`{"image_url": "` + missingURL(t) + `"}`)}}, 400, "404"},
 		{"not base64", ImageEditRequest{Prompt: "p", Image: StringList{"not base64!!"}}, 400, "base64"},
 		{"not an image", ImageEditRequest{Prompt: "p", Image: StringList{
 			base64.StdEncoding.EncodeToString([]byte("hello"))}}, 400, "png and jpeg"},
@@ -786,4 +791,42 @@ func TestImageEditBackground(t *testing.T) {
 			t.Error("the form's background \"transparent\" did not reach the backend")
 		}
 	})
+}
+
+// missingURL is an http URL that answers 404.
+func missingURL(t *testing.T) string {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	return srv.URL + "/missing.png"
+}
+
+// servePNG serves raw at an http URL for the test's life.
+func servePNG(t *testing.T, raw []byte) string {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(raw)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL + "/picture.png"
+}
+
+// TestImageEditImageURLs: OpenAI's JSON `images`, an http URL (fetched, as
+// OpenAI fetches it) and a data: URL, after the base64 `image`, in order.
+func TestImageEditImageURLs(t *testing.T) {
+	fake := &fakeImage{geo: editGeo()}
+	s := &Server{Image: fake}
+	raw, _ := base64.StdEncoding.DecodeString(pngOf(t, 96, 32))
+	rec, _ := edit(t, s, ImageEditRequest{Prompt: "p", Image: StringList{pngOf(t, 64, 64)}, Images: []json.RawMessage{
+		json.RawMessage(`{"image_url": "` + servePNG(t, raw) + `"}`),
+		json.RawMessage(`{"image_url": "data:image/png;base64,` + pngOf(t, 32, 48) + `"}`),
+	}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	init := fake.reqs[0].Init
+	for i, want := range [][2]int{{64, 64}, {96, 32}, {32, 48}} {
+		if b := init[i].Bounds(); b.Dx() != want[0] || b.Dy() != want[1] {
+			t.Errorf("reference %d is %dx%d, want %v", i, b.Dx(), b.Dy(), want)
+		}
+	}
 }

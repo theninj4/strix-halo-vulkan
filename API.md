@@ -28,7 +28,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
-| `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. `t2va` only (keyframes are VIDEO.md M10). See [Videos are jobs](#videos-are-jobs) |
+| `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
 | `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](CLASSIFICATION.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
@@ -434,9 +434,16 @@ in its place between the texts:
 - responses: `{"type": "input_image", "image_url": "data:…"}`
 - messages: `{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "…"}}`
 
-**Only `data:` URLs.** This server fetches nothing on a client's behalf, so an
-`http(s)` URL is a 400 that says to send the bytes instead, and a Responses
-`file_id` is refused because there are no files. PNG, JPEG and GIF (the first
+**Image URLs are fetched where OpenAI's API fetches them** (and Anthropic's,
+for Messages' `url` source): an `image_url` is "a fully qualified URL or a
+base64-encoded data URL", so an `http(s)` URL is downloaded before the vision
+tower is taken, and a `data:` URL is read in place. The fetch is capped at
+50 MB and 60 s, follows up to 5 redirects, and needs a 2xx; any failure is a
+400 naming the URL (without its query string). Other schemes are refused,
+and so is a Responses `file_id`, because there is no Files API. **The server
+fetches whatever the client names, the LAN included**, as an OpenAI-shaped
+server does; a deployment that must not reach its own network on a client's
+say-so needs that boundary in front of it. PNG, JPEG and GIF (the first
 frame) decode; **WebP is refused**, because the module takes no dependencies
 and the standard library has no decoder. Images are read in **user turns**:
 the template itself refuses one in a system message, and one inside a tool
@@ -658,6 +665,11 @@ client sees:
   reference, an edit is **1m54s** against a generation's 1m28.8s — the
   reference's own encoding is 7.1 s of it (a 27-layer vision tower and a VAE
   encode), and the rest is the prefix riding along in every denoising step.
+- **References arrive as OpenAI sends them**: multipart `image` / `image[]`
+  parts, JSON base64 `image`, or OpenAI's JSON `images: [{"image_url": …}]`,
+  where an http(s) URL is fetched as OpenAI fetches it (the same capped
+  fetch as a chat image) and a data: URL is read; `{"file_id": …}` is a 400,
+  there being no Files API. A `mask`, in any of its forms, is the 501 below.
 - **`image[]` is a real list.** Up to `max_reference_images` pictures are
   accepted, in the order they were sent, and the model's own limit is ten.
   How many *this* server takes is residency — every reference adds its latent
@@ -891,6 +903,11 @@ curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
 curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
   -d '{"task": "t2va", "prompt": "…", "seed": 0,
        "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10}}'  # SGLang's
+curl -s localhost:8080/v1/videos -F prompt="…" -F input_reference=@start.png          # OpenAI's, from a first frame
+curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
+  -d '{"task": "fl2va", "prompt": "…", "target": {"short_edge": 480, "aspect_ratio": "auto"},
+       "conditions": [{"type": "image", "uri": "data:image/png;base64,…", "role": "keyframe", "frame_index": 0},
+                      {"type": "image", "uri": "data:image/jpeg;base64,…", "role": "keyframe", "frame_index": -1}]}'
 ```
 
 Both envelopes are read, and a multipart form as OpenAI's SDK sends one.
@@ -904,8 +921,24 @@ text encoder is staged for it. Extensions: `steps` (or
 `num_inference_steps`; default 20, the release's 50), `seed` (reported
 either way), and on the job `seed`, `steps`, `frames`, `stage` and
 `estimated_seconds`, the backend's estimate of the run from measured rates.
-`input_reference`, `task: fl2va` and `conditions` are refused until
-keyframes land (VIDEO.md M10); `variant` other than `video` is a 400.
+`variant` other than `video` is a 400.
+
+**Keyframes (`fl2va`, VIDEO.md M10)** pin the video's first frame, its last,
+or both. OpenAI's `input_reference` is the first frame: a multipart file, or in JSON
+OpenAI's `{"image_url": …}` (an http(s) URL is fetched, as OpenAI fetches it;
+a data: URL is read) — `{"file_id": …}` is a 400, there being no Files API —
+or, leniently, a bare URL or base64 string. SGLang's `conditions` are up to
+two images with a `frame_index`: 0 is the first frame, and -1 — or any index
+at or past the last requested frame — is the last; without one, the first
+condition is the first frame and a second the last. A condition's `uri` is
+fetched the same way (SGLang fetches it too), so the README's requests run
+unchanged. URLs are fetched at submit, so an unreadable picture is a 400 and
+not a failed job; the fetch is the chat images' (50 MB, 60 s). png and jpeg
+are read, up to 64 megapixels. With no `size` and `aspect_ratio`
+`auto` (or none), the canvas takes the first keyframe's aspect ratio; the
+first keyframe is stretched onto the canvas and a second one cover-cropped,
+as the reference pipeline does. `task: t2va` with a keyframe, or `ref2va`
+(references, VIDEO.md M13), is a 400.
 
 **The queue is in `api`, and one job runs at a time.** The backend is
 synchronous — one mp4 to a path — and a request's stagings peak at ~50 GB,

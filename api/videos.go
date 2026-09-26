@@ -22,12 +22,15 @@ package api
 // like too.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -37,6 +40,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"strix-halo-vulkan/util"
 )
 
 // VideoBackend generates one video at a time, synchronously.
@@ -72,6 +77,17 @@ type VideoRequest struct {
 	Steps int
 	// Seed is the noise seed; nil draws one, and the plan reports it.
 	Seed *int64
+	// Keyframes are fl2va's pictures (VIDEO.md M10): at most one for the
+	// first frame and one for the last. None is t2va.
+	Keyframes []VideoKeyframe
+}
+
+// VideoKeyframe is one keyframe: a decoded picture and the frame it pins,
+// SGLang's `frame_index` — 0 for the first frame, and -1 (or any index at
+// or past the clip's last frame, which the backend resolves) for the last.
+type VideoKeyframe struct {
+	Image      image.Image
+	FrameIndex int
 }
 
 // VideoPlan is what a request resolves to.
@@ -444,11 +460,16 @@ type VideoCreateRequest struct {
 	Size string `json:"size,omitempty"`
 	// Seconds is OpenAI's duration, which it sends as a string ("8").
 	Seconds flexFloat `json:"seconds,omitempty"`
-	// InputReference is OpenAI's keyframe; it arrives as a multipart file.
-	// Task and Conditions are SGLang's: "t2va", or "fl2va" with keyframe
-	// conditions. Keyframes are VIDEO.md M10 and not served yet.
-	Task       string            `json:"task,omitempty"`
-	Conditions []json.RawMessage `json:"conditions,omitempty"`
+	// InputReference is OpenAI's keyframe, the video's first frame: a
+	// multipart file, or in JSON OpenAI's {"image_url": …} (fetched if it is
+	// http(s), as OpenAI fetches it) or {"file_id": …} (refused: there are no
+	// files here). A bare string — a URL, a data: URL or base64 — is read too.
+	InputReference json.RawMessage `json:"input_reference,omitempty"`
+	inputReference []byte
+	// Task and Conditions are SGLang's: "t2va", or "fl2va" with up to two
+	// keyframe conditions (VIDEO.md M10).
+	Task       string           `json:"task,omitempty"`
+	Conditions []videoCondition `json:"conditions,omitempty"`
 	Target     *struct {
 		ShortEdge   int       `json:"short_edge,omitempty"`
 		AspectRatio string    `json:"aspect_ratio,omitempty"`
@@ -460,6 +481,126 @@ type VideoCreateRequest struct {
 	Steps       int    `json:"steps,omitempty"`
 	NumSteps    int    `json:"num_inference_steps,omitempty"`
 	Seed        *int64 `json:"seed,omitempty"`
+}
+
+// videoCondition is one of SGLang's fl2va conditions:
+// {"type": "image", "uri": ..., "role": "keyframe", "frame_index": 0}.
+// The uri is fetched if it is http(s), as SGLang fetches it (the README's
+// requests name CDN links), or read if it is a data: URL.
+type videoCondition struct {
+	Type       string `json:"type"`
+	URI        string `json:"uri"`
+	Role       string `json:"role,omitempty"`
+	FrameIndex *int   `json:"frame_index,omitempty"`
+}
+
+// maxKeyframePixels bounds a keyframe before it is decoded: it is resized
+// to the canvas anyway, and a picture past this is a mistake or a bomb.
+const maxKeyframePixels = 64 << 20
+
+// decodeKeyframe reads a keyframe's bytes as png or jpeg.
+func decodeKeyframe(raw []byte) (image.Image, error) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("this server decodes png and jpeg: %v", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width*cfg.Height > maxKeyframePixels {
+		return nil, fmt.Errorf("a %dx%d picture; keyframes are at most %d megapixels", cfg.Width, cfg.Height, maxKeyframePixels>>20)
+	}
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("this server decodes png and jpeg: %v", err)
+	}
+	return img, nil
+}
+
+// imageRef is where a JSON image reference points: OpenAI's
+// {"image_url": …} / {"file_id": …}, or a bare string.
+func imageRef(raw json.RawMessage) (string, error) {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, nil
+	}
+	var ref struct {
+		ImageURL string `json:"image_url"`
+		FileID   string `json:"file_id"`
+	}
+	if err := json.Unmarshal(raw, &ref); err != nil {
+		return "", errors.New(`an image reference is {"image_url": …}, {"file_id": …} or a string`)
+	}
+	switch {
+	case ref.FileID != "" && ref.ImageURL != "":
+		return "", errors.New("give one of image_url and file_id, not both")
+	case ref.FileID != "":
+		return "", fmt.Errorf("file_id %q: this server has no Files API, so send the picture as image_url", ref.FileID)
+	case ref.ImageURL == "":
+		return "", errors.New("an image reference with neither image_url nor file_id")
+	}
+	return ref.ImageURL, nil
+}
+
+// readImageRef returns the bytes of an image named by a URL (fetched, as
+// OpenAI's API fetches one), a data: URL, or bare base64.
+func readImageRef(ctx context.Context, ref string) ([]byte, error) {
+	ref = strings.TrimSpace(ref)
+	if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") || strings.HasPrefix(ref, "data:") {
+		return util.FetchImage(ctx, ref)
+	}
+	return decodeImageField(ref)
+}
+
+// keyframes decodes the request's keyframes: an OpenAI input_reference
+// (the first frame), or SGLang's conditions. URLs are fetched here, at
+// submit, so a picture that cannot be read is a 400 and not a failed job.
+func (c *VideoCreateRequest) keyframes(ctx context.Context) ([]VideoKeyframe, error) {
+	var out []VideoKeyframe
+	if len(c.inputReference) > 0 || len(c.InputReference) > 0 {
+		raw := c.inputReference
+		if raw == nil {
+			ref, err := imageRef(c.InputReference)
+			if err != nil {
+				return nil, fmt.Errorf("input_reference: %v", err)
+			}
+			if raw, err = readImageRef(ctx, ref); err != nil {
+				return nil, fmt.Errorf("input_reference: %v", err)
+			}
+		}
+		img, err := decodeKeyframe(raw)
+		if err != nil {
+			return nil, fmt.Errorf("input_reference: %v", err)
+		}
+		out = append(out, VideoKeyframe{Image: img})
+	}
+	if len(c.Conditions) > 2 || (len(out) > 0 && len(c.Conditions) > 0) {
+		return nil, errors.New("fl2va takes at most two keyframes, a first and a last, from one of input_reference or conditions")
+	}
+	for i, cond := range c.Conditions {
+		if cond.Type != "image" {
+			return nil, fmt.Errorf("conditions[%d]: type %q; fl2va's conditions are images", i, cond.Type)
+		}
+		if cond.Role != "" && cond.Role != "keyframe" {
+			return nil, fmt.Errorf("conditions[%d]: role %q; fl2va's conditions are keyframes", i, cond.Role)
+		}
+		raw, err := readImageRef(ctx, cond.URI)
+		if err != nil {
+			return nil, fmt.Errorf("conditions[%d]: %v", i, err)
+		}
+		img, err := decodeKeyframe(raw)
+		if err != nil {
+			return nil, fmt.Errorf("conditions[%d]: %v", i, err)
+		}
+		// Without an index, the first condition is the first frame and a
+		// second one the last.
+		idx := -i
+		if cond.FrameIndex != nil {
+			idx = *cond.FrameIndex
+		}
+		if idx < -1 {
+			return nil, fmt.Errorf("conditions[%d]: frame_index %d", i, idx)
+		}
+		out = append(out, VideoKeyframe{Image: img, FrameIndex: idx})
+	}
+	return out, nil
 }
 
 // flexFloat is a number sent as a number or as a string.
@@ -498,22 +639,28 @@ func parseAspect(s string) (w, h float64, err error) {
 }
 
 // toRequest turns the envelope into a VideoRequest.
-func (c *VideoCreateRequest) toRequest() (*VideoRequest, error) {
+func (c *VideoCreateRequest) toRequest(ctx context.Context) (*VideoRequest, error) {
 	if strings.TrimSpace(c.Prompt) == "" {
 		return nil, errors.New("prompt is required")
 	}
+	keys, err := c.keyframes(ctx)
+	if err != nil {
+		return nil, err
+	}
 	switch c.Task {
-	case "", "t2va":
-	case "fl2va", "i2va", "ref2va":
-		return nil, fmt.Errorf("task %q (keyframes and references) is not served yet; only t2va is", c.Task)
+	case "", "fl2va", "i2va":
+		// fl2va with no keyframe is t2va, as the model card has it.
+	case "t2va":
+		if len(keys) > 0 {
+			return nil, errors.New("task t2va takes no keyframes; send task fl2va")
+		}
+	case "ref2va":
+		return nil, errors.New("task ref2va (references) is not served; t2va and fl2va are")
 	default:
 		return nil, fmt.Errorf("unknown task %q", c.Task)
 	}
-	if len(c.Conditions) > 0 {
-		return nil, errors.New("conditions (keyframes) are not served yet; only t2va is")
-	}
 	r := &VideoRequest{Model: c.Model, Prompt: c.Prompt, Seconds: float64(c.Seconds), Seed: c.Seed,
-		ShortEdge: c.ShortEdge, Steps: c.Steps}
+		ShortEdge: c.ShortEdge, Steps: c.Steps, Keyframes: keys}
 	if r.Steps == 0 {
 		r.Steps = c.NumSteps
 	}
@@ -529,7 +676,6 @@ func (c *VideoCreateRequest) toRequest() (*VideoRequest, error) {
 			r.Seconds = float64(c.Target.Duration)
 		}
 	}
-	var err error
 	if r.AspectW, r.AspectH, err = parseAspect(aspect); err != nil {
 		return nil, err
 	}
@@ -562,8 +708,24 @@ func readVideoCreate(ctx context.Context, w http.ResponseWriter, r *http.Request
 		return nil, false
 	}
 	if r.MultipartForm != nil && len(r.MultipartForm.File["input_reference"]) > 0 {
-		badRequest(ctx, w, "input_reference (a keyframe) is not served yet; only t2va is")
-		return nil, false
+		fh := r.MultipartForm.File["input_reference"][0]
+		f, err := fh.Open()
+		if err == nil {
+			c.inputReference, err = io.ReadAll(f)
+			f.Close()
+		}
+		if err != nil {
+			badRequest(ctx, w, "input_reference: "+err.Error())
+			return nil, false
+		}
+	} else if v := r.FormValue("input_reference"); v != "" {
+		// A form field rather than a file: a URL, a data: URL, base64, or
+		// OpenAI's JSON object.
+		ref := json.RawMessage(v)
+		if !json.Valid(ref) || v[0] != '{' {
+			ref, _ = json.Marshal(v)
+		}
+		c.InputReference = ref
 	}
 	c.Model, c.Prompt, c.Size = r.FormValue("model"), r.FormValue("prompt"), r.FormValue("size")
 	c.Task, c.AspectRatio = r.FormValue("task"), r.FormValue("aspect_ratio")
@@ -594,7 +756,7 @@ func (s *Server) handleVideoCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	req, err := c.toRequest()
+	req, err := c.toRequest(ctx)
 	if err != nil {
 		badRequest(ctx, w, err.Error())
 		return

@@ -35,6 +35,11 @@
 // untouched -- so every arm's output is *bit-identical*, which is what the
 // screen asserts.
 //
+// REFLECT builds the same filter over PyTorch's "reflect" padding instead of
+// zeros (MiniMax-H3's video encoder, VIDEO.md M10): a tap at -1 reads row 1
+// and a tap at H reads row H-2. It is only meaningful for pad <= 1, which is
+// every filter that build runs.
+//
 // IC_BLOCK trades LDS footprint against barrier count and changes nothing
 // numerically either; the products are still accumulated in ascending channel
 // order.
@@ -97,15 +102,23 @@ void main() {
             uint srcBase = pc.inOff + (ic0 + j) * outHW;
             for (uint kh = 0u; kh < pc.KH; ++kh) {
                 int ih = int(oh) + int(kh) - int(pc.pad);
+#ifdef REFLECT
+                ih = ih < 0 ? -ih : (ih >= int(pc.H) ? 2 * int(pc.H) - 2 - ih : ih);
+#else
                 if (ih < 0 || ih >= int(pc.H)) {
                     continue;
                 }
+#endif
                 uint rowBase = srcBase + uint(ih) * pc.W;
                 for (uint kw = 0u; kw < pc.KW; ++kw) {
                     int iw = int(ow) + int(kw) - int(pc.pad);
+#ifdef REFLECT
+                    iw = iw < 0 ? -iw : (iw >= int(pc.W) ? 2 * int(pc.W) - 2 - iw : iw);
+#else
                     if (iw < 0 || iw >= int(pc.W)) {
                         continue;
                     }
+#endif
                     // One activation read feeding OC_BLOCK accumulators.
                     float v = act[rowBase + uint(iw)];
                     uint wIdx = j * MAX_TAPS + kh * pc.KW + kw;

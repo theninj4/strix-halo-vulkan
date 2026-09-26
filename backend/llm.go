@@ -353,6 +353,14 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			return nil, fmt.Errorf("%d images in one request; this server takes at most %d: %w",
 				len(images), l.opt.VisionImages, api.ErrUnsupported)
 		}
+		// Fetched before the tower is taken: a URL is a download of
+		// unknown length, and the device is not held for it. OpenAI's API
+		// fetches an image_url, so this one does too (util.FetchImage).
+		for i := range images {
+			if images[i].data, err = util.FetchImage(ctx, images[i].url); err != nil {
+				return nil, fmt.Errorf("image %d: %v: %w", i, err, api.ErrUnsupported)
+			}
+		}
 		done := sched.towerBegin(class)
 		for _, im := range images {
 			p, took, err := l.vision.encode(ctx, l.opt.Device, im)
