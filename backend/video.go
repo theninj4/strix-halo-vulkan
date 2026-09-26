@@ -13,6 +13,7 @@ import (
 	"strix-halo-vulkan/h3/pipeline"
 	"strix-halo-vulkan/h3/plan"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 )
 
 // VideoOptions is what cmd/serve's flags come to.
@@ -24,6 +25,9 @@ type VideoOptions struct {
 	Device *Device
 	// MaxPrompt caps a prompt's tokens (0: pipeline.DefaultMaxPrompt).
 	MaxPrompt int
+	// FP16 stages the text encoder and the transformer in fp16, the
+	// control; the default is their int8 banks (VIDEO.md M11a).
+	FP16 bool
 	// ID is the model id this backend answers to.
 	ID string
 }
@@ -64,8 +68,13 @@ func NewVideo(opt VideoOptions) (*Video, error) {
 		return nil, fmt.Errorf("backend: the video pipeline needs a device; there is no host path for it")
 	}
 	d := opt.Device
+	bank := qwen.BankQ8
+	if opt.FP16 {
+		bank = qwen.BankFP16
+	}
 	p, err := pipeline.New(d.dev, opt.Model, pipeline.Options{
 		MaxPrompt: opt.MaxPrompt,
+		Bank:      bank,
 		Hold: func(fn func() error) error {
 			return d.Do(func(*vk.Device) error { return fn() })
 		},

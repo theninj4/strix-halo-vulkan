@@ -14,7 +14,7 @@
 //	go run ./cmd/serve -kev                         # System One classification (Kev-4B), ~9 GB resident
 //	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
-//	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~50 GB a request
+//	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~27 GB a request
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
@@ -91,6 +91,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -214,6 +215,7 @@ func main() {
 	videoTTL := flag.Duration("video-ttl", 24*time.Hour, "how long a finished video job and its file are kept")
 	videoQueue := flag.Int("video-queue", 16, "video jobs that may wait behind the running one")
 	videoPrompt := flag.Int("video-max-prompt", 0, "longest video prompt in tokens; 0 is the pipeline's 4096")
+	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
 	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*videoOn {
@@ -410,7 +412,7 @@ func main() {
 			log.Fatal("-video needs the device; it has no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt})
+		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt, FP16: *videoFP16})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -604,6 +606,11 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 	hs := srv.HTTPServer(addr)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Every backend has staged by now, and staging leaves collected host
+	// buffers resident: ~11 GB of the 24 GB this process held with image,
+	// kev and video up (VIDEO.md M11a). Hand them back before serving.
+	debug.FreeOSMemory()
 
 	errs := make(chan error, 2)
 	go func() {

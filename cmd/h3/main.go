@@ -27,6 +27,7 @@ import (
 	"strix-halo-vulkan/backend"
 	"strix-halo-vulkan/h3/pipeline"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 )
 
 func main() {
@@ -41,7 +42,12 @@ func main() {
 	seconds := flag.Float64("seconds", pipeline.DefaultSeconds, "duration, 5–15 s (snapped up to 17n+5 frames)")
 	steps := flag.Int("steps", pipeline.DefaultSteps, "sampling steps N (N−1 forwards); the release's default is 50")
 	seed := flag.Uint64("seed", 0, "noise seed")
+	bankName := flag.String("bank", "q8", "text encoder and transformer weights: q8 (int8, ~27 GB peak) or fp16 (~50 GB)")
 	flag.Parse()
+	bank, err := qwen.ParseBank(*bankName)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	text := *prompt
 	if *promptFile != "" {
@@ -82,7 +88,7 @@ func main() {
 	req := &pipeline.Request{Prompt: text, AspectW: aw, AspectH: ah, ShortEdge: *short,
 		Seconds: *seconds, Steps: *steps, Seed: *seed, First: picture(*first), Last: picture(*last)}
 	err = dev.Do(func(d *vk.Device) error {
-		p, err := pipeline.New(d, *model, pipeline.Options{})
+		p, err := pipeline.New(d, *model, pipeline.Options{Bank: bank})
 		if err != nil {
 			return err
 		}

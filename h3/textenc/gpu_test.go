@@ -123,6 +123,24 @@ func newTestDevice(t *testing.T) (*vk.Device, func()) {
 // cancels the massive-activation channel before layer 50 reads it.
 const gpuTol = 5e-4
 
+// q8Tol is the int8 bank's bound (VIDEO.md M11a). Measured 2026-09-26:
+// 2.1e-4 (en), 1.7e-4 (cjk), 3.0e-4 (readme), 40x inside the official bf16
+// pipeline's distance from the same oracle.
+const q8Tol = 1e-3
+
+// testBank is the bank H3_BANK names: fp16 (the default) or q8.
+func testBank(t *testing.T) qwen.Bank {
+	s := os.Getenv("H3_BANK")
+	if s == "" {
+		return qwen.BankFP16
+	}
+	b, err := qwen.ParseBank(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 // TestGPUEncoder is M2's gate: zimage/qwen's GPU encoder, unchanged, over
 // the 32 B config with Layers of its 64 layers, for every dumped prompt,
 // against the fp32 oracle. It also reports where the official bf16 pipeline
@@ -148,13 +166,18 @@ func TestGPUEncoder(t *testing.T) {
 	dev, done := newTestDevice(t)
 	defer done()
 
+	bank := testBank(t)
 	start := time.Now()
-	g, err := qwen.NewGPUEncoder(dev, set, cfg, Layers, 1024, nil)
+	g, err := qwen.NewGPUEncoderBank(dev, set, cfg, Layers, 1024, nil, bank)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer g.Destroy()
-	t.Logf("staged %d layers in %v", Layers, time.Since(start).Round(time.Millisecond))
+	t.Logf("staged %d layers (%s, %.1f GB) in %v", Layers, bank, float64(g.WeightBytes())/1e9, time.Since(start).Round(time.Millisecond))
+	tol := gpuTol
+	if bank == qwen.BankQ8 {
+		tol = q8Tol
+	}
 	for _, label := range []string{"en", "cjk", "readme"} {
 		start := time.Now()
 		out, err := g.Forward(m.Prompts[label].IDs)
@@ -165,10 +188,10 @@ func TestGPUEncoder(t *testing.T) {
 		want := encMat(t, m, label+"_fp32")
 		rel, maxAbs, rms := gap(out, want)
 		brel, babs, _ := gap(encMat(t, m, label+"_bf16"), want)
-		t.Logf("%-7s %4d tokens in %v: fp16 rel %.3g (max abs %.4g, rms %.3g); official bf16 rel %.3g (max abs %.4g)",
-			label, out.Rows, took.Round(time.Millisecond), rel, maxAbs, rms, brel, babs)
-		if rel > gpuTol || math.IsNaN(rel) {
-			t.Errorf("%s: rel %.3g > %.0e", label, rel, gpuTol)
+		t.Logf("%-7s %4d tokens in %v: %s rel %.3g (max abs %.4g, rms %.3g); official bf16 rel %.3g (max abs %.4g)",
+			label, out.Rows, took.Round(time.Millisecond), bank, rel, maxAbs, rms, brel, babs)
+		if rel > tol || math.IsNaN(rel) {
+			t.Errorf("%s: rel %.3g > %.0e", label, rel, tol)
 		}
 	}
 }

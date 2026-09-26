@@ -2,6 +2,7 @@ package dit
 
 import (
 	"fmt"
+	"runtime"
 
 	"strix-halo-vulkan/safetensors"
 )
@@ -13,7 +14,7 @@ import (
 // projection is read, applied and dropped in turn, so the host holds one
 // block's (1 GB as fp32) at a time.
 func Tables(dir string, tvals []float32) ([]*Table, error) {
-	host, err := Load(dir, 0)
+	host, err := LoadHost(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -30,6 +31,7 @@ func Tables(dir string, tvals []float32) ([]*Table, error) {
 	c := host.Cfg
 	tabs := make([]*Table, c.Layers)
 	for i := range tabs {
+		runtime.GC() // the last projection's 1 GB of fp32, beside the encoder's staging
 		l := &loader{set: set}
 		lin := l.linear(fmt.Sprintf("transformer_blocks.%d.adaln_proj.linear", i), 6*Modalities*c.Hidden, c.TimeDim, true)
 		if l.err != nil {

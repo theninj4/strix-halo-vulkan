@@ -198,6 +198,12 @@ const forcedTol = 2e-3
 // held to t2va's gpuTol.
 const deviceTol = 1e-2
 
+// q8ForcedTol is the teacher-forced arm's bound on the int8 bank (VIDEO.md
+// M11a), priced on the released bf16 pipeline's 1.1–1.2e-2 as the
+// transformer's int8 gate is. Measured 2026-09-26: 6.6e-3 (f), 2.3e-3
+// (fl); the device-tower arm, 4.1e-3 and 3.3e-3, stays inside deviceTol.
+const q8ForcedTol = 1e-2
+
 // TestGPUPresentation is the conditioner gate for fl2va: the tower on both
 // keyframes against its fp32 run, then hidden_states[50] over the "f" and
 // "fl" presentations against the fp32 walk, with the tower's own output
@@ -271,7 +277,12 @@ func TestGPUPresentation(t *testing.T) {
 	}
 	defer set.Close()
 	start := time.Now()
-	g, err := qwen.NewGPUEncoder(dev, set, cfg, Layers, 1280, nil)
+	bank := testBank(t)
+	forced := forcedTol
+	if bank == qwen.BankQ8 {
+		forced = q8ForcedTol
+	}
+	g, err := qwen.NewGPUEncoderBank(dev, set, cfg, Layers, 1280, nil, bank)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +326,7 @@ func TestGPUPresentation(t *testing.T) {
 			name  string
 			conds []qtextenc.Condition
 			tol   float64
-		}{{"teacher-forced", oracle[:n], forcedTol}, {"device tower", conds[:n], deviceTol}} {
+		}{{"teacher-forced", oracle[:n], forced}, {"device tower", conds[:n], deviceTol}} {
 			start := time.Now()
 			out, _, err := p.EncodeGPU(g, rope, arm.conds, 0, nil)
 			if err != nil {

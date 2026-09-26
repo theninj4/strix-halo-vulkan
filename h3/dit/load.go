@@ -75,7 +75,16 @@ func (l *loader) swiglu(p string, c *Config) *SwiGLU {
 // Load reads the transformer in float32 with the first blocks of its
 // blocks. This is the oracle, not the fast path: every block is 1.8 GB here
 // with its AdaLN projection, and the whole model would be 132 GB.
-func Load(dir string, blocks int) (*Model, error) {
+func Load(dir string, blocks int) (*Model, error) { return load(dir, blocks, true) }
+
+// LoadHost is Load without blocks and without the refiner's projections,
+// which the device stages from the checkpoint itself: the pieces the host
+// runs beside the device path (the time MLP, the norms, the heads). The
+// refiner's projections are 3.1 GB of fp32 that would otherwise sit beside
+// a request's stagings (VIDEO.md M11a).
+func LoadHost(dir string) (*Model, error) { return load(dir, 0, false) }
+
+func load(dir string, blocks int, refiner bool) (*Model, error) {
 	cfg, err := LoadConfig(dir)
 	if err != nil {
 		return nil, err
@@ -106,12 +115,14 @@ func Load(dir string, blocks int) (*Model, error) {
 	}
 	for i := 0; i < c.RefinerLayers; i++ {
 		p := fmt.Sprintf("token_refiner.refiner_blocks.%d.", i)
-		m.Refiner = append(m.Refiner, &RefinerBlock{
+		b := &RefinerBlock{
 			Norm1: l.rms(p+"norm1.weight", c.Hidden, c.NormEps),
 			Norm2: l.rms(p+"norm2.weight", c.Hidden, c.NormEps),
-			Attn:  l.attention(p+"attn.", c),
-			FF:    l.swiglu(p+"ff.", c),
-		})
+		}
+		if refiner {
+			b.Attn, b.FF = l.attention(p+"attn.", c), l.swiglu(p+"ff.", c)
+		}
+		m.Refiner = append(m.Refiner, b)
 	}
 	for i := 0; i < blocks; i++ {
 		p := fmt.Sprintf("transformer_blocks.%d.", i)

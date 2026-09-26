@@ -3635,6 +3635,15 @@ var H3BiasCopy []byte
 //go:embed h3_qk_pack_tpw8.spv
 var H3QKPackTPW8 []byte
 
+// The int8 bank's expander (VIDEO.md M11a): one qwen.PackQ8 matrix into the
+// fp16 fragment tiles dit_gemm.comp reads, a block at a time, so the H3
+// transformer and its text encoder hold int8 and keep their fp16 GEMMs.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o dit_dequant_q8.spv dit_dequant_q8.comp
+
+//go:embed dit_dequant_q8.spv
+var DiTDequantQ8 []byte
+
 // The attention screen's arms for MiniMax-H3's long key ranges (VIDEO.md
 // M11): dit_attention_wmma.comp with fp16 context out, at more query tiles
 // a wave (QT) and longer key blocks (KTIL) than the image DiT's QT=1 KTIL=4,

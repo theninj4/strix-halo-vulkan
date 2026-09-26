@@ -47,26 +47,27 @@ open.
 
 **Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
 stereo sound** (`GOALS.md` item 7). The live plan and handoff is the root
-[`VIDEO.md`](VIDEO.md) (M-stages). M0–M10 are done: a prompt, and
+[`VIDEO.md`](VIDEO.md) (M-stages). M0–M10 and M11a are done: a prompt, and
 optionally a first and/or last keyframe (`fl2va`, M10), becomes an mp4 with
 sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
 OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
 runs (speech beside it ≤ 0.27 s). It takes **35.6 s a forward at the served
 480p** (~14 min a request) and 143 s at the trained 768p (~2 h for 50 steps).
-Deployed in `ai.service` beside the image model (2026-09-26), but **a
-request does not fit there yet**: at rest the service leaves ~35 GB
-available (image is 49.7 GB with `-edits 3`), and a video request peaks at
-50 GB (text encoder) and 44 GB (transformer), so it would fail or wake the
-OOM killer. Open: staging cost, performance (M11), a Context-IR stand-in
-(M12).
+Deployed in `ai.service` beside the image model (2026-09-26). At rest the
+service leaves ~35 GB available (image is 49.7 GB with `-edits 3`), and
+since **M11a** a 480p request runs through the service with 15.4 GB still
+free (it was OOM-killed before): int8 banks for the encoder and
+transformer, and two host-memory fixes in `safetensors` and `serve`. Open: staging cost, performance (M11), a Context-IR
+stand-in (M12).
 
-- [ ] **Video in int8, to fit beside the image model.** Stage the Qwen3-VL-32B
-  text encoder as an int8 bank (Kev K7.1's route: 50 → ~25 GB) *and* the
-  transformer's block weights as int8 (40 → ~20 GB), so a request peaks at
-  ~25 GB inside the ~35 GB the deployed service leaves free. Gate it like
-  the fp16 path: encoder rel against the fp32 oracle (M2), teacher-forced
-  steps against M4's oracle (M7), and TestE2E's PSNR against the oracle's
-  own run (M8). Price the speed too: the GEMMs are ~half of a 480p forward.
+- [x] **Video in int8, to fit beside the image model** (2026-09-26,
+  VIDEO.md M11a). Encoder and transformer as int8 banks by default, every
+  teacher-forced step inside the released bf16 pipeline's error, no speed
+  cost. A 480p request through `ai.service` beside the image model
+  completed in 834 s with 15.4 GB free, after fixing what its first
+  attempt's OOM kill exposed: `safetensors` F32/F16 grew by `append` (5×
+  churn), and `serve` kept ~11 GB of staging garbage resident. That gave
+  every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,

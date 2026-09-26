@@ -27,6 +27,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 )
 
@@ -346,6 +347,11 @@ func (s *Set) Bytes() int64 {
 // float32 rounding; BF16 is an exact widening first (it is the top 16 bits
 // of an F32), so the only lossy step for either is the final F32 -> F16.
 func (t *Tensor) F16(dst []uint16) ([]uint16, error) {
+	// The capacity is reserved once. Grown by append instead, a large slice
+	// grows ~1.25x at a time, and a 3.1 GB table churned ~15 GB of copies
+	// through the heap: enough, inside a server with a large live heap, to
+	// wake the OOM killer before the GC's next target (VIDEO.md M11a).
+	dst = slices.Grow(dst, t.Elems())
 	n := t.Elems()
 	switch t.DType {
 	case F16:
@@ -376,6 +382,11 @@ func (t *Tensor) F16(dst []uint16) ([]uint16, error) {
 // modulation biases and anything feeding a reduction — where fp16's 10-bit
 // mantissa is not enough.
 func (t *Tensor) F32(dst []float32) ([]float32, error) {
+	// The capacity is reserved once. Grown by append instead, a large slice
+	// grows ~1.25x at a time, and a 3.1 GB table churned ~15 GB of copies
+	// through the heap: enough, inside a server with a large live heap, to
+	// wake the OOM killer before the GC's next target (VIDEO.md M11a).
+	dst = slices.Grow(dst, t.Elems())
 	n := t.Elems()
 	switch t.DType {
 	case F32:

@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,7 +179,7 @@ func TestGPUForward(t *testing.T) {
 	dev, done := newTestDevice(t)
 	defer done()
 	start = time.Now()
-	g, err := NewGPU(dev, modelDir, 5120, 1024, 2048)
+	g, err := NewGPUBank(dev, modelDir, 5120, 1024, 2048, testBank(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,12 +265,89 @@ func TestGPURun(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stages 42 GB")
 	}
+	r := newRunRef(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g, err := NewGPUBank(dev, modelDir, 5120, 1024, 2048, testBank(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if os.Getenv("H3_FREE") != "" {
+		r.run(t, g, true)
+		return
+	}
+	steps := r.run(t, g, false)
+	if g.bank == qwen.BankFP16 {
+		for f, e := range steps {
+			if e[0] > stepRMS || e[1] > stepRMS {
+				t.Errorf("step %d: video latents rms %.3g, audio rms %.3g > %.0e", f, e[0], e[1], stepRMS)
+			}
+		}
+		return
+	}
+	// The int8 bank is held to the released pipeline: each step within
+	// q8OverBF16 of bf16's same teacher-forced step from the fp32 oracle.
+	bf := bf16Steps(t)
+	for f, e := range steps {
+		t.Logf("step %d: video rms %.3g against bf16's %.3g, audio %.3g against %.3g", f, e[0], bf[f][0], e[1], bf[f][1])
+		if e[0] > q8OverBF16*bf[f][0] || e[1] > q8OverBF16*bf[f][1] {
+			t.Errorf("step %d: %s is past %.2gx bf16's distance from fp32 (video rms %.3g against %.3g, audio %.3g against %.3g)",
+				f, g.bank, q8OverBF16, e[0], bf[f][0], e[1], bf[f][1])
+		}
+	}
+}
+
+// q8OverBF16 is how far past the bf16 pipeline's step error the int8 bank
+// may land. Measured 2026-09-26: at or inside it on every step of both
+// modalities (0.46x–0.99x; step 1's audio is the 0.99), so the headroom is
+// for kernel changes that move the last digit, not for the bank.
+const q8OverBF16 = 1.25
+
+// bf16Steps is reference/dump_h3_dit_bf16.py's teacher-forced run: each
+// step's video and audio latents rms against the fp32 oracle, at the
+// precision the released pipeline runs the transformer.
+func bf16Steps(t *testing.T) [][2]float64 {
+	buf, err := os.ReadFile(filepath.Join(ditRef+"_bf16", "manifest.json"))
+	if err != nil {
+		t.Fatalf("the int8 gate is priced on the bf16 run (%v); run reference/dump_h3_dit_bf16.py", err)
+	}
+	var m struct {
+		Forwards []struct {
+			Latents, Audio [2]float64
+		} `json:"forwards"`
+	}
+	if err := json.Unmarshal(buf, &m); err != nil {
+		t.Fatal(err)
+	}
+	out := make([][2]float64, len(m.Forwards))
+	for f, fw := range m.Forwards {
+		out[f] = [2]float64{fw.Latents[1], fw.Audio[1]}
+	}
+	return out
+}
+
+// runRef is the oracle's N = 8 run, set up for a sampler on the device: the
+// layout, both schedules, the AdaLN tables built once over every timestep
+// the request uses (as the served path does) and each forward's rows
+// indexed into them.
+type runRef struct {
+	m      ditManifest
+	lay    *plan.Layout
+	vs, as *plan.Schedule
+	tvals  []float32
+	rowTs  [][]int32
+	tabs   []*Table
+	cond   *qwen.Mat
+}
+
+func newRunRef(t *testing.T) *runRef {
 	buf, err := os.ReadFile(filepath.Join(ditRef, "manifest.json"))
 	if err != nil {
 		t.Skipf("no reference dump (%v)", err)
 	}
-	var m ditManifest
-	if err := json.Unmarshal(buf, &m); err != nil {
+	r := &runRef{}
+	if err := json.Unmarshal(buf, &r.m); err != nil {
 		t.Fatal(err)
 	}
 	tbuf, err := os.ReadFile(filepath.Join(textencRef, "manifest.json"))
@@ -279,61 +358,58 @@ func TestGPURun(t *testing.T) {
 	if err := json.Unmarshal(tbuf, &tm); err != nil {
 		t.Fatal(err)
 	}
-	lay, err := plan.NewLayout(filled(m.TextTokens, plan.TextTag), m.LatentFrames, m.LatentHeight, m.LatentWidth, m.AudioLatents, nil)
-	if err != nil {
+	m := r.m
+	if r.lay, err = plan.NewLayout(filled(m.TextTokens, plan.TextTag), m.LatentFrames, m.LatentHeight, m.LatentWidth, m.AudioLatents, nil); err != nil {
 		t.Fatal(err)
 	}
-	vs, err := plan.NewSchedule(len(m.Forwards)+1, 12)
-	if err != nil {
+	if r.vs, err = plan.NewSchedule(len(m.Forwards)+1, 12); err != nil {
 		t.Fatal(err)
 	}
-	as, err := plan.NewSchedule(len(m.Forwards)+1, 3)
-	if err != nil {
+	if r.as, err = plan.NewSchedule(len(m.Forwards)+1, 3); err != nil {
 		t.Fatal(err)
 	}
-	// Every timestep of the request, and each forward's rows indexed into it.
-	var tvals []float32
 	seen := map[float32]bool{}
-	rowTs := make([][]int32, len(vs.Timesteps))
-	for f := range vs.Timesteps {
-		u, idx := lay.RowTimesteps(vs.Timesteps[f], as.Timesteps[f])
+	r.rowTs = make([][]int32, len(r.vs.Timesteps))
+	for f := range r.vs.Timesteps {
+		u, idx := r.lay.RowTimesteps(r.vs.Timesteps[f], r.as.Timesteps[f])
 		for _, v := range u {
 			if !seen[v] {
 				seen[v] = true
-				tvals = append(tvals, v)
+				r.tvals = append(r.tvals, v)
 			}
 		}
-		rowTs[f] = make([]int32, len(idx))
+		r.rowTs[f] = make([]int32, len(idx))
 		for i, j := range idx {
-			rowTs[f][i] = int32(indexOf(tvals, u[j]))
+			r.rowTs[f][i] = int32(indexOf(r.tvals, u[j]))
 		}
 	}
 	start := time.Now()
-	tabs, err := Tables(modelDir, tvals)
-	if err != nil {
+	if r.tabs, err = Tables(modelDir, r.tvals); err != nil {
 		t.Skipf("no weights (%v)", err)
 	}
-	t.Logf("AdaLN tables for %d timesteps in %v", len(tvals), time.Since(start).Round(time.Millisecond))
+	t.Logf("AdaLN tables for %d timesteps in %v", len(r.tvals), time.Since(start).Round(time.Millisecond))
+	r.cond = readRef(t, textencRef, tm.Tensors, "readme_fp32")
+	return r
+}
 
-	dev, done := newTestDevice(t)
-	defer done()
-	g, err := NewGPU(dev, modelDir, 5120, 1024, 2048)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer g.Destroy()
-	if err := g.Begin(lay, readRef(t, textencRef, tm.Tensors, "readme_fp32"), tvals, tabs); err != nil {
+// run steps all seven forwards on g, teacher-forced unless free, logging
+// every forward's velocity and step against the oracle, and returns the
+// video and audio latents rms of every step. TestGPURun says why the gate
+// is teacher-forced.
+func (r *runRef) run(t *testing.T, g *GPU, free bool) (steps [][2]float64) {
+	m := r.m
+	if err := g.Begin(r.lay, r.cond, r.tvals, r.tabs); err != nil {
 		t.Fatal(err)
 	}
 	video := readRef(t, ditRef, m.Tensors, "noise_video")
 	audio := readRef(t, ditRef, m.Tensors, "noise_audio")
 	var total time.Duration
-	for f := range vs.Timesteps {
-		if os.Getenv("H3_FREE") == "" && f > 0 {
+	for f := range r.vs.Timesteps {
+		if !free && f > 0 {
 			video = readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_latents", f-1))
 			audio = readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_audio", f-1))
 		}
-		v, a, took, err := g.Step(video, audio, rowTs[f])
+		v, a, took, err := g.Step(video, audio, r.rowTs[f])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -341,17 +417,74 @@ func TestGPURun(t *testing.T) {
 		rv, rvs := relGap(v, readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_v_video", f)))
 		ra, ras := relGap(a, readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_v_audio", f)))
 		t.Logf("forward %d velocity: video rel %.3g rms %.3g, audio rel %.3g rms %.3g", f, rv, rvs, ra, ras)
-		vs.Step(f, v.Data, video.Data)
-		as.Step(f, a.Data, audio.Data)
+		r.vs.Step(f, v.Data, video.Data)
+		r.as.Step(f, a.Data, audio.Data)
 		relV, rmsV := relGap(video, readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_latents", f)))
 		relA, rmsA := relGap(audio, readRef(t, ditRef, m.Tensors, fmt.Sprintf("f%d_audio", f)))
 		t.Logf("step %d (t %.4f / %.4f) %v: video latents rel %.3g rms %.3g; audio rel %.3g rms %.3g",
-			f, vs.Timesteps[f], as.Timesteps[f], took.Round(time.Millisecond), relV, rmsV, relA, rmsA)
-		if os.Getenv("H3_FREE") == "" && (rmsV > stepRMS || rmsA > stepRMS || math.IsNaN(relV+relA)) {
-			t.Errorf("step %d: video latents rms %.3g, audio rms %.3g > %.0e", f, rmsV, rmsA, stepRMS)
+			f, r.vs.Timesteps[f], r.as.Timesteps[f], took.Round(time.Millisecond), relV, rmsV, relA, rmsA)
+		if math.IsNaN(relV + relA) {
+			t.Fatalf("step %d is NaN", f)
 		}
+		steps = append(steps, [2]float64{rmsV, rmsA})
 	}
-	t.Logf("%d forwards in %v", len(vs.Timesteps), total.Round(time.Millisecond))
+	t.Logf("%d forwards in %v", len(r.vs.Timesteps), total.Round(time.Millisecond))
+	return steps
+}
+
+// TestGPUQ8Ablation says where the int8 bank's error comes from (VIDEO.md
+// M11a): the teacher-forced run with the named projections held at their
+// int8 values and the rest fp16, one staging an arm. H3_Q8_ARMS is a
+// semicolon-separated list of comma-separated projection sets ("" is the
+// fp16 control, "all" every projection); the default is the control, all,
+// and all but each one in turn.
+func TestGPUQ8Ablation(t *testing.T) {
+	if os.Getenv("H3_Q8_ABLATION") == "" {
+		t.Skip("H3_Q8_ABLATION=1: one 40 GB staging and seven forwards an arm")
+	}
+	arms := []string{"", "all"}
+	for _, p := range projOrder {
+		arms = append(arms, "-"+projNames[p])
+	}
+	if s, ok := os.LookupEnv("H3_Q8_ARMS"); ok {
+		arms = strings.Split(s, ";")
+	}
+	r := newRunRef(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	defer func() { simQ8 = nil }()
+	for _, arm := range arms {
+		simQ8 = map[proj]bool{}
+		switch {
+		case arm == "all":
+			for _, p := range projOrder {
+				simQ8[p] = true
+			}
+		case strings.HasPrefix(arm, "-"):
+			for _, p := range projOrder {
+				simQ8[p] = projNames[p] != arm[1:]
+			}
+		case arm != "":
+			for _, name := range strings.Split(arm, ",") {
+				for _, p := range projOrder {
+					if projNames[p] == name {
+						simQ8[p] = true
+					}
+				}
+			}
+		}
+		g, err := NewGPU(dev, modelDir, 5120, 1024, 2048)
+		if err != nil {
+			t.Fatal(err)
+		}
+		steps := r.run(t, g, false)
+		g.Destroy()
+		var line string
+		for _, e := range steps {
+			line += fmt.Sprintf(" %.2e/%.2e", e[0], e[1])
+		}
+		t.Logf("ARM %-8q steps video/audio rms:%s", arm, line)
+	}
 }
 
 func finite(xs []float32) bool {
@@ -423,7 +556,7 @@ func TestGPUSensitivity(t *testing.T) {
 	}
 	dev, done := newTestDevice(t)
 	defer done()
-	g, err := NewGPU(dev, modelDir, 5120, 1024, 2048)
+	g, err := NewGPUBank(dev, modelDir, 5120, 1024, 2048, testBank(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,11 +564,11 @@ func TestGPUSensitivity(t *testing.T) {
 	if err := g.Begin(lay, readRef(t, textencRef, tm.Tensors, "readme_fp32"), tvals, tabs); err != nil {
 		t.Fatal(err)
 	}
-	run := func(eps float64) []*qwen.Mat {
+	run := func(eps, phase float64) []*qwen.Mat {
 		video := readRef(t, ditRef, m.Tensors, "noise_video")
 		audio := readRef(t, ditRef, m.Tensors, "noise_audio")
 		for i := range video.Data {
-			video.Data[i] *= 1 + float32(eps*math.Sin(float64(i)))
+			video.Data[i] *= 1 + float32(eps*math.Sin(float64(i)+phase))
 		}
 		var out []*qwen.Mat
 		for f := range vs.Timesteps {
@@ -449,13 +582,29 @@ func TestGPUSensitivity(t *testing.T) {
 		}
 		return out
 	}
-	base := run(0)
+	base := run(0, 0)
 	for _, eps := range []float64{1e-4, 1e-3} {
-		moved := run(eps)
+		moved := run(eps, 0)
 		for f := range moved {
 			rel, rms := relGap(moved[f], base[f])
 			t.Logf("eps %.0e step %d: device-vs-device video latents rel %.3g rms %.3g", eps, f, rel, rms)
 		}
+	}
+	// H3_SENSITIVITY_DRAWS=n: the spread of the final step's distance over
+	// n draws of the 1e-4 move (a phase each), which is what one
+	// free-running comparison is a single sample of.
+	draws, _ := strconv.Atoi(os.Getenv("H3_SENSITIVITY_DRAWS"))
+	var finals []float64
+	for d := 1; d <= draws; d++ {
+		moved := run(1e-4, float64(d))
+		_, rms := relGap(moved[len(moved)-1], base[len(base)-1])
+		finals = append(finals, rms)
+		t.Logf("draw %d: final video latents rms %.3g", d, rms)
+	}
+	if len(finals) > 0 {
+		sort.Float64s(finals)
+		t.Logf("%d draws of a 1e-4 move: final video latents rms min %.3g, median %.3g, max %.3g",
+			len(finals), finals[0], finals[len(finals)/2], finals[len(finals)-1])
 	}
 }
 
@@ -503,7 +652,7 @@ func TestGPUShapes(t *testing.T) {
 	if c := os.Getenv("H3_CHUNK"); c != "" {
 		fmt.Sscan(c, &chunk)
 	}
-	g, err := NewGPU(dev, modelDir, maxRows, 1024, chunk)
+	g, err := NewGPUBank(dev, modelDir, maxRows, 1024, chunk, testBank(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,7 +789,7 @@ func TestGPUAttentionScreen(t *testing.T) {
 	}
 	dev, done := newTestDevice(t)
 	defer done()
-	g, err := NewGPU(dev, modelDir, len(lay.Pos), 1024, 8192)
+	g, err := NewGPUBank(dev, modelDir, len(lay.Pos), 1024, 8192, testBank(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -699,4 +848,19 @@ func f16(h uint16) float32 {
 		return float32(math.Inf(1))
 	}
 	return math.Float32frombits(sign | (exp+112)<<23 | man<<13)
+}
+
+// testBank is the block stack's bank H3_BANK names: fp16 (the default) or
+// q8 (VIDEO.md M11a).
+func testBank(t *testing.T) qwen.Bank {
+	s := os.Getenv("H3_BANK")
+	if s == "" {
+		return qwen.BankFP16
+	}
+	b, err := qwen.ParseBank(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bank %s", b)
+	return b
 }

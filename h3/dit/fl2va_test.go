@@ -114,7 +114,7 @@ func TestGPUFL2VA(t *testing.T) {
 
 	dev, done := newTestDevice(t)
 	defer done()
-	g, err := NewGPU(dev, modelDir, len(lay.Pos), d.TextTokens, 2048)
+	g, err := NewGPUBank(dev, modelDir, len(lay.Pos), d.TextTokens, 2048, testBank(t))
 	if err != nil {
 		t.Fatal(err)
 	}

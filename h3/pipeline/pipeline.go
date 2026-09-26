@@ -4,21 +4,24 @@
 // ffmpeg.
 //
 // It composes what M1–M7 built, and its own job is the order in which they
-// hold the machine. Everything resident at once is ~106 GB, so a request
-// runs as three stagings, each freed before the next is allocated
-// (decision 2):
+// hold the machine. Everything resident at once is ~106 GB in fp16, so a
+// request runs as three stagings, each freed before the next is allocated
+// (decision 2). With Options.Bank = BankQ8 (VIDEO.md M11a; the served
+// default) the two big ones are int8 banks, and a request's measured peak is
+// ~31 GB of the machine against ~57 GB in fp16:
 //
 //	keyframes    0.4 GB  (fl2va) the video VAE's encoder, freed
-//	text encoder  50 GB  staged with the vision tower for fl2va, one
-//	                     forward, freed
-//	transformer   44 GB  staged (weights + arenas), N − 1 forwards, freed
+//	text encoder  27 GB  (fp16: 50) staged with the vision tower for fl2va,
+//	                     one forward, freed
+//	transformer   23 GB  (fp16: 42) staged (weights + arenas), N − 1
+//	                     forwards, freed
 //	video VAE      7 GB  staged, the decode — the audio decode runs beside
 //	                     it on the CPU
 //
-// The AdaLN tables (29 s of host work over 26 GB of bf16) are computed while
-// the text encoder stages, since neither needs the other. A caller that
+// The AdaLN tables (~40 s of host work over 26 GB of bf16) are computed
+// while the transformer stages, since neither needs the other. A caller that
 // holds the machine for many requests can keep the transformer and the VAE
-// staged between them (Options.Resident): 51 GB, which is then the floor.
+// staged between them (Options.Resident), which is then the floor.
 package pipeline
 
 import (
@@ -28,6 +31,7 @@ import (
 	"image"
 	"math/rand/v2"
 	"path/filepath"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -201,6 +205,12 @@ type Options struct {
 	Chunk int
 	// MaxPrompt caps a prompt's tokens (0: DefaultMaxPrompt).
 	MaxPrompt int
+	// Bank is how the text encoder's and the transformer's projections are
+	// held. The zero value is BankFP16; BankQ8 is the served default
+	// (VIDEO.md M11a), and halves both stagings (50 → 27 GB, 42 → 23 GB)
+	// at no measurable cost in speed, inside the released bf16 pipeline's
+	// distance from fp32.
+	Bank qwen.Bank
 
 	// Hold runs fn with the device's queue held, and nil runs it directly,
 	// for a caller that owns the device outright (cmd/h3, the tests).
@@ -349,7 +359,7 @@ type Stage string
 
 const (
 	StageEncode    Stage = "encode"    // staging the text encoder and running it
-	StageTables    Stage = "tables"    // the AdaLN tables, beside the encoder
+	StageTables    Stage = "tables"    // the AdaLN tables, beside the transformer's staging
 	StageTransform Stage = "transform" // staging the transformer
 	StageStep      Stage = "step"      // one forward
 	StageDecode    Stage = "decode"    // both decoders
@@ -389,6 +399,13 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	lay := r.Layout
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// Freed heap goes back to the OS at every boundary between stagings.
+	// Inside a server whose other models left ~11 GB of collected garbage
+	// resident, a staging's multi-GB host buffers do not fit the fragmented
+	// free spans and take fresh pages on top of them: that was ~5 GB past
+	// the standalone peak, and the OOM killer (VIDEO.md M11a).
+	debug.FreeOSMemory()
+	defer memLog("generate")()
 	res := &Result{Resolved: r, Timings: map[Stage]time.Duration{}}
 	if !p.opt.Resident {
 		defer p.freeDiT()
@@ -431,21 +448,32 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		}
 	}
 
-	// The text encoder and, beside it, the AdaLN tables. The transformer is
-	// not staged yet, whether or not it will stay: the encoder's 50 GB and
-	// its 44 do not fit together beside anything else.
-	p.freeDiT()
+	// The AdaLN tables are disk-bound host work run beside a staging: the
+	// transformer's, whose int8 21 GB leaves room for their ~3.5 GB of
+	// transients where the encoder's phase (27 GB staged) did not (VIDEO.md
+	// M11a) — or, when the transformer is resident and there is no staging
+	// to hide behind, the encoder's, as before.
 	var tabs []*dit.Table
 	var tabErr error
 	var tabTook time.Duration
 	var tabWG sync.WaitGroup
-	tabWG.Add(1)
-	go func() {
-		defer tabWG.Done()
-		start := time.Now()
-		tabs, tabErr = dit.Tables(filepath.Join(p.dir, "transformer"), tvals)
-		tabTook = time.Since(start)
-	}()
+	startTables := func() {
+		tabWG.Add(1)
+		go func() {
+			defer tabWG.Done()
+			start := time.Now()
+			tabs, tabErr = dit.Tables(filepath.Join(p.dir, "transformer"), tvals)
+			tabTook = time.Since(start)
+		}()
+	}
+	defer tabWG.Wait()
+	if p.opt.Resident {
+		startTables()
+	}
+
+	// The text encoder. The transformer is not staged yet, whether or not
+	// it will stay: the two do not fit together beside anything else.
+	p.freeDiT()
 	start := time.Now()
 	progress(StageEncode, 0, 1)
 	var anchors *qwen.Mat
@@ -460,6 +488,22 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		return p.encode(ctx, r)
 	}()
 	res.Timings[StageEncode] = time.Since(start)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	debug.FreeOSMemory() // the encoder's host-side staging
+
+	// The transformer, with the tables beside its staging.
+	if !p.opt.Resident {
+		startTables()
+	}
+	start = time.Now()
+	progress(StageTransform, 0, 1)
+	g, err := p.stageDiT(len(lay.Pos), len(r.Tokens))
 	tabWG.Wait()
 	res.Timings[StageTables] = tabTook
 	if err != nil {
@@ -467,17 +511,6 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	}
 	if tabErr != nil {
 		return nil, tabErr
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
-	// The transformer.
-	start = time.Now()
-	progress(StageTransform, 0, 1)
-	g, err := p.stageDiT(len(lay.Pos), len(r.Tokens))
-	if err != nil {
-		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -519,6 +552,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	if !p.opt.Resident {
 		p.freeDiT()
 	}
+	debug.FreeOSMemory() // the tables and the transformer's host-side staging
 
 	// Both decoders: the video's on the device, the audio's on the CPU
 	// beside it.
@@ -568,7 +602,7 @@ func (p *Pipeline) encode(ctx context.Context, r *Resolved) (*qwen.Mat, error) {
 			return nil, err
 		}
 	}
-	enc, err := qwen.NewGPUEncoder(p.dev, set, cfg, textenc.Layers, len(ids), nil)
+	enc, err := qwen.NewGPUEncoderBank(p.dev, set, cfg, textenc.Layers, len(ids), nil, p.opt.Bank)
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +726,7 @@ func (p *Pipeline) stageDiT(rows, text int) (*dit.GPU, error) {
 		// Staged for the request's own sizes; a resident one is sized up to
 		// a text budget so the next prompt fits.
 		text = p.textBudget(text)
-		g, err := dit.NewGPU(p.dev, filepath.Join(p.dir, "transformer"), rows, text, p.opt.Chunk)
+		g, err := dit.NewGPUBank(p.dev, filepath.Join(p.dir, "transformer"), rows, text, p.opt.Chunk, p.opt.Bank)
 		if err != nil {
 			return nil, err
 		}

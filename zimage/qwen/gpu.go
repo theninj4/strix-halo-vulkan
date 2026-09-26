@@ -21,6 +21,7 @@ package qwen
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -258,8 +259,12 @@ type layerWeights struct {
 	attnNorm, ffnNorm uint32
 	qNorm, kNorm      uint32
 	// fp16 bank and the offset of each projection inside it, in halves.
+	// Under BankQ8 that is the shared scratch, the same for every layer.
 	bank int
 	bOff map[Proj]uint32
+	// BankQ8: the int8 bank and each projection's byte offset in it.
+	qbank int
+	qOff  map[Proj]uint32
 }
 
 // GPUEncoder runs Qwen3 layers on the device. One instance holds every layer
@@ -273,6 +278,12 @@ type GPUEncoder struct {
 	abuf  *vk.Buffer
 	hbuf  *vk.Buffer
 	banks []*vk.Buffer
+	// bank is how the projections are held. Under BankQ8, qbanks hold them
+	// as int8 and banks is the one fp16 scratch a layer is expanded into
+	// by its first seven dispatches (dequant, one pipeline per qbank).
+	bank    Bank
+	qbanks  []*vk.Buffer
+	dequant []*vk.ComputePipeline
 
 	pipes map[string]*vk.ComputePipeline
 	gemms []map[GEMMKernel]*vk.ComputePipeline
@@ -326,10 +337,17 @@ type GPUEncoder struct {
 // the host as fp32 (1.56 GB) and every projection is narrowed into a bank --
 // so the caller may close it afterwards, as the DiT's stack allows.
 func NewGPUEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, BankFP16)
 }
 
-func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int) (*GPUEncoder, error) {
+// NewGPUEncoderBank is NewGPUEncoder with the projections held as bank
+// says. BankQ8 halves the weights (MiniMax-H3's 32 B encoder: 50 → 27 GB)
+// for one expansion dispatch per projection per run (VIDEO.md M11a).
+func NewGPUEncoderBank(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank) (*GPUEncoder, error) {
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank)
+}
+
+func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int, bank Bank) (*GPUEncoder, error) {
 	explicitPlan := plan
 	if layers <= 0 || layers > cfg.NumLayers {
 		return nil, fmt.Errorf("qwen: asked for %d of %d layers", layers, cfg.NumLayers)
@@ -357,6 +375,7 @@ func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTo
 		dev:     dev,
 		cfg:     cfg,
 		ctl:     ctl,
+		bank:    bank,
 		plan:    plan,
 		pipes:   make(map[string]*vk.ComputePipeline),
 		kernels: make(map[GEMMKernel]gemmVariant),
@@ -518,9 +537,13 @@ func (g *GPUEncoder) layoutWeights(layers, bankBytes int) error {
 		return fmt.Errorf("qwen: one layer's weights are %d MB and a bank holds %d MB",
 			(perLayer16*2)>>20, bankBytes>>20)
 	}
+	perLayerQ := 0
+	for _, r := range projOrder {
+		perLayerQ += Q8Bytes(shapes[r][0], shapes[r][1])
+	}
 
 	g.w = make([]layerWeights, layers)
-	var bankElems []int
+	var bankElems, qbankBytes []int
 	cur := -1
 	for i := range g.w {
 		w := layerWeights{bOff: make(map[Proj]uint32, len(projOrder))}
@@ -530,6 +553,30 @@ func (g *GPUEncoder) layoutWeights(layers, bankBytes int) error {
 		w.kNorm = w.qNorm + uint32(c.HeadDim)
 		total32 += perLayer32
 
+		if g.bank == BankQ8 {
+			// Every layer is expanded into the same scratch, so its fp16
+			// offsets are the first layer's.
+			if i == 0 {
+				bankElems = []int{0}
+				for _, r := range projOrder {
+					w.bOff[r] = uint32(bankElems[0])
+					bankElems[0] += bElems(shapes[r][0], shapes[r][1], kernelLayout)
+				}
+			} else {
+				w.bOff = g.w[0].bOff
+			}
+			if len(qbankBytes) == 0 || qbankBytes[len(qbankBytes)-1]+perLayerQ > bankBytes {
+				qbankBytes = append(qbankBytes, 0)
+			}
+			w.qbank = len(qbankBytes) - 1
+			w.qOff = make(map[Proj]uint32, len(projOrder))
+			for _, r := range projOrder {
+				w.qOff[r] = uint32(qbankBytes[w.qbank])
+				qbankBytes[w.qbank] += Q8Bytes(shapes[r][0], shapes[r][1])
+			}
+			g.w[i] = w
+			continue
+		}
 		if cur < 0 || (bankElems[cur]+perLayer16)*2 > bankBytes {
 			bankElems = append(bankElems, 0)
 			cur = len(bankElems) - 1
@@ -540,6 +587,13 @@ func (g *GPUEncoder) layoutWeights(layers, bankBytes int) error {
 			bankElems[cur] += perProj[r]
 		}
 		g.w[i] = w
+	}
+	for _, n := range qbankBytes {
+		b, err := g.dev.NewBuffer(n)
+		if err != nil {
+			return fmt.Errorf("qwen: int8 weight bank %d (%d MB): %w", len(g.qbanks), n>>20, err)
+		}
+		g.qbanks = append(g.qbanks, b)
 	}
 
 	var err error
@@ -642,6 +696,21 @@ func (g *GPUEncoder) build() error {
 		g.attn = attnVariant{name: "qt1_kt4_nocausal", qt: 1, ktil: 4}
 	}
 
+	for b, qb := range g.qbanks {
+		mod, err := g.dev.NewShaderModule(shaders.DiTDequantQ8)
+		if err != nil {
+			return fmt.Errorf("qwen: shader dequant: %w", err)
+		}
+		g.mods = append(g.mods, mod)
+		pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
+			Buffers: []*vk.Buffer{g.wbuf, g.abuf, qb, g.banks[0]}, PushConstantSize: pcSize,
+		})
+		if err != nil {
+			return fmt.Errorf("qwen: dequant pipeline on int8 bank %d: %w", b, err)
+		}
+		g.dequant = append(g.dequant, pipe)
+	}
+
 	feat := g.dev.Features()
 	sgs, err := g.dev.Physical().SubgroupSizeControl()
 	if err != nil {
@@ -706,6 +775,11 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 
 	shapes := g.projShapes()
 	for i := range g.w {
+		// A layer is ~2 GB of fp32 on the host at 32 B, dead once it is in
+		// its bank: collected here, it never accumulates into the GC's
+		// doubling headroom beside a staging that is itself tens of GB
+		// (VIDEO.md M11a). Its slices hold no pointers, so this is ms.
+		runtime.GC()
 		layer, err := LoadLayer(set, i, c)
 		if err != nil {
 			return err
@@ -725,6 +799,14 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 			lin := lins[r]
 			if lin.Out != shapes[r][0] || lin.In != shapes[r][1] {
 				return fmt.Errorf("qwen: layer %d %s is [%d %d], want %v", i, r, lin.Out, lin.In, shapes[r])
+			}
+			if g.bank == BankQ8 {
+				buf := make([]byte, Q8Bytes(lin.Out, lin.In))
+				if err := PackQ8(buf, lin.Weight, lin.Out, lin.In); err != nil {
+					return err
+				}
+				g.qbanks[w.qbank].WriteBytesAt(int(w.qOff[r]), buf)
+				continue
 			}
 			buf := make([]uint16, bElems(lin.Out, lin.In, g.stagedLayout))
 			packB(buf, lin.Weight, lin.Out, lin.In, g.stagedLayout)
@@ -785,10 +867,13 @@ func (g *GPUEncoder) Destroy() {
 			p.Destroy()
 		}
 	}
+	for _, p := range g.dequant {
+		p.Destroy()
+	}
 	for _, m := range g.mods {
 		m.Destroy()
 	}
-	for _, b := range append([]*vk.Buffer{g.hbuf, g.abuf, g.wbuf}, g.banks...) {
+	for _, b := range append(append([]*vk.Buffer{g.hbuf, g.abuf, g.wbuf}, g.banks...), g.qbanks...) {
 		if b != nil {
 			b.Destroy()
 		}
@@ -1168,7 +1253,7 @@ func (g *GPUEncoder) Banks() (bytes []int, byLayer []int) {
 func (g *GPUEncoder) ActivationBytes() int { return g.abuf.Size() + g.hbuf.Size() }
 func (g *GPUEncoder) WeightBytes() int {
 	n := g.wbuf.Size()
-	for _, b := range g.banks {
+	for _, b := range append(g.banks[:len(g.banks):len(g.banks)], g.qbanks...) {
 		n += b.Size()
 	}
 	return n
@@ -1312,6 +1397,15 @@ func (g *GPUEncoder) layerGraph(i int) ([]vk.MultiDispatch, []string, error) {
 		pc := base
 		pc.InOff, pc.OutOff = y, g.aX
 		add("add", kind, uint32(g.rows), 1, pc)
+	}
+
+	// ---- The int8 bank's expansion into the scratch every GEMM below reads.
+	if g.bank == BankQ8 {
+		shapes := g.projShapes()
+		for _, r := range projOrder {
+			d = append(d, Q8Dispatch(g.dequant[w.qbank], w.qOff[r], w.bOff[r], shapes[r][0], shapes[r][1]))
+			kinds = append(kinds, "dequant "+string(r))
+		}
 	}
 
 	// ---- Attention.

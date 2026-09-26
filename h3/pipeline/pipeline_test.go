@@ -16,6 +16,7 @@ import (
 	"strix-halo-vulkan/h3/plan"
 	"strix-halo-vulkan/h3/vae"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
 )
 
@@ -141,7 +142,8 @@ func TestE2E(t *testing.T) {
 
 	dev, done := newTestDevice(t)
 	defer done()
-	p, err := New(dev, modelDir, Options{})
+	bank := testBank(t)
+	p, err := New(dev, modelDir, Options{Bank: bank})
 	if err != nil {
 		t.Skipf("no checkpoint: %v", err)
 	}
@@ -185,8 +187,12 @@ func TestE2E(t *testing.T) {
 	}
 	snr := 10 * math.Log10(sig/noise)
 	t.Logf("against the oracle's decode: frames PSNR %.1f dB, soundtrack SNR %.1f dB", psnr, snr)
-	if psnr < 20 || math.IsNaN(psnr) {
-		t.Errorf("frames PSNR %.1f dB", psnr)
+	floor := 20.0
+	if bank == qwen.BankQ8 {
+		floor = q8PSNRFloor
+	}
+	if psnr < floor || math.IsNaN(psnr) {
+		t.Errorf("frames PSNR %.1f dB < %.0f", psnr, floor)
 	}
 	if math.IsNaN(rmsV+rmsA) || rmsV > 0.5 || rmsA > 0.5 {
 		t.Errorf("latents rms %.3g / %.3g", rmsV, rmsA)
@@ -211,6 +217,15 @@ func TestE2E(t *testing.T) {
 	}
 }
 
+// q8PSNRFloor is TestE2E's floor for the int8 bank (VIDEO.md M11a). The
+// run is free-running, so the PSNR is one draw of a chaotic divergence: 8
+// draws of a 1e-4 move of the starting noise alone end 0.056–0.212 rms
+// apart (TestGPUSensitivity), fp16 ends 0.121 from the oracle (25.9 dB),
+// bf16 0.146, int8 0.263 (19.8 dB) — while every teacher-forced int8 step
+// is inside bf16's (TestGPURun). The floor catches a broken run, not the
+// bank's precision, which TestGPURun holds.
+const q8PSNRFloor = 18
+
 func gap(got, want []float32) (rel, rmsRel float64) {
 	var maxAbs, ref, sq, refSq float64
 	for i := range want {
@@ -221,4 +236,19 @@ func gap(got, want []float32) (rel, rmsRel float64) {
 		refSq += float64(want[i]) * float64(want[i])
 	}
 	return maxAbs / ref, math.Sqrt(sq / refSq)
+}
+
+// testBank is the bank H3_BANK names: fp16 (the default) or q8 (VIDEO.md
+// M11a).
+func testBank(t *testing.T) qwen.Bank {
+	s := os.Getenv("H3_BANK")
+	if s == "" {
+		return qwen.BankFP16
+	}
+	b, err := qwen.ParseBank(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("bank %s", b)
+	return b
 }
