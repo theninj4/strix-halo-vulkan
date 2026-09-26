@@ -29,6 +29,7 @@ Ultimately we want to be able to run these tasks:
     * https://github.com/MiniMax-AI/MiniMax-H3
   8. Music Generation via `ace-step-1.5-xl-turbo`:
     * https://huggingface.co/ACE-Step/acestep-v15-xl-turbo
+    * https://huggingface.co/ACE-Step/acestep-5Hz-lm-4B
     * https://github.com/ace-step/ACE-Step-1.5
 
 We will ultimately serve up a HTTP API serving these features, in Go.
