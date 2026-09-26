@@ -28,6 +28,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
+| `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. `t2va` only (keyframes are VIDEO.md M10). See [Videos are jobs](#videos-are-jobs) |
 | `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](CLASSIFICATION.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
@@ -257,6 +258,13 @@ Two things would fix it, and both are measurements rather than arguments:
     -gpu         true             use the device where an adapter has a resident path
     -max-upload  128              largest body carrying a file, in MB
     -log-bodies  false            print request and response bodies in the access log
+
+    -video           false        load MiniMax-H3 and serve /v1/videos; ~0.3 GB at rest, ~50 GB at a request's peak
+    -video-model     models/MiniMax-H3             the diffusers-layout checkpoint root
+    -video-dir       ""           where finished mp4s wait to be fetched; empty is a temporary directory
+    -video-ttl       24h          how long a finished job and its file are kept
+    -video-queue     16           jobs that may wait behind the running one; past it is a 429
+    -video-max-prompt 0           longest prompt in tokens; 0 is 4096
 
     -kev             false        load Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) and serve /v1/systemone
     -kev-model       models/kev-4b                 adapter, converted head (reference/convert_kev_head.py), tokenizer
@@ -865,6 +873,48 @@ none.
   other answer bit-identical (`TestGPUQuestionsAreIsolated`). Options inside
   one question are *not* independent, and reordering them can move the
   answer. That is Kev's and Jev's behaviour, not a defect of this server.
+
+## Videos are jobs
+
+A video is minutes at the served 480p and hours at the trained 768p
+(VIDEO.md), so `/v1/videos` is OpenAI's asynchronous shape and not a request
+that waits: `POST` answers at once with a job, the client polls `GET
+/v1/videos/{id}` until `status` is `completed` (or `failed`, with an `error`),
+and fetches `GET /v1/videos/{id}/content`, an H.264/AAC mp4. `DELETE` cancels
+a queued or running job — within one ≤ 800 ms submission — and forgets it. A
+finished job and its file are kept for `-video-ttl` and then 404, as does
+everything after a restart: jobs live in memory.
+
+```sh
+curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
+  -d '{"prompt": "…", "size": "864x480", "seconds": "5"}'          # OpenAI's shape
+curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
+  -d '{"task": "t2va", "prompt": "…", "seed": 0,
+       "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 10}}'  # SGLang's
+```
+
+Both envelopes are read, and a multipart form as OpenAI's SDK sends one.
+**`size` is read as an aspect ratio and a short edge**, not a canvas: the
+model's canvases are on a 32-pixel grid, so `1280x720` runs as 1280x704 and
+the job's `size` says so. `seconds` below the model's 5 s floor is raised
+to it (OpenAI's clients default to "4"); past 15 s is a 400. So is a request
+the transformer's arenas cannot span — 87,296 rows, which is the trained
+768p canvas to ~11.8 s — and that is found at submit time, before 50 GB of
+text encoder is staged for it. Extensions: `steps` (or
+`num_inference_steps`; default 20, the release's 50), `seed` (reported
+either way), and on the job `seed`, `steps`, `frames`, `stage` and
+`estimated_seconds`, the backend's estimate of the run from measured rates.
+`input_reference`, `task: fl2va` and `conditions` are refused until
+keyframes land (VIDEO.md M10); `variant` other than `video` is a 400.
+
+**The queue is in `api`, and one job runs at a time.** The backend is
+synchronous — one mp4 to a path — and a request's stagings peak at ~50 GB,
+so two at once would not fit. **The device is not held for the job.** The
+stagings (~2 of a request's minutes, reading bf16 from disk) allocate and
+write mapped memory and never touch the queue, so they take no lock; what
+does — the encoder's forward, each transformer forward, the VAE decode —
+yields the device between submissions, so a speech request behind a 35 s
+forward waits for one submission, not the forward.
 
 ## What is left
 

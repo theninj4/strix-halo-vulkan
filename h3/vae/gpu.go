@@ -51,6 +51,13 @@ import (
 //     underflow a real weight. The planes are zeroed at allocation, and
 //     every row the attention can read is written by a pack before it is.
 type GPU struct {
+	// Between, when set, is called between two submissions, when nothing
+	// of this model's is on the device. A server uses it to let other work
+	// run inside a forward that holds the device for tens of seconds, and
+	// an error from it (a cancelled request) abandons the run there
+	// (VIDEO.md M9).
+	Between func() error
+
 	dev *vk.Device
 	cfg *Config
 
@@ -657,6 +664,11 @@ func (gr *graph) submit() (time.Duration, error) {
 			est += c
 			j++
 		}
+		if i > 0 && gr.g.Between != nil {
+			if err := gr.g.Between(); err != nil {
+				return total, err
+			}
+		}
 		t, err := vk.DispatchMultiTimed(gr.d[i:j], 1, 1, true)
 		if err != nil {
 			return total, fmt.Errorf("vae: dispatch %d-%d (%s): %w", i, j-1, gr.kinds[i], err)
@@ -924,6 +936,11 @@ func (g *GPU) Decode(z *Tensor, pqc *PostQuantConv) (*Tensor, Stats, error) {
 	stitched := make([]*Tensor, p.Clips)
 	nx := len(p.XStarts)
 	for b := 0; b < len(items); b += g.maxSeqs {
+		if b > 0 && g.Between != nil {
+			if err := g.Between(); err != nil {
+				return nil, st, err
+			}
+		}
 		batch := items[b:min(b+g.maxSeqs, len(items))]
 		in := make([]*Tensor, len(batch))
 		for i, it := range batch {

@@ -271,7 +271,7 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M6 | Audio VAE decoder, stereo, on the CPU, then the GPU | **done 2026-09-26** (`h3/audiovae`, CPU fp32): every stage ≤ 2.8e-6 of the oracle, the stereo decode at **SNR 106 dB**; 7.2 s for 5.2 s of audio (the GPU is an M11 lever) |
 | M7 | DiT on the GPU: GEMMs and WMMA attention at 5k–105k rows, the 4 GiB plan, per-step profile | **done 2026-09-26** (`h3/dit/gpu.go`): a forward at ≤ 6.7e-3 of the fp32 oracle, teacher-forced steps ≤ 1.7e-3 rms; **35.6 s a forward at 480p, 143 s at the trained 768p** |
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
-| M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | |
+| M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | |
 | M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | |
 | M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | |
@@ -623,6 +623,67 @@ At the served 480p × 20 steps, the forwards are 11.3 min and the fixed
 costs above are ~2.5 min: **~14 min a request**, ~18% of it staging. The
 cure is decision 2's pre-narrowed fp16 banks on disk, or residency (M9/M11).
 
+### M9 — serving (2026-09-26)
+
+`-video` serves OpenAI's asynchronous video API (API.md, *Videos are
+jobs*): `POST /v1/videos` → a queued job, `GET /v1/videos[/{id}]`,
+`GET /v1/videos/{id}/content` → the mp4, `DELETE` to cancel and forget. It
+also reads SGLang's H3 envelope (`task`, `target.{short_edge, aspect_ratio,
+duration_seconds}`, `seed`), so the README's request scripts work against it
+unchanged but for the host. `t2va` only: `fl2va`, `conditions` and
+`input_reference` are 400s until M10. The pieces:
+
+- **The queue is in `api`** (`VideoJobs`): one job at a time, 16 waiting at
+  most (429 past it), jobs in memory, files in `-video-dir` for `-video-ttl`
+  (24 h). The backend (`backend.Video`) is synchronous: plan a request on the
+  host, then generate one mp4 to a path. `api/videos_test.go` covers the
+  queue against a fake: both envelopes and a multipart form, the refusals,
+  one-at-a-time, 409 on unfinished content, 429, cancel of a running job,
+  failure, shutdown, expiry.
+- **A request is planned at submit** (`Pipeline.Resolve`): canvas, frames,
+  prompt tokens (≤ 4096) and **the transformer's arena check**
+  (`dit.CheckArenas`, split out of `allocActivations`). The fp16 q/k/v planes
+  span the sequence, so **87,296 rows** is the ceiling: 480p to 14.4 s, the
+  trained 768p to ~11.8 s (10 s is 73k rows; 12 s is 88.7k and refused). The
+  refusal is a 400 at submit, not a failed job after a 50 GB encode. Under
+  5 s is raised to 5 (OpenAI clients send "4").
+- **Only submissions hold the device.** Staging here is allocation, pipeline
+  creation and writes into mapped memory; none of it touches the queue
+  (checked: no dispatch in `newEncoder`, `dit.NewGPU`, `vae.NewGPU`). So
+  `pipeline.Options.Hold` wraps just the encoder's forward, `Begin`, each
+  forward and the VAE decode, and ~2 of a request's minutes of bf16 reads run
+  unlocked. Inside a held section, `dit.GPU.Between` / `vae.GPU.Between` run
+  between the ≤ 800 ms submissions: the backend yields the device there, and
+  the request's context is checked there, so a DELETE or a shutdown stops a
+  forward within one submission.
+- The job reports `stage`, `progress` (weighted by the estimate) and
+  `estimated_seconds`: forward = 1.159e-3·L + 6.745e-8·L² s (fitted through
+  M7's 480p and 768p), plus M8's fixed stagings. 206 s estimated, 199 s run.
+
+**The gate** (`serve -video -tts`, the README prompt at 448×256 × N = 8 in
+SGLang's envelope, a speech request every ~2 s beside it):
+
+| stage | job | speech round trip (idle: 17–18 ms) |
+|---|---|---|
+| encode (encoder staging unlocked + forward) | ~75 s | 19–92 ms, but **1.18 and 1.09 s in its first 4 s** |
+| transformer staging | ~60 s | 18–267 ms, one **0.50 s** at its start |
+| 7 forwards (7.7 s each, held) | ~55 s | **28–255 ms** |
+| decode + mux | ~17 s | 20–201 ms |
+| total | **3 m 19 s** (M8 direct: 3 m 28 s) | |
+
+A speech request is several device units, and each waits at most one
+submission. The two long waits at the start of the encode, and the 0.5 s at
+the transformer's, line up with allocating 50 and 44 GB. That is the kernel
+making the memory (the lock is not held then), and it is not something the
+lock order can fix. The mp4 reads back as h264 448×256 × 124 frames plus aac
+32 kHz stereo.
+
+**Cancel, then again.** A second job was DELETEd 3 s into its forwards, and
+it stopped **0.33 s** later, inside a forward. A third job on the same
+process then ran in 3 m 17 s, and its mp4 is **byte-identical** to the
+first's (same seed). So an abandoned forward leaves nothing behind, and a
+served request reproduces from its seed.
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -656,41 +717,43 @@ projections are folded out.
 
 ## Handoff
 
-**2026-09-26, session 2: M5, M6 and M8 done.** The vertical makes a video
-with sound from a prompt (`go run ./cmd/h3 -prompt … -out x.mp4`). M9
-onward is open.
+**2026-09-26, session 3: M9 done.** The vertical is served:
+`serve -video` answers `/v1/videos` as OpenAI's async jobs (and SGLang's H3
+envelope), and shares the device with the other verticals while it runs.
+M10 onward is open.
 
 - Weights: `models/MiniMax-H3` (135 GB, gitignored): `transformer/`,
   `text_encoder/`, `vae/`, `audio_vae/`, plus configs, tokenizers, docs and
-  the README's request scripts.
+  the README's request scripts (`scripts/readme/*.sh`).
 - Code: `h3/plan` (M1), `h3/textenc` (M2), `h3/dit` (M3 CPU, `Tables`, M7
-  GPU `gpu.go`), `h3/vae` (M5: host tiling and blends in `vae.go`, the
-  batched ViT on the device in `gpu.go`), `h3/audiovae` (M6, CPU fp32),
-  `h3/pipeline` (M8: staging order, `Generate`, `WriteMP4`), `cmd/h3`.
-  Shaders: `shaders/h3_*.comp`, plus the `h3vae_*` head-64 builds of
-  existing sources.
+  GPU `gpu.go`, `CheckArenas`), `h3/vae` (M5), `h3/audiovae` (M6, CPU fp32),
+  `h3/pipeline` (M8: staging order, `Generate`, `WriteMP4`; M9: `Resolve`
+  with limits, `Options.Hold`/`Between`), `cmd/h3` (CLI), and for serving
+  `backend/video.go` + `api/videos.go` + the `-video*` flags in `cmd/serve`.
 - Oracles: `reference/dump_h3_{plan,tokens,textenc,dit_block,dit,ranges,vae,audio}.py`,
-  outputs in `reference/out/h3*`. The VAE oracle decodes M4's final latents
-  (~3 min, 12 GB); the audio one takes seconds.
-- Tests: `go test -short ./h3/...` is quick. Without `-short`:
-  `TestGPUDecoder` (h3/vae, 10 s), `TestStages`/`TestDecode` (h3/audiovae,
-  ~10 s), and `TestE2E` (h3/pipeline, ~3.5 min, 50 GB peak). The opt-ins
-  are `H3_VAE_FULL=1`, `H3_VAE_SHAPES=1` (+`H3_VAE_SEQS`),
+  outputs in `reference/out/h3*`.
+- Tests: `go test -short ./h3/...` and `go test ./api/` are quick. Without
+  `-short`: `TestGPUDecoder` (h3/vae, 10 s), `TestStages`/`TestDecode`
+  (h3/audiovae, ~10 s), `TestE2E` (h3/pipeline, ~3.5 min, 50 GB peak). The
+  opt-ins are `H3_VAE_FULL=1`, `H3_VAE_SHAPES=1` (+`H3_VAE_SEQS`),
   `H3_AUDIO_RAW=path`, `H3_E2E_MP4=path`, and M7's (`H3_SHAPES`,
   `H3_PROFILE`, `H3_CHUNK`, `H3_SCREEN`, `H3_SENSITIVITY`, `H3_FREE`).
+- Served gate by hand: `serve -addr 127.0.0.1:18080 -token= -video -tts`, then
+  POST the README request with `target.short_edge 256, aspect_ratio "7:4"`,
+  `num_inference_steps 8` and poll (M9's table).
+- **Not deployed.** `ai.service` has no `-video` yet: it is M-o5's decision
+  (the ~50 GB peak beside image's 32 GB and the rest on the second machine).
+  Adding `-video` to the non-LLM line is the whole change.
 
 **Next, in order:**
 
-1. **M9, serve.** Wire `h3/pipeline` into `backend` and `api` as OpenAI's
-   async `/v1/videos` (POST → id, GET status, GET content), with
-   cancellation. Take the device through `backend.Device.Do`. A forward is
-   35 s at 480p, so yielding only between forwards starves the other
-   verticals: give `dit.GPU`'s `graph.submit` (and the VAE's) a hook that
-   calls `Device.yield` between its ≤ 800 ms submissions. Decide residency
-   by the machine it lands on (M-o5).
-2. **The staging cost** (~2.5 min of a ~14 min request): pre-narrowed fp16
-   banks on disk for the encoder and transformer (decision 2), and cache
-   `Tables` by schedule.
+1. **The staging cost** (~2.3 of a served request's ~14 min): pre-narrowed
+   fp16 banks on disk for the encoder and transformer (decision 2), and cache
+   `Tables` by schedule. Since M9 the stagings no longer block other
+   verticals, so this is now about the video's own latency only.
+2. **M10, `fl2va`**: the VAE encoder (a CNN), the vision tower for keyframes,
+   keyframe rows in the layout (M1 already plans them), and in the API
+   `input_reference` / SGLang's `conditions` (both 400 today).
 3. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
    55.5 peak; 68% of a trained forward), the down projection's GEMM (22
    against 37), and the audio decode on the device (7 s on the CPU against

@@ -210,3 +210,22 @@ func toI32(f []float32) []int32 {
 	}
 	return out
 }
+
+// TestCheckArenas: the served and trained 5 s canvases fit, and the trained
+// canvas at 14.4 s (104,966 rows) does not: its q/k/v planes alone are past
+// one storage buffer. This is what M9 refuses at submit time.
+func TestCheckArenas(t *testing.T) {
+	cfg, err := LoadConfig(modelDir)
+	if err != nil {
+		t.Skipf("no transformer config (%v)", err)
+	}
+	for _, c := range []struct {
+		rows int
+		ok   bool
+	}{{15936, true}, {38247, true}, {74386, true}, {104966, false}} {
+		err := CheckArenas(cfg, c.rows, 2048, 8192)
+		if (err == nil) != c.ok {
+			t.Errorf("%d rows: %v", c.rows, err)
+		}
+	}
+}

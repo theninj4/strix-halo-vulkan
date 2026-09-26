@@ -49,6 +49,13 @@ import (
 //     else that is a few rows of arithmetic (the timestep MLP, the output
 //     norm's modulation), is on the host in fp32.
 type GPU struct {
+	// Between, when set, is called between two submissions, when nothing
+	// of this model's is on the device. A server uses it to let other work
+	// run inside a forward that holds the device for tens of seconds, and
+	// an error from it (a cancelled request) abandons the run there
+	// (VIDEO.md M9).
+	Between func() error
+
 	dev  *vk.Device
 	cfg  *Config
 	host *Model // fp32 pieces the host runs: time MLP, refiner norm, norm_out.linear, head biases
@@ -196,19 +203,9 @@ func NewGPU(dev *vk.Device, dir string, maxRows, maxText, chunk int) (*GPU, erro
 	if err != nil {
 		return nil, err
 	}
-	g := &GPU{
-		dev: dev, cfg: cfg, host: host,
-		pipes: map[string]*vk.ComputePipeline{},
-		H:     cfg.Hidden, inner: cfg.Inner(), ffn: cfg.FFN, heads: cfg.Heads, headDim: cfg.HeadDim,
-		ropeHalf: cfg.RopeWidth() / 2,
-		maxRows:  maxRows, maxText: maxText, chunk: chunk,
-		aBias: map[string]uint32{},
-	}
-	g.planeRows = roundUp(maxRows, rowAlign)
-	g.ldaH, g.ldaInner, g.ldaFFN = g.H+gemmPad, g.inner+gemmPad, g.ffn+gemmPad
-	g.ldaText = cfg.TextDim + gemmPad
-	g.vidK, g.audK = roundUp(cfg.Patch(), tile), roundUp(cfg.AudioChannels, tile)
-	g.ldaVid, g.ldaAud = g.vidK+gemmPad, g.audK+gemmPad
+	g := shell(cfg, maxRows, maxText, chunk)
+	g.dev, g.host = dev, host
+	g.pipes = map[string]*vk.ComputePipeline{}
 
 	set, err := safetensors.OpenSet(dir)
 	if err != nil {
@@ -222,6 +219,38 @@ func NewGPU(dev *vk.Device, dir string, maxRows, maxText, chunk int) (*GPU, erro
 		}
 	}
 	return g, nil
+}
+
+// shell is a GPU with its sizes worked out and nothing staged: what the
+// activation layout needs.
+func shell(cfg *Config, maxRows, maxText, chunk int) *GPU {
+	g := &GPU{
+		cfg: cfg,
+		H:   cfg.Hidden, inner: cfg.Inner(), ffn: cfg.FFN, heads: cfg.Heads, headDim: cfg.HeadDim,
+		ropeHalf: cfg.RopeWidth() / 2,
+		maxRows:  maxRows, maxText: maxText, chunk: chunk,
+		aBias: map[string]uint32{},
+	}
+	g.planeRows = roundUp(maxRows, rowAlign)
+	g.ldaH, g.ldaInner, g.ldaFFN = g.H+gemmPad, g.inner+gemmPad, g.ffn+gemmPad
+	g.ldaText = cfg.TextDim + gemmPad
+	g.vidK, g.audK = roundUp(cfg.Patch(), tile), roundUp(cfg.AudioChannels, tile)
+	g.ldaVid, g.ldaAud = g.vidK+gemmPad, g.audK+gemmPad
+	g.vidOut.n = roundUp(cfg.Patch(), gemmVariants[gemmSmall].bn)
+	g.audOut.n = roundUp(cfg.AudioChannels, gemmVariants[gemmSmall].bn)
+	return g
+}
+
+// CheckArenas reports whether NewGPU could stage a transformer for maxRows
+// rows (maxText of them text) at this chunk, without staging anything: the
+// activation arenas' storage-buffer range check, which is otherwise met only
+// after a request has paid for its text encoder. The fp16 q/k/v planes span
+// the sequence, so this is what caps a request's rows (~90k).
+func CheckArenas(cfg *Config, maxRows, maxText, chunk int) error {
+	if chunk <= 0 || chunk%rowAlign != 0 {
+		return fmt.Errorf("dit: chunk %d is not a positive multiple of %d", chunk, rowAlign)
+	}
+	return shell(cfg, maxRows, maxText, chunk).layoutActivations()
 }
 
 func roundUp(n, m int) int { return (n + m - 1) / m * m }
@@ -407,7 +436,10 @@ func (g *GPU) stage(set *safetensors.Set) error {
 	return nil
 }
 
-func (g *GPU) allocActivations(*safetensors.Set) error {
+// layoutActivations places every activation in the two arenas and refuses a
+// layout past the storage-buffer range. It allocates nothing.
+func (g *GPU) layoutActivations() error {
+	g.actElems, g.hElems = 0, 0
 	alloc := func(n int) uint32 {
 		off := uint32(g.actElems)
 		g.actElems += roundUp(n, 64)
@@ -456,6 +488,13 @@ func (g *GPU) allocActivations(*safetensors.Set) error {
 			return fmt.Errorf("dit: the %s arena for %d rows (chunk %d) is %d MB, past the %d MB storage-buffer range",
 				a.name, g.maxRows, g.chunk, a.bytes>>20, maxBankBytes>>20)
 		}
+	}
+	return nil
+}
+
+func (g *GPU) allocActivations(*safetensors.Set) error {
+	if err := g.layoutActivations(); err != nil {
+		return err
 	}
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
@@ -718,6 +757,11 @@ func (gr *graph) submit() (time.Duration, error) {
 			}
 			est += c
 			j++
+		}
+		if i > 0 && gr.g.Between != nil {
+			if err := gr.g.Between(); err != nil {
+				return total, err
+			}
 		}
 		t, err := vk.DispatchMultiTimed(gr.d[i:j], 1, 1, true)
 		if err != nil {

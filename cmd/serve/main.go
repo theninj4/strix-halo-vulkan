@@ -14,6 +14,7 @@
 //	go run ./cmd/serve -kev                         # System One classification (Kev-4B), ~9 GB resident
 //	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
+//	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~50 GB a request
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
@@ -207,9 +208,15 @@ func main() {
 	imgCond := flag.Int("image-condition-size", 1024,
 		"square whose area every reference image is resized to, and the default output size of an edit "+
 			"that names none; diffusers' output_resolution")
+	videoOn := flag.Bool("video", false, "load MiniMax-H3 and serve /v1/videos (asynchronous jobs; ~50 GB at a request's peak, nothing staged at rest)")
+	videoModel := flag.String("video-model", "models/MiniMax-H3", "MiniMax-H3 checkpoint root")
+	videoDir := flag.String("video-dir", "", "where finished videos are kept until they expire; empty is a temporary directory")
+	videoTTL := flag.Duration("video-ttl", 24*time.Hour, "how long a finished video job and its file are kept")
+	videoQueue := flag.Int("video-queue", 16, "video jobs that may wait behind the running one")
+	videoPrompt := flag.Int("video-max-prompt", 0, "longest video prompt in tokens; 0 is the pipeline's 4096")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn {
+	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*videoOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -288,7 +295,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || *videoOn || (*tts && *ttsGPU)) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -395,6 +402,30 @@ func main() {
 		log.Printf("image: %s, to %dx%d, %d steps, %s, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
 			*imgModel, imgW, imgH, *imgSteps, previews, edits,
 			float64(enc+tr+vaeW+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9,
+			time.Since(start).Round(time.Millisecond))
+	}
+
+	if *videoOn {
+		if dev == nil {
+			log.Fatal("-video needs the device; it has no host path (drop -gpu=false)")
+		}
+		start := time.Now()
+		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		jobs, err := api.NewVideoJobs(b, api.VideoJobsOptions{Dir: *videoDir, TTL: *videoTTL, MaxQueued: *videoQueue})
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Deferred after the backend's Close, so it runs first: the running
+		// job is cancelled and waited for before anything is freed.
+		defer jobs.Close()
+		srv.Videos = jobs
+		geo := b.VideoGeometry()
+		log.Printf("video: %s, jobs in %s (kept %v, %d queued at most), default %s x %gs x %d steps, in %v",
+			*videoModel, jobs.Dir(), *videoTTL, *videoQueue, geo.DefaultSize, geo.DefaultSeconds, geo.DefaultSteps,
 			time.Since(start).Round(time.Millisecond))
 	}
 
@@ -581,6 +612,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
 			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
+			"/v1/videos",
 		} {
 			log.Printf("  %s", route)
 		}

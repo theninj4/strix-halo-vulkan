@@ -20,6 +20,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"path/filepath"
@@ -148,7 +149,31 @@ type Options struct {
 	Resident bool
 	// Chunk is the transformer's row chunk (0: 8192).
 	Chunk int
+	// MaxPrompt caps a prompt's tokens (0: DefaultMaxPrompt).
+	MaxPrompt int
+
+	// Hold runs fn with the device's queue held, and nil runs it directly,
+	// for a caller that owns the device outright (cmd/h3, the tests).
+	//
+	// **Only submissions are held.** Staging a model here is allocation,
+	// pipeline creation and writes into mapped memory, none of which touch
+	// the queue, so the three stagings (~100 s of a request, most of it
+	// reading bf16 from disk) run while other work has the device. What is
+	// held is the encoder's forward, the transformer's Begin and each
+	// forward, and the video decode.
+	Hold func(fn func() error) error
+	// Between is called inside Hold between two of a forward's or the
+	// decode's submissions (dit.GPU.Between, vae.GPU.Between); a server
+	// yields the device there. A 480p forward is 35 s. The request's
+	// context is checked at the same points, so a cancelled request stops
+	// within one submission (≤ 800 ms) and not one forward.
+	Between func()
 }
+
+// DefaultMaxPrompt is the longest prompt a request may carry, in tokens.
+// MiniMax's Context-IR prompts run to ~500–1,500; the cost of a long one is
+// its text rows in every forward's attention, not the encoder.
+const DefaultMaxPrompt = 4096
 
 // Pipeline holds the checkpoint's host-side pieces and, when resident, its
 // device stagings.
@@ -157,6 +182,7 @@ type Pipeline struct {
 	dev  *vk.Device
 	opt  Options
 	tok  *tokenizer.Tokenizer
+	dcfg *dit.Config
 	pqc  *vae.PostQuantConv
 	avae *audiovae.Decoder
 
@@ -174,9 +200,18 @@ func New(dev *vk.Device, dir string, opt Options) (*Pipeline, error) {
 	if opt.Chunk == 0 {
 		opt.Chunk = 8192
 	}
+	if opt.MaxPrompt == 0 {
+		opt.MaxPrompt = DefaultMaxPrompt
+	}
+	if opt.Hold == nil {
+		opt.Hold = func(fn func() error) error { return fn() }
+	}
 	p := &Pipeline{dir: dir, dev: dev, opt: opt}
 	var err error
 	if p.tok, err = tokenizer.Load(filepath.Join(dir, "tokenizer")); err != nil {
+		return nil, err
+	}
+	if p.dcfg, err = dit.LoadConfig(filepath.Join(dir, "transformer")); err != nil {
 		return nil, err
 	}
 	if p.pqc, err = vae.LoadPostQuantConv(filepath.Join(dir, "vae")); err != nil {
@@ -188,8 +223,40 @@ func New(dev *vk.Device, dir string, opt Options) (*Pipeline, error) {
 	return p, nil
 }
 
+// SampleRate is the soundtrack's rate.
+func (p *Pipeline) SampleRate() int { return p.avae.Cfg.SamplingRate }
+
 // Tokenizer is the prompt tokenizer, for Resolve.
 func (p *Pipeline) Tokenizer() *tokenizer.Tokenizer { return p.tok }
+
+// ErrTooLarge is a request this pipeline cannot run as asked: a prompt past
+// MaxPrompt, or more rows than the transformer's arenas can span. Resolve
+// wraps it, so a server can refuse the request before anything is staged.
+var ErrTooLarge = errors.New("h3: request too large")
+
+// Resolve is the package's Resolve plus this pipeline's limits.
+func (p *Pipeline) Resolve(req *Request) (*Resolved, error) {
+	r, err := Resolve(p.tok, req)
+	if err != nil {
+		return nil, err
+	}
+	if len(r.Tokens) > p.opt.MaxPrompt {
+		return nil, fmt.Errorf("%w: the prompt is %d tokens, past this server's %d", ErrTooLarge, len(r.Tokens), p.opt.MaxPrompt)
+	}
+	if err := dit.CheckArenas(p.dcfg, len(r.Layout.Pos), p.textBudget(len(r.Tokens)), p.opt.Chunk); err != nil {
+		return nil, fmt.Errorf("%w: %dx%d for %d frames is %d rows: %v", ErrTooLarge, r.Width, r.Height, r.Frames, len(r.Layout.Pos), err)
+	}
+	return r, nil
+}
+
+// textBudget is the text rows a transformer is staged for: the request's
+// own, or for a resident one a budget the next prompt will likely fit.
+func (p *Pipeline) textBudget(text int) int {
+	if p.opt.Resident {
+		return max(text, 2048)
+	}
+	return text
+}
 
 // Close frees whatever is staged.
 func (p *Pipeline) Close() {
@@ -251,7 +318,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	if progress == nil {
 		progress = func(Stage, int, int) {}
 	}
-	r, err := Resolve(p.tok, req)
+	r, err := p.Resolve(req)
 	if err != nil {
 		return nil, err
 	}
@@ -262,6 +329,15 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	if !p.opt.Resident {
 		defer p.freeDiT()
 		defer p.freeVAE()
+	}
+	between := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if p.opt.Between != nil {
+			p.opt.Between()
+		}
+		return nil
 	}
 
 	// The schedules, and every row's timestep index into the distinct
@@ -308,7 +384,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	}()
 	start := time.Now()
 	progress(StageEncode, 0, 1)
-	cond, err := p.encode(r.Tokens)
+	cond, err := p.encode(ctx, r.Tokens)
 	res.Timings[StageEncode] = time.Since(start)
 	tabWG.Wait()
 	res.Timings[StageTables] = tabTook
@@ -329,7 +405,11 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 	if err != nil {
 		return nil, err
 	}
-	if err := g.Begin(lay, cond, tvals, tabs); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	g.Between = between
+	if err := p.opt.Hold(func() error { return g.Begin(lay, cond, tvals, tabs) }); err != nil {
 		return nil, err
 	}
 	res.Timings[StageTransform] = time.Since(start)
@@ -339,7 +419,13 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		v, a, took, err := g.Step(video, audio, rowTs[f])
+		var v, a *qwen.Mat
+		var took time.Duration
+		err := p.opt.Hold(func() error {
+			var err error
+			v, a, took, err = g.Step(video, audio, rowTs[f])
+			return err
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -365,7 +451,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		defer audioWG.Done()
 		res.Left, res.Right, audioErr = p.avae.Decode(audio.Data)
 	}()
-	frames, err := p.decodeVideo(r, video.Data)
+	frames, err := p.decodeVideo(ctx, between, r, video.Data)
 	audioWG.Wait()
 	if err != nil {
 		return nil, err
@@ -380,7 +466,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 }
 
 // encode stages the text encoder, runs the prompt through it and frees it.
-func (p *Pipeline) encode(ids []int32) (*qwen.Mat, error) {
+func (p *Pipeline) encode(ctx context.Context, ids []int32) (*qwen.Mat, error) {
 	dir := filepath.Join(p.dir, "text_encoder")
 	cfg, err := textenc.LoadConfig(dir)
 	if err != nil {
@@ -396,7 +482,16 @@ func (p *Pipeline) encode(ids []int32) (*qwen.Mat, error) {
 		return nil, err
 	}
 	defer enc.Destroy()
-	return enc.Forward(ids)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var cond *qwen.Mat
+	err = p.opt.Hold(func() error {
+		var err error
+		cond, err = enc.Forward(ids)
+		return err
+	})
+	return cond, err
 }
 
 // stageDiT returns a transformer staged for at least rows rows and text
@@ -408,9 +503,7 @@ func (p *Pipeline) stageDiT(rows, text int) (*dit.GPU, error) {
 	if p.dit == nil {
 		// Staged for the request's own sizes; a resident one is sized up to
 		// a text budget so the next prompt fits.
-		if p.opt.Resident {
-			text = max(text, 2048)
-		}
+		text = p.textBudget(text)
 		g, err := dit.NewGPU(p.dev, filepath.Join(p.dir, "transformer"), rows, text, p.opt.Chunk)
 		if err != nil {
 			return nil, err
@@ -442,7 +535,7 @@ func (p *Pipeline) noise(req *Request, lay *plan.Layout) (video, audio *qwen.Mat
 
 // decodeVideo unpatchifies and denormalises the video rows and decodes
 // them, staging the VAE for the plan's tile size.
-func (p *Pipeline) decodeVideo(r *Resolved, rows []float32) ([][]byte, error) {
+func (p *Pipeline) decodeVideo(ctx context.Context, between func() error, r *Resolved, rows []float32) ([][]byte, error) {
 	dir := filepath.Join(p.dir, "vae")
 	cfg, err := vae.LoadConfig(dir)
 	if err != nil {
@@ -468,7 +561,16 @@ func (p *Pipeline) decodeVideo(r *Resolved, rows []float32) ([][]byte, error) {
 		}
 		p.vaeTile = tile
 	}
-	dec, _, err := p.vae.Decode(z, p.pqc)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var dec *vae.Tensor
+	p.vae.Between = between
+	err = p.opt.Hold(func() error {
+		var err error
+		dec, _, err = p.vae.Decode(z, p.pqc)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}

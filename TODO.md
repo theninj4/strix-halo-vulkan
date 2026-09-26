@@ -47,16 +47,13 @@ open.
 
 **Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
 stereo sound** (`GOALS.md` item 7). The live plan and handoff is the root
-[`VIDEO.md`](VIDEO.md) (M-stages). M0–M4 and M7 are done:
-
-- the packed layout and schedulers are bit-exact;
-- the 32 B conditioner runs through the unchanged `zimage/qwen` at rel 1e-4;
-- **the 50-block transformer runs on the GPU** at ≤ 6.7e-3 of an fp32 oracle
-  a forward, with teacher-forced steps ≤ 1.7e-3 rms.
-
-It takes **35.6 s a forward at the served 480p** (11 min for 20 steps) and
-143 s at the trained 768p (~2 h for 50); the attention is 68% of the latter.
-Open: the two decoders (M5, M6), end to end (M8), serving (M9).
+[`VIDEO.md`](VIDEO.md) (M-stages). M0–M9 are done: a prompt becomes an
+mp4 with sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
+OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
+runs (speech beside it ≤ 0.27 s). It takes **35.6 s a forward at the served
+480p** (~14 min a request) and 143 s at the trained 768p (~2 h for 50 steps).
+Not in `ai.service` yet (M-o5). Open: staging cost, keyframes (M10),
+performance (M11), a Context-IR stand-in (M12).
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,

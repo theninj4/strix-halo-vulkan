@@ -27,6 +27,8 @@ type Model struct {
 	// this process staged, so a client that has to guess will guess wrong on
 	// a server started at something other than 1024x1024.
 	Image *ImageGeometry `json:"image,omitempty"`
+	// Video is what a video model accepts, for the same reason.
+	Video *VideoGeometry `json:"video,omitempty"`
 }
 
 // backends returns every loaded backend, in the order GET /v1/models lists
@@ -50,6 +52,9 @@ func (s *Server) backends() []Backend {
 	}
 	if s.SystemOne != nil {
 		out = append(out, s.SystemOne)
+	}
+	if s.Videos != nil {
+		out = append(out, s.Videos.backend)
 	}
 	return out
 }
@@ -97,6 +102,15 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			if owns(s.Image, resp.Data[i].ID) {
 				g := geo
 				resp.Data[i].Image = &g
+			}
+		}
+	}
+	if s.Videos != nil {
+		geo := s.Videos.backend.VideoGeometry()
+		for i := range resp.Data {
+			if owns(s.Videos.backend, resp.Data[i].ID) {
+				g := geo
+				resp.Data[i].Video = &g
 			}
 		}
 	}

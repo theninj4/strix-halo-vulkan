@@ -58,6 +58,8 @@ type Server struct {
 	Embedding     EmbeddingBackend
 	Image         ImageBackend
 	SystemOne     SystemOneBackend
+	// Videos is the video job queue over its backend (videos.go).
+	Videos *VideoJobs
 }
 
 // Handler builds the mux. It is a fresh *http.ServeMux rather than
@@ -101,6 +103,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/images/generations", s.route(s.handleImageGeneration))
 	// Input: ImageEditRequest{}, Output: ImageGenerationResponse{}
 	mux.Handle("POST /v1/images/edits", s.route(s.handleImageEdit))
+
+	// OpenAI's asynchronous video API (videos.go, VIDEO.md M9).
+	// Input: VideoCreateRequest{}, Output: VideoJob{}
+	mux.Handle("POST /v1/videos", s.route(s.handleVideoCreate))
+	mux.Handle("GET /v1/videos", s.route(s.handleVideoList))
+	mux.Handle("GET /v1/videos/{id}", s.route(s.handleVideoGet))
+	mux.Handle("GET /v1/videos/{id}/content", s.route(s.handleVideoContent))
+	mux.Handle("DELETE /v1/videos/{id}", s.route(s.handleVideoDelete))
 
 	return mux
 }

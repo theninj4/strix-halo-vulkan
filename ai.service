@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=###
 ;ExecStart=###/ai -addr 0.0.0.0:11434 -token= -llm -llm-ctx 262144 -llm-batch 8192 -llm-slots 3 -llm-preempt-chunk 2048 -llm-reserve 1 -llm-class background -llm-mmproj models/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf
-ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 3 -kev -wyoming 0.0.0.0:10300
+ExecStart=###/ai -addr 0.0.0.0:11434 -token= -embed -tts -tts-gpu -stt -image -edits 3 -kev -video -wyoming 0.0.0.0:10300
 Restart=always
 RestartSec=1
 
