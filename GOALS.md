@@ -16,11 +16,7 @@ Ultimately we want to be able to run these tasks:
   4. Image generation and editing via Qwen's `Qwen-Image-2.1`:
     * https://huggingface.co/Qwen/Qwen-Image-2.1
     * https://qwen.ai/blog?id=qwen-image-2.1
-    * Unified text-to-image and reference-image editing (up to 10 refs), native RGBA transparency
-    * In-progress previews: no tiny autoencoder exists yet for its 64-channel VAE,
-      so we fit our own linear preview and watch https://github.com/madebyollin/taehv
-      for a proper one (replaced z-image-turbo + taef1 on 2026-09-20;
-      the vertical is served and parked — research/qimage-vertical.md)
+    * Previews via https://github.com/madebyollin/taesd
   5. Compute embeddings via Qwen's `Qwen3-Embedding-0.6B`:
     * https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
     * https://arxiv.org/html/2506.05176v3
@@ -31,5 +27,8 @@ Ultimately we want to be able to run these tasks:
   7. Video generation via MiniMax's `H3`:
     * https://huggingface.co/MiniMaxAI/MiniMax-H3
     * https://github.com/MiniMax-AI/MiniMax-H3
+  8. Music Generation via `ace-step-1.5-xl-turbo`:
+    * https://huggingface.co/ACE-Step/acestep-v15-xl-turbo
+    * https://github.com/ace-step/ACE-Step-1.5
 
 We will ultimately serve up a HTTP API serving these features, in Go.
