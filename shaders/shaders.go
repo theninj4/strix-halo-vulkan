@@ -3656,3 +3656,22 @@ var H3AttnQT4KT4 []byte
 
 //go:embed h3_attn_qt1_kt8_w32_of16.spv
 var H3AttnQT1KT8 []byte
+
+// MiniMax-H3's video VAE decoder (h3/vae, VIDEO.md M5): a 36-layer ViT at
+// head 64, on the same kernels as the transformer. Only the head width
+// differs: the q/k pack rotates 48 of the 64 channels (0.75 of the head, as
+// three axes of eight frequencies, rotate-half), and the v pack and the
+// attention are the existing sources at -DHEAD_DIM=64.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DROPE_WIDTH=48 -DTPW=8 -o h3vae_qk_pack_hd64.spv h3_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DTPW=8 -o h3vae_pack_hd64.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DHEAD_DIM=64 -o h3vae_attn_hd64.spv dit_attention_wmma.comp
+
+//go:embed h3vae_qk_pack_hd64.spv
+var H3VAEQKPackHD64 []byte
+
+//go:embed h3vae_pack_hd64.spv
+var H3VAEPackHD64 []byte
+
+//go:embed h3vae_attn_hd64.spv
+var H3VAEAttnHD64 []byte

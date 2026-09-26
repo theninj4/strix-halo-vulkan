@@ -267,10 +267,10 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M2 | Text encoder: Qwen3-VL-32B through `qimage/textenc`, `hidden_states[50]`, no template; GPU, staged per request | **done 2026-09-26**: the unchanged `zimage/qwen` GPU encoder at **rel ≤ 1.1e-4** against fp32 (official bf16: 1.2–1.4e-2); 537 tokens in 1.0 s; staging 50 GB takes 51 s (see decision 2) |
 | M3 | Front, AdaLN tables, two blocks and tail on the CPU (`h3/dit`) against `dump_h3_dit_block.py` | **done 2026-09-26**: 13 stages at ≤ 8e-7 of absmax (temb 5e-6); residual absmax **3.1e4 by block 1** |
 | M4 | The whole-stack oracle: torch fp32 with AdaLN folded (80 GB) at 448×256, per-block outputs of one forward and per-step latents of a short run | **done 2026-09-26** (`dump_h3_dit.py`): 5,095 rows, N = 8, ~175 s a forward on the CPU; per-block ranges answer M-o1 |
-| M5 | Video VAE decoder (36-layer ViT) on the CPU, then the GPU; the fp16 question | |
-| M6 | Audio VAE decoder, stereo, on the CPU, then the GPU | |
+| M5 | Video VAE decoder (36-layer ViT) on the CPU, then the GPU; the fp16 question | **done 2026-09-26** (`h3/vae`): the decode at **PSNR 81.7 dB** against fp32 (≤ 1.3 8-bit levels); **38 s at 480p, 72 s at 768p**; M-o2 answered, fp16 is fine |
+| M6 | Audio VAE decoder, stereo, on the CPU, then the GPU | **done 2026-09-26** (`h3/audiovae`, CPU fp32): every stage ≤ 2.8e-6 of the oracle, the stereo decode at **SNR 106 dB**; 7.2 s for 5.2 s of audio (the GPU is an M11 lever) |
 | M7 | DiT on the GPU: GEMMs and WMMA attention at 5k–105k rows, the 4 GiB plan, per-step profile | **done 2026-09-26** (`h3/dit/gpu.go`): a forward at ≤ 6.7e-3 of the fp32 oracle, teacher-forced steps ≤ 1.7e-3 rms; **35.6 s a forward at 480p, 143 s at the trained 768p** |
-| M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | |
+| M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | |
 | M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | |
@@ -509,6 +509,120 @@ with bit-identical output. The build now switches by key count at 24k, which
 took the trained forward from 157 s to 143 s. QT4 spills (5 TFLOP/s) and
 KTIL8 loses everywhere.
 
+### M5 — the video VAE decoder (2026-09-26)
+
+`h3/vae` decodes on the device, and the host does what diffusers does
+around the decoder: unpatchify and denormalise, post_quant_conv (a 1x1
+conv, float64), the 256-pixel tiles with their widened overlaps
+(`_split_tiles`), the 7-latent temporal clips, and the linear cross-fades
+that put them back together (`_stitch_tiles`, `_decode`'s loop).
+diffusers' order is reproduced as written: a tile blends with the
+*unblended* tile above it and then the unblended tile to its left. The
+oracle is `reference/dump_h3_vae.py`, diffusers' own decode in fp32 on M4's
+final latents (the real 8-step sample). It takes 10.8 s a tile-clip on the
+CPU, and its repeat run is byte-identical.
+
+**The shape decides the graph.** A decoder call is one tile-clip:
+7 × 16 × 16 latents, 4 registers and a zero token, 1,797 tokens of full
+attention. A 5 s clip is 105 of them at 480p (7 clips × 15 tiles) and 196
+at 768p (7 × 28), all the same length and all independent. So they run
+**batched**, S = 8 sequences at a 1,808-row stride. Every row-local stage is
+one dispatch over all the rows, and only the attention runs a sequence at a
+time. The kernels are M7's, three rebuilt at head 64 (`shaders.H3VAE*`).
+The biases ride in the GEMMs as a ones column (the transformer has none),
+and proj_in's register tokens are one-hot columns, so the input stage is one
+GEMM into the residual.
+
+**M-o2, answered: fp16 is fine.** The oracle's per-block absmax
+(`block_stats`) peaks at 832 (the FFN's down projection output, block 30;
+its input is 354). The residual stays under 22, because the layer-scale
+vectors keep every update small. This is not Qwen-Image's conv VAE. The
+pipeline itself decodes under fp16 autocast, so fp16 is the released recipe
+and not a compromise.
+
+| gate (`TestGPUDecoder`, `TestGPUDecodeFull`) | result |
+|---|---|
+| unpatchify + denormalise vs the oracle's z | bit-exact |
+| post_quant_conv | rel 3e-7 |
+| blocks 0/1/18/35, teacher-forced | rel 1.7e-5 … 1.4e-4 |
+| one tile-clip, whole decoder | rms 2.2e-4; ≤ 1.28 levels, PSNR 81.7 dB |
+| 12 latent frames (2 clips × 2 tiles: both blends) | rms 2.2e-4; ≤ 1.12 levels, PSNR 81.7 dB |
+| all 37 latent frames, 124 frames | rms 2.3e-4; ≤ 1.08 levels, PSNR 81.7 dB, 5.1 s |
+
+**Speed** (`H3_VAE_SHAPES=1`, S = 8): 105 tile-clips in **38 s at 480p**
+and 196 in **72 s at 768p**, both at 26.4 TFLOP/s. That is ~6% of a served
+20-step request and ~1% of a trained one. The arenas are 1.9 GB at S = 8,
+and the weights 4.9 GB fp16.
+
+The frames are coherent: M4's 8-step sample of the README prompt is a
+starship bridge that cuts to a close-up of a commander. That is the first
+video out of this vertical.
+
+### M6 — the audio VAE decoder (2026-09-26)
+
+`h3/audiovae` is the BigVGAN in Go, **fp32 on the CPU**. A 5 s stereo clip
+is ~480 GFLOP of 1-D convolutions (about 1% of a served request's device
+time), and diffusers pins this model to fp32 on purpose: bf16 decodes come
+out ~20 dB quieter. So it is the one piece that needed neither the device
+nor fp16 to start with. Activations are channel-last, and every conv is
+4 × 4 register-blocked dot products over contiguous channels. The oracle is
+`reference/dump_h3_audio.py`: diffusers' decode of M4's final audio rows,
+dumped stage by stage (its staged run equals `vae.decode` bit for bit).
+
+| gate (`TestStages`, `TestDecode`) | result |
+|---|---|
+| dec_in_proj + conv_pre | rel 1.1e-6 |
+| one alias-free SnakeBeta alone (the replicate-padded ×2 resampling) | rel 2.6e-7 |
+| stages 0–6, teacher-forced | rel 3.6e-7 … 2.8e-6 |
+| tail (activation, conv_post, clamp) | rel 2.8e-7 |
+| the whole stereo decode from the transformer's rows | rms 6.6e-6 / 1.4e-6, **SNR 106 dB** |
+
+**7.2 s for 5.17 s of stereo** on 32 threads. torch does it in 1.1 s
+(oneDNN, ~440 GFLOP/s), so this is where the Go port is weakest: stage 0 runs
+at ~80 GFLOP/s. It can overlap the video decode, which is on the device, and
+M11 decides whether it moves there. The sample's soundtrack is plausible:
+−25.8 dB mean, −9.8 dB peak, steady harmonic lines under broadband ambience
+that swells from ~2 s. It is muxed with M5's frames in the scratch
+`av.mp4` (not kept).
+
+### M8 — end to end (2026-09-26)
+
+`h3/pipeline` runs a t2va request from the prompt string, and `cmd/h3` is
+its CLI (`go run ./cmd/h3 -prompt … -out clip.mp4`). Its own job is the
+order in which the pieces hold the machine. Everything at once is ~106 GB,
+so a request is three stagings, each freed before the next is allocated:
+the text encoder (50 GB, one forward), the transformer (44 GB), then the
+video VAE (7 GB). The AdaLN tables are computed on the host while the
+encoder stages, and the audio decode runs on the CPU beside the video
+decode. `Options.Resident` keeps the transformer and VAE between requests
+(51 GB held) for M9. The noise is our own PCG (video, then audio), and it
+is injectable. The mux pipes rgb24 frames to ffmpeg's stdin, with the
+soundtrack as a float32 file (H.264 crf 18 + AAC 192k, faststart).
+
+**The gate** (`TestE2E`) starts from the README's Context-IR prompt as a
+string, at M4's oracle shape (448×256, 124 frames, N = 8) and from M4's own
+noise. It runs free, so the latents are not held to a tolerance: they end
+0.115 rms (video) and 0.031 (audio) from the oracle's, the size M7 measured
+for two runs whose noise differs by 1e-4. What is gated is the output
+against the oracle's decode of its own run: **frames PSNR 25.9 dB**,
+**soundtrack SNR 21.5 dB**, and an mp4 whose streams ffprobe reads back
+(h264 448×256 × 124 frames, aac 32 kHz stereo). Side by side, the two
+clips are the same scene, the same shots and the same composition. The
+visible difference is a collar that is red in one and navy in the other.
+
+**Where the 3 m 28 s went:**
+
+| stage | wall | note |
+|---|---|---|
+| encode (stage 50 GB + forward), tables beside it | 81.6 s (tables 48.6 s) | both reading bf16 from disk at ~0.9 GB/s |
+| transformer staging + Begin | 52.8 s | 40 GB narrowed from bf16 |
+| 7 forwards | 55.9 s | 7.98 s each, as M7 |
+| both decoders | 17.2 s | VAE staging 7 s + decode 5 s; audio 7 s beside it |
+
+At the served 480p × 20 steps, the forwards are 11.3 min and the fixed
+costs above are ~2.5 min: **~14 min a request**, ~18% of it staging. The
+cure is decision 2's pre-narrowed fp16 banks on disk, or residency (M9/M11).
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -525,9 +639,8 @@ projections are folded out.
   on the device. Still open: the per-block absmax of every GEMM input and
   output over the full 50 blocks with real conditioning, which M4's oracle
   dumps and M7's fp16 operands have to fit.
-- **M-o2. Does the ViT decoder tolerate fp16?** Qwen-Image's conv VAE did
-  not. A ViT is a different animal, and at 9.7 GB fp32 the answer matters for
-  memory.
+- ~~M-o2. Does the ViT decoder tolerate fp16?~~ **Yes** (M5): its activations
+  peak at 832, and the decode lands at PSNR 81.7 dB against fp32.
 - **M-o3. How good is the output without Context-IR?** The card is blunt that
   it matters. The oracle comparisons don't care; the product does. M12.
 - **M-o4. Is the sparse attention coming?** It is the only lever on the L²
@@ -543,33 +656,43 @@ projections are folded out.
 
 ## Handoff
 
-**2026-09-26, session 1: M0–M4 and M7 done** (M5, M6 and M8 onward open).
+**2026-09-26, session 2: M5, M6 and M8 done.** The vertical makes a video
+with sound from a prompt (`go run ./cmd/h3 -prompt … -out x.mp4`). M9
+onward is open.
 
 - Weights: `models/MiniMax-H3` (135 GB, gitignored): `transformer/`,
   `text_encoder/`, `vae/`, `audio_vae/`, plus configs, tokenizers, docs and
   the README's request scripts.
-- Code: `h3/plan` (M1), `h3/textenc` (M2), `h3/dit` (M3 CPU,
-  `Tables`, and the M7 GPU transformer `gpu.go`), `shaders/h3_*.comp`.
-  `zimage/tokenizer` also reads `tokenizer_config.json`'s extra specials and
-  the `"a b"` merge form.
-- Oracles: `reference/dump_h3_{plan,tokens,textenc,dit_block,dit,ranges}.py`,
-  outputs in `reference/out/h3*`. `dump_h3_dit.py` needs ~85 GB and ~23 min,
-  so nothing else big can run beside it.
-- Tests: `go test -short ./h3/...` is quick. Without `-short`, the M2 gate
-  stages 50 GB (~1 min) and the M7 gates stage 42 GB (~1.5–2 min each). The
-  opt-in instruments are `H3_SHAPES=1` (+`H3_PROFILE=1`, `H3_CHUNK`),
-  `H3_SCREEN=<h>x<w>`, `H3_SENSITIVITY=1` and `H3_FREE=1`.
+- Code: `h3/plan` (M1), `h3/textenc` (M2), `h3/dit` (M3 CPU, `Tables`, M7
+  GPU `gpu.go`), `h3/vae` (M5: host tiling and blends in `vae.go`, the
+  batched ViT on the device in `gpu.go`), `h3/audiovae` (M6, CPU fp32),
+  `h3/pipeline` (M8: staging order, `Generate`, `WriteMP4`), `cmd/h3`.
+  Shaders: `shaders/h3_*.comp`, plus the `h3vae_*` head-64 builds of
+  existing sources.
+- Oracles: `reference/dump_h3_{plan,tokens,textenc,dit_block,dit,ranges,vae,audio}.py`,
+  outputs in `reference/out/h3*`. The VAE oracle decodes M4's final latents
+  (~3 min, 12 GB); the audio one takes seconds.
+- Tests: `go test -short ./h3/...` is quick. Without `-short`:
+  `TestGPUDecoder` (h3/vae, 10 s), `TestStages`/`TestDecode` (h3/audiovae,
+  ~10 s), and `TestE2E` (h3/pipeline, ~3.5 min, 50 GB peak). The opt-ins
+  are `H3_VAE_FULL=1`, `H3_VAE_SHAPES=1` (+`H3_VAE_SEQS`),
+  `H3_AUDIO_RAW=path`, `H3_E2E_MP4=path`, and M7's (`H3_SHAPES`,
+  `H3_PROFILE`, `H3_CHUNK`, `H3_SCREEN`, `H3_SENSITIVITY`, `H3_FREE`).
 
 **Next, in order:**
 
-1. **M5, the video VAE decoder** (the 36-layer ViT; M-o2's fp16 question), and
-   **M6, the audio decoder**. They are small next to M7, both oracles are
-   cheap on the CPU, and M8 needs them.
-2. **M8, end to end**: a pipeline package holding the text encoder (staged
-   per request), `Tables`, the GPU transformer and the decoders, plus the
-   ffmpeg mux. Its gate is teacher-forced or perceptual (see M7 on free
-   running). The memory plan has to sequence the stagings: text encoder
-   50 GB → freed → transformer 40 GB + 4.3 GB of arenas → VAE.
+1. **M9, serve.** Wire `h3/pipeline` into `backend` and `api` as OpenAI's
+   async `/v1/videos` (POST → id, GET status, GET content), with
+   cancellation. Take the device through `backend.Device.Do`. A forward is
+   35 s at 480p, so yielding only between forwards starves the other
+   verticals: give `dit.GPU`'s `graph.submit` (and the VAE's) a hook that
+   calls `Device.yield` between its ≤ 800 ms submissions. Decide residency
+   by the machine it lands on (M-o5).
+2. **The staging cost** (~2.5 min of a ~14 min request): pre-narrowed fp16
+   banks on disk for the encoder and transformer (decision 2), and cache
+   `Tables` by schedule.
 3. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
    55.5 peak; 68% of a trained forward), the down projection's GEMM (22
-   against 37), and `Tables`' 29 s (cache it by schedule, or narrow the reads).
+   against 37), and the audio decode on the device (7 s on the CPU against
+   torch's 1.1).
+4. M12: a Context-IR stand-in, since plain prompts are what users will send.
