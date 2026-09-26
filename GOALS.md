@@ -28,5 +28,8 @@ Ultimately we want to be able to run these tasks:
     * https://huggingface.co/jaredpalmer/kev-4b
     * https://github.com/jaredpalmer/kev
     * https://archerhume.com/posts/jevs-architecture-unmasked
+  7. Video generation via MiniMax's `H3`:
+    * https://huggingface.co/MiniMaxAI/MiniMax-H3
+    * https://github.com/MiniMax-AI/MiniMax-H3
 
 We will ultimately serve up a HTTP API serving these features, in Go.
