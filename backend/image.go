@@ -61,10 +61,10 @@ type ImageOptions struct {
 	// cache, which at one 1024² reference is ~2.1 GB. Ten of them is the
 	// model's limit and a different machine's decision.
 	//
-	// There is no Preview field any more: previews were residency under
-	// Z-Image (taef1 was 1.0 GB of activation arena) and are 260 float32s
-	// here, so they are always on. A flag that cannot be turned off is not a
-	// flag.
+	// There is no Preview field: TAEQI2.1, the preview decoder, is 29 MB of
+	// weights and 224 MB of activation arena at a 1024² ceiling, which is
+	// too little residency to be worth a switch, so previews are always on.
+	// Its checkpoint is `taeqi2_1/` beside Model.
 	Refs int
 	// CondSize is the square whose *area* every reference image is resized
 	// to before it is encoded, and the default output size of an edit that
@@ -81,13 +81,11 @@ type ImageOptions struct {
 const (
 	defaultImageModelID = "qwen-image-2.1"
 	// maxPartialImages bounds `partial_images`, and it is past OpenAI's 3 on
-	// purpose. Under Z-Image a frame was 87 ms of taef1 against a 1.67 s
-	// step, so three were 1.8% of the image. Here the decode is 260
-	// multiply-adds a latent pixel on the host, and what actually costs
-	// anything is resizing (19 ms), encoding the PNG (60 ms) and writing it
-	// to a client -- ~80-100 ms a frame at 1024², serial with the steps, so
-	// sixteen are ~1.5 s of an 89 s image (~1.7%). A client written against
-	// OpenAI never asks for more than 3 and pays nothing for the headroom.
+	// purpose. A frame at 1024² is ~63 ms of TAEQI2.1 on the device plus
+	// encoding the PNG (~60 ms) and writing it to a client -- ~130 ms,
+	// serial with the steps, so sixteen are ~2 s of an 89 s image (~2.3%).
+	// A client written against OpenAI never asks for more than 3 and pays
+	// nothing for the headroom.
 	maxPartialImages = 16
 )
 
@@ -158,8 +156,7 @@ func (b *Image) Models() []api.Model {
 // Geometry is what this process was started for.
 func (b *Image) Geometry() api.ImageGeometry {
 	w, h := b.pipe.Size()
-	// Previews are unconditional -- the decoder is a constant matrix, not
-	// residency -- so unlike under Z-Image there is no flag for the two
+	// Previews are unconditional -- the tiny decoder is always staged -- so unlike under Z-Image there is no flag for the two
 	// fields to disagree about. Edits report the *count* rather than a
 	// strength, because 2.1 has no strength: a client reads MaxRefs to know
 	// how many pictures it may send.
@@ -300,23 +297,14 @@ func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.Image
 				perr = fmt.Errorf("preview at step %d: %w", st.Index, err)
 				return
 			}
-			// A preview is opaque whatever the request asked for. Its alpha
-			// comes from the same fitted matrix as its colour and is the
-			// least reliable of the four channels; a transparent in-progress
-			// frame would show the client holes that the finished image does
-			// not have.
-			//
-			// **It is sent at the finished image's size, not the latent
-			// grid's.** The matrix decodes one pixel per latent pixel, so a
-			// 1024² request previews at 64x64, and a client that shows an
-			// image at its own size showed a thumbnail. Lanczos adds no
-			// detail -- nothing can, from 64 channels through a linear map --
-			// but it puts the frame where the finished image will land.
-			// Measured at 1024²: 19 ms to resize and 25 ms to JPEG-encode,
-			// against a 2.3 s step.
-			small := pipeline.ToImage(t, true)
-			w, h := t.W*pipeline.VAEScale, t.H*pipeline.VAEScale
-			frame := pipeline.Resize(small, w, h)
+			// A preview takes the finished image's alpha policy. Under the
+			// fitted matrix it was always opaque, because that alpha was the
+			// least reliable of its four channels; TAEQI2.1's lands rms
+			// 0.0034 from the full VAE's, so a transparent request now sees
+			// the holes it will get. The frame is already the finished
+			// image's size -- the tiny decoder is 16x, like the real one.
+			frame := pipeline.ToImage(t, !req.Transparent)
+			w, h := t.W, t.H
 			drawProgress(frame, st.Index+1, steps)
 			perr = req.Partial(api.ImagePartial{
 				Index: idx, Step: st.Index, Steps: steps,
@@ -404,7 +392,7 @@ func drawProgress(img *image.NRGBA, done, steps int) {
 // something as soon as there is something to see, and step 0's denoised
 // estimate already carries the composition and colour, only fuzzy. Nothing
 // earlier is worth a frame: before the first step the latent is the seeded
-// noise, and the preview matrix maps that to grey static. The rest follow at
+// noise, and the preview decoder maps that to grey static. The rest follow at
 // run/n intervals, so with the finished image counted as frame n+1 the
 // spacing is even all the way to the end.
 //

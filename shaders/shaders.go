@@ -3705,5 +3705,23 @@ var H3EncConvOC48 []byte
 //go:embed h3enc_conv_oc16.spv
 var H3EncConvOC16 []byte
 
+// TAEQI2.1, Qwen-Image-2.1's preview decoder (qimage/vae/tiny_gpu.go): the
+// same convolution with its ReLU and residual add fused into the store. The
+// arms are screened by TestTinyKernelScreen; its widths are 256, 128, 64 and
+// a 16-channel conv_out, so every block here divides all but the last.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DEPILOGUE -DOC_BLOCK=16u -DIC_BLOCK=8u -o tae_conv_oc16.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DEPILOGUE -DOC_BLOCK=32u -DIC_BLOCK=16u -o tae_conv_oc32.spv vae_conv2d.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DEPILOGUE -DOC_BLOCK=64u -DIC_BLOCK=8u -o tae_conv_oc64.spv vae_conv2d.comp
+
+//go:embed tae_conv_oc16.spv
+var TAEConvOC16 []byte
+
+//go:embed tae_conv_oc32.spv
+var TAEConvOC32 []byte
+
+//go:embed tae_conv_oc64.spv
+var TAEConvOC64 []byte
+
 //go:embed h3_groupnorm.spv
 var H3GroupNorm []byte

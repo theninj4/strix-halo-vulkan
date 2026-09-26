@@ -1,33 +1,28 @@
 package pipeline
 
 import (
+	"context"
 	"fmt"
 
 	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/zimage/qwen"
 )
 
-// The in-progress preview — IMAGE.md Q7.
+// The in-progress preview — IMAGE.md Q7, redone once Q-o4 came true.
 //
-// Z-Image previewed through `madebyollin/taef1`, a distilled decoder, at
-// 87 ms a frame. **No such decoder exists for this model**: taehv's taew2_1
-// decodes the Wan-2.1 16-channel/8x latent that the *original* Qwen-Image
-// borrowed, and 2.1's VAE is a new 64-channel/16x RGBA design. Training one
-// is a project this repo does not want.
+// Q7 shipped a fitted 64x4 matrix because no tiny decoder existed for this
+// VAE. madebyollin/taesd then shipped one, TAEQI2.1 (2026-09-25), and it is
+// what previews run through now: qvae.TinyGPUDecoder, staged beside the full
+// decoder. On the final latent of a real 1024² run it lands rms 0.087 from
+// the full VAE's image where the matrix, upscaled, landed 0.20 — and on the
+// matrix's own 1/16 grid 0.012 against 0.116, ten times closer at the one
+// thing the matrix was fitted to do. It also decodes at the finished size,
+// with texture, where the matrix gave a 64x64 thumbnail.
 //
-// So the preview is the other well-known thing to do with a latent, the
-// "latent2rgb" trick: **one 64x4 matrix and a bias, per latent pixel**. It
-// is a least-squares fit of the VAE's own decoder restricted to its constant
-// and linear terms — see cmd/previewfit for how the pairs were collected and
-// how the fit scores. What it costs is 260 multiply-adds a latent pixel on
-// the host: 1.0 M FLOPs for a 1024x1024 image's 64x64 grid, against 2.3 s of
-// device time for the step that produced it. The frame is therefore free in
-// a way taef1's was not, which is why previews here are not behind a flag.
-//
-// What it cannot do is resolve anything the latent does not already carry
-// per-pixel: a preview is 1/16 scale and has no texture, and it is upscaled
-// by whatever is displaying it. What it does carry is composition, colour
-// and layout, which is what an in-progress frame is for.
+// What it costs is ~63 ms a frame at 1024² (qvae's TestTinyGPUTiming)
+// against a ~2.2 s step, and 224 MB of activation arena and 29 MB of weights
+// at a 1024² ceiling. That is enough to be lazy about (Step.Preview is a
+// closure) and not enough to be a flag.
 //
 // **The tensor it decodes is the denoised estimate, not the current
 // latent**, and that distinction is load-bearing rather than pedantic. The
@@ -39,38 +34,21 @@ import (
 // hand. Step.Preview does it; see Run.
 
 // PreviewDecode maps packed *normalized* latents -- the space the DiT works
-// in, so no denormalisation happens first -- to an RGBA image at latent
-// resolution: [1, 4, h, w] in [-1, 1], which is the range and layout the
-// real decoder produces. Everything downstream (ToImage, the backend, the
-// SSE frame) is therefore identical for a preview and a finished image.
-func PreviewDecode(latents *qwen.Mat, h, w int) (*qvae.Tensor, error) {
+// in, and the one TAEQI2.1 was distilled on, so no denormalisation happens
+// first -- to an RGBA image [1, 4, 16h, 16w] in [-1, 1], the range and
+// layout the real decoder produces. Everything downstream (ToImage, the
+// backend, the SSE frame) is therefore identical for a preview and a
+// finished image. It runs on the device.
+func (p *Pipeline) PreviewDecode(ctx context.Context, latents *qwen.Mat, h, w int) (*qvae.Tensor, error) {
 	if latents.Rows != h*w {
 		return nil, fmt.Errorf("pipeline: %d latent rows for a %dx%d preview grid", latents.Rows, h, w)
 	}
-	if latents.Cols != previewZDim {
-		return nil, fmt.Errorf("pipeline: preview matrix is fitted for %d channels, latents have %d",
-			previewZDim, latents.Cols)
-	}
-	out := qvae.NewTensor(1, previewChannels, h, w)
-	plane := h * w
-	for p := 0; p < plane; p++ {
-		z := latents.Row(p)
-		for c := 0; c < previewChannels; c++ {
-			row := previewWeight[c]
-			sum := previewBias[c]
-			for k := 0; k < previewZDim; k++ {
-				sum += row[k] * z[k]
-			}
-			// The real decoder clamps; so does this, for the same reason --
-			// a value past the range wraps to the opposite end when it is
-			// converted to 8 bits, and a white highlight comes out black.
-			if sum > 1 {
-				sum = 1
-			} else if sum < -1 {
-				sum = -1
-			}
-			out.Data[c*plane+p] = sum
+	z := qvae.NewTensor(1, latents.Cols, h, w)
+	for tk := 0; tk < latents.Rows; tk++ {
+		row := latents.Row(tk)
+		for c := 0; c < latents.Cols; c++ {
+			z.Plane(0, c)[tk] = row[c]
 		}
 	}
-	return out, nil
+	return p.tiny.Decode(ctx, z)
 }

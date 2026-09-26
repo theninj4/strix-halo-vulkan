@@ -310,8 +310,8 @@ func (s *Server) checkStreaming(ctx context.Context, w http.ResponseWriter, geo 
 		// backend cannot answer it.
 		//
 		// **The image backend this server ships always can**, because its
-		// preview decoder is a fitted 64x4 matrix compiled in rather than a
-		// checkpoint to load (IMAGE.md Q7). So this branch is reached only
+		// preview decoder is always staged with the pipeline rather than
+		// behind a flag. So this branch is reached only
 		// by a backend that reports no previews, and the message stays
 		// generic rather than naming a flag that no longer exists: what
 		// would be wrong is a model without one, not a server started

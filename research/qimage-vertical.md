@@ -122,13 +122,14 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q4 | DiT on the GPU (`qimage/dit/gpu.go`) | **done for t2i** — teacher-forced flat ≤8e-3 over 40 steps; **2.27 s/step at 1024²** |
 | Q5g | VAE decoder on the GPU (`qimage/vae/gpu.go`) | **done 2026-09-20** — stagewise on the dump's own bounds; **1024² in 7.4 s**, 117 dispatches. Encoder stays CPU until Q8 needs it |
 | Q6 | Serve t2i (`/v1/images/generations`, RGBA, ceiling geometry) | **done 2026-09-20** — `qimage/pipeline` resident at **31.7 GB**, served 1024²/40 in **1m38.2s / 1m41.3s**, `background: "transparent"` answered; the Z-Image deletion it owed is Q12 |
-| Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone |
+| Q7 | Previews (fitted linear 64→RGB; no tiny AE exists for this VAE) | **done 2026-09-20** — R² 0.97, **159 µs a frame**, three partials cost 0.3% of a request; previews are unconditional, the flags are gone. **Superseded by Q14** |
 | Q8 | Edits (vision tower, multi-ref, VAE encoder serving) | **done 2026-09-20** — `/v1/images/edits` answers from a **2m8s served edit at 1024²**, 39.4 GB resident, reproducing the reference edit at **max abs 0.0014, mean 1.7e-4** (24x tighter than t2i's own served number); seventeen controls firing |
 | Q9 | Percents (fusion ports, tile re-screens, the full-seq re-pack) | **first pass done 2026-09-20** — the DiT attributed (`TestGPUStepProfile`), the GEMM swizzle re-screen closed with a measurement (SWZ=8 wins here too), the fragment pack taken **44 → 131 GB/s**: image 1m38→**1m32**, edit 2m8→**1m59**, output bit-identical. The VAE's two priced ports became Q9b |
 | Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
 | Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **23% of a run** (one step) or **152 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
 | Q9b | The VAE's two priced ports (`qimage/vae/kernels.go`, two shaders) | **done 2026-09-21** — the fp16 route **refused with a measurement** (`TestConvFP16Ladder`: one narrowed convolution costs the image max abs 0.0885), the same percents taken in fp32 instead: decode **7.4 → 4.02 s**, encoder **1.7 → 0.91 s**, image **1m32 → 1m28.8**, edit **1m59 → 1m54.2**, every output **bit-identical** |
 | Q13 | Int8 banks for the text encoder and the DiT (post-archive, 2026-09-26) | **done** — served default; resident **31.5 → 20.4 GB** (encoder 13.2 → 7.8, DiT 13.3 → 7.5), edits the same 11 GB less; every teacher-forced DiT step **0.03–0.10x** the released bf16 transformer's error at 1024², the free run 0.81x bf16's; the encoder needs layers 6 and 16 kept fp16; ~4% a step |
+| Q14 | TAEQI2.1 previews (post-archive, 2026-09-26) | **done** — madebyollin's tiny decoder for this VAE replaces Q7's matrix: **rms 0.087 from the full VAE against the matrix's 0.20**, full-size frames, **63 ms at 1024²**; matches taesd at 2.6e-5; `preview_matrix.go` and `cmd/previewfit` deleted |
 | Q12 | The Z-Image deletion (`zimage/vae`, three `cmd/`s, 28 shader builds) | **done 2026-09-21** — `tensor.go` + `math.go` hoisted into `qimage/vae`, the rest deleted: **6,839 lines of Go, 895 of GLSL**, every gate re-run with no digit changed |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
@@ -309,6 +310,10 @@ for free.
   not a commitment.
 
 ## The preview problem (taef1 has no successor here)
+
+> **Solved 2026-09-26 (Q14):** madebyollin shipped TAEQI2.1 in `taesd`, not
+> `taehv`, and it is what previews run through now. The history below is
+> kept as it was.
 
 `madebyollin/taehv`'s **taew2_1 does *not* fit this model**: it decodes the
 Wan-2.1 16-channel/8x latent that the *original* Qwen-Image borrowed; 2.1's
@@ -1432,6 +1437,59 @@ two-run numbers.
   so it is its own question), and an int8-reading GEMM that would take the
   4% back.
 
+- **Q14 — TAEQI2.1 previews. Done 2026-09-26** (after the archive). Q-o4
+  came true in `madebyollin/taesd` rather than taehv: `taeqi2_1_*.pth`,
+  commit 401ce45e (issue #38), a 64-channel/16x RGBA tiny AE distilled
+  against this VAE. Its decoder is taesd's new `F16Decoder` — tanh clamp,
+  conv 64→256, blocks at 256/128/64/64 with a nearest upsample and a
+  bias-free narrowing conv between them, conv to 16 and a 2x2 pixel
+  shuffle — 7.6 M parameters, fp16 in the checkpoint. It replaces Q7's
+  fitted matrix outright: `preview_matrix.go` and `cmd/previewfit` are
+  deleted.
+
+  **It takes the normalized latent**, the DiT's space, which is what the
+  matrix took too. Measured rather than read: a served picture through the
+  real VAE encoder decodes rms 0.035 from the full VAE's own decode when
+  normalized (the full VAE's round trip is 0.030) and 0.198 raw.
+
+  | on the final latent of `qi21run1024`, vs the full VAE's image | fitted matrix (Q7) | **TAEQI2.1** |
+  |---|---|---|
+  | rms, at 1024² | 0.20 (upscaled) | **0.087** |
+  | rms, on the 1/16 grid (box-filtered) | 0.116 | **0.012** |
+  | alpha channel rms | 0.002 | 0.003 |
+  | frame size | 64x64 | 1024x1024 |
+  | cost a frame | 159 µs (host) | **62.6 ms** (device); 20 ms at 512² |
+  | residency at a 1024² ceiling | 0 | 29 MB weights + 224 MB arena |
+
+  **The port** is `qimage/vae/tiny.go` (CPU oracle) and `tiny_gpu.go`, on
+  the full decoder's engine, arena and upsample. The only shader change is
+  an `EPILOGUE` build of `vae_conv2d.comp` that fuses a ReLU and a residual
+  add into the store, so the graph is 35 convolutions and 3 upsamples; the
+  full decoder's and H3's builds are byte-identical after the edit
+  (checked with `cmp`). `TestTinyKernelScreen` picked OC_BLOCK 64 (62.6 ms
+  against oc32's 67.1 and oc16's 68.2, two runs agreeing, bit-identical).
+  `reference/dump_taeqi.py` converts the .pth to safetensors in
+  `models/taeqi2_1/` and dumps the oracle from taesd's own code, vendored at
+  `reference/taesd/` (MIT). **The pipeline loads it from `taeqi2_1/` beside
+  the Qwen checkpoint** (`Options.Preview` overrides); a server without it
+  refuses to start, since there is no longer a fallback.
+
+  **Gates.** CPU and GPU each match taesd layer by layer at rel ≤ 2.2e-5
+  and at the image max abs **1.7e-5 / 2.6e-5** (gate 2e-4), crop and full
+  1024². Two negative controls fire at the image gate: the shuffle's 2x2
+  offsets transposed (7,900x) and the latent denormalized first as the full
+  decoder's is (9,800x). `TestPreviewFrames` keeps its x0-vs-x_t control
+  (3.5x at step 0) and now measures frames at full size: mean abs 0.130 at
+  step 0 of 8 falling to **0.016** at the last, where the matrix could only
+  be graded on a 1/16 grid.
+
+  **One behaviour change in the API**: a preview now takes the finished
+  image's alpha policy. The matrix's frames were forced opaque because its
+  alpha was the least reliable channel; TAEQI2.1's is rms 0.003 from the
+  full VAE's, so a `background: "transparent"` request's frames are
+  transparent too. The served 512²/16 streaming table in API.md was
+  measured under the matrix and is not yet re-measured.
+
 ## Decisions taken now (so future sessions don't relitigate)
 
 1. **New `qimage/` tree; `zimage/qwen` and `zimage/tokenizer` stay put** until
@@ -1450,6 +1508,7 @@ two-run numbers.
    the arena is 3060 bytes a pixel for every aspect ratio and a side limit
    was charging landscape requests for a constraint that does not exist.
 5. **No self-trained tiny decoder**; linear preview + watch taehv.
+   *Closed by Q14: upstream's TAEQI2.1 is the preview decoder.*
 6. **No CFG path in the Go port** (true_cfg_scale stays a refusal if asked
    for over HTTP) until something demands it — it would double every step.
 7. **The VAE stays fp32 end to end** — added 2026-09-21 (Q9b), measured, not
@@ -1477,7 +1536,8 @@ two-run numbers.
   appear? (Watch the examples repo and lightx2v.)
 - **Q-o3**: how are separate masks / painted annotations fed for local edits?
   (Examples repo, before `/v1/images/edits` promises masks.)
-- **Q-o4**: does taehv grow a 2.1 variant? (Q7 fallback becomes an upgrade.)
+- ~~**Q-o4**: does taehv grow a 2.1 variant?~~ **Settled 2026-09-26 (Q14)**:
+  yes, in `madebyollin/taesd` as `taeqi2_1_*` (commit 401ce45e, issue #38).
 - ~~**Q-o5**: text-only mrope — confirmed equivalent to plain RoPE by dump?~~
   **Settled 2026-09-20 (Q0)**: gap 0.0 against a plain theta-5e6 NeoX table;
   `zimage/qwen` needs nothing mrope-shaped before Q8.

@@ -40,6 +40,13 @@
 // and a tap at H reads row H-2. It is only meaningful for pad <= 1, which is
 // every filter that build runs.
 //
+// EPILOGUE builds the same filter with TAEQI2.1's tail fused into the store
+// (qimage/vae/tiny_gpu.go): aux0 bit 0 adds the tensor at resOff, bit 1
+// applies a ReLU after it. That covers everything the tiny decoder does
+// between convolutions -- conv+ReLU, and a block's conv+skip+ReLU -- so its
+// graph is convolutions and upsamples only. Without the define the store is
+// the plain one, so the full decoder's builds are unchanged.
+//
 // IC_BLOCK trades LDS footprint against barrier count and changes nothing
 // numerically either; the products are still accumulated in ascending channel
 // order.
@@ -134,7 +141,18 @@ void main() {
         for (uint o = 0u; o < OC_BLOCK; ++o) {
             uint oc = ocBase + o;
             if (oc < pc.OC) {
+#ifdef EPILOGUE
+                float v = acc[o];
+                if ((pc.aux0 & 1u) != 0u) {
+                    v += act[pc.resOff + oc * outHW + p];
+                }
+                if ((pc.aux0 & 2u) != 0u) {
+                    v = max(v, 0.0);
+                }
+                act[pc.outOff + oc * outHW + p] = v;
+#else
                 act[pc.outOff + oc * outHW + p] = acc[o];
+#endif
             }
         }
     }

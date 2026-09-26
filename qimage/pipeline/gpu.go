@@ -6,6 +6,7 @@ import (
 	"image"
 	"math"
 	"math/rand"
+	"path/filepath"
 	"time"
 
 	"strix-halo-vulkan/qimage/dit"
@@ -108,6 +109,10 @@ type Options struct {
 	// textenc.Q8KeepFP16 and dit.Q8KeepFP16 held in fp16, the served
 	// default (research/qimage-vertical.md Q13).
 	Bank qwen.Bank
+	// Preview is the TAEQI2.1 tiny decoder's directory (preview.go), the
+	// converted `taeqi2_1_decoder.safetensors`. Empty takes `taeqi2_1/`
+	// beside Model, which is where reference/dump_taeqi.py puts it.
+	Preview string
 }
 
 // geom is a resolved size, all the way down to the transformer's row count.
@@ -141,6 +146,7 @@ type Pipeline struct {
 	enc  *qwen.GPUEncoder
 	dt   *dit.GPU
 	dec  *qvae.GPUDecoder
+	tiny *qvae.TinyGPUDecoder
 	vcfg *qvae.Config
 	scfg *SchedConfig
 
@@ -278,6 +284,18 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: staging the VAE decoder: %w", err)
 	}
+	if opt.Preview == "" {
+		opt.Preview = filepath.Join(filepath.Dir(filepath.Clean(opt.Model)), "taeqi2_1")
+	}
+	cpuTiny, err := qvae.LoadTinyDecoder(opt.Preview)
+	if err != nil {
+		p.Destroy()
+		return nil, fmt.Errorf("pipeline: preview decoder: %w", err)
+	}
+	if p.tiny, err = qvae.NewTinyGPUDecoder(dev, cpuTiny, max.latentH, max.latentW); err != nil {
+		p.Destroy()
+		return nil, fmt.Errorf("pipeline: staging the preview decoder: %w", err)
+	}
 	if p.refs > 0 {
 		if err := p.stageEdit(dev); err != nil {
 			p.Destroy()
@@ -286,9 +304,9 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	}
 
 	p.encBytes = p.enc.WeightBytes()
-	p.vaeBytes = p.dec.WeightBytes()
+	p.vaeBytes = p.dec.WeightBytes() + p.tiny.WeightBytes()
 	p.ditBytes = p.dt.WeightBytes()
-	p.actBytes = p.enc.ActivationBytes() + p.dt.ActivationBytes() + p.dec.ActivationBytes() + p.dt.CacheBytes()
+	p.actBytes = p.enc.ActivationBytes() + p.dt.ActivationBytes() + p.dec.ActivationBytes() + p.tiny.ActivationBytes() + p.dt.CacheBytes()
 	if p.tower != nil {
 		p.editBytes = p.tower.WeightBytes() + p.venc.WeightBytes()
 		p.actBytes += p.tower.ActivationBytes() + p.venc.ActivationBytes()
@@ -301,6 +319,10 @@ func (p *Pipeline) Destroy() {
 	if p.dec != nil {
 		p.dec.Destroy()
 		p.dec = nil
+	}
+	if p.tiny != nil {
+		p.tiny.Destroy()
+		p.tiny = nil
 	}
 	if p.dt != nil {
 		p.dt.Destroy()
@@ -409,16 +431,15 @@ type Step struct {
 	Sigma, NextSigma float64
 	Latents          *qwen.Mat
 
-	// Preview decodes this step's *denoised estimate* through the fitted
-	// linear map (preview.go) into an image at latent resolution, in the
-	// same [-1, 1] RGBA layout the real decoder produces. It is valid only
-	// for the duration of the callback.
+	// Preview decodes this step's *denoised estimate* through the TAEQI2.1
+	// tiny decoder (preview.go) into an image at the finished image's size,
+	// in the same [-1, 1] RGBA layout the real decoder produces. It is valid
+	// only for the duration of the callback, and it runs on the device, so
+	// only from the goroutine that holds it -- which the callback does.
 	//
-	// It is a closure rather than a decoded tensor because the estimate has
-	// to be formed -- one pass over the latents -- and a callback that only
-	// wants the wall clock should not pay for it. That it is cheap enough
-	// not to need a flag is the point of Q7; that it is not *free* is why it
-	// is still lazy.
+	// It is a closure rather than a decoded tensor because a frame costs
+	// ~63 ms at 1024² and a callback that only wants the wall clock should
+	// not pay for it.
 	Preview func() (*qvae.Tensor, error)
 }
 
@@ -601,7 +622,7 @@ func (p *Pipeline) denoise(ctx context.Context, latents *qwen.Mat, g geom, sched
 							x0.Data[j] -= s * v.Data[j]
 						}
 					}
-					return PreviewDecode(x0, g.latentH, g.latentW)
+					return p.PreviewDecode(ctx, x0, g.latentH, g.latentW)
 				},
 			})
 		}

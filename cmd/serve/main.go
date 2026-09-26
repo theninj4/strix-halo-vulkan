@@ -26,10 +26,10 @@
 //
 // **There is no -preview flag any more, and that is the change rather than
 // an omission.** Under Z-Image it loaded madebyollin/taef1 and cost 1.0 GB
-// of activation arena, so streaming was a residency decision. This model has
-// no distilled decoder to load: its preview is a fitted 64x4 matrix
-// (IMAGE.md Q7), 260 float32s compiled in, so `stream: true` is always
-// answerable and there is nothing to turn on.
+// of activation arena, so streaming was a residency decision. This model's
+// preview decoder, TAEQI2.1, is 29 MB of weights and 224 MB of arena at
+// 1024², always staged from `taeqi2_1/` beside -image-model, so
+// `stream: true` is always answerable and there is nothing to turn on.
 //
 // **-wyoming is a second door onto the speech backends**, not a second copy
 // of them: one process, one staging, one GPU queue, answering Home

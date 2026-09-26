@@ -544,18 +544,17 @@ func TestGeometryCeiling(t *testing.T) {
 	t.Logf("2048x2048 ceiling refused: %v", err)
 }
 
-// TestPreviewFrames is Q7's gate, and it is an eyeball with a number beside
-// it rather than a tolerance: a 64x4 linear map cannot reproduce a
-// convolutional decoder, so what has to be true is that an in-progress frame
-// is *recognisably the picture being made*. The number is the distance
-// between the last preview and the finished image box-filtered to the same
-// 1/16 grid — the preview's own job, measured against the only thing that
-// could grade it.
+// TestPreviewFrames is the preview's gate, and it is an eyeball with a number
+// beside it rather than a tolerance: TAEQI2.1 is a distillation of the VAE,
+// not a port of it, so what has to be true is that an in-progress frame is
+// *recognisably the picture being made*. The number is each frame's distance
+// from the finished image. The decoder's own correctness against taesd is
+// qvae's TestTinyGPUDecoder; this is the pipeline's use of it.
 //
 // It also pins the mechanism the frames depend on: the tensor decoded is the
 // denoised estimate x0 and not the sample x_t. At step 1 of 8 the sample is
 // still 80% noise, so a run of this test with that substitution produces
-// noise, and the numbers below separate by an order of magnitude.
+// noise, and the numbers below separate by several times.
 func TestPreviewFrames(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stages the whole pipeline")
@@ -584,10 +583,10 @@ func TestPreviewFrames(t *testing.T) {
 			}
 			frames = append(frames, f)
 			at = append(at, st.Index)
-			// The negative control: the same matrix over the *sample* rather
+			// The negative control: the same decoder over the *sample* rather
 			// than the denoised estimate. It is the substitution the field
 			// name invites and the one that would silently ship noise.
-			sc, err := PreviewDecode(st.Latents, side/16, side/16)
+			sc, err := p.PreviewDecode(t.Context(), st.Latents, side/16, side/16)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -600,31 +599,23 @@ func TestPreviewFrames(t *testing.T) {
 	if len(frames) != 8 {
 		t.Fatalf("%d frames for 8 steps", len(frames))
 	}
-	if frames[0].H != side/16 || frames[0].W != side/16 {
-		t.Fatalf("preview is %dx%d, want the %d latent grid", frames[0].W, frames[0].H, side/16)
+	if frames[0].H != side || frames[0].W != side || frames[0].C != 4 {
+		t.Fatalf("preview is %s, want [1 4 %d %d]", frames[0], side, side)
 	}
 
-	// The finished image on the preview's own grid, which is what a frame is
-	// trying to be.
-	want := boxDown(img, 16)
 	for i, f := range frames {
-		var sum float64
-		for j := range f.Data {
-			sum += math.Abs(float64(f.Data[j] - want.Data[j]))
-		}
-		t.Logf("step %d: mean abs %.4f from the finished image, in [-1,1]", at[i], sum/float64(len(f.Data)))
+		t.Logf("step %d: mean abs %.4f from the finished image, in [-1,1]", at[i], meanAbs(f, img))
 		writeArtifact(t, fmt.Sprintf("preview_step%d.png", at[i]), f)
 	}
 	writeArtifact(t, "preview_final_full.png", img)
-	writeArtifact(t, "preview_final_grid.png", want)
 	t.Logf("%dx%d/8 steps in %v", tm.Width, tm.Height, tm.Total.Round(time.Millisecond))
 
 	// The last frame is the finished latent (the terminal sigma makes x0 the
-	// sample exactly), so it is the fit's own error and nothing else. The
-	// first is a preview of a picture that barely exists. Both are logged;
-	// only the ordering is asserted, because that ordering is the claim a
-	// preview makes.
-	first, last := meanAbs(frames[0], want), meanAbs(frames[len(frames)-1], want)
+	// sample exactly), so it is the distillation's own error and nothing
+	// else. The first is a preview of a picture that barely exists. Both are
+	// logged; only the ordering is asserted, because that ordering is the
+	// claim a preview makes.
+	first, last := meanAbs(frames[0], img), meanAbs(frames[len(frames)-1], img)
 	if last >= first {
 		t.Errorf("previews do not converge: step 0 is %.4f from the image and the last is %.4f", first, last)
 	}
@@ -634,14 +625,14 @@ func TestPreviewFrames(t *testing.T) {
 	// They coincide at the end by construction (the terminal sigma is zero),
 	// which is itself worth asserting -- it is what says the two really are
 	// the same quantity at the end and only the middle is a choice.
-	ctrl := meanAbs(samples[0], want)
+	ctrl := meanAbs(samples[0], img)
 	writeArtifact(t, "preview_control_step0_sample.png", samples[0])
 	if ctrl < first*2 {
 		t.Errorf("decoding the sample at step 0 is %.4f from the image against the estimate's %.4f; "+
 			"the control should be far worse", ctrl, first)
 	}
 	t.Logf("control: step 0 from the sample x_t is %.4f, from the estimate x0 %.4f (%.1fx)", ctrl, first, ctrl/first)
-	if tail := meanAbs(samples[len(samples)-1], want); tail != last {
+	if tail := meanAbs(samples[len(samples)-1], img); tail != last {
 		t.Errorf("at the last step the sample and the estimate differ (%.6f vs %.6f); "+
 			"the terminal sigma should make them identical", tail, last)
 	}
@@ -653,25 +644,4 @@ func meanAbs(a, b *qvae.Tensor) float64 {
 		sum += math.Abs(float64(a.Data[i] - b.Data[i]))
 	}
 	return sum / float64(len(a.Data))
-}
-
-// boxDown averages n x n blocks, which is how cmd/previewfit paired a latent
-// pixel with the colour it produced.
-func boxDown(t *qvae.Tensor, n int) *qvae.Tensor {
-	out := qvae.NewTensor(1, t.C, t.H/n, t.W/n)
-	inPlane, outPlane := t.H*t.W, out.H*out.W
-	for c := 0; c < t.C; c++ {
-		for y := 0; y < out.H; y++ {
-			for x := 0; x < out.W; x++ {
-				var acc float64
-				for dy := 0; dy < n; dy++ {
-					for dx := 0; dx < n; dx++ {
-						acc += float64(t.Data[c*inPlane+(y*n+dy)*t.W+x*n+dx])
-					}
-				}
-				out.Data[c*outPlane+y*out.W+x] = float32(acc / float64(n*n))
-			}
-		}
-	}
-	return out
 }

@@ -325,8 +325,9 @@ Two things would fix it, and both are measurements rather than arguments:
     -image-condition-size    1024           the area every reference image is resized to, and an edit's
                                             default output size (diffusers' output_resolution)
 
-There is no `-preview`/`-previews` flag: this model's preview decoder is a
-fitted 64x4 matrix compiled in, so `stream: true` always answers.
+There is no `-preview`/`-previews` flag: this model's preview decoder,
+TAEQI2.1, is always staged (29 MB of weights, 224 MB of arena at 1024²) from
+`taeqi2_1/` beside `-image-model`, so `stream: true` always answers.
 
 **-llm and -image do not fit together.** ~84 GB and ~32 GB against 128 GB of
 unified memory the rest of the machine is also in: they are separate
@@ -579,18 +580,19 @@ client watching one arrive knows how much is left — followed by one
 named, so the terminal one is already unambiguous, and the sentinel exists on
 the chat endpoint only because its frames are not.
 
-**It needs no flag, and that is the change from Z-Image-Turbo rather than an
-omission.** There, previewing meant loading `madebyollin/taef1` beside the
-full VAE — 1.0 GB of activation arena, so streaming was a residency decision
-and `-preview` was how you made it. Qwen-Image-2.1's 64-channel VAE has no
-distilled decoder in existence, so the preview here is a **fitted linear
-64→RGBA matrix**: 260 float32s compiled into the binary, least-squares
-fitted against the real decoder's own output (research/qimage-vertical.md Q7, R² 0.97 on the
-fit and 0.83–0.90 on held-out prompts).
-There is nothing to load and nothing to turn on.
+**It needs no flag.** Under Z-Image-Turbo previewing meant loading
+`madebyollin/taef1` and 1.0 GB of activation arena, so `-preview` was a
+residency decision. Here the preview decoder is **TAEQI2.1**
+(`madebyollin/taesd`, 2026-09-25), a tiny decoder distilled against this
+very VAE: 7.6 M parameters, 29 MB of weights and 224 MB of arena at a 1024²
+ceiling, always staged. It replaced Q7's fitted 64→RGBA matrix, which
+stood in while no such decoder existed. On the final latent of a real 1024²
+run it lands rms 0.087 from the full VAE's image against the matrix's 0.20
+(research/qimage-vertical.md Q14).
 
-Measured on one `-image -image-size 512x512 -image-steps 16` process, two
-runs each:
+Measured under the fitted matrix, on one `-image -image-size 512x512
+-image-steps 16` process, two runs each (not yet re-measured with TAEQI2.1,
+which adds ~20 ms of device time a frame at 512²):
 
 | request | wall clock | first picture |
 |---|---|---|
@@ -603,14 +605,13 @@ So the framing is free and three in-progress frames cost **0.3%** — against
 of at ten. The frames land at 2.27, 4.34 and 6.43 s, from steps 3, 7 and 11
 of the sixteen.
 
-A preview decode itself is **159 µs** against a 587 ms step; everything else
-in that 0.3% is encoding the PNG and writing it. Partial frames go out at
-`png.BestSpeed` — 15% more bytes for a fifth of the latency — while the
-finished image keeps the careful encoder. A transient frame and a deliverable
-are not the same object. **A frame is 1/16 scale** (32x32 for a 512x512
-image, 64x64 for a 1024x1024 one) and is upscaled by whatever displays it: a
-latent2rgb map carries composition, colour and layout, and cannot carry
-texture the latent does not hold per-pixel.
+A preview decode is **20 ms at 512² and 63 ms at 1024²** on the device,
+against ~0.6 s and ~2.2 s steps. Partial frames go out at `png.BestSpeed` —
+15% more bytes for a fifth of the latency — while the finished image keeps
+the careful encoder. A transient frame and a deliverable are not the same
+object. **A frame is the finished image's size**, with texture, and it
+follows the request's `background`: a transparent request's frames are
+transparent too.
 
 **What the frame decodes is the denoised estimate, not the current latent**,
 and the distinction is load-bearing. The schedule is flow matching, so the
