@@ -67,8 +67,74 @@ type tokenizerJSON struct {
 		IgnoreMerges bool             `json:"ignore_merges"`
 		ByteFallback bool             `json:"byte_fallback"`
 		Vocab        map[string]int32 `json:"vocab"`
-		Merges       [][2]string      `json:"merges"`
+		Merges       mergeList        `json:"merges"`
 	} `json:"model"`
+}
+
+// mergeList is the BPE merge table in either of the two forms tokenizers
+// writes it: pairs (`["a", "b"]`, the current one) or single strings joined
+// by a space (`"a b"`, the older one, e.g. MiniMax-H3's). The two are the
+// same table: byte-level tokens never hold a literal space (it is `Ġ`), so
+// the string form splits unambiguously.
+type mergeList [][2]string
+
+func (m *mergeList) UnmarshalJSON(b []byte) error {
+	var pairs [][2]string
+	if err := json.Unmarshal(b, &pairs); err == nil {
+		*m = pairs
+		return nil
+	}
+	var joined []string
+	if err := json.Unmarshal(b, &joined); err != nil {
+		return fmt.Errorf("merges are neither pairs nor strings: %w", err)
+	}
+	*m = make([][2]string, len(joined))
+	for i, s := range joined {
+		a, c, ok := strings.Cut(s, " ")
+		if !ok || strings.Contains(c, " ") {
+			return fmt.Errorf("merge %d is %q, want two tokens", i, s)
+		}
+		(*m)[i] = [2]string{a, c}
+	}
+	return nil
+}
+
+// configSpecials reads additional_special_tokens from a tokenizer_config.json
+// beside tokenizer.json, if there is one. transformers adds any of them that
+// tokenizer.json does not already hold as new tokens, numbered on from the
+// highest id in list order, so a checkpoint can declare tokens there alone:
+// MiniMax-H3's `<d>`/`</d>` dialogue tags (151669/151670) are only in this
+// list.
+func configSpecials(dir string) ([]string, error) {
+	buf, err := os.ReadFile(filepath.Join(dir, "tokenizer_config.json"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfg struct {
+		Additional []json.RawMessage `json:"additional_special_tokens"`
+	}
+	if err := json.Unmarshal(buf, &cfg); err != nil {
+		return nil, fmt.Errorf("tokenizer: parsing tokenizer_config.json: %w", err)
+	}
+	// An entry is a string, or an AddedToken object carrying its content.
+	out := make([]string, 0, len(cfg.Additional))
+	for _, raw := range cfg.Additional {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			var tok struct {
+				Content string `json:"content"`
+			}
+			if err := json.Unmarshal(raw, &tok); err != nil || tok.Content == "" {
+				return nil, fmt.Errorf("tokenizer: additional_special_tokens entry %s", raw)
+			}
+			s = tok.Content
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // Load reads a tokenizer directory -- the one next to the checkpoint, e.g.
@@ -110,6 +176,25 @@ func Load(dir string) (*Tokenizer, error) {
 	for _, a := range raw.AddedTokens {
 		t.specials = append(t.specials, a.Content)
 		t.specialID[a.Content] = a.ID
+	}
+	extra, err := configSpecials(dir)
+	if err != nil {
+		return nil, err
+	}
+	next := int32(-1)
+	for _, id := range raw.Model.Vocab {
+		next = max(next, id)
+	}
+	for _, id := range t.specialID {
+		next = max(next, id)
+	}
+	for _, s := range extra {
+		if _, ok := t.specialID[s]; ok {
+			continue
+		}
+		next++
+		t.specials = append(t.specials, s)
+		t.specialID[s] = next
 	}
 	// Longest first, so "<|im_start|>" is not shadowed by a shorter added
 	// token that happens to be a prefix of it.

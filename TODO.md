@@ -45,6 +45,19 @@ PLE) and llama.cpp (the whole model's argmax). Live record and handoff:
 root [`LLM-VISION.md`](LLM-VISION.md) (V-stages). V10's eval and video are
 open.
 
+**Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
+stereo sound** (`GOALS.md` item 7). The live plan and handoff is the root
+[`VIDEO.md`](VIDEO.md) (M-stages). M0–M4 and M7 are done:
+
+- the packed layout and schedulers are bit-exact;
+- the 32 B conditioner runs through the unchanged `zimage/qwen` at rel 1e-4;
+- **the 50-block transformer runs on the GPU** at ≤ 6.7e-3 of an fp32 oracle
+  a forward, with teacher-forced steps ≤ 1.7e-3 rms.
+
+It takes **35.6 s a forward at the served 480p** (11 min for 20 steps) and
+143 s at the trained 768p (~2 h for 50); the attention is 68% of the latter.
+Open: the two decoders (M5, M6), end to end (M8), serving (M9).
+
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant

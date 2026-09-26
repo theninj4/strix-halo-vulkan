@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// MiniMax-H3's modulated pre-norm (VIDEO.md M7): an RMS norm, then the
+// block's AdaLN modulation, narrowed into the fp16 arena as a GEMM A operand.
+//
+//   out = x * rsqrt(mean(x^2) + eps) * a + b
+//
+// with a = norm.weight * (1 + scale) and b = shift folded on the host, one
+// pair of vectors per *run* of rows that share a modulation row (a
+// (timestep, modality) pair): the packed sequence is [text | keyframes |
+// audio | video], so a forward has at most four runs and each is one
+// dispatch of this shader with its own pc.aux0 (a) and pc.aux1 (b), both in
+// the fp32 activation arena where the per-step tables are uploaded.
+//
+// The same shader with a = weight, b = 0 is the token refiner's plain norm.
+//
+// One workgroup per row; one reduction, since an RMS norm has no mean.
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#define WG 256
+layout(local_size_x = WG) in;
+shared float partial[WG];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint t = gl_LocalInvocationID.x;
+    uint src = pc.inOff + r * pc.dim;
+    uint dst = pc.outOff + r * pc.lda;
+    float s = 0.0;
+    for (uint c = t; c < pc.dim; c += WG) {
+        float v = act[src + c];
+        s += v * v;
+    }
+    partial[t] = s;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(partial[0] / float(pc.dim) + uintBitsToFloat(pc.eps));
+    for (uint c = t; c < pc.dim; c += WG) {
+        hact[dst + c] = float16_t(act[src + c] * inv * act[pc.aux0 + c] + act[pc.aux1 + c]);
+    }
+}

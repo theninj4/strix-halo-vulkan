@@ -3616,3 +3616,43 @@ var KevGEMMQ8GLUM8 []byte
 //go:embed kev_gemm_q8_rb_m8.spv
 var KevGEMMQ8RBM8 []byte
 
+
+// MiniMax-H3's three additions to the DiT set (h3/dit/gpu.go, VIDEO.md M7):
+// the modulated RMS pre-norm with per-run AdaLN vectors, the q/k pack with
+// H3's 96-channel rotate-half RoPE, and the bias copy that lands an input
+// projection's rows in the residual stream.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o h3_norm_mod.spv h3_norm_mod.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o h3_bias_copy.spv h3_bias_copy.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -o h3_qk_pack_tpw8.spv h3_qk_pack.comp
+
+//go:embed h3_norm_mod.spv
+var H3NormMod []byte
+
+//go:embed h3_bias_copy.spv
+var H3BiasCopy []byte
+
+//go:embed h3_qk_pack_tpw8.spv
+var H3QKPackTPW8 []byte
+
+// The attention screen's arms for MiniMax-H3's long key ranges (VIDEO.md
+// M11): dit_attention_wmma.comp with fp16 context out, at more query tiles
+// a wave (QT) and longer key blocks (KTIL) than the image DiT's QT=1 KTIL=4,
+// which is DiTAttentionWMMAQT1KT4W32OutF16.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -o h3_attn_qt2_kt4_w32_of16.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=8 -DWAVE=32 -DOUT_F16=1 -o h3_attn_qt2_kt8_w32_of16.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=4 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -o h3_attn_qt4_kt4_w32_of16.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -DWAVE=32 -DOUT_F16=1 -o h3_attn_qt1_kt8_w32_of16.spv dit_attention_wmma.comp
+
+//go:embed h3_attn_qt2_kt4_w32_of16.spv
+var H3AttnQT2KT4 []byte
+
+//go:embed h3_attn_qt2_kt8_w32_of16.spv
+var H3AttnQT2KT8 []byte
+
+//go:embed h3_attn_qt4_kt4_w32_of16.spv
+var H3AttnQT4KT4 []byte
+
+//go:embed h3_attn_qt1_kt8_w32_of16.spv
+var H3AttnQT1KT8 []byte

@@ -1,0 +1,161 @@
+#version 450
+// MiniMax-H3's q/k pack (VIDEO.md M7): dit_qk_pack.comp with the rotation
+// H3 applies, which is not the DiT's. H3 rotates **the first ROPE_WIDTH (96)
+// of each head's 128 channels in the rotate-half convention** -- channel j
+// pairs with j + ROPE_WIDTH/2 -- and passes channels 96..127 through with the
+// norm weight and the scale only. The tables hold ROPE_WIDTH/2 angles a row
+// (the model's cos/sin are cat(freqs, freqs), so half of each row is a copy),
+// indexed by the dispatch-local token, so a row chunk points pc.wOff/pc.aux0
+// at its first row's angles.
+//
+// Everything else -- the per-head RMS norm, the scale, the fragment-tile
+// layout, TPW -- is dit_qk_pack.comp unchanged; the comment below is its own.
+//
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+// The whole of what happens to q and k between their projection and
+// attention, in one pass: the per-head RMS norm, the 3-D rotary embedding,
+// the softmax scale, and the narrowing into dit_pack_f16.comp's fragment-tile
+// layout.
+//
+// Unfused, that is three dispatches and 346 MB of traffic per operand at 4096
+// tokens (read 63, write 63, read 63, write 63, read 63, write 31) for 63 MB
+// of input and 31 MB of output. None of them does arithmetic worth the name
+// and all three are at the bus, so the fusion is worth what the round trips
+// cost -- measured at 1.83 ms -> 0.55 ms per operand
+// (research/stage-4-dit-graph.md).
+//
+// It is possible at all because the three steps have the same natural unit as
+// the pack already does: a **head of one token**. The RMS norm is per head
+// (128 wide, not 3840 -- normalising over the full width is a plausible port
+// bug that changes the output by 2.4x), the rotation pairs components 2j and
+// 2j+1 within a head, and a fragment tile column is a slice of one head. So a
+// workgroup that owns 16 tokens of one head owns everything all three steps
+// need, and the intermediate never leaves LDS.
+//
+// The unfused kernels stay: they are three separately validated stages, and
+// GPUBlock keeps a path through them so the fused output can be checked
+// against the thing it replaces rather than only against the reference.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#define TILE 16
+#ifndef HEAD_DIM
+#define HEAD_DIM 128
+#endif
+#define HDT (HEAD_DIM / TILE)
+#ifndef ROPE_WIDTH
+#define ROPE_WIDTH 96
+#endif
+#define HALF (ROPE_WIDTH / 2)
+#define PASS (HEAD_DIM - ROPE_WIDTH)
+#define WG 256
+#define LANES (WG / TILE)   // lanes cooperating on one token's head
+// Token tiles per workgroup, as in dit_pack_f16.comp and for the same reason
+// (IMAGE.md Q9): one tile is 2048 elements over 256 threads, and the DiT's
+// profile measured this pass at 46 GB/s against a ~190 GB/s bus. TPW = 1 is
+// every pre-existing build, unchanged; pc.span carries the tile count so a
+// grid rounded up to TPW cannot overrun into the next head's plane.
+#ifndef TPW
+#define TPW 1
+#endif
+
+layout(local_size_x = WG) in;
+
+shared float rows[TILE * HEAD_DIM];
+shared float partial[WG];
+shared float inv[TILE];
+
+void main() {
+    uint head = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+
+  for (uint slab = 0u; slab < uint(TPW); ++slab) {
+    uint tt = gl_WorkGroupID.x * uint(TPW) + slab;
+    if (pc.span != 0u && tt >= pc.span) {
+        return;
+    }
+    uint tok0 = tt * TILE;
+    if (slab > 0u) {
+        barrier();
+    }
+
+    // Coalesced in: consecutive lanes read consecutive components of one
+    // token. Tokens past the sequence are zeroed rather than skipped -- the
+    // attention kernel reads the padding and a pad key has to score
+    // something finite.
+    for (uint i = tid; i < TILE * HEAD_DIM; i += WG) {
+        uint m = i / HEAD_DIM, d = i % HEAD_DIM;
+        uint token = tok0 + m;
+        rows[i] = (token < pc.tokens)
+            ? act[pc.inOff + token * pc.dim + head * HEAD_DIM + d]
+            : 0.0;
+    }
+    barrier();
+
+    // The per-head RMS: LANES lanes per token row, each summing HEAD_DIM/LANES
+    // components at stride LANES, then a tree over the lanes. Consecutive
+    // lanes touch consecutive LDS addresses, so the stride costs no bank
+    // conflicts.
+    uint m = tid / LANES, lane = tid % LANES;
+    float s = 0.0;
+    for (uint d = lane; d < HEAD_DIM; d += LANES) {
+        float v = rows[m * HEAD_DIM + d];
+        s += v * v;
+    }
+    partial[tid] = s;
+    barrier();
+    [[unroll]] for (uint step = LANES / 2u; step > 0u; step >>= 1) {
+        if (lane < step) {
+            partial[tid] += partial[tid + step];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        // A pad row is all zeros; giving it inv = 0 keeps the zeros zero
+        // instead of propagating the 1/sqrt(eps) a real norm would produce.
+        inv[m] = (tok0 + m < pc.tokens)
+            ? inversesqrt(partial[tid] / float(HEAD_DIM) + uintBitsToFloat(pc.eps))
+            : 0.0;
+    }
+    barrier();
+
+    // Norm weight, rotate-half over the leading ROPE_WIDTH channels, and the
+    // scale, in place in LDS. Pair j is channels (j, j + HALF); the channels
+    // past ROPE_WIDTH are handled by the first PASS threads' second loop.
+    float sc = uintBitsToFloat(pc.scale);
+    for (uint p = tid; p < TILE * HALF; p += WG) {
+        uint r = p / HALF, j = p % HALF;
+        uint token = tok0 + r;
+        uint base = r * HEAD_DIM;
+        float x1 = rows[base + j] * inv[r] * wbuf[pc.aux2 + j];
+        float x2 = rows[base + j + HALF] * inv[r] * wbuf[pc.aux2 + j + HALF];
+        float c = 0.0, sn = 0.0;
+        if (token < pc.tokens) {
+            c = wbuf[pc.wOff + token * HALF + j];
+            sn = wbuf[pc.aux0 + token * HALF + j];
+        }
+        rows[base + j] = (x1 * c - x2 * sn) * sc;
+        rows[base + j + HALF] = (x2 * c + x1 * sn) * sc;
+    }
+    for (uint p = tid; p < TILE * PASS; p += WG) {
+        uint r = p / PASS, d = ROPE_WIDTH + p % PASS;
+        rows[r * HEAD_DIM + d] *= inv[r] * wbuf[pc.aux2 + d] * sc;
+    }
+    barrier();
+
+    // Coalesced out: consecutive lanes write consecutive halves of one 512 B
+    // fragment tile. Tile (t, c) of a head holds token rows 16t.. and
+    // component columns 16c.., element (token, component) at m*16 + k, which
+    // is what a row-major fragment load of stride 16 reads.
+    uint outBase = pc.outOff + (head * pc.aux1 / TILE + tt) * (HDT * TILE * TILE);
+    for (uint o = tid; o < HDT * TILE * TILE; o += WG) {
+        uint c = o / (TILE * TILE);
+        uint rem = o % (TILE * TILE);
+        hact[outBase + o] = float16_t(rows[(rem / TILE) * HEAD_DIM + c * TILE + rem % TILE]);
+    }
+  }
+}

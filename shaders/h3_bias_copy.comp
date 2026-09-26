@@ -1,0 +1,24 @@
+#version 450
+// out[r] = in[r] + bias, row by row inside the fp32 activation arena
+// (VIDEO.md M7): how an input projection's GEMM output, computed into scratch,
+// reaches its rows of the residual stream with the checkpoint's fp32 bias
+// added exactly. pc.aux2 = 0 is a plain copy.
+#include "dit_common.glsl"
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + r * pc.lda;
+    uint dst = pc.outOff + r * pc.dim;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        float v = act[src + c];
+        if (pc.aux2 != 0u) {
+            v += act[pc.aux0 + c];
+        }
+        act[dst + c] = v;
+    }
+}
