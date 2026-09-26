@@ -23,6 +23,10 @@
 > has the fp32 dump as the *less* accurate side — are the ones that have
 > each already caught a port, so they are the ones to read before touching
 > this code again.
+>
+> **Reopened once, 2026-09-26, for Q13** (int8 banks, below the stages):
+> the footprint, not the plan. It is written in this file because the code
+> cites it here.
 
 
 > **Rewritten through 2026-09-21 — Q0–Q11 are done**: `POST
@@ -124,6 +128,7 @@ Go on Vulkan, served at `POST /v1/images/generations` and
 | Q10 | The ceiling is an area (`api`, `qimage/pipeline`) | **done 2026-09-21** — the arena measured at **3060 B/px for every aspect ratio** (`TestArenaShape`), so a side box was costing 16:9 **44% of its pixels**: the same server now answers `aspect_ratio: "16:9"` with **1344x768 instead of 1024x576**, at the same wall clock |
 | Q11 | Cancellation (`qimage/*`, `backend`) | **done 2026-09-21** — the context reaches the sampler and the VAE's submit batches: a hung-up client stops in **23% of a run** (one step) or **152 ms of a decode** instead of paying for the whole image, and the next run is bit-identical (`TestCancellation`) |
 | Q9b | The VAE's two priced ports (`qimage/vae/kernels.go`, two shaders) | **done 2026-09-21** — the fp16 route **refused with a measurement** (`TestConvFP16Ladder`: one narrowed convolution costs the image max abs 0.0885), the same percents taken in fp32 instead: decode **7.4 → 4.02 s**, encoder **1.7 → 0.91 s**, image **1m32 → 1m28.8**, edit **1m59 → 1m54.2**, every output **bit-identical** |
+| Q13 | Int8 banks for the text encoder and the DiT (post-archive, 2026-09-26) | **done** — served default; resident **31.5 → 20.4 GB** (encoder 13.2 → 7.8, DiT 13.3 → 7.5), edits the same 11 GB less; every teacher-forced DiT step **0.03–0.10x** the released bf16 transformer's error at 1024², the free run 0.81x bf16's; the encoder needs layers 6 and 16 kept fp16; ~4% a step |
 | Q12 | The Z-Image deletion (`zimage/vae`, three `cmd/`s, 28 shader builds) | **done 2026-09-21** — `tensor.go` + `math.go` hoisted into `qimage/vae`, the rest deleted: **6,839 lines of Go, 895 of GLSL**, every gate re-run with no digit changed |
 
 Every gate is dump-driven and every tolerance in this file is measured, with
@@ -1346,6 +1351,86 @@ two-run numbers.
   3060 B/px, both decoder and encoder stagewise gates and every negative
   control unchanged, and `go test ./... -short` green. **6,839 lines of Go
   and 895 of GLSL deleted; 204 added, nearly all of them comments.**
+
+- **Q13 — int8 banks for the text encoder and the DiT. Done 2026-09-26**
+  (after the archive). The question was the footprint: 31.5 GB resident for
+  generation, 49.7 GB with `-edits 3` beside the video model in
+  `ai.service`. The route is VIDEO.md M11a's, unchanged: `qwen.PackQ8`
+  (int8, one fp16 scale per 32 k of a row), expanded a layer or block at a
+  time into one fp16 scratch by `dit_dequant_q8.comp`, and the validated
+  fp16 GEMMs read the scratch. **Priced against the released bf16 pipeline,
+  not against our fp16 path**, as M11a was, with two new dumps:
+  `reference/dump_qi21_textenc_bf16.py` (the bf16 encoder on Q1's three
+  prompts) and `reference/dump_qi21_dit_bf16.py` (the bf16 transformer over
+  any t2i or edit oracle, teacher-forced or `--free`; its copied denoising
+  loop reproduces the pipeline-driven run bit for bit, image included).
+
+  | | fp16 | **int8** | official bf16 |
+  |---|---|---|---|
+  | encoder weights | 13.9 GB | **8.13 GB** (layers 6, 16 fp16) | |
+  | DiT weights | 13.96 GB | **7.85 GB** (0.44 GB of it scratch) | |
+  | served resident, 1024² t2i | 31.5 GB | **20.4 GB** | |
+  | encoder rms diff, en / cjk / empty | 0.018 / 0.021 / 0.25 | **0.244 / 0.245 / 2.58** | 0.765 / 0.903 / 2.34 |
+  | encoder, edit prompt 1 / 2 refs | 0.017 / 0.019 | 0.273 / 0.307 | |
+  | DiT teacher-forced, 1024²/40, rms diff | ≤ 2.8e-5 | **≤ 1.9e-4 (0.03–0.10x bf16)** | 1.7e-3 … 2.5e-3 |
+  | DiT free run, 1024²/40, final rms diff | 1.05e-3 | **0.027 (0.81x)** | 0.0334 |
+  | DiT, 256² edit, teacher-forced / free | | 0.07–0.80x / 0.89x | |
+  | served 256² image vs fp32, max abs / mean | 0.033 / 3.4e-4 | **0.378 / 0.0052** | 0.390 / 0.0081 |
+  | DiT step at 1024² (clean, two runs) | 2.261 s | **2.351 / 2.349 s (+4%)** | |
+
+  **The encoder is the one that needed work, and the massive-activation
+  channel is why.** Int8 throughout is 7.77 GB but 20x fp16's error (en max
+  abs 45.6, empty 3.6 rms — past bf16). `TestGPUBankLadder` (int8 against
+  fp16 on the device, layer by layer, `QI21_BANK_LADDER=1`) found it in
+  exactly two places: **layer 6's FFN writes the ~13k channel and injects
+  max abs 4.8; layer 16's FFN injects 442**; both are carried flat and
+  surface when layers 34–35 cancel the channel — Q1's mechanism, with int8
+  as the perturbation. Holding layers 6 and 16 in fp16
+  (`qwen.NewGPUEncoderMixed`, `textenc.Q8KeepFP16`) costs 0.36 GB and
+  halves the error. **Layer 16 still injects 56 with its own weights
+  exact**: its FFN amplifies the error that *arrives* (0.38 from int8
+  layers 0–15), so the rest is upstream and spread, and closing it means
+  fp16 for most of 0–16. Adding 34–35 buys 1.2x for another 0.36 GB and was
+  not taken. The empty prompt, all template and cancellation residue, is
+  the one place int8 sits past bf16 (1.10x); the gate allows 1.25x there
+  and 0.5x on real prompts.
+
+  **The DiT needed nothing.** Every block int8, no exceptions
+  (`dit.Q8KeepFP16` is empty): teacher-forced it is an order of magnitude
+  inside bf16 at the served shape. The 256² steps (0.08–0.47x) and the edit
+  (to 0.80x) sit closer to bf16 because bf16's own error is smaller there.
+  The expansion is bandwidth-bound, ~2.8 ms a block (0.67 GB at ~240 GB/s);
+  dropping the barriers between a block's seven dequant dispatches was
+  measured and bought nothing (2.351 against 2.349 s), so it was removed.
+
+  **Gates** (all `QIMAGE_BANK=q8`; fp16 remains the default in tests and
+  keeps its old bounds): `qimage/textenc` `TestGPUEncoder` and
+  `TestGPUEditEncoder` switch to rms-diff bounds under int8 (a quantised
+  bank moves every element a little, and the worst-element rel then names
+  one residue element — rel 0.87 on an edit prompt whose rms diff is 0.27),
+  plus the bf16 ratio; the edit controls still fire at 10–11x.
+  `qimage/dit` `TestGPUOracle256/1024` and `TestGPUEditOracle` hold every
+  teacher-forced step to 1.25x bf16's and the free run to 1.25x bf16's free
+  run; the edit controls fire at 29–54x. `qimage/pipeline`
+  `TestServedOracle256` holds the served image to 1.25x the bf16 free run's
+  image on max abs and mean — the int8 image is past fp16's `servedImgTol`
+  (0.35) on max abs and inside bf16's on both. **The eyeball**: the served
+  1024² fox is 42.6 dB from fp16's
+  (`out/qi21served/served1024_40steps{,_q8}.png`); the drivetrain drawing,
+  the step sweep's most fragile prompt, is 28.0 dB with the same
+  composition and parts and detail drifting at the derailleur.
+  **Wall clock**: the served A/B ran while `ai.service` was working through
+  a video job, so its absolutes (1m52–1m57 against 1m49–1m51) are
+  contended; the ratio agrees with the clean DiT number.
+  **Where it is switched**: `pipeline.Options.Bank` (zero value fp16),
+  `backend.ImageOptions.FP16`, `serve -image-fp16` for the control (int8 is
+  the default), `cmd/qimage -bank q8|fp16`. Blocks and layers are
+  `runtime.GC()`'d one at a time while staging (M11a's server-memory
+  finding). **Not done**: the served peak under the 20 ms sampler inside
+  `ai.service` (server-memory-is-not-standalone-memory), the prefix KV
+  cache (~2.1 GB a reference, fp16; it goes through the attention kernel,
+  so it is its own question), and an int8-reading GEMM that would take the
+  4% back.
 
 ## Decisions taken now (so future sessions don't relitigate)
 

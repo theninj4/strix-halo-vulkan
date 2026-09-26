@@ -14,6 +14,7 @@ import (
 	"strix-halo-vulkan/qimage/pipeline"
 	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 )
 
 // ImageOptions is what cmd/serve's flags come to.
@@ -72,6 +73,9 @@ type ImageOptions struct {
 	CondSize int
 	// ID is the model id this backend answers to in /v1/models.
 	ID string
+	// FP16 stages the text encoder and the transformer as fp16 rather than
+	// the int8 banks: the control (research/qimage-vertical.md Q13).
+	FP16 bool
 }
 
 const (
@@ -91,8 +95,9 @@ const (
 // qimage/pipeline.
 //
 // **It is resident, and the resolution is not part of what is resident.**
-// Construction stages ~13.2 GB of text encoder, ~13.3 GB of transformer and
-// ~1.0 GB of VAE, sizes the activation arenas for the largest image the flags
+// Construction stages ~7.8 GB of text encoder, ~7.5 GB of transformer (int8
+// banks; 13.2 and 13.3 as fp16, research/qimage-vertical.md Q13) and ~1.0 GB
+// of VAE, sizes the activation arenas for the largest image the flags
 // asked for, and then every request is arithmetic: the transformer states its
 // run length per image, the VAE re-records its graph from the latent it is
 // handed. So a 512x512 request out of a 1024x1024 server costs a quarter of
@@ -123,11 +128,15 @@ func NewImage(opt ImageOptions) (*Image, error) {
 		return nil, fmt.Errorf("backend: the image pipeline needs a device; there is no host path for it")
 	}
 	b := &Image{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
+	bank := qwen.BankQ8
+	if opt.FP16 {
+		bank = qwen.BankFP16
+	}
 	err := opt.Device.Do(func(dev *vk.Device) error {
 		p, err := pipeline.New(dev, pipeline.Options{
 			Model: opt.Model, Width: opt.Width, Height: opt.Height,
 			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt,
-			Refs: opt.Refs, CondSize: opt.CondSize,
+			Refs: opt.Refs, CondSize: opt.CondSize, Bank: bank,
 		})
 		if err != nil {
 			return err

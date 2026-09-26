@@ -33,6 +33,7 @@ import (
 	"strix-halo-vulkan/qimage/pipeline"
 	qvae "strix-halo-vulkan/qimage/vae"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 )
 
 const strixHaloDeviceID = 0x1586
@@ -54,10 +55,13 @@ func main() {
 	seed := flag.Int64("seed", 1, "seed for the initial latent")
 	maxPrompt := flag.Int("maxprompt", 512, "longest prompt the text encoder is built for")
 	reps := flag.Int("reps", 1, "generate this many times, reporting each; the first also pays the arenas' first touch")
+	bankName := flag.String("bank", "q8", "text encoder and transformer weights: q8 (int8, the served default) or fp16 (the control)")
 	transparent := flag.Bool("transparent", false,
 		"ask for an RGBA image with a transparent background, using the model card's recommended prompt phrasing")
 	progress := flag.Bool("progress", false, "log every denoising step as it lands")
 	flag.Parse()
+	bank, err := qwen.ParseBank(*bankName)
+	must(err)
 
 	if *height == 0 {
 		*height = *width
@@ -95,6 +99,7 @@ func main() {
 	t0 := time.Now()
 	p, err := pipeline.New(dev, pipeline.Options{
 		Model: *model, Width: *width, Height: *height, Steps: *steps, MaxPrompt: *maxPrompt,
+		Bank: bank,
 	})
 	must(err)
 	defer p.Destroy()

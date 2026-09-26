@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image/png"
@@ -69,6 +70,7 @@ func newPipeline(t *testing.T, dev *vk.Device, opt Options) *Pipeline {
 	if _, err := os.Stat(opt.Model); err != nil {
 		t.Skipf("no checkpoint at %s", opt.Model)
 	}
+	opt.Bank = testBank(t)
 	start := time.Now()
 	p, err := New(dev, opt)
 	if err != nil {
@@ -77,11 +79,25 @@ func newPipeline(t *testing.T, dev *vk.Device, opt Options) *Pipeline {
 	t.Cleanup(p.Destroy)
 	enc, dt, vae, act := p.Residency()
 	edit, cache := p.EditResidency()
-	t.Logf("staged in %v: text encoder %d MB, transformer %d MB, VAE %d MB, edit %d MB "+
+	t.Logf("%s banks, staged in %v: text encoder %d MB, transformer %d MB, VAE %d MB, edit %d MB "+
 		"(cache %d MB), activations %d MB (%.1f GB total)",
-		time.Since(start).Round(time.Second), enc>>20, dt>>20, vae>>20, edit>>20, cache>>20,
+		opt.Bank, time.Since(start).Round(time.Second), enc>>20, dt>>20, vae>>20, edit>>20, cache>>20,
 		act>>20, float64(enc+dt+vae+edit+act)/(1<<30))
 	return p
+}
+
+// testBank is the bank QIMAGE_BANK names: fp16 (the default) or q8.
+func testBank(t *testing.T) qwen.Bank {
+	t.Helper()
+	s := os.Getenv("QIMAGE_BANK")
+	if s == "" {
+		return qwen.BankFP16
+	}
+	b, err := qwen.ParseBank(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 // writeArtifact saves a PNG for the eyeball, and says where.
@@ -139,6 +155,10 @@ func imageDistance(got *qvae.Tensor, want *qwen.Mat) (maxAbs, mean float64) {
 const (
 	teacherImgTol = 2.2e-2
 	servedImgTol  = 0.35
+	// q8ImgRatio bounds the int8 banks' served image by the released bf16
+	// pipeline's free-run image, on max abs and on mean: VIDEO.md M11a's
+	// 1.25x.
+	q8ImgRatio = 1.25
 )
 
 // TestServedOracle256 is Q6's composition gate: the served pipeline, exactly
@@ -198,6 +218,37 @@ func TestServedOracle256(t *testing.T) {
 
 	maxAbs, mean = imageDistance(img, want)
 	writeArtifact(t, "oracle256_served.png", img)
+
+	// The released pipeline's own free run from the same noise and the
+	// oracle's embeddings (bf16 transformer and VAE; the first version of
+	// dump_qi21_dit_bf16.py --free, research/qimage-vertical.md Q13):
+	// max abs 0.390, mean 0.0081. The int8 banks are held to it, because
+	// their served image lands past servedImgTol's max abs (0.378) while
+	// inside bf16's on both numbers; fp16 keeps servedImgTol.
+	var bMax, bMean float64
+	raw, err := os.ReadFile(filepath.Join(runRef+"_bf16_free", "image.bin"))
+	if err == nil && len(raw) == len(want.Data)*4 {
+		for i := range want.Data {
+			d := math.Abs(float64(math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))) - float64(want.Data[i]))
+			bMax = math.Max(bMax, d)
+			bMean += d
+		}
+		bMean /= float64(len(want.Data))
+		t.Logf("official bf16 free run: max abs %.4f, mean %.5f", bMax, bMean)
+	}
+	if testBank(t) == qwen.BankQ8 {
+		if bMax == 0 {
+			t.Fatalf("the int8 served image is gated against %s_bf16_free/image.bin, and there is none", runRef)
+		}
+		if maxAbs > q8ImgRatio*bMax || mean > q8ImgRatio*bMean {
+			t.Errorf("served image: max abs %.4f, mean %.5f, past %.2fx the bf16 free run's; latents rel %.3g",
+				maxAbs, mean, q8ImgRatio, latentRel)
+			return
+		}
+		t.Logf("served image: max abs %.4f (%.2fx bf16), mean %.5f (%.2fx bf16); final latents rel %.3g",
+			maxAbs, maxAbs/bMax, mean, mean/bMean, latentRel)
+		return
+	}
 	if maxAbs > servedImgTol {
 		t.Errorf("served image: max abs %.4f (mean %.5f) > %.2g, latents rel %.3g",
 			maxAbs, mean, servedImgTol, latentRel)
@@ -251,7 +302,11 @@ func TestServedWallClock(t *testing.T) {
 			(steps / time.Duration(len(tm.Steps)-1)).Round(time.Millisecond),
 			tm.Decode.Round(time.Millisecond))
 		if run == 1 {
-			writeArtifact(t, "served1024_40steps.png", img)
+			name := "served1024_40steps.png"
+			if testBank(t) == qwen.BankQ8 {
+				name = "served1024_40steps_q8.png"
+			}
+			writeArtifact(t, name, img)
 		}
 	}
 }

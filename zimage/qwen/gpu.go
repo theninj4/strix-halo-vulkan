@@ -262,7 +262,10 @@ type layerWeights struct {
 	// Under BankQ8 that is the shared scratch, the same for every layer.
 	bank int
 	bOff map[Proj]uint32
-	// BankQ8: the int8 bank and each projection's byte offset in it.
+	// BankQ8: the int8 bank and each projection's byte offset in it. q8 is
+	// false for a layer the bank keeps in fp16 (NewGPUEncoderMixed), which
+	// then has fp16 offsets of its own and no expansion.
+	q8    bool
 	qbank int
 	qOff  map[Proj]uint32
 }
@@ -282,6 +285,7 @@ type GPUEncoder struct {
 	// as int8 and banks is the one fp16 scratch a layer is expanded into
 	// by its first seven dispatches (dequant, one pipeline per qbank).
 	bank    Bank
+	keep    map[int]bool // layers BankQ8 holds in fp16 instead
 	qbanks  []*vk.Buffer
 	dequant []*vk.ComputePipeline
 
@@ -337,17 +341,26 @@ type GPUEncoder struct {
 // the host as fp32 (1.56 GB) and every projection is narrowed into a bank --
 // so the caller may close it afterwards, as the DiT's stack allows.
 func NewGPUEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, BankFP16)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, BankFP16, nil)
 }
 
 // NewGPUEncoderBank is NewGPUEncoder with the projections held as bank
 // says. BankQ8 halves the weights (MiniMax-H3's 32 B encoder: 50 → 27 GB)
 // for one expansion dispatch per projection per run (VIDEO.md M11a).
 func NewGPUEncoderBank(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, nil)
 }
 
-func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int, bank Bank) (*GPUEncoder, error) {
+// NewGPUEncoderMixed is NewGPUEncoderBank with the layers in keepFP16 held
+// in fp16 whatever bank says. It is for a checkpoint whose int8 error enters
+// in a few named layers: Qwen-Image-2.1's encoder writes its massive-
+// activation channel in layers 6 and 16, and int8 there costs the
+// embeddings 20x (research/qimage-vertical.md Q13).
+func NewGPUEncoderMixed(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank, keepFP16 []int) (*GPUEncoder, error) {
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, keepFP16)
+}
+
+func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int, bank Bank, keepFP16 []int) (*GPUEncoder, error) {
 	explicitPlan := plan
 	if layers <= 0 || layers > cfg.NumLayers {
 		return nil, fmt.Errorf("qwen: asked for %d of %d layers", layers, cfg.NumLayers)
@@ -365,6 +378,13 @@ func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTo
 	if !ok {
 		return nil, fmt.Errorf("qwen: this device has no 16x16x16 fp16 cooperative matrix; the encoder graph needs one")
 	}
+	keep := make(map[int]bool, len(keepFP16))
+	for _, l := range keepFP16 {
+		if l < 0 || l >= layers {
+			return nil, fmt.Errorf("qwen: keeping layer %d in fp16, but the encoder holds %d", l, layers)
+		}
+		keep[l] = true
+	}
 	if cfg.NumHeads%cfg.NumKVHeads != 0 {
 		return nil, fmt.Errorf("qwen: %d heads do not divide into %d kv heads", cfg.NumHeads, cfg.NumKVHeads)
 	}
@@ -376,6 +396,7 @@ func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTo
 		cfg:     cfg,
 		ctl:     ctl,
 		bank:    bank,
+		keep:    keep,
 		plan:    plan,
 		pipes:   make(map[string]*vk.ComputePipeline),
 		kernels: make(map[GEMMKernel]gemmVariant),
@@ -545,6 +566,18 @@ func (g *GPUEncoder) layoutWeights(layers, bankBytes int) error {
 	g.w = make([]layerWeights, layers)
 	var bankElems, qbankBytes []int
 	cur := -1
+	// Under BankQ8 every int8 layer is expanded into the same scratch, bank
+	// 0, so they all share its fp16 offsets. A layer kept in fp16 packs
+	// after it like any fp16 layer.
+	var scratchOff map[Proj]uint32
+	if g.bank == BankQ8 && len(g.keep) < layers {
+		scratchOff = make(map[Proj]uint32, len(projOrder))
+		bankElems, cur = []int{0}, 0
+		for _, r := range projOrder {
+			scratchOff[r] = uint32(bankElems[0])
+			bankElems[0] += bElems(shapes[r][0], shapes[r][1], kernelLayout)
+		}
+	}
 	for i := range g.w {
 		w := layerWeights{bOff: make(map[Proj]uint32, len(projOrder))}
 		w.attnNorm = uint32(total32)
@@ -553,18 +586,8 @@ func (g *GPUEncoder) layoutWeights(layers, bankBytes int) error {
 		w.kNorm = w.qNorm + uint32(c.HeadDim)
 		total32 += perLayer32
 
-		if g.bank == BankQ8 {
-			// Every layer is expanded into the same scratch, so its fp16
-			// offsets are the first layer's.
-			if i == 0 {
-				bankElems = []int{0}
-				for _, r := range projOrder {
-					w.bOff[r] = uint32(bankElems[0])
-					bankElems[0] += bElems(shapes[r][0], shapes[r][1], kernelLayout)
-				}
-			} else {
-				w.bOff = g.w[0].bOff
-			}
+		if g.bank == BankQ8 && !g.keep[i] {
+			w.q8, w.bank, w.bOff = true, 0, scratchOff
 			if len(qbankBytes) == 0 || qbankBytes[len(qbankBytes)-1]+perLayerQ > bankBytes {
 				qbankBytes = append(qbankBytes, 0)
 			}
@@ -800,7 +823,7 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 			if lin.Out != shapes[r][0] || lin.In != shapes[r][1] {
 				return fmt.Errorf("qwen: layer %d %s is [%d %d], want %v", i, r, lin.Out, lin.In, shapes[r])
 			}
-			if g.bank == BankQ8 {
+			if w.q8 {
 				buf := make([]byte, Q8Bytes(lin.Out, lin.In))
 				if err := PackQ8(buf, lin.Weight, lin.Out, lin.In); err != nil {
 					return err
@@ -1400,7 +1423,7 @@ func (g *GPUEncoder) layerGraph(i int) ([]vk.MultiDispatch, []string, error) {
 	}
 
 	// ---- The int8 bank's expansion into the scratch every GEMM below reads.
-	if g.bank == BankQ8 {
+	if w.q8 {
 		shapes := g.projShapes()
 		for _, r := range projOrder {
 			d = append(d, Q8Dispatch(g.dequant[w.qbank], w.qOff[r], w.bOff[r], shapes[r][0], shapes[r][1]))

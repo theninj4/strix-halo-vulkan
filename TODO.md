@@ -34,7 +34,7 @@ here is our own ceiling, not a reference implementation.
 | text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; `hc.cn` at prefill; decode is now fusion at 1-2% a step, the 196 moves the largest |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s**, 31.5 GB resident, native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
+| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 | classification | Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) | TypeSafe's `/v1/systemone` via `-kev`, **within 4e-4 of Kev's fp32 probabilities**, questions isolated bit-exactly, the TypeSafe SDK unchanged; the README ticket in **52 ms** on an int8 bank (K7.1, K7.6); **Kev's published accuracy reproduced (K8): fp16 on every suite within a question of the card, fp16 agrees with Kev's fp32 except on exact ties, int8 −0.19 pp**; a repeated text from the prefix cache, bit-identically (K7.2), attention on the matrix cores (K7.3): the GDN scan in the LLM's l8 shape (K7.4), SwiGLU fused into the gate+up GEMM and a GEMM rung per projection (K7.6): a 2,269-token text 761 ms new, 87 ms again ; concurrent requests share passes (K7.5, ~29 req/s against 19.5) | live plan in root [`CLASSIFICATION.md`](CLASSIFICATION.md) (K-stages): bit-exact across batches, chunks and cache hits (K7.7: the WMMA residue was stale V padding); deployed in `ai.service` (2026-09-25); open: int8's −0.19 pp, int8 GEMM speed |
 
@@ -588,6 +588,15 @@ hang-up through to the sampler and the VAE's submit batches; Q12 finished the
 Z-Image deletion (**6,839 lines of Go and 895 of GLSL** out, every gate
 re-run with no digit changed). The full write-up, every tolerance with its
 instrument named, is in the archive.
+
+**Int8 banks (Q13, 2026-09-26, after parking)**: the text encoder and the
+DiT now stage as int8 by default (`serve -image-fp16` is the control):
+resident **31.5 → 20.4 GB**, edits the same 11 GB less, ~4% a step. Priced
+against the released bf16 pipeline: DiT teacher-forced steps 0.03–0.10x its
+error at 1024², the free run 0.81x; the encoder keeps layers 6 and 16 in
+fp16 (the massive-activation channel is written there) and lands 3x inside
+bf16 on real prompts. `ai.service` picks it up on its next deploy. Still
+open: the served peak measured inside the service, and the prefix KV cache.
 
 **What to read before touching this code again** — three precision facts,
 each of which has already caught a port:

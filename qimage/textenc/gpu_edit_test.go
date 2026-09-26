@@ -81,10 +81,7 @@ func TestGPUEditEncoder(t *testing.T) {
 
 	dev, done := newTestDevice(t)
 	defer done()
-	g, err := qwen.NewGPUEncoder(dev, set, cfg, cfg.NumLayers, 512, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	g := newBankEncoder(t, dev, set, cfg)
 	defer g.Destroy()
 
 	// --- one condition image.
@@ -102,14 +99,14 @@ func TestGPUEditEncoder(t *testing.T) {
 		if layer != 0 {
 			return nil
 		}
-		compareAt(t, "edit_layer0_out", g.Read(g.TensorX(), cfg.HiddenSize),
-			loadEditRef(t, m, "edit_layer0_out"), layerTol)
+		gate(t, "edit_layer0_out", g.Read(g.TensorX(), cfg.HiddenSize),
+			loadEditRef(t, m, "edit_layer0_out"), layerTol, q8LayerRMSTol)
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	compareAt(t, "edit_prompt_embeds", embeds, loadEditRef(t, m, "edit_prompt_embeds"), gpuEditTol)
+	gate(t, "edit_prompt_embeds", embeds, loadEditRef(t, m, "edit_prompt_embeds"), gpuEditTol, q8EditRMSTol)
 	if got := countTrue(mask); got != m.PadMaskCount {
 		t.Errorf("%d image rows in the mask, want %d", got, m.PadMaskCount)
 	}
@@ -124,14 +121,14 @@ func TestGPUEditEncoder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		controlAt(t, "plain RoPE instead of mrope", out, want, gpuEditTol)
+		controlAt(t, "plain RoPE instead of mrope", out, want, gpuEditTol, q8EditRMSTol)
 
 		bare := []Condition{{Merged: one[0].Merged}}
 		out, _, err = p.EncodeGPU(g, rope, bare, m.DropIdx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		controlAt(t, "no deepstack injection", out, want, gpuEditTol)
+		controlAt(t, "no deepstack injection", out, want, gpuEditTol, q8EditRMSTol)
 	})
 
 	// --- two condition images, on the encoder that is already staged. The
@@ -149,7 +146,7 @@ func TestGPUEditEncoder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		compareAt(t, "multi_prompt_embeds", embeds, loadEditRef(t, m, "multi_prompt_embeds"), gpuEditTol)
+		gate(t, "multi_prompt_embeds", embeds, loadEditRef(t, m, "multi_prompt_embeds"), gpuEditTol, q8EditRMSTol)
 		if got := countTrue(mask); got != m.MultiPadMaskCount {
 			t.Errorf("%d image rows in the mask, want %d", got, m.MultiPadMaskCount)
 		}
@@ -180,13 +177,16 @@ func dumpedCondition(t *testing.T, m *editManifest, prefix string) Condition {
 
 // controlAt is control against a bound the caller names, which the fp16 path
 // needs: a control has to miss the gate *this* path is held to, not the fp32
-// one.
-func controlAt(t *testing.T, what string, got, want *qwen.Mat, tol float64) {
+// one. Under the int8 bank that gate is gate's rms diff bound, q8Tol.
+func controlAt(t *testing.T, what string, got, want *qwen.Mat, tol, q8Tol float64) {
 	t.Helper()
 	if got.Rows != want.Rows || got.Cols != want.Cols {
 		t.Fatalf("%s: shape %s, want %s", what, got, want)
 	}
 	_, _, rel, _ := deviation(got, want)
+	if testBank(t) == qwen.BankQ8 {
+		rel, tol = rmsDiff(got, want), q8Tol
+	}
 	if rel <= tol {
 		t.Errorf("%s still matches at rel %.3g, inside the %.0e bound", what, rel, tol)
 		return

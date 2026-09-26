@@ -105,3 +105,11 @@ func Drop(m *qwen.Mat, drop int) (*qwen.Mat, error) {
 	}
 	return &qwen.Mat{Rows: m.Rows - drop, Cols: m.Cols, Data: m.Data[drop*m.Cols:]}, nil
 }
+
+// Q8KeepFP16 is the layers an int8 encoder bank holds in fp16. This
+// checkpoint writes its massive-activation channel (~13k, carried to layer
+// 34) in the FFNs of layers 6 and 16, and that is where the int8 error
+// enters: max abs 4.8 at layer 6 and 442 at 16, carried flat and surfaced
+// when layers 34-35 cancel the channel (TestGPUBankLadder). Every other
+// layer's int8 error stays at the fp16 path's own scale.
+var Q8KeepFP16 = []int{6, 16}

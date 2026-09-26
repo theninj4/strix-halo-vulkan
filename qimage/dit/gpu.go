@@ -3,6 +3,7 @@ package dit
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -69,6 +70,17 @@ type GPU struct {
 	abuf  *vk.Buffer // fp32 activations
 	hbuf  *vk.Buffer // fp16 activations and fragment planes
 	banks []*vk.Buffer
+
+	// bank is how the blocks' projections are held (research/qimage-
+	// vertical.md Q13, VIDEO.md M11a's route). Under BankQ8 an int8 block's
+	// projections live in qbanks, and its pass opens with seven dispatches
+	// (dequant, one pipeline per qbank) expanding them into one fp16
+	// scratch in banks that every int8 block's GEMMs read. The GEMMs are
+	// unchanged. keep names blocks held in fp16 whatever bank says.
+	bank    qwen.Bank
+	keep    map[int]bool
+	qbanks  []*vk.Buffer
+	dequant []*vk.ComputePipeline
 
 	pipes map[string]*vk.ComputePipeline
 	gemms []map[gemmKernel]*vk.ComputePipeline
@@ -141,6 +153,10 @@ type gpuBlockW struct {
 	// after it.
 	kvBank int
 	kvOff  uint32
+	// BankQ8: the int8 bank and each projection's byte offset in it; bank
+	// and bOff are then the shared scratch. qOff is nil for an fp16 block.
+	qbank int
+	qOff  map[proj]uint32
 }
 
 type proj string
@@ -272,6 +288,14 @@ const (
 // sit in different places (the cache is sized by the first, the projected
 // text staging by the second).
 func NewGPU(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int) (*GPU, error) {
+	return NewGPUBank(dev, dir, maxTokens, maxPrefix, maxText, qwen.BankFP16, nil)
+}
+
+// NewGPUBank is NewGPU with the blocks' projections held as bank says, the
+// blocks in keepFP16 excepted. BankQ8 is int8 with one fp16 scale per 32 k
+// of a row (qwen.PackQ8): ~7 GB of int8 banks and one block's 0.44 GB fp16
+// scratch in place of 14 GB.
+func NewGPUBank(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int, bank qwen.Bank, keepFP16 []int) (*GPU, error) {
 	cfg, err := LoadConfig(dir)
 	if err != nil {
 		return nil, err
@@ -293,6 +317,14 @@ func NewGPU(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int) (*GPU
 		packTPW:     defaultPackTiles,
 		eps:         cfg.Eps,
 		outChannels: cfg.OutChannels,
+		bank:        bank,
+		keep:        make(map[int]bool, len(keepFP16)),
+	}
+	for _, b := range keepFP16 {
+		if b < 0 || b >= cfg.NumLayers {
+			return nil, fmt.Errorf("dit: keeping block %d in fp16, but the model has %d", b, cfg.NumLayers)
+		}
+		g.keep[b] = true
 	}
 	g.tokPad = (maxTokens+wmmaTokenAlign-1)&^(wmmaTokenAlign-1) + wmmaTokenAlign
 	g.ldaDim = g.dim + gemmPad
@@ -382,18 +414,47 @@ func (g *GPU) layoutAndStage(set *safetensors.Set, cfg *Config) error {
 	g.projOutOff = uint32(bankElems[cur])
 	bankElems[cur] += g.outChannels * g.dim
 
+	perBlockQ := 0
+	for _, r := range projOrder {
+		sh := g.projShape(r)
+		perBlockQ += qwen.Q8Bytes(sh[0], sh[1])
+	}
+	var qbankBytes []int
+	var scratch *gpuBlockW
 	for i := range g.blocks {
 		w := &g.blocks[i]
 		w.normQ = uint32(total32)
 		w.normK = w.normQ + uint32(g.headDim)
 		total32 += 2 * g.headDim
-		newBank(perBlock16)
-		w.bank = cur
-		w.bOff = make(map[proj]uint32, len(projOrder))
+		q8 := g.bank == qwen.BankQ8 && !g.keep[i]
+		if q8 && scratch != nil {
+			// Every int8 block expands into the first one's fp16 region.
+			w.bank, w.bOff = scratch.bank, scratch.bOff
+		} else {
+			newBank(perBlock16)
+			w.bank = cur
+			w.bOff = make(map[proj]uint32, len(projOrder))
+			for _, r := range projOrder {
+				sh := g.projShape(r)
+				w.bOff[r] = uint32(bankElems[cur])
+				bankElems[cur] += sh[0] * sh[1]
+			}
+		}
+		if !q8 {
+			continue
+		}
+		if scratch == nil {
+			scratch = &gpuBlockW{bank: w.bank, bOff: w.bOff}
+		}
+		if len(qbankBytes) == 0 || qbankBytes[len(qbankBytes)-1]+perBlockQ > maxBankBytes {
+			qbankBytes = append(qbankBytes, 0)
+		}
+		w.qbank = len(qbankBytes) - 1
+		w.qOff = make(map[proj]uint32, len(projOrder))
 		for _, r := range projOrder {
 			sh := g.projShape(r)
-			w.bOff[r] = uint32(bankElems[cur])
-			bankElems[cur] += sh[0] * sh[1]
+			w.qOff[r] = uint32(qbankBytes[w.qbank])
+			qbankBytes[w.qbank] += qwen.Q8Bytes(sh[0], sh[1])
 		}
 	}
 
@@ -408,6 +469,13 @@ func (g *GPU) layoutAndStage(set *safetensors.Set, cfg *Config) error {
 		}
 		g.banks = append(g.banks, b)
 	}
+	for _, n := range qbankBytes {
+		b, err := g.dev.NewBuffer(n)
+		if err != nil {
+			return fmt.Errorf("dit: int8 bank %d (%d MB): %w", len(g.qbanks), n>>20, err)
+		}
+		g.qbanks = append(g.qbanks, b)
+	}
 
 	// Stage the head projections.
 	stage := func(bank int, off uint32, w []float32, n, k int) {
@@ -419,8 +487,11 @@ func (g *GPU) layoutAndStage(set *safetensors.Set, cfg *Config) error {
 	stage(0, g.projOutOff, g.head.ProjOut.Weight, g.outChannels, g.dim)
 
 	// Stage the blocks, one at a time — a block is 872 MB as fp32 on the
-	// host and none of it is wanted once narrowed.
+	// host and none of it is wanted once narrowed. It is collected per block
+	// so the dead ones never accumulate into the GC's headroom beside a
+	// server's live heap (VIDEO.md M11a); the slices hold no pointers.
 	for i := range g.blocks {
+		runtime.GC()
 		blk, err := LoadBlock(set, i, cfg)
 		if err != nil {
 			return err
@@ -437,6 +508,14 @@ func (g *GPU) layoutAndStage(set *safetensors.Set, cfg *Config) error {
 			sh := g.projShape(r)
 			if lin.Out != sh[0] || lin.In != sh[1] {
 				return fmt.Errorf("dit: block %d %s is [%d %d], want %v", i, r, lin.Out, lin.In, sh)
+			}
+			if w.qOff != nil {
+				buf := make([]byte, qwen.Q8Bytes(lin.Out, lin.In))
+				if err := qwen.PackQ8(buf, lin.Weight, lin.Out, lin.In); err != nil {
+					return fmt.Errorf("dit: block %d %s: %w", i, r, err)
+				}
+				g.qbanks[w.qbank].WriteBytesAt(int(w.qOff[r]), buf)
+				continue
 			}
 			stage(w.bank, w.bOff[r], lin.Weight, lin.Out, lin.In)
 		}
@@ -642,6 +721,31 @@ func (g *GPU) build() error {
 		g.kvPipes = append(g.kvPipes, pipe)
 	}
 
+	// The int8 bank's expansion, one pipeline per int8 bank, all writing the
+	// scratch every int8 block's GEMMs read.
+	for b, qb := range g.qbanks {
+		mod, err := g.dev.NewShaderModule(shaders.DiTDequantQ8)
+		if err != nil {
+			return fmt.Errorf("dit: dequant shader: %w", err)
+		}
+		g.mods = append(g.mods, mod)
+		var scratch int
+		for _, w := range g.blocks {
+			if w.qOff != nil {
+				scratch = w.bank
+				break
+			}
+		}
+		pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
+			Buffers:          []*vk.Buffer{g.wbuf, g.abuf, qb, g.banks[scratch]},
+			PushConstantSize: pcSize,
+		})
+		if err != nil {
+			return fmt.Errorf("dit: dequant pipeline on int8 bank %d: %w", b, err)
+		}
+		g.dequant = append(g.dequant, pipe)
+	}
+
 	// GEMM pipelines, per bank and kernel.
 	for b := range g.banks {
 		m := make(map[gemmKernel]*vk.ComputePipeline, len(gemmVariants))
@@ -673,6 +777,9 @@ func (g *GPU) Destroy() {
 	for _, p := range g.kvPipes {
 		p.Destroy()
 	}
+	for _, p := range g.dequant {
+		p.Destroy()
+	}
 	for _, m := range g.gemms {
 		for _, p := range m {
 			p.Destroy()
@@ -690,6 +797,9 @@ func (g *GPU) Destroy() {
 		b.Destroy()
 	}
 	for _, b := range g.kvBanks {
+		b.Destroy()
+	}
+	for _, b := range g.qbanks {
 		b.Destroy()
 	}
 }
@@ -887,14 +997,18 @@ func (g *GPU) ReadRows(off uint32, rows, cols int) *qwen.Mat {
 
 // WeightBytes is what the transformer holds on the device: the fp32 arena
 // (the rope table and the per-block q/k norms) plus the fp16 banks the
-// blocks' projections are staged into.
+// blocks' projections are staged into (under BankQ8, the int8 banks and the
+// one block's scratch).
 func (g *GPU) WeightBytes() int {
 	n := g.wbuf.Size()
-	for _, b := range g.banks {
+	for _, b := range append(g.banks[:len(g.banks):len(g.banks)], g.qbanks...) {
 		n += b.Size()
 	}
 	return n
 }
+
+// Bank is how the blocks' projections are held.
+func (g *GPU) Bank() qwen.Bank { return g.bank }
 
 // ActivationBytes is the fp32 arena plus the fp16 one. The prefix KV cache
 // is separate (CacheBytes): it is sized by the prefix rather than by the
@@ -1114,6 +1228,19 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		cacheV := cacheK + uint32(g.maxPrefix*g.dim)
 		kvPipe := g.kvPipes[w.kvBank]
 
+		// The int8 bank's expansion into the scratch the GEMMs below read:
+		// ~2.8 ms a block at 1024², bandwidth-bound (0.67 GB at ~240 GB/s).
+		// Dropping the barriers between the seven was measured and buys
+		// nothing (2.351 against 2.349 s a step).
+		if w.qOff != nil {
+			for _, r := range projOrder {
+				sh := g.projShape(r)
+				d = append(d, qwen.Q8Dispatch(g.dequant[w.qbank], w.qOff[r], w.bOff[r], sh[0], sh[1]))
+				kinds = append(kinds, "dequant")
+				fl = append(fl, 0)
+			}
+		}
+
 		normScale("attn in", 0)
 		for _, pr := range []struct {
 			r   proj
@@ -1303,3 +1430,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 	}
 	return d, kinds, fl, nil
 }
+
+// Q8KeepFP16 is the blocks an int8 bank holds in fp16: none. Every block in
+// int8 is 0.03-0.10x the released bf16 transformer's teacher-forced error at
+// 1024² (research/qimage-vertical.md Q13), so nothing earns an exception.
+var Q8KeepFP16 []int

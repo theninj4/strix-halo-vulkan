@@ -58,3 +58,50 @@ func TestGPULadder(t *testing.T) {
 		t.Logf("layer %2d: max abs %8.4f  rms %9.3f  rel %.3g", layer, maxAbs, rms, rel)
 	}
 }
+
+// TestGPUBankLadder walks the QIMAGE_BANK encoder against the fp16 one layer
+// by layer, both on the device, and logs each layer's deviation and the
+// column it is worst in. It is the bisecting instrument for the int8 bank:
+// the fp16 path is 20x tighter to fp32, so it serves as the reference, and
+// the pair is ~22 GB rather than the fp32 ladder's ~50.
+func TestGPUBankLadder(t *testing.T) {
+	if os.Getenv("QI21_BANK_LADDER") == "" {
+		t.Skip("diagnostic; set QI21_BANK_LADDER=1 and QIMAGE_BANK=q8 (stages ~22 GB)")
+	}
+	m := loadManifest(t)
+	cfg, err := LoadConfig(encoder)
+	if err != nil {
+		t.Skipf("no text encoder checkpoint at %s (%v)", encoder, err)
+	}
+	ids := m.Prompts["en"].IDs
+	set, err := safetensors.OpenSet(encoder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer set.Close()
+	dev, done := newTestDevice(t)
+	defer done()
+	ref, err := qwen.NewGPUEncoder(dev, set, cfg, cfg.NumLayers, 512, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ref.Destroy()
+	g := newBankEncoder(t, dev, set, cfg)
+	defer g.Destroy()
+
+	for layer := 0; layer < cfg.NumLayers; layer++ {
+		for _, label := range []string{"resid attn", "resid ffn"} {
+			if err := ref.RunTo(ids, layer, label); err != nil {
+				t.Fatal(err)
+			}
+			want := ref.Read(ref.TensorX(), cfg.HiddenSize)
+			if err := g.RunTo(ids, layer, label); err != nil {
+				t.Fatal(err)
+			}
+			got := g.Read(g.TensorX(), cfg.HiddenSize)
+			maxAbs, rms, rel, worst := deviation(got, want)
+			t.Logf("layer %2d %-10s: max abs %8.4f  rms %9.3f  rel %.3g  worst col %d (want %.1f)",
+				layer, label, maxAbs, rms, rel, worst%cfg.HiddenSize, want.Data[worst])
+		}
+	}
+}

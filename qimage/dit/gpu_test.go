@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,78 @@ const (
 	gpuTrajTol = 0.12
 )
 
+// The int8 bank is gated against the released pipeline rather than against
+// fp16's bounds: reference/dump_qi21_dit_bf16.py runs the same oracle
+// teacher-forced through diffusers at torch_dtype=bfloat16 into <oracle>_bf16,
+// and every teacher-forced int8 step must land within q8BF16StepRatio of
+// that step's bf16 rms diff — VIDEO.md M11a's 1.25x.
+const q8BF16StepRatio = 1.25
+
+// testBank is the bank QIMAGE_BANK names: fp16 (the default) or q8.
+func testBank(t *testing.T) qwen.Bank {
+	t.Helper()
+	s := os.Getenv("QIMAGE_BANK")
+	if s == "" {
+		return qwen.BankFP16
+	}
+	b, err := qwen.ParseBank(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// newGPU stages the transformer in testBank's bank. Under q8 the blocks held
+// in fp16 are dit.Q8KeepFP16, or QIMAGE_DIT_KEEP's comma list ("-" for none).
+func newGPU(t *testing.T, dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int) (*dit.GPU, error) {
+	t.Helper()
+	bank := testBank(t)
+	keep := dit.Q8KeepFP16
+	if s, ok := os.LookupEnv("QIMAGE_DIT_KEEP"); ok {
+		keep = nil
+		for _, f := range strings.Split(s, ",") {
+			if f == "" || f == "-" {
+				continue
+			}
+			b, err := strconv.Atoi(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keep = append(keep, b)
+		}
+	}
+	if bank != qwen.BankQ8 {
+		keep = nil
+	}
+	start := time.Now()
+	g, err := dit.NewGPUBank(dev, dir, maxTokens, maxPrefix, maxText, bank, keep)
+	if err == nil {
+		t.Logf("staged %s keeping %v in fp16: %.2f GB of weights in %v", bank, keep,
+			float64(g.WeightBytes())/1e9, time.Since(start).Round(time.Millisecond))
+	}
+	return g, err
+}
+
+// loadBF16 is the oracle's bf16 twin, or nil when it was never dumped.
+func loadBF16(t *testing.T, m *runManifest) *runManifest {
+	t.Helper()
+	dir := strings.TrimSuffix(m.dir, "/") + "_bf16"
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+		t.Logf("no bf16 twin at %s; run reference/dump_qi21_dit_bf16.py --ref %s", dir, m.dir)
+		return nil
+	}
+	return loadRun(t, dir)
+}
+
+func rmsDiff(got, want *qwen.Mat) float64 {
+	var s float64
+	for i := range want.Data {
+		d := float64(got.Data[i]) - float64(want.Data[i])
+		s += d * d
+	}
+	return math.Sqrt(s / float64(len(want.Data)))
+}
+
 func stepRel(got, want *qwen.Mat) (maxAbs, rel float64) {
 	var sumSq float64
 	for i := range want.Data {
@@ -171,6 +244,11 @@ func runOracle(t *testing.T, g *dit.GPU, m *runManifest, lay *dit.Layout, cond *
 	}
 	latents := loadMat(t, m, "noise").Clone()
 
+	var bf *runManifest
+	if teacher {
+		bf = loadBF16(t, m)
+	}
+	q8 := testBank(t) == qwen.BankQ8
 	var walls []time.Duration
 	var rel float64
 	for i := 0; i < sched.Steps(); i++ {
@@ -187,14 +265,45 @@ func runOracle(t *testing.T, g *dit.GPU, m *runManifest, lay *dit.Layout, cond *
 			t.Fatal(err)
 		}
 		var maxAbs float64
-		maxAbs, rel = stepRel(latents, loadMat(t, m, fmt.Sprintf("step%d_latents", i)))
-		t.Logf("step %2d: %7.1f ms  max abs %.4g  rel %.3g", i, float64(walls[i].Microseconds())/1000, maxAbs, rel)
-		if teacher && rel > gpuStepTol {
+		want := loadMat(t, m, fmt.Sprintf("step%d_latents", i))
+		maxAbs, rel = stepRel(latents, want)
+		d := rmsDiff(latents, want)
+		if bf == nil {
+			t.Logf("step %2d: %7.1f ms  max abs %.4g  rel %.3g  rms diff %.3g", i, float64(walls[i].Microseconds())/1000, maxAbs, rel, d)
+		} else {
+			b := rmsDiff(loadMat(t, bf, fmt.Sprintf("step%d_latents", i)), want)
+			t.Logf("step %2d: %7.1f ms  max abs %.4g  rel %.3g  rms diff %.3g | bf16 %.3g (%.2fx)",
+				i, float64(walls[i].Microseconds())/1000, maxAbs, rel, d, b, d/b)
+			if q8 && d > q8BF16StepRatio*b {
+				t.Errorf("step %d: teacher-forced rms diff %.3g is %.2fx the official bf16's, past %.2fx", i, d, d/b, q8BF16StepRatio)
+			}
+		}
+		if teacher && !q8 && rel > gpuStepTol {
 			t.Fatalf("step %d: teacher-forced rel %.3g > %.0e", i, rel, gpuStepTol)
 		}
+		if teacher && q8 && bf == nil {
+			t.Fatalf("step %d: the int8 bank is gated against the bf16 twin, and there is none", i)
+		}
 	}
-	if !teacher && rel > gpuTrajTol {
+	if !teacher && !q8 && rel > gpuTrajTol {
 		t.Fatalf("trajectory rel %.3g > %.2g after %d steps", rel, gpuTrajTol, sched.Steps())
+	}
+	if !teacher && q8 {
+		// A quantised trajectory is held to the released pipeline's own
+		// free run from the same noise (dump_qi21_dit_bf16.py --free), not
+		// to fp16's drift.
+		last := fmt.Sprintf("step%d_latents", sched.Steps()-1)
+		want := loadMat(t, m, last)
+		d := rmsDiff(latents, want)
+		free := strings.TrimSuffix(m.dir, "/") + "_bf16_free"
+		if _, err := os.Stat(filepath.Join(free, "manifest.json")); err != nil {
+			t.Fatalf("the int8 trajectory is gated against %s, and there is none", free)
+		}
+		b := rmsDiff(loadMat(t, loadRun(t, free), last), want)
+		t.Logf("trajectory rms diff %.3g | bf16 free run %.3g (%.2fx)", d, b, d/b)
+		if d > q8BF16StepRatio*b {
+			t.Errorf("trajectory rms diff %.3g is %.2fx the bf16 free run's, past %.2fx", d, d/b, q8BF16StepRatio)
+		}
 	}
 	return walls
 }
@@ -216,7 +325,7 @@ func TestGPUOracle256(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +362,7 @@ func TestGPUOracle1024(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +433,7 @@ func TestGPUEditOracle(t *testing.T) {
 	t.Logf("%d VLM rows -> %d prefix + %d target = %d joint rows, %d segments",
 		embeds.Rows, lay.PrefixLen, side*side, lay.Seq(), len(lay.Segments))
 
-	g, err := dit.NewGPU(dev, transformer, lay.Seq(), lay.PrefixLen, embeds.Rows)
+	g, err := newGPU(t, dev, transformer, lay.Seq(), lay.PrefixLen, embeds.Rows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -425,7 +534,7 @@ func TestGPUEditWallClock(t *testing.T) {
 	t.Logf("%d VLM rows -> %d prefix + %d target = %d joint rows, %d segments",
 		vlmRows, lay.PrefixLen, side*side, lay.Seq(), len(lay.Segments))
 
-	g, err := dit.NewGPU(dev, transformer, lay.Seq(), lay.PrefixLen, vlmRows)
+	g, err := newGPU(t, dev, transformer, lay.Seq(), lay.PrefixLen, vlmRows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -500,7 +609,7 @@ func TestGPUStepProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +715,7 @@ func TestGPUGEMMScreen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +803,7 @@ func TestGPUPackScreen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g, err := dit.NewGPU(dev, transformer, side*side+embeds.Rows, 512, 512)
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
 	if err != nil {
 		t.Fatal(err)
 	}

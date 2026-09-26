@@ -76,7 +76,7 @@ func newEncoderFor(t *testing.T, dev *vk.Device, layers int, m *manifest, plan G
 	t.Helper()
 	set, cfg := openSet(t)
 	defer set.Close()
-	g, err := newEncoder(dev, set, cfg, layers, m.Seq, plan, ctl, bankBytes, BankFP16)
+	g, err := newEncoder(dev, set, cfg, layers, m.Seq, plan, ctl, bankBytes, BankFP16, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

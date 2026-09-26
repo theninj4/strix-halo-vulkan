@@ -103,6 +103,11 @@ type Options struct {
 	// every reference image is resized to before it is encoded, and the
 	// default output size of an edit that names none. Default DefaultSize.
 	CondSize int
+	// Bank is how the text encoder's and the transformer's projections are
+	// held. The zero value is BankFP16; BankQ8 is int8 with
+	// textenc.Q8KeepFP16 and dit.Q8KeepFP16 held in fp16, the served
+	// default (research/qimage-vertical.md Q13).
+	Bank qwen.Bank
 }
 
 // geom is a resolved size, all the way down to the transformer's row count.
@@ -244,7 +249,11 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	// The text encoder's ceiling: an edit's prompt carries one `<|image_pad|>`
 	// per 2x2 group of every reference's latents on top of the user's text.
 	encTokens := opt.MaxPrompt + p.refs*p.condTokens/4
-	if p.enc, err = qwen.NewGPUEncoder(dev, set, tcfg, tcfg.NumLayers, encTokens, nil); err != nil {
+	var keep []int
+	if opt.Bank == qwen.BankQ8 {
+		keep = textenc.Q8KeepFP16
+	}
+	if p.enc, err = qwen.NewGPUEncoderMixed(dev, set, tcfg, tcfg.NumLayers, encTokens, nil, opt.Bank, keep); err != nil {
 		set.Close()
 		return nil, fmt.Errorf("pipeline: staging the text encoder: %w", err)
 	}
@@ -256,8 +265,12 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	// KV cache is sized by.
 	condRows := p.refs * p.condTokens
 	prefix := condRows + opt.MaxPrompt
-	if p.dt, err = dit.NewGPU(dev, opt.Model+"/transformer",
-		max.imgTokens+prefix, prefix, encTokens); err != nil {
+	var ditKeep []int
+	if opt.Bank == qwen.BankQ8 {
+		ditKeep = dit.Q8KeepFP16
+	}
+	if p.dt, err = dit.NewGPUBank(dev, opt.Model+"/transformer",
+		max.imgTokens+prefix, prefix, encTokens, opt.Bank, ditKeep); err != nil {
 		p.Destroy()
 		return nil, fmt.Errorf("pipeline: staging the transformer: %w", err)
 	}

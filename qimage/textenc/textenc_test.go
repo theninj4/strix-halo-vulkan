@@ -137,11 +137,11 @@ func compareAt(t *testing.T, name string, got, want *qwen.Mat, tol float64) {
 	}
 	maxAbs, rms, rel, worst := deviation(got, want)
 	if rel > tol {
-		t.Errorf("%s %s: max abs %.6g, worst rel %.3g at %d (got %g want %g), rms %.6g > %.0e",
-			name, got, maxAbs, rel, worst, got.Data[worst], want.Data[worst], rms, tol)
+		t.Errorf("%s %s: max abs %.6g, worst rel %.3g at %d (got %g want %g), rms %.6g, rms diff %.3g > %.0e",
+			name, got, maxAbs, rel, worst, got.Data[worst], want.Data[worst], rms, rmsDiff(got, want), tol)
 		return
 	}
-	t.Logf("%-22s %-14s max abs %.3g  rms %.4g  rel %.2g", name, got.String(), maxAbs, rms, rel)
+	t.Logf("%-22s %-14s max abs %.3g  rms %.4g  rel %.2g  rms diff %.3g", name, got.String(), maxAbs, rms, rel, rmsDiff(got, want))
 }
 
 func loadTok(t *testing.T) *tokenizer.Tokenizer {

@@ -209,6 +209,7 @@ func main() {
 	imgCond := flag.Int("image-condition-size", 1024,
 		"square whose area every reference image is resized to, and the default output size of an edit "+
 			"that names none; diffusers' output_resolution")
+	imgFP16 := flag.Bool("image-fp16", false, "stage the image text encoder and transformer as fp16 instead of int8: the control, 27.9 GB of weights instead of 16.0")
 	videoOn := flag.Bool("video", false, "load MiniMax-H3 and serve /v1/videos (asynchronous jobs; ~50 GB at a request's peak, nothing staged at rest)")
 	videoModel := flag.String("video-model", "models/MiniMax-H3", "MiniMax-H3 checkpoint root")
 	videoDir := flag.String("video-dir", "", "where finished videos are kept until they expire; empty is a temporary directory")
@@ -379,6 +380,7 @@ func main() {
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
 			Steps: *imgSteps, MaxPrompt: *imgPrompt, Refs: *imgEdits, CondSize: *imgCond,
+			FP16: *imgFP16,
 		})
 		if err != nil {
 			log.Fatal(err)
