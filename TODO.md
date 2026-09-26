@@ -52,8 +52,20 @@ mp4 with sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
 OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
 runs (speech beside it ≤ 0.27 s). It takes **35.6 s a forward at the served
 480p** (~14 min a request) and 143 s at the trained 768p (~2 h for 50 steps).
-Not in `ai.service` yet (M-o5). Open: staging cost, keyframes (M10),
-performance (M11), a Context-IR stand-in (M12).
+Deployed in `ai.service` beside the image model (2026-09-26), but **a
+request does not fit there yet**: at rest the service leaves ~35 GB
+available (image is 49.7 GB with `-edits 3`), and a video request peaks at
+50 GB (text encoder) and 44 GB (transformer), so it would fail or wake the
+OOM killer. Open: staging cost, keyframes (M10), performance (M11), a
+Context-IR stand-in (M12).
+
+- [ ] **Video in int8, to fit beside the image model.** Stage the Qwen3-VL-32B
+  text encoder as an int8 bank (Kev K7.1's route: 50 → ~25 GB) *and* the
+  transformer's block weights as int8 (40 → ~20 GB), so a request peaks at
+  ~25 GB inside the ~35 GB the deployed service leaves free. Gate it like
+  the fp16 path: encoder rel against the fp32 oracle (M2), teacher-forced
+  steps against M4's oracle (M7), and TestE2E's PSNR against the oracle's
+  own run (M8). Price the speed too: the GEMMs are ~half of a 480p forward.
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,

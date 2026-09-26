@@ -741,21 +741,27 @@ M10 onward is open.
 - Served gate by hand: `serve -addr 127.0.0.1:18080 -token= -video -tts`, then
   POST the README request with `target.short_edge 256, aspect_ratio "7:4"`,
   `num_inference_steps 8` and poll (M9's table).
-- **Not deployed.** `ai.service` has no `-video` yet: it is M-o5's decision
-  (the ~50 GB peak beside image's 32 GB and the rest on the second machine).
-  Adding `-video` to the non-LLM line is the whole change.
+- **Deployed, but a request does not fit yet** (2026-09-26): `ai.service`
+  runs `-video` beside `-image -edits 3` (49.7 GB), `-kev` and the speech
+  models, which leaves ~35 GB available at rest. A request peaks at 50 GB
+  (encoder) and 44 GB (transformer). No video has been submitted to it.
+  The fix is item 1 below (TODO.md has it).
 
 **Next, in order:**
 
-1. **The staging cost** (~2.3 of a served request's ~14 min): pre-narrowed
+1. **int8 banks for the text encoder and the transformer's blocks**, so a
+   request peaks at ~25 GB and fits beside the deployed image model (see
+   TODO.md): encoder via Kev K7.1's int8 route, transformer blocks likewise;
+   gated as M2/M7/M8 were, and the speed priced.
+2. **The staging cost** (~2.3 of a served request's ~14 min): pre-narrowed
    fp16 banks on disk for the encoder and transformer (decision 2), and cache
    `Tables` by schedule. Since M9 the stagings no longer block other
    verticals, so this is now about the video's own latency only.
-2. **M10, `fl2va`**: the VAE encoder (a CNN), the vision tower for keyframes,
+3. **M10, `fl2va`**: the VAE encoder (a CNN), the vision tower for keyframes,
    keyframe rows in the layout (M1 already plans them), and in the API
    `input_reference` / SGLang's `conditions` (both 400 today).
-3. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
+4. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
    55.5 peak; 68% of a trained forward), the down projection's GEMM (22
    against 37), and the audio decode on the device (7 s on the CPU against
    torch's 1.1).
-4. M12: a Context-IR stand-in, since plain prompts are what users will send.
+5. M12: a Context-IR stand-in, since plain prompts are what users will send.
