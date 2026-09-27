@@ -44,6 +44,7 @@ func main() {
 	seed := flag.Uint64("seed", 42, "noise seed")
 	think := flag.Bool("think", true, "plan with the 5 Hz LM first (upstream's default)")
 	lmSeed := flag.Uint64("lm-seed", 42, "the LM's sampling seed")
+	lmFP16 := flag.Bool("lm-fp16", false, "stage the LM's layers as fp16 instead of int8: the control, 2x slower a step and 3.4 GB more")
 	sample := flag.String("sample", "", "sample mode: the LM writes the song from this description")
 	sampleMode := flag.Bool("sample-mode", false, "sample mode, and no phase-1 CoT for a meta the song lacks (upstream's sample_mode); alone, the LM picks the song")
 	out := flag.String("out", "ace.mp3", "output file: .wav, .flac, .mp3 or .opus")
@@ -88,7 +89,11 @@ func main() {
 		}
 		defer p.Destroy()
 		if *think || smp != nil {
-			if err := p.LoadLM(d, pipeline.LMDir(*models), lm.DefaultOptions()); err != nil {
+			o := lm.DefaultOptions()
+			if *lmFP16 {
+				o.Bank = lm.BankFP16
+			}
+			if err := p.LoadLM(d, pipeline.LMDir(*models), o); err != nil {
 				return err
 			}
 		}

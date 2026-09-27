@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -13,28 +14,48 @@ import (
 )
 
 var (
-	gpuOnce sync.Once
-	gpuLM   *GPU
-	gpuErr  error
+	devOnce sync.Once
+	testDev *vk.Device
+	devErr  error
+
+	gpuMu sync.Mutex
+	gpuLM = map[Bank]*GPU{}
 )
 
-// loadGPU stages the LM once for the package's tests (~8 GB of fp16).
-func loadGPU(t testing.TB) *GPU {
-	t.Helper()
-	gpuOnce.Do(func() {
-		dev, err := openDevice()
-		if err != nil {
-			gpuErr = err
-			return
-		}
-		t0 := time.Now()
-		gpuLM, gpuErr = Load(dev, lmDir, Options{MaxLen: 4096, Slots: 2, Rows: 256})
-		t.Logf("staged the LM in %v", time.Since(t0))
-	})
-	if gpuErr != nil {
-		t.Skipf("no device or checkpoint: %v", gpuErr)
+// testBank is the bank the tests stage: int8 (served), or ACE_LM_BANK=fp16
+// for the control.
+func testBank() Bank {
+	if os.Getenv("ACE_LM_BANK") == "fp16" {
+		return BankFP16
 	}
-	return gpuLM
+	return BankQ8
+}
+
+// loadGPU stages the LM in testBank's width, once for the package's tests.
+func loadGPU(t testing.TB) *GPU { return loadGPUBank(t, testBank()) }
+
+// loadGPUBank stages the LM in a given width once (3.9 GB of int8 layers or
+// 7.3 of fp16, and a 1.1 GB fp16 head); the two share a device.
+func loadGPUBank(t testing.TB, bank Bank) *GPU {
+	t.Helper()
+	devOnce.Do(func() { testDev, devErr = openDevice() })
+	if devErr != nil {
+		t.Skipf("no device: %v", devErr)
+	}
+	gpuMu.Lock()
+	defer gpuMu.Unlock()
+	if g := gpuLM[bank]; g != nil {
+		return g
+	}
+	t0 := time.Now()
+	g, err := Load(testDev, lmDir, Options{MaxLen: 4096, Slots: 2, Rows: 256, Bank: bank,
+		allSlabs: os.Getenv("ACE_LM_LADDER") != ""})
+	if err != nil {
+		t.Skipf("no checkpoint: %v", err)
+	}
+	t.Logf("staged the LM (%s bank) in %v", bank, time.Since(t0))
+	gpuLM[bank] = g
+	return g
 }
 
 // logitStats compares a row of logits with the oracle's over [lo, hi):
@@ -95,14 +116,18 @@ func cfg(cond, uncond []float32, s float32) []float32 {
 	return out
 }
 
-// TestLogits is A7a and A7b's gate: the prompts prefilled, then the oracle's
+// TestLogits is A7a and A7b's gate, on the fp16 bank whatever testBank
+// says: it gates the implementation against fp32, and TestBankAgainstBF16
+// prices the int8 quantisation (MUSIC.md A10).
+//
+// It is the prompts prefilled, then the oracle's
 // own sampled tokens fed back one step at a time (teacher-forced), and the
 // logits at the steps it dumped compared -- phase 1 over the text tokens
 // (all the FSM ever allows there), phase 2 over the codes, each row and
 // after CFG.
 func TestLogits(t *testing.T) {
 	m := loadLMManifest(t)
-	g := loadGPU(t)
+	g := loadGPUBank(t, BankFP16)
 	steps := map[int]bool{0: true, 1: true, 2: true, 3: true, 10: true, 50: true, 100: true}
 	for _, label := range []string{"given_duration", "all_metas", "sample", "sample_ja"} {
 		c, ok := m.Cases[label]

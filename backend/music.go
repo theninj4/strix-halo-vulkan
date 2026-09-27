@@ -26,9 +26,12 @@ type MusicOptions struct {
 	Models string
 	// Device is required.
 	Device *Device
-	// NoLM leaves the 5 Hz LM out (8 GB of weights and 1.8 GB of KV
+	// NoLM leaves the 5 Hz LM out (5 GB of weights and 1.8 GB of KV
 	// cache): the DiT-only path, and a thinking request is a 400.
 	NoLM bool
+	// LMFP16 stages the LM's layers as fp16 instead of int8 (MUSIC.md A10):
+	// the control, 2x slower a step and 3.4 GB more.
+	LMFP16 bool
 	// ID is the model id this backend answers to.
 	ID string
 	// Swap is the residency slot this pipeline takes turns in with image
@@ -42,14 +45,15 @@ const defaultMusicModelID = "acestep-v15-xl-turbo"
 // (MUSIC.md A9).
 //
 // **Everything is resident while it holds the Swap** (A-o4): the DiT, its
-// encoders, the VAE, the text encoder and the LM with its cache, ~21 GB.
-// Staging them is ~16 s and a 60 s song is 26 s, so they stay staged
+// encoders, the VAE, the text encoder and the LM with its cache, ~18 GB
+// (~21 with the LM in fp16). Staging them is ~16 s and a 60 s song is
+// 14 s, so they stay staged
 // between songs, until image or video is asked for or the slot's idle
 // timer frees them. Planning a request needs none of it: the LM's
 // tokenizer and genres vocabulary are held on the host for that.
 //
 // **The device is shared a step at a time.** A request holds it only
-// between yields: after every LM step (~50 ms) and every DiT forward
+// between yields: after every LM step (~25 ms) and every DiT forward
 // (0.1-2.4 s by length), so speech waits for one of those, not the song.
 type Music struct {
 	opt  MusicOptions
@@ -78,6 +82,9 @@ func NewMusic(opt MusicOptions) (*Music, error) {
 		return nil, fmt.Errorf("backend: the music pipeline needs a swap slot")
 	}
 	b := &Music{opt: opt, id: opt.ID, lmOpt: lm.DefaultOptions(), rng: rand.New(rand.NewSource(rand.Int63()))}
+	if opt.LMFP16 {
+		b.lmOpt.Bank = lm.BankFP16
+	}
 	if !opt.NoLM {
 		dir := pipeline.LMDir(opt.Models)
 		tk, err := tokenizer.Load(dir)
@@ -251,7 +258,7 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 				need, secs, b.lmOpt.MaxLen)
 		}
 	}
-	p.Estimate = musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120)).total()
+	p.Estimate = musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120), b.lmOpt.Bank).total()
 	return p, nil
 }
 
@@ -273,7 +280,8 @@ func musicLatents(r *plan.Request, thinking bool) int {
 }
 
 // musicCost is a request's expected wall time by stage, from MUSIC.md's
-// measurements with the device to itself: an LM step is 50 ms (A7), a CoT
+// measurements with the device to itself: an LM step is 28 ms writing text
+// and 25 ms writing codes on the int8 bank, 47 and 44 on fp16 (A10), a CoT
 // ~150 of them; a DiT forward is 2.65e-4·L + 7.16e-9·L² s over L = 12.5 a
 // second tokens (A3's 0.86 s at 3,000 and 2.39 s at 7,500) plus 35 ms of
 // host; the VAE is 10.4 ms a second of audio (A6); encoding the file is
@@ -290,17 +298,21 @@ func (c musicCost) total() time.Duration {
 	return c.sample + c.think + c.codes + c.dit + c.vae + c.write
 }
 
-func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64) musicCost {
+func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank lm.Bank) musicCost {
 	sec := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+	text, code := 0.028, 0.025
+	if bank == lm.BankFP16 {
+		text, code = 0.047, 0.044
+	}
 	var c musicCost
 	if sample {
-		c.sample = sec(sampleSteps * 0.050)
+		c.sample = sec(sampleSteps * text)
 	}
 	if thinking {
 		if !sample && !lm.UserMeta(r).HasAll() {
-			c.think = sec(150 * 0.050)
+			c.think = sec(150 * text)
 		}
-		c.codes = sec((seconds*lm.CodesPerSecond + 1) * 0.050)
+		c.codes = sec((seconds*lm.CodesPerSecond + 1) * code)
 	}
 	L := seconds * 12.5
 	c.dit = sec(8 * (2.65e-4*L + 7.16e-9*L*L + 0.035))
@@ -313,7 +325,7 @@ func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64) musi
 func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *api.MusicPlan, dst string, progress func(api.MusicProgress)) error {
 	r := musicRequest(req)
 	secs := cmpOr(mp.Seconds, 120)
-	c := musicEstimate(r, req.Thinking, req.Sample, secs)
+	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank)
 	var sampling *lm.Sampling
 	if req.LMTemperature != nil || req.LMCFGScale != nil || req.LMTopP != nil {
 		s := lm.DefaultSampling
@@ -390,7 +402,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 				// The plan fixes the length, so the estimate is redone
 				// around it; what is spent is kept.
 				spent, sampled := c.think, c.sample
-				c = musicEstimate(d, req.Thinking, req.Sample, seconds)
+				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank)
 				c.think, c.sample = spent, sampled
 				m := &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM, KeyScale: d.KeyScale,
 					TimeSignature: d.TimeSignature, Duration: seconds, Language: cmpStr(d.Language, "unknown")}

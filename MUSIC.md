@@ -339,7 +339,7 @@ flash, so no scores are materialised.
 | A7 | The 5 Hz LM: Qwen3-4B prefill + KV-cached decode, CFG rows, sampling, the constrained FSM | **done 2026-09-27** (`ace/lm`): prompts and 3,100/3,100 fuzzed CoTs exact; teacher-forced logits over 101 steps of both phases ≤2e-3 rel, KL ≤1.4e-5, every argmax; the FSM exact over 857 steps; top-p survivors exact (one fp32 boundary); 45 ms a step for 1 or 2 rows |
 | A8 | End to end with thinking: CoT → codes → hints → DiT → VAE | **done 2026-09-27** (`ace/pipeline`, `cmd/ace` thinks by default): from the oracle's CoT and codes, caption states ≤1.0e-3 rms, lyrics exact, hints ≤1.6e-4; **60 s of song in 26 s**, 90% of it the LM |
 | A9 | Serve: the endpoint (A-o3), queueing, yielding the device between DiT steps and LM chunks | **done 2026-09-27** (`serve -music`, `/v1/music`): submit-then-poll jobs in `/v1/videos`' shape, ACE-Step's `release_task` fields read; estimates within 10% of the run; speech beside a song waits ≤ one LM step or DiT forward |
-| A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | |
+| A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | **done 2026-09-27 for the LM** (`ace/lm` `BankQ8`, the default): int8 layers priced against upstream bf16 over every teacher-forced step (text 0.88× its mean KL, codes 0.02×); a step 45 → 22 ms on the device, host sampling 10 → 1 ms; **a 60 s song 26.0 → 14.4 s**, 3 min served in 34.9 s. The DiT and VAE (≤20% of a request) are left |
 | A11 | Other tasks (optional): reference-audio timbre, cover, repaint, via the VAE encoder and the audio tokenizer | |
 | A12 | Sample mode: from a description alone the LM writes the caption, metas, genres and lyrics (upstream's `sample_query` / "simple mode"), then the thinking path runs on them | **done 2026-09-27** (`ace/lm` `Sample`, `pipeline.Options.Sample`, `sample_query` on `/v1/music`, `cmd/ace -sample`): host side exact on 358 hints, 24 prompts, 20 lyric cuts; the FSM exact over 2,001 scripted and 1,208 real steps; upstream's own song parsed field for field and its codes prompts rebuilt id for id; teacher-forced KL ≤ 5.7e-5, every argmax; served, 45 s of song in 31 s |
 
@@ -1070,15 +1070,140 @@ caption, the metas and a song's lyrics: 100 to 750 tokens, so 5 to 40 s.
   lyrics and a 10-minute song) would not fit 6,144 positions and fails the
   job with the LM's own message.
 
+### A10 — the LM's decode (2026-09-27)
+
+A request was 90% LM. At the end of A9 a step was 45 ms on the device and
+50 ms wall: 7.3 GB of fp16 layers plus the head, read at ~187 GB/s, and 5 ms
+of host sampling. A10 attacked both: fewer bytes, and less host work.
+
+**The int8 bank.** `ace/lm` stages the layers in the LLM's L8a layout
+(`BankQ8`): int8 in the §2.8 fragment tiling, one fp16 scale per 32 k of a
+row. It is quantised from the bf16 checkpoint as Kev's is (K7.1), with q
+rounded against the fp16 scale the kernel multiplies by. That is **3.9 GB
+of layers against 7.3**. Decode reads it with `llm_gemv -DQ8B` and prefill
+with the LLM's `llm_gemm -DQ8B` rungs (Kev's `q8m2`/`q8m4` schedule), both
+unchanged. The tied head stays fp16 (below). `Options.Bank = BankFP16`,
+`cmd/ace -lm-fp16` and `serve -music-lm-fp16` run the control.
+
+**The price, against bf16 (the M11a lesson).**
+`reference/dump_ace_lm_tf.py` (`.venv-acestep`, 19 s) teacher-forces
+each of the A7/A12 oracle's sampled phases in one causal forward, in fp32
+and again in bf16 (upstream's CUDA dtype). It writes fp32 logits at all
+101 steps and bf16's KL(fp32 ‖ bf16) at T = 0.85 per step. Phase 1's KL is
+over what the FSM allowed at that step, from the oracle's trace. **A step the
+FSM forces is left out**: its logits choose nothing, and bf16's worst
+whole-vocabulary steps are exactly those (steps 3–4 of a sample pass, where
+the codes also hold up to 1% of the mass). `TestBankAgainstBF16` then runs
+the bank over the same steps.
+
+| KL from fp32, pooled | fp16 bank | int8 bank | upstream bf16 |
+|---|---|---|---|
+| phase 1, 273 unforced steps of 3 cases: mean / worst | 9.4e-7 / 3.2e-5 | **6.6e-4 / 4.6e-2** | 7.4e-4 / 3.4e-2 |
+| phase 2, 2 × 101 steps (each row and after CFG): mean / worst | 3.1e-6 / 2.5e-5 | **6.6e-4 / 6.8e-3** | 3.4e-2 / 1.25e-1 |
+| phase 1 argmax agreement | 273/273 | 271/273 | 271/273 |
+| phase 2 CFG argmax agreement | 200/202 | 187/202 | 89/202 |
+
+So int8 is **upstream's own bf16 in the CoT** and **50× under it in the
+codes**. The gate pools each kind of phase: the bank's mean ≤ bf16's, and
+its worst step ≤ 2× bf16's (int8: 0.88× and 1.36×; codes 0.02× and 0.05×).
+One sensitive `sample_ja` step (4.6e-2) makes the phase-1 worst. Per case it
+is noise: one case's mean is 1.4× bf16's, another's 0.44×.
+`TestLogits`, the implementation gate against fp32, now always stages the
+fp16 bank, so `go test ./ace/lm` runs both (~2 min, two stagings).
+
+Tried and measured, and not kept:
+
+- **Layers 6 and 16 in fp16**, Qwen3's massive-activation layers and Q13's
+  exceptions. Phase 1 moved from 7.6e-4 to 5.9e-4 on one case and 3.6e-4
+  to 3.5e-4 on another, and the worst step stayed. A per-layer sweep
+  (`sample_ja`, one layer in int8 and the rest fp16, layers 0–26) shows why:
+  layer 6 is 1.1e-4 of mean KL, layer 16 4.4e-5, and every other layer
+  3e-6 to 4e-5. The error is spread thin, and no exception list buys much.
+- **MSE-chosen scales** (the least-squares scale among amax/127 × 0.80–1.00
+  per group): KL unchanged within noise, and staging took 19 s instead of 5.
+- **An int8 head.** It moved phase 2's KL 25× (to 1.6e-2, half of bf16's)
+  and its CFG argmax to 69/101, because the code logits are sensitive to
+  the head and CFG doubles the difference. As a split head (int8 vocabulary
+  for phase 1, an fp16 codes block for phase 2) it was clean, but it saved
+  only 0.7 ms of a 24.8 ms phase-1 step: the int8 GEMV reads a 217k-row
+  head at ~110 GB/s. Not worth two head banks.
+- **Skipping the 64,000 code rows in phase 1's head** (328 MB a step). The
+  FSM masks them in every constrained state, but upstream leaves the field
+  name after a caption unmasked, and there the codes can hold real mass
+  (1% on one of the oracle's steps). The skip would change upstream's
+  behaviour, so the head reads the whole vocabulary.
+
+**The split-K ladder** (`TestSlabLadder`, `ACE_LM_LADDER=1`) re-rungs the
+int8 GEMVs, one projection at a time, whole steps at a fixed position:
+
+| | fp16's rung → int8's | a step |
+|---|---|---|
+| (the fp16 table on int8) | | 27.1 ms |
+| o (K 4096) | k16 → **k2** | 24.9 |
+| gate, up | k4 → **k8** | 25.8 each |
+| k, v | k20 → **k40** | 26.8 each |
+| q, down | k8, k8 | unchanged |
+| all of them | | **21.5 ms** (21.7 at two rows) |
+
+21.7 ms for the 4.2 GB a codes step reads (3.9 layers + 0.33 head) is 194
+GB/s, this bus. A decode step is also one command buffer now instead of
+six: wall 22.7 → 22.3 ms against 21.7 on the device.
+
+**Host sampling, 10 → 1 ms.** `topP` sorted every candidate within 30
+nats of the max. That is ~64,000 on a flat codes step, 8 of the step's 10
+ms (`BenchmarkCodeStep`). Now it buckets the candidates by distance below
+the max (2,048 buckets over 30 nats). It keeps whole buckets while their
+mass stays at most p, bins the rest once (a counting sort), and sorts only
+the bucket that crosses. Equal scores share a bucket, so the kept set is
+the sort's. `TestTopPBucketed` wants it identical on 343 rows (every
+oracle codes step, text steps, 200 random rows full of ties) at p = 0.5,
+0.9 and 0.99, and `TestTopP` still passes against upstream. Two traps:
+
+- The first version walked a peaked phase-1 step through hundreds of empty
+  buckets, rescanning 217k scores each time. It was 90 ms a step, and only
+  the end-to-end run showed it. That's the reason for the counting sort and
+  `BenchmarkTextStep`.
+- `math.Max` in the max scans was half of what remained (NaN handling). A
+  plain comparison replaced it.
+
+A codes step's host work is 0.95 ms and a text step's 1.5 ms (fp16 was
+10.1 and ~5).
+
+**End to end** (`cmd/ace`, A8's request: synthwave caption, the oracle's
+lyrics, `-duration 60`, seeds 42; staged models, the device to itself):
+
+| | LM phase 1 | LM phase 2 | DiT | VAE | total |
+|---|---|---|---|---|---|
+| A8 (fp16) | 162 steps, 8.2 s (50 ms) | 300 codes, 15.1 s (50 ms) | 1.77 s | 0.62 s | 26.0 s |
+| fp16 + A10's host | 162 steps, 7.6 s (47 ms) | 13.1 s (44 ms) | 1.79 s | 0.63 s | 23.5 s |
+| **int8** | 163 steps, **4.5 s (27.7 ms)** | **7.2 s (24.0 ms)** | 1.79 s | 0.63 s | **14.4 s** |
+
+Served (`serve -music`, one job at a time, device to itself): a 30 s folk
+song with lyrics (flac) in **9.6 s** (A9: 16.2 s), and a 3-minute
+instrumental techno track in **34.9 s** (A9's 233 s one was 78.7 s). The
+job's `estimated_seconds` now uses the bank's rates (28 and 25 ms a step
+int8, 47 and 44 fp16). Resident music is ~18 GB (was ~21). The songs are
+`out/ace-a10-int8-synthwave-60s.mp3` and `out/ace-a10-int8-techno-180s.mp3`,
+at −15.8 and −15.1 dB mean with peaks of −1.9 and −1.4 dB. Nobody has
+listened to them yet.
+
+**What is left of A10.** The LM is still ~80% of a request, and its step is
+at the bus. Fewer bytes a step would mean a 4-bit bank: `llm_gemv -DQ4B`
+reads one, but a K-quant quantiser from bf16 would be new, and phase 1 has
+no headroom under bf16 left to spend. The DiT (1.8 s of a 60 s song, 6.9 s
+of 4 minutes) and the VAE (0.6 s) are ≤ 20% of any request. They were the
+plan's second and third items, and are left until something wants them.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
   residual (5.7e5), fp16 operands (≤ 2.45e3).
-- **A-o2: the LM's decode path.** Answered (A7): both options at once. The
+- **A-o2: the LM's decode path.** Answered (A7, A10): both options at once. The
   weight is staged once in the fragment tiling that the DiT GEMM rungs
   (prefill) and `llm_gemv.comp` (1–3 rows) both read. Attention is a new
-  split-key kernel over a KV cache. 45 ms a step, bandwidth-bound; int8
-  (A10) is the lever.
+  split-key kernel over a KV cache. 45 ms a step, bandwidth-bound. A10 made
+  the layers int8 (the L8a bank, the same two kernels' `-DQ8B` arms): 22 ms
+  a step, at the bus.
 - **A-o3: the served door.** Answered by the user (A9): submit-then-poll,
   as `/v1/music` in `/v1/videos`' shape, reading upstream's request fields.
   OpenAI has no music endpoint. Upstream ships
@@ -1198,16 +1323,29 @@ and the LM writes the caption, metas, genres and lyrics before the song
 the LM (the upstream clone); without it sample mode is a 400 and the rest
 serves as before. Songs to hear: `out/ace-sample-*.mp3`.
 
+**2026-09-27, session 6: A10 done for the LM.** The layers are int8 by
+default and priced against upstream bf16. Host sampling is 1 ms, and a 60 s
+song is 14.4 s (§ A10).
+
+- Code: `ace/lm/gpu.go` (`Bank`, `BankQ8`, `tileBQ8`, `gemvSlabsQ8`, the
+  q8 GEMM rungs, one submit a decode step), `ace/lm/sample.go` (bucketed
+  top-p, `maxScore`), `-lm-fp16` on `cmd/ace`, `-music-lm-fp16` on
+  `serve`, and `backend/music.go`'s estimate rates by bank.
+- Oracle: `reference/dump_ace_lm_tf.py` → `reference/out/acelmtf` (fp32
+  logits at every teacher-forced step, bf16's KL per step, FSM-restricted in
+  phase 1). It reads `reference/out/acelm`, so rerun it after
+  `dump_ace_lm.py`.
+- Tests: `ace/lm/bank_test.go` (`TestBankAgainstBF16`; `TestSlabLadder`
+  under `ACE_LM_LADDER=1`), `ace/lm/sample_bench_test.go`
+  (`TestTopPBucketed`, `BenchmarkCodeStep`, `BenchmarkTextStep`).
+  `ACE_LM_BANK=fp16` runs the package's shared staging as fp16. `TestLogits`
+  always stages fp16.
+- Not deployed: `ai.service`'s unit line still has no `-music`. That is the
+  user's call (session 4).
+
 **Next, in order:**
 
-1. **A10, the LM's decode**, which is 90% of a request (a 233 s song was 79
-   s, ~60 s of it codes):
-   - an int8 bank (`llm_gemv -DQ8B` reads the L8a bank at 1–3 rows; it
-     halves the 8 GB a step);
-   - host sampling (5 of 50 ms);
-   - the phase-1 head over all 217k rows.
-
-   Price int8 against bf16 logits (the M11a lesson).
+1. Listen to `out/ace-a10-int8-*.mp3`: the first songs from the int8 LM.
 2. A11 (optional): other tasks (cover, repaint, reference timbre). Each is a
    field `/v1/music` refuses today.
 3. Close the vertical: freeze this file to `research/music-vertical.md` and

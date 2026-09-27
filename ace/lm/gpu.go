@@ -95,14 +95,14 @@ func (p push) bytes() []byte {
 // their indices.
 type gemvPush struct {
 	resOff, xnOff, outOff, bOff uint32
-	lda, gemmN, gemmK           uint32
+	lda, gemmM, gemmN, gemmK    uint32
 }
 
 func (p gemvPush) bytes() []byte {
 	var u [pushBytes / 4]uint32
 	u[0], u[1], u[4], u[6] = p.resOff, p.xnOff, p.outOff, p.bOff
 	u[7] = 0xffffffff // gateOff: NO_W
-	u[12], u[15], u[16] = p.lda, p.gemmN, p.gemmK
+	u[12], u[14], u[15], u[16] = p.lda, p.gemmM, p.gemmN, p.gemmK
 	out := make([]byte, pushBytes)
 	copy(out, unsafe.Slice((*byte)(unsafe.Pointer(&u[0])), pushBytes))
 	return out
@@ -139,6 +139,17 @@ var gemvSPIRV = map[int][]byte{
 	16: shaders.LLMGEMVK16, 20: shaders.LLMGEMVK20, 32: shaders.LLMGEMVK32, 40: shaders.LLMGEMVK40,
 }
 
+// gemvSlabsQ8 is the same ladder on the int8 bank, where a slab is half the
+// bytes: TestSlabLadder, a whole step at one row (the fp16 table's rung ->
+// this one), 27.1 ms before: o k16 27.1 -> k2 24.9, gate and up k4 27.2 ->
+// k8 25.8, k and v k20 27.2 -> k40 26.8; q and down stay at k8 (MUSIC.md A10).
+var gemvSlabsQ8 = [nProj]int{pQ: 8, pK: 40, pV: 40, pO: 2, pGate: 8, pUp: 8, pDown: 8}
+
+var gemvQ8SPIRV = map[int][]byte{
+	1: shaders.LLMGEMVQ8K1, 2: shaders.LLMGEMVQ8K2, 4: shaders.LLMGEMVQ8K4, 8: shaders.LLMGEMVQ8K8,
+	16: shaders.LLMGEMVQ8K16, 20: shaders.LLMGEMVQ8K20, 32: shaders.LLMGEMVQ8K32, 40: shaders.LLMGEMVQ8K40,
+}
+
 var gemvSumSPIRV = map[int][]byte{
 	2: shaders.LLMGEMVSumK2, 4: shaders.LLMGEMVSumK4, 8: shaders.LLMGEMVSumK8,
 	16: shaders.LLMGEMVSumK16, 20: shaders.LLMGEMVSumK20, 32: shaders.LLMGEMVSumK32, 40: shaders.LLMGEMVSumK40,
@@ -171,9 +182,60 @@ func gemmFor(rows int) gemmKernel {
 	}
 }
 
+// q8Kernels are the int8 bank's GEMM rungs for a pass of many rows: the
+// LLM's llm_gemm.comp -DQ8B plain arm, as Kev runs it (CLASSIFICATION.md
+// K7.1). BN is 64.
+var q8Kernels = []gemmKernel{
+	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, 1},
+	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, 1},
+	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, 1},
+}
+
+// q8For is Kev's schedule for the int8 rungs.
+func q8For(rows int) gemmKernel {
+	if rows <= 128 {
+		return q8Kernels[0]
+	}
+	return q8Kernels[1]
+}
+
+// Bank is the width the layers' projections are staged in (MUSIC.md A10).
+// The tied head stays fp16 in either: int8 there moved phase 2's KL 25x (to
+// half of upstream bf16's) and saved 0.7 ms of a 24.8 ms phase-1 step.
+type Bank int
+
+const (
+	// BankQ8 is int8 in the fragment tiling with an fp16 scale per 32
+	// elements of a row: the LLM's L8a bank, read by llm_gemv.comp and
+	// llm_gemm.comp -DQ8B, quantised here from the bf16 checkpoint the way
+	// Kev's is (K7.1). 8.5 bits a weight: 3.9 GB of layers against 7.3.
+	BankQ8 Bank = iota
+	// BankFP16 is halves, what A7-A12 ran: the control.
+	BankFP16
+)
+
+func (b Bank) String() string {
+	if b == BankFP16 {
+		return "fp16"
+	}
+	return "q8"
+}
+
+// q8Group is how many elements of a row share one scale.
+const q8Group = 32
+
+// projBytes is a [n, k] projection's staged size, rounded so the next one
+// starts on 16 bytes.
+func (b Bank) projBytes(n, k int) int {
+	if b == BankQ8 {
+		return (n*k + n*k/q8Group*2 + 15) &^ 15
+	}
+	return n * k * 2
+}
+
 type layerWeights struct {
 	bank int
-	off  [nProj]uint32 // halves, in the bank
+	off  [nProj]uint32 // in the bank: halves (fp16) or bytes (int8), as the kernels read it
 	// fp32 arena
 	attnNorm, ffnNorm, qkNorm uint32
 	// fp16 arena: this layer's caches, [slot][pos][8][128]
@@ -189,6 +251,10 @@ type Options struct {
 	Slots int
 	// Rows is the longest pass; a longer prefill runs as several.
 	Rows int
+	// Bank is the layers' weight width: int8 (the zero value) or fp16.
+	Bank Bank
+	// allSlabs builds every split-K rung, for the A10 ladder.
+	allSlabs bool
 }
 
 // DefaultOptions fits a 10-minute song with a long lyric sheet, CFG pair.
@@ -229,8 +295,23 @@ type GPU struct {
 	hElems             int
 	ldaDim, ldaQ, ldaF int
 
-	// LayersPerSubmit is how many layers go in one command buffer.
+	// LayersPerSubmit is how many layers of a prefill go in one command
+	// buffer; a decode step is always one.
 	LayersPerSubmit int
+	// slabOverride replaces a projection's split-K (the A10 ladder); 0 keeps
+	// the table's. Only slab counts built at Load can be chosen.
+	slabOverride [nProj]int
+}
+
+// slabs is projection p's split-K at 1-3 rows.
+func (g *GPU) slabs(p proj) int {
+	if s := g.slabOverride[p]; s != 0 {
+		return s
+	}
+	if g.o.Bank == BankQ8 {
+		return gemvSlabsQ8[p]
+	}
+	return gemvSlabs[p]
 }
 
 // Load stages the LM from its checkpoint directory.
@@ -294,31 +375,36 @@ func (g *GPU) layout(set *safetensors.Set) error {
 	g.vocab = emb.Shape[0]
 	g.vocabPad = roundUp(g.vocab, tile)
 
-	// fp16 banks: the layers in order, a new bank when one is full, and the
-	// head in a bank of its own.
+	// Weight banks: the layers in order, a new bank when one is full, and
+	// the head (fp16) in a bank of its own.
+	bk := g.o.Bank
 	perLayer := 0
 	for _, s := range projShape {
-		perLayer += s[0] * s[1]
+		perLayer += bk.projBytes(s[0], s[1])
 	}
-	var bankElems []int
+	unit := 2 // what an offset counts: halves on fp16, bytes on int8
+	if bk == BankQ8 {
+		unit = 1
+	}
+	var bankBytes []int
 	g.w = make([]layerWeights, c.NumLayers)
 	for i := range g.w {
-		if len(bankElems) == 0 || (bankElems[len(bankElems)-1]+perLayer)*2 > maxBankBytes {
-			bankElems = append(bankElems, 0)
+		if len(bankBytes) == 0 || bankBytes[len(bankBytes)-1]+perLayer > maxBankBytes {
+			bankBytes = append(bankBytes, 0)
 		}
-		b := len(bankElems) - 1
+		b := len(bankBytes) - 1
 		g.w[i].bank = b
 		for p, s := range projShape {
-			g.w[i].off[p] = uint32(bankElems[b])
-			bankElems[b] += s[0] * s[1]
+			g.w[i].off[p] = uint32(bankBytes[b] / unit)
+			bankBytes[b] += bk.projBytes(s[0], s[1])
 		}
 	}
-	g.head = len(bankElems)
-	bankElems = append(bankElems, g.vocabPad*hidden)
-	for _, n := range bankElems {
-		b, err := g.dev.NewBuffer(n * 2)
+	g.head = len(bankBytes)
+	bankBytes = append(bankBytes, g.vocabPad*hidden*2)
+	for i, n := range bankBytes {
+		b, err := g.dev.NewBuffer(n)
 		if err != nil {
-			return fmt.Errorf("lm: fp16 bank %d (%d MB): %w", len(g.banks), (n*2)>>20, err)
+			return fmt.Errorf("lm: bank %d (%d MB): %w", i, n>>20, err)
 		}
 		g.banks = append(g.banks, b)
 	}
@@ -356,11 +442,7 @@ func (g *GPU) layout(set *safetensors.Set) error {
 	g.aFF = alloc(rows * hidden)
 	g.aMeta = alloc(rows * 2)
 	g.aPart = alloc(partBudget * partStride)
-	maxSlabs := 0
-	for _, s := range gemvSlabs {
-		maxSlabs = max(maxSlabs, s)
-	}
-	g.aRes = alloc(MaxRows * maxSlabs * ffn)
+	g.aRes = alloc(MaxRows * 40 * ffn) // 40: the widest split-K rung
 	g.aLogits = alloc(MaxRows * g.vocabPad)
 	g.aUnscale = alloc(hidden)
 	if g.abuf, err = g.dev.NewHostCachedBuffer(g.actElems * 4); err != nil {
@@ -442,20 +524,24 @@ func (g *GPU) build() error {
 			g.pipes[fmt.Sprintf("sum_k%d_r%d", slabs, r)] = p
 		}
 	}
-	used := map[int]bool{1: true}
-	for _, s := range gemvSlabs {
-		used[s] = true
-	}
 	g.gemms = make([]map[string]*vk.ComputePipeline, len(g.banks))
 	g.gemvs = make([]map[string]*vk.ComputePipeline, len(g.banks))
 	for b, bank := range g.banks {
 		g.gemms[b] = map[string]*vk.ComputePipeline{}
 		g.gemvs[b] = map[string]*vk.ComputePipeline{}
 		bb := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, bank}
+		q8 := b != g.head && g.o.Bank == BankQ8
+		gemms, gemvs, table := gemmKernels, gemvSPIRV, gemvSlabs
+		if q8 {
+			// llm_common.glsl's bindings: the scale plane is read as halves
+			// at 3 and the tiles as words at 5; 4 is declared and unused.
+			bb = []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, bank, g.abuf, bank}
+			gemms, gemvs, table = q8Kernels, gemvQ8SPIRV, gemvSlabsQ8
+		}
 		if b != g.head {
-			for _, k := range gemmKernels {
+			for _, k := range gemms {
 				spec := vk.PipelineSpec{Buffers: bb, PushConstantSize: pc}
-				if k.waves > 1 {
+				if k.waves > 1 || q8 {
 					spec.RequiredSubgroupSize = 64
 				}
 				p, err := g.pipeline("gemm "+k.name, k.spirv, spec)
@@ -465,12 +551,21 @@ func (g *GPU) build() error {
 				g.gemms[b][k.name] = p
 			}
 		}
+		used := map[int]bool{1: true}
+		for _, s := range table {
+			used[s] = true
+		}
+		if g.o.allSlabs && b != g.head {
+			for s := range gemvs {
+				used[s] = true
+			}
+		}
 		for slabs := range used {
 			if b == g.head && slabs != 1 {
 				continue
 			}
 			for r := 1; r <= MaxRows; r++ {
-				p, err := g.pipeline("gemv", gemvSPIRV[slabs], vk.PipelineSpec{Buffers: bb, PushConstantSize: pc,
+				p, err := g.pipeline("gemv", gemvs[slabs], vk.PipelineSpec{Buffers: bb, PushConstantSize: pc,
 					SpecConstants: rowSpec(r), RequiredSubgroupSize: 64})
 				if err != nil {
 					return err
@@ -563,12 +658,66 @@ func (g *GPU) stage(set *safetensors.Set) error {
 			if lin.Out != n || lin.In != k {
 				return fmt.Errorf("lm: layer %d %s is [%d %d]", i, projNames[p], lin.Out, lin.In)
 			}
+			if g.o.Bank == BankQ8 {
+				q, sc := tileBQ8(lin.Weight, n, k)
+				g.banks[w.bank].WriteBytesAt(int(w.off[p]), q)
+				g.banks[w.bank].WriteUint16At((int(w.off[p])+len(q))/2, sc)
+				continue
+			}
 			buf := make([]uint16, n*k)
 			tileB(buf, n, k, func(r int, dst []float32) { copy(dst, lin.Weight[r*k:(r+1)*k]) })
 			g.banks[w.bank].WriteUint16At(int(w.off[p]), buf)
 		}
 	}
 	return nil
+}
+
+// tileBQ8 quantises a [n, k] row-major matrix into the int8 bank's layout
+// (Kev's packQ8, llm.tileBQ8's layout): tile (nt, kt) is 256 bytes holding
+// (k, n) at (n%16)*16 + k%16, tiles kt-fastest; then the scale plane, scale
+// (nt, group g, n%16) at (nt*kgroups + g)*16 + n%16. q is rounded against the
+// fp16 scale the kernel multiplies by, which is the smaller error.
+func tileBQ8(w []float32, n, k int) ([]byte, []uint16) {
+	kt, kg := k/tile, k/q8Group
+	q := make([]byte, n*k)
+	sc := make([]uint16, n*kg)
+	workers := runtime.GOMAXPROCS(0)
+	chunk := (n + workers - 1) / workers
+	done := make(chan struct{}, workers)
+	for wk := 0; wk < workers; wk++ {
+		go func(lo, hi int) {
+			for r := lo; r < hi; r++ {
+				base := (r / tile) * kt * tile * tile
+				lane := (r % tile) * tile
+				sbase := (r/tile)*kg*tile + r%tile
+				x := w[r*k : (r+1)*k]
+				for gi := 0; gi < kg; gi++ {
+					blk := x[gi*q8Group : (gi+1)*q8Group]
+					var amax float32
+					for _, v := range blk {
+						amax = max(amax, float32(math.Abs(float64(v))))
+					}
+					dh := safetensors.F32ToF16(amax / 127)
+					d := safetensors.F16ToF32(dh)
+					sc[sbase+gi*tile] = dh
+					for j, v := range blk {
+						var qi int32
+						if d != 0 {
+							qi = int32(math.Round(float64(v / d)))
+						}
+						qi = min(max(qi, -127), 127)
+						c := gi*q8Group + j
+						q[base+(c/tile)*tile*tile+lane+c%tile] = byte(int8(qi))
+					}
+				}
+			}
+			done <- struct{}{}
+		}(wk*chunk, min(n, (wk+1)*chunk))
+	}
+	for wk := 0; wk < workers; wk++ {
+		<-done
+	}
+	return q, sc
 }
 
 func bf16(b uint16) float32 { return math.Float32frombits(uint32(b) << 16) }
@@ -601,7 +750,10 @@ type Tok struct {
 }
 
 // Range is a span of vocabulary rows to compute logits for; the head reads
-// only those. Phase 1 wants the text tokens, phase 2 the codes and EOS.
+// only those. Phase 1 wants the whole vocabulary: its FSM leaves the field
+// name after a caption unmasked, and the codes can hold 1% of the mass on a
+// phase-1 step (MUSIC.md A10), so they are not skipped. Phase 2 wants the
+// codes and EOS.
 type Range struct{ Lo, Hi int }
 
 // Pass runs every layer over toks. With a non-empty head range it also
@@ -650,6 +802,11 @@ func (g *GPU) Pass(toks []Tok, head Range) ([][]float32, time.Duration, error) {
 
 	var total time.Duration
 	per := max(g.LayersPerSubmit, 1)
+	if n <= MaxRows {
+		// A decode step is one submit: 22 ms, and the fence waits between
+		// six were 0.4 of it (TestSubmitSplit, MUSIC.md A10).
+		per = len(g.w)
+	}
 	for i := 0; i < len(g.w); i += per {
 		var d []vk.MultiDispatch
 		for j := i; j < min(i+per, len(g.w)); j++ {
@@ -714,10 +871,22 @@ func (g *GPU) layerGraph(i, n, chunks, chunkLen int) []vk.MultiDispatch {
 		gk = gemmFor(n)
 		tokPad = roundUp(n, gk.bm)
 	}
+	q8 := g.o.Bank == BankQ8
+	if q8 && n > MaxRows {
+		gk = q8For(n)
+		tokPad = roundUp(n, gk.bm)
+	}
 	proj := func(p proj, aOff uint32, lda int, cOff uint32) {
 		nOut, k := projShape[p][0], projShape[p][1]
 		if n <= MaxRows {
-			d = append(d, g.gemv(w.bank, gemvSlabs[p], aOff, lda, cOff, w.off[p], nOut, k, n)...)
+			d = append(d, g.gemv(w.bank, g.slabs(p), aOff, lda, cOff, w.off[p], nOut, k, n)...)
+			return
+		}
+		if q8 {
+			pc := gemvPush{xnOff: aOff, outOff: cOff, bOff: w.off[p], lda: uint32(lda),
+				gemmM: uint32(tokPad), gemmN: uint32(nOut), gemmK: uint32(k)}
+			d = append(d, vk.MultiDispatch{Pipeline: g.gemms[w.bank][gk.name], GroupsX: uint32(nOut / gk.bn),
+				GroupsY: uint32(tokPad / gk.bm), PushConstants: pc.bytes()})
 			return
 		}
 		pc := push{InOff: aOff, OutOff: cOff, BOff: w.off[p], GemmM: uint32(tokPad), GemmN: uint32(nOut),

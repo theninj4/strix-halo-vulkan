@@ -1057,7 +1057,8 @@ language, and in sample mode the `lyrics` and `genres` the LM wrote, there
 as soon as it has written them), `stage` is `sample`, `think`, `codes`,
 `dit`, `vae` or `write`, and
 `estimated_seconds` is redone from measured rates once the length is known.
-Three jobs submitted together on this machine:
+Three jobs submitted together on this machine (MUSIC.md A9, before A10's
+int8 LM halved its step):
 
 | request | LM chose | estimated | ran |
 |---|---|---|---|
@@ -1065,13 +1066,17 @@ Three jobs submitted together on this machine:
 | techno, instrumental, no duration | 233 s, 136 bpm, E♭ minor | 43 → 76 s | 78.7 s |
 | piano, `thinking: false`, 20 s | — | 1 s | 1.4 s |
 
+Since A10 (the LM's layers in int8, `-music-lm-fp16` for the control), a
+30 s folk song with lyrics runs in 9.6 s and a 3-minute techno track in
+34.9 s.
+
 **Everything is resident while it holds the swap slot, and one job runs at
-a time.** The pipeline holds ~21 GB, and staging it per request (~16-19 s)
+a time.** The pipeline holds ~18 GB, and staging it per request (~16-19 s)
 would be most of a request, so it stays staged between songs until image or
 video is asked for or `-swap-idle` passes; a job that has to wait for the
 load reports `stage: "load"`. **The
 device is not held for the song**: the job yields it after every LM step
-(~50 ms) and every DiT forward, so speech behind a song waits for one of
+(~25 ms) and every DiT forward, so speech behind a song waits for one of
 those. Measured with `-tts` beside it, a short speech request took 32 ms
 idle, 32–71 ms while the LM planned a 3-minute song, and 0.14–0.31 s during
 its DiT forwards.
