@@ -60,20 +60,23 @@ type GPU struct {
 	maxEnc    int // longest condition sequence
 
 	ditL, lyricL, timbreL []layerW
-	detokL                []layerW
+	detokL, poolL         []layerW
 	projIn, projOut       headW
 	condEmb, textProj     headW
 	lyricIn, timbreIn     headW
 	detokIn, detokOut     headW
+	tokIn                 headW // the tokenizer's two input projections, folded
 
 	// wbuf (fp32): rope tables, identity tables, the detokenizer's tables
-	// (position = row mod 5), q/k norm weights.
+	// (position = row mod 5) and the tokenizer's pooler's (row mod 6), q/k
+	// norm weights.
 	wCos, wSin, wCosID, wSinID uint32
 	wCosG, wSinG               uint32
+	wCosP, wSinP               uint32
 	// abuf (fp32): residual, scratch, per-step modulation, encoder norms.
 	aX, aS, aMod, aTail, aZeros, aOnes uint32
 	aProjInB, aLyricB, aTimbreB        uint32
-	aDetokNorm                         uint32
+	aDetokNorm, aPoolNorm              uint32
 	actElems                           int
 	// hbuf (fp16): planes, A operands, the cross planes.
 	hQ, hK, hV, hA, hCtx, hFFN, hIn uint32
@@ -306,12 +309,14 @@ func (g *GPU) stage(set *safetensors.Set) error {
 	g.timbreIn = head(g.enc.H, c.TimbreDim)
 	g.detokIn = head(g.enc.H, g.enc.H)
 	g.detokOut = head(c.Latent, g.enc.H)
+	g.tokIn = head(g.enc.H, c.Latent)
 
 	ropeHalf := headDim / 2
 	g.wCos, g.wSin = 0, uint32(g.rows*ropeHalf)
 	g.wCosID, g.wSinID = uint32(2*g.rows*ropeHalf), uint32(3*g.rows*ropeHalf)
 	g.wCosG, g.wSinG = uint32(4*g.rows*ropeHalf), uint32(5*g.rows*ropeHalf)
-	w32 := 6 * g.rows * ropeHalf
+	g.wCosP, g.wSinP = uint32(6*g.rows*ropeHalf), uint32(7*g.rows*ropeHalf)
+	w32 := 8 * g.rows * ropeHalf
 	newLayer := func(d dims, i int, cross bool) layerW {
 		w := layerW{off: map[proj]uint32{}, window: c.Windowed(i)}
 		ps := selfProjs
@@ -352,6 +357,11 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		w.window, w.group = false, c.PoolWindow
 		g.detokL = append(g.detokL, w)
 	}
+	for i := 0; i < c.DetokLayers; i++ {
+		w := newLayer(g.enc, i, false)
+		w.window, w.group = false, c.PoolWindow+1
+		g.poolL = append(g.poolL, w)
+	}
 
 	var err error
 	if g.wbuf, err = g.dev.NewBuffer(w32 * 4); err != nil {
@@ -383,15 +393,21 @@ func (g *GPU) stage(set *safetensors.Set) error {
 	g.wbuf.WriteFloat32At(int(g.wSin), sin)
 	g.wbuf.WriteFloat32At(int(g.wCosID), ones)
 	g.wbuf.ZeroFloat32At(int(g.wSinID), g.rows*ropeHalf)
-	// Position row mod PoolWindow: every detokenizer group starts at 0.
-	cosG, sinG := make([]float32, g.rows*ropeHalf), make([]float32, g.rows*ropeHalf)
-	for r := 0; r < g.rows; r++ {
-		p := r % c.PoolWindow
-		copy(cosG[r*ropeHalf:(r+1)*ropeHalf], cos[p*ropeHalf:(p+1)*ropeHalf])
-		copy(sinG[r*ropeHalf:(r+1)*ropeHalf], sin[p*ropeHalf:(p+1)*ropeHalf])
+	// Position row mod the group: every detokenizer group (5 rows) and
+	// every pooler group (a CLS row and 5) starts at 0.
+	for _, gt := range []struct {
+		n        int
+		cos, sin uint32
+	}{{c.PoolWindow, g.wCosG, g.wSinG}, {c.PoolWindow + 1, g.wCosP, g.wSinP}} {
+		cosG, sinG := make([]float32, g.rows*ropeHalf), make([]float32, g.rows*ropeHalf)
+		for r := 0; r < g.rows; r++ {
+			p := r % gt.n
+			copy(cosG[r*ropeHalf:(r+1)*ropeHalf], cos[p*ropeHalf:(p+1)*ropeHalf])
+			copy(sinG[r*ropeHalf:(r+1)*ropeHalf], sin[p*ropeHalf:(p+1)*ropeHalf])
+		}
+		g.wbuf.WriteFloat32At(int(gt.cos), cosG)
+		g.wbuf.WriteFloat32At(int(gt.sin), sinG)
 	}
-	g.wbuf.WriteFloat32At(int(g.wCosG), cosG)
-	g.wbuf.WriteFloat32At(int(g.wSinG), sinG)
 
 	put := func(bank int, off uint32, w []float32, n, k int) {
 		buf := make([]uint16, n*k)
@@ -453,6 +469,31 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		}
 		put(hd.w.bank, hd.w.off, w, hd.w.n, hd.w.k)
 	}
+	// The tokenizer's audio_acoustic_proj (64 → 2048) and its pooler's
+	// embed_tokens (2048 → 2048) have nothing between them, so they are
+	// one [2048, 64] projection, folded in fp64 (the bias on the host).
+	{
+		H, L := g.enc.H, c.Latent
+		wp := l.f32("tokenizer.audio_acoustic_proj.weight", H, L)
+		we := l.f32("tokenizer.attention_pooler.embed_tokens.weight", H, H)
+		if l.err != nil {
+			return l.err
+		}
+		f := make([]float32, H*L)
+		parallel(H, func(o int) {
+			var acc [64]float64
+			for j := 0; j < H; j++ {
+				e := float64(we[o*H+j])
+				for i := 0; i < L; i++ {
+					acc[i] += e * float64(wp[j*L+i])
+				}
+			}
+			for i := 0; i < L; i++ {
+				f[o*L+i] = float32(acc[i])
+			}
+		})
+		put(g.tokIn.bank, g.tokIn.off, f, H, L)
+	}
 
 	stageLayer := func(w layerW, d dims, p string, cross bool) error {
 		ps := selfProjs
@@ -487,6 +528,11 @@ func (g *GPU) stage(set *safetensors.Set) error {
 	}
 	for i, w := range g.detokL {
 		if err := stageLayer(w, g.enc, fmt.Sprintf("detokenizer.layers.%d.", i), false); err != nil {
+			return err
+		}
+	}
+	for i, w := range g.poolL {
+		if err := stageLayer(w, g.enc, fmt.Sprintf("tokenizer.attention_pooler.layers.%d.", i), false); err != nil {
 			return err
 		}
 	}
@@ -529,6 +575,9 @@ func (g *GPU) allocActivations(set *safetensors.Set) error {
 		g.detokL[i].norm1, g.detokL[i].norm2 = alloc(g.enc.H), alloc(g.enc.H)
 	}
 	g.aDetokNorm = alloc(g.enc.H)
+	for i := range g.poolL {
+		g.poolL[i].norm1, g.poolL[i].norm2 = alloc(g.enc.H), alloc(g.enc.H)
+	}
 	for i := range g.ditL {
 		g.ditL[i].crossNorm = alloc(g.dit.H)
 	}
@@ -581,7 +630,7 @@ func (g *GPU) allocActivations(set *safetensors.Set) error {
 		ls []layerW
 		p  string
 	}{{g.lyricL, "encoder.lyric_encoder.layers.%d."}, {g.timbreL, "encoder.timbre_encoder.layers.%d."},
-		{g.detokL, "detokenizer.layers.%d."}} {
+		{g.detokL, "detokenizer.layers.%d."}, {g.poolL, "tokenizer.attention_pooler.layers.%d."}} {
 		for i, w := range st.ls {
 			p := fmt.Sprintf(st.p, i)
 			g.abuf.WriteFloat32At(int(w.norm1), l.f32(p+"input_layernorm.weight", g.enc.H))
@@ -831,8 +880,12 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 	nf := float64(n)
 
 	cos, sin := g.wCos, g.wSin
-	if w.group > 0 {
+	switch w.group {
+	case 0:
+	case g.cfg.PoolWindow:
 		cos, sin = g.wCosG, g.wSinG
+	default:
+		cos, sin = g.wCosP, g.wSinP
 	}
 	gr.norm(d, "attn in", n, v[0], v[1])
 	for _, p := range []struct {
@@ -1385,4 +1438,85 @@ func (g *GPU) DetokLayers(x *qwen.Mat, from, to int) (*qwen.Mat, error) {
 		return nil, err
 	}
 	return g.readX(x.Rows, g.enc.H), nil
+}
+
+// ---- the audio tokenizer (A11c) ----------------------------------------------
+
+// Tokenize turns 25 Hz latents [T, 64] (T a multiple of 5: upstream pads
+// with the silence latent first) into 5 Hz audio codes, as upstream's
+// tokenize does for a cover's source: audio_acoustic_proj and the pooler's
+// embed_tokens (one folded projection), a CLS row before every 5 latents,
+// the pooler's two layers over each 6-row group (the GROUP attention), the
+// final norm on the CLS rows, and the FSQ on the host. It also returns the
+// pooled rows (the FSQ's input, [T/5, 2048]) and each code's margin from a
+// quantisation boundary (plan.FSQIndex), for the gates.
+func (g *GPU) Tokenize(lat *qwen.Mat) (codes []int32, pooled *qwen.Mat, margins []float32, err error) {
+	c := g.cfg
+	h := g.Host
+	H, P := g.enc.H, c.PoolWindow
+	G := P + 1
+	if lat.Cols != c.Latent || lat.Rows == 0 || lat.Rows%P != 0 {
+		return nil, nil, nil, fmt.Errorf("dit: tokenizer input %v, want rows a multiple of %d", lat, P)
+	}
+	groups := lat.Rows / P
+	pooled = qwen.NewMat(groups, H)
+	codes = make([]int32, groups)
+	margins = make([]float32, groups)
+	chunk := g.rows / G
+	for c0 := 0; c0 < groups; c0 += chunk {
+		cs := min(chunk, groups-c0)
+		in := &qwen.Mat{Rows: cs * P, Cols: c.Latent, Data: lat.Data[c0*P*c.Latent : (c0+cs)*P*c.Latent]}
+		g.narrowRows(g.hIn, in, c.Latent+gemmPad)
+		gr := g.newGraph()
+		if err := gr.gemm(gemmBig, g.tokIn.bank, "gemm tok embed", g.hIn, g.aS, g.tokIn.off, cs*P, H, c.Latent, c.Latent+gemmPad); err != nil {
+			return nil, nil, nil, err
+		}
+		if _, err := gr.submit(); err != nil {
+			return nil, nil, nil, err
+		}
+		e := g.abuf.ReadFloat32At(int(g.aS), cs*P*H)
+		n := cs * G
+		x := make([]float32, n*H)
+		parallel(cs, func(i int) {
+			copy(x[i*G*H:], h.PoolSpecial)
+			for p := 0; p < P; p++ {
+				row := x[(i*G+1+p)*H : (i*G+2+p)*H]
+				src := e[(i*P+p)*H:]
+				for j := range row {
+					row[j] = src[j] + h.TokB[j]
+				}
+			}
+		})
+		g.abuf.WriteFloat32At(int(g.aX), x)
+		if err := gr.encoderLayers(g.poolL, n, 0, len(g.poolL)); err != nil {
+			return nil, nil, nil, err
+		}
+		if _, err := gr.submit(); err != nil {
+			return nil, nil, nil, err
+		}
+		all := g.abuf.ReadFloat32At(int(g.aX), n*H)
+		cls := qwen.NewMat(cs, H)
+		for i := 0; i < cs; i++ {
+			copy(cls.Row(i), all[i*G*H:(i*G+1)*H])
+		}
+		normed, err := h.PoolNorm.Apply(cls)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		copy(pooled.Data[c0*H:], normed.Data)
+		for i := 0; i < cs; i++ {
+			row := normed.Row(i)
+			var z [6]float32
+			for d := range z {
+				s := float64(h.FSQInB[d])
+				for j, v := range h.FSQInW[d*H : (d+1)*H] {
+					s += float64(v) * float64(row[j])
+				}
+				z[d] = float32(s)
+			}
+			idx, m := plan.FSQIndex(z)
+			codes[c0+i], margins[c0+i] = int32(idx), m
+		}
+	}
+	return codes, pooled, margins, nil
 }

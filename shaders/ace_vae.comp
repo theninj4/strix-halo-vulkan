@@ -20,7 +20,14 @@
 // into a dense [tokens, dim] block: the stereo pair out of the last
 // convolution's 32-wide tile, so a readback is 8 bytes a sample, not 128.
 //
-// Both are flat over the elements with C a power of two (pc.aux2 = log2 C),
+// SPLIT is SNAKE writing each value as two fp16s, hi (v cut to fp16's
+// mantissa) and lo = fp16(v − hi), into a row of 2C: hi in columns [0, C), lo in [C, 2C). A
+// convolution whose weights are duplicated across the two halves then sums
+// W·hi + W·lo = W·v to ~22 bits of v. The VAE encoder's first block needs
+// it (MUSIC.md A11a): its 48 kHz activations rounded to fp16 cost the
+// posterior 14 dB.
+//
+// All are flat over the elements with C a power of two (pc.aux2 = log2 C),
 // as kokoro_act.comp is: the decoder's widths are 64 to 2048.
 
 #include "dit_common.glsl"
@@ -29,6 +36,9 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 
 #ifndef PICK
 #define PICK 0
+#endif
+#ifndef SPLIT
+#define SPLIT 0
 #endif
 
 layout(local_size_x = 256) in;
@@ -56,6 +66,16 @@ void main() {
         float s = sin(wbuf[pc.wOff + c] * v);
         v += wbuf[pc.wOff + pc.dim + c] * (s * s);
     }
+#if SPLIT
+    // hi is v cut to fp16's 10 mantissa bits in fp32, so converting it is
+    // exact and v - hi is exact too; lo then keeps 11 more bits. (The
+    // obvious float16_t(v) and v - float(hi) is folded to lo = 0.)
+    float hv = uintBitsToFloat(floatBitsToUint(v) & 0xffffe000u);
+    uint o = pc.outOff + (t << (pc.aux2 + 1u)) + c;
+    hact[o] = float16_t(hv);
+    hact[o + pc.dim] = float16_t(v - hv);
+#else
     hact[pc.outOff + idx] = float16_t(v);
+#endif
 #endif
 }

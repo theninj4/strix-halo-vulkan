@@ -9,6 +9,9 @@
 //	go run ./cmd/ace -caption "calm piano" -lyrics "[Instrumental]" -duration 30 -bpm 70 -key "C major"
 //	go run ./cmd/ace -think=false -caption "..." -duration 30    # the DiT-only path (A6)
 //	go run ./cmd/ace -sample "a melancholy synthwave song about a neon city"   # sample mode (A12)
+//	go run ./cmd/ace -task cover -src song.mp3 -caption "acoustic folk" -lyrics-file song.txt -out folk.mp3   # A11
+//	go run ./cmd/ace -task repaint -src song.mp3 -start 10 -end 20 -caption "..." -out fixed.mp3
+//	go run ./cmd/ace -ref voice.flac -caption "..." -duration 60   # a reference's timbre, any task
 //
 // Lyrics use upstream's section tags ([Verse], [Chorus], [Instrumental]...).
 // Without -duration the LM chooses it (10-600 s); with -think=false it is
@@ -16,6 +19,12 @@
 // metas and lyrics from the description (upstream's sample mode); -caption
 // and -lyrics are then not given, and -duration, -bpm, -key and -timesig are
 // held in the song as it is written.
+//
+// The audio-in tasks (MUSIC.md A11) are the turbo model's: cover (the
+// source through the audio tokenizer as the DiT's source), cover-nofsq (its
+// latents as they are) and repaint (the span [-start, -end) regenerated,
+// the rest kept); they run without the LM, as upstream's do, and the song is
+// the source's length. -ref adds a reference audio's timbre to any request.
 package main
 
 import (
@@ -48,6 +57,16 @@ func main() {
 	sample := flag.String("sample", "", "sample mode: the LM writes the song from this description")
 	sampleMode := flag.Bool("sample-mode", false, "sample mode, and no phase-1 CoT for a meta the song lacks (upstream's sample_mode); alone, the LM picks the song")
 	out := flag.String("out", "ace.mp3", "output file: .wav, .flac, .mp3 or .opus")
+	task := flag.String("task", "text2music", "text2music, cover, cover-nofsq or repaint")
+	src := flag.String("src", "", "the source audio of a cover or repaint (any format ffmpeg reads)")
+	ref := flag.String("ref", "", "a reference audio whose timbre the song takes")
+	coverStrength := flag.Float64("cover-strength", 1, "audio_cover_strength: the share of steps conditioned on the source")
+	coverNoise := flag.Float64("cover-noise", 0, "cover_noise_strength: start this close to the source (0: from noise)")
+	start := flag.Float64("start", 0, "repaint span start, seconds (negative pads the front)")
+	end := flag.Float64("end", 0, "repaint span end, seconds (0: the source's end; past it pads)")
+	mode := flag.String("repaint-mode", "balanced", "conservative, balanced or aggressive")
+	strength := flag.Float64("repaint-strength", 0.5, "balanced mode's strength: 0 keeps the most of the source")
+	explicit := flag.Bool("explicit-mask", false, `chunk_mask_mode "explicit": the chunk mask is the span`)
 	flag.Parse()
 
 	text := *lyrics
@@ -72,6 +91,33 @@ func main() {
 	}
 	req := &plan.Request{Caption: *caption, Lyrics: text, BPM: *bpm, KeyScale: *key,
 		TimeSignature: *timesig, Duration: *duration, Language: *lang}
+	var audio *pipeline.Audio
+	if *task != pipeline.Text2Music || *ref != "" {
+		audio = pipeline.NewAudio(*task)
+		audio.CoverStrength, audio.CoverNoise = *coverStrength, *coverNoise
+		audio.RepaintStart, audio.RepaintEnd, audio.RepaintMode, audio.RepaintStrength = *start, *end, *mode, *strength
+		audio.ExplicitMask = *explicit
+		var err error
+		if *src != "" {
+			if audio.Source, err = pipeline.ReadAudio(*src); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if *ref != "" {
+			if audio.Reference, err = pipeline.ReadAudio(*ref); err != nil {
+				log.Fatal(err)
+			}
+		}
+		if err := audio.Check(); err != nil {
+			log.Fatal(err)
+		}
+		if *task != pipeline.Text2Music {
+			*think = false // upstream skips the LM for these tasks
+			if smp != nil {
+				log.Fatal("-sample writes a new song; it does not take a -task")
+			}
+		}
+	}
 
 	dev, err := backend.OpenDevice("ace")
 	if err != nil {
@@ -82,6 +128,9 @@ func main() {
 		ceiling := req.Seconds()
 		if (*think || smp != nil) && req.Duration <= 0 {
 			ceiling = plan.MaxSeconds // the LM chooses
+		}
+		if s := audio.Seconds(); s > 0 {
+			ceiling = s
 		}
 		p, err := pipeline.New(d, pipeline.DefaultDirs(*models), ceiling)
 		if err != nil {
@@ -97,7 +146,7 @@ func main() {
 				return err
 			}
 		}
-		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp})
+		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp, Audio: audio})
 		if err != nil {
 			return err
 		}

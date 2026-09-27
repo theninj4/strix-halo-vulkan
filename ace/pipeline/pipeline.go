@@ -79,7 +79,8 @@ type Pipeline struct {
 	Tok   *tokenizer.Tokenizer
 	DiT   *dit.GPU
 	VAE   *vae.GPU
-	table []float32 // the text encoder's embedding rows, for the lyrics
+	Enc   *vae.Encoder // the VAE encoder, over VAE's activations (A11)
+	table []float32    // the text encoder's embedding rows, for the lyrics
 	width int
 	// silence is silence_latent [15000, 64], time-major.
 	silence []float32
@@ -167,6 +168,10 @@ func New(dev *vk.Device, d Dirs, maxSeconds float64) (*Pipeline, error) {
 		p.Destroy()
 		return nil, err
 	}
+	if p.Enc, err = vae.NewEncoder(p.VAE, d.VAE); err != nil {
+		p.Destroy()
+		return nil, err
+	}
 	return p, nil
 }
 
@@ -174,6 +179,9 @@ func New(dev *vk.Device, d Dirs, maxSeconds float64) (*Pipeline, error) {
 func (p *Pipeline) Destroy() {
 	if p.lmGPU != nil {
 		p.lmGPU.Destroy()
+	}
+	if p.Enc != nil {
+		p.Enc.Destroy()
 	}
 	if p.VAE != nil {
 		p.VAE.Destroy()
@@ -244,6 +252,10 @@ type Options struct {
 	// take shift 3's table).
 	Shift     float64
 	Timesteps []float64
+	// Audio is the audio-in part (MUSIC.md A11): a reference's timbre, or a
+	// cover or repaint of a source. A task other than text2music runs the
+	// DiT-only path, as upstream skips the LM for it.
+	Audio *Audio
 
 	// Between, when set, runs between units of device work -- every LM
 	// step and every DiT forward, and before the decode: a server yields
@@ -309,6 +321,27 @@ func (p *Pipeline) Condition(r *plan.Request) (text, lyric *qwen.Mat, err error)
 func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 	start := time.Now()
 	res := &Result{}
+	if err := o.Audio.Check(); err != nil {
+		return nil, err
+	}
+	if o.Audio.needsSource() {
+		if o.Sample != nil {
+			return nil, fmt.Errorf("ace: sample mode writes a new song; it does not take a %s task", o.Audio.Task)
+		}
+		d, dp, err := p.taskPlan(r, o.Audio, o.Seed)
+		if err != nil {
+			return nil, err
+		}
+		if o.Planned != nil {
+			o.Planned(d, float64(dp.T*plan.Hop)/plan.SampleRate)
+		}
+		res.DiT = d
+		out, err := p.generate(d, o, dp, res)
+		if err == nil {
+			out.Timings.Total = time.Since(start)
+		}
+		return out, err
+	}
 	var rng *rand.Rand
 	if o.Think || o.Sample != nil {
 		if p.LM == nil {
@@ -336,7 +369,11 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 			o.Planned(r, float64(r.LatentLength()*plan.Hop)/plan.SampleRate)
 		}
 		res.DiT = r
-		out, err := p.generate(r, o, r.LatentLength(), nil, res)
+		dp, err := p.textPlan(o, r.LatentLength(), nil)
+		if err != nil {
+			return nil, err
+		}
+		out, err := p.generate(r, o, dp, res)
 		if err == nil {
 			out.Timings.Total = time.Since(start)
 		}
@@ -372,7 +409,11 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	out, err := p.generate(res.DiT, o, T, hints, res)
+	dp, err := p.textPlan(o, T, hints)
+	if err != nil {
+		return nil, err
+	}
+	out, err := p.generate(res.DiT, o, dp, res)
 	if err != nil {
 		return nil, err
 	}
@@ -486,43 +527,71 @@ func (p *Pipeline) Hints(codes []int, T int) ([]float32, error) {
 	return out, nil
 }
 
-// generate is the DiT and the VAE over T latents, from the silence or from
-// the LM's hints as the source.
-func (p *Pipeline) generate(r *plan.Request, o Options, T int, hints []float32, res *Result) (*Result, error) {
-	start := time.Now()
-	tm := res.Timings
-	text, lyric, err := p.Condition(r)
-	if err != nil {
-		return nil, err
-	}
-	tm.Text = time.Since(start)
-
-	t0 := time.Now()
-	timbre := &qwen.Mat{Rows: plan.TimbreLatents, Cols: plan.LatentChannels, Data: p.silence[:plan.TimbreLatents*plan.LatentChannels]}
-	enc, err := p.DiT.Encode(text, lyric, timbre)
-	if err != nil {
-		return nil, err
-	}
-	if err := p.DiT.Begin(enc); err != nil {
-		return nil, err
-	}
-	tm.Encode = time.Since(t0)
-
+// textPlan is text2music's DiT inputs: T latents over the silence, or the
+// LM's hints; the reference's timbre when there is one.
+func (p *Pipeline) textPlan(o Options, T int, hints []float32) (*ditPlan, error) {
 	if T*plan.LatentChannels > len(p.silence) {
 		return nil, fmt.Errorf("ace: %d latents is past the %d-latent silence", T, len(p.silence)/plan.LatentChannels)
 	}
-	src := p.silence
+	timbre, err := p.timbre(o.Audio, o.Seed)
+	if err != nil {
+		return nil, err
+	}
+	src := p.silence[:T*plan.LatentChannels]
 	if hints != nil {
 		src = hints
 	}
-	ctx := qwen.NewMat(T, 2*plan.LatentChannels)
-	for i := 0; i < T; i++ {
+	return &ditPlan{T: T, src: src, hidden: src, timbre: timbre}, nil
+}
+
+// context is the DiT's [T, 128] context: the source rows and the chunk
+// mask.
+func (dp *ditPlan) context(src []float32) *qwen.Mat {
+	ctx := qwen.NewMat(dp.T, 2*plan.LatentChannels)
+	for i := 0; i < dp.T; i++ {
 		row := ctx.Row(i)
 		copy(row, src[i*plan.LatentChannels:(i+1)*plan.LatentChannels])
+		m := float32(plan.ChunkMask)
+		if dp.mask != nil {
+			m = dp.mask[i]
+		}
 		for j := plan.LatentChannels; j < len(row); j++ {
-			row[j] = plan.ChunkMask
+			row[j] = m
 		}
 	}
+	return ctx
+}
+
+// condition encodes r's caption and lyrics with the timbre and hands the
+// packed sequence to the DiT (Begin), timing the text encoder and the rest.
+func (p *Pipeline) condition(r *plan.Request, timbre []float32) (textTook, encTook time.Duration, err error) {
+	t0 := time.Now()
+	text, lyric, err := p.Condition(r)
+	if err != nil {
+		return 0, 0, err
+	}
+	textTook = time.Since(t0)
+	t0 = time.Now()
+	tm := &qwen.Mat{Rows: len(timbre) / plan.LatentChannels, Cols: plan.LatentChannels, Data: timbre}
+	enc, err := p.DiT.Encode(text, lyric, tm)
+	if err != nil {
+		return 0, 0, err
+	}
+	err = p.DiT.Begin(enc)
+	return textTook, time.Since(t0), err
+}
+
+// generate is the DiT and the VAE over dp: generate_audio's sampling loop,
+// the decode, and upstream's post-decode steps.
+func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result) (*Result, error) {
+	start := time.Now()
+	tm := res.Timings
+	T := dp.T
+	var err error
+	if tm.Text, tm.Encode, err = p.condition(r, dp.timbre); err != nil {
+		return nil, err
+	}
+	ctx := dp.context(dp.src)
 	noise := o.Noise
 	if noise == nil {
 		if noise, err = h3vae.TorchRandn(o.Seed, T*plan.LatentChannels); err != nil {
@@ -533,26 +602,81 @@ func (p *Pipeline) generate(r *plan.Request, o Options, T int, hints []float32, 
 		return nil, fmt.Errorf("ace: %d noise values for %d latents", len(noise), T)
 	}
 
-	t0 = time.Now()
+	t0 := time.Now()
 	shift := o.Shift
 	if shift == 0 {
 		shift = plan.DefaultShift
 	}
 	sched := plan.Schedule(shift, o.Timesteps)
-	lat, err := plan.Sample(noise, sched, plan.DefaultDCW, func(x []float32, t float32) ([]float32, error) {
+	x0 := noise
+	if dp.coverNoise > 0 {
+		// Start from the source renoised to the schedule entry nearest
+		// 1 − strength, and drop the entries before it.
+		at := 0
+		for i, t := range sched {
+			if math.Abs(float64(t)-(1-dp.coverNoise)) < math.Abs(float64(sched[at])-(1-dp.coverNoise)) {
+				at = i
+			}
+		}
+		t := sched[at]
+		x0 = make([]float32, len(noise))
+		for i := range x0 {
+			x0[i] = float32(t*noise[i]) + float32((1-t)*dp.hidden[i])
+		}
+		sched = sched[at:]
+	}
+	steps := len(sched)
+	switchAt := steps
+	if dp.alt != nil {
+		switchAt = int(float64(steps) * dp.switchFrac)
+	}
+	var cutoff int
+	if dp.rp != nil {
+		cutoff = int(math.RoundToEven(dp.rp.ratio * float64(steps)))
+	}
+	done := 0
+	lat, err := plan.Sample(x0, sched, plan.DefaultDCW, func(x []float32, t float32) ([]float32, error) {
 		if err := o.between(); err != nil {
 			return nil, err
+		}
+		if done == switchAt {
+			// audio_cover_strength: the text2music condition over silence.
+			if _, _, err := p.condition(dp.alt, dp.timbre); err != nil {
+				return nil, err
+			}
+			ctx = dp.context(p.silence[:T*plan.LatentChannels])
 		}
 		v, took, err := p.DiT.Step(&qwen.Mat{Rows: T, Cols: plan.LatentChannels, Data: x}, ctx, t)
 		if err != nil {
 			return nil, err
 		}
+		done++
 		tm.Steps = append(tm.Steps, took)
 		o.progress("dit", len(tm.Steps), len(sched))
 		return v.Data, nil
-	}, o.Step)
+	}, func(i int, x []float32) {
+		if rp := dp.rp; rp != nil && i < cutoff && i < steps-1 {
+			// _repaint_step_injection: outside the span, the source noised
+			// to the next entry.
+			tn := sched[i+1]
+			for f, in := range rp.span {
+				if in {
+					continue
+				}
+				for c := f * plan.LatentChannels; c < (f+1)*plan.LatentChannels; c++ {
+					x[c] = float32(tn*noise[c]) + float32((1-tn)*rp.clean[c])
+				}
+			}
+		}
+		if o.Step != nil {
+			o.Step(i, x)
+		}
+	})
 	if err != nil {
 		return nil, err
+	}
+	if dp.rp != nil && dp.rp.cfFrames > 0 {
+		dp.rp.blendEdges(lat)
 	}
 	tm.DiT = time.Since(t0)
 
@@ -564,6 +688,10 @@ func (p *Pipeline) generate(r *plan.Request, o Options, T int, hints []float32, 
 	wav, _, err := p.VAE.Decode(lat)
 	if err != nil {
 		return nil, err
+	}
+	if dp.rp != nil && dp.rp.splice {
+		vae.ClampPeak(wav)
+		dp.rp.spliceWave(wav)
 	}
 	vae.Normalize(wav, -1)
 	tm.VAE = time.Since(t0)

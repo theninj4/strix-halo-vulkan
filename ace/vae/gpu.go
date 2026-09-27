@@ -411,11 +411,12 @@ func (g *GPU) build() error {
 		return g.dev.NewPipeline(mod, spec)
 	}
 	for name, spirv := range map[string][]byte{
-		"snake":    shaders.ACEVAESnake,
-		"pick":     shaders.ACEVAEPick,
-		"upadd":    shaders.KokoroUpAdd,
-		"residual": shaders.KokoroResidual,
-		"copy":     shaders.KokoroCopy,
+		"snake":       shaders.ACEVAESnake,
+		"snake split": shaders.ACEVAESnakeSplit,
+		"pick":        shaders.ACEVAEPick,
+		"upadd":       shaders.KokoroUpAdd,
+		"residual":    shaders.KokoroResidual,
+		"copy":        shaders.KokoroCopy,
 	} {
 		p, err := newPipe(spirv, vk.PipelineSpec{Buffers: base, PushConstantSize: pcSize})
 		if err != nil {
@@ -604,11 +605,9 @@ func (g *GPU) Profile(n int) ([]Stage, error) {
 	return out, nil
 }
 
-// Normalize is what upstream does to a decode before writing it: divide by
-// the peak when it passes 1 (generate_music_decode), then scale the peak to
-// db dBFS (audio_utils.normalize_audio, -1 by default), leaving
-// near-silence (peak < 1e-6) alone.
-func Normalize(wav []float32, db float64) {
+// ClampPeak is the first half of Normalize, generate_music_decode's: divide
+// by the peak when it passes 1. A repaint splices its source in after it.
+func ClampPeak(wav []float32) float32 {
 	var peak float32
 	for _, v := range wav {
 		peak = max(peak, float32(math.Abs(float64(v))))
@@ -619,6 +618,15 @@ func Normalize(wav []float32, db float64) {
 		}
 		peak = 1
 	}
+	return peak
+}
+
+// Normalize is what upstream does to a decode before writing it: divide by
+// the peak when it passes 1 (generate_music_decode), then scale the peak to
+// db dBFS (audio_utils.normalize_audio, -1 by default), leaving
+// near-silence (peak < 1e-6) alone.
+func Normalize(wav []float32, db float64) {
+	peak := ClampPeak(wav)
 	if peak < 1e-6 {
 		return
 	}

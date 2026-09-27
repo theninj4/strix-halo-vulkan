@@ -63,6 +63,14 @@ type Host struct {
 	DetokEmbedB  []float32
 	DetokSpecial []float32
 	DetokProjB   []float32
+	// The audio tokenizer's host pieces (A11c): the folded input bias
+	// (embed_tokens·proj bias + embed_tokens bias), the pooler's CLS row
+	// and final norm, and the FSQ project_in ([6, 2048] and bias).
+	TokB        []float32
+	PoolSpecial []float32
+	PoolNorm    *qwen.RMSNorm
+	FSQInW      []float32
+	FSQInB      []float32
 }
 
 // loader reads named tensors as float32, holding the first error.
@@ -134,6 +142,28 @@ func LoadHost(set *safetensors.Set, c *Config) (*Host, error) {
 		DetokEmbedB:  l.f32("detokenizer.embed_tokens.bias", c.EncHidden),
 		DetokSpecial: l.f32("detokenizer.special_tokens", c.PoolWindow, c.EncHidden),
 		DetokProjB:   l.f32("detokenizer.proj_out.bias", c.Latent),
+		PoolSpecial:  l.f32("tokenizer.attention_pooler.special_token", c.EncHidden),
+		PoolNorm:     &qwen.RMSNorm{Weight: l.f32("tokenizer.attention_pooler.norm.weight", c.EncHidden), Eps: c.Eps},
+		FSQInW:       l.f32("tokenizer.quantizer.project_in.weight", 6, c.EncHidden),
+		FSQInB:       l.f32("tokenizer.quantizer.project_in.bias", 6),
+	}
+	// The folded input bias: embed_tokens(audio_acoustic_proj.bias) +
+	// embed_tokens.bias, in fp64.
+	{
+		H := c.EncHidden
+		we := l.f32("tokenizer.attention_pooler.embed_tokens.weight", H, H)
+		be := l.f32("tokenizer.attention_pooler.embed_tokens.bias", H)
+		bp := l.f32("tokenizer.audio_acoustic_proj.bias", H)
+		if l.err == nil {
+			h.TokB = make([]float32, H)
+			for o := 0; o < H; o++ {
+				s := float64(be[o])
+				for j := 0; j < H; j++ {
+					s += float64(we[o*H+j]) * float64(bp[j])
+				}
+				h.TokB[o] = float32(s)
+			}
+		}
 	}
 	for i := 0; i < c.Layers; i++ {
 		p := fmt.Sprintf("decoder.layers.%d.", i)

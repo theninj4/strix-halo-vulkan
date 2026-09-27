@@ -18,8 +18,14 @@ package api
 // The request reads ACE-Step's own API (`POST /release_task`, docs/en/API.md
 // upstream): its field names and their aliases, flat or in a nested
 // `metas`/`metadata`/`user_metadata` object, as JSON or a form. What that API
-// offers and this server does not run -- other tasks, reference audio,
-// batches, format mode -- is a 400 naming the field, never ignored.
+// offers and this server does not run -- the base model's tasks, batches,
+// format mode -- is a 400 naming the field, never ignored.
+//
+// Audio in (MUSIC.md A11) is upstream's multipart upload: `src_audio` (or
+// `ctx_audio`) is a cover's or a repaint's source, `reference_audio` (or
+// `ref_audio`) a timbre reference for any task, in any format ffmpeg reads.
+// Upstream's `src_audio_path` and `reference_audio_path` name files on the
+// server; this server reads none, so they are a 400 that says to upload.
 //
 // Sample mode (`sample_query`, or `sample_mode` alone for a song of the
 // LM's choosing; MUSIC.md A12) has the LM write the caption, metas and
@@ -36,6 +42,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -91,7 +98,29 @@ type MusicRequest struct {
 	Timesteps []float64
 	// The LM's sampling, nil for upstream's (0.85, 2.0, 0.9).
 	LMTemperature, LMCFGScale, LMTopP *float64
+
+	// Task is the audio-in task (MUSIC.md A11): "text2music", or cover,
+	// cover-nofsq and repaint, which read SourceAudio and skip the LM.
+	Task string
+	// SourceAudio and ReferenceAudio are uploaded files as sent; the
+	// backend decodes them.
+	SourceAudio, ReferenceAudio []byte
+	// A cover's audio_cover_strength (nil: 1) and cover_noise_strength.
+	CoverStrength *float64
+	CoverNoise    float64
+	// A repaint's span in seconds (an end ≤ 0 is the source's end), its
+	// mode and strength (nil: 0.5), and chunk_mask_mode "explicit".
+	RepaintStart, RepaintEnd float64
+	RepaintMode              string
+	RepaintStrength          *float64
+	ExplicitMask             bool
 }
+
+// Music tasks the turbo model runs (upstream's TASK_TYPES_TURBO).
+var musicTasks = map[string]bool{"text2music": true, "cover": true, "cover-nofsq": true, "repaint": true}
+
+// musicSourceTask reports whether a task reads a source.
+func musicSourceTask(task string) bool { return task != "" && task != "text2music" }
 
 // MusicPlan is what a request resolves to at submit time.
 type MusicPlan struct {
@@ -163,6 +192,7 @@ type MusicJob struct {
 
 	Caption  string `json:"caption"`
 	Lyrics   string `json:"lyrics"`
+	Task     string `json:"task_type"`
 	Thinking bool   `json:"thinking"`
 	// SampleQuery is sample mode's description; Sample says it ran (a
 	// query, or sample_mode with none).
@@ -284,7 +314,7 @@ func (q *MusicJobs) Submit(req *MusicRequest) (MusicJob, error) {
 	}
 	j := &musicJob{req: req, plan: plan, MusicJob: MusicJob{
 		ID: newMusicID(), Object: "music", Model: model, Status: MusicQueued,
-		CreatedAt: time.Now().Unix(), Caption: req.Caption, Lyrics: req.Lyrics, Thinking: req.Thinking,
+		CreatedAt: time.Now().Unix(), Caption: req.Caption, Lyrics: req.Lyrics, Thinking: req.Thinking, Task: req.Task,
 		Sample: req.Sample, SampleQuery: req.SampleQuery,
 		Format: plan.Format, Seed: plan.Seed, LMSeed: plan.LMSeed, Steps: plan.Steps,
 		Estimated: plan.Estimate.Round(time.Second).Seconds(),
@@ -542,14 +572,19 @@ func (f musicFields) boolean(names ...string) (bool, bool, error) {
 	return b, true, nil
 }
 
-// readMusicFields reads a JSON body or a form into fields.
-func readMusicFields(ctx context.Context, w http.ResponseWriter, r *http.Request) (musicFields, bool) {
+// musicFiles are the multipart file fields the create request reads, by
+// upstream's names: the source and the reference.
+var musicFiles = map[string]string{"src_audio": "src", "ctx_audio": "src", "reference_audio": "ref", "ref_audio": "ref"}
+
+// readMusicFields reads a JSON body or a form into fields, and a form's
+// audio uploads (musicFiles) into files by role.
+func readMusicFields(ctx context.Context, w http.ResponseWriter, r *http.Request) (musicFields, map[string][]byte, bool) {
 	mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	f := musicFields{}
 	if mt != "multipart/form-data" && mt != "application/x-www-form-urlencoded" {
 		var top map[string]json.RawMessage
 		if !decodeJSON(ctx, w, r, &top) {
-			return nil, false
+			return nil, nil, false
 		}
 		for _, n := range musicNested {
 			var inner map[string]json.RawMessage
@@ -562,19 +597,46 @@ func readMusicFields(ctx context.Context, w http.ResponseWriter, r *http.Request
 		for k, v := range top {
 			f[k] = v
 		}
-		return f, true
+		return f, nil, true
 	}
 	if err := r.ParseMultipartForm(32 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
 		if tooLarge(ctx, w, err) {
-			return nil, false
+			return nil, nil, false
 		}
 		badRequest(ctx, w, "malformed form: "+err.Error())
-		return nil, false
+		return nil, nil, false
 	}
+	files := map[string][]byte{}
 	if r.MultipartForm != nil {
-		for name := range r.MultipartForm.File {
-			badRequest(ctx, w, fmt.Sprintf("file %q: this server takes no audio files; text2music is served", name))
-			return nil, false
+		for name, fhs := range r.MultipartForm.File {
+			role, ok := musicFiles[name]
+			if !ok {
+				badRequest(ctx, w, fmt.Sprintf("file %q: the audio fields are src_audio (or ctx_audio) and reference_audio (or ref_audio)", name))
+				return nil, nil, false
+			}
+			if len(fhs) != 1 || files[role] != nil {
+				badRequest(ctx, w, fmt.Sprintf("file %q: one file a role", name))
+				return nil, nil, false
+			}
+			fh, err := fhs[0].Open()
+			if err != nil {
+				badRequest(ctx, w, fmt.Sprintf("file %q: %v", name, err))
+				return nil, nil, false
+			}
+			data, err := io.ReadAll(fh)
+			fh.Close()
+			if err != nil {
+				if tooLarge(ctx, w, err) {
+					return nil, nil, false
+				}
+				badRequest(ctx, w, fmt.Sprintf("file %q: %v", name, err))
+				return nil, nil, false
+			}
+			if len(data) == 0 {
+				badRequest(ctx, w, fmt.Sprintf("file %q is empty", name))
+				return nil, nil, false
+			}
+			files[role] = data
 		}
 	}
 	for k, vs := range r.Form {
@@ -591,7 +653,7 @@ func readMusicFields(ctx context.Context, w http.ResponseWriter, r *http.Request
 		}
 		f[k] = raw
 	}
-	return f, true
+	return f, files, true
 }
 
 // musicRefused are release_task fields this server does not run, with why.
@@ -601,11 +663,17 @@ var musicRefused = []struct {
 	ok    func(v json.RawMessage) bool
 	why   string
 }{
-	{[]string{"task_type", "taskType"}, isOneOf("text2music"), "only text2music is served (cover, repaint, lego, extract and complete are not)"},
+	{[]string{"task_type", "taskType"}, isOneOf("text2music", "cover", "cover-nofsq", "repaint"), "lego, extract and complete are the base model's tasks; this is turbo (text2music, cover, cover-nofsq, repaint)"},
 	{[]string{"batch_size", "batchSize"}, isOneOf("1"), "one song a job; submit one job per song"},
 	{[]string{"use_format", "useFormat", "format"}, isOneOf("false"), "format mode is not served"},
 	{[]string{"audio_code_string", "audioCodeString"}, isOneOf(""), "audio codes in are not served; thinking writes them"},
-	{[]string{"reference_audio_path", "src_audio_path", "reference_audio", "src_audio"}, isOneOf(""), "no reference or source audio: text2music is served"},
+	{[]string{"reference_audio_path", "src_audio_path", "reference_audio", "src_audio", "ref_audio", "ctx_audio"}, isOneOf(""),
+		"this server reads no files of its own: upload the audio as a multipart file field (src_audio, reference_audio)"},
+	{[]string{"instruction"}, isOneOf("", "Fill the audio semantic mask based on the given conditions:"), "the instruction is the task's own; set task_type"},
+	{[]string{"repaint_latent_crossfade_frames"}, isOneOf("10"), "upstream sets the crossfades from repaint_mode and repaint_strength, whatever this says"},
+	{[]string{"repaint_wav_crossfade_sec"}, isOneOf("0"), "upstream sets the crossfades from repaint_mode and repaint_strength, whatever this says"},
+	{[]string{"retake_variance"}, isOneOf("0"), "retake is not served"},
+	{[]string{"flow_edit_morph"}, isOneOf("false"), "flow-edit morph is not served"},
 	{[]string{"infer_method", "inferMethod"}, isOneOf("ode"), "only the ODE (Euler) sampler is served"},
 	{[]string{"lm_top_k", "lmTopK"}, isOneOf("0"), "top-k is not served (upstream's default is off)"},
 	{[]string{"lm_repetition_penalty", "lmRepetitionPenalty"}, isOneOf("1"), "a repetition penalty is not served (upstream's default is 1)"},
@@ -640,8 +708,8 @@ func isOneOf(vals ...string) func(json.RawMessage) bool {
 	}
 }
 
-// toMusicRequest reads the fields into a request.
-func (f musicFields) toMusicRequest() (*MusicRequest, error) {
+// toMusicRequest reads the fields and the uploads into a request.
+func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, error) {
 	for _, r := range musicRefused {
 		if v, n, ok := f.get(r.names...); ok && !r.ok(v) {
 			return nil, fmt.Errorf("%s: %s", n, r.why)
@@ -665,6 +733,16 @@ func (f musicFields) toMusicRequest() (*MusicRequest, error) {
 		return nil, err
 	}
 	r.Sample = r.SampleMode || strings.TrimSpace(r.SampleQuery) != ""
+	if r.Task, err = f.str("task_type", "taskType"); err != nil {
+		return nil, err
+	}
+	if r.Task == "" {
+		r.Task = "text2music"
+	}
+	r.SourceAudio, r.ReferenceAudio = files["src"], files["ref"]
+	if err := f.readTask(r); err != nil {
+		return nil, err
+	}
 	switch {
 	case r.Sample && (strings.TrimSpace(r.Caption) != "" || strings.TrimSpace(r.Lyrics) != ""):
 		return nil, errors.New("sample mode writes the caption and lyrics itself: send sample_query without them, or them without it")
@@ -676,11 +754,19 @@ func (f musicFields) toMusicRequest() (*MusicRequest, error) {
 	} else if ok {
 		r.Thinking = b
 	}
+	if musicSourceTask(r.Task) {
+		// Upstream skips the LM for these tasks whatever thinking says
+		// (DIRECT_CONDITIONING_TASKS): the source is the plan.
+		r.Thinking = false
+	}
 	if r.Duration, _, err = f.num("audio_duration", "duration", "target_duration", "audioDuration"); err != nil {
 		return nil, err
 	}
 	if r.Duration < 0 {
 		r.Duration = 0 // upstream's -1: unset
+	}
+	if r.Duration > 0 && musicSourceTask(r.Task) {
+		return nil, fmt.Errorf("audio_duration: a %s is as long as its source (upstream ignores the field)", r.Task)
 	}
 	bpm, _, err := f.num("bpm")
 	if err != nil {
@@ -776,17 +862,95 @@ func (f musicFields) toMusicRequest() (*MusicRequest, error) {
 	return r, nil
 }
 
+// readTask reads the audio-in task's fields (MUSIC.md A11) and refuses
+// what the task would not use: upstream drops a cover's strengths on
+// text2music and a repaint's span elsewhere, silently.
+func (f musicFields) readTask(r *MusicRequest) error {
+	source := musicSourceTask(r.Task)
+	switch {
+	case !musicTasks[r.Task]:
+		return fmt.Errorf("task_type %q: text2music, cover, cover-nofsq or repaint", r.Task)
+	case source && r.SourceAudio == nil:
+		return fmt.Errorf("task_type %s needs the source audio uploaded as src_audio", r.Task)
+	case !source && r.SourceAudio != nil:
+		return errors.New("src_audio: text2music reads no source (upstream ignores it); set task_type to cover, cover-nofsq or repaint")
+	case source && r.Sample:
+		return fmt.Errorf("sample mode writes a new song; it does not take task_type %s", r.Task)
+	}
+	var err error
+	num := func(dst *float64, lo, hi float64, names ...string) (bool, error) {
+		v, ok, err := f.num(names...)
+		if err != nil || !ok {
+			return false, err
+		}
+		if v < lo || v > hi {
+			return false, fmt.Errorf("%s %v is outside [%v, %v]", names[0], v, lo, hi)
+		}
+		*dst = v
+		return true, nil
+	}
+	var cs, rs float64
+	if ok, err := num(&cs, 0, 1, "audio_cover_strength", "audioCoverStrength"); err != nil {
+		return err
+	} else if ok {
+		r.CoverStrength = &cs
+	}
+	if _, err := num(&r.CoverNoise, 0, 1, "cover_noise_strength", "coverNoiseStrength"); err != nil {
+		return err
+	}
+	if !source && ((r.CoverStrength != nil && *r.CoverStrength != 1) || r.CoverNoise != 0) {
+		return errors.New("audio_cover_strength and cover_noise_strength shape a cover or a repaint; text2music has no source for them")
+	}
+	if _, err := num(&r.RepaintStart, -plan600, plan600, "repainting_start", "repaintingStart"); err != nil {
+		return err
+	}
+	if _, err := num(&r.RepaintEnd, -1, plan600, "repainting_end", "repaintingEnd"); err != nil {
+		return err
+	}
+	if r.RepaintMode, err = f.str("repaint_mode", "repaintMode"); err != nil {
+		return err
+	}
+	switch r.RepaintMode {
+	case "", "balanced", "conservative", "aggressive":
+	default:
+		return fmt.Errorf("repaint_mode %q: conservative, balanced or aggressive", r.RepaintMode)
+	}
+	if ok, err := num(&rs, 0, 1, "repaint_strength", "repaintStrength"); err != nil {
+		return err
+	} else if ok {
+		r.RepaintStrength = &rs
+	}
+	mode, err := f.str("chunk_mask_mode", "chunkMaskMode")
+	if err != nil {
+		return err
+	}
+	switch mode {
+	case "", "auto":
+	case "explicit":
+		r.ExplicitMask = true
+	default:
+		return fmt.Errorf("chunk_mask_mode %q: auto or explicit", mode)
+	}
+	if r.Task != "repaint" && (r.RepaintStart != 0 || r.RepaintEnd > 0 || r.RepaintMode != "" || r.RepaintStrength != nil || r.ExplicitMask) {
+		return fmt.Errorf("the repaint fields (repainting_start/end, repaint_mode, repaint_strength, chunk_mask_mode) shape a repaint, not a %s", r.Task)
+	}
+	return nil
+}
+
+// plan600 bounds a repaint span's seconds: upstream's 10-minute ceiling.
+const plan600 = 600
+
 func (s *Server) handleMusicCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if s.Music == nil {
 		notLoaded(ctx, w, "the music model", "-music")
 		return
 	}
-	f, ok := readMusicFields(ctx, w, r)
+	f, files, ok := readMusicFields(ctx, w, r)
 	if !ok {
 		return
 	}
-	req, err := f.toMusicRequest()
+	req, err := f.toMusicRequest(files)
 	if err != nil {
 		badRequest(ctx, w, err.Error())
 		return
@@ -799,8 +963,8 @@ func (s *Server) handleMusicCreate(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		backendError(ctx, w, "music", err)
 	default:
-		logf(ctx, "music %s queued: thinking %v, sample %v, %s, seed %d, ~%v", job.ID, job.Thinking, job.Sample,
-			job.Format, job.Seed, time.Duration(job.Estimated)*time.Second)
+		logf(ctx, "music %s queued: %s, thinking %v, sample %v, reference %v, %s, seed %d, ~%v", job.ID, job.Task, job.Thinking,
+			job.Sample, req.ReferenceAudio != nil, job.Format, job.Seed, time.Duration(job.Estimated)*time.Second)
 		writeJSON(w, http.StatusOK, job)
 	}
 }

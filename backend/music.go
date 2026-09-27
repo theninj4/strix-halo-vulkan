@@ -224,7 +224,22 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	if v := req.LMTopP; v != nil && (*v <= 0 || *v > 1) {
 		return nil, unsupported("lm_top_p %g is outside (0, 1]", *v)
 	}
+	// Audio in (MUSIC.md A11): decoded here to be checked and measured,
+	// and again when the job runs.
+	audio, err := musicAudio(req)
+	if err != nil {
+		return nil, err
+	}
 	p := &api.MusicPlan{Format: format, Steps: len(plan.Schedule(cmpOr(req.Shift, plan.DefaultShift), req.Timesteps))}
+	if audio != nil && audio.Task != pipeline.Text2Music {
+		p.Seconds = audio.Seconds()
+		if p.Seconds > plan.MaxSeconds {
+			return nil, unsupported("the %s would be %.0f s, past the %d s ceiling", audio.Task, p.Seconds, plan.MaxSeconds)
+		}
+		if cs := p.Seconds; cs < 1 {
+			return nil, unsupported("the source audio is %.2f s; a latent is 0.04 s and upstream pads to 5.12 s, but this is too short to hear", cs)
+		}
+	}
 	// Drawn seeds are 32-bit, as upstream draws them: a client in
 	// JavaScript reads a JSON number past 2^53 wrong, and could not replay
 	// the song it was given the seed of.
@@ -239,6 +254,7 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	}
 	r := musicRequest(req)
 	switch {
+	case p.Seconds > 0:
 	case req.Duration > 0:
 		p.Seconds = float64(musicLatents(r, req.Thinking)*plan.Hop) / plan.SampleRate
 	case !req.Thinking:
@@ -258,8 +274,46 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 				need, secs, b.lmOpt.MaxLen)
 		}
 	}
-	p.Estimate = musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120), b.lmOpt.Bank).total()
+	c := musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120), b.lmOpt.Bank)
+	c.encode = encodeCost(audio)
+	p.Estimate = c.total()
 	return p, nil
+}
+
+// musicAudio decodes a request's uploads into the pipeline's audio-in
+// options, or nil for plain text2music. An unreadable or silent file is
+// the client's.
+func musicAudio(req *api.MusicRequest) (*pipeline.Audio, error) {
+	if req.Task == "" || (req.Task == pipeline.Text2Music && req.ReferenceAudio == nil) {
+		return nil, nil
+	}
+	a := pipeline.NewAudio(req.Task)
+	var err error
+	if req.SourceAudio != nil {
+		if a.Source, err = pipeline.ReadAudioBytes(req.SourceAudio); err != nil {
+			return nil, unsupported("src_audio: %v", err)
+		}
+		if len(a.Source)/2 < plan.Hop {
+			return nil, unsupported("src_audio is shorter than one latent (%d samples)", plan.Hop)
+		}
+	}
+	if req.ReferenceAudio != nil {
+		if a.Reference, err = pipeline.ReadAudioBytes(req.ReferenceAudio); err != nil {
+			return nil, unsupported("reference_audio: %v", err)
+		}
+	}
+	if req.CoverStrength != nil {
+		a.CoverStrength = *req.CoverStrength
+	}
+	a.CoverNoise = req.CoverNoise
+	a.RepaintStart, a.RepaintEnd, a.RepaintMode, a.ExplicitMask = req.RepaintStart, req.RepaintEnd, req.RepaintMode, req.ExplicitMask
+	if req.RepaintStrength != nil {
+		a.RepaintStrength = *req.RepaintStrength
+	}
+	if err := a.Check(); err != nil {
+		return nil, unsupported("%v", err)
+	}
+	return a, nil
 }
 
 func cmpOr(a, b float64) float64 {
@@ -289,13 +343,13 @@ func musicLatents(r *plan.Request, thinking bool) int {
 // a song's lyrics), and the song it writes usually has every meta, so
 // phase 1 is then skipped.
 type musicCost struct {
-	sample, think, codes, dit, vae, write time.Duration
+	sample, think, codes, encode, dit, vae, write time.Duration
 }
 
 const sampleSteps = 450
 
 func (c musicCost) total() time.Duration {
-	return c.sample + c.think + c.codes + c.dit + c.vae + c.write
+	return c.sample + c.think + c.codes + c.encode + c.dit + c.vae + c.write
 }
 
 func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank lm.Bank) musicCost {
@@ -325,7 +379,12 @@ func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank
 func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *api.MusicPlan, dst string, progress func(api.MusicProgress)) error {
 	r := musicRequest(req)
 	secs := cmpOr(mp.Seconds, 120)
+	audio, err := musicAudio(req)
+	if err != nil {
+		return err
+	}
 	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank)
+	c.encode = encodeCost(audio)
 	var sampling *lm.Sampling
 	if req.LMTemperature != nil || req.LMCFGScale != nil || req.LMTopP != nil {
 		s := lm.DefaultSampling
@@ -356,9 +415,9 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 		case "codes":
 			return (c.sample+c.think).Seconds()/t + part(c.codes, done, total)/t
 		case "dit":
-			return (c.sample+c.think+c.codes).Seconds()/t + part(c.dit, done, total)/t
+			return (c.sample+c.think+c.codes+c.encode).Seconds()/t + part(c.dit, done, total)/t
 		case "vae":
-			return (c.sample + c.think + c.codes + c.dit).Seconds() / t
+			return (c.sample + c.think + c.codes + c.encode + c.dit).Seconds() / t
 		}
 		return 0
 	}
@@ -380,7 +439,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 		var err error
 		res, err = b.pipe.Generate(r, pipeline.Options{
 			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling, Sample: smp,
-			Shift: req.Shift, Timesteps: req.Timesteps,
+			Shift: req.Shift, Timesteps: req.Timesteps, Audio: audio,
 			Between: func() error {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -401,9 +460,9 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 			Planned: func(d *plan.Request, seconds float64) {
 				// The plan fixes the length, so the estimate is redone
 				// around it; what is spent is kept.
-				spent, sampled := c.think, c.sample
+				spent, sampled, enc := c.think, c.sample, c.encode
 				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank)
-				c.think, c.sample = spent, sampled
+				c.think, c.sample, c.encode = spent, sampled, enc
 				m := &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM, KeyScale: d.KeyScale,
 					TimeSignature: d.TimeSignature, Duration: seconds, Language: cmpStr(d.Language, "unknown")}
 				if song != nil {
@@ -430,4 +489,18 @@ func cmpStr(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// encodeCost is the VAE encoder's share of a request: the source and a
+// reference's 30 s, at 11.4 ms a second of audio (A11a), plus ffmpeg's
+// decode (~2 ms a second) and, for a cover, the tokenizer.
+func encodeCost(a *pipeline.Audio) time.Duration {
+	if a == nil {
+		return 0
+	}
+	secs := float64(len(a.Source)/2) / plan.SampleRate
+	if a.Reference != nil {
+		secs += 30
+	}
+	return time.Duration((0.0134*secs + 0.05) * float64(time.Second))
 }

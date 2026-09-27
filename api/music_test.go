@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -262,6 +263,88 @@ func TestMusicSample(t *testing.T) {
 		rec := do(t, s, jsonRequest("POST", "/v1/music", body))
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%v: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+}
+
+// musicForm is a multipart create request: fields, then files by field.
+func musicForm(t *testing.T, fields map[string]string, files map[string]string) *http.Request {
+	t.Helper()
+	var body strings.Builder
+	w := multipart.NewWriter(&body)
+	for k, v := range fields {
+		if err := w.WriteField(k, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for k, v := range files {
+		fw, err := w.CreateFormFile(k, k+".wav")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fw.Write([]byte(v))
+	}
+	w.Close()
+	req := httptest.NewRequest("POST", "/v1/music", strings.NewReader(body.String()))
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	return req
+}
+
+// TestMusicAudioTasks: the audio-in tasks (MUSIC.md A11) as upstream's
+// multipart release_task sends them -- the files under their names or
+// aliases, the task's fields read, the LM skipped for a source task -- and
+// the refusals for what a task would not use.
+func TestMusicAudioTasks(t *testing.T) {
+	f := &fakeMusic{}
+	s := newMusicServer(t, f)
+	job := decodeMusic(t, do(t, s, musicForm(t, map[string]string{
+		"prompt": "remix", "task_type": "repaint", "repainting_start": "10", "repainting_end": "20",
+		"chunk_mask_mode": "explicit", "repaint_mode": "balanced", "repaint_strength": "0.25", "thinking": "true",
+		"repaint_latent_crossfade_frames": "10", "repaint_wav_crossfade_sec": "0",
+	}, map[string]string{"ctx_audio": "SRC", "ref_audio": "REF"})))
+	if job.Task != "repaint" || job.Thinking {
+		t.Errorf("repaint job %+v", job)
+	}
+	decodeMusic(t, do(t, s, musicForm(t, map[string]string{
+		"caption": "a cover", "task_type": "cover", "audio_cover_strength": "0.5", "cover_noise_strength": "0.2",
+	}, map[string]string{"src_audio": "SRC2"})))
+	decodeMusic(t, do(t, s, musicForm(t, map[string]string{"caption": "in this voice"},
+		map[string]string{"reference_audio": "REF3"})))
+	a, b, c := f.reqs[0], f.reqs[1], f.reqs[2]
+	if string(a.SourceAudio) != "SRC" || string(a.ReferenceAudio) != "REF" || a.RepaintStart != 10 || a.RepaintEnd != 20 ||
+		!a.ExplicitMask || a.RepaintMode != "balanced" || a.RepaintStrength == nil || *a.RepaintStrength != 0.25 || a.Thinking {
+		t.Errorf("repaint request %+v", a)
+	}
+	if b.Task != "cover" || string(b.SourceAudio) != "SRC2" || b.CoverStrength == nil || *b.CoverStrength != 0.5 || b.CoverNoise != 0.2 {
+		t.Errorf("cover request %+v", b)
+	}
+	if c.Task != "text2music" || string(c.ReferenceAudio) != "REF3" || c.SourceAudio != nil || !c.Thinking {
+		t.Errorf("reference request %+v", c)
+	}
+
+	for _, c := range []struct {
+		fields map[string]string
+		files  map[string]string
+		want   string
+	}{
+		{map[string]string{"caption": "x"}, map[string]string{"src_audio": "S"}, "text2music reads no source"},
+		{map[string]string{"caption": "x", "task_type": "lego"}, map[string]string{"src_audio": "S"}, "base model"},
+		{map[string]string{"caption": "x", "task_type": "cover"}, nil, "src_audio"},
+		{map[string]string{"caption": "x", "task_type": "cover"}, map[string]string{"song": "S"}, "src_audio (or ctx_audio)"},
+		{map[string]string{"caption": "x", "task_type": "cover", "audio_duration": "30"}, map[string]string{"src_audio": "S"}, "audio_duration"},
+		{map[string]string{"caption": "x", "task_type": "cover", "repainting_start": "3"}, map[string]string{"src_audio": "S"}, "repaint fields"},
+		{map[string]string{"caption": "x", "audio_cover_strength": "0.5"}, nil, "text2music has no source"},
+		{map[string]string{"caption": "x", "task_type": "repaint", "chunk_mask_mode": "both"}, map[string]string{"src_audio": "S"}, "chunk_mask_mode"},
+		{map[string]string{"caption": "x", "task_type": "repaint", "repaint_mode": "wild"}, map[string]string{"src_audio": "S"}, "repaint_mode"},
+		{map[string]string{"caption": "x", "task_type": "repaint", "repaint_wav_crossfade_sec": "0.1"}, map[string]string{"src_audio": "S"}, "repaint_wav_crossfade_sec"},
+		{map[string]string{"sample_query": "a song", "task_type": "cover"}, map[string]string{"src_audio": "S"}, "sample mode"},
+		{map[string]string{"caption": "x", "reference_audio_path": "/etc/passwd"}, nil, "upload"},
+		{map[string]string{"caption": "x", "task_type": "cover", "audio_cover_strength": "2"}, map[string]string{"src_audio": "S"}, "outside"},
+		{map[string]string{"caption": "x", "task_type": "repaint", "instruction": "Do something else:"}, map[string]string{"src_audio": "S"}, "instruction"},
+	} {
+		rec := do(t, s, musicForm(t, c.fields, c.files))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), c.want) {
+			t.Errorf("%v %v: %d %s", c.fields, c.files, rec.Code, rec.Body)
 		}
 	}
 }

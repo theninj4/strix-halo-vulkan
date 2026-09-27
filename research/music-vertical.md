@@ -1,11 +1,46 @@
 # MUSIC — text (and lyrics) to a song (ACE-Step 1.5 XL turbo)
 
-> **Live tracking and session handoff doc, opened 2026-09-27.** Stage letters
-> are **A** (for ACE; `M` is the video vertical's). When the vertical closes,
-> this file is frozen to `research/music-vertical.md` like the others and
-> `TODO.md` gets the one-line summary. Until then: tick a stage when its gate
-> passes, put its measured numbers under it, and keep **§ Handoff** at the
-> bottom current. A new session should be able to start from there.
+> **ARCHIVED 2026-09-27 — the vertical is closed, not unfinished.** This is
+> the closing record of ACE-Step 1.5 (A0–A12, all done in one day). It was
+> `MUSIC.md` at the repo root; the live state of play is
+> [`../TODO.md`](../TODO.md), which carries the open items in summary.
+>
+> **Stage letters `A0…A12`, decisions `1–7` and open questions
+> `A-o1…A-o7` resolve here.** They are cited from comments in `ace/`,
+> `api/`, `backend/`, `cmd/ace`, `shaders/` and `reference/` that still
+> say `MUSIC.md`, the same way live code still cites `LLM.md` and
+> `IMAGE.md`. Nothing below was rewritten on archiving: the tenses are the
+> working sessions'.
+>
+> **What was built**:
+>
+> - upstream's default thinking path (the 5 Hz LM's CoT and codes, the
+>   DiT, the VAE), and sample mode;
+> - the turbo model's audio-in tasks (cover, cover-nofsq, repaint) and a
+>   reference's timbre;
+> - all of it served as `/v1/music` jobs.
+>
+> Every gate is against upstream's own handler in fp32. Every drift is
+> priced against upstream's bf16 (its CUDA dtype), and each lands under it,
+> 2.8–39× closer to fp32. A 60 s song takes 14.4 s, and a 30 s cover or
+> repaint ~2 s. The user listened after A8: "sounds great".
+>
+> **Where to pick it up**: the stage table, then "Open questions" and
+> § Handoff. Three facts have each already caught a port, so read them
+> before touching this code again:
+>
+> - the VAE encoder needs its audio and first block as fp16 pairs, and the
+>   compiler folds the naive split to nothing (§ A11a);
+> - a cover's fidelity is FSQ code flips (§ A11b–e);
+> - the LM is priced against bf16 only over steps the FSM leaves open
+>   (§ A10).
+>
+> **Left open when it closed**:
+>
+> - listening to the A10 (int8 LM) and A11 songs in `out/`;
+> - the DiT's and the VAE's speed (≤20% of a request);
+> - upstream's retake and flow-edit, which are refused;
+> - deployment: `-music` is not in `ai.service`, which is the user's call.
 
 ## What we are building
 
@@ -340,7 +375,7 @@ flash, so no scores are materialised.
 | A8 | End to end with thinking: CoT → codes → hints → DiT → VAE | **done 2026-09-27** (`ace/pipeline`, `cmd/ace` thinks by default): from the oracle's CoT and codes, caption states ≤1.0e-3 rms, lyrics exact, hints ≤1.6e-4; **60 s of song in 26 s**, 90% of it the LM |
 | A9 | Serve: the endpoint (A-o3), queueing, yielding the device between DiT steps and LM chunks | **done 2026-09-27** (`serve -music`, `/v1/music`): submit-then-poll jobs in `/v1/videos`' shape, ACE-Step's `release_task` fields read; estimates within 10% of the run; speech beside a song waits ≤ one LM step or DiT forward |
 | A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | **done 2026-09-27 for the LM** (`ace/lm` `BankQ8`, the default): int8 layers priced against upstream bf16 over every teacher-forced step (text 0.88× its mean KL, codes 0.02×); a step 45 → 22 ms on the device, host sampling 10 → 1 ms; **a 60 s song 26.0 → 14.4 s**, 3 min served in 34.9 s. The DiT and VAE (≤20% of a request) are left |
-| A11 | Other tasks (optional): reference-audio timbre, cover, repaint, via the VAE encoder and the audio tokenizer | |
+| A11 | Other tasks: reference-audio timbre, cover, cover-nofsq, repaint, via the VAE encoder and the audio tokenizer (§ A11 — the plan) | **done 2026-09-27** (`ace/vae.Encoder`, `dit.GPU.Tokenize`, `ace/pipeline/tasks.go`, `/v1/music` multipart): encoder mean 56–63 dB from fp32 (bf16 16–19), with the audio and block 0 as fp16 pairs; tokenizer codes exact but 7 of 900 at a boundary; all six oracle cases under half of bf16's drift (2.8–39×); a 30 s cover or repaint in ~2 s, served |
 | A12 | Sample mode: from a description alone the LM writes the caption, metas, genres and lyrics (upstream's `sample_query` / "simple mode"), then the thinking path runs on them | **done 2026-09-27** (`ace/lm` `Sample`, `pipeline.Options.Sample`, `sample_query` on `/v1/music`, `cmd/ace -sample`): host side exact on 358 hints, 24 prompts, 20 lyric cuts; the FSM exact over 2,001 scripted and 1,208 real steps; upstream's own song parsed field for field and its codes prompts rebuilt id for id; teacher-forced KL ≤ 5.7e-5, every argmax; served, 45 s of song in 31 s |
 
 ### A0 — weights, environment, oracles
@@ -1194,6 +1229,284 @@ no headroom under bf16 left to spend. The DiT (1.8 s of a 60 s song, 6.9 s
 of 4 minutes) and the VAE (0.6 s) are ≤ 20% of any request. They were the
 plan's second and third items, and are left until something wants them.
 
+### A11 — the plan: audio in (2026-09-27)
+
+Every task that takes audio needs the one piece A0–A10 never built, the
+**VAE encoder**, and then a different wiring of what is already on the
+device. Upstream's turbo model serves four tasks (`TASK_TYPES_TURBO`):
+text2music, cover, cover-nofsq and repaint. Lego, extract and complete are
+base-model tasks, so they stay refused. A reference audio (timbre) can go
+with any of them. What upstream does, read at `ca1e85f`:
+
+- **Audio in** (`io_audio.py`): soundfile, or torchaudio for what it cannot
+  read; mono is doubled, a third channel dropped; resampled to 48 kHz
+  (torchaudio's `Resample`); clamped to ±1. All-silent (|x| < 1e-6
+  everywhere) is refused.
+- **The VAE encoder** (`OobleckEncoder`, diffusers): conv1 (k7, 2 → 128),
+  five blocks (three residual units at dilation 1/3/9, Snake, then a
+  strided conv of kernel 2s, stride s, padding s/2; s = 2, 4, 4, 6, 10;
+  channels 128 → 128 → 256 → 512 → 1024 → 2048), Snake, conv2 (k3,
+  2048 → 128). The 128 are a mean and a scale, and upstream **samples** the
+  posterior, `mean + (softplus(scale) + 1e-4)·randn`, unseeded
+  (`latent_dist.sample()`). It tiles at 30 s with 2 s overlap.
+- **Reference audio** (`process_reference_audio`, `infer_refer_latent`):
+  repeated to at least 30 s, then three 10 s segments at random offsets in
+  its front, middle and back thirds, concatenated; encoded and sampled; the
+  timbre encoder reads those 750 latents where it reads the silence today.
+- **cover**: the source's latents (encoded, sampled) are the DiT's source,
+  and `is_covers` sends them through the audio tokenizer (a pooler over
+  5-latent groups plus a CLS row, FSQ) and back through the detokenizer:
+  the A8 hints path, from audio instead of from the LM. **cover-nofsq** skips
+  that bottleneck: the raw latents are the source. Both use the LM's
+  instruction ("Generate audio semantic tokens…"), the length is the
+  source's, and the LM does not run (`DIRECT_CONDITIONING_TASKS`).
+  - `audio_cover_strength` < 1 switches to a text2music conditioning
+    (instruction "Fill the audio semantic mask…", silence source) after
+    `int(steps × strength)` steps.
+  - `cover_noise_strength` > 0 starts from `t·noise + (1−t)·src` at the
+    schedule entry nearest `1 − strength` and drops the entries before it.
+- **repaint**: the source's latents with the span [start, end) replaced by
+  silence are the source; `is_covers` is off. The chunk mask is the span as
+  0/1 only with `chunk_mask_mode: "explicit"`; "auto" (the default) makes
+  it all ones. Then:
+  - after each of the first `round(ratio × steps)` steps, everything outside
+    the span is reset to `t_next·noise + (1−t_next)·src`;
+  - the result is blended with the clean source over `crossfade` latents at
+    each edge;
+  - after the decode, the source *waveform* is spliced back outside the span
+    with a linear crossfade.
+  `repaint_mode` and `repaint_strength` set the ratio and both crossfades
+  (conservative 1.0/25/50 ms, aggressive 0/0/0, balanced (1−s) of each).
+  A span past either end of the source pads the source with silence
+  (outpainting).
+
+The sub-stages, each gated against the fp32 oracle as before:
+
+| # | what | gate |
+|---|---|---|
+| A11a | `ace/vae` encoder: posterior mean and scale | **done**: mean 55.9–62.9 dB from fp32, where upstream bf16 is 15.7–19.3 |
+| A11b | reference timbre: segments, encode, sample, timbre encoder | **done**: clip exact, latents 4.1e-2 (bf16 0.40) |
+| A11c | the audio tokenizer (pooler + FSQ) and cover / cover-nofsq, both strengths | **done**: 7 of 900 codes flip, all at a boundary; latents 3.5–39× under bf16 |
+| A11d | repaint: padding, masks, injection, both blends, the splice | **done**: spans and masks exact; latents 2.8× / 13× under bf16 |
+| A11e | serve: `/v1/music` takes `task_type`, `src_audio`/`reference_audio` uploads and the repaint and cover fields; `cmd/ace` flags | **done**: `TestMusicAudioTasks`; served repaint and cover in 2.0 and 2.7 s |
+
+Our audio is read by ffmpeg (decision 7), resampled by its `swr`. That is
+not torchaudio's sinc resampler, so the gates feed 48 kHz audio, and a
+source at another rate is a documented departure. Noise (the posterior's
+and the reference segments' offsets) is ours and seeded; the gates feed the
+oracle's.
+
+### A11a — result (2026-09-27)
+
+`reference/dump_ace_vae_enc.py` (~1 min) encodes A5's two upstream-written
+songs, plus the 120 s one cut to 100 s and 1,234 frames (not whole
+latents), with diffusers' `OobleckEncoder` in fp32 and again in bf16
+(upstream's CUDA dtype, `_get_vae_dtype`). It dumps per stage on 4 s, and
+the whole posterior (mean, scale) untiled and through upstream's own
+tiling (30 s chunks, 2 s overlap, the mean standing in for its unseeded
+sample).
+
+`ace/vae.Encoder` (`encoder.go`, `go test ./ace/vae`) is the decoder's
+graph mirrored, on the same kernels and the same glue passes:
+
+- **The strided convolutions are the A_CONV GEMM over overlapping rows.**
+  Output frame t reads 2s consecutive input rows, which is one contiguous
+  run of 2s·C values. The row stride is s·C and the tap stride C, so there
+  is no im2col and no new GEMM.
+- **The audio and block 0's activations are carried as two fp16s**, hi and
+  lo = v − hi, against weights duplicated across the pair. The GEMM then
+  sums W·v to ~22 bits of v (below).
+  - The audio's pair rides in conv1's padding channels (its 2 channels are
+    padded to 16 and its 7 taps to 8), so it is free.
+  - Block 0's convolutions read a 2C-wide operand that a new `SPLIT` build
+    of `shaders/ace_vae.comp` writes.
+- **It borrows the decoder's activation arenas.** The two never run at
+  once. Block 0's split operand is twice the decoder's widest fp16 stage,
+  so the encoder's window is 255 latents, derived from the arena. It adds
+  only its weights: 0.16 GB.
+- **The margin is 16 latents.** The receptive field is ~±7: block 4's
+  residual units reach ±3.9 latents, and its strided convolution and
+  conv2 one each. A window holds the frames past the last whole latent
+  too, which the unpadded convolutions read.
+
+**Why the split: the encoder is precision-hungry at 48 kHz, not the
+port.** The first fp16 build reached only 37.7 dB on the mean. That
+matched, within 0.1 dB at every stage, torch's fp32 encoder with every
+convolution's input and weights rounded to fp16. Rounding one site at a
+time locates the loss:
+
+| site rounded to fp16 (torch, 4 s) | posterior mean |
+|---|---|
+| the audio (conv1's input) | 45.5 dB |
+| block 0's inputs | 51.1 dB |
+| blocks 1–4, conv2 | 72–87 dB each |
+| every weight | 67.4 dB |
+
+Carrying the audio and block 0 exactly predicts 64 dB, and the port lands
+on the prediction stage by stage. One trap: the obvious split,
+`float16_t(v)` and then `v − float(hi)`, is folded by the compiler to
+lo = 0. The shader instead cuts v to fp16's mantissa with a bit mask. A
+teacher-forced block-0 convolution showed the fold: it matched the
+activations-rounded model at 79 dB, not the exact one. After the fix it
+matches the fp16-weight model at 105 dB.
+
+| gate | ours (fp16, split) | upstream bf16 |
+|---|---|---|
+| conv1, blocks 0–4 (4 s excerpt) | 82.8, 67.6, 59.2, 54.7, 67.1, 65.9 dB | |
+| posterior (4 s) | 79.9 dB | |
+| mean: 30 s / 120 s tiled / 100 s + 1,234 frames | **59.5 / 55.9 / 62.9 dB** | 15.7 / 17.7 / 19.3 dB |
+| scale: same | 80.9 / 77.1 / 80.9 dB | 32.4 / 39.8 / 46.5 dB |
+| upstream's tiling vs untiled (mean) | | 107–130 dB: tiling changes nothing |
+
+The stages are gated at 50 dB, and the whole encode at bf16's SNR or
+50 dB, whichever is higher. The posterior's std is ~3e-4 against a mean
+rms of ~1, so upstream's sampling barely moves a latent. `vae.Sample`
+reproduces it, softplus threshold included. Device time: 30 s in 343 ms,
+120 s in 1.39 s (0.28 s and 1.17 s before the split).
+
+### A11b–e — the tasks, gated and served (2026-09-27)
+
+**The oracle** is `reference/dump_ace_tasks.py` (~4 min; `--bf16` for
+upstream's CUDA dtype, from the fp32 run's DiT noise). It runs upstream's
+own `generate_music` on six requests, with the instruction upstream's API
+resolves for each task. The source is the 30 s synthwave song and the
+reference the 120 s lofi one, both from A5's oracle and written as 48 kHz
+wavs. Hooks record:
+
+- the processed audio and the reference's three `random.randint` draws;
+- every VAE encode's mean and the sample upstream went on with;
+- what `generate_audio` was handed;
+- every `prepare_condition`'s packed sequence and context;
+- the tokenizer's pooled rows and codes;
+- the noise, the final latents and the audio.
+
+| case | what it is |
+|---|---|
+| `ref_t2m` | text2music, 30 s, the lofi song as the reference |
+| `cover` | cover of the synthwave song as a folk ballad |
+| `cover_mix` | the same, `audio_cover_strength` 0.5, `cover_noise_strength` 0.3 |
+| `cover_nofsq` | cover-nofsq, with the reference |
+| `repaint` | repaint 10–20 s, balanced 0.5 (auto mask) |
+| `repaint_out` | repaint 24–34 s of the 30 s song (outpainting 4 s), conservative, explicit mask |
+
+**The tokenizer** (`dit.GPU.Tokenize`, A11c) is the detokenizer's mirror:
+
+- `audio_acoustic_proj` and the pooler's `embed_tokens` have nothing
+  between them, so they are folded into one [2048, 64] projection;
+- a CLS row goes before every 5 latents;
+- the two layers run over 6-row groups, on the GROUP attention at span 6
+  with a row-mod-6 rope table;
+- the final norm runs on the CLS rows;
+- the FSQ runs on the host (`plan.FSQIndex`): project_in, ResidualFSQ's
+  soft clamp tanh(z/c)·c with c = 1 + 1/(L−1), the hard clamp, and
+  floor((L−1)(z+1)/2 + 0.5).
+
+`TestGPUTokenize` feeds it A4's latents (the fp32 DiT's, whose codes A4's
+detokenizer gate reads) and the cover's source latents. The pooled rows
+are 5.8e-4 rms from fp32. 7 of 900 codes differ, each within 0.0008 of a
+floor boundary.
+
+**The wiring** (`ace/pipeline/tasks.go`, `Options.Audio`):
+
+- **Reference** (`ReferenceClip`, exact against the oracle's draws): the
+  30 s clip is encoded and sampled, and the timbre encoder reads it where
+  it read the silence.
+- **cover**: the source's sampled latents are padded to whole 5-latent
+  groups with the silence's *first* rows, as upstream pads. They go through
+  `Tokenize` and `Detokenize`, and the hints are cut back to T.
+- **cover-nofsq**: the latents as they are.
+- **audio_cover_strength**: after `int(steps × s)` steps the DiT is
+  re-conditioned (`Begin`) on the same caption with text2music's
+  instruction, over silence.
+- **cover_noise_strength**: the start is the entry nearest 1 − s, from
+  the renoised source (before the hints).
+- **repaint**:
+  - padding, and the span in latents with upstream's float floor
+    division;
+  - the context with the span silenced; the explicit or all-ones chunk
+    mask;
+  - the injection after the first `round(ratio·steps)` steps (half-even,
+    as Python rounds; after DCW, never on the last step);
+  - the latent crossfade (torch's fp32 `linspace`);
+  - after the decode: the peak clamp, the waveform splice with its
+    crossfade, then −1 dBFS. `vae.ClampPeak` splits Normalize for this.
+- **Length and prompt**: T is the source's whole latents, padded to 128
+  with the silence's first rows. The prompt's duration is the *unpadded*
+  source's.
+
+| gate | result |
+|---|---|
+| reference clip from the oracle's draws | exact |
+| caption prompt through the text encoder (all six; and the non-cover one) | 0.9–1.0e-3 rms, A6's |
+| chunk masks, repaint spans, context rows (non-cover) | exact |
+| cover hints: outside the 1 flipped code of 150 | 1.3e-4 rms |
+
+End to end (`TestTasks`), from the oracle's sampled latents and noise.
+Every case is held under half of bf16's drift, as A6's gate is:
+
+| case | latents rms from fp32 | upstream bf16 | audio SNR | device |
+|---|---|---|---|---|
+| ref_t2m | 4.1e-2 | 0.40 (9.7×) | 20.7 dB | 1.43 s / 30 s |
+| cover | 1.91e-1 | 0.66 (3.5×) | 11.3 dB | 1.44 s |
+| cover_mix | 6.1e-3 | 0.24 (39×) | 41.4 dB | 0.96 s (4 steps) |
+| cover_nofsq | 2.1e-2 | 0.23 (11×) | 32.0 dB | 1.43 s |
+| repaint | 9.8e-2 | 0.27 (2.8×) | 16.3 dB | 1.43 s |
+| repaint_out | 1.2e-2 | 0.15 (13×) | 32.8 dB | 1.74 s / 34 s |
+
+The full path, with our clip, encoder and posterior sampling and no oracle
+latents (`TestTasksOwnEncode`), gives ref_t2m 4.1e-2, cover 2.37e-1 and
+repaint 8.7e-2. All are under half of bf16's. bf16's own run encodes for
+itself too.
+
+**A cover is the fragile case, and the reason is the codes.** A code at a
+floor boundary flips, and a flip replaces 5 rows of hints outright:
+
+- Even from the oracle's own hints the cover drifts 0.13, against
+  text2music's 0.085 (A6).
+- Upstream's own unseeded posterior noise, at std 3e-4, flips 2 codes and
+  moves the song 0.155. We measured that as two of our runs that differ
+  only in the posterior seed.
+- Before the encoder's split, our encode flipped 13 codes (0.465). bf16
+  flips 73 of 150 (0.66).
+
+So the encoder's precision is what a cover's fidelity rides on.
+
+**Served** (`/v1/music`, A11e): `task_type`, multipart `src_audio` /
+`ctx_audio` and `reference_audio` / `ref_audio`, and the cover and repaint
+fields (API.md § Music). A source task skips the LM as upstream's does,
+and runs as long as its source. The backend decodes the uploads at submit
+(`pipeline.ReadAudioBytes`, ffmpeg pinned to local files) to check and
+measure them, and again when the job runs. Refused where upstream would
+silently drop a field:
+
+- `*_path` fields (this server reads no files of its own);
+- the base model's tasks;
+- `audio_duration` on a source task;
+- a task's fields on another task, a custom `instruction`, and the
+  crossfade fields `repaint_mode` overrides.
+
+Through a side server:
+
+- **A 30 s repaint (mp3 in, flac out): 2.0 s.** Outside the span the
+  result is the source at a constant gain (the −1 dBFS normalisation)
+  within 27–33 dB, which is the mp3 upload's own error. Inside the span it
+  is new audio.
+- **A 30 s cover with a reference: 2.7 s**, against a 2 s estimate.
+
+Staging still makes zero queue submits (`TestStagingSkipsTheQueue`, music
+16 s).
+
+Songs to hear, from `cmd/ace` (the synthwave song as the source):
+
+- `out/ace-a11-cover-folk.mp3`
+- `out/ace-a11-repaint-sax.mp3` (10–20 s)
+- `out/ace-a11-ref-lofi.mp3` (thinking, with the lofi song as the
+  reference)
+- the served `out/ace-a11-served-{repaint.flac,cover-ref.mp3}`
+
+Their lyrics lost the `[Verse 1]` tag to a test script's extraction; the
+rest is A1's `LYRICS`.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -1343,10 +1656,36 @@ song is 14.4 s (§ A10).
 - Not deployed: `ai.service`'s unit line still has no `-music`. That is the
   user's call (session 4).
 
-**Next, in order:**
+**2026-09-27, session 7: A11 done.** Audio in: a reference's timbre on
+any request, and cover, cover-nofsq and repaint (§ A11). Try
+`go run ./cmd/ace -task cover -src song.mp3 -caption "…"`, or
+`POST /v1/music -F task_type=repaint -F src_audio=@song.mp3 …`.
 
-1. Listen to `out/ace-a10-int8-*.mp3`: the first songs from the int8 LM.
-2. A11 (optional): other tasks (cover, repaint, reference timbre). Each is a
-   field `/v1/music` refuses today.
-3. Close the vertical: freeze this file to `research/music-vertical.md` and
-   leave `TODO.md` a one-line summary.
+- Code:
+  - `ace/vae/encoder.go` (`Encoder`, `Sample`, `ClampPeak`);
+  - `shaders/ace_vae.comp` `SPLIT` (`ace_vae_snake_split.spv`);
+  - `ace/dit` `Tokenize` (+ `poolL`, `tokIn`, the row-mod-6 rope tables,
+    `Host.TokB/PoolSpecial/PoolNorm/FSQInW/FSQInB`);
+  - `ace/plan.FSQIndex`;
+  - `ace/pipeline/tasks.go` (`Audio`, `ReadAudio`, `ReadAudioBytes`,
+    `ReferenceClip`, `taskPlan`), and `generate` now runs from a `ditPlan`;
+  - `api/music.go` (multipart audio, the task fields, `readTask`);
+  - `backend/music.go` (`musicAudio`, `encodeCost`);
+  - `cmd/ace` (`-task -src -ref -start -end -cover-strength -cover-noise
+    -repaint-mode -repaint-strength -explicit-mask`).
+- Oracles:
+  - `reference/dump_ace_vae_enc.py` → `reference/out/acevaeenc`;
+  - `reference/dump_ace_tasks.py [--bf16] [label …]` →
+    `reference/out/acetasks{,_bf16}`. It merges into its manifest, reads
+    `acevae`'s audio, and `--bf16` reads the fp32 run's noise.
+- Tests:
+  - `ace/vae/encoder_test.go`;
+  - `ace/dit/tokenize_test.go`;
+  - `ace/pipeline/tasks_test.go` (`TestReferenceClip`, `TestTaskInputs`,
+    `TestTasks`, `TestTasksOwnEncode`, ~40 s);
+  - `api` `TestMusicAudioTasks`.
+- Not deployed: as before, `-music` is not in `ai.service`.
+
+**2026-09-27: closed.** This file was frozen to `research/music-vertical.md`
+at the user's request. What was left is in the archive note at the top and
+in `TODO.md`'s music section.

@@ -9,7 +9,10 @@ package plan
 // The LM's vocabulary holds 65,535 code tokens; upstream clamps an index to
 // FSQCodes − 1 before it gets here.
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // FSQLevels are the config's fsq_input_levels.
 var FSQLevels = [6]int{8, 8, 8, 5, 5, 5}
@@ -52,4 +55,29 @@ func FSQOutput(index int, w, b []float32) ([]float32, error) {
 		out[o] = s + b[o]
 	}
 	return out, nil
+}
+
+// FSQIndex quantizes one pooled row's project_in output z (six values) as
+// the audio tokenizer's ResidualFSQ does (one quantizer, scale 1): its
+// bound_hard_clamp soft clamp tanh(z/c)·c with c = 1 + 1/(L−1), then FSQ's
+// symmetry-preserving bound with the hard clamp, bracket = floor((L−1)·(z+1)/2
+// + 0.5), and the index the mixed-radix sum of the brackets. It returns the
+// index and, per digit, how far the bracket's argument sat from the floor's
+// boundary (the fraction's distance to 0 or 1): what an fp16 path can flip.
+func FSQIndex(z [6]float32) (index int, margin float32) {
+	basis := 1
+	margin = 1
+	for i, l := range FSQLevels {
+		lm1 := float32(l - 1)
+		c := 1 + 1/lm1
+		v := float32(math.Tanh(float64(z[i]/c))) * c
+		v = max(-1, min(1, v))
+		arg := lm1*(v+1)/2 + 0.5
+		b := float32(math.Floor(float64(arg)))
+		frac := arg - b
+		margin = min(margin, frac, 1-frac)
+		index += int(b) * basis
+		basis *= l
+	}
+	return index, margin
 }

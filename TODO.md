@@ -18,6 +18,8 @@
 > Q9b, E7, P6…) resolve in the vertical archives listed at the bottom;
 > decisions **D1–D21** are in
 > [`research/llm-vertical.md`](research/llm-vertical.md). A code comment
+> citing `MUSIC.md` (A-stages) resolves in
+> [`research/music-vertical.md`](research/music-vertical.md). A code comment
 > citing `IMAGE.md` resolves by what follows it: **Q-stages, numbered
 > decisions and Q-o numbers** are `research/qimage-vertical.md`, **I-stages**
 > are `research/zimage-vertical.md`. `GOALS.md` is the target; `API.md`
@@ -35,6 +37,7 @@ here is our own ceiling, not a reference implementation.
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
+| music | ACE-Step 1.5 XL turbo + 5 Hz LM 4B | a **60 s song with thinking in 14.4 s** (the int8 LM at the bus, ~80% of it), 4 min DiT-only in 9.6 s; a **30 s cover or repaint in ~2 s**; latents **2.8–39× closer to fp32 than upstream's own bf16** across text2music, cover and repaint; served as `/v1/music` jobs, ~18 GB resident in the swap slot | **closed 2026-09-27** (A0–A12); listening to the A10/A11 songs; not in `ai.service` |
 | embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
 | classification | Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) | TypeSafe's `/v1/systemone` via `-kev`, **within 4e-4 of Kev's fp32 probabilities**, questions isolated bit-exactly, the TypeSafe SDK unchanged; the README ticket in **52 ms** on an int8 bank (K7.1, K7.6); **Kev's published accuracy reproduced (K8): fp16 on every suite within a question of the card, fp16 agrees with Kev's fp32 except on exact ties, int8 −0.19 pp**; a repeated text from the prefix cache, bit-identically (K7.2), attention on the matrix cores (K7.3): the GDN scan in the LLM's l8 shape (K7.4), SwiGLU fused into the gate+up GEMM and a GEMM rung per projection (K7.6): a 2,269-token text 761 ms new, 87 ms again ; concurrent requests share passes (K7.5, ~29 req/s against 19.5) | live plan in root [`CLASSIFICATION.md`](CLASSIFICATION.md) (K-stages): bit-exact across batches, chunks and cache hits (K7.7: the WMMA residue was stale V padding); deployed in `ai.service` (2026-09-25); open: int8's −0.19 pp, int8 GEMM speed |
 
@@ -69,18 +72,10 @@ stand-in (M12).
   churn), and `serve` kept ~11 GB of staging garbage resident. That gave
   every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
 
-**Music (opened 2026-09-27): ACE-Step 1.5 XL turbo, caption + lyrics to a
-48 kHz stereo song** (`GOALS.md` item 8). The live plan and handoff is the
-root [`MUSIC.md`](MUSIC.md) (A-stages). It has three generators: the 5 Hz
-LM (a Qwen3-4B that plans metas and audio codes), a 4 B DiT (8 CFG-free
-Euler steps over 25 Hz latents) and an Oobleck VAE. The oracle is
-upstream's own handler in a pinned `.venv-acestep`. A0–A9 are done
-(2026-09-27): upstream's default thinking path runs end to end (`cmd/ace`),
-it has been listened to ("sounds great"), and `serve -music` answers
-`/v1/music` as submit-then-poll jobs in `/v1/videos`' shape, reading
-ACE-Step's own request fields. A 60 s song takes 26 s, 90% of it the LM at
-45 ms a step. Next: the LM's int8 decode (A10). `-music` is not in the
-deployed unit yet.
+**Music (2026-09-27): ACE-Step 1.5 XL turbo — closed the same day.** A
+caption and lyrics (or an uploaded song) become 48 kHz stereo; see the
+music section below and the archive
+[`research/music-vertical.md`](research/music-vertical.md).
 
 **Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
 `API.md` *Residency*).** A request loads its vertical and unloads the
@@ -688,6 +683,32 @@ reproducibility). A self-trained tiny decoder for previews — a training
 project this repo does not want. No CFG path (`true_cfg_scale` stays a
 refusal) — it would double every step.
 
+## Music generation — **closed** (archive: [`research/music-vertical.md`](research/music-vertical.md))
+
+**Where it stands.** Closed 2026-09-27: A0–A12 are all done, and the plan
+ran out. ACE-Step 1.5's three generators (the 5 Hz LM, the 4 B DiT, the
+Oobleck VAE) run upstream's default thinking path, sample mode, and the
+turbo model's audio-in tasks (cover, cover-nofsq, repaint, a reference's
+timbre). Every gate is against upstream's handler in fp32, with the drift
+priced against its bf16. `serve -music` answers `/v1/music` as
+submit-then-poll jobs (multipart audio in), sharing the swap slot with
+image and video. Code: `ace/` (`plan`, `dit`, `vae`, `lm`, `pipeline`),
+`api/music.go`, `backend/music.go`, `cmd/ace`.
+
+**Open, none of it planned:**
+
+- **Listen** to `out/ace-a10-int8-*` (the int8 LM) and `out/ace-a11-*`
+  (a cover, a repaint, a referenced song). The user listened after A8
+  ("sounds great") but not since.
+- **Deployment**: `-music` is not in `ai.service` (the user's call; it
+  belongs on the non-LLM machine).
+- **Speed past the LM**: the DiT (1.8 s of a 60 s song, 6.9 s of 4 min) and
+  the VAE are ≤ 20% of a request, and the LM's step is at the bus. A 4-bit
+  bank would be the next byte cut, and phase 1 has no headroom under bf16
+  for it.
+- Upstream's retake and flow-edit, and the base model's tasks (lego,
+  extract, complete), stay refusals.
+
 ## Embeddings (archive: [`research/embedding-vertical.md`](research/embedding-vertical.md))
 
 **Where it stands.** E0–E8 done except E7. Same `zimage/qwen` transformer,
@@ -718,7 +739,7 @@ a batch makes the weights the limit again.
 
 ---
 
-## Where the old files went (2026-09-20 consolidation, and IMAGE.md again on 2026-09-21)
+## Where the old files went (2026-09-20 consolidation, IMAGE.md again on 2026-09-21, MUSIC.md on 2026-09-27)
 
 | was | now |
 |---|---|
@@ -730,6 +751,7 @@ a batch makes the weights the limit again.
 | `IMAGE.md` (Qwen-Image-2.1, 2026-09-20–21) | [`research/qimage-vertical.md`](research/qimage-vertical.md) — frozen 2026-09-21 with the vertical; **Q-stages, decisions 1–7 and Q-o numbers resolve there** |
 | `PIPELINE.md` | [`research/zimage-pipeline.md`](research/zimage-pipeline.md) — inventory, validation rules, budget |
 | `EMBEDDING.md` | [`research/embedding-vertical.md`](research/embedding-vertical.md) |
+| `MUSIC.md` (2026-09-27) | [`research/music-vertical.md`](research/music-vertical.md) — frozen 2026-09-27 with the vertical; **A-stages, decisions 1–7 and A-o numbers resolve there** |
 | `IDEAS.md` | [`research/ideas.md`](research/ideas.md) — the `§N.M` backlog and the measured roofline |
 | `TODO.md` (session log) | distilled into `research/` as each stage closed; the phase-1 tail is [`research/phase1-backlog.md`](research/phase1-backlog.md); the full log is in git history |
 

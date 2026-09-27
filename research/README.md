@@ -31,6 +31,7 @@ rewritten — same as `LLM.md` and `SPEECH.md`.
 | [`zimage-vertical.md`](zimage-vertical.md) | `IMAGE.md` (until 2026-09-20) | z-image I0–I7: serving, previews, edits, re-checked hypotheses |
 | [`zimage-pipeline.md`](zimage-pipeline.md) | `PIPELINE.md` | the slice as built: inventory, the five validation rules, the budget |
 | [`embedding-vertical.md`](embedding-vertical.md) | `EMBEDDING.md` | Qwen3-Embedding E0–E8 — its only write-up |
+| [`music-vertical.md`](music-vertical.md) | `MUSIC.md` (2026-09-27) | ACE-Step 1.5 **A0–A12**: the thinking path, sample mode, cover/repaint/reference, `/v1/music`; decisions **1–7**, open questions **A-o1–A-o7** — the vertical's closing record, closed 2026-09-27 |
 | [`ideas.md`](ideas.md) | `IDEAS.md` | the `§N.M` backlog and the measured roofline — **the address space; never renumber** |
 | [`phase1-backlog.md`](phase1-backlog.md) | old `TODO.md` tail | what phase 1 built, the bugs worth remembering, the microbenchmark backlog |
 

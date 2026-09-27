@@ -3753,6 +3753,10 @@ var ACEAttnCross []byte
 // one. The convolutions themselves are kokoro's A_CONV GEMM builds.
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o ace_vae_snake.spv ace_vae.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DPICK=1 -o ace_vae_pick.spv ace_vae.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DSPLIT=1 -o ace_vae_snake_split.spv ace_vae.comp
+
+//go:embed ace_vae_snake_split.spv
+var ACEVAESnakeSplit []byte
 
 //go:embed ace_vae_snake.spv
 var ACEVAESnake []byte

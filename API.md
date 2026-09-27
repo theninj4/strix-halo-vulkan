@@ -1039,9 +1039,51 @@ changes the URL and reads a job instead of a `task_id`.
 - `inference_steps` and `guidance_scale` are accepted and change nothing,
   as upstream's turbo model ignores them too (MUSIC.md A1).
 
+**Audio in** (MUSIC.md A11) is upstream's multipart upload, in any format
+ffmpeg reads:
+
+```sh
+curl -s localhost:8080/v1/music -F task_type=cover -F src_audio=@song.mp3 \
+  -F prompt="acoustic folk ballad, male vocals" -F lyrics="$(cat song.txt)"
+curl -s localhost:8080/v1/music -F task_type=repaint -F src_audio=@song.mp3 \
+  -F repainting_start=10 -F repainting_end=20 -F prompt="…, a saxophone solo"
+curl -s localhost:8080/v1/music -F reference_audio=@voice.flac -F prompt="…" -F audio_duration=60
+```
+
+- `task_type`: `text2music` (default), or the turbo model's three audio
+  tasks. They need `src_audio` (or `ctx_audio`), skip the LM as upstream's
+  do whatever `thinking` says, and last as long as the source, so an
+  `audio_duration` is a 400.
+  - `cover`: the source through the audio tokenizer is what the DiT
+    renders, so its structure and melody are kept and the caption and
+    lyrics restyle it. `audio_cover_strength` (default 1) is the share of
+    steps conditioned on the source; the rest are plain text2music.
+    `cover_noise_strength` (default 0) starts that close to the source
+    instead of from noise.
+  - `cover-nofsq`: the same, from the source's latents as they are, with
+    no tokenizer bottleneck.
+  - `repaint`: `repainting_start`/`repainting_end` (seconds; an end of 0
+    or −1 is the source's end) is regenerated and the rest kept. A span past
+    either end extends the song (outpainting). `repaint_mode` is
+    `conservative`, `balanced` (default, with `repaint_strength` 0.5) or
+    `aggressive`, and sets how long the kept part is pinned during
+    sampling and the crossfades at the span's edges. `chunk_mask_mode:
+    "explicit"` also tells the DiT where the span is.
+- `reference_audio` (or `ref_audio`), with any task: 30 s from three
+  random places in it give the song its timbre.
+- **Departures:** upstream's `src_audio_path` and `reference_audio_path`
+  name files on its server, and this server reads none of its own, so they
+  are a 400 that says to upload. A source at another rate is resampled by
+  ffmpeg, not by torchaudio, and a file of more than two channels is
+  downmixed rather than cut to its first two. The base model's tasks
+  (`lego`, `extract`, `complete`) are a 400. So is a field its task would
+  not use, which upstream drops silently: a cover's strengths on
+  text2music, a repaint's span on anything else, a custom `instruction`,
+  and the crossfade fields that `repaint_mode` overrides.
+
 **What ACE-Step's API offers and this server does not run is a 400 naming
-the field**, never quietly ignored: `task_type` other than `text2music`,
-reference or source audio, `batch_size` above 1 (submit one job per song),
+the field**, never quietly ignored: the base model's tasks, audio named by
+a server path, `batch_size` above 1 (submit one job per song),
 format mode, `audio_code_string`, the `sde` sampler, top-k, a
 repetition penalty or negative prompt, and turning off the LM's CoT caption,
 language, metas or constrained decoding. Their upstream defaults are
