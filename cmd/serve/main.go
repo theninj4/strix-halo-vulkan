@@ -15,6 +15,7 @@
 //	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~27 GB a request
+//	go run ./cmd/serve -music                       # ACE-Step 1.5 music jobs; ~21 GB resident
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
@@ -216,10 +217,16 @@ func main() {
 	videoTTL := flag.Duration("video-ttl", 24*time.Hour, "how long a finished video job and its file are kept")
 	videoQueue := flag.Int("video-queue", 16, "video jobs that may wait behind the running one")
 	videoPrompt := flag.Int("video-max-prompt", 0, "longest video prompt in tokens; 0 is the pipeline's 4096")
+	musicOn := flag.Bool("music", false, "load ACE-Step 1.5 (XL turbo + the 5 Hz LM) and serve /v1/music (asynchronous jobs; ~21 GB resident)")
+	musicModels := flag.String("music-models", "models", "root holding acestep-v15-xl-turbo/, acestep-5Hz-lm-4B/, Ace-Step1.5/vae and Qwen3-Embedding-0.6B/")
+	musicLM := flag.Bool("music-lm", true, "load the 5 Hz LM, for thinking (upstream's default path); without it only thinking=false is served, ~10 GB lighter")
+	musicDir := flag.String("music-dir", "", "where finished songs are kept until they expire; empty is a temporary directory")
+	musicTTL := flag.Duration("music-ttl", 24*time.Hour, "how long a finished music job and its file are kept")
+	musicQueue := flag.Int("music-queue", 32, "music jobs that may wait behind the running one")
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*videoOn {
+	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*videoOn && !*musicOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -298,7 +305,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || *videoOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || *videoOn || *musicOn || (*tts && *ttsGPU)) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -430,6 +437,29 @@ func main() {
 		geo := b.VideoGeometry()
 		log.Printf("video: %s, jobs in %s (kept %v, %d queued at most), default %s x %gs x %d steps, in %v",
 			*videoModel, jobs.Dir(), *videoTTL, *videoQueue, geo.DefaultSize, geo.DefaultSeconds, geo.DefaultSteps,
+			time.Since(start).Round(time.Millisecond))
+	}
+
+	if *musicOn {
+		if dev == nil {
+			log.Fatal("-music needs the device; it has no host path (drop -gpu=false)")
+		}
+		start := time.Now()
+		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, Device: dev, NoLM: !*musicLM})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		jobs, err := api.NewMusicJobs(b, api.MusicJobsOptions{Dir: *musicDir, TTL: *musicTTL, MaxQueued: *musicQueue})
+		if err != nil {
+			log.Fatal(err)
+		}
+		// Deferred after the backend's Close, so it runs first.
+		defer jobs.Close()
+		srv.Music = jobs
+		info := b.MusicInfo()
+		log.Printf("music: %s (thinking %v), jobs in %s (kept %v, %d queued at most), %g-%g s songs, in %v",
+			*musicModels, info.Thinking, jobs.Dir(), *musicTTL, *musicQueue, info.MinSeconds, info.MaxSeconds,
 			time.Since(start).Round(time.Millisecond))
 	}
 
@@ -621,7 +651,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
 			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
-			"/v1/videos",
+			"/v1/videos", "/v1/music",
 		} {
 			log.Printf("  %s", route)
 		}

@@ -1,0 +1,141 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// ACE-Step's 5 Hz LM (ace/lm, MUSIC.md A7): causal GQA attention of a pass's
+// rows over the KV cache, split over the keys.
+//
+// A row at position p of slot s sees that slot's keys 0..p, which ace_lm_prep
+// has already written, this pass's included. So a prefill pass and a decode
+// step are the same dispatch; they differ in how many rows there are and how
+// long a chunk of keys is.
+//
+// Default build: one 64-lane workgroup a (row, q head + 32 x chunk of
+// pc.aux1 keys). Keys are taken 64 at a time: lane j scores key j against the head's
+// q (fp16 cache, fp32 sums, q pre-scaled by 1/sqrt(128)), the block's max
+// and sum are subgroup reductions, and then each lane accumulates two dims
+// of p·V over the block. The chunk's (max, sum, o[128]) go to the partials.
+//
+// COMBINE: one workgroup a (row, q head) merges the chunks that hold keys
+// and writes o / sum into o_proj's fp16 A operand.
+//
+// Fields:
+//
+//	inOff  q fp16 [rows][32][128] (COMBINE: the partials)
+//	outOff the partials, fp32 [rows][32][aux2][130] (COMBINE: the fp16 A operand, row stride dim)
+//	kOff, vOff  the layer's caches, fp16 [slot][pos][8][128]
+//	aux0   row metadata (slot, pos)      span  positions a slot holds
+//	aux1   keys a chunk                  aux2  chunks a (row, head)
+//	tokens rows                          dim   COMBINE: the A operand's row stride
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 128u
+#define NQ 32u
+#define NKV 8u
+#define PSTRIDE 130u
+
+layout(local_size_x = 64) in;
+
+#ifndef COMBINE
+
+shared float qs[HD];
+shared float ps[64];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y % NQ;
+    uint c = gl_WorkGroupID.y / NQ; // vk.MultiDispatch has no z
+    uint lane = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint slot = floatBitsToUint(act[pc.aux0 + r * 2u]);
+    uint pos = floatBitsToUint(act[pc.aux0 + r * 2u + 1u]);
+    uint n = pos + 1u;
+    uint k0 = c * pc.aux1;
+    if (k0 >= n) {
+        return; // COMBINE never reads a chunk past the row's keys
+    }
+    uint k1 = min(n, k0 + pc.aux1);
+    uint g = h / (NQ / NKV);
+
+    uint q = pc.inOff + (r * NQ + h) * HD;
+    qs[lane] = float(hact[q + lane]);
+    qs[lane + 64u] = float(hact[q + lane + 64u]);
+    barrier();
+
+    uint base = (slot * pc.span * NKV + g) * HD; // + key * NKV * HD
+    float m = -1.0 / 0.0;
+    float l = 0.0;
+    float o0 = 0.0, o1 = 0.0;
+    for (uint b = k0; b < k1; b += 64u) {
+        uint kj = b + lane;
+        float s = -1.0 / 0.0;
+        if (kj < k1) {
+            uint kb = pc.kOff + base + kj * NKV * HD;
+            s = 0.0;
+            for (uint d = 0u; d < HD; d++) {
+                s += qs[d] * float(hact[kb + d]);
+            }
+        }
+        float mn = max(m, subgroupMax(s));
+        float corr = exp(m - mn);
+        float p = kj < k1 ? exp(s - mn) : 0.0;
+        l = l * corr + subgroupAdd(p);
+        ps[lane] = p;
+        barrier();
+        o0 *= corr;
+        o1 *= corr;
+        uint cnt = min(64u, k1 - b);
+        uint vb = pc.vOff + base + b * NKV * HD + lane * 2u;
+        for (uint j = 0u; j < cnt; j++) {
+            float pj = ps[j];
+            o0 += pj * float(hact[vb + j * NKV * HD]);
+            o1 += pj * float(hact[vb + j * NKV * HD + 1u]);
+        }
+        barrier();
+        m = mn;
+    }
+    uint out_ = pc.outOff + ((r * NQ + h) * pc.aux2 + c) * PSTRIDE;
+    if (lane == 0u) {
+        act[out_] = m;
+        act[out_ + 1u] = l;
+    }
+    act[out_ + 2u + lane * 2u] = o0;
+    act[out_ + 3u + lane * 2u] = o1;
+}
+
+#else
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint lane = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint pos = floatBitsToUint(act[pc.aux0 + r * 2u + 1u]);
+    uint chunks = (pos + pc.aux1) / pc.aux1; // ceil((pos + 1) / aux1)
+    uint base = pc.inOff + (r * NQ + h) * pc.aux2 * PSTRIDE;
+    float mx = -1.0 / 0.0;
+    for (uint c = 0u; c < chunks; c++) {
+        mx = max(mx, act[base + c * PSTRIDE]);
+    }
+    float l = 0.0, o0 = 0.0, o1 = 0.0;
+    for (uint c = 0u; c < chunks; c++) {
+        uint p = base + c * PSTRIDE;
+        float w = exp(act[p] - mx);
+        l += act[p + 1u] * w;
+        o0 += act[p + 2u + lane * 2u] * w;
+        o1 += act[p + 3u + lane * 2u] * w;
+    }
+    uint dst = pc.outOff + r * pc.dim + h * HD + lane * 2u;
+    hact[dst] = float16_t(o0 / l);
+    hact[dst + 1u] = float16_t(o1 / l);
+}
+
+#endif

@@ -3766,3 +3766,20 @@ var ACEVAEPick []byte
 
 //go:embed ace_attn_group.spv
 var ACEAttnGroup []byte
+
+// ACE-Step's 5 Hz LM (ace/lm, MUSIC.md A7): the q/k norm + rope + KV-cache
+// write between a layer's projections and its attention, and a split-key
+// causal attention over the cache, with its combine. Prefill and decode are
+// the same dispatches.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o ace_lm_prep.spv ace_lm_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o ace_lm_attn.spv ace_lm_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DCOMBINE=1 -o ace_lm_attn_combine.spv ace_lm_attn.comp
+
+//go:embed ace_lm_prep.spv
+var ACELMPrep []byte
+
+//go:embed ace_lm_attn.spv
+var ACELMAttn []byte
+
+//go:embed ace_lm_attn_combine.spv
+var ACELMAttnCombine []byte

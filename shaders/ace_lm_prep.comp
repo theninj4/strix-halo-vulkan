@@ -1,0 +1,89 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// ACE-Step's 5 Hz LM (ace/lm, MUSIC.md A7): the step between a layer's q/k/v
+// projections and its attention, for prefill and decode alike.
+//
+// Every row of a pass is a token of some sequence: its slot (which KV cache)
+// and its position, from the row metadata. One workgroup a (row, head) over
+// 32 q heads, then 8 k heads, then 8 v heads, one thread a dim:
+//
+//   q: RMSNorm over the head (q_norm), NeoX rope at the row's position,
+//      times pc.scale (1/sqrt(128)), into the fp16 q the attention reads;
+//   k: RMSNorm (k_norm, the 128 after q_norm), rope, into the key cache at
+//      (slot, position);
+//   v: straight into the value cache at (slot, position).
+//
+// The cache holds every position ever written, so attention needs nothing
+// from the pass but the query: a prefill is the same code as a decode, and
+// a prompt can be prefilled in any number of passes.
+//
+// Fields:
+//
+//	inOff  q fp32 [rows][32][128]        kOff  k fp32 [rows][8][128]     vOff  v fp32 [rows][8][128]
+//	outOff q fp16 [rows][32][128]        wOff  q_norm [128], k_norm [128] (weights arena)
+//	aux0   row metadata: (slot, pos) as uint bits, 2 a row
+//	aux1   the layer's key cache, aux2 its value cache: fp16 [slot][pos][8][128] (fp16 arena)
+//	span   positions a slot holds        bOff  rope cos [pos][64], then sin (weights arena)
+//	kStride  the rope table's positions  eps, scale, tokens (rows)
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 128u
+#define NQ 32u
+#define NKV 8u
+
+layout(local_size_x = 128) in;
+
+shared float red[128];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint y = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint slot = floatBitsToUint(act[pc.aux0 + r * 2u]);
+    uint pos = floatBitsToUint(act[pc.aux0 + r * 2u + 1u]);
+    uint cell = ((slot * pc.span + pos) * NKV) * HD;
+
+    if (y >= NQ + NKV) {
+        uint h = y - NQ - NKV;
+        hact[pc.aux2 + cell + h * HD + t] = float16_t(act[pc.vOff + (r * NKV + h) * HD + t]);
+        return;
+    }
+    bool isQ = y < NQ;
+    uint h = isQ ? y : y - NQ;
+    uint src = isQ ? pc.inOff + (r * NQ + h) * HD : pc.kOff + (r * NKV + h) * HD;
+    float x = act[src + t];
+
+    red[t] = x * x;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(HD) + uintBitsToFloat(pc.eps));
+    float xn = x * inv * wbuf[pc.wOff + (isQ ? 0u : HD) + t];
+    barrier(); // every thread has read red[0] before red is reused
+
+    // NeoX: dim i pairs with i ± 64 at the frequency of i mod 64.
+    red[t] = xn;
+    barrier();
+    uint i = t % 64u;
+    float c = wbuf[pc.bOff + pos * 64u + i];
+    float s = wbuf[pc.bOff + pc.kStride * 64u + pos * 64u + i];
+    float y2 = t < 64u ? xn * c - red[t + 64u] * s : xn * c + red[t - 64u] * s;
+
+    if (isQ) {
+        hact[pc.outOff + (r * NQ + h) * HD + t] = float16_t(y2 * uintBitsToFloat(pc.scale));
+    } else {
+        hact[pc.aux1 + cell + h * HD + t] = float16_t(y2);
+    }
+}

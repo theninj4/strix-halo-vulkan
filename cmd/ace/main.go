@@ -1,14 +1,17 @@
 // Command ace generates a song from a caption and lyrics with ACE-Step 1.5
-// XL turbo (MUSIC.md A6): the DiT-only text2music path, upstream's defaults
-// (8 steps, shift 3, DCW), 48 kHz stereo peak-normalised to -1 dBFS, written
-// through ffmpeg as wav, flac, mp3 or opus by the output's extension.
+// XL turbo, upstream's defaults: the 5 Hz LM plans it first ("thinking",
+// MUSIC.md A8: a CoT of the metadata the request leaves out, then 5 audio
+// codes a second), then the DiT (8 steps, shift 3, DCW) and the VAE. Out
+// comes 48 kHz stereo peak-normalised to -1 dBFS, written through ffmpeg as
+// wav, flac, mp3 or opus by the output's extension.
 //
 //	go run ./cmd/ace -caption "upbeat synth-pop, female vocals" -lyrics-file song.txt -duration 90 -out song.mp3
 //	go run ./cmd/ace -caption "calm piano" -lyrics "[Instrumental]" -duration 30 -bpm 70 -key "C major"
+//	go run ./cmd/ace -think=false -caption "..." -duration 30    # the DiT-only path (A6)
 //
 // Lyrics use upstream's section tags ([Verse], [Chorus], [Instrumental]...).
-// A request without -duration is 120 s of audio (upstream's fallback with no
-// LM); the 5 Hz LM that would plan it is A7.
+// Without -duration the LM chooses it (10-600 s); with -think=false it is
+// upstream's 120 s fallback.
 package main
 
 import (
@@ -17,6 +20,7 @@ import (
 	"os"
 	"strings"
 
+	"strix-halo-vulkan/ace/lm"
 	"strix-halo-vulkan/ace/pipeline"
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/backend"
@@ -34,6 +38,8 @@ func main() {
 	timesig := flag.String("timesig", "", `time signature, e.g. "4" (empty: unspecified)`)
 	lang := flag.String("lang", "", "vocal language code, e.g. en (empty: unknown)")
 	seed := flag.Uint64("seed", 42, "noise seed")
+	think := flag.Bool("think", true, "plan with the 5 Hz LM first (upstream's default)")
+	lmSeed := flag.Uint64("lm-seed", 42, "the LM's sampling seed")
 	out := flag.String("out", "ace.mp3", "output file: .wav, .flac, .mp3 or .opus")
 	flag.Parse()
 
@@ -60,12 +66,21 @@ func main() {
 	}
 	defer dev.Close()
 	err = dev.Do(func(d *vk.Device) error {
-		p, err := pipeline.New(d, pipeline.DefaultDirs(*models), req.Seconds())
+		ceiling := req.Seconds()
+		if *think && req.Duration <= 0 {
+			ceiling = plan.MaxSeconds // the LM chooses
+		}
+		p, err := pipeline.New(d, pipeline.DefaultDirs(*models), ceiling)
 		if err != nil {
 			return err
 		}
 		defer p.Destroy()
-		res, err := p.Generate(req, pipeline.Options{Seed: *seed})
+		if *think {
+			if err := p.LoadLM(d, pipeline.LMDir(*models), lm.DefaultOptions()); err != nil {
+				return err
+			}
+		}
+		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed})
 		if err != nil {
 			return err
 		}
@@ -73,6 +88,13 @@ func main() {
 			return err
 		}
 		t := res.Timings
+		if *think {
+			if res.CoT != "" {
+				log.Printf("LM phase 1 (%v):\n%s", t.Think, res.CoT)
+			}
+			log.Printf("LM phase 2: %d codes (%v)", len(res.Codes), t.Codes)
+			log.Printf("DiT metas: %q", res.DiT.Metas())
+		}
 		log.Printf("wrote %s: %.1f s of audio in %.2f s (text %.0f ms, encoders %.0f ms, DiT %.2f s, VAE %.2f s)",
 			*out, res.Seconds, t.Total.Seconds(), t.Text.Seconds()*1e3, t.Encode.Seconds()*1e3, t.DiT.Seconds(), t.VAE.Seconds())
 		return nil

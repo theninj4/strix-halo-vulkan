@@ -29,6 +29,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 | `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
+| `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
 | `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](CLASSIFICATION.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
@@ -265,6 +266,13 @@ Two things would fix it, and both are measurements rather than arguments:
     -video-ttl       24h          how long a finished job and its file are kept
     -video-queue     16           jobs that may wait behind the running one; past it is a 429
     -video-max-prompt 0           longest prompt in tokens; 0 is 4096
+
+    -music           false        load ACE-Step 1.5 (XL turbo, the 5 Hz LM, VAE, text encoder) and serve /v1/music; ~21 GB resident
+    -music-models    models       the root holding acestep-v15-xl-turbo/, acestep-5Hz-lm-4B/, Ace-Step1.5/vae, Qwen3-Embedding-0.6B/
+    -music-lm        true         load the 5 Hz LM; false serves only thinking=false, ~10 GB lighter
+    -music-dir       ""           where finished songs wait to be fetched; empty is a temporary directory
+    -music-ttl       24h          how long a finished job and its file are kept
+    -music-queue     32           jobs that may wait behind the running one; past it is a 429
 
     -kev             false        load Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) and serve /v1/systemone
     -kev-model       models/kev-4b                 adapter, converted head (reference/convert_kev_head.py), tokenizer
@@ -949,6 +957,79 @@ write mapped memory and never touch the queue, so they take no lock; what
 does — the encoder's forward, each transformer forward, the VAE decode —
 yields the device between submissions, so a speech request behind a 35 s
 forward waits for one submission, not the forward.
+
+## Music is a job
+
+OpenAI has no music endpoint, so `/v1/music` takes the shape of the one it
+has for a generator that outlasts a connection: `/v1/videos`, route for
+route (MUSIC.md A9). `POST` answers at once with a job, the client polls
+`GET /v1/music/{id}` until `status` is `completed` (or `failed`, with an
+`error`), and fetches `GET /v1/music/{id}/content`. `DELETE` cancels a queued
+or running job and forgets it. A finished job and its file are kept for
+`-music-ttl`; jobs live in memory, so a restart 404s them.
+
+```sh
+curl -s localhost:8080/v1/music -H 'Content-Type: application/json' \
+  -d '{"prompt": "warm acoustic folk, fingerpicked guitar, male vocals",
+       "lyrics": "[Verse]\nMorning light on the river\n…", "audio_duration": 30, "audio_format": "flac"}'
+curl -s localhost:8080/v1/music/music_…            # status, progress, stage, and the plan once there is one
+curl -s localhost:8080/v1/music/music_…/content -o song.flac
+```
+
+**The request is ACE-Step's own** (`POST /release_task` in its API docs):
+its field names and their aliases, flat or inside a `metas`, `metadata` or
+`user_metadata` object, as JSON or a form. So a client of ACE-Step's server
+changes the URL and reads a job instead of a `task_id`.
+
+- `prompt`/`caption`, `lyrics` (section tags: `[Verse]`, `[Chorus]`,
+  `[Instrumental]`…). One of caption or lyrics is required.
+- `thinking` (default **true**, upstream's pipeline default; its API server
+  defaults to false): the 5 Hz LM writes the metadata the request leaves out
+  and the audio codes the DiT renders. `thinking: false` is the DiT alone.
+- `audio_duration`/`duration` (10–600 s). Without it the LM chooses the
+  length when thinking, and it is upstream's 120 s when not.
+- `bpm` (30–300), `key_scale`/`keyscale`, `time_signature` (2, 3, 4, 6 or
+  2/4, 3/4, 4/4, 6/8), `vocal_language` (the LM's language codes).
+- `audio_format`/`response_format`: `mp3` (default), `wav`, `flac`, `opus`.
+- `seed` (the DiT's noise) and `lm_seed` (the LM's sampling): given, they
+  are used (upstream also wants `use_random_seed: false`; here `true`
+  still draws); drawn, they are 32-bit and reported, so a job can be rerun.
+- `shift` and `timesteps` (the DiT's schedule), `lm_temperature` (0 is
+  greedy), `lm_cfg_scale`, `lm_top_p`.
+- `inference_steps` and `guidance_scale` are accepted and change nothing,
+  as upstream's turbo model ignores them too (MUSIC.md A1).
+
+**What ACE-Step's API offers and this server does not run is a 400 naming
+the field**, never quietly ignored: `task_type` other than `text2music`,
+reference or source audio, `batch_size` above 1 (submit one job per song),
+sample and format modes, `audio_code_string`, the `sde` sampler, top-k, a
+repetition penalty or negative prompt, and turning off the LM's CoT caption,
+language, metas or constrained decoding. Their upstream defaults are
+accepted. So is a request that would not fit: a duration or bpm out of
+range, or lyrics so long the LM's cache could not hold them with the codes
+behind — found at submit, not twenty seconds in.
+
+**The job tells a client what the LM planned before the audio exists.**
+`seconds` is null until the length is known (at once when the request gave
+it; after the CoT when the LM chose it), `metadata` holds what the DiT was
+asked for (the rewritten caption, bpm, key, time signature, duration,
+language), `stage` is `think`, `codes`, `dit`, `vae` or `write`, and
+`estimated_seconds` is redone from measured rates once the length is known.
+Three jobs submitted together on this machine:
+
+| request | LM chose | estimated | ran |
+|---|---|---|---|
+| folk, lyrics, 30 s, flac | the metas; the length was given | 17 s | 16.2 s |
+| techno, instrumental, no duration | 233 s, 136 bpm, E♭ minor | 43 → 76 s | 78.7 s |
+| piano, `thinking: false`, 20 s | — | 1 s | 1.4 s |
+
+**Everything is resident and one job runs at a time.** The pipeline holds
+~21 GB, and staging it per request (~15 s) would be most of a request. **The
+device is not held for the song**: the job yields it after every LM step
+(~50 ms) and every DiT forward, so speech behind a song waits for one of
+those. Measured with `-tts` beside it, a short speech request took 32 ms
+idle, 32–71 ms while the LM planned a 3-minute song, and 0.14–0.31 s during
+its DiT forwards.
 
 ## What is left
 

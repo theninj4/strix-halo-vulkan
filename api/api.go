@@ -60,6 +60,8 @@ type Server struct {
 	SystemOne     SystemOneBackend
 	// Videos is the video job queue over its backend (videos.go).
 	Videos *VideoJobs
+	// Music is the music job queue over its backend (music.go).
+	Music *MusicJobs
 }
 
 // Handler builds the mux. It is a fresh *http.ServeMux rather than
@@ -111,6 +113,14 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/videos/{id}", s.route(s.handleVideoGet))
 	mux.Handle("GET /v1/videos/{id}/content", s.route(s.handleVideoContent))
 	mux.Handle("DELETE /v1/videos/{id}", s.route(s.handleVideoDelete))
+
+	// Music as the same kind of job (music.go, MUSIC.md A9).
+	// Input: ACE-Step's release_task fields, Output: MusicJob{}
+	mux.Handle("POST /v1/music", s.route(s.handleMusicCreate))
+	mux.Handle("GET /v1/music", s.route(s.handleMusicList))
+	mux.Handle("GET /v1/music/{id}", s.route(s.handleMusicGet))
+	mux.Handle("GET /v1/music/{id}/content", s.route(s.handleMusicContent))
+	mux.Handle("DELETE /v1/music/{id}", s.route(s.handleMusicDelete))
 
 	return mux
 }

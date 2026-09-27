@@ -336,9 +336,9 @@ flash, so no scores are materialised.
 | A4 | Detokenizer: codes → 25 Hz hints | **done 2026-09-27** (`dit.GPU.Detokenize`): real codes to hints within 1.3e-4 rms, whole or chunked; a `GROUP` attention build (block-diagonal 5-row sequences) |
 | A5 | VAE decoder (Oobleck) on the GPU: folded weight norm, Snake, conv/convT; fp16 question; tiled vs untiled | **done 2026-09-27** (`ace/vae`): every stage ≥59 dB SNR against fp32, whole songs 60–65 dB; 30 s in 0.29 s, 2 min in 1.19 s; tiling is free (A-o6) |
 | A6 | End to end, DiT only: caption + lyrics → wav/mp3 (`cmd/ace`), against the oracle's run with its noise | **done 2026-09-27** (`ace/pipeline`, `cmd/ace`): seed-42 noise 1e-7, caption hidden ≤2e-3 rms, latents 3.6–17× closer to fp32 than upstream bf16; **4 min of audio in 9.6 s** |
-| A7 | The 5 Hz LM: Qwen3-4B prefill + KV-cached decode, CFG rows, sampling, the constrained FSM | oracle done (`dump_ace_lm.py`); **A-o5 answered** (§ A7 — the oracle) |
-| A8 | End to end with thinking: CoT → codes → hints → DiT → VAE | |
-| A9 | Serve: the endpoint (A-o3), queueing, yielding the device between DiT steps and LM chunks | |
+| A7 | The 5 Hz LM: Qwen3-4B prefill + KV-cached decode, CFG rows, sampling, the constrained FSM | **done 2026-09-27** (`ace/lm`): prompts and 3,100/3,100 fuzzed CoTs exact; teacher-forced logits over 101 steps of both phases ≤2e-3 rel, KL ≤1.4e-5, every argmax; the FSM exact over 857 steps; top-p survivors exact (one fp32 boundary); 45 ms a step for 1 or 2 rows |
+| A8 | End to end with thinking: CoT → codes → hints → DiT → VAE | **done 2026-09-27** (`ace/pipeline`, `cmd/ace` thinks by default): from the oracle's CoT and codes, caption states ≤1.0e-3 rms, lyrics exact, hints ≤1.6e-4; **60 s of song in 26 s**, 90% of it the LM |
+| A9 | Serve: the endpoint (A-o3), queueing, yielding the device between DiT steps and LM chunks | **done 2026-09-27** (`serve -music`, `/v1/music`): submit-then-poll jobs in `/v1/videos`' shape, ACE-Step's `release_task` fields read; estimates within 10% of the run; speech beside a song waits ≤ one LM step or DiT forward |
 | A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | |
 | A11 | Other tasks (optional): reference-audio timbre, cover, repaint, via the VAE encoder and the audio tokenizer | |
 
@@ -748,17 +748,221 @@ What a port must reproduce around it, all read from `llm_inference.py`:
 3. **A7c, sampling and the FSM** (the table above), the YAML emitter,
    phase 1 → phase 2 → `Detokenize` → the DiT's covers path (A8).
 
+### A7 — result (2026-09-27)
+
+`ace/lm` is the LM in four files:
+
+- `prompt.go`: the phase prompts, `ParseCoT` (parse_lm_output), and
+  `Meta.CoT`, a port of PyYAML's emitter for one top-level string value.
+  It folds a plain scalar at width 80 and falls back to single or double
+  quotes. It also runs the implicit-resolver check that writes the
+  language `no` as `'no'`.
+- `gpu.go`: the model on the device (below).
+- `fsm.go`: the phase-1 FSM, state for state.
+- `sample.go` and `planner.go`: top-p, the draw, the CFG/EOS rule, and the
+  two phases.
+
+**The device graph** is a dense Qwen3-4B with a KV cache. Nothing in the
+repo decoded one before. `zimage/qwen` is prefill-only, Kev is GDN plus
+attention, and the LLM is MoE. The pieces already existed, though, and they
+all read the same staged weight:
+
+- the projections are staged once, fp16 in the §2.8 fragment tiling. That
+  is zimage/qwen's layout 2, which the DiT GEMM rungs read for a pass of
+  many rows. It is also `llm_gemv.comp`'s fp16 bank, for 1–3 rows (split-K
+  GEMV, `ROWS` specialised). So there is no second copy of 7.3 GB;
+- the norms, SwiGLU and residual adds are the DiT's scalar kernels;
+- two new shaders:
+  - `ace_lm_prep.comp` does the q/k norm, the NeoX rope at each row's own
+    position, and the KV write;
+  - `ace_lm_attn.comp` is causal GQA over the cache, split over keys, plus
+    its combine. Q carries 1/√128.
+
+A row is (token, slot, position). Attention reads keys only from the cache,
+so a prompt prefills in any number of passes. The CFG pair's two prompts
+share one pass, and a decode step is one row per slot. A prefill leaves its
+last token for the first step, the only pass that runs the head. The head is
+the tied embedding tiled into a bank of its own, and it reads only the rows
+asked for: the whole vocabulary in phase 1 (the FSM needs it), and
+`<|im_end|>` through the last code in phase 2 (64,024 rows).
+
+**Two things the gates found:**
+
+- **Qwen3's massive activations reach fp16's ceiling.** On a newline of the
+  phase-2 prompt, layer 16's SwiGLU product is 6.39e4, 2.4% under 65,504.
+  Layer 6's is 1.2e4, and the residual reaches 1.1e6 (fp32). The product is
+  narrowed at ×1/16 and the residual add undoes it, using the DiT add
+  shader's per-column gate (H3's factor, VIDEO.md).
+- **A race in the new prep shader.** Every thread read the norm's `red[0]`,
+  and thread 0 then overwrote it for the rope exchange with no barrier in
+  between. It NaN'd about one layer in twelve. It hid behind the overflow
+  above and passed a tolerance gate most of the time. `TestDeterministic`
+  now wants 8 runs of prefill + decode bit-identical.
+
+Gates (`go test ./ace/lm`, ~40 s):
+
+| gate | result |
+|---|---|
+| prompts: phase 1, phase 2 cond, uncond (both cases) | 5/5 rows' ids exact |
+| phase-2 CoT against `yaml.dump` (`dump_ace_yaml.py`, 3,100 fuzzed metadata dicts: folding, quoting, `no`/`123`/`''`, unicode, control chars) | 3,100/3,100 exact |
+| logits, teacher-forced from the oracle's sampled tokens, steps 0–100 of each phase | phase 1: ≤2.0e-3 rel, KL(T=0.85) ≤3e-8; phase 2 rows and CFG: ≤5.1e-4 rel, KL ≤1.4e-5; **every argmax agrees** |
+| the FSM against upstream's processor, driven through 7 scripted CoTs (`dump_ace_fsm.py`: free, user metas injected, extremes, fields out of order, invalid values drifting into the free caption path) | 737 steps, every allowed set exact |
+| the FSM along the oracle's real phase 1 | 120 steps exact |
+| FSM + top-p on the oracle's own logits, every dumped step | 20/21 exact; 1 keeps 3,830 where torch keeps 3,829 (below) |
+| 8 × (prefill + 4 decode steps) | bit-identical |
+
+**The top-p boundary** is torch's rounding, not ours. Its fp32 softmax
+denominator came out 8.7e-6 low (from its vectorised reduction), and that
+pushed a token of probability 3.6e-5 across 0.9. Our sums are fp64. The gate
+accepts one extra token only when the boundary sits within 2e-5 of p, and it
+reports the case. Reproducing one CPU build's SIMD reduction order is not
+worth it: upstream on CUDA reduces differently again.
+
+**Phase 1 is upstream's FSM, quirks included:**
+
+- a caption ends when the *raw* argmax after a newline is not indentation;
+- the model then writes the next field name unmasked and may skip fields;
+- the language is the top-1 candidate, forced;
+- the request's metas are injected as the tokens of `" value\n"`.
+
+One divergence: a `genres:` value is left free. Upstream constrains it to a
+vocabulary file, but the field is skipped by default, so the state is
+reachable only if the model writes `genres:` itself.
+
+Speed, with the device to itself:
+
+- a decode step is **45 ms for one row or two**: the CFG row is free, and
+  that is ~187 GB/s over the 8.4 GB a step reads with the full head;
+- the planner's step is 50 ms wall; the other 5 ms is host sampling;
+- prefill is 60 ms for 86 tokens and 97 ms for the 239-row CFG pair;
+- staging is 4.9 s.
+
+A 30 s song is ~130 CoT steps plus 151 code steps, **~14 s of LM**. The
+estimate was 25 tokens/s from 8 GB at 200 GB/s. That lever is A10's
+(int8: 4 GB a step).
+
+### A8 — result (2026-09-27)
+
+`pipeline.Generate` with `Options.Think`, after `LoadLM`, runs phase 1 and
+phase 2, then `DiTRequest` does upstream's `_update_metadata_from_lm`:
+
+- the CoT's bpm, key, time signature and duration fill what the request left
+  out;
+- the rewritten caption replaces the request's when phase 1 ran;
+- **the language stays the request's.** Upstream reads the CoT's `language`
+  as `vocal_language`, a key its parser never writes, so the default
+  `"unknown"` survives;
+- **the instruction becomes the cover task's.** Audio codes switch
+  text2music to `cover` (`_resolve_generate_music_task`), and its
+  instruction is `Generate audio semantic tokens…`. With the default cover
+  strength 1.0 and cover noise 0, that line is all the switch changes. It
+  was worth one token of the caption prompt, and the gate caught it
+  (132 rows against 131).
+
+The length is the codes' (T = 5 per code, `conditioning_target`). The codes
+through `Detokenize` are the source latents, padded or cropped with the
+silence. The chunk mask stays 1.0.
+
+`go test ./ace/pipeline -run TestThinkingInputs` rebuilds the DiT's inputs
+from the oracle's own CoT and codes:
+
+| | given_duration (phase 1 ran) | all_metas (skipped) |
+|---|---|---|
+| caption last_hidden_state | [131 1024], 1.00e-3 rms | [62 1024], 9.4e-4 |
+| lyric embeddings | exact | exact |
+| hints (150 codes → 750 latents) | 1.55e-4 rms | 1.38e-4 |
+
+`cmd/ace` thinks by default (`-think=false` is A6's path). A 60 s request
+(synthwave caption, the oracle's lyrics, `-duration 60`) is **26.0 s** from
+staged models:
+
+| LM phase 1 | LM phase 2 | text + encoders | DiT | VAE |
+|---|---|---|---|---|
+| 162 steps, 8.2 s | 300 codes, 15.1 s | 83 ms | 1.77 s | 0.62 s |
+
+The mp3 is at −15.8 dB mean with a −1.4 dB peak, and its loudness is steady
+across the minute. Its zero-crossing rate is 0.05 (noise would be 0.5). It
+is `out/ace-think-synthwave-60s.mp3`, and nobody has listened to it yet.
+
+### Listening (2026-09-27)
+
+The user listened to `out/ace-think-synthwave-60s.mp3` (thinking, A8): **it
+sounds great.** That is the first ear on the vertical's output, and it
+closes the handoff's "listen" item.
+
+### A9 — result (2026-09-27)
+
+A-o3, answered by the user: **a submit-then-poll endpoint.** It is
+`/v1/music`, in `/v1/videos`' shape (API.md § Music is a job):
+
+- `POST` answers with a job;
+- `GET /v1/music/{id}` polls it;
+- `GET …/content` fetches the audio;
+- `DELETE` cancels it;
+- `GET /v1/music` lists the jobs.
+
+**The request reads ACE-Step's own `release_task` fields**: the names, the
+aliases, the nested `metas` object, JSON or a form. What that API offers and
+this server does not run is a 400 naming the field: other tasks, reference
+audio, batches, sample and format modes, top-k and the rest. Upstream's own
+routes (`/release_task`, `/query_result`) are not served. Their `{data, code}`
+wrapper, integer statuses and path-based file URLs would be a second door to
+add if a client of upstream's server needs one.
+
+The pieces:
+
+- `api/music.go` (a queue after `videos.go`'s, kept separate rather than
+  refactoring the served video one);
+- `backend/music.go`, which is everything resident (~21 GB, A-o4: resident);
+- `serve -music` (`-music-lm=false` serves only `thinking: false`, ~10 GB
+  lighter).
+
+What the job shows while it runs:
+
+- `seconds` is null until the length is known;
+- `metadata` is the DiT's inputs once the LM has planned them;
+- `stage` is `think`, `codes`, `dit`, `vae` or `write`;
+- `estimated_seconds` comes from the measured rates and is redone when the
+  length is known.
+
+`ace/lm`'s `Planner` and `pipeline.Options` gained hooks for this:
+`Between` (yield the device and check for cancellation after every LM step
+and DiT forward), `Progress` and `Planned`.
+
+Measured live (`serve -music -tts`, three jobs submitted at once, then a
+3-minute song with speech requests beside it):
+
+| | result |
+|---|---|
+| folk, 30 s given, flac | estimated 17 s, ran 16.2 s |
+| techno, no duration: the LM chose 233 s, 136 bpm, E♭ minor | estimated 43 s, then 76 s once planned; ran 78.7 s |
+| piano, `thinking: false`, 20 s | estimated 1 s, ran 1.4 s |
+| a speech request, idle / during LM planning / during DiT forwards (3-min song) | 32 ms / 32–71 ms / 0.14–0.31 s |
+
+Each fetched file had the right container and length and peaked at −1 dB.
+Drawn seeds are 32-bit, as upstream draws them. The first run drew int63
+seeds, which a JavaScript client reads wrong past 2^53.
+
+`go test ./api -run Music` covers:
+
+- the lifecycle, with the plan arriving mid-run;
+- upstream's fields (flat, nested, form);
+- the refusals, and the upstream defaults they accept;
+- cancel, and a 409 on content before completion;
+- the 501 without `-music`.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
   residual (5.7e5), fp16 operands (≤ 2.45e3).
-- **A-o2: the LM's decode path.** Options:
-  - a dense GQA decode on `zimage/qwen`'s arena (new GEMV kernels);
-  - borrow the LLM vertical's attention/decode kernels.
-
-  The quantisation question (int8 bank for bandwidth) is separate. The LM is
-  most of a thinking request's time, so this is the vertical's main lever.
-- **A-o3: the served door.** OpenAI has no music endpoint. Upstream ships
+- **A-o2: the LM's decode path.** Answered (A7): both options at once. The
+  weight is staged once in the fragment tiling that the DiT GEMM rungs
+  (prefill) and `llm_gemv.comp` (1–3 rows) both read. Attention is a new
+  split-key kernel over a KV cache. 45 ms a step, bandwidth-bound; int8
+  (A10) is the lever.
+- **A-o3: the served door.** Answered by the user (A9): submit-then-poll,
+  as `/v1/music` in `/v1/videos`' shape, reading upstream's request fields.
+  OpenAI has no music endpoint. Upstream ships
   two:
   - its own async `/release_task` + `/query_result`;
   - an OpenAI-chat-compatible server (`openrouter/`): `/v1/chat/completions`
@@ -768,8 +972,10 @@ What a port must reproduce around it, all read from `llm_inference.py`:
   Our `/v1/chat/completions` belongs to the LLM. To decide at A9 against
   OpenAI's reference ([[api-follows-openai-standard]]); ask before
   inventing.
-- **A-o4: resident or staged per request?** It is ~19.5 GB in fp16, beside
-  the image and video models on the non-LLM machine.
+- **A-o4: resident or staged per request?** Resident (A9): ~21 GB with the
+  LM's cache, against ~15 s of staging for a request of 16–80 s. It sits
+  beside image (~32 GB) and video (~50 GB at a request's peak) on the
+  non-LLM machine.
 - **A-o5: how much of the constrained-decoding FSM is live** in the default
   thinking path, and what it masks. Answered (§ A7 — the oracle): a
   forced-token YAML skeleton, digit/range and key/time-signature prefix
@@ -838,15 +1044,45 @@ runs end to end: `go run ./cmd/ace -caption … -lyrics-file … -duration 90
 - The fp16 drift is all DiT layer 0's q/k (§ A2/A3 result, A-o7), priced
   against upstream's bf16.
 
+**2026-09-27, session 3: A7 and A8 done.** The thinking path runs end to
+end: `go run ./cmd/ace -caption … -lyrics-file … -duration 60 -out
+song.mp3` (`-think=false` for the DiT-only path).
+
+- Code: `ace/lm` (prompts + PyYAML emitter, the device graph, the FSM,
+  sampling, the planner), `shaders/ace_lm_{prep,attn}.comp` (and
+  `ace_lm_attn_combine.spv` from the second), `ace/pipeline` (`LoadLM`,
+  `Options.Think`, `DiTRequest`, `Hints`), `cmd/ace` (`-think`,
+  `-lm-seed`).
+- Oracles: `reference/dump_ace_yaml.py` (`reference/out/aceyaml`, seconds)
+  and `reference/dump_ace_fsm.py` (`reference/out/acefsm`, ~1 min), both
+  under `.venv-acestep`, both byte-identical twice.
+- Tests: `go test ./ace/lm` (~40 s, stages the LM at MaxLen 1024) and
+  `ace/pipeline`'s `TestThinkingInputs`. `go test ./ace/...` is ~90 s, one
+  package at a time.
+
+**2026-09-27, session 4: listened (sounds great) and A9 done.** Songs are
+served: `go run ./cmd/serve -music -token=`, then `POST /v1/music` (API.md
+§ Music is a job).
+
+- Code: `api/music.go` (+ `music_test.go`), `backend/music.go`,
+  `cmd/serve` (`-music*` flags), and hooks in `ace/lm/planner.go` and
+  `ace/pipeline` (`Between`, `Progress`, `Planned`, `Sampling`, `Shift`,
+  `Timesteps`).
+- Not deployed: `ai.service`'s unit line does not have `-music` yet. It
+  belongs on the non-LLM machine (deployment is two machines), and adding it
+  is the user's call.
+
 **Next, in order:**
 
-1. **Listen.** Nobody has heard a song yet. Generate a few across genres and
-   lengths (`cmd/ace`) and check they are music, not merely close to the
-   oracle.
-2. ~~A4~~ done (§ A4 result).
-3. **A7, the 5 Hz LM**, in the three pieces of § A7 — the oracle: A7a
-   (prompts + prefill logits on `zimage/qwen.GPUEncoder`), A7b (the
-   two-row KV decode, A-o2), A7c (sampling, the FSM, PyYAML's emitter).
-   The oracle is `reference/out/acelm` (`dump_ace_lm.py`, ~4 min, not
-   byte-reproducible: upstream's LM sampling is unseeded).
-4. A8 (thinking end to end), then A9 (serve; A-o3, ask first).
+1. **A10, the LM's decode**, which is 90% of a request (a 233 s song was 79
+   s, ~60 s of it codes):
+   - an int8 bank (`llm_gemv -DQ8B` reads the L8a bank at 1–3 rows; it
+     halves the 8 GB a step);
+   - host sampling (5 of 50 ms);
+   - the phase-1 head over all 217k rows.
+
+   Price int8 against bf16 logits (the M11a lesson).
+2. A11 (optional): other tasks (cover, repaint, reference timbre). Each is a
+   field `/v1/music` refuses today.
+3. Close the vertical: freeze this file to `research/music-vertical.md` and
+   leave `TODO.md` a one-line summary.

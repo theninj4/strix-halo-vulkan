@@ -74,10 +74,13 @@ stand-in (M12).
 root [`MUSIC.md`](MUSIC.md) (A-stages). It has three generators: the 5 Hz
 LM (a Qwen3-4B that plans metas and audio codes), a 4 B DiT (8 CFG-free
 Euler steps over 25 Hz latents) and an Oobleck VAE. The oracle is
-upstream's own handler in a pinned `.venv-acestep`. A0 (weights, fp16
-audit) and A1 (`ace/plan`: prompts, tokens, lengths, and the whole sampler
-bit-exact against upstream) are done. Next: the condition encoder and the
-DiT on the GPU (A2, A3), with the DiT-only path first.
+upstream's own handler in a pinned `.venv-acestep`. A0–A9 are done
+(2026-09-27): upstream's default thinking path runs end to end (`cmd/ace`),
+it has been listened to ("sounds great"), and `serve -music` answers
+`/v1/music` as submit-then-poll jobs in `/v1/videos`' shape, reading
+ACE-Step's own request fields. A 60 s song takes 26 s, 90% of it the LM at
+45 ms a step. Next: the LM's int8 decode (A10). `-music` is not in the
+deployed unit yet.
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,

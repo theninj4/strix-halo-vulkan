@@ -29,6 +29,8 @@ type Model struct {
 	Image *ImageGeometry `json:"image,omitempty"`
 	// Video is what a video model accepts, for the same reason.
 	Video *VideoGeometry `json:"video,omitempty"`
+	// Music is what a music model accepts.
+	Music *MusicInfo `json:"music,omitempty"`
 }
 
 // backends returns every loaded backend, in the order GET /v1/models lists
@@ -55,6 +57,9 @@ func (s *Server) backends() []Backend {
 	}
 	if s.Videos != nil {
 		out = append(out, s.Videos.backend)
+	}
+	if s.Music != nil {
+		out = append(out, s.Music.backend)
 	}
 	return out
 }
@@ -111,6 +116,15 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			if owns(s.Videos.backend, resp.Data[i].ID) {
 				g := geo
 				resp.Data[i].Video = &g
+			}
+		}
+	}
+	if s.Music != nil {
+		info := s.Music.backend.MusicInfo()
+		for i := range resp.Data {
+			if owns(s.Music.backend, resp.Data[i].ID) {
+				m := info
+				resp.Data[i].Music = &m
 			}
 		}
 	}
