@@ -31,5 +31,11 @@ Ultimately we want to be able to run these tasks:
     * https://huggingface.co/ACE-Step/acestep-v15-xl-turbo
     * https://huggingface.co/ACE-Step/acestep-5Hz-lm-4B
     * https://github.com/ace-step/ACE-Step-1.5
+  9. Image Embedding via `Qwen/Qwen3-VL-Embedding-2B`:
+    * https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B
+    * https://arxiv.org/abs/2601.04720
+  10. OCR via `PaddleOCR-VL-1.6`:
+    * https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6
+    * https://arxiv.org/pdf/2606.03264
 
 We will ultimately serve up a HTTP API serving these features, in Go.
