@@ -20,7 +20,12 @@ fp32 on the CPU -- with hooks that record:
 Cases are A1's requests by label (default: full_metas, 30 s, 375 tokens;
 defaults, 120 s, 1,500 tokens).
 
-    HF_HUB_OFFLINE=1 .venv-acestep/bin/python reference/dump_ace_dit.py [label ...]
+    HF_HUB_OFFLINE=1 .venv-acestep/bin/python reference/dump_ace_dit.py [--bf16] [label ...]
+
+--bf16 runs the same request the way upstream serves it on CUDA (the
+handler's dtype there is bfloat16; on ROCm and the CPU it is fp32), into
+reference/out/acedit_bf16: the bar a device path's own drift from the fp32
+oracle is priced against (decision 2).
 """
 
 import json
@@ -38,7 +43,8 @@ from acestep.handler import AceStepHandler  # noqa: E402
 from acestep.inference import GenerationConfig, GenerationParams, generate_music  # noqa: E402
 from dump_ace_plan import CASES, PROJECT  # noqa: E402
 
-OUT = "reference/out/acedit"
+BF16 = "--bf16" in sys.argv
+OUT = "reference/out/acedit_bf16" if BF16 else "reference/out/acedit"
 KEEP_LAYERS = (0, 1, 2, 15, 31)
 
 
@@ -47,7 +53,7 @@ class Stop(Exception):
 
 
 def main():
-    labels = sys.argv[1:] or ["full_metas", "defaults"]
+    labels = [a for a in sys.argv[1:] if not a.startswith("--")] or ["full_metas", "defaults"]
     os.makedirs(OUT, exist_ok=True)
     manifest = {"cases": {}, "tensors": {}}
     manifest_path = os.path.join(OUT, "manifest.json")
@@ -64,6 +70,11 @@ def main():
                                    use_mlx_dit=False)
     assert ok, msg
     model = h.model
+    if BF16:
+        model.to(torch.bfloat16)
+        h.dtype = torch.bfloat16
+        if getattr(h, "text_encoder", None) is not None:
+            h.text_encoder.to(torch.bfloat16)
     real_generate = model.generate_audio
     cases = dict(CASES)
 
@@ -175,6 +186,15 @@ def main():
                 lambda _m, _i, out, li=li: stats[state["forward"]][li].__setitem__("ff_out", amax(out))))
 
         # --- the run -----------------------------------------------------------
+        if BF16:
+            # The fp32 run's noise, so the two runs start from the same x:
+            # a bf16 prepare_noise draws a different tensor.
+            ref = np.fromfile(f"reference/out/acedit/{label}_noise.bin", dtype=np.float32)
+            ref = torch.from_numpy(ref.reshape(1, -1, 64))
+
+            def fixed_noise(context_latents, seed, ref=ref):
+                return ref.to(context_latents.dtype)
+            model.prepare_noise = fixed_noise
         t0 = time.time()
         out = model.generate_audio(**captured)["target_latents"][0]
         elapsed = time.time() - t0

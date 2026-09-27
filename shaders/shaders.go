@@ -3725,3 +3725,44 @@ var TAEConvOC64 []byte
 
 //go:embed h3_groupnorm.spv
 var H3GroupNorm []byte
+
+// ACE-Step 1.5's DiT and condition encoders (ace/dit, MUSIC.md A2/A3): the
+// q/k pack with Qwen3's full-width rotate-half RoPE (H3's pack at
+// ROPE_WIDTH = HEAD_DIM), and three attention builds, all GQA with the tail
+// kept out of the row max: full self-attention, the ±span band of the even
+// layers (WINDOW), and cross-attention onto the condition sequence (CROSS).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DROPE_WIDTH=128 -DTPW=8 -o ace_qk_pack.spv h3_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DTAIL_MAX=1 -o ace_attn_full.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DWINDOW=1 -o ace_attn_window.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DCROSS=1 -o ace_attn_cross.spv dit_attention_wmma.comp
+
+//go:embed ace_qk_pack.spv
+var ACEQKPack []byte
+
+//go:embed ace_attn_full.spv
+var ACEAttnFull []byte
+
+//go:embed ace_attn_window.spv
+var ACEAttnWindow []byte
+
+//go:embed ace_attn_cross.spv
+var ACEAttnCross []byte
+
+// ACE-Step's VAE decoder (ace/vae, MUSIC.md A5): the fused bias + Snake +
+// narrow pass between its convolutions, and the stereo pick out of the last
+// one. The convolutions themselves are kokoro's A_CONV GEMM builds.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o ace_vae_snake.spv ace_vae.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DPICK=1 -o ace_vae_pick.spv ace_vae.comp
+
+//go:embed ace_vae_snake.spv
+var ACEVAESnake []byte
+
+//go:embed ace_vae_pick.spv
+var ACEVAEPick []byte
+
+// The audio detokenizer's attention (ace/dit, MUSIC.md A4): every code's
+// 5 rows attend only to each other, as block-diagonal groups of pc.span.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DGROUP=1 -o ace_attn_group.spv dit_attention_wmma.comp
+
+//go:embed ace_attn_group.spv
+var ACEAttnGroup []byte

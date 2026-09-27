@@ -208,6 +208,49 @@ layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
 #ifndef TAIL_MAX
 #define TAIL_MAX 0
 #endif
+// ACE-Step's two differences (MUSIC.md A2/A3). Both compile-time, so every
+// existing build's SPIR-V is unchanged.
+//
+//   WINDOW  bidirectional sliding-window attention: query i sees key j only
+//           when |i - j| <= pc.span (128 in every ACE layer that has it).
+//           The key loop starts at the block holding i - span and stops
+//           after the one holding i + span, so a windowed layer reads
+//           ~2*span keys a query however long the song is; inside those
+//           blocks the band is masked on the row max as well as on P, for
+//           CAUSAL's reason. A row can meet a block with no key of its band
+//           in it (a pad query row can meet none at all), so the running max
+//           may still be -inf after a block: the rescale then measures
+//           against 0 instead of forming exp2(-inf - -inf), and a row whose
+//           denominator is 0 writes 0 rather than 0/0.
+//   CROSS   cross-attention: the keys are another sequence. pc.tokens is the
+//           key count, pc.kStride the query count (REL_BIAS's split), and
+//           the k/v planes are pc.ldb rows a plane where q's are pc.aux1.
+//           The key tail is masked on the max too (TAIL_MAX), since a
+//           condition sequence's scores can all be negative.
+//   GROUP   block-diagonal attention: the sequence is independent groups of
+//           pc.span rows and a query sees only its own group's keys. It is
+//           ACE-Step's audio detokenizer, which runs every 5 Hz code as its
+//           own 5-row sequence; packing them into one dispatch this way
+//           replaces thousands of 5-token attentions. It rides WINDOW's
+//           machinery (a band predicate, a key range, the -inf guard) with
+//           a different band.
+#ifndef WINDOW
+#define WINDOW 0
+#endif
+#ifndef GROUP
+#define GROUP 0
+#endif
+#if GROUP
+#undef WINDOW
+#define WINDOW 1
+// Key kj is outside query qi's band.
+#define OUT_OF_BAND(qi, kj) ((kj) / win != (qi) / win)
+#else
+#define OUT_OF_BAND(qi, kj) ((kj) + win < (qi) || (kj) > (qi) + win)
+#endif
+#ifndef CROSS
+#define CROSS 0
+#endif
 
 #define TILE 16
 #define HDT (HEAD_DIM / TILE)
@@ -241,7 +284,7 @@ void main() {
     uint head = gl_WorkGroupID.y;
     uint q0 = gl_WorkGroupID.x * BM;
     uint n = pc.tokens;
-#if REL_BIAS
+#if REL_BIAS || CROSS
     uint qrows = pc.kStride;
 #else
     uint qrows = n;
@@ -256,7 +299,11 @@ void main() {
     // share the geometry and differ only in what one tile holds, which is the
     // transpose dit_pack_f16.comp applies to v.
     uint plane = head * (pc.aux1 / TILE) * (HDT * TILE * TILE);
-#if GQA
+#if CROSS && GQA
+    uint kvPlane = (head / max(pc.aux2, 1u)) * (pc.ldb / TILE) * (HDT * TILE * TILE);
+#elif CROSS
+    uint kvPlane = head * (pc.ldb / TILE) * (HDT * TILE * TILE);
+#elif GQA
     uint kvPlane = (head / max(pc.aux2, 1u)) * (pc.aux1 / TILE) * (HDT * TILE * TILE);
 #else
     uint kvPlane = plane;
@@ -294,10 +341,23 @@ void main() {
     // blocks beyond it are not read at all -- which at BM = BN is half the
     // key traffic of the bidirectional kernel, averaged over the grid.
     uint last = min(n, q0 + BM);
+#elif WINDOW
+    uint win = pc.span;
+#if GROUP
+    uint first = ((q0 / win) * win / BN) * BN;
+    uint last = min(n, ((q0 + BM - 1u) / win + 1u) * win);
+#else
+    uint first = (q0 > win) ? ((q0 - win) / BN) * BN : 0u;
+    uint last = min(n, q0 + BM + win);
+#endif
 #else
     uint last = n;
 #endif
+#if WINDOW
+    for (uint base = first; base < last; base += BN) {
+#else
     for (uint base = 0u; base < last; base += BN) {
+#endif
         uint cnt = min(BN, n - base);
 
         // ---- S = Q.K^T. K is the B operand and already K-contiguous, so it
@@ -361,7 +421,15 @@ void main() {
                         break;      // and every c after it, the row is done
                     }
 #endif
-#if REL_BIAS || TAIL_MAX
+#if WINDOW
+                    {
+                        uint kj = base + kk * TILE + c;
+                        if (kj >= n || OUT_OF_BAND(q0 + i, kj)) {
+                            continue;
+                        }
+                    }
+#endif
+#if REL_BIAS || TAIL_MAX || CROSS
                     // The tail mask, applied to the *max* and not only to P.
                     //
                     // Every build masks the pad keys out of P, which is what
@@ -395,6 +463,13 @@ void main() {
             float mo = rowMax[i];
             float mn = max(mo, blkMax[i]);
             rowMax[i] = mn;
+#if WINDOW
+            // No key of this row's band seen yet: measure against 0, which
+            // keeps corr at exp2(-inf) = 0 and the (masked) P finite-or-zero.
+            if (mn == -1.0 / 0.0) {
+                mn = 0.0;
+            }
+#endif
             float corr = exp2(mo - mn);
             for (uint c = 0u; c < TILE; ++c) {
                 stage[qi * (TILE * TILE) + r * TILE + c] = mn;
@@ -442,6 +517,23 @@ void main() {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 uint col = i & (BN - 1u);
                 if (col >= cnt || base + col > q0 + i / BN) {
+                    pbuf[i] = float16_t(0.0);
+                }
+            }
+            barrier();
+        }
+#elif WINDOW
+        // Every block that is not wholly inside every row's band, and the
+        // tail block, need the band mask.
+#if GROUP
+        if (true) {
+#else
+        if (cnt < BN || q0 + BM - 1u > base + win || base + BN - 1u > q0 + win) {
+#endif
+            for (uint i = lane; i < BM * BN; i += WAVE) {
+                uint kj = base + (i & (BN - 1u));
+                uint qi = q0 + i / BN;
+                if ((i & (BN - 1u)) >= cnt || OUT_OF_BAND(qi, kj)) {
                     pbuf[i] = float16_t(0.0);
                 }
             }
@@ -507,7 +599,11 @@ void main() {
     // loop has finished with.
     for (uint i = lane; i < BM; i += WAVE) {
         uint qi = i / TILE, r = i % TILE;
+#if WINDOW
+        float inv = rowSum[i] > 0.0 ? 1.0 / rowSum[i] : 0.0;
+#else
         float inv = 1.0 / rowSum[i];
+#endif
         for (uint c = 0u; c < TILE; ++c) {
             bcorr[qi * (TILE * TILE) + r * TILE + c] = inv;
         }

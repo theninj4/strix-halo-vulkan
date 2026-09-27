@@ -65,10 +65,12 @@ structure, and it is also most of the request's time (see below).
 | text-encoder weights | **not downloaded** | (1.19 GB) | **byte-identical to `models/Qwen3-Embedding-0.6B`** (sha256 `0437e45c…` both). Only the config differs: `Qwen3Model` rather than `Qwen3ForCausalLM`, and the same weights |
 | `acestep-v15-turbo/` (2 B DiT), `acestep-5Hz-lm-1.7B/` | `ACE-Step/Ace-Step1.5` | 8.5 GB | not the models `GOALS.md` names |
 
-Both model repos were already present in `models/` as **git-LFS clones**, so
-every weight is on disk twice (`.git/lfs/objects` plus the working tree:
-36 GB for 28 GB of weights). Removing the two `.git` directories would
-reclaim ~28 GB, but that is the user's call. The rest was fetched with:
+Both model repos were already present in `models/` as git-LFS clones, so
+every weight was on disk twice. By 2026-09-27 11:35 their `.git`
+directories had been removed (19 GB + 7.9 GB remain). **So nothing in them
+can be restored with `git checkout` any more**, which is one more reason
+never to point the upstream handler at them (§ A0 result). The rest was
+fetched with:
 
 ```sh
 .venv/bin/hf download ACE-Step/Ace-Step1.5 vae/config.json vae/diffusion_pytorch_model.safetensors \
@@ -329,12 +331,12 @@ flash, so no scores are materialised.
 |---|---|---|
 | A0 | Weights, oracle venv, fp16 weight audit, the silence latent to safetensors | **done 2026-09-27**: no weight in the DiT, LM or VAE overflows fp16 (absmax 31.6 / 43.8 / 5.6); the oracle is upstream's handler on the CPU |
 | A1 | The plan in Go (`ace/plan`): prompt, lyric and metas formatting, tokenisation, latent/token counts, the three schedules, DCW's Haar step, the FSQ codebook | **done 2026-09-27**: six requests' prompts, token ids and latent lengths exact; the whole upstream sampler loop (3 shifts × DCW on/off × odd/even T) **bit-exact**; noise within 1 ulp; FSQ codes exact |
-| A2 | Conditioning on the GPU: caption through `embed`, the lyric lookup, lyric and timbre encoders, packing, cross-K/V | oracle done (`dump_ace_dit.py`) |
-| A3 | DiT on the GPU: GEMMs, windowed/full self-attention, cross-attention, AdaLN; teacher-forced per layer and per step against the fp32 oracle; per-step profile | oracle done; **A-o1 answered: fp32 residual, fp16 operands** |
-| A4 | Detokenizer: codes → 25 Hz hints | |
-| A5 | VAE decoder (Oobleck) on the GPU: folded weight norm, Snake, conv/convT; fp16 question; tiled vs untiled | |
-| A6 | End to end, DiT only: caption + lyrics → wav/mp3 (`cmd/ace`), against the oracle's run with its noise | |
-| A7 | The 5 Hz LM: Qwen3-4B prefill + KV-cached decode, CFG rows, sampling, the constrained FSM | |
+| A2 | Conditioning on the GPU: caption through `embed`, the lyric lookup, lyric and timbre encoders, packing, cross-K/V | **done 2026-09-27** (`ace/dit`): both encoders ≤2.2e-4 rms a layer, the packed sequence ≤3.1e-4; the caption's `embed` pass is wired in A6 |
+| A3 | DiT on the GPU: GEMMs, windowed/full self-attention, cross-attention, AdaLN; teacher-forced per layer and per step against the fp32 oracle; per-step profile | **done 2026-09-27**: layers ≤2.5e-4 rms except layer 0 (3.8e-3, fp16 q/k); latents 5–9% rms from fp32, **3.6–16× closer than upstream's own bf16**; 8 forwards 0.97 s (30 s) / 6.9 s (4 min) / 19.1 s (10 min) |
+| A4 | Detokenizer: codes → 25 Hz hints | **done 2026-09-27** (`dit.GPU.Detokenize`): real codes to hints within 1.3e-4 rms, whole or chunked; a `GROUP` attention build (block-diagonal 5-row sequences) |
+| A5 | VAE decoder (Oobleck) on the GPU: folded weight norm, Snake, conv/convT; fp16 question; tiled vs untiled | **done 2026-09-27** (`ace/vae`): every stage ≥59 dB SNR against fp32, whole songs 60–65 dB; 30 s in 0.29 s, 2 min in 1.19 s; tiling is free (A-o6) |
+| A6 | End to end, DiT only: caption + lyrics → wav/mp3 (`cmd/ace`), against the oracle's run with its noise | **done 2026-09-27** (`ace/pipeline`, `cmd/ace`): seed-42 noise 1e-7, caption hidden ≤2e-3 rms, latents 3.6–17× closer to fp32 than upstream bf16; **4 min of audio in 9.6 s** |
+| A7 | The 5 Hz LM: Qwen3-4B prefill + KV-cached decode, CFG rows, sampling, the constrained FSM | oracle done (`dump_ace_lm.py`); **A-o5 answered** (§ A7 — the oracle) |
 | A8 | End to end with thinking: CoT → codes → hints → DiT → VAE | |
 | A9 | Serve: the endpoint (A-o3), queueing, yielding the device between DiT steps and LM chunks | |
 | A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | |
@@ -478,6 +480,274 @@ end, fp16 everywhere a GEMM reads. The residual grows over the steps
 (3.5e5 at forward 0 to 4.4e5 at forward 7 for 30 s), so the gate has to
 cover every forward, not only the first.
 
+### A2/A3 — result (2026-09-27)
+
+`ace/dit` (`go test ./ace/dit`, ~35 s, stages everything once at 7,500
+tokens: 10.1 GB of fp16 weights). It holds the lyric encoder, the timbre
+encoder and the DiT as one layer graph (h3/dit's machinery without row
+chunks or runs):
+
+- **The encoders are the DiT layer without modulation**: a = the norm
+  weight, b = 0, a plain residual add, no cross-attention.
+- **Cross-attention K/V are computed once a request** (`Begin`):
+  `condition_embedder`, then each layer's k_proj → k_norm (no rotation) and
+  v_proj, packed into that layer's planes, ~10 MB a layer.
+- **Three new attention builds** (`shaders/ace_attn_*`, two new flags on
+  `dit_attention_wmma.comp`; **every existing build's SPIR-V is
+  byte-identical**, checked against all 40 of them):
+  - `WINDOW`: the ±128 band. The key loop covers only the blocks the band
+    reaches, and the band is masked on the row max as well as on P. A row
+    with no key yet keeps its max at 0, not −inf, so no 0/0.
+  - `CROSS`: key and query counts split, and the kv planes' own row stride
+    (`pc.ldb`).
+  - The full build is GQA with `TAIL_MAX`.
+- **The q/k pack** is H3's with `ROPE_WIDTH=128` (Qwen3's full-width
+  rotate-half). Cross q/k read identity tables.
+- The final norms (lyric, timbre CLS), the timestep MLPs (1e-6 against the
+  oracle) and the output's bias run on the host in fp32.
+
+Gates, teacher-forced from the fp32 oracle:
+
+| what | full_metas (375 tokens) | defaults (1,500) |
+|---|---|---|
+| lyric / timbre layers, worst rms | 2.2e-4 / 5.5e-5 | 4.3e-5 / 5.5e-5 |
+| packed condition sequence | 5.3e-4 max, 3.1e-4 rms | 9.2e-5 max, 3.0e-4 rms |
+| DiT layer 0 | 8.1e-3 max, 3.8e-3 rms | 9.4e-3, 2.3e-3 |
+| DiT layers 1, 2, 3–15, 16–31 | ≤3.8e-4 max, ≤2.2e-4 rms | ≤9.2e-4, ≤2.5e-4 |
+| velocity, forward 0 (t = 1) | 6.7e-2 rms | 2.9e-2 |
+| velocity, forwards 1–7 | 1.2e-3 – 2.7e-2 | 1.3e-3 – 1.6e-2 |
+| final latents, 8 steps from the oracle's noise | 8.6e-2 rms | 5.2e-2 |
+| **upstream bf16's** v0 / latents, same noise | 1.85e-1 / 3.08e-1 | 3.94e-1 / 8.24e-1 |
+
+**Layer 0 is the whole of the error.** A host fp32 layer 0 matches the
+oracle to 8e-6. Rounding only its q, k and v to fp16 gives 8.2e-3, the
+device's error exactly. Rounding the normed input, the context, the SwiGLU
+product or P instead costs ≤3e-4 each. The cause is that layer 0's q/k-norm
+weights reach 31.6, so its logits are large and fp16's 11 bits move the
+softmax. That error rides the residual's outlier channel (5.8e3 after layer
+0) through every later layer's norm.
+
+**It is well inside what upstream ships.** `dump_ace_dit.py --bf16` runs
+the same requests from the same noise the way upstream serves them on CUDA
+(`init_service_orchestrator`: bf16 on CUDA; **fp32 on ROCm**, i.e. this
+machine, and on the CPU). It even rounds the timesteps to bf16 (0.953125 for
+0.9545). The bf16 run drifts 2.8–16× further from fp32 than we do, and the
+test holds ours under half of it (`underBF16`). A split-precision QK for
+layer 0 only (hi/lo fp16 planes, three products a score tile) would remove
+the error for ~1/64 of the attention time. It is not needed for the gate;
+it is recorded as A-o7.
+
+Timing, one forward with the device to itself, best of 3:
+
+| song | tokens | a forward | 8 forwards | estimate |
+|---|---|---|---|---|
+| 30 s | 375 | 121 ms | 0.97 s | 0.8 s |
+| 2 min | 1,500 | 403 ms | 3.22 s | 3.4 s |
+| 4 min | 3,000 | 859 ms | 6.87 s | 7.2 s |
+| 10 min | 7,500 | 2,389 ms | 19.1 s | 20 s |
+
+At 4 minutes the GEMMs are 77% of the forward and run at 37–41 TFLOP/s.
+Self-attention is 9% at 32 TFLOP/s, cross-attention 1% at 22, SwiGLU 6%,
+and the norms, packs and residual adds the remaining ~12%.
+
+### A4 — result (2026-09-27)
+
+`reference/dump_ace_detok.py` (run twice, byte-identical) runs upstream's
+`_decode_audio_codes_to_latents` in fp32. Its codes are real: the fp32 DiT
+oracle's latents through the model's own audio tokenizer (`tokenize`), 150
+and 600 codes. The handler's entry from the code string equals the direct
+call exactly.
+
+The detokenizer runs **every code as its own 5-row sequence**: the code's
+projection ×5 plus 5 learned tokens, RoPE positions 0–4, then 2 encoder
+layers, the norm and proj_out 2048 → 64. `dit.GPU.Detokenize`:
+
+- FSQ digits and project_out on the host (`plan.FSQOutput`);
+- embed_tokens as a GEMM;
+- the ×5 and the learned tokens on the host;
+- the two layers as `ace/dit` encoder layers with `group = 5`;
+- the norm and proj_out on the device.
+
+It runs in chunks of `rows/5` codes, since a 10-minute song is 15,000 rows,
+twice the DiT's planes.
+
+- **`GROUP`** is a fourth flag on `dit_attention_wmma.comp` that rides
+  `WINDOW`'s machinery. The band predicate becomes `kj/G == qi/G`, the key
+  range the query block's groups, and every block is masked. Every non-ACE
+  build is still byte-identical; the window build's SPIR-V moved with the
+  refactor and its gates are unchanged.
+- **The rope tables restart every group**: a table at position `row mod 5`
+  beside the plain one.
+
+| gate | full_metas (150 codes) | defaults (600) |
+|---|---|---|
+| layer 1, teacher-forced | 4.3e-5 rms | 4.0e-5 |
+| hints, whole | 2.3e-4 max, 1.3e-4 rms | 3.1e-4, 1.2e-4 |
+| hints, 97-code chunks | the same | the same |
+
+Device time is small (the whole test is 0.4 s with both cases twice). The
+hints are the DiT's source latents on the thinking path (A8).
+
+### A5 — result (2026-09-27)
+
+`reference/dump_ace_vae.py` (~45 s, run twice, byte-identical) decodes the
+fp32 DiT oracle's latents with diffusers' `AutoencoderOobleck` in fp32. It
+dumps per stage on a 4 s excerpt, whole songs untiled and through
+upstream's own tiling (`VaeDecodeChunksMixin`, chunk 512, overlap 64), and
+the audio upstream writes.
+
+`ace/vae` (`go test ./ace/vae`) runs every convolution on kokoro's
+`A_CONV=1` GEMM (32×64, wave32; 32×32 for conv2's two channels). The
+activations are channel-last fp16 in a zero-bordered arena. The pieces:
+
+- **The transposed convolutions** are kokoro's 2-tap GEMM with an
+  s-times-wider output.
+- **The glue is one new pass**, `shaders/ace_vae.comp`: the preceding bias,
+  Snake with β, the fp16 narrowing, and the zero rows the next
+  convolution's taps and M padding read.
+- **Weight norm is folded at load.** For a ConvTranspose1d it is over the
+  *input* channel (`weight_g` is `[in, 1, 1]`).
+- **The decode is tiled**: 512-latent windows with a 32-latent margin. The
+  last stage is 1920 × 128 fp32 a latent, so a 4-minute song cannot be one
+  buffer.
+
+| gate | result |
+|---|---|
+| conv1, blocks 0–4, output (4 s excerpt) | 70.9, 63.6, 59.4, 63.1, 69.7, 69.4, 67.4 dB SNR |
+| full_metas, 30 s, tiled vs the untiled oracle | 63.6 dB (max 4.9e-3 of peak) |
+| defaults, 120 s, same | 65.0 dB |
+| after the peak clamp and −1 dBFS | 60.6 / 63.9 dB |
+| **A-o6: upstream's tiling vs untiled** | max 2.4e-6 / 8.3e-6 abs: tiling changes nothing |
+
+Device time: 285 ms for 30 s, 1,189 ms for 120 s (~12 TFLOP/s on the
+estimated 120 GFLOP a second of audio). One VAE staging is ~1.9 GB, most
+of it the 512-latent window's activations.
+
+What upstream writes, and it is the same everywhere: after the decode,
+divide by the peak if it passes 1 (`generate_music_decode`); then
+`normalize_audio` to −1 dBFS (`enable_normalization` is on by default).
+`latent_shift`/`latent_rescale` default to 0 and 1, and the fades to 0.
+
+### A6 — result (2026-09-27)
+
+`ace/pipeline` puts it together:
+
+- `ace/plan` formats the prompts and fixes the length;
+- `embed.GPU.Hidden` (Qwen3-Embedding-0.6B, the same bytes) encodes the
+  caption;
+- the lyrics are rows of the same model's embedding table;
+- `ace/dit` runs Encode, then Begin, then `plan.Sample` over `Step`, with
+  seeded noise (`h3/vae.TorchRandn`, torch's CPU randn) and the context
+  [silence | 1.0];
+- `ace/vae` decodes, then Normalize.
+
+`cmd/ace` writes wav/flac/mp3/opus through ffmpeg. `go test ./ace/pipeline`
+(~20 s, 240 s ceiling):
+
+| gate | full_metas (30 s) | defaults (120 s) |
+|---|---|---|
+| seed-42 noise vs the oracle's | 1.0e-7 of absmax | |
+| caption last_hidden_state (also long_caption at 256 tokens, instrumental_60) | 1.0e-3 rms | 9.2e-4 (worst 2.0e-3, long_caption) |
+| lyric embeddings | exact | exact |
+| final latents vs the fp32 oracle | 8.5e-2 rms | 4.7e-2 |
+| upstream bf16's own drift, same request and noise | 3.1e-1 (3.6×) | 8.2e-1 (17×) |
+| −1 dBFS audio vs the fp32 oracle's | 14.1 dB SNR | 20.8 dB |
+
+The audio SNR is the latent drift from layer 0's fp16 logits (A-o7)
+carried through the decoder. It is not a VAE error: the VAE alone is ≥60
+dB. Timings, request to samples with the device to itself (`cmd/ace`,
+warm):
+
+| song | text | encoders | DiT (8 steps) | VAE | total |
+|---|---|---|---|---|---|
+| 30 s | 14 ms | 49 ms | 1.10 s | 0.30 s | 1.47 s |
+| 45 s | 15 ms | 46 ms | 1.58 s | 0.46 s | 2.10 s |
+| 2 min | 15 ms | 41 ms | 3.41 s | 1.23 s | 4.70 s |
+| 4 min | 16 ms | 42 ms | 7.08 s | 2.49 s | 9.63 s |
+
+`cmd/ace` for 4 minutes is 18.8 s of wall time, ~9 s of it staging 17 GB
+of fp32 checkpoint into 10 GB of fp16 (page cache warm). A 45 s mp3 comes
+out at 48 kHz stereo with its peak at −1.0 dB (volumedetect). Nobody has
+listened yet. The gate is the oracle's audio at 14–21 dB SNR, with the
+drift priced against bf16.
+
+### A7 — the oracle, and what the FSM masks (2026-09-27)
+
+`reference/dump_ace_lm.py` runs upstream's `generate_music` with thinking
+on: `LLMHandler`, PyTorch backend, fp32 on the CPU, 75–170 s a case. It
+stops at the DiT's door. At every sampling step it records the FSM state,
+how many tokens the FSM alone allows (and which, when ≤ 64), how many are
+left after top-p (and which), and the sampled token. It records the prompts
+as text and ids, the CFG pair's padding mask, and the raw logits of both
+rows at steps 0, 1, 2, 3, 10, 50 and 100 of each phase. It also dumps what
+reaches the DiT. Two cases:
+
+- `given_duration`: caption, lyrics, 30 s; the LM plans the rest.
+- `all_metas`: A1's full_metas request.
+
+**Upstream's LM sampling is not seeded**: two runs of `given_duration`
+wrote 161- and 120-token CoTs. So this oracle is a trace to teacher-force
+against, not a byte-reproducible run. The manifest holds the last run;
+regenerating it moves every gate's tokens.
+
+**A-o5, answered: the default path's FSM is small.**
+
+| phase 1 state | what the FSM allows |
+|---|---|
+| `<think>`, field names (`bpm:`, `caption:`…), newlines, `</think>` | exactly one token (forced) |
+| bpm value | a space, then 1–9, then 0–9, then newline (30–300 by range check) |
+| caption value | **everything but the 64,001 audio-code tokens** (153,203 of 217,204); the model's own YAML folding (`\n  ` continuations) and its newline end the field |
+| duration value | a user's duration, forced digit by digit; otherwise the LM's (10–600) |
+| keyscale value | a root (C, A, D, B, F, E, G, Ab, Db, Eb as tokens), then `#`/`b`/`♯`/`♭`/` major`/` minor`, then newline |
+| language value | forced here (` en`); to check against a request with other lyrics |
+| timesignature value | a space, then 2/3/4/6, then newline |
+| end | `<|im_end|>` (EOS) at `THINK_END_TAG` |
+| **phase 2** | **exactly the 64,000 valid codes** until 5 × seconds codes, then EOS alone |
+
+What a port must reproduce around it, all read from `llm_inference.py`:
+
+- **Top-p (0.9) filters the untempered logits.** Temperature (0.85) is
+  applied only inside `_sample_tokens`. The FSM's phase temperatures are
+  unset by default. Repetition penalty is 1.0 and top-k is off.
+- **CFG (2.0) runs in phase 2 only**, over the 64,000 code tokens:
+  `uncond + 2·(cond − uncond)`, everything else −inf. The sampled token is
+  appended to both rows.
+- **The unconditional row** is the chat prompt with `NO USER INPUT` as the
+  user turn and `<think>\n\n</think>\n\n`. It is *left-padded* with
+  `<|endoftext|>` to the conditional row's length, attention-masked, and
+  given no position ids. Its real tokens' positions are therefore shifted
+  by the pad count, which RoPE makes a numerical no-op.
+- **Phase 2's CoT is re-serialised, not phase 1's text.**
+  `_format_metadata_as_cot` builds `{bpm, caption, duration, keyscale,
+  language, timesignature}` (digit strings → ints, `N/4` → `N`) and emits
+  it with `yaml.dump(allow_unicode=True, sort_keys=True)`. The caption's
+  line folding is **PyYAML's plain-scalar emitter at width 80**, and a
+  caption with `: ` or a leading indicator switches to a quoted style. A
+  port needs that emitter for strings, fuzzed against Python.
+- **With every meta given (`all_metas`), phase 1 is skipped**
+  (`has_all_metas`). The CoT then holds only the user's bpm, duration,
+  keyscale and timesignature: no caption and no language, and the DiT
+  keeps the user's caption.
+- The DiT reads the hints: `is_covers` is True, the source latents are the
+  detokenized codes (A4), and the chunk mask stays 1.0.
+
+**The plan for A7, in pieces:**
+
+1. **A7a, prompts and prefill.** Build the phase prompts and tokens (the
+   LM's tokenizer has 65k added tokens), exact against the dumped ids. The
+   prefill is `zimage/qwen.GPUEncoder`, which is this model's shape: dense
+   Qwen3-4B, causal GQA, prefill only. The lm_head is the tied 217k-row
+   embedding. Gate: logits at step 0 of each phase, both rows.
+2. **A7b, KV-cached decode for two rows (A-o2).** Nothing in the repo
+   decodes a *dense* Qwen3 today: Kev is Qwen3.5 (GDN + attention) and the
+   LLM is MoE. The candidate is the GPUEncoder's staged weights with
+   narrow-M GEMM rungs at M = 2 plus a decode attention over a KV cache.
+   At ~200 GB/s, 8 GB of fp16 is ~25 tokens/s, so 1,200 codes (4 min) is
+   ~50 s. That makes int8 (A10) the lever. Gate: teacher-forced logits at
+   steps 1–100 of both phases.
+3. **A7c, sampling and the FSM** (the table above), the YAML emitter,
+   phase 1 → phase 2 → `Detokenize` → the DiT's covers path (A8).
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -501,9 +771,17 @@ cover every forward, not only the first.
 - **A-o4: resident or staged per request?** It is ~19.5 GB in fp16, beside
   the image and video models on the non-LLM machine.
 - **A-o5: how much of the constrained-decoding FSM is live** in the default
-  thinking path, and what it masks.
+  thinking path, and what it masks. Answered (§ A7 — the oracle): a
+  forced-token YAML skeleton, digit/range and key/time-signature prefix
+  sets, captions free except audio codes, and codes-only with a forced EOS
+  in phase 2.
 - **A-o6: does untiled decode differ audibly from upstream's tiled one?**
-  (A5)
+  Answered (A5): no. Upstream's own tiling is within 8.3e-6 of untiled,
+  and ours (512/32) is within the fp16 path's 60+ dB.
+- **A-o7: split-precision QK for DiT layer 0?** fp16 q/k there are the
+  whole of the path's drift from fp32 (§ A2/A3 result), still 3.6–16×
+  under upstream bf16's. It is worth doing if an end-to-end listen or a
+  later gate wants the path closer to fp32.
 
 ## Handoff
 
@@ -522,9 +800,9 @@ oracle disagreed (chunk masks are 1.0, not 2.0).
   (see § A0 result; **never point the handler at the HF clones**).
 
 - Weights, all gitignored under `models/`:
-  - `acestep-v15-xl-turbo/` (git-LFS clone; includes `silence_latent.pt`
+  - `acestep-v15-xl-turbo/` (HF clone, `.git` since removed; includes `silence_latent.pt`
     and the HF `modeling_acestep_v15_xl_turbo.py`);
-  - `acestep-5Hz-lm-4B/` (git-LFS clone);
+  - `acestep-5Hz-lm-4B/` (HF clone, `.git` since removed);
   - `Ace-Step1.5/` (`vae/`, the text encoder's configs);
   - `ACE-Step-1.5-src/` (upstream pipeline at `ca1e85f`; its
     `acestep/models/xl_turbo/` model file is the HF one plus DCW and
@@ -535,27 +813,40 @@ oracle disagreed (chunk masks are 1.0, not 2.0).
   and `uv pip install --python .venv-acestep/bin/python transformers==4.57.1 diffusers==0.37.0 vector-quantize-pytorch einops loguru pyyaml numpy safetensors soundfile scipy pytorch-wavelets PyWavelets`.
   (`vector-quantize-pytorch` also went into `.venv`, harmlessly.)
 
+**2026-09-27, session 2: A2–A6 done, A7's oracle written, A-o5 answered.** The DiT-only path
+runs end to end: `go run ./cmd/ace -caption … -lyrics-file … -duration 90
+-out song.mp3`.
+
+- Code:
+  - `ace/dit`: the three stacks, and the `WINDOW`/`CROSS` builds of
+    `dit_attention_wmma.comp`;
+  - `ace/vae`: Oobleck on kokoro's `A_CONV` GEMM, plus
+    `shaders/ace_vae.comp`;
+  - `ace/pipeline`;
+  - `cmd/ace`.
+- Oracles:
+  - `dump_ace_dit.py --bf16` (upstream's CUDA dtype, from the fp32 run's
+    noise, into `reference/out/acedit_bf16`);
+  - `dump_ace_vae.py` (`reference/out/acevae`);
+  - `dump_ace_detok.py` (A4, `reference/out/acedetok`);
+  - `dump_ace_lm.py` (A7, `reference/out/acelm`; run it with
+    `PYTHONDONTWRITEBYTECODE=1`, as the scripts import each other and
+    would leave a `reference/__pycache__`).
+- Tests: `go test ./ace/...`, ~1 min in all. Each package stages its own
+  models and they don't share a device, so run them one package at a time
+  if the machine is busy.
+- The fp16 drift is all DiT layer 0's q/k (§ A2/A3 result, A-o7), priced
+  against upstream's bf16.
+
 **Next, in order:**
 
-1. **The attention kernel's two new bounds.**
-   `shaders/dit_attention_wmma.comp` already does GQA, and a query count
-   different from the key count (the REL_BIAS split). It needs two more
-   things:
-   - a **±128 window** (skip key blocks outside it, mask inside it, with the
-     row max masked too, as its CAUSAL build does);
-   - **cross-attention planes** whose key count and plane stride differ
-     from the queries'.
-
-   The encoders need the window and the DiT needs both. This is the one
-   new piece of kernel work before A2/A3 are plumbing.
-2. A2 on the GPU (`ace/cond`?):
-   - `embed.GPU.Hidden` for the caption, gated against
-     `reference/out/aceplan/*_text_hidden.bin`;
-   - the lyric lookup (`*_lyric_embeds.bin`);
-   - the lyric (8-layer) and timbre (4-layer) encoders against
-     `reference/out/acedit/*_{lyric,timbre}_layer*.bin`, and the packed
-     `*_encoder_states.bin`.
-3. A3 (`ace/dit`): on H3's block machinery (fp32 residual, per-run AdaLN
-   vectors, RMS pre-norms, q/k norm + full-width RoPE, SwiGLU), plus the
-   cross-attention K/V computed once a request. Gate teacher-forced per
-   layer and per forward against `acedit`, as H3's M7 did.
+1. **Listen.** Nobody has heard a song yet. Generate a few across genres and
+   lengths (`cmd/ace`) and check they are music, not merely close to the
+   oracle.
+2. ~~A4~~ done (§ A4 result).
+3. **A7, the 5 Hz LM**, in the three pieces of § A7 — the oracle: A7a
+   (prompts + prefill logits on `zimage/qwen.GPUEncoder`), A7b (the
+   two-row KV decode, A-o2), A7c (sampling, the FSM, PyYAML's emitter).
+   The oracle is `reference/out/acelm` (`dump_ace_lm.py`, ~4 min, not
+   byte-reproducible: upstream's LM sampling is unseeded).
+4. A8 (thinking end to end), then A9 (serve; A-o3, ask first).

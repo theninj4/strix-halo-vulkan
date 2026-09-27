@@ -1,0 +1,61 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// ACE-Step's VAE decoder (Oobleck, ace/vae, MUSIC.md A5): the two passes that
+// sit between its convolutions, which run on dit_gemm.comp's A_CONV build.
+//
+// SNAKE (default) is Oobleck's activation, x + sin²(αx) / (β + 1e-9) with α
+// and β already exponentiated (the checkpoint stores them log-scale), fused
+// with the bias of the convolution in front of it (pc.kOff, or NO_W) and the
+// narrowing into the next convolution's channel-last fp16 A operand (row
+// stride pc.dim). It also writes pc.span zero rows after the pc.tokens real
+// ones. The A_CONV read of a k7 tap at dilation 9 reaches 27 rows past the
+// last frame, and a GEMM padded to its M tile reads further still; those
+// rows have to be the zero padding the convolution means. Stages of
+// different widths share the arena, so a longer, narrower stage leaves
+// something else there.
+//
+// PICK copies the first pc.dim columns of pc.tokens rows (row stride pc.lda)
+// into a dense [tokens, dim] block: the stereo pair out of the last
+// convolution's 32-wide tile, so a readback is 8 bytes a sample, not 128.
+//
+// Both are flat over the elements with C a power of two (pc.aux2 = log2 C),
+// as kokoro_act.comp is: the decoder's widths are 64 to 2048.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef PICK
+#define PICK 0
+#endif
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+#if PICK
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint t = idx / pc.dim, c = idx % pc.dim;
+    act[pc.outOff + idx] = act[pc.inOff + t * pc.lda + c];
+#else
+    if (idx >= (pc.tokens + pc.span) * pc.dim) {
+        return;
+    }
+    uint t = idx >> pc.aux2;
+    uint c = idx & (pc.dim - 1u);
+    float v = 0.0;
+    if (t < pc.tokens) {
+        v = act[pc.inOff + idx];
+        if (pc.kOff != NO_W) {
+            v += wbuf[pc.kOff + c];
+        }
+        float s = sin(wbuf[pc.wOff + c] * v);
+        v += wbuf[pc.wOff + pc.dim + c] * (s * s);
+    }
+    hact[pc.outOff + idx] = float16_t(v);
+#endif
+}
