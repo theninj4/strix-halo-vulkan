@@ -19,7 +19,12 @@ package api
 // upstream): its field names and their aliases, flat or in a nested
 // `metas`/`metadata`/`user_metadata` object, as JSON or a form. What that API
 // offers and this server does not run -- other tasks, reference audio,
-// batches, sample/format modes -- is a 400 naming the field, never ignored.
+// batches, format mode -- is a 400 naming the field, never ignored.
+//
+// Sample mode (`sample_query`, or `sample_mode` alone for a song of the
+// LM's choosing; MUSIC.md A12) has the LM write the caption, metas and
+// lyrics from a description first. A caption or lyrics sent with it would
+// be discarded, as upstream discards them, so they are a 400 instead.
 //
 // Jobs live in memory, as the video ones do: a restart forgets them and
 // their files.
@@ -71,6 +76,11 @@ type MusicRequest struct {
 	Language      string
 	// Thinking runs the 5 Hz LM before the DiT: upstream's default path.
 	Thinking bool
+	// Sample has the LM write the song from SampleQuery first (sample mode):
+	// upstream's sample_mode flag, or a query given. SampleMode is the flag
+	// itself, which also keeps phase 1 from filling a meta the song lacks.
+	Sample, SampleMode bool
+	SampleQuery        string
 	// Seed is the DiT's noise seed and LMSeed the LM's sampling seed; nil
 	// draws one, and the plan reports it.
 	Seed, LMSeed *int64
@@ -108,7 +118,11 @@ type MusicProgress struct {
 // MusicMetadata is what the DiT was asked for: the request's metas where
 // it gave them and the LM's where it did not, as upstream reports `metas`.
 type MusicMetadata struct {
-	Caption       string  `json:"caption"`
+	Caption string `json:"caption"`
+	// Lyrics and Genres are what sample mode wrote (empty otherwise: the
+	// lyrics are the request's own).
+	Lyrics        string  `json:"lyrics,omitempty"`
+	Genres        string  `json:"genres,omitempty"`
 	BPM           int     `json:"bpm,omitempty"`
 	KeyScale      string  `json:"keyscale,omitempty"`
 	TimeSignature string  `json:"timesignature,omitempty"`
@@ -150,7 +164,11 @@ type MusicJob struct {
 	Caption  string `json:"caption"`
 	Lyrics   string `json:"lyrics"`
 	Thinking bool   `json:"thinking"`
-	Format   string `json:"format"`
+	// SampleQuery is sample mode's description; Sample says it ran (a
+	// query, or sample_mode with none).
+	Sample      bool   `json:"sample_mode,omitempty"`
+	SampleQuery string `json:"sample_query,omitempty"`
+	Format      string `json:"format"`
 	// Seconds is the song's length: null until known, which with thinking
 	// and no duration is when the LM has planned it.
 	Seconds *float64 `json:"seconds"`
@@ -267,6 +285,7 @@ func (q *MusicJobs) Submit(req *MusicRequest) (MusicJob, error) {
 	j := &musicJob{req: req, plan: plan, MusicJob: MusicJob{
 		ID: newMusicID(), Object: "music", Model: model, Status: MusicQueued,
 		CreatedAt: time.Now().Unix(), Caption: req.Caption, Lyrics: req.Lyrics, Thinking: req.Thinking,
+		Sample: req.Sample, SampleQuery: req.SampleQuery,
 		Format: plan.Format, Seed: plan.Seed, LMSeed: plan.LMSeed, Steps: plan.Steps,
 		Estimated: plan.Estimate.Round(time.Second).Seconds(),
 	}}
@@ -584,8 +603,6 @@ var musicRefused = []struct {
 }{
 	{[]string{"task_type", "taskType"}, isOneOf("text2music"), "only text2music is served (cover, repaint, lego, extract and complete are not)"},
 	{[]string{"batch_size", "batchSize"}, isOneOf("1"), "one song a job; submit one job per song"},
-	{[]string{"sample_mode", "sampleMode"}, isOneOf("false"), "sample mode is not served"},
-	{[]string{"sample_query", "sampleQuery", "description", "desc"}, isOneOf(""), "sample mode is not served"},
 	{[]string{"use_format", "useFormat", "format"}, isOneOf("false"), "format mode is not served"},
 	{[]string{"audio_code_string", "audioCodeString"}, isOneOf(""), "audio codes in are not served; thinking writes them"},
 	{[]string{"reference_audio_path", "src_audio_path", "reference_audio", "src_audio"}, isOneOf(""), "no reference or source audio: text2music is served"},
@@ -641,8 +658,18 @@ func (f musicFields) toMusicRequest() (*MusicRequest, error) {
 	if r.Lyrics, err = f.str("lyrics"); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(r.Caption) == "" && strings.TrimSpace(r.Lyrics) == "" {
-		return nil, errors.New("caption (or prompt) is required, or lyrics")
+	if r.SampleQuery, err = f.str("sample_query", "sampleQuery", "description", "desc"); err != nil {
+		return nil, err
+	}
+	if r.SampleMode, _, err = f.boolean("sample_mode", "sampleMode"); err != nil {
+		return nil, err
+	}
+	r.Sample = r.SampleMode || strings.TrimSpace(r.SampleQuery) != ""
+	switch {
+	case r.Sample && (strings.TrimSpace(r.Caption) != "" || strings.TrimSpace(r.Lyrics) != ""):
+		return nil, errors.New("sample mode writes the caption and lyrics itself: send sample_query without them, or them without it")
+	case !r.Sample && strings.TrimSpace(r.Caption) == "" && strings.TrimSpace(r.Lyrics) == "":
+		return nil, errors.New("caption (or prompt) is required, or lyrics, or a sample_query")
 	}
 	if b, ok, err := f.boolean("thinking"); err != nil {
 		return nil, err
@@ -772,8 +799,8 @@ func (s *Server) handleMusicCreate(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		backendError(ctx, w, "music", err)
 	default:
-		logf(ctx, "music %s queued: thinking %v, %s, seed %d, ~%v", job.ID, job.Thinking, job.Format, job.Seed,
-			time.Duration(job.Estimated)*time.Second)
+		logf(ctx, "music %s queued: thinking %v, sample %v, %s, seed %d, ~%v", job.ID, job.Thinking, job.Sample,
+			job.Format, job.Seed, time.Duration(job.Estimated)*time.Second)
 		writeJSON(w, http.StatusOK, job)
 	}
 }

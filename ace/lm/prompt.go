@@ -43,8 +43,10 @@ const (
 // ChatPrompt is the Qwen3 chat template over the system instruction and one
 // user turn, with the generation prompt: what apply_chat_template renders
 // for upstream's two-message conversations.
-func ChatPrompt(user string) string {
-	return "<|im_start|>system\n# Instruction\n" + Instruction + "\n\n<|im_end|>\n" +
+func ChatPrompt(user string) string { return chatPrompt(Instruction, user) }
+
+func chatPrompt(instruction, user string) string {
+	return "<|im_start|>system\n# Instruction\n" + instruction + "\n\n<|im_end|>\n" +
 		"<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n"
 }
 

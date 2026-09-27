@@ -131,6 +131,14 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	if req.Thinking && b.pipe.LM == nil {
 		return nil, unsupported("thinking needs the 5 Hz LM, which this server did not load (-music-lm)")
 	}
+	if req.Sample {
+		if b.pipe.LM == nil {
+			return nil, unsupported("sample mode needs the 5 Hz LM, which this server did not load (-music-lm)")
+		}
+		if !b.pipe.LM.HasGenres() {
+			return nil, unsupported("sample mode needs upstream's genres vocabulary (models/%s): %v", lm.GenresFile, b.pipe.GenresErr)
+		}
+	}
 	if req.Duration != 0 && (req.Duration < plan.MinSeconds || req.Duration > plan.MaxSeconds) {
 		return nil, unsupported("duration %g s is outside %d-%d s", req.Duration, plan.MinSeconds, plan.MaxSeconds)
 	}
@@ -189,9 +197,10 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	case !req.Thinking:
 		p.Seconds = plan.FallbackSeconds
 	}
-	if req.Thinking {
+	if req.Thinking && !req.Sample {
 		// The codes phase's prompt is the CoT's plus the CoT, and the codes
-		// follow it in the same cache.
+		// follow it in the same cache. (Sample mode's lyrics are not known
+		// yet; the codes phase checks its own fit when it starts.)
 		secs := cmpOr(p.Seconds, plan.MaxSeconds)
 		need, err := b.pipe.LM.Positions(r.Caption, r.Lyrics, secs)
 		if err != nil {
@@ -202,7 +211,7 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 				need, secs, b.pipe.LM.MaxLen())
 		}
 	}
-	p.Estimate = musicEstimate(r, req.Thinking, cmpOr(p.Seconds, 120)).total()
+	p.Estimate = musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120)).total()
 	return p, nil
 }
 
@@ -228,18 +237,27 @@ func musicLatents(r *plan.Request, thinking bool) int {
 // ~150 of them; a DiT forward is 2.65e-4·L + 7.16e-9·L² s over L = 12.5 a
 // second tokens (A3's 0.86 s at 3,000 and 2.39 s at 7,500) plus 35 ms of
 // host; the VAE is 10.4 ms a second of audio (A6); encoding the file is
-// ffmpeg's.
+// ffmpeg's. Sample mode's pass is ~sampleSteps (a caption, the metas and
+// a song's lyrics), and the song it writes usually has every meta, so
+// phase 1 is then skipped.
 type musicCost struct {
-	think, codes, dit, vae, write time.Duration
+	sample, think, codes, dit, vae, write time.Duration
 }
 
-func (c musicCost) total() time.Duration { return c.think + c.codes + c.dit + c.vae + c.write }
+const sampleSteps = 450
 
-func musicEstimate(r *plan.Request, thinking bool, seconds float64) musicCost {
+func (c musicCost) total() time.Duration {
+	return c.sample + c.think + c.codes + c.dit + c.vae + c.write
+}
+
+func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64) musicCost {
 	sec := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
 	var c musicCost
+	if sample {
+		c.sample = sec(sampleSteps * 0.050)
+	}
 	if thinking {
-		if !lm.UserMeta(r).HasAll() {
+		if !sample && !lm.UserMeta(r).HasAll() {
 			c.think = sec(150 * 0.050)
 		}
 		c.codes = sec((seconds*lm.CodesPerSecond + 1) * 0.050)
@@ -255,7 +273,7 @@ func musicEstimate(r *plan.Request, thinking bool, seconds float64) musicCost {
 func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *api.MusicPlan, dst string, progress func(api.MusicProgress)) error {
 	r := musicRequest(req)
 	secs := cmpOr(mp.Seconds, 120)
-	c := musicEstimate(r, req.Thinking, secs)
+	c := musicEstimate(r, req.Thinking, req.Sample, secs)
 	var sampling *lm.Sampling
 	if req.LMTemperature != nil || req.LMCFGScale != nil || req.LMTopP != nil {
 		s := lm.DefaultSampling
@@ -279,22 +297,29 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 			return d.Seconds() * float64(min(done, total)) / float64(total)
 		}
 		switch stage {
+		case "sample":
+			return part(c.sample, done, sampleSteps) / t
 		case "think":
-			return part(c.think, done, 150) / t
+			return (c.sample.Seconds() + part(c.think, done, 150)) / t
 		case "codes":
-			return (c.think.Seconds() + part(c.codes, done, total)) / t
+			return (c.sample+c.think).Seconds()/t + part(c.codes, done, total)/t
 		case "dit":
-			return (c.think+c.codes).Seconds()/t + part(c.dit, done, total)/t
+			return (c.sample+c.think+c.codes).Seconds()/t + part(c.dit, done, total)/t
 		case "vae":
-			return (c.think + c.codes + c.dit).Seconds() / t
+			return (c.sample + c.think + c.codes + c.dit).Seconds() / t
 		}
 		return 0
 	}
+	var smp *pipeline.Sample
+	if req.Sample {
+		smp = &pipeline.Sample{Query: req.SampleQuery, SkipCoT: req.SampleMode}
+	}
+	var song *lm.Song
 	var res *pipeline.Result
 	err := b.opt.Device.Do(func(*vk.Device) error {
 		var err error
 		res, err = b.pipe.Generate(r, pipeline.Options{
-			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling,
+			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling, Sample: smp,
 			Shift: req.Shift, Timesteps: req.Timesteps,
 			Between: func() error {
 				if err := ctx.Err(); err != nil {
@@ -306,16 +331,26 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 			Progress: func(stage string, done, total int) {
 				progress(api.MusicProgress{Stage: stage, Fraction: frac(stage, done, total)})
 			},
+			Sampled: func(s lm.Song) {
+				song = &s
+				progress(api.MusicProgress{Stage: "sampled", Fraction: frac("think", 0, 1),
+					Plan: &api.MusicMetadata{Caption: s.Caption, Lyrics: s.Lyrics, Genres: s.Genres, BPM: s.BPM,
+						KeyScale: s.KeyScale, TimeSignature: s.TimeSignature, Duration: s.Duration,
+						Language: cmpStr(s.Language, "unknown")}})
+			},
 			Planned: func(d *plan.Request, seconds float64) {
 				// The plan fixes the length, so the estimate is redone
 				// around it; what is spent is kept.
-				spent := c.think
-				c = musicEstimate(d, req.Thinking, seconds)
-				c.think = spent
+				spent, sampled := c.think, c.sample
+				c = musicEstimate(d, req.Thinking, req.Sample, seconds)
+				c.think, c.sample = spent, sampled
+				m := &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM, KeyScale: d.KeyScale,
+					TimeSignature: d.TimeSignature, Duration: seconds, Language: cmpStr(d.Language, "unknown")}
+				if song != nil {
+					m.Lyrics, m.Genres = d.Lyrics, song.Genres
+				}
 				progress(api.MusicProgress{Stage: "planned", Fraction: frac("codes", 0, 1), Seconds: seconds,
-					Estimate: c.total(), Plan: &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM,
-						KeyScale: d.KeyScale, TimeSignature: d.TimeSignature, Duration: seconds,
-						Language: cmpStr(d.Language, "unknown")}})
+					Estimate: c.total(), Plan: m})
 			},
 		})
 		return err

@@ -21,6 +21,12 @@ Cases (label: what the request gives; the LM plans the rest):
 * ``given_duration``: caption + lyrics + duration 30 s.
 * ``all_metas``: A1's full_metas request (bpm, key, time signature,
   duration 30 s, language).
+* ``sample``, ``sample_ja`` (MUSIC.md A12): sample mode as upstream's API
+  runs it for a `sample_query` -- parse_description_hints, create_sample
+  (phase 0: caption, metas, genres and lyrics from the query), then
+  generate_music on what it wrote. The run stops once the codes phase's
+  prompts are recorded; the codes path is the thinking path's. ``sample_ja``
+  names its language, which the FSM then injects.
 
     HF_HUB_OFFLINE=1 .venv-acestep/bin/python reference/dump_ace_lm.py [label ...]
 """
@@ -38,7 +44,8 @@ sys.path.insert(0, "reference")
 
 from acestep.constrained_logits_processor import MetadataConstrainedLogitsProcessor  # noqa: E402
 from acestep.handler import AceStepHandler  # noqa: E402
-from acestep.inference import GenerationConfig, GenerationParams, generate_music  # noqa: E402
+from acestep.api.server_utils import parse_description_hints  # noqa: E402
+from acestep.inference import GenerationConfig, GenerationParams, create_sample, generate_music  # noqa: E402
 from acestep.llm_inference import LLMHandler  # noqa: E402
 from dump_ace_plan import CASES, PROJECT  # noqa: E402
 
@@ -55,6 +62,10 @@ def main():
     labels = sys.argv[1:] or ["given_duration", "all_metas"]
     os.makedirs(OUT, exist_ok=True)
     manifest = {"cases": {}, "tensors": {}}
+    path = os.path.join(OUT, "manifest.json")
+    if os.path.exists(path):  # other labels' cases are kept
+        with open(path) as fh:
+            manifest = json.load(fh)
 
     def dump(name, t, dtype="float32"):
         arr = t.detach().contiguous().cpu().numpy().astype(dtype) if torch.is_tensor(t) else np.asarray(t, dtype=dtype)
@@ -78,6 +89,8 @@ def main():
     requests = {
         "given_duration": {"caption": base["caption"], "lyrics": base["lyrics"], "duration": 30.0},
         "all_metas": base,
+        "sample": {"sample_query": "a melancholy synthwave song about driving through a neon city at night"},
+        "sample_ja": {"sample_query": "a gentle japanese city pop song for a summer evening"},
     }
 
     for label in labels:
@@ -100,6 +113,8 @@ def main():
                 if am is not None:
                     dump(f"{label}_p{ph}_prompt_mask", am.cpu(), "int32")
                 rec["prompts"].append([tok.decode(r) for r in ids])
+                if "sample_query" in requests[label] and rows == 2:
+                    raise Stop()  # the codes phase: its prompts are what we wanted
             out = real_fwd(model, generated_ids, model_kwargs, past_key_values, use_cache)
             if state["step"] in LOGIT_STEPS:
                 dump(f"{label}_p{state['phase']}_logits{state['step']}", out.logits[:, -1, :].float())
@@ -144,9 +159,30 @@ def main():
             raise Stop()
         h.model.generate_audio = capture
 
-        params = GenerationParams(thinking=True, seed=42, shift=3.0, **requests[label])
         t0 = time.time()
         try:
+            req = requests[label]
+            if "sample_query" in req:
+                # llm_generation_inputs.py with sample_query set, sample_mode
+                # false and vocal_language "unknown" (this server's default).
+                q = req["sample_query"]
+                lang, instrumental = parse_description_hints(q)
+                torch.manual_seed(42)
+                sr = create_sample(llm_handler=lm, query=q, instrumental=instrumental, vocal_language=lang,
+                                   temperature=0.85, top_k=None, top_p=0.9, use_constrained_decoding=True)
+                assert sr.success, sr.error
+                rec["sample"] = {"caption": sr.caption, "lyrics": sr.lyrics, "bpm": sr.bpm, "duration": sr.duration,
+                                 "keyscale": sr.keyscale, "timesignature": sr.timesignature,
+                                 "language": sr.language, "instrumental": sr.instrumental,
+                                 "hint_language": lang, "hint_instrumental": instrumental}
+                params = GenerationParams(thinking=True, seed=42, shift=3.0, caption=sr.caption, lyrics=sr.lyrics,
+                                          instrumental=not sr.lyrics.strip() or sr.lyrics.strip().lower() in (
+                                              "[inst]", "[instrumental]"),
+                                          vocal_language="unknown", bpm=sr.bpm, keyscale=sr.keyscale,
+                                          timesignature=sr.timesignature,
+                                          duration=sr.duration if sr.duration else -1.0)
+            else:
+                params = GenerationParams(thinking=True, seed=42, shift=3.0, **req)
             res = generate_music(h, lm, params, GenerationConfig(batch_size=1, use_random_seed=False, seeds=[42]))
             err = getattr(res, "status_message", "")
         except Stop:

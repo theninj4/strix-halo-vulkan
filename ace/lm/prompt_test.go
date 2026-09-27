@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"strix-halo-vulkan/ace/plan"
@@ -38,6 +39,8 @@ type lmManifest struct {
 			} `json:"steps"`
 		} `json:"phases"`
 		Prompts [][]string `json:"prompts"`
+		// Sample is create_sample's result in the sample cases (A12).
+		Sample map[string]any `json:"sample"`
 	} `json:"cases"`
 	Tensors map[string]struct {
 		Shape []int  `json:"shape"`
@@ -147,6 +150,9 @@ func TestPrompts(t *testing.T) {
 	m := loadLMManifest(t)
 	tk := loadTokenizer(t)
 	for label, c := range m.Cases {
+		if c.Sample != nil {
+			continue // TestSamplePrompts
+		}
 		caption, _ := c.Request["caption"].(string)
 		lyrics, _ := c.Request["lyrics"].(string)
 		var want [][]string
@@ -206,4 +212,81 @@ func requestOf(q map[string]any) *plan.Request {
 	r.Duration, _ = q["duration"].(float64)
 	r.Language, _ = q["vocal_language"].(string)
 	return r
+}
+
+// TestSamplePrompts is TestPrompts for the sample cases (MUSIC.md A12):
+// the sample pass's prompt from the query and its hints; the song parsed
+// out of what upstream's LM wrote, against create_sample's own result; and
+// the thinking path's prompts rebuilt from that song -- phase 1's when a
+// meta is missing, and the codes phase's two rows.
+func TestSamplePrompts(t *testing.T) {
+	m := loadLMManifest(t)
+	tk := loadTokenizer(t)
+	n := 0
+	for label, c := range m.Cases {
+		if c.Sample == nil {
+			continue
+		}
+		n++
+		q, _ := c.Request["sample_query"].(string)
+		lang, inst := DescriptionHints(q)
+		if want, _ := c.Sample["hint_language"].(string); lang != want || inst != c.Sample["hint_instrumental"] {
+			t.Errorf("%s: hints (%q, %v), want (%v, %v)", label, lang, inst, c.Sample["hint_language"], c.Sample["hint_instrumental"])
+		}
+		checkRow := func(ph, r int, got string) {
+			t.Helper()
+			w := c.Prompts[ph][r]
+			for strings.HasPrefix(w, "<|endoftext|>") {
+				w = w[len("<|endoftext|>"):]
+			}
+			if got != w {
+				t.Errorf("%s phase %d row %d text:\n got %q\nwant %q", label, ph, r, got, w)
+				return
+			}
+			ids, err := tk.Encode(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if at := equalIDs(ids, promptRows(t, m, label, ph)[r]); at >= 0 {
+				t.Errorf("%s phase %d row %d: ids differ at %d", label, ph, r, at)
+				return
+			}
+			t.Logf("%s phase %d row %d: %d ids exact", label, ph, r, len(ids))
+		}
+		checkRow(0, 0, SamplePrompt(q, inst))
+
+		text := c.Phases[0].Text
+		lyrics := ExtractLyrics(text)
+		if lyrics == "" && inst {
+			lyrics = "[Instrumental]"
+		}
+		song := SongOf(ParseCoT(text), lyrics, inst)
+		want := c.Sample
+		num := func(k string) float64 { v, _ := want[k].(float64); return v }
+		str := func(k string) string { v, _ := want[k].(string); return v }
+		if song.Caption != str("caption") || song.Lyrics != str("lyrics") || song.BPM != int(num("bpm")) ||
+			song.Duration != num("duration") || song.KeyScale != str("keyscale") ||
+			song.TimeSignature != str("timesignature") || song.Language != str("language") {
+			t.Errorf("%s: song %+v,\nwant %v", label, song, want)
+		}
+		t.Logf("%s: %d-token song, genres %q, %d s, lyrics %q...", label, len(c.Phases[0].Steps), song.Genres,
+			int(song.Duration), song.Lyrics[:min(60, len(song.Lyrics))])
+
+		// The thinking path on the song, as the oracle's generate_music ran it.
+		req := &plan.Request{Caption: song.Caption, Lyrics: song.Lyrics, BPM: song.BPM, KeyScale: song.KeyScale,
+			TimeSignature: song.TimeSignature, Duration: song.Duration}
+		meta, ph := UserMeta(req), 1
+		if !meta.HasAll() {
+			checkRow(1, 0, Phase1Prompt(song.Caption, song.Lyrics))
+			meta, ph = ParseCoT(c.Phases[1].Text), 2
+		}
+		if len(c.Prompts) != ph+1 || len(c.Prompts[ph]) != 2 {
+			t.Fatalf("%s: the oracle's phase %d is not the codes pair", label, ph)
+		}
+		checkRow(ph, 0, Phase2Prompt(song.Caption, song.Lyrics, meta.CoT()))
+		checkRow(ph, 1, Phase2Uncond())
+	}
+	if n == 0 {
+		t.Skip("no sample cases; run reference/dump_ace_lm.py sample sample_ja")
+	}
 }

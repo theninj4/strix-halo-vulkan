@@ -12,10 +12,12 @@ package lm
 // injected as the tokens of " value\n". reference/dump_ace_fsm.py drives the
 // upstream processor through scripted CoTs and TestFSM replays them.
 //
-// One divergence, recorded: upstream constrains a `genres:` value to a
-// vocabulary file. That state is reachable only if the model writes
-// "genres:" after its caption (the field is skipped by default); here it is
-// left free until its newline.
+// Sample mode (MUSIC.md A12) is the same processor as create_sample_from_
+// query configures it: phase "understand", genres generated, no stop at
+// reasoning. It writes `</think>` and goes on to free-form lyrics, where
+// only the audio codes are masked. A `genres:` value is held to upstream's
+// vocabulary (genres.go) whenever it was loaded; without it the value is
+// free until its newline.
 
 import (
 	"fmt"
@@ -89,6 +91,9 @@ const (
 	captionMaxTokens         = 512
 )
 
+// fieldOrder is the CoT's, genres included.
+var fieldOrder = []string{"bpm", "caption", "duration", "genres", "keyscale", "language", "timesignature"}
+
 func validKeyscales() []string {
 	var out []string
 	for _, note := range []string{"A", "B", "C", "D", "E", "F", "G"} {
@@ -142,6 +147,7 @@ type fsmVocab struct {
 	decoded                                map[int32]string
 	fixed                                  map[string]int32 // remaining fixed text -> its longest single-token prefix
 	fixedLen                               map[string]int
+	genres                                 *genreVocab // nil until loaded
 }
 
 func newFSMVocab(tk *tokenizer.Tokenizer) (*fsmVocab, error) {
@@ -255,11 +261,14 @@ func (v *fsmVocab) fixedToken(remaining string) (int32, bool) {
 	return 0, false
 }
 
-// FSM is one phase-1 generation's state.
+// FSM is one phase-1 (or sample-mode) generation's state.
 type FSM struct {
 	v    *fsmVocab
 	user Meta
 	eos  int32
+	// sample is the understand phase: genres generated, `</think>` written
+	// rather than stopped at, then lyrics.
+	sample bool
 
 	state               fsmState
 	pos                 int // characters of the fixed string written
@@ -274,32 +283,37 @@ type FSM struct {
 	next                map[fsmState]fsmState
 }
 
-// newFSM starts phase 1 with the request's metas (UserMeta).
-func newFSM(v *fsmVocab, user Meta) *FSM {
-	f := &FSM{v: v, user: user, eos: ImEndID, state: stThinkTag}
+// newFSM starts phase 1 with the request's metas (UserMeta), or with
+// sample set, sample mode's pass with its (the language, and any metas the
+// request gave).
+func newFSM(v *fsmVocab, user Meta, sample bool) *FSM {
+	f := &FSM{v: v, user: user, eos: ImEndID, state: stThinkTag, sample: sample}
 	f.next = map[fsmState]fsmState{
 		stThinkTag: stNewlineAfterThink, stNewlineAfterThink: stBPMName, stThinkEndTag: stCodes, stCodes: stCompleted,
-		stBPMName: stBPMValue, stBPMValue: nextField("bpm"),
-		stCaptionName: stCaptionValue, stCaptionValue: nextField("caption"),
-		stDurationName: stDurationValue, stDurationValue: nextField("duration"),
-		stKeyscaleName: stKeyscaleValue, stKeyscaleValue: nextField("keyscale"),
-		stLanguageName: stLanguageValue, stLanguageValue: nextField("language"),
+		stBPMName: stBPMValue, stBPMValue: f.nextField("bpm"),
+		stCaptionName: stCaptionValue, stCaptionValue: f.nextField("caption"),
+		stDurationName: stDurationValue, stDurationValue: f.nextField("duration"),
+		stKeyscaleName: stKeyscaleValue, stKeyscaleValue: f.nextField("keyscale"),
+		stLanguageName: stLanguageValue, stLanguageValue: f.nextField("language"),
 		stTimesigName: stTimesigValue, stTimesigValue: stThinkEndTag,
+	}
+	if sample {
+		f.next[stGenresName] = stGenresValue
+		f.next[stGenresValue] = f.nextField("genres")
 	}
 	return f
 }
 
-// nextField is _get_next_field_state with genres skipped.
-func nextField(field string) fsmState {
-	order := []string{"bpm", "caption", "duration", "genres", "keyscale", "language", "timesignature"}
+// nextField is _get_next_field_state: genres are skipped but in sample mode.
+func (f *FSM) nextField(field string) fsmState {
 	states := map[string]fsmState{"bpm": stBPMName, "caption": stCaptionName, "duration": stDurationName,
-		"keyscale": stKeyscaleName, "language": stLanguageName, "timesignature": stTimesigName}
-	for i, f := range order {
-		if f != field {
+		"genres": stGenresName, "keyscale": stKeyscaleName, "language": stLanguageName, "timesignature": stTimesigName}
+	for i, name := range fieldOrder {
+		if name != field {
 			continue
 		}
-		for _, n := range order[i+1:] {
-			if n == "genres" {
+		for _, n := range fieldOrder[i+1:] {
+			if n == "genres" && !f.sample {
 				continue
 			}
 			return states[n]
@@ -337,6 +351,11 @@ func argmax(scores []float32) int32 {
 // Apply masks one step's full-vocabulary scores in place.
 func (f *FSM) Apply(scores []float32) {
 	if f.state == stCompleted {
+		if f.sample {
+			for i := CodeBase; i < CodeBase+NumCodes; i++ {
+				scores[i] = negInf // the lyrics are text
+			}
+		}
 		return
 	}
 	f.process(scores)
@@ -365,7 +384,7 @@ func (f *FSM) process(scores []float32) {
 		rs := []rune(fixed)
 		if f.pos < len(rs) {
 			remaining := string(rs[f.pos:])
-			if f.state == stThinkEndTag && len(rs)-f.pos <= 10 {
+			if f.state == stThinkEndTag && !f.sample && len(rs)-f.pos <= 10 {
 				whitelist(scores, []int32{f.eos}) // stop at reasoning
 				return
 			}
@@ -376,7 +395,7 @@ func (f *FSM) process(scores []float32) {
 			whitelist(scores, []int32{id})
 			return
 		}
-		if f.state == stThinkEndTag {
+		if f.state == stThinkEndTag && !f.sample {
 			whitelist(scores, []int32{f.eos})
 			return
 		}
@@ -426,7 +445,13 @@ func (f *FSM) process(scores []float32) {
 			whitelist(scores, []int32{f.v.newline})
 		}
 	case stGenresValue:
-		// Unconstrained (see the file comment).
+		if f.v.genres != nil {
+			if allowed := f.v.genres.allowed(f.accValue, f.v.newline); len(allowed) > 0 {
+				whitelist(scores, allowed)
+			} else {
+				whitelist(scores, []int32{f.v.newline})
+			}
+		}
 	case stKeyscaleValue, stLanguageValue:
 		field, tree := "keyscale", f.v.keyscale
 		if f.state == stLanguageValue {
@@ -489,7 +514,7 @@ func (f *FSM) Update(tok int32) {
 	if len(f.queue) > 0 {
 		f.queue = f.queue[1:]
 		if len(f.queue) == 0 {
-			f.state = nextField(f.curField)
+			f.state = f.nextField(f.curField)
 			f.curField = ""
 			f.pos = 0
 			f.accValue = ""

@@ -29,7 +29,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 | `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
-| `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
+| `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics (or just a description, sample mode) to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
 | `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](CLASSIFICATION.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
@@ -982,7 +982,21 @@ its field names and their aliases, flat or inside a `metas`, `metadata` or
 changes the URL and reads a job instead of a `task_id`.
 
 - `prompt`/`caption`, `lyrics` (section tags: `[Verse]`, `[Chorus]`,
-  `[Instrumental]`…). One of caption or lyrics is required.
+  `[Instrumental]`…). One of caption or lyrics is required, unless the
+  request is in sample mode.
+- `sample_query` (or `description`/`desc`): **sample mode**, upstream's
+  "simple mode" (MUSIC.md A12). From a description alone ("a melancholy
+  synthwave song about driving through a neon city at night") the LM first
+  writes the caption, bpm, key, time signature, duration, genres and the
+  lyrics, and the song is then made from those. A language named in the
+  description ("… japanese city pop …") holds the lyrics to it, as does a
+  `vocal_language` (upstream ignores an `en` there, its default; here it
+  holds the lyrics to English); "instrumental", "pure music" or a
+  trailing "solo" asks for no lyrics. `sample_mode: true` with no query
+  lets the LM choose the whole song. A caption or lyrics sent with it is a
+  400: upstream would discard them. Unlike upstream, the request's own
+  `audio_duration`, `bpm`, `key_scale` and `time_signature` are kept: the
+  LM writes the song around them.
 - `thinking` (default **true**, upstream's pipeline default; its API server
   defaults to false): the 5 Hz LM writes the metadata the request leaves out
   and the audio codes the DiT renders. `thinking: false` is the DiT alone.
@@ -1002,7 +1016,7 @@ changes the URL and reads a job instead of a `task_id`.
 **What ACE-Step's API offers and this server does not run is a 400 naming
 the field**, never quietly ignored: `task_type` other than `text2music`,
 reference or source audio, `batch_size` above 1 (submit one job per song),
-sample and format modes, `audio_code_string`, the `sde` sampler, top-k, a
+format mode, `audio_code_string`, the `sde` sampler, top-k, a
 repetition penalty or negative prompt, and turning off the LM's CoT caption,
 language, metas or constrained decoding. Their upstream defaults are
 accepted. So is a request that would not fit: a duration or bpm out of
@@ -1013,7 +1027,9 @@ behind — found at submit, not twenty seconds in.
 `seconds` is null until the length is known (at once when the request gave
 it; after the CoT when the LM chose it), `metadata` holds what the DiT was
 asked for (the rewritten caption, bpm, key, time signature, duration,
-language), `stage` is `think`, `codes`, `dit`, `vae` or `write`, and
+language, and in sample mode the `lyrics` and `genres` the LM wrote, there
+as soon as it has written them), `stage` is `sample`, `think`, `codes`,
+`dit`, `vae` or `write`, and
 `estimated_seconds` is redone from measured rates once the length is known.
 Three jobs submitted together on this machine:
 

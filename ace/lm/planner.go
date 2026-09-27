@@ -112,39 +112,7 @@ func (p *Planner) Think(caption, lyrics string, user Meta, rng *rand.Rand) (Meta
 	if err != nil {
 		return nil, "", st, err
 	}
-	st.Prompt = len(ids)
-	if st.Prefill, err = p.prefill([][]int32{ids}); err != nil {
-		return nil, "", st, err
-	}
-	f := newFSM(p.v, user)
-	step := []Tok{{ID: ids[len(ids)-1], Slot: 0, Pos: len(ids) - 1}}
-	var gen []int32
-	t0 := time.Now()
-	for len(gen) < maxCoT {
-		if step[0].Pos >= p.G.o.MaxLen {
-			return nil, "", st, fmt.Errorf("lm: the CoT outgrew the cache")
-		}
-		out, _, err := p.G.Pass(step, Range{Lo: 0, Hi: p.G.vocab})
-		if err != nil {
-			return nil, "", st, err
-		}
-		scores := out[0]
-		f.Apply(scores)
-		topP(scores, p.S.TopP)
-		tok := int32(draw(scores, p.S.Temperature, rng))
-		f.Update(tok)
-		gen = append(gen, tok)
-		if tok == ImEndID || tok == EndOfTextID {
-			break
-		}
-		if err := p.after(1, len(gen), 0); err != nil {
-			return nil, "", st, err
-		}
-		step[0].ID = tok
-		step[0].Pos++
-	}
-	st.Steps, st.Tokens = time.Since(t0), len(gen)
-	text, err := p.Tk.Decode(gen)
+	text, st, err := p.decode(ids, newFSM(p.v, user, false), 1, rng)
 	if err != nil {
 		return nil, "", st, err
 	}

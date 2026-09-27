@@ -10,6 +10,10 @@
 //     replace the silence as the source latents (upstream's is_covers
 //     path; the chunk mask stays 1.0).
 //
+//     Sample mode (A12, Options.Sample) comes before that: from a
+//     description the LM writes the caption, metas and lyrics itself, and
+//     the request is then those.
+//
 //  1. ace/plan formats the caption and lyric prompts and fixes the length.
 //
 //  2. The caption runs through Qwen3-Embedding-0.6B (`embed`, the same bytes
@@ -82,13 +86,17 @@ type Pipeline struct {
 	// The 5 Hz LM, when loaded.
 	LM    *lm.Planner
 	lmGPU *lm.GPU
+	// GenresErr is why the genres vocabulary did not load (sample mode
+	// needs it), or nil.
+	GenresErr error
 }
 
 // LMDir is the 5 Hz LM's checkpoint under models/.
 func LMDir(models string) string { return filepath.Join(models, "acestep-5Hz-lm-4B") }
 
 // LoadLM stages the 5 Hz LM (8 GB of fp16 and its KV cache) for the
-// thinking path.
+// thinking path, and the genres vocabulary beside it (models/GenresFile)
+// for sample mode, which goes without when the file is missing.
 func (p *Pipeline) LoadLM(dev *vk.Device, dir string, o lm.Options) error {
 	g, err := lm.Load(dev, dir, o)
 	if err != nil {
@@ -104,6 +112,7 @@ func (p *Pipeline) LoadLM(dev *vk.Device, dir string, o lm.Options) error {
 		g.Destroy()
 		return err
 	}
+	p.GenresErr = pl.LoadGenres(filepath.Join(filepath.Dir(dir), lm.GenresFile))
 	p.LM, p.lmGPU = pl, g
 	return nil
 }
@@ -179,6 +188,7 @@ func (p *Pipeline) Destroy() {
 
 // Timings is where a request's time went.
 type Timings struct {
+	Sample                        lm.Stats // sample mode's pass
 	Think, Codes                  lm.Stats // the LM's two phases (thinking path)
 	Text, Encode, DiT, VAE, Total time.Duration
 	Steps                         []time.Duration // device time a forward
@@ -198,6 +208,20 @@ type Result struct {
 	CoT   string
 	Codes []int
 	DiT   *plan.Request
+	// Sample mode's song and the text it was parsed from.
+	Song       *lm.Song
+	SampleText string
+}
+
+// Sample is sample mode's request (upstream's sample_query/sample_mode):
+// the request's caption and lyrics are ignored and the LM writes them.
+type Sample struct {
+	// Query describes the song; empty lets the LM choose (NO USER INPUT).
+	Query string
+	// SkipCoT is upstream's sample_mode flag, which turns use_cot_metas off:
+	// phase 1 does not run even when the song left a meta out. A query
+	// alone leaves it on.
+	SkipCoT bool
 }
 
 // Options are the per-request knobs beyond the request itself.
@@ -210,6 +234,8 @@ type Options struct {
 	Step func(i int, x []float32)
 	// Think runs the 5 Hz LM first (LoadLM): upstream's default.
 	Think bool
+	// Sample, when set, has the LM write the song first (MUSIC.md A12).
+	Sample *Sample
 	// LMSeed seeds the LM's sampling.
 	LMSeed uint64
 	// Sampling overrides the LM's (lm.DefaultSampling when zero).
@@ -230,6 +256,8 @@ type Options struct {
 	// Planned, when set, is told what the DiT will be asked for once the
 	// LM has planned it: the request with the CoT's metas and the length.
 	Planned func(d *plan.Request, seconds float64)
+	// Sampled, when set, sees sample mode's song as soon as it is written.
+	Sampled func(song lm.Song)
 }
 
 func (o *Options) between() error {
@@ -279,29 +307,50 @@ func (p *Pipeline) Condition(r *plan.Request) (text, lyric *qwen.Mat, err error)
 
 // Generate runs one request.
 func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
+	start := time.Now()
+	res := &Result{}
+	var rng *rand.Rand
+	if o.Think || o.Sample != nil {
+		if p.LM == nil {
+			return nil, fmt.Errorf("ace: the 5 Hz LM is not loaded")
+		}
+		rng = rand.New(rand.NewPCG(o.LMSeed, 0x5a))
+		p.LM.S = lm.DefaultSampling
+		if o.Sampling != nil {
+			p.LM.S = *o.Sampling
+		}
+		p.LM.Between = o.Between
+		p.LM.Step = func(phase, done, total int) {
+			o.progress(map[int]string{0: "sample", 1: "think", 2: "codes"}[phase], done, total)
+		}
+		defer func() { p.LM.Between, p.LM.Step = nil, nil }()
+	}
+	if o.Sample != nil {
+		var err error
+		if r, err = p.sample(r, o, rng, res); err != nil {
+			return nil, err
+		}
+	}
 	if !o.Think {
 		if o.Planned != nil {
 			o.Planned(r, float64(r.LatentLength()*plan.Hop)/plan.SampleRate)
 		}
-		return p.generate(r, o, r.LatentLength(), nil, &Result{})
+		res.DiT = r
+		out, err := p.generate(r, o, r.LatentLength(), nil, res)
+		if err == nil {
+			out.Timings.Total = time.Since(start)
+		}
+		return out, err
 	}
-	if p.LM == nil {
-		return nil, fmt.Errorf("ace: thinking without the LM loaded")
-	}
-	start := time.Now()
-	res := &Result{}
-	rng := rand.New(rand.NewPCG(o.LMSeed, 0x5a))
-	p.LM.S = lm.DefaultSampling
-	if o.Sampling != nil {
-		p.LM.S = *o.Sampling
-	}
-	p.LM.Between = o.Between
-	p.LM.Step = func(phase, done, total int) {
-		o.progress(map[int]string{1: "think", 2: "codes"}[phase], done, total)
-	}
-	defer func() { p.LM.Between, p.LM.Step = nil, nil }()
-	meta, cot, st, err := p.LM.Think(r.Caption, r.Lyrics, lm.UserMeta(r), rng)
-	if err != nil {
+	var (
+		meta lm.Meta
+		cot  string
+		st   lm.Stats
+		err  error
+	)
+	if o.Sample != nil && o.Sample.SkipCoT {
+		meta = lm.UserMeta(r) // use_cot_metas off: the song's metas, as they are
+	} else if meta, cot, st, err = p.LM.Think(r.Caption, r.Lyrics, lm.UserMeta(r), rng); err != nil {
 		return nil, err
 	}
 	res.Meta, res.CoT, res.Timings.Think = meta, cot, st
@@ -329,6 +378,61 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 	}
 	out.Timings.Total = time.Since(start)
 	return out, nil
+}
+
+// sample runs sample mode and returns the request the song makes, as
+// upstream's API builds it (llm_generation_inputs.py): the query's hints
+// give the language the LM is held to (the request's own when it gave one)
+// and whether it is an instrumental; the song's caption, lyrics and metas
+// replace the request's.
+//
+// Three departures, each for a field upstream's API would silently drop:
+//   - a request's own bpm, duration, key and time signature are injected
+//     into the pass as the language is (upstream discards them for the
+//     song's);
+//   - a request's "en" holds the lyrics to English (upstream skips "en",
+//     its API's default, which cannot tell a choice from none; ours is "");
+//   - the DiT's vocal language is the song's when the request gave none
+//     (the Gradio app's choice; the API keeps its default "en").
+func (p *Pipeline) sample(r *plan.Request, o Options, rng *rand.Rand, res *Result) (*plan.Request, error) {
+	s := o.Sample
+	if !p.LM.HasGenres() {
+		return nil, fmt.Errorf("ace: sample mode needs the genres vocabulary: %v", p.GenresErr)
+	}
+	lang, instrumental := lm.DescriptionHints(s.Query)
+	if l := r.Language; l != "" && l != "unknown" {
+		lang = l
+	}
+	user := lm.UserMeta(r)
+	if lang != "" {
+		user["language"] = lang
+	}
+	song, text, st, err := p.LM.Sample(s.Query, instrumental, user, rng)
+	if err != nil {
+		return nil, err
+	}
+	res.Song, res.SampleText, res.Timings.Sample = &song, text, st
+	if o.Sampled != nil {
+		o.Sampled(song)
+	}
+	d := *r
+	d.Caption, d.Lyrics = song.Caption, song.Lyrics
+	if d.BPM == 0 {
+		d.BPM = song.BPM
+	}
+	if d.KeyScale == "" {
+		d.KeyScale = song.KeyScale
+	}
+	if d.TimeSignature == "" {
+		d.TimeSignature = song.TimeSignature
+	}
+	if d.Duration <= 0 {
+		d.Duration = song.Duration
+	}
+	if d.Language == "" {
+		d.Language = song.Language
+	}
+	return &d, nil
 }
 
 // DiTRequest is what the DiT is asked for after the LM has planned

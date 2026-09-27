@@ -228,3 +228,40 @@ func TestMusicNotLoaded(t *testing.T) {
 		t.Errorf("%d %s", rec.Code, rec.Body)
 	}
 }
+
+// TestMusicSample: sample mode's fields (MUSIC.md A12) -- a query under any
+// of upstream's names, or sample_mode alone -- reach the backend, the job
+// reports them, and a caption or lyrics beside them is a 400.
+func TestMusicSample(t *testing.T) {
+	f := &fakeMusic{}
+	s := newMusicServer(t, f)
+	j := decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"sample_query": "a love song"})))
+	if !j.Sample || j.SampleQuery != "a love song" {
+		t.Errorf("job %+v", j)
+	}
+	decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"description": "sea shanty", "duration": 60})))
+	decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"sample_mode": true})))
+	if len(f.reqs) != 3 {
+		t.Fatalf("%d requests", len(f.reqs))
+	}
+	a, b, c := f.reqs[0], f.reqs[1], f.reqs[2]
+	if !a.Sample || a.SampleMode || a.SampleQuery != "a love song" || !a.Thinking {
+		t.Errorf("query request %+v", a)
+	}
+	if !b.Sample || b.SampleQuery != "sea shanty" || b.Duration != 60 {
+		t.Errorf("description request %+v", b)
+	}
+	if !c.Sample || !c.SampleMode || c.SampleQuery != "" {
+		t.Errorf("sample_mode request %+v", c)
+	}
+	for _, body := range []map[string]any{
+		{"sample_query": "x", "lyrics": "[Verse]\nla"},
+		{"sample_mode": true, "prompt": "jazz"},
+		{"sample_mode": "maybe"},
+	} {
+		rec := do(t, s, jsonRequest("POST", "/v1/music", body))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%v: %d %s", body, rec.Code, rec.Body)
+		}
+	}
+}

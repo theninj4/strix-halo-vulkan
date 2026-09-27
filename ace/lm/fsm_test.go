@@ -77,8 +77,18 @@ type fsmStep struct {
 // TestFSM replays reference/dump_ace_fsm.py: upstream's processor driven
 // through scripted CoTs (free, user metas injected, extremes, fields out of
 // order, invalid values drifting into the free caption path).
-func TestFSM(t *testing.T) {
-	buf, err := os.ReadFile(filepath.Join(fsmRef, "fsm.json"))
+func TestFSM(t *testing.T) { testFSMFile(t, "fsm.json", false) }
+
+// TestFSMSample replays its sample-mode scripts (MUSIC.md A12): genres held
+// to the vocabulary (a clean one, a multi-word one, one that drifts off it),
+// the language injected, `</think>` written, and the lyrics after it with
+// an audio code masked out of them.
+func TestFSMSample(t *testing.T) { testFSMFile(t, "fsm_sample.json", true) }
+
+const genresPath = "../../models/" + GenresFile
+
+func testFSMFile(t *testing.T, name string, sample bool) {
+	buf, err := os.ReadFile(filepath.Join(fsmRef, name))
 	if err != nil {
 		t.Skipf("no FSM reference (%v); run reference/dump_ace_fsm.py", err)
 	}
@@ -101,6 +111,11 @@ func TestFSM(t *testing.T) {
 	if v.vocab != ref.Vocab {
 		t.Fatalf("vocab %d, want %d", v.vocab, ref.Vocab)
 	}
+	if sample {
+		if v.genres, err = loadGenres(v, genresPath); err != nil {
+			t.Skipf("no genres vocabulary: %v", err)
+		}
+	}
 	for _, sc := range ref.Scenarios {
 		user := Meta{}
 		for k, val := range sc.User {
@@ -111,7 +126,7 @@ func TestFSM(t *testing.T) {
 				user[k] = x
 			}
 		}
-		replayFSM(t, sc.Name, newFSM(v, user), v.vocab, sc.Steps)
+		replayFSM(t, sc.Name, newFSM(v, user, sample), v.vocab, sc.Steps)
 		t.Logf("%s: %d steps exact", sc.Name, len(sc.Steps))
 	}
 }
@@ -133,7 +148,7 @@ func TestFSMTrace(t *testing.T) {
 	for _, s := range c.Phases[0].Steps {
 		steps = append(steps, fsmStep{State: s.FSM, N: s.FSMAllowed, Top: s.Token, Lang: s.Token, Tok: s.Token, IDs: s.FSMIDs})
 	}
-	replayFSM(t, "given_duration", newFSM(v, user), v.vocab, steps)
+	replayFSM(t, "given_duration", newFSM(v, user, false), v.vocab, steps)
 	t.Logf("given_duration phase 1: %d steps exact", len(steps))
 }
 
@@ -155,7 +170,7 @@ func TestTopP(t *testing.T) {
 		for ph, p := range c.Phases {
 			var f *FSM
 			if p.Rows == 1 {
-				f = newFSM(v, UserMeta(requestOf(c.Request)))
+				f = newFSM(v, UserMeta(requestOf(c.Request)), false)
 			}
 			checked := 0
 			for i, s := range p.Steps {
@@ -211,5 +226,43 @@ func checkSurvivors(t *testing.T, name string, scores []float32, base int32, n i
 	}
 	if len(got) != n || (ids != nil && equalIDs(got, ids) >= 0) {
 		t.Errorf("%s: %d survivors %v, want %d %v", name, len(got), head(got), n, head(ids))
+	}
+}
+
+// TestFSMSampleTrace replays the sample pass of the real LM runs
+// (reference/dump_ace_lm.py sample sample_ja): upstream's genres, its
+// `</think>` and the lyrics after it, taking the sampled token as the
+// argmax at each step.
+func TestFSMSampleTrace(t *testing.T) {
+	m := loadLMManifest(t)
+	tk := loadTokenizer(t)
+	v, err := newFSMVocab(tk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.genres, err = loadGenres(v, genresPath); err != nil {
+		t.Skipf("no genres vocabulary: %v", err)
+	}
+	n := 0
+	for _, label := range []string{"sample", "sample_ja"} {
+		c, ok := m.Cases[label]
+		if !ok {
+			continue
+		}
+		n++
+		q, _ := c.Request["sample_query"].(string)
+		user := Meta{}
+		if lang, _ := DescriptionHints(q); lang != "" {
+			user["language"] = lang
+		}
+		var steps []fsmStep
+		for _, s := range c.Phases[0].Steps {
+			steps = append(steps, fsmStep{State: s.FSM, N: s.FSMAllowed, Top: s.Token, Lang: s.Token, Tok: s.Token, IDs: s.FSMIDs})
+		}
+		replayFSM(t, label, newFSM(v, user, true), v.vocab, steps)
+		t.Logf("%s sample pass: %d steps exact", label, len(steps))
+	}
+	if n == 0 {
+		t.Skip("no sample cases; run reference/dump_ace_lm.py sample sample_ja")
 	}
 }
