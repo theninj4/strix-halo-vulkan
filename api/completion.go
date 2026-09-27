@@ -46,6 +46,19 @@ type CompletionRequest struct {
 	MaxCompletionTokens int  `json:"max_completion_tokens,omitempty"`
 	N                   int  `json:"n,omitempty"`
 	Stream              bool `json:"stream"`
+	// vLLM's sampling extras, which an OpenAI client sends through
+	// extra_body and so arrive at the top level. PaddleOCR's pipeline sends
+	// all three to its recognition model (OCR.md O6); a backend that does not
+	// implement one refuses it rather than ignoring it.
+	//
+	// RepetitionPenalty is vLLM's and HF's multiplicative penalty over every
+	// token of the prompt and the output, not llama-server's windowed
+	// repeat_penalty. SkipSpecialTokens (vLLM's default true) keeps or drops
+	// special tokens in the text. MMProcessorKwargs are the image
+	// processor's overrides, of which min_pixels and max_pixels are read.
+	RepetitionPenalty *float64         `json:"repetition_penalty,omitempty"`
+	SkipSpecialTokens *bool            `json:"skip_special_tokens,omitempty"`
+	MMProcessorKwargs *MMProcessorArgs `json:"mm_processor_kwargs,omitempty"`
 	// ServiceTier is OpenAI's field, read as this server's priority class
 	// (CONCURRENCY.md): "priority" is interactive — a voice command, served
 	// ahead of everything else — and "flex" is background. Anything else
@@ -60,6 +73,13 @@ func (r *CompletionRequest) Budget() int {
 		return r.MaxCompletionTokens
 	}
 	return r.MaxTokens
+}
+
+// MMProcessorArgs is vLLM's `mm_processor_kwargs`: the pixel bounds a
+// Qwen2-VL-style processor resizes an image between.
+type MMProcessorArgs struct {
+	MinPixels int `json:"min_pixels,omitempty"`
+	MaxPixels int `json:"max_pixels,omitempty"`
 }
 
 // StreamOptions is OpenAI's `stream_options`. The only member that means

@@ -27,14 +27,34 @@
 //	aux1   the layer's key cache, aux2 its value cache: fp16 [slot][pos][8][128] (fp16 arena)
 //	span   positions a slot holds        bOff  rope cos [pos][64], then sin (weights arena)
 //	kStride  the rope table's positions  eps, scale, tokens (rows)
+//
+// PaddleOCR-VL's ERNIE-4.5-0.3B (ocr/lm.go) is the same step with three
+// build switches: NQ=16 NKV=2, QK_NORM=0 (it has none), and MROPE=1, its
+// 3-D rope. Under MROPE a row's rope positions are three numbers, (t, h, w)
+// as uint bits at pc.dim + row*3, apart from its cache position (text after
+// an image resumes at p + max(mh, mw), not at its cache index), and each of
+// the 64 frequency pairs reads one of them in *chunked* sections: pairs
+// 0-15 t, 16-39 h, 40-63 w (HF's recomposition_frequencies, [16, 24, 24]).
+// The table is still one [pos][64] over one inv_freq: only the position a
+// pair reads changes.
 
 #include "dit_common.glsl"
 
 layout(binding = 2) buffer HAct { float16_t hact[]; };
 
 #define HD 128u
+#ifndef NQ
 #define NQ 32u
+#endif
+#ifndef NKV
 #define NKV 8u
+#endif
+#ifndef QK_NORM
+#define QK_NORM 1
+#endif
+#ifndef MROPE
+#define MROPE 0
+#endif
 
 layout(local_size_x = 128) in;
 
@@ -61,6 +81,7 @@ void main() {
     uint src = isQ ? pc.inOff + (r * NQ + h) * HD : pc.kOff + (r * NKV + h) * HD;
     float x = act[src + t];
 
+#if QK_NORM
     red[t] = x * x;
     barrier();
     for (uint s = 64u; s > 0u; s >>= 1) {
@@ -72,13 +93,22 @@ void main() {
     float inv = inversesqrt(red[0] / float(HD) + uintBitsToFloat(pc.eps));
     float xn = x * inv * wbuf[pc.wOff + (isQ ? 0u : HD) + t];
     barrier(); // every thread has read red[0] before red is reused
+#else
+    float xn = x;
+#endif
 
     // NeoX: dim i pairs with i ± 64 at the frequency of i mod 64.
     red[t] = xn;
     barrier();
     uint i = t % 64u;
-    float c = wbuf[pc.bOff + pos * 64u + i];
-    float s = wbuf[pc.bOff + pc.kStride * 64u + pos * 64u + i];
+#if MROPE
+    uint axis = i < 16u ? 0u : (i < 40u ? 1u : 2u);
+    uint rp = floatBitsToUint(act[pc.dim + r * 3u + axis]);
+#else
+    uint rp = pos;
+#endif
+    float c = wbuf[pc.bOff + rp * 64u + i];
+    float s = wbuf[pc.bOff + pc.kStride * 64u + rp * 64u + i];
     float y2 = t < 64u ? xn * c - red[t + 64u] * s : xn * c + red[t - 64u] * s;
 
     if (isQ) {

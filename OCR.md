@@ -233,10 +233,10 @@ demo, so a page on the CPU is minutes: fine for dumps, useless as a server.
 | O0 | Weights, oracle scripts, fp16 range audit, decision 3 on a page, llama.cpp baseline on this machine, the official pipeline in a Paddle CPU venv as the page-level oracle | **done 2026-09-27 except the Paddle venv** (moved to O8): `dump_ocr.py` over 6 cases, byte-identical twice; **fp16 audit: largest activation 2,725, 24x of headroom**; decision 3 moves the page's step-0 KL by 1.0e-5 and none of 300 tokens; **llama.cpp: 243 tok/s decode, the page in 7.4 s** |
 | O1 | Host side in Go (`ocr/`): smart_resize, PIL bicubic, patchify, template ids, 3-D positions, tokenizer both ways | **done 2026-09-27**: tokenizer 229/229 encodes and 880/880 decodes exact; all 6 prompts, 3-D positions, rope deltas and decodes exact; PNG pixels bit-exact (RGB, RGBA, grayscale), JPEG ≤ 3 levels on 2.8% (Go's IDCT) |
 | O2 | Tower + projector on the CPU in fp32 against the dumps | **done 2026-09-27** (`ocr/vision.go`, on qimage/vision's blocks): embedding with the resized grid 2.6e-7, blocks 0–1 ≤ 4.9e-7, projector 3.5e-7 from the dump's post-LN; the whole stack is O3's gate (scalar attention is minutes) |
-| O3 | Tower + projector on the GPU (from `qimage/vision/gpu.go`) | |
-| O4 | ERNIE on the GPU (from `ace/lm`): prefill, KV decode, M-RoPE sections, head; teacher-forced logits, then greedy equality | |
-| O5 | Element level end to end, `cmd/ocr`, all six tasks against HF greedy | |
-| O6 | Serve element level (`-ocr`, chat door, vLLM extras); **gate: PaddleOCR's `doc_parser --vl_rec_backend vllm-server` against us, unchanged** | |
+| O3 | Tower + projector on the GPU (from `qimage/vision/gpu.go`) | **done 2026-09-27** (`ocr/gpu.go`): qimage's device tower through five hooks, patches run 2x2-block-major; all six cases, every dumped stage: **proj ≤ 2.8e-3, post_ln ≤ 1.8e-3** of fp32; raster-order control 1.12; **the page's 4,884 patches in 389 ms**, a line in 33 ms |
+| O4 | ERNIE on the GPU (from `ace/lm`): prefill, KV decode, M-RoPE sections, head; teacher-forced logits, then greedy equality | **done 2026-09-27** (`ocr/lm.go`): all six cases greedy-equal to fp32 HF, **the page's 768 tokens included**; layers ≤ 7.5e-4, logits KL ≤ 5.3e-6; 1-D rope control rel 0.24; prefill of the page's 1,234 rows 100 ms; **decode 4.06 ms a step on the device, 4.4 ms a token end to end** (llama.cpp 4.1) |
+| O5 | Element level end to end, `cmd/ocr`, all six tasks against HF greedy | **done 2026-09-27** (`ocr/engine.go`, `cmd/ocr`): image file → text, **all six cases token- and text-identical to fp32 HF** (the page's 768 and both JPEGs included); 2.33 GB on the device; every element case faster than llama.cpp end to end (line 83 vs ~140 ms, seal 293 vs ~450); **the full page 8.1 s to `</s>` at 212 tok/s vs llama.cpp's 7.4 s at 233**: prefill wins 3x, decode at depth loses |
+| O6 | Serve element level (`-ocr`, chat door, vLLM extras); **gate: PaddleOCR's `doc_parser --vl_rec_backend vllm-server` against us, unchanged** | **done 2026-09-27** (`backend/ocr.go`, `api/route.go`): `serve -ocr` answers `PaddleOCR-VL-1.6-0.9B` on `/v1/chat/completions`, routed beside `-llm`; **PaddleOCR 3.7.0's `doc_parser` runs unchanged against it**: the demo page's 27 regions all 200, markdown byte-identical across runs; table, formula and chart pages too; streamed = buffered = fp32 text on all six cases |
 | O7 | PP-DocLayoutV3 on the CPU then the GPU, against HF `pp_doclayout_v3` | |
 | O8 | Page glue in Go: box post-processing, crops, merges, per-label prompts, OTSL→HTML, markdown; against PaddleX's functions | |
 | O9 | Serve page level: `/v1/ocr`, `/layout-parsing`, PDFs; a page's regions batched | |
@@ -319,6 +319,230 @@ Moved to O8, where it is needed: `.venv-paddle` with paddlepaddle CPU and
 `paddleocr[doc-parser]`, running the official page pipeline against the HF
 oracle and later against our server.
 
+### O3 — the tower on the device
+
+`ocr/gpu.go` is `qimage/vision`'s `GPU`, not a copy. That package gained five
+device-path hooks, each nil or a no-op for its two existing users (their
+gates, `TestGPUTower` and `TestLLMGPUTower`, read the same numbers after):
+
+- `Model.PostNorm`/`PostNormEps`: an affine LayerNorm in place after the last
+  block, on `parakeet_layernorm` (fp32 out, the only affine-LN-to-fp32 kernel
+  in the tree). The projector's pre_norm cannot fold into it: two norms in a
+  row.
+- `Merger.NormEps`: the projector's 1e-5.
+- `Model.Geometry`: the position grid and rope table, supplied by the
+  caller.
+- the patch reduction is padded to the GEMM's 64-wide K slab (588 → 640,
+  weight and pixels zero-extended; qimage's 1536 already is one);
+- `GPU.Tap`: the residual stream after the embedding, each block and the
+  post-norm, splitting submits there. For gates only.
+
+**The one idea: run the tower 2x2-block-major although the checkpoint is
+raster.** Full attention does not care about row order when every row
+carries its own grid position and rope angles, so the pixels, the grid and
+the rope table are permuted on the host, and the projector's 2x2 gather
+becomes the free four-row concatenation qimage's merger already does. The
+merged rows come out in merged-grid raster order, the image tokens' order.
+Taps are permuted back. `TestGPUTowerRasterControl` feeds raster rows
+straight in: proj rel **1.12**.
+
+Measured (`go test ./ocr -run GPUTower`, 5 s, ai.service up and idle; two
+runs, same numbers):
+
+| case | patches | embed | block 26 | post_ln | proj | tower + projector |
+|---|---|---|---|---|---|---|
+| line | 76×8 | 3.8e-5 | 7.1e-3 | 5.5e-4 | 8.4e-4 | 33 ms |
+| formula | 64×10 | 1.8e-5 | 1.2e-3 | 5.1e-4 | 9.9e-4 | 33 ms |
+| table | 50×12 | 3.4e-5 | 2.2e-3 | 5.2e-4 | 8.6e-4 | 33 ms |
+| seal | 46×46 | 7.6e-5 | 3.6e-3 | 1.0e-3 | 2.0e-3 | 136 ms |
+| chart | 44×40 | 4.6e-5 | 3.5e-3 | 9.3e-4 | 1.7e-3 | 105 ms |
+| page | 74×66 | 3.8e-5 | 4.5e-3 | 1.8e-3 | 2.8e-3 | **389 ms** |
+
+Bounds: embed 3e-4, blocks 2e-2, post_ln 6e-3, proj 1e-2. This tower is
+**fifty times kinder to fp16 than Qwen-Image's** (0.14–0.56 on the same
+kernels, qimage/vision's gate): its residual peaks at 2.6k, not 1.4e4.
+Device cost 0.89 GB weights + 0.36 GB activations at the 5,120-patch budget.
+
+Speed, for O11: llama.cpp's page *prefill* (tower + 1,234 LM tokens) is
+1,045 ms, so the tower is already well under it. The small crops sit on a
+**33 ms floor**: ~600 dispatches at 8 a submit is ~75 synchronous submits,
+which is qimage's watchdog bargain for a 4k-patch image and pure overhead
+for a 600-patch crop. A page is 10–40 crops, so that floor is the first
+thing O11 takes (a submit size by patch count, or several crops a pass).
+
+### O4 — ERNIE on the device
+
+`ocr/lm.go` is ace/lm's decoder at ERNIE's shape, fp16 only (no int8 bank;
+decision 7): the projections in the fragment tiling, read by the DiT GEMM
+rungs for a pass of many rows and by llm_gemv's split-K GEMV at 1–3 rows; a
+KV cache a slot; attention over the cache only, so a prefill and a decode
+step are the same dispatches. What changed:
+
+- **Shaders**: `ace_lm_prep.comp` and `ace_lm_attn.comp` take `NQ`/`NKV` as
+  build switches, and prep gains `QK_NORM=0` and `MROPE=1`: a row's rope
+  positions are three numbers apart from its cache index (at `pc.dim`,
+  3 a row), and pair i reads t for i < 16, h for i < 40, w after (HF's
+  `recomposition_frequencies`, chunked). One `[pos][64]` table still serves:
+  only the position a pair reads changes. The OCR builds are
+  `ocr_lm_{prep,attn,attn_combine}.spv`; ACE's three binaries are
+  byte-identical (prep was rebuilt and differed only in SPIR-V ids, so the
+  committed one stays).
+- **Rows** (`Row`) are a token id or an embedding (the image rows), a slot,
+  a cache position and a rope (t, h, w). Generated token j sits at cache
+  L+j and rope L+j+`rope_delta` on all three axes.
+- **The head is untied** (`lm_head.weight`, own bank); logits come for the
+  last 1–3 rows of any pass, so a prefill needs no separate last-token pass.
+- **No SwiGLU narrowing** (ace/lm's 1/16): O0's audit found 24x headroom.
+
+Gate (`go test ./ocr -run TestLM`, 9 s): prefill from the dump's own inputs
+(text rows by id through the host's bf16 lookup, image rows from
+`lm.embed`), every layer, the prompt logits, every teacher-forced step
+against `logits.tf`, then greedy against the reference generation:
+
+| case | prompt | worst layer rel | prompt logits rel / KL | tf worst rel / KL | greedy |
+|---|---|---|---|---|---|
+| line | 165 | 5.0e-4 | 1.2e-3 / 4e-9 | 9.2e-4 / 8e-7 | 10/10 |
+| formula | 173 | 7.0e-4 | 2.2e-3 / 4e-10 | 2.0e-3 / 2e-7 | 80/80 |
+| table | 163 | 4.0e-4 | 1.1e-3 / 8e-10 | 2.3e-3 / 5e-7 | 71/71 |
+| seal | 543 | 5.1e-4 | 3.2e-3 / 2e-10 | 2.5e-3 / 7e-7 | 29/29 |
+| chart | 453 | 7.5e-4 | 1.6e-3 / 4e-7 | 6.3e-3 / 5e-6 | 137/137 |
+| page | 1,234 | 6.6e-4 | 1.3e-3 / 6e-9 | 1.9e-3 / 3e-6 | **768/768** |
+
+Bounds: layers 5e-3, logits rel 2e-2, KL 1e-4 a step. **The page is
+greedy-equal for all 768 tokens**, where llama.cpp's f16 flips a `(` at
+character 108 (O0): the near-tie did not tip here, but it can on another
+page, so O5's page gate stays teacher-forced plus first-divergence.
+`TestLMRopeControl` gives every row a plain 1-D rope at its cache index
+(what a Qwen3 port does): prompt logits rel **0.24**, KL 6.7e-3.
+
+**Speed.** Prefill: 10 ms for ~165 rows, 28 ms for 543, **100 ms for the
+page's 1,234** (llama.cpp's tower + LM prefill for the page was 1,045 ms;
+ours is 389 + 100). Decode, one row at depth 200
+(`TestLMStepLadder`, median of 64, ai.service up and idle):
+
+| split-K (q k v o gate up down) | device | wall |
+|---|---|---|
+| ace/lm's, scaled: 8 16 16 16 4 4 8 | 5.64 ms | 5.89 ms |
+| all 1 | 4.56 | 4.76 |
+| all 4 / all 8 | 5.40 / 5.58 | 5.66 / 5.81 |
+| all 16 | 4.31 | 4.60 |
+| **16 16 16 1 16 16 16** | **4.06** | **4.30** |
+
+Greedy end to end (host argmax over 103k logits included) is **4.35–4.62
+ms a token** against llama.cpp's 4.1. The ladder is not monotone: gate/up at
+8 slabs cost 0.7 ms over 16, and every middle table is slower than both
+ends; O11 should find out why before tuning further. A step is ~340
+dispatches at ~12 µs each: fusing q/k/v and gate/up (adjacent in the bank
+already) and batching slots (decision 10) are the obvious next moves, and
+both belong to O11.
+
+### O5 — element level end to end
+
+`ocr.Engine` (`ocr/engine.go`) is the unit O6's chat door and O8's page
+glue both call: `Recognize(ctx, Request{Image, Prompt, MinPixels,
+MaxPixels, MaxTokens, OnToken})` → `Result{IDs, Text, Finish, timings}`.
+Process (Go, PIL bicubic) → `BuildPrompt` → the device tower → the image
+rows spliced over the placeholders → one prefill pass (chunked if a prompt
+outgrows `LMOptions.Rows`) with the last row's logits → greedy, first-max
+ties as torch.argmax, until `</s>` or the cap (lowered to what the cache has
+left). One request holds the device at a time (a mutex); batching is O11.
+**Not in the engine, because vLLM's server does not do it either:**
+Spotting's 2x Lanczos upscale (`pre_process_for_spotting`), per-label pixel
+bounds and the text post-processing. Those are PaddleX's pipeline: O8.
+
+`cmd/ocr -image F [-task ocr|table|formula|chart|seal|spotting] [-prompt
+T] [-max-tokens N] [-min-pixels] [-max-pixels]`: the text on stdout,
+timings on stderr.
+
+Gate (`go test ./ocr -run TestEngine`, 8 s): every case from its **image
+file**, not the dump's pixels, so Go's JPEG decode (≤3 levels off on 2.8%,
+O1) and the fp16 tower are both in the loop. **All six are token-identical
+and text-identical to the fp32 reference**, the page through its 768-token
+cap included. The test device now opens with subgroup size control, as the
+server does (the O3/O4 numbers are unchanged).
+
+End to end, ai.service up and idle, against llama.cpp's O0 table (its
+total is prefill + tokens at its decode rate):
+
+| case | prompt + new | tower | prefill | decode | ms/token | total | llama.cpp |
+|---|---|---|---|---|---|---|---|
+| line | 165 + 10 | 33 ms | 10 ms | 39 ms | 3.89 | **83 ms** | ~140 ms |
+| formula | 173 + 80 | 33 | 11 | 347 | 4.34 | **393** | ~432 |
+| table | 163 + 71 | 33 | 11 | 309 | 4.35 | **354** | ~388 |
+| seal | 543 + 29 | 130 | 29 | 126 | 4.36 | **293** | ~450 |
+| chart | 453 + 137 | 103 | 25 | 605 | 4.42 | **740** | ~811 |
+| page, to `</s>` | 1,234 + 1,621 | 354 | 100 | 7,656 | 4.72 | **8.14 s** | 7.4 s (1,453 tokens) |
+
+(`cmd/ocr` on the page twice: identical text, 8.143 and 8.141 s. Load is
+2.3 s; 2.33 GB on the device, of which the KV cache for 10,240 positions is
+0.19 GB.) Prefill is where we win, 3x on the page; decode is ~5% behind
+llama.cpp at shallow depth and ~10% at the page's depth of 2,855, where
+the scalar attention over the cache grows. The two runs of the page stop
+at different lengths (1,621 against 1,453) because llama.cpp's f16 took
+another branch at character 108 (O0); both are the demo's article.
+
+### O6 — the chat door
+
+`serve -ocr [-ocr-model DIR]` loads `backend.OCR` (an `ocr.Engine`, 2.33 GB,
+2.3 s) as a chat backend with the id **`PaddleOCR-VL-1.6-0.9B`**, the name
+PaddleOCR's own `genai_server` serves it under. With `-llm` too, the door is
+`api.CompletionRoute{llm, ocr}`: a request naming the OCR id goes to OCR,
+every other name to the LLM as before, and `/v1/models` lists the LLM
+first. Responses name the model that ran (`modelID` now returns the
+requested id when the backend owns it). The machine-B line of `ai.service`
+carries `-ocr` (decision 8); **it is not deployed yet** (`deploy.sh`
+restarts the live server).
+
+**What PaddleOCR sends**, captured by pointing `doc_parser` at a stub that
+records bodies (27 requests from the demo page, all identical but the
+image): `model`, one user message `[image_url (JPEG data URL), text
+"OCR:"]`, `max_completion_tokens: 4096`, `temperature: 0`,
+`skip_special_tokens: true`, `mm_processor_kwargs: {min_pixels: 112896,
+max_pixels: 1003520}`. It picks the model as `/v1/models`' first entry
+unless `--vl_rec_api_model_name` says otherwise, and keeps up to 200
+requests in flight (they queue on the engine's mutex; batching is O11).
+
+The api layer gained vLLM's three extras as request fields
+(`repetition_penalty`, `skip_special_tokens`, `mm_processor_kwargs`);
+**the LLM backend refuses all three** rather than ignoring them. The OCR
+backend (`ocrRequest`) accepts one user message with one image and any text
+parts (joined, after the image, as the template does), greedy only:
+temperature ≠ 0, top_k, min_p, `repeat_penalty` (llama-server's), presence
+penalty, stop sequences, tools, template kwargs and a `max_pixels` over the
+staged budget are 400s; `top_p` is accepted because it is a no-op under
+greedy. `repetition_penalty` is vLLM's over prompt + output ids, in the
+engine. Each device pass (tower, prefill, every decode step) takes
+`Device.Do` on its own, so speech interleaves with a page token by token.
+Streaming decodes the whole prefix per token and sends the new tail,
+holding back while it ends in U+FFFD (an incomplete byte-fallback
+character), so the deltas concatenate to exactly the buffered text.
+
+Gates:
+
+- `go test ./backend -run TestOCR` (8 s): the refusals; every dumped case
+  through `Complete` from a data URL, streamed deltas joined = the fp32
+  reference text, no delta holding a partial character.
+- `go test ./api -run TestCompletionRoute`: routing, reported model, the
+  extras reaching the backend, `/v1/models` order.
+- **PaddleOCR's pipeline, unchanged** (`.venv-paddle`: Python 3.12,
+  paddlepaddle 3.3.1 CPU, paddleocr 3.7.0, paddlex 3.7.2, python-docx):
+
+      .venv-paddle/bin/paddleocr doc_parser -i testdata/ocr/paddleocr_vl_demo.png \
+          --pipeline_version v1.6 --vl_rec_backend vllm-server \
+          --vl_rec_server_url http://127.0.0.1:18080/v1 --save_path OUT
+
+  against `ai -addr 127.0.0.1:18080 -token= -ocr`: exit 0, markdown, JSON
+  and docx written; the page's **27 region requests all 200**, 8.1 s of
+  recognition first request to last (1,770 tokens, serial), and **the
+  markdown is byte-identical across two runs**. The table image comes back
+  as an HTML table (1 `Table Recognition:` request), the formula as `$$ …
+  $$` LaTeX (1 `Formula Recognition:`), the chart page's three text crops
+  as text; chart and seal recognition are off in 1.6's default config, so
+  those regions send nothing. Three of the page's text blocks come back
+  empty in the markdown: that is PaddleX merging a paragraph that runs
+  across columns into its first block, not a failed request (every
+  request returned text); O8 compares the glue against PaddleX's own.
+
 ## Open questions
 
 - O-o1: how far does PIL vs torch bicubic move a crop's text? (decision 4)
@@ -328,6 +552,28 @@ oracle and later against our server.
 - O-o4: the report's own throughput numbers, for a reference to beat.
 
 ## Handoff
+
+**2026-09-27, session 2.** O3 and O4 done: `ocr/gpu.go` (`NewGPUTower`,
+`Forward(ctx, *Image)` → the image-token rows) and `ocr/lm.go` (`LoadLM`,
+`Pass([]Row, logits)`), gated by `go test ./ocr` (28 s, all gates).
+`qimage/vision` gained the hooks listed under O3; the ace_lm shaders gained
+build switches (O4).
+
+- O5 done the same day: `ocr.Engine` + `cmd/ocr`, gated by
+  `go test ./ocr -run TestEngine`.
+- O6 done the same day: `serve -ocr`, PaddleOCR's pipeline runs unchanged
+  against it (section O6). `ai.service`'s machine-B line has `-ocr` but is
+  **not deployed**: run `./deploy.sh` when the live server may restart.
+- `.venv-paddle` exists now (O6's gate command is in its section).
+- Next: **O7**, PP-DocLayoutV3 on the CPU then the GPU, against HF
+  `pp_doclayout_v3` (`models/PP-DocLayoutV3/`). Dump first (a
+  `reference/dump_doclayout.py` over the demo page and the four element
+  images: preprocessed input, backbone stages, encoder, each decoder layer's
+  boxes/logits, the order head, final detections), and read PaddleX's
+  layout post-processing (`layout_merge_bboxes_mode`, `layout_nms`,
+  `layout_unclip_ratio`, the order) since O8 needs it. PaddleX's own layout
+  output for the demo page is in `doc_parser`'s `*_res.json`
+  (`layout_det_res`) as the page-level check.
 
 **2026-09-27, session 1.** Plan written; O0, O1 and O2 done.
 
@@ -345,12 +591,4 @@ oracle and later against our server.
   exported blocks (`go test ./ocr` without `-short` adds its ~15 s gate).
 - llama.cpp's GGUFs are in `models/PaddleOCR-VL-1.6-GGUF/`; the baseline
   table is in O0.
-- Next: **O3**, the tower on the GPU. Start from `qimage/vision/gpu.go` and
-  change what O2 changed: patch 14 (588 values, pad to the GEMM's K), raster
-  order for the rope table and positions, the 27² grid with align_corners
-  False, the post-LN, then the projector (pre-norm eps 1e-5, the 2x2
-  gather, erf GELU). Gate every `vis.*` and `proj` of all six cases,
-  including the page's 5,120 patches, against llama.cpp's 1,045 ms prefill.
-  Then **O4**, ERNIE from `ace/lm`: its constants become ERNIE's (1024, 16/2
-  heads, 3072, 18 layers), `ace_lm_prep.comp` loses the q/k norm and gains
-  the chunked `[16, 24, 24]` 3-position rope.
+- (O3/O4's plans, done, are in their sections above.)

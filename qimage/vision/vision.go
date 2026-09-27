@@ -344,6 +344,9 @@ type Merger struct {
 	Norm            LayerNorm
 	FC1, FC2        Linear
 	Act             func(float64) float64
+	// NormEps is the norm's epsilon on the device path; 0 is the tower's
+	// 1e-6. PaddleOCR-VL's projector (ocr/) normalises at 1e-5.
+	NormEps float64
 }
 
 func (m *Merger) Forward(x *qwen.Mat) (*qwen.Mat, error) {
@@ -396,6 +399,19 @@ type Model struct {
 	// wrong here. See Rope.Pairs: it exists so the gate can be shown to
 	// catch the swap.
 	RopePairs bool
+
+	// The hooks below are for another checkpoint of the same tower on the
+	// device path (NewGPU), PaddleOCR-VL's (ocr/); this model leaves them
+	// nil and the CPU path ignores them.
+	//
+	// PostNorm is an affine LayerNorm after the last block, applied in
+	// place (so Output.Last is after it), at epsilon PostNormEps.
+	PostNorm    *LayerNorm
+	PostNormEps float64
+	// Geometry replaces the position grid and the rope table for a grid:
+	// both indexed in the order the pixels' rows are given, which the
+	// merger reads as 2x2-block-major whatever the checkpoint's own order.
+	Geometry func(gridH, gridW int) (*qwen.Mat, *Rope, error)
 }
 
 // SetFP16 switches every linear in the tower between the fp32 oracle and the

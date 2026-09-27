@@ -189,6 +189,9 @@ func main() {
 	kevBatch := flag.Int("kev-batch", 8, "the most requests one pass answers: a burst shares passes, a lone request waits for nothing (K7.5)")
 	kevFP16 := flag.Bool("kev-fp16", false, "stage Kev's weights as fp16 instead of int8: the control, 1.27x slower and 3.3 GB more")
 
+	ocrOn := flag.Bool("ocr", false, "load PaddleOCR-VL-1.6 and serve it on /v1/chat/completions as model "+backend.OCRModelID+" (OCR.md)")
+	ocrModel := flag.String("ocr-model", "models/PaddleOCR-VL-1.6", "PaddleOCR-VL-1.6 checkpoint directory")
+
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
 	maxAudio := flag.Float64("max-audio", 60, "longest clip the transcription arenas are sized for, in seconds")
@@ -238,7 +241,7 @@ func main() {
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*videoOn && !*musicOn {
+	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*kevOn && !*ocrOn && !*videoOn && !*musicOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -317,7 +320,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || *videoOn || *musicOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *kevOn || *ocrOn || *videoOn || *musicOn || (*tts && *ttsGPU)) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -392,6 +395,23 @@ func main() {
 		log.Printf("kev: %s on %s, %s weights, passes of %d tokens, %d cached states of up to %d tokens, in %v",
 			*kevModel, *kevBase, b.Bank(), b.MaxTokens(), slots, cached,
 			time.Since(start).Round(time.Millisecond))
+	}
+
+	var ocrB *backend.OCR
+	if *ocrOn {
+		if dev == nil {
+			log.Fatal("-ocr needs the device; it has no CPU path")
+		}
+		start := time.Now()
+		b, err := backend.NewOCR(backend.OCROptions{Model: *ocrModel, Device: dev})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		ocrB = b
+		srv.Completion = b
+		log.Printf("ocr: %s as %s, %.2f GB on the device, in %v",
+			*ocrModel, backend.OCRModelID, float64(b.DeviceBytes())/1e9, time.Since(start).Round(time.Millisecond))
 	}
 
 	// The slot image, video and music take turns in. Deferred first, so it
@@ -526,6 +546,11 @@ func main() {
 		}
 		defer b.Close()
 		srv.Completion = b
+		if ocrB != nil {
+			// One chat door, routed by model: the language model is the
+			// default and listed first (OCR.md decision 2).
+			srv.Completion = api.CompletionRoute{b, ocrB}
+		}
 		layers := "every layer"
 		if *llmLayers > 0 {
 			layers = fmt.Sprintf("the first %d layers only", *llmLayers)

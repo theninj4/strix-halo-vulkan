@@ -785,6 +785,17 @@ func (l *LLM) sampler(req *api.CompletionRequest) *llm.Sampler {
 func chatRequest(req *api.CompletionRequest) ([]llm.ChatMessage, llm.ChatOpts, []requestImage, error) {
 	var opt llm.ChatOpts
 	var images []requestImage
+	// vLLM's extras are the OCR model's (backend/ocr.go); this model would
+	// accept and ignore them, which is the one thing a knob must not do.
+	switch {
+	case req.RepetitionPenalty != nil:
+		return nil, opt, nil, fmt.Errorf("repetition_penalty (vLLM's, over the whole sequence) is not implemented "+
+			"for this model; it takes llama-server's windowed repeat_penalty: %w", api.ErrUnsupported)
+	case req.MMProcessorKwargs != nil:
+		return nil, opt, nil, fmt.Errorf("mm_processor_kwargs is not read by this model's image processor: %w", api.ErrUnsupported)
+	case req.SkipSpecialTokens != nil && !*req.SkipSpecialTokens:
+		return nil, opt, nil, fmt.Errorf("skip_special_tokens=false is not implemented for this model: %w", api.ErrUnsupported)
+	}
 	// "Do not think" is enforced by the template in the prompt rather than
 	// asked for.
 	think, err := req.Thinking()

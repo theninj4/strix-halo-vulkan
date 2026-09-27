@@ -3,6 +3,7 @@
 /models/*
 .venv/
 .venv-acestep/
+.venv-paddle/
 reference/out/
 ai
 /out/

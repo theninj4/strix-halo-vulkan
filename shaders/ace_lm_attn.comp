@@ -34,8 +34,12 @@
 layout(binding = 2) buffer HAct { float16_t hact[]; };
 
 #define HD 128u
-#define NQ 32u
+#ifndef NQ
+#define NQ 32u // ocr/lm.go builds 16 and 2
+#endif
+#ifndef NKV
 #define NKV 8u
+#endif
 #define PSTRIDE 130u
 
 layout(local_size_x = 64) in;

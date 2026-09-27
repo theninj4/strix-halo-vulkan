@@ -86,6 +86,13 @@ type GPU struct {
 	// set by the tower's one caller, between Forwards.
 	Between func()
 
+	// Tap, if set, sees the residual stream after the embedding ("embed"),
+	// after each block ("block%d") and after Model.PostNorm ("post_norm"),
+	// rows in the order the pixels were given. It splits the graph's
+	// submits at those points, so it is for gates, not serving.
+	Tap   func(name string, x *qwen.Mat)
+	marks []tapMark
+
 	// The staged budget, and the grid of the run in progress. The arenas are
 	// sized for the first and every dispatch is bounded by the second.
 	maxRows, maxMerged int
@@ -95,6 +102,9 @@ type GPU struct {
 
 	dim, heads, headDim, ffn, ffnPad int
 	mergeIn, mergeOut                int
+	// patchK is the patch embedding's reduction, zero-padded to the GEMM's
+	// K slab: 1536 here already is one, PaddleOCR-VL's 588 is not.
+	patchK int
 
 	// The matrix-core attention (see the file comment). hdPad is the head
 	// width in the fragment planes, planeTok their token stride, and hQ, hK,
@@ -122,6 +132,8 @@ type GPU struct {
 
 	// weight offsets
 	wPatchBias uint32
+	wPostG     uint32 // Model.PostNorm's weight and bias, if any
+	wPostB     uint32
 	patchBank  int
 	patchOff   uint32
 	cpu        *Model
@@ -148,6 +160,15 @@ type gpuMerger struct {
 	gamma      uint32
 	post       bool // normalise the 4608 concatenation rather than each 1152
 	act        uint32
+	eps        float64
+}
+
+// tapMark is a Tap point: after dispatch `at`, the rows x cols at off.
+type tapMark struct {
+	at         int
+	name       string
+	off        uint32
+	rows, cols int
 }
 
 // pushConstants mirrors the PC block in shaders/dit_common.glsl.
@@ -174,6 +195,10 @@ const noW = 0xffffffff
 // tile does not divide 1152.
 const gemmBN = 64
 const gemmBM = 64
+
+// gemmBK is the kernel's K slab (BK_TILES=4 of 16): every reduction is a
+// multiple of it, with zero columns where the model's is not.
+const gemmBK = 64
 
 // NewGPU stages the tower for patch grids of up to maxRows patches and builds
 // its pipelines.
@@ -202,6 +227,7 @@ func NewGPU(dev *vk.Device, cpu *Model, maxRows int) (*GPU, error) {
 		pipes: map[string]*vk.ComputePipeline{},
 	}
 	g.ffnPad = (g.ffn + ffnAlign - 1) &^ (ffnAlign - 1)
+	g.patchK = (cfg.PatchElems() + gemmBK - 1) &^ (gemmBK - 1)
 	g.hdPad = (g.headDim + coopMatTile - 1) &^ (coopMatTile - 1)
 	// The packed planes are built for exactly one pad, 72 -> 80. Anything
 	// else, or the explicit control, runs the scalar kernel.
@@ -359,8 +385,12 @@ func (g *GPU) stageWeights(cpu *Model) error {
 
 	// The patch embedding: a Conv3d whose kernel is exactly one patch, i.e. a
 	// linear over the 1536 flattened values.
-	pxBank, pxOff := place(g.dim, g.cfg.PatchElems(), cpu.PatchProj.Weight)
+	pxBank, pxOff := place(g.dim, g.patchK, padWeight(cpu.PatchProj.Weight, g.dim, g.cfg.PatchElems(), g.dim, g.patchK))
 	g.wPatchBias = w32.put(cpu.PatchProj.Bias)
+	if cpu.PostNorm != nil {
+		g.wPostG = w32.put(cpu.PostNorm.Weight)
+		g.wPostB = w32.put(cpu.PostNorm.Bias)
+	}
 	g.blocks = make([]gpuBlock, len(cpu.Blocks))
 	deepOf := map[int]int{}
 	for j, idx := range g.cfg.DeepstackIndexes {
@@ -419,6 +449,10 @@ func (g *GPU) stageWeights(cpu *Model) error {
 		gm.post = m.PostShuffleNorm
 		gm.gamma = gamma(m.Norm.Weight)
 		gm.act = 2 // both mergers use the exact erf GELU
+		gm.eps = m.NormEps
+		if gm.eps == 0 {
+			gm.eps = normEps
+		}
 		beta := m.Norm.Bias
 		if !gm.post {
 			beta = tile4(m.Norm.Bias, g.mergeIn)
@@ -495,7 +529,7 @@ func (g *GPU) allocActivations() error {
 	// that nothing reads, but they are written.
 	rows := g.rowsPad()
 	mrg := g.mergedPad()
-	g.aPix = alloc(rows * g.cfg.PatchElems())
+	g.aPix = alloc(rows * g.patchK)
 	g.aPos = alloc(rows * g.dim)
 	g.aX = alloc(rows * g.dim)
 	g.aQ = alloc(rows * g.dim)
@@ -521,7 +555,7 @@ func (g *GPU) allocActivations() error {
 	g.aMerged = alloc(mrg * g.mergeOut)
 
 	// One fp16 A operand, sized for the widest reduction any GEMM makes.
-	kMax := g.cfg.PatchElems()
+	kMax := g.patchK
 	for _, k := range []int{g.dim, g.ffnPad, g.mergeIn, g.heads * g.hdPad} {
 		if k > kMax {
 			kMax = k
@@ -595,6 +629,7 @@ func (g *GPU) build() error {
 		"attention": shaders.DiTAttention,
 		"biasact":   shaders.QViTBiasAct,
 		"rope":      shaders.QViTRoPE,
+		"layernorm": shaders.ParakeetLayerNorm,
 	} {
 		if err := g.pipeline(name, spirv, base); err != nil {
 			return err
@@ -667,12 +702,24 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 		return nil, fmt.Errorf("vision: pixels are %s, want [%d %d]", pixels, rows, g.cfg.PatchElems())
 	}
 	g.gridH, g.gridW, g.rows, g.merged = gridH, gridW, rows, rows/merge
-	pos, err := g.cpu.positionEmbedding(g.gridH, g.gridW)
+	var pos *qwen.Mat
+	var rope *Rope
+	var err error
+	if g.cpu.Geometry != nil {
+		pos, rope, err = g.cpu.Geometry(g.gridH, g.gridW)
+	} else {
+		pos, err = g.cpu.positionEmbedding(g.gridH, g.gridW)
+		rope = NewRope(&g.cfg, g.gridH, g.gridW)
+	}
 	if err != nil {
 		return nil, err
 	}
-	rope := NewRope(&g.cfg, g.gridH, g.gridW)
-	g.abuf.WriteFloat32At(int(g.aPix), pixels.Data)
+	px := pixels.Data
+	if pe := g.cfg.PatchElems(); g.patchK != pe {
+		// Zero K columns, which the narrowing carries into the A operand.
+		px = padWeight(px, rows, pe, rows, g.patchK)
+	}
+	g.abuf.WriteFloat32At(int(g.aPix), px)
 	g.abuf.WriteFloat32At(int(g.aPos), pos.Data)
 	g.abuf.WriteFloat32At(int(g.aCos), rope.Cos.Data)
 	g.abuf.WriteFloat32At(int(g.aSin), rope.Sin.Data)
@@ -700,12 +747,18 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 	}
 	// norm is the affine LayerNorm: dit_final_norm's LN(x)*gamma into the
 	// fp16 arena, with the beta already folded into the next bias.
-	norm := func(src uint32, tokens, dim int, gammaIdx uint32, lda int) {
+	norm := func(src uint32, tokens, dim int, gammaIdx uint32, lda int, eps float64) {
 		add("norm", uint32(tokens), 1, pushConstants{
 			InOff: src, OutOff: g.hA, Tokens: uint32(tokens), Dim: uint32(dim),
 			Aux0: g.aGamma + g.gammaOff[gammaIdx],
-			Eps:  math.Float32bits(float32(normEps)), LDA: uint32(lda),
+			Eps:  math.Float32bits(float32(eps)), LDA: uint32(lda),
 		})
+	}
+	g.marks = g.marks[:0]
+	mark := func(name string) {
+		if g.Tap != nil {
+			g.marks = append(g.marks, tapMark{at: len(d), name: name, off: g.aX, rows: g.rows, cols: g.dim})
+		}
 	}
 	narrow := func(src uint32, tokens, dim, lda int) {
 		add("narrow", uint32(tokens), 1, pushConstants{
@@ -724,19 +777,20 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 	}
 
 	// ---- the patch embedding, plus the interpolated position grid.
-	narrow(g.aPix, g.rows, g.cfg.PatchElems(), g.ldaA)
-	if err := gemm(g.patchBank, g.hA, g.aX, g.patchOff, g.rows, g.dim, g.cfg.PatchElems(), g.ldaA); err != nil {
+	narrow(g.aPix, g.rows, g.patchK, g.ldaA)
+	if err := gemm(g.patchBank, g.hA, g.aX, g.patchOff, g.rows, g.dim, g.patchK, g.ldaA); err != nil {
 		return nil, err
 	}
 	biasact(g.aX, g.wPatchBias, g.rows, g.dim, 0)
 	residual(g.aPos, g.aX, g.rows, g.dim)
+	mark("embed")
 
 	// ---- the 27 blocks.
 	kStride := g.rows + attnTokenPad
 	scale := math.Float32bits(float32(1 / math.Sqrt(float64(g.headDim))))
 	for i := range g.blocks {
 		b := &g.blocks[i]
-		norm(g.aX, g.rows, g.dim, b.gamma1, g.ldaA)
+		norm(g.aX, g.rows, g.dim, b.gamma1, g.ldaA, normEps)
 		for _, pr := range []struct {
 			w, bias, out uint32
 		}{{b.wQ, b.bQ, g.aQ}, {b.wK, b.bK, g.aK}, {b.wV, b.bV, g.aV}} {
@@ -794,7 +848,7 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 		biasact(g.aY, b.bO, g.rows, g.dim, 0)
 		residual(g.aY, g.aX, g.rows, g.dim)
 
-		norm(g.aX, g.rows, g.dim, b.gamma2, g.ldaA)
+		norm(g.aX, g.rows, g.dim, b.gamma2, g.ldaA, normEps)
 		if err := gemm(b.bank, g.hA, g.aH, b.wFC1, g.rows, g.ffnPad, g.dim, g.ldaA); err != nil {
 			return nil, err
 		}
@@ -812,6 +866,15 @@ func (g *GPU) Forward(ctx context.Context, pixels *qwen.Mat, gridH, gridW int) (
 				return nil, err
 			}
 		}
+		mark(fmt.Sprintf("block%d", i))
+	}
+	if g.cpu.PostNorm != nil {
+		add("layernorm", uint32(g.rows), 1, pushConstants{
+			InOff: g.aX, OutOff: g.aX, WOff: g.wPostG, Aux0: g.wPostB,
+			Tokens: uint32(g.rows), Dim: uint32(g.dim),
+			Eps: math.Float32bits(float32(g.cpu.PostNormEps)),
+		})
+		mark("post_norm")
 	}
 	if err := g.merger(&d, add, gemm, norm, narrow, biasact, len(g.mergers)-1, g.aMerged); err != nil {
 		return nil, err
@@ -840,7 +903,7 @@ func (g *GPU) merger(
 	d *[]vk.MultiDispatch,
 	add func(string, uint32, uint32, pushConstants),
 	gemm func(int, uint32, uint32, uint32, int, int, int, int) error,
-	norm func(uint32, int, int, uint32, int),
+	norm func(uint32, int, int, uint32, int, float64),
 	narrow func(uint32, int, int, int),
 	biasact func(uint32, uint32, int, int, uint32),
 	idx int, dst uint32,
@@ -848,12 +911,12 @@ func (g *GPU) merger(
 	m := &g.mergers[idx]
 	lda := g.ldaA
 	if m.post {
-		norm(g.aX, g.merged, g.mergeIn, m.gamma, lda)
+		norm(g.aX, g.merged, g.mergeIn, m.gamma, lda, m.eps)
 	} else {
 		// A tight stride, so that four normalised rows of 1152 sit
 		// contiguously and the GEMM reads them as one row of 4608.
 		lda = g.mergeIn
-		norm(g.aX, g.rows, g.dim, m.gamma, g.dim)
+		norm(g.aX, g.rows, g.dim, m.gamma, g.dim, m.eps)
 	}
 	if err := gemm(m.bank, g.hA, g.aH, m.wFC1, g.merged, g.mergeIn, g.mergeIn, lda); err != nil {
 		return err
@@ -884,7 +947,8 @@ const dispatchesPerSubmit = 8
 // tower's is on the device. A server uses it to let other work run in the
 // middle of a long image (backend's tower slices).
 func (g *GPU) run(ctx context.Context, ds []vk.MultiDispatch) error {
-	for i := 0; i < len(ds); i += dispatchesPerSubmit {
+	marks := g.marks
+	for i := 0; i < len(ds); {
 		if i > 0 && g.Between != nil {
 			g.Between()
 		}
@@ -892,9 +956,18 @@ func (g *GPU) run(ctx context.Context, ds []vk.MultiDispatch) error {
 			return fmt.Errorf("vision: cancelled after %d of %d dispatches: %w", i, len(ds), err)
 		}
 		j := min(i+dispatchesPerSubmit, len(ds))
+		if len(marks) > 0 && marks[0].at < j {
+			j = marks[0].at
+		}
 		if _, err := vk.DispatchMultiTimed(ds[i:j], 1, 1, true); err != nil {
 			return fmt.Errorf("vision: dispatch %d-%d: %w", i, j-1, err)
 		}
+		for len(marks) > 0 && marks[0].at == j {
+			m := marks[0]
+			g.Tap(m.name, g.read(m.off, m.rows, m.cols))
+			marks = marks[1:]
+		}
+		i = j
 	}
 	return nil
 }

@@ -3787,3 +3787,19 @@ var ACELMAttn []byte
 
 //go:embed ace_lm_attn_combine.spv
 var ACELMAttnCombine []byte
+
+// PaddleOCR-VL's ERNIE-4.5-0.3B (ocr/lm.go, OCR.md O4): the same three
+// kernels at 16 q and 2 kv heads, the prep without q/k norm and with the
+// 3-D rope in chunked [16, 24, 24] sections.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DQK_NORM=0 -DMROPE=1 -o ocr_lm_prep.spv ace_lm_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -o ocr_lm_attn.spv ace_lm_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DCOMBINE=1 -o ocr_lm_attn_combine.spv ace_lm_attn.comp
+
+//go:embed ocr_lm_prep.spv
+var OCRLMPrep []byte
+
+//go:embed ocr_lm_attn.spv
+var OCRLMAttn []byte
+
+//go:embed ocr_lm_attn_combine.spv
+var OCRLMAttnCombine []byte

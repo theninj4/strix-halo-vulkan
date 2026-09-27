@@ -201,9 +201,17 @@ const maxStopSequences = 4
 // modelID is what the response reports it ran. It is the backend's own id
 // rather than the one the request asked for: a client configured for "gpt-4"
 // against this server got this model, and saying otherwise would make a
-// transcript unreadable a week later.
-func modelID(b Backend, _ string) string {
-	if ms := b.Models(); len(ms) > 0 {
+// transcript unreadable a week later. When the request names one of the
+// backend's own ids -- a routed pair of chat models (CompletionRoute) has
+// several -- that one is what ran.
+func modelID(b Backend, asked string) string {
+	ms := b.Models()
+	for _, m := range ms {
+		if m.ID == asked {
+			return asked
+		}
+	}
+	if len(ms) > 0 {
 		return ms[0].ID
 	}
 	return "unknown"
