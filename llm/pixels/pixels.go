@@ -161,7 +161,7 @@ func (p Processor) Planes(img *RGB) (planes []float32, h, w int, err error) {
 
 // Resize is torch's uint8 antialiased bicubic to w x h (see the package
 // comment, step 3).
-func Resize(src *RGB, w, h int) *RGB { return resize(src, w, h, false) }
+func Resize(src *RGB, w, h int) *RGB { return resize(src, w, h, kindTorchAA) }
 
 // ResizePillow is Pillow's own `Image.resize(resample=BICUBIC)`: the same
 // plan as Resize, with the coefficients at Pillow's fixed 22 fractional bits
@@ -169,15 +169,38 @@ func Resize(src *RGB, w, h int) *RGB { return resize(src, w, h, false) }
 // picks per axis. That is the whole difference, and it is the ~0.5% of
 // samples one level apart the package comment mentions. PaddleOCR-VL's
 // processor calls this one (OCR.md decision 4).
-func ResizePillow(src *RGB, w, h int) *RGB { return resize(src, w, h, true) }
+func ResizePillow(src *RGB, w, h int) *RGB { return resize(src, w, h, kindPillow) }
 
-func resize(src *RGB, w, h int, pillow bool) *RGB {
+// ResizeNoAA is torch's uint8 bicubic *without* antialiasing, which is what
+// torchvision's resize(antialias=False) runs on a uint8 image on a CPU with
+// AVX2: the same separable int16 passes as Resize (horizontal first, a
+// uint8 intermediate, the same precision search), with the plan changed --
+// the cubic is a = -0.75 (numpy's and torch's float kernel's) rather than
+// Pillow's -0.5, the support does not stretch on a downscale, and the
+// window is the float kernel's four taps with their indices clamped to the
+// edge (taps on the same index summed), not Pillow's truncated and
+// renormalised one: that reading was 13 levels off on an upscale. Against
+// torch's *float* bicubic plus rounding it is up to 9 levels apart, from the
+// int16 weights and the uint8 intermediate. PP-DocLayoutV3's HF processor
+// calls this (ocr/layout).
+func ResizeNoAA(src *RGB, w, h int) *RGB { return resize(src, w, h, kindNoAA) }
+
+// kind is which of the three resamplers a plan is for.
+type kind int
+
+const (
+	kindTorchAA kind = iota
+	kindPillow
+	kindNoAA
+)
+
+func resize(src *RGB, w, h int, k kind) *RGB {
 	out := src
 	if w != src.W {
-		out = resample(out, w, true, pillow)
+		out = resample(out, w, true, k)
 	}
 	if h != src.H {
-		out = resample(out, h, false, pillow)
+		out = resample(out, h, false, k)
 	}
 	if out == src {
 		out = &RGB{W: w, H: h, Pix: append([]uint8(nil), src.Pix...)}
@@ -185,9 +208,9 @@ func resize(src *RGB, w, h int, pillow bool) *RGB {
 	return out
 }
 
-// cubic is the Keys kernel at a = -0.5, torch's and Pillow's bicubic.
-func cubic(x float64) float64 {
-	const a = -0.5
+// cubic is the Keys kernel: a = -0.5 is torch's antialiased and Pillow's
+// bicubic, -0.75 torch's plain one.
+func cubic(x, a float64) float64 {
 	x = math.Abs(x)
 	switch {
 	case x < 1:
@@ -210,15 +233,41 @@ type plan struct {
 // pillowPrecision is Pillow's PRECISION_BITS, 32 - 8 - 2.
 const pillowPrecision = 22
 
-func newPlan(inSize, outSize int, pillow bool) plan {
+func newPlan(inSize, outSize int, kd kind) plan {
+	pillow := kd == kindPillow
 	scale := float64(inSize) / float64(outSize)
 	fs := math.Max(scale, 1)
+	a := -0.5
+	if kd == kindNoAA {
+		fs, a = 1, -0.75
+	}
 	support := 2 * fs
 	ksize := int(math.Ceil(support))*2 + 1
 	p := plan{ksize: ksize, bounds: make([][2]int, outSize), kk: make([]int32, outSize*ksize)}
 	k := make([]float64, outSize*ksize)
 	maxW := math.Inf(-1)
 	for xx := 0; xx < outSize; xx++ {
+		if kd == kindNoAA {
+			// The float kernel's four taps at floor-1..floor+2, their
+			// indices clamped to the edge and the weights of taps that land
+			// on the same index summed: a window of up to four, unnormalised
+			// (the four always sum to one).
+			real := scale*(float64(xx)+0.5) - 0.5
+			f := math.Floor(real)
+			t := real - f
+			co := [4]float64{cubic(t+1, a), cubic(t, a), cubic(1-t, a), cubic(2-t, a)}
+			lo := min(max(int(f)-1, 0), inSize-1)
+			hi := min(max(int(f)+2, 0), inSize-1)
+			row := k[xx*ksize : (xx+1)*ksize]
+			for j, c := range co {
+				row[min(max(int(f)-1+j, 0), inSize-1)-lo] += c
+			}
+			for x := 0; x <= hi-lo; x++ {
+				maxW = math.Max(maxW, row[x])
+			}
+			p.bounds[xx] = [2]int{lo, hi - lo + 1}
+			continue
+		}
 		center := (float64(xx) + 0.5) * scale
 		// C's truncating cast; below zero the clamp makes it a floor.
 		xmin := max(int(center-support+0.5), 0)
@@ -226,7 +275,7 @@ func newPlan(inSize, outSize int, pillow bool) plan {
 		row := k[xx*ksize : (xx+1)*ksize]
 		var tot float64
 		for x := 0; x < n; x++ {
-			row[x] = cubic((float64(x+xmin) - center + 0.5) / fs)
+			row[x] = cubic((float64(x+xmin)-center+0.5)/fs, a)
 			tot += row[x]
 		}
 		for x := 0; x < n; x++ {
@@ -260,7 +309,7 @@ func newPlan(inSize, outSize int, pillow bool) plan {
 }
 
 // resample runs one pass along x (horizontal) or y, into uint8.
-func resample(src *RGB, size int, horizontal, pillow bool) *RGB {
+func resample(src *RGB, size int, horizontal bool, k kind) *RGB {
 	var out *RGB
 	var in int
 	if horizontal {
@@ -271,7 +320,7 @@ func resample(src *RGB, size int, horizontal, pillow bool) *RGB {
 		in = src.H
 	}
 	out.Pix = make([]uint8, out.W*out.H*3)
-	p := newPlan(in, size, pillow)
+	p := newPlan(in, size, k)
 	round := int32(1) << (p.prec - 1)
 	clip := func(v int32) uint8 {
 		v >>= p.prec

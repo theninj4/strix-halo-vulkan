@@ -13,6 +13,7 @@
 //       noise, large enough to matter after 27 layers, and qimage/vision's
 //       negative control catches the swap at 221x its bound.
 //
+//   3 — ReLU and 4 — SiLU, PP-DocLayoutV3's convolutions (ocr/layout).
 // wOff is the bias vector, or NO_W for a pass that only applies the
 // activation. One workgroup per row, the same shape as dit_gate_add: the
 // bias is indexed by column, and a flat grid would pay an integer division
@@ -58,6 +59,10 @@ void main() {
             v = 0.5 * v * (1.0 + tanh(SQRT_2_OVER_PI * (v + 0.044715 * v * v * v)));
         } else if (pc.aux0 == 2u) {
             v = 0.5 * v * (1.0 + erfApprox(v * SQRT_1_2));
+        } else if (pc.aux0 == 3u) {
+            v = max(v, 0.0);
+        } else if (pc.aux0 == 4u) {
+            v = v / (1.0 + exp(-v));
         }
         act[base + c] = v;
     }

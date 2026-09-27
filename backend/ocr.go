@@ -11,6 +11,8 @@ import (
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/llm/pixels"
 	"strix-halo-vulkan/ocr"
+	"strix-halo-vulkan/ocr/layout"
+	"strix-halo-vulkan/ocr/page"
 	"strix-halo-vulkan/util"
 	"strix-halo-vulkan/vk"
 )
@@ -24,6 +26,11 @@ type OCROptions struct {
 	// MaxPixels is the largest image the tower is staged for (0: the
 	// checkpoint's 1,003,520). A request's max_pixels above it is refused.
 	MaxPixels int
+	// LayoutModel is the PP-DocLayoutV3 checkpoint the page doors run; empty
+	// serves the chat door alone.
+	LayoutModel string
+	// MaxPages bounds one document request (0: 100).
+	MaxPages int
 }
 
 // OCRModelID is the name the chat door answers to, and the one vLLM serves
@@ -47,9 +54,11 @@ const OCRModelID = "PaddleOCR-VL-1.6-0.9B"
 // device lock on its own, so speech and the rest interleave with a page's
 // generation a token at a time.
 type OCR struct {
-	opt OCROptions
-	mu  sync.Mutex // guards eng against Close
-	eng *ocr.Engine
+	opt    OCROptions
+	mu     sync.Mutex // guards eng, lay and parser against Close
+	eng    *ocr.Engine
+	lay    *layout.GPU
+	parser *page.Parser
 }
 
 // NewOCR loads the tokenizer, the tower and ERNIE: 2.3 GB on the device,
@@ -75,11 +84,49 @@ func NewOCR(opt OCROptions) (*OCR, error) {
 	b.eng.Do = func(fn func() error) error {
 		return opt.Device.Do(func(*vk.Device) error { return fn() })
 	}
+	if opt.LayoutModel != "" {
+		lm, err := layout.Load(opt.LayoutModel)
+		if err != nil {
+			b.Close()
+			return nil, err
+		}
+		err = opt.Device.Do(func(dev *vk.Device) error {
+			g, err := layout.NewGPU(dev, lm)
+			b.lay = g
+			return err
+		})
+		if err != nil {
+			b.Close()
+			return nil, err
+		}
+		b.parser = &page.Parser{
+			// The whole layout forward holds the device: its trunk is 35 ms
+			// of the ~225, the rest the host's head (O11 splits it).
+			Layout: func(px []float32) (*layout.Output, error) {
+				var out *layout.Output
+				err := opt.Device.Do(func(*vk.Device) error {
+					var err error
+					out, _, err = b.lay.Forward(px, nil)
+					return err
+				})
+				return out, err
+			},
+		}
+	}
 	return b, nil
 }
 
+// Pages reports whether the page doors are loaded.
+func (b *OCR) Pages() bool { return b.parser != nil }
+
 // DeviceBytes is what the model holds on the device.
-func (b *OCR) DeviceBytes() int { return b.eng.DeviceBytes() }
+func (b *OCR) DeviceBytes() int {
+	n := b.eng.DeviceBytes()
+	if b.lay != nil {
+		n += b.lay.DeviceBytes()
+	}
+	return n
+}
 
 // Close releases the device objects.
 func (b *OCR) Close() {
@@ -88,6 +135,10 @@ func (b *OCR) Close() {
 	if b.eng != nil {
 		_ = b.opt.Device.Do(func(*vk.Device) error { b.eng.Destroy(); return nil })
 		b.eng = nil
+	}
+	if b.lay != nil {
+		_ = b.opt.Device.Do(func(*vk.Device) error { b.lay.Destroy(); return nil })
+		b.lay, b.parser = nil, nil
 	}
 }
 

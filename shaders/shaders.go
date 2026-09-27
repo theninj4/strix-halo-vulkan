@@ -3798,6 +3798,38 @@ var ACELMAttnCombine []byte
 //go:embed ocr_lm_prep.spv
 var OCRLMPrep []byte
 
+// PP-DocLayoutV3's convolution trunk (ocr/layout/gpu.go, OCR.md O7): the
+// im2col, depthwise, pooling, upsampling, add and channel-copy kernels
+// around dit_gemm, one build a mode.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -o layout_im2col.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -o layout_dwconv.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -o layout_maxpool.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=3 -o layout_upnearest.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=4 -o layout_upbilinear.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=5 -o layout_add.spv layout_ops.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=6 -o layout_copych.spv layout_ops.comp
+
+//go:embed layout_im2col.spv
+var LayoutIm2col []byte
+
+//go:embed layout_dwconv.spv
+var LayoutDWConv []byte
+
+//go:embed layout_maxpool.spv
+var LayoutMaxPool []byte
+
+//go:embed layout_upnearest.spv
+var LayoutUpNearest []byte
+
+//go:embed layout_upbilinear.spv
+var LayoutUpBilinear []byte
+
+//go:embed layout_add.spv
+var LayoutAdd []byte
+
+//go:embed layout_copych.spv
+var LayoutCopyCh []byte
+
 //go:embed ocr_lm_attn.spv
 var OCRLMAttn []byte
 

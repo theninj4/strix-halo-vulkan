@@ -55,6 +55,9 @@ func (s *Server) backends() []Backend {
 	if s.SystemOne != nil {
 		out = append(out, s.SystemOne)
 	}
+	if s.Document != nil {
+		out = append(out, s.Document)
+	}
 	if s.Videos != nil {
 		out = append(out, s.Videos.backend)
 	}

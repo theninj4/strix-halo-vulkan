@@ -191,6 +191,8 @@ func main() {
 
 	ocrOn := flag.Bool("ocr", false, "load PaddleOCR-VL-1.6 and serve it on /v1/chat/completions as model "+backend.OCRModelID+" (OCR.md)")
 	ocrModel := flag.String("ocr-model", "models/PaddleOCR-VL-1.6", "PaddleOCR-VL-1.6 checkpoint directory")
+	ocrLayout := flag.String("ocr-layout-model", "models/PP-DocLayoutV3", "PP-DocLayoutV3 checkpoint for the page doors (/v1/ocr, /layout-parsing); empty serves the chat door alone")
+	ocrMaxPages := flag.Int("ocr-max-pages", 100, "most pages one document request may parse")
 
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
 	sttModel := flag.String("stt-model", "models/parakeet-tdt-0.6b-v3", "parakeet checkpoint directory")
@@ -403,15 +405,20 @@ func main() {
 			log.Fatal("-ocr needs the device; it has no CPU path")
 		}
 		start := time.Now()
-		b, err := backend.NewOCR(backend.OCROptions{Model: *ocrModel, Device: dev})
+		b, err := backend.NewOCR(backend.OCROptions{Model: *ocrModel, Device: dev, LayoutModel: *ocrLayout, MaxPages: *ocrMaxPages})
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer b.Close()
 		ocrB = b
 		srv.Completion = b
-		log.Printf("ocr: %s as %s, %.2f GB on the device, in %v",
-			*ocrModel, backend.OCRModelID, float64(b.DeviceBytes())/1e9, time.Since(start).Round(time.Millisecond))
+		pages := "no page doors"
+		if b.Pages() {
+			srv.Document = b
+			pages = "pages by " + *ocrLayout
+		}
+		log.Printf("ocr: %s as %s, %s, %.2f GB on the device, in %v",
+			*ocrModel, backend.OCRModelID, pages, float64(b.DeviceBytes())/1e9, time.Since(start).Round(time.Millisecond))
 	}
 
 	// The slot image, video and music take turns in. Deferred first, so it
@@ -697,7 +704,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
 			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
-			"/v1/videos", "/v1/music",
+			"/v1/videos", "/v1/music", "/v1/ocr", "/layout-parsing",
 		} {
 			log.Printf("  %s", route)
 		}

@@ -58,6 +58,8 @@ type Server struct {
 	Embedding     EmbeddingBackend
 	Image         ImageBackend
 	SystemOne     SystemOneBackend
+	// Document parses pages: /v1/ocr and /layout-parsing (document.go).
+	Document DocumentBackend
 	// Videos is the video job queue over its backend (videos.go).
 	Videos *VideoJobs
 	// Music is the music job queue over its backend (music.go).
@@ -94,6 +96,11 @@ func (s *Server) Handler() http.Handler {
 	// TypeSafe's System One: typed questions about a text, answered with
 	// calibrated probabilities (systemone.go, CLASSIFICATION.md).
 	mux.Handle("POST /v1/systemone", s.route(s.handleSystemOne))
+
+	// Document parsing (document.go, OCR.md O9): Mistral's OCR API, and
+	// PaddleX's serving endpoint at the path its clients call, outside /v1.
+	mux.Handle("POST /v1/ocr", s.route(s.handleOCR))
+	mux.Handle("POST /layout-parsing", s.route(s.handleLayoutParsing))
 
 	// Input: SpeechRequest{}, Output: SpeechResponse{}
 	mux.Handle("POST /v1/audio/speech", s.route(s.handleSpeech))

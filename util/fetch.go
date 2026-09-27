@@ -55,6 +55,16 @@ var fetchClient = &http.Client{
 // FetchImage returns the bytes an image URL names: a data: URL's base64
 // payload, or an http(s) URL's body.
 func FetchImage(ctx context.Context, url string) ([]byte, error) {
+	return fetchBytes(ctx, url, "image/*")
+}
+
+// FetchDocument is FetchImage for a document that may also be a PDF (the
+// OCR doors, whose `document_url` and PaddleX `file` name either).
+func FetchDocument(ctx context.Context, url string) ([]byte, error) {
+	return fetchBytes(ctx, url, "application/pdf, image/*")
+}
+
+func fetchBytes(ctx context.Context, url, accept string) ([]byte, error) {
 	url = strings.TrimSpace(url)
 	if strings.HasPrefix(url, "data:") {
 		meta, payload, ok := strings.Cut(url[len("data:"):], ",")
@@ -83,7 +93,7 @@ func FetchImage(ctx context.Context, url string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrImageURL, err)
 	}
-	req.Header.Set("Accept", "image/*")
+	req.Header.Set("Accept", accept)
 	resp, err := fetchClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: fetching %s: %v", ErrImageURL, redact(url), err)

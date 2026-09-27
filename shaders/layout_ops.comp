@@ -1,0 +1,166 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// PP-DocLayoutV3's convolution trunk on the device (ocr/layout/gpu.go,
+// OCR.md O7): the element-wise and gather kernels around dit_gemm, one
+// build a MODE.
+//
+// Every feature map is fp32 channel-last in the activation arena: row r =
+// y*W + x, pc.headDim floats a row (the channel count padded to 64, the pad
+// channels zero). A convolution is an im2col into the fp16 A operand, then
+// dit_gemm against the fragment-tiled weight, then qvit_bias_act. The
+// kernels that are not a product are here.
+//
+// All of them are grid-stride loops over their elements: a 400x400 map has
+// more rows than a dispatch has workgroups on one axis.
+//
+// MODE 0, IM2COL: A[m][k] for output pixel m = oy*outW + ox and k = (ky*K +
+//   kx)*Cin + c, i.e. tap-major with the real channels innermost (the
+//   weight is packed the same way). Taps outside the input read zero, which
+//   is both the conv's zero padding and F.pad's.
+//     inOff  input map          outOff A (fp16 arena)       lda   A's row stride
+//     tokens M (output pixels)  dim    Cin*K*K (real K)      gemmK K padded to 64: [dim, gemmK) is written 0
+//     heads  Cin                headDim input row stride     span  K (kernel side)
+//     kOff   input H            vOff   input W               kStride output W
+//     aux0   stride             aux1   pad top               aux2  pad left
+// MODE 1, DWCONV: depthwise K x K, bias and activation, fp32.
+//     inOff/outOff maps, headDim their row stride (the same), heads C,
+//     tokens output pixels, span K, kOff/vOff input H/W, kStride output W,
+//     aux0 stride, aux1 pad, wOff weights [C][K][K] then bias [C] (weight
+//     arena), scale the activation (0 none, 3 ReLU, 4 SiLU).
+// MODE 2, MAXPOOL2: 2x2, stride 1, over the map with a zero row and column
+//     added at the bottom and right (the stem's F.pad then MaxPool2d
+//     ceil_mode): output H x W from input H x W. tokens pixels, heads C,
+//     headDim stride, kOff H, vOff W.
+// MODE 3, UPNEAREST2 and MODE 4, UPBILINEAR2 (align_corners=False): output
+//     2H x 2W. tokens output pixels, heads C, headDim stride, kOff/vOff
+//     input H/W.
+// MODE 5, ADD: out = in + in2 (kOff), then the activation in scale, over
+//     tokens rows of heads channels at stride headDim.
+// MODE 6, COPYCH: out[r][aux0 + c] = in[r][c] for c < heads; out's stride
+//     is aux1, in's headDim. A channel concatenation that a conv reads.
+
+#include "dit_common.glsl"
+
+#ifndef MODE
+#define MODE 0
+#endif
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+float activate(float v, uint a) {
+    if (a == 3u) {
+        return max(v, 0.0);
+    }
+    if (a == 4u) {
+        return v / (1.0 + exp(-v));
+    }
+    return v;
+}
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint first = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+#if MODE == 0
+    uint total = pc.tokens * pc.gemmK;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.gemmK;
+        uint k = i - m * pc.gemmK;
+        float v = 0.0;
+        if (k < pc.dim) {
+            uint tap = k / pc.heads;
+            uint c = k - tap * pc.heads;
+            uint ky = tap / pc.span;
+            uint kx = tap - ky * pc.span;
+            uint oy = m / pc.kStride;
+            uint ox = m - oy * pc.kStride;
+            int iy = int(oy * pc.aux0 + ky) - int(pc.aux1);
+            int ix = int(ox * pc.aux0 + kx) - int(pc.aux2);
+            if (iy >= 0 && iy < int(pc.kOff) && ix >= 0 && ix < int(pc.vOff)) {
+                v = act[pc.inOff + (uint(iy) * pc.vOff + uint(ix)) * pc.headDim + c];
+            }
+        }
+        hact[pc.outOff + m * pc.lda + k] = float16_t(v);
+    }
+#elif MODE == 1
+    uint total = pc.tokens * pc.heads;
+    uint kk = pc.span * pc.span;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.heads;
+        uint c = i - m * pc.heads;
+        uint oy = m / pc.kStride;
+        uint ox = m - oy * pc.kStride;
+        float acc = wbuf[pc.wOff + pc.heads * kk + c];
+        for (uint ky = 0u; ky < pc.span; ky++) {
+            int iy = int(oy * pc.aux0 + ky) - int(pc.aux1);
+            if (iy < 0 || iy >= int(pc.kOff)) {
+                continue;
+            }
+            for (uint kx = 0u; kx < pc.span; kx++) {
+                int ix = int(ox * pc.aux0 + kx) - int(pc.aux1);
+                if (ix < 0 || ix >= int(pc.vOff)) {
+                    continue;
+                }
+                acc += wbuf[pc.wOff + c * kk + ky * pc.span + kx] *
+                       act[pc.inOff + (uint(iy) * pc.vOff + uint(ix)) * pc.headDim + c];
+            }
+        }
+        act[pc.outOff + m * pc.headDim + c] = activate(acc, pc.scale);
+    }
+#elif MODE == 2
+    uint total = pc.tokens * pc.heads;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.heads;
+        uint c = i - m * pc.heads;
+        uint y = m / pc.vOff;
+        uint x = m - y * pc.vOff;
+        float v = act[pc.inOff + m * pc.headDim + c];
+        bool right = x + 1u < pc.vOff, down = y + 1u < pc.kOff;
+        v = max(v, right ? act[pc.inOff + (m + 1u) * pc.headDim + c] : 0.0);
+        v = max(v, down ? act[pc.inOff + (m + pc.vOff) * pc.headDim + c] : 0.0);
+        v = max(v, right && down ? act[pc.inOff + (m + pc.vOff + 1u) * pc.headDim + c] : 0.0);
+        act[pc.outOff + m * pc.headDim + c] = v;
+    }
+#elif MODE == 3 || MODE == 4
+    uint total = pc.tokens * pc.heads;
+    uint ow = pc.vOff * 2u;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.heads;
+        uint c = i - m * pc.heads;
+        uint y = m / ow;
+        uint x = m - y * ow;
+#if MODE == 3
+        float v = act[pc.inOff + ((y / 2u) * pc.vOff + x / 2u) * pc.headDim + c];
+#else
+        float sy = max((float(y) + 0.5) * 0.5 - 0.5, 0.0);
+        float sx = max((float(x) + 0.5) * 0.5 - 0.5, 0.0);
+        uint y0 = uint(sy), x0 = uint(sx);
+        uint y1 = min(y0 + 1u, pc.kOff - 1u), x1 = min(x0 + 1u, pc.vOff - 1u);
+        float fy = sy - float(y0), fx = sx - float(x0);
+        float a = act[pc.inOff + (y0 * pc.vOff + x0) * pc.headDim + c];
+        float b = act[pc.inOff + (y0 * pc.vOff + x1) * pc.headDim + c];
+        float d = act[pc.inOff + (y1 * pc.vOff + x0) * pc.headDim + c];
+        float e = act[pc.inOff + (y1 * pc.vOff + x1) * pc.headDim + c];
+        float v = (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (d * (1.0 - fx) + e * fx) * fy;
+#endif
+        act[pc.outOff + m * pc.headDim + c] = v;
+    }
+#elif MODE == 5
+    uint total = pc.tokens * pc.heads;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.heads;
+        uint c = i - m * pc.heads;
+        uint o = m * pc.headDim + c;
+        act[pc.outOff + o] = activate(act[pc.inOff + o] + act[pc.kOff + o], pc.scale);
+    }
+#elif MODE == 6
+    uint total = pc.tokens * pc.heads;
+    for (uint i = first; i < total; i += stride) {
+        uint m = i / pc.heads;
+        uint c = i - m * pc.heads;
+        act[pc.outOff + m * pc.aux1 + pc.aux0 + c] = act[pc.inOff + m * pc.headDim + c];
+    }
+#endif
+}
