@@ -2,6 +2,7 @@
 *.spv
 /models/*
 .venv/
+.venv-acestep/
 reference/out/
 ai
 /out/

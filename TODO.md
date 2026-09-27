@@ -69,6 +69,16 @@ stand-in (M12).
   churn), and `serve` kept ~11 GB of staging garbage resident. That gave
   every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
 
+**Music (opened 2026-09-27): ACE-Step 1.5 XL turbo, caption + lyrics to a
+48 kHz stereo song** (`GOALS.md` item 8). The live plan and handoff is the
+root [`MUSIC.md`](MUSIC.md) (A-stages). It has three generators: the 5 Hz
+LM (a Qwen3-4B that plans metas and audio codes), a 4 B DiT (8 CFG-free
+Euler steps over 25 Hz latents) and an Oobleck VAE. The oracle is
+upstream's own handler in a pinned `.venv-acestep`. A0 (weights, fp16
+audit) and A1 (`ace/plan`: prompts, tokens, lengths, and the whole sampler
+bit-exact against upstream) are done. Next: the condition encoder and the
+DiT on the GPU (A2, A3), with the DiT-only path first.
+
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant
