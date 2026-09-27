@@ -16,7 +16,6 @@ import (
 
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/llm/pixels"
-	"strix-halo-vulkan/ocr"
 	"strix-halo-vulkan/ocr/page"
 )
 
@@ -145,42 +144,15 @@ func (b *OCR) ParseDocument(ctx context.Context, req *api.DocumentRequest) (*api
 		pages = append(pages, pageIn{0, img, 0})
 	}
 
-	// The request's overrides apply to every block, as PaddleX's min_pixels
-	// and max_pixels do (every label's bounds default to them).
 	p := *parser
-	p.Recognize = func(ctx context.Context, r ocr.Request) (*ocr.Result, error) {
-		if req.MinPixels > 0 {
-			r.MinPixels = req.MinPixels
-		}
-		if req.MaxPixels > 0 {
-			if req.MaxPixels > b.opt.MaxPixels {
-				return nil, fmt.Errorf("max_pixels %d: this server staged the tower for %d: %w", req.MaxPixels, b.opt.MaxPixels, api.ErrUnsupported)
-			}
-			r.MaxPixels = req.MaxPixels
-		}
-		if req.MaxTokens > 0 {
-			r.MaxTokens = req.MaxTokens
-		}
-		r.RepetitionPenalty = req.RepetitionPenalty
-		return eng.Recognize(ctx, r)
-	}
-	var pageCount *int
-	if req.PDF {
-		pageCount = &res.PDFPages
-	}
+	p.Recognize = eng.Recognize
 	imgN, tblN := 0, 0
 	for _, in := range pages {
 		pg, err := p.Parse(ctx, in.img)
 		if err != nil {
 			return nil, fmt.Errorf("page %d: %w", in.index, err)
 		}
-		dp := api.DocumentPage{
-			Index: in.index, Width: in.img.W, Height: in.img.H, DPI: in.dpi,
-			Markdown: pg.Markdown, Pruned: pg.Pruned(pageCount), MarkdownImages: map[string]image.Image{},
-		}
-		for path, im := range pg.Images {
-			dp.MarkdownImages[path] = rgbImage(im)
-		}
+		dp := api.DocumentPage{Index: in.index, Width: in.img.W, Height: in.img.H, DPI: in.dpi}
 		md, tables, imgs := page.Mistral(pg.Results, req.SeparateTables, imgN, tblN)
 		imgN, tblN = imgN+len(imgs), tblN+len(tables)
 		dp.Mistral = md

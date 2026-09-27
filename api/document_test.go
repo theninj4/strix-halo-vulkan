@@ -30,11 +30,10 @@ func (f *fakeDocs) ParseDocument(_ context.Context, req *DocumentRequest) (*Docu
 	}
 	for i := 0; i < n; i++ {
 		res.Pages = append(res.Pages, DocumentPage{
-			Index: i, Width: 100, Height: 50, Markdown: "# Title", Pruned: map[string]any{"width": 100},
-			MarkdownImages: map[string]image.Image{"imgs/a.jpg": image.NewGray(image.Rect(0, 0, 2, 2))},
-			Mistral:        "# Title\n\n![img-0.jpeg](img-0.jpeg)",
-			MistralImages:  []DocumentImage{{ID: "img-0.jpeg", Box: [4]int{1, 2, 3, 4}, Image: image.NewGray(image.Rect(0, 0, 2, 2))}},
-			Header:         "running head",
+			Index: i, Width: 100, Height: 50,
+			Mistral:       "# Title\n\n![img-0.jpeg](img-0.jpeg)",
+			MistralImages: []DocumentImage{{ID: "img-0.jpeg", Box: [4]int{1, 2, 3, 4}, Image: image.NewGray(image.Rect(0, 0, 2, 2))}},
+			Header:        "running head",
 		})
 	}
 	return res, nil
@@ -75,56 +74,6 @@ func TestOCREndpoint(t *testing.T) {
 	} {
 		if rec := do(t, s, jsonRequest("POST", "/v1/ocr", body)); rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: %d, want 400: %s", name, rec.Code, rec.Body)
-		}
-	}
-}
-
-func TestLayoutParsingEndpoint(t *testing.T) {
-	f := &fakeDocs{}
-	s := &Server{Document: f}
-	file := base64.StdEncoding.EncodeToString([]byte("%PDF-1.4 fake"))
-	rec := do(t, s, jsonRequest("POST", "/layout-parsing", map[string]any{"file": file, "fileType": 0,
-		"useLayoutDetection": true, "layoutShapeMode": "rect", "minPixels": 200000, "visualize": false}))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("%d %s", rec.Code, rec.Body)
-	}
-	var out struct {
-		LogID     string `json:"logId"`
-		ErrorCode int    `json:"errorCode"`
-		ErrorMsg  string `json:"errorMsg"`
-		Result    struct {
-			LayoutParsingResults []struct {
-				PrunedResult map[string]any `json:"prunedResult"`
-				Markdown     struct {
-					Text   string            `json:"text"`
-					Images map[string]string `json:"images"`
-				} `json:"markdown"`
-			} `json:"layoutParsingResults"`
-			DataInfo map[string]any `json:"dataInfo"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
-		t.Fatal(err)
-	}
-	if out.ErrorCode != 0 || out.ErrorMsg != "Success" || len(out.LogID) != 36 || len(out.Result.LayoutParsingResults) != 2 ||
-		out.Result.DataInfo["type"] != "pdf" || out.Result.DataInfo["numPages"] != 2.0 ||
-		out.Result.LayoutParsingResults[0].Markdown.Images["imgs/a.jpg"] == "" || !f.req.PDF || f.req.MinPixels != 200000 {
-		t.Errorf("%s", rec.Body)
-	}
-	for name, body := range map[string]map[string]any{
-		"polygons":    {"file": file, "layoutShapeMode": "auto"},
-		"charts":      {"file": file, "useChartRecognition": true},
-		"visualize":   {"file": file, "visualize": true},
-		"restructure": {"file": file, "restructurePages": true},
-		"temperature": {"file": file, "temperature": 0.7},
-		"type":        {"file": file, "fileType": 1},
-		"no file":     {"fileType": 1},
-	} {
-		rec := do(t, s, jsonRequest("POST", "/layout-parsing", body))
-		var e paddleError
-		_ = json.Unmarshal(rec.Body.Bytes(), &e)
-		if rec.Code != http.StatusUnprocessableEntity || e.ErrorCode != 422 || e.ErrorMsg == "" {
-			t.Errorf("%s: %d %s, want PaddleX's 422 envelope", name, rec.Code, rec.Body)
 		}
 	}
 }

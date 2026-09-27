@@ -191,7 +191,7 @@ func main() {
 
 	ocrOn := flag.Bool("ocr", false, "load PaddleOCR-VL-1.6 and serve it on /v1/chat/completions as model "+backend.OCRModelID+" (OCR.md)")
 	ocrModel := flag.String("ocr-model", "models/PaddleOCR-VL-1.6", "PaddleOCR-VL-1.6 checkpoint directory")
-	ocrLayout := flag.String("ocr-layout-model", "models/PP-DocLayoutV3", "PP-DocLayoutV3 checkpoint for the page doors (/v1/ocr, /layout-parsing); empty serves the chat door alone")
+	ocrLayout := flag.String("ocr-layout-model", "models/PP-DocLayoutV3", "PP-DocLayoutV3 checkpoint for the page door (/v1/ocr); empty serves the chat door alone")
 	ocrMaxPages := flag.Int("ocr-max-pages", 100, "most pages one document request may parse")
 
 	stt := flag.Bool("stt", false, "load parakeet-tdt-0.6b-v3 and serve /v1/audio/transcriptions")
@@ -704,7 +704,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
 			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
-			"/v1/videos", "/v1/music", "/v1/ocr", "/layout-parsing",
+			"/v1/videos", "/v1/music", "/v1/ocr",
 		} {
 			log.Printf("  %s", route)
 		}

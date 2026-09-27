@@ -7,7 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -142,8 +142,8 @@ func TestOCRDocument(t *testing.T) {
 	for _, p := range paths {
 		raw, _ := os.ReadFile(p)
 		var rec struct {
-			Name, Image, Markdown string
-			Pruned                map[string]any `json:"pruned"`
+			Name, Image   string
+			MarkdownPlain string `json:"markdown_plain"`
 		}
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			t.Fatal(err)
@@ -156,21 +156,17 @@ func TestOCRDocument(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pg := res.Pages[0]
-		if pg.Markdown != rec.Markdown {
-			t.Errorf("%s: markdown differs from PaddleX's", rec.Name)
+		// Mistral's markdown is PaddleX's plain markdown with each picture
+		// referenced as Mistral does.
+		want := rec.MarkdownPlain
+		for i, im := range res.Pages[0].MistralImages {
+			want = strings.Replace(want, "![](imgs/", "![PENDING"+strconv.Itoa(i)+"](imgs/", 1)
+			j := strings.Index(want, "![PENDING"+strconv.Itoa(i)+"](")
+			k := j + strings.Index(want[j:], ")")
+			want = want[:j] + "![" + im.ID + "](" + im.ID + ")" + want[k+1:]
 		}
-		gj, _ := json.Marshal(pg.Pruned)
-		var got any
-		_ = json.Unmarshal(gj, &got)
-		wj, _ := json.Marshal(rec.Pruned)
-		var want any
-		_ = json.Unmarshal(wj, &want)
-		// The device layout's scores are fp16's (within 3e-3 of HF's, O7),
-		// and a box edge at a rounding boundary can land a pixel over (the
-		// demo page's block 8: HF's 656.5 against 656.52); the rest is exact.
-		if !sameWithin(got, want, map[string]float64{"score": 3e-3, "coordinate": 1, "block_bbox": 1}) {
-			t.Errorf("%s: prunedResult differs:\n got %s\nwant %s", rec.Name, gj, wj)
+		if got := res.Pages[0].Mistral; got != want {
+			t.Errorf("%s: markdown differs from PaddleX's:\n got %q\nwant %q", rec.Name, got, want)
 		}
 	}
 	data, err := os.ReadFile("../testdata/ocr/two_pages.pdf")
@@ -187,60 +183,9 @@ func TestOCRDocument(t *testing.T) {
 		t.Fatalf("PDF pages: %d of %d, sizes %dx%d and %dx%d", len(res.Pages), res.PDFPages,
 			res.Pages[0].Width, res.Pages[0].Height, res.Pages[1].Width, res.Pages[1].Height)
 	}
-	if pc := res.Pages[1].Pruned["page_count"]; pc == nil || *pc.(*int) != 2 {
-		t.Errorf("page_count %v", pc)
-	}
-	t.Logf("two-page PDF in %v; page 2: %.60q", time.Since(start).Round(time.Millisecond), res.Pages[1].Markdown)
+	t.Logf("two-page PDF in %v; page 2: %.60q", time.Since(start).Round(time.Millisecond), res.Pages[1].Mistral)
 	sel, err := b.ParseDocument(context.Background(), &api.DocumentRequest{Data: data, PDF: true, Pages: []int{1}})
 	if err != nil || len(sel.Pages) != 1 || sel.Pages[0].Index != 1 {
 		t.Errorf("page selection: %v", err)
 	}
-}
-
-// sameWithin is reflect.DeepEqual over decoded JSON, but the numbers under
-// the keys of loose may differ by their tolerance.
-func sameWithin(a, b any, loose map[string]float64) bool {
-	return within(a, b, loose, -1)
-}
-
-func within(a, b any, loose map[string]float64, tol float64) bool {
-	if tol >= 0 {
-		if x, ok := a.(float64); ok {
-			y, ok := b.(float64)
-			return ok && x-y <= tol && y-x <= tol
-		}
-	}
-	switch av := a.(type) {
-	case map[string]any:
-		bv, ok := b.(map[string]any)
-		if !ok || len(av) != len(bv) {
-			return false
-		}
-		for k, v := range av {
-			w, ok := bv[k]
-			if !ok {
-				return false
-			}
-			t := tol
-			if lt, ok := loose[k]; ok {
-				t = lt
-			}
-			if !within(v, w, loose, t) {
-				return false
-			}
-		}
-		return true
-	case []any:
-		bv, ok := b.([]any)
-		if !ok || len(av) != len(bv) {
-			return false
-		}
-		for i := range av {
-			if !within(av[i], bv[i], loose, tol) {
-				return false
-			}
-		}
-		return true
-	}
-	return reflect.DeepEqual(a, b)
 }

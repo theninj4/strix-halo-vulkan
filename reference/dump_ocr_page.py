@@ -67,22 +67,6 @@ LABELS = ["abstract", "algorithm", "aside_text", "chart", "content", "display_fo
           "table", "text", "vertical_text", "vision_footnote"]
 
 
-def prune_result(result):
-    # paddlex/inference/serving/basic_serving/_pipeline_apps/_common/common.py,
-    # verbatim (importing it needs PaddleX's serving plugin).
-    KEYS_TO_REMOVE = ["input_path", "page_index"]
-
-    def _process_obj(obj):
-        if isinstance(obj, dict):
-            return {k: _process_obj(v) for k, v in obj.items() if k not in KEYS_TO_REMOVE}
-        elif isinstance(obj, list):
-            return [_process_obj(item) for item in obj]
-        else:
-            return obj
-
-    return _process_obj(result)
-
-
 def sha(img_rgb):
     return hashlib.sha256(np.ascontiguousarray(img_rgb).tobytes()).hexdigest()
 
@@ -170,9 +154,7 @@ def main():
         })
         md = res.markdown["markdown_texts"]
         md_plain = res._to_markdown(pretty=False)["markdown_texts"]
-        md_images = sorted(res._to_markdown(pretty=True)["markdown_images"].keys())
         js = res.json["res"]
-        pruned = prune_result(js)
 
         def plain(v):
             if isinstance(v, (np.integer,)):
@@ -197,8 +179,6 @@ def main():
             "parsing_res_list": js["parsing_res_list"],
             "markdown": md,
             "markdown_plain": md_plain,
-            "markdown_images": md_images,
-            "pruned": pruned,
         }
         with open(os.path.join(out_dir, "record.json"), "w") as f:
             json.dump(out, f, indent=1, ensure_ascii=False, default=plain)

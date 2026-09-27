@@ -118,11 +118,9 @@ type oracle struct {
 		SHA256    string `json:"sha256"`
 		Raw       string `json:"raw"`
 	} `json:"vlm"`
-	Parsing        []JSONBlock    `json:"parsing_res_list"`
-	Markdown       string         `json:"markdown"`
-	MarkdownPlain  string         `json:"markdown_plain"`
-	MarkdownImages []string       `json:"markdown_images"`
-	Pruned         map[string]any `json:"pruned"`
+	Parsing       []JSONBlock `json:"parsing_res_list"`
+	Markdown      string      `json:"markdown"`
+	MarkdownPlain string      `json:"markdown_plain"`
 }
 
 func oracles(t *testing.T) []oracle {
@@ -263,29 +261,6 @@ func TestGlue(t *testing.T) {
 			if md := MarkdownPlain(results); md != o.MarkdownPlain {
 				t.Errorf("plain markdown differs:\n got %q\nwant %q", md, o.MarkdownPlain)
 			}
-			pg := &Page{Width: img.W, Height: img.H, Boxes: boxes, Results: results}
-			if got := roundTrip(t, pg.Pruned(nil)); !reflect.DeepEqual(got, roundTrip(t, o.Pruned)) {
-				gj, _ := json.Marshal(got)
-				wj, _ := json.Marshal(o.Pruned)
-				t.Errorf("prunedResult differs:\n got %s\nwant %s", gj, wj)
-			}
-			paths := map[string]bool{}
-			for _, r := range results {
-				if r.Image != "" {
-					paths[r.Image] = true
-				}
-			}
-			for _, f := range figures {
-				paths[imgPath(f.Label, f.Coord)] = true
-			}
-			if len(paths) != len(o.MarkdownImages) {
-				t.Errorf("%d markdown images, PaddleX has %v", len(paths), o.MarkdownImages)
-			}
-			for _, p := range o.MarkdownImages {
-				if !paths[p] {
-					t.Errorf("markdown image %s missing", p)
-				}
-			}
 			t.Logf("%d boxes, %d blocks, %d recognitions, %d markdown bytes: PaddleX's (pixels exact: %v)",
 				len(boxes), len(blocks), len(ents), len(o.Markdown), exactPixels)
 		})
@@ -299,19 +274,4 @@ func nonNil(got, want []string) []string {
 		return []string{}
 	}
 	return got
-}
-
-// roundTrip is v through JSON, so that Go values and decoded Python ones
-// compare as the same generic structure.
-func roundTrip(t *testing.T, v any) any {
-	t.Helper()
-	b, err := json.Marshal(v)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var out any
-	if err := json.Unmarshal(b, &out); err != nil {
-		t.Fatal(err)
-	}
-	return out
 }

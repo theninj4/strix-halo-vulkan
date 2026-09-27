@@ -172,9 +172,12 @@ small convs; everything else is GEMM and LayerNorm we already run.
    When `-llm` is also loaded (not the deployment, see 8) the chat door
    routes by `model`. Page level is **`POST /v1/ocr` in Mistral's OCR API
    shape** (`document_url` / `image_url`, `pages[].markdown`, images), the
-   closest thing to an industry standard, plus **PaddleX's
-   `/layout-parsing`** envelope so PaddleOCR serving clients work: one
-   engine, two envelopes, as `/v1/videos` carries SGLang's.
+   closest thing to an industry standard. *Revised 2026-09-28:* PaddleX's
+   `/layout-parsing` envelope was built in O9 and then removed. Nothing
+   here calls it; PaddleX's own pipeline reaches the model through the chat
+   door (O6's gate); and it cost a second response shape (`prunedResult`,
+   PaddleX's field-refusal list) to keep in step with PaddleX. If a PaddleOCR
+   serving client ever needs it, git history has it (O9).
 3. **Position-grid interpolation is `align_corners=False`.** The authors'
    remote code, vLLM and PaddleX all use False; HF's native port uses True.
    Three to one, and the three include both of the authors'. The dumps
@@ -239,7 +242,7 @@ demo, so a page on the CPU is minutes: fine for dumps, useless as a server.
 | O6 | Serve element level (`-ocr`, chat door, vLLM extras); **gate: PaddleOCR's `doc_parser --vl_rec_backend vllm-server` against us, unchanged** | **done 2026-09-27** (`backend/ocr.go`, `api/route.go`): `serve -ocr` answers `PaddleOCR-VL-1.6-0.9B` on `/v1/chat/completions`, routed beside `-llm`; **PaddleOCR 3.7.0's `doc_parser` runs unchanged against it**: the demo page's 27 regions all 200, markdown byte-identical across runs; table, formula and chart pages too; streamed = buffered = fp32 text on all six cases |
 | O7 | PP-DocLayoutV3 on the CPU then the GPU, against HF `pp_doclayout_v3` | **done 2026-09-27** (`ocr/layout`): CPU oracle ≤ 2.5e-5 of HF fp32 at every stage, regions identical; preprocessing bit-exact on PNG (`pixels.ResizeNoAA`); **device trunk** (fp16 GEMMs, 35 ms) + host AIFI and decoder: **~225 ms a page against the CPU's 2.2 s**, every region, label and reading order of the five cases HF's, scores ≤ 6.6e-4 |
 | O8 | Page glue in Go: box post-processing, crops, merges, per-label prompts, OTSL→HTML, markdown; against PaddleX's functions | **O8a done 2026-09-27** (`ocr/page`, `cmd/ocr -page`): PaddleX's glue in rect mode, **every step identical to PaddleX 3.7.2's own functions** on five pages (layout boxes, crops by hash, merged images, prompts, block list, markdown byte for byte), 204 text-function edge cases exact; the Go pipeline end to end = PaddleX's markdown, the demo page in 8.3 s. **O8b left**: polygons (`layout_shape_mode` auto), figures inside tables |
-| O9 | Serve page level: `/v1/ocr`, `/layout-parsing`, PDFs; a page's regions batched | **done 2026-09-27 except the batching** (moved to O11): `serve -ocr` answers Mistral's `/v1/ocr` (**Mistral's own SDK works unchanged**) and PaddleX's `/layout-parsing` (PaddleX's markdown and prunedResult for the page); PDFs by `pdftoppm` at PaddleX's 144 dpi; 3.35 GB resident with the layout |
+| O9 | Serve page level: `/v1/ocr`, PDFs; a page's regions batched | **done 2026-09-27 except the batching** (moved to O11): `serve -ocr` answers Mistral's `/v1/ocr` (**Mistral's own SDK works unchanged**; PaddleX's `/layout-parsing` was built and removed the next day, decision 2); PDFs by `pdftoppm` at PaddleX's 144 dpi; 3.35 GB resident with the layout |
 | O10 | Accuracy: an OmniDocBench v1.6 subset against the card, as K8 reproduced Kev's | |
 | O11 | Performance: multi-row decode across regions, tower batching, int8 if decode pays for it | |
 
@@ -753,8 +756,8 @@ without layout).
 ### O9 — the page doors
 
 `serve -ocr` now also loads PP-DocLayoutV3 (`-ocr-layout-model`, default
-`models/PP-DocLayoutV3`; empty serves the chat door alone) and answers two
-envelopes over one `api.DocumentBackend` (`api/document.go`,
+`models/PP-DocLayoutV3`; empty serves the chat door alone) and answers
+Mistral's envelope over an `api.DocumentBackend` (`api/document.go`,
 `backend/ocr_document.go`):
 
 - **`POST /v1/ocr`, Mistral's OCR API**: `document` as `document_url` or
@@ -769,16 +772,8 @@ envelopes over one `api.DocumentBackend` (`api/document.go`,
   `images[]` their boxes (and JPEG base64); `dimensions.dpi` is 144 for a
   PDF page, 0 for an image. Refused by name: `file` ids, annotation
   formats.
-- **`POST /layout-parsing`, PaddleX's serving envelope** (outside `/v1`,
-  where its clients call): `file` base64 or URL, `fileType`,
-  `minPixels`/`maxPixels`/`maxNewTokens`/`repetitionPenalty`/`temperature
-  0`/`topP`, `returnMarkdownImages`; `{logId, errorCode, errorMsg,
-  result: {layoutParsingResults: [{prunedResult, markdown: {text,
-  images}}], dataInfo}}`, and PaddleX's 422 envelope for a refusal. Every
-  other field is accepted at its default or null and refused by name
-  otherwise (`layoutShapeMode` other than `"rect"`, chart/seal recognition,
-  preprocessing, `visualize`, `restructurePages`, `outputFormats`,
-  `prettifyMarkdown: false`, custom thresholds and merge modes).
+- (PaddleX's `/layout-parsing` envelope stood beside it for a day; it
+  was removed on 2026-09-28, decision 2.)
 
 **PDFs** (decision 9): `pdfinfo` for the page sizes, then `pdftoppm -png
 -singlefile -scale-to-x/-y` at **ceil(points x 2)** a side: PaddleX's
@@ -791,21 +786,17 @@ trunk is 35 ms); the recognitions take it a pass at a time as before.
 
 Gates:
 
-- `go test ./api -run 'TestOCREndpoint|TestLayoutParsing'` (fake backend):
-  both envelopes' shapes, `image_url` in both forms, the refusals, the PDF
-  `dataInfo`.
+- `go test ./api -run TestOCREndpoint` (fake backend): the envelope,
+  `image_url` in both forms, the refusals.
 - `go test ./backend -run TestOCRDocument` (device, 23 s): every PNG page
-  oracle through the document path: **markdown = PaddleX's**, prunedResult
-  = PaddleX's within the device layout's fp16 (scores 3e-3, and one box
-  edge of the demo page a pixel over: HF's 656.5 against the device's
-  656.52 rounds the other way; the text of that block is unchanged); the
-  two-page PDF (`testdata/ocr/two_pages.pdf`: the demo page and the table
-  image at 144 dpi) at the right sizes, `page_count` 2, page selection.
-- **Over HTTP, the real clients** (`reference/gate_ocr_http.py`, in
-  `.venv-paddle`, against `ai -ocr`): PaddleX's documented request to
-  `/layout-parsing` returns **PaddleX's markdown and markdown images for the
-  demo page** (8.5 s) and a two-page `dataInfo` for the PDF (10.0 s); and
-  **Mistral's own SDK** (`mistralai` 2.10.1, `client.ocr.process` with
+  oracle through the document path: **the Mistral markdown is PaddleX's
+  plain markdown** with only the picture references renamed (the device
+  layout's fp16 moves one box edge of the demo page a pixel, HF's 656.5
+  against 656.52, without changing its text); the two-page PDF
+  (`testdata/ocr/two_pages.pdf`: the demo page and the table image at 144
+  dpi) at the right sizes, page selection.
+- **Over HTTP, the real client** (`reference/gate_ocr_http.py`, in
+  `.venv-paddle`, against `ai -ocr`): **Mistral's own SDK** (`mistralai` 2.10.1, `client.ocr.process` with
   `server_url` pointed here) parses the PDF unchanged: 144 dpi dimensions,
   `img-0.jpeg` with its box and base64, the table as `tbl-0.html`.
 
@@ -842,8 +833,9 @@ build switches (O4).
 - O8a done the same day: `ocr/page` + `cmd/ocr -page`, oracles
   `reference/dump_ocr_page.py` (needs `serve -ocr` on :18080, see its
   docstring) and `reference/dump_ocr_textfns.py`, both in `.venv-paddle`.
-- O9 done the same day (section O9): `serve -ocr` serves `/v1/ocr` and
-  `/layout-parsing`, the HTTP gate is `reference/gate_ocr_http.py`.
+- O9 done the same day (section O9): `serve -ocr` serves `/v1/ocr`; the
+  HTTP gate is `reference/gate_ocr_http.py`. (`/layout-parsing` was removed
+  on 2026-09-28, decision 2.)
   `ai.service` carries `-ocr`, which now means 3.35 GB with the layout;
   **still not deployed**.
 - Next: **O10**, accuracy on an OmniDocBench v1.6 subset against the card

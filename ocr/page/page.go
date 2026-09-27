@@ -109,41 +109,7 @@ type Page struct {
 	Texts    []string
 	Results  []Result
 	Markdown string
-	// Images are the markdown's pictures by path: the image, chart and seal
-	// blocks' crops and every image, figure and seal region (gather_imgs),
-	// as PaddleX's markdown_images.
-	Images  map[string]*pixels.RGB
-	Timings Timings
-}
-
-// Pruned is PaddleX's serving prunedResult for the page: the result JSON
-// without input_path and page_index, at the pipeline's model settings.
-// pageCount is nil for an image.
-func (pg *Page) Pruned(pageCount *int) map[string]any {
-	var boxes []map[string]any
-	for _, b := range pg.Boxes {
-		var order any
-		if b.Order > 0 {
-			order = b.Order
-		}
-		boxes = append(boxes, map[string]any{"cls_id": b.ClsID, "label": b.Label, "score": float64(b.Score),
-			"coordinate": b.Coord, "order": order})
-	}
-	return map[string]any{
-		"page_count": pageCount,
-		"width":      pg.Width,
-		"height":     pg.Height,
-		"model_settings": map[string]any{
-			"use_doc_preprocessor": false, "use_layout_detection": true, "use_chart_recognition": false,
-			"use_seal_recognition": false, "use_ocr_for_image_block": false, "format_block_content": false,
-			"merge_layout_blocks": true,
-			"markdown_ignore_labels": []string{"number", "footnote", "header", "header_image", "footer",
-				"footer_image", "aside_text"},
-			"return_layout_polygon_points": false,
-		},
-		"parsing_res_list": JSON(pg.Results),
-		"layout_det_res":   map[string]any{"boxes": boxes},
-	}
+	Timings  Timings
 }
 
 // Timings is where a page's time went.
@@ -203,14 +169,5 @@ func (p *Parser) Parse(ctx context.Context, img *pixels.RGB) (*Page, error) {
 	pg.Timings.Recognition = time.Since(t0)
 	pg.Results = assemble(pg.Blocks, ents, pg.Texts, drop)
 	pg.Markdown = Markdown(pg.Results, img.W)
-	pg.Images = map[string]*pixels.RGB{}
-	for _, r := range pg.Results {
-		if r.Image != "" {
-			pg.Images[r.Image] = r.Img.(*pixels.RGB)
-		}
-	}
-	for _, f := range figures {
-		pg.Images[imgPath(f.Label, f.Coord)] = crop(img, f.Coord)
-	}
 	return pg, nil
 }
