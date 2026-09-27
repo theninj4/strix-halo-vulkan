@@ -161,13 +161,23 @@ func (p Processor) Planes(img *RGB) (planes []float32, h, w int, err error) {
 
 // Resize is torch's uint8 antialiased bicubic to w x h (see the package
 // comment, step 3).
-func Resize(src *RGB, w, h int) *RGB {
+func Resize(src *RGB, w, h int) *RGB { return resize(src, w, h, false) }
+
+// ResizePillow is Pillow's own `Image.resize(resample=BICUBIC)`: the same
+// plan as Resize, with the coefficients at Pillow's fixed 22 fractional bits
+// (PRECISION_BITS) rather than the int16-range precision torch's kernel
+// picks per axis. That is the whole difference, and it is the ~0.5% of
+// samples one level apart the package comment mentions. PaddleOCR-VL's
+// processor calls this one (OCR.md decision 4).
+func ResizePillow(src *RGB, w, h int) *RGB { return resize(src, w, h, true) }
+
+func resize(src *RGB, w, h int, pillow bool) *RGB {
 	out := src
 	if w != src.W {
-		out = resample(out, w, true)
+		out = resample(out, w, true, pillow)
 	}
 	if h != src.H {
-		out = resample(out, h, false)
+		out = resample(out, h, false, pillow)
 	}
 	if out == src {
 		out = &RGB{W: w, H: h, Pix: append([]uint8(nil), src.Pix...)}
@@ -197,7 +207,10 @@ type plan struct {
 	kk     []int32
 }
 
-func newPlan(inSize, outSize int) plan {
+// pillowPrecision is Pillow's PRECISION_BITS, 32 - 8 - 2.
+const pillowPrecision = 22
+
+func newPlan(inSize, outSize int, pillow bool) plan {
 	scale := float64(inSize) / float64(outSize)
 	fs := math.Max(scale, 1)
 	support := 2 * fs
@@ -224,10 +237,15 @@ func newPlan(inSize, outSize int) plan {
 		}
 		p.bounds[xx] = [2]int{xmin, n}
 	}
-	// The largest precision whose biggest weight, doubled, stays under 2^15.
-	for p.prec = 0; p.prec < 22; p.prec++ {
-		if int(0.5+maxW*float64(int(1)<<(p.prec+1))) >= 1<<15 {
-			break
+	// The largest precision whose biggest weight, doubled, stays under 2^15;
+	// Pillow does not search.
+	if pillow {
+		p.prec = pillowPrecision
+	} else {
+		for p.prec = 0; p.prec < 22; p.prec++ {
+			if int(0.5+maxW*float64(int(1)<<(p.prec+1))) >= 1<<15 {
+				break
+			}
 		}
 	}
 	one := float64(int(1) << p.prec)
@@ -242,7 +260,7 @@ func newPlan(inSize, outSize int) plan {
 }
 
 // resample runs one pass along x (horizontal) or y, into uint8.
-func resample(src *RGB, size int, horizontal bool) *RGB {
+func resample(src *RGB, size int, horizontal, pillow bool) *RGB {
 	var out *RGB
 	var in int
 	if horizontal {
@@ -253,7 +271,7 @@ func resample(src *RGB, size int, horizontal bool) *RGB {
 		in = src.H
 	}
 	out.Pix = make([]uint8, out.W*out.H*3)
-	p := newPlan(in, size)
+	p := newPlan(in, size, pillow)
 	round := int32(1) << (p.prec - 1)
 	clip := func(v int32) uint8 {
 		v >>= p.prec

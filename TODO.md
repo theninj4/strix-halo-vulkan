@@ -77,6 +77,13 @@ caption and lyrics (or an uploaded song) become 48 kHz stereo; see the
 music section below and the archive
 [`research/music-vertical.md`](research/music-vertical.md).
 
+**OCR (opened 2026-09-27): PaddleOCR-VL-1.6** (`GOALS.md` item 10). The
+live plan and handoff is the root [`OCR.md`](OCR.md) (O-stages): element
+recognition first (the 0.9 B VLM behind `/v1/chat/completions`, which
+PaddleOCR's own pipeline can drive unchanged), then page parsing with
+PP-DocLayoutV3 and the glue in Go (`/v1/ocr`). O1 (tokenizer, prompt,
+processor) is done and exact; the fp16 audit found 24x of headroom.
+
 **Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
 `API.md` *Residency*).** A request loads its vertical and unloads the
 other; `-swap-idle` (10 min) empties the slot. Served with the unit's full
