@@ -76,6 +76,9 @@ type ImageOptions struct {
 	// FP16 stages the text encoder and the transformer as fp16 rather than
 	// the int8 banks: the control (research/qimage-vertical.md Q13).
 	FP16 bool
+	// Swap is the residency slot this pipeline takes turns in with music
+	// and video. Required.
+	Swap *Swap
 }
 
 const (
@@ -92,14 +95,16 @@ const (
 // Image is the Qwen-Image-2.1 adapter: an api.ImageBackend over
 // qimage/pipeline.
 //
-// **It is resident, and the resolution is not part of what is resident.**
-// Construction stages ~7.8 GB of text encoder, ~7.5 GB of transformer (int8
+// **It is resident while it holds the Swap, and the resolution is not part
+// of what is resident.** A request makes it resident (evicting music or
+// video, ~28 s when it was not), and the slot's idle timer frees it. Staging
+// is ~7.8 GB of text encoder, ~7.5 GB of transformer (int8
 // banks; 13.2 and 13.3 as fp16, research/qimage-vertical.md Q13) and ~1.0 GB
 // of VAE, sizes the activation arenas for the largest image the flags
 // asked for, and then every request is arithmetic: the transformer states its
 // run length per image, the VAE re-records its graph from the latent it is
 // handed. So a 512x512 request out of a 1024x1024 server costs a quarter of
-// the tokens and stages nothing.
+// the tokens and stages nothing more.
 //
 // One mutex guards the pipeline, and it is a correctness lock rather than a
 // contention one: the DiT's prefix KV cache and both activation arenas are
@@ -110,14 +115,20 @@ type Image struct {
 	id  string
 
 	mu   sync.Mutex
-	pipe *pipeline.Pipeline
+	pipe *pipeline.Pipeline // nil while another vertical holds the slot
+	// geo and the residency are the first staging's, kept for /v1/models
+	// and the handler's checks while the pipeline is unloaded.
+	geo                    api.ImageGeometry
+	res                    [4]int // encoder, transformer, vae weights, activations
+	editWeights, editCache int
 	// rng draws a seed for a request that named none. It is here rather than
 	// in the handler because the seed that was used is part of what the model
 	// produced -- a client asking for the same image again sends it back.
 	rng *rand.Rand
 }
 
-// NewImage stages the whole pipeline on the device.
+// NewImage stages the whole pipeline on the device, through the slot: it
+// is resident when this returns, until something else is asked for.
 func NewImage(opt ImageOptions) (*Image, error) {
 	if opt.ID == "" {
 		opt.ID = defaultImageModelID
@@ -125,27 +136,66 @@ func NewImage(opt ImageOptions) (*Image, error) {
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the image pipeline needs a device; there is no host path for it")
 	}
-	b := &Image{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
-	bank := qwen.BankQ8
-	if opt.FP16 {
-		bank = qwen.BankFP16
+	if opt.Swap == nil {
+		return nil, fmt.Errorf("backend: the image pipeline needs a swap slot")
 	}
-	err := opt.Device.Do(func(dev *vk.Device) error {
-		p, err := pipeline.New(dev, pipeline.Options{
-			Model: opt.Model, Width: opt.Width, Height: opt.Height,
-			Steps: opt.Steps, MaxPrompt: opt.MaxPrompt,
-			Refs: opt.Refs, CondSize: opt.CondSize, Bank: bank,
-		})
-		if err != nil {
-			return err
-		}
-		b.pipe = p
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("backend: loading %s: %w", opt.Model, err)
+	b := &Image{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
+	if err := opt.Swap.Load(b); err != nil {
+		return nil, err
 	}
 	return b, nil
+}
+
+// SwapName is the vertical's name in the swap log.
+func (b *Image) SwapName() string { return "image" }
+
+// Load stages the pipeline. It takes no device lock (TestStagingSkipsTheQueue).
+func (b *Image) Load() error {
+	bank := qwen.BankQ8
+	if b.opt.FP16 {
+		bank = qwen.BankFP16
+	}
+	p, err := pipeline.New(b.opt.Device.dev, pipeline.Options{
+		Model: b.opt.Model, Width: b.opt.Width, Height: b.opt.Height,
+		Steps: b.opt.Steps, MaxPrompt: b.opt.MaxPrompt,
+		Refs: b.opt.Refs, CondSize: b.opt.CondSize, Bank: bank,
+	})
+	if err != nil {
+		return fmt.Errorf("backend: loading %s: %w", b.opt.Model, err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pipe = p
+	w, h := p.Size()
+	// Previews are unconditional -- the tiny decoder is always staged -- so unlike under Z-Image there is no flag for the two
+	// fields to disagree about. Edits report the *count* rather than a
+	// strength, because 2.1 has no strength: a client reads MaxRefs to know
+	// how many pictures it may send.
+	b.geo = api.ImageGeometry{
+		Width: w, Height: h,
+		MaxPixels:   p.MaxPixels(),
+		Multiple:    pipeline.SizeMultiple,
+		Steps:       p.Steps(),
+		Previews:    true,
+		MaxPartials: maxPartialImages,
+		Edits:       p.Refs() > 0,
+		MaxRefs:     p.Refs(),
+	}
+	b.res[0], b.res[1], b.res[2], b.res[3] = p.Residency()
+	b.editWeights, b.editCache = p.EditResidency()
+	return nil
+}
+
+// Unload frees the pipeline. Destroying touches no queue, so it takes no
+// device lock either; the slot guarantees nothing is running on it.
+func (b *Image) Unload() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pipe == nil {
+		return
+	}
+	b.pipe.Destroy()
+	b.pipe = nil
 }
 
 // Models reports the one model this backend serves.
@@ -153,49 +203,32 @@ func (b *Image) Models() []api.Model {
 	return []api.Model{{ID: b.id, Object: "model", OwnedBy: "local"}}
 }
 
-// Geometry is what this process was started for.
+// Geometry is what this process was started for, resident or not.
 func (b *Image) Geometry() api.ImageGeometry {
-	w, h := b.pipe.Size()
-	// Previews are unconditional -- the tiny decoder is always staged -- so unlike under Z-Image there is no flag for the two
-	// fields to disagree about. Edits report the *count* rather than a
-	// strength, because 2.1 has no strength: a client reads MaxRefs to know
-	// how many pictures it may send.
-	return api.ImageGeometry{
-		Width: w, Height: h,
-		MaxPixels:   b.pipe.MaxPixels(),
-		Multiple:    pipeline.SizeMultiple,
-		Steps:       b.pipe.Steps(),
-		Previews:    true,
-		MaxPartials: maxPartialImages,
-		Edits:       b.pipe.Refs() > 0,
-		MaxRefs:     b.pipe.Refs(),
-	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.geo
 }
 
-// Residency reports what the pipeline holds on the device, for the startup
-// banner.
+// Residency reports what the pipeline holds on the device while it is
+// resident, for the startup banner.
 func (b *Image) Residency() (encoder, transformer, vaeWeights, activations int) {
-	return b.pipe.Residency()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.res[0], b.res[1], b.res[2], b.res[3]
 }
 
 // EditResidency is what the edit half holds: the vision tower's and the VAE
 // encoder's weights, and the transformer's prefix KV cache. Zero when this
 // server does not edit.
-func (b *Image) EditResidency() (weights, cache int) { return b.pipe.EditResidency() }
-
-// Close releases the device residency.
-func (b *Image) Close() {
+func (b *Image) EditResidency() (weights, cache int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.pipe == nil {
-		return
-	}
-	_ = b.opt.Device.Do(func(*vk.Device) error {
-		b.pipe.Destroy()
-		b.pipe = nil
-		return nil
-	})
+	return b.editWeights, b.editCache
 }
+
+// Close releases the device residency. The slot is closed after it.
+func (b *Image) Close() { b.Unload() }
 
 // transparentPrefix and transparentSuffix are the model card's recommended
 // phrasing for an RGBA image, verbatim. Transparency in this model is asked
@@ -222,6 +255,11 @@ const (
 // vertical in the process, so an abandoned image used to block the queued
 // speech and embedding requests behind it for its full duration too.
 func (b *Image) Generate(ctx context.Context, req *api.ImageRequest) (*api.ImageResult, error) {
+	release, err := b.opt.Swap.Hold(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if err := ctx.Err(); err != nil {

@@ -165,8 +165,32 @@ input is truncated: the front of the text survives and the end-of-text token
 is re-appended, because last-token pooling takes *that* row and an input
 truncated through it would be pooled from an ordinary word.
 
-**The image pipeline is resident, and its resolution is not part of what is
-resident.** `-image` stages 13.2 GB of text encoder, 13.3 GB of transformer
+**Image, music and video take turns in one slot** (`backend.Swap`,
+2026-09-27). Each is 26-46 GB and asked for rarely, so a request makes its
+vertical resident, unloading whichever other one is, and runs with the slot
+held; after `-swap-idle` (10 min) with no request the slot is emptied. Each
+is staged once at startup so a bad checkpoint fails then, and the last one
+staged (music, when it is on) is resident when serving begins. A load takes
+no device lock -- staging makes no queue submit (`TestStagingSkipsTheQueue`,
+`STAGE_GPU=1`) -- so speech is answered through it. Served, with the unit's
+flags (`-embed -tts -tts-gpu -stt -kev -image -edits 3 -video -music`), one
+image → music → video → image cycle, 20 ms sampling:
+
+| state | process over the machine's idle | switch |
+|---|---|---|
+| nothing resident (idle unload) | 9.4 GB | image unloaded in 0.5 s |
+| music resident | 35 GB | loaded in 18.6 s; a 30 s song in 20.5 s end to end |
+| image resident (`-edits 3`) | 56 GB (38.1 GB device, ~8.6 GB of host heap) | loaded in 24.7-30.6 s; unloaded in 0.3-0.5 s |
+| video, at its peak | 40 GB | nothing to load; 448x256 x 8 steps in 2m23s |
+| **worst moment of the cycle** | **60 GB** (an image staging) | |
+
+All three resident was ~112 GB at a video's peak, which is why the unit ran
+without image and video. Speech through the cycle: median 19 ms, p95 105 ms,
+≤ 0.86 s through every load; the two waits past a second (5.4 and 6.5 s)
+were image generations, which hold the device for their whole run.
+
+**The image pipeline is resident while it holds the slot, and its
+resolution is not part of what is resident.** `-image` stages 13.2 GB of text encoder, 13.3 GB of transformer
 and 1.0 GB of VAE in **28 s**, sizes 5.0 GB of activation arenas for
 `-image-size`, and then a request moves no weight. That last clause is what
 this endpoint needed and did not have: the pipeline used to fix its width
@@ -260,14 +284,16 @@ Two things would fix it, and both are measurements rather than arguments:
     -max-upload  128              largest body carrying a file, in MB
     -log-bodies  false            print request and response bodies in the access log
 
-    -video           false        load MiniMax-H3 and serve /v1/videos; ~0.3 GB at rest, ~50 GB at a request's peak
+    -swap-idle       10m          how long image, music or video stays staged with no request; 0 keeps it until another is asked for
+
+    -video           false        load MiniMax-H3 and serve /v1/videos; ~0.3 GB at rest, ~31 GB at a request's peak
     -video-model     models/MiniMax-H3             the diffusers-layout checkpoint root
     -video-dir       ""           where finished mp4s wait to be fetched; empty is a temporary directory
     -video-ttl       24h          how long a finished job and its file are kept
     -video-queue     16           jobs that may wait behind the running one; past it is a 429
     -video-max-prompt 0           longest prompt in tokens; 0 is 4096
 
-    -music           false        load ACE-Step 1.5 (XL turbo, the 5 Hz LM, VAE, text encoder) and serve /v1/music; ~21 GB resident
+    -music           false        load ACE-Step 1.5 (XL turbo, the 5 Hz LM, VAE, text encoder) and serve /v1/music; ~26 GB while it holds the swap slot
     -music-models    models       the root holding acestep-v15-xl-turbo/, acestep-5Hz-lm-4B/, Ace-Step1.5/vae, Qwen3-Embedding-0.6B/
     -music-lm        true         load the 5 Hz LM; false serves only thinking=false, ~10 GB lighter
     -music-dir       ""           where finished songs wait to be fetched; empty is a temporary directory
@@ -1039,8 +1065,11 @@ Three jobs submitted together on this machine:
 | techno, instrumental, no duration | 233 s, 136 bpm, E♭ minor | 43 → 76 s | 78.7 s |
 | piano, `thinking: false`, 20 s | — | 1 s | 1.4 s |
 
-**Everything is resident and one job runs at a time.** The pipeline holds
-~21 GB, and staging it per request (~15 s) would be most of a request. **The
+**Everything is resident while it holds the swap slot, and one job runs at
+a time.** The pipeline holds ~21 GB, and staging it per request (~16-19 s)
+would be most of a request, so it stays staged between songs until image or
+video is asked for or `-swap-idle` passes; a job that has to wait for the
+load reports `stage: "load"`. **The
 device is not held for the song**: the job yields it after every LM step
 (~50 ms) and every DiT forward, so speech behind a song waits for one of
 those. Measured with `-tts` beside it, a short speech request took 32 ms

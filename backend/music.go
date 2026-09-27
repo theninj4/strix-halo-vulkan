@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/tokenizer"
 )
 
 // MusicOptions is what cmd/serve's flags come to.
@@ -29,6 +31,9 @@ type MusicOptions struct {
 	NoLM bool
 	// ID is the model id this backend answers to.
 	ID string
+	// Swap is the residency slot this pipeline takes turns in with image
+	// and video. Required.
+	Swap *Swap
 }
 
 const defaultMusicModelID = "acestep-v15-xl-turbo"
@@ -36,9 +41,12 @@ const defaultMusicModelID = "acestep-v15-xl-turbo"
 // Music is the ACE-Step 1.5 adapter: an api.MusicBackend over ace/pipeline
 // (MUSIC.md A9).
 //
-// **Everything is resident** (A-o4): the DiT, its encoders, the VAE, the
-// text encoder and the LM with its cache, ~21 GB. Staging them is ~15 s and
-// a 60 s song is 26 s, so staging per request would be most of it.
+// **Everything is resident while it holds the Swap** (A-o4): the DiT, its
+// encoders, the VAE, the text encoder and the LM with its cache, ~21 GB.
+// Staging them is ~16 s and a 60 s song is 26 s, so they stay staged
+// between songs, until image or video is asked for or the slot's idle
+// timer frees them. Planning a request needs none of it: the LM's
+// tokenizer and genres vocabulary are held on the host for that.
 //
 // **The device is shared a step at a time.** A request holds it only
 // between yields: after every LM step (~50 ms) and every DiT forward
@@ -46,13 +54,19 @@ const defaultMusicModelID = "acestep-v15-xl-turbo"
 type Music struct {
 	opt  MusicOptions
 	id   string
-	pipe *pipeline.Pipeline
+	pipe *pipeline.Pipeline // nil while another vertical holds the slot
+	// planner is the LM's tokenizer and genres vocabulary without the LM,
+	// for PlanMusic; nil under NoLM.
+	planner   *lm.Planner
+	genresErr error
+	lmOpt     lm.Options
 
 	mu  sync.Mutex // rng
 	rng *rand.Rand
 }
 
-// NewMusic stages the models on the device.
+// NewMusic stages the models on the device, through the slot: they are
+// resident when this returns, until something else is asked for.
 func NewMusic(opt MusicOptions) (*Music, error) {
 	if opt.ID == "" {
 		opt.ID = defaultMusicModelID
@@ -60,25 +74,55 @@ func NewMusic(opt MusicOptions) (*Music, error) {
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the music pipeline needs a device; there is no host path for it")
 	}
-	b := &Music{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
-	err := opt.Device.Do(func(d *vk.Device) error {
-		p, err := pipeline.New(d, pipeline.DefaultDirs(opt.Models), plan.MaxSeconds)
+	if opt.Swap == nil {
+		return nil, fmt.Errorf("backend: the music pipeline needs a swap slot")
+	}
+	b := &Music{opt: opt, id: opt.ID, lmOpt: lm.DefaultOptions(), rng: rand.New(rand.NewSource(rand.Int63()))}
+	if !opt.NoLM {
+		dir := pipeline.LMDir(opt.Models)
+		tk, err := tokenizer.Load(dir)
 		if err != nil {
-			return err
+			return nil, fmt.Errorf("backend: the 5 Hz LM's tokenizer: %w", err)
 		}
-		if !opt.NoLM {
-			if err := p.LoadLM(d, pipeline.LMDir(opt.Models), lm.DefaultOptions()); err != nil {
-				p.Destroy()
-				return err
-			}
+		if b.planner, err = lm.NewPlanner(nil, tk); err != nil {
+			return nil, err
 		}
-		b.pipe = p
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("backend: loading ACE-Step from %s: %w", opt.Models, err)
+		// A missing vocabulary refuses sample mode, and PlanMusic says why.
+		b.genresErr = b.planner.LoadGenres(filepath.Join(filepath.Dir(dir), lm.GenresFile))
+	}
+	if err := opt.Swap.Load(b); err != nil {
+		return nil, err
 	}
 	return b, nil
+}
+
+// SwapName is the vertical's name in the swap log.
+func (b *Music) SwapName() string { return "music" }
+
+// Load stages the pipeline. It takes no device lock (TestStagingSkipsTheQueue).
+func (b *Music) Load() error {
+	d := b.opt.Device.dev
+	p, err := pipeline.New(d, pipeline.DefaultDirs(b.opt.Models), plan.MaxSeconds)
+	if err == nil && !b.opt.NoLM {
+		if err = p.LoadLM(d, pipeline.LMDir(b.opt.Models), b.lmOpt); err != nil {
+			p.Destroy()
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("backend: loading ACE-Step from %s: %w", b.opt.Models, err)
+	}
+	b.pipe = p
+	return nil
+}
+
+// Unload frees the pipeline. The slot guarantees nothing is running on it,
+// and destroying touches no queue.
+func (b *Music) Unload() {
+	if b.pipe == nil {
+		return
+	}
+	b.pipe.Destroy()
+	b.pipe = nil
 }
 
 // Models reports the one model this backend serves.
@@ -100,16 +144,12 @@ func formats() []string {
 func (b *Music) MusicInfo() api.MusicInfo {
 	return api.MusicInfo{MinSeconds: plan.MinSeconds, MaxSeconds: plan.MaxSeconds,
 		FallbackSeconds: plan.FallbackSeconds, SampleRate: plan.SampleRate, Formats: formats(),
-		Thinking: b.pipe.LM != nil, Steps: len(plan.Schedule(plan.DefaultShift, nil))}
+		Thinking: b.planner != nil, Steps: len(plan.Schedule(plan.DefaultShift, nil))}
 }
 
-// Close frees the device objects. The job queue must be closed first.
-func (b *Music) Close() {
-	b.opt.Device.Do(func(*vk.Device) error {
-		b.pipe.Destroy()
-		return nil
-	})
-}
+// Close frees the device objects. The job queue must be closed first, and
+// the slot is closed after it.
+func (b *Music) Close() { b.Unload() }
 
 // request is the pipeline's request for an API one.
 func musicRequest(req *api.MusicRequest) *plan.Request {
@@ -128,15 +168,15 @@ func unsupported(format string, args ...any) error {
 // given, its length. Nothing touches the device; the LM's prompt is
 // tokenised to check it fits the cache with the codes behind it.
 func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
-	if req.Thinking && b.pipe.LM == nil {
+	if req.Thinking && b.planner == nil {
 		return nil, unsupported("thinking needs the 5 Hz LM, which this server did not load (-music-lm)")
 	}
 	if req.Sample {
-		if b.pipe.LM == nil {
+		if b.planner == nil {
 			return nil, unsupported("sample mode needs the 5 Hz LM, which this server did not load (-music-lm)")
 		}
-		if !b.pipe.LM.HasGenres() {
-			return nil, unsupported("sample mode needs upstream's genres vocabulary (models/%s): %v", lm.GenresFile, b.pipe.GenresErr)
+		if !b.planner.HasGenres() {
+			return nil, unsupported("sample mode needs upstream's genres vocabulary (models/%s): %v", lm.GenresFile, b.genresErr)
 		}
 	}
 	if req.Duration != 0 && (req.Duration < plan.MinSeconds || req.Duration > plan.MaxSeconds) {
@@ -202,13 +242,13 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 		// follow it in the same cache. (Sample mode's lyrics are not known
 		// yet; the codes phase checks its own fit when it starts.)
 		secs := cmpOr(p.Seconds, plan.MaxSeconds)
-		need, err := b.pipe.LM.Positions(r.Caption, r.Lyrics, secs)
+		need, err := b.planner.Positions(r.Caption, r.Lyrics, secs)
 		if err != nil {
 			return nil, err
 		}
-		if need > b.pipe.LM.MaxLen() {
+		if need > b.lmOpt.MaxLen {
 			return nil, unsupported("the LM would need up to %d positions for %.0f s of codes after these lyrics, and holds %d; shorten the lyrics or the song",
-				need, secs, b.pipe.LM.MaxLen())
+				need, secs, b.lmOpt.MaxLen)
 		}
 	}
 	p.Estimate = musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120)).total()
@@ -314,9 +354,17 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 	if req.Sample {
 		smp = &pipeline.Sample{Query: req.SampleQuery, SkipCoT: req.SampleMode}
 	}
+	if b.opt.Swap.Resident() != Swappable(b) {
+		progress(api.MusicProgress{Stage: "load"})
+	}
+	release, err := b.opt.Swap.Hold(ctx, b)
+	if err != nil {
+		return err
+	}
+	defer release()
 	var song *lm.Song
 	var res *pipeline.Result
-	err := b.opt.Device.Do(func(*vk.Device) error {
+	err = b.opt.Device.Do(func(*vk.Device) error {
 		var err error
 		res, err = b.pipe.Generate(r, pipeline.Options{
 			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling, Sample: smp,

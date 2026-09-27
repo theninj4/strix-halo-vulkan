@@ -82,6 +82,15 @@ ACE-Step's own request fields. A 60 s song takes 26 s, 90% of it the LM at
 45 ms a step. Next: the LM's int8 decode (A10). `-music` is not in the
 deployed unit yet.
 
+**Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
+`API.md` *Residency*).** A request loads its vertical and unloads the
+other; `-swap-idle` (10 min) empties the slot. Served with the unit's full
+flags through image → music → video → image: 9.4 GB at rest with nothing
+staged, 60 GB at the worst moment (all three resident was ~112 GB), a switch
+costs ~25-30 s before an image and ~19 s before a song, and speech is
+answered through every load (loads take no device lock). This is what lets
+`-image -edits 3 -video -music` go back into the unit; not yet deployed.
+
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant

@@ -12,10 +12,10 @@
 //	go run ./cmd/serve -stt -max-audio 300          # five-minute clips
 //	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
 //	go run ./cmd/serve -kev                         # System One classification (Kev-4B), ~9 GB resident
-//	go run ./cmd/serve -image                       # qwen-image-2.1, 32 GB resident
+//	go run ./cmd/serve -image                       # qwen-image-2.1, ~20 GB while resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
-//	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~27 GB a request
-//	go run ./cmd/serve -music                       # ACE-Step 1.5 music jobs; ~21 GB resident
+//	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~31 GB a request
+//	go run ./cmd/serve -music                       # ACE-Step 1.5 music jobs; ~21 GB while resident
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
@@ -31,6 +31,15 @@
 // preview decoder, TAEQI2.1, is 29 MB of weights and 224 MB of arena at
 // 1024², always staged from `taeqi2_1/` beside -image-model, so
 // `stream: true` is always answerable and there is nothing to turn on.
+//
+// **-image, -video and -music take turns in one slot** (backend.Swap). A
+// request makes its vertical resident, unloading whichever other one is,
+// and runs with the slot held; after -swap-idle with no request the slot is
+// emptied. So the three cost the largest of them rather than their sum, and
+// nothing at rest, and a switch costs a load: ~28 s before an image, ~16 s
+// before a song. Each is staged once at startup, so a bad checkpoint is
+// reported then; the last one staged is resident when serving begins.
+// Loads take no device lock, so speech is served through them.
 //
 // **-wyoming is a second door onto the speech backends**, not a second copy
 // of them: one process, one staging, one GPU queue, answering Home
@@ -223,6 +232,8 @@ func main() {
 	musicDir := flag.String("music-dir", "", "where finished songs are kept until they expire; empty is a temporary directory")
 	musicTTL := flag.Duration("music-ttl", 24*time.Hour, "how long a finished music job and its file are kept")
 	musicQueue := flag.Int("music-queue", 32, "music jobs that may wait behind the running one")
+	swapIdle := flag.Duration("swap-idle", 10*time.Minute,
+		"how long image, music or video stays staged with no request before the swap slot frees it; 0 keeps it until another is asked for")
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
@@ -382,12 +393,21 @@ func main() {
 			time.Since(start).Round(time.Millisecond))
 	}
 
+	// The slot image, video and music take turns in. Deferred first, so it
+	// runs last: after the job queues have stopped, the backends' Closes
+	// have freed what they held, and nothing can take it back.
+	var swap *backend.Swap
+	if *imgOn || *videoOn || *musicOn {
+		swap = backend.NewSwap(*swapIdle)
+		defer swap.Close()
+	}
+
 	if *imgOn {
 		start := time.Now()
 		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
 			Steps: *imgSteps, MaxPrompt: *imgPrompt, Refs: *imgEdits, CondSize: *imgCond,
-			FP16: *imgFP16,
+			FP16: *imgFP16, Swap: swap,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -421,7 +441,7 @@ func main() {
 			log.Fatal("-video needs the device; it has no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt, FP16: *videoFP16})
+		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt, FP16: *videoFP16, Swap: swap})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -445,7 +465,7 @@ func main() {
 			log.Fatal("-music needs the device; it has no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, Device: dev, NoLM: !*musicLM})
+		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, Device: dev, NoLM: !*musicLM, Swap: swap})
 		if err != nil {
 			log.Fatal(err)
 		}

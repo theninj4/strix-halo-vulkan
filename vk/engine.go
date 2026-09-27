@@ -13,6 +13,7 @@ import "C"
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -297,8 +298,18 @@ func (d *Device) Queue() C.VkQueue { return d.queue }
 // QueueFamily returns the index of the queue family backing Queue().
 func (d *Device) QueueFamily() uint32 { return d.queueFamily }
 
+// submits counts the calls that touch the queue: every submit and every
+// WaitIdle, from any device.
+var submits atomic.Int64
+
+// Submits is how many times this process has touched a device's queue. It is
+// what backs a claim that some piece of work -- staging a model, say -- runs
+// without the queue and so needs no lock on it: read it either side.
+func Submits() int64 { return submits.Load() }
+
 // WaitIdle blocks until every queue on the device is idle.
 func (d *Device) WaitIdle() error {
+	submits.Add(1)
 	return check("vkDeviceWaitIdle", C.shim_device_wait_idle(d.handle))
 }
 
@@ -766,6 +777,7 @@ func (p *ComputePipeline) DispatchTimed(groupsX, groupsY, groupsZ, iterations ui
 		pcPtr = unsafe.Pointer(&pushConstants[0])
 		pcLen = C.uint32_t(len(pushConstants))
 	}
+	submits.Add(1)
 	if err := check("vkQueueSubmit", C.shim_dispatch_timed(p.dev.handle, p.dev.queue, &p.handle,
 		C.uint32_t(groupsX), C.uint32_t(groupsY), C.uint32_t(groupsZ), C.uint32_t(iterations),
 		pcPtr, pcLen, &start, &end)); err != nil {
@@ -820,6 +832,7 @@ func (p *ComputePipeline) DispatchSequenceTimed(groupsX []uint32, groupsY, group
 	if len(flat) > 0 {
 		pcPtr = unsafe.Pointer(&flat[0])
 	}
+	submits.Add(1)
 	if err := check("vkQueueSubmit", C.shim_dispatch_seq_timed(p.dev.handle, p.dev.queue, &p.handle,
 		(*C.uint32_t)(unsafe.Pointer(&groupsX[0])), C.uint32_t(len(groupsX)),
 		C.uint32_t(groupsY), C.uint32_t(groupsZ), C.uint32_t(iterations),
@@ -951,6 +964,7 @@ func dispatchMulti(dispatches []MultiDispatch, groupsZ, iterations uint32, barri
 	if ov := overlapFlags(dispatches); ov != nil {
 		ovPtr = &ov[0]
 	}
+	submits.Add(1)
 	if err := check("dispatch sequence", C.shim_dispatch_multi_timed(dev.handle, dev.queue,
 		&handles[0],
 		&groupsX[0], &groupsY[0], C.uint32_t(len(dispatches)),
@@ -1049,6 +1063,7 @@ func (p *Prerecorded) Count() int { return p.count }
 // dispatch, exactly as DispatchMultiMarked reports them.
 func (p *Prerecorded) Submit() (time.Duration, []time.Duration, error) {
 	ticks := make([]C.uint64_t, p.handle.marks)
+	submits.Add(1)
 	if err := check("submit prerecorded", C.shim_submit_prerecorded(p.dev.handle, p.dev.queue,
 		&p.handle, &ticks[0])); err != nil {
 		return 0, nil, err

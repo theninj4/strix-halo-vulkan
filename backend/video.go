@@ -30,6 +30,9 @@ type VideoOptions struct {
 	FP16 bool
 	// ID is the model id this backend answers to.
 	ID string
+	// Swap is the residency slot a request takes, evicting image or music
+	// so its ~31 GB peak does not stack on theirs. Required.
+	Swap *Swap
 }
 
 const defaultVideoModelID = "minimax-h3"
@@ -41,6 +44,10 @@ const defaultVideoModelID = "minimax-h3"
 // stages the video VAE (7 GB), so the process holds the host-side pieces
 // (tokenizer, audio decoder: 0.3 GB) at rest and ~50 GB at a request's peak
 // (VIDEO.md decision 2, M-o5).
+//
+// **It takes the Swap for a request** and has nothing to load: holding the
+// slot is what evicts image or music first, and keeps them out until the
+// video is done.
 //
 // **The device is shared, in two ways** (VIDEO.md M9). The stagings do not
 // take it at all: they allocate, build pipelines and write mapped memory,
@@ -67,6 +74,9 @@ func NewVideo(opt VideoOptions) (*Video, error) {
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the video pipeline needs a device; there is no host path for it")
 	}
+	if opt.Swap == nil {
+		return nil, fmt.Errorf("backend: the video pipeline needs a swap slot")
+	}
 	d := opt.Device
 	bank := qwen.BankQ8
 	if opt.FP16 {
@@ -85,6 +95,14 @@ func NewVideo(opt VideoOptions) (*Video, error) {
 	}
 	return &Video{opt: opt, id: opt.ID, pipe: p, rng: rand.New(rand.NewSource(rand.Int63()))}, nil
 }
+
+// SwapName is the vertical's name in the swap log.
+func (b *Video) SwapName() string { return "video" }
+
+// Load and Unload have nothing to do: a request stages and frees its own
+// models.
+func (b *Video) Load() error { return nil }
+func (b *Video) Unload()     {}
 
 // Models reports the one model this backend serves.
 func (b *Video) Models() []api.Model {
@@ -225,6 +243,11 @@ func (b *Video) GenerateVideo(ctx context.Context, req *api.VideoRequest, vp *ap
 	if err != nil {
 		return fmt.Errorf("%v: %w", err, api.ErrUnsupported)
 	}
+	release, err := b.opt.Swap.Hold(ctx, b)
+	if err != nil {
+		return err
+	}
+	defer release()
 	c := estimate(r)
 	total := c.total().Seconds()
 	at := func(d time.Duration) float64 { return d.Seconds() / total }
