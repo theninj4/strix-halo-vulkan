@@ -123,11 +123,13 @@ type Page struct {
 	Boxes   []Box
 	Blocks  []Block
 	Entries []Entry
-	// Texts are the raw recognitions, one an entry.
-	Texts    []string
-	Results  []Result
-	Markdown string
-	Timings  Timings
+	// Texts are the raw recognitions, one an entry, and Recognitions the
+	// engine's results they came from.
+	Texts        []string
+	Recognitions []*ocr.Result
+	Results      []Result
+	Markdown     string
+	Timings      Timings
 }
 
 // Timings is where a page's time went.
@@ -137,10 +139,11 @@ type Timings struct {
 
 // Parser runs pages: Layout is PP-DocLayoutV3 over the preprocessed page
 // (the device trunk's or the CPU oracle's Forward), Recognize the
-// element-level engine.
+// element-level engine over all of a page's regions at once
+// (ocr.Engine.RecognizeAll, which decodes them together: OCR.md O11).
 type Parser struct {
 	Layout    func(pixels []float32) (*layout.Output, error)
-	Recognize func(ctx context.Context, req ocr.Request) (*ocr.Result, error)
+	Recognize func(ctx context.Context, reqs []ocr.Request) ([]*ocr.Result, error)
 }
 
 // Parse runs one page.
@@ -169,12 +172,19 @@ func (p *Parser) Parse(ctx context.Context, img *pixels.RGB) (*Page, error) {
 	pg.Timings.Glue = time.Since(t0)
 
 	t0 = time.Now()
-	for _, e := range ents {
-		res, err := p.Recognize(ctx, ocr.Request{Image: e.Img, Prompt: e.Prompt, MinPixels: e.MinPixels, MaxPixels: e.MaxPixels, MaxTokens: maxNewTokens})
+	reqs := make([]ocr.Request, len(ents))
+	for i, e := range ents {
+		reqs[i] = ocr.Request{Image: e.Img, Prompt: e.Prompt, MinPixels: e.MinPixels, MaxPixels: e.MaxPixels, MaxTokens: maxNewTokens}
+	}
+	if len(reqs) > 0 {
+		res, err := p.Recognize(ctx, reqs)
 		if err != nil {
-			return nil, fmt.Errorf("page: block %d (%s): %w", e.Block, pg.Blocks[e.Block].Label, err)
+			return nil, fmt.Errorf("page: %d blocks: %w", len(reqs), err)
 		}
-		pg.Texts = append(pg.Texts, res.Text)
+		for _, r := range res {
+			pg.Texts = append(pg.Texts, r.Text)
+		}
+		pg.Recognitions = res
 	}
 	pg.Timings.Recognition = time.Since(t0)
 	pg.Results = assemble(pg.Blocks, ents, pg.Texts, drop)

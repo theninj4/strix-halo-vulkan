@@ -28,6 +28,10 @@
 //	aux0   row metadata (slot, pos)      span  positions a slot holds
 //	aux1   keys a chunk                  aux2  chunks a (row, head)
 //	tokens rows                          dim   COMBINE: the A operand's row stride
+//
+// PAGED (OCR's build): the caches are 64-position pages (ace_lm_prep's
+// PAGED), pc.heads the page table and pc.span its pages a slot. A chunk
+// starts on a multiple of 64 keys, so each block of 64 keys is one page.
 
 #include "dit_common.glsl"
 
@@ -39,6 +43,9 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #endif
 #ifndef NKV
 #define NKV 8u
+#endif
+#ifndef PAGED
+#define PAGED 0
 #endif
 #define PSTRIDE 130u
 
@@ -72,12 +79,21 @@ void main() {
     qs[lane + 64u] = float(hact[q + lane + 64u]);
     barrier();
 
+#if PAGED
+    uint table = pc.heads + slot * pc.span;
+#else
     uint base = (slot * pc.span * NKV + g) * HD; // + key * NKV * HD
+#endif
     float m = -1.0 / 0.0;
     float l = 0.0;
     float o0 = 0.0, o1 = 0.0;
     for (uint b = k0; b < k1; b += 64u) {
         uint kj = b + lane;
+#if PAGED
+        // The block's page, as if the slot's cache were contiguous from it.
+        uint page = floatBitsToUint(act[table + b / 64u]);
+        uint base = (page * 64u * NKV + g) * HD - b * NKV * HD; // wraps; the sums below do not
+#endif
         float s = -1.0 / 0.0;
         if (kj < k1) {
             uint kb = pc.kOff + base + kj * NKV * HD;

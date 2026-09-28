@@ -28,6 +28,11 @@ package ocr
 //  4. **A row may be an embedding rather than a token**: the image rows are
 //     the projector's output, spliced in on the host.
 //
+// The KV cache is paged (OCR.md O11): every layer's keys and values are a
+// pool of 64-position pages, and each slot a table of them, so 32 slots cost
+// what the positions they hold cost rather than 32 full-length planes. A
+// page is the attention's key block, so a block of keys is one page.
+//
 // No narrowing factor on the SwiGLU product: OCR.md O0's audit put ERNIE's
 // largest activation at 2,725, 24x under fp16's ceiling, where ace/lm's
 // Qwen3 reached 6.4e4 and needed 1/16.
@@ -36,6 +41,7 @@ package ocr
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -70,10 +76,15 @@ const (
 	maxBankBytes = 0xfffffffc
 	pushBytes    = 256 // the LLM's 64-uint block; the dit_common kernels read its first 88 bytes
 
-	// MaxLogitRows is llm_gemv's MAXROWS: at most this many rows of a pass
-	// get logits, and a pass of at most this many runs its projections as
-	// GEMVs.
-	MaxLogitRows = 3
+	// gemvMaxRows is the OCR builds' MAXROWS (ocr_gemv_k*.spv): the most
+	// rows a GEMV pass takes.
+	gemvMaxRows = 16
+	// PageSize is the positions a KV cache page holds: ace_lm_attn's key
+	// block, which the PAGED build reads one page at a time.
+	PageSize = 64
+	// maxSlots bounds the logit rows of a pass to the smallest GEMM rung's
+	// reach (reg32x128, up to 96 rows).
+	maxSlots = 96
 	// keyBlock is how many keys ace_lm_attn scores at once (one per lane).
 	keyBlock = 64
 	// partBudget caps (row, head, chunk) partials a pass writes.
@@ -139,6 +150,10 @@ var projShape = [nProj][2]int{
 	pGate: {lmFFN, lmHidden}, pUp: {lmFFN, lmHidden}, pDown: {lmHidden, lmFFN},
 }
 
+// gemvRows is where a pass stops running its projections and its head as
+// GEMVs and runs them as GEMMs (OCR.md O11); at most gemvMaxRows.
+var gemvRows = gemvMaxRows
+
 // gemvSlabs is each projection's split-K at 1-3 rows: K/16/slabs must be a
 // multiple of 4. Measured (TestLMStepLadder, OCR.md O4), a step at depth 200
 // on the device: ace/lm's ladder scaled to these widths (8/16/16/16/4/4/8)
@@ -147,14 +162,11 @@ var projShape = [nProj][2]int{
 // the two ends is slower than both.
 var gemvSlabs = [nProj]int{pQ: 16, pK: 16, pV: 16, pO: 1, pGate: 16, pUp: 16, pDown: 16}
 
-var gemvSPIRV = map[int][]byte{
-	1: shaders.LLMGEMVK1, 2: shaders.LLMGEMVK2, 4: shaders.LLMGEMVK4, 8: shaders.LLMGEMVK8,
-	16: shaders.LLMGEMVK16,
-}
+// gemvSPIRV are the slab counts with 16-row builds; O4's ladder also tried
+// the LLM's 2, 4 and 8, three rows at most.
+var gemvSPIRV = map[int][]byte{1: shaders.OCRGEMVK1, 16: shaders.OCRGEMVK16}
 
-var gemvSumSPIRV = map[int][]byte{
-	2: shaders.LLMGEMVSumK2, 4: shaders.LLMGEMVSumK4, 8: shaders.LLMGEMVSumK8, 16: shaders.LLMGEMVSumK16,
-}
+var gemvSumSPIRV = map[int][]byte{16: shaders.LLMGEMVSumK16}
 
 // gemmKernel is a DiT GEMM rung over the fragment-tiled weight.
 type gemmKernel struct {
@@ -185,7 +197,7 @@ func gemmFor(rows int) gemmKernel {
 type lmLayer struct {
 	off               [nProj]uint32 // in the layer bank, halves
 	attnNorm, ffnNorm uint32        // fp32 arena
-	kc, vc            uint32        // fp16 arena: this layer's caches, [slot][pos][2][128]
+	kc, vc            uint32        // fp16 arena: this layer's caches, [page][64][2][128]
 }
 
 // LMOptions size the device state.
@@ -196,11 +208,17 @@ type LMOptions struct {
 	Slots int
 	// Rows is the longest pass; a longer prefill runs as several.
 	Rows int
+	// CachePositions is the page pool the slots share (0: Slots x MaxLen,
+	// every slot full length at once). At least MaxLen.
+	CachePositions int
 }
 
 // DefaultLMOptions fits one full-bound crop (1,280 image tokens and the
 // template) and PaddleX's 8,192 new tokens, in one slot.
 func DefaultLMOptions() LMOptions { return LMOptions{MaxLen: 10240, Slots: 1, Rows: 2048} }
+
+// ErrCacheFull is Reserve's (and Pass's) when the page pool is spent.
+var ErrCacheFull = errors.New("ocr: the KV cache has no free page")
 
 // LM is ERNIE, resident.
 type LM struct {
@@ -225,10 +243,19 @@ type LM struct {
 	finalNorm uint32
 	rope      uint32 // cos [MaxLen][64], then sin
 
+	// The page pool: free pages, and each slot's table of the pages that
+	// hold its positions 0, 64, 128, ...
+	slotPages int // a table's length, MaxLen in pages
+	free      []int32
+	tables    [][]int32
+	ptHost    []uint32
+	logitsBuf [][]float32
+	maxLogits int
+
 	arenaRows int
 	// fp32 arena
-	aX, aQ, aK, aV, aO, aGate, aUp, aFF, aMeta, aRope, aPart, aRes, aLogits uint32
-	actElems                                                                int
+	aX, aQ, aK, aV, aO, aGate, aUp, aFF, aMeta, aRope, aPart, aRes, aLogits, aPT uint32
+	actElems                                                                     int
 	// fp16 arena
 	hA, hQ, hCtx, hFFN uint32
 	hElems             int
@@ -253,7 +280,10 @@ func (g *LM) Vocab() int { return g.vocab }
 
 // LoadLM stages ERNIE from the checkpoint directory.
 func LoadLM(dev *vk.Device, dir string, o LMOptions) (*LM, error) {
-	if o.MaxLen <= 0 || o.Slots <= 0 || o.Rows <= 0 {
+	if o.CachePositions == 0 {
+		o.CachePositions = o.Slots * roundUp(o.MaxLen, PageSize)
+	}
+	if o.MaxLen <= 0 || o.Slots <= 0 || o.Slots > maxSlots || o.Rows <= 0 || o.CachePositions < o.MaxLen {
 		return nil, fmt.Errorf("ocr: LM options %+v", o)
 	}
 	f, err := safetensors.Open(filepath.Join(dir, "model.safetensors"))
@@ -298,8 +328,8 @@ func (g *LM) layout(f *safetensors.File) error {
 		return fmt.Errorf("ocr: embed_tokens is %v %s, want [vocab 1024] bf16", emb.Shape, emb.DType)
 	}
 	g.vocab = emb.Shape[0]
-	if g.vocab%tile != 0 {
-		return fmt.Errorf("ocr: a vocabulary of %d is not a multiple of %d", g.vocab, tile)
+	if g.vocab%gemmKernels[0].bn != 0 {
+		return fmt.Errorf("ocr: a vocabulary of %d is not a multiple of %d", g.vocab, gemmKernels[0].bn)
 	}
 
 	perLayer := 0
@@ -354,8 +384,12 @@ func (g *LM) layout(f *safetensors.File) error {
 	g.aMeta = alloc(rows * 2)
 	g.aRope = alloc(rows * 3)
 	g.aPart = alloc(partBudget * partStride)
-	g.aRes = alloc(MaxLogitRows * 16 * lmFFN) // 16: the widest split-K rung
-	g.aLogits = alloc(MaxLogitRows * g.vocab)
+	g.aRes = alloc(gemvMaxRows * 16 * lmFFN) // 16: the widest split-K rung
+	// Logits for a row a slot; the head's GEMM writes its padding rows too.
+	g.maxLogits = max(gemvMaxRows, g.o.Slots)
+	g.aLogits = alloc(roundUp(g.maxLogits, gemmKernels[0].bm) * g.vocab)
+	g.slotPages = (g.o.MaxLen + PageSize - 1) / PageSize
+	g.aPT = alloc(g.o.Slots * g.slotPages)
 	if g.abuf, err = g.dev.NewHostCachedBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("ocr: fp32 arena (%d MB): %w", (g.actElems*4)>>20, err)
 	}
@@ -370,7 +404,13 @@ func (g *LM) layout(f *safetensors.File) error {
 	g.hQ = halloc(rows * lmQWidth)
 	g.hCtx = halloc(rows * g.ldaQ)
 	g.hFFN = halloc(rows * g.ldaF)
-	cache := g.o.Slots * g.o.MaxLen * lmKVWidth
+	pages := (g.o.CachePositions + PageSize - 1) / PageSize
+	for p := pages - 1; p >= 0; p-- {
+		g.free = append(g.free, int32(p))
+	}
+	g.tables = make([][]int32, g.o.Slots)
+	g.ptHost = make([]uint32, g.o.Slots*g.slotPages)
+	cache := pages * PageSize * lmKVWidth
 	for i := range g.w {
 		g.w[i].kc = halloc(cache)
 		g.w[i].vc = halloc(cache)
@@ -421,7 +461,7 @@ func (g *LM) build() error {
 		g.pipes[s.name] = p
 	}
 	for slabs, spirv := range gemvSumSPIRV {
-		for r := 1; r <= MaxLogitRows; r++ {
+		for r := 1; r <= gemvMaxRows; r++ {
 			p, err := g.pipeline("gemv sum", spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pc,
 				SpecConstants: rowSpec(r), RequiredSubgroupSize: 64})
 			if err != nil {
@@ -435,6 +475,15 @@ func (g *LM) build() error {
 		g.gemvs[b] = map[string]*vk.ComputePipeline{}
 		bb := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, bank}
 		used := map[int]bool{1: true}
+		if b == 1 {
+			// The head over more rows than a GEMV takes: the smallest rung.
+			k := gemmKernels[0]
+			p, err := g.pipeline("gemm head "+k.name, k.spirv, vk.PipelineSpec{Buffers: bb, PushConstantSize: pc})
+			if err != nil {
+				return err
+			}
+			g.gemms[b][k.name] = p
+		}
 		if b == 0 {
 			for _, k := range gemmKernels {
 				spec := vk.PipelineSpec{Buffers: bb, PushConstantSize: pc}
@@ -452,7 +501,7 @@ func (g *LM) build() error {
 			}
 		}
 		for slabs := range used {
-			for r := 1; r <= MaxLogitRows; r++ {
+			for r := 1; r <= gemvMaxRows; r++ {
 				p, err := g.pipeline("gemv", gemvSPIRV[slabs], vk.PipelineSpec{Buffers: bb, PushConstantSize: pc,
 					SpecConstants: rowSpec(r), RequiredSubgroupSize: 64})
 				if err != nil {
@@ -596,15 +645,54 @@ type Row struct {
 	Rope  [3]int32
 }
 
+// Reserve gives slot pages for its positions [0, n), taking them from the
+// pool; ErrCacheFull, with nothing taken, when the pool has too few.
+func (g *LM) Reserve(slot, n int) error {
+	if slot < 0 || slot >= g.o.Slots || n > g.o.MaxLen {
+		return fmt.Errorf("ocr: %d positions in slot %d; the cache is %d x %d", n, slot, g.o.Slots, g.o.MaxLen)
+	}
+	need := (n+PageSize-1)/PageSize - len(g.tables[slot])
+	if need <= 0 {
+		return nil
+	}
+	if need > len(g.free) {
+		return ErrCacheFull
+	}
+	for ; need > 0; need-- {
+		p := g.free[len(g.free)-1]
+		g.free = g.free[:len(g.free)-1]
+		g.tables[slot] = append(g.tables[slot], p)
+	}
+	return nil
+}
+
+// Release returns slot's pages to the pool; its positions are forgotten.
+func (g *LM) Release(slot int) {
+	for i := len(g.tables[slot]) - 1; i >= 0; i-- {
+		g.free = append(g.free, g.tables[slot][i])
+	}
+	g.tables[slot] = g.tables[slot][:0]
+}
+
+// FreePages is how many pages the pool has left.
+func (g *LM) FreePages() int { return len(g.free) }
+
+// Pages is the pool's size.
+func (g *LM) Pages() int { return (g.o.CachePositions + PageSize - 1) / PageSize }
+
 // Pass runs every layer over rows and returns the logits of the last
-// `logits` rows (at most MaxLogitRows), over the whole vocabulary.
+// `logits` rows (at most one a slot, or gemvMaxRows if more), over the whole
+// vocabulary. The rows may come in any order: every row's keys are in the
+// cache before any row attends. A row's slot gets pages for its position as
+// Reserve would (ErrCacheFull if the pool is spent). The logits are the
+// LM's own buffers, valid until the next pass.
 func (g *LM) Pass(rows []Row, logits int) ([][]float32, time.Duration, error) {
 	n := len(rows)
 	if n == 0 || n > g.o.Rows {
 		return nil, 0, fmt.Errorf("ocr: a pass of %d rows; 1 to %d", n, g.o.Rows)
 	}
-	if logits < 0 || logits > min(n, MaxLogitRows) {
-		return nil, 0, fmt.Errorf("ocr: logits for %d of %d rows; at most %d", logits, n, MaxLogitRows)
+	if logits < 0 || logits > min(n, g.maxLogits) {
+		return nil, 0, fmt.Errorf("ocr: logits for %d of %d rows; at most %d", logits, n, g.maxLogits)
 	}
 	x := make([]float32, n*lmHidden)
 	meta := make([]uint32, 2*n)
@@ -634,12 +722,21 @@ func (g *LM) Pass(rows []Row, logits int) ([][]float32, time.Duration, error) {
 			}
 			rp[3*r+a] = uint32(p)
 		}
+		if err := g.Reserve(t.Slot, t.Pos+1); err != nil {
+			return nil, 0, err
+		}
 		meta[2*r], meta[2*r+1] = uint32(t.Slot), uint32(t.Pos)
 		maxKeys = max(maxKeys, t.Pos+1)
+	}
+	for s, tb := range g.tables {
+		for i, p := range tb {
+			g.ptHost[s*g.slotPages+i] = uint32(p)
+		}
 	}
 	g.abuf.WriteFloat32At(int(g.aX), x)
 	g.abuf.WriteUint32At(int(g.aMeta), meta)
 	g.abuf.WriteUint32At(int(g.aRope), rp)
+	g.abuf.WriteUint32At(int(g.aPT), g.ptHost)
 
 	// Chunks of keys: 64 for a decode step, longer when many rows would
 	// overrun the partials.
@@ -652,7 +749,7 @@ func (g *LM) Pass(rows []Row, logits int) ([][]float32, time.Duration, error) {
 
 	var total time.Duration
 	per := max(g.LayersPerSubmit, 1)
-	if n <= MaxLogitRows {
+	if n <= gemvRows {
 		per = len(g.w)
 	}
 	if g.Tap != nil {
@@ -680,14 +777,17 @@ func (g *LM) Pass(rows []Row, logits int) ([][]float32, time.Duration, error) {
 	if logits == 0 {
 		return nil, total, nil
 	}
-	out := make([][]float32, logits)
+	for len(g.logitsBuf) < logits {
+		g.logitsBuf = append(g.logitsBuf, make([]float32, g.vocab))
+	}
+	out := g.logitsBuf[:logits]
 	for r := range out {
-		out[r] = g.abuf.ReadFloat32At(int(g.aLogits)+r*g.vocab, g.vocab)
+		g.abuf.ReadFloat32Into(int(g.aLogits)+r*g.vocab, out[r])
 	}
 	return out, total, nil
 }
 
-// gemv is one projection at n ≤ MaxLogitRows rows: split-K partials and
+// gemv is one projection at n ≤ gemvRows rows: split-K partials and
 // their sum, or one dispatch at a single slab.
 func (g *LM) gemv(bank int, slabs int, aOff uint32, lda int, cOff, bOff uint32, nOut, k, n int) []vk.MultiDispatch {
 	kt := k / tile
@@ -721,13 +821,13 @@ func (g *LM) layerGraph(i, n, chunks, chunkLen int) []vk.MultiDispatch {
 	}
 	var gk gemmKernel
 	tokPad := 0
-	if n > MaxLogitRows {
+	if n > gemvRows {
 		gk = gemmFor(n)
 		tokPad = roundUp(n, gk.bm)
 	}
 	proj := func(p proj, aOff uint32, lda int, cOff uint32) {
 		nOut, k := projShape[p][0], projShape[p][1]
-		if n <= MaxLogitRows {
+		if n <= gemvRows {
 			d = append(d, g.gemv(0, gemvSlabs[p], aOff, lda, cOff, w.off[p], nOut, k, n)...)
 			return
 		}
@@ -743,10 +843,10 @@ func (g *LM) layerGraph(i, n, chunks, chunkLen int) []vk.MultiDispatch {
 	proj(pK, g.hA, g.ldaDim, g.aK)
 	proj(pV, g.hA, g.ldaDim, g.aV)
 	add("prep", uint32(n), lmNQ+2*lmNKV, lmPush{InOff: g.aQ, KOff: g.aK, VOff: g.aV, OutOff: g.hQ,
-		Aux0: g.aMeta, Aux1: w.kc, Aux2: w.vc, Span: uint32(g.o.MaxLen), BOff: g.rope, KStride: uint32(g.o.MaxLen),
+		Aux0: g.aMeta, Aux1: w.kc, Aux2: w.vc, Heads: g.aPT, Span: uint32(g.slotPages), BOff: g.rope, KStride: uint32(g.o.MaxLen),
 		Dim: g.aRope, Scale: math.Float32bits(float32(1 / math.Sqrt(lmHD))), Tokens: uint32(n)})
 	add("attn", uint32(n), uint32(lmNQ*chunks), lmPush{InOff: g.hQ, OutOff: g.aPart, KOff: w.kc, VOff: w.vc,
-		Aux0: g.aMeta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Span: uint32(g.o.MaxLen), Tokens: uint32(n)})
+		Aux0: g.aMeta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Heads: g.aPT, Span: uint32(g.slotPages), Tokens: uint32(n)})
 	add("combine", uint32(n), lmNQ, lmPush{InOff: g.aPart, OutOff: g.hCtx, Dim: uint32(g.ldaQ), Aux0: g.aMeta,
 		Aux1: uint32(chunkLen), Aux2: uint32(chunks), Tokens: uint32(n)})
 	proj(pO, g.hCtx, g.ldaQ, g.aO)
@@ -770,5 +870,13 @@ func (g *LM) headGraph(n, rows int) []vk.MultiDispatch {
 	d := []vk.MultiDispatch{{Pipeline: g.pipes["normf16"], GroupsX: uint32(rows), GroupsY: 1,
 		PushConstants: lmPush{InOff: g.aX + uint32((n-rows)*lmHidden), OutOff: g.hA, WOff: g.finalNorm,
 			Tokens: uint32(rows), Dim: lmHidden, LDA: uint32(g.ldaDim), Eps: eps}.bytes()}}
-	return append(d, g.gemv(1, 1, g.hA, g.ldaDim, g.aLogits, 0, g.vocab, lmHidden, rows)...)
+	if rows <= gemvRows {
+		return append(d, g.gemv(1, 1, g.hA, g.ldaDim, g.aLogits, 0, g.vocab, lmHidden, rows)...)
+	}
+	k := gemmKernels[0]
+	tokPad := roundUp(rows, k.bm)
+	pc := lmPush{InOff: g.hA, OutOff: g.aLogits, GemmM: uint32(tokPad), GemmN: uint32(g.vocab), GemmK: lmHidden,
+		LDA: uint32(g.ldaDim)}
+	return append(d, vk.MultiDispatch{Pipeline: g.gemms[1][k.name], GroupsX: uint32(g.vocab / k.bn),
+		GroupsY: uint32(tokPad / k.bm), PushConstants: pc.bytes()})
 }

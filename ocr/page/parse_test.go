@@ -71,11 +71,12 @@ func TestParse(t *testing.T) {
 			out, _, err := lg.Forward(px, nil)
 			return out, err
 		},
-		Recognize: eng.Recognize,
+		Recognize: eng.RecognizeAll,
 	}
 	for _, o := range os {
 		t.Run(o.Name, func(t *testing.T) {
 			img, format := decode(t, o.Image)
+			st0 := eng.Stats()
 			start := time.Now()
 			pg, err := p.Parse(context.Background(), img)
 			if err != nil {
@@ -91,6 +92,13 @@ func TestParse(t *testing.T) {
 			t.Logf("%s: %d/%d recognitions identical; layout %v, glue %v, recognition %v, %v in all",
 				format, same, len(o.VLM), pg.Timings.Layout.Round(time.Millisecond), pg.Timings.Glue.Round(time.Millisecond),
 				pg.Timings.Recognition.Round(time.Millisecond), wall.Round(time.Millisecond))
+			st := eng.Stats()
+			if n := st.Passes - st0.Passes; n > 0 {
+				t.Logf("engine: %d towers %v; %d passes %v (%.1f rows, %.1f logit rows a pass), sampling %v; %d preemptions",
+					st.Towers-st0.Towers, (st.Tower - st0.Tower).Round(time.Millisecond), n, (st.Pass - st0.Pass).Round(time.Millisecond),
+					float64(st.Rows-st0.Rows)/float64(n), float64(st.LogitRows-st0.LogitRows)/float64(n),
+					(st.Sample - st0.Sample).Round(time.Millisecond), st.Preemptions-st0.Preemptions)
+			}
 			if format == "jpeg" {
 				return // the JPEG decodes differently; reported, not held
 			}

@@ -85,6 +85,10 @@ type GPU struct {
 	// Between is called between two of a Forward's submits (see run). It is
 	// set by the tower's one caller, between Forwards.
 	Between func()
+	// PerSubmit, if set, replaces dispatchesPerSubmit for the next
+	// Forward: a small image's whole tower is a few milliseconds of work,
+	// and eight dispatches a submit adds a tenth to it (OCR.md O11).
+	PerSubmit int
 
 	// Tap, if set, sees the residual stream after the embedding ("embed"),
 	// after each block ("block%d") and after Model.PostNorm ("post_norm"),
@@ -955,7 +959,11 @@ func (g *GPU) run(ctx context.Context, ds []vk.MultiDispatch) error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("vision: cancelled after %d of %d dispatches: %w", i, len(ds), err)
 		}
-		j := min(i+dispatchesPerSubmit, len(ds))
+		per := dispatchesPerSubmit
+		if g.PerSubmit > 0 {
+			per = g.PerSubmit
+		}
+		j := min(i+per, len(ds))
 		if len(marks) > 0 && marks[0].at < j {
 			j = marks[0].at
 		}

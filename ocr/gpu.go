@@ -107,6 +107,9 @@ func (gt *GPUTower) Forward(ctx context.Context, im *Image) (*qwen.Mat, error) {
 		}
 	}
 	px := gather(&qwen.Mat{Rows: gh * gw, Cols: PatchElems, Data: im.Patches}, gt.order)
+	// A submit's work about what eight dispatches of a full-budget image
+	// are: a 600-patch crop's tower goes from 32 to 29 ms (O11).
+	gt.g.PerSubmit = 8 * max(1, gt.g.MaxRows()/(gh*gw))
 	gt.g.Tap = nil
 	if gt.Tap != nil {
 		gt.g.Tap = func(name string, x *qwen.Mat) {

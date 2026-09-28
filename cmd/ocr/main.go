@@ -171,7 +171,7 @@ func newParser(dev *vk.Device, e *ocr.Engine, dir string) (*page.Parser, func())
 			out, _, err := lg.Forward(px, nil)
 			return out, err
 		},
-		Recognize: e.Recognize,
+		Recognize: e.RecognizeAll,
 	}, lg.Destroy
 }
 
@@ -180,13 +180,26 @@ func runPage(dev *vk.Device, e *ocr.Engine, img *pixels.RGB, dir string) {
 	p, done := newParser(dev, e, dir)
 	defer done()
 	start := time.Now()
+	st0 := e.Stats()
 	pg, err := p.Parse(context.Background(), img)
 	must(err)
 	fmt.Println(pg.Markdown)
+	st := e.Stats()
 	fmt.Fprintf(os.Stderr, "page     %dx%d: %d regions, %d blocks, %d recognitions\n", img.W, img.H, len(pg.Boxes), len(pg.Blocks), len(pg.Entries))
 	fmt.Fprintf(os.Stderr, "time     layout %v, glue %v, recognition %v; %v in all\n",
 		pg.Timings.Layout.Round(time.Millisecond), pg.Timings.Glue.Round(time.Millisecond),
 		pg.Timings.Recognition.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+	if n := st.Passes - st0.Passes; n > 0 {
+		tokens, longest := 0, 0
+		for _, r := range pg.Recognitions {
+			tokens += len(r.IDs)
+			longest = max(longest, len(r.IDs))
+		}
+		fmt.Fprintf(os.Stderr, "engine   %d tokens, the longest %d; %d towers %v; %d passes %v (%.1f rows, %.1f sampled a pass); %d preemptions\n",
+			tokens, longest, st.Towers-st0.Towers, (st.Tower - st0.Tower).Round(time.Millisecond), n,
+			(st.Pass - st0.Pass).Round(time.Millisecond), float64(st.Rows-st0.Rows)/float64(n),
+			float64(st.LogitRows-st0.LogitRows)/float64(n), st.Preemptions-st0.Preemptions)
+	}
 }
 
 // runDir parses every image of dir (or those list names) into out, one

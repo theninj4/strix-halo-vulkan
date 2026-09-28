@@ -85,9 +85,10 @@ PP-DocLayoutV3 and the glue in Go (`/v1/ocr`, Mistral's shape). O0–O10
 are done: every element case token-identical to fp32 HF, the glue PaddleX's
 byte for byte, and **OmniDocBench v1.6 on a 331-page subset: the Go
 pipeline 96.13, PaddleX's own pipeline on our engine 96.14 with the card's
-text edit (0.0326)** (card 96.34 on the full set). Open: O11 speed (a page's
-regions decode one after another), reading order through HF's layout port
-(O-o5).
+text edit (0.0326)** (card 96.34 on the full set). O11a batches a page's
+regions over a paged KV cache: the subset at the same score in 18 min
+instead of 66 (3.0 s a page mean, worst 143 → 18 s). Open: O11b (towers,
+the long tail), reading order through HF's layout port (O-o5).
 
 **Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
 `API.md` *Residency*).** A request loads its vertical and unloads the

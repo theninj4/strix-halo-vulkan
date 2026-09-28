@@ -145,7 +145,7 @@ func (b *OCR) ParseDocument(ctx context.Context, req *api.DocumentRequest) (*api
 	}
 
 	p := *parser
-	p.Recognize = eng.Recognize
+	p.Recognize = eng.RecognizeAll
 	imgN, tblN := 0, 0
 	for _, in := range pages {
 		pg, err := p.Parse(ctx, in.img)

@@ -37,6 +37,11 @@
 // 0-15 t, 16-39 h, 40-63 w (HF's recomposition_frequencies, [16, 24, 24]).
 // The table is still one [pos][64] over one inv_freq: only the position a
 // pair reads changes.
+//
+// PAGED (OCR's build, OCR.md O11): the caches are a pool of 64-position
+// pages, not a plane a slot. pc.heads is the page table in the activation
+// arena (uint bits, [slot][pc.span] pages), so position p of a slot lives in
+// cell (table[slot][p / 64] * 64 + p % 64).
 
 #include "dit_common.glsl"
 
@@ -55,6 +60,9 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #ifndef MROPE
 #define MROPE 0
 #endif
+#ifndef PAGED
+#define PAGED 0
+#endif
 
 layout(local_size_x = 128) in;
 
@@ -69,7 +77,12 @@ void main() {
     }
     uint slot = floatBitsToUint(act[pc.aux0 + r * 2u]);
     uint pos = floatBitsToUint(act[pc.aux0 + r * 2u + 1u]);
+#if PAGED
+    uint page = floatBitsToUint(act[pc.heads + slot * pc.span + pos / 64u]);
+    uint cell = ((page * 64u + pos % 64u) * NKV) * HD;
+#else
     uint cell = ((slot * pc.span + pos) * NKV) * HD;
+#endif
 
     if (y >= NQ + NKV) {
         uint h = y - NQ - NKV;

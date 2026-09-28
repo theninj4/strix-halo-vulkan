@@ -2430,6 +2430,17 @@ var LLMGEMMQ4M8 []byte
 //go:embed llm_gemm_q5_m8.spv
 var LLMGEMMQ5M8 []byte
 
+// OCR's decode projection (OCR.md O11): llm_gemv.comp's fp16 rungs with
+// accumulators for 16 rows, so a step of up to 16 regions stays a GEMV.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DMAXROWS=16 -o ocr_gemv_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DMAXROWS=16 -o ocr_gemv_k16.spv llm_gemv.comp
+
+//go:embed ocr_gemv_k1.spv
+var OCRGEMVK1 []byte
+
+//go:embed ocr_gemv_k16.spv
+var OCRGEMVK16 []byte
+
 // The **decode** projection: llm_gemv.comp, LLM.md L8d. llm_gemm.comp MODE 2
 // at one token is a sixteen-row fragment holding one row, an LDS slab per
 // K-step and a grid of gemmN/64 workgroups; this is the split-K GEMV over the
@@ -3791,8 +3802,8 @@ var ACELMAttnCombine []byte
 // PaddleOCR-VL's ERNIE-4.5-0.3B (ocr/lm.go, OCR.md O4): the same three
 // kernels at 16 q and 2 kv heads, the prep without q/k norm and with the
 // 3-D rope in chunked [16, 24, 24] sections.
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DQK_NORM=0 -DMROPE=1 -o ocr_lm_prep.spv ace_lm_prep.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -o ocr_lm_attn.spv ace_lm_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DQK_NORM=0 -DMROPE=1 -DPAGED=1 -o ocr_lm_prep.spv ace_lm_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DPAGED=1 -o ocr_lm_attn.spv ace_lm_attn.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DNQ=16u -DNKV=2u -DCOMBINE=1 -o ocr_lm_attn_combine.spv ace_lm_attn.comp
 
 //go:embed ocr_lm_prep.spv

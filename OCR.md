@@ -244,7 +244,7 @@ demo, so a page on the CPU is minutes: fine for dumps, useless as a server.
 | O8 | Page glue in Go: box post-processing, crops, merges, per-label prompts, OTSL→HTML, markdown; against PaddleX's functions | **O8a done 2026-09-27** (`ocr/page`, `cmd/ocr -page`): PaddleX's glue in rect mode, **every step identical to PaddleX 3.7.2's own functions** on five pages (layout boxes, crops by hash, merged images, prompts, block list, markdown byte for byte), 204 text-function edge cases exact; the Go pipeline end to end = PaddleX's markdown, the demo page in 8.3 s. **O8b left**: polygons (`layout_shape_mode` auto); figures inside tables done in O10 |
 | O9 | Serve page level: `/v1/ocr`, PDFs; a page's regions batched | **done 2026-09-27 except the batching** (moved to O11): `serve -ocr` answers Mistral's `/v1/ocr` (**Mistral's own SDK works unchanged**; PaddleX's `/layout-parsing` was built and removed the next day, decision 2); PDFs by `pdftoppm` at PaddleX's 144 dpi; 3.35 GB resident with the layout |
 | O10 | Accuracy: an OmniDocBench v1.6 subset against the card, as K8 reproduced Kev's | **done 2026-09-28** on a 331-page stratified fifth (card: 96.34 on all 1,651): **PaddleX's own pipeline on our engine 96.14, text edit 0.0326 = the card's**; **the Go pipeline 96.13** once `tokenize_figure_of_table` was ported (95.61 before: two refused pages); reading order 0.133 against PaddleX's 0.123 is the layout runtime, not the glue (O-o5); PaddleX's default polygon mode scores *lower* here (95.67, formula CDM −1.4) |
-| O11 | Performance: multi-row decode across regions, tower batching, int8 if decode pays for it | |
+| O11 | Performance: multi-row decode across regions, tower batching, int8 if decode pays for it | **O11a done 2026-09-28** (`ocr/engine.go`, `ocr/lm.go`): a continuous-batching scheduler over a paged KV cache (32 slots, 64k positions), a page's regions submitted together (`RecognizeAll`), 16-row GEMVs; **the O10 subset in 18 min instead of 66, recognition 3.0 s a page mean against 11.8, score unchanged (96.13), 329/331 pages byte-identical**; demo page 8.3 → 2.7 s, worst newspaper 143 → 18 s. Refused: several crops a tower pass (the tower is compute). Left: towers (half the time on dense pages), the long tail |
 
 ### O0 — weights, environment, oracles
 
@@ -892,6 +892,107 @@ pages', 2.8e-3). The JPEG page with a figure in a table stayed out of the
 layout dumps: its differences are Go's JPEG decoder, which those gates
 already exclude.
 
+### O11 — performance
+
+**O11a: a page's regions decode together** (decision 10). Measured first
+(`TestLMRowLadder`, a decode step of N rows, one a slot, depth ~200, idle
+device):
+
+| rows | 1 | 2 | 3 | 4 | 8 | 12 | 16 | 24 | 32 | 64 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| O4's kernels (GEMV to 3 rows, GEMM past) | 4.46 | 4.53 | 4.69 | 8.43 | 8.55 | 8.76 | 8.98 | 9.46 | 10.38 | 15.22 |
+| **16-row GEMV** (GEMM past 16) | 4.45 | 4.59 | 4.80 | **4.88** | **5.44** | **5.98** | **6.36** | 9.45 | 10.62 | 15.29 |
+
+ms a step, wall, logits for every row included. Sixteen regions decode for
+1.4 steps of one. What was built:
+
+- **A paged KV cache** (`ocr/lm.go`, the prep and attention shaders'
+  `PAGED` build): every layer's K and V are a pool of 64-position pages
+  (the attention's key block, so a block of keys is one page), each slot a
+  table of them in the fp32 arena (`pc.heads`, `pc.span` its length).
+  `LM.Reserve`/`Release`/`FreePages`; `Pass` reserves what its rows need.
+  ACE's `ace_lm_*` binaries are byte-identical (the switch defaults off).
+  32 slots x 10,240 positions unpaged would be 6 GB; the pool is 64k
+  positions, 1.2 GB.
+- **Logits for every row a pass finishes** (one a slot, up to 96), the head
+  as a GEMM past 16 rows; the logits are the LM's own reused buffers.
+- **16-row GEMVs**: `llm_gemv.comp`'s `MAXROWS` is overridable and OCR builds
+  `ocr_gemv_k{1,16}.spv` at 16 (the LLM's binaries unchanged). `gemvRows`
+  is the crossover; `OCR_GEMV_ROWS` moves it in the ladder.
+- **The scheduler** (`ocr/engine.go`): one goroutine owns the tower and the
+  LM. A pass is a row for every decoding request, then the prompts of new
+  ones, oldest first, up to `Rows` (2,048), with every row that ends a
+  request's input at the tail for its logits (rows may come in any order:
+  prep writes every row's K/V before any row attends). Prefill, decode and
+  recompute are one code path: a request needs positions [filled, prompt +
+  tokens). Admission takes a free slot and the pages for the prompt plus a
+  page for each running request; when the pool runs dry anyway, the
+  youngest request gives its cache back and prefills prompt + tokens again
+  later (vLLM's recompute preemption). Tokens reach `OnToken` through a
+  channel on the caller's goroutine, so a slow streaming client stalls no
+  one; cancellation is reaped every pass. `RecognizeAll` queues a page's
+  regions in one go (a page alone is reproducible; see below), and
+  `page.Parser.Recognize` now takes the whole page's requests.
+- `Engine.Stats()` counts towers, passes, rows and preemptions;
+  `cmd/ocr -page` prints them.
+
+**The one thing batching changes: a request's numbers depend a little on
+its company.** A pass of up to 16 rows sums its projections in the GEMV's
+order and a larger one in the GEMM's, so a near-tie can flip between a
+region run alone and in a crowd. On the O10 subset this flipped **2 of 331
+pages** (a space in "Part 1 演示", `align*` for `aligned`); the score did not
+move.
+
+Gates:
+
+- `TestEngine` (every case alone) and **`TestEngineBatched`**: all six
+  cases at once, token-identical to fp32 HF; the "tight" arm (16 pages,
+  admission without the page check) forces **137 preemptions**, still
+  token-identical.
+- `TestParse`: every oracle page's recognitions identical to the serial
+  ones, markdown = PaddleX's.
+- `TestOCR*` (backend): chat, streaming, the document door.
+- **PaddleOCR's `doc_parser`, unchanged, against `serve -ocr`**: the demo
+  page's 27 concurrent requests batch; exit 0, markdown byte-identical
+  across three runs, 7.6 s end to end (Paddle's CPU layout included).
+  Three streams dropped mid-generation are reaped and the server keeps
+  answering.
+- **The O10 subset again** (`pred/go_rect_o11`): 18 min 12 s for 331 pages
+  (O10: 66 min of recognition alone); recognition 992 s against 3,897,
+  **3.0 s a page mean against 11.8**; **96.13, every column identical to
+  O10's go_rect**; 329 pages byte-identical. That run had the GEMM past 3
+  rows; **the rerun with the 16-row GEMVs** (`pred/go_rect_o11b`): 17 min
+  8 s, recognition 929 s (2.8 s a page mean), **96.13 again, every column
+  identical**, 328 pages byte-identical to O10.
+
+Where a page's time goes now (`cmd/ocr -page`, idle device except where
+said):
+
+| page | regions | serial (O10) | O11a | towers | LM passes | note |
+|---|---|---|---|---|---|---|
+| demo | 27 | 8.3 s | **2.7 s** | 0.87 s | 1.58 s, 244 | the longest region is 240 tokens |
+| newspaper `0b1bb8d0…_1` | 194 | 143 s | **18.2 s** | 8.3 s | 9.3 s, 755 (78 rows a pass) | towers are half |
+| Washington Post p. 42 | 103 | 120 s | **28.8 s** | 4.5 s | 23.6 s, 4,097 | one region loops to the 4,096 cap and decodes alone |
+
+(The newspaper rows ran beside the OmniDocBench scorer on the CPU.)
+
+**Refused: several crops in one tower pass.** O3 read the small crop's
+33 ms as ~75 synchronous submits. It is not: the whole tower in one submit
+is 29 ms against 32 (line, 608 patches), 123 against 128 (seal), 346 against
+355 (page), and a `ForwardMany` that ran 27 crops in 4 passes (shared GEMMs,
+attention a crop at a time) took 907 ms against 919 one at a time. 608
+patches are ~0.9 TFLOP, so 29 ms is the ~30 TFLOP/s our GEMMs reach: the
+tower is compute. Built, measured, reverted; what stayed is the submit size
+scaled by patch count (`vision.GPU.PerSubmit`, 8 x 5120/patches a submit),
+worth the 3 ms.
+
+**Left for O11b**, by where the time is: the towers (half of a dense
+page: int8 or faster GEMM rungs, since it is compute); the long tail (a
+single region decoding alone at depth, the scalar attention O5 saw, and
+repetition loops PaddleX truncates afterwards but generates to the cap, as
+vLLM does); a device argmax (sampling is ~1 ms a pass at 64 rows); a GEMV
+past 16 rows.
+
 ## Open questions
 
 - O-o1: how far does PIL vs torch bicubic move a crop's text? (decision 4)
@@ -907,6 +1008,20 @@ already exclude.
   inference is the better one, the port follows Paddle, not HF.
 
 ## Handoff
+
+**2026-09-28, O11a.** Batched decode (section O11): `ocr.Engine` is a
+scheduler over a paged KV cache, `RecognizeAll` runs a page's regions
+together, and `page.Parser.Recognize` takes a slice. The O10 subset runs
+3.6x faster at the same score.
+
+- `serve -ocr` is now **4.38 GB** on the device (the 1.2 GB page pool;
+  `ocr.DefaultOptions`); `ai.service` still runs the pre-O11 binary until
+  `./deploy.sh`.
+- Timing tools: `TestLMRowLadder` (`OCR_GEMV_ROWS`), `TestLMStepLadder`
+  (its `OCR_SLABS` now takes 1s and 16s only), `cmd/ocr -page`'s engine
+  line, `Engine.Stats()`.
+- Next: **O11b**, the towers and the tail (end of section O11); O-o5 is
+  still the one accuracy item.
 
 **2026-09-28.** O10 done (section O10): OmniDocBench v1.6 on a 331-page
 subset, the Go pipeline 96.13 against PaddleX's 96.14 on the same engine
