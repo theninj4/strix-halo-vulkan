@@ -30,6 +30,9 @@ type Entry struct {
 	Img                  *pixels.RGB
 	Prompt               string
 	MinPixels, MaxPixels int
+	// Figures are the tokens painted into a table's crop, for assembly to
+	// swap back (tokenize_figure_of_table).
+	Figures []figToken
 }
 
 // filterOverlap is paddleocr_vl/uilts.py filter_overlap_boxes in rect mode:
@@ -396,7 +399,7 @@ const (
 // It also returns the figures inside tables, which PaddleX drops from the
 // page's blocks (their content is the table's): gather_imgs' image, figure
 // and seal regions, by construct_img_path.
-func entries(blocks []Block, figures []Box) ([]Entry, map[string]bool, error) {
+func entries(blocks []Block, figures []Box) ([]Entry, map[string]bool) {
 	var out []Entry
 	drop := map[string]bool{}
 	for j, b := range blocks {
@@ -407,16 +410,10 @@ func entries(blocks []Block, figures []Box) ([]Entry, map[string]bool, error) {
 		switch {
 		case b.Label == "table":
 			e.Prompt = ocr.Tasks["table"]
-			for _, f := range figures {
-				c := f.Coord
-				if c[0] >= b.Box[0] && c[1] >= b.Box[1] && c[2] <= b.Box[2] && c[3] <= b.Box[3] {
-					drop[imgPath(f.Label, c)] = true
-					if min(c[2]-c[0], c[3]-c[1]) >= 25 {
-						// tokenize_figure_of_table paints "[F<n>]" into the
-						// crop with OpenCV's Hershey font: not ported (O8b).
-						return nil, nil, fmt.Errorf("page: a table holds a %dx%d figure; tokenizing it is not implemented", c[2]-c[0], c[3]-c[1])
-					}
-				}
+			var dropped []string
+			e.Img, e.Figures, dropped = tokenizeFigures(b.Img, b.Box, figures)
+			for _, p := range dropped {
+				drop[p] = true
 			}
 		case containsFormula(b.Label) && b.Label != "formula_number":
 			e.Prompt = ocr.Tasks["formula"]
@@ -426,11 +423,23 @@ func entries(blocks []Block, figures []Box) ([]Entry, map[string]bool, error) {
 		}
 		out = append(out, e)
 	}
-	return out, drop, nil
+	return out, drop
 }
 
 // figureLabels are gather_imgs' labels (BLOCK_LABEL_MAP["image_labels"]).
 var figureLabels = map[string]bool{"image": true, "figure": true, "seal": true}
+
+// gatherFigures is layout_parsing/utils.py gather_imgs: the page's image,
+// figure and seal regions that are not empty, in layout order.
+func gatherFigures(boxes []Box) []Box {
+	var out []Box
+	for _, b := range boxes {
+		if figureLabels[b.Label] && b.Coord[2] > b.Coord[0] && b.Coord[3] > b.Coord[1] {
+			out = append(out, b)
+		}
+	}
+	return out
+}
 
 // imgPath is layout_parsing/utils.py construct_img_path.
 func imgPath(label string, c [4]int) string {

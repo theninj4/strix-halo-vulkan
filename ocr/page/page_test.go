@@ -198,12 +198,7 @@ func TestGlue(t *testing.T) {
 					t.Errorf("box %d: %+v, want %+v (order %d)", i, g, w, order)
 				}
 			}
-			var figures []Box
-			for _, b := range boxes {
-				if figureLabels[b.Label] {
-					figures = append(figures, b)
-				}
-			}
+			figures := gatherFigures(boxes)
 			var blocks []Block
 			for _, b := range filterOverlap(boxes) {
 				blocks = append(blocks, Block{Label: b.Label, Box: b.Coord, Img: crop(img, b.Coord), GroupID: -1})
@@ -232,10 +227,7 @@ func TestGlue(t *testing.T) {
 					t.Errorf("block %d: crop %dx%d differs from PaddleX's %v", i, g.Img.W, g.Img.H, w.Img.Size)
 				}
 			}
-			ents, drop, err := entries(blocks, figures)
-			if err != nil {
-				t.Fatal(err)
-			}
+			ents, drop := entries(blocks, figures)
 			if len(ents) != len(o.VLM) {
 				t.Fatalf("%d recognitions, PaddleX has %d", len(ents), len(o.VLM))
 			}

@@ -81,8 +81,13 @@ music section below and the archive
 live plan and handoff is the root [`OCR.md`](OCR.md) (O-stages): element
 recognition first (the 0.9 B VLM behind `/v1/chat/completions`, which
 PaddleOCR's own pipeline can drive unchanged), then page parsing with
-PP-DocLayoutV3 and the glue in Go (`/v1/ocr`). O1 (tokenizer, prompt,
-processor) is done and exact; the fp16 audit found 24x of headroom.
+PP-DocLayoutV3 and the glue in Go (`/v1/ocr`, Mistral's shape). O0–O10
+are done: every element case token-identical to fp32 HF, the glue PaddleX's
+byte for byte, and **OmniDocBench v1.6 on a 331-page subset: the Go
+pipeline 96.13, PaddleX's own pipeline on our engine 96.14 with the card's
+text edit (0.0326)** (card 96.34 on the full set). Open: O11 speed (a page's
+regions decode one after another), reading order through HF's layout port
+(O-o5).
 
 **Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
 `API.md` *Residency*).** A request loads its vertical and unloads the

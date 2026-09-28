@@ -14,6 +14,14 @@
 // glue and one recognition a region, printing PaddleX's markdown.
 //
 //	go run ./cmd/ocr -page -image testdata/ocr/paddleocr_vl_demo.png
+//
+// -page -dir parses every image in a directory instead (OCR.md O10), writing
+// <stem>.md (PaddleX's plain markdown, pretty=False, as OmniDocBench's
+// PaddleOCR script saves it) and a timings.tsv line a page to -out. Pages
+// already written are skipped, so a run resumes; -list names the files to
+// take, one a line.
+//
+//	go run ./cmd/ocr -page -dir ~/repos/omnidocbench-data/ds/images -out OUT
 package main
 
 import (
@@ -22,6 +30,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -46,7 +55,22 @@ func main() {
 	maxPixels := flag.Int("max-pixels", ocr.DefaultMaxPixels, "resize upper bound, in pixels")
 	pageMode := flag.Bool("page", false, "parse the image as a page: layout, regions, markdown")
 	layoutModel := flag.String("layout-model", "models/PP-DocLayoutV3", "PP-DocLayoutV3 checkpoint directory (-page)")
+	dir := flag.String("dir", "", "with -page: parse every image in this directory")
+	out := flag.String("out", "", "with -dir: where the markdown goes")
+	list := flag.String("list", "", "with -dir: file naming the images to take, one a line")
 	flag.Parse()
+	if *pageMode && *dir != "" {
+		if *out == "" {
+			log.Fatal("-dir needs -out")
+		}
+		dev, done := openDevice()
+		defer done()
+		e, err := ocr.Load(dev, *model, ocr.DefaultOptions())
+		must(err)
+		defer e.Destroy()
+		runDir(dev, e, *layoutModel, *dir, *out, *list)
+		return
+	}
 	if *image == "" {
 		flag.Usage()
 		os.Exit(2)
@@ -134,23 +158,28 @@ func must(err error) {
 	}
 }
 
-// runPage parses img as a page and prints the markdown.
-func runPage(dev *vk.Device, e *ocr.Engine, img *pixels.RGB, dir string) {
+// newParser loads PP-DocLayoutV3 onto the device beside e.
+func newParser(dev *vk.Device, e *ocr.Engine, dir string) (*page.Parser, func()) {
 	start := time.Now()
 	lm, err := layout.Load(dir)
 	must(err)
 	lg, err := layout.NewGPU(dev, lm)
 	must(err)
-	defer lg.Destroy()
 	fmt.Fprintf(os.Stderr, "layout   %v\n", time.Since(start).Round(time.Millisecond))
-	p := &page.Parser{
+	return &page.Parser{
 		Layout: func(px []float32) (*layout.Output, error) {
 			out, _, err := lg.Forward(px, nil)
 			return out, err
 		},
 		Recognize: e.Recognize,
-	}
-	start = time.Now()
+	}, lg.Destroy
+}
+
+// runPage parses img as a page and prints the markdown.
+func runPage(dev *vk.Device, e *ocr.Engine, img *pixels.RGB, dir string) {
+	p, done := newParser(dev, e, dir)
+	defer done()
+	start := time.Now()
 	pg, err := p.Parse(context.Background(), img)
 	must(err)
 	fmt.Println(pg.Markdown)
@@ -158,4 +187,64 @@ func runPage(dev *vk.Device, e *ocr.Engine, img *pixels.RGB, dir string) {
 	fmt.Fprintf(os.Stderr, "time     layout %v, glue %v, recognition %v; %v in all\n",
 		pg.Timings.Layout.Round(time.Millisecond), pg.Timings.Glue.Round(time.Millisecond),
 		pg.Timings.Recognition.Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
+}
+
+// runDir parses every image of dir (or those list names) into out, one
+// <stem>.md a page, skipping the pages already there. A page that fails is
+// logged to out/failed.tsv and left without markdown.
+func runDir(dev *vk.Device, e *ocr.Engine, layoutDir, dir, out, list string) {
+	p, done := newParser(dev, e, layoutDir)
+	defer done()
+	var names []string
+	if list != "" {
+		data, err := os.ReadFile(list)
+		must(err)
+		for _, l := range strings.Split(string(data), "\n") {
+			if l = strings.TrimSpace(l); l != "" {
+				names = append(names, l)
+			}
+		}
+	} else {
+		ents, err := os.ReadDir(dir)
+		must(err)
+		for _, de := range ents {
+			switch strings.ToLower(filepath.Ext(de.Name())) {
+			case ".png", ".jpg", ".jpeg", ".gif":
+				names = append(names, de.Name())
+			}
+		}
+	}
+	must(os.MkdirAll(out, 0o755))
+	tsv, err := os.OpenFile(filepath.Join(out, "timings.tsv"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	must(err)
+	defer tsv.Close()
+	failed, err := os.OpenFile(filepath.Join(out, "failed.tsv"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	must(err)
+	defer failed.Close()
+	start := time.Now()
+	n := 0
+	for i, name := range names {
+		md := filepath.Join(out, strings.TrimSuffix(name, filepath.Ext(name))+".md")
+		if _, err := os.Stat(md); err == nil {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		must(err)
+		img, _, err := pixels.Decode(data)
+		if err == nil {
+			var pg *page.Page
+			if pg, err = p.Parse(context.Background(), img); err == nil {
+				must(os.WriteFile(md, []byte(page.MarkdownPlain(pg.Results)), 0o644))
+				fmt.Fprintf(tsv, "%s\t%d\t%d\t%d\t%.3f\t%.3f\t%.3f\n", name, img.W, img.H, len(pg.Entries),
+					pg.Timings.Layout.Seconds(), pg.Timings.Glue.Seconds(), pg.Timings.Recognition.Seconds())
+				n++
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(failed, "%s\t%v\n", name, err)
+			fmt.Fprintf(os.Stderr, "%s: %v\n", name, err)
+		}
+		fmt.Fprintf(os.Stderr, "\r%d/%d pages, %d parsed, %v", i+1, len(names), n, time.Since(start).Round(time.Second))
+	}
+	fmt.Fprintln(os.Stderr)
 }

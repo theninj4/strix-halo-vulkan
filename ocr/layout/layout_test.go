@@ -104,8 +104,12 @@ func checkDetections(t *testing.T, rec record, got []Region, scoreTol, boxTol fl
 		g := got[i]
 		// The regions come sorted by order, so the sequence is compared
 		// everywhere; the absolute rank among all 300 queries only at fp32,
-		// since a junk query's vote can move it by one under fp16.
-		if g.Query != w.Query || g.LabelID != w.LabelID || (scoreTol < 1e-3 && g.Order != w.Order) {
+		// since a junk query's vote can move it by one under fp16. Even at
+		// fp32 it may move by one: HF sums the votes in float32 and argsorts
+		// unstably, so a near-tie with an undetected query is noise (the
+		// OmniDocBench page reference/dump_doclayout.py --case figtab1 has
+		// one, O10).
+		if g.Query != w.Query || g.LabelID != w.LabelID || (scoreTol < 1e-3 && abs(g.Order-w.Order) > 1) {
 			t.Errorf("region %d: query %d %s order %d, want query %d %s order %d",
 				i, g.Query, g.Label, g.Order, w.Query, w.Label, w.Order)
 			continue
@@ -236,4 +240,11 @@ func TestDetect(t *testing.T) {
 			checkDetections(t, rec, got, 1e-4, 0.05)
 		})
 	}
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

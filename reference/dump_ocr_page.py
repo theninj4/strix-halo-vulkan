@@ -77,11 +77,13 @@ def main():
     ap.add_argument("--out", default="reference/out/ocr_page")
     ap.add_argument("--server", default="http://127.0.0.1:18080/v1")
     ap.add_argument("--only", default="")
+    ap.add_argument("--case", action="append", default=[],
+                    help="a page dump_doclayout.py --case dumped, by name, instead of PAGES (repeatable)")
     args = ap.parse_args()
     client = OpenAI(base_url=args.server, api_key="null")
     only = set(filter(None, args.only.split(",")))
 
-    for name in PAGES:
+    for name in args.case or PAGES:
         if only and name not in only:
             continue
         rec = json.load(open(os.path.join(args.layout, name, "record.json")))

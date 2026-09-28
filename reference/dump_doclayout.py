@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--out", default="reference/out/doclayout")
     ap.add_argument("--only", default="")
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--case", action="append", default=[],
+                    help="name=path: dump this image instead of the built-in cases (repeatable)")
     args = ap.parse_args()
     torch.manual_seed(0)
     torch.set_grad_enabled(False)
@@ -70,7 +72,8 @@ def main():
     labels = model.config.id2label
 
     only = set(filter(None, args.only.split(",")))
-    for name, path in CASES:
+    cases = [tuple(c.split("=", 1)) for c in args.case] or CASES
+    for name, path in cases:
         if only and name not in only:
             continue
         t0 = time.time()

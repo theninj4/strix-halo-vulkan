@@ -241,9 +241,9 @@ demo, so a page on the CPU is minutes: fine for dumps, useless as a server.
 | O5 | Element level end to end, `cmd/ocr`, all six tasks against HF greedy | **done 2026-09-27** (`ocr/engine.go`, `cmd/ocr`): image file → text, **all six cases token- and text-identical to fp32 HF** (the page's 768 and both JPEGs included); 2.33 GB on the device; every element case faster than llama.cpp end to end (line 83 vs ~140 ms, seal 293 vs ~450); **the full page 8.1 s to `</s>` at 212 tok/s vs llama.cpp's 7.4 s at 233**: prefill wins 3x, decode at depth loses |
 | O6 | Serve element level (`-ocr`, chat door, vLLM extras); **gate: PaddleOCR's `doc_parser --vl_rec_backend vllm-server` against us, unchanged** | **done 2026-09-27** (`backend/ocr.go`, `api/route.go`): `serve -ocr` answers `PaddleOCR-VL-1.6-0.9B` on `/v1/chat/completions`, routed beside `-llm`; **PaddleOCR 3.7.0's `doc_parser` runs unchanged against it**: the demo page's 27 regions all 200, markdown byte-identical across runs; table, formula and chart pages too; streamed = buffered = fp32 text on all six cases |
 | O7 | PP-DocLayoutV3 on the CPU then the GPU, against HF `pp_doclayout_v3` | **done 2026-09-27** (`ocr/layout`): CPU oracle ≤ 2.5e-5 of HF fp32 at every stage, regions identical; preprocessing bit-exact on PNG (`pixels.ResizeNoAA`); **device trunk** (fp16 GEMMs, 35 ms) + host AIFI and decoder: **~225 ms a page against the CPU's 2.2 s**, every region, label and reading order of the five cases HF's, scores ≤ 6.6e-4 |
-| O8 | Page glue in Go: box post-processing, crops, merges, per-label prompts, OTSL→HTML, markdown; against PaddleX's functions | **O8a done 2026-09-27** (`ocr/page`, `cmd/ocr -page`): PaddleX's glue in rect mode, **every step identical to PaddleX 3.7.2's own functions** on five pages (layout boxes, crops by hash, merged images, prompts, block list, markdown byte for byte), 204 text-function edge cases exact; the Go pipeline end to end = PaddleX's markdown, the demo page in 8.3 s. **O8b left**: polygons (`layout_shape_mode` auto), figures inside tables |
+| O8 | Page glue in Go: box post-processing, crops, merges, per-label prompts, OTSL→HTML, markdown; against PaddleX's functions | **O8a done 2026-09-27** (`ocr/page`, `cmd/ocr -page`): PaddleX's glue in rect mode, **every step identical to PaddleX 3.7.2's own functions** on five pages (layout boxes, crops by hash, merged images, prompts, block list, markdown byte for byte), 204 text-function edge cases exact; the Go pipeline end to end = PaddleX's markdown, the demo page in 8.3 s. **O8b left**: polygons (`layout_shape_mode` auto); figures inside tables done in O10 |
 | O9 | Serve page level: `/v1/ocr`, PDFs; a page's regions batched | **done 2026-09-27 except the batching** (moved to O11): `serve -ocr` answers Mistral's `/v1/ocr` (**Mistral's own SDK works unchanged**; PaddleX's `/layout-parsing` was built and removed the next day, decision 2); PDFs by `pdftoppm` at PaddleX's 144 dpi; 3.35 GB resident with the layout |
-| O10 | Accuracy: an OmniDocBench v1.6 subset against the card, as K8 reproduced Kev's | |
+| O10 | Accuracy: an OmniDocBench v1.6 subset against the card, as K8 reproduced Kev's | **done 2026-09-28** on a 331-page stratified fifth (card: 96.34 on all 1,651): **PaddleX's own pipeline on our engine 96.14, text edit 0.0326 = the card's**; **the Go pipeline 96.13** once `tokenize_figure_of_table` was ported (95.61 before: two refused pages); reading order 0.133 against PaddleX's 0.123 is the layout runtime, not the glue (O-o5); PaddleX's default polygon mode scores *lower* here (95.67, formula CDM −1.4) |
 | O11 | Performance: multi-row decode across regions, tower batching, int8 if decode pays for it | |
 
 ### O0 — weights, environment, oracles
@@ -747,11 +747,11 @@ engine's single-stream decode, which O11's batching (decision 10) is for.
 
 **O8b, not done**: `layout_shape_mode="auto"` (the default: masks traced
 with OpenCV's `findContours`/`approxPolyDP`/`minAreaRect`, polygons
-compared with shapely, the crop whitened outside the polygon);
-`tokenize_figure_of_table` (a figure >= 25 px inside a table is painted
-over with `[F<n>]` in OpenCV's Hershey font; `Parse` refuses such a page
-rather than guess); Spotting's pre- and post-processing (only reachable
-without layout).
+compared with shapely, the crop whitened outside the polygon; O10 found it
+scores lower than rect on OmniDocBench); Spotting's pre- and
+post-processing (only reachable without layout).
+`tokenize_figure_of_table` (a figure >= 25 px inside a table painted over
+with `[F<n>]` in OpenCV's Hershey font) was refused here and is done in O10.
 
 ### O9 — the page doors
 
@@ -804,6 +804,94 @@ Gates:
 is still one recognition after another (27 of them, 8.1 s, on the demo
 page).
 
+### O10 — accuracy on OmniDocBench
+
+**The benchmark**: OmniDocBench v1.6 (`opendatalab/OmniDocBench` on HF at
+`aa1ee96d`, 1,651 pages, in `~/repos/omnidocbench-data/ds`) and its
+evaluator (`~/repos/OmniDocBench` at `f133a71`), run in the authors' Docker
+image (`ghcr.io/zeng-weijun/omnidocbench-eval:repro-ubuntu2204`: TeX Live,
+ImageMagick 7 and Ghostscript for CDM) with the README's config.
+Overall = ((1 − text edit) × 100 + formula CDM + table TEDS) / 3, page
+averages, as the leaderboard and the evaluator's own `parse_results.py`
+compute it. The card's row (v1.6_full): **96.34**, text edit 0.0326, CDM
+97.53, TEDS 94.76, TEDS-S 97.10, reading order 0.1278.
+
+**The subset**: every fifth page per data source
+(`reference/omnidocbench_subset.py --every 5`), 331 pages, all ten sources
+in proportion. A prediction is `<stem>.md`, PaddleX's plain markdown
+(`pretty=False`, as the benchmark's `PaddleOCR_img2md.py` saves it).
+
+**Three arms, one engine** (every recognition is our `serve -ocr`, fp16):
+
+- `go_rect`: the Go pipeline, `cmd/ocr -page -dir IN -list L -out OUT`
+  (new: a directory mode that resumes and logs timings.tsv / failed.tsv);
+  device layout, rect mode.
+- `px_rect`: PaddleOCR 3.7.0's own `PaddleOCRVL` pipeline v1.6 (Paddle's
+  layout on the CPU, PaddleX's glue, crops JPEG-encoded by its vllm-server
+  client) against `serve -ocr`, `layout_shape_mode="rect"`
+  (`reference/omnidocbench_paddlex.py`).
+- `px_auto`: the same at PaddleX's default, polygons.
+
+Scored by `reference/omnidocbench_eval.sh` and
+`reference/omnidocbench_score.py`:
+
+| arm | Overall | Text Edit | Formula CDM | Table TEDS | TEDS-S | Read Order |
+|---|---|---|---|---|---|---|
+| card (all 1,651 pages) | 96.34 | 0.0326 | 97.53 | 94.76 | 97.10 | 0.1278 |
+| go_rect, first run | 95.61 | 0.0397 | 98.08 | 92.73 | 94.87 | 0.1392 |
+| **go_rect** | **96.13** | 0.0333 | 98.08 | 93.65 | 96.01 | 0.1333 |
+| px_rect | 96.14 | 0.0326 | 98.26 | 93.42 | 95.84 | 0.1226 |
+| px_auto | 95.67 | 0.0328 | 96.88 | 93.42 | 95.84 | 0.1226 |
+
+CDM: 449 formulas, TEDS: 136 tables, no timeouts or errors in either.
+
+**What it says.**
+
+1. **The engine reproduces the card.** PaddleX's pipeline around it lands
+   the card's text edit to four places; Overall is 0.2 under the card on a
+   subset whose mix is not the full set's (CDM is 0.7 over, TEDS 1.3
+   under), so the subset is not the place to split hairs finer.
+2. **The first Go run lost 0.52, and 90% of the text-edit gap was two
+   pages**: `Parse` refused a page with a figure inside a table
+   (O8b's `tokenize_figure_of_table`), which scores as an empty page.
+   Ported (`ocr/page/figtoken.go`): CPython's Mersenne Twister for
+   `random.seed(1024)`/`shuffle`, and OpenCV 4.10's `getTextSize` and
+   `putText` in Hershey simplex with LINE_AA (ThickLine, LineAA,
+   FillConvexPoly, EllipseEx from `drawing.cpp`), then untokenize in
+   assembly. **Byte for byte**: `TestFigureTokens` holds 120 generated
+   tables (284 tokens, figures 5–810 px, noise and flat crops) to
+   PaddleX's function under cv2 (`reference/dump_ocr_figtoken.py`), 0
+   bytes off; `TestGlue` gained the OmniDocBench page
+   (`dump_doclayout.py --case figtab1=…`, `dump_ocr_page.py --case
+   figtab1`) with its painted table crop identical by SHA-256 and the
+   model writing the four tokens back into `<img>`s. The second run: 96.13.
+3. **What remains is reading order** (0.133 against 0.123; 37 pages worse,
+   7 better, 281 identical) **and it is the layout model's runtime, not the
+   glue**: `TestGlue` shows the glue is PaddleX's given the same
+   detections, and on the worst page HF's model (which ours matches) finds
+   a 0.54 `paragraph_title` that Paddle's does not report at all. Not the
+   resize: torch's no-AA bicubic and cv2's (whose 8-bit cubic is Intel
+   IPP's, closed; its output is cv2's float path rounded, to 3 values in
+   1.9 M) differ by 1.5e-4 on average on that page's input. O-o5.
+4. **PaddleX's default polygons cost formulas here**: `auto` = `rect` on
+   text, tables and order, and 1.4 points of CDM lower. So O8b (polygons)
+   is not an accuracy item on this evidence; rect stays the Go default.
+
+**Timings** (not a speed measurement: three clients shared the GPU, and
+the live `ai` service ran beside them): the Go arm 11.8 s a page mean,
+8.2 median, 143 s worst (a newspaper, 194 regions), 19 recognitions a
+page on average; layout 0.31 s. The recognitions are one after another,
+which is O11's batching.
+
+**Layout gates, widened by the new page** (every region, label and order
+still HF's): at fp32 a region's rank among all 300 queries may move by one
+(HF sums votes in float32 and argsorts unstably; figtab1 has such a
+near-tie with an undetected query); the device's fp16 score bound is
+1e-2 (figtab1 moves one score 4.6e-3 from a trunk no worse than the other
+pages', 2.8e-3). The JPEG page with a figure in a table stayed out of the
+layout dumps: its differences are Go's JPEG decoder, which those gates
+already exclude.
+
 ## Open questions
 
 - O-o1: how far does PIL vs torch bicubic move a crop's text? (decision 4)
@@ -812,8 +900,33 @@ page).
   0.001, O7); what remains is PaddleX's post-processing (thresholds, NMS,
   merges, box clipping, polygons), which O8 ports and gates.
 - O-o4: the report's own throughput numbers, for a reference to beat.
+- O-o5: reading order is 0.011 worse through HF's PP-DocLayoutV3 (ours)
+  than through Paddle's on the O10 subset, not from the resize. Next: dump
+  Paddle's raw logits and order head on `jiaocaineedrop_Proofs_From_The_Book
+  (Aigner).pdf_54.jpg` beside HF's from the same pixels. If Paddle's
+  inference is the better one, the port follows Paddle, not HF.
 
 ## Handoff
+
+**2026-09-28.** O10 done (section O10): OmniDocBench v1.6 on a 331-page
+subset, the Go pipeline 96.13 against PaddleX's 96.14 on the same engine
+(card 96.34 on the full set). Figures inside tables are ported and gated
+byte for byte (`ocr/page/figtoken.go`), so `Parse` no longer refuses a page.
+
+- Data and tools live outside the repo: `~/repos/omnidocbench-data` (the
+  dataset in `ds/`, the subset in `subset5/`, predictions in `pred/`,
+  scores in `eval/`), `~/repos/OmniDocBench` (the evaluator); the Docker
+  image is pulled (32 GB).
+- To rerun an arm: `cmd/ocr -page -dir … -list … -out …` (Go), or
+  `reference/omnidocbench_paddlex.py` against `serve -ocr` on :18080; then
+  `reference/omnidocbench_eval.sh GT PRED OUT` (~8 min) and
+  `reference/omnidocbench_score.py OUT…`.
+- Next: **O11** (speed). A newspaper page is 50–190 regions and 50–140 s
+  serially: batched decode across a page's regions is where the time is.
+  O-o5 (reading order) is the one accuracy item left, and it is in the
+  layout model, not the glue.
+- `ai.service` carries `-ocr` and runs; restart it (`./deploy.sh`) to serve
+  the figure-in-table pages, which the running binary still refuses.
 
 **2026-09-27, session 2.** O3 and O4 done: `ocr/gpu.go` (`NewGPUTower`,
 `Forward(ctx, *Image)` → the image-token rows) and `ocr/lm.go` (`LoadLM`,

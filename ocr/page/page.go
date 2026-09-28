@@ -19,13 +19,20 @@ const maxNewTokens = 4096
 
 // assemble is _paddleocr_vl_assemble_parsing_results: each block's content
 // from its recognition, post-processed by label, and an image path for the
-// visual blocks; an image inside a table is dropped.
+// visual blocks; an image inside a table is dropped, and the table's
+// figure tokens become the image's <img> (untokenize_figure_of_table).
 func assemble(blocks []Block, ents []Entry, texts []string, drop map[string]bool) []Result {
 	byBlock := map[int]int{}
 	for k, e := range ents {
 		byBlock[e.Block] = k
 	}
 	var out []Result
+	type tableFigs struct {
+		at   int // index in out
+		toks []figToken
+	}
+	var tables []tableFigs
+	images := map[string]string{} // image_path_to_obj_map, path -> content
 	for j, b := range blocks {
 		content := ""
 		if k, ok := byBlock[j]; ok {
@@ -44,14 +51,25 @@ func assemble(blocks []Block, ents []Entry, texts []string, drop map[string]bool
 			content = r
 		}
 		res := Result{Label: b.Label, BBox: b.Box, Content: content, GroupID: b.GroupID}
+		if b.Label == "table" {
+			var toks []figToken
+			if k, ok := byBlock[j]; ok {
+				toks = ents[k].Figures
+			}
+			tables = append(tables, tableFigs{len(out), toks})
+		}
 		if visImageLabels[b.Label] && b.Img != nil {
 			p := imgPath(b.Label, b.Box)
+			images[p] = content
 			if drop[p] {
 				continue
 			}
 			res.Image, res.Img = p, b.Img
 		}
 		out = append(out, res)
+	}
+	for _, t := range tables {
+		out[t.at].Content = untokenizeFigures(out[t.at].Content, t.toks, images)
 	}
 	return out
 }
@@ -137,12 +155,7 @@ func (p *Parser) Parse(ctx context.Context, img *pixels.RGB) (*Page, error) {
 	pg.Timings.Layout = time.Since(t0)
 
 	t0 = time.Now()
-	var figures []Box
-	for _, b := range pg.Boxes {
-		if figureLabels[b.Label] {
-			figures = append(figures, b)
-		}
-	}
+	figures := gatherFigures(pg.Boxes)
 	for _, b := range filterOverlap(pg.Boxes) {
 		pg.Blocks = append(pg.Blocks, Block{Label: b.Label, Box: b.Coord, Img: crop(img, b.Coord), GroupID: -1})
 	}
@@ -151,10 +164,7 @@ func (p *Parser) Parse(ctx context.Context, img *pixels.RGB) (*Page, error) {
 		nonMerge[l] = true
 	}
 	pg.Blocks = mergeBlocks(pg.Blocks, nonMerge)
-	ents, drop, err := entries(pg.Blocks, figures)
-	if err != nil {
-		return nil, err
-	}
+	ents, drop := entries(pg.Blocks, figures)
 	pg.Entries = ents
 	pg.Timings.Glue = time.Since(t0)
 
