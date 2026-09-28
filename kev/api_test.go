@@ -3,6 +3,8 @@ package kev
 import (
 	"encoding/json"
 	"errors"
+	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
@@ -326,5 +328,53 @@ func TestKeyOrderAndDuplicates(t *testing.T) {
 	rec, meta := ToRecord(req)
 	if !slices.Equal(rec.Questions[0].Options, []string{"z: Z", "a: A"}) || !slices.Equal(meta[0].Keys, []string{"z", "a"}) {
 		t.Errorf("options %q keys %q", rec.Questions[0].Options, meta[0].Keys)
+	}
+}
+
+// TestHeadLogitsManyIsSerial: the parallel head (K9) gives the serial loop's
+// bits, whatever the mix of questions.
+func TestHeadLogitsManyIsSerial(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	const dim, hidden = 256, 2560
+	vec := func(n int) []float32 {
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = float32(rng.NormFloat64())
+		}
+		return v
+	}
+	h := &Head{Dim: dim, QW: vec(dim * hidden), QB: vec(dim), KW: vec(dim * hidden), KB: vec(dim)}
+	serial := func(w, b, x []float32) []float64 {
+		out := make([]float64, dim)
+		for i := range out {
+			s := float64(b[i])
+			for j, v := range x {
+				s += float64(w[i*hidden+j]) * float64(v)
+			}
+			out[i] = s
+		}
+		return out
+	}
+	var qs []HeadQuestion
+	for n := 1; n <= 5; n++ {
+		q := HeadQuestion{Decide: vec(hidden)}
+		for range n {
+			q.Opts = append(q.Opts, vec(hidden))
+		}
+		qs = append(qs, q)
+	}
+	got := h.LogitsMany(qs, 2.406)
+	for i, q := range qs {
+		qp := serial(h.QW, h.QB, q.Decide)
+		for o, x := range q.Opts {
+			k := serial(h.KW, h.KB, x)
+			var s float64
+			for j := range k {
+				s += k[j] * qp[j]
+			}
+			if want := s * (1 / math.Sqrt(dim) / 2.406); got[i][o] != want {
+				t.Fatalf("question %d option %d: %v, serial %v", i, o, got[i][o], want)
+			}
+		}
 	}
 }

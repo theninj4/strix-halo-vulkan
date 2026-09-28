@@ -187,6 +187,8 @@ func main() {
 	kevCache := flag.Int("kev-cache", 4, "states the prefix cache keeps, so a repeated text pays for its questions only; 0 turns it off")
 	kevCacheTokens := flag.Int("kev-cache-tokens", 4096, "the longest state the prefix cache keeps (32 KB of KV a token, plus 52.7 MB a state)")
 	kevBatch := flag.Int("kev-batch", 8, "the most requests one pass answers: a burst shares passes, a lone request waits for nothing (K7.5)")
+	kevChunk := flag.Int("kev-chunk", 512, "a long request's state runs this many tokens a pass, so short requests go between its chunks; negative never chunks (K9)")
+	kevBatchTokens := flag.Int("kev-batch-tokens", 1024, "the most packed tokens requests share a pass up to; a longer request runs alone, after cheaper ones (K9)")
 	kevFP16 := flag.Bool("kev-fp16", false, "stage Kev's weights as fp16 instead of int8: the control, 1.27x slower and 3.3 GB more")
 
 	ocrOn := flag.Bool("ocr", false, "load PaddleOCR-VL-1.6 and serve it on /v1/chat/completions as model "+backend.OCRModelID+" (OCR.md)")
@@ -386,7 +388,7 @@ func main() {
 		start := time.Now()
 		b, err := backend.NewKev(backend.KevOptions{
 			Model: *kevModel, Base: *kevBase, Device: dev, MaxTokens: *kevTokens, FP16: *kevFP16,
-			CacheStates: cacheStates(*kevCache), CacheTokens: *kevCacheTokens, MaxBatch: *kevBatch,
+			CacheStates: cacheStates(*kevCache), CacheTokens: *kevCacheTokens, MaxBatch: *kevBatch, BatchTokens: *kevBatchTokens, ChunkTokens: *kevChunk,
 		})
 		if err != nil {
 			log.Fatal(err)

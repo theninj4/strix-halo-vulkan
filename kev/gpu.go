@@ -232,6 +232,7 @@ type layerWeights struct {
 	qkNorm           uint32 // attention: q_norm (1+w) [256] then k_norm (1+w) [256]
 	// act arena, per layer
 	state, tail uint32 // GDN: S [32][128][128]; conv tail [3][8192]
+	tail2       uint32 // GDN: the second conv tail a chunked state alternates with (K9), [slots][3][8192]
 	// fp16 arena, per layer (K7.3)
 	kc, vc uint32 // attention: key and value caches, fp16 [cells][4][256], in halves
 }
@@ -258,6 +259,11 @@ type GPU struct {
 	// the ladder; empty is the schedule. GLU does the same for the gate+up
 	// GEMM (glum2, glum4, glum8).
 	GEMM, GLU string
+	// ChunkRows is the chunk a stream's state runs in (K9): a multiple of
+	// the attention's 64-key block, 512 by default. Zero never chunks.
+	ChunkRows int
+	stream    *stream
+
 	// LayersPerSubmit is how many layers go into one command buffer (see
 	// run). Load sets 8.
 	LayersPerSubmit int
@@ -366,7 +372,7 @@ func LoadWith(dev *vk.Device, kevDir, baseDir string, o Options) (*GPU, error) {
 	}
 	defer set.Close()
 
-	g := &GPU{Bank: bank, Cfg: cfg, Head: head, dev: dev, pipes: map[string]*vk.ComputePipeline{}, LayersPerSubmit: 8, Attention: "wmma", ScanLPC: 8, slots: o.Slots}
+	g := &GPU{Bank: bank, Cfg: cfg, Head: head, dev: dev, pipes: map[string]*vk.ComputePipeline{}, LayersPerSubmit: 8, Attention: "wmma", ScanLPC: 8, slots: o.Slots, ChunkRows: 512}
 	g.rows = roundUp(maxTokens, rowAlign)
 	// A pass of branches continues a state of up to MaxState cells, each
 	// branch starting on a 64-aligned cell; the planner splits a pass whose
@@ -485,6 +491,7 @@ func (g *GPU) layout() error {
 			lw.state = gdnAt
 			lw.tail = gdnAt + 32*128*128
 			gdnAt += gdnLayer
+			lw.tail2 = alloc(g.slots * 3 * 8192)
 		}
 		g.w[i] = lw
 	}
@@ -973,6 +980,12 @@ type preq struct {
 	sLo       int  // its state's first attention cell
 	withState bool // its state's rows are in this pass (else they are resident)
 	stateRow  int  // the pass row of its state's first token, when they are
+	// A state can run in chunks (K9): done of its tokens are resident
+	// already, and chunk more are in this pass (all of them, from zero,
+	// unless the request is a stream). tail2 has the chunk write the second
+	// conv tail (kev_gdn_prep.comp).
+	done, chunk int
+	tail2       bool
 }
 
 // prow names one pass row: which request of the pass, which index of its
@@ -987,11 +1000,14 @@ type pass struct {
 	reqs     []*preq
 	src      []prow
 	meta     []uint32 // 8 words a row, as kev_gdn_prep.comp documents
-	states   [][3]int // state segments: first row, length, slot
-	branches [][3]int // branch segments, the same
+	states   [][4]int // state segments: first row, length, slot, and 1 for a later chunk (K9)
+	branches [][4]int // branch segments, the same (the fourth is 0)
 	readouts []prow
 	cursor   int // the next free attention cell
 	n        int
+	// streamBranches is how many of the stream's questions this pass runs
+	// (K9); the stream, when in the pass, is its request 0.
+	streamBranches int
 }
 
 // keyAlign is the attention's key block (kev_attn_wmma's BN). Every state's
@@ -1000,30 +1016,44 @@ type pass struct {
 // segment sits in the cache (K7.3).
 const keyAlign = 64
 
+// Row kinds, the second word of a row's metadata (kev_gdn_prep.comp).
+const (
+	kindBranch = 1 // a branch row, not a state row
+	kindTail2  = 2 // a state chunk that writes the second conv tail (K9)
+)
+
 // row appends one pass row and its metadata.
-func (p *pass) row(q, e, cell int, branch bool, segStart, sLo, sHi, stateEnd int) {
+func (p *pass) row(q, e, cell int, kind uint32, segStart, sLo, sHi, stateEnd int) {
 	r := p.reqs[q]
 	p.src = append(p.src, prow{q, e})
-	b := uint32(0)
-	if branch {
-		b = 1
-	}
-	p.meta = append(p.meta, uint32(r.enc.Pos[e]), b, uint32(segStart), uint32(cell),
+	p.meta = append(p.meta, uint32(r.enc.Pos[e]), kind, uint32(segStart), uint32(cell),
 		uint32(sLo), uint32(sHi), uint32(r.slot), uint32(stateEnd))
 }
 
-// addState appends request q's state rows at its cells.
+// addState appends request q's state rows at its cells: tokens [done,
+// done+chunk) of it, which is the whole state unless it is a stream's (K9).
 func (p *pass) addState(q int) {
 	r := p.reqs[q]
-	ls := r.enc.StateLen
+	ls := r.chunk
 	r.stateRow = len(p.src)
-	p.states = append(p.states, [3]int{r.stateRow, ls, r.slot})
-	for e := 0; e < ls; e++ {
-		// A state row: its own segment from the state's first cell, no
-		// separate state range, and its state's end for the conv tail.
-		p.row(q, e, r.sLo+e, false, r.stateRow, 0, 0, r.stateRow+ls)
+	later := 0
+	// A state row: its own segment from its chunk's first cell, and its
+	// chunk's end for the conv tail. A first chunk has no separate state
+	// range; a later one sees the earlier chunks' cells as one.
+	sLo, sHi := 0, 0
+	if r.done > 0 {
+		later, sLo, sHi = 1, r.sLo, r.sLo+r.done
 	}
-	p.cursor = max(p.cursor, r.sLo+ls)
+	kind := uint32(0)
+	if r.tail2 {
+		kind = kindTail2
+	}
+	p.states = append(p.states, [4]int{r.stateRow, ls, r.slot, later})
+	for e := r.done; e < r.done+ls; e++ {
+		p.row(q, e, r.sLo+e, kind, r.stateRow, sLo, sHi, r.stateRow+ls)
+	}
+	// The whole state's cells are the request's, chunked or not.
+	p.cursor = max(p.cursor, r.sLo+r.enc.StateLen)
 }
 
 // fitsBranch is whether a branch of `length` rows fits.
@@ -1037,13 +1067,13 @@ func (p *pass) addBranch(q, k int) {
 	lo, hi := r.enc.Branch(k)
 	at := roundUp(p.cursor, keyAlign)
 	first := len(p.src)
-	p.branches = append(p.branches, [3]int{first, hi - lo, r.slot})
+	p.branches = append(p.branches, [4]int{first, hi - lo, r.slot, 0})
 	end := 0
 	if r.withState {
-		end = r.stateRow + r.enc.StateLen
+		end = r.stateRow + r.chunk
 	}
 	for e := lo; e < hi; e++ {
-		p.row(q, e, at+e-lo, true, first, r.sLo, r.sLo+r.enc.StateLen, end)
+		p.row(q, e, at+e-lo, kindBranch, first, r.sLo, r.sLo+r.enc.StateLen, end)
 	}
 	p.cursor = at + hi - lo
 	p.readouts = append(p.readouts, prow{q, r.enc.Decide[k]})
@@ -1062,7 +1092,7 @@ func (g *GPU) plan(enc *Encoding, resident bool) ([]*pass, error) {
 		return nil, &OverflowError{Msg: fmt.Sprintf("a %d-token state does not fit a pass of %d tokens (-kev-tokens)", enc.StateLen, limit)}
 	}
 	fresh := func(withState bool) *pass {
-		p := &pass{reqs: []*preq{{enc: enc, withState: withState}}, cursor: enc.StateLen}
+		p := &pass{reqs: []*preq{{enc: enc, withState: withState, chunk: enc.StateLen}}, cursor: enc.StateLen}
 		if withState {
 			p.addState(0)
 		}
@@ -1095,18 +1125,61 @@ func (g *GPU) plan(enc *Encoding, resident bool) ([]*pass, error) {
 // its state on the next aligned cells, or reports false if they do not fit
 // its rows, cells or slots.
 func (g *GPU) planBatch(encs []*Encoding, resident []bool) (*pass, bool) {
-	if len(encs) > g.slots {
+	return g.planStep(false, encs, resident)
+}
+
+// planStep lays out one pass: the stream's next step when withStream (K9),
+// then encs, each whole. While a stream runs, it keeps slot 0 and cells [0,
+// its state's length) whether it is in the pass or not, and encs take the
+// slots and cells after it. It reports false if they do not all fit.
+func (g *GPU) planStep(withStream bool, encs []*Encoding, resident []bool) (*pass, bool) {
+	p := &pass{}
+	first := 0
+	if s := g.stream; s != nil {
+		first = 1
+		p.cursor = s.enc.StateLen
+		if withStream {
+			r := &preq{enc: s.enc, slot: 0}
+			p.reqs = append(p.reqs, r)
+			if s.next < len(s.chunks) {
+				r.withState, r.done, r.chunk = true, s.done, s.chunks[s.next]
+				// Chunks alternate conv tails, and the last writes the
+				// first tail, which branches and the cache read.
+				r.tail2 = (len(s.chunks)-1-s.next)%2 == 1
+				p.addState(0)
+			}
+			// Its questions once its state is complete, as many as keep
+			// its rows here within a chunk, and at least one.
+			if s.next >= len(s.chunks)-1 {
+				for k := s.branch; k < len(s.enc.Decide); k++ {
+					lo, hi := s.enc.Branch(k)
+					if len(p.src) > 0 && len(p.src)+hi-lo > g.ChunkRows {
+						break
+					}
+					if !p.fitsBranch(hi-lo, g.passRows(), g.cells) {
+						break
+					}
+					p.addBranch(0, k)
+					p.streamBranches++
+				}
+			}
+			if len(p.src) == 0 {
+				return nil, false
+			}
+		}
+	}
+	if len(encs)+first > g.slots {
 		return nil, false
 	}
-	p := &pass{}
+	off := len(p.reqs)
 	for i, enc := range encs {
-		r := &preq{enc: enc, slot: i, sLo: roundUp(p.cursor, keyAlign), withState: !resident[i]}
+		r := &preq{enc: enc, slot: first + i, sLo: roundUp(p.cursor, keyAlign), withState: !resident[i], chunk: enc.StateLen}
 		p.reqs = append(p.reqs, r)
 		if r.sLo+enc.StateLen > g.cells {
 			return nil, false
 		}
 		if r.withState {
-			p.addState(i)
+			p.addState(off + i)
 		} else {
 			p.cursor = r.sLo + enc.StateLen
 		}
@@ -1117,11 +1190,39 @@ func (g *GPU) planBatch(encs []*Encoding, resident []bool) (*pass, bool) {
 			if !p.fitsBranch(hi-lo, g.passRows(), g.cells) {
 				return nil, false
 			}
-			p.addBranch(i, k)
+			p.addBranch(off+i, k)
 		}
 	}
 	p.n = len(p.src)
 	return p, p.n > 0 && p.n <= g.passRows()
+}
+
+// PassCost is the rows a request would add to a pass now: every question's
+// branch, plus its state unless the prefix cache holds it. It is what a
+// scheduler orders requests by (K9); a pass's time grows with its rows. A
+// cached state it finds is marked used, as the request will soon use it.
+func (g *GPU) PassCost(enc *Encoding) int {
+	n := enc.StateLen
+	if g.cache.peek(enc.IDs[:enc.StateLen]) >= 0 {
+		n = 0
+	}
+	for k := range enc.Decide {
+		lo, hi := enc.Branch(k)
+		n += hi - lo
+	}
+	return n
+}
+
+// FitsStep is whether Step would answer these requests as one pass -- with
+// the stream's next step when withStream -- with the prefix cache as it is
+// now: rows, attention cells and state slots.
+func (g *GPU) FitsStep(withStream bool, encs []*Encoding) bool {
+	resident := make([]bool, len(encs))
+	for i, enc := range encs {
+		resident[i] = g.cache.peek(enc.IDs[:enc.StateLen]) >= 0
+	}
+	_, ok := g.planStep(withStream, encs, resident)
+	return ok
 }
 
 // passRows is the most rows a pass takes: the arena, or PassRows when a test
@@ -1166,14 +1267,14 @@ func (g *GPU) upload(p *pass) error {
 	g.abuf.WriteFloat32At(int(g.aX), x)
 	g.abuf.WriteUint32At(int(g.aMeta), p.meta)
 	tab := make([]uint32, 0, 4*(len(p.states)+len(p.branches)))
-	for _, sg := range append(append([][3]int(nil), p.states...), p.branches...) {
-		tab = append(tab, uint32(sg[0]), uint32(sg[1]), uint32(sg[2]), 0)
+	for _, sg := range append(append([][4]int(nil), p.states...), p.branches...) {
+		tab = append(tab, uint32(sg[0]), uint32(sg[1]), uint32(sg[2]), uint32(sg[3]))
 	}
 	g.abuf.WriteUint32At(int(g.aSeg), tab)
 	// A state shorter than the conv window leaves tail rows the prep kernel
 	// never writes; they are the zeros before a sequence's start.
 	for _, r := range p.reqs {
-		if r.withState && r.enc.StateLen < 3 {
+		if r.withState && r.done == 0 && r.enc.StateLen < 3 {
 			for i := range g.w {
 				if !g.w[i].attn {
 					g.abuf.ZeroFloat32At(int(g.w[i].tail)+r.slot*g.gdnFloats, 3*8192)
@@ -1295,7 +1396,7 @@ func (g *GPU) layerGraph(i int, p *pass) ([]vk.MultiDispatch, []string) {
 	} else {
 		pc := base
 		pc.InOff, pc.OutOff, pc.WOff, pc.KOff = g.aP, g.aG, lw.conv, lw.gates
-		pc.Aux0, pc.VOff, pc.Dim = uint32(lw.in.n), lw.tail, uint32(g.gdnFloats)
+		pc.Aux0, pc.VOff, pc.Dim, pc.BOff = uint32(lw.in.n), lw.tail, uint32(g.gdnFloats), lw.tail2
 		add("gdnprep", "gdn prep", uint32(n), 1, pc)
 
 		pc = base
@@ -1404,6 +1505,9 @@ func (g *GPU) readRows(p *pass, rows []prow, final bool, into []map[int][]float3
 // The state comes from the prefix cache when it is there, and goes into it
 // when it fits; a request longer than a pass runs as several.
 func (g *GPU) Forward(enc *Encoding) (*Pass, error) {
+	if g.stream != nil {
+		return nil, fmt.Errorf("kev: a stream is running; use Step")
+	}
 	out := &Pass{Hidden: map[int][]float32{}, Batch: 1}
 	key := enc.IDs[:enc.StateLen]
 	resident := false
@@ -1449,58 +1553,195 @@ func (g *GPU) ForwardBatch(encs []*Encoding) ([]*Pass, error) {
 		p, err := g.Forward(encs[0])
 		return []*Pass{p}, err
 	}
+	if g.stream != nil {
+		return nil, fmt.Errorf("kev: a stream is running; use Step")
+	}
+	_, out, ok, err := g.step(false, encs)
+	if err != nil || ok {
+		return out, err
+	}
+	out = make([]*Pass, len(encs))
+	for i, enc := range encs {
+		if out[i], err = g.Forward(enc); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// A stream is a request whose state runs in chunks, one pass each (K9), so
+// that other requests can have passes in between: a 2,300-token text is one
+// 760 ms pass, and a short request that arrives just after it would wait for
+// all of it. The stream holds GDN slot 0 and attention cells [0, its state's
+// length) until it finishes, and every pass leaves them alone. A later chunk
+// continues the scan from the slot's S, reads its conv history from the tail
+// the previous chunk wrote (the two tails alternate, kev_gdn_prep.comp), and
+// attends to the earlier chunks' cells as its request's state. Its chunks
+// are ChunkRows long, a multiple of the attention's key block, so it runs the
+// same kernels on the same key blocks as the whole state would: its answers
+// are the same bits.
+type stream struct {
+	enc    *Encoding
+	chunks []int // state tokens a chunk
+	next   int   // the next chunk
+	done   int   // state tokens resident
+	branch int   // the next question
+	out    *Pass
+}
+
+// chunkPlan cuts a state of ls tokens into chunks of c, the last taking any
+// remainder under a key block with it, so every chunk is at least a block.
+func chunkPlan(ls, c int) []int {
+	var out []int
+	for ls-c >= keyAlign {
+		out = append(out, c)
+		ls -= c
+	}
+	return append(out, ls)
+}
+
+// Chunks is whether BeginStream would run this request's state in chunks:
+// ChunkRows is set, the state is longer than a chunk, and it is not cached.
+func (g *GPU) Chunks(enc *Encoding) bool {
+	return g.ChunkRows > 0 && enc.StateLen > g.ChunkRows+keyAlign && enc.StateLen <= g.cells-2*g.ChunkRows &&
+		g.cache.peek(enc.IDs[:enc.StateLen]) < 0
+}
+
+// BeginStream makes enc the stream; Step then runs it a chunk at a time.
+func (g *GPU) BeginStream(enc *Encoding) error {
+	if g.stream != nil {
+		return fmt.Errorf("kev: a stream is already running")
+	}
+	if !g.Chunks(enc) {
+		return fmt.Errorf("kev: a %d-token state is not one to chunk", enc.StateLen)
+	}
+	g.stream = &stream{enc: enc, chunks: chunkPlan(enc.StateLen, g.ChunkRows), out: &Pass{Hidden: map[int][]float32{}, Batch: 1}}
+	return nil
+}
+
+// Streaming is whether a stream is running.
+func (g *GPU) Streaming() bool { return g.stream != nil }
+
+// StreamRows is the rows the stream's next step takes, 0 without a stream.
+func (g *GPU) StreamRows() int {
+	if g.stream == nil {
+		return 0
+	}
+	p, _ := g.planStep(true, nil, nil)
+	if p == nil {
+		return 0
+	}
+	return len(p.src)
+}
+
+// Step runs one pass: the stream's next step when withStream, and encs, each
+// whole (FitsStep says whether they fit). It returns the stream's Pass when
+// this step finished it, and one Pass for each of encs.
+func (g *GPU) Step(withStream bool, encs []*Encoding) (*Pass, []*Pass, error) {
+	if withStream && g.stream == nil {
+		return nil, nil, fmt.Errorf("kev: no stream is running")
+	}
+	done, out, ok, err := g.step(withStream, encs)
+	if err == nil && !ok {
+		err = fmt.Errorf("kev: %d requests do not fit one pass beside the stream", len(encs))
+	}
+	return done, out, err
+}
+
+// StepProbs is Step plus the pointer head: the stream's probabilities when
+// this step finished it (else nil), and each of encs'.
+func (g *GPU) StepProbs(withStream bool, encs []*Encoding) ([][]float64, [][][]float64, error) {
+	var senc *Encoding
+	if g.stream != nil {
+		senc = g.stream.enc
+	}
+	done, ps, err := g.Step(withStream, encs)
+	if err != nil {
+		return nil, nil, err
+	}
+	if done == nil {
+		return nil, g.headProbs(encs, ps), nil
+	}
+	all := g.headProbs(append([]*Encoding{senc}, encs...), append([]*Pass{done}, ps...))
+	return all[0], all[1:], nil
+}
+
+// AbortStream drops the stream, as a failed step leaves it.
+func (g *GPU) AbortStream() { g.stream = nil }
+
+// step is Step, reporting false (and running nothing) when they do not fit.
+func (g *GPU) step(withStream bool, encs []*Encoding) (*Pass, []*Pass, bool, error) {
 	resident := make([]bool, len(encs))
 	slot := make([]int, len(encs))
 	for i, enc := range encs {
 		slot[i] = g.cache.peek(enc.IDs[:enc.StateLen])
 		resident[i] = slot[i] >= 0
 	}
-	p, ok := g.planBatch(encs, resident)
+	p, ok := g.planStep(withStream, encs, resident)
 	if !ok {
-		out := make([]*Pass, len(encs))
-		for i, enc := range encs {
-			var err error
-			if out[i], err = g.Forward(enc); err != nil {
-				return nil, err
-			}
-		}
-		return out, nil
+		return nil, nil, false, nil
 	}
+	off := len(p.reqs) - len(encs) // 1 when the stream is in the pass
 	var total time.Duration
-	for i, r := range p.reqs {
+	for i := range encs {
+		r := p.reqs[off+i]
 		g.cache.count(resident[i])
 		if resident[i] {
 			dur, err := g.cache.restore(g, slot[i], r.slot, r.sLo, r.enc.StateLen)
 			if err != nil {
-				return nil, err
+				return nil, nil, false, err
 			}
 			total += dur
 		}
 	}
 	dur, err := g.run(p, len(g.w))
 	if err != nil {
-		return nil, err
+		return nil, nil, false, err
 	}
 	total += dur
-	hidden := make([]map[int][]float32, len(encs))
+	hidden := make([]map[int][]float32, len(p.reqs))
 	for i := range hidden {
 		hidden[i] = map[int][]float32{}
 	}
+	if off == 1 {
+		hidden[0] = g.stream.out.Hidden
+	}
 	g.readRows(p, p.readouts, true, hidden)
-	for _, r := range p.reqs {
+	for _, r := range p.reqs[off:] {
 		if r.withState && g.cache.fits(r.enc.StateLen) {
 			dur, err := g.cache.save(g, r.enc.IDs[:r.enc.StateLen], r.slot, r.sLo)
 			if err != nil {
-				return nil, err
+				return nil, nil, false, err
 			}
 			total += dur
 		}
 	}
+	var finished *Pass
+	if off == 1 {
+		s := g.stream
+		if r := p.reqs[0]; r.withState {
+			s.done += r.chunk
+			s.next++
+		}
+		s.branch += p.streamBranches
+		s.out.Passes++
+		if s.next == len(s.chunks) && s.branch == len(s.enc.Decide) {
+			if g.cache.fits(s.enc.StateLen) {
+				dur, err := g.cache.save(g, s.enc.IDs[:s.enc.StateLen], 0, 0)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				total += dur
+			}
+			finished, g.stream = s.out, nil
+		}
+		s.out.GPU += total
+	}
 	out := make([]*Pass, len(encs))
 	for i := range encs {
-		out[i] = &Pass{Hidden: hidden[i], GPU: total, Passes: 1, CacheHit: resident[i], Batch: len(encs)}
+		out[i] = &Pass{Hidden: hidden[off+i], GPU: total, Passes: 1, CacheHit: resident[i], Batch: len(p.reqs)}
 	}
-	return out, nil
+	return finished, out, true, nil
 }
 
 // ForwardRows runs the first `layers` layers of a request that fits one pass,
@@ -1508,7 +1749,7 @@ func (g *GPU) ForwardBatch(encs []*Encoding) ([]*Pass, error) {
 // final-normed only when every layer ran. It is the stagewise seam the K4
 // gate uses.
 func (g *GPU) ForwardRows(enc *Encoding, rows []int, layers int) (*Pass, error) {
-	p := &pass{reqs: []*preq{{enc: enc, withState: true}}}
+	p := &pass{reqs: []*preq{{enc: enc, withState: true, chunk: enc.StateLen}}}
 	p.addState(0)
 	for k := range enc.Decide {
 		lo, hi := enc.Branch(k)
@@ -1546,15 +1787,27 @@ func (g *GPU) finalNorm(x []float32) []float32 {
 	return out
 }
 
-// headProbs runs the pointer head over one request's readouts.
-func (g *GPU) headProbs(enc *Encoding, p *Pass) [][]float64 {
-	out := make([][]float64, len(enc.Decide))
-	for k, d := range enc.Decide {
-		opts := make([][]float32, len(enc.Opts[k]))
-		for j, o := range enc.Opts[k] {
-			opts[j] = p.Hidden[o]
+// headProbs runs the pointer head over requests' readouts, every question of
+// every request in one parallel call.
+func (g *GPU) headProbs(encs []*Encoding, ps []*Pass) [][][]float64 {
+	var qs []HeadQuestion
+	for i, enc := range encs {
+		for k, d := range enc.Decide {
+			q := HeadQuestion{Decide: ps[i].Hidden[d], Opts: make([][]float32, len(enc.Opts[k]))}
+			for j, o := range enc.Opts[k] {
+				q.Opts[j] = ps[i].Hidden[o]
+			}
+			qs = append(qs, q)
 		}
-		out[k] = Softmax(g.Head.Logits(p.Hidden[d], opts, g.Head.Temperature))
+	}
+	z := g.Head.LogitsMany(qs, g.Head.Temperature)
+	out := make([][][]float64, len(encs))
+	for i, enc := range encs {
+		out[i] = make([][]float64, len(enc.Decide))
+		for k := range enc.Decide {
+			out[i][k] = Softmax(z[0])
+			z = z[1:]
+		}
 	}
 	return out
 }
@@ -1566,7 +1819,7 @@ func (g *GPU) Probs(enc *Encoding) ([][]float64, *Pass, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return g.headProbs(enc, p), p, nil
+	return g.headProbs([]*Encoding{enc}, []*Pass{p})[0], p, nil
 }
 
 // ProbsBatch is Probs for several requests, in one pass when they fit.
@@ -1575,11 +1828,7 @@ func (g *GPU) ProbsBatch(encs []*Encoding) ([][][]float64, []*Pass, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	out := make([][][]float64, len(encs))
-	for i, enc := range encs {
-		out[i] = g.headProbs(enc, ps[i])
-	}
-	return out, ps, nil
+	return g.headProbs(encs, ps), ps, nil
 }
 
 // Profile runs a request that fits one pass one dispatch at a time, without

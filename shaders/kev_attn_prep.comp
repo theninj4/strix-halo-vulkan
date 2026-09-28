@@ -139,7 +139,7 @@ void main() {
     // The first branch row of its request (a request's branches are
     // contiguous and its state rows, when present, are not its neighbours).
     bool first = r == seg && (r == 0u || floatBitsToUint(act[pc.aux1 + (r - 1u) * 8u + 6u]) != slot);
-    if (branch != 0u && resident && first && sHi > floatBitsToUint(act[pc.aux1 + r * 8u + 4u])) {
+    if ((branch & 1u) != 0u && resident && first && sHi > floatBitsToUint(act[pc.aux1 + r * 8u + 4u])) {
         for (uint i = sHi * NKV * HD + t; i < ((sHi + 63u) & ~63u) * NKV * HD; i += 256u) {
             hact[pc.vOff + i] = float16_t(0.0);
         }

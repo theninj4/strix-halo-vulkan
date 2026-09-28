@@ -31,7 +31,8 @@
 //
 //	inOff   kev_gdn_prep's planes (q, k, v, g, beta), stride span rows
 //	outOff  o [rows][4096]
-//	aux1    segment table, 4 uints a segment: first row, length, state slot, _
+//	aux1    segment table, 4 uints a segment: first row, length, state slot,
+//	        and bit 0 of the fourth: start from S (a state's later chunk, K9)
 //	dim     the stride between state slots (K7.5)
 //	aux0    first segment this dispatch runs (the grid's y is added to it)
 //	kOff    S for this layer, [32][128][128] as [head][k][v] (act arena)
@@ -69,6 +70,8 @@ void main() {
     uint first = floatBitsToUint(act[pc.aux1 + seg * 4u]);
     uint len = floatBitsToUint(act[pc.aux1 + seg * 4u + 1u]);
     uint slot = floatBitsToUint(act[pc.aux1 + seg * 4u + 2u]); // the request's state slot (K7.5)
+    // A later chunk of a state (K9) continues from its slot's S.
+    bool fromS = (pc.aux2 & 1u) != 0u || (floatBitsToUint(act[pc.aux1 + seg * 4u + 3u]) & 1u) != 0u;
 
     uint S = pc.span;
     uint qIn = pc.inOff, kIn = qIn + S * QK, vIn = kIn + S * QK;
@@ -78,7 +81,7 @@ void main() {
 
     // This lane's rows of the column: i = r * LPC + lane.
     float s[RPL];
-    if ((pc.aux2 & 1u) != 0u) {
+    if (fromS) {
         [[unroll]] for (uint r = 0u; r < RPL; r++) {
             s[r] = act[st + (r * LPC + lane) * DK];
         }

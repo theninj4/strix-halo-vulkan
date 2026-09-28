@@ -27,6 +27,16 @@
 // a later pass of branches alone can read them. A state shorter than three
 // tokens leaves the leading rows as the host zeroed them.
 //
+// **A state can run in chunks (K9).** A chunk after the first continues its
+// request's state: its rows carry the earlier chunks' cells as [sLo, sHi),
+// and its history across its start is the tail the previous chunk wrote. It
+// writes its own tail too, and in one dispatch a workgroup reading the tail
+// and another writing it would race, so chunks alternate between the tail at
+// vOff and a second one at bOff: a row whose kind has bit 1 set writes the
+// second and reads vOff's, and one without writes vOff's and reads the
+// second. The host makes a request's last chunk write vOff's, which is the
+// one branches and the prefix cache read.
+//
 // **Layout.** Consecutive threads take consecutive channels (a channel every
 // 256), so a wave's loads and stores are coalesced; the conv goes through
 // LDS, and the l2-norms are eight threads a head and a clustered sum. K7.6
@@ -41,7 +51,8 @@
 //	wOff    conv taps [8192][4] (fp32 arena)      kOff  -exp(A_log) [32], then dt_bias [32] (fp32 arena)
 //	aux1    token metadata, 4 uints a row: pos, seg, segment start row, unused
 //	aux2    stateHi: the state's rows are [0, aux2) of this pass
-//	vOff    the conv tail [3][8192], oldest first: read when aux2 == 0, written when it is not
+//	vOff    the conv tail [3][8192], oldest first, one a slot at stride dim
+//	bOff    the second tail (K9's chunks), one a slot at stride 3*8192
 //	tokens  rows in this pass          span  the plane stride (arena rows)
 
 #version 450
@@ -68,8 +79,8 @@ float softplus(float x) { return x > 20.0 ? x : log(1.0 + exp(x)); }
 
 // row of P holding the input `back` tokens before token r (back >= 1), or -1
 // for a zero, or -2 - i for row i of the cached tail.
-// Token metadata (K7.5), 8 words a row: pos, branch (0 a state row, 1 a
-// branch row), segment start row, cache cell, the request's state cells
+// Token metadata (K7.5), 8 words a row: pos, kind (bit 0: a branch row, not
+// a state row; bit 1: a state chunk writing the second tail, K9), segment start row, cache cell, the request's state cells
 // [sLo, sHi), its state slot, and its state's end row in this pass + 0 (0 when
 // the state is not in the pass; a state row's is its own).
 uint meta(uint r, uint w) { return floatBitsToUint(act[pc.aux1 + r * 8u + w]); }
@@ -80,8 +91,12 @@ int historyRow(uint r, uint back) {
     if (local >= 0) {
         return int(start) + local;
     }
-    if (meta(r, 1u) == 0u) {
-        return -1; // before the state: a fresh sequence
+    if ((meta(r, 1u) & 1u) == 0u) {
+        if (meta(r, 5u) <= meta(r, 4u)) {
+            return -1; // before the state: a fresh sequence
+        }
+        // A later chunk of a state (K9): the previous chunk's tail.
+        return local >= -3 ? -2 - (3 + local) : -1;
     }
     // Continue into this request's state, counting back from its end: its
     // rows in this pass, or its slot's saved tail.
@@ -102,12 +117,17 @@ void main() {
     uint rs = pc.aux0;
     int h1 = historyRow(r, 1u), h2 = historyRow(r, 2u), h3 = historyRow(r, 3u);
 
-    uint tail = pc.vOff + meta(r, 6u) * pc.dim; // this request's slot: dim is the slot stride
+    uint slot = meta(r, 6u);
+    uint kind = meta(r, 1u);
+    uint tail = pc.vOff + slot * pc.dim;     // this request's slot: dim is the slot stride
+    uint tail2 = pc.bOff + slot * 3u * CH;   // the second tail (K9)
+    uint tailIn = (kind & 3u) == 0u ? tail2 : tail;  // a state chunk reads the tail it does not write
+    uint tailOut = (kind & 2u) != 0u ? tail2 : tail;
     uint end = meta(r, 7u);
-    if (meta(r, 1u) == 0u && r + 3u >= end) {
+    if ((kind & 1u) == 0u && r + 3u >= end) {
         uint row = r + 3u - end;
         for (uint c = t; c < CH; c += WG) {
-            act[tail + row * CH + c] = act[pc.inOff + r * rs + c];
+            act[tailOut + row * CH + c] = act[pc.inOff + r * rs + c];
         }
     }
 
@@ -121,7 +141,7 @@ void main() {
             if (h >= 0) {
                 x = act[pc.inOff + uint(h) * rs + c];
             } else if (h <= -2) {
-                x = act[tail + uint(-2 - h) * CH + c];
+                x = act[tailIn + uint(-2 - h) * CH + c];
             }
             s += x * wbuf[pc.wOff + c * 4u + 2u - j];
         }

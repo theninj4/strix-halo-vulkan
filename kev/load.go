@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"strix-halo-vulkan/safetensors"
 )
@@ -141,24 +142,81 @@ func LoadHead(dir string) (*Head, error) {
 // all already final-normed. Divided by the temperature; T = 1 is the raw
 // head. Computed in float64 from Kev's fp32 weights.
 func (h *Head) Logits(decide []float32, opts [][]float32, temperature float64) []float64 {
-	q := h.project(h.QW, h.QB, decide)
-	scale := 1 / math.Sqrt(float64(h.Dim)) / temperature
-	z := make([]float64, len(opts))
-	for i, o := range opts {
-		k := h.project(h.KW, h.KB, o)
-		var s float64
-		for j := range k {
-			s += k[j] * q[j]
-		}
-		z[i] = s * scale
-	}
-	return z
+	return h.LogitsMany([]HeadQuestion{{Decide: decide, Opts: opts}}, temperature)[0]
 }
 
-func (h *Head) project(w, b, x []float32) []float64 {
-	out := make([]float64, h.Dim)
+// HeadQuestion is one question's readout rows, final-normed.
+type HeadQuestion struct {
+	Decide []float32
+	Opts   [][]float32
+}
+
+// LogitsMany is Logits for many questions -- a whole pass's, across its
+// requests -- with every row's projection spread over the cores (K9). A
+// projection is 655k multiply-adds in float64, ~0.3 ms on one core, and a
+// short request has a dozen of them, so on one core the head was 4 ms of a
+// 50 ms request. Each output is still one sum in index order, so the bits
+// are those of the serial loop.
+func (h *Head) LogitsMany(qs []HeadQuestion, temperature float64) [][]float64 {
+	type job struct {
+		w, b, x []float32
+		out     []float64
+	}
+	var jobs []job
+	qp := make([][]float64, len(qs))
+	kp := make([][][]float64, len(qs))
+	for i, q := range qs {
+		qp[i] = make([]float64, h.Dim)
+		jobs = append(jobs, job{h.QW, h.QB, q.Decide, qp[i]})
+		kp[i] = make([][]float64, len(q.Opts))
+		for j, o := range q.Opts {
+			kp[i][j] = make([]float64, h.Dim)
+			jobs = append(jobs, job{h.KW, h.KB, o, kp[i][j]})
+		}
+	}
+	// A task is one row's projection over a block of outputs.
+	const block = 32
+	blocks := (h.Dim + block - 1) / block
+	tasks := len(jobs) * blocks
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range min(runtime.GOMAXPROCS(0), tasks) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				t := int(next.Add(1)) - 1
+				if t >= tasks {
+					return
+				}
+				j := jobs[t/blocks]
+				lo := t % blocks * block
+				projectRange(j.w, j.b, j.x, j.out, lo, min(lo+block, h.Dim))
+			}
+		}()
+	}
+	wg.Wait()
+
+	scale := 1 / math.Sqrt(float64(h.Dim)) / temperature
+	out := make([][]float64, len(qs))
+	for i := range qs {
+		q := qp[i]
+		out[i] = make([]float64, len(kp[i]))
+		for o, k := range kp[i] {
+			var s float64
+			for j := range k {
+				s += k[j] * q[j]
+			}
+			out[i][o] = s * scale
+		}
+	}
+	return out
+}
+
+// projectRange writes outputs [lo, hi) of w·x + b.
+func projectRange(w, b, x []float32, out []float64, lo, hi int) {
 	d := len(x)
-	for i := range out {
+	for i := lo; i < hi; i++ {
 		s := float64(b[i])
 		row := w[i*d : (i+1)*d]
 		for j, v := range x {
@@ -166,7 +224,6 @@ func (h *Head) project(w, b, x []float32) []float64 {
 		}
 		out[i] = s
 	}
-	return out
 }
 
 // Softmax of logits, in float64.
