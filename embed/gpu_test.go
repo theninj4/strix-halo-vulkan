@@ -1,7 +1,9 @@
 package embed
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,5 +273,291 @@ func TestGPULadder(t *testing.T) {
 		t.Logf("%2d layers  %-10s max abs %9.3g  rms %9.4g  rel %.2g  err/rms %.2g  worst row cos %.6f",
 			c.layers, c.ref, maxAbs, rms, rel, relRMS, worstCos)
 		enc.Destroy()
+	}
+}
+
+// batchTexts is a set of inputs whose lengths cover the cases RunBatch lays
+// out differently: one token short of a key block, exactly one, one over,
+// several blocks, and the model card's four.
+func batchTexts(t *testing.T, g *GPU, m *manifest) [][]int32 {
+	t.Helper()
+	var seqs [][]int32
+	for _, text := range m.Texts {
+		ids, err := g.Tok.Encode(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, ids)
+	}
+	words := "the quick brown fox jumps over a lazy dog while seven engineers argue about memory bandwidth "
+	for _, n := range []int{63, 64, 65, 1, 150, 17} {
+		ids, err := g.Tok.Encode(strings.Repeat(words, 20))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Keep the appended end-of-text token last, as EncodeLimit does.
+		s := append(append([]int32{}, ids[:n-1]...), ids[len(ids)-1])
+		seqs = append(seqs, s)
+	}
+	return seqs
+}
+
+// TestGPUBatchMatchesSingle is E7's gate: a text's vector out of a batch is
+// the vector it gets alone, **bit for bit**, under one plan. That is the
+// strongest statement available and the right one -- rows never meet in a
+// projection, and a text's attention region is laid out as its own run lays
+// it out -- so any difference at all is a leak between texts or a layout
+// bug, not rounding. Then again under AutoPlan, where the batch runs a
+// wider GEMM rung than a lone text and only the direction can be held.
+func TestGPUBatchMatchesSingle(t *testing.T) {
+	m := loadManifest(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g := newGPU(t, dev, 1024)
+	defer g.Destroy()
+	seqs := batchTexts(t, g, m)
+
+	single := func() [][]float32 {
+		out := make([][]float32, len(seqs))
+		for i, s := range seqs {
+			v, err := g.EmbedIDs(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[i] = v
+		}
+		return out
+	}
+
+	for _, k := range []qwen.GEMMKernel{qwen.GEMMReg16x64K8, qwen.GEMMReg64} {
+		g.AutoPlan = false
+		if err := g.Enc.SetPlan(qwen.UniformGEMMPlan(k)); err != nil {
+			t.Fatal(err)
+		}
+		want := single()
+		// Forwards, then reversed, so every text has different neighbours
+		// and a different place in the planes.
+		for pass, order := range [][]int{identity(len(seqs)), reversed(len(seqs))} {
+			batch := make([][]int32, len(order))
+			for i, j := range order {
+				batch[i] = seqs[j]
+			}
+			got, err := g.EmbedBatch(batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, j := range order {
+				for e := range got[i] {
+					if got[i][e] != want[j][e] {
+						t.Errorf("%s pass %d: text %d (%d tokens) differs from its lone run at element %d: %g vs %g",
+							k, pass, j, len(seqs[j]), e, got[i][e], want[j][e])
+						break
+					}
+				}
+			}
+		}
+	}
+
+	g.AutoPlan = true
+	want := single()
+	got, err := g.EmbedBatch(seqs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worst := 1.0
+	for i := range seqs {
+		worst = min(worst, float64(Cosine(got[i], want[i])))
+	}
+	if 1-worst > 1e-5 {
+		t.Errorf("auto plan: worst cosine between batched and lone vectors is %.7f", worst)
+	}
+	t.Logf("auto plan: worst cosine batched vs lone %.8f over %d texts", worst, len(seqs))
+
+	// And the card's matrix out of one batch of its four texts.
+	card, err := g.EmbedBatch(seqs[:4])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		for j := 0; j < 2; j++ {
+			got := float64(Cosine(card[i], card[2+j]))
+			if want := m.CardScores[i][j]; math.Abs(got-want) > 2e-3 {
+				t.Errorf("batched score[%d][%d] is %.6f, want %.6f (the model card's)", i, j, got, want)
+			}
+		}
+	}
+}
+
+// TestGPUBatchLeakIsCaught is the control for the gate above: the same texts
+// run as *one* sequence -- what batching without per-text attention would
+// be -- must come back different, or the bit-for-bit comparison could not
+// see a leak.
+func TestGPUBatchLeakIsCaught(t *testing.T) {
+	m := loadManifest(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g := newGPU(t, dev, 1024)
+	defer g.Destroy()
+	seqs := batchTexts(t, g, m)[:4]
+	lone, err := g.EmbedIDs(seqs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaked, err := g.EmbedIDs(append(append([]int32{}, seqs[0]...), seqs[1]...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cos := float64(Cosine(lone, leaked))
+	if cos > 0.999 {
+		t.Errorf("text 1 after text 0 in one sequence is cosine %.6f to text 1 alone; a leak would not be seen", cos)
+	}
+	t.Logf("text 1 with text 0 visible: cosine %.4f to its lone vector", cos)
+}
+
+// TestGPUBatchThroughput is the E7 number: short texts one at a time against
+// the same texts as batches.
+func TestGPUBatchThroughput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("loads the model onto the device")
+	}
+	m := loadManifest(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g := newGPU(t, dev, 4096)
+	defer g.Destroy()
+	g.Enc.PerSubmit = 1 << 10
+
+	words := strings.Fields("the quick brown fox jumps over a lazy dog while seven engineers argue about memory bandwidth and caches")
+	for _, size := range []int{12, 40, 120} {
+		for _, b := range []int{1, 8, 32, 64} {
+			seqs := make([][]int32, b)
+			for i := range seqs {
+				text := ""
+				for w := 0; len(text) < size*5; w++ {
+					text += words[(w*7+i*3)%len(words)] + " "
+				}
+				ids, err := g.Tok.Encode(text + m.Texts[i%len(m.Texts)][:8])
+				if err != nil {
+					t.Fatal(err)
+				}
+				seqs[i] = ids
+			}
+			lens := make([]int, b)
+			rows := 0
+			for i := range seqs {
+				lens[i] = len(seqs[i])
+				rows += lens[i]
+			}
+			if !g.Fits(lens) {
+				continue
+			}
+			best := func(f func()) time.Duration {
+				f()
+				d := time.Duration(math.MaxInt64)
+				for r := 0; r < 3; r++ {
+					start := time.Now()
+					f()
+					d = min(d, time.Since(start))
+				}
+				return d
+			}
+			alone := best(func() {
+				for _, s := range seqs {
+					if _, err := g.EmbedIDs(s); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+			batched := best(func() {
+				if _, err := g.EmbedBatch(seqs); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Logf("%3d texts x ~%3d tokens (%5d rows): alone %8v (%6.2f ms/text)  batched %8v (%6.2f ms/text)  %5.2fx",
+				b, rows/b, rows, alone.Round(10*time.Microsecond), ms(alone)/float64(b),
+				batched.Round(10*time.Microsecond), ms(batched)/float64(b), float64(alone)/float64(batched))
+		}
+	}
+}
+
+func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+
+func identity(n int) []int {
+	o := make([]int, n)
+	for i := range o {
+		o[i] = i
+	}
+	return o
+}
+
+func reversed(n int) []int {
+	o := make([]int, n)
+	for i := range o {
+		o[i] = n - 1 - i
+	}
+	return o
+}
+
+// TestGPUBatchLadder prices every GEMM rung at batch sizes past the 602
+// tokens embed.PlanFor was fitted to, and the command-buffer size at one
+// text, which is what a lone query's latency is made of.
+func TestGPUBatchLadder(t *testing.T) {
+	if testing.Short() {
+		t.Skip("loads the model onto the device")
+	}
+	m := loadManifest(t)
+	dev, done := newTestDevice(t)
+	defer done()
+	g := newGPU(t, dev, 4096)
+	defer g.Destroy()
+	best := func(f func()) time.Duration {
+		f()
+		d := time.Duration(math.MaxInt64)
+		for r := 0; r < 5; r++ {
+			start := time.Now()
+			f()
+			d = min(d, time.Since(start))
+		}
+		return d
+	}
+	ids, err := g.Tok.Encode(m.Texts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, every := range []int{8, 16, 32, 1 << 10} {
+		g.Enc.PerSubmit = every
+		d := best(func() {
+			if _, err := g.EmbedIDs(ids); err != nil {
+				t.Fatal(err)
+			}
+		})
+		t.Logf("one text, %d tokens, %4d dispatches a submit: %v", len(ids), every, d.Round(10*time.Microsecond))
+	}
+	g.Enc.PerSubmit = 1 << 10
+
+	seqs := batchTexts(t, g, m)
+	g.AutoPlan = false
+	for _, reps := range []int{1, 2, 4} {
+		var batch [][]int32
+		rows := 0
+		for r := 0; r < reps; r++ {
+			for _, s := range seqs {
+				batch = append(batch, s)
+				rows += len(s)
+			}
+		}
+		line := ""
+		for _, k := range qwen.GEMMKernels() {
+			if err := g.Enc.SetPlan(qwen.UniformGEMMPlan(k)); err != nil {
+				t.Fatal(err)
+			}
+			d := best(func() {
+				if _, err := g.EmbedBatch(batch); err != nil {
+					t.Fatal(err)
+				}
+			})
+			line += fmt.Sprintf("  %s %.2f", k, ms(d))
+		}
+		t.Logf("%4d rows, %3d texts:%s", rows, len(batch), line)
 	}
 }

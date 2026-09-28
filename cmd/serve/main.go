@@ -179,6 +179,7 @@ func main() {
 	embedOn := flag.Bool("embed", false, "load Qwen3-Embedding-0.6B and serve /v1/embeddings")
 	embedModel := flag.String("embed-model", "models/Qwen3-Embedding-0.6B", "embedding checkpoint directory")
 	embedTokens := flag.Int("embed-tokens", 512, "longest input the embedding arenas hold; longer inputs are truncated")
+	embedBatch := flag.Int("embed-batch-tokens", 1024, "most rows one embedding pass runs, across inputs and requests")
 
 	kevOn := flag.Bool("kev", false, "load Kev-4B and serve POST /v1/systemone (TypeSafe's System One, CLASSIFICATION.md)")
 	kevModel := flag.String("kev-model", "models/kev-4b", "Kev checkpoint directory: adapter, converted head, tokenizer")
@@ -370,7 +371,7 @@ func main() {
 	if *embedOn {
 		start := time.Now()
 		b, err := backend.NewEmbed(backend.EmbedOptions{
-			Model: *embedModel, Device: dev, MaxTokens: *embedTokens,
+			Model: *embedModel, Device: dev, MaxTokens: *embedTokens, BatchTokens: *embedBatch,
 		})
 		if err != nil {
 			log.Fatal(err)

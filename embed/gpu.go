@@ -95,6 +95,12 @@ func NewGPU(dev *vk.Device, dir string, maxTokens int) (*GPU, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A layer a command buffer rather than qwen's eight dispatches: a submit
+	// and its fence are ~40 us, a lone text makes 84 of them at eight, and
+	// this is 11.9 -> 9.6 ms for a 27-token query (TestGPUBatchLadder). A
+	// layer of this model is ~4 ms of GPU at 2048 rows, well inside the
+	// watchdog that eight was chosen for on the 4B.
+	enc.PerSubmit = 1 << 10
 	return &GPU{Cfg: cfg, Enc: enc, Tok: tok, norm: norm, AutoPlan: true}, nil
 }
 
@@ -120,6 +126,34 @@ func (g *GPU) EmbedIDs(ids []int32) ([]float32, error) {
 	row := g.Enc.ReadRow(g.Enc.TensorX(), len(ids)-1, g.Cfg.HiddenSize)
 	return Normalize(g.normRow(row)), nil
 }
+
+// EmbedBatch runs several texts in one pass (E7) and returns their unit
+// vectors in order. The projections read the weights once for all of them and
+// attention runs per text (qwen.GPUEncoder.RunBatch), so a vector is what
+// EmbedIDs returns for the same text under the same plan. Fits says whether a
+// set of lengths goes in one call.
+func (g *GPU) EmbedBatch(seqs [][]int32) ([][]float32, error) {
+	rows := 0
+	for _, s := range seqs {
+		rows += len(s)
+	}
+	if err := g.plan(rows); err != nil {
+		return nil, err
+	}
+	offs, err := g.Enc.RunBatch(seqs)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]float32, len(seqs))
+	for i, s := range seqs {
+		row := g.Enc.ReadRow(g.Enc.TensorX(), offs[i]+len(s)-1, g.Cfg.HiddenSize)
+		out[i] = Normalize(g.normRow(row))
+	}
+	return out, nil
+}
+
+// Fits reports whether texts of these token counts fit one EmbedBatch.
+func (g *GPU) Fits(lens []int) bool { return g.Enc.BatchFits(lens) }
 
 // Embed is the whole thing: text to a unit vector.
 func (g *GPU) Embed(text string) ([]float32, error) {

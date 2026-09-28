@@ -38,7 +38,7 @@ here is our own ceiling, not a reference implementation.
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt |
 | music | ACE-Step 1.5 XL turbo + 5 Hz LM 4B | a **60 s song with thinking in 14.4 s** (the int8 LM at the bus, ~80% of it), 4 min DiT-only in 9.6 s; a **30 s cover or repaint in ~2 s**; latents **2.8–39× closer to fp32 than upstream's own bf16** across text2music, cover and repaint; served as `/v1/music` jobs, ~18 GB resident in the swap slot | **closed 2026-09-27** (A0–A12); listening to the A10/A11 songs; not in `ai.service` |
-| embeddings | Qwen3-Embedding-0.6B | a text in **11.5 ms**, the card's similarity matrix to 1.3e-4 over HTTP | E7 batching, worth up to 10x on short texts |
+| embeddings | Qwen3-Embedding-0.6B | a text in **10.4 ms** served (9.6 on the device), the card's similarity matrix to 1.3e-4 over HTTP; **E7 batching: 32 short texts in 46 ms (8.3x), 128 of ~36 tokens in 305 ms (5.0x)**, bit-exact against a lone run, requests share passes | not deployed yet (`ai.service` restart); latency levers: fused qkv / gate+up, split-K on o/down, an int8 bank on the small-M kernels |
 | classification | Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) | TypeSafe's `/v1/systemone` via `-kev`, **within 4e-4 of Kev's fp32 probabilities**, questions isolated bit-exactly, the TypeSafe SDK unchanged; the README ticket in **52 ms** on an int8 bank (K7.1, K7.6); **Kev's published accuracy reproduced (K8): fp16 on every suite within a question of the card, fp16 agrees with Kev's fp32 except on exact ties, int8 −0.19 pp**; a repeated text from the prefix cache, bit-identically (K7.2), attention on the matrix cores (K7.3): the GDN scan in the LLM's l8 shape (K7.4), SwiGLU fused into the gate+up GEMM and a GEMM rung per projection (K7.6): a 2,269-token text 761 ms new, 87 ms again ; concurrent requests share passes (K7.5, ~29 req/s against 19.5) | live plan in root [`CLASSIFICATION.md`](CLASSIFICATION.md) (K-stages): bit-exact across batches, chunks and cache hits (K7.7: the WMMA residue was stale V padding); deployed in `ai.service` (2026-09-25); open: int8's −0.19 pp, int8 GEMM speed |
 
 **Vision (2026-09-24): the text vertical reads images.** `-llm-mmproj`
@@ -724,18 +724,67 @@ image and video. Code: `ace/` (`plan`, `dit`, `vae`, `lm`, `pipeline`),
 
 ## Embeddings (archive: [`research/embedding-vertical.md`](research/embedding-vertical.md))
 
-**Where it stands.** E0–E8 done except E7. Same `zimage/qwen` transformer,
-third caller; 500 lines of package. A ≤32-token text costs what the weights
-cost (11.5 ms, 32% of the bus); cosine 0.999999+ against fp32. Served with
-MRL `dimensions` and the non-OpenAI `instruct` field.
+**Where it stands.** E0–E8 and E7 done. Same `zimage/qwen` transformer,
+third caller. Cosine 0.999999+ against fp32. Served with MRL `dimensions` and
+the non-OpenAI `instruct` field.
 
-**Open: E7, batching — up to 10x on short texts.** The projections already
-take M; the blocker is attention (two texts in one causal stream need a
-block-diagonal mask). Measure the cheap shape first: **attention per
-segment, projections batched** — attention is 1.5% of the graph and the
-push block already carries per-text offsets, so no shader changes. The
-segmented-mask kernel is the fallback. Quantisation stays unplanned until
-a batch makes the weights the limit again.
+**E7, batching (done 2026-09-28).** The shape the archive proposed:
+projections batched, attention per text, with no shader changes.
+- **`qwen.GPUEncoder.RunBatch`.** The texts sit back to back in the
+  residual stream with no gap rows, so the GEMMs pay nothing for the
+  batching. Each text gets its own key-block (64-row) aligned region of the
+  packed q/k/v planes, written by a per-text pack that zero-fills its tail.
+  Attention is one dispatch per text. Positions restart per text.
+- **Bit-exact.** Because of that layout, a text's vector out of a batch is
+  **bit-identical** to its lone run under the same plan
+  (`TestGPUBatchMatchesSingle`: 10 lengths including 63/64/65, both orders,
+  two plans). A control that lets text 1 see text 0 moves it to cosine 0.896.
+- **Measured on the device** (`TestGPUBatchThroughput`, ms a text):
+
+  | tokens a text | alone | 8 texts | 32 | 64 |
+  |---|---|---|---|---|
+  | ~14 | 9.6 | 1.76 | **1.14** | 1.12 |
+  | ~38 | 9.8 | 2.80 | 2.24 | 2.28 |
+  | ~108 | 11.4 | 5.57 | 5.89 | – |
+
+- **Compute-bound past ~450 rows**, at 0.056 ms a row: 15.6 TFLOP/s, 28% of
+  peak. `reg64` stays the best rung up to 1,796 rows
+  (`TestGPUBatchLadder`), so `embed.PlanFor` is unchanged.
+- **Free latency on the side.** `PerSubmit`: a layer per command buffer
+  instead of qwen's 8 dispatches takes a lone 27-token text from
+  **11.9 → 9.6 ms** (the ~40 µs submit+fence, 84 times). Qwen's other
+  callers keep 8.
+- **Serving** (`backend/embed.go`). Inputs are tokenized in the handler and
+  queued. One worker runs passes of at most `-embed-batch-tokens` (1024)
+  rows, taken **round-robin across requests**, with one `Device.Do` a pass.
+  The arenas are 2x the pass, because 64-row plane regions make 32 short
+  queries want 2048 plane rows for 448 stream rows.
+- **Served, private `-embed` server** (production numbers in brackets):
+
+  | | new | production |
+  |---|---|---|
+  | 1 text | 10.4 ms | [12.2] |
+  | 32 short | **46 ms** | [383] |
+  | 32 × 36 tok | 82 ms | [385] |
+  | 128 × 36 tok | **305 ms** | [1535] |
+  | lone query behind a 128-text job | **94 ms** | [1523] |
+
+- **Trap found on the way.** The request path first took the model lock
+  that a pass holds, so a lone query could not even queue until the passes
+  ahead of it had drained, and it came back *with* the job at 300 ms.
+  `TestEmbedQueryOvertakesJob` pins it.
+- **Not deployed.** `ai.service` needs a restart to pick it up.
+
+**Next, for single-query latency** (the GEMMs run at ~70 GB/s against a
+236 GB/s bus; small-M grids underfill at hidden 1024):
+- q/k/v as one projection: k and v cost nearly what q does at half its size.
+- gate+up with SwiGLU fused in: Kev's K7.6 kernel, and its lesson about grid
+  order.
+- split-K on o and down.
+- pricing an int8 bank on the LLM's small-M kernels.
+
+Also unexplained: the Sep 27 production requests ran at 47 ms a text, 4x
+the model's own time, probably another vertical holding the device.
 
 ## The server, cross-vertical (docs: [`API.md`](API.md))
 

@@ -312,6 +312,21 @@ type GPUEncoder struct {
 	// pads 24 tokens to 32 rows and not to 128.
 	tokens, arenaRows, rows int
 	align                   int
+	// segs is the batched run in progress (RunBatch), or nil for the one
+	// sequence every other entry point runs. Under it the residual stream
+	// is the sequences' rows back to back with no gaps, and planeRows is
+	// the packed attention planes' length: each sequence gets its own
+	// key-block-aligned region there, so the kernel never reads another
+	// sequence's keys and a sequence's run sees exactly the zero tail a run
+	// of its own would.
+	segs      []segment
+	planeRows int
+
+	// PerSubmit is how many dispatches go into one command buffer; zero is
+	// perSubmit. A submit and its fence wait cost ~40 us, and a batched run
+	// adds four dispatches a layer per sequence, so a caller whose layers are
+	// short enough for the watchdog raises it.
+	PerSubmit int
 	// stagedLayout is how the weights were written; kernelLayout is what
 	// every rung reads. They differ only under the wrongBLayout control,
 	// which is the whole point of it.
@@ -907,9 +922,13 @@ func (g *GPUEncoder) Destroy() {
 // in one buffer can outlive the driver's reset watchdog (stage 2).
 const perSubmit = 8
 
-func submit(d []vk.MultiDispatch) error {
-	for i := 0; i < len(d); i += perSubmit {
-		j := min(i+perSubmit, len(d))
+func (g *GPUEncoder) submit(d []vk.MultiDispatch) error {
+	every := g.PerSubmit
+	if every <= 0 {
+		every = perSubmit
+	}
+	for i := 0; i < len(d); i += every {
+		j := min(i+every, len(d))
 		if _, err := vk.DispatchMultiTimed(d[i:j], 1, 1, true); err != nil {
 			return fmt.Errorf("qwen: dispatch %d-%d: %w", i, j-1, err)
 		}
@@ -956,6 +975,95 @@ func (g *GPUEncoder) RunIDs(ids []int32) error {
 	return g.Run()
 }
 
+// segment is one sequence of a batched run: its rows [row, row+n) of the
+// dense residual stream, and where its region of the packed planes starts.
+type segment struct {
+	row, n int
+	packed int // in rows of a plane; a multiple of the key block
+}
+
+// span is the rows of plane the sequence owns: its length rounded up to the
+// key block, which is every row the attention kernel reads for it.
+func (s segment) span(keyBlock int) int { return roundUp(s.n, keyBlock) }
+
+// tileOff is the region's offset in halves inside every head's plane.
+func (s segment) tileOff() uint32 {
+	return uint32(s.packed / coopMatTile * (headDim / coopMatTile) * coopMatTile * coopMatTile)
+}
+
+// BatchFits reports whether sequences of these lengths fit one RunBatch:
+// their rows together within Tokens, and their key-block-aligned regions
+// within the planes.
+func (g *GPUEncoder) BatchFits(lens []int) bool {
+	rows, packed := 0, 0
+	for _, n := range lens {
+		if n <= 0 {
+			return false
+		}
+		rows += n
+		packed += roundUp(n, g.attn.keyBlock())
+	}
+	return len(lens) > 0 && rows <= g.tokens && packed <= g.arenaRows
+}
+
+// RunBatch runs several independent sequences in one pass: every projection
+// sees all of their rows at once, which is one read of the weights for the
+// lot, and attention runs once per sequence over its own keys, so no
+// sequence sees another. The rows sit back to back in the residual stream
+// -- sequence i's last row is at Offsets()[i]+len(seqs[i])-1 -- and each
+// sequence's positions start at zero.
+//
+// It is what an embedding model wants, where the texts in a request are
+// independent and a short one reads 0.9 GB of weights to do 32 rows of
+// arithmetic. The result for a sequence is its own run's, bit for bit, under
+// the same plan: rows do not meet in a projection, and its attention reads a
+// region laid out as its own run would lay it out.
+func (g *GPUEncoder) RunBatch(seqs [][]int32) ([]int, error) {
+	lens := make([]int, len(seqs))
+	var ids []int32
+	for i, s := range seqs {
+		lens[i] = len(s)
+		ids = append(ids, s...)
+	}
+	if !g.BatchFits(lens) {
+		return nil, fmt.Errorf("qwen: a batch of %d sequences, %d rows, does not fit an encoder built for %d",
+			len(seqs), len(ids), g.tokens)
+	}
+	x, err := g.Embeddings(ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.UploadEmbeds(x); err != nil {
+		return nil, err
+	}
+
+	half := g.cfg.HeadDim / 2
+	longest := 0
+	for _, n := range lens {
+		longest = max(longest, n)
+	}
+	one := NewRoPE(g.cfg.HeadDim, longest, g.cfg.RopeTheta)
+	rope := &RoPE{HeadDim: g.cfg.HeadDim, Cos: make([]float32, 0, len(ids)*half), Sin: make([]float32, 0, len(ids)*half)}
+	segs := make([]segment, len(seqs))
+	offs := make([]int, len(seqs))
+	row, packed := 0, 0
+	for i, n := range lens {
+		segs[i] = segment{row: row, n: n, packed: packed}
+		offs[i] = row
+		rope.Cos = append(rope.Cos, one.Cos[:n*half]...)
+		rope.Sin = append(rope.Sin, one.Sin[:n*half]...)
+		row += n
+		packed += segs[i].span(g.attn.keyBlock())
+	}
+	if err := g.SetRoPE(rope); err != nil {
+		return nil, err
+	}
+	// After UploadEmbeds, which clears them: it is the entry point every
+	// one-sequence caller goes through.
+	g.segs, g.planeRows = segs, packed
+	return offs, g.Run()
+}
+
 // Run is Forward without the upload or the read-back: it runs every layer
 // over whatever the residual stream already holds.
 func (g *GPUEncoder) Run() error { return g.RunHooked(nil) }
@@ -976,7 +1084,7 @@ func (g *GPUEncoder) RunHooked(after func(layer int) error) error {
 		if err != nil {
 			return err
 		}
-		if err := submit(d); err != nil {
+		if err := g.submit(d); err != nil {
 			return fmt.Errorf("qwen: layer %d: %w", i, err)
 		}
 		if after != nil {
@@ -1031,7 +1139,7 @@ func (g *GPUEncoder) RunTo(ids []int32, layer int, label string) error {
 		if err != nil {
 			return err
 		}
-		if err := submit(d); err != nil {
+		if err := g.submit(d); err != nil {
 			return err
 		}
 	}
@@ -1049,7 +1157,7 @@ func (g *GPUEncoder) RunTo(ids []int32, layer int, label string) error {
 	if end < 0 {
 		return fmt.Errorf("qwen: no dispatch labelled %q (have %v)", label, kinds)
 	}
-	return submit(d[:end])
+	return g.submit(d[:end])
 }
 
 // Labels lists one layer's dispatches in order, which is both what Profile
@@ -1119,6 +1227,7 @@ func (g *GPUEncoder) UploadEmbeds(x *Mat) error {
 		return fmt.Errorf("qwen: %d rows; the encoder was built for 1 to %d", x.Rows, g.tokens)
 	}
 	g.rows = x.Rows
+	g.segs = nil
 	if g.AutoPlan {
 		if err := g.SetPlan(PlanFor(x.Rows)); err != nil {
 			return err
@@ -1169,7 +1278,7 @@ func (g *GPUEncoder) AddRows(at int, m *Mat) error {
 		Heads: uint32(c.NumHeads), HeadDim: uint32(c.HeadDim),
 		InOff: g.aAttn, OutOff: g.aX + uint32(at*c.HiddenSize),
 	}
-	return submit([]vk.MultiDispatch{{
+	return g.submit([]vk.MultiDispatch{{
 		Pipeline: g.pipes["add"], GroupsX: uint32(m.Rows), GroupsY: 1, PushConstants: pc.bytes(),
 	}})
 }
@@ -1383,13 +1492,29 @@ func (g *GPUEncoder) layerGraph(i int) ([]vk.MultiDispatch, []string, error) {
 	}
 	// The fragment pack: one plane per head, tiles of 16 tokens. mode 1 is
 	// the transpose v needs as the B operand of p.v.
+	// Under a batch it is one dispatch per sequence: rows [row, row+n) of
+	// the dense stream into that sequence's region of the planes, with the
+	// rest of the region written as zeros.
+	planeRows := tokPad
+	if g.segs != nil {
+		planeRows = g.planeRows
+	}
 	pack := func(kind string, in, out uint32, width, heads, mode int, scale float32) {
 		pc := base
 		pc.InOff, pc.OutOff = in, out
 		pc.Dim = uint32(width)
-		pc.Aux0, pc.Aux1 = uint32(mode), uint32(tokPad)
+		pc.Aux0, pc.Aux1 = uint32(mode), uint32(planeRows)
 		pc.Scale = math.Float32bits(scale)
-		add("pack", kind, groups(tokPad, coopMatTile), uint32(heads), pc)
+		if g.segs == nil {
+			add("pack", kind, groups(tokPad, coopMatTile), uint32(heads), pc)
+			return
+		}
+		for _, s := range g.segs {
+			pc.Tokens = uint32(s.n)
+			pc.InOff = in + uint32(s.row*width)
+			pc.OutOff = out + s.tileOff()
+			add("pack", kind, groups(s.span(g.attn.keyBlock()), coopMatTile), uint32(heads), pc)
+		}
 	}
 	gemm := func(r Proj, kind string, aOff, cOff uint32, n, k, lda int) error {
 		kernel := g.plan[r]
@@ -1459,8 +1584,17 @@ func (g *GPUEncoder) layerGraph(i int) ([]vk.MultiDispatch, []string, error) {
 	pcAttn.InOff, pcAttn.OutOff = g.hQ, g.aCtx
 	pcAttn.KOff, pcAttn.VOff = g.hK, g.hV
 	pcAttn.Dim = uint32(qWidth)
-	pcAttn.Aux1, pcAttn.Aux2 = uint32(tokPad), uint32(rep)
-	add("attention", "attention", groups(g.rows, g.attn.rows()), uint32(c.NumHeads), pcAttn)
+	pcAttn.Aux1, pcAttn.Aux2 = uint32(planeRows), uint32(rep)
+	if g.segs == nil {
+		add("attention", "attention", groups(g.rows, g.attn.rows()), uint32(c.NumHeads), pcAttn)
+	}
+	for _, s := range g.segs {
+		pc := pcAttn
+		pc.Tokens = uint32(s.n)
+		pc.InOff, pc.KOff, pc.VOff = g.hQ+s.tileOff(), g.hK+s.tileOff(), g.hV+s.tileOff()
+		pc.OutOff = g.aCtx + uint32(s.row*qWidth)
+		add("attention", "attention", groups(s.n, g.attn.rows()), uint32(c.NumHeads), pc)
+	}
 
 	pcNarrow := base
 	pcNarrow.InOff, pcNarrow.OutOff = g.aCtx, g.hCtx
