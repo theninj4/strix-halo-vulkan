@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"strix-halo-vulkan/shaders"
@@ -57,6 +60,9 @@ type peakMode struct {
 	// coopMat, when set, is the A/C component-type pair whose native shape
 	// this variant needs bound as specialization constants.
 	coopMat *coopMatTypes
+	// wave pins the subgroup size the variant was built for (-DWAVE); 0
+	// leaves the driver's default, which is 64 here (KERNELS.md G0).
+	wave uint32
 }
 
 type coopMatTypes struct {
@@ -105,6 +111,42 @@ func peakModes() []peakMode {
 			outElemsPerGroup:  16 * 16, outElemSize: 4,
 			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
 		},
+		// KERNELS.md G0: the same WMMA loop at 8 and 16 chains, and at
+		// wave32, to tell the hardware's rate from the 4-chain probe's.
+		{
+			name: "wmma_fp16_acc8", spirv: shaders.ALUPeakWMMAFP16Acc8,
+			operands:          func() []byte { return float32SliceToFloat16Bytes(constFloats(aluPeakInputFloats, 0.05)) },
+			opsPerRepPerChain: 2 * 16 * 16 * 16,
+			chains:            8,
+			outElemsPerGroup:  16 * 16, outElemSize: 4,
+			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
+		},
+		{
+			name: "wmma_fp16_acc16", spirv: shaders.ALUPeakWMMAFP16Acc16,
+			operands:          func() []byte { return float32SliceToFloat16Bytes(constFloats(aluPeakInputFloats, 0.05)) },
+			opsPerRepPerChain: 2 * 16 * 16 * 16,
+			chains:            16,
+			outElemsPerGroup:  16 * 16, outElemSize: 4,
+			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
+		},
+		{
+			name: "wmma_fp16_w32", spirv: shaders.ALUPeakWMMAFP16W32,
+			operands:          func() []byte { return float32SliceToFloat16Bytes(constFloats(aluPeakInputFloats, 0.05)) },
+			opsPerRepPerChain: 2 * 16 * 16 * 16,
+			chains:            4,
+			outElemsPerGroup:  16 * 16, outElemSize: 4,
+			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
+			wave:    32,
+		},
+		{
+			name: "wmma_fp16_w32_acc8", spirv: shaders.ALUPeakWMMAFP16W32Acc8,
+			operands:          func() []byte { return float32SliceToFloat16Bytes(constFloats(aluPeakInputFloats, 0.05)) },
+			opsPerRepPerChain: 2 * 16 * 16 * 16,
+			chains:            8,
+			outElemsPerGroup:  16 * 16, outElemSize: 4,
+			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
+			wave:    32,
+		},
 		{
 			name: "wmma_int8", spirv: shaders.ALUPeakWMMAInt8,
 			operands:          func() []byte { return onesInt8Bytes(aluPeakInputFloats) },
@@ -123,7 +165,13 @@ func peakModes() []peakMode {
 // extrapolated from a different chip.
 func RunPeak(dev *vk.Device, phys *vk.PhysicalDevice, warmup, iters uint32) ([]Result, error) {
 	var results []Result
-	for _, mode := range peakModes() {
+	modes := peakModes()
+	if loaded, err := loadedPeakModes(); err != nil {
+		return nil, err
+	} else if len(loaded) > 0 {
+		modes = loaded
+	}
+	for _, mode := range modes {
 		var specConsts []vk.SpecConstant
 		if mode.coopMat != nil {
 			shape, ok, err := findCoopMatShape(phys, mode.coopMat.aType, mode.coopMat.cType)
@@ -164,6 +212,61 @@ func RunPeak(dev *vk.Device, phys *vk.PhysicalDevice, warmup, iters uint32) ([]R
 	return results, nil
 }
 
+// loadedPeakModes is the screening hook (KERNELS.md G-o8): PEAK_SPV names
+// one or more WMMA fp16 builds on disk, comma-separated, and the peak family
+// runs those instead of its own table, so a kernel-shaped probe such as
+// shaders/wmma_issue_probe.comp is timed by the same calibrated loop and
+// read against the same 480 FLOP/clk/CU. The build's geometry comes with
+// it: PEAK_MMAS is the 16x16x16 MMAs one subgroup issues per rep,
+// PEAK_SUBGROUPS the subgroups a workgroup (each stores its own tile), and
+// PEAK_WAVE pins the subgroup size (0 leaves the driver's 64).
+func loadedPeakModes() ([]peakMode, error) {
+	paths := os.Getenv("PEAK_SPV")
+	if paths == "" {
+		return nil, nil
+	}
+	envInt := func(name string, def int) (int, error) {
+		v := os.Getenv(name)
+		if v == "" {
+			return def, nil
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s=%q: %w", name, v, err)
+		}
+		return n, nil
+	}
+	mmas, err := envInt("PEAK_MMAS", 1)
+	if err != nil {
+		return nil, err
+	}
+	subgroups, err := envInt("PEAK_SUBGROUPS", 1)
+	if err != nil {
+		return nil, err
+	}
+	wave, err := envInt("PEAK_WAVE", 0)
+	if err != nil {
+		return nil, err
+	}
+	var modes []peakMode
+	for _, p := range strings.Split(paths, ",") {
+		spirv, err := os.ReadFile(p)
+		if err != nil {
+			return nil, err
+		}
+		modes = append(modes, peakMode{
+			name: strings.TrimSuffix(filepath.Base(p), ".spv"), spirv: spirv,
+			operands:          func() []byte { return float32SliceToFloat16Bytes(constFloats(aluPeakInputFloats, 0.05)) },
+			opsPerRepPerChain: 2 * 16 * 16 * 16 * float64(mmas) * float64(subgroups),
+			chains:            1,
+			outElemsPerGroup:  16 * 16 * subgroups, outElemSize: 4,
+			coopMat: &coopMatTypes{aType: vk.ComponentFloat16, cType: vk.ComponentFloat32},
+			wave:    uint32(wave),
+		})
+	}
+	return modes, nil
+}
+
 func runPeakCase(dev *vk.Device, mod *vk.ShaderModule, mode peakMode, specConsts []vk.SpecConstant, waves int, warmup, iters uint32) (Result, error) {
 	in, err := dev.NewBuffer(aluPeakInputFloats * 4) // 4 bytes/element is the widest any mode needs
 	if err != nil {
@@ -179,9 +282,10 @@ func runPeakCase(dev *vk.Device, mod *vk.ShaderModule, mode peakMode, specConsts
 	defer out.Destroy()
 
 	pipe, err := dev.NewPipeline(mod, vk.PipelineSpec{
-		Buffers:          []*vk.Buffer{in, out},
-		PushConstantSize: 4,
-		SpecConstants:    specConsts,
+		Buffers:              []*vk.Buffer{in, out},
+		PushConstantSize:     4,
+		SpecConstants:        specConsts,
+		RequiredSubgroupSize: mode.wave,
 	})
 	if err != nil {
 		return Result{}, err

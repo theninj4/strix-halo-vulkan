@@ -3,6 +3,7 @@
 #extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_control_flow_attributes : enable
@@ -56,8 +57,28 @@
 
 #include "dit_common.glsl"
 
+#ifndef LDS_STAGE
+#define LDS_STAGE 0
+#endif
+#if LDS_STAGE && STAGE_RW
+// STAGE_RW (KERNELS.md G-o8): the same views without `readonly`. A
+// read-only load may be reordered freely, and NIR sinks it to its use: with
+// the K tiles kept as a loop (KT_LOOP) the six staging loads were sunk to
+// after it, in front of the stores that consume them, with their whole
+// latency exposed. Without the qualifier they stay where the source issues
+// them, at the top of the slab -- provided a store to each view exists, or
+// nir_opt_access infers the qualifier back (the guarded store in main()).
+layout(binding = 2) buffer HAct4 { uvec4 hact4[]; };
+layout(binding = 3) buffer W16x4 { uvec4 w16x4[]; };
+#elif LDS_STAGE
+// The staging copies read A and B 16 bytes a lane; under LDS_STAGE these are
+// the only reads of either arena, so the bindings are declared as uvec4.
+layout(binding = 2) readonly buffer HAct4 { uvec4 hact4[]; };
+layout(binding = 3) readonly buffer W16x4 { uvec4 w16x4[]; };
+#else
 layout(binding = 2) buffer HAct { float16_t hact[]; };
 layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
+#endif
 
 #ifndef WM
 #define WM 4        // accumulator tiles per wave, M direction
@@ -196,12 +217,227 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 #ifndef C_PACK
 #define C_PACK 0
 #endif
+// LDS_PAD (KERNELS.md G1): an unused shared allocation of this many uints,
+// which caps how many workgroups a WGP can hold (the LDS is 128 KB a WGP on
+// this part) without changing one instruction of the loop. It is how the
+// kernel's rate is measured against its own occupancy: 16384 uints leaves
+// one workgroup a CU, 8192 two. Not a shipped build.
+#ifndef LDS_PAD
+#define LDS_PAD 0
+#endif
+#if LDS_PAD > 0
+shared uint ldsPad[LDS_PAD];
+#endif
+
+// SR (KERNELS.md G2, §6.5): strength-reduced fragment addresses. The
+// shipped loop recomputes every fragment's element offset from the push
+// constants each K tile -- 85 scalar and vector instructions with 20
+// dependency stalls in front of the 24 loads, because RADV lowers the
+// cooperative-matrix loads after its loop-invariant pass has run. Each
+// fragment's offset advances by a constant per tile (A by BK halves, a tiled
+// B by BK_TILES tiles of 256 halves), so with SR the offsets are loop-carried
+// scalars and the arithmetic is one add a fragment. Same loads, same MMAs,
+// same order: bit-identical. Plain A only (A_CONV carries its own offsets).
+#ifndef SR
+#define SR 0
+#endif
+#if SR && (A_CONV || L0_LOADS)
+#error "SR strength-reduces the plain A path"
+#endif
+
+// PIPE (KERNELS.md G2, §6.5): the K loop software-pipelined inside the 4x8
+// wave tile's register budget. The shipped loop issues a tile's 24 loads and
+// then waits for them in front of its 32 MMAs, and §6.5 measured that stall
+// at ~16 points of the ceiling with every load an L0 hit. A second copy of
+// the twelve fragments would hide it but costs 96 VGPRs at wave64 (a
+// fragment is 8, not 2), and the tile sits at 240 of 256. So the next tile's
+// fragments are loaded into the registers this tile has finished with: the
+// MMAs run as A2,A3 x B0..7 then A0,A1 x B0..7, A2/A3 are reloaded after the
+// first half, each B right after its last MMA of the second half, and A0/A1,
+// which the second half needs to the end, alternate between two sets (the
+// 16 spare VGPRs). Every fragment's loads are then in flight for 14 to 32
+// MMAs (~480 to 1,090 clocks) before the MMA that reads them. Each
+// accumulator still sees one MMA a K tile in K order: bit-identical.
+//
+// DB is the plain version of the same idea, a full second fragment set
+// loaded a whole tile ahead, for wave tiles small enough to hold it (4x4 at
+// wave64: 64 + 2 x 64 VGPRs); its cost is the arithmetic intensity the
+// smaller tile gives up (32 against 43 FLOP a byte).
+//
+// Both measured dead on Mesa 26.2.2 (research §2.9): ACO cannot coalesce a
+// cooperative-matrix fragment carried across the loop's back-edge and copies
+// it element by element (200 v_mov_b16 a trip for PIPE, 128 for DB), which
+// costs more than the latency they hide: 34.3 and 36.7 TFLOP/s against the
+// shipped 37.2. Kept as the record, so the idea is re-tried on a new
+// compiler and not on this one. What did fit is LDS_STAGE, below.
+//
+// Both read [kStart, kEnd) in tiles; at the last tile the "next" loads
+// re-read the current one (in bounds, and their results are never used).
+#ifndef PIPE
+#define PIPE 0
+#endif
+#ifndef DB
+#define DB 0
+#endif
+#if (PIPE || DB) && (!SR || BK_TILES != 1 || HOIST_A)
+#error "PIPE and DB are written on SR, one K tile a slab, no hoist"
+#endif
+#if PIPE && (WM != 4 || WN != 8)
+#error "PIPE is the 4x8 wave tile's schedule"
+#endif
+
+// LDS_STAGE (KERNELS.md G2, research §2.9; the shipped build at wave32, 4x4
+// tiles, eight waves, two tiles a slab as a loop -- KT_LOOP + STAGE_RW,
+// §2.10): the K slab staged through LDS, double-buffered,
+// so the prefetch depth is a whole tile at the 4x8 tile's intensity without
+// a second fragment set in registers. A wave64 fragment is 8 VGPRs because
+// the hardware holds it four times over (lanes 16-31, 32-47 and 48-63
+// replicate 0-15), so a prefetched *fragment* costs 4x its bytes in
+// registers and 4x its bytes on the L0-to-VGPR path; a prefetched *slab*
+// costs each byte once: 128x16 of A and 256x16 of B are 12 KB, 3 uvec4
+// loads a lane, 12 VGPRs, in flight for the whole of the previous tile's
+// MMAs and written to the other LDS plane behind them. The fragments are
+// then read from LDS just ahead of their MMAs, off a path that is not the
+// L0's. One barrier a tile. §2.1 measured LDS staging as a loss on an
+// unpadded slab (4-way bank conflicts on every fragment read: 16 lanes at a
+// pitch of 8 dwords) and an [N, K] B gather; here both pitches are
+// A_LPITCH and B_LPITCH halves, 12 dwords, conflict-free for the 8 lanes
+// a ds_read_b128 serves a clock, and B is staged as the fragment tiles it
+// already is. (Measured: the lowering emits ds_load_b64, 16 lanes a clock,
+// for which 12 dwords is 2-way conflicted; 36 halves, 18 dwords, is the
+// conflict-free pitch, and it is what ships. Wave32 halves the bytes a
+// fragment read moves and is the other half of the win: at wave64 the same
+// build is 36.5 TFLOP/s, at wave32 40.9, the wave64 shipped kernel 37.2.) Same MMAs in the same order: bit-identical. Plain A, tiled B,
+// one K tile a slab, fp32 C.
+#if LDS_STAGE && (A_CONV || L0_LOADS || B_LAYOUT != 2 || BK_TILES > 2 || HOIST_A || C_F16 || C_PACK || PIPE || DB)
+#error "LDS_STAGE is the plain fp32-C GEMM over tiled B, one or two K tiles a slab"
+#endif
+#if LDS_STAGE && (A_LPITCH < BK_TILES * 16 || B_LPITCH < BK_TILES * 16)
+#error "an LDS pitch must hold the slab's K"
+#endif
+// STAGE_L0 (a screening knob, never shipped): the staging loads re-read the
+// first slab for all of K, so every one is an L0 hit and the rate is the
+// LDS-side schedule's alone. Wrong by construction, like L0_LOADS.
+#ifndef STAGE_L0
+#define STAGE_L0 0
+#endif
+#ifndef LOAD_ORDER
+#define LOAD_ORDER 0
+#endif
+#ifndef A_LPITCH
+#define A_LPITCH 24
+#endif
+#ifndef B_LPITCH
+#define B_LPITCH 24
+#endif
+// LDS_XCHG (KERNELS.md G-o8): a fragment read from LDS costs twice its bytes
+// at wave32, because lanes l and l + 16 hold the same 16 halves and each
+// loads all of them (four ds_load_b64 a fragment). Here each lane loads 8
+// of them -- lanes under 16 the first eight, the rest the last eight -- and
+// the pair is completed with one 16-lane exchange, which ACO lowers to
+// v_permlanex16 (a VALU op; no LDS traffic) and a select a dword. Half the
+// LDS bytes and half the ds_load issue for +12 VALU a fragment; the same
+// values land in the same elements, so the MMAs are the same: bit-identical.
+// Written against the element order coopmat_layout_probe.comp pins (an A
+// lane l holds row l % 16 with element e column e; a B lane l holds column
+// l % 16 with element e row e), which the host checks before selecting a
+// build that relies on it. The planes are a uint view for it.
+#ifndef LDS_XCHG
+#define LDS_XCHG 0
+#endif
+#if LDS_XCHG && (!LDS_STAGE || WAVE != 32 || (A_LPITCH & 1) || (B_LPITCH & 1))
+#error "LDS_XCHG is the wave32 LDS_STAGE build's fragment read, at an even pitch"
+#endif
+// Two pricing knobs, never shipped, wrong by construction: LDS_NOBAR drops
+// the per-slab barrier (the staging races the reads), LDS_HALF_READS reads
+// a slab's fragments once and uses them for both K tiles (half the LDS
+// reads, the same MMAs). Each removes one component of the LDS-side
+// schedule and is timed in the H3 screen like STAGE_L0.
+#ifndef LDS_NOBAR
+#define LDS_NOBAR 0
+#endif
+// Two scheduling arms (KERNELS.md G-o8), bit-identical: the disassembly of
+// the shipped build shows ACO hoisting the next tile's six staging loads
+// above this tile's MMAs (across the barrier), so the second K tile's
+// fragments land in whatever register pairs are free and are moved into
+// place with 30-50 v_swap/v_mov a tile -- and on this part every VALU
+// instruction costs the matrix pipe a clock (wmma_issue_probe.comp).
+// LDS_FENCE gives the slab barrier buffer semantics, so the staging loads
+// stay behind it; KT_LOOP keeps the slab's K tiles as a loop the compiler
+// may not unroll, so one tile's fragments are dead before the next's load.
+#ifndef LDS_FENCE
+#define LDS_FENCE 0
+#endif
+#ifndef KT_LOOP
+#define KT_LOOP 0
+#endif
+#ifndef STAGE_RW
+#define STAGE_RW 0
+#endif
+#ifndef LDS_HALF_READS
+#define LDS_HALF_READS 0
+#endif
 
 #define TILE 16
 #define BM (WAVES_M * WM * TILE)
 #define BN (WAVES_N * WN * TILE)
 #define BK (BK_TILES * TILE)
 #define NTHREADS (WAVES_M * WAVES_N * WAVE)
+
+#if LDS_STAGE
+// A plane: BM rows of the slab's BK halves at A_LPITCH. B plane: for each of
+// the BN/16 tile columns, 16 columns of the slab's BK halves at B_LPITCH, so
+// the fragment for (nt, kt) is a column-major read at nt*16*B_LPITCH + kt*16.
+#define A_PLANE (BM * A_LPITCH)                 // halves
+#define B_PLANE ((BN / TILE) * TILE * B_LPITCH)
+#define A_VECS (BM * BK / 8)                    // uvec4 chunks a slab
+#define B_VECS (BN * BK / 8)
+#define A_STAGE ((A_VECS + NTHREADS - 1) / NTHREADS)
+#define B_STAGE ((B_VECS + NTHREADS - 1) / NTHREADS)
+#if LDS_XCHG
+shared uint lsA[2 * A_PLANE / 2];
+shared uint lsB[2 * B_PLANE / 2];
+// Four dwords into the uint planes (base in uints).
+#define PUT4(arr, base, v) {                                                   \
+    arr[(base) + 0u] = (v).x; arr[(base) + 1u] = (v).y;                        \
+    arr[(base) + 2u] = (v).z; arr[(base) + 3u] = (v).w;                        \
+}
+// Eight halves of a packed uvec4 into elements [b, b+8) of a fragment.
+#define PUT8(f, b, v) {                                                        \
+    f16vec2 h0 = unpackFloat2x16((v).x), h1 = unpackFloat2x16((v).y);          \
+    f16vec2 h2 = unpackFloat2x16((v).z), h3 = unpackFloat2x16((v).w);          \
+    f[(b) + 0] = h0.x; f[(b) + 1] = h0.y; f[(b) + 2] = h1.x; f[(b) + 3] = h1.y; \
+    f[(b) + 4] = h2.x; f[(b) + 5] = h2.y; f[(b) + 6] = h3.x; f[(b) + 7] = h3.y; \
+}
+// One fragment out of a plane: `at` is this lane's uint index of its eight
+// halves (the row's or column's base, plus 4 for lanes 16..31).
+#define XCHG_FRAG(T, arr, at, out) {                                           \
+    uvec4 mine = uvec4(arr[at], arr[(at) + 1u], arr[(at) + 2u], arr[(at) + 3u]); \
+    uvec4 other = subgroupShuffleXor(mine, 16u);                               \
+    bool low = gl_SubgroupInvocationID < 16u;                                  \
+    uvec4 lo = low ? mine : other, hi = low ? other : mine;                    \
+    T f;                                                                       \
+    PUT8(f, 0, lo)                                                             \
+    PUT8(f, 8, hi)                                                             \
+    out = f;                                                                   \
+}
+#else
+shared float16_t lsA[2 * A_PLANE];
+shared float16_t lsB[2 * B_PLANE];
+#endif
+// Eight halves into shared memory; ACO folds the eight stores into one
+// ds_store_b128 (gemm_wmma.comp verified it in the disassembly).
+#define SPREAD8(arr, base, v) {                                                \
+    f16vec2 h0 = unpackFloat2x16((v).x);                                       \
+    f16vec2 h1 = unpackFloat2x16((v).y);                                       \
+    f16vec2 h2 = unpackFloat2x16((v).z);                                       \
+    f16vec2 h3 = unpackFloat2x16((v).w);                                       \
+    arr[(base) + 0u] = h0.x; arr[(base) + 1u] = h0.y;                          \
+    arr[(base) + 2u] = h1.x; arr[(base) + 3u] = h1.y;                          \
+    arr[(base) + 4u] = h2.x; arr[(base) + 5u] = h2.y;                          \
+    arr[(base) + 6u] = h3.x; arr[(base) + 7u] = h3.y;                          \
+}
+#endif
 
 layout(local_size_x = NTHREADS) in;
 
@@ -224,14 +460,61 @@ layout(local_size_x = NTHREADS) in;
         + (((k0) + (kt) * TILE) >> pc.aux2) * pc.aux1                              \
         + (((k0) + (kt) * TILE) & (pc.aux0 - 1u)),                                 \
         pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+#elif L0_LOADS
+// L0_LOADS (KERNELS.md G1): every fragment load reads one of two K tiles,
+// whichever k0's bit 4 says, so the loop's loads all hit the L0 and the
+// kernel's rate is the in-wave schedule's alone -- the loads are still
+// issued and waited for, only the memory system behind them is taken away.
+// The result is wrong by construction. Not a shipped build.
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda + ((k0) & 16u), \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
+#elif LDS_STAGE && LDS_XCHG
+// A and B out of the current LDS plane, lp, by the exchange read; xrow and
+// xhalf are the lane's row (or column) inside a tile and its half's offset
+// in uints, set once in main().
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    XCHG_FRAG(FRAG_A_T, lsA, ((lp * A_PLANE + (waveM * (WM * TILE) + (i) * TILE + xrow) * A_LPITCH + (kt) * TILE) >> 1) + xhalf, dst)
+#elif LDS_STAGE
+// A and B out of the current LDS plane, lp (set before each MMA_BLOCK).
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, lsA, lp * A_PLANE + (waveM * (WM * TILE) + (i) * TILE) * A_LPITCH + (kt) * TILE, \
+        A_LPITCH, gl_CooperativeMatrixLayoutRowMajor);
+#elif SR
+// A: the loop-carried offset aAt[i], declared and advanced in main().
+#define LOAD_FRAG_A(dst, i, k0, kt)                                            \
+    coopMatLoad(dst, hact, aAt[i] + (kt) * TILE,                               \
+        pc.lda, gl_CooperativeMatrixLayoutRowMajor);
 #else
 // A: [M, lda], K-contiguous, row-major fragment load.
 #define LOAD_FRAG_A(dst, i, k0, kt)                                            \
     coopMatLoad(dst, hact, pc.inOff + (wm0 + (i) * TILE) * pc.lda + (k0) + (kt) * TILE, \
         pc.lda, gl_CooperativeMatrixLayoutRowMajor);
 #endif
+#ifndef L0_LOADS
+#define L0_LOADS 0
+#endif
 
-#if B_LAYOUT == 0
+#if LDS_STAGE && LDS_XCHG
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    XCHG_FRAG(FRAG_B_T, lsB, ((lp * B_PLANE + (waveN * WN + (j)) * (TILE * B_LPITCH) + xrow * B_LPITCH + (kt) * TILE) >> 1) + xhalf, dst)
+#elif LDS_STAGE
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, lsB, lp * B_PLANE + (waveN * WN + (j)) * (TILE * B_LPITCH) + (kt) * TILE, \
+        B_LPITCH, gl_CooperativeMatrixLayoutColumnMajor);
+#elif SR && B_LAYOUT == 0
+#define B_STEP BK
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, bAt[j] + (kt) * TILE, pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
+#elif SR && B_LAYOUT == 1
+#define B_STEP (BK * pc.ldb)
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, bAt[j] + (kt) * TILE * pc.ldb, pc.ldb, gl_CooperativeMatrixLayoutRowMajor);
+#elif SR
+#define B_STEP (BK_TILES * TILE * TILE)
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, bAt[j] + (kt) * (TILE * TILE), TILE, gl_CooperativeMatrixLayoutColumnMajor);
+#elif B_LAYOUT == 0
 #define LOAD_FRAG_B(dst, j, k0, kt)                                            \
     coopMatLoad(dst, w16, pc.bOff + (wn0 + (j) * TILE) * pc.ldb + (k0) + (kt) * TILE, \
         pc.ldb, gl_CooperativeMatrixLayoutColumnMajor);
@@ -239,6 +522,11 @@ layout(local_size_x = NTHREADS) in;
 #define LOAD_FRAG_B(dst, j, k0, kt)                                            \
     coopMatLoad(dst, w16, pc.bOff + ((k0) + (kt) * TILE) * pc.ldb + wn0 + (j) * TILE, \
         pc.ldb, gl_CooperativeMatrixLayoutRowMajor);
+#elif L0_LOADS
+#define LOAD_FRAG_B(dst, j, k0, kt)                                            \
+    coopMatLoad(dst, w16, pc.bOff +                                            \
+        (((wn0 + (j) * TILE) / TILE) * (pc.gemmK / TILE) + (((k0) & 16u) / TILE)) * (TILE * TILE), \
+        TILE, gl_CooperativeMatrixLayoutColumnMajor);
 #else
 // Tile (nt, kt) is one contiguous 512 B block, kt fastest, holding element
 // (k, n) at n*TILE + k -- which is what a column-major load of stride TILE
@@ -269,9 +557,53 @@ layout(local_size_x = NTHREADS) in;
         }                                                                      \
     }                                                                          \
 }
-#else
+#elif LDS_HALF_READS
+// The slab's first tile's fragments, used for every tile (wrong by
+// construction; the pricing arm above).
 #define MMA_BLOCK(k0) {                                                        \
+    FRAG_A_T fragA[WM];                                                        \
+    FRAG_B_T fragB[WN];                                                        \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(fragA[i], i, k0, 0) } \
+    [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(fragB[j], j, k0, 0) } \
     [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                       \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);      \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+#elif LOAD_ORDER
+// The reads issued A0, B0..BWN-1, A1..: the first MMA (A0 x B0) waits for
+// the second fragment to land instead of the (WM+1)th, and each A after
+// that enables a row of MMAs as it arrives.
+#if KT_LOOP
+#define KT_UNROLL [[dont_unroll]]
+#else
+#define KT_UNROLL [[unroll]]
+#endif
+#define MMA_BLOCK(k0) {                                                        \
+    KT_UNROLL for (uint kt = 0u; kt < BK_TILES; kt++) {                        \
+        FRAG_A_T fragA[WM];                                                    \
+        FRAG_B_T fragB[WN];                                                    \
+        LOAD_FRAG_A(fragA[0], 0, k0, kt)                                       \
+        [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(fragB[j], j, k0, kt) } \
+        [[unroll]] for (uint i = 1u; i < WM; i++) { LOAD_FRAG_A(fragA[i], i, k0, kt) } \
+        [[unroll]] for (uint i = 0u; i < WM; i++) {                            \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                        \
+                acc[i][j] = coopMatMulAdd(fragA[i], fragB[j], acc[i][j]);      \
+            }                                                                  \
+        }                                                                      \
+    }                                                                          \
+}
+#else
+#if KT_LOOP
+#define KT_UNROLL [[dont_unroll]]
+#else
+#define KT_UNROLL [[unroll]]
+#endif
+#define MMA_BLOCK(k0) {                                                        \
+    KT_UNROLL for (uint kt = 0u; kt < BK_TILES; kt++) {                        \
         FRAG_A_T fragA[WM];                                                    \
         FRAG_B_T fragB[WN];                                                    \
         [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(fragA[i], i, k0, kt) } \
@@ -286,6 +618,10 @@ layout(local_size_x = NTHREADS) in;
 #endif
 
 void main() {
+#if LDS_PAD > 0
+    // Never taken (gemmK is never 0); it keeps the allocation live.
+    if (pc.gemmK == 0u) { ldsPad[gl_LocalInvocationID.x] = 0u; }
+#endif
     uint waveM = gl_SubgroupID / WAVES_N;
     uint waveN = gl_SubgroupID % WAVES_N;
 
@@ -330,11 +666,188 @@ void main() {
     uint aTap = 0u, aCol = 0u;
 #endif
 #if KRANGE
-    for (uint k0 = pc.aux0; k0 < pc.aux1; k0 += BK) {
+    const uint kStart = pc.aux0, kEnd = pc.aux1;
 #else
-    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+    const uint kStart = 0u, kEnd = pc.gemmK;
 #endif
+#if SR
+    // The fragment offsets, carried across the loop (see SR above).
+    uint aAt[WM], bAt[WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        aAt[i] = pc.inOff + (wm0 + i * TILE) * pc.lda + kStart;
+    }
+    [[unroll]] for (uint j = 0u; j < WN; j++) {
+#if B_LAYOUT == 0
+        bAt[j] = pc.bOff + (wn0 + j * TILE) * pc.ldb + kStart;
+#elif B_LAYOUT == 1
+        bAt[j] = pc.bOff + kStart * pc.ldb + wn0 + j * TILE;
+#else
+        bAt[j] = pc.bOff + (((wn0 + j * TILE) / TILE) * (pc.gemmK / TILE) + kStart / TILE) * (TILE * TILE);
+#endif
+    }
+#endif
+#if LDS_STAGE
+    uint tid = gl_LocalInvocationID.x;
+    uvec4 stageA[A_STAGE], stageB[B_STAGE];
+    // Each lane's chunk of the slab: where it comes from (a uvec4 index into
+    // the arena, advanced a tile at a time) and where it goes in the plane.
+    uint aG[A_STAGE], aL[A_STAGE], bG[B_STAGE], bL[B_STAGE];
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {
+        uint c = tid + s * NTHREADS;
+        uint r = c / (BK / 8), col = (c % (BK / 8)) * 8u;
+        aG[s] = (pc.inOff + (tileY * BM + r) * pc.lda + kStart + col) >> 3u;
+        aL[s] = r * A_LPITCH + col;
+    }
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {
+        // Chunk c: tile (nt, kt) of the slab, 16-byte piece w of its 512.
+        uint c = tid + s * NTHREADS;
+        uint nt = c / (BK_TILES * TILE * TILE / 8);
+        uint kt = (c / (TILE * TILE / 8)) % BK_TILES, w = c % (TILE * TILE / 8);
+        bG[s] = (pc.bOff + ((tileX * (BN / TILE) + nt) * (pc.gemmK / TILE) + kStart / TILE + kt) * (TILE * TILE) + w * 8u) >> 3u;
+        bL[s] = nt * (TILE * B_LPITCH) + (w / 2u) * B_LPITCH + kt * TILE + (w % 2u) * 8u;
+    }
+#define LOAD_STAGE(back) {                                                     \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < A_VECS) { stageA[s] = hact4[aG[s] - (back) * (BK / 8)]; } \
+    }                                                                          \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < B_VECS) { stageB[s] = w16x4[bG[s] - (back) * (BK_TILES * TILE * TILE / 8)]; } \
+    }                                                                          \
+}
+#if LDS_XCHG
+#define STORE_STAGE(plane) {                                                   \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < A_VECS) { PUT4(lsA, ((plane) * A_PLANE + aL[s]) >> 1, stageA[s]) } \
+    }                                                                          \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < B_VECS) { PUT4(lsB, ((plane) * B_PLANE + bL[s]) >> 1, stageB[s]) } \
+    }                                                                          \
+}
+    const uint xrow = gl_SubgroupInvocationID & 15u;
+    const uint xhalf = (gl_SubgroupInvocationID >> 4u) * 4u;
+#else
+#define STORE_STAGE(plane) {                                                   \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < A_VECS) { SPREAD8(lsA, (plane) * A_PLANE + aL[s], stageA[s]) } \
+    }                                                                          \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) {                           \
+        if (tid + s * NTHREADS < B_VECS) { SPREAD8(lsB, (plane) * B_PLANE + bL[s], stageB[s]) } \
+    }                                                                          \
+}
+#endif
+#if LDS_NOBAR
+#define SLAB_BARRIER
+#elif LDS_FENCE
+#define SLAB_BARRIER controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup, gl_StorageSemanticsShared | gl_StorageSemanticsBuffer, gl_SemanticsAcquireRelease);
+#else
+#define SLAB_BARRIER barrier();
+#endif
+#define ADVANCE_STAGE(on) {                                                    \
+    [[unroll]] for (uint s = 0u; s < A_STAGE; s++) { aG[s] += (on) * (1u - uint(STAGE_L0)) * (BK / 8); } \
+    [[unroll]] for (uint s = 0u; s < B_STAGE; s++) { bG[s] += (on) * (1u - uint(STAGE_L0)) * (BK_TILES * TILE * TILE / 8); } \
+}
+#if STAGE_RW
+    // Never taken (gemmK is never 0): a store to each staging view, so
+    // nir_opt_access cannot infer them read-only and re-sink the loads.
+    if (pc.gemmK == 0u) { hact4[tid] = uvec4(0u); w16x4[tid] = uvec4(0u); }
+#endif
+    LOAD_STAGE(0u)
+    STORE_STAGE(0u)
+    barrier();
+    ADVANCE_STAGE(1u)
+// One tile out of plane cur while the next slab is fetched into registers
+// and, behind the MMAs, written to plane nxt. At the last tile the fetch
+// re-reads the current slab (in bounds; never read back).
+#define STAGE_TILE(cur, nxt, k0) {                                             \
+    uint more = ((k0) + BK < kEnd) ? 1u : 0u;                                  \
+    LOAD_STAGE(1u - more)                                                      \
+    ADVANCE_STAGE(more)                                                        \
+    uint lp = cur;                                                             \
+    MMA_BLOCK(k0)                                                              \
+    STORE_STAGE(nxt)                                                           \
+    SLAB_BARRIER                                                               \
+}
+    uint k0 = kStart;
+    for (; k0 + 2u * BK <= kEnd; k0 += 2u * BK) {
+        STAGE_TILE(0u, 1u, k0)
+        STAGE_TILE(1u, 0u, k0 + BK)
+    }
+    if (k0 < kEnd) {
+        STAGE_TILE(0u, 1u, k0)
+    }
+#elif PIPE
+    FRAG_A_T aX[2], aY[2], a23[2];
+    FRAG_B_T b[WN];
+    LOAD_FRAG_A(aX[0], 0, kStart, 0)
+    LOAD_FRAG_A(aX[1], 1, kStart, 0)
+    LOAD_FRAG_A(a23[0], 2, kStart, 0)
+    LOAD_FRAG_A(a23[1], 3, kStart, 0)
+    [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(b[j], j, kStart, 0) }
+// One K tile: cur holds A0/A1 for it, nxt receives A0/A1 for the next.
+#define PIPE_TILE(cur, nxt, k0) {                                              \
+    uint sA = ((k0) + BK < kEnd) ? BK : 0u;                                    \
+    uint sB = ((k0) + BK < kEnd) ? uint(B_STEP) : 0u;                          \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { aAt[i] += sA; }                \
+    [[unroll]] for (uint j = 0u; j < WN; j++) { bAt[j] += sB; }                \
+    LOAD_FRAG_A(nxt[0], 0, k0, 0)                                              \
+    LOAD_FRAG_A(nxt[1], 1, k0, 0)                                              \
+    [[unroll]] for (uint j = 0u; j < WN; j++) {                                \
+        acc[2][j] = coopMatMulAdd(a23[0], b[j], acc[2][j]);                    \
+        acc[3][j] = coopMatMulAdd(a23[1], b[j], acc[3][j]);                    \
+    }                                                                          \
+    LOAD_FRAG_A(a23[0], 2, k0, 0)                                              \
+    LOAD_FRAG_A(a23[1], 3, k0, 0)                                              \
+    [[unroll]] for (uint j = 0u; j < WN; j++) {                                \
+        acc[0][j] = coopMatMulAdd(cur[0], b[j], acc[0][j]);                    \
+        acc[1][j] = coopMatMulAdd(cur[1], b[j], acc[1][j]);                    \
+        LOAD_FRAG_B(b[j], j, k0, 0)                                            \
+    }                                                                          \
+}
+    // Two tiles a trip so the sets alternate without a copy; the odd tail is
+    // peeled after the loop (a branch inside it made ACO carry both sets
+    // across the merge, through scratch).
+    uint k0 = kStart;
+    for (; k0 + 2u * BK <= kEnd; k0 += 2u * BK) {
+        PIPE_TILE(aX, aY, k0)
+        PIPE_TILE(aY, aX, k0 + BK)
+    }
+    if (k0 < kEnd) {
+        PIPE_TILE(aX, aY, k0)
+    }
+#elif DB
+    FRAG_A_T aX[WM], aY[WM];
+    FRAG_B_T bX[WN], bY[WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(aX[i], i, kStart, 0) }
+    [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(bX[j], j, kStart, 0) }
+// One K tile on set (ca, cb); the next tile's fragments into (na, nb).
+#define DB_TILE(ca, cb, na, nb, k0) {                                          \
+    uint sA = ((k0) + BK < kEnd) ? BK : 0u;                                    \
+    uint sB = ((k0) + BK < kEnd) ? uint(B_STEP) : 0u;                          \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { aAt[i] += sA; }                \
+    [[unroll]] for (uint j = 0u; j < WN; j++) { bAt[j] += sB; }                \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_FRAG_A(na[i], i, k0, 0) } \
+    [[unroll]] for (uint j = 0u; j < WN; j++) { LOAD_FRAG_B(nb[j], j, k0, 0) } \
+    [[unroll]] for (uint i = 0u; i < WM; i++) {                                \
+        [[unroll]] for (uint j = 0u; j < WN; j++) {                            \
+            acc[i][j] = coopMatMulAdd(ca[i], cb[j], acc[i][j]);                \
+        }                                                                      \
+    }                                                                          \
+}
+    uint k0 = kStart;
+    for (; k0 + 2u * BK <= kEnd; k0 += 2u * BK) {
+        DB_TILE(aX, bX, aY, bY, k0)
+        DB_TILE(aY, bY, aX, bX, k0 + BK)
+    }
+    if (k0 < kEnd) {
+        DB_TILE(aX, bX, aY, bY, k0)
+    }
+#else
+    for (uint k0 = kStart; k0 < kEnd; k0 += BK) {
         MMA_BLOCK(k0)
+#if SR
+        [[unroll]] for (uint i = 0u; i < WM; i++) { aAt[i] += BK; }
+        [[unroll]] for (uint j = 0u; j < WN; j++) { bAt[j] += B_STEP; }
+#endif
 #if A_CONV == 2
         aCol += BK;
         if (aCol >= pc.aux0) {
@@ -343,6 +856,7 @@ void main() {
         }
 #endif
     }
+#endif
 
     [[unroll]] for (uint i = 0u; i < WM; i++) {
         [[unroll]] for (uint j = 0u; j < WN; j++) {

@@ -355,6 +355,15 @@ func TestGPUDiT(t *testing.T) {
 func TestGPUStepTiming(t *testing.T) {
 	g := sharedGPU(t)
 	loadDitManifest(t)
+	// ACE_DIT_BIG=w64|small runs the big projections on the wave64 128x256
+	// build or the 64x64 rung instead (KERNELS.md G8's small-M screen).
+	switch os.Getenv("ACE_DIT_BIG") {
+	case "w64":
+		g.big = gemmBigW64
+	case "small":
+		g.big = gemmSmall
+	}
+	defer func() { g.big = gemmBig }()
 	if err := g.Begin(readMat(t, ditRef, "full_metas_encoder_states")); err != nil {
 		t.Fatal(err)
 	}

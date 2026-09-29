@@ -273,7 +273,7 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | **done 2026-09-26** (`h3/vae/encoder.go`, `h3/textenc` Presentation, `h3/pipeline/keyframe.go`, `-first`/`-last`, `input_reference` / `conditions`): encoder moments at ≤ 1.6e-5 of fp32, torch's seed-42 draw reproduced; conditioner 9.3e-4 teacher-forced (bf16: 1.2e-2); teacher-forced steps ≤ 1.3e-4 rms; frame 0 of a served run lands on the keyframe at **27.1 dB** |
-| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. **M11c done 2026-09-29**: the attention transposed (`h3_attn_t.comp`), so P reaches the matrix cores without LDS: 1.55–1.61x on the kernel, a forward 35.6 → 30.6 s at 480p and 144 → 111 s at 768p, gated teacher-forced. **M11d**: the down projection in two K passes, bit-identical, 1.02x a 480p forward; its swizzle band and row pad screened and already optimal. **M11e**: the video VAE's attention on M11c's transposed kernel at head 64, 1.44x on the kernel, a 480p decode 38.4 → 37.1 s, PSNR against the oracle unchanged at 81.7 dB. **M11f**: the audio decode on the device, priced and not built: the CPU decode already hides under the video decode, and costs a request only the 2.4 s of device time its memory traffic takes from that decode. The rest is open |
+| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. **M11c done 2026-09-29**: the attention transposed (`h3_attn_t.comp`), so P reaches the matrix cores without LDS: 1.55–1.61x on the kernel, a forward 35.6 → 30.6 s at 480p and 144 → 111 s at 768p, gated teacher-forced. **M11d**: the down projection in two K passes, bit-identical, 1.02x a 480p forward; its swizzle band and row pad screened and already optimal. **M11e**: the video VAE's attention on M11c's transposed kernel at head 64, 1.44x on the kernel, a 480p decode 38.4 → 37.1 s, PSNR against the oracle unchanged at 81.7 dB. **M11f**: the audio decode on the device, priced and not built: the CPU decode already hides under the video decode, and costs a request only the 2.4 s of device time its memory traffic takes from that decode. **M11h** (2026-09-29): the headroom assessed; a 480p forward runs at 33.5 TFLOP/s, 80% of this machine's best kernel, so exact work has ≤ 1.25x left; the row chunk at 4096 is 1.04x measured, not shipped; the multiples are lossy (step caching, block-sparse attention, a 4-step LoRA) and the user's call. **KERNELS.md G2** (2026-09-29): the big GEMM is `dit_gemm_wg128x256_lds_w32` (K slabs staged through LDS at wave32, research §2.9), bit-identical: projections 37 → 41 TFLOP/s, the split down projection 29 → 41, **a 480p forward 29.9 → 27.1 s**; the video VAE on the same build (G8), PSNR unchanged, **a 480p decode 37.1 → 35.5 s**. **KERNELS.md G-o8** (2026-09-29, research §2.10): the same build with its K tiles kept as a loop (the register allocator's ~40 moves a tile were costing the matrix pipe a clock each), bit-identical again: projections 40.4 → 43.5 TFLOP/s, **a 480p forward 27.3 → 26.7 s** |
 | M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | **a client concern, 2026-09-29**: `/v1/videos` takes the prompt verbatim; the front-end rewrites before it submits (see M12 below). Nothing to build here |
 | M13 | `ref2va` (optional) | |
 
@@ -1170,9 +1170,13 @@ stereo), on random latents, two passes:
 | 4 | 27.6 s | 38.9 s | 38.4 s | +1.2–1.3 s |
 
 The audio always finishes inside the video decode. The cost is that the
-*device* runs slower while the CPU decodes. That is contention for the
-shared memory, not host scheduling: the host-side part of the video
-decode is unchanged. Fewer workers spread the same traffic over a longer
+*device* runs slower while the CPU decodes. ~~That is contention for the
+shared memory, not host scheduling~~ **Corrected 2026-09-29 (KERNELS.md
+G0, research §0.6): it is the package power budget.** The GPU runs a
+forward at 2600–2650 MHz and ~149 W; 32 busy CPU threads take it to
+1300–1400 MHz and a forward from 30 to 50 s. The audio decode's 32
+workers draw from the same ~150 W, and the device slows in proportion.
+The host-side part of the video decode is unchanged either way. Fewer workers spread the same traffic over a longer
 time, so the cost falls but never goes away. At four workers the audio
 also takes 28 s, which would put it on the critical path of any canvas
 smaller than 480p. `audiovae.SetWorkers` is the knob, and
@@ -1226,6 +1230,92 @@ staging, and costs that staging ~3.9 s of host time. The conclusion holds
   cold at M11b's 4.7 GB/s).
 
 Together these are worth ~4–7 s of a request (~1% at 480p). Not built.
+
+### M11h — where the headroom is (2026-09-29)
+
+An assessment against the goal, which is the most out of this hardware,
+not the fastest video. A 480p forward re-profiled today (`TestGPUShapes`,
+`H3_SHAPES=480 H3_PROFILE=1`, int8, two passes): **28.98 / 29.33 s**.
+
+| kind | share | rate (TFLOP/s) |
+|---|---|---|
+| attention | 33% | 37.4–37.5 |
+| gemm qkv / gate / up / o | 17 / 11 / 11 / 6% | 37.2–37.9 / 35–36.5 |
+| gemm down (two K passes) | 13–14% | **29.0–31.3** |
+| swiglu, packs, gates, norms, dequant | 6.5% | (elementwise) |
+
+**The exact ceiling.** A 480p forward is 978 TFLOP (614 in the GEMMs, 364
+in the attention), so today's forward runs at **33.4–33.8 TFLOP/s, 60% of
+the 55.5 WMMA peak and 80% of the 42 TFLOP/s that the best kernel on this
+machine has ever reached** (research/ideas.md, the ceiling table). If every
+MMA ran at 42 the forward would be 23.3 s: **1.25x is all that exact
+kernel work can give**, and most of the pieces are already at 37–38. So
+the dense pipeline is within ~1.15x of what this hardware does with the
+arithmetic the model asks for; every larger multiple is fewer forwards or
+cheaper attention, and both change the output.
+
+**The exact levers, priced:**
+
+- **The row chunk: 8192 → 4096 is 1.04x, measured, not shipped.** The
+  same run at `H3_CHUNK=4096` is **27.94 / 28.11 s**, and 2048 is 29.98 s.
+  The whole gain is the down projection, 29–31 → **34–37 TFLOP/s**: at
+  chunk 8192 its A chunk is 235 MB (M11d), past the MALL, and at 2048 its
+  grid is 16 × 21 workgroups. The other GEMMs and the attention move by
+  under 2% either way. This closes M11d's "29 against `o`'s 35" gap
+  without touching the kernel, and it should be bit-identical (the chunk
+  is a row partition, and every GEMM and query tile makes the same MMAs in
+  the same order). One line in `pipeline.Options.Chunk`'s default, a
+  `TestGPUForward` byte comparison, and the 768p shape timed.
+- **Gate + up + SwiGLU as one GEMM** (Kev's K7.6, `kev_gemm_q8_glu.comp`,
+  for the big-tile fp16 GEMM): removes the swiglu pass (0.57 s, 2%) and
+  one stream of the A chunk. ≤ 2.5% of a forward.
+- **The attention**, 37.5 TFLOP/s at 68% of peak, spilling 112 VGPRs.
+  Before any kernel work, price it the M11c way: gut the transposed loop to
+  its MMAs alone. If that arm is ~40, the softmax and spills cost nothing
+  worth chasing; if it is 45+, a spill-free QT2 is worth up to 15% of the
+  attention, 5% of a forward.
+- **The elementwise 6.5%**: the two gates could ride in the GEMM epilogue
+  and the v pack in the qkv GEMM's. ≤ 3%, several kernels.
+- **The video VAE decode**, 37 s at 480p (~6% of a request; ~40% of the
+  80 s served small-canvas request). GEMM-bound at ~26 TFLOP/s, K = 2048:
+  the same chunk/grid screen as above, at `H3_VAE_SEQS`. ≤ 1.5% of a
+  480p request.
+- **The stagings** (M11g): 4–7 s a request, ~1% at 480p.
+- Refused: the transformer resident between video requests (12 s a
+  request, 2%, for 28 GB standing in the swap slot against the image
+  model); int8 GEMMs (compute-bound, M11a); a device audio decode (M11f).
+
+Together the exact levers are ~1.10–1.15x a request, the chunk being a
+third of it for one line.
+
+**The lossy levers, which are where the multiples are.** All of these are
+the community's, measured on other hardware, and none is in this tree:
+
+- **MiniMax's own sparse attention** is still "a future update" on the
+  card as of today (M-o4 stays open).
+- **SGLang's H200 post** (2026-08-27): fused kernels are 1.95x lossless
+  over diffusers (we have those fusions: modulated norm, gated residual,
+  packed RoPE). **Cache-DiT** (a forward is skipped when the residual's
+  change is under a threshold) and **SubBlock sparse attention** (64-token
+  query and key blocks, 20–25% of key blocks kept) compose to **6.24x at
+  SSIM 0.76–0.91** against their lossless run. At 480p the attention is
+  33% of a forward, so sparsity alone is worth ≤ 1.3x here; step caching
+  is the bigger of the two.
+- **Lightx2v's Turbo-SLA** (2026-08-20): a **4-step LoRA** over the base
+  transformer, shifts 6 / 3, with 85% sparse attention through a SageAttention
+  operator. **fl2va only, 768p**, 2.5x on a 5090 against the 30-step base.
+  The step count is the lever: N = 4 is 3 forwards against 19. Whether
+  the LoRA holds up dense (without its sparse operator) is unmeasured.
+
+These change the output, so if any is built it is a request parameter
+with the dense schedule as the default, as `steps` is, and its gate is
+perceptual (M8's PSNR/SSIM against the dense run), never a tolerance.
+Whether to chase them is a product decision: the honest number for a
+lossy mode is "N× faster at SSIM s against the dense run".
+
+**Not yet measured:** the served 480p × 20 request after M11c–M11e
+(estimated ~640 s from M11b's 741; one request through `ai.service` gives
+the real number).
 
 ### M12 — Context-IR is the client's (2026-09-29)
 
@@ -1289,6 +1379,16 @@ projections are folded out.
   acceptable.
 
 ## Handoff
+
+**2026-09-29, session 11: M11h, the headroom assessed.** A 480p forward
+is 29.0–29.3 s at 33.5 TFLOP/s: 60% of the WMMA peak and 80% of the best
+kernel this machine has run, so exact kernel work has ≤ 1.25x left and
+~1.10–1.15x is reachable. **The row chunk at 4096 is 1.04x** (27.9–28.1 s,
+the down projection 29 → 34–37 TFLOP/s; 2048 loses), measured twice and
+not shipped. The multiples are lossy and the community's: SGLang's
+Cache-DiT + SubBlock sparse attention (6.24x at SSIM 0.76–0.91), Lightx2v's
+4-step Turbo-SLA LoRA (fl2va, 768p). MiniMax's sparse attention is still
+unreleased. The next steps are re-ordered below.
 
 **2026-09-29, session 10: M11g, the last stagings timed.** The embedding
 table is 0.73 s warm, 1.0 s cold. The video VAE staging is 4.6 s alone,
@@ -1408,17 +1508,30 @@ envelope), and shares the device with the other verticals while it runs.
 
 **Next, in order:**
 
-1. ~~The staging cost~~: done, M11b; the rest timed in M11g. The embedding
-   table is 0.7–1.0 s (leave it). The VAE staging is 8.5 s in a request
-   (4.6 s alone, the rest the audio decode beside it); M11g lists the
-   cheap levers.
-2. M11 levers, measured and priced: ~~the attention~~ (M11c), ~~the down
-   projection~~ (M11d; still 29 against `o`'s 35, and nothing cheap is
-   left there), ~~the video VAE's attention~~
-   (M11e, 1.035x the decode: the VAE is GEMM-bound now), ~~the audio decode on the
-   device~~ (M11f: priced at ≤ 2.4 s a request, not built). Outside this vertical,
-   every `dit_attention_wmma.comp` user (the image DiT, Kev, OCR, ACE) pays
-   the same LDS round trip for P.
-3. ~~M12~~: a client concern (the front-end rewrites; see M12). Left in
-   this vertical: M13 (`ref2va`, optional, weights not fetched), the
-   VAE staging levers in M11g (~4–7 s a request). M11b–M11e are deployed.
+1. **Ship the row chunk at 4096** (M11h): `pipeline.Options.Chunk`'s
+   default, assert `TestGPUForward` byte-identical against 8192, time the
+   768p shape (`H3_SHAPES=1 H3_CHUNK=4096`), deploy. 1.04x a 480p forward
+   for one line.
+2. **Measure the served default** after M11c–M11e and the chunk: one
+   864×480 × 20 request through `ai.service` (estimate ~615 s; M11b
+   measured 741). Put the number in the M11 row.
+3. **Price the attention's MMA-only ceiling** (M11h) before any kernel
+   work: the M11c gutting on `h3_attn_t.comp`. Chase a spill-free QT2 only
+   if the arm says 45+.
+4. The small exact items, each ≤ 2.5%: gate+up+SwiGLU fused (K7.6's
+   pattern at 128×256), the gates and v pack into GEMM epilogues, the VAE's
+   chunk/grid at K = 2048, the M11g stagings. Worth doing together for
+   ~5–8%, not one at a time.
+5. **A lossy mode, if wanted** (M11h): step caching first (Cache-DiT's
+   residual threshold, the bigger lever at 480p), then 64-token block-sparse
+   attention; each a request parameter off by default, gated by SSIM
+   against the dense run. Turbo-SLA's 4-step LoRA is fl2va-only and needs
+   its own evaluation. A product decision, not a kernel item.
+6. Left as before: M13 (`ref2va`, optional, weights not fetched); M-o4
+   (MiniMax's sparse attention, still unreleased); M-o6.
+
+~~Earlier list~~: the staging cost (M11b, M11g), the attention (M11c), the
+down projection (M11d), the VAE's attention (M11e), the audio decode
+(M11f, priced), M12 (the client's). Outside this vertical, every
+`dit_attention_wmma.comp` user (the image DiT, Kev, OCR, ACE) still pays
+the LDS round trip for P that M11c removed here.

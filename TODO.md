@@ -67,7 +67,10 @@ stagings take ~12 s instead of ~94, output byte-identical. Since **M11c**
 (2026-09-29) the attention runs transposed so P never
 goes through LDS: 1.55–1.61x on the kernel, a 480p forward 35.6 → 30.6 s,
 768p 144 → 111 s. **M11d** runs the down projection as two K passes,
-bit-identical: a 480p forward is ~29.9 s. **M11e** runs the video VAE's
+bit-identical: a 480p forward is ~29.9 s, **27.1 s** since KERNELS.md
+G2 (2026-09-29) put the GEMM on LDS-staged slabs at wave32, and **26.7 s**
+since G-o8 the same day kept that build's K tiles as a loop (research
+§2.10), both bit-identical. **M11e** runs the video VAE's
 attention on the same transposed kernel at head 64: a 480p decode 38.4 →
 37.1 s, PSNR unchanged. **M11f** priced the audio decode on the device at
 ≤ 2.4 s a request (it already overlaps the video decode) and left it on
@@ -76,7 +79,11 @@ the CPU. Open: the rest of performance
 front-end rewrites prompts before it submits. M11b–M11e deployed 2026-09-29: the
 README prompt at 448×256 × 8 steps serves in 80 s (M9: 199 s). **M11g** timed
 the last stagings: the embedding table is under a second; the video VAE's
-is 8.5 s in a request (4.6 s alone, the audio decode contends).
+is 8.5 s in a request (4.6 s alone, the audio decode contends). **M11h**
+(2026-09-29) assessed the headroom: a 480p forward runs at 33.5 TFLOP/s,
+80% of this machine's best kernel, so exact work has ≤ 1.25x left; the
+row chunk at 4096 is 1.04x measured (to ship); the multiples are lossy
+(step caching, block-sparse attention, a 4-step LoRA) and a product call.
 
 - [x] **Video in int8, to fit beside the image model** (2026-09-26,
   VIDEO.md M11a). Encoder and transformer as int8 banks by default, every
@@ -86,6 +93,37 @@ is 8.5 s in a request (4.6 s alone, the audio decode contends).
   attempt's OOM kill exposed: `safetensors` F32/F16 grew by `append` (5×
   churn), and `serve` kept ~11 GB of staging garbage resident. That gave
   every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
+
+**Kernels (reopened 2026-09-29): the matrix cores to their ceiling.** The
+project's first vertical, given its own live plan in root
+[`KERNELS.md`](KERNELS.md) (G-stages). The fp16 GEMM has sat at **42.0 of
+55.5 TFLOP/s** since stage 4, the attention at 38, and every vertical since
+has ended on "the GEMMs are at their ceiling". Restated per clock (the GEMM
+runs at 2813 MHz and 137 W where the peak probe ran 2899 and 110) that is
+72–78%, against ~92% a mature library reaches on RDNA3 silicon. The shipped
+GEMM is 240 VGPRs, no spill, one K tile a loop with no prefetch; both
+head-128 attentions spill 112–126 VGPRs. The plan: pin the ceiling (G0),
+read the ISA (G1), a register-prefetch GEMM (G2), attention without spills
+and with lazy rescaling (G4), int8/Q4 fragments built in registers from the
+probed lane layout instead of through LDS (G5). `cmd/probe` (the ISA tool,
+deleted by accident 2026-09-22) is restored. **G0 and G1 done
+2026-09-29** (research §0.6, §6.5): the ceiling is the hardware's (480
+FLOP/clk/CU, flat across chains and wave size); **a video forward runs at
+2600 MHz and ~149 W**, so its ceiling is 49.9 TFLOP/s and the shipped
+GEMM is at 74% of it; **32 busy CPU threads halve the GPU clock** (a
+forward 1.67x slower; VIDEO.md M11f's mechanism). The GEMM's loop has no
+prefetch across K tiles, its rate is flat from 1 to 3+ workgroups a CU,
+and with every load an L0 hit it reaches 82–85% per clock: ~10 points
+memory, ~16 in-wave schedule. **G2 done 2026-09-29** (§2.9): the prefetch
+that fits is the K slab staged through LDS at wave32
+(`dit_gemm_wg128x256_lds_w32`), bit-identical, 74 → 80% per clock, and
+**G8 carried it to all nine hosts** the same day (it loses under ~40
+workgroups; `ace/dit` keeps the wave64 build up to 1024 rows). **G-o8
+done 2026-09-29** (§2.10): every VALU instruction costs the matrix pipe
+a clock on this part, the allocator's ~40 moves a tile were 7% of it, and
+the K tiles kept as a loop take the GEMM to **85% per clock** (H3's
+projections 43.5 TFLOP/s, a 480p forward 26.7 s), bit-identical again.
+Left in the GEMM: the barrier's lockstep, ≤ 9 points. Next: G4 or G5.
 
 **Music (2026-09-27): ACE-Step 1.5 XL turbo — closed the same day.** A
 caption and lyrics (or an uploaded song) become 48 kHz stereo; see the

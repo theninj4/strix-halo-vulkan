@@ -110,7 +110,7 @@ const (
 	GEMMWG16x256   GEMMKernel = "wg16x256_bt16"
 	// The DiT's winner at 4096 tokens, kept as the ladder's control: it is
 	// what "use the kernel we already have" would pick.
-	GEMMWG128x256 GEMMKernel = "wg128x256_bt16_swz8"
+	GEMMWG128x256 GEMMKernel = "wg128x256_lds_w32"
 	// The single-wave 64x64 tile, the other shape the DiT measured.
 	GEMMReg64 GEMMKernel = "reg64_bt16"
 )
@@ -122,7 +122,8 @@ type gemmVariant struct {
 	spirv  []byte
 	bm, bn int
 	waves  int
-	layout int // 2 everywhere here: the fragment-tiled weight (§2.8)
+	layout int    // 2 everywhere here: the fragment-tiled weight (§2.8)
+	wave   uint32 // a pinned subgroup size; 0 is 64 for a multi-wave build, the default otherwise
 }
 
 var gemmVariants = []gemmVariant{
@@ -134,7 +135,9 @@ var gemmVariants = []gemmVariant{
 	{name: GEMMReg16x64K8, spirv: shaders.DiTGEMMReg16x64TiledK8, bm: 16, bn: 64, waves: 1, layout: 2},
 	{name: GEMMWG16x256, spirv: shaders.DiTGEMMWG16x256Tiled, bm: 16, bn: 256, waves: 2, layout: 2},
 	{name: GEMMReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1, layout: 2},
-	{name: GEMMWG128x256, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4, layout: 2},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9), bit-identical
+	// to the wave64 one it replaced; K a multiple of 32.
+	{name: GEMMWG128x256, spirv: shaders.DiTGEMMWG128x256LDSW32, bm: 128, bn: 256, waves: 8, layout: 2, wave: 32},
 }
 
 // GEMMPlan chooses a kernel per projection. As in the DiT the weights are
@@ -771,11 +774,15 @@ func (g *GPUEncoder) build() error {
 		bankBufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}
 		for k, v := range g.kernels {
 			spec := vk.PipelineSpec{Buffers: bankBufs, PushConstantSize: pcSize}
-			if v.waves > 1 {
-				if !feat.SubgroupSizeControl || !sgs.Supported || sgs.MaxSubgroupSize < 64 {
-					return fmt.Errorf("qwen: kernel %q needs a pinned 64-wide subgroup", k)
+			wave := v.wave
+			if wave == 0 && v.waves > 1 {
+				wave = 64
+			}
+			if wave != 0 {
+				if !feat.SubgroupSizeControl || !sgs.Supported || wave < sgs.MinSubgroupSize || wave > sgs.MaxSubgroupSize {
+					return fmt.Errorf("qwen: kernel %q needs a pinned %d-wide subgroup", k, wave)
 				}
-				spec.RequiredSubgroupSize = 64
+				spec.RequiredSubgroupSize = wave
 			}
 			mod, err := g.dev.NewShaderModule(v.spirv)
 			if err != nil {

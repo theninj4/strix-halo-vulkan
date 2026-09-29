@@ -103,21 +103,21 @@ const q8Group = 32
 // register-pipelined slab) and each lost to these at every length measured;
 // CLASSIFICATION.md has the ladder.
 var q8Kernels = []gemmKernel{
-	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, 1, false},
-	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, 1, false},
-	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, 1, false},
+	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, 1, false, 0},
+	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, 1, false, 0},
+	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, 1, false, 0},
 }
 
 // gluKernels are kev_gemm_q8_glu at the q8m2 and q8m4 rungs' tiles; the
 // schedule picks the one matching q8For's BM.
 var gluKernels = []gemmKernel{
-	{"glum2", shaders.KevGEMMQ8GLUM2, 32, 64, 1, true},
-	{"glum4", shaders.KevGEMMQ8GLUM4, 64, 64, 1, true},
-	{"glum8", shaders.KevGEMMQ8GLUM8, 128, 64, 1, true},
+	{"glum2", shaders.KevGEMMQ8GLUM2, 32, 64, 1, true, 0},
+	{"glum4", shaders.KevGEMMQ8GLUM4, 64, 64, 1, true, 0},
+	{"glum8", shaders.KevGEMMQ8GLUM8, 128, 64, 1, true, 0},
 	// The same kernel with a plain fp32 store, for every other projection.
-	{"rbm2", shaders.KevGEMMQ8RBM2, 32, 64, 1, true},
-	{"rbm4", shaders.KevGEMMQ8RBM4, 64, 64, 1, true},
-	{"rbm8", shaders.KevGEMMQ8RBM8, 128, 64, 1, true},
+	{"rbm2", shaders.KevGEMMQ8RBM2, 32, 64, 1, true, 0},
+	{"rbm4", shaders.KevGEMMQ8RBM4, 64, 64, 1, true, 0},
+	{"rbm8", shaders.KevGEMMQ8RBM8, 128, 64, 1, true, 0},
 }
 
 // grid is a GEMM's workgroup counts for n columns over tokPad rows.
@@ -189,14 +189,16 @@ type gemmKernel struct {
 	waves  int
 	// rowFast is kev_gemm_q8_glu's grid: x = row block, y = column tile.
 	rowFast bool
+	wave    uint32 // a pinned subgroup size; 0 is 64 for a multi-wave build
 }
 
 // The rungs zimage/qwen's PlanFor chooses between for a 2560-wide Qwen, which
 // this is.
 var gemmKernels = []gemmKernel{
-	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1, false},
-	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1, false},
-	{"wg128x256", shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256, 4, false},
+	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1, false, 0},
+	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1, false, 0},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9).
+	{"wg128x256", shaders.DiTGEMMWG128x256LDSW32, 128, 256, 8, false, 32},
 }
 
 // gemmFor is zimage/qwen's measured schedule for hidden 2560.
@@ -576,7 +578,9 @@ func (g *GPU) build() error {
 		}
 		for _, k := range kernels {
 			spec := vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, bank}, PushConstantSize: pc}
-			if k.waves > 1 {
+			if k.wave != 0 {
+				spec.RequiredSubgroupSize = k.wave
+			} else if k.waves > 1 {
 				spec.RequiredSubgroupSize = 64
 			}
 			if g.Bank == BankQ8 {

@@ -210,11 +210,14 @@ const (
 	gemmSWZ8  gemmKernel = "wg128x256_bt16_swz8"
 	gemmSWZ16 gemmKernel = "wg128x256_bt16_swz16"
 	gemmReg64 gemmKernel = "reg64_bt16"
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9): the same
+	// 128x256 workgroup and band 8, bit-identical to gemmSWZ8, the default.
+	gemmLDSW32 gemmKernel = "wg128x256_lds_w32"
 )
 
 // BigKernels are the crown-kernel arms a screen may select between, in the
 // order they are reported.
-var BigKernels = []gemmKernel{gemmSWZ2, gemmSWZ4, gemmSWZ8, gemmSWZ16}
+var BigKernels = []gemmKernel{gemmSWZ2, gemmSWZ4, gemmSWZ8, gemmSWZ16, gemmLDSW32}
 
 // KernelName is the string form, for a test's log line.
 func KernelName(k gemmKernel) string { return string(k) }
@@ -240,14 +243,17 @@ type gemmVariant struct {
 	spirv  []byte
 	bm, bn int
 	waves  int
+	bk     int    // the K tile: 32 for the LDS-staged build, 16 otherwise
+	wave   uint32 // a pinned subgroup size, or 0 for the device's default
 }
 
 var gemmVariants = map[gemmKernel]gemmVariant{
-	gemmSWZ2:  {name: gemmSWZ2, spirv: shaders.DiTGEMMWG128x256TiledSWZ2, bm: 128, bn: 256, waves: 4},
-	gemmSWZ4:  {name: gemmSWZ4, spirv: shaders.DiTGEMMWG128x256TiledSWZ4, bm: 128, bn: 256, waves: 4},
-	gemmSWZ8:  {name: gemmSWZ8, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4},
-	gemmSWZ16: {name: gemmSWZ16, spirv: shaders.DiTGEMMWG128x256TiledSWZ16, bm: 128, bn: 256, waves: 4},
-	gemmReg64: {name: gemmReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1},
+	gemmSWZ2:   {name: gemmSWZ2, spirv: shaders.DiTGEMMWG128x256TiledSWZ2, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ4:   {name: gemmSWZ4, spirv: shaders.DiTGEMMWG128x256TiledSWZ4, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ8:   {name: gemmSWZ8, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ16:  {name: gemmSWZ16, spirv: shaders.DiTGEMMWG128x256TiledSWZ16, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmLDSW32: {name: gemmLDSW32, spirv: shaders.DiTGEMMWG128x256LDSW32, bm: 128, bn: 256, waves: 8, bk: 32, wave: 32},
+	gemmReg64:  {name: gemmReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1, bk: 16},
 }
 
 // attnVariant is the attention build, as in zimage/dit.
@@ -313,7 +319,7 @@ func NewGPUBank(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int, b
 		dim:   cfg.Dim(), ffn: cfg.Dim() * cfg.MLPRatio,
 		heads: cfg.NumHeads, headDim: cfg.HeadDim,
 		maxTokens: maxTokens, maxPrefix: maxPrefix, maxText: maxText,
-		big:         gemmSWZ8,
+		big:         gemmLDSW32,
 		packTPW:     defaultPackTiles,
 		eps:         cfg.Eps,
 		outChannels: cfg.OutChannels,
@@ -756,8 +762,9 @@ func (g *GPU) build() error {
 			}
 			g.mods = append(g.mods, mod)
 			pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
-				Buffers:          []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]},
-				PushConstantSize: pcSize,
+				Buffers:              []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]},
+				PushConstantSize:     pcSize,
+				RequiredSubgroupSize: v.wave,
 			})
 			if err != nil {
 				return fmt.Errorf("dit: gemm %s bank %d: %w", name, b, err)
@@ -1114,8 +1121,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 	gemm := func(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, mRows, n, k, lda int) error {
 		v := gemmVariants[kernel]
 		mPad := (mRows + v.bm - 1) &^ (v.bm - 1)
-		if n%v.bn != 0 {
-			return fmt.Errorf("dit: %s tile %d does not divide N=%d", kind, v.bn, n)
+		if n%v.bn != 0 || k%v.bk != 0 {
+			return fmt.Errorf("dit: %s tile %dx%d does not divide N=%d K=%d", kind, v.bn, v.bk, n, k)
 		}
 		pc := base
 		pc.InOff, pc.OutOff, pc.BOff = aOff, cOff, bOff

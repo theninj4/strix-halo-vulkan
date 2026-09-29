@@ -43,8 +43,11 @@ type GPU struct {
 	// this model's is on the device (h3/dit's hook, for a server).
 	Between func() error
 
-	dev  *vk.Device
-	cfg  *Config
+	dev *vk.Device
+	cfg *Config
+	// big is the kernel every big projection runs on: gemmBig, or what a
+	// screen sets (TestGPUStepTiming's ACE_DIT_BIG).
+	big  gemmKernel
 	Host *Host
 
 	wbuf, abuf, hbuf *vk.Buffer
@@ -158,16 +161,31 @@ func (p pushConstants) bytes() []byte {
 type gemmKernel int
 
 const (
-	gemmBig   gemmKernel = iota // 128x256 tiles
-	gemmSmall                   // 64x64, for the 128-wide output head
+	gemmBig    gemmKernel = iota // 128x256 tiles
+	gemmSmall                    // 64x64, for the 128-wide output head
+	gemmBigW64                   // the wave64 128x256 build, for short clips (bigW64Rows)
 )
+
+// bigW64Rows is the row count up to which the big projections run on the
+// wave64 build (KERNELS.md G8, 2026-09-29): at 375 rows (a 30 s clip) the
+// LDS-staged build is 8% slower a forward (130 against 120 ms; its grid is
+// 30 workgroups and the per-slab barrier shows), the two tie at 1500, and
+// from 3000 rows the LDS build wins by 2.5-3%. The 64x64 rung is never the
+// answer (131 ms at 375, 1.2-1.4x slower above).
+const bigW64Rows = 1024
 
 var gemmVariants = map[gemmKernel]struct {
 	spirv  []byte
 	bm, bn int
+	bk     int    // the K tile: 32 for the LDS-staged build, 16 otherwise
+	wave   uint32 // a pinned subgroup size, or 0 for the device's default
 }{
-	gemmBig:   {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256},
-	gemmSmall: {shaders.DiTGEMMReg64Tiled, 64, 64},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9), bit-identical
+	// to the wave64 one it replaced.
+	gemmBig:   {shaders.DiTGEMMWG128x256LDSW32, 128, 256, 32, 32},
+	gemmSmall: {shaders.DiTGEMMReg64Tiled, 64, 64, 16, 0},
+	// The wave64 build gemmBig replaced, which still wins up to bigW64Rows.
+	gemmBigW64: {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256, 16, 0},
 }
 
 const (
@@ -204,7 +222,7 @@ func NewGPU(dev *vk.Device, dir string, maxTokens int) (*GPU, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &GPU{dev: dev, cfg: cfg, Host: host, maxTokens: maxTokens, pipes: map[string]*vk.ComputePipeline{}}
+	g := &GPU{dev: dev, cfg: cfg, Host: host, maxTokens: maxTokens, pipes: map[string]*vk.ComputePipeline{}, big: gemmBig}
 	g.dit = dims{H: cfg.Hidden, heads: cfg.Heads, kv: cfg.KVHeads, ffn: cfg.FFN}
 	g.enc = dims{H: cfg.EncHidden, heads: cfg.EncHeads, kv: cfg.EncKVHeads, ffn: cfg.EncFFN}
 	for _, d := range []*dims{&g.dit, &g.enc} {
@@ -691,7 +709,7 @@ func (g *GPU) build(*safetensors.Set) error {
 	for b := range g.banks {
 		m := map[gemmKernel]*vk.ComputePipeline{}
 		for k, v := range gemmVariants {
-			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize})
+			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize, RequiredSubgroupSize: v.wave})
 			if err != nil {
 				return fmt.Errorf("dit: gemm bank %d: %w", b, err)
 			}
@@ -756,9 +774,12 @@ func (gr *graph) add(pipe, kind string, gx, gy uint32, pc pushConstants, flops f
 // gemm issues C[mPad, n] fp32 at cOff (row stride n) = A[m, k] fp16 at aOff
 // (row stride lda) × B, the fragment-tiled weight at bOff of bank.
 func (gr *graph) gemm(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, m, n, k, lda int) error {
+	if kernel == gemmBig && m <= bigW64Rows {
+		kernel = gemmBigW64
+	}
 	v := gemmVariants[kernel]
-	if n%v.bn != 0 || k%tile != 0 {
-		return fmt.Errorf("dit: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, tile)
+	if n%v.bn != 0 || k%v.bk != 0 {
+		return fmt.Errorf("dit: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, v.bk)
 	}
 	mPad := roundUp(m, v.bm)
 	var pc pushConstants
@@ -893,7 +914,7 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 		out uint32
 	}{{pQ, aQ}, {pK, aK}, {pV, aV}} {
 		sh := g.projShape(d, p.p)
-		if err := gr.gemm(gemmBig, w.bank, "gemm qkv", g.hA, p.out, w.off[p.p], n, sh[0], sh[1], d.ldaH); err != nil {
+		if err := gr.gemm(g.big, w.bank, "gemm qkv", g.hA, p.out, w.off[p.p], n, sh[0], sh[1], d.ldaH); err != nil {
 			return err
 		}
 	}
@@ -917,14 +938,14 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 		}
 		gr.add(pipe, "attention", uint32((n+tile-1)/tile), uint32(d.heads), pc, 4*nf*keys*headDim*float64(d.heads))
 	}
-	if err := gr.gemm(gemmBig, w.bank, "gemm o", g.hCtx, aAttn, w.off[pO], n, d.H, d.qW(), d.ldaQ); err != nil {
+	if err := gr.gemm(g.big, w.bank, "gemm o", g.hCtx, aAttn, w.off[pO], n, d.H, d.qW(), d.ldaQ); err != nil {
 		return err
 	}
 	gr.residual(d, "gate attn", n, aAttn, v[2])
 
 	if cross {
 		gr.norm(d, "cross in", n, w.crossNorm, g.aZeros)
-		if err := gr.gemm(gemmBig, w.bank, "gemm cross q", g.hA, aQ, w.off[pCQ], n, d.qW(), d.H, d.ldaH); err != nil {
+		if err := gr.gemm(g.big, w.bank, "gemm cross q", g.hA, aQ, w.off[pCQ], n, d.qW(), d.H, d.ldaH); err != nil {
 			return err
 		}
 		gr.qkpack("qkpack cross q", n, d.heads, aQ, g.hQ, R, g.wCosID, g.wSinID, w.cnormQ, qScale)
@@ -935,17 +956,17 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 		pc.Aux1, pc.Aux2, pc.LDB = uint32(R), uint32(d.heads/d.kv), uint32(g.encRows)
 		gr.add("attn cross", "cross attention", uint32((n+tile-1)/tile), uint32(d.heads), pc,
 			4*nf*float64(g.encLen)*headDim*float64(d.heads))
-		if err := gr.gemm(gemmBig, w.bank, "gemm cross o", g.hCtx, aAttn, w.off[pCO], n, d.H, d.qW(), d.ldaQ); err != nil {
+		if err := gr.gemm(g.big, w.bank, "gemm cross o", g.hCtx, aAttn, w.off[pCO], n, d.H, d.qW(), d.ldaQ); err != nil {
 			return err
 		}
 		gr.residual(d, "cross add", n, aAttn, noGate)
 	}
 
 	gr.norm(d, "ffn in", n, v[3], v[4])
-	if err := gr.gemm(gemmBig, w.bank, "gemm gate", g.hA, aGate, w.off[pGate], n, d.ffn, d.H, d.ldaH); err != nil {
+	if err := gr.gemm(g.big, w.bank, "gemm gate", g.hA, aGate, w.off[pGate], n, d.ffn, d.H, d.ldaH); err != nil {
 		return err
 	}
-	if err := gr.gemm(gemmBig, w.bank, "gemm up", g.hA, aUp, w.off[pUp], n, d.ffn, d.H, d.ldaH); err != nil {
+	if err := gr.gemm(g.big, w.bank, "gemm up", g.hA, aUp, w.off[pUp], n, d.ffn, d.H, d.ldaH); err != nil {
 		return err
 	}
 	var pc pushConstants
@@ -953,7 +974,7 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 	pc.InOff, pc.KOff, pc.OutOff = aGate, aUp, g.hFFN
 	pc.Scale = math.Float32bits(1)
 	gr.add("swiglu", "swiglu", uint32(n), 1, pc, 0)
-	if err := gr.gemm(gemmBig, w.bank, "gemm down", g.hFFN, aFF, w.off[pDown], n, d.H, d.ffn, d.ldaFFN); err != nil {
+	if err := gr.gemm(g.big, w.bank, "gemm down", g.hFFN, aFF, w.off[pDown], n, d.H, d.ffn, d.ldaFFN); err != nil {
 		return err
 	}
 	gr.residual(d, "gate ffn", n, aFF, v[5])
@@ -1055,7 +1076,7 @@ func (g *GPU) EncoderLayers(s Stack, x *qwen.Mat, from, to int) (*qwen.Mat, erro
 func (gr *graph) embedInto(hw headW, m, dst int, bias uint32) error {
 	g := gr.g
 	out := g.aX + uint32(dst*hw.n)
-	if err := gr.gemm(gemmBig, hw.bank, "gemm embed", g.hIn, out, hw.off, m, hw.n, hw.k, hw.k+gemmPad); err != nil {
+	if err := gr.gemm(g.big, hw.bank, "gemm embed", g.hIn, out, hw.off, m, hw.n, hw.k, hw.k+gemmPad); err != nil {
 		return err
 	}
 	var pc pushConstants
@@ -1082,7 +1103,7 @@ func (g *GPU) Encode(text, lyric, timbre *qwen.Mat) (*qwen.Mat, error) {
 	// The caption: text_projector alone, into the scratch.
 	g.narrowRows(g.hIn, text, c.TextDim+gemmPad)
 	gr := g.newGraph()
-	if err := gr.gemm(gemmBig, g.textProj.bank, "gemm text", g.hIn, g.aS, g.textProj.off, text.Rows, H, c.TextDim, c.TextDim+gemmPad); err != nil {
+	if err := gr.gemm(g.big, g.textProj.bank, "gemm text", g.hIn, g.aS, g.textProj.off, text.Rows, H, c.TextDim, c.TextDim+gemmPad); err != nil {
 		return nil, err
 	}
 	if _, err := gr.submit(); err != nil {
@@ -1144,7 +1165,7 @@ func (g *GPU) Begin(enc *qwen.Mat) error {
 	L, H := enc.Rows, g.dit.H
 	g.narrowRows(g.hIn, enc, g.enc.H+gemmPad)
 	gr := g.newGraph()
-	if err := gr.gemm(gemmBig, g.condEmb.bank, "gemm condition", g.hIn, g.aS, g.condEmb.off, L, H, g.enc.H, g.enc.H+gemmPad); err != nil {
+	if err := gr.gemm(g.big, g.condEmb.bank, "gemm condition", g.hIn, g.aS, g.condEmb.off, L, H, g.enc.H, g.enc.H+gemmPad); err != nil {
 		return err
 	}
 	if _, err := gr.submit(); err != nil {
@@ -1164,10 +1185,10 @@ func (g *GPU) Begin(enc *qwen.Mat) error {
 	kv := g.dit.kvW()
 	for _, w := range g.ditL {
 		g.zeroKeyTail([]uint32{w.crossK, w.crossV}, g.dit.kv, g.encRows, L)
-		if err := gr.gemm(gemmBig, w.bank, "gemm cross k", g.hIn, aK, w.off[pCK], L, kv, H, H+gemmPad); err != nil {
+		if err := gr.gemm(g.big, w.bank, "gemm cross k", g.hIn, aK, w.off[pCK], L, kv, H, H+gemmPad); err != nil {
 			return err
 		}
-		if err := gr.gemm(gemmBig, w.bank, "gemm cross v", g.hIn, aV, w.off[pCV], L, kv, H, H+gemmPad); err != nil {
+		if err := gr.gemm(g.big, w.bank, "gemm cross v", g.hIn, aV, w.off[pCV], L, kv, H, H+gemmPad); err != nil {
 			return err
 		}
 		gr.qkpack("qkpack cross k", L, g.dit.kv, aK, w.crossK, g.encRows, g.wCosID, g.wSinID, w.cnormK, 1)
@@ -1386,7 +1407,7 @@ func (g *GPU) Detokenize(codes []int32) (*qwen.Mat, error) {
 		}
 		g.narrowRows(g.hIn, q, H+gemmPad)
 		gr := g.newGraph()
-		if err := gr.gemm(gemmBig, g.detokIn.bank, "gemm detok embed", g.hIn, g.aS, g.detokIn.off, len(cs), H, H, H+gemmPad); err != nil {
+		if err := gr.gemm(g.big, g.detokIn.bank, "gemm detok embed", g.hIn, g.aS, g.detokIn.off, len(cs), H, H, H+gemmPad); err != nil {
 			return nil, err
 		}
 		if _, err := gr.submit(); err != nil {
@@ -1468,7 +1489,7 @@ func (g *GPU) Tokenize(lat *qwen.Mat) (codes []int32, pooled *qwen.Mat, margins 
 		in := &qwen.Mat{Rows: cs * P, Cols: c.Latent, Data: lat.Data[c0*P*c.Latent : (c0+cs)*P*c.Latent]}
 		g.narrowRows(g.hIn, in, c.Latent+gemmPad)
 		gr := g.newGraph()
-		if err := gr.gemm(gemmBig, g.tokIn.bank, "gemm tok embed", g.hIn, g.aS, g.tokIn.off, cs*P, H, c.Latent, c.Latent+gemmPad); err != nil {
+		if err := gr.gemm(g.big, g.tokIn.bank, "gemm tok embed", g.hIn, g.aS, g.tokIn.off, cs*P, H, c.Latent, c.Latent+gemmPad); err != nil {
 			return nil, nil, nil, err
 		}
 		if _, err := gr.submit(); err != nil {

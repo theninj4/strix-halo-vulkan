@@ -120,3 +120,62 @@ by launch cost. Caveat: this measures dispatch + pipeline barrier *within*
 one command buffer, which is what the harness does; it does not measure
 CPU-side `vkQueueSubmit` + fence wait, so §4.2's question is still open.
 
+
+### 0.6 The WMMA ceiling re-pinned, and the clock under a real kernel — **done** ✅ (KERNELS.md G0, 2026-09-29)
+
+**Hypothesis** (KERNELS.md G-o1): 478 FLOP/clk/CU might be the probe's
+number, not the hardware's — §0.1's loop has 4 dependent chains and a
+loop counter, and the spec says 512.
+**Change**: the same loop at 8 and 16 chains (`-DACC`) and at wave32
+(`-DWAVE`, pinned with `requiredSubgroupSize`), five new `peak` rows.
+**[measured] It is the hardware's.** 481 / 481 / 480 / 479 / 478
+FLOP/clk/CU (4, 8, 16 chains; wave32 at 4 and 8), int8 482: flat to 1%
+and **15/16 of 512 exactly**. 55.5 TFLOP/s at 2899 MHz stands.
+
+**[measured] But no real kernel runs at 2899.** A 100 ms sampler on
+`freq1_input`/`power1_average` around H3's `TestGPUShapes`:
+
+| load | sclk mode | package W |
+|---|---|---|
+| the probe (registers only) | 2890–2899 | 100–112 |
+| the suite's 20 ms GEMM bursts (`gemm_wmma.csv`) | 2813 | 137 |
+| **a 480p video forward** | **2600–2650** | **149** |
+| a 768p forward, sustained ~2 min | 2550–2600 | 142–155 |
+| a 480p forward beside 32 busy CPU threads | **1300–1400** | 121 (GPU) |
+
+The package is limited at ~150 W; a GEMM's memory traffic costs ~40 W
+over the probe and the clock gives 9–10%. So the ceiling *during a
+forward* is 49.9 TFLOP/s and the shipped GEMM's 37 there is **74% per
+clock**, not 67% of 55.5. And the CPU draws from the same budget: 32
+busy threads take a forward from 30.0 to **50.1 s** (768p: 106.7 →
+190 s). That is VIDEO.md M11f's "+2.4 s of device time beside the
+32-thread audio decode" — power, not memory contention. Every
+utilisation this repo quotes from here on carries the clock it ran at
+(KERNELS.md decision 1).
+
+### 0.7 The energy roofline — **opened** (KERNELS.md G0b, 2026-09-29)
+
+**Observation**, from rows the harness had already recorded (`power_w`):
+the `gemm_wmma` ladder at N = 2048 draws 136–137 W at every rung from 23
+to 39 TFLOP/s. Under a ~150 W package cap (§0.6), rate is cap ÷ energy
+per operation, so the ladder's winners are the rungs that spend fewer
+joules a FLOP. Energy per operation, PPT above a ~20 W idle:
+
+| | rate | PPT | GFLOP/J or GB/J | pJ each |
+|---|---|---|---|---|
+| WMMA fp16, registers only, 16 chains | 55.5 TFLOP/s | 98 W | 567 | 1.4 a FLOP |
+| the same at 4 chains | 55.5 | 112 W | 495 | +14 W of loop issue |
+| `dot4_int8` / packed fp16 FMA / fp32 FMA | 54 / 25 / 23 T | 118–121 | 450 / 215 / 189 | |
+| MALL-resident copy | 800 GB/s | 105–136 | 6–8 | ~100 a byte |
+| DRAM stream | 236 GB/s | 136 | 1.7 | **~490 a byte** |
+| best suite GEMM | 39.0 TFLOP/s | 137 | 285 | |
+| a video forward | 32.5 TFLOP/s | 149 | 218 | |
+| LLM prefill, 8,192 tokens, 24 layers | 2,680 tok/s | 142 (2713 MHz) | ≈110 mJ a token at 48 layers | |
+| LLM decode, 24 layers | 63.2 tok/s | 91 (2590 MHz) | ≈2.9 J a token at 48 layers | memory-bound |
+
+A DRAM byte is ~340 matrix FLOPs of energy; a MALL byte ~70. The matrix
+cores at full rate cost ~80 W over idle, leaving ~50 W under the cap for
+every byte and every non-MMA instruction. **Open**: the pJ a byte at L0,
+L1 and L2 (the `bandwidth` family stops at 2 MB footprints), and the
+sensor split (`power1_label` is `PPT`, the package; the CPU's share is
+in `/sys/class/powercap/intel-rapl:0`, so GPU = PPT − CPU).

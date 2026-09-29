@@ -174,13 +174,15 @@ type gemmKernel struct {
 	spirv  []byte
 	bm, bn int
 	waves  int
+	wave   uint32 // a pinned subgroup size; 0 is 64 for a multi-wave build
 }
 
 // gemmKernels are ace/lm's rungs, all of which divide ERNIE's N (256 and up).
 var gemmKernels = []gemmKernel{
-	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1},
-	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1},
-	{"wg128x256", shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256, 4},
+	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1, 0},
+	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1, 0},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9).
+	{"wg128x256", shaders.DiTGEMMWG128x256LDSW32, 128, 256, 8, 32},
 }
 
 func gemmFor(rows int) gemmKernel {
@@ -487,7 +489,9 @@ func (g *LM) build() error {
 		if b == 0 {
 			for _, k := range gemmKernels {
 				spec := vk.PipelineSpec{Buffers: bb, PushConstantSize: pc}
-				if k.waves > 1 {
+				if k.wave != 0 {
+					spec.RequiredSubgroupSize = k.wave
+				} else if k.waves > 1 {
 					spec.RequiredSubgroupSize = 64
 				}
 				p, err := g.pipeline("gemm "+k.name, k.spirv, spec)

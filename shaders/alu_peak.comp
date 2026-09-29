@@ -55,7 +55,14 @@
 // coopmat kernels: the cooperative-matrix scope is gl_ScopeSubgroup, so a
 // workgroup-per-subgroup keeps "waves in flight" equal to the dispatched
 // workgroup count.
-layout(local_size_x = 64) in;
+// WAVE (KERNELS.md G0): the workgroup is one subgroup of this many lanes; the
+// host pins the size with VK_EXT_subgroup_size_control when it is 32. The
+// scalar modes index lanes at lid+64 and are only built at 64; the WMMA modes
+// are what wave32 is measured on, because the transposed attention runs there.
+#ifndef WAVE
+#define WAVE 64
+#endif
+layout(local_size_x = WAVE) in;
 
 #if defined(MODE_WMMA_F16) || defined(MODE_WMMA_I8)
 // Bound at pipeline creation to a shape the device actually reports (see

@@ -1,0 +1,227 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// KERNELS.md G-o8: what the matrix pipe loses to the instructions around
+// it. alu_peak.comp's WMMA loop touches nothing but registers and reaches
+// 480 FLOP/clk/CU; the shipped LDS-staged GEMM (dit_gemm.comp, LDS_STAGE at
+// wave32) surrounds each 4x4 tile's 16 MMAs with 32 ds_load_b64, ~40 VALU
+// moves, a waitcnt ladder and, once a slab, a workgroup barrier, and runs at
+// 80%. This probe adds those things back one at a time to the register-only
+// loop, in the GEMM's own geometry (WM x WN accumulators a wave, SUBGROUPS
+// waves a workgroup, the LDS planes at its pitch), so each is priced on its
+// own against the same 480:
+//
+//   VALU_PER_MMA n  n independent fp32 FMAs a lane per MMA, on live chains
+//                   (does VALU issue steal matrix-pipe cycles?)
+//   LDS_A / LDS_B   the A / B fragments re-read from LDS every rep, as the
+//                   GEMM reads them (coopMatLoad: four ds_load_b64 each)
+//   XCHG            the same fragments read as one 16-byte piece a lane and
+//                   completed with a 16-lane exchange (v_permlanex16: half
+//                   the LDS bytes, +12 VALU a fragment)
+//   BARRIER         a workgroup barrier a rep
+//
+// The LDS is filled once and never written again, so the loop's reads are
+// bank-exact copies of the GEMM's without its stores; the plane alternates
+// with the rep so the loads cannot be hoisted. The loaded values are 0.05, so
+// a rep adds 16 x 0.0025 to every accumulator and millions of reps stay far
+// inside fp32. Run through `cmd/bench peak` with PEAK_SPV (bench/ops_peak.go).
+
+#ifndef WM
+#define WM 4
+#endif
+#ifndef WN
+#define WN 4
+#endif
+#ifndef WAVES_M
+#define WAVES_M 2
+#endif
+#ifndef WAVES_N
+#define WAVES_N 4
+#endif
+#ifndef WAVE
+#define WAVE 32
+#endif
+#ifndef VALU_PER_MMA
+#define VALU_PER_MMA 0
+#endif
+#ifndef LDS_A
+#define LDS_A 0
+#endif
+#ifndef LDS_B
+#define LDS_B 0
+#endif
+#ifndef XCHG
+#define XCHG 0
+#endif
+#ifndef BARRIER
+#define BARRIER 0
+#endif
+// The plane pitch in halves: 36 is the GEMM's conflict-free pitch for
+// ds_load_b64 (16 lanes a clock); the exchange reads 16 bytes a lane, and 40
+// is 16-byte aligned and conflict-free for 8 lanes a clock.
+#ifndef PITCH
+#if XCHG
+#define PITCH 40
+#else
+#define PITCH 36
+#endif
+#endif
+
+#define TILE 16
+#define SUBGROUPS (WAVES_M * WAVES_N)
+#define BM (WAVES_M * WM * TILE)
+#define BN (WAVES_N * WN * TILE)
+#define A_PLANE (BM * PITCH)   // halves
+#define B_PLANE (BN * PITCH)
+
+layout(local_size_x = WAVE * SUBGROUPS) in;
+
+layout(binding = 0) readonly buffer In { float16_t src[]; };
+layout(binding = 1) writeonly buffer Out { float dst[]; };
+
+layout(push_constant) uniform PC {
+    uint reps;
+} pc;
+
+#define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+#define ACC_T coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+
+#if LDS_A || LDS_B
+#if XCHG
+// A uint view: the exchange reads and the fill are 16 bytes a lane.
+shared uint lsA[2 * A_PLANE / 2];
+shared uint lsB[2 * B_PLANE / 2];
+
+// Eight halves of a packed uvec4 into elements [b, b+8) of a fragment.
+#define PUT8(f, b, v) {                                                        \
+    f16vec2 h0 = unpackFloat2x16((v).x), h1 = unpackFloat2x16((v).y);          \
+    f16vec2 h2 = unpackFloat2x16((v).z), h3 = unpackFloat2x16((v).w);          \
+    f[(b) + 0] = h0.x; f[(b) + 1] = h0.y; f[(b) + 2] = h1.x; f[(b) + 3] = h1.y; \
+    f[(b) + 4] = h2.x; f[(b) + 5] = h2.y; f[(b) + 6] = h3.x; f[(b) + 7] = h3.y; \
+}
+// The device's element order (coopmat_layout_probe.comp, wave32): an A
+// lane l holds row l % 16, element e is column e; a B lane l holds column
+// l % 16, element e is row e. Lanes l and l + 16 hold the same 16 halves,
+// so each loads 8 of them (lanes under 16 the first 8, the rest the last 8)
+// and the pair is completed with one exchange. `at` is this lane's uint
+// index of its 8 halves: a row or column base plus (l / 16) * 4.
+FRAG_A_T xchgA(uint at) {
+    uvec4 mine = uvec4(lsA[at], lsA[at + 1u], lsA[at + 2u], lsA[at + 3u]);
+    uvec4 other = subgroupShuffleXor(mine, 16u);
+    bool low = gl_SubgroupInvocationID < 16u;
+    uvec4 lo = low ? mine : other, hi = low ? other : mine;
+    FRAG_A_T f;
+    PUT8(f, 0, lo)
+    PUT8(f, 8, hi)
+    return f;
+}
+FRAG_B_T xchgB(uint at) {
+    uvec4 mine = uvec4(lsB[at], lsB[at + 1u], lsB[at + 2u], lsB[at + 3u]);
+    uvec4 other = subgroupShuffleXor(mine, 16u);
+    bool low = gl_SubgroupInvocationID < 16u;
+    uvec4 lo = low ? mine : other, hi = low ? other : mine;
+    FRAG_B_T f;
+    PUT8(f, 0, lo)
+    PUT8(f, 8, hi)
+    return f;
+}
+#else
+shared float16_t lsA[2 * A_PLANE];
+shared float16_t lsB[2 * B_PLANE];
+#endif
+#endif
+
+void main() {
+    uint waveM = gl_SubgroupID / WAVES_N;
+    uint waveN = gl_SubgroupID % WAVES_N;
+    uint lane = gl_SubgroupInvocationID;
+    uint tid = gl_LocalInvocationID.x;
+
+#if LDS_A || LDS_B
+    // 0.05 in fp16 is 0x2A66, everywhere in both planes.
+#if XCHG
+    for (uint i = tid; i < 2u * A_PLANE / 2u; i += WAVE * SUBGROUPS) { lsA[i] = 0x2A662A66u; }
+    for (uint i = tid; i < 2u * B_PLANE / 2u; i += WAVE * SUBGROUPS) { lsB[i] = 0x2A662A66u; }
+#else
+    for (uint i = tid; i < 2u * A_PLANE; i += WAVE * SUBGROUPS) { lsA[i] = float16_t(0.05); }
+    for (uint i = tid; i < 2u * B_PLANE; i += WAVE * SUBGROUPS) { lsB[i] = float16_t(0.05); }
+#endif
+    barrier();
+#endif
+
+    FRAG_A_T a0;
+    FRAG_B_T b0;
+    coopMatLoad(a0, src, 0, TILE, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b0, src, 0, TILE, gl_CooperativeMatrixLayoutRowMajor);
+
+    ACC_T acc[WM][WN];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            acc[i][j] = ACC_T(0.0);
+        }
+    }
+    // The VALU chains: four independent so the FMA latency is not what is
+    // measured; operands from the buffer so nothing folds.
+    float y = float(src[lane]), z = float(src[lane + 16u]);
+    float x0 = y, x1 = z, x2 = y + z, x3 = y - z;
+
+    for (uint r = 0u; r < pc.reps; r++) {
+        uint lp = r & 1u;
+        FRAG_A_T fa[WM];
+        FRAG_B_T fb[WN];
+        [[unroll]] for (uint i = 0u; i < WM; i++) {
+#if LDS_A && XCHG
+            fa[i] = xchgA(lp * (A_PLANE / 2) + (waveM * (WM * TILE) + i * TILE + (lane & 15u)) * (PITCH / 2) + (lane >> 4u) * 4u);
+#elif LDS_A
+            coopMatLoad(fa[i], lsA, lp * A_PLANE + (waveM * (WM * TILE) + i * TILE) * PITCH,
+                PITCH, gl_CooperativeMatrixLayoutRowMajor);
+#else
+            fa[i] = a0;
+#endif
+        }
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+#if LDS_B && XCHG
+            fb[j] = xchgB(lp * (B_PLANE / 2) + (waveN * (WN * TILE) + j * TILE + (lane & 15u)) * (PITCH / 2) + (lane >> 4u) * 4u);
+#elif LDS_B
+            coopMatLoad(fb[j], lsB, lp * B_PLANE + (waveN * (WN * TILE) + j * TILE) * PITCH,
+                PITCH, gl_CooperativeMatrixLayoutColumnMajor);
+#else
+            fb[j] = b0;
+#endif
+        }
+        [[unroll]] for (uint i = 0u; i < WM; i++) {
+            [[unroll]] for (uint j = 0u; j < WN; j++) {
+                acc[i][j] = coopMatMulAdd(fa[i], fb[j], acc[i][j]);
+            }
+        }
+#if VALU_PER_MMA > 0
+        [[unroll]] for (uint v = 0u; v < (VALU_PER_MMA * WM * WN) / 4u; v++) {
+            x0 = fma(x0, y, z);
+            x1 = fma(x1, y, z);
+            x2 = fma(x2, y, z);
+            x3 = fma(x3, y, z);
+        }
+#endif
+#if BARRIER
+        barrier();
+#endif
+    }
+
+    ACC_T sum = acc[0][0];
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < WN; j++) {
+            if (i != 0u || j != 0u) { sum += acc[i][j]; }
+        }
+    }
+    sum += ACC_T(x0 + x1 + x2 + x3);
+    coopMatStore(sum, dst, (gl_WorkGroupID.x * SUBGROUPS + gl_SubgroupID) * (TILE * TILE), TILE,
+        gl_CooperativeMatrixLayoutRowMajor);
+}

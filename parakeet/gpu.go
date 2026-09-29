@@ -125,7 +125,7 @@ const (
 	GEMMReg32x64  GEMMKernel = "reg32x64_bt16"
 	GEMMReg32x128 GEMMKernel = "reg32x128_bt16"
 	GEMMReg64     GEMMKernel = "reg64_bt16"
-	GEMMWG128x256 GEMMKernel = "wg128x256_bt16_swz8"
+	GEMMWG128x256 GEMMKernel = "wg128x256_lds_w32"
 	// The position term's rungs. Its B operand is rel_k -- an activation,
 	// different every clip -- so it cannot be staged as fragment tiles and
 	// reads the natural [N, ldb] layout instead (B_LAYOUT=0). These are the
@@ -157,7 +157,9 @@ var gemmVariants = []gemmVariant{
 	{name: GEMMReg32x64, spirv: shaders.DiTGEMMReg32x64Tiled, bm: 32, bn: 64, layout: 2},
 	{name: GEMMReg32x128, spirv: shaders.DiTGEMMReg32x128Tiled, bm: 32, bn: 128, layout: 2},
 	{name: GEMMReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, layout: 2},
-	{name: GEMMWG128x256, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, layout: 2},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9), bit-identical
+	// to the wave64 one it replaced; K a multiple of 32.
+	{name: GEMMWG128x256, spirv: shaders.DiTGEMMWG128x256LDSW32, bm: 128, bn: 256, layout: 2, wave: 32},
 }
 
 // actGEMMVariants are the rungs whose B operand comes out of the fp16

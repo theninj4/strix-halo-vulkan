@@ -132,6 +132,10 @@ var Empty []byte
 //go:generate glslc --target-env=vulkan1.2 -O -DMODE_DOT4 -DACC=8 -o alu_peak_dot4.spv alu_peak.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=4 -o alu_peak_wmma_f16.spv alu_peak.comp
 //go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_I8 -DACC=4 -o alu_peak_wmma_i8.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=8 -o alu_peak_wmma_f16_acc8.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=16 -o alu_peak_wmma_f16_acc16.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=4 -DWAVE=32 -o alu_peak_wmma_f16_w32.spv alu_peak.comp
+//go:generate glslc --target-env=vulkan1.2 -O -DMODE_WMMA_F16 -DACC=8 -DWAVE=32 -o alu_peak_wmma_f16_w32_acc8.spv alu_peak.comp
 
 //go:embed alu_peak_fma.spv
 var ALUPeakFMA []byte
@@ -147,6 +151,21 @@ var ALUPeakWMMAFP16 []byte
 
 //go:embed alu_peak_wmma_i8.spv
 var ALUPeakWMMAInt8 []byte
+
+// KERNELS.md G0: is 478 FLOP/clk/CU the hardware's dense WMMA rate or the
+// probe's? More chains and the other wave size answer it.
+//
+//go:embed alu_peak_wmma_f16_acc8.spv
+var ALUPeakWMMAFP16Acc8 []byte
+
+//go:embed alu_peak_wmma_f16_acc16.spv
+var ALUPeakWMMAFP16Acc16 []byte
+
+//go:embed alu_peak_wmma_f16_w32.spv
+var ALUPeakWMMAFP16W32 []byte
+
+//go:embed alu_peak_wmma_f16_w32_acc8.spv
+var ALUPeakWMMAFP16W32Acc8 []byte
 
 // Elementwise / activation.
 
@@ -3694,6 +3713,55 @@ var H3AttnTQT2KT4 []byte
 
 //go:embed dit_gemm_wg128x256_bt16_swz8_krange.spv
 var DiTGEMMWG128x256TiledSWZ8KRange []byte
+
+// The 128x256 GEMM with its K slabs staged through LDS at wave32 (KERNELS.md
+// G2, research §2.9): eight 4x4 waves, two K tiles a slab, double-buffered,
+// one barrier a slab; the same MMAs in the same order as the wave64 build,
+// so bit-identical, at 1.10x on H3's projections and 1.40x on its split
+// down projection (whose A chunk overflows the MALL: the slab is read once a
+// workgroup here instead of once a wave). The host pins the wave size to 32
+// (vk.PipelineSpec.RequiredSubgroupSize); M a multiple of 128, N of 256, K
+// of 32. The plain build and its KRANGE companion.
+//
+// KT_LOOP + STAGE_RW (KERNELS.md G-o8, research §2.10): the slab's two K
+// tiles kept as a loop the compiler may not unroll, and the staging views
+// without `readonly`, so the second tile's fragments are not loaded into
+// scattered register pairs and moved into place -- 30-50 v_swap/v_mov a
+// tile, each of which costs the matrix pipe a clock. Same MMAs, same order:
+// bit-identical again; H3's projections 40.4 → 43.5 TFLOP/s (80 → 85% per
+// clock), a 480p forward 27.3 → 26.7 s.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -o dit_gemm_wg128x256_lds_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -DKRANGE=1 -o dit_gemm_wg128x256_lds_w32_krange.spv dit_gemm.comp
+
+//go:embed dit_gemm_wg128x256_lds_w32.spv
+var DiTGEMMWG128x256LDSW32 []byte
+
+//go:embed dit_gemm_wg128x256_lds_w32_krange.spv
+var DiTGEMMWG128x256LDSW32KRange []byte
+
+// The matrix-pipe issue probe (KERNELS.md G-o8, research §2.10): the
+// register-only WMMA loop in the shipped GEMM's geometry (eight wave32
+// waves of 4x4 tiles) with one thing at a time added back -- VALU
+// instructions, the LDS fragment reads, the 16-lane exchange, a barrier.
+// Not embedded: `PEAK_SPV=shaders/wmma_issue_valu4.spv,...
+// PEAK_MMAS=16 PEAK_SUBGROUPS=8 PEAK_WAVE=32 go run ./cmd/bench peak`
+// times them against the same 480 FLOP/clk/CU (bench/ops_peak.go). What
+// they found: every VALU instruction costs the pipe about a clock, a
+// barrier alone nothing, the GEMM's LDS reads 3%, the two together 9%, and
+// the exchange more than the LDS bytes it saves.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o wmma_issue_reg.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DVALU_PER_MMA=2 -o wmma_issue_valu2.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DVALU_PER_MMA=4 -o wmma_issue_valu4.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DVALU_PER_MMA=8 -o wmma_issue_valu8.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DVALU_PER_MMA=16 -o wmma_issue_valu16.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DBARRIER=1 -o wmma_issue_bar.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLDS_A=1 -o wmma_issue_ldsa.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLDS_A=1 -DLDS_B=1 -o wmma_issue_lds.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLDS_A=1 -DLDS_B=1 -DBARRIER=1 -o wmma_issue_lds_bar.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLDS_A=1 -DLDS_B=1 -DXCHG=1 -o wmma_issue_xchg.spv wmma_issue_probe.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DLDS_A=1 -DLDS_B=1 -DXCHG=1 -DBARRIER=1 -o wmma_issue_xchg_bar.spv wmma_issue_probe.comp
 
 // Which (row, column) each lane's element of a cooperative matrix is, per
 // Use: the element order h3_attn_t.comp depends on (VIDEO.md M11c), read back

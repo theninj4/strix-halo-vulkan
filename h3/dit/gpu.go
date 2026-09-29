@@ -194,10 +194,14 @@ const (
 var gemmVariants = map[gemmKernel]struct {
 	spirv  []byte
 	bm, bn int
+	wave   uint32 // a pinned subgroup size, or 0 for the device's default (wave64)
 }{
-	gemmBig:    {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256},
-	gemmSmall:  {shaders.DiTGEMMReg64Tiled, 64, 64},
-	gemmKRange: {shaders.DiTGEMMWG128x256TiledSWZ8KRange, 128, 256},
+	// The big GEMM is the LDS-staged wave32 build (KERNELS.md G2): 1.10x on
+	// the projections and 1.40x on the split down projection over the wave64
+	// build it replaced, bit-identical to it (research §2.9).
+	gemmBig:    {shaders.DiTGEMMWG128x256LDSW32, 128, 256, 32},
+	gemmSmall:  {shaders.DiTGEMMReg64Tiled, 64, 64, 0},
+	gemmKRange: {shaders.DiTGEMMWG128x256LDSW32KRange, 128, 256, 32},
 }
 
 const (
@@ -710,7 +714,7 @@ func (g *GPU) build(*safetensors.Set) error {
 	for b := range g.banks {
 		m := map[gemmKernel]*vk.ComputePipeline{}
 		for k, v := range gemmVariants {
-			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize})
+			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize, RequiredSubgroupSize: v.wave})
 			if err != nil {
 				return fmt.Errorf("dit: gemm bank %d: %w", b, err)
 			}

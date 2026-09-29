@@ -151,8 +151,12 @@ const gemmBig gemmKernel = 0 // 128x256 tiles, the image DiT's measured winner
 var gemmVariants = map[gemmKernel]struct {
 	spirv  []byte
 	bm, bn int
+	bk     int    // the K tile: 32 for the LDS-staged build, 16 otherwise
+	wave   uint32 // a pinned subgroup size, or 0 for the device's default
 }{
-	gemmBig: {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9), bit-identical
+	// to the wave64 one it replaced.
+	gemmBig: {shaders.DiTGEMMWG128x256LDSW32, 128, 256, 32, 32},
 }
 
 const (
@@ -186,9 +190,12 @@ func NewGPU(dev *vk.Device, dir string, tileH, tileW, maxSeqs int) (*GPU, error)
 	g.seqLen = cfg.ClipTokens()*tileH*tileW + cfg.Registers + 1
 	g.stride = roundUp(g.seqLen, tile)
 	g.maxRows = roundUp(maxSeqs*g.stride, rowAlign)
-	// One column past the real width for the bias, K padded to the tile.
-	g.kH, g.kF = g.H+tile, g.ffn+tile
-	g.kIn = roundUp(cfg.LatentChannels+1+cfg.Registers, tile)
+	// One column past the real width for the bias, K padded to the big
+	// GEMM's K tile (32 since KERNELS.md G2; the pad columns are zero in
+	// every A operand and every weight).
+	bk := gemmVariants[gemmBig].bk
+	g.kH, g.kF = roundUp(g.H+1, bk), roundUp(g.ffn+1, bk)
+	g.kIn = roundUp(cfg.LatentChannels+1+cfg.Registers, bk)
 	g.ldaH, g.ldaF, g.ldaIn = g.kH+gemmPad, g.kF+gemmPad, g.kIn+gemmPad
 
 	set, err := safetensors.OpenSet(dir)
@@ -521,7 +528,11 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		}
 		for _, pr := range projOrder {
 			n, k := g.projShape(pr)
-			put(bw.bank, bw.off[pr], withBias(lin[pr][0], lin[pr][1], n, k-tile, k), n, k)
+			realK := g.H
+			if pr == projDown {
+				realK = g.ffn
+			}
+			put(bw.bank, bw.off[pr], withBias(lin[pr][0], lin[pr][1], n, realK, k), n, k)
 		}
 		g.abuf.WriteFloat32At(int(bw.norm1), n1)
 		g.abuf.WriteFloat32At(int(bw.norm2), n2)
@@ -575,7 +586,7 @@ func (g *GPU) build(*safetensors.Set) error {
 	for b := range g.banks {
 		m := map[gemmKernel]*vk.ComputePipeline{}
 		for k, v := range gemmVariants {
-			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize})
+			p, err := newPipe(v.spirv, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[b]}, PushConstantSize: pcSize, RequiredSubgroupSize: v.wave})
 			if err != nil {
 				return fmt.Errorf("vae: gemm bank %d: %w", b, err)
 			}
@@ -643,8 +654,8 @@ func (gr *graph) add(pipe *vk.ComputePipeline, kind string, gx, gy uint32, pc pu
 // lda) × B, the fragment-tiled weight at bOff of bank.
 func (gr *graph) gemm(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, m, n, k, lda int) error {
 	v := gemmVariants[kernel]
-	if n%v.bn != 0 || k%tile != 0 {
-		return fmt.Errorf("vae: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, tile)
+	if n%v.bn != 0 || k%v.bk != 0 {
+		return fmt.Errorf("vae: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, v.bk)
 	}
 	mPad := roundUp(m, v.bm)
 	pc := gr.base

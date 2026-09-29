@@ -65,11 +65,16 @@ that `grep -rl '§2\.3' .` and `ls research/2.3*` find the same thing.
 | [§2.2](2.2-q4-coopmat.md) | Q4 into the coopmat path | **2.10x a MoE block**; LDS round-trip is unavoidable |
 | [§2.3](2.3-channel-aliasing.md) | The [N,K] contradiction | It was **DRAM channel aliasing**; pad strides off a 4 KB multiple |
 | [§2.7](2.7-kslab-hoist.md) | Hoist the K-slab's fragment loads | **2.1x → 38990 GFLOP/s, 70% of the ceiling**; concurrency, not depth |
+| [§2.10](2.10-valu-costs-matrix-clocks.md) | Every VALU instruction costs the matrix pipe a clock; the LDS-staged GEMM's second K tile as a loop | **80 → 85% per clock, bit-identical; H3's projections 40.4 → 43.5 TFLOP/s, a 480p forward 27.3 → 26.7 s.** The register allocator's ~40 `v_swap`/`v_mov` a tile were 7% of the pipe; a probe that adds the kernel's parts back to the register-only loop prices VALU at ~3% an instruction a MMA, the LDS reads at 3%, the barrier's lockstep at 6–9, and the 16-lane exchange (`v_permlanex16`) as a loss |
+| [§2.9](2.9-lds-staged-wave32-gemm.md) | The prefetch that fits: K slabs through LDS at wave32 | **74 → 80% per clock, bit-identical; H3's projections 37 → 41 TFLOP/s, the split down projection 29 → 41, a 480p forward 29.9 → 27.1 s.** A wave64 fragment is 8 VGPRs (4x replicated), ACO copies any fragment carried across a loop back-edge element by element, and LDS fragment reads are `ds_load_b64` (pitch 36 halves) |
 | [§3.4](3.4-model-shapes.md) | The models' real shapes | Prefill has **two winners split by M alone**; the per-model budget table |
 | [§3.5](3.5-grouped-moe-gemm.md) | Grouped / MoE GEMM | **1.1-4.1x**, and the mechanism is **occupancy** |
 | [§5.1](5.1-memory-types.md) | Which memory type is fastest? | **None of them** — 0.57% across all 8, heap0/heap1 = 1.0004; and the **reported heap sizes are fiction** (105 GiB out of an 83.79 GiB heap) |
 | [§5.1b](5.1b-mall-cliff-and-stride.md) | The MALL cliff and the stride probe | The coverage law `min(1, C/gcd(stride, 4096))`; rotation is **4 KB** |
 | [§6.2](6.2-wave32-vs-wave64.md) | wave32 vs wave64 | Splits three ways; decode **96% of the bus**, the best GEMM **spills** |
+| [§0.6](0-measurement-validity.md) | The WMMA ceiling re-pinned; the clock under a real kernel | **480 FLOP/clk/CU is the hardware's**; a forward runs at **2600 MHz, ~149 W**, so its ceiling is 49.9 TFLOP/s; 32 busy CPU threads halve the GPU clock |
+| [§0.7](0-measurement-validity.md) | The energy roofline | The GEMM ladder draws 137 W at every rung; **rate = cap ÷ J per op**; a DRAM byte ~490 pJ, a MALL byte ~100, a matrix FLOP 1.4 |
+| [§6.5](6.5-gemm-schedule.md) | The shipped GEMM's schedule, from the ISA | No cross-tile prefetch, 85 address instructions an iteration; **flat from 1 to 3+ workgroups a CU**; L0-hit loads reach **82–85%** per clock, so ~10 points memory, ~16 schedule |
 
 §2.4 (the workgroup swizzle), §2.6 (fp16 output and epilogue fusion) and §2.8
 (a weight stored as fragment tiles) were all measured as part of stage 4 and

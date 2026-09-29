@@ -161,14 +161,16 @@ type gemmKernel struct {
 	spirv  []byte
 	bm, bn int
 	waves  int
+	wave   uint32 // a pinned subgroup size; 0 is 64 for a multi-wave build
 }
 
 // gemmKernels are the rungs zimage/qwen's PlanFor picks between for a
 // 2560-wide Qwen3, and gemmFor its schedule (as Kev uses it).
 var gemmKernels = []gemmKernel{
-	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1},
-	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1},
-	{"wg128x256", shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256, 4},
+	{"reg32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, 1, 0},
+	{"reg64", shaders.DiTGEMMReg64Tiled, 64, 64, 1, 0},
+	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9).
+	{"wg128x256", shaders.DiTGEMMWG128x256LDSW32, 128, 256, 8, 32},
 }
 
 func gemmFor(rows int) gemmKernel {
@@ -186,9 +188,9 @@ func gemmFor(rows int) gemmKernel {
 // LLM's llm_gemm.comp -DQ8B plain arm, as Kev runs it (CLASSIFICATION.md
 // K7.1). BN is 64.
 var q8Kernels = []gemmKernel{
-	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, 1},
-	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, 1},
-	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, 1},
+	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, 1, 0},
+	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, 1, 0},
+	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, 1, 0},
 }
 
 // q8For is Kev's schedule for the int8 rungs.
@@ -541,7 +543,9 @@ func (g *GPU) build() error {
 		if b != g.head {
 			for _, k := range gemms {
 				spec := vk.PipelineSpec{Buffers: bb, PushConstantSize: pc}
-				if k.waves > 1 || q8 {
+				if k.wave != 0 && !q8 {
+					spec.RequiredSubgroupSize = k.wave
+				} else if k.waves > 1 || q8 {
 					spec.RequiredSubgroupSize = 64
 				}
 				p, err := g.pipeline("gemm "+k.name, k.spirv, spec)

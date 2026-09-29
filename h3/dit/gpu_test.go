@@ -1,6 +1,7 @@
 package dit
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -690,6 +691,43 @@ func TestGPUShapes(t *testing.T) {
 	if c := os.Getenv("H3_CHUNK"); c != "" {
 		fmt.Sscan(c, &chunk)
 	}
+	// H3_GEMM_SPV=path runs the big GEMM from a build on disk, the same
+	// geometry (128x256) as the shipped one (KERNELS.md G1, G2: occupancy
+	// arms and prefetch candidates, screened on H3's own shapes).
+	if p := os.Getenv("H3_GEMM_SPV"); p != "" {
+		spirv, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := gemmVariants[gemmBig]
+		v.spirv = spirv
+		// H3_GEMM_WAVE=32 pins the loaded build's wave size; H3_GEMM_BM and
+		// H3_GEMM_BN its workgroup tile when it is not 128x256 (G-o8's
+		// four-wave arm).
+		if w := os.Getenv("H3_GEMM_WAVE"); w != "" {
+			fmt.Sscan(w, &v.wave)
+		}
+		if w := os.Getenv("H3_GEMM_BM"); w != "" {
+			fmt.Sscan(w, &v.bm)
+		}
+		if w := os.Getenv("H3_GEMM_BN"); w != "" {
+			fmt.Sscan(w, &v.bn)
+		}
+		gemmVariants[gemmBig] = v
+		t.Logf("gemm big: %s (wave %d)", filepath.Base(p), v.wave)
+		// H3_GEMM_KRANGE_SPV=path is the same build's KRANGE companion, for
+		// the split down projection (M11d).
+		if p := os.Getenv("H3_GEMM_KRANGE_SPV"); p != "" {
+			spirv, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			k := gemmVariants[gemmKRange]
+			k.spirv, k.wave, k.bm, k.bn = spirv, v.wave, v.bm, v.bn
+			gemmVariants[gemmKRange] = k
+			t.Logf("gemm krange: %s", filepath.Base(p))
+		}
+	}
 	g, err := NewGPUBank(dev, modelDir, maxRows, 1024, chunk, testBank(t))
 	if err != nil {
 		t.Fatal(err)
@@ -723,7 +761,40 @@ func TestGPUShapes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !finite(v.Data) {
+		// H3_GEMM_REF=path is the bit-identical gate for a loaded GEMM build
+		// (KERNELS.md G2): the first run writes the velocities' bits there,
+		// every later one compares against them. A scheduling arm makes the
+		// same MMAs in the same order per accumulator, so its forward is the
+		// same bits as the shipped build's.
+		if p := os.Getenv("H3_GEMM_REF"); p != "" && i == 0 {
+			bits := make([]byte, 4*len(v.Data))
+			for j, x := range v.Data {
+				binary.LittleEndian.PutUint32(bits[4*j:], math.Float32bits(x))
+			}
+			if ref, err := os.ReadFile(p); err == nil {
+				if bytes.Equal(ref, bits) {
+					t.Logf("forward bit-identical to %s", filepath.Base(p))
+				} else {
+					n := 0
+					for j := range bits {
+						if j < len(ref) && ref[j] != bits[j] {
+							n++
+						}
+					}
+					t.Errorf("forward differs from %s: %d of %d bytes", filepath.Base(p), n, len(bits))
+				}
+			} else if err := os.WriteFile(p, bits, 0o644); err != nil {
+				t.Fatal(err)
+			} else {
+				t.Logf("forward bits written to %s", filepath.Base(p))
+			}
+		}
+		// A build loaded from disk may be wrong by construction (KERNELS.md
+		// G1's L0_LOADS arm reads two K tiles for all of K): it is being
+		// timed, not gated, so the bisect below is skipped for it.
+		if !finite(v.Data) && os.Getenv("H3_GEMM_SPV") != "" {
+			t.Logf("%v: non-finite velocity from the loaded GEMM build; timing it anyway", shapes[i])
+		} else if !finite(v.Data) {
 			// Bisect: the packed input, then block by block.
 			gr, err := g.stepGraph(video, audio, rowT, 0)
 			if err != nil {
