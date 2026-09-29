@@ -26,7 +26,7 @@ MiniMax's product is three modules. **Only the middle one is open.**
 
 | module | what it does | here |
 |---|---|---|
-| H3-Context-IR | hosted multi-model service that rewrites a free-form request into a long structured prompt (`integrated_multimodal_description:` / `overall_soundscape:` / `non_diegetic_music:`, shot markers, `<d>` dialogue tags) | **not released.** The card says output quality depends on it. M12 substitutes our own LLM with MiniMax's published prompt-writing guide |
+| H3-Context-IR | hosted multi-model service that rewrites a free-form request into a long structured prompt (`integrated_multimodal_description:` / `overall_soundscape:` / `non_diegetic_music:`, shot markers, `<d>` dialogue tags) | **not released.** The card says output quality depends on it. A stand-in (our LLM under MiniMax's published prompt-writing guide) is the **client's** job, not the server's (M12) |
 | **H3-Base** | the generator: 768p short edge, 5–15 s, 24 fps, stereo | **this vertical** |
 | H3-Regenerate-2K | re-generates the 768p result at 2K in context | not released ("once it is ready") |
 
@@ -273,8 +273,8 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | **done 2026-09-26** (`h3/vae/encoder.go`, `h3/textenc` Presentation, `h3/pipeline/keyframe.go`, `-first`/`-last`, `input_reference` / `conditions`): encoder moments at ≤ 1.6e-5 of fp32, torch's seed-42 draw reproduced; conditioner 9.3e-4 teacher-forced (bf16: 1.2e-2); teacher-forced steps ≤ 1.3e-4 rms; frame 0 of a served run lands on the keyframe at **27.1 dB** |
-| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. **M11c done 2026-09-29**: the attention transposed (`h3_attn_t.comp`), so P reaches the matrix cores without LDS: 1.55–1.61x on the kernel, a forward 35.6 → 30.6 s at 480p and 144 → 111 s at 768p, gated teacher-forced. **M11d**: the down projection in two K passes, bit-identical, 1.02x a 480p forward; its swizzle band and row pad screened and already optimal. The rest is open |
-| M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | |
+| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. **M11c done 2026-09-29**: the attention transposed (`h3_attn_t.comp`), so P reaches the matrix cores without LDS: 1.55–1.61x on the kernel, a forward 35.6 → 30.6 s at 480p and 144 → 111 s at 768p, gated teacher-forced. **M11d**: the down projection in two K passes, bit-identical, 1.02x a 480p forward; its swizzle band and row pad screened and already optimal. **M11e**: the video VAE's attention on M11c's transposed kernel at head 64, 1.44x on the kernel, a 480p decode 38.4 → 37.1 s, PSNR against the oracle unchanged at 81.7 dB. **M11f**: the audio decode on the device, priced and not built: the CPU decode already hides under the video decode, and costs a request only the 2.4 s of device time its memory traffic takes from that decode. The rest is open |
+| M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | **a client concern, 2026-09-29**: `/v1/videos` takes the prompt verbatim; the front-end rewrites before it submits (see M12 below). Nothing to build here |
 | M13 | `ref2va` (optional) | |
 
 ### M0 — weights, environment, oracles
@@ -1113,6 +1113,149 @@ gap, not all of it.
 29.91 s** against 30.41 / 30.42 s one-pass (1.02x). 768p 106.1 / 109.6
 against 107.2 / 114.4, inside that shape's run-to-run spread.
 
+### M11e — the VAE's attention, transposed (2026-09-29)
+
+The decoder's attention (36 layers, 32 heads of 64, a tile-clip's 1,797
+tokens against its own keys, 8 tile-clips a batch) ran the plain
+`dit_attention_wmma.comp` at head 64. It now runs `h3_attn_t.comp` at
+`-DHEAD_DIM=64`, chosen at the first run by the same element-order probe
+the transformer uses (`dit.TransposedAttentionOK`, exported for this; the
+plain build stays the fallback, `vae.AttnVariant`, `GPU.SetAttention`).
+
+One change to the kernel. The tile-clips sit side by side at a 16-row
+stride (1,808), so at QT = 2 the last workgroup's second query tile is
+the *next* sequence's first 16 rows, and storing it would race that
+sequence's dispatch. `-DSTORE_TAIL=0` skips a query tile that starts
+past the sequence. The transformer's build leaves it at 1 and its
+SPIR-V is byte-identical to before. `maxKeyBlock` went from 4 to 8 tiles,
+for the KTIL 8 builds (the plane's pad rows).
+
+**Screen** (`TestGPUAttentionScreen`, block 0's planes of 8 random
+tile-clips, one batch-layer, median of 7, two runs):
+
+| build | ms | TFLOP/s | rms vs plain |
+|---|---|---|---|
+| plain QT1 KTIL4 (was shipped) | 8.91 / 9.14 | 23–24 | — |
+| T QT1 KTIL4 | 6.49 / 6.54 | 32.5 | 8.7e-5 |
+| T QT1 KTIL8 | 6.76 / 6.56 | 31–32 | 1.1e-4 |
+| **T QT2 KTIL4** | **6.19 / 6.21** | **34.1** | 8.7e-5 |
+| T QT2 KTIL8 | 6.85 / 6.87 | 31 | 1.1e-4 |
+| T QT4 KTIL4 | 10.6 / 10.8 | 20 | 8.7e-5 |
+
+The transformer's choice (QT2 KTIL4) wins here too, 1.44x. QT4 spills.
+
+**Decode** (`TestGPUShapes`, `H3_VAE_ATTN_PLAIN=1` the control, two
+passes of each arm, interleaved): 480p **37.0 / 37.2 s** against 38.4 /
+38.4, 768p **69.4 / 69.2** against 71.5 / 71.5 — 1.035x, which is the
+kernel's saving (14 batches × 36 layers × 2.9 ms ≈ 1.5 s) and nothing
+else. The attention was ~12% of the decode, so this is its ceiling.
+**Gate** (`TestGPUDecoder`): blocks teacher-forced at rel ≤ 1.4e-4, the
+tile-clip and the 12-frame decode at **PSNR 81.7 dB** against fp32, as
+in M5.
+
+### M11f — the audio decode on the device, priced (2026-09-29)
+
+The handoff's lever was "7.2 s on the CPU against torch's 1.1". But
+`Generate` has run the audio decode in a goroutine beside the video
+decode since M8. So the question is not the audio's time but what it
+adds to the request. `TestDecodeOverlap` (`h3/pipeline`, `H3_OVERLAP=1`)
+answers that at the served 480p × 124 frames (105 tile-clips, 5.17 s of
+stereo), on random latents, two passes:
+
+| audio workers | audio alone | together | video's device time | past the video alone |
+|---|---|---|---|---|
+| — (video alone) | | 37.6–37.7 s | 37.13–37.17 s | |
+| 32 (shipped) | 7.5–7.7 s | 40.1–40.2 s | 39.4–39.5 s | **+2.4–2.6 s** |
+| 8 | 15.4–15.5 s | 39.2–39.3 s | 38.7–38.8 s | +1.6 s |
+| 4 | 27.6 s | 38.9 s | 38.4 s | +1.2–1.3 s |
+
+The audio always finishes inside the video decode. The cost is that the
+*device* runs slower while the CPU decodes. That is contention for the
+shared memory, not host scheduling: the host-side part of the video
+decode is unchanged. Fewer workers spread the same traffic over a longer
+time, so the cost falls but never goes away. At four workers the audio
+also takes 28 s, which would put it on the critical path of any canvas
+smaller than 480p. `audiovae.SetWorkers` is the knob, and
+`H3_OVERLAP_WORKERS=a,b,...` sets the arms.
+
+**Price.** A device BigVGAN would remove at most the ~2.4 s of contention,
+minus its own device time (~480 GFLOP of fp32 1-D convolutions). That is
+≤ 0.3% of a served 480p request (~740 s). The port is the whole codec:
+dilated convolutions, transposed-convolution upsampling, and SnakeBeta
+with its replicate-padded ×2 kaiser resampling, all in fp32 (M6: bf16 is
+20 dB quieter). **Not built.** A worker count that adapts to the tile-clip
+count (the audio finishing just before the video decode) would get about
+half the saving without a port. It was not shipped either: its model of
+the audio's time is per-machine, for ~1 s a request.
+
+### M11g — the last two stagings, timed (2026-09-29)
+
+M11b left two stagings untimed. `TestStagings` (`h3/pipeline`,
+`H3_STAGINGS=1`) times each on its own. For a cold read, the files are
+first evicted with `posix_fadvise(DONTNEED)`, as in M11b. Two warm runs
+and two cold:
+
+| staging | warm | cold | where in a request |
+|---|---|---|---|
+| the text encoder's embedding table (151,936 × 5,120 bf16 → 3.11 GB fp32) | 0.73–0.74 s | 1.01–1.02 s | inside the encoder's staging |
+| the video VAE decoder (4.88 GB fp16 banks + 1.86 GB activations at 8 × 1,808 rows) | 4.58–4.65 s | 5.44–5.50 s | first act of the decode |
+| the same, beside the 5.17 s audio decode | **8.44–8.53 s** | | *as a request runs it* |
+
+The embedding table is noise: under a second, 0.1% of a 480p request.
+Leave it.
+
+The VAE staging is the one that counts. It is a serial loop over 36
+blocks. Each block reads fp32 from the checkpoint (the decoder is 9.8 GB
+of fp32), adds the bias column, packs to fp16 and writes into the mapped
+bank: ~2.1 GB/s, and cold is only 0.8 s slower than warm, so it is CPU,
+not disk. And `Generate` starts the audio decode just *before*
+`decodeVideo`, whose first act is this staging. The two contend for the
+CPU, and the staging stretches from 4.6 to **8.5 s**.
+
+**This corrects M11f's picture.** M11f timed the audio beside an
+already-staged video decode (+2.4 s of device time). In a request, the
+7.5 s audio decode instead spends most of its time beside the VAE
+staging, and costs that staging ~3.9 s of host time. The conclusion holds
+(a device port still buys only seconds), but the cheap levers are here:
+
+- stage the VAE's blocks in parallel (the loop has no dependency between
+  blocks; bytes identical);
+- or start the audio decode after the staging, so it overlaps the video
+  decode's device time instead of the staging's CPU time;
+- or cache the packed fp16 banks as M11b does (4.9 GB of disk, ~1 s
+  cold at M11b's 4.7 GB/s).
+
+Together these are worth ~4–7 s of a request (~1% at 480p). Not built.
+
+### M12 — Context-IR is the client's (2026-09-29)
+
+Decided, not built: the prompt rewrite lives in the front-end, and
+`serve -video` gets no `-video-rewrite-url`. The reasons:
+
+- The user should see (and can edit) the rewrite before a ~12-minute
+  generation is spent on it; inside a job, a misread prompt only shows up
+  in the finished video.
+- MiniMax runs Context-IR as its own step too
+  (`/video-generation-v2-h3-context-ir` returns a prompt, which then goes
+  to the create call), as the README's examples show.
+- `/v1/videos` keeps OpenAI's behaviour: the
+  prompt is used as given, and the same request and seed still give a
+  byte-identical mp4.
+- The LLM is on the other machine. The front-end already talks to both
+  machines; the video server would otherwise depend on the LLM's address
+  and health.
+- The keyframes the vision LLM must see are already in the client's hands.
+
+What a client needs: the guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md`
+in the checkpoint) as the system prompt; the instruction line by mode (none
+for text only; `For the target video, at 0.00 seconds … <Picture 1> (from
+[Shot 1]) is fully referenced.` for a first frame; `How the reference
+pictures align with the target video — …` for first + last, or last only);
+the keyframes as image parts; `S.SS` as the clip's length to two decimals,
+rounded as `Resolve` rounds the requested seconds to frames; and a pass-through
+for a prompt that already starts with `integrated_multimodal_description:` or
+an instruction line.
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -1132,7 +1275,8 @@ projections are folded out.
 - ~~M-o2. Does the ViT decoder tolerate fp16?~~ **Yes** (M5): its activations
   peak at 832, and the decode lands at PSNR 81.7 dB against fp32.
 - **M-o3. How good is the output without Context-IR?** The card is blunt that
-  it matters. The oracle comparisons don't care; the product does. M12.
+  it matters. The oracle comparisons don't care; the product does. It is
+  the client's to answer (M12): the server takes whatever prompt it gets.
 - **M-o4. Is the sparse attention coming?** It is the only lever on the L²
   term, which is 59% of a trained-canvas 5 s forward and 80% of a 14.4 s one.
 - **M-o6. Forward 2's video velocity is 2.6% rms off** (teacher-forced),
@@ -1145,6 +1289,38 @@ projections are folded out.
   acceptable.
 
 ## Handoff
+
+**2026-09-29, session 10: M11g, the last stagings timed.** The embedding
+table is 0.73 s warm, 1.0 s cold. The video VAE staging is 4.6 s alone,
+but **8.5 s in a request**, because the audio decode starts beside it
+(`TestStagings`, `H3_STAGINGS=1`). That corrects M11f: the audio's cost
+lands on this staging, not only on the video decode. Parallel block
+staging, or starting the audio after the staging, are the cheap levers.
+
+**2026-09-29, session 10: M11b–M11e deployed.** `ai.service` restarted
+at 18:40 on a build with the bank cache, both transposed attentions and
+the split down projection (up in 71 s, no restarts). The README t2va
+prompt at 448×256 × 124 frames × 8 steps, served: **80 s** (M9: 199 s).
+It is h264 448×256 with 124 frames and stereo AAC at 32 kHz (−27.8 dB mean), and the frames follow the
+prompt. The bank cache was already on disk (M11b's served run wrote it
+at 12:55), so this was a warm hit.
+
+**2026-09-29, session 10: M12 moved to the client.** The Context-IR
+stand-in is the front-end's job; `/v1/videos` takes prompts verbatim.
+
+**2026-09-29, session 10: M11f priced, not built.** The audio decode
+already overlaps the video decode. Its only cost is the 2.4 s of device
+time its memory traffic takes from that decode (`TestDecodeOverlap`), so a
+device port is worth ≤ 0.3% of a request. `audiovae.SetWorkers` caps its
+goroutines (default unchanged).
+
+**2026-09-29, session 9: M11e done.** The video VAE's attention runs
+the transposed kernel at head 64 (`h3vae_attn_t_hd64_qt2_kt4`, chosen by
+the element-order probe at the first run; `-DSTORE_TAIL=0` for the
+side-by-side tile-clips). 1.44x on the kernel, a 480p decode 38.4 →
+37.1 s, 768p 71.5 → 69.3 s, PSNR unchanged. `TestGPUAttentionScreen`
+(`H3_VAE_SHAPES=1`) screens the builds; `H3_VAE_ATTN_PLAIN=1` is the
+control in `TestGPUShapes`. Not deployed.
 
 **2026-09-29, session 8: M11d done.** The down projection runs as two K
 passes (`-DKRANGE`, `downSplit`), bit-identical, 29 TFLOP/s against
@@ -1232,16 +1408,17 @@ envelope), and shares the device with the other verticals while it runs.
 
 **Next, in order:**
 
-1. ~~The staging cost~~: done, M11b. What staging is left (the video VAE,
-   the fp32 embedding table) is not yet timed on its own.
+1. ~~The staging cost~~: done, M11b; the rest timed in M11g. The embedding
+   table is 0.7–1.0 s (leave it). The VAE staging is 8.5 s in a request
+   (4.6 s alone, the rest the audio decode beside it); M11g lists the
+   cheap levers.
 2. M11 levers, measured and priced: ~~the attention~~ (M11c), ~~the down
    projection~~ (M11d; still 29 against `o`'s 35, and nothing cheap is
-   left there), the video VAE's attention
-   (`h3vae_attn_hd64`, the plain kernel at head 64: a HEAD_DIM=64 build of
-   `h3_attn_t.comp` is the obvious try), and the audio decode on the
-   device (7 s on the CPU against torch's 1.1). Outside this vertical,
+   left there), ~~the video VAE's attention~~
+   (M11e, 1.035x the decode: the VAE is GEMM-bound now), ~~the audio decode on the
+   device~~ (M11f: priced at ≤ 2.4 s a request, not built). Outside this vertical,
    every `dit_attention_wmma.comp` user (the image DiT, Kev, OCR, ACE) pays
    the same LDS round trip for P.
-3. M12: a Context-IR stand-in, since plain prompts are what users will send.
-   For fl2va it has to write the `<Picture 1>` references the README's
-   prompts carry ("at 0.00 seconds … <Picture 1> … is fully referenced").
+3. ~~M12~~: a client concern (the front-end rewrites; see M12). Left in
+   this vertical: M13 (`ref2va`, optional, weights not fetched), the
+   VAE staging levers in M11g (~4–7 s a request). M11b–M11e are deployed.

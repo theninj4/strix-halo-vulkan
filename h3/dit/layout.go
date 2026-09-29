@@ -109,3 +109,15 @@ func checkCoopMatLayout(dev *vk.Device) error {
 	}
 	return nil
 }
+
+// TransposedAttentionOK says whether h3_attn_t.comp's builds are right on dev
+// (checkCoopMatLayout), for the other callers of that kernel (the video
+// VAE's decoder). A false with a nil error is a device with another element
+// order; an error is a probe that did not run.
+func TransposedAttentionOK(dev *vk.Device) (bool, error) {
+	err := checkCoopMatLayout(dev)
+	if errors.Is(err, errLayout) {
+		return false, nil
+	}
+	return err == nil, err
+}

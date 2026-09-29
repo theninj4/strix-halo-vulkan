@@ -61,14 +61,22 @@ service leaves ~35 GB available (image is 49.7 GB with `-edits 3`), and
 since **M11a** a 480p request runs through the service with 15.4 GB still
 free (it was OOM-killed before): int8 banks for the encoder and
 transformer, and two host-memory fixes in `safetensors` and `serve`. Since
-**M11b** (2026-09-29, not yet deployed) the int8 banks and AdaLN tables are
+**M11b** (2026-09-29) the int8 banks and AdaLN tables are
 cached in `bank-cache/` beside the checkpoint (47 GB of disk): a request's
 stagings take ~12 s instead of ~94, output byte-identical. Since **M11c**
-(2026-09-29, not yet deployed) the attention runs transposed so P never
+(2026-09-29) the attention runs transposed so P never
 goes through LDS: 1.55–1.61x on the kernel, a 480p forward 35.6 → 30.6 s,
 768p 144 → 111 s. **M11d** runs the down projection as two K passes,
-bit-identical: a 480p forward is ~29.9 s. Open: the rest of performance
-(M11), a Context-IR stand-in (M12).
+bit-identical: a 480p forward is ~29.9 s. **M11e** runs the video VAE's
+attention on the same transposed kernel at head 64: a 480p decode 38.4 →
+37.1 s, PSNR unchanged. **M11f** priced the audio decode on the device at
+≤ 2.4 s a request (it already overlaps the video decode) and left it on
+the CPU. Open: the rest of performance
+(M11). The Context-IR stand-in (M12) is a client concern: the
+front-end rewrites prompts before it submits. M11b–M11e deployed 2026-09-29: the
+README prompt at 448×256 × 8 steps serves in 80 s (M9: 199 s). **M11g** timed
+the last stagings: the embedding table is under a second; the video VAE's
+is 8.5 s in a request (4.6 s alone, the audio decode contends).
 
 - [x] **Video in int8, to fit beside the image model** (2026-09-26,
   VIDEO.md M11a). Encoder and transformer as int8 banks by default, every
@@ -104,7 +112,8 @@ flags through image → music → video → image: 9.4 GB at rest with nothing
 staged, 60 GB at the worst moment (all three resident was ~112 GB), a switch
 costs ~25-30 s before an image and ~19 s before a song, and speech is
 answered through every load (loads take no device lock). This is what lets
-`-image -edits 3 -video -music` go back into the unit; not yet deployed.
+`-image -edits 3 -video -music` go back into the unit; deployed (the unit
+runs it, and the 2026-09-29 18:40 start logs the swaps).
 
 **The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
@@ -780,7 +789,7 @@ projections batched, attention per text, with no shader changes.
   that a pass holds, so a lone query could not even queue until the passes
   ahead of it had drained, and it came back *with* the job at 300 ms.
   `TestEmbedQueryOvertakesJob` pins it.
-- **Not deployed.** `ai.service` needs a restart to pick it up.
+- **Deployed** by the 2026-09-29 18:40 restart (VIDEO.md session 10).
 
 **Next, for single-query latency** (the GEMMs run at ~70 GB/s against a
 236 GB/s bus; small-M grids underfill at hidden 1024):

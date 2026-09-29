@@ -77,6 +77,14 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define QREG 1
 #endif
 
+// STORE_TAIL=0 skips a query tile that starts past the sequence, for callers
+// whose sequences sit side by side at a 16-row stride (the video VAE's
+// tile-clips): at QT > 1 the last workgroup's later tiles are the next
+// sequence's first rows, and writing them would race its own dispatch.
+#ifndef STORE_TAIL
+#define STORE_TAIL 1
+#endif
+
 #define TILE 16
 #define HDT (HEAD_DIM / TILE)
 #define BM (QT * TILE)
@@ -241,6 +249,11 @@ void main() {
     // The rows past the sequence are written too, as the plain build does:
     // they are the A operand's pad rows, which nothing reads.
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+#if !STORE_TAIL
+        if (q0 + qq * TILE >= n) {
+            break;
+        }
+#endif
         float inv = 1.0 / (runSum[qq] + subgroupShuffleXor(runSum[qq], 16u));
         [[unroll]] for (uint j = 0u; j < HDT; ++j) {
             ACC r = o[qq][j];

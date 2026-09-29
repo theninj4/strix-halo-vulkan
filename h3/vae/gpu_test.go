@@ -6,9 +6,13 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"strix-halo-vulkan/h3/dit"
+	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/vk"
 )
 
@@ -196,7 +200,8 @@ func TestGPUDecodeFull(t *testing.T) {
 
 // TestGPUShapes times the decode at the served and trained canvases on
 // random latents (the cost does not depend on the values). Opt-in with
-// H3_VAE_SHAPES=1; H3_VAE_SEQS sets the batch.
+// H3_VAE_SHAPES=1; H3_VAE_SEQS sets the batch, H3_VAE_ATTN_PLAIN=1 runs the
+// plain attention (M11e's control arm).
 func TestGPUShapes(t *testing.T) {
 	if os.Getenv("H3_VAE_SHAPES") == "" {
 		t.Skip("set H3_VAE_SHAPES=1")
@@ -212,6 +217,11 @@ func TestGPUShapes(t *testing.T) {
 	}
 	g, done := newTestGPU(t, 16, 16, seqs)
 	defer done()
+	if os.Getenv("H3_VAE_ATTN_PLAIN") != "" {
+		if err := g.SetAttention(attnPlain); err != nil {
+			t.Fatal(err)
+		}
+	}
 	r := rand.New(rand.NewPCG(1, 2))
 	for _, s := range []struct {
 		name   string
@@ -230,5 +240,87 @@ func TestGPUShapes(t *testing.T) {
 		flops := float64(st.Calls) * g.callFlops()
 		t.Logf("%s × 124 frames: %d tile-clips in %d batches of ≤%d; %v device (%.1f TFLOP/s), %v wall",
 			s.name, st.Calls, st.Batches, seqs, st.Device.Round(time.Millisecond), flops/st.Device.Seconds()/1e12, wall.Round(time.Millisecond))
+	}
+}
+
+// TestGPUAttentionScreen times every attention build on block 0's planes of
+// a batch of random tile-clips at the served tile size, and prices each
+// against the plain build's context (VIDEO.md M11e). Opt-in with
+// H3_VAE_SHAPES=1; H3_VAE_SEQS sets the batch.
+func TestGPUAttentionScreen(t *testing.T) {
+	if os.Getenv("H3_VAE_SHAPES") == "" {
+		t.Skip("set H3_VAE_SHAPES=1")
+	}
+	seqs := 8
+	if s := os.Getenv("H3_VAE_SEQS"); s != "" {
+		fmt.Sscan(s, &seqs)
+	}
+	c := testConfig(t)
+	g, done := newTestGPU(t, 16, 16, seqs)
+	defer done()
+	ok, err := dit.TransposedAttentionOK(g.dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("transposed element order: %v", ok)
+
+	r := rand.New(rand.NewPCG(3, 4))
+	clips := make([]*Tensor, seqs)
+	for i := range clips {
+		clips[i] = NewTensor(c.LatentChannels, c.ClipTokens(), 16, 16)
+		for j := range clips[i].Data {
+			clips[i].Data[j] = float32(r.NormFloat64())
+		}
+	}
+	g.input(clips)
+	if err := g.SetAttention(attnPlain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.run(seqs, 0, 1, true, false); err != nil {
+		t.Fatal(err)
+	}
+	ctx := func() []float32 {
+		out := make([]float32, 0, seqs*g.seqLen*g.H)
+		for s := 0; s < seqs; s++ {
+			for row := 0; row < g.seqLen; row++ {
+				h := g.hbuf.ReadUint16At(int(g.hCtx)+(s*g.stride+row)*g.ldaH, g.H)
+				for _, v := range h {
+					out = append(out, safetensors.F16ToF32(v))
+				}
+			}
+		}
+		return out
+	}
+	ref := ctx()
+
+	flops := 4 * float64(seqs) * float64(g.seqLen) * float64(g.seqLen) * float64(g.headDim) * float64(g.heads)
+	vs := AttnVariants()
+	slices.SortFunc(vs, func(a, b AttnVariant) int { return strings.Compare(a.String(), b.String()) })
+	for _, v := range vs {
+		if v.T && !ok {
+			continue
+		}
+		if err := g.SetAttention(v); err != nil {
+			t.Fatal(err)
+		}
+		var times []time.Duration
+		for rep := 0; rep < 7; rep++ {
+			gr := g.newGraph()
+			gr.attention(seqs)
+			d, err := gr.submit()
+			if err != nil {
+				t.Fatal(err)
+			}
+			times = append(times, d)
+		}
+		slices.Sort(times)
+		med := times[len(times)/2]
+		rel, rms := gap(ctx(), ref)
+		t.Logf("%-22v %8v median (%v..%v), %.1f TFLOP/s; against plain rel %.2e rms %.2e",
+			v, med.Round(10*time.Microsecond), times[0].Round(10*time.Microsecond), times[len(times)-1].Round(10*time.Microsecond),
+			flops/med.Seconds()/1e12, rel, rms)
+		if rel > 5e-3 {
+			t.Errorf("%v: rel %.2e against plain", v, rel)
+		}
 	}
 }

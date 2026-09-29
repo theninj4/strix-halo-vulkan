@@ -65,8 +65,13 @@ type GPU struct {
 	banks            []*vk.Buffer
 	pipes            map[string]*vk.ComputePipeline
 	gemms            []map[gemmKernel]*vk.ComputePipeline
-	attnPipe         *vk.ComputePipeline
-	mods             []*vk.ShaderModule
+	attnPipes        map[AttnVariant]*vk.ComputePipeline
+	// attn is the build blockPass records; attnProbed says the first run
+	// has chosen it (the probe is a dispatch, so a staging can't), and
+	// attnFixed that a test has.
+	attn                  AttnVariant
+	attnProbed, attnFixed bool
+	mods                  []*vk.ShaderModule
 
 	H, ffn, heads, headDim, ropeHalf int
 	seqLen, stride, maxSeqs, maxRows int // tokens a sequence, its row stride, sequences a batch
@@ -158,7 +163,7 @@ const (
 	// maxBankBytes is one storage buffer's range on this device.
 	maxBankBytes = 0xfffffffc
 	// maxKeyBlock is the longest key block the attention reads past its count.
-	maxKeyBlock = 4 * tile
+	maxKeyBlock = 8 * tile
 )
 
 func roundUp(n, m int) int { return (n + m - 1) / m * m }
@@ -558,9 +563,15 @@ func (g *GPU) build(*safetensors.Set) error {
 	if !g.dev.Features().SubgroupSizeControl || !sgs.Supported || 32 < sgs.MinSubgroupSize || 32 > sgs.MaxSubgroupSize {
 		return fmt.Errorf("vae: the attention build needs a pinned wave32")
 	}
-	if g.attnPipe, err = newPipe(shaders.H3VAEAttnHD64, vk.PipelineSpec{Buffers: base, PushConstantSize: pcSize, RequiredSubgroupSize: 32}); err != nil {
-		return fmt.Errorf("vae: attention pipeline: %w", err)
+	g.attnPipes = map[AttnVariant]*vk.ComputePipeline{}
+	for v, spirv := range attnBuilds {
+		p, err := newPipe(spirv, vk.PipelineSpec{Buffers: base, PushConstantSize: pcSize, RequiredSubgroupSize: 32})
+		if err != nil {
+			return fmt.Errorf("vae: attention pipeline %v: %w", v, err)
+		}
+		g.attnPipes[v] = p
 	}
+	g.attn = attnPlain
 	for b := range g.banks {
 		m := map[gemmKernel]*vk.ComputePipeline{}
 		for k, v := range gemmVariants {
@@ -580,8 +591,8 @@ func (g *GPU) Destroy() {
 	for _, p := range g.pipes {
 		p.Destroy()
 	}
-	if g.attnPipe != nil {
-		g.attnPipe.Destroy()
+	for _, p := range g.attnPipes {
+		p.Destroy()
 	}
 	for _, m := range g.gemms {
 		for _, p := range m {
@@ -695,7 +706,6 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 	aGate := aAttn + uint32(pad*g.H)
 	aUp := aGate + uint32(pad*g.ffn)
 	aFF := aUp + uint32(pad*g.ffn)
-	planeTile := uint32(g.headDim * tile) // halves a 16-row tile of one head
 
 	norm := func(kind string, weight uint32) {
 		pc := gr.base
@@ -745,17 +755,7 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 	pc.Scale = math.Float32bits(1)
 	gr.add(g.pipes["pack"], "pack v", uint32((tiles+7)/8), uint32(g.heads), pc, 0)
 
-	// The attention, a sequence at a time, each over its own keys.
-	for s := 0; s < seqs; s++ {
-		t0 := uint32(s*g.stride/tile) * planeTile
-		pc := gr.base
-		pc.Tokens = uint32(g.seqLen)
-		pc.InOff, pc.KOff, pc.VOff = g.hQ+t0, g.hK+t0, g.hV+t0
-		pc.OutOff, pc.LDA = g.hCtx+uint32(s*g.stride*g.ldaH), uint32(g.ldaH)
-		pc.Aux1 = uint32(g.planeRows)
-		gr.add(g.attnPipe, "attention", uint32((g.seqLen+tile-1)/tile), uint32(g.heads), pc,
-			4*float64(g.seqLen)*float64(g.seqLen)*float64(g.headDim)*float64(g.heads))
-	}
+	gr.attention(seqs)
 	if err := gr.gemm(gemmBig, w.bank, "gemm o", g.hCtx, aAttn, w.off[projO], rows, g.H, g.kH, g.ldaH); err != nil {
 		return err
 	}
@@ -777,6 +777,24 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 	}
 	gate("gate ffn", aFF, w.s2)
 	return nil
+}
+
+// attention records the packed planes' attention into hCtx, a sequence at
+// a time, each over its own keys.
+func (gr *graph) attention(seqs int) {
+	g := gr.g
+	planeTile := uint32(g.headDim * tile) // halves a 16-row tile of one head
+	rowsPer := g.attn.QT * tile
+	for s := 0; s < seqs; s++ {
+		t0 := uint32(s*g.stride/tile) * planeTile
+		pc := gr.base
+		pc.Tokens = uint32(g.seqLen)
+		pc.InOff, pc.KOff, pc.VOff = g.hQ+t0, g.hK+t0, g.hV+t0
+		pc.OutOff, pc.LDA = g.hCtx+uint32(s*g.stride*g.ldaH), uint32(g.ldaH)
+		pc.Aux1 = uint32(g.planeRows)
+		gr.add(g.attnPipes[g.attn], "attention", uint32((g.seqLen+rowsPer-1)/rowsPer), uint32(g.heads), pc,
+			4*float64(g.seqLen)*float64(g.seqLen)*float64(g.headDim)*float64(g.heads))
+	}
 }
 
 // input writes a batch's proj_in operand: each tile-clip's latents
@@ -812,6 +830,9 @@ func (g *GPU) input(clips []*Tensor) {
 // input GEMM straight into the residual, the blocks, and the tail into
 // aOut. last < 0 runs every block, and tail false stops after them.
 func (g *GPU) run(seqs, first, last int, input, tail bool) (time.Duration, error) {
+	if err := g.chooseAttention(); err != nil {
+		return 0, err
+	}
 	gr := g.newGraph()
 	rows := seqs * g.stride
 	if input {

@@ -3723,6 +3723,31 @@ var H3VAEPackHD64 []byte
 //go:embed h3vae_attn_hd64.spv
 var H3VAEAttnHD64 []byte
 
+// The decoder's attention transposed (h3_attn_t.comp, VIDEO.md M11e) at head
+// 64, the tile-clips side by side at a 16-row stride, so no tile past a
+// sequence is stored (-DSTORE_TAIL=0).
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DHEAD_DIM=64 -DSTORE_TAIL=0 -o h3vae_attn_t_hd64_qt1_kt4.spv h3_attn_t.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DHEAD_DIM=64 -DSTORE_TAIL=0 -o h3vae_attn_t_hd64_qt2_kt4.spv h3_attn_t.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=4 -DKTIL=4 -DHEAD_DIM=64 -DSTORE_TAIL=0 -o h3vae_attn_t_hd64_qt4_kt4.spv h3_attn_t.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=8 -DHEAD_DIM=64 -DSTORE_TAIL=0 -o h3vae_attn_t_hd64_qt1_kt8.spv h3_attn_t.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=8 -DHEAD_DIM=64 -DSTORE_TAIL=0 -o h3vae_attn_t_hd64_qt2_kt8.spv h3_attn_t.comp
+
+//go:embed h3vae_attn_t_hd64_qt1_kt4.spv
+var H3VAEAttnTHD64QT1KT4 []byte
+
+//go:embed h3vae_attn_t_hd64_qt2_kt4.spv
+var H3VAEAttnTHD64QT2KT4 []byte
+
+//go:embed h3vae_attn_t_hd64_qt4_kt4.spv
+var H3VAEAttnTHD64QT4KT4 []byte
+
+//go:embed h3vae_attn_t_hd64_qt1_kt8.spv
+var H3VAEAttnTHD64QT1KT8 []byte
+
+//go:embed h3vae_attn_t_hd64_qt2_kt8.spv
+var H3VAEAttnTHD64QT2KT8 []byte
+
 // MiniMax-H3's video encoder (VIDEO.md M10), which turns an fl2va keyframe
 // into its anchor latents: a causal 3-D CNN that, at one frame, is a 2-D CNN
 // on each filter's last temporal tap. Its convolutions pad by reflection,

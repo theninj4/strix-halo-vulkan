@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"strix-halo-vulkan/safetensors"
 )
@@ -536,9 +537,21 @@ func (l *loader) act(p string, ch int) *Act {
 	return a
 }
 
-// parallelFor runs fn(0..n-1) over GOMAXPROCS workers.
+// workers caps parallelFor's goroutines; 0 is GOMAXPROCS.
+var workers atomic.Int64
+
+// SetWorkers caps the goroutines a decode runs on (0: GOMAXPROCS). The
+// pipeline decodes audio on the CPU beside the video decode on the device,
+// and the two contend (VIDEO.md M11f).
+func SetWorkers(n int) { workers.Store(int64(n)) }
+
+// parallelFor runs fn(0..n-1) over GOMAXPROCS workers, or SetWorkers' cap.
 func parallelFor(n int, fn func(i int)) {
-	workers := min(runtime.GOMAXPROCS(0), n)
+	w := runtime.GOMAXPROCS(0)
+	if c := int(workers.Load()); c > 0 {
+		w = min(w, c)
+	}
+	workers := min(w, n)
 	var wg sync.WaitGroup
 	next := make(chan int, n)
 	for i := 0; i < n; i++ {
