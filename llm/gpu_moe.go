@@ -271,6 +271,9 @@ const moeBMMax = 64
 //	   512   m2/m2 1.00x   m2/m1 1.05x        2.33x padded rows
 //	  2048   m4/m4 1.00x   m4/m2 1.00x        1.90x padded rows
 //
+// (That table is the padded schedule's; since §2.12 the alignment is one
+// fragment and the boundary sits at 256, see moeGEMMPlanFor.)
+//
 // A wider row block amortises the slab a workgroup unpacks over more rows and
 // costs padding, and how much padding depends on how skewed the routing is:
 // at 512 tokens 274 experts share 5120 rows and a 64-row block executes
@@ -404,11 +407,19 @@ func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 // quietly stopped pinning at two rows — Graph.PinSchedule went on returning
 // nil and the schedule went on changing under it. P5c found it as a two-token
 // chunk split that did not reproduce the whole prompt.
+//
+// **The boundary is 256 since §2.12** (KERNELS.md G5c). With the alignment
+// one fragment the wide rung no longer pays for its width in padding rows,
+// only in the 16-row tail its 2- and 4-tile copies round up to, and the
+// ladder on the SHORT builds (block µs, m2/m2 against m4/m4) reads 3075 /
+// 3126 at 64 tokens, 3822 / 3869 at 128, 4737 / 4735 at 256, 6460 / 6380 at
+// 512 and 9361 / 8999 at 1024. Before it the m4 rung lost below 1024 to its
+// 2.33x rows at 512.
 func moeGEMMPlanFor(tokens int) (MoEKernel, MoEKernel) {
 	switch {
 	case tokens == 1:
 		return MoEN1M1, MoEM1
-	case tokens <= 1024:
+	case tokens <= 256:
 		return MoEM2, MoEM2
 	}
 	return MoEM4, MoEM4
@@ -838,11 +849,46 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 // **P11 tried to make it the fragment** — sixteen rows, which is what a store
 // actually cannot mask — so that an expert's last tile could be a short one
 // and a 2048-token ubatch would execute 24 304 rows instead of 38 912 over
-// the same 608 tiles. Every form of it is a wash or a loss, because this
-// kernel is not bound by the rows: see research/p11-prefill.md.
+// the same 608 tiles. Every form of it was a wash or a loss *then*, because
+// the kernel was not bound by the rows: see research/p11-prefill.md.
+//
+// **It is the fragment since §2.11 made the rows the cost** (KERNELS.md G5c,
+// §2.12). The single-wave rungs are `SHORT` builds: a record's third word,
+// the block's real rows, says how many of the block's row tiles exist and
+// the kernel runs one of WM copies of its loop, so the alignment those rungs
+// need is sixteen. A multi-wave rung still wants its whole block, so a plan
+// that names one is aligned to it (`moeAlign`), and `LLM_MOE_PAD` forces the
+// alignment for screening (a build loaded through `LLM_MOE_SPV` without
+// SHORT needs 64, or it writes the next expert's rows).
 func (g *MoEGPU) pad() int {
-	return maxInt(maxInt(moeBM(g.up), moeBM(g.down)), maxInt(moeBM(g.shUp), moeBM(g.shDown)))
+	if moePadForce > 0 {
+		return moePadForce
+	}
+	return maxInt(maxInt(moeAlign(g.up), moeAlign(g.down)), maxInt(moeAlign(g.shUp), moeAlign(g.shDown)))
 }
+
+// moeAlign is the row alignment a rung needs of the permutation: one
+// fragment for the rungs that bound their tiles (every single-wave GEMM
+// build is SHORT, and the GEMVs read the record's real rows themselves),
+// the whole block for the multi-wave ones.
+func moeAlign(k MoEKernel) int {
+	switch k {
+	case MoEW2M1, MoEW4M1:
+		return moeBM(k)
+	}
+	return moeBMMin
+}
+
+// moePadForce is `LLM_MOE_PAD`, the alignment forced for a screen.
+var moePadForce = func() int {
+	if v := os.Getenv("LLM_MOE_PAD"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= moeBMMin && n <= moeBMMax && n%moeBMMin == 0 {
+			return n
+		}
+		panic("llm: LLM_MOE_PAD wants 16, 32 or 64")
+	}
+	return 0
+}()
 
 // maxRows is the static upper bound on the permuted row space: the shared
 // expert's group at the front, every routed row, and at most one alignment of
@@ -874,8 +920,20 @@ func (g *MoEGPU) touchable(rows int) int {
 // dispatch it padded; at the GEMV rungs, whose whole point is a narrower BN,
 // it is the dispatch. The bound below is exact at one token.
 func (g *MoEGPU) maxTiles(bm, rows int) int {
-	pad := g.pad()
-	return roundUpInt(rows, pad)/bm + roundUpInt(rows*g.cfg.NExpertUsed, bm)/bm + g.touchable(rows)*(pad/bm)
+	return g.maxTilesAt(bm, rows, g.pad())
+}
+
+// maxTilesAt is maxTiles under a given alignment. Under an alignment at
+// least the block, every expert's range is whole blocks and its slack is
+// `pad/bm` of them; under a narrower one (the SHORT rungs, §2.12) the range
+// is whole alignments and the last block is short, so an expert's slack is
+// one block plus the alignment's rows.
+func (g *MoEGPU) maxTilesAt(bm, rows, pad int) int {
+	if pad >= bm {
+		return roundUpInt(rows, pad)/bm + roundUpInt(rows*g.cfg.NExpertUsed, bm)/bm + g.touchable(rows)*(pad/bm)
+	}
+	t := g.touchable(rows)
+	return roundUpInt(roundUpInt(rows, pad), bm)/bm + (rows*g.cfg.NExpertUsed+t*(pad-1))/bm + t
 }
 
 // alloc lays out the five arenas. Nothing is read here — every size follows
@@ -912,8 +970,10 @@ func (g *MoEGPU) alloc(layers []MoEWeights) error {
 	// The counting sort's four per-expert arrays: counts, offsets, the
 	// scatter cursor and the tile base.
 	g.aBook = alloc(4 * c.NExpert)
-	g.aTilesUp = alloc(2 + 3*g.maxTiles(moeBMMin, rows))
-	g.aTilesDown = alloc(2 + 3*g.maxTiles(moeBMMin, rows))
+	// Sized for the widest alignment any plan can ask for, whatever the
+	// plan is now.
+	g.aTilesUp = alloc(2 + 3*g.maxTilesAt(moeBMMin, rows, moeBMMax))
+	g.aTilesDown = alloc(2 + 3*g.maxTilesAt(moeBMMin, rows, moeBMMax))
 	// The shared expert is one group of the same grouped GEMM — same shape,
 	// same kernel, one expert — so it has a schedule of its own, and that one
 	// is host-written because a dense group's is the identity.
@@ -1364,7 +1424,9 @@ func (g *MoEGPU) syncShared() {
 		off uint32
 		bm  int
 	}{{g.aShTilesUp, moeBM(g.shUp)}, {g.aShTilesDown, moeBM(g.shDown)}} {
-		n := reserve / t.bm
+		// A short last block when the alignment is narrower than the
+		// block (§2.12): the rung bounds it by the record's real rows.
+		n := roundUpInt(reserve, t.bm) / t.bm
 		rec := make([]uint32, 2+3*n)
 		rec[0] = uint32(n)
 		rec[1] = uint32(reserve)
@@ -1511,6 +1573,9 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	up := base
 	up.MoEPermOff, up.MoETileOff = g.aPerm, g.aTilesUp
 	up.BOff, up.MoEBOff2 = w.gate, w.up
+	// The alignment, which a SHORT build rounds a record's real rows up to
+	// (§2.12): under a wide one every block is whole.
+	up.GemmM = uint32(g.pad())
 	up.CtxOff = g.hSwiglu
 	up.GemmN, up.GemmK = uint32(c.FFNExpert), uint32(c.NEmbd)
 	add(moeExpertPipe("up", w.gateFmt, g.up, g.rows), "up",
@@ -1520,6 +1585,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	down := base
 	down.MoEPermOff, down.MoETileOff = g.aPerm, g.downTiles()
 	down.BOff = w.down
+	down.GemmM = uint32(g.pad())
 	down.CtxOff = g.hSwiglu
 	down.GemmN, down.GemmK = uint32(c.NEmbd), uint32(c.FFNExpert)
 	add(moeExpertPipe("down", w.downFmt, g.down, g.rows), "down",
@@ -1531,18 +1597,20 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shUp := base
 	shUp.MoEPermOff, shUp.MoETileOff = g.aPerm, g.aShTilesUp
 	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
+	shUp.GemmM = uint32(g.pad())
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
 	add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
-		uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shUp)), shUp)
+		uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
 
 	shDown := base
 	shDown.MoEPermOff, shDown.MoETileOff = g.aPerm, g.aShTilesDown
 	shDown.BOff = w.shDown
+	shDown.GemmM = uint32(g.pad())
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
 	add(moeExpertPipe("down", w.shDownFmt, g.shDown, g.rows), "shexp.down",
-		uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(g.rows, g.pad())/moeBM(g.shDown)), shDown)
+		uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shDown))/moeBM(g.shDown)), shDown)
 
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.
 	add("combine", "combine", uint32(roundUpInt(c.NEmbd, moeCombineWG)/moeCombineWG), uint32(g.rows), base)
@@ -1820,7 +1888,7 @@ func (g *MoEGPU) Schedule(k MoEKernel) (tiles, executed, real int) {
 	bm, pad := moeBM(k), g.pad()
 	for _, c := range g.Counts() {
 		padded := roundUpInt(int(c), pad)
-		tiles += padded / bm
+		tiles += roundUpInt(padded, bm) / bm
 		executed += padded
 		real += int(c)
 	}

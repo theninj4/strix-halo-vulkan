@@ -338,7 +338,7 @@ it on these kernels.
 | G2 | The register-prefetch GEMM (H2): `PREFETCH=1` in `gemm_wmma.comp` and `dit_gemm.comp`, the tile geometries it fits in, screened on the `shapes` family and on the DiT's and H3's shapes; bit-identical | **done 2026-09-29** (§2.9): not registers, **LDS**: the K slab staged a slab ahead through 24 staging registers into a double-buffered LDS plane, at **wave32** (a fragment is 8 VGPRs and 4x its bytes at wave64, 2x at wave32), 4×4 tiles, eight waves. Bit-identical; H3's projections **37 → 41 TFLOP/s**, the split down projection **29 → 41**, a 480p forward **29.9 → 27.1 s**; 74 → 80% per clock. Shipped for H3; the other eight hosts are G8 |
 | G3 | The epilogue and the tail (H4, H5): the store's cost priced with a live control; `C_F16` and the fragment-tile C for attention's operands (stage 4's open item) where the consumer allows; the M sawtooth | |
 | G4 | Attention (A1–A3): the honest gutting first, then a head-split and a wave64 transposed build, then lazy rescaling; every build through the H3 screen and the image DiT's; carried to the VAE, Kev, OCR, ACE (every `dit_attention_wmma.comp` user still pays the LDS round trip M11c removed) | |
-| G5 | Int8/Q4 B fragments built in registers from the probed layout: the MoE Q4 GEMM (51% → ?), `llm_gemm`'s Q8 arm, `kev_gemm_q8_glu`, and H3's dequant pass folded away | **G5a done 2026-09-29** (§2.11), and not as written: the controls on the MoE up GEMM say the LDS round trip is ~8% and the loop without its stagings already runs at the pipe; the cost was the per-step chain of divergent bank loads, re-reading each block's lines two to eight times. **The K loop as a software pipeline** (`-DPIPE=2`: the next step's bytes fetched behind this step's MMAs, a header once a super-block, a nibble group once per two steps) is bit-identical and takes `moe.up` **11.5 → 6.8 ms a layer at 2048 tokens (1.68x), 2.01x at 512, 1.57x at 4096**; shipped on the seven Q4_K up builds. **G5b the same day:** the down mode's pipeline moves Q5_1 by nothing and IQ4_NL (served) by 1.05x at 2048 / 1.20x at 512, shipped for IQ4_NL alone. In the whole model, prefill **1194 → 1407 tok/s at 2048 (1.17x)**, 1317 → 1494 at 4096, 1306 → 1459 at 8192. Left: the m4 rung's 1.90x padding, the Q5_K up build, the down mode's A fragment loads; the register-fragment idea itself has nothing to buy on this kernel |
+| G5 | Int8/Q4 B fragments built in registers from the probed layout: the MoE Q4 GEMM (51% → ?), `llm_gemm`'s Q8 arm, `kev_gemm_q8_glu`, and H3's dequant pass folded away | **G5a done 2026-09-29** (§2.11), and not as written: the controls on the MoE up GEMM say the LDS round trip is ~8% and the loop without its stagings already runs at the pipe; the cost was the per-step chain of divergent bank loads, re-reading each block's lines two to eight times. **The K loop as a software pipeline** (`-DPIPE=2`: the next step's bytes fetched behind this step's MMAs, a header once a super-block, a nibble group once per two steps) is bit-identical and takes `moe.up` **11.5 → 6.8 ms a layer at 2048 tokens (1.68x), 2.01x at 512, 1.57x at 4096**; shipped on the seven Q4_K up builds. **G5b the same day:** the down mode's pipeline moves Q5_1 by nothing and IQ4_NL (served) by 1.05x at 2048 / 1.20x at 512, shipped for IQ4_NL alone. In the whole model, prefill **1194 → 1407 tok/s at 2048 (1.17x)**, 1317 → 1494 at 4096, 1306 → 1459 at 8192. **G5c 2026-09-30** (§2.12): the padding. The alignment is one fragment, the record's real-row count picks one of WM copies of the K loop (`SHORT` builds, bit-identical): the padding factor at 2048 tokens 1.90x → 1.19x, `moe.down` **1.23x** (1.28x on the served IQ4_NL), `moe.up` 1.11x (any third copy of its loop spills, so it keeps the 2- and 4-tile ones and executes as 1.41x), the block 1.13–1.14x; whole-model prefill **1417 → 1514 tok/s at 2048 (1.07x)**, 1500 → 1549 at 4096, 1461 → 1481 at 8192; the m2/m4 boundary moves from 1024 tokens to 256. Left: the slab unpack, now the largest term in the up projection (~300 VALU a lane a step at a matrix clock each), the Q5_K up build, the down mode's A fragment loads. **G5d 2026-09-30** (§2.13): the unpack read from the ISA is three VALU an element, not five (the compiler already fuses affine and half conversion into `v_fma_mix`); **the nibble read as an f16 denormal** (`NIB_F16`, a masked halfword *is* the half `nib × 2^-24`, the scale carries the power of two) takes the extract-and-convert pair away, bit-identical, the four-tile step's non-MMA VALU 331 → 259 and `moe.up` **1.02x** at 512–4096 tokens (the count predicted 3–5%: the VALU was only partly on the critical path); whole-model prefill 1 513 → 1 522 tok/s at 2048 (1.006x), 1 548 → 1 555 at 4096, 1 484 → 1 489 at 8192, same-hour A/B twice. The m4 build's 71 allocator moves a step are register pressure at 256 VGPRs (the m2 carries four), and both arms on them are dead: the K tiles as a loop adds 38 moves a tile, A fetched at the top of the step removes the moves for **−12%**. There is no 5% left in the unpack; G5 is closed on this kernel |
 | G6 | The streaming kernels: a bandwidth column in every vertical's profile, the ones under 200 GB/s listed and fixed or fused (`hc.cn` at 134 first) | |
 | G7 | The budget: what the server's CPU work beside a device job costs in GPU clock (the audio decode's 32 threads, staging on 32 cores, tokenising; G0 measured 32 busy threads at 1.67x), whether a thread cap or a CPU power limit is a net win, and the sampler folded into `bench/sysmon.go` around the vertical tests | G0 measured the extremes; the server's own load is open |
 | G8 | Carry-in: each vertical's screen re-run on the new builds, the numbers into VIDEO.md M11, the image and LLM records, and TODO.md's table | continuous. **G2 carried to all nine hosts 2026-09-29** (table below): every gate passes; the image step 2179 → 2058 ms, the VAE decode 37.1 → 35.5 s, Kev's fp16 pass at 494 tokens 154 → 132 ms; **the build loses below ~1000 rows** (a 30-workgroup grid), so `ace/dit` keeps the wave64 build up to 1024 rows and the ladders' schedules already keep it off short inputs |
@@ -637,9 +637,101 @@ each); Q5_1, Q4_1 and Q8_0 keep the plain loop.
 What binds the down mode now is its A fragment loads inside the MMA
 block, which a fragment's back-edge copy (§2.9) keeps from pipelining.
 
-**Next in G5:** the up rung's padding factor (1.90x executed rows at
-m4, 2048 tokens: the largest term left in the up kernel), the Q5_K up
-build (layer 2), and the down mode's A side.
+**Next in G5:** ~~the up rung's padding factor (1.90x executed rows at
+m4, 2048 tokens: the largest term left in the up kernel)~~ (G5c), the
+Q5_K up build (layer 2), and the down mode's A side.
+
+### G5c — the short last tile (2026-09-30)
+
+Filed as **§2.12** in `research/2.12-moe-short-tiles.md`.
+
+**The rows were the cost now.** P11-4 padded to the fragment three ways
+and lost every time because the slab unpack was the kernel; after §2.11
+the MMAs are ~78% of it. The permutation's record already said how many
+of a block's rows are real (C5 wrote it for the decode GEMV); the
+single-wave builds of `llm_moe_gemm.comp` are now `SHORT` builds that
+round it to the schedule's alignment (`pc.gemmM`) and run one of WM
+copies of the K loop and store on a uniform `switch` — no bound inside
+the unrolled loops, the same MMAs per real row in the same order —
+and the alignment (`MoEGPU.pad`, `moeAlign`) is sixteen rows unless a
+plan names a multi-wave rung. Bit-identical: `TestMoEGPULadderAgrees` at
+`maxAbs == 0` across every mixed plan, `TestMoEGPUPaddingIsInert`, and
+`TestGraphLogits`'s whole-model line reproduced to the digit against the
+old test binary.
+
+| 2048 tokens, m4, µs a layer (old / new, two interleaved runs) | rows | `moe.up` | `moe.down` | block |
+|---|---:|---:|---:|---:|
+| the padded schedule | 1.90x | 6 994 / 7 029 | 6 577 / 6 609 (Q5_1) | 15 733 / 15 793 |
+| **SHORT** | **1.19x** (up executes 1.41x) | **6 314 / 6 255** | **5 370 / 5 339** | **13 822 / 13 721** |
+| … with the served IQ4_NL down | | 6 922 → 6 374 | 5 373 → **4 209** | 14 441 → **12 727** |
+
+**What decided the form.** Any third copy of the Q4_K up loop spills
+11–15 registers its epilogue needs across the K loop, and a control run
+of the four-copy build with `LLM_MOE_PAD=64` (every block whole) is 9%
+slower than the shipped kernel on the same work; the two-copy form
+(`SHORT_STEP=2`: 2 and 4 tiles, the store still bounded by the real
+count — the first cut stored the rounded tile over the next expert's
+rows, a race the ladder test caught) costs nothing on full blocks and
+executes a 16-row tail as 32. The down builds have 120–144 registers and
+keep all four. **A short tile's rows are cheap rows**: on the four-copy
+build the alignment 64 → 16 sheds 14 608 rows for 1 255 µs, 0.086 µs a
+row against the MMA-only control's 0.137, because the tile still unpacks
+two whole slabs (~300 VALU a lane a step, a matrix clock each, §2.10)
+beside its sixteen MMAs. That unpack is now the largest term in the up
+projection at every rung.
+
+**In the whole model** (`cmd/llm -graph`, old and new interleaved twice):
+**1416.5 / 1418.6 → 1514.0 / 1513.2 tok/s at 2048 (1.07x)**, 1499.7 /
+1502.1 → 1549.4 / 1542.8 at 4096, 1461.4 / 1466.7 → 1480.8 / 1482.7 at
+8192. The rung ladder on the SHORT builds puts `m4/m4` ahead of `m2/m2`
+from 512 tokens (6 380 against 6 460; 8 999 against 9 361 at 1024) and
+behind it at 64–128, so `moeGEMMPlanFor`'s boundary is 256, not 1024.
+Tools: `-DSHORT`, `-DSHORT_STEP` on `llm_moe_gemm.comp`, `LLM_MOE_PAD` on
+the host (a pre-§2.12 build loaded through `LLM_MOE_SPV` needs it at 64).
+
+### G5d — the nibble as an f16 denormal (2026-09-30)
+
+Filed as **§2.13** in `research/2.13-moe-nibble-denormal.md`.
+
+**The estimate was wrong by the compiler.** §2.12 priced the slab unpack
+at ~300 VALU a lane a step and G5's plan was `v_perm`/`v_cvt_pk`
+sequences. The ISA of the shipped `up_q4k_m4` says an element is three
+instructions, not five — ACO already fuses `ds * nib - dm` and the
+`float16_t()` into one `v_fma_mixlo/hi_f16` — so the only work in front
+of the floor is a `v_bfe_u32` and a `v_cvt_f32_u32` an element. Both go
+by reading the nibble as a half: a halfword whose low nibble is the
+value and whose other bits are zero is the f16 denormal `nib × 2^-24`,
+`v_fma_mix` takes a half from either half of a word through op_sel, and
+`d × sc × 2^24` is as exact as `d × sc`. Three instructions for four
+elements, the same fma operands to the bit, and the slab is byte-identical
+(`TestMoEGPULadderAgrees` at `maxAbs == 0` with the new m4 against the
+old m2/m2; the negative control through the same override fails).
+
+| four-tile K-step, VALU beside 64 MMAs | shipped | `NIB_F16` |
+|---|---:|---:|
+| extract + convert | 128 | 0 |
+| masks | — | 48 |
+| `v_fma_mix` (floor) | 64 | 64 |
+| allocator moves | 65 | 71 |
+| scale path, addresses, A store | ~74 | ~76 |
+| **non-MMA VALU** | **331** | **259** |
+
+| `moe.up`, µs a layer (two interleaved runs) | 512 | 1024 | 2048 | 4096 |
+|---|---:|---:|---:|---:|
+| shipped | 2 960 / 2 964 | 4 075 / 4 118 | 6 236 / 6 298 | 10 235 / 10 205 |
+| **`NIB_F16`** | **2 922 / 2 921** | **4 022 / 4 016** | **6 180 / 6 115** | **9 941 / 10 014** |
+| `NIB_F16` + `PIPE_A=0` | 3 290 / 3 280 | 4 546 / 4 508 | 7 014 / 6 887 | 11 225 / 11 311 |
+
+**Why 2% for a 22% cut in VALU.** The count is an upper bound: four
+waves a SIMD overlap one wave's unpack with another's MMAs part of the
+time, which §2.10's single-kernel probe does not see. **And the move
+storm is closed**: the 71 moves are the allocator building eight-register
+fragments from scattered `ds_load_b64` pairs at the 256-VGPR limit
+(m1/m2/n-rungs at 96–240 VGPRs carry 4–6); the K tiles as a loop
+(`MOE_KT_LOOP`, §2.10's fix) adds 38 moves a tile here, and freeing the
+A prefetch's sixteen registers (`PIPE_A=0`) removes the moves and loses
+12% to the exposed latency. Whole model: **1 513.1 / 1 512.7 → 1 521.1 / 1 523.3 tok/s at 2048 (1.006x)**, 1 549.3 / 1 546.7 → 1 553.9 / 1 556.6 at 4096 (1.005x), 1 483.9 / 1 483.4 → 1 491.4 / 1 487.5 at 8192 (1.004x), the clock 2 671–2 674 MHz at 141–142 W on every arm. The ladder at the
+plan boundary: on the served IQ4_NL down, one run of 30 iters, `m2/m2` against `m4/m4` is 4 057 against 3 994 µs a block at 256 tokens and 5 616 against 5 431 at 512, so the wide rung leads at both and `moeGEMMPlanFor`'s boundary at 256 stands (the 1.6% at 256 is inside a run's spread and 256 is not a served ubatch).
 
 ## How to run
 
@@ -664,7 +756,14 @@ build (layer 2), and the down mode's A side.
   `research/stage-4-dit-graph.md`, Kev's `cmd/kevload`, the LLM's
   `cmd/llm -bench` (memory: it needs `LLM_BANK_CACHE`).
 - A MoE GEMM build from disk: `LLM_MOE_SPV=up_q4k_m4=path.spv[,…]`
-  (`LLM_MOE_SPV_WAVE=32` for a wave32 build) on `cmd/llm -moe` and on the
+  (`cmd/llm` needs `-model` as the **shard**, not the checkpoint
+  directory, which holds four GGUFs and is refused; before trusting a
+  pass, load a wrong-by-construction build through the same override
+  and see the gate fail)
+  (`LLM_MOE_SPV_WAVE=32` for a wave32 build; `LLM_MOE_PAD=64` for a build
+  without `-DSHORT`, since §2.12 the schedule aligns to 16 and a plain
+  build would write the next expert's rows; the shared expert runs the
+  `q80` builds of the same rungs) on `cmd/llm -moe` and on the
   `llm` tests, which run from `llm/`; `cmd/llm -moe -model <shard>
   -tokens 2048 -iters 60` is ~2 s of device time an arm, so the clock is
   the median of the samples above 100 W.
@@ -723,6 +822,58 @@ build (layer 2), and the down mode's A side.
   transposed attention has a wave64 build for free (G4).
 
 ## Handoff
+
+**2026-09-30, session 8: G5d, the unpack, and G5 closed on this kernel.**
+The ISA said the estimate was wrong: an element of the Q4_K unpack is
+three VALU, not five, because ACO already fuses the affine and the half
+conversion into `v_fma_mix`. The nibble read as an f16 denormal
+(`-DNIB_F16=1` on the seven Q4_K up builds, `research/2.13-…`) removes
+the extract-and-convert pair in front of it — three instructions for
+four elements, the scale carrying the 2^24, bit-identical (the ladder at
+`maxAbs == 0`, the whole-model logits line to the digit against the old test binary) — and the four-tile step's non-MMA
+VALU goes 331 → 259 for `moe.up` **1.02x** at every count (the count
+predicted 3–5%: the VALU is only partly on the critical path with four
+waves a SIMD); **1 513.1 / 1 512.7 → 1 521.1 / 1 523.3 tok/s at 2048 (1.006x)**, 1 549.3 / 1 546.7 → 1 553.9 / 1 556.6 at 4096 (1.005x), 1 483.9 / 1 483.4 → 1 491.4 / 1 487.5 at 8192 (1.004x), the clock 2 671–2 674 MHz at 141–142 W on every arm. Two arms dead on the m4 build's 71 allocator
+moves a step: the K tiles as a loop adds 38 moves a tile (dropped on the
+count), and fetching A at the top of the step frees the sixteen prefetch
+registers, removes the moves and costs **12%** (the m2 build at 240
+VGPRs carries four moves, so it is pressure, and the pipeline is worth
+six times the moves). Three consecutive arms at ≤ 2% is decision 7's
+plateau: **G5 is closed on this kernel** — the up projection's step is
+64 MMAs, 64 fma_mix, ~50 masks, ~70 moves that cannot be bought, ~75 of
+scale path and addresses, 24 fragment reads and 12 LDS stores. Left
+unbuilt and small: the Q5_K up build (layer 2 of 48), the down mode's A
+fragment loads inside its MMA block (§2.11), and the scale path (~30 a
+step, ≤ 1%). Tools: `-DNIB_F16`, `-DPIPE_A`, `-DMOE_KT_LOOP` on
+`llm_moe_gemm.comp`; `cmd/llm -moe` wants `-model <shard>`. Results:
+`results/g5d_moe_{shipped,nib,nib_pipea0}_r{1,2}.csv`. The served binary still needs a redeploy.
+**Next:** G4 (attention) or G6 (the streaming kernels), as the order
+says; G3's epilogue also still open.
+
+**2026-09-30, session 7: G5c, the MoE GEMM's padding.** The schedule's
+alignment is one fragment instead of the widest row block, and the
+single-wave builds of `llm_moe_gemm.comp` are `SHORT` builds that pick
+one of WM copies of their K loop from the record's real-row count
+(`research/2.12-…`): bit-identical (the ladder at `maxAbs == 0`, the
+whole-model logits line to the digit), the padding factor at 2048 tokens
+1.90x → 1.19x, `moe.down` **1.23x** (1.28x on the served IQ4_NL),
+`moe.up` **1.11x**, the block 1.13–1.14x, whole-model prefill **1417 →
+1514 tok/s at 2048 (1.07x)**, 1500 → 1549 at 4096, 1461 → 1481 at 8192
+(same-hour A/B, twice); `moeGEMMPlanFor`'s m2/m4 boundary moved from 1024
+tokens to 256 on the new ladder; TODO.md's table carries it. Two facts
+for whoever touches the kernel next: any third copy of the Q4_K up m4
+loop spills 11–15 registers and costs 9% on full blocks, so that build
+ships two copies (a 16-row tail runs as 32; its store is bounded by the
+real count, and storing the rounded tile is a race the ladder test
+catches); and a short tile's rows are cheap rows (0.086 µs against 0.137)
+because the slab unpack — ~300 VALU a lane a step, a matrix clock each —
+is now the largest term in the up projection at every rung. Tools:
+`-DSHORT`/`-DSHORT_STEP`, `LLM_MOE_PAD` (a pre-§2.12 build through
+`LLM_MOE_SPV` needs 64). Results: `results/g5c_moe_short_*.csv`. The
+served binary still needs a redeploy. **Next:** the unpack's VALU (G5's
+`v_perm`/`v_cvt_pk` argument, and it lifts the short tiles most), the
+Q5_K up build, the down mode's A fragment loads; or G4 (attention) as the
+order says.
 
 **2026-09-29, session 6: G5a, the MoE up GEMM 1.68x.** G5 was started as
 written (register-built Q4 fragments) and measured out of it before a

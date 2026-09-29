@@ -52,6 +52,13 @@
 // permutation entry naming a token one past the batch, whose activation row
 // is zero. Every store then goes straight to global, and the only cost is
 // arithmetic on rows nothing reads.
+//
+// **Since §2.12 the alignment is one fragment and the tail is short**
+// (KERNELS.md G5c): the single-wave builds are `SHORT` builds that run one
+// of WM copies of their loop on the record's real rows, so a 2048-token
+// ubatch executes 1.19x the rows that exist instead of 1.90x. The padding
+// rows that remain are the same sentinel rows as before; the whole-block
+// padding above is what the multi-wave rungs still get.
 
 // **The K loop is a software pipeline on the Q4_K up builds** (`-DPIPE=2`,
 // KERNELS.md G5, §2.11). The plain loop is, per K-step, one dependent
@@ -115,6 +122,16 @@
 // One K-step is 32 elements by default: exactly one Q5_1 or Q8_0 block, whose
 // scale a lane then reads once for the whole slab.
 //
+// **The Q4_K nibble is read as an f16 denormal** (`-DNIB_F16=1`, KERNELS.md
+// G5d, §2.13): the compiler already fuses the affine and the half
+// conversion into one `v_fma_mix`, and a halfword holding one nibble *is*
+// the half `nib * 2^-24`, so the extract-and-convert pair in front of every
+// element goes and the scale carries the power of two. Bit-identical; the
+// four-tile step's non-MMA VALU 331 -> 259, `moe.up` 1.02x. The 71 allocator
+// moves a step in the m4 build are register pressure (the m2 carries four),
+// and the two arms on them — the K tiles as a loop, A fetched at the top of
+// the step — are dead (38 moves a tile; -12%). Both stay as knobs.
+//
 // It is a `-D` because Q4_K and Q5_K look as though they want 64. A 64-element
 // group of those formats packs the low nibbles of all 32 bytes first and the
 // high nibbles of the *same* 32 bytes second, so a 32-element step reads the
@@ -139,6 +156,37 @@
 #define WAVE 64
 #endif
 #define LANES (WAVES * WAVE)
+// **A short last block** (KERNELS.md G5c, §2.12). The permutation used to
+// pad every expert's rows to the widest row block in the plan, so a tile was
+// always whole and this kernel had nothing to bound: at a 2048-token ubatch
+// that executed 1.90x the rows that exist (P11-4), and P11 measured the
+// rows as nearly free because the unpack was the cost. §2.11's pipeline
+// made the MMAs ~78% of the kernel, so the rows are the cost now. With SHORT
+// the alignment is one fragment (sixteen rows), the record's third word —
+// the block's real rows — says how many of the workgroup's WM row tiles
+// exist, and the K loop and the store run as one of WM copies chosen by a
+// uniform switch on that count: no bound inside the unrolled loops (P11's
+// arm, which paid in registers and clauses), the same MMAs per real row in
+// the same order, so it is bit-identical to the padded schedule. The A
+// staging of MODE 0 still fills all BM rows (the loads are in flight behind
+// the MMAs and the rows past the block are valid entries of the permuted
+// space, sentinel-filled to a whole block at its end); only the MMAs and
+// the stores of the missing tiles are skipped. SHORT_STEP 2 keeps only the
+// copies at even tile counts (a third copy spills 15 registers on the Q4_K
+// up m4 build, and a 16-row tile costs that kernel what a 32-row one does):
+// the count is rounded up for the loop, and **the store stays bounded by the
+// real count**, because the rows past the block belong to the next expert.
+// Single-wave builds only: a multi-wave rung keeps the block whole and the
+// host aligns the permutation to its BM (`moeAlign`).
+#ifndef SHORT
+#define SHORT 0
+#endif
+#ifndef SHORT_STEP
+#define SHORT_STEP 1
+#endif
+#if SHORT && WAVES != 1
+#error "SHORT is written for the single-wave rungs"
+#endif
 
 // Screening knobs (KERNELS.md G5), never shipped and wrong by construction:
 // each takes one part of the K-step away so that part is priced by its
@@ -169,6 +217,41 @@
 #endif
 #ifndef MOE_FRAG2
 #define MOE_FRAG2 0
+#endif
+// NIB_F16 (KERNELS.md G5d): the Q4_K nibble read as an f16 *denormal*. The
+// shipped unpack spends a `v_bfe_u32` and a `v_cvt_f32_u32` in front of every
+// element's `v_fma_mixlo_f16`, and every VALU instruction costs the matrix
+// pipe a clock (§2.10). A halfword whose low nibble is the value and whose
+// other twelve bits are zero *is* the half `nib * 2^-24` — a denormal, exact —
+// and `v_fma_mix` reads a half from either half of a word for free (op_sel).
+// So a word's four nibbles become two masked words (`w & 0x000F000F` holds
+// elements 0 and 2, `(w >> 8) & mask` elements 1 and 3): three instructions
+// for four elements instead of eight, and the scale carries the 2^24 (2^20
+// for the high nibble, whose halfword is `nib * 16`). `d * sc` is an
+// 11-by-6-bit product, exact in fp32, and a power of two keeps it exact, so
+// the fma sees the same operands to the bit and the slab is byte-identical
+// (the ladder gate against a build without it says so). fp16 denormals are
+// preserved by default under RADV; a build that flushed them would fail
+// that gate at once, with every value `-dm`.
+#ifndef NIB_F16
+#define NIB_F16 0
+#endif
+// MOE_KT_LOOP keeps the MMA block's two K tiles as a loop the compiler
+// cannot unroll, §2.10's `KT_LOOP` on this kernel: the unrolled block carries
+// ~50 `v_mov`/`v_swap` a step from the allocator at 256 VGPRs.
+#ifndef MOE_KT_LOOP
+#define MOE_KT_LOOP 0
+#endif
+// PIPE_A=0 keeps the B pipeline and fetches A at the top of the step instead
+// of a step ahead: an arm on the m4 build's register pressure, whose 71
+// allocator moves a step the m1/m2 builds (216/240 VGPRs) do not carry.
+#ifndef PIPE_A
+#define PIPE_A 1
+#endif
+#if MOE_KT_LOOP
+#define KT_UNROLL [[dont_unroll]]
+#else
+#define KT_UNROLL [[unroll]]
 #endif
 #if MOE_NIB_ONLY
 #define Q_AFFINE(NIB, DS, DM) float16_t(NIB)
@@ -320,20 +403,42 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
     vec2 dd = unpackHalf2x16(hdr.x);                                                            \
     uint sc, mn;                                                                                \
     scaleMinK4(2u * g + sub, hdr.yzw, sc, mn);                                                  \
-    float ds = dd.x * float(sc);                                                                \
+    float ds = dd.x * float(sc) * Q4K_SCALE(sub);                                               \
     float dm = dd.y * float(mn);                                                                \
     uint sh = sub * 4u;                                                                         \
+    uint nmask = Q4K_MASK(sub);                                                                 \
     uint qv = (blk + 16u + g * 32u) >> 4;                                                       \
     uvec4 lo4 = qbank4[qv];                                                                     \
     uvec4 hi4 = qbank4[qv + 1u];                                                                \
     [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                                 \
         uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
-        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
-            uint nib = (w >> (8u * b + sh)) & 0xFu;                                             \
-            DST[dst + c + t * 4u + b] = Q_AFFINE(nib, ds, dm);                                  \
-        }                                                                                       \
+        Q4K_WORD(DST, dst + c + t * 4u, w)                                                      \
     }                                                                                           \
   }
+#if NIB_F16
+// The four elements of one nibble word, as f16 denormals (NIB_F16 above).
+// `ds` arrives scaled by 2^24 or 2^20 (Q4K_SCALE), `nmask` is the halfword
+// mask for this step's nibble.
+#define Q4K_SCALE(sub) ((sub) == 0u ? 16777216.0 : 1048576.0)
+#define Q4K_MASK(sub) ((sub) == 0u ? 0x000F000Fu : 0x00F000F0u)
+#define Q4K_WORD(DST, at, w)                                                                    \
+        {                                                                                       \
+            vec2 e02 = unpackHalf2x16((w) & nmask);                                             \
+            vec2 e13 = unpackHalf2x16(((w) >> 8) & nmask);                                      \
+            DST[(at) + 0u] = float16_t(ds * e02.x - dm);                                        \
+            DST[(at) + 1u] = float16_t(ds * e13.x - dm);                                        \
+            DST[(at) + 2u] = float16_t(ds * e02.y - dm);                                        \
+            DST[(at) + 3u] = float16_t(ds * e13.y - dm);                                        \
+        }
+#else
+#define Q4K_SCALE(sub) 1.0
+#define Q4K_MASK(sub) 0u
+#define Q4K_WORD(DST, at, w)                                                                    \
+        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
+            uint nib = ((w) >> (8u * b + sh)) & 0xFu;                                           \
+            DST[(at) + b] = Q_AFFINE(nib, ds, dm);                                              \
+        }
+#endif
 #elif QFMT == FMT_Q5_K
 #define DEQUANT_BODY(DST)                                                                       \
   [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
@@ -609,12 +714,14 @@ void pipeUnpackDown(uint k0, uint tid, uint bankBase, uint fw[DN_W]) {
 void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
     out uvec4 aV[A_ITERS], inout uvec4 hdr[B_ITERS], inout uvec4 lo[B_ITERS], inout uvec4 hi[B_ITERS]) {
     uint slots = MOE_USED + 1u;
+#if PIPE_A
     [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {
         uint idx = tid + n * LANES;
         uint r = idx / (BK / A_VEC);
         uint c = (idx - r * (BK / A_VEC)) * A_VEC;
         aV[n] = hact4[(pc.xnOff + (aP[n] / slots) * pc.lda + k0 + c) / A_VEC];
     }
+#endif
     [[unroll]] for (uint n = 0u; n < B_ITERS; ++n) {
 #if LANES == 64
         // Pass n is slab n's column tid (the unpack's static split).
@@ -663,24 +770,25 @@ void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
         vec2 dd = unpackHalf2x16(hdr[n].x);                                                 \
         uint sc, mn;                                                                        \
         scaleMinK4(2u * g + sub, hdr[n].yzw, sc, mn);                                       \
-        float ds = dd.x * float(sc);                                                        \
+        float ds = dd.x * float(sc) * Q4K_SCALE(sub);                                       \
         float dm = dd.y * float(mn);                                                        \
         uint sh = sub * 4u;                                                                 \
+        uint nmask = Q4K_MASK(sub);                                                         \
         [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                         \
             uint w = (t < 4u) ? lo[n][t] : hi[n][t - 4u];                                   \
-            [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                     \
-                uint nib = (w >> (8u * b + sh)) & 0xFu;                                     \
-                DST[dst + t * 4u + b] = Q_AFFINE(nib, ds, dm);                              \
-            }                                                                               \
+            Q4K_WORD(DST, dst + t * 4u, w)                                                  \
         }                                                                                   \
     }
 
-void pipeUnpack(uint k0, uint tid, uvec4 aV[A_ITERS], uvec4 hdr[B_ITERS], uvec4 lo[B_ITERS], uvec4 hi[B_ITERS]) {
+void pipeUnpack(uint k0, uint tid, uint aP[A_ITERS], uvec4 aV[A_ITERS], uvec4 hdr[B_ITERS], uvec4 lo[B_ITERS], uvec4 hi[B_ITERS]) {
     [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {
         uint idx = tid + n * LANES;
         uint r = idx / (BK / A_VEC);
         uint c = (idx - r * (BK / A_VEC)) * A_VEC;
         uint dst = r * LDS_ROW + c;
+#if !PIPE_A
+        aV[n] = hact4[(pc.xnOff + (aP[n] / (MOE_USED + 1u)) * pc.lda + k0 + c) / A_VEC];
+#endif
         [[unroll]] for (uint w = 0u; w < 4u; ++w) {
             f16vec2 h = unpackFloat2x16(aV[n][w]);
             sA[dst + 2u * w] = h.x;
@@ -728,11 +836,17 @@ void main() {
     uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
     uint expert = actu[rec];
     uint rowStart = actu[rec + 1u];
-    // The record's third word is how many rows it covers, and since P11 that
-    // is **always `BM`**: the schedule cuts an expert's rows into one list
-    // per rung, so a record's block is full by construction and this kernel
-    // has no partial tile to mask. Read for the assertion, not for the loop
-    // bounds — a list dispatched on the wrong pipeline would show up here.
+    // The record's third word is how many of the block's rows are real. A
+    // plain build never reads it: the schedule pads every expert's range to
+    // the block, so a record's block is full by construction. A SHORT build
+    // rounds it up to the schedule's alignment (`pc.gemmM`, `MoEGPU.pad`) and
+    // runs that many fragments of rows — the whole block under a wide
+    // alignment, the last tiles skipped under a narrow one.
+#if SHORT && WM > 1
+    uint blkRows = ((actu[rec + 2u] + pc.gemmM - 1u) / pc.gemmM) * pc.gemmM;
+    uint wmReal = max((blkRows + TILE - 1u) / TILE, 1u);
+    uint wmEff = (wmReal + SHORT_STEP - 1u) / SHORT_STEP * SHORT_STEP;
+#endif
     uint n0 = gl_WorkGroupID.x * BN;
     uint slots = MOE_USED + 1u;
 
@@ -816,18 +930,19 @@ void main() {
 #define MMA_AT(ACC, i, j, B, B2) ACC = coopMatMulAdd(fragA[i], B, ACC);
 #endif
 #if MODE == 0
-#define MMA_UP(j, kt)                                                                      \
+#define MMA_UP(j, kt, WME)                                                                 \
     coopMatLoad(fragB, sB1, ((j) * TILE) * LDS_ROW + (kt) * TILE, LDS_ROW,                 \
         gl_CooperativeMatrixLayoutColumnMajor);                                            \
     FRAG2_B(sB1, j, kt)                                                                    \
-    [[unroll]] for (uint i = 0u; i < WM; i++) { MMA_AT(acc1[i][j], i, j, fragB, fragB2) }
+    [[unroll]] for (uint i = 0u; i < (WME); i++) { MMA_AT(acc1[i][j], i, j, fragB, fragB2) }
 #else
-#define MMA_UP(j, kt)
+#define MMA_UP(j, kt, WME)
 #endif
-#define MMA_BLOCK(K0)                                                                      \
-    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                                   \
+// WME is how many of the wave's WM row tiles this block has (SHORT), or WM.
+#define MMA_BLOCK(K0, WME)                                                                 \
+    KT_UNROLL for (uint kt = 0u; kt < BK_TILES; kt++) {                                    \
         FRAG_A_T fragA[WM];                                                                \
-        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_A(fragA[i], i, kt, K0) }          \
+        [[unroll]] for (uint i = 0u; i < (WME); i++) { LOAD_A(fragA[i], i, kt, K0) }       \
         FRAG2_A(kt, K0)                                                                    \
         [[unroll]] for (uint j = 0u; j < WN; j++) {                                        \
             FRAG_B_T fragB;                                                                \
@@ -835,24 +950,28 @@ void main() {
             coopMatLoad(fragB, sB0, ((j) * TILE) * LDS_ROW + (kt) * TILE, LDS_ROW,         \
                 gl_CooperativeMatrixLayoutColumnMajor);                                    \
             FRAG2_B(sB0, j, kt)                                                            \
-            [[unroll]] for (uint i = 0u; i < WM; i++) { MMA_AT(acc0[i][j], i, j, fragB, fragB2) } \
-            MMA_UP(j, kt)                                                                  \
+            [[unroll]] for (uint i = 0u; i < (WME); i++) { MMA_AT(acc0[i][j], i, j, fragB, fragB2) } \
+            MMA_UP(j, kt, WME)                                                             \
         }                                                                                  \
     }
 #if MOE_FRAG2
     uint f2 = pc.moeUsed >> 20;
 #endif
 
+// ---- The K loop, as a macro over WME so a SHORT build can hold one copy
+// per block height. What comes before it (the pipeline's first fetch) is
+// shared by every copy; each copy is the loop and the store.
 #if PIPE && MODE == 1
     uint fw[DN_W];
     pipeFetchDown(0u, tid, bankBase, fw);
-    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
-        pipeUnpackDown(k0, tid, bankBase, fw);
-        uint kn = k0 + BK;
-        pipeFetchDown(kn < pc.gemmK ? kn : k0, tid, bankBase, fw);
-        barrier();
-        MMA_BLOCK(k0)
-        barrier();
+#define K_LOOP(WME)                                                                        \
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {                                          \
+        pipeUnpackDown(k0, tid, bankBase, fw);                                             \
+        uint kn = k0 + BK;                                                                 \
+        pipeFetchDown(kn < pc.gemmK ? kn : k0, tid, bankBase, fw);                         \
+        barrier();                                                                         \
+        MMA_BLOCK(k0, WME)                                                                 \
+        barrier();                                                                         \
     }
 #elif PIPE
     // The permutation entries once, then step 0's bytes in flight before
@@ -867,68 +986,76 @@ void main() {
     }
     uvec4 pA[A_ITERS], pH[B_ITERS], pL[B_ITERS], pI[B_ITERS];
     pipeFetch(0u, tid, bankBase, aP, pA, pH, pL, pI);
-    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
-        pipeUnpack(k0, tid, pA, pH, pL, pI);
-        // The next step's bytes, or this step's again at the end (in
-        // bounds, never read back).
-        uint kn = k0 + BK;
-        pipeFetch(kn < pc.gemmK ? kn : k0, tid, bankBase, aP, pA, pH, pL, pI);
-        barrier();
-        MMA_BLOCK(k0)
-        barrier();
+    // The next step's bytes, or this step's again at the end (in bounds,
+    // never read back).
+#define K_LOOP(WME)                                                                        \
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {                                          \
+        pipeUnpack(k0, tid, aP, pA, pH, pL, pI);                                           \
+        uint kn = k0 + BK;                                                                 \
+        pipeFetch(kn < pc.gemmK ? kn : k0, tid, bankBase, aP, pA, pH, pL, pI);             \
+        barrier();                                                                         \
+        MMA_BLOCK(k0, WME)                                                                 \
+        barrier();                                                                         \
     }
 #else
-    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
-#if MODE == 0
-        // The A operand is gathered: BM rows of the block input, named by the
-        // permutation and belonging to BM different tokens.
-        //
-        // **Eight halves a load, not one** (P11). This loop used to run
-        // `BM * BK / LANES` times — 32 iterations a lane a K-step at BM 64 —
-        // and each iteration fetched *two bytes*, where the B unpack below
-        // fetches 32 in one `uvec4`. It is the same finding L5b-7 made about
-        // the unpack, on the operand instead of the weight: the kernel is
-        // bound by how many load instructions it issues. A K-step is BK
-        // halves, so a row is `BK / A_VEC` sixteen-byte loads and the
-        // permutation entry behind it is read once per load rather than once
-        // per half. Bit for bit the same slab: `unpackFloat2x16` is a
-        // reinterpretation, the LDS layout is unchanged, and the loop covers
-        // the same (r, c) in the same order.
-#if !MOE_NO_ASTAGE
-        for (uint idx = tid; idx < BM * (BK / A_VEC); idx += LANES) {
-            uint r = idx / (BK / A_VEC);
-            uint c = (idx - r * (BK / A_VEC)) * A_VEC;
-            uint p = MOE_L0_A != 0 ? 0u : actu[pc.moePermOff + rowStart + r];
-            uvec4 v = hact4[(pc.xnOff + (p / slots) * pc.lda + k0 + c) / A_VEC];
-            uint dst = r * LDS_ROW + c;
-            [[unroll]] for (uint w = 0u; w < 4u; ++w) {
-                f16vec2 h = unpackFloat2x16(v[w]);
-                sA[dst + 2u * w] = h.x;
-                sA[dst + 2u * w + 1u] = h.y;
-            }
-        }
-#endif
-        // The two matrices are one staging pass, so every lane of every wave
-        // has a row to unpack rather than half of them idling.
-#if !MOE_NO_UNPACK
-        for (uint r = tid; r < 2u * BN; r += LANES) {
-            if (r < BN) {
-                dequantB0(pc.bOff, bankBase + r, k0, r);
-            } else {
-                dequantB1(pc.moeBOff2, bankBase + r - BN, k0, r - BN);
-            }
-        }
-#endif
+    // The plain loop's staging, one K-step of it.
+#if MODE == 0 && !MOE_NO_ASTAGE
+    // The A operand is gathered: BM rows of the block input, named by the
+    // permutation and belonging to BM different tokens.
+    //
+    // **Eight halves a load, not one** (P11). This loop used to run
+    // `BM * BK / LANES` times — 32 iterations a lane a K-step at BM 64 —
+    // and each iteration fetched *two bytes*, where the B unpack below
+    // fetches 32 in one `uvec4`. It is the same finding L5b-7 made about
+    // the unpack, on the operand instead of the weight: the kernel is
+    // bound by how many load instructions it issues. A K-step is BK
+    // halves, so a row is `BK / A_VEC` sixteen-byte loads and the
+    // permutation entry behind it is read once per load rather than once
+    // per half. Bit for bit the same slab: `unpackFloat2x16` is a
+    // reinterpretation, the LDS layout is unchanged, and the loop covers
+    // the same (r, c) in the same order.
+#define STAGE_A(K0)                                                                        \
+    for (uint idx = tid; idx < BM * (BK / A_VEC); idx += LANES) {                          \
+        uint r = idx / (BK / A_VEC);                                                       \
+        uint c = (idx - r * (BK / A_VEC)) * A_VEC;                                         \
+        uint p = MOE_L0_A != 0 ? 0u : actu[pc.moePermOff + rowStart + r];                  \
+        uvec4 v = hact4[(pc.xnOff + (p / slots) * pc.lda + (K0) + c) / A_VEC];             \
+        uint dst = r * LDS_ROW + c;                                                        \
+        [[unroll]] for (uint w = 0u; w < 4u; ++w) {                                        \
+            f16vec2 h = unpackFloat2x16(v[w]);                                             \
+            sA[dst + 2u * w] = h.x;                                                        \
+            sA[dst + 2u * w + 1u] = h.y;                                                   \
+        }                                                                                  \
+    }
 #else
-#if !MOE_NO_UNPACK
-        for (uint r = tid; r < BN; r += LANES) {
-            dequantB0(pc.bOff, bankBase + r, k0, r);
-        }
+#define STAGE_A(K0)
 #endif
+#if MOE_NO_UNPACK
+#define STAGE_B(K0)
+#elif MODE == 0
+    // The two matrices are one staging pass, so every lane of every wave
+    // has a row to unpack rather than half of them idling.
+#define STAGE_B(K0)                                                                        \
+    for (uint r = tid; r < 2u * BN; r += LANES) {                                          \
+        if (r < BN) {                                                                      \
+            dequantB0(pc.bOff, bankBase + r, K0, r);                                       \
+        } else {                                                                           \
+            dequantB1(pc.moeBOff2, bankBase + r - BN, K0, r - BN);                         \
+        }                                                                                  \
+    }
+#else
+#define STAGE_B(K0)                                                                        \
+    for (uint r = tid; r < BN; r += LANES) {                                               \
+        dequantB0(pc.bOff, bankBase + r, K0, r);                                           \
+    }
 #endif
-        barrier();
-        MMA_BLOCK(k0)
-        barrier();
+#define K_LOOP(WME)                                                                        \
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {                                          \
+        STAGE_A(k0)                                                                        \
+        STAGE_B(k0)                                                                        \
+        barrier();                                                                         \
+        MMA_BLOCK(k0, WME)                                                                 \
+        barrier();                                                                         \
     }
 #endif
 
@@ -939,22 +1066,59 @@ void main() {
     // leaves the routing weight to the combine — which has to read every one
     // of these values once anyway, and which is the only place that knows
     // which (token, slot) a row belongs to without a gather.
-    [[unroll]] for (uint i = 0u; i < WM; i++) {
-        [[unroll]] for (uint j = 0u; j < WN; j++) {
 #if MODE == 0
-            ACC16_T sw;
-            [[unroll]] for (uint e = 0u; e < acc0[i][j].length(); e++) {
-                float g = float(acc0[i][j][e]);
-                sw[e] = float16_t(g * sigmoidf(g) * float(acc1[i][j][e]));
-            }
-            coopMatStore(sw, hact,
-                pc.ctxOff + (rowStart + wrow + i * TILE) * pc.ldCtx + n0 + j * TILE,
-                pc.ldCtx, gl_CooperativeMatrixLayoutRowMajor);
-#else
-            coopMatStore(acc0[i][j], act,
-                pc.gatedOff + (rowStart + wrow + i * TILE) * pc.nEmbd + n0 + j * TILE, pc.nEmbd,
-                gl_CooperativeMatrixLayoutRowMajor);
-#endif
-        }
+#define STORE_TILE(i, j)                                                                   \
+    {                                                                                      \
+        ACC16_T sw;                                                                        \
+        [[unroll]] for (uint e = 0u; e < acc0[i][j].length(); e++) {                       \
+            float g = float(acc0[i][j][e]);                                                \
+            sw[e] = float16_t(g * sigmoidf(g) * float(acc1[i][j][e]));                     \
+        }                                                                                  \
+        coopMatStore(sw, hact,                                                             \
+            pc.ctxOff + (rowStart + wrow + (i) * TILE) * pc.ldCtx + n0 + (j) * TILE,       \
+            pc.ldCtx, gl_CooperativeMatrixLayoutRowMajor);                                 \
     }
+#else
+#define STORE_TILE(i, j)                                                                   \
+    coopMatStore(acc0[i][j], act,                                                          \
+        pc.gatedOff + (rowStart + wrow + (i) * TILE) * pc.nEmbd + n0 + (j) * TILE, pc.nEmbd, \
+        gl_CooperativeMatrixLayoutRowMajor);
+#endif
+// A rounded-up copy computes tiles the block does not have; it must not
+// store them (the rows are the next expert's). A uniform branch, in the
+// epilogue only.
+#if SHORT && WM > 1 && SHORT_STEP > 1
+#define STORE_IF(i) if ((i) < wmReal)
+#else
+#define STORE_IF(i)
+#endif
+#define EPILOGUE(WME)                                                                      \
+    [[unroll]] for (uint i = 0u; i < (WME); i++) {                                         \
+        STORE_IF(i) {                                                                      \
+            [[unroll]] for (uint j = 0u; j < WN; j++) {                                    \
+                STORE_TILE(i, j)                                                           \
+            }                                                                              \
+        }                                                                                  \
+    }
+
+#if SHORT && WM > 1
+    // One copy of the loop and the store per block height, on a uniform
+    // switch: the block's fragments are the record's, the widest is the
+    // default so no clamp is needed.
+    switch (wmEff) {
+#if WM > 3 && SHORT_STEP == 1
+    case 3u: { K_LOOP(3u) EPILOGUE(3u) break; }
+#endif
+#if WM > 2
+    case 2u: { K_LOOP(2u) EPILOGUE(2u) break; }
+#endif
+#if SHORT_STEP == 1
+    case 1u: { K_LOOP(1u) EPILOGUE(1u) break; }
+#endif
+    default: { K_LOOP(WM) EPILOGUE(WM) break; }
+    }
+#else
+    K_LOOP(WM)
+    EPILOGUE(WM)
+#endif
 }

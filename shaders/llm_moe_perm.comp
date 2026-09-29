@@ -32,7 +32,12 @@
 // the padding rows are named by a **sentinel** permutation entry pointing at
 // a token index one past the batch, whose activation row is zero. The
 // alignment is the wider of the two modes' row blocks, so both tile lists
-// divide it exactly and the two ladders stay independent.
+// divide it exactly and the two ladders stay independent. **Since §2.12 it
+// is one fragment for the single-wave rungs** (KERNELS.md G5c): those are
+// `SHORT` builds of the GEMM that bound their tiles by a record's real rows,
+// so an expert's range is rounded to sixteen and its last block is short;
+// `MoEGPU.pad` still widens the alignment to the block when a plan names a
+// multi-wave rung.
 //
 // Two more things the layout does. The row a permutation entry names is
 // `token * (used + 1) + slot`, not the token — so the slot stride carries the
@@ -108,7 +113,10 @@ void main() {
         uint cnt = (e < nE) ? actu[counts + e] : 0u;
         shCnt[e] = cnt;
         uint padded = ((cnt + pad - 1u) / pad) * pad;
-        uint nt = padded / bm;
+        // A whole number of blocks under an alignment at least the block;
+        // a short last one under a narrower alignment (the SHORT rungs,
+        // §2.12), bounded by the record's real rows.
+        uint nt = (padded + bm - 1u) / bm;
 
         uint rowTot = subgroupAdd(padded);
         uint rowEx = subgroupExclusiveAdd(padded);
@@ -159,8 +167,12 @@ void main() {
     // token past the batch, whose activation row is a zero pad. What the
     // scatter does not overwrite is padding, and padding has to compute
     // something finite rather than whatever the arena last held.
+    // The fill runs on to a whole widest block past the end, because a
+    // SHORT rung's last block stages every row of the block whether or not
+    // it multiplies them (§2.12), and the arena has the room (`maxRows`).
     uint sentinel = pc.tokens * slots;
-    for (uint r = reserve + tid; r < shTotal; r += WG) {
+    uint fillEnd = ((shTotal + 63u) / 64u) * 64u;
+    for (uint r = reserve + tid; r < fillEnd; r += WG) {
         actu[pc.moePermOff + r] = sentinel;
     }
     barrier();
