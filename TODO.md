@@ -60,8 +60,11 @@ Deployed in `ai.service` beside the image model (2026-09-26). At rest the
 service leaves ~35 GB available (image is 49.7 GB with `-edits 3`), and
 since **M11a** a 480p request runs through the service with 15.4 GB still
 free (it was OOM-killed before): int8 banks for the encoder and
-transformer, and two host-memory fixes in `safetensors` and `serve`. Open: staging cost, performance (M11), a Context-IR
-stand-in (M12).
+transformer, and two host-memory fixes in `safetensors` and `serve`. Since
+**M11b** (2026-09-29, not yet deployed) the int8 banks and AdaLN tables are
+cached in `bank-cache/` beside the checkpoint (47 GB of disk): a request's
+stagings take ~12 s instead of ~94, output byte-identical. Open: performance
+(M11), a Context-IR stand-in (M12).
 
 - [x] **Video in int8, to fit beside the image model** (2026-09-26,
   VIDEO.md M11a). Encoder and transformer as int8 banks by default, every

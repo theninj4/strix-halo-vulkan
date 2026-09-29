@@ -28,6 +28,10 @@ type VideoOptions struct {
 	// FP16 stages the text encoder and the transformer in fp16, the
 	// control; the default is their int8 banks (VIDEO.md M11a).
 	FP16 bool
+	// BankCache keeps the int8 banks and AdaLN tables beside the
+	// checkpoint (pipeline.Options.BankCache): ~50 GB of disk, written by
+	// the first request, and ~70 s off every later one.
+	BankCache bool
 	// ID is the model id this backend answers to.
 	ID string
 	// Swap is the residency slot a request takes, evicting image or music
@@ -85,6 +89,7 @@ func NewVideo(opt VideoOptions) (*Video, error) {
 	p, err := pipeline.New(d.dev, opt.Model, pipeline.Options{
 		MaxPrompt: opt.MaxPrompt,
 		Bank:      bank,
+		BankCache: opt.BankCache,
 		Hold: func(fn func() error) error {
 			return d.Do(func(*vk.Device) error { return fn() })
 		},

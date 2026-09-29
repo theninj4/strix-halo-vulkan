@@ -19,9 +19,12 @@
 //	                     it on the CPU
 //
 // The AdaLN tables (~40 s of host work over 26 GB of bf16) are computed
-// while the transformer stages, since neither needs the other. A caller that
-// holds the machine for many requests can keep the transformer and the VAE
-// staged between them (Options.Resident), which is then the floor.
+// while the transformer stages, since neither needs the other. With
+// Options.BankCache (VIDEO.md M11b) the int8 banks and the tables are read
+// back from bank-cache/ beside the checkpoint instead, and a request's
+// stagings take ~12 s rather than ~94. A caller that holds the machine for
+// many requests can keep the transformer and the VAE staged between them
+// (Options.Resident), which is then the floor.
 package pipeline
 
 import (
@@ -211,6 +214,13 @@ type Options struct {
 	// at no measurable cost in speed, inside the released bf16 pipeline's
 	// distance from fp32.
 	Bank qwen.Bank
+	// BankCache keeps what a request would otherwise rebuild from the
+	// checkpoint every time in a bank-cache directory beside it (VIDEO.md
+	// M11b): the int8 banks (27 GB for the encoder, 23 GB for the
+	// transformer), and the AdaLN tables of every timestep set seen
+	// (~0.8 GB each). The first request writes them; later ones read them
+	// at disk speed instead of re-packing ~110 GB of bf16.
+	BankCache bool
 
 	// Hold runs fn with the device's queue held, and nil runs it directly,
 	// for a caller that owns the device outright (cmd/h3, the tests).
@@ -462,7 +472,7 @@ func (p *Pipeline) Generate(ctx context.Context, req *Request, progress Progress
 		go func() {
 			defer tabWG.Done()
 			start := time.Now()
-			tabs, tabErr = dit.Tables(filepath.Join(p.dir, "transformer"), tvals)
+			tabs, tabErr = dit.TablesCached(filepath.Join(p.dir, "transformer"), tvals, p.cacheDir("transformer"))
 			tabTook = time.Since(start)
 		}()
 	}
@@ -602,7 +612,7 @@ func (p *Pipeline) encode(ctx context.Context, r *Resolved) (*qwen.Mat, error) {
 			return nil, err
 		}
 	}
-	enc, err := qwen.NewGPUEncoderBank(p.dev, set, cfg, textenc.Layers, len(ids), nil, p.opt.Bank)
+	enc, err := qwen.NewGPUEncoderCached(p.dev, set, cfg, textenc.Layers, len(ids), nil, p.opt.Bank, nil, p.cacheDir("text_encoder"))
 	if err != nil {
 		return nil, err
 	}
@@ -716,6 +726,14 @@ func (p *Pipeline) encodeKeyframes(ctx context.Context, between func() error, r 
 	return &qwen.Mat{Rows: len(rows) / cols, Cols: cols, Data: rows}, nil
 }
 
+// cacheDir is where a component's bank cache lives, or "" without one.
+func (p *Pipeline) cacheDir(component string) string {
+	if !p.opt.BankCache {
+		return ""
+	}
+	return filepath.Join(p.dir, component, "bank-cache")
+}
+
 // stageDiT returns a transformer staged for at least rows rows and text
 // text rows, restaging a resident one that is too small.
 func (p *Pipeline) stageDiT(rows, text int) (*dit.GPU, error) {
@@ -726,7 +744,7 @@ func (p *Pipeline) stageDiT(rows, text int) (*dit.GPU, error) {
 		// Staged for the request's own sizes; a resident one is sized up to
 		// a text budget so the next prompt fits.
 		text = p.textBudget(text)
-		g, err := dit.NewGPUBank(p.dev, filepath.Join(p.dir, "transformer"), rows, text, p.opt.Chunk, p.opt.Bank)
+		g, err := dit.NewGPUCached(p.dev, filepath.Join(p.dir, "transformer"), rows, text, p.opt.Chunk, p.opt.Bank, p.cacheDir("transformer"))
 		if err != nil {
 			return nil, err
 		}

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -356,14 +357,14 @@ type GPUEncoder struct {
 // the host as fp32 (1.56 GB) and every projection is narrowed into a bank --
 // so the caller may close it afterwards, as the DiT's stack allows.
 func NewGPUEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, BankFP16, nil)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, BankFP16, nil, "")
 }
 
 // NewGPUEncoderBank is NewGPUEncoder with the projections held as bank
 // says. BankQ8 halves the weights (MiniMax-H3's 32 B encoder: 50 → 27 GB)
 // for one expansion dispatch per projection per run (VIDEO.md M11a).
 func NewGPUEncoderBank(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, nil)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, nil, "")
 }
 
 // NewGPUEncoderMixed is NewGPUEncoderBank with the layers in keepFP16 held
@@ -372,10 +373,18 @@ func NewGPUEncoderBank(dev *vk.Device, set *safetensors.Set, cfg *Config, layers
 // activation channel in layers 6 and 16, and int8 there costs the
 // embeddings 20x (research/qimage-vertical.md Q13).
 func NewGPUEncoderMixed(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank, keepFP16 []int) (*GPUEncoder, error) {
-	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, keepFP16)
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, keepFP16, "")
 }
 
-func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int, bank Bank, keepFP16 []int) (*GPUEncoder, error) {
+// NewGPUEncoderCached is NewGPUEncoderMixed keeping its int8 banks in
+// cacheDir (Q8Cache): the first staging writes them there as it packs them,
+// and every later one reads them back instead of the checkpoint's
+// projections (VIDEO.md M11b). cacheDir "" is NewGPUEncoderMixed.
+func NewGPUEncoderCached(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, bank Bank, keepFP16 []int, cacheDir string) (*GPUEncoder, error) {
+	return newEncoder(dev, set, cfg, layers, maxTokens, plan, controls{}, maxBankBytes, bank, keepFP16, cacheDir)
+}
+
+func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTokens int, plan GEMMPlan, ctl controls, bankBytes int, bank Bank, keepFP16 []int, cacheDir string) (*GPUEncoder, error) {
 	explicitPlan := plan
 	if layers <= 0 || layers > cfg.NumLayers {
 		return nil, fmt.Errorf("qwen: asked for %d of %d layers", layers, cfg.NumLayers)
@@ -465,7 +474,7 @@ func newEncoder(dev *vk.Device, set *safetensors.Set, cfg *Config, layers, maxTo
 		g.Destroy()
 		return nil, err
 	}
-	if err := g.stageWeights(set, layers); err != nil {
+	if err := g.stageWeights(set, layers, cacheDir); err != nil {
 		g.Destroy()
 		return nil, err
 	}
@@ -803,7 +812,7 @@ func (g *GPUEncoder) pipeline(name string, spirv []byte, spec vk.PipelineSpec) e
 // One layer at a time is the point. LoadLayer materialises a layer as fp32 on
 // the host, 404 MB; all 35 at once would be 14.1 GB and none of it is wanted
 // once it has been narrowed into its bank.
-func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
+func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int, cacheDir string) (err error) {
 	c := g.cfg
 	rows, embed, err := LoadEmbedding(set, c)
 	if err != nil {
@@ -812,21 +821,40 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 	g.embedRows, g.embed = rows, embed
 
 	shapes := g.projShapes()
-	for i := range g.w {
-		// A layer is ~2 GB of fp32 on the host at 32 B, dead once it is in
-		// its bank: collected here, it never accumulates into the GC's
-		// doubling headroom beside a staging that is itself tens of GB
-		// (VIDEO.md M11a). Its slices hold no pointers, so this is ms.
-		runtime.GC()
-		layer, err := LoadLayer(set, i, c)
+	cache := g.q8Cache(set.Dir(), cacheDir, shapes)
+	cached := cache.Load(g.qbanks)
+	defer func() {
 		if err != nil {
-			return err
+			cache.Abort()
 		}
+	}()
+	for i := range g.w {
 		w := &g.w[i]
+		var layer *Layer
+		if cached && w.q8 {
+			// The projections are on the device already; only the norms
+			// are read.
+			if layer, err = LoadNorms(set, i, c); err != nil {
+				return err
+			}
+		} else {
+			// A layer is ~2 GB of fp32 on the host at 32 B, dead once it is
+			// in its bank: collected here, it never accumulates into the
+			// GC's doubling headroom beside a staging that is itself tens
+			// of GB (VIDEO.md M11a). Its slices hold no pointers, so this
+			// is ms.
+			runtime.GC()
+			if layer, err = LoadLayer(set, i, c); err != nil {
+				return err
+			}
+		}
 		g.wbuf.WriteFloat32At(int(w.attnNorm), layer.AttnNorm.Weight)
 		g.wbuf.WriteFloat32At(int(w.ffnNorm), layer.FFNNorm.Weight)
 		g.wbuf.WriteFloat32At(int(w.qNorm), layer.QNorm.Weight)
 		g.wbuf.WriteFloat32At(int(w.kNorm), layer.KNorm.Weight)
+		if cached && w.q8 {
+			continue
+		}
 
 		lins := map[Proj]*Linear{
 			ProjQ: layer.Q, ProjK: layer.K, ProjV: layer.V, ProjO: layer.O,
@@ -844,6 +872,7 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 					return err
 				}
 				g.qbanks[w.qbank].WriteBytesAt(int(w.qOff[r]), buf)
+				cache.Put(w.qbank, int(w.qOff[r]), buf)
 				continue
 			}
 			buf := make([]uint16, bElems(lin.Out, lin.In, g.stagedLayout))
@@ -851,7 +880,35 @@ func (g *GPUEncoder) stageWeights(set *safetensors.Set, layers int) error {
 			bank.WriteUint16At(int(w.bOff[r]), buf)
 		}
 	}
+	if !cached {
+		cache.Commit()
+	}
 	return nil
+}
+
+// q8Cache is the encoder's Q8Cache: keyed by the checkpoint and by where
+// every int8 layer's projections sit, so a different layer count or fp16
+// keep list is a different set of files.
+func (g *GPUEncoder) q8Cache(src, dir string, shapes map[Proj][2]int) *Q8Cache {
+	if dir == "" || len(g.qbanks) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "qwen encoder %q", g.cfg.Prefix)
+	for i, w := range g.w {
+		if !w.q8 {
+			continue
+		}
+		fmt.Fprintf(&b, "\n%d:%d", i, w.qbank)
+		for _, r := range projOrder {
+			fmt.Fprintf(&b, " %s%v@%d", r, shapes[r], w.qOff[r])
+		}
+	}
+	sizes := make([]int, len(g.qbanks))
+	for i, q := range g.qbanks {
+		sizes[i] = q.Size()
+	}
+	return OpenQ8Cache(dir, src, b.String(), sizes)
 }
 
 // packChunk is how many output rows one worker narrows at a time.

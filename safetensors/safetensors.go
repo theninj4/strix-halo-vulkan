@@ -207,6 +207,7 @@ func (f *File) Close() error {
 // Set is a checkpoint that may be sharded over several files, as named by a
 // model.safetensors.index.json "weight_map".
 type Set struct {
+	dir     string
 	files   []*File
 	tensors map[string]*Tensor
 	order   []string
@@ -225,7 +226,7 @@ func OpenSet(dir string) (*Set, error) {
 		return nil, fmt.Errorf("safetensors: no .safetensors files under %s", dir)
 	}
 
-	s := &Set{tensors: make(map[string]*Tensor)}
+	s := &Set{dir: dir, tensors: make(map[string]*Tensor)}
 	for _, p := range paths {
 		f, err := Open(p)
 		if err != nil {
@@ -315,6 +316,9 @@ func (s *Set) Get(name string) (*Tensor, error) {
 
 // Has reports whether the checkpoint holds a tensor.
 func (s *Set) Has(name string) bool { _, ok := s.tensors[name]; return ok }
+
+// Dir is the directory the set was opened from.
+func (s *Set) Dir() string { return s.dir }
 
 // Names returns every tensor name, in the order the shards were read.
 func (s *Set) Names() []string { return s.order }

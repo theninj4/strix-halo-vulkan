@@ -37,5 +37,9 @@ Ultimately we want to be able to run these tasks:
   10. OCR via `PaddleOCR-VL-1.6`:
     * https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6
     * https://arxiv.org/pdf/2606.03264
+  11. Object detection via Roboflow's `RF-DETR-L`:
+    * https://huggingface.co/Roboflow/rf-detr-large
+    * https://github.com/roboflow/rf-detr
+    * https://arxiv.org/abs/2511.09554
 
 We will ultimately serve up a HTTP API serving these features, in Go.

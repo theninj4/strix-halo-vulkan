@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -60,6 +61,8 @@ type GPU struct {
 	dev  *vk.Device
 	cfg  *Config
 	host *Model // fp32 pieces the host runs: time MLP, refiner norm, norm_out.linear, head biases
+	// cacheDir keeps the int8 banks (NewGPUCached); "" is no cache.
+	cacheDir string
 
 	wbuf, abuf, hbuf *vk.Buffer
 	banks            []*vk.Buffer
@@ -218,6 +221,14 @@ func NewGPU(dev *vk.Device, dir string, maxRows, maxText, chunk int) (*GPU, erro
 // NewGPUBank is NewGPU with the block stack held as bank says: BankQ8 is
 // ~22 GB of int8 banks and a 0.8 GB fp16 scratch in place of 40 GB.
 func NewGPUBank(dev *vk.Device, dir string, maxRows, maxText, chunk int, bank qwen.Bank) (*GPU, error) {
+	return NewGPUCached(dev, dir, maxRows, maxText, chunk, bank, "")
+}
+
+// NewGPUCached is NewGPUBank keeping its int8 banks in cacheDir
+// (qwen.Q8Cache): the first staging writes them there as it packs them, and
+// every later one reads them back instead of the checkpoint's projections
+// (VIDEO.md M11b). cacheDir "" is NewGPUBank.
+func NewGPUCached(dev *vk.Device, dir string, maxRows, maxText, chunk int, bank qwen.Bank, cacheDir string) (*GPU, error) {
 	cfg, err := LoadConfig(dir)
 	if err != nil {
 		return nil, err
@@ -230,7 +241,7 @@ func NewGPUBank(dev *vk.Device, dir string, maxRows, maxText, chunk int, bank qw
 		return nil, err
 	}
 	g := shell(cfg, maxRows, maxText, chunk)
-	g.dev, g.host, g.bank = dev, host, bank
+	g.dev, g.host, g.bank, g.cacheDir = dev, host, bank, cacheDir
 	g.pipes = map[string]*vk.ComputePipeline{}
 
 	set, err := safetensors.OpenSet(dir)
@@ -313,7 +324,7 @@ func (g *GPU) projShape(p proj) [2]int {
 // stage lays the fp16 banks out and fills them, and fills the fp32 weight
 // arena: rope tables are per request, so here it is the identity tables and
 // the per-block q/k norm weights.
-func (g *GPU) stage(set *safetensors.Set) error {
+func (g *GPU) stage(set *safetensors.Set) (err error) {
 	perBlock := 0
 	for _, p := range projOrder {
 		sh := g.projShape(p)
@@ -395,7 +406,6 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		g.blocks[i] = newBlock()
 	}
 
-	var err error
 	if g.wbuf, err = g.dev.NewBuffer(w32 * 4); err != nil {
 		return fmt.Errorf("dit: fp32 weight arena: %w", err)
 	}
@@ -413,6 +423,14 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		}
 		g.qbanks = append(g.qbanks, b)
 	}
+	cache := g.q8Cache(set.Dir())
+	cached := cache.Load(g.qbanks)
+	defer func() {
+		if err != nil {
+			cache.Abort()
+		}
+	}()
+
 	ones := make([]float32, g.maxText*g.ropeHalf)
 	for i := range ones {
 		ones[i] = 1
@@ -450,6 +468,17 @@ func (g *GPU) stage(set *safetensors.Set) error {
 
 	stageBlock := func(w blockW, p string) error {
 		l := &loader{set: set}
+		if cached && w.qOff != nil {
+			// The projections are on the device already.
+			nq := l.f32(p+"attn.norm_q.weight", g.headDim)
+			nk := l.f32(p+"attn.norm_k.weight", g.headDim)
+			if l.err != nil {
+				return l.err
+			}
+			g.wbuf.WriteFloat32At(int(w.normQ), nq)
+			g.wbuf.WriteFloat32At(int(w.normK), nk)
+			return nil
+		}
 		wq := l.f32(p+"attn.to_q.weight", g.inner, g.H)
 		wk := l.f32(p+"attn.to_k.weight", g.inner, g.H)
 		wv := l.f32(p+"attn.to_v.weight", g.inner, g.H)
@@ -474,6 +503,7 @@ func (g *GPU) stage(set *safetensors.Set) error {
 					return err
 				}
 				g.qbanks[w.qbank].WriteBytesAt(int(w.qOff[pr]), buf)
+				cache.Put(w.qbank, int(w.qOff[pr]), buf)
 				continue
 			}
 			if simQ8[pr] {
@@ -507,12 +537,38 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		}
 	}
 	for i, w := range g.blocks {
-		runtime.GC() // the last block's 1.5 GB of fp32, as qwen's staging does
+		if !cached {
+			runtime.GC() // the last block's 1.5 GB of fp32, as qwen's staging does
+		}
 		if err := stageBlock(w, fmt.Sprintf("transformer_blocks.%d.", i)); err != nil {
 			return err
 		}
 	}
+	if !cached {
+		cache.Commit()
+	}
 	return nil
+}
+
+// q8Cache is the transformer's qwen.Q8Cache: keyed by the checkpoint and by
+// where every refiner and main block's projections sit.
+func (g *GPU) q8Cache(src string) *qwen.Q8Cache {
+	if g.cacheDir == "" || len(g.qbanks) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("h3 dit")
+	for i, w := range append(append([]blockW{}, g.refiner...), g.blocks...) {
+		fmt.Fprintf(&b, "\n%d:%d", i, w.qbank)
+		for _, p := range projOrder {
+			fmt.Fprintf(&b, " %d%v@%d", p, g.projShape(p), w.qOff[p])
+		}
+	}
+	sizes := make([]int, len(g.qbanks))
+	for i, q := range g.qbanks {
+		sizes[i] = q.Size()
+	}
+	return qwen.OpenQ8Cache(g.cacheDir, src, b.String(), sizes)
 }
 
 // layoutActivations places every activation in the two arenas and refuses a

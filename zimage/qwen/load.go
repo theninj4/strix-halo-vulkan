@@ -213,6 +213,23 @@ func LoadLayer(set *safetensors.Set, i int, cfg *Config) (*Layer, error) {
 	return layer, nil
 }
 
+// LoadNorms is LoadLayer without the projections: the four norms, for a
+// staging whose projections come from its Q8Cache.
+func LoadNorms(set *safetensors.Set, i int, cfg *Config) (*Layer, error) {
+	l := &loader{set: set}
+	p := fmt.Sprintf("%slayers.%d.", cfg.Prefix, i)
+	layer := &Layer{
+		AttnNorm: l.rms(p+"input_layernorm", cfg.RMSEps),
+		QNorm:    l.rms(p+"self_attn.q_norm", cfg.RMSEps),
+		KNorm:    l.rms(p+"self_attn.k_norm", cfg.RMSEps),
+		FFNNorm:  l.rms(p+"post_attention_layernorm", cfg.RMSEps),
+		Heads:    cfg.NumHeads,
+		KVHeads:  cfg.NumKVHeads,
+		HeadDim:  cfg.HeadDim,
+	}
+	return layer, l.err
+}
+
 // embedName is the one tensor outside the layers that the encoder reads,
 // under Config.Prefix. The final norm and the lm_head are in the checkpoint
 // and are never loaded by *this* path: hidden_states[-2] is taken before

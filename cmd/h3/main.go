@@ -43,6 +43,7 @@ func main() {
 	steps := flag.Int("steps", pipeline.DefaultSteps, "sampling steps N (N−1 forwards); the release's default is 50")
 	seed := flag.Uint64("seed", 0, "noise seed")
 	bankName := flag.String("bank", "q8", "text encoder and transformer weights: q8 (int8, ~27 GB peak) or fp16 (~50 GB)")
+	bankCache := flag.Bool("bank-cache", true, "keep the int8 banks and AdaLN tables in bank-cache/ beside the checkpoint (~50 GB of disk, written by the first run)")
 	flag.Parse()
 	bank, err := qwen.ParseBank(*bankName)
 	if err != nil {
@@ -88,7 +89,7 @@ func main() {
 	req := &pipeline.Request{Prompt: text, AspectW: aw, AspectH: ah, ShortEdge: *short,
 		Seconds: *seconds, Steps: *steps, Seed: *seed, First: picture(*first), Last: picture(*last)}
 	err = dev.Do(func(d *vk.Device) error {
-		p, err := pipeline.New(d, *model, pipeline.Options{Bank: bank})
+		p, err := pipeline.New(d, *model, pipeline.Options{Bank: bank, BankCache: *bankCache})
 		if err != nil {
 			return err
 		}

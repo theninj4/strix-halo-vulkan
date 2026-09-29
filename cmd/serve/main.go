@@ -243,6 +243,7 @@ func main() {
 	musicQueue := flag.Int("music-queue", 32, "music jobs that may wait behind the running one")
 	swapIdle := flag.Duration("swap-idle", 10*time.Minute,
 		"how long image, music or video stays staged with no request before the swap slot frees it; 0 keeps it until another is asked for")
+	videoCache := flag.Bool("video-bank-cache", true, "keep the video int8 banks and AdaLN tables in bank-cache/ beside the checkpoint (~50 GB of disk, written by the first request): ~70 s off every later request")
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
@@ -472,7 +473,7 @@ func main() {
 			log.Fatal("-video needs the device; it has no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt, FP16: *videoFP16, Swap: swap})
+		b, err := backend.NewVideo(backend.VideoOptions{Model: *videoModel, Device: dev, MaxPrompt: *videoPrompt, FP16: *videoFP16, BankCache: *videoCache, Swap: swap})
 		if err != nil {
 			log.Fatal(err)
 		}

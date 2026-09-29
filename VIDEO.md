@@ -273,7 +273,7 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | **done 2026-09-26** (`h3/vae/encoder.go`, `h3/textenc` Presentation, `h3/pipeline/keyframe.go`, `-first`/`-last`, `input_reference` / `conditions`): encoder moments at ≤ 1.6e-5 of fp32, torch's seed-42 draw reproduced; conditioner 9.3e-4 teacher-forced (bf16: 1.2e-2); teacher-forced steps ≤ 1.3e-4 rms; frame 0 of a served run lands on the keyframe at **27.1 dB** |
-| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. The rest is open |
+| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. The rest is open |
 | M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | |
 | M13 | `ref2va` (optional) | |
 
@@ -928,6 +928,55 @@ the image model. Don't measure headroom with anything else running: a
 background `go test -short` sweep stages models too, and it tripped the
 guard on the first attempt.
 
+### M11b — the stagings from a bank cache (2026-09-29)
+
+M11a left every request re-making its int8 banks from the checkpoint: 48 GB
+of bf16 for the encoder and 42 GB for the transformer read, widened to fp32
+and `PackQ8`'d, plus 17 GB more for the AdaLN tables beside it. At 3.7 GB/s
+off this disk that is ~30 s of reads. **The rest was CPU**, and all of it
+produces the same bytes every time.
+
+**The cache** (`qwen.Q8Cache`, `zimage/qwen/q8cache.go`) keeps a staging's
+int8 banks on disk byte for byte as the device holds them, one file a bank,
+in `bank-cache/` beside each component (`text_encoder/`, `transformer/`).
+A miss stages as before and writes each packed matrix at its bank offset
+into a temporary file, renamed into place once the staging is complete. A
+hit reads the files straight into the mapped banks, 64 MB chunks on 8
+readers, and loads only the norms from the checkpoint. The key hashes the
+layout (every matrix's shape, bank and offset, so a different layer count
+or fp16 keep list is a different file set), `q8CacheVersion`, and each
+shard's name, size and mtime. It does not hash the shards' bytes (the LLM's
+bank cache makes the same trade, P4c). The AdaLN tables are cached the same
+way (`dit.TablesCached`), keyed by the request's timestep bits: one file a
+step count and t2va/fl2va, 19 MB a distinct timestep (0.25 GB at N = 8, 0.72 GB at N = 20).
+
+On by default: `pipeline.Options.BankCache`, `serve -video-bank-cache`,
+`cmd/h3 -bank-cache`. The tests leave it off. It takes **47 GB of disk**
+(25.9 GB encoder, 21.3 GB transformer), written by the first request, which
+pays ~14 s for the writes.
+
+| 448×256 × N = 2, `cmd/h3` | encode (staging + forward) | transformer staging | tables | request |
+|---|---|---|---|---|
+| M11a (no cache) | 40.5 s | 34.3 s | 19.2 s (beside it) | 97 s |
+| first run (writes the cache) | 48.2 s | 40.4 s | 19.3 s | 111 s |
+| cached, files evicted from the page cache | **7.5 s** | **4.5 s** | **8 ms** | **33 s** |
+
+The cold row is honest: the files were evicted with
+`posix_fadvise(DONTNEED)` first (no root needed), and buff/cache fell from
+71 to 13 GB. That is 26 GB in ~6 s and 21 GB in 4.5 s, ~4.7 GB/s. Every
+run's mp4 is **byte-identical** to the uncached one (same seed).
+
+Served (hand-run `serve -video`, README-style request at `short_edge 256`,
+`7:4`, N = 8): **74 s** end to end, against M9's 3 m 19 s. The default shape
+(864×480 × 124 frames, N = 20): **741 s** against M11a's 826 s. That run
+also computed the N = 20 tables for the first time (0.7 GB, 19 s, which
+hide behind the transformer's staging), so a repeat should come in ~10 s
+under. The forwards are now ~95% of a served request.
+
+What is left of a request's staging is the video VAE's (inside the decode's
+14 s at the small canvas) and the embedding table (3.1 GB of fp32 widened
+from bf16 on every encoder staging). Neither has been timed on its own yet.
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -961,14 +1010,22 @@ projections are folded out.
 
 ## Handoff
 
+**2026-09-29, session 6: M11b done.** The stagings read their int8 banks
+and AdaLN tables from `bank-cache/` beside the checkpoint (`qwen.Q8Cache`,
+`dit.TablesCached`; on by default in `serve` and `cmd/h3`, off in the
+tests). The first request writes the cache (47 GB, ~14 s extra). After that
+a request's stagings are ~12 s instead of ~94 s, and the output is
+byte-identical. **Not yet deployed**: `ai.service` runs the binary from
+before this change. The next deploy's first video request writes the cache.
+
 **2026-09-26, session 5: M11a done.** The text encoder and the
 transformer stage as int8 banks by default (`qwen.BankQ8`: `serve`
 unless `-video-fp16`, `cmd/h3 -bank`, `pipeline.Options.Bank`). A
 request's measured peak is 31–33 GB (fp16: 57), inside the ~35 GB the
 deployed service leaves free, and every teacher-forced step is inside the
-released bf16 pipeline's error. **Not yet done: a request through the
-deployed `ai.service`, beside the image model, completed in 834 s with
-15.4 GB still free**, after two host-side fixes the first attempt's OOM
+released bf16 pipeline's error. **A request through the deployed
+`ai.service`, beside the image model, completed in 834 s with 15.4 GB
+still free**, after two host-side fixes the first attempt's OOM
 kill exposed (`safetensors` F32/F16 `append` growth, and
 `debug.FreeOSMemory` in `serve` and between the stagings).
 
@@ -1017,13 +1074,15 @@ envelope), and shares the device with the other verticals while it runs.
   teacher-forced and free-running distance from fp32; `TestGPURun` prices
   int8 on it), `H3_Q8_ABLATION=1` (`TestGPUQ8Ablation`) and
   `H3_SENSITIVITY_DRAWS=n`.
+- M11b's: `qwen.TestGPUQ8Cache` (round trip and the three misses), and
+  `-bank-cache=false` / `-video-bank-cache=false` as the control. Delete a
+  `bank-cache/` to re-pack. Time a cold hit by evicting the files first
+  (`posix_fadvise(POSIX_FADV_DONTNEED)` on each, e.g. from Python).
 
 **Next, in order:**
 
-1. **The staging cost** (~2.3 of a served request's ~14 min): the int8
-   banks pre-quantised on disk (48 GB of bf16 read and `PackQ8`'d every
-   request today), and `Tables` cached by schedule. Since M9 the stagings no longer block other
-   verticals, so this is now about the video's own latency only.
+1. ~~The staging cost~~: done, M11b. What staging is left (the video VAE,
+   the fp32 embedding table) is not yet timed on its own.
 2. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
    55.5 peak; 68% of a trained forward), the down projection's GEMM (22
    against 37), and the audio decode on the device (7 s on the CPU against
