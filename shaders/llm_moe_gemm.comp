@@ -53,6 +53,23 @@
 // is zero. Every store then goes straight to global, and the only cost is
 // arithmetic on rows nothing reads.
 
+// **The K loop is a software pipeline on the Q4_K up builds** (`-DPIPE=2`,
+// KERNELS.md G5, §2.11). The plain loop is, per K-step, one dependent
+// chain — the gathered rows, the block headers and the nibbles, each waited
+// for, unpacked and stored, and only then the fragment loads and the MMAs —
+// and G5's controls priced it: with the bank loads made L0 hits the up
+// projection is 1.43x faster, with the slab unpacks skipped 1.76x, and with
+// both stagings skipped the loop runs at ~90% of the matrix pipe, so the
+// LDS round trip §2.2 blamed is not the cost. The pipeline fetches the
+// next step's bytes into registers before this step's MMAs, reads a block
+// header once per super-block and a nibble group once per two steps
+// instead of every step, and unpacks from registers: 2.7x fewer bank load
+// instructions a super-block, none of them waited for in front of the
+// MMAs. Bit-identical (the same arithmetic in the same order), and the up
+// projection **1.68x at 2048 tokens, 2.01x at 512, 1.57x at 4096**. The
+// other formats and the down mode keep the plain loop until the pipeline
+// is written for their block layouts.
+
 #define MOE_QBANK
 #include "llm_common.glsl"
 
@@ -118,8 +135,48 @@
 #if (BK % A_VEC) != 0
 #error "BK must be a whole number of uvec4 loads"
 #endif
+#ifndef WAVE
 #define WAVE 64
+#endif
 #define LANES (WAVES * WAVE)
+
+// Screening knobs (KERNELS.md G5), never shipped and wrong by construction:
+// each takes one part of the K-step away so that part is priced by its
+// absence, the way dit_gemm.comp's L0_LOADS and LDS_NOBAR price theirs.
+// MOE_NO_UNPACK skips the B slab's unpack (the fragments read whatever LDS
+// holds); MOE_NO_ASTAGE skips the gathered A staging; MOE_NIB_ONLY is
+// P12-3's `float16_t(nib)`, no header, no scale, no affine; MOE_L0_BANK
+// reads every lane's bank bytes from the tile's first row and MOE_L0_A every
+// gathered row from token zero, so the loads are issued and waited for but
+// hit the L0 (MOE_L0_BANK=2 keeps the real rows, sixty-four lines a load,
+// but the same bytes every step, so what is taken away is the fetch and
+// not the divergence); MOE_FRAG2 reads every fragment twice, so the LDS
+// fragment reads are priced by their addition.
+#ifndef MOE_NO_UNPACK
+#define MOE_NO_UNPACK 0
+#endif
+#ifndef MOE_NO_ASTAGE
+#define MOE_NO_ASTAGE 0
+#endif
+#ifndef MOE_NIB_ONLY
+#define MOE_NIB_ONLY 0
+#endif
+#ifndef MOE_L0_BANK
+#define MOE_L0_BANK 0
+#endif
+#ifndef MOE_L0_A
+#define MOE_L0_A 0
+#endif
+#ifndef MOE_FRAG2
+#define MOE_FRAG2 0
+#endif
+#if MOE_NIB_ONLY
+#define Q_AFFINE(NIB, DS, DM) float16_t(NIB)
+#define Q_AFFINE_ADD(NIB, D, M) float16_t(NIB)
+#else
+#define Q_AFFINE(NIB, DS, DM) float16_t((DS) * float(NIB) - (DM))
+#define Q_AFFINE_ADD(NIB, D, M) float16_t(float(NIB) * (D) + (M))
+#endif
 
 layout(local_size_x = LANES) in;
 
@@ -246,7 +303,7 @@ void scaleMinK4(uint j, uvec3 s, out uint sc, out uint mn) {
 // header is read once for the whole slab.
 #define DEQUANT_SLAB(NAME, DST)                                                                 \
 void NAME(uint bankBase, uint row, uint k0, uint col) {                                         \
-    uint rb = bankBase + row * ((pc.gemmK / QK) * QB);                                          \
+    uint rb = bankBase + (MOE_L0_BANK == 1 ? 0u : row) * ((pc.gemmK / QK) * QB);                \
     uint dst = col * LDS_ROW;                                                                   \
     DEQUANT_BODY(DST)                                                                           \
 }
@@ -254,7 +311,7 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
 #if QFMT == FMT_Q4_K
 #define DEQUANT_BODY(DST)                                                                       \
   [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
-    uint k0c = k0 + c;                                                                          \
+    uint k0c = (MOE_L0_BANK == 2 ? 0u : k0) + c;                                                \
     uint within = k0c & 255u;                                                                    \
     uint g = within >> 6;                                                                       \
     uint sub = (within >> 5) & 1u;                                                              \
@@ -273,7 +330,7 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
         uint w = (t < 4u) ? lo4[t] : hi4[t - 4u];                                               \
         [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
             uint nib = (w >> (8u * b + sh)) & 0xFu;                                             \
-            DST[dst + c + t * 4u + b] = float16_t(ds * float(nib) - dm);                        \
+            DST[dst + c + t * 4u + b] = Q_AFFINE(nib, ds, dm);                                  \
         }                                                                                       \
     }                                                                                           \
   }
@@ -307,7 +364,7 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
             if (((h >> (8u * b)) & hmask) != 0u) {                                              \
                 nib += 16u;                                                                     \
             }                                                                                   \
-            DST[dst + c + t * 4u + b] = float16_t(ds * float(nib) - dm);                        \
+            DST[dst + c + t * 4u + b] = Q_AFFINE(nib, ds, dm);                                  \
         }                                                                                       \
     }                                                                                           \
   }
@@ -325,8 +382,8 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
             uint by = (w >> (8u * b)) & 0xFFu;                                                  \
             uint lo = (by & 0xFu) | (((qh >> j) & 1u) << 4);                                    \
             uint hi = (by >> 4) | (((qh >> (j + 16u)) & 1u) << 4);                              \
-            DST[dst + c + j] = float16_t(float(lo) * dm.x + dm.y);                              \
-            DST[dst + c + j + 16u] = float16_t(float(hi) * dm.x + dm.y);                        \
+            DST[dst + c + j] = Q_AFFINE_ADD(lo, dm.x, dm.y);                                    \
+            DST[dst + c + j + 16u] = Q_AFFINE_ADD(hi, dm.x, dm.y);                              \
         }                                                                                       \
     }                                                                                           \
   }
@@ -407,6 +464,254 @@ DEQUANT_SLAB(dequantB1, sB1)
 
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
 
+// ---- PIPE (KERNELS.md G5): the K loop as a software pipeline.
+//
+// The shipped loop is, per K-step, one dependent chain: the permutation
+// entries, then the gathered rows they name, then the block headers and
+// nibbles, each waited for, unpacked and stored, and only then the fragment
+// loads and the MMAs. Nothing of step k+1 is in flight while step k's MMAs
+// run, and with one wave a workgroup and four of them a SIMD the chain is
+// covered by three other waves in the same phase. The pipeline moves the
+// *loads* one step ahead: the bytes a lane will unpack at step k+1 are
+// fetched into registers before step k's MMAs issue, so their latency lands
+// behind the matrix work instead of in front of it. The unpack itself, the
+// LDS slab and the fragment reads are exactly the shipped ones — same
+// arithmetic, same order, bit-identical — and the permutation entries, which
+// never change across K, are read once before the loop rather than once a
+// step.
+//
+// Written for the up mode over Q4_K at BK 32, which is the kernel a prefill
+// token spends a quarter of itself in; the other formats keep the plain
+// loop until this one is measured.
+#ifndef PIPE
+#define PIPE 0
+#endif
+#if PIPE
+#if !((MODE == 0 && QFMT == FMT_Q4_K) || (MODE == 1 && QFMT != FMT_Q4_K && QFMT != FMT_Q5_K)) || BK != 32
+#error "PIPE is written for the Q4_K up mode and the block-32 down formats, at BK 32"
+#endif
+#endif
+#if PIPE && MODE == 1
+// The down mode's pipeline: B only (its A is read by the fragment loads
+// straight from the arena), one column a lane, the block's words fetched
+// a step ahead as `uint`s from the word base the plain unpack computes.
+// DN_W is the words a step's unpack touches: Q5_1's 24-byte block is six,
+// Q4_1's twenty bytes five, Q8_0's 34-byte block reaches nine words past
+// its scale through the rotating window, and IQ4_NL's 36-byte pair is
+// nine, fetched once per two steps under PIPE 2.
+#if QFMT == FMT_Q5_1
+#define DN_W 6
+#elif QFMT == FMT_Q4_1
+#define DN_W 5
+#elif QFMT == FMT_IQ4NL
+#define DN_W 9
+#else
+#define DN_W 10
+#endif
+
+void pipeFetchDown(uint k0, uint tid, uint bankBase, inout uint fw[DN_W]) {
+    if (tid < BN) {
+        uint rb = pc.bOff + (bankBase + tid) * ((pc.gemmK / QK) * QB);
+#if QFMT == FMT_IQ4NL
+        uint m = k0 >> 5;
+        if (PIPE < 2 || (m & 1u) == 0u) {
+            uint pw = (rb + (m >> 1) * 36u) >> 2;
+            [[unroll]] for (uint i = 0u; i < DN_W; ++i) { fw[i] = qbank[pw + i]; }
+        }
+#else
+        uint hw = (rb + (k0 >> 5) * QB) >> 2;
+        [[unroll]] for (uint i = 0u; i < DN_W; ++i) { fw[i] = qbank[hw + i]; }
+#endif
+    }
+}
+
+// The plain unpack's arithmetic verbatim, off the fetched words.
+void pipeUnpackDown(uint k0, uint tid, uint bankBase, uint fw[DN_W]) {
+    if (tid < BN) {
+        uint dst = tid * LDS_ROW;
+#if QFMT == FMT_Q5_1
+        vec2 dm = unpackHalf2x16(fw[0]);
+        uint qh = fw[1];
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+            uint w = fw[2u + t];
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                uint j = t * 4u + b;
+                uint by = (w >> (8u * b)) & 0xFFu;
+                uint lo = (by & 0xFu) | (((qh >> j) & 1u) << 4);
+                uint hi = (by >> 4) | (((qh >> (j + 16u)) & 1u) << 4);
+                sB0[dst + j] = Q_AFFINE_ADD(lo, dm.x, dm.y);
+                sB0[dst + j + 16u] = Q_AFFINE_ADD(hi, dm.x, dm.y);
+            }
+        }
+#elif QFMT == FMT_Q4_1
+        vec2 dm = unpackHalf2x16(fw[0]);
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+            uint w = fw[1u + t];
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                uint j = t * 4u + b;
+                uint by = (w >> (8u * b)) & 0xFFu;
+                sB0[dst + j] = float16_t(float(by & 0xFu) * dm.x + dm.y);
+                sB0[dst + j + 16u] = float16_t(float(by >> 4) * dm.x + dm.y);
+            }
+        }
+#elif QFMT == FMT_IQ4NL
+        uint m = k0 >> 5;
+        vec2 dd = unpackHalf2x16(fw[0]);
+        float d = ((m & 1u) == 0u) ? dd.x : dd.y;
+        uint bw = 1u + (m & 1u) * 4u;
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {
+            uint w = fw[bw + t];
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                uint j = t * 4u + b;
+                uint by = (w >> (8u * b)) & 0xFFu;
+                sB0[dst + j] = float16_t(kIQ4[by & 0xFu] * d);
+                sB0[dst + j + 16u] = float16_t(kIQ4[by >> 4] * d);
+            }
+        }
+#else
+        // Q8_0: the plain body's rotating window over the fetched words,
+        // with the block's byte parity recomputed from the same address.
+        uint rb = pc.bOff + (bankBase + tid) * ((pc.gemmK / QK) * QB);
+        uint blk = rb + (k0 >> 5) * 34u;
+        vec2 dd = unpackHalf2x16(fw[0]);
+        float d = ((blk & 2u) == 0u) ? dd.x : dd.y;
+        uint base = blk + 2u;
+        uint bo = (base >> 2) - (blk >> 2);
+        bool odd = (base & 2u) != 0u;
+        uint carry = fw[bo];
+        [[unroll]] for (uint t = 0u; t < 8u; ++t) {
+            uint nxt = fw[bo + t + 1u];
+            uint w = odd ? ((carry >> 16) | (nxt << 16)) : carry;
+            carry = nxt;
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                uint by = (w >> (8u * b)) & 0xFFu;
+                sB0[dst + t * 4u + b] = float16_t(float(int(by) - int((by >> 7) << 8)) * d);
+            }
+        }
+#endif
+    }
+}
+#endif
+#if PIPE && MODE == 0
+#define A_ITERS ((BM * (BK / A_VEC)) / LANES)
+#if A_ITERS * LANES != BM * (BK / A_VEC)
+#error "PIPE wants the gathered rows' loads to divide the lanes"
+#endif
+#if LANES == 64
+#define B_ITERS 2
+#else
+#define B_ITERS ((2 * BN + LANES - 1) / LANES)
+#endif
+
+// One lane's share of a step's bytes: A_ITERS gathered `uvec4` of the block
+// input, and for each slab column it unpacks the block header and the two
+// `uvec4` of nibbles P12 reads.
+void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
+    out uvec4 aV[A_ITERS], inout uvec4 hdr[B_ITERS], inout uvec4 lo[B_ITERS], inout uvec4 hi[B_ITERS]) {
+    uint slots = MOE_USED + 1u;
+    [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {
+        uint idx = tid + n * LANES;
+        uint r = idx / (BK / A_VEC);
+        uint c = (idx - r * (BK / A_VEC)) * A_VEC;
+        aV[n] = hact4[(pc.xnOff + (aP[n] / slots) * pc.lda + k0 + c) / A_VEC];
+    }
+    [[unroll]] for (uint n = 0u; n < B_ITERS; ++n) {
+#if LANES == 64
+        // Pass n is slab n's column tid (the unpack's static split).
+        uint r = tid + n * BN;
+        if (tid < BN) {
+#else
+        uint r = tid + n * LANES;
+        if (r < 2u * BN) {
+#endif
+            uint base = r < BN ? pc.bOff : pc.moeBOff2;
+            uint row = bankBase + (r < BN ? r : r - BN);
+            uint rb = base + row * ((pc.gemmK / QK) * QB);
+            uint blk = rb + (k0 >> 8) * 144u;
+            uint g = (k0 & 255u) >> 6;
+            uint qv = (blk + 16u + g * 32u) >> 4;
+#if PIPE >= 2
+            // The header serves eight steps and a nibble group two: fetch
+            // each once, on the step that enters it, and keep it. The
+            // bytes a step reads are then read once from the cache instead
+            // of two to eight times, for the same sixty-four lines a load.
+            if ((k0 & 255u) == 0u) {
+                hdr[n] = qbank4[blk >> 4];
+            }
+            if ((k0 & 63u) == 0u) {
+                lo[n] = qbank4[qv];
+                hi[n] = qbank4[qv + 1u];
+            }
+#else
+            hdr[n] = qbank4[blk >> 4];
+            lo[n] = qbank4[qv];
+            hi[n] = qbank4[qv + 1u];
+#endif
+        }
+    }
+}
+
+// The same bytes unpacked into the slabs, the shipped arithmetic verbatim:
+// the A halves are a reinterpretation, the B values `Q_AFFINE` in the same
+// order the plain loop writes them.
+#define PIPE_UNPACK_COL(DST, n)                                                             \
+    {                                                                                       \
+        uint dst = col * LDS_ROW;                                                           \
+        uint within = k0 & 255u;                                                            \
+        uint g = within >> 6;                                                               \
+        uint sub = (within >> 5) & 1u;                                                      \
+        vec2 dd = unpackHalf2x16(hdr[n].x);                                                 \
+        uint sc, mn;                                                                        \
+        scaleMinK4(2u * g + sub, hdr[n].yzw, sc, mn);                                       \
+        float ds = dd.x * float(sc);                                                        \
+        float dm = dd.y * float(mn);                                                        \
+        uint sh = sub * 4u;                                                                 \
+        [[unroll]] for (uint t = 0u; t < 8u; ++t) {                                         \
+            uint w = (t < 4u) ? lo[n][t] : hi[n][t - 4u];                                   \
+            [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                     \
+                uint nib = (w >> (8u * b + sh)) & 0xFu;                                     \
+                DST[dst + t * 4u + b] = Q_AFFINE(nib, ds, dm);                              \
+            }                                                                               \
+        }                                                                                   \
+    }
+
+void pipeUnpack(uint k0, uint tid, uvec4 aV[A_ITERS], uvec4 hdr[B_ITERS], uvec4 lo[B_ITERS], uvec4 hi[B_ITERS]) {
+    [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {
+        uint idx = tid + n * LANES;
+        uint r = idx / (BK / A_VEC);
+        uint c = (idx - r * (BK / A_VEC)) * A_VEC;
+        uint dst = r * LDS_ROW + c;
+        [[unroll]] for (uint w = 0u; w < 4u; ++w) {
+            f16vec2 h = unpackFloat2x16(aV[n][w]);
+            sA[dst + 2u * w] = h.x;
+            sA[dst + 2u * w + 1u] = h.y;
+        }
+    }
+#if LANES == 64 && BN == 64
+    // One wave over the full column block: its first pass is the gate
+    // slab's column tid, its second the up slab's, statically.
+    { uint col = tid; PIPE_UNPACK_COL(sB0, 0) }
+    { uint col = tid; PIPE_UNPACK_COL(sB1, 1) }
+#elif LANES == 64
+    // One wave over a narrow block (the n-rungs): the same two passes, the
+    // lanes past BN idle in each.
+    if (tid < BN) { uint col = tid; PIPE_UNPACK_COL(sB0, 0) }
+    if (tid < BN) { uint col = tid; PIPE_UNPACK_COL(sB1, 1) }
+#else
+    {
+        uint r = tid;
+        if (r < BN) {
+            uint col = r;
+            PIPE_UNPACK_COL(sB0, 0)
+        } else if (r < 2u * BN) {
+            uint col = r - BN;
+            PIPE_UNPACK_COL(sB1, 0)
+        }
+    }
+#endif
+}
+#endif
+
 void main() {
     uint tid = gl_LocalInvocationID.x;
     // Which rows of the tile this wave owns. Every cooperative-matrix op
@@ -457,6 +762,122 @@ void main() {
     barrier();
 #endif
 
+// ---- The MMA block, one K-step of fragments out of the slabs, as a macro
+// so the pipelined loop below can issue it twice a trip without a second
+// copy of the text. The `#if`s it needs are resolved into the helpers first
+// (a macro body cannot hold a directive).
+#if MODE == 0
+#define LOAD_A(dst, i, kt, K0)                                                             \
+    coopMatLoad(dst, sA, (wrow + (i) * TILE) * LDS_ROW + (kt) * TILE, LDS_ROW,             \
+        gl_CooperativeMatrixLayoutRowMajor);
+#define LOAD_A2(dst, i, kt, K0)                                                            \
+    coopMatLoad(dst, sA, (wrow + (i) * TILE) * LDS_ROW + (kt) * TILE + f2, LDS_ROW,        \
+        gl_CooperativeMatrixLayoutRowMajor);
+#else
+// MODE 1's rows are permutation positions and so contiguous: no gather, and
+// the overhang past this expert reads the next one's swiglu rows and is
+// thrown away at the store.
+#define LOAD_A(dst, i, kt, K0)                                                             \
+    coopMatLoad(dst, hact,                                                                 \
+        pc.ctxOff + (rowStart + wrow + (i) * TILE) * pc.ldCtx + (K0) + (kt) * TILE, pc.ldCtx, \
+        gl_CooperativeMatrixLayoutRowMajor);
+#define LOAD_A2(dst, i, kt, K0)                                                            \
+    coopMatLoad(dst, hact,                                                                 \
+        pc.ctxOff + (rowStart + wrow + (i) * TILE) * pc.ldCtx + (K0) + (kt) * TILE + f2, pc.ldCtx, \
+        gl_CooperativeMatrixLayoutRowMajor);
+#endif
+#if MOE_FRAG2
+// The same fragments again at an address the compiler cannot fold onto the
+// first (pc.moeUsed's top bits are zero), consumed by the second half of
+// each grid so neither copy is dead.
+#define FRAG2_A(kt, K0)                                                                    \
+    FRAG_A_T fragA2[WM];                                                                   \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_A2(fragA2[i], i, kt, K0) }
+#define FRAG2_B(SLAB, j, kt)                                                               \
+    coopMatLoad(fragB2, SLAB, ((j) * TILE) * LDS_ROW + (kt) * TILE + f2, LDS_ROW,          \
+        gl_CooperativeMatrixLayoutColumnMajor);
+#define FRAG2_B_DECL FRAG_B_T fragB2;
+// The four ways an MMA can pick its copies, on unrolled indices, so each is
+// a folded branch and not a select (SPIR-V has no select on a cooperative
+// matrix).
+#define MMA_AT(ACC, i, j, B, B2)                                                           \
+    if ((j) < WN / 2u) {                                                                  \
+        if ((i) < WM / 2u) { ACC = coopMatMulAdd(fragA[i], B, ACC); }                     \
+        else               { ACC = coopMatMulAdd(fragA[i], B2, ACC); }                    \
+    } else {                                                                              \
+        if ((i) < WM / 2u) { ACC = coopMatMulAdd(fragA2[i], B, ACC); }                    \
+        else               { ACC = coopMatMulAdd(fragA2[i], B2, ACC); }                   \
+    }
+#else
+#define FRAG2_A(kt, K0)
+#define FRAG2_B(SLAB, j, kt)
+#define FRAG2_B_DECL
+#define fragB2 fragB
+#define MMA_AT(ACC, i, j, B, B2) ACC = coopMatMulAdd(fragA[i], B, ACC);
+#endif
+#if MODE == 0
+#define MMA_UP(j, kt)                                                                      \
+    coopMatLoad(fragB, sB1, ((j) * TILE) * LDS_ROW + (kt) * TILE, LDS_ROW,                 \
+        gl_CooperativeMatrixLayoutColumnMajor);                                            \
+    FRAG2_B(sB1, j, kt)                                                                    \
+    [[unroll]] for (uint i = 0u; i < WM; i++) { MMA_AT(acc1[i][j], i, j, fragB, fragB2) }
+#else
+#define MMA_UP(j, kt)
+#endif
+#define MMA_BLOCK(K0)                                                                      \
+    [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {                                   \
+        FRAG_A_T fragA[WM];                                                                \
+        [[unroll]] for (uint i = 0u; i < WM; i++) { LOAD_A(fragA[i], i, kt, K0) }          \
+        FRAG2_A(kt, K0)                                                                    \
+        [[unroll]] for (uint j = 0u; j < WN; j++) {                                        \
+            FRAG_B_T fragB;                                                                \
+            FRAG2_B_DECL                                                                   \
+            coopMatLoad(fragB, sB0, ((j) * TILE) * LDS_ROW + (kt) * TILE, LDS_ROW,         \
+                gl_CooperativeMatrixLayoutColumnMajor);                                    \
+            FRAG2_B(sB0, j, kt)                                                            \
+            [[unroll]] for (uint i = 0u; i < WM; i++) { MMA_AT(acc0[i][j], i, j, fragB, fragB2) } \
+            MMA_UP(j, kt)                                                                  \
+        }                                                                                  \
+    }
+#if MOE_FRAG2
+    uint f2 = pc.moeUsed >> 20;
+#endif
+
+#if PIPE && MODE == 1
+    uint fw[DN_W];
+    pipeFetchDown(0u, tid, bankBase, fw);
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+        pipeUnpackDown(k0, tid, bankBase, fw);
+        uint kn = k0 + BK;
+        pipeFetchDown(kn < pc.gemmK ? kn : k0, tid, bankBase, fw);
+        barrier();
+        MMA_BLOCK(k0)
+        barrier();
+    }
+#elif PIPE
+    // The permutation entries once, then step 0's bytes in flight before
+    // the loop; every step unpacks what it holds and fetches the next
+    // step's into the same registers (their old values are dead by then).
+    // A two-set form, so the fetch could be hoisted above the unpack, was
+    // measured: it spills at m4 and buys nothing where it fits.
+    uint aP[A_ITERS];
+    [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {
+        uint r = (tid + n * LANES) / (BK / A_VEC);
+        aP[n] = actu[pc.moePermOff + rowStart + r];
+    }
+    uvec4 pA[A_ITERS], pH[B_ITERS], pL[B_ITERS], pI[B_ITERS];
+    pipeFetch(0u, tid, bankBase, aP, pA, pH, pL, pI);
+    for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+        pipeUnpack(k0, tid, pA, pH, pL, pI);
+        // The next step's bytes, or this step's again at the end (in
+        // bounds, never read back).
+        uint kn = k0 + BK;
+        pipeFetch(kn < pc.gemmK ? kn : k0, tid, bankBase, aP, pA, pH, pL, pI);
+        barrier();
+        MMA_BLOCK(k0)
+        barrier();
+    }
+#else
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
 #if MODE == 0
         // The A operand is gathered: BM rows of the block input, named by the
@@ -473,10 +894,11 @@ void main() {
         // per half. Bit for bit the same slab: `unpackFloat2x16` is a
         // reinterpretation, the LDS layout is unchanged, and the loop covers
         // the same (r, c) in the same order.
+#if !MOE_NO_ASTAGE
         for (uint idx = tid; idx < BM * (BK / A_VEC); idx += LANES) {
             uint r = idx / (BK / A_VEC);
             uint c = (idx - r * (BK / A_VEC)) * A_VEC;
-            uint p = actu[pc.moePermOff + rowStart + r];
+            uint p = MOE_L0_A != 0 ? 0u : actu[pc.moePermOff + rowStart + r];
             uvec4 v = hact4[(pc.xnOff + (p / slots) * pc.lda + k0 + c) / A_VEC];
             uint dst = r * LDS_ROW + c;
             [[unroll]] for (uint w = 0u; w < 4u; ++w) {
@@ -485,8 +907,10 @@ void main() {
                 sA[dst + 2u * w + 1u] = h.y;
             }
         }
+#endif
         // The two matrices are one staging pass, so every lane of every wave
         // has a row to unpack rather than half of them idling.
+#if !MOE_NO_UNPACK
         for (uint r = tid; r < 2u * BN; r += LANES) {
             if (r < BN) {
                 dequantB0(pc.bOff, bankBase + r, k0, r);
@@ -494,46 +918,19 @@ void main() {
                 dequantB1(pc.moeBOff2, bankBase + r - BN, k0, r - BN);
             }
         }
+#endif
 #else
+#if !MOE_NO_UNPACK
         for (uint r = tid; r < BN; r += LANES) {
             dequantB0(pc.bOff, bankBase + r, k0, r);
         }
 #endif
+#endif
         barrier();
-
-        [[unroll]] for (uint kt = 0u; kt < BK_TILES; kt++) {
-            FRAG_A_T fragA[WM];
-            [[unroll]] for (uint i = 0u; i < WM; i++) {
-#if MODE == 0
-                coopMatLoad(fragA[i], sA, (wrow + i * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
-                    gl_CooperativeMatrixLayoutRowMajor);
-#else
-                // MODE 1's rows are permutation positions and so contiguous:
-                // no gather, and the overhang past this expert reads the next
-                // one's swiglu rows and is thrown away at the store.
-                coopMatLoad(fragA[i], hact,
-                    pc.ctxOff + (rowStart + wrow + i * TILE) * pc.ldCtx + k0 + kt * TILE, pc.ldCtx,
-                    gl_CooperativeMatrixLayoutRowMajor);
-#endif
-            }
-            [[unroll]] for (uint j = 0u; j < WN; j++) {
-                FRAG_B_T fragB;
-                coopMatLoad(fragB, sB0, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
-                    gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint i = 0u; i < WM; i++) {
-                    acc0[i][j] = coopMatMulAdd(fragA[i], fragB, acc0[i][j]);
-                }
-#if MODE == 0
-                coopMatLoad(fragB, sB1, (j * TILE) * LDS_ROW + kt * TILE, LDS_ROW,
-                    gl_CooperativeMatrixLayoutColumnMajor);
-                [[unroll]] for (uint i = 0u; i < WM; i++) {
-                    acc1[i][j] = coopMatMulAdd(fragA[i], fragB, acc1[i][j]);
-                }
-#endif
-            }
-        }
+        MMA_BLOCK(k0)
         barrier();
     }
+#endif
 
     // ---- The epilogue. MODE 0 applies `ggml_swiglu_split(gate, up)` =
     // silu(gate)*up on the accumulators, so the [rows, ffn] pair the

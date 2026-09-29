@@ -45,6 +45,9 @@ package llm
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -1090,10 +1093,19 @@ func (g *MoEGPU) build() error {
 	// so the seventy-odd `.spv` of these two families do not double. The
 	// grouped GEMM below takes its row block from its own name and needs
 	// none of this.
-	for _, fam := range []map[string][]byte{moeSPIRV, moeRouterSPIRV} {
+	override, overrideWave, err := moeSPVOverride()
+	if err != nil {
+		return err
+	}
+	for fi, fam := range []map[string][]byte{moeSPIRV, moeRouterSPIRV} {
 		for name, spirv := range fam {
+			wave := uint32(moeWave)
+			if o, ok := override[name]; ok && fi == 0 {
+				spirv, wave = o, overrideWave
+			}
 			for rows := 1; rows <= GEMVMaxRows; rows++ {
 				rspec := spec
+				rspec.RequiredSubgroupSize = wave
 				rspec.SpecConstants = gemvSpec(rows)
 				if err := g.pipeline(gemvRowName(name, rows), spirv, rspec); err != nil {
 					return err
@@ -1107,6 +1119,43 @@ func (g *MoEGPU) build() error {
 		}
 	}
 	return nil
+}
+
+// moeSPVOverride is `LLM_MOE_SPV` (KERNELS.md G5): a build of the grouped
+// GEMM loaded from disk in place of the embedded one, `up_q4k_m4=path.spv`,
+// comma-separated, with `LLM_MOE_SPV_WAVE` the wave those builds were
+// compiled for (64 unless said). It is this kernel's `H3_GEMM_SPV`: a
+// screening knob for the ladder and the record, never the served path, and a
+// build that is wrong by construction is still timed.
+func moeSPVOverride() (map[string][]byte, uint32, error) {
+	spec := os.Getenv("LLM_MOE_SPV")
+	wave := uint32(moeWave)
+	if spec == "" {
+		return nil, wave, nil
+	}
+	out := map[string][]byte{}
+	for _, kv := range strings.Split(spec, ",") {
+		name, path, ok := strings.Cut(kv, "=")
+		if !ok {
+			return nil, 0, fmt.Errorf("llm: LLM_MOE_SPV entry %q is not name=path", kv)
+		}
+		if _, known := moeSPIRV[name]; !known {
+			return nil, 0, fmt.Errorf("llm: LLM_MOE_SPV names %q, which is not a grouped GEMM build", name)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil, 0, fmt.Errorf("llm: LLM_MOE_SPV %s: %w", name, err)
+		}
+		out[name] = b
+	}
+	if w := os.Getenv("LLM_MOE_SPV_WAVE"); w != "" {
+		n, err := strconv.Atoi(w)
+		if err != nil || (n != 32 && n != 64) {
+			return nil, 0, fmt.Errorf("llm: LLM_MOE_SPV_WAVE %q: want 32 or 64", w)
+		}
+		wave = uint32(n)
+	}
+	return out, wave, nil
 }
 
 func (g *MoEGPU) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {

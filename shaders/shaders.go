@@ -3145,11 +3145,20 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_route.spv llm_moe_route.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_perm.spv llm_moe_perm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_combine.spv llm_moe_combine.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q4k_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q4k_w4m1.spv llm_moe_gemm.comp
+// The Q4_K up builds carry `-DPIPE=2` (KERNELS.md G5, §2.11): the K loop as
+// a software pipeline, the next step's bank and activation bytes fetched into
+// registers before this step's MMAs, the block header once a super-block and
+// the nibble group once per two steps. Bit-identical to the plain loop; the
+// up projection 1.68x at 2048 tokens. The IQ4_NL down builds (the served
+// down format) carry it too, for the pair fetched once per two steps: 1.05x
+// at 2048 tokens, 1.20x at 512. The Q5_K and Q8_0 up builds and the Q5_1,
+// Q8_0 and Q4_1 down builds keep the plain loop: measured, the pipeline
+// moves the Q5_1 down mode by nothing (§2.11).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=2 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=4 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=2 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWAVES=4 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_w4m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m2.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_m4.spv llm_moe_gemm.comp
@@ -3169,8 +3178,8 @@ var LLMDNScanL4P []byte
 // multiplies the grid by four and two and divides the slab each workgroup
 // unpacks by the same, for the same total unpack. They are up-mode only: the
 // down mode's N is 2560 and its grid is already 400.
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_n1m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q4k_n2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=1 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_n1m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=0 -DWM=1 -DWN=2 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_up_q4k_n2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_n1m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWN=2 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q5k_n2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWN=1 -DWAVES=1 -DNBANK=48 -o llm_moe_up_q80_n1m1.spv llm_moe_gemm.comp
@@ -3190,11 +3199,11 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_q41_m4.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_q41_w2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=4 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_q41_w4m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=2 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m2.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=4 -DWAVES=1 -DNBANK=48 -o llm_moe_down_iq4nl_m4.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_down_iq4nl_w2m1.spv llm_moe_gemm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_down_iq4nl_w4m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_down_iq4nl_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=2 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_down_iq4nl_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=4 -DWAVES=1 -DPIPE=2 -DNBANK=48 -o llm_moe_down_iq4nl_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=2 -DPIPE=2 -DNBANK=48 -o llm_moe_down_iq4nl_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=5 -DWM=1 -DWAVES=4 -DPIPE=2 -DNBANK=48 -o llm_moe_down_iq4nl_w4m1.spv llm_moe_gemm.comp
 
 //go:embed llm_moe_up_q4k_m1.spv
 var LLMMoEUpQ4KM1 []byte
