@@ -222,6 +222,27 @@ func TestGPUForward(t *testing.T) {
 		t.Errorf("forward 0: video rel %.3g, audio rel %.3g", relV, relA)
 	}
 
+	// The down projection's K split (M11d) is the one-pass GEMM split in
+	// time, so the same forward without it is the same bits.
+	split := g.downSplit
+	g.downSplit = 1
+	v1, a1, _, err := g.Step(readRef(t, ditRef, m.Tensors, "noise_video"), readRef(t, ditRef, m.Tensors, "noise_audio"), rowT)
+	g.downSplit = split
+	if err != nil {
+		t.Fatal(err)
+	}
+	if split < 2 {
+		t.Errorf("the down projection is not split (%d): nothing compared", split)
+	}
+	for _, p := range [][2]*qwen.Mat{{v, v1}, {a, a1}} {
+		for i := range p[0].Data {
+			if math.Float32bits(p[0].Data[i]) != math.Float32bits(p[1].Data[i]) {
+				t.Fatalf("down in %d K pieces differs from one pass at %d: %g against %g", split, i, p[0].Data[i], p[1].Data[i])
+			}
+		}
+	}
+	t.Logf("down projection in %d K pieces: bit-identical to one pass", split)
+
 	// A second request after a full forward: the planes now hold 5,095 rows
 	// of keys, and the refiner's 537-key attention reads a key block past
 	// its own count. Before zeroKeyTail that turned every text row into NaN.
@@ -231,22 +252,36 @@ func TestGPUForward(t *testing.T) {
 	if again, _ := relGap(g.text, readRef(t, ditRef, m.Tensors, "text_refined")); !(again <= 1e-2) {
 		t.Errorf("refiner after a forward: rel %v", again)
 	}
-	// The negative control: without the zeroing, the same sequence fails.
+	// The negative control: without the zeroing, the same sequence fails --
+	// on the plain kernel, whose row max reads the stale keys. The transposed
+	// one (M11c) masks the key tail out of its max as well as out of P, so it
+	// survives stale keys on its own; it keeps the zeroing, since P = 0 still
+	// multiplies whatever the stale v rows hold.
 	g.noKeyTail = true
-	defer func() { g.noKeyTail = false }()
-	if err := g.Begin(lay, cond, uniq, tabs); err != nil {
+	defer func() { g.noKeyTail, g.attnFixed = false, false }()
+	sequence := func() float64 {
+		if err := g.Begin(lay, cond, uniq, tabs); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := g.Step(readRef(t, ditRef, m.Tensors, "noise_video"), readRef(t, ditRef, m.Tensors, "noise_audio"), rowT); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Begin(lay, cond, uniq, tabs); err != nil {
+			t.Fatal(err)
+		}
+		again, _ := relGap(g.text, readRef(t, ditRef, m.Tensors, "text_refined"))
+		return again
+	}
+	if g.attnT {
+		t.Logf("transposed attention without zeroKeyTail: refiner after a forward rel %v", sequence())
+	}
+	if err := g.SetAttention(AttnVariant{QT: 1, KTIL: 4}); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := g.Step(readRef(t, ditRef, m.Tensors, "noise_video"), readRef(t, ditRef, m.Tensors, "noise_audio"), rowT); err != nil {
-		t.Fatal(err)
-	}
-	if err := g.Begin(lay, cond, uniq, tabs); err != nil {
-		t.Fatal(err)
-	}
-	if again, _ := relGap(g.text, readRef(t, ditRef, m.Tensors, "text_refined")); again <= 1e-2 {
+	if again := sequence(); again <= 1e-2 {
 		t.Errorf("without zeroKeyTail the refiner still matches (rel %v): the check above proves nothing", again)
 	} else {
-		t.Logf("negative control: without zeroKeyTail the refiner after a forward is rel %v", again)
+		t.Logf("negative control: without zeroKeyTail the plain kernel's refiner after a forward is rel %v", again)
 	}
 }
 
@@ -629,6 +664,9 @@ func TestGPUShapes(t *testing.T) {
 	cond := readRef(t, textencRef, tm.Tensors, "readme_fp32")
 	type shape struct{ h, w, frames int }
 	shapes := []shape{{480, 864, 124}, {768, 1344, 124}}
+	if os.Getenv("H3_SHAPES") == "480" {
+		shapes = shapes[:1]
+	}
 	lays := make([]*plan.Layout, len(shapes))
 	maxRows := 0
 	for i, s := range shapes {
@@ -658,6 +696,15 @@ func TestGPUShapes(t *testing.T) {
 	}
 	defer g.Destroy()
 	t.Logf("staged for %d rows, chunk %d: activations %.2f GB", maxRows, chunk, float64(g.ActivationBytes())/1e9)
+	// H3_ATTN_PLAIN=1 is the control arm: the plain attention builds, as
+	// before M11c's transposed one.
+	if os.Getenv("H3_ATTN_PLAIN") != "" {
+		g.attnProbed = true
+	}
+	// H3_DOWN_SPLIT=n runs the down projection as n K pieces (M11d).
+	if v := os.Getenv("H3_DOWN_SPLIT"); v != "" {
+		fmt.Sscan(v, &g.downSplit)
+	}
 	for i, lay := range lays {
 		if err := g.Begin(lay, cond, tvals, tabs); err != nil {
 			t.Fatal(err)
@@ -811,8 +858,34 @@ func TestGPUAttentionScreen(t *testing.T) {
 	}
 	L := float64(len(lay.Pos))
 	fl := 4 * L * L * float64(g.headDim*g.heads)
+	// H3_ATTN_SPV=qt:ktil:path[,...] adds candidate builds to the screen.
+	variants := AttnVariants()
+	if env := os.Getenv("H3_ATTN_SPV"); env != "" {
+		for _, arm := range strings.Split(env, ",") {
+			var v AttnVariant
+			f := strings.SplitN(arm, ":", 3)
+			if len(f) != 3 {
+				t.Fatalf("H3_ATTN_SPV arm %q: want qt:ktil:path", arm)
+			}
+			v.QT, _ = strconv.Atoi(f[0])
+			v.KTIL, _ = strconv.Atoi(f[1])
+			v.Tag = filepath.Base(f[2])
+			spirv, err := os.ReadFile(f[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := g.AddAttention(v, spirv); err != nil {
+				t.Fatal(err)
+			}
+			variants = append(variants, v)
+		}
+	}
+	if os.Getenv("H3_ATTN_ONLY_SPV") != "" {
+		variants = variants[len(AttnVariants()):]
+		variants = append([]AttnVariant{{QT: 1, KTIL: 4}}, variants...)
+	}
 	var base []uint16
-	for _, v := range AttnVariants() {
+	for _, v := range variants {
 		if err := g.SetAttention(v); err != nil {
 			t.Fatal(err)
 		}
@@ -826,12 +899,15 @@ func TestGPUAttentionScreen(t *testing.T) {
 		if base == nil {
 			base = ctx
 		}
-		var worst float64
+		var worst, d2, b2 float64
 		for i := range ctx {
-			worst = math.Max(worst, math.Abs(float64(f16(ctx[i])-f16(base[i]))))
+			d := float64(f16(ctx[i]) - f16(base[i]))
+			worst = math.Max(worst, math.Abs(d))
+			d2 += d * d
+			b2 += float64(f16(base[i])) * float64(f16(base[i]))
 		}
-		t.Logf("QT%d KTIL%d: %8v  %5.1f TFLOP/s  max |ctx - QT1 KTIL4| %.3g", v.QT, v.KTIL,
-			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst)
+		t.Logf("QT%d KTIL%d T %-5v %s: %8v  %5.1f TFLOP/s  against QT1 KTIL4: max |d| %.3g, rms rel %.3g", v.QT, v.KTIL, v.T, v.Tag,
+			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst, math.Sqrt(d2/b2))
 	}
 }
 

@@ -3677,6 +3677,33 @@ var H3AttnQT4KT4 []byte
 //go:embed h3_attn_qt1_kt8_w32_of16.spv
 var H3AttnQT1KT8 []byte
 
+// MiniMax-H3's attention transposed (VIDEO.md M11c): S^T = K.Q^T and
+// O^T += V^T.P^T, so a lane owns a query and P reaches the matrix cores
+// without a trip through LDS. Written against the element order
+// coopmat_layout_probe.comp reads back.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -o h3_attn_t_qt2_kt4.spv h3_attn_t.comp
+
+//go:embed h3_attn_t_qt2_kt4.spv
+var H3AttnTQT2KT4 []byte
+
+// The 128x256 GEMM over a K range, accumulating into the fp32 C already in
+// place (-DKRANGE, VIDEO.md M11d): H3's down projection split in time.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=8 -DWAVES_M=2 -DWAVES_N=2 -DB_LAYOUT=2 -DSWZ=8 -DKRANGE=1 -o dit_gemm_wg128x256_bt16_swz8_krange.spv dit_gemm.comp
+
+//go:embed dit_gemm_wg128x256_bt16_swz8_krange.spv
+var DiTGEMMWG128x256TiledSWZ8KRange []byte
+
+// Which (row, column) each lane's element of a cooperative matrix is, per
+// Use: the element order h3_attn_t.comp depends on (VIDEO.md M11c), read back
+// by h3/dit's TestCoopMatLayout.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o coopmat_layout_probe.spv coopmat_layout_probe.comp
+
+//go:embed coopmat_layout_probe.spv
+var CoopMatLayoutProbe []byte
+
 // MiniMax-H3's video VAE decoder (h3/vae, VIDEO.md M5): a 36-layer ViT at
 // head 64, on the same kernels as the transformer. Only the head width
 // differs: the q/k pack rotates 48 of the 64 channels (0.75 of the head, as

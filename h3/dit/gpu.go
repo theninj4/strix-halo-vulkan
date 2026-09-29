@@ -1,6 +1,7 @@
 package dit
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"runtime"
@@ -71,15 +72,18 @@ type GPU struct {
 	// with seven dispatches (dequant, one pipeline per qbank) expanding them
 	// into one fp16 scratch in banks that every block's GEMMs read. The
 	// heads stay fp16.
-	bank      qwen.Bank
-	qbanks    []*vk.Buffer
-	dequant   []*vk.ComputePipeline
-	pipes     map[string]*vk.ComputePipeline
-	gemms     []map[gemmKernel]*vk.ComputePipeline
-	mods      []*vk.ShaderModule
-	attn      AttnVariant // a fixed build, when attnFixed; else attnFor picks
-	attnFixed bool
-	attnPipes map[AttnVariant]*vk.ComputePipeline
+	bank       qwen.Bank
+	qbanks     []*vk.Buffer
+	dequant    []*vk.ComputePipeline
+	pipes      map[string]*vk.ComputePipeline
+	gemms      []map[gemmKernel]*vk.ComputePipeline
+	mods       []*vk.ShaderModule
+	attn       AttnVariant // a fixed build, when attnFixed; else attnFor picks
+	attnFixed  bool
+	attnT      bool // the device's element order is h3_attn_t.comp's
+	attnProbed bool // attnT is known: probed at the first Begin
+	attnPipes  map[AttnVariant]*vk.ComputePipeline
+	downSplit  int // K pieces of the down projection (M11d); 1 for one pass
 
 	H, inner, ffn, heads, headDim, ropeHalf int
 	maxRows, maxText, chunk, planeRows      int
@@ -182,16 +186,18 @@ func (p pushConstants) bytes() []byte {
 type gemmKernel int
 
 const (
-	gemmBig   gemmKernel = iota // 128x256 tiles, the image DiT's measured winner
-	gemmSmall                   // 64x64, for the narrow heads
+	gemmBig    gemmKernel = iota // 128x256 tiles, the image DiT's measured winner
+	gemmSmall                    // 64x64, for the narrow heads
+	gemmKRange                   // gemmBig over a K range, accumulating into C (M11d)
 )
 
 var gemmVariants = map[gemmKernel]struct {
 	spirv  []byte
 	bm, bn int
 }{
-	gemmBig:   {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256},
-	gemmSmall: {shaders.DiTGEMMReg64Tiled, 64, 64},
+	gemmBig:    {shaders.DiTGEMMWG128x256TiledSWZ8, 128, 256},
+	gemmSmall:  {shaders.DiTGEMMReg64Tiled, 64, 64},
+	gemmKRange: {shaders.DiTGEMMWG128x256TiledSWZ8KRange, 128, 256},
 }
 
 const (
@@ -267,6 +273,9 @@ func shell(cfg *Config, maxRows, maxText, chunk int) *GPU {
 		ropeHalf: cfg.RopeWidth() / 2,
 		maxRows:  maxRows, maxText: maxText, chunk: chunk,
 		aBias: map[string]uint32{},
+		// M11d: at K = 14336 the one-pass 128x256 GEMM runs at 24-26
+		// TFLOP/s; in two K passes, 29, bit-identical.
+		downSplit: 2,
 	}
 	g.planeRows = roundUp(maxRows, rowAlign)
 	g.ldaH, g.ldaInner, g.ldaFFN = g.H+gemmPad, g.inner+gemmPad, g.ffn+gemmPad
@@ -775,6 +784,16 @@ func (g *GPU) Begin(lay *plan.Layout, cond *qwen.Mat, tvals []float32, tabs []*T
 	if len(tabs) != len(g.blocks) {
 		return fmt.Errorf("dit: %d AdaLN tables for %d blocks", len(tabs), len(g.blocks))
 	}
+	// The layout probe is a dispatch, so it waits for the first Begin (held,
+	// in a server) rather than running in the staging, which submits nothing.
+	if !g.attnProbed {
+		if err := checkCoopMatLayout(g.dev); err == nil {
+			g.attnT = true
+		} else if !errors.Is(err, errLayout) {
+			return err
+		}
+		g.attnProbed = true
+	}
 	temb, err := g.host.TimeEmbed(tvals)
 	if err != nil {
 		return err
@@ -877,6 +896,31 @@ func (gr *graph) gemm(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff
 	gr.d = append(gr.d, vk.MultiDispatch{Pipeline: gr.g.gemms[bank][kernel], GroupsX: uint32(n / v.bn), GroupsY: uint32(mPad / v.bm), PushConstants: pc.bytes()})
 	gr.kinds = append(gr.kinds, kind)
 	gr.flops = append(gr.flops, 2*float64(mPad)*float64(n)*float64(k))
+	return nil
+}
+
+// gemmSplit records a 128x256 GEMM as pieces dispatches over K, each after
+// the first accumulating into C (gemmKRange): bit-identical to one pass.
+func (gr *graph) gemmSplit(bank int, kind string, aOff, cOff, bOff uint32, m, n, k, lda, pieces int) error {
+	v := gemmVariants[gemmKRange]
+	step := roundUp((k+pieces-1)/pieces, 2*tile) // a whole K-slab (BK_TILES of 2)
+	if n%v.bn != 0 || k%(2*tile) != 0 {
+		return fmt.Errorf("dit: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, 2*tile)
+	}
+	mPad := roundUp(m, v.bm)
+	for k0 := 0; k0 < k; k0 += step {
+		k1 := min(k0+step, k)
+		pc := gr.base
+		pc.InOff, pc.OutOff, pc.BOff = aOff, cOff, bOff
+		pc.GemmM, pc.GemmN, pc.GemmK, pc.LDA = uint32(mPad), uint32(n), uint32(k), uint32(lda)
+		pc.Aux0, pc.Aux1 = uint32(k0), uint32(k1)
+		if k0 > 0 {
+			pc.Aux2 = 1
+		}
+		gr.d = append(gr.d, vk.MultiDispatch{Pipeline: gr.g.gemms[bank][gemmKRange], GroupsX: uint32(n / v.bn), GroupsY: uint32(mPad / v.bm), PushConstants: pc.bytes()})
+		gr.kinds = append(gr.kinds, kind)
+		gr.flops = append(gr.flops, 2*float64(mPad)*float64(n)*float64(k1-k0))
+	}
 	return nil
 }
 
@@ -1051,7 +1095,11 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 		pcG.InOff, pcG.KOff, pcG.OutOff = aGate, aUp, g.hFFN
 		pcG.Scale = math.Float32bits(ffScale)
 		gr.add("swiglu", "swiglu", uint32(n), 1, pcG)
-		if err := gr.gemm(gemmBig, w.bank, "gemm down", g.hFFN, aFF, w.off[projDown], n, g.H, g.ffn, g.ldaFFN); err != nil {
+		if g.downSplit > 1 {
+			if err := gr.gemmSplit(w.bank, "gemm down", g.hFFN, aFF, w.off[projDown], n, g.H, g.ffn, g.ldaFFN, g.downSplit); err != nil {
+				return err
+			}
+		} else if err := gr.gemm(gemmBig, w.bank, "gemm down", g.hFFN, aFF, w.off[projDown], n, g.H, g.ffn, g.ldaFFN); err != nil {
 			return err
 		}
 		gate("gate ffn", r0, r1, 1, aFF)
@@ -1395,22 +1443,35 @@ func (g *GPU) Profile(video, audio *qwen.Mat, rowT []int32) ([]Stage, error) {
 }
 
 // AttnVariant is one build of the WMMA attention with fp16 context out: QT
-// query tiles a wave, KTIL key tiles a block, wave32.
-type AttnVariant struct{ QT, KTIL int }
+// query tiles a wave, KTIL key tiles a block, wave32. T is the transposed
+// kernel (h3_attn_t.comp, M11c). Tag names a build a screen loaded from a
+// file (AddAttention).
+type AttnVariant struct {
+	QT, KTIL int
+	T        bool
+	Tag      string
+}
 
 // attnFor is the build for a key count. TestGPUAttentionScreen, block 49's
-// planes after a real forward (2026-09-26): at 15,936 keys QT1 KTIL4 is
-// 26.3 TFLOP/s and QT2 KTIL4 24.5; at 38,247 keys QT1 is 19.6 and QT2 22.4,
-// +14%. Both write bit-identical context. QT4 spills (5.5) and KTIL8 loses
-// at both. The switch sits between the two measured points.
+// planes after a real forward: the transposed QT2 KTIL4 is 1.55x the best
+// plain build at 15,936 keys (194 against 297 ms) and 1.61x at 38,247 (1.17
+// against 1.87 s), at rms 1e-4 of the context (M11c). It runs wherever the
+// device's cooperative-matrix element order is the one it is written
+// against (checkCoopMatLayout, at the first Begin). Otherwise the plain builds, whose
+// screen (2026-09-26) put QT1 KTIL4 first at 15,936 keys (26.3 TFLOP/s
+// against QT2's 24.5) and QT2 KTIL4 at 38,247 (22.4 against 19.6); the
+// switch sits between the two measured points.
 func (g *GPU) attnFor(keys int) AttnVariant {
 	if g.attnFixed {
 		return g.attn
 	}
-	if keys >= 24576 {
-		return AttnVariant{2, 4}
+	if g.attnT {
+		return AttnVariant{QT: 2, KTIL: 4, T: true}
 	}
-	return AttnVariant{1, 4}
+	if keys >= 24576 {
+		return AttnVariant{QT: 2, KTIL: 4}
+	}
+	return AttnVariant{QT: 1, KTIL: 4}
 }
 
 // attention records one query chunk's attention of n rows over keys keys.
@@ -1424,11 +1485,12 @@ func (gr *graph) attention(keys, n int, pc pushConstants) {
 }
 
 var attnBuilds = map[AttnVariant][]byte{
-	{1, 4}: shaders.DiTAttentionWMMAQT1KT4W32OutF16,
-	{1, 8}: shaders.H3AttnQT1KT8,
-	{2, 4}: shaders.H3AttnQT2KT4,
-	{2, 8}: shaders.H3AttnQT2KT8,
-	{4, 4}: shaders.H3AttnQT4KT4,
+	{QT: 1, KTIL: 4}:          shaders.DiTAttentionWMMAQT1KT4W32OutF16,
+	{QT: 1, KTIL: 8}:          shaders.H3AttnQT1KT8,
+	{QT: 2, KTIL: 4}:          shaders.H3AttnQT2KT4,
+	{QT: 2, KTIL: 8}:          shaders.H3AttnQT2KT8,
+	{QT: 4, KTIL: 4}:          shaders.H3AttnQT4KT4,
+	{QT: 2, KTIL: 4, T: true}: shaders.H3AttnTQT2KT4,
 }
 
 // maxKeyBlock is the longest key block any build reads past its count.
@@ -1436,7 +1498,30 @@ const maxKeyBlock = 8 * tile
 
 // AttnVariants lists the builds a screen chooses between.
 func AttnVariants() []AttnVariant {
-	return []AttnVariant{{1, 4}, {1, 8}, {2, 4}, {2, 8}, {4, 4}}
+	return []AttnVariant{{QT: 1, KTIL: 4}, {QT: 1, KTIL: 8}, {QT: 2, KTIL: 4}, {QT: 2, KTIL: 8},
+		{QT: 4, KTIL: 4}, {QT: 2, KTIL: 4, T: true}}
+}
+
+// AddAttention makes a candidate build of the attention available to
+// SetAttention without a rebuild: a screen's arm compiled to a file. It has
+// to read and write the planes as dit_attention_wmma.comp's OUT_F16 builds
+// do, at v.QT query tiles a workgroup.
+func (g *GPU) AddAttention(v AttnVariant, spirv []byte) error {
+	if _, ok := g.attnPipes[v]; ok {
+		return fmt.Errorf("dit: attention build %v exists", v)
+	}
+	mod, err := g.dev.NewShaderModule(spirv)
+	if err != nil {
+		return fmt.Errorf("dit: attention module %v: %w", v, err)
+	}
+	g.mods = append(g.mods, mod)
+	p, err := g.dev.NewPipeline(mod, vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf},
+		PushConstantSize: uint32(unsafe.Sizeof(pushConstants{})), RequiredSubgroupSize: 32})
+	if err != nil {
+		return fmt.Errorf("dit: attention pipeline %v: %w", v, err)
+	}
+	g.attnPipes[v] = p
+	return nil
 }
 
 // SetAttention fixes the attention build every block records, overriding

@@ -1,0 +1,45 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// Which (row, column) of a 16x16 cooperative matrix each lane's element i is,
+// for every Use this repo multiplies with: fp16 A, fp16 B, fp32 and fp16
+// accumulators. GL_KHR_cooperative_matrix leaves it to the implementation,
+// and h3_attn_t.comp (VIDEO.md M11c) is written against the one RADV gives
+// on this device; h3/dit checks it with this probe before running that kernel.
+//
+// One wave32. The input is the matrix whose element (r, c) is r*16 + c,
+// exact in fp16, loaded row-major; the output is, per Use, per lane, per
+// element index, the value that element holds, -1 past the length.
+
+layout(local_size_x = 32) in;
+
+layout(binding = 0) readonly buffer In32 { float src32[]; };
+layout(binding = 1) readonly buffer In16 { float16_t src16[]; };
+layout(binding = 2) writeonly buffer Out { float dst[]; };
+
+#define SLOTS 32
+
+void put(uint use, uint lane, uint e, float v) {
+    dst[(use * 32u + lane) * SLOTS + e] = v;
+}
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h;
+    coopMatLoad(a, src16, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(b, src16, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(c, src32, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(h, src16, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    for (uint e = 0u; e < SLOTS; ++e) {
+        put(0u, lane, e, e < uint(a.length()) ? float(a[e]) : -1.0);
+        put(1u, lane, e, e < uint(b.length()) ? float(b[e]) : -1.0);
+        put(2u, lane, e, e < uint(c.length()) ? c[e] : -1.0);
+        put(3u, lane, e, e < uint(h.length()) ? float(h[e]) : -1.0);
+    }
+}

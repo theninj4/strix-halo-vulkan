@@ -179,6 +179,20 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 // Range: v is a projection output like any other and is narrowed to fp16 by
 // the pack either way, so this changes nothing about what fits -- unlike
 // C_F16, which moved a tensor that used to stay fp32.
+// KRANGE (VIDEO.md M11d): the K loop runs over [pc.aux0, pc.aux1) instead of
+// [0, gemmK), and with pc.aux2 = 1 the accumulators start from the fp32 C
+// already in place instead of zero. Two dispatches over the two halves of K
+// are then the one-pass GEMM split in time: an fp32 store and reload is
+// exact, so every accumulator sees the same MMAs in the same order and the
+// result is bit-identical. gemmK stays the whole K, which is the B tile
+// row's length. Plain fp32 C only.
+#ifndef KRANGE
+#define KRANGE 0
+#endif
+#if KRANGE && (C_F16 || A_CONV)
+#error "KRANGE accumulates in the fp32 C of a plain GEMM"
+#endif
+
 #ifndef C_PACK
 #define C_PACK 0
 #endif
@@ -298,6 +312,16 @@ void main() {
             acc[i][j] = coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>(0.0);
         }
     }
+#if KRANGE
+    if (pc.aux2 != 0u) {
+        [[unroll]] for (uint i = 0u; i < WM; i++) {
+            [[unroll]] for (uint j = 0u; j < WN; j++) {
+                coopMatLoad(acc[i][j], act, pc.outOff + (wm0 + i * TILE) * pc.gemmN + wn0 + j * TILE,
+                    pc.gemmN, gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+#endif
 
 #if A_CONV == 2
     // The tap's row offset and the column inside it, carried across the loop.
@@ -305,7 +329,11 @@ void main() {
     // is always inside one tap.
     uint aTap = 0u, aCol = 0u;
 #endif
+#if KRANGE
+    for (uint k0 = pc.aux0; k0 < pc.aux1; k0 += BK) {
+#else
     for (uint k0 = 0u; k0 < pc.gemmK; k0 += BK) {
+#endif
         MMA_BLOCK(k0)
 #if A_CONV == 2
         aCol += BK;

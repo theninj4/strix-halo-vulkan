@@ -273,7 +273,7 @@ row-chunked. Every arena buffer is asserted under the limit at planning time
 | M8 | End to end `t2va`: prompt → mp4 against the oracle's run at a tiny canvas; the ffmpeg mux | **done 2026-09-26** (`h3/pipeline`, `cmd/h3`): the README prompt to mp4 in 3 m 28 s at 448×256 × N = 8; frames **PSNR 25.9 dB** / soundtrack SNR 21.5 dB against the oracle's own free-running run |
 | M9 | Serve: `/v1/videos` async jobs, cancellation, **yielding the device between steps** so other verticals are not starved for minutes | **done 2026-09-26** (`api/videos.go`, `backend/video.go`, `-video`): the README prompt served in 3 m 19 s at 448×256 × N = 8 (estimate 206 s); speech beside it **≤ 0.27 s** through every forward, against 17 ms idle; DELETE stops a running job within one submission |
 | M10 | `fl2va`: video VAE encoder + vision tower + keyframe rows | **done 2026-09-26** (`h3/vae/encoder.go`, `h3/textenc` Presentation, `h3/pipeline/keyframe.go`, `-first`/`-last`, `input_reference` / `conditions`): encoder moments at ≤ 1.6e-5 of fp32, torch's seed-42 draw reproduced; conditioner 9.3e-4 teacher-forced (bf16: 1.2e-2); teacher-forced steps ≤ 1.3e-4 rms; frame 0 of a served run lands on the keyframe at **27.1 dB** |
-| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. The rest is open |
+| M11 | Performance: the profile's winners; sparse attention if MiniMax publishes it | **M11a done 2026-09-26**: int8 banks for the text encoder and the transformer (`qwen.BankQ8`, served default): 50 → 26.9 GB and 42 → 22.9 GB staged, measured request peak 57 → 32.6 GB at 480p, no speed cost, every teacher-forced step inside the released bf16 pipeline's error. **M11b done 2026-09-29**: the int8 banks and AdaLN tables cached beside the checkpoint (`qwen.Q8Cache`, 47 GB of disk), staging ~94 s → ~12 s of a request, output byte-identical. **M11c done 2026-09-29**: the attention transposed (`h3_attn_t.comp`), so P reaches the matrix cores without LDS: 1.55–1.61x on the kernel, a forward 35.6 → 30.6 s at 480p and 144 → 111 s at 768p, gated teacher-forced. **M11d**: the down projection in two K passes, bit-identical, 1.02x a 480p forward; its swizzle band and row pad screened and already optimal. The rest is open |
 | M12 | A Context-IR stand-in: the LLM rewrites the request under MiniMax's prompt-writing guide (`docs/VIDEO_PROMPT_WRITING_GUIDE_*.md`) | |
 | M13 | `ref2va` (optional) | |
 
@@ -977,6 +977,142 @@ What is left of a request's staging is the video VAE's (inside the decode's
 14 s at the small canvas) and the embedding table (3.1 GB of fp32 widened
 from bf16 on every encoder staging). Neither has been timed on its own yet.
 
+### M11c — the attention, transposed (2026-09-29)
+
+The attention was 42% of a served forward and 68% of a trained one, at
+20–26 TFLOP/s against 55.5. **It is now 1.55–1.61x faster, and a forward
+is 1.16x (480p) and 1.30x (768p).**
+
+**Where the time went.** The kernel was priced by gutting it one phase at
+a time on H3's own planes (block 49 after a real forward, 480p, 15,936
+keys, QT1 KTIL4; `H3_ATTN_SPV` loads a build from a file into
+`TestGPUAttentionScreen`):
+
+| arm | time | TFLOP/s |
+|---|---|---|
+| the plain kernel | 288 ms | 25.3 |
+| no row max (LDS scan, 2 barriers a key tile) | 288 ms | 25.3 |
+| and no exp2 | 296 ms | 24.6 |
+| and no LDS round trip for P (store, barrier, reload as A) | **111 ms** | 65.7 |
+
+The softmax costs nothing. The round trip that turns P from an
+accumulator back into an A operand is **~60% of the kernel**. The
+extension has no other path from an accumulator to an operand.
+
+**Refused first: LLM's P12-1 lane split** (the row max over all 32
+lanes, one clustered max, the running max in a register). Bit-identical,
+and **slower in every arm**: 23.8 → 23.1 TFLOP/s at QT1 KTIL4, 480p, and
+22.4 → 19.8 at QT2 KTIL4, 38k keys. That is what the table predicts: the
+row max was never the cost. It is not in the tree.
+
+**The fix: compute the transpose.** `shaders/h3_attn_t.comp` runs
+S^T = K·Q^T and O^T += V^T·P^T. On this device an accumulator's column
+and a B operand's column are the same lane. The accumulator splits a
+column's 16 rows between lanes l and l^16 (even rows in the first
+half-wave, odd in the second), where B wants all 16 in both. So P^T
+becomes the B operand with one `subgroupShuffleXor(16)` per packed pair
+of halves. A lane then owns one query of a tile, and the row max, the
+online correction, the row sum and the final 1/sum are all per-lane
+scalars. **No LDS and no barrier.** The memory reads are the plain
+kernel's, byte for byte: K as a row-major A, Q^T as a column-major B, the
+packed v tile as V^T row-major, and O^T stored column-major is O at the
+output projection's stride.
+
+That relies on an element order `GL_KHR_cooperative_matrix` leaves to
+the implementation, so it is checked, not assumed.
+`shaders/coopmat_layout_probe.comp` reads back which (row, column) every
+lane's element is, for A, B and both accumulators. `checkCoopMatLayout`
+runs it at the first `Begin` (held in a server; staging still submits
+nothing), and on any other order the build falls back to the plain
+kernel. `TestCoopMatLayout` pins it: A lane l = row l%16, element e =
+column e; B lane l = column l%16, element e = row e; accumulators lane l
+= column l%16, element e = row 2e + l/16.
+
+**Two numeric differences, neither bit-for-bit with the plain kernel.**
+The denominator sums the fp16-narrowed weights in fp32 registers instead
+of through a ones column on the matrix cores. The key tail is masked out
+of the max as well as out of P. The second makes the kernel immune to
+stale keys by itself: `TestGPUForward`'s negative control (no
+`zeroKeyTail`) now pins the plain kernel, which still goes NaN, while the
+transposed one stays at rel 5.3e-4. The zeroing stays, because P = 0
+still multiplies whatever stale v rows hold.
+
+**The screen** (`TestGPUAttentionScreen` + `H3_ATTN_SPV`, block 49's
+planes; rms relative to the plain QT1 KTIL4 context):
+
+| build | 15,936 keys | 38,247 keys | VGPRs / spilled |
+|---|---|---|---|
+| plain QT1 KTIL4 | 297 ms (24.5) | 2.16 s (19.4) | |
+| plain QT2 KTIL4 (was picked ≥ 24k) | 297 ms | 1.87 s (22.4) | |
+| T QT1 KTIL4 | 246 ms (29.6) | 2.02 s (20.8) | 216 / 0 |
+| T QT2 KTIL2 | 227 ms (32.1) | | 256 / 64 |
+| **T QT2 KTIL4** | **194 ms (37.6)** | **1.17 s (36.0)** | 256 / 112 |
+| T QT2 KTIL4, Q reloaded a block (`QREG=0`) | 215 ms (33.8) | | 256 / 0 |
+| T QT2 KTIL8, QT3, QT4 | 301–881 ms | | spills 266–1341 |
+
+rms against the plain kernel **9.7e-5 / 1.1e-4**, about the size of fp16's
+own rounding of the context. QT2 KTIL4 spills 112 VGPRs and still wins.
+Reloading Q every block removes the spill and loses 11%. `attnFor` runs
+T QT2 KTIL4 at every key count.
+
+**Gates** (fp16 bank unless noted):
+
+| gate | result |
+|---|---|
+| `TestGPUForward` forward 0 | video rel 6.43e-3 (M7: 6.7e-3), audio 1.25e-3; blocks ≤ 1.9e-4 of absmax |
+| `TestGPURun`, 7 teacher-forced steps | latents rms 9.8e-5 … 1.68e-3 (M7: 7.9e-5 … 1.7e-3) |
+| `TestGPURun`, int8 | every step inside the released bf16 pipeline's error (step 6: 6.9e-3 against 1.59e-2) |
+| `TestGPUFL2VA`, int8 | steps 1.4e-3 rms, as M10 |
+| `TestE2E`, int8, free-running | frames 20.3 dB, soundtrack 16.0 dB (M11a's int8 draw: 19.8 / 16.5) |
+
+**Forwards** (`TestGPUShapes`, int8, `H3_ATTN_PLAIN=1` as the control, two
+passes of each arm interleaved):
+
+| shape | plain | transposed | |
+|---|---|---|---|
+| 864×480 × 124 (served), 15,936 rows | 35.80 / 35.37 s | **30.77 / 30.50 s** | 1.16x |
+| 1344×768 × 124 (trained), 38,247 rows | 143.9 / 145.1 s | **108.1 / 113.6 s** | 1.30x |
+
+A served 480p × 20 request (19 forwards) should lose ~95 s of M11b's
+741 s. That is estimated from the forwards, not yet measured served.
+
+### M11d — the down projection (2026-09-29)
+
+After M11c, a 480p forward's profile (`TestGPUShapes`, `H3_PROFILE=1`,
+int8) is attention 32%, qkv 16%, **down 16%**, gate and up 11% each, `o`
+6%. Every GEMM runs at 35–38 TFLOP/s except the down projection, at
+24–28. Its grid is `o`'s: 21 × 64 workgroups of 128×256 at chunk 8192,
+N = 5376 for both. What differs is K: 14,336 against 7,168.
+
+**Three screens, 480p** (`gemm down`'s share of one forward's profile):
+
+| arm | gemm down | |
+|---|---|---|
+| swizzle band 8 (shipped) | 4.33–4.71 s, 26–28.5 TFLOP/s | |
+| band 16 / 4 / 2 | 22.6 / 14.1 / 9.3 TFLOP/s | refused |
+| A row pad 0 / 64 / 256 / 512 halves (shipped 128) | 19.8 / 24.0 / 23.7 / 25.6 | refused |
+| **K in 2 passes** (`-DKRANGE`) | **4.24–4.27 s, 28.9–29.1** | shipped |
+| K in 3 / 4 passes | 29.3 / 29.2 | no better than 2 |
+
+The band result refutes the first guess, which was that a band of 8
+columns of B slabs (59 MB at this K, against 29 MB for `o`) overflows the
+32 MB MALL. Narrower bands are *worse*, because every band re-streams the
+235 MB A chunk. The shipped band and pad are both already the optimum.
+
+**K in two passes.** `dit_gemm.comp -DKRANGE` runs the K loop over
+`[aux0, aux1)`. With `aux2 = 1`, its accumulators start from the fp32 C
+already in place. An fp32 store and reload is exact, so the two passes
+make the same MMAs in the same order as one: **bit-identical**, which
+`TestGPUForward` now asserts (`dit.GPU.downSplit`, default 2;
+`H3_DOWN_SPLIT=n` in `TestGPUShapes`). Two passes also steady the
+kernel: one pass measured 24.0–28.5 TFLOP/s across runs, two passes
+28.9–29.1. It still stops short of `o`'s 35, so K's length is part of the
+gap, not all of it.
+
+**Forwards** (int8, two passes of each arm, interleaved): 480p **29.81 /
+29.91 s** against 30.41 / 30.42 s one-pass (1.02x). 768p 106.1 / 109.6
+against 107.2 / 114.4, inside that shape's run-to-run spread.
+
 ### Planning correction: no Go CPU stack
 
 A Go CPU forward at the smallest canvas (5,558 rows) is ~214 TFLOP: about
@@ -1009,6 +1145,21 @@ projections are folded out.
   acceptable.
 
 ## Handoff
+
+**2026-09-29, session 8: M11d done.** The down projection runs as two K
+passes (`-DKRANGE`, `downSplit`), bit-identical, 29 TFLOP/s against
+24–28. It is 1.02x a 480p forward, now ~29.9 s. Its swizzle band and A row
+pad were screened, and the shipped values are the optimum. `H3_SHAPES=480`
+times only the served shape. Not deployed.
+
+**2026-09-29, session 7: M11c done.** The attention runs transposed
+(`shaders/h3_attn_t.comp`, `attnFor`) wherever `checkCoopMatLayout` finds
+the element order it is written against, which it does on this device. A
+480p forward takes 30.6 s (35.6 before), a 768p one 111 s (144). Output is
+no longer byte-identical to earlier builds (rms 1e-4 on the context), and
+every gate holds. Not deployed. The screen now takes `H3_ATTN_SPV=qt:ktil:path,...`
+to time a candidate build without a rebuild, and `TestGPUShapes` takes
+`H3_ATTN_PLAIN=1` as the control arm.
 
 **2026-09-29, session 6: M11b done.** The stagings read their int8 banks
 and AdaLN tables from `bank-cache/` beside the checkpoint (`qwen.Q8Cache`,
@@ -1083,10 +1234,14 @@ envelope), and shares the device with the other verticals while it runs.
 
 1. ~~The staging cost~~: done, M11b. What staging is left (the video VAE,
    the fp32 embedding table) is not yet timed on its own.
-2. M11 levers, measured and priced: the attention (20–26 TFLOP/s against
-   55.5 peak; 68% of a trained forward), the down projection's GEMM (22
-   against 37), and the audio decode on the device (7 s on the CPU against
-   torch's 1.1).
+2. M11 levers, measured and priced: ~~the attention~~ (M11c), ~~the down
+   projection~~ (M11d; still 29 against `o`'s 35, and nothing cheap is
+   left there), the video VAE's attention
+   (`h3vae_attn_hd64`, the plain kernel at head 64: a HEAD_DIM=64 build of
+   `h3_attn_t.comp` is the obvious try), and the audio decode on the
+   device (7 s on the CPU against torch's 1.1). Outside this vertical,
+   every `dit_attention_wmma.comp` user (the image DiT, Kev, OCR, ACE) pays
+   the same LDS round trip for P.
 3. M12: a Context-IR stand-in, since plain prompts are what users will send.
    For fl2va it has to write the `<Picture 1>` references the README's
    prompts carry ("at 0.00 seconds … <Picture 1> … is fully referenced").
