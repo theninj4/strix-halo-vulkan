@@ -3,6 +3,7 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_vote : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_control_flow_attributes : require
@@ -77,12 +78,68 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define QREG 1
 #endif
 
-// STORE_TAIL=0 skips a query tile that starts past the sequence, for callers
-// whose sequences sit side by side at a 16-row stride (the video VAE's
-// tile-clips): at QT > 1 the last workgroup's later tiles are the next
-// sequence's first rows, and writing them would race its own dispatch.
+// STORE_TAIL=0 skips a query tile that starts past the sequence, and stores
+// the tile the sequence ends inside one query at a time, bounded: for
+// callers whose rows past the count belong to someone else -- the video
+// VAE's tile-clips side by side at a 16-row stride (at QT > 1 the last
+// workgroup's later tiles are the next sequence's first rows, and writing
+// them would race its own dispatch), and the image DiT's prefix repair,
+// which runs this kernel with the key count cut to a segment's end over
+// rows the next segment's pass has already finished (KERNELS.md G4). A
+// lane owns one query of a tile, so the bounded store is its own eight
+// elements a tile or nothing; the whole-tile path is untouched.
 #ifndef STORE_TAIL
 #define STORE_TAIL 1
+#endif
+
+// KERNELS.md G4 (research/3.8): the key loop's knobs. TAIL_SPLIT=1 peels the
+// last (short) key block out of the loop, so the whole blocks carry no tail
+// arithmetic; QLDS=1 keeps Q^T in LDS at a pitch of Q_LPITCH halves instead
+// of in registers (which the compiler spills at QT2 KTIL4). Both are
+// bit-identical to the plain loop. GUT_* are screening arms that are wrong
+// by construction, each with its result kept live: GUT_CORR skips the online
+// rescale of O^T, GUT_EXP the exp2, GUT_MAX the row max, GUT_SOFTMAX all of
+// the softmax (P^T = S^T narrowed), GUT_XCHG the half-wave exchange too.
+#ifndef TAIL_SPLIT
+#define TAIL_SPLIT 0
+#endif
+#ifndef QLDS
+#define QLDS 0
+#endif
+#ifndef Q_LPITCH
+#define Q_LPITCH 16     // halves; a tile is 16 columns of this pitch
+#endif
+#define Q_LTILE (TILE * Q_LPITCH / 2)   // uints a tile
+// MAX_TREE=1 takes the row max as a balanced tree (exact); LAZY=1 skips the
+// online rescale when no lane's max moved (exact: corr is 1); PV_ORDER=1
+// builds P^T a key tile at a time with its MMAs right behind it (the same
+// MMAs per accumulator in the same order).
+#ifndef MAX_TREE
+#define MAX_TREE 0
+#endif
+#ifndef LAZY
+#define LAZY 0
+#endif
+#ifndef PV_ORDER
+#define PV_ORDER 0
+#endif
+#ifndef L0_LOADS
+#define L0_LOADS 0
+#endif
+#ifndef GUT_CORR
+#define GUT_CORR 0
+#endif
+#ifndef GUT_EXP
+#define GUT_EXP 0
+#endif
+#ifndef GUT_MAX
+#define GUT_MAX 0
+#endif
+#ifndef GUT_SOFTMAX
+#define GUT_SOFTMAX 0
+#endif
+#ifndef GUT_XCHG
+#define GUT_XCHG 0
 #endif
 
 #define TILE 16
@@ -91,6 +148,10 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define BN (KTIL * TILE)
 
 layout(local_size_x = WAVE) in;
+
+#if QLDS
+shared uint qs[QT * HDT * Q_LTILE];
+#endif
 
 #define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
 #define ACCH coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
@@ -113,7 +174,19 @@ void main() {
     uint kBase = pc.kOff + plane;
     uint vBase = pc.vOff + plane;
 
-#if QREG
+#if QLDS
+    // Q^T stays in this wave's LDS for the whole sequence.
+    [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
+        [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
+            FRAG_B f;
+            coopMatLoad(f, hact, qBase + (qq * HDT + kt) * (TILE * TILE),
+                TILE, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatStore(f, qs, (qq * HDT + kt) * Q_LTILE, Q_LPITCH / 2u,
+                gl_CooperativeMatrixLayoutColumnMajor);
+        }
+    }
+    subgroupMemoryBarrierShared();
+#elif QREG
     // Q^T stays in registers for the whole sequence.
     FRAG_B fragQ[QT][HDT];
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
@@ -135,114 +208,28 @@ void main() {
         runSum[qq] = 0.0;
     }
 
+#if TAIL_SPLIT
+    uint base = 0u;
+    for (; base + BN <= n; base += BN) {
+        const uint cnt = BN;
+#define MASKED 0
+#include "h3_attn_t_block.glsl"
+#undef MASKED
+    }
+    if (base < n) {
+        uint cnt = n - base;
+#define MASKED 1
+#include "h3_attn_t_block.glsl"
+#undef MASKED
+    }
+#else
     for (uint base = 0u; base < n; base += BN) {
         uint cnt = min(BN, n - base);
-
-        // ---- S^T = K . Q^T.
-        ACC s[QT][KTIL];
-        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                s[qq][kk] = ACC(0.0);
-            }
-        }
-        [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
-            FRAG_A fragK[KTIL];
-            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                coopMatLoad(fragK[kk], hact, kBase + ((base / TILE + kk) * HDT + kt) * (TILE * TILE),
-                    TILE, gl_CooperativeMatrixLayoutRowMajor);
-            }
-            [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-#if QREG
-                FRAG_B fq = fragQ[qq][kt];
-#else
-                FRAG_B fq;
-                coopMatLoad(fq, hact, qBase + (qq * HDT + kt) * (TILE * TILE),
-                    TILE, gl_CooperativeMatrixLayoutColumnMajor);
-#endif
-                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                    s[qq][kk] = coopMatMulAdd(fragK[kk], fq, s[qq][kk]);
-                }
-            }
-        }
-
-        // ---- The softmax, in registers: a lane's elements of s[qq][kk] are
-        // its query's scores against keys kk*16 + 2e + hw.
-        FRAG_B fragP[QT][KTIL];
-        [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-            float mx = -1.0 / 0.0;
-            if (cnt == BN) {
-                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                    [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-                        mx = max(mx, s[qq][kk][e]);
-                    }
-                }
-            } else {
-                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                    [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-                        if (kk * TILE + 2u * e + hw < cnt) {
-                            mx = max(mx, s[qq][kk][e]);
-                        }
-                    }
-                }
-            }
-            mx = max(mx, subgroupShuffleXor(mx, 16u));
-            float mo = runMax[qq];
-            float mn = max(mo, mx);
-            runMax[qq] = mn;
-            // exp2(-inf - m) is 0: the first block's correction, no special case.
-            float corr = exp2(mo - mn);
-            [[unroll]] for (uint j = 0u; j < HDT; ++j) {
-                [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-                    o[qq][j][e] *= corr;
-                }
-            }
-            float sum = 0.0;
-            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                // P^T narrowed to fp16, two keys a word: w[i] holds this
-                // lane's keys 4i + hw and 4i + 2 + hw.
-                uint w[4];
-                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-                    float p0 = exp2(s[qq][kk][2u * i] - mn);
-                    float p1 = exp2(s[qq][kk][2u * i + 1u] - mn);
-                    if (cnt < BN) {
-                        uint k0 = kk * TILE + 4u * i + hw;
-                        p0 = k0 < cnt ? p0 : 0.0;
-                        p1 = k0 + 2u < cnt ? p1 : 0.0;
-                    }
-                    f16vec2 h = f16vec2(p0, p1);
-                    sum += float(h.x) + float(h.y);
-                    w[i] = packFloat2x16(h);
-                }
-                // B wants keys 0..15 of this lane's query in order. The other
-                // half-wave holds the other parity; swap and interleave.
-                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-                    f16vec2 mine = unpackFloat2x16(w[i]);
-                    f16vec2 theirs = unpackFloat2x16(subgroupShuffleXor(w[i], 16u));
-                    f16vec2 even = hw == 0u ? mine : theirs;   // keys 4i, 4i+2
-                    f16vec2 odd = hw == 0u ? theirs : mine;    // keys 4i+1, 4i+3
-                    fragP[qq][kk][4u * i] = even.x;
-                    fragP[qq][kk][4u * i + 1u] = odd.x;
-                    fragP[qq][kk][4u * i + 2u] = even.y;
-                    fragP[qq][kk][4u * i + 3u] = odd.y;
-                }
-            }
-            runSum[qq] = runSum[qq] * corr + sum;
-        }
-
-        // ---- O^T += V^T . P^T.
-        [[unroll]] for (uint j = 0u; j < HDT; ++j) {
-            FRAG_A fragV[KTIL];
-            [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                coopMatLoad(fragV[kk], hact, vBase + ((base / TILE + kk) * HDT + j) * (TILE * TILE),
-                    TILE, gl_CooperativeMatrixLayoutRowMajor);
-            }
-            [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-                [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
-                    o[qq][j] = coopMatMulAdd(fragV[kk], fragP[qq][kk], o[qq][j]);
-                }
-            }
-        }
+#define MASKED 1
+#include "h3_attn_t_block.glsl"
+#undef MASKED
     }
+#endif
 
     // ---- Epilogue: the two halves' sums make the denominator; O^T goes out
     // column-major, which is O row-major at the output projection's stride.
@@ -255,6 +242,22 @@ void main() {
         }
 #endif
         float inv = 1.0 / (runSum[qq] + subgroupShuffleXor(runSum[qq], 16u));
+#if !STORE_TAIL
+        if (q0 + qq * TILE + TILE > n) {
+            // The tile the sequence ends inside: this lane's query is
+            // column lane%16, its elements rows 2e + hw of O^T.
+            uint q = q0 + qq * TILE + (lane % 16u);
+            if (q < n) {
+                uint dst = pc.outOff + q * pc.lda + head * HEAD_DIM;
+                [[unroll]] for (uint j = 0u; j < HDT; ++j) {
+                    [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                        hact[dst + j * TILE + 2u * e + hw] = float16_t(o[qq][j][e] * inv);
+                    }
+                }
+            }
+            continue;
+        }
+#endif
         [[unroll]] for (uint j = 0u; j < HDT; ++j) {
             ACC r = o[qq][j];
             [[unroll]] for (uint e = 0u; e < 8u; ++e) {

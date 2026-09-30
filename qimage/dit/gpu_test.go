@@ -183,6 +183,10 @@ func newGPU(t *testing.T, dev *vk.Device, dir string, maxTokens, maxPrefix, maxT
 	}
 	start := time.Now()
 	g, err := dit.NewGPUBank(dev, dir, maxTokens, maxPrefix, maxText, bank, keep)
+	if err == nil && os.Getenv("QIMAGE_FUSE") == "0" {
+		// The SwiGLU epilogue's control (KERNELS.md G3): the pass instead.
+		g.SetFuseGLU(false)
+	}
 	if err == nil {
 		t.Logf("staged %s keeping %v in fp16: %.2f GB of weights in %v", bank, keep,
 			float64(g.WeightBytes())/1e9, time.Since(start).Round(time.Millisecond))
@@ -887,4 +891,64 @@ func TestGPUPackScreen(t *testing.T) {
 			r.tiles, float64(r.pack.Microseconds())/1000, packBytes/r.pack.Seconds()/1e9,
 			float64(r.wall.Microseconds())/1000, 100*(r.wall.Seconds()/best.wall.Seconds()-1), mark)
 	}
+}
+
+// TestGPUFusedEpilogues checks the SwiGLU epilogue (KERNELS.md G3, research
+// §2.14) against its control on the same weights: a prefill and a cached
+// step with w1|w3's SwiGLU as the GEMM's epilogue, then the same two with
+// the SwiGLU pass over the fused GEMM's fp32 output. Same MMAs, same
+// expression: the same bits.
+func TestGPUFusedEpilogues(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stages 14 GB of fp16 banks")
+	}
+	m := loadRun(t, runRef)
+	dev, done := newTestDevice(t)
+	defer done()
+
+	side := m.Size / 16
+	embeds := loadMat(t, m, "prompt_embeds")
+	lay, err := dit.NewLayout([]int{embeds.Rows}, [][3]int{{1, side, side}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := newGPU(t, dev, transformer, side*side+embeds.Rows, 512, 512)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	scfg, err := pipeline.LoadSchedConfig(scheduler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched, err := scfg.Timesteps(m.Steps, side*side)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latents := loadMat(t, m, "noise").Clone()
+	steps := func(on bool) [2]*qwen.Mat {
+		g.SetFuseGLU(on)
+		if err := g.BeginImage(embeds, lay, nil); err != nil {
+			t.Fatal(err)
+		}
+		var out [2]*qwen.Mat
+		for i, prefill := range []bool{true, false} {
+			v, err := g.Step(latents, sched.T(i), prefill)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[i] = v
+		}
+		return out
+	}
+	fused, control := steps(true), steps(false)
+	g.SetFuseGLU(true)
+	for i := range fused {
+		for j := range fused[i].Data {
+			if math.Float32bits(fused[i].Data[j]) != math.Float32bits(control[i].Data[j]) {
+				t.Fatalf("step %d: the SwiGLU epilogue differs from the pass at %d: %g against %g", i, j, fused[i].Data[j], control[i].Data[j])
+			}
+		}
+	}
+	t.Logf("SwiGLU epilogue: a prefill and a cached step bit-identical to the pass (%d + %d values)", len(fused[0].Data), len(fused[1].Data))
 }

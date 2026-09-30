@@ -79,6 +79,11 @@ layout(binding = 3) readonly buffer W16x4 { uvec4 w16x4[]; };
 layout(binding = 2) buffer HAct { float16_t hact[]; };
 layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 #endif
+#if LDS_STAGE && (C_F16 || C_PACK || C_SWIGLU)
+// The fp16 epilogues store halves into the same arena the staging reads as
+// uvec4: a second view of binding 2 (KERNELS.md G3).
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+#endif
 
 #ifndef WM
 #define WM 4        // accumulator tiles per wave, M direction
@@ -217,6 +222,30 @@ layout(binding = 3) readonly buffer W16 { float16_t w16[]; };
 #ifndef C_PACK
 #define C_PACK 0
 #endif
+// C_SWIGLU (KERNELS.md G3, research §2.14): the FFN's gate and up
+// projections as one GEMM whose epilogue is the SwiGLU, so neither half is
+// ever written as fp32 and dit_swiglu_f16's pass (2.1% of a video forward,
+// reading 940 MB and writing 235 a chunk) is not run. The store priced by
+// STORE_TILES costs the matrix pipe nothing, but the fp32 round trip of the
+// two halves is 1.9 GB of DRAM traffic a chunk, and at the package's power
+// cap traffic is clock (§0.7).
+//
+// The host interleaves the fused [2*ffn, K] weight in groups of WN*16 rows:
+// the first WN/2 tiles' worth are gate rows for HALF*16 outputs, the next
+// WN/2 the up rows for the same outputs (kev_gemm_q8_glu.comp's trick, K7.6).
+// A wave's WN accumulator tiles are then gate tiles 0..HALF-1 and up tiles
+// HALF..WN-1 of the same columns, and the epilogue is element-wise on two
+// accumulators of one layout: h = silu(g) * u * pc.scale as fp16, the
+// expression dit_swiglu_f16 computes in the same order, so the same bits.
+// The output's row stride is pc.aux0 (the A stride of the down projection
+// that reads it); its column for tile j of this wave is
+// (wn0 / (WN*16)) * (HALF*16) + j*16. gemmN is the fused 2*ffn.
+#ifndef C_SWIGLU
+#define C_SWIGLU 0
+#endif
+#if C_SWIGLU && ((WN & 1) || C_F16 || C_PACK || KRANGE || A_CONV)
+#error "C_SWIGLU is the plain GEMM's epilogue over an even WN"
+#endif
 // LDS_PAD (KERNELS.md G1): an unused shared allocation of this many uints,
 // which caps how many workgroups a WGP can hold (the LDS is 128 KB a WGP on
 // this part) without changing one instruction of the loop. It is how the
@@ -309,8 +338,8 @@ shared uint ldsPad[LDS_PAD];
 // fragment read moves and is the other half of the win: at wave64 the same
 // build is 36.5 TFLOP/s, at wave32 40.9, the wave64 shipped kernel 37.2.) Same MMAs in the same order: bit-identical. Plain A, tiled B,
 // one K tile a slab, fp32 C.
-#if LDS_STAGE && (A_CONV || L0_LOADS || B_LAYOUT != 2 || BK_TILES > 2 || HOIST_A || C_F16 || C_PACK || PIPE || DB)
-#error "LDS_STAGE is the plain fp32-C GEMM over tiled B, one or two K tiles a slab"
+#if LDS_STAGE && (A_CONV || L0_LOADS || B_LAYOUT != 2 || BK_TILES > 2 || HOIST_A || PIPE || DB)
+#error "LDS_STAGE is the GEMM over tiled B, one or two K tiles a slab"
 #endif
 #if LDS_STAGE && (A_LPITCH < BK_TILES * 16 || B_LPITCH < BK_TILES * 16)
 #error "an LDS pitch must hold the slab's K"
@@ -376,6 +405,15 @@ shared uint ldsPad[LDS_PAD];
 #endif
 #ifndef LDS_HALF_READS
 #define LDS_HALF_READS 0
+#endif
+// STORE_TILES (KERNELS.md G3, H4): a pricing knob, never shipped, wrong by
+// construction. Only the first STORE_TILES of a wave's WM*WN accumulator
+// tiles are stored; the rest are stored under a condition that is never
+// true at run time (pc.gemmK == 0) and that the compiler cannot decide, so
+// every MMA stays and only the epilogue's stores go. At 0 the K loop runs
+// alone, and the difference from the shipped build is the epilogue's price.
+#ifndef STORE_TILES
+#define STORE_TILES (WM * WN)
 #endif
 
 #define TILE 16
@@ -858,8 +896,27 @@ void main() {
     }
 #endif
 
+#if C_SWIGLU
+    const uint HALF = WN / 2;
+    float sw = uintBitsToFloat(pc.scale);
+    uint col0 = (wn0 / (WN * TILE)) * (HALF * TILE);
+    [[unroll]] for (uint i = 0u; i < WM; i++) {
+        [[unroll]] for (uint j = 0u; j < HALF; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> h;
+            for (uint e = 0u; e < h.length(); e++) {
+                float gt = acc[i][j][e];
+                h[e] = float16_t(gt / (1.0 + exp(-gt)) * acc[i][j + HALF][e] * sw);
+            }
+            coopMatStore(h, hact, pc.outOff + (wm0 + i * TILE) * pc.aux0 + col0 + j * TILE,
+                pc.aux0, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+#else
     [[unroll]] for (uint i = 0u; i < WM; i++) {
         [[unroll]] for (uint j = 0u; j < WN; j++) {
+#if STORE_TILES < WM * WN
+            if (i * WN + j >= uint(STORE_TILES) && pc.gemmK != 0u) { continue; }
+#endif
 #if C_PACK
             // Tile (token tile, component tile) of one head, as
             // dit_pack_f16.comp mode 1 lays it out.
@@ -884,4 +941,5 @@ void main() {
 #endif
         }
     }
+#endif
 }

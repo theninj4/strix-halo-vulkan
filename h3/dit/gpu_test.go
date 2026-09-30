@@ -244,6 +244,25 @@ func TestGPUForward(t *testing.T) {
 	}
 	t.Logf("down projection in %d K pieces: bit-identical to one pass", split)
 
+	// G3's fused epilogues (research §2.14) against their controls: the v
+	// projection stored as the attention's tiles against the pack, and
+	// gate|up's SwiGLU epilogue against the pass over the same fp32 GEMM
+	// output. Same MMAs, same expression: the same bits.
+	g.packV, g.fuseGLU = false, false
+	v2, a2, _, err := g.Step(readRef(t, ditRef, m.Tensors, "noise_video"), readRef(t, ditRef, m.Tensors, "noise_audio"), rowT)
+	g.packV, g.fuseGLU = true, true
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range [][2]*qwen.Mat{{v, v2}, {a, a2}} {
+		for i := range p[0].Data {
+			if math.Float32bits(p[0].Data[i]) != math.Float32bits(p[1].Data[i]) {
+				t.Fatalf("fused epilogues differ from their controls at %d: %g against %g", i, p[0].Data[i], p[1].Data[i])
+			}
+		}
+	}
+	t.Logf("fused v and SwiGLU epilogues: bit-identical to the pack and SwiGLU passes")
+
 	// A second request after a full forward: the planes now hold 5,095 rows
 	// of keys, and the refiner's 537-key attention reads a key block past
 	// its own count. Before zeroKeyTail that turned every text row into NaN.
@@ -257,9 +276,11 @@ func TestGPUForward(t *testing.T) {
 	// on the plain kernel, whose row max reads the stale keys. The transposed
 	// one (M11c) masks the key tail out of its max as well as out of P, so it
 	// survives stale keys on its own; it keeps the zeroing, since P = 0 still
-	// multiplies whatever the stale v rows hold.
-	g.noKeyTail = true
-	defer func() { g.noKeyTail, g.attnFixed = false, false }()
+	// multiplies whatever the stale v rows hold. With v stored by the GEMM
+	// (G3, packV) the v tail is +0 by construction, so the control runs the
+	// pack path, where the stale v rows are what the kernel reads.
+	g.noKeyTail, g.packV = true, false
+	defer func() { g.noKeyTail, g.attnFixed, g.packV = false, false, true }()
 	sequence := func() float64 {
 		if err := g.Begin(lay, cond, uniq, tabs); err != nil {
 			t.Fatal(err)
@@ -691,43 +712,7 @@ func TestGPUShapes(t *testing.T) {
 	if c := os.Getenv("H3_CHUNK"); c != "" {
 		fmt.Sscan(c, &chunk)
 	}
-	// H3_GEMM_SPV=path runs the big GEMM from a build on disk, the same
-	// geometry (128x256) as the shipped one (KERNELS.md G1, G2: occupancy
-	// arms and prefetch candidates, screened on H3's own shapes).
-	if p := os.Getenv("H3_GEMM_SPV"); p != "" {
-		spirv, err := os.ReadFile(p)
-		if err != nil {
-			t.Fatal(err)
-		}
-		v := gemmVariants[gemmBig]
-		v.spirv = spirv
-		// H3_GEMM_WAVE=32 pins the loaded build's wave size; H3_GEMM_BM and
-		// H3_GEMM_BN its workgroup tile when it is not 128x256 (G-o8's
-		// four-wave arm).
-		if w := os.Getenv("H3_GEMM_WAVE"); w != "" {
-			fmt.Sscan(w, &v.wave)
-		}
-		if w := os.Getenv("H3_GEMM_BM"); w != "" {
-			fmt.Sscan(w, &v.bm)
-		}
-		if w := os.Getenv("H3_GEMM_BN"); w != "" {
-			fmt.Sscan(w, &v.bn)
-		}
-		gemmVariants[gemmBig] = v
-		t.Logf("gemm big: %s (wave %d)", filepath.Base(p), v.wave)
-		// H3_GEMM_KRANGE_SPV=path is the same build's KRANGE companion, for
-		// the split down projection (M11d).
-		if p := os.Getenv("H3_GEMM_KRANGE_SPV"); p != "" {
-			spirv, err := os.ReadFile(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-			k := gemmVariants[gemmKRange]
-			k.spirv, k.wave, k.bm, k.bn = spirv, v.wave, v.bm, v.bn
-			gemmVariants[gemmKRange] = k
-			t.Logf("gemm krange: %s", filepath.Base(p))
-		}
-	}
+	loadGEMMOverride(t)
 	g, err := NewGPUBank(dev, modelDir, maxRows, 1024, chunk, testBank(t))
 	if err != nil {
 		t.Fatal(err)
@@ -742,6 +727,11 @@ func TestGPUShapes(t *testing.T) {
 	// H3_DOWN_SPLIT=n runs the down projection as n K pieces (M11d).
 	if v := os.Getenv("H3_DOWN_SPLIT"); v != "" {
 		fmt.Sscan(v, &g.downSplit)
+	}
+	// H3_FUSE=0 runs the fused epilogues' controls (KERNELS.md G3): the v
+	// pack and the SwiGLU pass.
+	if os.Getenv("H3_FUSE") == "0" {
+		g.packV, g.fuseGLU = false, false
 	}
 	for i, lay := range lays {
 		if err := g.Begin(lay, cond, tvals, tabs); err != nil {
@@ -951,11 +941,15 @@ func TestGPUAttentionScreen(t *testing.T) {
 			variants = append(variants, v)
 		}
 	}
+	// H3_ATTN_ONLY_SPV=1 screens the loaded builds alone, after the plain
+	// QT1 KTIL4 (the rms reference) and the shipped transposed build, which
+	// every loaded arm is also compared against bit for bit: a scheduling
+	// arm of h3_attn_t.comp must match it exactly (KERNELS.md G4).
 	if os.Getenv("H3_ATTN_ONLY_SPV") != "" {
 		variants = variants[len(AttnVariants()):]
-		variants = append([]AttnVariant{{QT: 1, KTIL: 4}}, variants...)
+		variants = append([]AttnVariant{{QT: 1, KTIL: 4}, {QT: 2, KTIL: 4, T: true}}, variants...)
 	}
-	var base []uint16
+	var base, tref []uint16
 	for _, v := range variants {
 		if err := g.SetAttention(v); err != nil {
 			t.Fatal(err)
@@ -970,6 +964,19 @@ func TestGPUAttentionScreen(t *testing.T) {
 		if base == nil {
 			base = ctx
 		}
+		if v.T && v.Tag == "" {
+			tref = ctx
+		}
+		bits := ""
+		if tref != nil && v.Tag != "" {
+			bits = "  bits: identical to T QT2 KTIL4"
+			for i := range ctx {
+				if ctx[i] != tref[i] {
+					bits = fmt.Sprintf("  bits: differ from T QT2 KTIL4 (first at %d)", i)
+					break
+				}
+			}
+		}
 		var worst, d2, b2 float64
 		for i := range ctx {
 			d := float64(f16(ctx[i]) - f16(base[i]))
@@ -977,8 +984,8 @@ func TestGPUAttentionScreen(t *testing.T) {
 			d2 += d * d
 			b2 += float64(f16(base[i])) * float64(f16(base[i]))
 		}
-		t.Logf("QT%d KTIL%d T %-5v %s: %8v  %5.1f TFLOP/s  against QT1 KTIL4: max |d| %.3g, rms rel %.3g", v.QT, v.KTIL, v.T, v.Tag,
-			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst, math.Sqrt(d2/b2))
+		t.Logf("QT%d KTIL%d T %-5v %s: %8v  %5.1f TFLOP/s  against QT1 KTIL4: max |d| %.3g, rms rel %.3g%s", v.QT, v.KTIL, v.T, v.Tag,
+			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst, math.Sqrt(d2/b2), bits)
 	}
 }
 
@@ -1010,4 +1017,160 @@ func testBank(t *testing.T) qwen.Bank {
 	}
 	t.Logf("bank %s", b)
 	return b
+}
+
+// TestGPUGEMMSawtooth times the big GEMM alone against its row count
+// (KERNELS.md G3, H5: the grid tail). Set H3_SAWTOOTH=<h>x<w>: one real
+// forward at that shape fills the A operand and, under the int8 bank, the
+// scratch the GEMMs read; then each projection is dispatched by itself at
+// every row count from 128 to the chunk in steps of 128 and its device time
+// taken as the median of H3_SAWTOOTH_REPS (7) repeats. The build under
+// H3_GEMM_SPV / H3_GEMM_WAVE / H3_GEMM_KRANGE_SPV as in TestGPUShapes. The
+// output is one row a count: rows, the grid, the time, the rate, and the
+// time per workgroup round at 40 resident workgroups.
+func TestGPUGEMMSawtooth(t *testing.T) {
+	var h, w int
+	if _, err := fmt.Sscanf(os.Getenv("H3_SAWTOOTH"), "%dx%d", &h, &w); err != nil || testing.Short() {
+		t.Skip("a screen, not a gate: set H3_SAWTOOTH=<h>x<w>")
+	}
+	reps := 7
+	if v := os.Getenv("H3_SAWTOOTH_REPS"); v != "" {
+		fmt.Sscan(v, &reps)
+	}
+	tbuf, err := os.ReadFile(filepath.Join(textencRef, "manifest.json"))
+	if err != nil {
+		t.Skip(err)
+	}
+	var tm ditManifest
+	if err := json.Unmarshal(tbuf, &tm); err != nil {
+		t.Fatal(err)
+	}
+	cond := readRef(t, textencRef, tm.Tensors, "readme_fp32")
+	lay, err := plan.NewLayout(filled(cond.Rows, plan.TextTag), plan.LatentFrames(124), h/plan.SpatialCompression,
+		w/plan.SpatialCompression, plan.AudioLatents(124), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vs, _ := plan.NewSchedule(20, 12)
+	as, _ := plan.NewSchedule(20, 3)
+	tvals, rowT := lay.RowTimesteps(vs.Timesteps[5], as.Timesteps[5])
+	tabs, err := Tables(modelDir, tvals)
+	if err != nil {
+		t.Skip(err)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+	loadGEMMOverride(t)
+	chunk := 8192
+	if c := os.Getenv("H3_CHUNK"); c != "" {
+		fmt.Sscan(c, &chunk)
+	}
+	g, err := NewGPUBank(dev, modelDir, len(lay.Pos), 1024, chunk, testBank(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	if err := g.Begin(lay, cond, tvals, tabs); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewPCG(1, 0))
+	video := qwen.NewMat(len(lay.Video), g.cfg.Patch())
+	audio := qwen.NewMat(len(lay.Audio), g.cfg.AudioChannels)
+	for j := range video.Data {
+		video.Data[j] = float32(rng.NormFloat64())
+	}
+	for j := range audio.Data {
+		audio.Data[j] = float32(rng.NormFloat64())
+	}
+	if _, _, took, err := g.Step(video, audio, rowT); err != nil {
+		t.Fatal(err)
+	} else {
+		t.Logf("%dx%d: %d rows, forward %v; H %d inner %d ffn %d", w, h, len(lay.Pos), took.Round(time.Millisecond), g.H, g.inner, g.ffn)
+	}
+	// The last block's weights are what the scratch holds under the int8
+	// bank; under fp16 any block's would do.
+	bw := g.blocks[len(g.blocks)-1]
+	aFF := g.aS + uint32(g.chunk*g.H) + 2*uint32(g.chunk*g.ffn)
+	kinds := []struct {
+		kind       string
+		aOff, cOff uint32
+		p          proj
+		n, k, lda  int
+		split      int
+	}{
+		{"q", g.hA, g.aS, projQ, g.inner, g.H, g.ldaH, 0},
+		{"gateup", g.hA, g.aS + uint32(g.chunk*g.H), projGateUp, 2 * g.ffn, g.H, g.ldaH, 0},
+		{"down", g.hFFN, aFF, projDown, g.H, g.ffn, g.ldaFFN, g.downSplit},
+	}
+	bm := gemmVariants[gemmBig].bm
+	bn := gemmVariants[gemmBig].bn
+	for _, kd := range kinds {
+		t.Logf("%s: N %d K %d (split %d)", kd.kind, kd.n, kd.k, kd.split)
+		t.Logf("  rows  mblk  grid  rounds     us   TFLOP/s  us/round")
+		for rows := bm; rows <= g.chunk; rows += bm {
+			var ds []time.Duration
+			for r := 0; r < reps; r++ {
+				gr := g.newGraph()
+				var err error
+				if kd.split > 0 {
+					err = gr.gemmSplit(bw.bank, kd.kind, kd.aOff, kd.cOff, bw.off[kd.p], rows, kd.n, kd.k, kd.lda, kd.split)
+				} else {
+					err = gr.gemm(gemmBig, bw.bank, kd.kind, kd.aOff, kd.cOff, bw.off[kd.p], rows, kd.n, kd.k, kd.lda)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				d, err := vk.DispatchMultiTimed(gr.d, 1, 1, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ds = append(ds, d)
+			}
+			sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+			d := ds[len(ds)/2]
+			grid := (rows / bm) * (kd.n / bn)
+			rounds := float64(grid) / 40
+			fl := 2 * float64(rows) * float64(kd.n) * float64(kd.k)
+			t.Logf("  %5d  %4d  %5d  %6.2f  %7.0f  %6.1f  %7.1f", rows, rows/bm, grid, rounds,
+				float64(d.Microseconds()), fl/d.Seconds()/1e12, float64(d.Microseconds())/math.Ceil(rounds))
+		}
+	}
+}
+
+// loadGEMMOverride swaps the big GEMM's build for H3_GEMM_SPV (and the split
+// down projection's for H3_GEMM_KRANGE_SPV), with H3_GEMM_WAVE, H3_GEMM_BM
+// and H3_GEMM_BN pinning what the build's name does not say (KERNELS.md G1,
+// G2): occupancy arms and prefetch candidates, screened on H3's own shapes.
+func loadGEMMOverride(t *testing.T) {
+	p := os.Getenv("H3_GEMM_SPV")
+	if p == "" {
+		return
+	}
+	spirv, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := gemmVariants[gemmBig]
+	v.spirv = spirv
+	if w := os.Getenv("H3_GEMM_WAVE"); w != "" {
+		fmt.Sscan(w, &v.wave)
+	}
+	if w := os.Getenv("H3_GEMM_BM"); w != "" {
+		fmt.Sscan(w, &v.bm)
+	}
+	if w := os.Getenv("H3_GEMM_BN"); w != "" {
+		fmt.Sscan(w, &v.bn)
+	}
+	gemmVariants[gemmBig] = v
+	t.Logf("gemm big: %s (wave %d)", filepath.Base(p), v.wave)
+	if p := os.Getenv("H3_GEMM_KRANGE_SPV"); p != "" {
+		spirv, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k := gemmVariants[gemmKRange]
+		k.spirv, k.wave, k.bm, k.bn = spirv, v.wave, v.bm, v.bn
+		gemmVariants[gemmKRange] = k
+		t.Logf("gemm krange: %s", filepath.Base(p))
+	}
 }

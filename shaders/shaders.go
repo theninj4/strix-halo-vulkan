@@ -3667,7 +3667,6 @@ var KevGEMMQ8GLUM8 []byte
 //go:embed kev_gemm_q8_rb_m8.spv
 var KevGEMMQ8RBM8 []byte
 
-
 // MiniMax-H3's three additions to the DiT set (h3/dit/gpu.go, VIDEO.md M7):
 // the modulated RMS pre-norm with per-run AdaLN vectors, the q/k pack with
 // H3's 96-channel rotate-half RoPE, and the bias copy that lands an input
@@ -3727,6 +3726,16 @@ var H3AttnQT1KT8 []byte
 //go:embed h3_attn_t_qt2_kt4.spv
 var H3AttnTQT2KT4 []byte
 
+// The image DiT on the same kernel (KERNELS.md G4, research §3.8), with
+// STORE_TAIL=0: its edit prefill repairs the prefix one segment at a time
+// with the key count cut to the segment's end, and a second query tile past
+// that end would overwrite the next segment's finished rows.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=2 -DKTIL=4 -DSTORE_TAIL=0 -o qimage_attn_t_qt2_kt4.spv h3_attn_t.comp
+
+//go:embed qimage_attn_t_qt2_kt4.spv
+var QImageAttnTQT2KT4 []byte
+
 // The 128x256 GEMM over a K range, accumulating into the fp32 C already in
 // place (-DKRANGE, VIDEO.md M11d): H3's down projection split in time.
 
@@ -3760,6 +3769,42 @@ var DiTGEMMWG128x256LDSW32 []byte
 
 //go:embed dit_gemm_wg128x256_lds_w32_krange.spv
 var DiTGEMMWG128x256LDSW32KRange []byte
+
+// The LDS-staged build's fp16 epilogues (KERNELS.md G3, research §2.14).
+// The fp32 store costs the matrix pipe nothing (STORE_TILES priced it at
+// under a point per clock), but what the consumers do with the fp32 C
+// afterwards is a pass each: the v projection's pack into the attention's
+// fragment tiles, and SwiGLU's read of both FFN halves. C_PACK stores v as
+// the tiles directly (the pad rows are the products of zeroed A rows, so
+// they are the +0 the pack wrote); C_SWIGLU runs gate and up as one GEMM
+// over the host-interleaved weight and stores silu(g) * u * scale as the
+// down projection's fp16 A operand. Both bit-identical to the passes they
+// replace (h3/dit's TestGPUForward).
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -DC_PACK=1 -o dit_gemm_wg128x256_lds_w32_cpack.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -DC_SWIGLU=1 -o dit_gemm_wg128x256_lds_w32_swiglu.spv dit_gemm.comp
+
+//go:embed dit_gemm_wg128x256_lds_w32_cpack.spv
+var DiTGEMMWG128x256LDSW32CPack []byte
+
+//go:embed dit_gemm_wg128x256_lds_w32_swiglu.spv
+var DiTGEMMWG128x256LDSW32SwiGLU []byte
+
+// zero_f16: pc.tokens rows of pc.dim halves, pc.lda apart, zeroed at
+// pc.outOff -- the A operand's pad rows ahead of the C_PACK GEMM.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o zero_f16.spv zero_f16.comp
+
+//go:embed zero_f16.spv
+var ZeroF16 []byte
+
+// The SwiGLU pass over the C_SWIGLU weight's interleaved fp32 output: the
+// fused epilogue's control, the same values through the same expression.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DINTERLEAVE=32 -o dit_swiglu_f16_il32.spv dit_swiglu_f16.comp
+
+//go:embed dit_swiglu_f16_il32.spv
+var DiTSwiGLUF16IL32 []byte
 
 // The matrix-pipe issue probe (KERNELS.md G-o8, research §2.10): the
 // register-only WMMA loop in the shipped GEMM's geometry (eight wave32

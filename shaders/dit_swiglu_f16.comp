@@ -39,6 +39,16 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #define UP(i)   act[up + (i)]
 #endif
 
+// INTERLEAVE (KERNELS.md G3, research §2.14): the two halves are one fused
+// [tokens, 2*dim] fp32 GEMM output at pc.inOff whose columns come in groups
+// of 2*INTERLEAVE -- INTERLEAVE gate columns, then the up columns of the
+// same outputs -- which is the weight layout dit_gemm.comp's C_SWIGLU
+// epilogue is built on. This build is that epilogue's control: the same
+// fp32 values through the same expression, read back from the arena.
+#ifndef INTERLEAVE
+#define INTERLEAVE 0
+#endif
+
 layout(local_size_x = 256) in;
 
 void main() {
@@ -46,12 +56,23 @@ void main() {
     if (r >= pc.tokens) {
         return;
     }
+#if INTERLEAVE
+    uint row = pc.inOff + r * 2u * pc.dim;
+#else
     uint gate = pc.inOff + r * pc.dim;
     uint up = pc.kOff + r * pc.dim;
+#endif
     uint dst = pc.outOff + r * pc.lda;
     float s = uintBitsToFloat(pc.scale);
     for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+#if INTERLEAVE
+        uint gc = (c / uint(INTERLEAVE)) * (2u * uint(INTERLEAVE)) + c % uint(INTERLEAVE);
+        float g = act[row + gc];
+        float u = act[row + gc + uint(INTERLEAVE)];
+        hact[dst + c] = float16_t(g / (1.0 + exp(-g)) * u * s);
+#else
         float g = GATE(c);
         hact[dst + c] = float16_t(g / (1.0 + exp(-g)) * UP(c) * s);
+#endif
     }
 }

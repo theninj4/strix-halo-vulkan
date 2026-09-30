@@ -3,10 +3,12 @@ package dit
 import (
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"time"
 	"unsafe"
 
+	h3dit "strix-halo-vulkan/h3/dit"
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
@@ -92,6 +94,12 @@ type GPU struct {
 	// knob for the fragment pack.
 	big     gemmKernel
 	packTPW int
+	// fuseGLU runs w1|w3 as one GEMM whose epilogue is the SwiGLU (KERNELS.md
+	// G3, research §2.14) when big is the LDS build; off, or on any other
+	// big kernel, the same fused GEMM stores fp32 and the SwiGLU pass reads
+	// its interleaved columns -- the same values through the same
+	// expression, so the same bits either way. SetFuseGLU.
+	fuseGLU bool
 
 	dim, ffn, heads, headDim      int
 	maxTokens, maxPrefix, maxText int
@@ -112,6 +120,23 @@ type GPU struct {
 	kvBanks []*vk.Buffer
 	kvPipes []*vk.ComputePipeline
 
+	// attnT is the transposed attention (h3_attn_t.comp, KERNELS.md G4,
+	// research §3.8): P never goes through LDS, and the context comes out
+	// fp16 at the output projection's stride, so "narrow ctx" is only the
+	// causal text rows' business. It is opt-in (QIMAGE_ATTN_T=1): exact at
+	// the fp16 level against the plain kernel (rms 8e-5 on a block's
+	// context, the same as H3's), 1.07x on the attention and 1.7% on a
+	// 1024² step, and it passes the t2i oracles — but the edit oracle's
+	// teacher-forced prefill amplifies fp16-level differences in the
+	// prefix rows ~100x at three target rows, where a plain-family
+	// perturbation of the same rows reads 1.7e-2 against the 2e-2 bound and
+	// this kernel's 7.9e-2. The vertical's gate stands, so the default is
+	// the plain kernel. When enabled it runs wherever the device's
+	// cooperative-matrix element order is the one it is written against,
+	// probed at the first graph (not at staging, which submits nothing);
+	// attnProbed says the probe ran.
+	attnT      attnVariant
+	attnProbed bool
 	// noPrefixRepair drops the prefill's segment passes, leaving every
 	// prefix row attending bidirectionally over the whole joint sequence.
 	// It is a negative control and nothing else — the mask is the
@@ -169,9 +194,14 @@ const (
 	projW1 proj = "w1" // img_mlp.gate_layer, the silu'd half
 	projW3 proj = "w3" // img_mlp.proj, the linear half
 	projW2 proj = "w2" // img_mlp.out
+	// projW13 is w1 and w3 as one [2·ffn, dim] projection interleaved in
+	// 64-row groups (qwen.InterleaveGLU), the layout dit_gemm.comp's
+	// C_SWIGLU epilogue is built on (KERNELS.md G3, research §2.14): the
+	// staged form, in place of w1 and w3, which name the checkpoint's halves.
+	projW13 proj = "w13"
 )
 
-var projOrder = []proj{projQ, projK, projV, projO, projW1, projW3, projW2}
+var projOrder = []proj{projQ, projK, projV, projO, projW13, projW2}
 
 // pushConstants mirrors shaders/dit_common.glsl, as zimage/dit's does.
 type pushConstants struct {
@@ -213,11 +243,18 @@ const (
 	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9): the same
 	// 128x256 workgroup and band 8, bit-identical to gemmSWZ8, the default.
 	gemmLDSW32 gemmKernel = "wg128x256_lds_w32"
+	// The same build with the SwiGLU as its epilogue over projW13
+	// (KERNELS.md G3): the K loop is gemmLDSW32's instruction for instruction.
+	gemmLDSW32GLU gemmKernel = "wg128x256_lds_w32_swiglu"
 )
 
 // BigKernels are the crown-kernel arms a screen may select between, in the
 // order they are reported.
 var BigKernels = []gemmKernel{gemmSWZ2, gemmSWZ4, gemmSWZ8, gemmSWZ16, gemmLDSW32}
+
+// SetFuseGLU turns the SwiGLU epilogue on or off (the control: the SwiGLU
+// pass over the fused GEMM's fp32 output). Bit-identical either way.
+func (g *GPU) SetFuseGLU(on bool) { g.fuseGLU = on }
 
 // KernelName is the string form, for a test's log line.
 func KernelName(k gemmKernel) string { return string(k) }
@@ -248,12 +285,13 @@ type gemmVariant struct {
 }
 
 var gemmVariants = map[gemmKernel]gemmVariant{
-	gemmSWZ2:   {name: gemmSWZ2, spirv: shaders.DiTGEMMWG128x256TiledSWZ2, bm: 128, bn: 256, waves: 4, bk: 16},
-	gemmSWZ4:   {name: gemmSWZ4, spirv: shaders.DiTGEMMWG128x256TiledSWZ4, bm: 128, bn: 256, waves: 4, bk: 16},
-	gemmSWZ8:   {name: gemmSWZ8, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4, bk: 16},
-	gemmSWZ16:  {name: gemmSWZ16, spirv: shaders.DiTGEMMWG128x256TiledSWZ16, bm: 128, bn: 256, waves: 4, bk: 16},
-	gemmLDSW32: {name: gemmLDSW32, spirv: shaders.DiTGEMMWG128x256LDSW32, bm: 128, bn: 256, waves: 8, bk: 32, wave: 32},
-	gemmReg64:  {name: gemmReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1, bk: 16},
+	gemmSWZ2:      {name: gemmSWZ2, spirv: shaders.DiTGEMMWG128x256TiledSWZ2, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ4:      {name: gemmSWZ4, spirv: shaders.DiTGEMMWG128x256TiledSWZ4, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ8:      {name: gemmSWZ8, spirv: shaders.DiTGEMMWG128x256TiledSWZ8, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmSWZ16:     {name: gemmSWZ16, spirv: shaders.DiTGEMMWG128x256TiledSWZ16, bm: 128, bn: 256, waves: 4, bk: 16},
+	gemmLDSW32:    {name: gemmLDSW32, spirv: shaders.DiTGEMMWG128x256LDSW32, bm: 128, bn: 256, waves: 8, bk: 32, wave: 32},
+	gemmLDSW32GLU: {name: gemmLDSW32GLU, spirv: shaders.DiTGEMMWG128x256LDSW32SwiGLU, bm: 128, bn: 256, waves: 8, bk: 32, wave: 32},
+	gemmReg64:     {name: gemmReg64, spirv: shaders.DiTGEMMReg64Tiled, bm: 64, bn: 64, waves: 1, bk: 16},
 }
 
 // attnVariant is the attention build, as in zimage/dit.
@@ -262,6 +300,7 @@ type attnVariant struct {
 	spirv []byte
 	qt    int
 	wave  uint32
+	t     bool // h3_attn_t.comp: fp16 context out at pc.lda
 }
 
 func (v attnVariant) rows() int { return v.qt * coopMatTile }
@@ -321,6 +360,7 @@ func NewGPUBank(dev *vk.Device, dir string, maxTokens, maxPrefix, maxText int, b
 		maxTokens: maxTokens, maxPrefix: maxPrefix, maxText: maxText,
 		big:         gemmLDSW32,
 		packTPW:     defaultPackTiles,
+		fuseGLU:     true,
 		eps:         cfg.Eps,
 		outChannels: cfg.OutChannels,
 		bank:        bank,
@@ -382,6 +422,8 @@ func (g *GPU) projShape(r proj) [2]int {
 	switch r {
 	case projW1, projW3:
 		return [2]int{g.ffn, g.dim}
+	case projW13:
+		return [2]int{2 * g.ffn, g.dim}
 	case projW2:
 		return [2]int{g.dim, g.ffn}
 	default:
@@ -505,9 +547,12 @@ func (g *GPU) layoutAndStage(set *safetensors.Set, cfg *Config) error {
 		w := &g.blocks[i]
 		g.wbuf.WriteFloat32At(int(w.normQ), blk.QNorm.Weight)
 		g.wbuf.WriteFloat32At(int(w.normK), blk.KNorm.Weight)
+		// The fused gate|up weight for the SwiGLU epilogue (projW13).
+		fused := &qwen.Linear{In: g.dim, Out: 2 * g.ffn, Weight: make([]float32, 2*g.ffn*g.dim)}
+		qwen.InterleaveGLU(fused.Weight, blk.GateL.Weight, blk.Proj.Weight, g.ffn, g.dim)
 		lins := map[proj]*qwen.Linear{
 			projQ: blk.Q, projK: blk.K, projV: blk.V, projO: blk.O,
-			projW1: blk.GateL, projW3: blk.Proj, projW2: blk.Out,
+			projW13: fused, projW2: blk.Out,
 		}
 		for _, r := range projOrder {
 			lin := lins[r]
@@ -672,6 +717,7 @@ func (g *GPU) build() error {
 		"pack4":      shaders.DiTPackF16TPW4,
 		"pack8":      shaders.DiTPackF16TPW8,
 		"swiglu":     shaders.DiTSwiGLUF16,
+		"swiglu_il":  shaders.DiTSwiGLUF16IL32,
 		"causal":     shaders.DiTAttnCausal,
 		"copy":       shaders.DiTCopy,
 	} {
@@ -707,6 +753,17 @@ func (g *GPU) build() error {
 		Buffers: base, PushConstantSize: pcSize, RequiredSubgroupSize: g.attn.wave,
 	}); err != nil {
 		return err
+	}
+	// The transposed kernel, wave32 only, opt-in; chosen at the first graph
+	// (chooseAttention). It masks the key tail on the row max itself, so it
+	// is the prefix repair's build too.
+	if g.attn.wave == 32 && os.Getenv("QIMAGE_ATTN_T") != "" {
+		g.attnT = attnVariant{name: "attention_t", spirv: shaders.QImageAttnTQT2KT4, qt: 2, wave: 32, t: true}
+		if err := g.pipeline(g.attnT.name, g.attnT.spirv, vk.PipelineSpec{
+			Buffers: base, PushConstantSize: pcSize, RequiredSubgroupSize: g.attnT.wave,
+		}); err != nil {
+			return err
+		}
 	}
 
 	// One KV-cache pipeline per cache bank: which buffer a dispatch reads or
@@ -1067,14 +1124,37 @@ func (g *GPU) qkpackPipe() string {
 func (g *GPU) SetNoPrefixRepair(v bool) { g.noPrefixRepair = v }
 
 // TensorX and friends expose arena offsets for ReadRows.
-func (g *GPU) TensorX() uint32    { return g.aX }
-func (g *GPU) TensorCtx() uint32  { return g.aCtx }
+func (g *GPU) TensorX() uint32   { return g.aX }
+func (g *GPU) TensorCtx() uint32 { return g.aCtx }
+
 func (g *GPU) TensorAttn() uint32 { return g.aAttn }
 
 // stepGraph builds the step's dispatch list. Everything before the blocks —
 // the latent upload and its narrowing, the text rows at a prefill — happens
 // here too, so a Step is one function.
+// chooseAttention probes the device's cooperative-matrix element order once,
+// at the first graph, and takes the transposed build if it is the order
+// h3_attn_t.comp is written against (h3/dit's check); otherwise the plain
+// kernel stays.
+func (g *GPU) chooseAttention() error {
+	if g.attnProbed || g.attnT.spirv == nil {
+		return nil
+	}
+	ok, err := h3dit.TransposedAttentionOK(g.dev)
+	if err != nil {
+		return err
+	}
+	if ok {
+		g.attn = g.attnT
+	}
+	g.attnProbed = true
+	return nil
+}
+
 func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiDispatch, []string, []float64, error) {
+	if err := g.chooseAttention(); err != nil {
+		return nil, nil, nil, err
+	}
 	if g.lay == nil {
 		return nil, nil, nil, fmt.Errorf("dit: Step before BeginImage")
 	}
@@ -1118,7 +1198,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		fl = append(fl, 0)
 	}
 	// gemm issues C[MPad, n] = A * B over the fp16 A at aOff.
-	gemm := func(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, mRows, n, k, lda int) error {
+	// gemmWith is gemm with the push constants an epilogue build reads beyond
+	// the GEMM's own (C_SWIGLU's output stride and scale) set by tweak.
+	gemmWith := func(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, mRows, n, k, lda int, tweak func(*pushConstants)) error {
 		v := gemmVariants[kernel]
 		mPad := (mRows + v.bm - 1) &^ (v.bm - 1)
 		if n%v.bn != 0 || k%v.bk != 0 {
@@ -1128,6 +1210,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pc.InOff, pc.OutOff, pc.BOff = aOff, cOff, bOff
 		pc.GemmM, pc.GemmN, pc.GemmK = uint32(mPad), uint32(n), uint32(k)
 		pc.LDA = uint32(lda)
+		if tweak != nil {
+			tweak(&pc)
+		}
 		d = append(d, vk.MultiDispatch{
 			Pipeline: g.gemms[bank][kernel], GroupsX: uint32(n / v.bn), GroupsY: uint32(mPad / v.bm),
 			PushConstants: pc.bytes(),
@@ -1137,6 +1222,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		// the unpadded rows would flatter a short prefix's GEMMs.
 		fl = append(fl, 2*float64(mPad)*float64(n)*float64(k))
 		return nil
+	}
+	gemm := func(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, mRows, n, k, lda int) error {
+		return gemmWith(kernel, bank, kind, aOff, cOff, bOff, mRows, n, k, lda, nil)
 	}
 	// normScale is dit_final_norm over a row range: LayerNorm times the
 	// modulation row's vector, narrowed into hA. At a prefill the prefix
@@ -1348,6 +1436,9 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pcA.InOff, pcA.OutOff = g.hQ, g.aCtx
 		pcA.KOff, pcA.VOff = g.hK, g.hV
 		pcA.Aux1 = uint32(g.tokPad)
+		if g.attn.t {
+			pcA.OutOff, pcA.LDA = g.hCtx, uint32(g.ldaDim)
+		}
 		add(g.attn.name, "attention", uint32((rows+g.attn.rows()-1)/g.attn.rows()), uint32(g.heads), pcA)
 		// Two GEMMs per head over the whole key range: q.k^T and p.v.
 		fl[len(fl)-1] = 4 * float64(rows) * float64(kvRows) * float64(g.headDim) * float64(g.heads)
@@ -1384,34 +1475,61 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 				// everything before it: the same kernel, with the key count
 				// cut to the block's end.
 				pcS.Tokens = uint32(seg.End)
-				add("prefix_attn", "prefix image", uint32((seg.End+g.attn.rows()-1)/g.attn.rows()), uint32(g.heads), pcS)
+				name := "prefix_attn"
+				if g.attn.t {
+					name = g.attn.name
+					pcS.OutOff, pcS.LDA = g.hCtx, uint32(g.ldaDim)
+				}
+				add(name, "prefix image", uint32((seg.End+g.attn.rows()-1)/g.attn.rows()), uint32(g.heads), pcS)
 				fl[len(fl)-1] = 4 * float64(seg.End) * float64(seg.End) * float64(g.headDim) * float64(g.heads)
 			}
 		}
 
 		pcN := base
 		pcN.InOff, pcN.OutOff, pcN.LDA = g.aCtx, g.hCtx, uint32(g.ldaDim)
-		add("scale", "narrow ctx", uint32(rows), 1, pcN)
+		if !g.attn.t {
+			add("scale", "narrow ctx", uint32(rows), 1, pcN)
+		} else if prefill && !g.noPrefixRepair {
+			// The transposed kernel wrote its rows fp16 already; only the
+			// causal text passes' rows are still fp32.
+			for _, seg := range g.lay.Segments {
+				if !seg.Text {
+					continue
+				}
+				pcT := pcN
+				pcT.Tokens = uint32(seg.End - seg.Start)
+				pcT.InOff += uint32(seg.Start * g.dim)
+				pcT.OutOff += uint32(seg.Start * g.ldaDim)
+				add("scale", "narrow ctx", uint32(seg.End-seg.Start), 1, pcT)
+			}
+		}
 		if err := gemm(g.big, w.bank, "gemm o", g.hCtx, g.aAttn, w.bOff[projO], rows, g.dim, g.dim, g.ldaDim); err != nil {
 			return nil, nil, nil, err
 		}
 		gateAdd("gate msa", g.aAttn, 1)
 
 		normScale("ffn in", 2)
-		for _, pr := range []struct {
-			r   proj
-			out uint32
-		}{{projW1, g.aGate}, {projW3, g.aUp}} {
-			if err := gemm(g.big, w.bank, "gemm "+string(pr.r), g.hA, pr.out, w.bOff[pr.r], rows, g.ffn, g.dim, g.ldaDim); err != nil {
+		if g.fuseGLU && g.big == gemmLDSW32 {
+			// w1|w3 as one GEMM over the interleaved weight, its epilogue
+			// the SwiGLU into w2's fp16 A operand (KERNELS.md G3).
+			if err := gemmWith(gemmLDSW32GLU, w.bank, "gemm w13", g.hA, g.hFFN, w.bOff[projW13], rows, 2*g.ffn, g.dim, g.ldaDim,
+				func(pc *pushConstants) { pc.Aux0, pc.Scale = uint32(g.ldaFFN), math.Float32bits(float32(ffScale)) }); err != nil {
 				return nil, nil, nil, err
 			}
+		} else {
+			// The control, and every other big kernel: the same GEMM stored
+			// as fp32 [rows, 2·ffn] over the gate|up scratch (contiguous),
+			// then the SwiGLU pass over its interleaved columns.
+			if err := gemm(g.big, w.bank, "gemm w13", g.hA, g.aGate, w.bOff[projW13], rows, 2*g.ffn, g.dim, g.ldaDim); err != nil {
+				return nil, nil, nil, err
+			}
+			pcGLU := base
+			pcGLU.InOff, pcGLU.OutOff = g.aGate, g.hFFN
+			pcGLU.Dim = uint32(g.ffn)
+			pcGLU.LDA = uint32(g.ldaFFN)
+			pcGLU.Scale = math.Float32bits(float32(ffScale))
+			add("swiglu_il", "swiglu", uint32(rows), 1, pcGLU)
 		}
-		pcGLU := base
-		pcGLU.InOff, pcGLU.KOff, pcGLU.OutOff = g.aGate, g.aUp, g.hFFN
-		pcGLU.Dim = uint32(g.ffn)
-		pcGLU.LDA = uint32(g.ldaFFN)
-		pcGLU.Scale = math.Float32bits(float32(ffScale))
-		add("swiglu", "swiglu", uint32(rows), 1, pcGLU)
 		if err := gemm(g.big, w.bank, "gemm w2", g.hFFN, g.aFF, w.bOff[projW2], rows, g.dim, g.ffn, g.ldaFFN); err != nil {
 			return nil, nil, nil, err
 		}

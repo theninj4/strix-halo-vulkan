@@ -1,0 +1,26 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Zero pc.tokens rows of pc.dim halves, pc.lda apart, at pc.outOff in the
+// fp16 arena: a GEMM's A operand pad rows ahead of a GEMM whose epilogue
+// writes its pad rows where a consumer reads them (KERNELS.md G3: the v
+// projection stored as the attention's fragment tiles, whose pad keys must
+// be +0 like the pack's -- a -0 behind a zero mask moves a WMMA sum an ulp).
+// One workgroup a row, 256 lanes along it.
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint dst = pc.outOff + r * pc.lda;
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        hact[dst + c] = float16_t(0.0);
+    }
+}
