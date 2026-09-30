@@ -3,6 +3,7 @@ package llm
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -1270,6 +1271,147 @@ func TestMoEGPUDecodeTwoRows(t *testing.T) {
 			if r.rms > 2e-3 {
 				t.Errorf("%s (%s) disagrees with the GEMM by rms %.3e (max %.3e at %d)",
 					name, arm.what, r.rms, r.maxAbs, r.at)
+			}
+		}
+	}
+}
+
+// TestMoEGPUSharedFold is P22's gate: at decode the shared expert rides the
+// routed dispatch as one more tile (foldShared) wherever its bank is the
+// routed bank's format, and that has to compute what its own two dispatches
+// computed — for one, two and three rows, and with the arena dirtied by a
+// different token between the arms, because the folded tile writes the same
+// swiglu rows and the same (token, slot) the split dispatches did, so a tile
+// that never ran would leave the previous arm's answer in place and pass a
+// plain comparison (P5c's lesson, TestMoEGPUDecodeTwoRows).
+//
+// The two arms are not bit-identical: the shared tile runs on the routed
+// rung (v16w4) where the split dispatch ran the shared plan's (v64w4 / v32w4),
+// and a lane group of a different width sums the row in a different order.
+// The bound is the reassociation's, parts in a million, against the 2e-3 the
+// GEMM/GEMV comparison allows.
+func TestMoEGPUSharedFold(t *testing.T) {
+	c, w, in, nTok, _ := moeFixtures4k(t)
+	if nTok < 4 {
+		t.Skipf("the trace is %d tokens and the control needs four", nTok)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+
+	// The checkpoint's own bank: the shared expert is Q8_0 and the routed
+	// pair is not, so nothing folds and both dispatches are recorded.
+	base, err := NewMoEGPU(dev, c, GEMVMaxRows, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lw := base.layers[0]
+	planName := map[moeFmt]string{fmtQ4K: "q4_k", fmtQ5K: "q5_k", fmtQ51: "q5_1", fmtQ41: "q4_1", fmtIQ4NL: "iq4_nl", fmtQ80: "q8_0"}
+	if err := base.Resize(1); err != nil {
+		t.Fatal(err)
+	}
+	_, kinds, err := base.graph(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	up0, down0 := base.foldShared(lw)
+	t.Logf("checkpoint bank: routed %s/%s/%s, shared %s/%s/%s, fold up %v down %v, %d dispatches %v",
+		lw.gateFmt, lw.upFmt, lw.downFmt, lw.shGateFmt, lw.shUpFmt, lw.shDownFmt, up0, down0, len(kinds), kinds)
+	if lw.shGateFmt != lw.gateFmt && up0 {
+		t.Errorf("the up mode folds a %s shared bank into a %s routed one", lw.shGateFmt, lw.gateFmt)
+	}
+	if !up0 && !hasKind(kinds, "shexp.up") {
+		t.Errorf("the up mode did not fold and the shared dispatch is missing: %v", kinds)
+	}
+	base.Destroy()
+
+	// The shared expert restaged in the routed pair's formats, which is what
+	// the shipped plan does for gate and up (and, on this fixture, the down
+	// as well, so both modes are exercised).
+	var parts []string
+	if lw.shGateFmt != lw.gateFmt {
+		parts = append(parts, "gate_shexp="+planName[lw.gateFmt])
+	}
+	if lw.shUpFmt != lw.upFmt {
+		parts = append(parts, "up_shexp="+planName[lw.upFmt])
+	}
+	if lw.shDownFmt != lw.downFmt {
+		parts = append(parts, "down_shexp="+planName[lw.downFmt])
+	}
+	plan, err := ParseMoEBankPlan(strings.Join(parts, ","), "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := NewMoEGPU(dev, c, GEMVMaxRows, []MoEWeights{w}, WithMoEBankPlan(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	lw = g.layers[0]
+	if up, down := g.foldShared(lw); !up || !down {
+		t.Fatalf("restaged as %s/%s/%s against routed %s/%s/%s, the fold is up %v down %v",
+			lw.shGateFmt, lw.shUpFmt, lw.shDownFmt, lw.gateFmt, lw.upFmt, lw.downFmt, up, down)
+	}
+
+	// run uploads `rows` tokens starting at `first` and returns ffn_out.
+	run := func(first, rows int, fold bool) []float32 {
+		t.Helper()
+		if err := g.Upload(in[first*c.NEmbd:(first+rows)*c.NEmbd], rows); err != nil {
+			t.Fatal(err)
+		}
+		g.SetSharedFold(fold)
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), g.Out()...)
+	}
+	for rows := 1; rows <= GEMVMaxRows; rows++ {
+		if err := g.Resize(rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetPlan(MoEPlanFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetSharedPlan(MoESharedPlanFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		g.SetSharedFold(true)
+		_, kinds, err := g.graph(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hasKind(kinds, "shexp.up") || hasKind(kinds, "shexp.down") {
+			t.Errorf("%d rows: folded, and the shared dispatches are still recorded: %v", rows, kinds)
+		}
+		g.SetSharedFold(false)
+		_, split, err := g.graph(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(split) != len(kinds)+2 {
+			t.Errorf("%d rows: %d dispatches split against %d folded", rows, len(split), len(kinds))
+		}
+
+		// Dirty with tokens 1.., then the arm under test on tokens 0.., then
+		// the control on the same tokens — and once more the other way
+		// round, so that each arm has been the one to overwrite the other's
+		// rows.
+		run(1, rows, false)
+		fold := run(0, rows, true)
+		splitOut := run(0, rows, false)
+		rowMoved(t, fmt.Sprintf("%d rows, the fold", rows), fold, run(1, rows, true))
+		fold2 := run(0, rows, true)
+		for _, arm := range []struct {
+			what      string
+			got, want []float32
+		}{{"fold after split", fold, splitOut}, {"fold after fold on other tokens", fold2, splitOut}} {
+			r, err := compare(arm.got, arm.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("%d rows, %-32s against the split dispatches: %v", rows, arm.what, r)
+			if r.rms > 1e-5 || r.maxAbs > 1e-4 {
+				t.Errorf("%d rows, %s: rms %.3e max %.3e at %d — more than a reassociation of the shared expert's row",
+					rows, arm.what, r.rms, r.maxAbs, r.at)
 			}
 		}
 	}

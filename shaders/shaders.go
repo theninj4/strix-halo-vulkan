@@ -2061,6 +2061,11 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_norm.spv llm_hc_norm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_combine.spv llm_hc_combine.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_hc_cn.spv llm_hc_cn.comp
+// P22b: the same two, reading the block output out of the sublayer's own
+// arena through binding 11 (XOUT in llm_common.glsl), which is what deletes
+// the move that used to copy it.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DXOUT=1 -o llm_hc_combine_x.spv llm_hc_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DXOUT=1 -o llm_hc_cn_x.spv llm_hc_cn.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=1 -DWN=3 -o llm_hc_down_m1.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=2 -DWN=3 -o llm_hc_down_m2.spv llm_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DWM=4 -DWN=3 -o llm_hc_down_m4.spv llm_gemm.comp
@@ -2161,6 +2166,14 @@ var KokoroGELU []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=80 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s80.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ4B -DDENSE_Q4 -o llm_hc_gemv_q4_s160.spv llm_hc_gemv.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=160 -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_gemv_q5_s160.spv llm_hc_gemv.comp
+// P21a: the up projection's decode GEMV (llm_hc_up_gemv.comp), on the two
+// K-quant banks only — it reads the ten-group record and has no halves arm.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQ4B -DDENSE_Q4 -o llm_hc_up_gemv_q4.spv llm_hc_up_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQ4B -DQ5B -DDENSE_Q4 -o llm_hc_up_gemv_q5.spv llm_hc_up_gemv.comp
+// P22b: the same two, writing the mixer's output as halves into the
+// sublayer's A operand through binding 11 (XIN in llm_common.glsl).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQ4B -DDENSE_Q4 -DXIN=1 -o llm_hc_up_gemv_q4_x.spv llm_hc_up_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQ4B -DQ5B -DDENSE_Q4 -DXIN=1 -o llm_hc_up_gemv_q5_x.spv llm_hc_up_gemv.comp
 
 // The PLE n-gram block (LLM.md L2), which runs once, at layer 1. It is 0.1% of
 // a prefill graph — its key projection is one dispatch of the 37 that share
@@ -2220,6 +2233,12 @@ var LLMHCCombine []byte
 
 //go:embed llm_hc_cn.spv
 var LLMHCCN []byte
+
+//go:embed llm_hc_combine_x.spv
+var LLMHCCombineX []byte
+
+//go:embed llm_hc_cn_x.spv
+var LLMHCCNX []byte
 
 //go:embed llm_hc_down_m1.spv
 var LLMHCDownM1 []byte
@@ -2423,6 +2442,18 @@ var LLMHCGemvQ4S160 []byte
 
 //go:embed llm_hc_gemv_q5_s160.spv
 var LLMHCGemvQ5S160 []byte
+
+//go:embed llm_hc_up_gemv_q4.spv
+var LLMHCUpGemvQ4 []byte
+
+//go:embed llm_hc_up_gemv_q5.spv
+var LLMHCUpGemvQ5 []byte
+
+//go:embed llm_hc_up_gemv_q4_x.spv
+var LLMHCUpGemvQ4X []byte
+
+//go:embed llm_hc_up_gemv_q5_x.spv
+var LLMHCUpGemvQ5X []byte
 
 //go:embed llm_gemm_plain_m2.spv
 var LLMGEMMPlainM2 []byte

@@ -45,9 +45,10 @@ void q4kScaleMin12(uint j, uvec4 s, out uint sc, out uint mn) {
     uint b = j * 12u;
     uint w = b >> 5, o = b & 31u;
     uint v = s[w] >> o;
-    if (o > 20u) {
-        v |= s[w + 1u] << (32u - o);
-    }
+    // Branch-free (P21b): the next word exists whenever the shift needs it
+    // (j = 2 and 5), and the index is clamped for the ones where it does not.
+    uint nx = s[min(w + 1u, 3u)] << ((32u - o) & 31u);
+    v |= o > 20u ? nx : 0u;
     sc = v & 63u;
     mn = (v >> 6) & 63u;
 }
@@ -68,6 +69,11 @@ void q4kScaleMin12(uint j, uvec4 s, out uint sc, out uint mn) {
 #ifdef Q5B
 #define QK_HIGH_BYTES(NK) ((NK) >> 3)
 #define QK_HIGH_BYTE(H0, WI) ((w8[(H0) + ((WI) >> 2)] >> (((WI) & 3u) * 8u)) & 0xFFu)
+// The same in two halves, for a kernel that fetches the plane word ahead of
+// the byte it needs (P21a's up GEMV): both plane bytes of a k-tile's two
+// nibble words sit in one plane word, because the word index is even.
+#define QK_HIGH_WORD(H0, WI) w8[(H0) + ((WI) >> 2)]
+#define QK_HIGH_BYTE_OF(W, WI) (((W) >> (((WI) & 3u) * 8u)) & 0xFFu)
 // The level of the nibble pair in byte `t` of a word: the low nibble carries
 // bit 2t of the plane byte and the high one bit 2t+1.
 #define QK_LEVEL_LO(BY, HB, T) (((BY) & 0xFu) | ((((HB) >> ((T) * 2u)) & 1u) << 4))
@@ -75,6 +81,8 @@ void q4kScaleMin12(uint j, uvec4 s, out uint sc, out uint mn) {
 #else
 #define QK_HIGH_BYTES(NK) 0u
 #define QK_HIGH_BYTE(H0, WI) 0u
+#define QK_HIGH_WORD(H0, WI) 0u
+#define QK_HIGH_BYTE_OF(W, WI) 0u
 #define QK_LEVEL_LO(BY, HB, T) ((BY) & 0xFu)
 #define QK_LEVEL_HI(BY, HB, T) ((BY) >> 4)
 #endif

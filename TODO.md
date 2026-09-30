@@ -33,7 +33,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | **token generation is the focus from 2026-09-30: P19–P24 in the text section (re-attribute the step, speculation re-priced with prompt lookup, the decode GEMVs' load count, fusion, the host gather, bytes)**; concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step, the 196 moves the largest |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | **token generation is the focus from 2026-09-30: P19–P24 in the text section; P19 and P21a done the same day (the step attributed: 16.4 / 4.3 / 3.0 / 1.1 ms; the head and `hc.up` — the two projections still on the padded GEMM at one row — moved to GEMVs, 37.5 → 38.7 tok/s at 25.8 ms a step; P21b's load hoisting measured dead; P22a the shared expert as the eleventh tile of the routed MoE dispatch, 38.8 → 39.2 tok/s at 25.5 ms; P21c the MoE down GEMV's five serial round trips a lane hoisted and A staged sixteen bytes a load, 39.1 → 39.8 tok/s at 25.13 ms, both down rungs re-laddered and confirmed), next the rest of P22, speculation re-priced at 1.23 steps a two-row pass**; concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step; the 196 moves went in P22b (2026-09-30, 196 → 4 and no zero rows at decode, 25.13 → 24.42 ms, 41.0 tok/s) |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt; KERNELS.md G4 (2026-09-30, research §3.8): the transposed attention (`h3_attn_t.comp`) on this DiT is 1.07x on the attention and 1.7% of a step, **opt-in** (`QIMAGE_ATTN_T=1`) because the edit oracle's teacher-forced prefill amplifies fp16-level differences in the prefix rows ~100x at three target rows — the kernel is exact on identical inputs at every block, a plain-family perturbation reads 1.73e-2 against the 2e-2 bound, and the call on that bound is this vertical's. **KERNELS.md G3 (2026-09-30, §2.14): w1|w3 as one GEMM whose epilogue is the SwiGLU**, bit-identical, a 1024² cached step **2044 → 1929–1968 ms** on the int8 bank (1.04–1.06x); the served binary needs a redeploy |
@@ -344,14 +344,37 @@ one table**: ~17 ms of weights at the bus rate (the floor at this format),
 stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
 ~1–2 ms of host, mostly the n-gram gather. The stages, in order:
 
-- [ ] **P19 — re-attribute the decode step.** Step zero; nothing below is
-  priced until it exists. P1's table (family, GB a token, ms, GB/s, ms at
-  the bus, lost) on the shipped banks at today's 27.6 ms, the weightless
-  dispatches by label, the host lines, at one row and at three, depth zero
-  and 128k, with the clock and power sampled. P4a's rule applies: take the
-  byte counts from the bank being timed. It answers what P1's two outliers
-  (`hyper_conn` at 114.6 GB/s, the shared expert at 136.5) read today,
-  which is not recorded anywhere. Write-up `research/p19-decode-attribution.md`.
+- [x] **P19 — re-attribute the decode step.** **Done 2026-09-30**
+  ([write-up](research/p19-decode-attribution.md)). A step is **26.66 ms**
+  (37.5 tok/s, two runs 0.15% apart, every label within 0.014 ms): **16.4
+  ms of weights at 242 GB/s, 4.3 ms of streams under the bus (against 227),
+  3.0 ms of weightless dispatches, 1.1 ms of host** — the reconstruction
+  above was right. The weight streams average 182 GB/s; the four big dense
+  GEMVs are at 195–211 (0.8 ms lost between them, and the Q4 arm's loads
+  are already vectorised by the compiler — one `b128`, one `b64`, two
+  `b128` a step), the MoE at 193/174 (1.3 ms), **and the two projections
+  still on the padded GEMM at one row are the largest single losses: the
+  lm head at 185 GB/s (2.37 ms, the biggest dispatch of the step) and
+  `hc.up` at 125 (1.75 ms over 97 dispatches)**. The small dispatches
+  (`hc.up`, `hc.down`, the shared expert, `ple.kv`: 340 a step of 1–2.3 MB)
+  run at half the bus, which is P8's latency rule at family scale. Clock
+  under decode: 97 W, shader clock p50 795 MHz — memory-bound, no matrix
+  clocks to buy. A two-row one-sequence pass is **1.23 steps** (P5c's 1.36),
+  three rows 1.37; three conversations 1.39 / 1.67. **First change, same
+  hour A/B: the head at one row on its GEMV (`llm_gemv.comp` K1, staged
+  since L8c and never wired), 2.37 → 2.06 ms at 212 GB/s, the step 26.66 →
+  26.37, 37.5 → 37.9 tok/s (+1.1%)**; `GraphOpts.HeadGEMM` / `LLM_HEAD_GEMM=1`
+  is the control, four bit-identity gates pin the GEMM, and
+  `TestGraphHeadDecodeGEMV` prices the kernel (rms 7e-6 of the logits' max).
+  **P21a done the same evening: `hc.up` on a GEMV** (`llm_hc_up_gemv.comp`,
+  a workgroup a feature block, five waves each a share of the column's
+  k-tiles, the four-stream collapse in the wave; `LLM_HC_UP_GEMM=1` the
+  control): 17.9 → 13.3 µs a dispatch, 125 → 169 GB/s, the step 26.10 →
+  **25.8 ms, 38.7 tok/s** (five interleaved arms 25.78–25.88). **P21b
+  measured dead**: the big GEMVs with their slab's loads issued together
+  (17–23 in flight, bit-identical) ran 0.7 ms *slower* — the head +0.3,
+  `hc.down` +0.23 — for 60–72 VGPRs against 48 and a branch-free record
+  decode at 800 MHz; removed. The four big GEMVs are not load-bound.
 - [ ] **P20 — speculation, re-priced.** The only lever with a multiple,
   parked at 0.95x (P5c) on numbers that are now stale: C5 raised
   `GEMVMaxRows` to 3, took the bank re-read out of the row loop and runs
@@ -377,20 +400,71 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     verification pass pre-recorded, the two drafts combined. `Reset`'s owed
     test (P5c finding 6) comes first, and every token-for-token claim
     prints its plain-against-plain row.
-- [ ] **P21 — the G-treatment on the decode GEMVs.** Half of the 5–6 ms
-  rate gap is ~+4 tok/s. First suspect, **untested**: `llm_gemv.comp`'s Q4
-  arm still builds its record from four scalar `w8[]` loads and walks the
-  payload a dword at a time, the shape C5 fixed in the MoE GEMV, and it
-  carries `dn.qkv` (4.07 ms), the head (2.38) and `attn.qkv`;
-  `llm_hc_gemv.comp` has the same header. Then whatever P19 shows under the
-  bus. Method: knock-out controls, the ISA's load count, the whole model
+- [ ] **P21 — the G-treatment on the decode GEMVs.** P19's `lost` column
+  sets the order; the first suspect is retired (the Q4 arm's loads are
+  vectorised as compiled) and so is the second (P21b above: issuing a
+  slab's loads together is slower on the big grids). ~~P21a `hc.up`~~ done
+  (above, +0.44 ms). ~~Left: **P21c `moe.down` (174 GB/s, +0.6 ms) and
+  `hc.down` (162, +0.4)**~~ — **P21c done 2026-09-30** ([Finding
+  5](research/p19-decode-attribution.md)): both rungs re-laddered in the
+  whole model (`LLM_MOE_DECODE_PLAN`, `LLM_HC_DOWN_SLABS`) and the shipped
+  ones confirmed (v16w4; 32 slabs, with 40 D12's whole multiple at 1.9x and
+  160 losing on its reduce); the ISA showed `moe.down`'s lane as five serial
+  round trips, each two loads and a `vmcnt(0)`, behind a half-a-load A
+  staging — `llm_moe_gemv.comp` now issues every trip's words before the
+  first unpack (the guards branch-free, or the compiler sinks the loads
+  back) and stages A eight halves a load: three interleaved pairs 25.57 /
+  25.50 / 25.56 → **25.09 / 25.13 / 25.17 ms, 39.1 → 39.8 tok/s**,
+  `moe.down` 53.3 → 49.2 µs, `moe.up` 104.5 → 100.4 from the staging alone.
+  The same treatment on the up mode's quad loop measured +1.5 µs and was
+  reverted (P21b a third time). `hc.down`'s 0.4 ms has no idea left; the
+  shared expert's two dispatches are P22a's eleventh tile. Method: knock-out controls, the ISA's load count, the whole model
   and not the block ladder (L8e-2 and C5 both chose a rung in the graph
-  that the ladder got wrong), a rate above 242 GB/s is an L3 hit (D16).
-- [ ] **P22 — the weightless dispatches.** ~3.3 ms, 1–2 recoverable: G3's
-  epilogue pattern (a norm, gate or combine folded into the kernel that
-  produces its input) and L6c's single arena, which deletes the 196 moves.
-  P19's label table sets the order. Check every re-gridded kernel at
-  `rows == 1` (P16's `hc.cn` lesson).
+  that the ladder got wrong), a rate above 242 GB/s is an L3 hit (D16),
+  and **VGPRs and VALU count at 800 MHz** (P21b's lesson: a decode kernel
+  runs at a third of the clock, so an instruction costs three times what
+  the ISA suggests).
+- [ ] **P22 — the weightless dispatches and the small ones.** 3.0 ms of
+  weightless dispatches (P19's list: `dn.scan` 0.64, the 196 moves 0.54,
+  `moe.route` 0.28, `hc.cn` 0.23, twenty more under 0.16), 1–2 recoverable:
+  G3's epilogue pattern (a norm, gate or combine folded into the kernel that
+  produces its input) and L6c's single arena, which deletes the moves.
+  ~~And **the shared expert as an eleventh tile of `moe.up`**~~ — **P22a
+  done 2026-09-30** ([Finding 4](research/p19-decode-attribution.md)):
+  `llm_moe_gemv.comp` carries the shared expert as one tile past the routed
+  schedule wherever its bank is the routed bank's format (47 of 48 layers'
+  up on the shipped plan; layer 2 is Q5_K and the shared down is Q5_1
+  against IQ4_NL), `MoEGPU.foldShared`, `LLM_MOE_SHEXP_SPLIT=1` the control,
+  `TestMoEGPUSharedFold` the gate (rms 8e-9 against the split, one to three
+  rows, arenas dirtied between arms). Same-hour interleaved pairs 25.75 /
+  25.74 → **25.56 / 25.51 ms, 38.8 → 39.2 tok/s**: the shared up is 9.2 µs
+  inside the routed dispatch against 15.0 on its own, which is the routed
+  rate. The down half is priced at ~0.15 ms more (25.31 with
+  `down_shexp=iq4_nl`) and waits on P24's eval of that width. Check every
+  re-gridded kernel at `rows == 1` (P16's `hc.cn` lesson).
+  ~~**The 196 moves**~~ — **P22b done 2026-09-30** ([Finding
+  6](research/p19-decode-attribution.md)): deleted at the boundary rather
+  than with L6c's shared arena. The kernel on either side binds the other
+  block's arena at binding 11 (`HCLink`, a pipeline per foreign buffer as
+  the mover had): `cn`/`combine` read a sublayer's output where it lies at
+  any row count, and the decode up GEMV writes the next sublayer's fp16 A
+  operand from the register that holds the value. 196 → 4 moves a step
+  (the PLE's residual out and back, the final row move, the head's input);
+  bit-exact by construction, `TestGraphHCLinkBitExact` the gate,
+  `LLM_HC_MOVES=1` / `GraphOpts.HCMoves` the control. Three same-hour pairs
+  25.13 / 25.15 / 25.13 → **24.83 / 24.83 / 24.81 ms, 39.8 → 40.3 tok/s**;
+  a third of the 0.53 came back as `hc.up` zeroing the consumers' pad rows
+  from one wave, so every `InPort` now reports the run itself as its row
+  block on the decode plan (its rungs are GEMVs that read ROWS rows) and no
+  zero row is written at decode by either arm.
+  Three more pairs with both arms so: **24.91 / 24.89 / 24.97 → 24.42 /
+  24.39 / 24.43 ms, 40.1 → 41.0 tok/s** — the zero rows had cost the moves
+  arm 0.22 ms on their own in the kernels after each move, so P22b is
+  **25.13 → 24.42 ms, 39.8 → 41.0 tok/s** in all
+  (`results/p22b_link_*.csv`).
+  Left of P22: `dn.scan` (0.64 ms) is the fp32 recurrent state read and
+  written every layer — bytes, P24's fp16-state item, not scheduling — and
+  the epilogue fusions at 0.1–0.3 ms each.
 - [ ] **P23 — the host gather.** ~1 ms a token, 75% of it two steps in 32
   at ~8.7 ms, unexplained. The fix on the table is residency of the 28.8 GB
   table (or of the rows a conversation can reach), a deployment decision
@@ -400,8 +474,11 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   +1.74% may no longer separate plans; fp16 DeltaNet state (+~1.3 of
   ceiling) is graded by the same instrument.
 
-P19 first, then P20a–c beside P21. P21–P23 together are perhaps 36 → 42–44
-tok/s if they land; only P20 reaches the 46–56 range. Batched throughput
+P19, P21a, P22a, P21c and P22b are done (36.2 → 41.0 tok/s on the day,
+24.4 ms a step); the rest of P22 (the epilogue fusions; `dn.scan` is P24's)
+next, then P20a–c. P21–P23 together are perhaps 38.7 → 42 tok/s
+if they land; only P20 reaches the 46–56 range, and P19 re-priced its
+two-row pass at 1.23 steps (break-even 23% acceptance for a free draft). Batched throughput
 (65 tok/s at three rows) keeps its own list in CONCURRENCY.md *Next*. The
 instrument rules at the end of this section apply to every number: a
 same-hour control, the shipped banks and `LLM_BANK_CACHE`, nothing else on

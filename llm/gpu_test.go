@@ -1097,3 +1097,106 @@ func rowMoved(t *testing.T, what string, a, b []float32) {
 	}
 	t.Errorf("%s: the output row did not move when its token did — the rung is not writing it", what)
 }
+
+// TestHCGPUUpGemvAgrees is P21a's gate: the up projection's decode GEMV
+// (`llm_hc_up_gemv.comp`) against the GEMM it replaces at one row, on both
+// K-quant banks, at one, two and three rows. The two are one rounding a
+// weight apart (the GEMV keeps the unpacked weight in f32 where the GEMM
+// rounds it to a half on the way through LDS), so the gate is a tolerance
+// on the gate and on `mixed`; the collapse itself sums the four streams in
+// the GEMM epilogue's order.
+func TestHCGPUUpGemvAgrees(t *testing.T) {
+	for _, spec := range []string{"q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) { hcUpGemvAgrees(t, spec) })
+	}
+}
+
+func hcUpGemvAgrees(t *testing.T, spec string) {
+	dev, done := newTestDevice(t)
+	defer done()
+
+	cfg := HCConfig{NEmbd: 2560, HC: 4, LowRank: 320, Eps: 1e-6}
+	wide := cfg.Wide()
+	rng := rand.New(rand.NewSource(29))
+	sim, err := ParseQuantSim(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim.Mode = "rtn"
+	bank, err := BankForSim(sim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := HCWeights{
+		Norm:   make([]float32, wide),
+		Down:   make([]float32, cfg.LowRank*wide),
+		Up:     make([]float32, wide*cfg.LowRank),
+		Inject: make([]float32, cfg.HC*wide),
+		Name:   "blk.0.hc_attn_",
+	}
+	for i := range w.Norm {
+		w.Norm[i] = 1 + float32(rng.NormFloat64())*0.1
+	}
+	for _, x := range [][]float32{w.Down, w.Up, w.Inject} {
+		for i := range x {
+			x[i] = float32(rng.NormFloat64()) * 0.05
+		}
+	}
+	const nTok = GEMVMaxRows
+	res := make([]float32, nTok*wide)
+	for i := range res {
+		res[i] = float32(rng.NormFloat64())
+	}
+	g, err := NewHCGPU(dev, cfg, nTok, []HCWeights{w}, HCOpts{Gate: true, Bank: bank, Q8: false, Sim: sim})
+	if err != nil {
+		t.Fatalf("hc (%s): %v", bank, err)
+	}
+	defer g.Destroy()
+
+	exec := func(uk HCKernel, rows int) (mixed, gate []float32) {
+		t.Helper()
+		if err := g.Upload(res[:rows*wide], rows); err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+		if err := g.SetPlan(HCDownGemv32, uk); err != nil {
+			t.Fatalf("plan %s: %v", uk, err)
+		}
+		if err := g.Run(0, false); err != nil {
+			t.Fatalf("run %s: %v", uk, err)
+		}
+		return g.Mixed(), g.Gate()
+	}
+	for rows := 1; rows <= nTok; rows++ {
+		wantMixed, wantGate := exec(HCUpM1, rows)
+		gotMixed, gotGate := exec(HCUpGemv, rows)
+		for _, tc := range []struct {
+			name      string
+			got, want []float32
+			maxAbs    float64
+		}{
+			{"gate", gotGate, wantGate, 1e-3},
+			{"mixed", gotMixed, wantMixed, 1e-3},
+		} {
+			r, err := compare(tc.got, tc.want)
+			if err != nil {
+				t.Fatalf("%d rows %s: %v", rows, tc.name, err)
+			}
+			t.Logf("%d rows %-5s against up_m1: %v", rows, tc.name, r)
+			if r.maxAbs > tc.maxAbs {
+				t.Errorf("%d rows: the up GEMV's %s is %.3e from the GEMM's (over %.0e)", rows, tc.name, r.maxAbs, tc.maxAbs)
+			}
+		}
+	}
+	// And a bank without the arm refuses the plan rather than running it.
+	if err := g.Upload(res[:wide], 1); err != nil {
+		t.Fatal(err)
+	}
+	h, err := NewHCGPU(dev, cfg, 1, []HCWeights{w}, HCOpts{Gate: true, Bank: BankFP16, Sim: sim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Destroy()
+	if err := h.SetPlan(HCDownGemv32, HCUpGemv); err == nil {
+		t.Fatal("the halves bank took the up GEMV")
+	}
+}

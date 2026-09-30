@@ -2985,10 +2985,16 @@ func (g *AttnGPU) Destroy() {
 }
 
 // InPort is the layer's input as the fused projection's A operand wants it:
-// fp16 [T][lda], `hc_mixed` narrowed.
+// fp16 [T][lda], `hc_mixed` narrowed. The row count is the projection's row
+// block, which is the run itself on the decode GEMV (P22b: ROWS rows of A
+// and not one more, so nothing needs zeroing past them) and the widest GEMM
+// tile otherwise, because the GEMM rungs have no bounds check.
 func (g *AttnGPU) InPort() Port {
-	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
-		Rows: roundUpInt(g.rows, g.rowAlign), Half: true}
+	rows := roundUpInt(g.rows, g.rowAlign)
+	if g.qkvGemv != GEMVOff {
+		rows = g.rows
+	}
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd, Rows: rows, Half: true}
 }
 
 // OutPort is the layer's output, `attn_output`: fp32 [T][nEmbd].

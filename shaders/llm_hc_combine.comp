@@ -19,6 +19,14 @@
 
 #include "llm_common.glsl"
 
+// The block output: this arena's, or the sublayer's own through binding 11
+// (P22b, XOUT in llm_common.glsl). Same floats either way.
+#ifdef XOUT
+#define OUT_LOAD(i) xout[src + (i)]
+#else
+#define OUT_LOAD(i) act[src + (i)]
+#endif
+
 #extension GL_EXT_control_flow_attributes : enable
 
 // **The grid is a stream across and a token down** (KERNELS.md G6, research
@@ -92,7 +100,7 @@ void main() {
 #if GUT == 1
             blk[j] = w;
 #else
-            blk[j] = act[src + i];
+            blk[j] = OUT_LOAD(i);
 #endif
         }
     }
@@ -108,7 +116,7 @@ void main() {
     }
 #else
     for (uint i = gl_LocalInvocationID.x; i < n; i += gl_WorkGroupSize.x) {
-        act[dst + i] += act[src + i] * w;
+        act[dst + i] += OUT_LOAD(i) * w;
     }
 #endif
 }

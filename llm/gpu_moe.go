@@ -20,7 +20,8 @@ package llm
 //	perm x2   counting sort + the two tile schedules    one workgroup
 //	up        gate and up, silu(gate)*up fused          grouped, Q4_K/Q5_K
 //	down      down, weighted, scattered                 grouped, Q5_1/Q8_0
-//	shexp x2  the same two kernels, one group, Q8_0
+//	shexp x2  the same two kernels, one group, Q8_0 (at decode, folded
+//	          into up/down as one more tile where the formats match: P22)
 //	combine   the eleven contributions summed
 //
 // Four tensors the reference materialises never exist here. `ffn_moe_gate`
@@ -48,6 +49,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -390,10 +392,35 @@ func moeCheckGemv(up, down MoEKernel, rows int) error {
 // and 15.2 → 14.3 at three, with v32w4 between them.
 func MoEPlanFor(tokens int) (MoEKernel, MoEKernel) {
 	if tokens >= 1 && tokens <= GEMVMaxRows && DecodeGEMV() {
+		if up, down, ok := moeDecodePlanOverride(); ok {
+			return up, down
+		}
 		return MoEV16W4, MoEV16W4
 	}
 	return moeGEMMPlanFor(tokens)
 }
+
+// moeDecodePlanOverride is `LLM_MOE_DECODE_PLAN=<up>,<down>`, the routed
+// pair's GEMV rungs for a whole-model screen (P21c): the block ladder chose
+// wrongly twice (L8e-2, C5), so a rung is screened in `cmd/llm -gen -attrib`
+// and not on the fixture. Never the served path.
+func moeDecodePlanOverride() (up, down MoEKernel, ok bool) {
+	p := moeDecodePlanEnv()
+	return p[0], p[1], p[0] != ""
+}
+
+var moeDecodePlanEnv = sync.OnceValue(func() [2]MoEKernel {
+	v := os.Getenv("LLM_MOE_DECODE_PLAN")
+	if v == "" {
+		return [2]MoEKernel{}
+	}
+	a, b, ok := strings.Cut(v, ",")
+	up, down := MoEKernel(a), MoEKernel(b)
+	if !ok || !MoEIsGemv(up) || !MoEIsGemv(down) {
+		panic(fmt.Sprintf("llm: LLM_MOE_DECODE_PLAN=%q wants two GEMV rungs of %v", v, MoEDecodeKernels()))
+	}
+	return [2]MoEKernel{up, down}
+})
 
 // moeGEMMPlanFor is that plan with the decode rungs taken out: the cooperative
 // -matrix pair a batch of this length would run if llm_moe_gemv.comp did not
@@ -712,6 +739,9 @@ type MoEGPU struct {
 	// pinGemv holds the block on llm_moe_gemm.comp and the GEMM router
 	// whatever the batch: see Graph.PinSchedule and DeltaNetGPU.pinGemv.
 	pinGemv bool
+	// sharedSplit keeps the shared expert on its own two dispatches at
+	// decode (P22's control, `LLM_MOE_SHEXP_SPLIT=1`); see foldShared.
+	sharedSplit bool
 
 	tokens, arenaRows, rows int
 	lda, ldCtx              int
@@ -805,12 +835,13 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 		dev: dev, cfg: cfg,
 		pipes:  make(map[string]*vk.ComputePipeline),
 		tokens: maxTokens, rows: maxTokens,
-		lda:        cfg.NEmbd + gemmPad,
-		ldCtx:      cfg.FFNExpert + gemmPad,
-		router:     GEMMKernelFor(maxTokens),
-		routerGemv: MoERouterFor(maxTokens),
-		autoPlan:   true,
-		bankPlan:   MoEBankPlanFromEnv(),
+		lda:         cfg.NEmbd + gemmPad,
+		ldCtx:       cfg.FFNExpert + gemmPad,
+		router:      GEMMKernelFor(maxTokens),
+		routerGemv:  MoERouterFor(maxTokens),
+		autoPlan:    true,
+		bankPlan:    MoEBankPlanFromEnv(),
+		sharedSplit: moeSharedSplitAtDecode(),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -1102,6 +1133,12 @@ func (g *MoEGPU) build() error {
 	if g.lda%moeAVec != 0 || int(g.hXn)%moeAVec != 0 {
 		return fmt.Errorf("llm: the gathered operand loads %d halves at a time; lda %d and xn at %d are not whole loads",
 			moeAVec, g.lda, g.hXn)
+	}
+	// And the decode GEMV stages its A rows the same way (P21c), so the
+	// swiglu rows the down mode reads have to be whole loads too.
+	if g.ldCtx%moeAVec != 0 || int(g.hSwiglu)%moeAVec != 0 {
+		return fmt.Errorf("llm: the decode GEMV loads %d halves at a time; ldCtx %d and swiglu at %d are not whole loads",
+			moeAVec, g.ldCtx, g.hSwiglu)
 	}
 	// **And a K-quant block's header is one sixteen-byte load** (P12): the
 	// unpack reads `d`, `dmin` and the twelve scale bytes as a single `uvec4`
@@ -1453,6 +1490,47 @@ func (g *MoEGPU) poisonPad(v float32) {
 	g.hbuf.WriteUint16At(int(g.hXn)+g.rows*g.lda, row)
 }
 
+// moeSharedSplitAtDecode is `LLM_MOE_SHEXP_SPLIT=1`: the shared expert stays
+// on its own two dispatches at decode, P22's control arm.
+var moeSharedSplitAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_MOE_SHEXP_SPLIT") == "1" })
+
+// SetSharedFold puts the shared expert on the routed dispatches (true) or on
+// its own two (false), for the gate that compares them. The environment
+// decides otherwise.
+func (g *MoEGPU) SetSharedFold(on bool) { g.sharedSplit = !on }
+
+// foldShared says, for one layer, whether each expert mode carries the shared
+// expert as one more tile of the routed dispatch (TODO.md P22, the
+// "eleventh tile") rather than as a dispatch of its own.
+//
+// The shared expert is one group of the same grouped kernel over the same
+// shape, and at decode its two dispatches were the block's slowest per byte:
+// 1.84 MB and 1.23 MB apiece at 124-125 GB/s where the routed dispatch beside
+// them runs 193 (research/p19-decode-attribution.md), because a dispatch of
+// ten microseconds is mostly launch, first latency and tail. Folded, its
+// forty workgroups are one more row of the routed grid and pay none of that
+// again. The kernel reads the shared bank through MOE_SH_B/MOE_SH_B2 and the
+// tile's rows from the reserve at the front of the row space, which the host
+// writes as the identity (syncShared) — so nothing about the permutation,
+// the combine or the shared expert's slot changes.
+//
+// **The format is compiled into the rung**, so a mode folds only where the
+// shared bank ships in the routed bank's format: under the shipped plan
+// (`ShippedMoEBank`) the shared gate and up are Q4_K like the routed pair on
+// 47 layers and not on layer 2, whose routed pair is Q5_K; the shared down
+// is Q5_1 against the routed IQ4_NL and does not fold. Only the GEMV rungs
+// know the extra tile; the GEMM plan at prefill keeps the shared expert's
+// own group. And the widths have to agree, which they do on this
+// checkpoint (FFNShared == FFNExpert) and are checked rather than assumed.
+func (g *MoEGPU) foldShared(w moeLayerWeights) (up, down bool) {
+	if g.sharedSplit || g.cfg.FFNShared != g.cfg.FFNExpert {
+		return false, false
+	}
+	up = MoEIsGemv(g.up) && w.shGateFmt == w.gateFmt && w.shUpFmt == w.upFmt
+	down = MoEIsGemv(g.down) && w.shDownFmt == w.downFmt
+	return up, down
+}
+
 // moeExpertPipe names the pipeline one of the two expert modes runs: the
 // bank's format, the rung, and — for a GEMV rung — **the row count it was
 // specialized to** (P5b).
@@ -1569,7 +1647,11 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 
 	// 5. gate and up for every routed row, with the swiglu on the
-	//    accumulators.
+	//    accumulators — and, at decode, for the shared expert as one more
+	//    tile of the same dispatch (P22, foldShared): the kernel reads its
+	//    bank through the two fields llm_common.glsl names MOE_SH_B and
+	//    MOE_SH_B2, and the grid is one tile taller.
+	foldUp, foldDown := g.foldShared(w)
 	up := base
 	up.MoEPermOff, up.MoETileOff = g.aPerm, g.aTilesUp
 	up.BOff, up.MoEBOff2 = w.gate, w.up
@@ -1578,8 +1660,13 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	up.GemmM = uint32(g.pad())
 	up.CtxOff = g.hSwiglu
 	up.GemmN, up.GemmK = uint32(c.FFNExpert), uint32(c.NEmbd)
+	upTiles := uint32(g.maxTiles(bmUp, g.rows))
+	if foldUp {
+		up.GateOff, up.LoOff = w.shGate, w.shUp
+		upTiles++
+	}
 	add(moeExpertPipe("up", w.gateFmt, g.up, g.rows), "up",
-		uint32(c.FFNExpert/moeBNOf(g.up)), uint32(g.maxTiles(bmUp, g.rows)), up)
+		uint32(c.FFNExpert/moeBNOf(g.up)), upTiles, up)
 
 	// 6. down, weighted and scattered to its (token, slot).
 	down := base
@@ -1588,20 +1675,29 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	down.GemmM = uint32(g.pad())
 	down.CtxOff = g.hSwiglu
 	down.GemmN, down.GemmK = uint32(c.NEmbd), uint32(c.FFNExpert)
+	downTiles := uint32(g.maxTiles(bmDown, g.rows))
+	if foldDown {
+		down.GateOff = w.shDown
+		downTiles++
+	}
 	add(moeExpertPipe("down", w.downFmt, g.down, g.rows), "down",
-		uint32(c.NEmbd/moeBNOf(g.down)), uint32(g.maxTiles(bmDown, g.rows)), down)
+		uint32(c.NEmbd/moeBNOf(g.down)), downTiles, down)
 
 	// 7-8. The shared expert: the same two kernels over one group whose
 	//      permutation is the identity, because it is the same shape as a
-	//      routed expert and runs for every token.
+	//      routed expert and runs for every token. At decode each mode is
+	//      folded into the routed dispatch above where the formats allow
+	//      it, and the dispatch below is not recorded.
 	shUp := base
 	shUp.MoEPermOff, shUp.MoETileOff = g.aPerm, g.aShTilesUp
 	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
 	shUp.GemmM = uint32(g.pad())
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
-	add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
-		uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
+	if !foldUp {
+		add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
+			uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
+	}
 
 	shDown := base
 	shDown.MoEPermOff, shDown.MoETileOff = g.aPerm, g.aShTilesDown
@@ -1609,8 +1705,10 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shDown.GemmM = uint32(g.pad())
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
-	add(moeExpertPipe("down", w.shDownFmt, g.shDown, g.rows), "shexp.down",
-		uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shDown))/moeBM(g.shDown)), shDown)
+	if !foldDown {
+		add(moeExpertPipe("down", w.shDownFmt, g.shDown, g.rows), "shexp.down",
+			uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shDown))/moeBM(g.shDown)), shDown)
+	}
 
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.
 	add("combine", "combine", uint32(roundUpInt(c.NEmbd, moeCombineWG)/moeCombineWG), uint32(g.rows), base)
@@ -1958,10 +2056,15 @@ func (g *MoEGPU) Formats(layer int) (gate, up, down string) {
 
 // InPort is the block's input as the router's and every routed tile's A
 // operand wants it: fp16 [T][lda], `hc_mixed` narrowed. The row count is the
-// widest row block a rung uses, because the grouped GEMM has no bounds check.
+// widest row block a rung uses, because the grouped GEMM has no bounds check
+// — and the run itself on the decode plan (P22b), where the router's
+// split-K kernel and the expert GEMVs read ROWS rows and not one more.
 func (g *MoEGPU) InPort() Port {
-	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
-		Rows: roundUpInt(g.rows, moeBMMax), Half: true}
+	rows := roundUpInt(g.rows, moeBMMax)
+	if g.routerGemv != MoERouterGEMM && MoEIsGemv(g.up) && MoEIsGemv(g.shUp) {
+		rows = g.rows
+	}
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd, Rows: rows, Half: true}
 }
 
 // OutPort is the block's output, `ffn_out`: fp32 [T][nEmbd].

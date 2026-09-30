@@ -168,6 +168,10 @@ const (
 	HCDownGemv40  HCKernel = "down_gemv40"
 	HCDownGemv80  HCKernel = "down_gemv80"
 	HCDownGemv160 HCKernel = "down_gemv160"
+	// HCUpGemv is the up projection's decode kernel (P21a,
+	// llm_hc_up_gemv.comp): one wave a feature block, the whole column's
+	// loads in flight, the collapse in the wave. K-quant banks only.
+	HCUpGemv HCKernel = "up_gemv"
 )
 
 // hcVariant is one build's geometry, which the host has to be told because BM
@@ -190,6 +194,22 @@ type hcVariant struct {
 	bm, bn int
 	reduce []byte
 	slabs  int
+	// q4x, q5x are the mode 3 builds that write the mixer's output straight
+	// into a sublayer's A operand through binding 11 (P22b, XIN in
+	// llm_common.glsl): the same kernel, one store changed.
+	q4x, q5x []byte
+}
+
+// spirvXFor is the linked build of the up GEMV for a bank, nil where the
+// rung has none.
+func (v hcVariant) spirvXFor(b DenseBank) []byte {
+	switch b {
+	case BankQ4K:
+		return v.q4x
+	case BankQ5K:
+		return v.q5x
+	}
+	return nil
 }
 
 // spirvFor is a rung's build for a bank. Every rung has all three.
@@ -226,6 +246,10 @@ var hcVariants = []hcVariant{
 		mode: 2, reduce: shaders.LLMHCGemvR80, slabs: 80},
 	{name: HCDownGemv160, spirv: shaders.LLMHCGemvS160, q8: shaders.LLMHCGemvQ8S160, q4: shaders.LLMHCGemvQ4S160, q5: shaders.LLMHCGemvQ5S160,
 		mode: 2, reduce: shaders.LLMHCGemvR160, slabs: 160},
+	// Mode 3 is the up GEMV: no halves and no Q8 arm, so on those banks the
+	// build skips it and the plan never names it.
+	{name: HCUpGemv, q4: shaders.LLMHCUpGemvQ4, q5: shaders.LLMHCUpGemvQ5, mode: 3, bm: 16, bn: 64,
+		q4x: shaders.LLMHCUpGemvQ4X, q5x: shaders.LLMHCUpGemvQ5X},
 }
 
 // hcMaxSlabs is the widest split any rung asks for, and so how many rows of
@@ -474,7 +498,38 @@ type HCGPU struct {
 // file D12 says has to be **re-measured** whenever a slab's stride changes.
 // L8c-6 is the third bank this ladder has been run on and the first where
 // the winner did not move; the next width has to run it again anyway.
-func hcQ4DecodePlan() (HCKernel, HCKernel) { return HCDownGemv32, HCUpM1 }
+func hcQ4DecodePlan() (HCKernel, HCKernel) {
+	down := HCDownGemv32
+	if k := hcDownSlabsOverride(); k != "" {
+		down = k
+	}
+	if hcUpGEMMAtDecode() {
+		return down, HCUpM1
+	}
+	return down, HCUpGemv
+}
+
+// hcDownSlabsOverride is `LLM_HC_DOWN_SLABS=<8|16|32|40|80|160>`, the down
+// projection's split-K rung for a whole-model screen (P21c: D12's ladder
+// re-run on the K-quant bank in `cmd/llm -gen -attrib`, not on the block
+// bench). Never the served path.
+var hcDownSlabsOverride = sync.OnceValue(func() HCKernel {
+	v := os.Getenv("LLM_HC_DOWN_SLABS")
+	if v == "" {
+		return ""
+	}
+	k := HCKernel("down_gemv" + v)
+	for _, have := range []HCKernel{HCDownGemv8, HCDownGemv16, HCDownGemv32, HCDownGemv40, HCDownGemv80, HCDownGemv160} {
+		if k == have {
+			return k
+		}
+	}
+	panic(fmt.Sprintf("llm: LLM_HC_DOWN_SLABS=%q wants 8, 16, 32, 40, 80 or 160", v))
+})
+
+// hcUpGEMMAtDecode is `LLM_HC_UP_GEMM=1`: the up projection stays on the
+// padded GEMM at one to three rows, which is P21a's control arm.
+var hcUpGEMMAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_HC_UP_GEMM") == "1" })
 
 // hcUpSub is the super-block the up rungs were compiled for: `-DQ4K_SUB=10`,
 // because the up projection's k is the low rank and 320 is ten groups of 32,
@@ -815,8 +870,19 @@ func (g *HCGPU) build() error {
 			// raw words — so only the SPIR-V differs (llm_common.glsl).
 			spirv, pipeBufs = v.spirvFor(g.dbank), q8bufs
 		}
+		if v.mode == 3 {
+			if spirv == nil {
+				continue // no arm on this bank
+			}
+			// The kernel is compiled for the shipped shape: a wave is one
+			// feature block of hc streams, and a lane holds KTILES k-tiles.
+			if g.cfg.HC != 4 || g.cfg.LowRank != 20*coopMatTile {
+				return fmt.Errorf("llm: up rung %q is built for hc 4 and a low rank of 320, not %d and %d",
+					v.name, g.cfg.HC, g.cfg.LowRank)
+			}
+		}
 		rowsMax := 1
-		if v.mode == 2 {
+		if v.mode == 2 || v.mode == 3 {
 			rowsMax = GEMVMaxRows
 		}
 		for rows := 1; rows <= rowsMax; rows++ {
@@ -1108,8 +1174,17 @@ func (g *HCGPU) SetPlan(down, up HCKernel) error {
 			down, GEMVMaxRows, g.rows)
 	}
 	uv, ok := hcVariantFor(up)
-	if !ok || uv.mode != 1 {
+	if !ok || (uv.mode != 1 && uv.mode != 3) {
 		return fmt.Errorf("llm: %q is not an up-projection kernel (have %v)", up, UpKernels())
+	}
+	if uv.mode == 3 {
+		if _, qk := qkBank(g.dbank); !qk {
+			return fmt.Errorf("llm: %q runs on the K-quant banks, not %s", up, g.dbank)
+		}
+		if g.rows < 1 || g.rows > GEMVMaxRows {
+			return fmt.Errorf("llm: %q carries at most %d rows (P5b) and this run is %d tokens",
+				up, GEMVMaxRows, g.rows)
+		}
 	}
 	g.down, g.up = down, up
 	g.autoPlan = false
@@ -1200,17 +1275,33 @@ func (g *HCGPU) UploadBlockOut(out []float32) error {
 // in the one dispatch that also does this mixer's norm (`llm_hc_cn.comp`).
 // -1 is the standalone norm, which is what a bench, a test and the two
 // boundaries in the graph that something else sits across all want.
-func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []string, error) {
+func (g *HCGPU) graph(mixer, prev int, combine bool, link HCLink) ([]vk.MultiDispatch, []string, bool, error) {
 	if mixer < 0 || mixer >= len(g.mixers) {
-		return nil, nil, fmt.Errorf("llm: mixer %d of %d", mixer, len(g.mixers))
+		return nil, nil, false, fmt.Errorf("llm: mixer %d of %d", mixer, len(g.mixers))
 	}
 	if prev >= len(g.mixers) {
-		return nil, nil, fmt.Errorf("llm: closing mixer %d of %d", prev, len(g.mixers))
+		return nil, nil, false, fmt.Errorf("llm: closing mixer %d of %d", prev, len(g.mixers))
 	}
 	c := g.cfg
 	m := g.mixers[mixer]
 	dv, _ := hcVariantFor(g.down)
 	uv, _ := hcVariantFor(g.up)
+	wroteIn := false
+
+	// The block output the combine closes on: this arena's, or the
+	// sublayer's own through binding 11 (P22b).
+	outPipe := func(name string, spirv []byte, pc *push) (string, error) {
+		if link.Out.Buf == nil {
+			pc.OutOff = g.aOut
+			return name, nil
+		}
+		o := link.Out
+		if o.Half || o.Width != c.NEmbd || o.Stride != c.NEmbd {
+			return "", fmt.Errorf("llm: a linked block output is fp32 [T][%d], not %+v", c.NEmbd, o)
+		}
+		pc.OutOff = o.Off
+		return g.xpipe(name, spirv, o.Buf, nil)
+	}
 
 	base := push{
 		ResOff: g.aRes, XnOff: g.hXn, LoOff: g.hLo, InjOff: g.aInject,
@@ -1236,13 +1327,16 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 		// names `prev` — so what the fusion needs from the push block is the
 		// block output and the inject row stride the combine would have set.
 		cn := base
-		cn.OutOff = g.aOut
+		cnPipe, err := outPipe("cn", shaders.LLMHCCNX, &cn)
+		if err != nil {
+			return nil, nil, false, err
+		}
 		cn.GemmN = uint32(g.gemmN())
 		// One workgroup a (token, stream), a stream across and a token down
 		// (KERNELS.md G6): the streams of a token are 2 KB of channel phase
 		// apart where a stream's rows a token apart are none, so this is
 		// the order that loads the DRAM channels evenly.
-		add("cn", "cn", uint32(c.HC), uint32(g.rows), cn)
+		add(cnPipe, "cn", uint32(c.HC), uint32(g.rows), cn)
 	} else {
 		add("norm", "norm", uint32(c.HC), uint32(g.rows), base)
 	}
@@ -1255,7 +1349,7 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 		// a decode rung, but a verification pass is two rows and a dot
 		// product extends to them for the price of the second row's A.
 		if g.rows < 1 || g.rows > GEMVMaxRows {
-			return nil, nil, fmt.Errorf("llm: %q carries at most %d rows and this run is %d tokens",
+			return nil, nil, false, fmt.Errorf("llm: %q carries at most %d rows and this run is %d tokens",
 				g.down, GEMVMaxRows, g.rows)
 		}
 		// `gammaOff` carries the partial sums: the GEMV reads no norm, and
@@ -1276,15 +1370,102 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 	if g.gate {
 		up.GateOff = g.aGate
 	}
-	add(string(g.up), "up", uint32(c.Wide()/uv.bn), uint32(roundUpInt(g.rows, uv.bm)/uv.bm), up)
+	if uv.mode == 3 {
+		if g.rows < 1 || g.rows > GEMVMaxRows {
+			return nil, nil, false, fmt.Errorf("llm: %q carries at most %d rows and this run is %d tokens",
+				g.up, GEMVMaxRows, g.rows)
+		}
+		// One wave a feature block, ROWS rows: the grid is the output width.
+		up.GemmM = uint32(g.rows)
+		pipe := gemvRowName(string(g.up), g.rows)
+		if in := link.In; in.Buf != nil {
+			// P22b: the mixer's output goes straight into the sublayer's
+			// fp16 A operand, rows past the run zeroed up to its row block
+			// — what the move did, from inside the kernel that has the
+			// value in a register. `outOff` is the halves offset there,
+			// and the stride and the row block ride two PLE fields
+			// (HC_XIN_STRIDE, HC_XIN_PADROWS in llm_common.glsl).
+			if !in.Half || in.Width != c.NEmbd {
+				return nil, nil, false, fmt.Errorf("llm: a linked mixer output is fp16 [T][%d], not %+v", c.NEmbd, in)
+			}
+			spirv := uv.spirvXFor(g.dbank)
+			if spirv == nil {
+				return nil, nil, false, fmt.Errorf("llm: %q has no linked build on bank %v", g.up, g.dbank)
+			}
+			up.OutOff, up.KVOff, up.GatedOff = in.Off, uint32(in.Stride), uint32(maxInt(in.Rows, g.rows))
+			var err error
+			if pipe, err = g.xpipe(pipe, spirv, in.Buf, gemvSpec(g.rows)); err != nil {
+				return nil, nil, false, err
+			}
+			wroteIn = true
+		}
+		add(pipe, "up", uint32(c.NEmbd/coopMatTile), 1, up)
+	} else {
+		add(string(g.up), "up", uint32(c.Wide()/uv.bn), uint32(roundUpInt(g.rows, uv.bm)/uv.bm), up)
+	}
 
 	if combine {
 		cb := base
-		cb.OutOff = g.aOut
+		cbPipe, err := outPipe("combine", shaders.LLMHCCombineX, &cb)
+		if err != nil {
+			return nil, nil, false, err
+		}
 		cb.GemmN = uint32(g.gemmN())
-		add("combine", "combine", uint32(c.HC), uint32(g.rows), cb)
+		add(cbPipe, "combine", uint32(c.HC), uint32(g.rows), cb)
 	}
-	return d, kinds, nil
+	return d, kinds, wroteIn, nil
+}
+
+// HCLink is where a mixer's output goes and where the block output its
+// combine closes on comes from, when they are another block's arenas
+// (TODO.md P22b). Either side may be empty (a nil Buf), which is the move.
+//
+// Every block owns its four buffers, so the activation that leaves the
+// mixer for a sublayer and comes back for the combine crossed a buffer
+// boundary through `llm_move.comp`: four dispatches a layer, 196 a decode
+// step, 0.54 ms of a 25 ms token — the largest of the weightless items P19
+// counted. L6c priced the shared arena that would delete them and refused
+// its two-phase construction; this is the other way to delete them. The
+// kernel on either side of the boundary binds the foreign arena at binding
+// 11, and a pipeline is built per (kernel, foreign buffer), which is what
+// the mover built per (source, destination) pair.
+//
+//   - Out: the sublayer's output, fp32 [T][nEmbd]. The combine reads it
+//     where it lies, at any row count, and reads the same floats the move
+//     copied.
+//   - In: the sublayer's A operand, fp16 [T][lda]. Only the decode up GEMV
+//     writes it (mode 3, one to three rows); the padded GEMM at prefill
+//     still writes `mixed` and the graph moves it. `Run` says which
+//     happened, so the graph knows whether to move.
+type HCLink struct {
+	In, Out Port
+}
+
+// xpipe is the pipeline `name` built with `buf` at binding 11, built on
+// first use and kept in `pipes` under a name that says which buffer, so
+// one build serves every dispatch over the same buffer (P22b). Bindings
+// 5-10 are padded with the bank so that the numbering stays the
+// vertical's: a binding the shader does not declare costs nothing. The
+// sublayers' arenas exist only once the graph does, which is why these are
+// not built with the rest.
+func (g *HCGPU) xpipe(name string, spirv []byte, buf *vk.Buffer, spec []vk.SpecConstant) (string, error) {
+	xname := fmt.Sprintf("%s@%p", name, buf)
+	if _, ok := g.pipes[xname]; ok {
+		return xname, nil
+	}
+	bufs := []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf}
+	for len(bufs) < 11 {
+		bufs = append(bufs, g.bank)
+	}
+	bufs = append(bufs, buf)
+	ps := vk.PipelineSpec{Buffers: bufs, PushConstantSize: uint32(unsafe.Sizeof(push{})), SpecConstants: spec}
+	if strings.HasPrefix(name, string(HCUpGemv)) {
+		ps.RequiredSubgroupSize = 64
+	}
+	if err := g.pipeline(xname, spirv, ps); err != nil {
+		return "", err
+	}
+	return xname, nil
 }
 
 // RunCombine executes the scatter alone, over whatever `inject` the mixer's
@@ -1300,7 +1481,11 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 // `aInject` and not in the bank — so the argument is here for the error
 // message and for the reader, who should be able to see which mix a combine
 // closes.
-func (g *HCGPU) RunCombine(mixer int) error {
+func (g *HCGPU) RunCombine(mixer int) error { return g.RunCombineFrom(mixer, Port{}) }
+
+// RunCombineFrom is RunCombine over a block output that lies in another
+// block's arena (P22b), or in this one's when `out` is empty.
+func (g *HCGPU) RunCombineFrom(mixer int, out Port) error {
 	if mixer < 0 || mixer >= len(g.mixers) {
 		return fmt.Errorf("llm: mixer %d of %d", mixer, len(g.mixers))
 	}
@@ -1310,8 +1495,19 @@ func (g *HCGPU) RunCombine(mixer int) error {
 		Tokens: uint32(g.rows), NEmbd: uint32(c.NEmbd), HC: uint32(c.HC),
 		LowRank: uint32(c.LowRank), GemmN: uint32(g.gemmN()),
 	}
+	pipe := "combine"
+	if out.Buf != nil {
+		if out.Half || out.Width != c.NEmbd || out.Stride != c.NEmbd {
+			return fmt.Errorf("llm: a linked block output is fp32 [T][%d], not %+v", c.NEmbd, out)
+		}
+		var err error
+		if pipe, err = g.xpipe("combine", shaders.LLMHCCombineX, out.Buf, nil); err != nil {
+			return err
+		}
+		pc.OutOff = out.Off
+	}
 	d := []vk.MultiDispatch{{
-		Pipeline: g.pipes["combine"],
+		Pipeline: g.pipes[pipe],
 		GroupsX:  uint32(c.HC), GroupsY: uint32(g.rows),
 		PushConstants: pc.bytes(),
 	}}
@@ -1329,20 +1525,34 @@ const perSubmit = 8
 
 // Run executes one mixer over whatever Upload left in the residual.
 func (g *HCGPU) Run(mixer int, combine bool) error {
-	d, kinds, err := g.graph(mixer, -1, combine)
+	_, err := g.run(mixer, -1, combine, HCLink{})
+	return err
+}
+
+// RunLinked opens mixer `mixer` — closing `prev` first in the same
+// dispatch when it is a mixer, as RunCombineMix does — over the ports of
+// the blocks on either side (P22b). It reports whether the mixer's output
+// was written into `link.In`, which is so on the decode GEMV and not on the
+// padded GEMM; when it is not, the caller moves `MixedPort` there itself.
+func (g *HCGPU) RunLinked(mixer, prev int, link HCLink) (bool, error) {
+	return g.run(mixer, prev, false, link)
+}
+
+func (g *HCGPU) run(mixer, prev int, combine bool, link HCLink) (bool, error) {
+	d, kinds, wroteIn, err := g.graph(mixer, prev, combine, link)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if g.rec.add(ownHC, kinds, d) {
-		return nil
+		return wroteIn, nil
 	}
 	for i := 0; i < len(d); i += perSubmit {
 		j := minInt(i+perSubmit, len(d))
 		if _, err := vk.DispatchMultiTimed(d[i:j], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: mixer %d dispatch %d-%d: %w", mixer, i, j-1, err)
+			return false, fmt.Errorf("llm: mixer %d after %d, dispatch %d-%d: %w", mixer, prev, i, j-1, err)
 		}
 	}
-	return nil
+	return wroteIn, nil
 }
 
 // RunCombineMix closes mixer `prev` and opens mixer `mixer` in one sequence,
@@ -1360,20 +1570,8 @@ func (g *HCGPU) RunCombineMix(prev, mixer int) error {
 	if prev < 0 {
 		return fmt.Errorf("llm: RunCombineMix needs a mixer to close, not %d", prev)
 	}
-	d, kinds, err := g.graph(mixer, prev, false)
-	if err != nil {
-		return err
-	}
-	if g.rec.add(ownHC, kinds, d) {
-		return nil
-	}
-	for i := 0; i < len(d); i += perSubmit {
-		j := minInt(i+perSubmit, len(d))
-		if _, err := vk.DispatchMultiTimed(d[i:j], 1, 1, true); err != nil {
-			return fmt.Errorf("llm: mixer %d after %d, dispatch %d-%d: %w", mixer, prev, i, j-1, err)
-		}
-	}
-	return nil
+	_, err := g.run(mixer, prev, false, HCLink{})
+	return err
 }
 
 // Stage is one timed dispatch of a profile.
@@ -1396,7 +1594,7 @@ func Elapsed(st []Stage) time.Duration {
 // measurement of the block: it carries the upload and the read-back, and this
 // arena reads at 0.2 GB/s.
 func (g *HCGPU) Profile(mixer int, combine bool, iters int) ([]Stage, error) {
-	d, kinds, err := g.graph(mixer, -1, combine)
+	d, kinds, _, err := g.graph(mixer, -1, combine, HCLink{})
 	if err != nil {
 		return nil, err
 	}
@@ -1426,7 +1624,7 @@ func (g *HCGPU) ProfileSweep(combine bool, iters int) ([]Stage, error) {
 	if iters <= 0 {
 		iters = 1
 	}
-	_, kinds, err := g.graph(0, -1, combine)
+	_, kinds, _, err := g.graph(0, -1, combine, HCLink{})
 	if err != nil {
 		return nil, err
 	}
@@ -1434,7 +1632,7 @@ func (g *HCGPU) ProfileSweep(combine bool, iters int) ([]Stage, error) {
 	for k := range kinds {
 		var d []vk.MultiDispatch
 		for m := range g.mixers {
-			dm, _, err := g.graph(m, -1, combine)
+			dm, _, _, err := g.graph(m, -1, combine, HCLink{})
 			if err != nil {
 				return nil, err
 			}

@@ -18,6 +18,17 @@ package llm
 // **3.6% of the graph at ubatch 2048**, against the 22.7% it replaces. A
 // shared arena would buy that last 3.6% and nothing else, so it is written
 // down here rather than built.
+//
+// **P22b (2026-09-30) deleted most of them another way.** At decode the 196
+// moves were 0.54 ms of a 25 ms token — the largest weightless item P19
+// counted — and the kernel on either side of the boundary can bind the
+// other block's arena instead: `HCLink` in gpu.go. The combine reads a
+// sublayer's output where it lies, and the decode up GEMV writes the next
+// sublayer's A operand directly, each through a pipeline built per foreign
+// buffer as the ones here are. What is left to this kernel is the padded
+// GEMM's output at prefill, the PLE block's wide residual, the final row
+// move and the head's input: four a decode step. `LLM_HC_MOVES=1` is the
+// control that keeps every move.
 
 import (
 	"fmt"

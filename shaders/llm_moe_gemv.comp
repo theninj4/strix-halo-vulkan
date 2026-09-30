@@ -37,8 +37,11 @@
 //   workgroup rather than once per K-step;
 //
 //   **the loads** — a lane's dwords are independent of each other and of
-//   every barrier, so the whole row's worth of loads is in flight at once
-//   instead of one K-step's being issued and immediately consumed (§2.7).
+//   every barrier, so the whole row's worth of loads can be in flight at
+//   once instead of one K-step's being issued and immediately consumed
+//   (§2.7). **As compiled it was not, until P21c** (research/
+//   p19-decode-attribution.md Finding 5): the down mode's lane was five
+//   trips of two loads and a `vmcnt(0)` each. See `Raw` below.
 //
 // **It is a decode kernel and it says so.** A tile is (expert, row block) and
 // this reads ROWS rows of it from the base — one when the batch is a single
@@ -239,16 +242,102 @@ struct W8 {
     uint kLo;
     uint kHi;
 #if QFMT == FMT_IQ4NL
-    float scale;    // the block's, applied to the dword's sum as before
+    float scale;    // the block's, applied to the dword's dot as before
 #endif
 };
 
+// **The loads are split from the unpack, and P21c is why.** As one function
+// a trip was two or three `buffer_load_b32` and then `s_waitcnt vmcnt(0)`
+// before the first nibble moved, and the down mode's lane walks its row in
+// five such trips (K = 640 at LPR 16): five serial DRAM round trips a lane,
+// behind a barrier that was itself three more, on a dispatch of 1600
+// workgroups that ran at 174 GB/s. `loadDword` is the words a dword needs
+// and nothing else; `unpackRaw` is the arithmetic on them. The down mode
+// issues every trip's words before it unpacks any (`TRIPS` below); the up
+// mode's Q4_K path walks quads and is unchanged.
+struct Raw {
+    uint w0, w1, w2;
+};
+
 #if QFMT == FMT_Q4_K
-W8 unpackDword(uint rb, uint d) {
+Raw loadDword(uint rb, uint d) {
+    uint sb = d >> 5;
+    uint ll = d & 31u;
+    uint hw = (rb + sb * QB) >> 2;
+    Raw o;
+    o.w0 = hw;                              // the header's word index; read at unpack
+    o.w1 = qbank[hw + 4u + ll];
+    o.w2 = 0u;
+    return o;
+}
+#elif QFMT == FMT_Q5_K
+Raw loadDword(uint rb, uint d) {
+    uint sb = d >> 5;
+    uint ll = d & 31u;
+    uint hw = (rb + sb * QB) >> 2;
+    Raw o;
+    o.w0 = hw;
+    o.w1 = qbank[hw + 4u + (ll & 7u)];
+    o.w2 = qbank[hw + 12u + ll];
+    return o;
+}
+#elif QFMT == FMT_Q5_1
+Raw loadDword(uint rb, uint d) {
+    uint m = d >> 2;
+    uint qq = d & 3u;
+    uint hw = (rb + m * QB) >> 2;
+    Raw o;
+    o.w0 = qbank[hw];
+    o.w1 = qbank[hw + 1u];
+    o.w2 = qbank[hw + 2u + qq];
+    return o;
+}
+#elif QFMT == FMT_Q4_1
+Raw loadDword(uint rb, uint d) {
+    uint m = d >> 2;
+    uint qq = d & 3u;
+    uint hw = (rb + m * QB) >> 2;
+    Raw o;
+    o.w0 = qbank[hw];
+    o.w1 = qbank[hw + 1u + qq];
+    o.w2 = 0u;
+    return o;
+}
+#elif QFMT == FMT_IQ4NL
+Raw loadDword(uint rb, uint d) {
+    uint m = d >> 2;
+    uint qq = d & 3u;
+    uint pw = (rb + (m >> 1) * 36u) >> 2;
+    Raw o;
+    o.w0 = qbank[pw];
+    o.w1 = qbank[pw + 1u + (m & 1u) * 4u + qq];
+    o.w2 = 0u;
+    return o;
+}
+#else
+Raw loadDword(uint rb, uint d) {
+    uint m = d >> 3;
+    uint qq = d & 7u;
+    uint blk = rb + m * QB;
+    uint hw = blk >> 2;
+    uint base = blk + 2u;
+    uint bw = (base >> 2) + qq;
+    Raw o;
+    o.w0 = qbank[hw];
+    o.w1 = qbank[bw];
+    // The second word only when the payload straddles two (an odd block);
+    // an even one re-reads the first, so the row's last dword never reads
+    // past the tensor.
+    o.w2 = qbank[bw + ((base & 2u) >> 1)];
+    return o;
+}
+#endif
+
+#if QFMT == FMT_Q4_K
+W8 unpackRaw(Raw r, uint d) {
     uint sb = d >> 5;               // which 256-element super-block
     uint ll = d & 31u;              // which of its 32 payload dwords
-    uint blk = rb + sb * QB;
-    uint hw = blk >> 2;
+    uint hw = r.w0;
     vec2 dd = unpackHalf2x16(qbank[hw]);
     uvec3 s = uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]);
     // A dword's four bytes are one 32-element sub-block in their low nibbles
@@ -260,7 +349,7 @@ W8 unpackDword(uint rb, uint d) {
     scaleMinK4(2u * g + 1u, s, sc1, mn1);
     float ds0 = dd.x * float(sc0), dm0 = dd.y * float(mn0);
     float ds1 = dd.x * float(sc1), dm1 = dd.y * float(mn1);
-    uint w = qbank[hw + 4u + ll];
+    uint w = r.w1;
     W8 o;
     o.kLo = sb * QK + g * 64u + (ll & 7u) * 4u;
     o.kHi = o.kLo + 32u;
@@ -272,11 +361,10 @@ W8 unpackDword(uint rb, uint d) {
     return o;
 }
 #elif QFMT == FMT_Q5_K
-W8 unpackDword(uint rb, uint d) {
+W8 unpackRaw(Raw r, uint d) {
     uint sb = d >> 5;
     uint ll = d & 31u;
-    uint blk = rb + sb * QB;
-    uint hw = blk >> 2;
+    uint hw = r.w0;
     vec2 dd = unpackHalf2x16(qbank[hw]);
     uvec3 s = uvec3(qbank[hw + 1u], qbank[hw + 2u], qbank[hw + 3u]);
     uint g = ll >> 3;
@@ -288,8 +376,8 @@ W8 unpackDword(uint rb, uint d) {
     // The fifth bit of element j of the super-block is bit (j >> 5) of
     // qh[j & 31], and a dword's eight elements share one qh byte per byte of
     // payload — so one dword of qh covers this lane's four.
-    uint h = qbank[hw + 4u + (ll & 7u)];
-    uint w = qbank[hw + 12u + ll];
+    uint h = r.w1;
+    uint w = r.w2;
     W8 o;
     o.kLo = sb * QK + g * 64u + (ll & 7u) * 4u;
     o.kHi = o.kLo + 32u;
@@ -304,14 +392,12 @@ W8 unpackDword(uint rb, uint d) {
     return o;
 }
 #elif QFMT == FMT_Q5_1
-W8 unpackDword(uint rb, uint d) {
+W8 unpackRaw(Raw r, uint d) {
     uint m = d >> 2;                // which 32-element block
     uint qq = d & 3u;               // which of its four payload dwords
-    uint blk = rb + m * QB;
-    uint hw = blk >> 2;
-    vec2 dm = unpackHalf2x16(qbank[hw]);
-    uint qh = qbank[hw + 1u];
-    uint w = qbank[hw + 2u + qq];
+    vec2 dm = unpackHalf2x16(r.w0);
+    uint qh = r.w1;
+    uint w = r.w2;
     uint j0 = qq * 4u;
     W8 o;
     o.kLo = m * QK + j0;
@@ -330,12 +416,11 @@ W8 unpackDword(uint rb, uint d) {
 // Q4_1 is the one format in this block with no addressing question at all:
 // twenty bytes a block keeps every block four-aligned, and the nibble pairs
 // split 0..15 / 16..31 exactly as Q5_1's do.
-W8 unpackDword(uint rb, uint d) {
+W8 unpackRaw(Raw r, uint d) {
     uint m = d >> 2;                // which 32-element block
     uint qq = d & 3u;               // which of its four payload dwords
-    uint hw = (rb + m * QB) >> 2;
-    vec2 dm = unpackHalf2x16(qbank[hw]);
-    uint w = qbank[hw + 1u + qq];
+    vec2 dm = unpackHalf2x16(r.w0);
+    uint w = r.w1;
     W8 o;
     o.kLo = m * QK + qq * 4u;
     o.kHi = o.kLo + 16u;
@@ -359,15 +444,14 @@ W8 unpackDword(uint rb, uint d) {
 // block of sixty-four different rows per K-step and a split scale doubles the
 // lines it opens. **36 is a multiple of four and keeps a block's scale beside
 // its own nibbles**, which is the arrangement both kernels want.
-W8 unpackDword(uint rb, uint d) {
+W8 unpackRaw(Raw r, uint d) {
     uint m = d >> 2;                    // which 32-element block
     uint qq = d & 3u;                   // which of its four payload dwords
     // The pair's record: two scales in the first word, then two 16-byte
-    // nibble groups.
-    uint pw = (rb + (m >> 1) * 36u) >> 2;
-    vec2 dd = unpackHalf2x16(qbank[pw]);
+    // nibble groups (loadDword).
+    vec2 dd = unpackHalf2x16(r.w0);
     float dq = ((m & 1u) == 0u) ? dd.x : dd.y;
-    uint w = qbank[pw + 1u + (m & 1u) * 4u + qq];
+    uint w = r.w1;
     W8 o;
     o.kLo = m * QK + qq * 4u;
     o.kHi = o.kLo + 16u;
@@ -386,16 +470,16 @@ W8 unpackDword(uint rb, uint d) {
 // Q8_0's 34-byte block is the one that is not word-aligned below the row: the
 // int8s start at an offset of 2 mod 4 on every other block, so a payload
 // dword comes out of a two-word rotating window.
-W8 unpackDword(uint rb, uint d) {
+W8 unpackRaw(Raw r, uint d) {
     uint m = d >> 3;
     uint qq = d & 7u;
-    uint blk = rb + m * QB;
-    uint hw = blk >> 2;
-    vec2 dd = unpackHalf2x16(qbank[hw]);
-    float dq = ((blk & 2u) == 0u) ? dd.x : dd.y;
-    uint base = blk + 2u;
-    uint bw = (base >> 2) + qq;
-    uint w = ((base & 2u) != 0u) ? ((qbank[bw] >> 16) | (qbank[bw + 1u] << 16)) : qbank[bw];
+    // Only the block's parity matters below, and QB is 34, so it is m's:
+    // an even block starts on a word and its int8s, two bytes in, straddle
+    // two; an odd block starts two bytes in and its int8s are word-aligned.
+    bool odd = (m & 1u) != 0u;
+    vec2 dd = unpackHalf2x16(r.w0);
+    float dq = odd ? dd.y : dd.x;
+    uint w = odd ? r.w1 : ((r.w1 >> 16) | (r.w2 << 16));
     W8 o;
     o.kLo = m * QK + qq * 4u;
     o.kHi = o.kLo;
@@ -407,6 +491,8 @@ W8 unpackDword(uint rb, uint d) {
     return o;
 }
 #endif
+
+W8 unpackDword(uint rb, uint d) { return unpackRaw(loadDword(rb, d), d); }
 
 // dotRow is one row of A against an unpacked dword: the fused function's
 // sum, term for term.
@@ -467,6 +553,16 @@ Q4KQuad loadQuad(uint rb, uint q) {
     return o;
 }
 
+// **The up mode keeps its loop as it is, and P21c measured why.** The same
+// treatment the down mode gets below — the header and payload loads of
+// both matrices issued together, the scale decode's `j < 4` as selects, the
+// row guard as a multiply — put four `buffer_load_b128` in flight a quad
+// where the shipped loop waits after each, and read **+1.5 µs a dispatch
+// slower** in the whole model (100.4 → 102.0, two pairs; the step 25.12 →
+// 25.19). At 20 MB a dispatch and 202 GB/s this loop is at the bus the big
+// dense GEMVs reach and is not short of loads in flight; what the change
+// bought was VALU at ~900 MHz (P21b's lesson again).
+
 // dotQuad is one row of A against a quad. The nibbles are unpacked per row
 // rather than held unpacked across rows: thirty-two floats a quad per mode
 // would be the kernel's registers, and a tile's rows past the first are rare
@@ -492,23 +588,58 @@ void main() {
     uint tileIdx = gl_WorkGroupID.y;
     // The grid is the same static upper bound the GEMM's is, and the same
     // early return: the schedule's real length lives on the device.
-    if (tileIdx >= actu[pc.moeTileOff]) {
+    //
+    // **The shared expert is the schedule's last tile** (TODO.md P22, the
+    // eleventh tile). It is the same shape as a routed expert and runs for
+    // every token, and until P22 it was two dispatches of its own — one
+    // group of the same kernel over the identity permutation at the front
+    // of the row space — at half the bus, because a 1-2 MB dispatch is
+    // mostly launch and tail (research/p19-decode-attribution.md). When the
+    // host names its bank in MOE_SH_B (NO_W otherwise) the dispatch carries
+    // one tile past the routed count, whose record is not in the list: its
+    // rows are the reserve at the front of the row space (the identity the
+    // host wrote), every token of the batch is real, and its bank rows are
+    // MOE_SH_B's rather than expert-major rows of `bOff`. The host only does
+    // it when the shared bank is the routed bank's format, since the format
+    // is compiled in.
+    uint nTiles = actu[pc.moeTileOff];
+    bool shTile = false;
+    if (MOE_SH_B != NO_W) {
+        if (tileIdx > nTiles) {
+            return;
+        }
+        shTile = (tileIdx == nTiles);
+    } else if (tileIdx >= nTiles) {
         return;
     }
-    uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
-    uint expert = actu[rec];
-    uint rowStart = actu[rec + 1u];
+    uint expert = 0u;
+    uint rowStart = 0u;
     // The real rows; the rest of the tile is padding (see the header). Every
     // guard below tests ROWS as well, which is a constant, so that a one-row
     // build still compiles to one row's code.
-    uint real = actu[rec + 2u];
+    uint real = pc.tokens;
+    if (!shTile) {
+        uint rec = pc.moeTileOff + 2u + 3u * tileIdx;
+        expert = actu[rec];
+        rowStart = actu[rec + 1u];
+        real = actu[rec + 2u];
+    }
     uint slots = MOE_USED + 1u;
 
     // The row. MODE 0's is some token's row of the block input, named by the
     // permutation; MODE 1's is the permutation position itself, which is what
     // MODE 0 wrote. One row per tile — see the header.
     [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
-        if (r >= ROWS || r >= real) {
+        if (r >= ROWS) {
+            continue;
+        }
+        // A row past the tile's real ones is staged as zeros, so that the
+        // down mode's branch-free consume below multiplies a zero and not
+        // whatever the LDS last held (which can be a NaN).
+        if (r >= real) {
+            for (uint k = tid; k < pc.gemmK; k += LANES) {
+                sA[r * AKMAX + k] = float16_t(0.0);
+            }
             continue;
         }
 #if MODE == 0
@@ -517,8 +648,16 @@ void main() {
 #else
         uint aBase = pc.ctxOff + (rowStart + r) * pc.ldCtx;
 #endif
-        for (uint k = tid; k < pc.gemmK; k += LANES) {
-            sA[r * AKMAX + k] = hact[aBase + k];
+        // Eight halves a load through binding 7 (P21c): a half a load was
+        // 2.5 serial round trips a lane before the barrier at K = 640. The
+        // row base and the stride are whole loads (MoEGPU.build checks).
+        for (uint q = tid; q < (pc.gemmK >> 3); q += LANES) {
+            uvec4 v = hact4[(aBase >> 3) + q];
+            uint k = r * AKMAX + q * 8u;
+            f16vec2 p0 = unpackFloat2x16(v.x), p1 = unpackFloat2x16(v.y);
+            f16vec2 p2 = unpackFloat2x16(v.z), p3 = unpackFloat2x16(v.w);
+            sA[k] = p0.x; sA[k + 1u] = p0.y; sA[k + 2u] = p1.x; sA[k + 3u] = p1.y;
+            sA[k + 4u] = p2.x; sA[k + 5u] = p2.y; sA[k + 6u] = p3.x; sA[k + 7u] = p3.y;
         }
     }
 #if QFMT == FMT_IQ4NL
@@ -531,11 +670,15 @@ void main() {
     uint lane = tid & (LPR - 1u);
     uint n0 = gl_WorkGroupID.x * NCOL + (tid / LPR);
     uint rowBytes = (pc.gemmK / QK) * QB;
-    uint bankRow = expert * pc.gemmN + n0;
-    uint rb0 = pc.bOff + bankRow * rowBytes;
-#if MODE == 0
-    uint rb1 = pc.moeBOff2 + bankRow * rowBytes;
-#endif
+    uint rb0, rb1;
+    if (shTile) {
+        rb0 = MOE_SH_B + n0 * rowBytes;
+        rb1 = MOE_SH_B2 + n0 * rowBytes;
+    } else {
+        uint bankRow = expert * pc.gemmN + n0;
+        rb0 = pc.bOff + bankRow * rowBytes;
+        rb1 = pc.moeBOff2 + bankRow * rowBytes;
+    }
 
     uint nqd = (pc.gemmK / QK) * QSDB;
     // **The row loop is inside the dword loop, and P5c is why.** P5b put it
@@ -579,20 +722,43 @@ void main() {
 #endif
         }
     }
+#elif MODE == 1
+    // Every trip's words in flight before the first unpack (P21c, see
+    // `Raw`). TRIPS is the most dwords a lane can own at this K, from the
+    // compiled AKMAX; a trip past the row re-reads its last dword and adds
+    // nothing.
+#define NQDMAX ((AKMAX / QK) * QSDB)
+#define TRIPS ((NQDMAX + LPR - 1) / LPR)
+    // The consume is branch-free on purpose: under an `if (d < nqd)`, or
+    // under the row guard `r < real`, the compiler sinks each trip's loads
+    // into the branch next to their use, and the wait is back one trip at a
+    // time. A trip past the row and a row past the tile's real ones
+    // multiply by zero instead (the rows are staged as zeros above).
+    Raw raw[TRIPS];
+    [[unroll]] for (uint t = 0u; t < TRIPS; ++t) {
+        raw[t] = loadDword(rb0, min(lane + t * LPR, nqd - 1u));
+    }
+    [[unroll]] for (uint t = 0u; t < TRIPS; ++t) {
+        uint d = lane + t * LPR;
+        float live = (d < nqd) ? 1.0 : 0.0;
+        W8 w0 = unpackRaw(raw[t], min(d, nqd - 1u));
+        [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
+            if (r >= ROWS) {
+                continue;
+            }
+            acc0[r] += ((r < real) ? live : 0.0) * dotRow(w0, r);
+        }
+    }
 #else
     for (uint d = lane; d < nqd; d += LPR) {
         W8 w0 = unpackDword(rb0, d);
-#if MODE == 0
         W8 w1 = unpackDword(rb1, d);
-#endif
         [[unroll]] for (uint r = 0u; r < MAXROWS; r++) {
             if (r >= ROWS || r >= real) {
                 continue;
             }
             acc0[r] += dotRow(w0, r);
-#if MODE == 0
             acc1[r] += dotRow(w1, r);
-#endif
         }
     }
 #endif

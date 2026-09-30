@@ -72,6 +72,18 @@ type GraphOpts struct {
 	// NoHead leaves `output.weight` unstaged, which saves 1.27 GB and 20
 	// seconds for a caller that wants `result_norm` and not logits.
 	NoHead bool
+	// HeadGEMM keeps the head on its GEMM at one row, where P19 (2026-09-30)
+	// runs `llm_gemv.comp` by default. The GEMV is a different rounding
+	// (one fewer a weight), so a gate that compares one-row logits with
+	// multi-row ones to the last place sets this: it is testing the graph's
+	// mechanics, and the head's kernel is priced by its own test.
+	HeadGEMM bool
+	// HCMoves keeps the four moves a layer that P22b (2026-09-30) deleted:
+	// the sublayer's A operand written by the mixer's decode GEMV and its
+	// output read by the combine where it lies, both through a binding to
+	// the other block's arena (HCLink). The moves are the control arm;
+	// `LLM_HC_MOVES=1` sets it from the environment.
+	HCMoves bool
 	// HeadRows is how many rows of logits the head's arena holds. One is
 	// what the reference computes and what every caller before L8c wanted:
 	// llama.cpp's graph ends with `inp_out_ids`, so prefill projects the
@@ -174,6 +186,8 @@ type Graph struct {
 	moe  *MoEGPU
 	head *HeadGPU
 	move *mover
+	// hcMoves is GraphOpts.HCMoves, or LLM_HC_MOVES=1.
+	hcMoves bool
 
 	pleCfg PLEConfig
 	hasPLE bool
@@ -591,7 +605,8 @@ func NewGraph(dev *vk.Device, m *Model, opts GraphOpts) (*Graph, error) {
 		return nil, fmt.Errorf("llm: GraphOpts.Slots and Speculative share the carried state's slot index; pick one")
 	}
 	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV,
-		slots: slots, parked: make([]seqState, slots), ropeHW: make([]int, slots)}
+		slots: slots, parked: make([]seqState, slots), ropeHW: make([]int, slots),
+		hcMoves: opts.HCMoves || os.Getenv("LLM_HC_MOVES") == "1"}
 
 	if err := g.stage(dev, opts); err != nil {
 		g.Destroy()
@@ -812,6 +827,9 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 		}
 		if g.head, err = NewHeadGPUBank(dev, c.NEmbd, t, headRows, bank, sim); err != nil {
 			return fmt.Errorf("llm: head: %w", err)
+		}
+		if opts.HeadGEMM {
+			g.head.DecodeGEMV(false)
 		}
 		mark("lm head", 1, g.head.Buffers(), g.head.WeightBytes(), g.head.ActivationBytes(), start)
 		freeHost()
@@ -2129,29 +2147,52 @@ func (g *Graph) layers(nTok, nLayer int, pleEmbd []float32, t0 time.Time) (time.
 	// which moves the residual out of this arena and back, flushes; the end
 	// of the pass flushes, because the final mixer is reached through a row
 	// move in `hidden`. Everything else absorbs, which is 94 of the 96.
+	//
+	// P22b: the ports. A held combine remembers where the sublayer left its
+	// output (`pendingOut`), and the mixer that absorbs or flushes it reads
+	// that arena directly; the mixer's own output goes into the next
+	// sublayer's A operand when the decode GEMV is the rung (`wroteIn`),
+	// and is moved there otherwise. With `hcMoves` both ports are empty
+	// and every move is issued, which is the control.
 	pending := -1
+	var pendingOut Port
 	flushHC := func() error {
 		if pending < 0 {
 			return nil
 		}
-		m := pending
-		pending = -1
-		return g.hc.RunCombine(m)
+		m, out := pending, pendingOut
+		pending, pendingOut = -1, Port{}
+		return g.hc.RunCombineFrom(m, out)
 	}
 	fuse := HCFuse()
-	mixHC := func(m int) error {
+	mixHC := func(m int, in Port) (bool, error) {
+		if g.hcMoves {
+			in = Port{}
+		}
 		if pending < 0 {
-			return g.hc.Run(m, false)
+			return g.hc.RunLinked(m, -1, HCLink{In: in})
 		}
 		if !fuse {
 			if err := flushHC(); err != nil {
-				return err
+				return false, err
 			}
-			return g.hc.Run(m, false)
+			return g.hc.RunLinked(m, -1, HCLink{In: in})
 		}
-		p := pending
-		pending = -1
-		return g.hc.RunCombineMix(p, m)
+		p, out := pending, pendingOut
+		pending, pendingOut = -1, Port{}
+		return g.hc.RunLinked(m, p, HCLink{In: in, Out: out})
+	}
+	// leave is where a sublayer's output stays for the combine that closes
+	// it: in its own arena, linked, or moved into the mixer's.
+	leave := func(out Port, nTok int, t0 time.Time) (time.Time, error) {
+		if !g.hcMoves {
+			pendingOut = out
+			return t0, nil
+		}
+		if err := g.move.Move(g.hc.BlockOutPort(), out, nTok); err != nil {
+			return t0, err
+		}
+		return g.blk(&g.Stats.Move, t0), nil
 	}
 
 	for l := 0; l < nLayer; l++ {
@@ -2181,40 +2222,52 @@ func (g *Graph) layers(nTok, nLayer int, pleEmbd []float32, t0 time.Time) (time.
 			t0 = g.blk(&g.Stats.Move, t0)
 		}
 
-		// The attention half.
-		if err := mixHC(2 * l); err != nil {
+		// The attention half. The sublayer's Resize comes first because
+		// its InPort's row block is what the linked mixer zero-pads to.
+		in, out, run, stat, err := g.sublayerPorts(l, nTok)
+		if err != nil {
+			return t0, err
+		}
+		t0 = since(&g.Stats.Glue, t0)
+		wroteIn, err := mixHC(2*l, in)
+		if err != nil {
 			return t0, fmt.Errorf("llm: layer %d attn mix: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.HC, t0)
-		t1, err := g.sublayer(l, nTok, t0)
+		t1, err := g.sublayer(l, nTok, in, run, stat, wroteIn, t0)
 		if err != nil {
 			return t0, err
 		}
 		t0 = t1
 		pending = 2 * l
+		if t0, err = leave(out, nTok, t0); err != nil {
+			return t0, err
+		}
 
 		// The FFN half, which every layer has.
-		if err := mixHC(2*l + 1); err != nil {
-			return t0, fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
-		}
-		t0 = g.blk(&g.Stats.HC, t0)
 		if err := g.moe.Resize(nTok); err != nil {
 			return t0, err
 		}
 		t0 = since(&g.Stats.Glue, t0)
-		if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), nTok); err != nil {
-			return t0, err
+		wroteIn, err = mixHC(2*l+1, g.moe.InPort())
+		if err != nil {
+			return t0, fmt.Errorf("llm: layer %d ffn mix: %w", l, err)
 		}
-		t0 = g.blk(&g.Stats.Move, t0)
+		t0 = g.blk(&g.Stats.HC, t0)
+		if !wroteIn {
+			if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), nTok); err != nil {
+				return t0, err
+			}
+			t0 = g.blk(&g.Stats.Move, t0)
+		}
 		if err := g.moe.Run(l); err != nil {
 			return t0, fmt.Errorf("llm: layer %d moe: %w", l, err)
 		}
 		t0 = g.blk(&g.Stats.MoE, t0)
-		if err := g.move.Move(g.hc.BlockOutPort(), g.moe.OutPort(), nTok); err != nil {
+		pending = 2*l + 1
+		if t0, err = leave(g.moe.OutPort(), nTok, t0); err != nil {
 			return t0, err
 		}
-		t0 = g.blk(&g.Stats.Move, t0)
-		pending = 2*l + 1
 	}
 	if err := flushHC(); err != nil {
 		return t0, fmt.Errorf("llm: last combine: %w", err)
@@ -2227,44 +2280,41 @@ func (g *Graph) layers(nTok, nLayer int, pleEmbd []float32, t0 time.Time) (time.
 // output in the hyper-connection block's arena for the combine, and returning
 // the clock it left off at.
 //
-// Nothing here is a host tensor. The mixer's output is moved into the layer's
-// fp16 A operand by one dispatch and the layer's output is moved back by
-// another; `Resize` is only the length of the run and whatever a Move will
-// not reach.
-func (g *Graph) sublayer(l, nTok int, t0 time.Time) (time.Time, error) {
+// Nothing here is a host tensor. Until P22b the mixer's output was moved
+// into the layer's fp16 A operand by one dispatch and the layer's output
+// moved back by another; `Resize` is only the length of the run and
+// whatever a Move will not reach.
+//
+// P22b split it in two: `sublayerPorts` sizes the block and names its ports
+// so that the mixer before it can write its A operand directly, and
+// `sublayer` runs it, moving the input only when the mixer did not
+// (`wroteIn`). The output stays where the block left it; the combine reads
+// it there (`leave` in `layers`).
+func (g *Graph) sublayerPorts(l, nTok int) (in, out Port, run func() error, stat *time.Duration, err error) {
 	k := g.kinds[l]
-	var in, out Port
-	var run func() error
 	if k.attn {
 		if err := g.attn.Resize(nTok); err != nil {
+			return in, out, nil, nil, err
+		}
+		return g.attn.InPort(), g.attn.OutPort(), func() error { return g.attn.Run(k.idx) }, &g.Stats.Attn, nil
+	}
+	if err := g.dn.Resize(nTok); err != nil {
+		return in, out, nil, nil, err
+	}
+	return g.dn.InPort(), g.dn.OutPort(), func() error { return g.dn.Run(k.idx) }, &g.Stats.DeltaNet, nil
+}
+
+func (g *Graph) sublayer(l, nTok int, in Port, run func() error, stat *time.Duration, wroteIn bool, t0 time.Time) (time.Time, error) {
+	if !wroteIn {
+		if err := g.move.Move(in, g.hc.MixedPort(), nTok); err != nil {
 			return t0, err
 		}
-		in, out = g.attn.InPort(), g.attn.OutPort()
-		run = func() error { return g.attn.Run(k.idx) }
-	} else {
-		if err := g.dn.Resize(nTok); err != nil {
-			return t0, err
-		}
-		in, out = g.dn.InPort(), g.dn.OutPort()
-		run = func() error { return g.dn.Run(k.idx) }
+		t0 = g.blk(&g.Stats.Move, t0)
 	}
-	t0 = since(&g.Stats.Glue, t0)
-	if err := g.move.Move(in, g.hc.MixedPort(), nTok); err != nil {
-		return t0, err
-	}
-	t0 = g.blk(&g.Stats.Move, t0)
 	if err := run(); err != nil {
 		return t0, fmt.Errorf("llm: layer %d sublayer: %w", l, err)
 	}
-	if k.attn {
-		t0 = g.blk(&g.Stats.Attn, t0)
-	} else {
-		t0 = g.blk(&g.Stats.DeltaNet, t0)
-	}
-	if err := g.move.Move(g.hc.BlockOutPort(), out, nTok); err != nil {
-		return t0, err
-	}
-	return g.blk(&g.Stats.Move, t0), nil
+	return g.blk(stat, t0), nil
 }
 
 // Prerecorded reports whether a captured decode step is live — the P1c fast

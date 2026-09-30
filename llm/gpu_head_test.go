@@ -219,6 +219,11 @@ func headBankGemv(t *testing.T, spec string) {
 		t.Fatal(err)
 	}
 	defer g.Destroy()
+	// P19 puts one row on the GEMV by itself; the GEMM is the reference here,
+	// so pin it before the first row goes up.
+	if err := g.SetGEMV(GEMVOff); err != nil {
+		t.Fatal(err)
+	}
 
 	x := make([]float32, nEmbd)
 	for i := range x {

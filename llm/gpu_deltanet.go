@@ -1605,9 +1605,15 @@ func DNPrefetches(k DNKernel) bool {
 // arena the moves went 5.5 -> 19.7 µs and the qkv projection after each one
 // 120 -> 233 µs, 8.6 ms of a 41 ms token, and that was the whole of what a
 // wide `-llm-batch` cost decode. No rung reads past `roundUp(rows, rowAlign)`.
+//
+// On the decode GEMV the row block is the run itself (P22b): the rung reads
+// ROWS rows of A and not one more, so nothing past them needs zeroing.
 func (g *DeltaNetGPU) InPort() Port {
-	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd,
-		Rows: roundUpInt(g.rows, g.rowAlign), Half: true}
+	rows := roundUpInt(g.rows, g.rowAlign)
+	if g.qkvGemv != GEMVOff {
+		rows = g.rows
+	}
+	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.cfg.NEmbd, Rows: rows, Half: true}
 }
 
 // OutPort is the layer's output, `linear_attn_out`: fp32 [T][nEmbd].

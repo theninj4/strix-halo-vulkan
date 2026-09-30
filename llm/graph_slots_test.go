@@ -24,7 +24,9 @@ import (
 // interleave never reached the state it claims to separate.
 func TestGraphSlotsAreSequences(t *testing.T) {
 	const steps = 24
-	g, _, ids := graphFixture(t, GraphOpts{Layers: 4, Slots: 2})
+	// Solo one-row steps against interleaved ones to the last place: the head
+	// stays on the GEMM (GraphOpts.HeadGEMM, P19).
+	g, _, ids := graphFixture(t, GraphOpts{Layers: 4, Slots: 2, HeadGEMM: true})
 	if g.Slots() != 2 {
 		t.Fatalf("staged %d slots", g.Slots())
 	}

@@ -50,7 +50,9 @@ func TestGraphCheckpointIsThePrefill(t *testing.T) {
 
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
-	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: chunk, NKV: nKV, Layers: layers, Slots: 2})
+	// Decode rows against prefill rows to the last place: the head stays on
+	// the GEMM (GraphOpts.HeadGEMM, P19).
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: chunk, NKV: nKV, Layers: layers, Slots: 2, HeadGEMM: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +256,7 @@ func TestGraphStaleValuesAreUnread(t *testing.T) {
 	}
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
-	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: chunk, NKV: nKV, Layers: layers})
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: chunk, NKV: nKV, Layers: layers, HeadGEMM: true})
 	if err != nil {
 		t.Fatal(err)
 	}

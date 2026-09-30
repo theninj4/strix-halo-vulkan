@@ -26,6 +26,8 @@ package llm
 
 import (
 	"fmt"
+	"os"
+	"sync"
 	"unsafe"
 
 	"time"
@@ -85,6 +87,10 @@ type HeadGPU struct {
 
 	gemm     GEMMKernel
 	autoPlan bool
+	// decodeGEMV is P19's default: one row on a quantised bank runs the
+	// GEMV. `DecodeGEMV(false)` (GraphOpts.HeadGEMM, or LLM_HEAD_GEMM=1 for
+	// every head) keeps the GEMM there.
+	decodeGEMV bool
 }
 
 // NewHeadGPU stages `output.weight` in the fragment tiling, as L8's int8 and
@@ -134,7 +140,7 @@ func NewHeadGPUBank(dev *vk.Device, nEmbd int, w *gguf.Tensor, maxRows int,
 		lda:      nEmbd + gemmPad,
 		gemm:     OutGEMMKernelFor(maxRows),
 		gemv:     GEMVOff,
-		autoPlan: true,
+		autoPlan: true, decodeGEMV: !headGEMMAtDecode(),
 	}
 	align := 1
 	for _, v := range gemmBuildsFor(bank) {
@@ -394,13 +400,11 @@ func (g *HeadGPU) Upload(x []float32, rows int) error {
 	if len(x) != rows*g.nEmbd {
 		return fmt.Errorf("llm: head input is %d values, want %d", len(x), rows*g.nEmbd)
 	}
-	if g.gemv != GEMVOff && rows != 1 {
+	if !g.autoPlan && g.gemv != GEMVOff && rows != 1 {
 		return fmt.Errorf("llm: the GEMV reads one row, not %d (D15)", rows)
 	}
 	g.rows = rows
-	if g.autoPlan {
-		g.gemm = OutGEMMKernelFor(rows)
-	}
+	g.plan()
 	slab := make([]uint16, rows*g.lda)
 	narrowRows(slab, x, rows, g.nEmbd, g.lda)
 	g.hbuf.WriteUint16At(int(g.hXn), slab)
@@ -441,8 +445,12 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 
 // SetGEMV puts the projection on `llm_gemv.comp` at one row, or GEMVOff back
 // on the GEMM. Only KSLABS = 1 is built here (see build), and only on a
-// quantised bank.
+// quantised bank. Since P19 `plan` picks the GEMV at one row by itself, so
+// this is for pinning an arm: the bench's ladder and the test's control.
 func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
+	// Either way the choice is pinned: `plan` stops choosing for the row
+	// count once a caller has.
+	g.autoPlan = false
 	if k == GEMVOff {
 		g.gemv = k
 		return nil
@@ -517,12 +525,38 @@ func (g *HeadGPU) Resize(rows int) error {
 	if rows <= 0 || rows > g.tokens {
 		return fmt.Errorf("llm: %d rows, the head arena is built for %d", rows, g.tokens)
 	}
-	if g.gemv != GEMVOff && rows != 1 {
+	if !g.autoPlan && g.gemv != GEMVOff && rows != 1 {
 		return fmt.Errorf("llm: the GEMV reads one row, not %d (D15)", rows)
 	}
 	g.rows = rows
-	if g.autoPlan {
-		g.gemm = OutGEMMKernelFor(rows)
-	}
+	g.plan()
 	return nil
 }
+
+// plan picks the kernel for the row count when nothing pinned one: the GEMM
+// rung for the width, and at **one row on a quantised bank the decode GEMV**
+// (P19, 2026-09-30). The head was the last projection still on the padded
+// GEMM at decode — 2.37 ms a token at 185 GB/s on the 437 MB q5_k bank,
+// where `llm_gemv.comp`'s K1 rung reads the same bytes at 210 (L8c's ladder,
+// results/l8c_head.csv). The arithmetic is the GEMV's: one fewer rounding a
+// weight than the GEMM, bounded by TestHeadGPUQ4Gemv. `LLM_HEAD_GEMM=1` keeps
+// the GEMM at one row, which is the control arm.
+func (g *HeadGPU) plan() {
+	if !g.autoPlan {
+		return
+	}
+	g.gemm = OutGEMMKernelFor(g.rows)
+	g.gemv = GEMVOff
+	if g.rows == 1 && g.bank != BankFP16 && g.decodeGEMV {
+		g.gemv = GEMVK1
+	}
+}
+
+// DecodeGEMV turns the one-row GEMV on or off for `plan` (on by default on
+// a quantised bank; see GraphOpts.HeadGEMM), and re-plans the current rows.
+func (g *HeadGPU) DecodeGEMV(on bool) {
+	g.decodeGEMV = on
+	g.plan()
+}
+
+var headGEMMAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_HEAD_GEMM") == "1" })

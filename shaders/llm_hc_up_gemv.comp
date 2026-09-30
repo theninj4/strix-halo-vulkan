@@ -1,0 +1,219 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// The hyper-connection **up projection at one token**: TODO.md P21a, from
+// P19's attribution.
+//
+// `llm_gemm.comp` MODE 1 is the up projection with its collapse: gate =
+// sigmoid([wide, lowRank] * lo), then mixed[i] = mean_c(xn[c][i] * gate[c][i])
+// over the four streams of one feature, which the host's `packUpB`
+// permutation puts sixteen columns apart in the same 64-column block. At
+// prefill that is the right kernel. **At decode it was the last projection
+// still on the padded GEMM**: 97 dispatches a token, each reading a 2.25 MB
+// bank through a sixteen-row fragment holding one row, at **125 GB/s** —
+// 1.75 ms of a 26.7 ms step, the largest single loss under the bus P19
+// found (research/p19-decode-attribution.md).
+//
+// This is the same dot product as `llm_gemv.comp`'s Q4 arm on the same
+// fragment tiling and the same 4.5/5.5-bit bank, with two things changed
+// for this matrix's shape:
+//
+//   **K is 320, so a lane holds its whole column.** The reduction is twenty
+//   k-tiles — 40 words of nibbles, 10 of fifth bits, a 20-byte record — and
+//   every one of those loads is independent of every other, so they are
+//   issued together before the first multiply: one wave has its 14 KB in
+//   flight at once, and the dispatch is one DRAM latency plus the bytes at
+//   the bus rather than twenty latencies in a row. There is no split of K
+//   and no partial-sum arena; the sigmoid needs the whole sum in one lane.
+//
+//   **A wave is one feature block.** 64 lanes are the 64 columns of one
+//   block — lane c*16 + r is stream c of feature r — so the collapse is
+//   three shuffles into lane c = 0, summed in the same order the GEMM's
+//   epilogue sums them (c = 0, 1, 2, 3), and the wave stores its sixteen
+//   `mixed` values directly. The grid is nEmbd/16 = 160 workgroups.
+//
+// **The record is the ten-group one** (`q4kScaleMin12`, LLM.md L8c-6): the
+// low rank is 320 = ten groups of 32 and one super-block for the whole row,
+// so a column's record is five words rather than four and `nsb` is one.
+//
+// **ROWS is P5b's specialization constant**, as in every decode GEMV: the
+// weight is read once and multiplied into ROWS accumulators against ROWS
+// rows of `lo`, and the epilogue runs once a row. `lo` is staged in LDS for
+// the workgroup — 320 halves a row, read by all 64 lanes.
+//
+// The arithmetic is `llm_gemv.comp`'s, not the GEMM's: the unpacked weight
+// stays an f32 and carries one fewer rounding than the GEMM's LDS store, so
+// the two agree to a tolerance and not to the bit (TestHCGPUUpGemvAgrees).
+
+#include "llm_common.glsl"
+#include "llm_q4k.glsl"
+
+#define TILE 16
+#define WAVE 64
+// Waves a workgroup, each holding a share of the column's k-tiles: the
+// loads of the whole block are still in flight together, and the unpack
+// and multiply — ~2000 VALU instructions a lane for twenty k-tiles, at the
+// ~800 MHz a memory-bound step runs at — is split across the waves rather
+// than serial in one. The partials meet in LDS and wave 0 sums them in
+// order and runs the collapse. Screened in the model (P19, Finding 2): one
+// wave 15.4 µs a dispatch, four 13.5, five 13.3, ten 13.85 — five, four
+// k-tiles a wave, and what is left is the dispatch's fixed cost.
+#ifndef WAVES
+#define WAVES 5
+#endif
+#define LANES (WAVES * WAVE)
+#define KT_PER (KTILES / WAVES)
+// The reduction: lowRank / TILE k-tiles, compiled in so the loads unroll.
+#ifndef KTILES
+#define KTILES 20
+#endif
+// Groups of 32 in the record: KTILES / 2.
+#define GROUPS (KTILES / 2)
+#define REC_WORDS 5u
+
+layout(constant_id = 0) const uint ROWS = 1;
+#ifndef MAXROWS
+#define MAXROWS 3
+#endif
+
+layout(local_size_x = LANES) in;
+
+shared float16_t sLo[MAXROWS * KTILES * TILE];
+shared float sPart[WAVES * MAXROWS * WAVE];
+
+float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
+
+void main() {
+    uint fb = gl_WorkGroupID.x;                 // feature block: sixteen features
+    uint tid = gl_LocalInvocationID.x;
+    uint wave = tid / WAVE;                     // which quarter of K
+    uint lane = tid % WAVE;
+    uint c = lane / TILE;                       // stream
+    uint r = lane % TILE;                       // feature inside the block
+    uint ktA = wave * KT_PER;                   // this wave's first k-tile
+    uint ktiles = pc.gemmK / TILE;              // == KTILES; the host checks
+    uint nt = fb * pc.hc + c;                   // this lane's n-tile (hc is 4)
+    uint col = r;
+
+    // Stage lo: ROWS rows of gemmK halves.
+    for (uint i = tid; i < ROWS * KTILES * TILE; i += LANES) {
+        uint row = i / (KTILES * TILE), k = i % (KTILES * TILE);
+        sLo[i] = hact[pc.loOff + row * pc.ldaLo + k];
+    }
+
+    // The bank: nibble tiles, then P3a's fifth-bit plane, then the records.
+    uint nk = pc.gemmN * pc.gemmK;
+    uint high0 = (pc.bOff + (nk >> 1)) >> 2;
+    uint rec0 = (pc.bOff + (nk >> 1) + QK_HIGH_BYTES(nk)) >> 2;
+    uint qbase = (pc.bOff >> 2) + nt * ktiles * 32u + col * 2u;
+    uint hbi = nt * ktiles * 32u + col * 2u;
+
+    // Everything this lane reads, issued together.
+    uint ridx = rec0 + (nt * TILE + col) * REC_WORDS;
+    uint recD = w8[ridx];
+    uvec4 recS = uvec4(w8[ridx + 1u], w8[ridx + 2u], w8[ridx + 3u], w8[ridx + 4u]);
+    uvec2 wq[KT_PER];
+    uint hq[KT_PER];
+    [[unroll]] for (uint i = 0u; i < KT_PER; i++) {
+        uint kt = ktA + i;
+        wq[i] = uvec2(w8[qbase + kt * 32u], w8[qbase + kt * 32u + 1u]);
+        // Both plane bytes of a k-tile's two words sit in one word: `hbi`
+        // is even, so word index >> 2 is the same for u = 0 and 1.
+        hq[i] = QK_HIGH_WORD(high0, hbi + kt * 32u);
+    }
+    vec2 dd = unpackHalf2x16(recD);
+
+#ifdef XIN
+    // The rows the consumer's row block reaches past the run, zeroed as the
+    // move zeroed them, by the whole workgroup in runs of sixteen halves.
+    // On the shipped decode plan there are none — every consumer's rung
+    // reads ROWS rows and its port says so — so this is the GEMM arm's.
+    for (uint i = tid; i < (HC_XIN_PADROWS - ROWS) * TILE; i += LANES) {
+        xin[pc.outOff + (ROWS + i / TILE) * HC_XIN_STRIDE + fb * TILE + i % TILE] = float16_t(0.0);
+    }
+#endif
+
+    barrier();
+
+    float sum[MAXROWS];
+    [[unroll]] for (uint rr = 0u; rr < MAXROWS; rr++) {
+        sum[rr] = 0.0;
+    }
+    [[unroll]] for (uint i = 0u; i < KT_PER; i++) {
+        uint kt = ktA + i;
+        uint sc, mn;
+        q4kScaleMin12(kt >> 1, recS, sc, mn);
+        float ds = dd.x * float(sc), dm = dd.y * float(mn);
+        [[unroll]] for (uint u = 0u; u < 2u; u++) {
+            uint word = wq[i][u];
+            uint hb = QK_HIGH_BYTE_OF(hq[i], hbi + kt * 32u + u);
+            [[unroll]] for (uint t = 0u; t < 4u; t++) {
+                uint by = bitfieldExtract(word, int(t * 8u), 8);
+                uint e = u * 8u + t * 2u;
+                float wlo = ds * float(QK_LEVEL_LO(by, hb, t)) - dm;
+                float whi = ds * float(QK_LEVEL_HI(by, hb, t)) - dm;
+                [[unroll]] for (uint rr = 0u; rr < MAXROWS; rr++) {
+                    if (rr < ROWS) {
+                        uint x = rr * (KTILES * TILE) + kt * TILE + e;
+                        sum[rr] += wlo * float(sLo[x]);
+                        sum[rr] += whi * float(sLo[x + 1u]);
+                    }
+                }
+            }
+        }
+    }
+
+    // The waves' partials, summed in wave order by wave 0.
+    [[unroll]] for (uint rr = 0u; rr < MAXROWS; rr++) {
+        if (rr < ROWS) {
+            sPart[(wave * MAXROWS + rr) * WAVE + lane] = sum[rr];
+        }
+    }
+    barrier();
+    if (wave != 0u) {
+        return;
+    }
+    [[unroll]] for (uint rr = 0u; rr < MAXROWS; rr++) {
+        if (rr < ROWS) {
+            float t = sPart[rr * WAVE + lane];
+            [[unroll]] for (uint w = 1u; w < WAVES; w++) {
+                t += sPart[(w * MAXROWS + rr) * WAVE + lane];
+            }
+            sum[rr] = t;
+        }
+    }
+
+    // The collapse: sigmoid, then the four streams of feature r into lane
+    // c = 0 in the GEMM epilogue's order.
+    float invHC = 1.0 / float(pc.hc);
+    uint wide = pc.hc * pc.nEmbd;
+    uint feat = fb * TILE + r;
+    [[unroll]] for (uint rr = 0u; rr < MAXROWS; rr++) {
+        if (rr >= ROWS) {
+            continue;
+        }
+        float gv = sigmoidf(sum[rr]);
+        float p = gv * float(hact[pc.xnOff + rr * pc.lda + c * pc.nEmbd + feat]);
+        if (pc.gateOff != NO_W) {
+            act[pc.gateOff + rr * wide + c * pc.nEmbd + feat] = gv;
+        }
+        float s = p;
+        s += subgroupShuffle(p, lane + 16u);
+        s += subgroupShuffle(p, lane + 32u);
+        s += subgroupShuffle(p, lane + 48u);
+        if (c == 0u) {
+#ifdef XIN
+            // Straight into the sublayer's fp16 A operand (P22b): the
+            // narrowing the move did, on the same fp32 value.
+            xin[pc.outOff + rr * HC_XIN_STRIDE + feat] = float16_t(s * invHC);
+#else
+            act[pc.outOff + rr * pc.nEmbd + feat] = s * invHC;
+#endif
+        }
+    }
+}

@@ -64,6 +64,14 @@
 
 #include "llm_common.glsl"
 
+// The block output: this arena's, or the sublayer's own through binding 11
+// (P22b, XOUT in llm_common.glsl). Same floats either way.
+#ifdef XOUT
+#define OUT_LOAD(i) xout[src + (i)]
+#else
+#define OUT_LOAD(i) act[src + (i)]
+#endif
+
 #ifndef TOKEN_FAST
 #define TOKEN_FAST 0
 #endif
@@ -124,7 +132,7 @@ void main() {
     [[unroll]] for (uint j = 0u; j < CN_MAX; j++) {
         uint i = tid + j * CN_LOCAL;
         if (i < n) {
-            blk[j] = act[src + i];
+            blk[j] = OUT_LOAD(i);
             r[j] = act[dst + i];
             gm[j] = wbuf[g + i];
         }
@@ -142,7 +150,7 @@ void main() {
     [[unroll]] for (uint j = 0u; j < CN_MAX; j++) {
         uint i = tid + j * CN_LOCAL;
         if (i < n) {
-            float v = act[dst + i] + act[src + i] * w;
+            float v = act[dst + i] + OUT_LOAD(i) * w;
             act[dst + i] = v;
             r[j] = v;
             sumSq += v * v;

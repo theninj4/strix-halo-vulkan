@@ -53,7 +53,10 @@ func decodeRowsIsEachSlot(t *testing.T, m *Model, nKV int, sparse bool, prompts 
 	const steps = 8
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
-	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: 1024, NKV: nKV, Layers: 4, Slots: 3})
+	// Batched rows against solo one-row steps to the last place: the head
+	// stays on the GEMM (GraphOpts.HeadGEMM, P19), since a batched pass is
+	// the GEMM and a solo step the GEMV.
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: 1024, NKV: nKV, Layers: 4, Slots: 3, HeadGEMM: true})
 	if err != nil {
 		t.Fatal(err)
 	}

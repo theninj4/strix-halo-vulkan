@@ -50,7 +50,10 @@ func TestGraphForwardRows(t *testing.T) {
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
 	start := time.Now()
-	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, Layers: layers, HeadRows: headRows})
+	// One-row logits against multi-row ones to the last place: the head
+	// stays on the GEMM here (GraphOpts.HeadGEMM), and TestGraphHeadDecodeGEMV
+	// below prices the one-row GEMV that decode runs.
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, Layers: layers, HeadRows: headRows, HeadGEMM: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,4 +119,60 @@ func TestGraphForwardRows(t *testing.T) {
 		}
 		t.Logf("row %d: identical to the %d-token prompt's logits, to the last place", tk, tk+1)
 	}
+}
+
+// TestGraphHeadDecodeGEMV prices P19's head at one row: the GEMV
+// (`llm_gemv.comp` K1, decode's default since 2026-09-30) against the GEMM
+// the head ran before, on the same `result_norm`, whole graph. The two are
+// one rounding a weight apart (TestHeadGPUQ4Gemv), so the gate is a
+// tolerance and not identity — and the identity gates above pin the GEMM.
+func TestGraphHeadDecodeGEMV(t *testing.T) {
+	const layers, nTok = 4, 8
+	m, tr := fixtures4k(t)
+	all, _, err := tr.Tokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < nTok {
+		t.Skipf("the 4k trace has %d tokens", len(all))
+	}
+	ids := all[:nTok]
+
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, Layers: layers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(g.Destroy)
+
+	oneRow := func(gemv bool) []float32 {
+		g.head.DecodeGEMV(gemv)
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := g.Forward(ids[:nTok-1]); err != nil {
+			t.Fatal(err)
+		}
+		l, _, err := g.Forward(ids[nTok-1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), l...)
+	}
+	gemm, gemv := oneRow(false), oneRow(true)
+	if g.head.gemv == GEMVOff {
+		t.Fatal("one row on a quantised bank did not plan the GEMV")
+	}
+	r, err := compare(gemv, gemm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.rms/r.refMax > 1e-3 {
+		t.Fatalf("the GEMV head is %v from the GEMM head", r)
+	}
+	if Argmax(gemv) != Argmax(gemm) {
+		t.Errorf("the GEMV head's argmax %d is not the GEMM's %d", Argmax(gemv), Argmax(gemm))
+	}
+	t.Logf("one row, %d layers: the GEMV head against the GEMM head %v", layers, r)
 }

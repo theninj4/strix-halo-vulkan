@@ -120,6 +120,36 @@ layout(binding = 7) readonly buffer HAct4 { uvec4 hact4[]; };
 layout(binding = 5) readonly buffer W8 { uint w8[]; };
 #endif
 
+// **The hyper-connection block's cross-block port** (TODO.md P22b). Every
+// block owns its arenas, so an activation leaving the mixer for a sublayer
+// and coming back for the combine crossed a buffer boundary through
+// `llm_move.comp` — 196 dispatches a decode step, 0.54 ms of a 25 ms token,
+// each of them a copy. The kernel on either side of that boundary can bind
+// the *other* block's arena instead: a compute pipeline here owns its
+// descriptor set, so the host builds one per (kernel, foreign buffer) pair,
+// exactly as the mover did. Binding 11 is that foreign buffer; 5-10 are
+// padded with the bank so the numbering stays the vertical's.
+//
+//   XOUT (llm_hc_cn.comp, llm_hc_combine.comp): the block output the
+//   combine closes on is read from the sublayer's own fp32 arena at
+//   `outOff`, and the same floats as the move copied.
+//
+//   XIN (llm_hc_up_gemv.comp): the mixer's output is written as halves
+//   into the sublayer's fp16 A operand at `outOff`, row stride
+//   HC_XIN_STRIDE, with the rows from ROWS up to HC_XIN_PADROWS zeroed —
+//   `float16_t(v)` on the same fp32 value the move narrowed, so the same
+//   bits. The two borrowed fields are PLE fields the mixer never uses, on
+//   the SEQ_PAST rule: the mapping lives here and nothing spells them at
+//   the call site.
+#ifdef XOUT
+layout(binding = 11) readonly buffer XOut { float xout[]; };
+#endif
+#ifdef XIN
+layout(binding = 11) writeonly buffer XIn { float16_t xin[]; };
+#define HC_XIN_STRIDE  pc.kvOff
+#define HC_XIN_PADROWS pc.gatedOff
+#endif
+
 layout(push_constant) uniform PC {
     // The wide residual, fp32 in the activation arena: [T][hc*nEmbd], which
     // is ggml's [nEmbd, hc, T] read the same way round (ne[0] is fastest).
@@ -318,6 +348,16 @@ layout(push_constant) uniform PC {
     //                 route and permutation kernels, the expert count
     //   gemmK         the reduction extent, which is also what says how many
     //                 quantised blocks a row holds
+    //   gateOff       **llm_moe_gemv.comp only** (P22): the byte offset of
+    //                 the shared expert's first matrix -- its gate for a
+    //                 swiglu dispatch, its down for a down dispatch -- when
+    //                 the dispatch carries the shared expert as one more
+    //                 tile past the routed schedule, or NO_W when it does
+    //                 not. Read as MOE_SH_B; the hyper-connection block's
+    //                 validation gate is never in a MoE push block.
+    //   loOff         MOE_SH_B2, the shared expert's up matrix for that
+    //                 tile (swiglu dispatches only). The hyper-connection
+    //                 block's low-rank gate input, on the same rule.
     uint moePermOff;   // uint: topk[T][used], then the expert-major permutation
     uint moeTileOff;   // uint: the tile count, the per-expert counts, offsets
                        // and tile bases, then 3 uints per (expert, row block)
@@ -339,6 +379,8 @@ layout(push_constant) uniform PC {
 
 #define MOE_USED (pc.moeUsed & 0xffffu)
 #define MOE_BANK (pc.moeUsed >> 16u)
+#define MOE_SH_B pc.gateOff
+#define MOE_SH_B2 pc.loOff
 
 const uint NO_W = 0xffffffffu;
 
