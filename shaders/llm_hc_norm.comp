@@ -23,13 +23,51 @@
 
 #include "llm_common.glsl"
 
+#extension GL_EXT_control_flow_attributes : enable
+
+// **The grid is a stream across and a token down** (KERNELS.md G6, research
+// §5.4), so the workgroups in flight at one moment walk the streams of a few
+// tokens rather than one stream of many. The residual is [T][hc][2560] fp32:
+// a stream's row is 10,240 B, two and a half turns of the 4 KB channel
+// rotation (§5.1b), so it asks the first half of the rotation for three bytes
+// where it asks the second for two; and a token is 40,960 B, ten turns
+// exactly, so a grid walked token-fastest has every workgroup in flight at
+// the same phase and the busier channels saturate at 5/6 of the bus. Streams
+// are 2,048 B of phase apart, so a token's four ask for the two halves evenly.
+// TOKEN_FAST=1 is the control: the same grid, walked the old way.
+#ifndef TOKEN_FAST
+#define TOKEN_FAST 0
+#endif
+// HOIST: every load of the row issued before anything waits on one, and kept
+// in registers. A `for (i = tid; i < n; i += 256)` loop is not unrolled (n is
+// a push constant), so it is one 256-byte request in flight a wave, and a
+// read-modify-write through one binding is load, `s_waitcnt vmcnt(0)`, store
+// even when it is. That is nothing at DRAM sizes and 1.1-1.6x where the
+// arena fits the MALL, which is every decode step. HOIST=0 is the control.
+#ifndef HOIST
+#define HOIST 1
+#endif
+// GUT (pricing only, wrong by construction): 2 keeps a tenth of the stores,
+// 3 drops the residual's read.
+#ifndef GUT
+#define GUT 0
+#endif
+// Registers per thread: nEmbd / 256, rounded up. 2560 is ten.
+#define HC_MAX 10
+
 layout(local_size_x = 256) in;
 
 shared float partials[256];
 
 void main() {
-    uint t = gl_WorkGroupID.x;
-    uint c = gl_WorkGroupID.y;
+#if TOKEN_FAST
+    uint id = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint t = id % gl_NumWorkGroups.y;
+    uint c = id / gl_NumWorkGroups.y;
+#else
+    uint c = gl_WorkGroupID.x;
+    uint t = gl_WorkGroupID.y;
+#endif
     if (t >= pc.tokens) {
         return;
     }
@@ -40,10 +78,30 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
 
     float sumSq = 0.0;
+#if HOIST
+    float r[HC_MAX], gm[HC_MAX];
+    [[unroll]] for (uint j = 0u; j < HC_MAX; j++) {
+        uint i = tid + j * gl_WorkGroupSize.x;
+        if (i < n) {
+#if GUT == 3
+            r[j] = float(i);
+#else
+            r[j] = act[src + i];
+#endif
+            gm[j] = wbuf[g + i];
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < HC_MAX; j++) {
+        if (tid + j * gl_WorkGroupSize.x < n) {
+            sumSq += r[j] * r[j];
+        }
+    }
+#else
     for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
         float v = act[src + i];
         sumSq += v * v;
     }
+#endif
     partials[tid] = sumSq;
     barrier();
     for (uint stride = gl_WorkGroupSize.x / 2u; stride > 0u; stride >>= 1u) {
@@ -56,7 +114,19 @@ void main() {
     // 1/sqrt rather than inversesqrt: ggml computes 1.0f/sqrtf(mean + eps)
     // and this tensor is compared against its output.
     float scale = 1.0 / sqrt(partials[0] / float(n) + uintBitsToFloat(pc.eps));
+#if HOIST
+    [[unroll]] for (uint j = 0u; j < HC_MAX; j++) {
+        uint i = tid + j * gl_WorkGroupSize.x;
+        if (i < n) {
+#if GUT == 2
+            if (j == 0u || scale == 12345.678)
+#endif
+            hact[dst + i] = float16_t(r[j] * scale * gm[j]);
+        }
+    }
+#else
     for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
         hact[dst + i] = float16_t(act[src + i] * scale * wbuf[g + i]);
     }
+#endif
 }

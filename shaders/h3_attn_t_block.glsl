@@ -12,6 +12,8 @@
 #define KV_BLOCK (base / TILE)
 #endif
 
+        KV_BEFORE_S
+
         // ---- S^T = K . Q^T.
         ACC s[QT][KTIL];
         [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
@@ -22,8 +24,13 @@
         [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
             FRAG_A fragK[KTIL];
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+#if KVLDS
+                coopMatLoad(fragK[kk], lsK, (kk * TILE) * K_LPITCH + kt * TILE,
+                    K_LPITCH, gl_CooperativeMatrixLayoutRowMajor);
+#else
                 coopMatLoad(fragK[kk], hact, kBase + ((KV_BLOCK + kk) * HDT + kt) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
 #if QLDS
@@ -42,6 +49,10 @@
                 }
             }
         }
+
+#if !KV_BSOFT
+        KV_AFTER_S
+#endif
 
         // ---- The softmax, in registers: a lane's elements of s[qq][kk] are
         // its query's scores against keys kk*16 + 2e + hw.
@@ -214,13 +225,22 @@
 #endif
 #if !PV_ORDER || GUT_SOFTMAX
         }
+#if KV_BSOFT
+        // KV_BSOFT: the barrier that ends the K reads behind the softmax.
+        KV_AFTER_S
+#endif
 
         // ---- O^T += V^T . P^T.
         [[unroll]] for (uint j = 0u; j < HDT; ++j) {
             FRAG_A fragV[KTIL];
             [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
+#if KVLDS
+                coopMatLoad(fragV[kk], lsV, (j * TILE) * V_LPITCH + kk * TILE,
+                    V_LPITCH, gl_CooperativeMatrixLayoutRowMajor);
+#else
                 coopMatLoad(fragV[kk], hact, vBase + ((KV_BLOCK + kk) * HDT + j) * (TILE * TILE),
                     TILE, gl_CooperativeMatrixLayoutRowMajor);
+#endif
             }
             [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
                 [[unroll]] for (uint kk = 0u; kk < KTIL; ++kk) {
@@ -228,4 +248,5 @@
                 }
             }
         }
+        KV_AFTER_O
 #endif

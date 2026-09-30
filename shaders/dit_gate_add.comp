@@ -17,6 +17,17 @@
 
 #include "dit_common.glsl"
 
+#extension GL_EXT_control_flow_attributes : enable
+// HOIST (KERNELS.md G6, research §5.4): every load of the row issued before
+// its first store. The residual is read and written through one binding, so
+// the plain loop is load, wait, store, a 256-byte request at a time a wave
+// (h3_norm_mod.comp's HOIST). Rows up to STEPS * 256 wide. The default build
+// is the plain loop, which every host that has not re-run its gate keeps.
+#ifndef HOIST
+#define HOIST 0
+#endif
+#define STEPS 24
+
 layout(local_size_x = 256) in;
 
 void main() {
@@ -28,6 +39,29 @@ void main() {
     // the column, and a flat grid would pay an integer division by a width
     // that is not a power of two (3840) on every element (IDEAS §1.2).
     uint base = r * pc.dim;
+#if HOIST
+    float x[STEPS], y[STEPS], g[STEPS];
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        uint c = gl_LocalInvocationID.x + j * 256u;
+        if (c < pc.dim) {
+            y[j] = act[pc.inOff + base + c];
+            x[j] = act[pc.outOff + base + c];
+            if (pc.aux2 != 0u) {
+                g[j] = act[pc.aux0 + c];
+            }
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        uint c = gl_LocalInvocationID.x + j * 256u;
+        if (c < pc.dim) {
+            float v = y[j];
+            if (pc.aux2 != 0u) {
+                v *= g[j];
+            }
+            act[pc.outOff + base + c] = x[j] + v;
+        }
+    }
+#else
     for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
         float v = act[pc.inOff + base + c];
         if (pc.aux2 != 0u) {
@@ -35,4 +69,5 @@ void main() {
         }
         act[pc.outOff + base + c] += v;
     }
+#endif
 }

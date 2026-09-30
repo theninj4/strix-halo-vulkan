@@ -63,6 +63,19 @@ layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
 #define TPW 1
 #endif
 
+// HEAD_X (KERNELS.md G6, research §5.4): the grid is a head across and a
+// token tile down, so the workgroups in flight together are the heads of a
+// few tokens, not one head of many. A workgroup reads 512 B of each of its
+// tokens' rows, and where a row is a whole number of the 4 KB channel
+// rotation (§5.1b) -- 56 heads x 512 B in H3, 32 in ACE's q, 8 in its k, 32 of
+// 64 wide in the VAE -- every read of one head lands on the same eighth of
+// the channels. Walked token-fastest that is the whole device on an eighth
+// of the bus at a time; walked head-fastest the heads of a row cover the
+// rotation. The same workgroups doing the same work: the same bits.
+#ifndef HEAD_X
+#define HEAD_X 0
+#endif
+
 layout(local_size_x = WG) in;
 
 shared float rows[TILE * HEAD_DIM];
@@ -70,11 +83,15 @@ shared float partial[WG];
 shared float inv[TILE];
 
 void main() {
-    uint head = gl_WorkGroupID.y;
+#if HEAD_X
+    uint head = gl_WorkGroupID.x, group = gl_WorkGroupID.y;
+#else
+    uint head = gl_WorkGroupID.y, group = gl_WorkGroupID.x;
+#endif
     uint tid = gl_LocalInvocationID.x;
 
   for (uint slab = 0u; slab < uint(TPW); ++slab) {
-    uint tt = gl_WorkGroupID.x * uint(TPW) + slab;
+    uint tt = group * uint(TPW) + slab;
     if (pc.span != 0u && tt >= pc.span) {
         return;
     }

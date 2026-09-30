@@ -141,13 +141,94 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #ifndef GUT_XCHG
 #define GUT_XCHG 0
 #endif
+// KVLDS (KERNELS.md G4b, research/3.9): §2.9's lever on the key side. A
+// workgroup is WAVES waves of QT query tiles each, and a key block's K and V
+// tiles are fetched once by the workgroup -- KV_STAGE uvec4 a lane a plane,
+// a block ahead, in flight behind the previous block's MMAs -- and written
+// to two LDS planes the waves read their fragments from: K as BN key rows of
+// the head's components at K_LPITCH halves, V^T as HEAD_DIM component rows
+// of the block's keys at V_LPITCH (both 2 dwords mod 32, conflict-free for
+// the sixteen lanes of a ds_load_b64). One plane each, so two barriers a
+// block: after the S^T reads (K's plane is rewritten behind it) and after
+// the O^T reads (V's). The same MMAs in the same order per accumulator as
+// the one-wave build at the same KTIL: bit-identical. A wave whose queries
+// start past the sequence runs the loop (the barriers need it) and stores
+// nothing. KV_NOBAR and KV_STAGE_L0 are pricing knobs, wrong by
+// construction: no barriers; every staging fetch the first block's.
+#ifndef KVLDS
+#define KVLDS 0
+#endif
+#ifndef WAVES
+#define WAVES 1
+#endif
+#ifndef KV_NOBAR
+#define KV_NOBAR 0
+#endif
+#ifndef KV_STAGE_L0
+#define KV_STAGE_L0 0
+#endif
+#ifndef KV_DEEP
+#define KV_DEEP 0
+#endif
+#ifndef KV_VTOP
+#define KV_VTOP 0
+#endif
+#ifndef KV_BSOFT
+#define KV_BSOFT 0
+#endif
+#if !KVLDS && WAVES != 1
+#error "more than one wave a workgroup is the KVLDS build"
+#endif
+#if KVLDS && (QLDS || L0_LOADS || PV_ORDER)
+#error "KVLDS is written on the plain key block, Q^T in registers or re-read"
+#endif
+#if KVLDS
+// The staging view of the fp16 arena: not readonly, and stored to under a
+// condition that is never true (main), so the fetches stay where the source
+// issues them (dit_gemm.comp's STAGE_RW).
+layout(binding = 2) buffer HAct4 { uvec4 hact4[]; };
+#endif
 
 #define TILE 16
 #define HDT (HEAD_DIM / TILE)
 #define BM (QT * TILE)
 #define BN (KTIL * TILE)
 
-layout(local_size_x = WAVE) in;
+layout(local_size_x = WAVE * WAVES) in;
+
+#if KVLDS
+#ifndef K_LPITCH
+#define K_LPITCH (HEAD_DIM + 4)
+#endif
+#ifndef V_LPITCH
+#define V_LPITCH (BN + 4)
+#endif
+#define NTHREADS (WAVE * WAVES)
+#define KV_VECS (KTIL * HDT * (TILE * TILE / 8))    // uvec4 a plane a block
+#define KV_STAGE (KV_VECS / NTHREADS)
+#if KV_STAGE * NTHREADS != KV_VECS
+#error "a key block's uvec4 count must divide by the workgroup's lanes"
+#endif
+shared float16_t lsK[BN * K_LPITCH];
+shared float16_t lsV[HEAD_DIM * V_LPITCH];
+// Eight halves into shared memory; ACO folds the eight stores into one
+// ds_store_b128 (dit_gemm.comp).
+#define SPREAD8(arr, base, v) {                                                \
+    f16vec2 h0 = unpackFloat2x16((v).x);                                       \
+    f16vec2 h1 = unpackFloat2x16((v).y);                                       \
+    f16vec2 h2 = unpackFloat2x16((v).z);                                       \
+    f16vec2 h3 = unpackFloat2x16((v).w);                                       \
+    arr[(base) + 0u] = h0.x; arr[(base) + 1u] = h0.y;                          \
+    arr[(base) + 2u] = h1.x; arr[(base) + 3u] = h1.y;                          \
+    arr[(base) + 4u] = h2.x; arr[(base) + 5u] = h2.y;                          \
+    arr[(base) + 6u] = h3.x; arr[(base) + 7u] = h3.y;                          \
+}
+#if KV_NOBAR
+#define KV_BARRIER
+#else
+#define KV_BARRIER barrier();
+#endif
+#endif
 
 #if QLDS
 shared uint qs[QT * HDT * Q_LTILE];
@@ -160,12 +241,23 @@ shared uint qs[QT * HDT * Q_LTILE];
 
 void main() {
     uint head = gl_WorkGroupID.y;
+#if KVLDS
+    uint q0 = (gl_WorkGroupID.x * WAVES + gl_SubgroupID) * BM;
+#else
     uint q0 = gl_WorkGroupID.x * BM;
+#endif
     uint n = pc.tokens;
     uint lane = gl_SubgroupInvocationID;
+#if KVLDS
+    // Uniform over the workgroup: a wave past the sequence keeps the barriers.
+    if (gl_WorkGroupID.x * (WAVES * BM) >= n || head >= pc.heads) {
+        return;
+    }
+#else
     if (q0 >= n || head >= pc.heads) {
         return;
     }
+#endif
     // This lane's rows of an accumulator are 2e + hw.
     uint hw = lane / 16u;
 
@@ -208,6 +300,66 @@ void main() {
         runSum[qq] = 0.0;
     }
 
+#if KVLDS
+    uint tid = gl_LocalInvocationID.x;
+    // Never taken: the store that keeps the staging view writable.
+    if (n == 0u) { hact4[tid] = uvec4(0u); }
+    // Chunk c of a block's plane is 16 bytes: tile c/32 (key tile kk, then
+    // component tile), piece c%32 of its 512, two pieces a tile row.
+    uvec4 stK[KV_STAGE], stV[KV_STAGE];
+    uint kL[KV_STAGE], vL[KV_STAGE];
+    [[unroll]] for (uint s = 0u; s < KV_STAGE; ++s) {
+        uint c = tid + s * NTHREADS;
+        uint kk = c / (HDT * 32u), ct = (c / 32u) % HDT, w = c % 32u;
+        kL[s] = (kk * TILE + w / 2u) * K_LPITCH + ct * TILE + (w % 2u) * 8u;
+        vL[s] = (ct * TILE + w / 2u) * V_LPITCH + kk * TILE + (w % 2u) * 8u;
+    }
+    uint kG = (kBase >> 3u) + tid, vG = (vBase >> 3u) + tid;
+#define FETCH_K(blk) { [[unroll]] for (uint s = 0u; s < KV_STAGE; ++s) { stK[s] = hact4[kG + (blk) * KV_VECS + s * NTHREADS]; } }
+#define FETCH_V(blk) { [[unroll]] for (uint s = 0u; s < KV_STAGE; ++s) { stV[s] = hact4[vG + (blk) * KV_VECS + s * NTHREADS]; } }
+#define STORE_K { [[unroll]] for (uint s = 0u; s < KV_STAGE; ++s) { SPREAD8(lsK, kL[s], stK[s]) } }
+#define STORE_V { [[unroll]] for (uint s = 0u; s < KV_STAGE; ++s) { SPREAD8(lsV, vL[s], stV[s]) } }
+    uint lastBlk = (n - 1u) / BN;
+#if KV_STAGE_L0
+#define KV_NEXT(b) 0u
+#else
+#define KV_NEXT(b) min((b), lastBlk)
+#endif
+    FETCH_K(0u)
+    FETCH_V(0u)
+    STORE_K
+    STORE_V
+    barrier();
+    // A block fetches the next block's K at its top, in flight behind its
+    // S^T MMAs, and writes it to the plane behind the barrier that ends
+    // their reads; then V likewise behind the softmax and the O^T MMAs.
+    // Fetched and stored inside one trip: a staging register carried across
+    // the back-edge is copied there, behind a wait for the fetch (the
+    // first cut's disassembly, research/3.9). At the last block the fetches
+    // re-read it (in bounds, never read back).
+#if KV_DEEP
+    // KV_DEEP: both fetches at the top, in flight for the whole block, both
+    // written behind the O^T reads; the barriers back to back around the
+    // stores.
+#define KV_BEFORE_S { FETCH_K(KV_NEXT(base / BN + 1u)) FETCH_V(KV_NEXT(base / BN + 1u)) }
+#define KV_AFTER_S
+#define KV_AFTER_O { KV_BARRIER STORE_K STORE_V KV_BARRIER }
+#elif KV_VTOP
+    // KV_VTOP: V fetched at the top as well (in flight the whole block).
+#define KV_BEFORE_S { FETCH_K(KV_NEXT(base / BN + 1u)) FETCH_V(KV_NEXT(base / BN + 1u)) }
+#define KV_AFTER_S { KV_BARRIER STORE_K }
+#define KV_AFTER_O { KV_BARRIER STORE_V }
+#else
+#define KV_BEFORE_S { FETCH_K(KV_NEXT(base / BN + 1u)) }
+#define KV_AFTER_S { KV_BARRIER STORE_K FETCH_V(KV_NEXT(base / BN + 1u)) }
+#define KV_AFTER_O { KV_BARRIER STORE_V }
+#endif
+#else
+#define KV_BEFORE_S
+#define KV_AFTER_S
+#define KV_AFTER_O
+#endif
+
 #if TAIL_SPLIT
     uint base = 0u;
     for (; base + BN <= n; base += BN) {
@@ -236,7 +388,7 @@ void main() {
     // The rows past the sequence are written too, as the plain build does:
     // they are the A operand's pad rows, which nothing reads.
     [[unroll]] for (uint qq = 0u; qq < QT; ++qq) {
-#if !STORE_TAIL
+#if !STORE_TAIL || KVLDS
         if (q0 + qq * TILE >= n) {
             break;
         }

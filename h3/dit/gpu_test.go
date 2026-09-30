@@ -728,6 +728,10 @@ func TestGPUShapes(t *testing.T) {
 	if v := os.Getenv("H3_DOWN_SPLIT"); v != "" {
 		fmt.Sscan(v, &g.downSplit)
 	}
+	// H3_ATTN_LDS=0 is G4b's control: the one-wave transposed attention.
+	if os.Getenv("H3_ATTN_LDS") == "0" {
+		g.attnNoLDS = true
+	}
 	// H3_FUSE=0 runs the fused epilogues' controls (KERNELS.md G3): the v
 	// pack and the SwiGLU pass.
 	if os.Getenv("H3_FUSE") == "0" {
@@ -831,6 +835,7 @@ func TestGPUShapes(t *testing.T) {
 			type agg struct {
 				d     time.Duration
 				fl    float64
+				mv    float64
 				count int
 			}
 			byKind := map[string]*agg{}
@@ -845,6 +850,7 @@ func TestGPUShapes(t *testing.T) {
 				}
 				a.d += st.GPU
 				a.fl += st.Flops
+				a.mv += st.Bytes
 				a.count++
 				total += st.GPU
 			}
@@ -854,6 +860,8 @@ func TestGPUShapes(t *testing.T) {
 				rate := ""
 				if a.fl > 0 {
 					rate = fmt.Sprintf("%5.1f TFLOP/s", a.fl/a.d.Seconds()/1e12)
+				} else if a.mv > 0 {
+					rate = fmt.Sprintf("%5.0f GB/s", a.mv/a.d.Seconds()/1e9)
 				}
 				t.Logf("  %-18s %5d  %9v  %5.1f%%  %s", k, a.count, a.d.Round(time.Millisecond), 100*a.d.Seconds()/total.Seconds(), rate)
 			}
@@ -954,12 +962,30 @@ func TestGPUAttentionScreen(t *testing.T) {
 		if err := g.SetAttention(v); err != nil {
 			t.Fatal(err)
 		}
+		// H3_SCREEN_REPS runs an arm that many times in one submission first
+		// (the time quoted is that run's, a repeat), so a 100 ms clock
+		// sampler has a busy window on it; the window is logged in epoch
+		// milliseconds (KERNELS.md G4b). The context is the run after it.
+		reps := 1
+		if r := os.Getenv("H3_SCREEN_REPS"); r != "" {
+			fmt.Sscan(r, &reps)
+		}
 		var took time.Duration
 		var ctx []uint16
-		for rep := 0; rep < 2; rep++ {
-			if took, ctx, err = g.TimeAttention(); err != nil {
-				t.Fatal(err)
-			}
+		if _, _, err = g.TimeAttention(); err != nil {
+			t.Fatal(err)
+		}
+		from := time.Now().UnixMilli()
+		mean, _, err := g.runAttention(reps)
+		if err != nil {
+			t.Fatal(err)
+		}
+		window := fmt.Sprintf("  window %d %d", from, time.Now().UnixMilli())
+		if took, ctx, err = g.TimeAttention(); err != nil {
+			t.Fatal(err)
+		}
+		if reps > 1 {
+			took = mean
 		}
 		if base == nil {
 			base = ctx
@@ -985,7 +1011,7 @@ func TestGPUAttentionScreen(t *testing.T) {
 			b2 += float64(f16(base[i])) * float64(f16(base[i]))
 		}
 		t.Logf("QT%d KTIL%d T %-5v %s: %8v  %5.1f TFLOP/s  against QT1 KTIL4: max |d| %.3g, rms rel %.3g%s", v.QT, v.KTIL, v.T, v.Tag,
-			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst, math.Sqrt(d2/b2), bits)
+			took.Round(time.Microsecond), fl/took.Seconds()/1e12, worst, math.Sqrt(d2/b2), bits+window)
 	}
 }
 

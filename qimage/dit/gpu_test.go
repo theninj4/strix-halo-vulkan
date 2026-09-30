@@ -187,6 +187,10 @@ func newGPU(t *testing.T, dev *vk.Device, dir string, maxTokens, maxPrefix, maxT
 		// The SwiGLU epilogue's control (KERNELS.md G3): the pass instead.
 		g.SetFuseGLU(false)
 	}
+	if err == nil && os.Getenv("QIMAGE_PACK_TF") == "1" {
+		// The packs' head-fastest grid's control (KERNELS.md G6).
+		g.SetPackTokenFast(true)
+	}
 	if err == nil {
 		t.Logf("staged %s keeping %v in fp16: %.2f GB of weights in %v", bank, keep,
 			float64(g.WeightBytes())/1e9, time.Since(start).Round(time.Millisecond))
@@ -928,6 +932,7 @@ func TestGPUFusedEpilogues(t *testing.T) {
 	latents := loadMat(t, m, "noise").Clone()
 	steps := func(on bool) [2]*qwen.Mat {
 		g.SetFuseGLU(on)
+		g.SetPackTokenFast(!on) // G6: the control runs the packs' old grid too
 		if err := g.BeginImage(embeds, lay, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -943,6 +948,7 @@ func TestGPUFusedEpilogues(t *testing.T) {
 	}
 	fused, control := steps(true), steps(false)
 	g.SetFuseGLU(true)
+	g.SetPackTokenFast(false)
 	for i := range fused {
 		for j := range fused[i].Data {
 			if math.Float32bits(fused[i].Data[j]) != math.Float32bits(control[i].Data[j]) {

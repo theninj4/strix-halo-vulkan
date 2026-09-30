@@ -33,7 +33,7 @@ import (
 	"math"
 	"os"
 	"runtime"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -752,6 +752,17 @@ func (g *HCGPU) build() error {
 		// and a standalone norm opens the pass.
 		"cn": shaders.LLMHCCN,
 	} {
+		// LLM_HC_SPV (KERNELS.md G6): a build of one of the three loaded
+		// from disk, `cn=path.spv,norm=path.spv`: a screening knob.
+		for _, kv := range strings.Split(os.Getenv("LLM_HC_SPV"), ",") {
+			if n, path, ok := strings.Cut(kv, "="); ok && n == name {
+				b, err := os.ReadFile(path)
+				if err != nil {
+					return fmt.Errorf("llm: LLM_HC_SPV %s: %w", name, err)
+				}
+				spirv = b
+			}
+		}
 		if err := g.pipeline(name, spirv, vk.PipelineSpec{Buffers: bufs, PushConstantSize: pcSize}); err != nil {
 			return err
 		}
@@ -1227,21 +1238,13 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 		cn := base
 		cn.OutOff = g.aOut
 		cn.GemmN = uint32(g.gemmN())
-		// **One workgroup a token, not one a (token, stream)** (P11): the
-		// four streams combine the same block output row, so a grid over
-		// them read it four times. The kernel walks them instead.
-		//
-		// **Except at decode** (P16): there the dispatch is a handful of
-		// workgroups on a forty-CU device, so the walk is four streams in
-		// series on one compute unit, and a stream a workgroup is the same
-		// arithmetic in a quarter of the serial length.
-		gy := uint32(1)
-		if g.rows <= hcCNSplitRows() {
-			gy = uint32(c.HC)
-		}
-		add("cn", "cn", uint32(g.rows), gy, cn)
+		// One workgroup a (token, stream), a stream across and a token down
+		// (KERNELS.md G6): the streams of a token are 2 KB of channel phase
+		// apart where a stream's rows a token apart are none, so this is
+		// the order that loads the DRAM channels evenly.
+		add("cn", "cn", uint32(c.HC), uint32(g.rows), cn)
 	} else {
-		add("norm", "norm", uint32(g.rows), uint32(c.HC), base)
+		add("norm", "norm", uint32(c.HC), uint32(g.rows), base)
 	}
 
 	down := base
@@ -1279,7 +1282,7 @@ func (g *HCGPU) graph(mixer, prev int, combine bool) ([]vk.MultiDispatch, []stri
 		cb := base
 		cb.OutOff = g.aOut
 		cb.GemmN = uint32(g.gemmN())
-		add("combine", "combine", uint32(g.rows), uint32(c.HC), cb)
+		add("combine", "combine", uint32(c.HC), uint32(g.rows), cb)
 	}
 	return d, kinds, nil
 }
@@ -1309,7 +1312,7 @@ func (g *HCGPU) RunCombine(mixer int) error {
 	}
 	d := []vk.MultiDispatch{{
 		Pipeline: g.pipes["combine"],
-		GroupsX:  uint32(g.rows), GroupsY: uint32(c.HC),
+		GroupsX:  uint32(c.HC), GroupsY: uint32(g.rows),
 		PushConstants: pc.bytes(),
 	}}
 	if g.rec.add(ownHC, []string{"combine"}, d) {
@@ -1641,17 +1644,3 @@ func (g *HCGPU) Resize(nTok int) error {
 	}
 	return nil
 }
-
-// hcCNSplitRows is the widest batch `hc.cn` runs a workgroup a (token, stream)
-// at rather than a workgroup a token (P16). Below it the per-token walk leaves
-// most of the device idle; above it P11's single read of the block output is
-// what the kernel is short of. LLM_HC_CN_SPLIT_ROWS moves it, and 0 is P11's
-// grid at every width.
-func hcCNSplitRows() int {
-	if n, err := strconv.Atoi(os.Getenv("LLM_HC_CN_SPLIT_ROWS")); err == nil && n >= 0 {
-		return n
-	}
-	return hcCNSplitRowsDefault
-}
-
-const hcCNSplitRowsDefault = 64

@@ -94,6 +94,8 @@ type GPU struct {
 	// knob for the fragment pack.
 	big     gemmKernel
 	packTPW int
+	// packTokenFast is SetPackTokenFast's control.
+	packTokenFast bool
 	// fuseGLU runs w1|w3 as one GEMM whose epilogue is the SwiGLU (KERNELS.md
 	// G3, research §2.14) when big is the LDS build; off, or on any other
 	// big kernel, the same fused GEMM stores fp32 and the SwiGLU pass reads
@@ -716,6 +718,8 @@ func (g *GPU) build() error {
 		"pack2":      shaders.DiTPackF16TPW2,
 		"pack4":      shaders.DiTPackF16TPW4,
 		"pack8":      shaders.DiTPackF16TPW8,
+		"pack8hx":    shaders.DiTPackF16TPW8HX,
+		"qkpack8hx":  shaders.DiTQKPackTPW8HX,
 		"swiglu":     shaders.DiTSwiGLUF16,
 		"swiglu_il":  shaders.DiTSwiGLUF16IL32,
 		"causal":     shaders.DiTAttnCausal,
@@ -1104,7 +1108,31 @@ func (g *GPU) SetPackTiles(n int) error {
 	return fmt.Errorf("dit: no pack build for %d tiles a workgroup", n)
 }
 
+// SetPackTokenFast puts the packs back on the grid they had before KERNELS.md
+// G6 — a token tile across, a head down — which is the control for the
+// head-fastest walk. The layout written is the same either way.
+func (g *GPU) SetPackTokenFast(v bool) { g.packTokenFast = v }
+
+// packHeadX reports whether the packs run the HEAD_X builds: a head across
+// and a token tile down, so the workgroups in flight are the heads of a few
+// tokens. A row here is 3840 floats, 3.75 turns of the 4 KB DRAM channel
+// rotation, so one head's 512 B of consecutive rows lands on four phases,
+// half the channels (research §5.4). Built at the served eight tiles.
+func (g *GPU) packHeadX() bool { return g.packTPW == defaultPackTiles && !g.packTokenFast }
+
+// packGrid is a pack dispatch's grid over tiles token tiles.
+func (g *GPU) packGrid(tiles int) (gx, gy uint32) {
+	gx, gy = uint32((tiles+g.packTPW-1)/g.packTPW), uint32(g.heads)
+	if g.packHeadX() {
+		gx, gy = gy, gx
+	}
+	return gx, gy
+}
+
 func (g *GPU) packPipe() string {
+	if g.packHeadX() {
+		return "pack8hx"
+	}
 	if g.packTPW == 1 {
 		return "pack"
 	}
@@ -1112,6 +1140,9 @@ func (g *GPU) packPipe() string {
 }
 
 func (g *GPU) qkpackPipe() string {
+	if g.packHeadX() {
+		return "qkpack8hx"
+	}
 	if g.packTPW == 1 {
 		return "qkpack"
 	}
@@ -1367,7 +1398,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 		pcQ.Scale = math.Float32bits(scale * log2e)
 		qTiles := planePad / coopMatTile
 		pcQ.Span = uint32(qTiles)
-		add(g.qkpackPipe(), "qkpack q", uint32((qTiles+g.packTPW-1)/g.packTPW), uint32(g.heads), pcQ)
+		qx, qy := g.packGrid(qTiles)
+		add(g.qkpackPipe(), "qkpack q", qx, qy, pcQ)
 
 		// k: the unfused trio, because the cache wants the fp32 post-RoPE
 		// rows. Both k and the pack work on global rows.
@@ -1425,7 +1457,8 @@ func (g *GPU) stepGraph(latents *qwen.Mat, t float64, prefill bool) ([]vk.MultiD
 			pc.InOff, pc.OutOff = pk.src, pk.dst
 			pc.Aux0, pc.Aux1, pc.Aux2 = pk.mode, uint32(g.tokPad), uint32(tiles)
 			pc.Scale = math.Float32bits(1)
-			add(g.packPipe(), pk.kind, uint32((tiles+g.packTPW-1)/g.packTPW), uint32(g.heads), pc)
+			px, py := g.packGrid(tiles)
+			add(g.packPipe(), pk.kind, px, py, pc)
 		}
 
 		// Attention: bidirectional over the key range; query rows are the

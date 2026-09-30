@@ -29,9 +29,9 @@ is:
 | class | file | today | target |
 |---|---|---|---|
 | fp16 WMMA GEMM (activation × fp16 weight) | `shaders/dit_gemm.comp` (the vertical kernel), `shaders/gemm_wmma.comp` (the ablation suite) | 39.0 suite / **42.0** pipeline, 72–78% | ≥ 85% per clock |
-| WMMA flash attention | `shaders/h3_attn_t.comp` (transposed, wave32), `shaders/dit_attention_wmma.comp` (plain) | **37.3–37.8** at 2650–2690 MHz, **73%** per clock (G4, §3.8: the floor with the softmax gutted is 81%, 87–90% with L0 hits; no exact arm beats the shipped build) | ≥ 80% |
+| WMMA flash attention | `shaders/h3_attn_t.comp` (transposed, wave32; since G4b eight waves a workgroup sharing each key block through LDS), `shaders/dit_attention_wmma.comp` (plain) | **40.8–40.9** at 2717 MHz in a 480p forward, **78%** per clock (G4b, §3.9; the one-wave build 37.1–37.8, 73%: G4, §3.8) | ≥ 80% |
 | int8 / Q4-weight WMMA GEMM | `shaders/llm_moe_gemm.comp`, `shaders/llm_gemm.comp`, `shaders/kev_gemm_q8_glu.comp`, `dit_dequant_q8` + fp16 GEMM (video) | MoE Q4 up: 22 → **37 TFLOP/s executed** at 2048 tokens (§2.11, ~75% per clock; 51% in §2.2), down 19–21, the rest unmeasured against the ceiling | the fp16 GEMM's rate at the same M, N, K |
-| streaming kernels (norms, packs, gates, SwiGLU, copies) | everywhere | 6–14% of every block; `hc.cn` at 134 GB/s (TODO); H3's SwiGLU and v pack fused into the GEMM's epilogue (G3, §2.14) | ≥ 200 GB/s each, or fused away |
+| streaming kernels (norms, packs, gates, SwiGLU, copies) | everywhere | 6–14% of every block; H3's SwiGLU and v pack fused into the GEMM's epilogue (G3, §2.14); **G6 (§5.4): the packs 93–151 → 173–209 GB/s, the norms 181–193 → 205–217, the gates 193–213, `hc.cn` 184 → 200 (its "134" left the write-back out)** | ≥ 200 GB/s each, or fused away |
 
 Decode is not in the table: §1.7–§1.12 took the GEMV to 96–103% of the
 bus, and the LLM's decode has been a *format* question since (L8).
@@ -103,6 +103,7 @@ The ceiling, restated per clock, because the clock moves under load:
 | **… with the K tiles as a loop (G-o8, §2.10; the shipped build, two runs)** | **42.8–43.5** (down 41.9–42.2) | **2637–2672** | 153 | **406–407 (85%)** |
 | … the same build with no C store at all (`STORE_TILES=0`, G3, §2.14: wrong by construction) | 47.1 | **2900** | **130** | 406 (85%): the store costs the pipe nothing, the 9% is clock |
 | H3's attention, transposed (G4, §3.8, three runs) | 37.3–37.8 (480p), 35.2 (768p) | 2650–2690 / 2600 | 154 | 350–355 (**73%**); the honest floor 81%, with L0 hits 87–90% |
+| **… its K/V blocks through LDS, eight waves a workgroup (G4b, §3.9; the shipped build, two forwards)** | **40.8–40.9** (480p), 38.6 (768p) | **2717** / 2704 | 154 | **375–376 (78%)**; its controls: softmax 6%, global side ≤ 6%, barriers 3% |
 
 Two things this table says that the old one did not. **The GEMM runs 3%
 under the probe's clock** (2813 against 2899, at 137 W against 110), so
@@ -337,12 +338,13 @@ it on these kernels.
 | G1 | The shipped GEMM's ISA: one K iteration's schedule (loads, waitcnts, MMAs), instructions per MMA, occupancy as the driver places it (H2, H3) | **done 2026-09-29** (§6.5): no prefetch across K tiles, 85 address instructions recomputed an iteration; **the rate is flat from 1 to 3+ workgroups a CU**; with every load an L0 hit the GEMMs reach 82–85% per clock, so the memory system is ~10 points and the in-wave schedule ~16 |
 | G2b | G-o8, the LDS-side points of `lds_w32`: the parts priced one at a time with `wmma_issue_probe.comp` through `cmd/bench peak` (`PEAK_SPV`), then the arms on H3's shapes | **done 2026-09-29** (§2.10): **every VALU instruction costs the matrix pipe a clock**, and ~40 `v_swap`/`v_mov` a tile from the register allocator were 7% of it; the slab's two K tiles kept as a loop (`KT_LOOP` + `STAGE_RW`) removes them, bit-identical: **projections 40.4 → 43.5, 80 → 85% per clock, a 480p forward 27.3 → 26.7 s**; shipped under the same build name to all nine hosts. Priced and left: the barrier's lockstep ≤ 9 points, the LDS reads ~4, the global side ~3; the 16-lane exchange, `LOAD_ORDER` and a 128×128 workgroup measured dead |
 | G2 | The register-prefetch GEMM (H2): `PREFETCH=1` in `gemm_wmma.comp` and `dit_gemm.comp`, the tile geometries it fits in, screened on the `shapes` family and on the DiT's and H3's shapes; bit-identical | **done 2026-09-29** (§2.9): not registers, **LDS**: the K slab staged a slab ahead through 24 staging registers into a double-buffered LDS plane, at **wave32** (a fragment is 8 VGPRs and 4x its bytes at wave64, 2x at wave32), 4×4 tiles, eight waves. Bit-identical; H3's projections **37 → 41 TFLOP/s**, the split down projection **29 → 41**, a 480p forward **29.9 → 27.1 s**; 74 → 80% per clock. Shipped for H3; the other eight hosts are G8 |
-| G3 | The epilogue and the tail (H4, H5): the store's cost priced with a live control; `C_F16` and the fragment-tile C for attention's operands (stage 4's open item) where the consumer allows; the M sawtooth | **done 2026-09-30** (§2.14): **H4 dead on the pipe** — a live control that keeps every MMA and skips the stores (`STORE_TILES`) runs the same 404–409 FLOP/clk/CU as the shipped build at every arm; its +9% in TFLOP/s is the clock (2900 MHz at 130 W with every downstream kernel on zeros, against 2671 at the 154 W cap), so the fp32 C is paid for in energy, not issue slots. **H5**: `TestGPUGEMMSawtooth` — the plateau by ~640 rows on gate and ~1300 on q and down, then a ±5% / ±2% / ±3% swing with the fractional round of 40; the served 480p chunks sit at its top; under ~600 rows the ramp is 2x (G8's "loses below ~1000 rows"). **The consumers fused**: the v projection stored as the attention's fragment tiles (`C_PACK` on the LDS build, the A pad rows zeroed by `zero_f16.comp` so the pad keys stay +0) and gate|up as one GEMM over a host-interleaved weight (`projGateUp`, 64-row groups) with the SwiGLU as its epilogue (`C_SWIGLU`, kev's K7.6 pattern), both **bit-identical** to the passes they replace (the morning's `H3_GEMM_REF`, `TestGPUForward`'s run-time controls): the `swiglu` (570 ms) and `pack v` (244 ms) dispatches gone, **a 480p forward 26.22 / 26.33 → 25.59 / 25.50 s (1.03x)** at the same clock (two controls 26.26 / 26.26); `TestGPUForward` and `TestGPURun` pass; the fused GEMM and the fp16 stores run at the shipped rate. **The SwiGLU epilogue carried to `qimage/dit` the same day** (`projW13`, `qwen.InterleaveGLU`; bit-identical to its control on both banks, the 256² oracle passing): a 1024² cached step **2044 / 2046 → 1929 / 1968 ms wall (1.04–1.06x)** on the served int8 bank, 1.99 → 1.905 s per dispatch, the 83 ms `swiglu` gone; the v store not carried there (a 19-row prefix puts the fresh rows mid-tile, for 1.2%). Not carried yet: `ace/dit`, the VAE, the speech encoders (G8). `C_F16` has no other consumer: o and down feed the fp32 residual |
+| G3 | The epilogue and the tail (H4, H5): the store's cost priced with a live control; `C_F16` and the fragment-tile C for attention's operands (stage 4's open item) where the consumer allows; the M sawtooth | **done 2026-09-30** (§2.14): **H4 dead on the pipe** — a live control that keeps every MMA and skips the stores (`STORE_TILES`) runs the same 404–409 FLOP/clk/CU as the shipped build at every arm; its +9% in TFLOP/s is the clock (2900 MHz at 130 W with every downstream kernel on zeros, against 2671 at the 154 W cap), so the fp32 C is paid for in energy, not issue slots. **H5**: `TestGPUGEMMSawtooth` — the plateau by ~640 rows on gate and ~1300 on q and down, then a ±5% / ±2% / ±3% swing with the fractional round of 40; the served 480p chunks sit at its top; under ~600 rows the ramp is 2x (G8's "loses below ~1000 rows"). **The consumers fused**: the v projection stored as the attention's fragment tiles (`C_PACK` on the LDS build, the A pad rows zeroed by `zero_f16.comp` so the pad keys stay +0) and gate|up as one GEMM over a host-interleaved weight (`projGateUp`, 64-row groups) with the SwiGLU as its epilogue (`C_SWIGLU`, kev's K7.6 pattern), both **bit-identical** to the passes they replace (the morning's `H3_GEMM_REF`, `TestGPUForward`'s run-time controls): the `swiglu` (570 ms) and `pack v` (244 ms) dispatches gone, **a 480p forward 26.22 / 26.33 → 25.59 / 25.50 s (1.03x)** at the same clock (two controls 26.26 / 26.26); `TestGPUForward` and `TestGPURun` pass; the fused GEMM and the fp16 stores run at the shipped rate. **The SwiGLU epilogue carried to `qimage/dit` the same day** (`projW13`, `qwen.InterleaveGLU`; bit-identical to its control on both banks, the 256² oracle passing): a 1024² cached step **2044 / 2046 → 1929 / 1968 ms wall (1.04–1.06x)** on the served int8 bank, 1.99 → 1.905 s per dispatch, the 83 ms `swiglu` gone; the v store not carried there (a 19-row prefix puts the fresh rows mid-tile, for 1.2%). **Carried to `ace/dit` and the video VAE the same day** (G8's section below): a music forward 1.07–1.10x, **a 480p VAE decode 34.4 → 30.0 s (1.15x)**, both bit-identical across binaries; the speech encoders priced and left (their FFN is not gated and the two passes are 2.3% of a 13.5 ms encoder). `C_F16` has no other consumer: o and down feed the fp32 residual |
 | G4 | Attention (A1–A3): the honest gutting first, then a head-split and a wave64 transposed build, then lazy rescaling; every build through the H3 screen and the image DiT's; carried to the VAE, Kev, OCR, ACE (every `dit_attention_wmma.comp` user still pays the LDS round trip M11c removed) | **done 2026-09-30** (§3.8): the honest floor (softmax gutted, results live) is **81% per clock with real loads, 87–90% with L0 hits**; the softmax is 6–7 points (the row max's 16-deep chain 7, the rescale 3), the K/V loads 11–12. Five exact, bit-identical arms (peeled tail, Q^T in LDS instead of the 112-register spill, a tree max, an exact lazy rescale, P·V a tile at a time) all land inside ±2% of the shipped build: the allocator's ~200–390 moves a block at 256 VGPRs change with every edit and cost what the edit saves. Head split (1.5x MMAs) and wave64 (VALU two passes) dead by arithmetic. **Carried to the image DiT, opt-in** (`QIMAGE_ATTN_T=1`; `qimage_attn_t_qt2_kt4`, `STORE_TAIL=0` with a per-query bound on the last tile, the fp16 context written in place): attention 248 → 232 ms a 1024² step (35.7 → 38.3 TFLOP/s), a cached step 1.908 → 1.876 s, the t2i oracles passing; the edit oracle's prefill reads 7.9e-2 against its 2e-2 bound where a plain-family fp16 perturbation of the same prefix rows reads 1.7e-2 — the kernel is exact on identical inputs at every block (rms 8e-5 / 1.1e-4), the gate is near its sensitivity floor for edits, and it is the vertical's gate, so the default stays plain. Left: G4b, the K/V block staged through LDS for a workgroup's waves (§2.9's lever; the 12 memory points less 6–9 of LDS reads and barrier, ≤ 2% of a forward) |
+| G4b | The attention's K/V block staged through LDS for a workgroup's waves (§2.9's lever on the key side) | **done 2026-09-30** (§3.9): `h3_attn_t_kvlds_w8_kt4` — eight wave32 waves of one query tile, a key block's K and V fetched once a workgroup as four `uvec4` a lane, half a block ahead, into one LDS plane each (pitches 132 and 68 halves, 34.8 KB), two barriers a block, spill-free, with §3.8's `LAZY` and `TAIL_SPLIT` (dead on the spilled build, 6–10% here). **Bit-identical** to the one-wave build (`H3_GEMM_REF` at both shapes, the screen per arm): the kernel **195 → 175 ms at 480p (1.11x), 1.195 → 1.046 s at 768p (1.14x)**, in the forward 37.2 → 40.8 TFLOP/s, **73 → 78% per clock; a 480p forward 25.22 → 24.31 s, 768p 95.9 → 92.5 s (1.037x)** with the clock 2657 → 2717 MHz. The first cut tied: staging registers carried across the back-edge are copied there behind `vmcnt(0)`, so its block-ahead fetch was waited out every block. `KV_DEEP`, `KV_VTOP`, `KV_BSOFT`, sixteen waves, `QREG=0`, `KTIL2` all lose. The default in `h3/dit` (`H3_ATTN_LDS=0` the control); the VAE's head-64 build priced and left (6.10 against 6.22 ms); the image DiT's stays behind its edit gate |
 | G5 | Int8/Q4 B fragments built in registers from the probed layout: the MoE Q4 GEMM (51% → ?), `llm_gemm`'s Q8 arm, `kev_gemm_q8_glu`, and H3's dequant pass folded away | **G5a done 2026-09-29** (§2.11), and not as written: the controls on the MoE up GEMM say the LDS round trip is ~8% and the loop without its stagings already runs at the pipe; the cost was the per-step chain of divergent bank loads, re-reading each block's lines two to eight times. **The K loop as a software pipeline** (`-DPIPE=2`: the next step's bytes fetched behind this step's MMAs, a header once a super-block, a nibble group once per two steps) is bit-identical and takes `moe.up` **11.5 → 6.8 ms a layer at 2048 tokens (1.68x), 2.01x at 512, 1.57x at 4096**; shipped on the seven Q4_K up builds. **G5b the same day:** the down mode's pipeline moves Q5_1 by nothing and IQ4_NL (served) by 1.05x at 2048 / 1.20x at 512, shipped for IQ4_NL alone. In the whole model, prefill **1194 → 1407 tok/s at 2048 (1.17x)**, 1317 → 1494 at 4096, 1306 → 1459 at 8192. **G5c 2026-09-30** (§2.12): the padding. The alignment is one fragment, the record's real-row count picks one of WM copies of the K loop (`SHORT` builds, bit-identical): the padding factor at 2048 tokens 1.90x → 1.19x, `moe.down` **1.23x** (1.28x on the served IQ4_NL), `moe.up` 1.11x (any third copy of its loop spills, so it keeps the 2- and 4-tile ones and executes as 1.41x), the block 1.13–1.14x; whole-model prefill **1417 → 1514 tok/s at 2048 (1.07x)**, 1500 → 1549 at 4096, 1461 → 1481 at 8192; the m2/m4 boundary moves from 1024 tokens to 256. Left: the slab unpack, now the largest term in the up projection (~300 VALU a lane a step at a matrix clock each), the Q5_K up build, the down mode's A fragment loads. **G5d 2026-09-30** (§2.13): the unpack read from the ISA is three VALU an element, not five (the compiler already fuses affine and half conversion into `v_fma_mix`); **the nibble read as an f16 denormal** (`NIB_F16`, a masked halfword *is* the half `nib × 2^-24`, the scale carries the power of two) takes the extract-and-convert pair away, bit-identical, the four-tile step's non-MMA VALU 331 → 259 and `moe.up` **1.02x** at 512–4096 tokens (the count predicted 3–5%: the VALU was only partly on the critical path); whole-model prefill 1 513 → 1 522 tok/s at 2048 (1.006x), 1 548 → 1 555 at 4096, 1 484 → 1 489 at 8192, same-hour A/B twice. The m4 build's 71 allocator moves a step are register pressure at 256 VGPRs (the m2 carries four), and both arms on them are dead: the K tiles as a loop adds 38 moves a tile, A fetched at the top of the step removes the moves for **−12%**. There is no 5% left in the unpack; G5 is closed on this kernel |
-| G6 | The streaming kernels: a bandwidth column in every vertical's profile, the ones under 200 GB/s listed and fixed or fused (`hc.cn` at 134 first) | |
+| G6 | The streaming kernels: a bandwidth column in every vertical's profile, the ones under 200 GB/s listed and fixed or fused (`hc.cn` at 134 first) | **done 2026-09-30** (§5.4), for the LLM's hyper-connection kernels and the four DiT-family hosts: **the grid's fast axis decides which DRAM channels are busy** (§5.1b's law between workgroups). `hc.cn` was never at 134 GB/s (the residual's write-back was not counted: 184); walked stream-fastest it is 200, `hc.norm` 183 → 217, `hc.combine` 1.48x, and with a row's loads hoisted `hc.cn` is 2.9x at decode: **prefill 1520 → 1538 tok/s at 2048, decode 36.87 → 37.35 tok/s**. The q/k packs walked head-fastest: 117 → 209 GB/s (H3), 120 → 208 (ACE), a sixteenth of the channels → 198 (VAE), 126–151 → 173–189 (image): **a 480p VAE decode 29.95 → 27.5 s, a video forward 25.5 → 25.2 s, a 10-min music forward 2113 → 2050 ms, an image step 1.895 → 1.886 s**. All bit-identical. Left: gate+norm fusion (~1.5% of a music forward), the hosts not profiled (kev, ocr, zimage, the speech encoders, the LLM's other passes) |
 | G7 | The budget: what the server's CPU work beside a device job costs in GPU clock (the audio decode's 32 threads, staging on 32 cores, tokenising; G0 measured 32 busy threads at 1.67x), whether a thread cap or a CPU power limit is a net win, and the sampler folded into `bench/sysmon.go` around the vertical tests | G0 measured the extremes; the server's own load is open |
-| G8 | Carry-in: each vertical's screen re-run on the new builds, the numbers into VIDEO.md M11, the image and LLM records, and TODO.md's table | continuous. **G2 carried to all nine hosts 2026-09-29** (table below): every gate passes; the image step 2179 → 2058 ms, the VAE decode 37.1 → 35.5 s, Kev's fp16 pass at 494 tokens 154 → 132 ms; **the build loses below ~1000 rows** (a 30-workgroup grid), so `ace/dit` keeps the wave64 build up to 1024 rows and the ladders' schedules already keep it off short inputs |
+| G8 | Carry-in: each vertical's screen re-run on the new builds, the numbers into VIDEO.md M11, the image and LLM records, and TODO.md's table | continuous. **G2 carried to all nine hosts 2026-09-29** (table below): every gate passes; the image step 2179 → 2058 ms, the VAE decode 37.1 → 35.5 s, Kev's fp16 pass at 494 tokens 154 → 132 ms; **the build loses below ~1000 rows** (a 30-workgroup grid), so `ace/dit` keeps the wave64 build up to 1024 rows and the ladders' schedules already keep it off short inputs. **G3's epilogues carried 2026-09-30** (section below): `qimage/dit` (SwiGLU, 1.04–1.06x a step), `ace/dit` (both; a forward **1.07–1.10x** at every length, the fused gate\|up on the LDS build even below 1024 rows), `h3/vae` (both; **a 480p decode 34.4 → 30.0 s, 768p 64.3 → 56.0 s, 1.15x**); parakeet and kokoro priced and left |
 
 **Order:** G0 (a day: it fixes the denominator), G1 (a session: it decides
 between H2 and H3 before anything is built), G2 (the big one), then G4 and
@@ -793,7 +795,197 @@ encoders, the VAE's exact arms.
 workgroup's waves, §2.9's lever, at `QT1` a wave (the staging registers
 do not fit beside `QT2`'s accumulators): the 12 memory points less ~6 of
 LDS reads at one fragment an MMA and the barrier's lockstep, ≤ 2% of a
-video forward for a session. Recorded, not built.
+video forward for a session. Recorded, not built. *(Built the same day:
+G4b below, §3.9 — 1.10x on the kernel and 3.7% of a forward, with one
+query tile a wave at eight waves.)*
+
+### G8 — G3's epilogues carried to the music DiT and the video VAE (2026-09-30)
+
+The two passes that read a GEMM's fp32 C (`pack v`, `swiglu`) are the
+GEMM's epilogue on two more hosts, as host changes only (the interleaved
+gate|up weight at staging, a `gemmWith`, `packV` / `fuseGLU` with their
+controls); `dit_gemm.comp` and its builds are untouched. Both hosts are
+**bit-identical to the binary before the change** (a hash of the outputs
+written by the old test binary and compared by the new one) and to their
+in-tree controls.
+
+| `ace/dit`, ms a forward (old / fused / control, interleaved twice) | 375 rows (30 s) | 1500 (2 min) | 3000 (4 min) | 7500 (10 min) |
+|---|---:|---:|---:|---:|
+| before (gate, up, `swiglu`, `pack v`) | 119.5 / 119.7 | 381.7 / 382.0 | 802.4 / 804.6 | 2258.8 / 2262.2 |
+| the control (fused GEMM + the SwiGLU pass, the pack) | 119.9 / 120.9 | 379.7 / 377.3 | 804.8 / 805.3 | 2255.1 / 2258.9 |
+| **fused** | **111.4** (one run, the final build) | **347.2 / 347.8** | **742.4 / 746.5** | **2121.8 / 2126.8** |
+| | 1.07x | 1.10x | 1.08x | 1.06x |
+
+2627–2631 MHz at 145–146 W fused against 2672–2683 at 143–145 before
+(the sampler over the whole timing test), so the gain is not clock. At
+4 minutes the `swiglu` pass was 50.4 ms of 801 (6.3%) and `pack v` 3.3;
+the fused gate|up runs at 44.9 TFLOP/s where gate and up ran 43.5 and
+42.2. **The row rule moved for this one projection**: the fused gate|up
+runs on the LDS build at every row count, because its grid is twice a
+projection's and there is no pass behind it — against the wave64 build's
+fused GEMM plus the pass, 110.1 / 110.9 against 120.5 / 119.7 ms at 375
+rows, 181 against 200 at 750, 249 against 274 at 1000, a tie at 125
+(75.5–76.6). Every other projection keeps `bigW64Rows`. v is stored by
+its GEMM on either build (`gemmBigPack` / `gemmBigW64Pack`), the
+request's 32 cross-attention v planes too; the A pad rows are zeroed
+first (`zero_f16`), as in H3. Gates: `TestGPUBits` (new: the condition
+encoder, a forward at 30 s and at 4 min and the detokenizer hashed, the
+same four hashes from the old binary, and fused against control),
+`TestGPUEncode`, `TestGPUDiT`, `TestGPUDetok`, `TestGPUTokenize`, and
+`ace/pipeline`'s `TestGenerate` and `TestTasks`, all passing.
+
+| `h3/vae`, 124 frames, batches of 8 (`TestGPUShapes`, every run) | 480p device | 768p device | useful TFLOP/s |
+|---|---:|---:|---:|
+| before | 34.41 / 34.47 / 34.40 s | 64.23 / 64.28 / 64.26 s | 29.4–29.5 |
+| the control | 34.28 s | 64.03 s | 29.6 |
+| **fused** | **30.02 / 29.94 s (1.15x)** | **55.97 / 57.42 s (1.12–1.15x)** | **33.0–33.9** |
+
+2762 MHz at 144 W fused against 2786 at 138–139 before; the second
+fused run sat at 2696 MHz / 129 W over its 768p half and read 57.4 s,
+the machine's and recorded as such. 1.15x is more than H3's DiT took
+from the same two fusions (1.03x) because the VAE's rows are 14,464 a
+batch in fp16 throughout with 36 blocks and nothing else between them:
+the passes were a larger share and their DRAM traffic a larger share of
+the power. Two things are the VAE's own. **Its biases ride in the
+GEMM**, so the interleaved weight is built from the two halves each with
+its bias column, and the epilogue's fp16 store stops at the FFN's width,
+under the down projection's column of ones. **And v is stored by its
+GEMM only when the batch's rows are whole 128-row tiles** (8 sequences
+of 1,808 are; the last partial batch of a decode runs the pack): a pad
+row of this GEMM is the bias, not +0, and zeroing the A operand's pad
+rows would take the ones column with them. Gates: `TestGPUDecoder` (now
+staged for 8 sequences; the short decode and a batch of eight tile-clips
+fused against control, bit for bit) and `TestGPUDecodeFull`, PSNR 81.7 dB
+unchanged, both decodes' hashes equal to the old binary's.
+
+**The speech encoders, priced and left.** Parakeet's feed forward is
+linear → SiLU → linear, not gated, so there is nothing to interleave;
+its plan runs the 32×32 wave32 rung, not the LDS build; and
+`TestGPUProfile` puts the whole 24-layer encoder at 13.5 ms for an 11 s
+clip with `silu ff1` + `silu ff2` at 1.8% and `pack v` at 0.5% — 48 and
+24 dispatches of 3–5 µs each, which is the dispatch floor. A `C_SILU`
+epilogue on that rung is a new build for ≤ 0.3 ms a clip. Kokoro's
+ALBERT has one GELU pass a layer over a few hundred rows and is smaller
+again (not measured). Neither is carried.
+
+### G6 — the streaming kernels (2026-09-30)
+
+Filed as **§5.4** in `research/5.4-grid-order-and-channel-phase.md`, with
+the arms and the full tables.
+
+**The finding.** A pass that reads a slice of each row a workgroup keeps
+the next few dozen workgroups, in grid order, in flight beside it. If one
+step along the grid's X axis moves the address by a whole number of the
+4 KB DRAM channel rotation (§5.1b), all of them load the same channels and
+the rest idle. That is the LLM's `[T][4][2560]` residual walked with the
+token on X (a token is ten rotations; a stream's 10,240 B row asks one half
+of the rotation for three bytes and the other for two: 5/6 of the bus), and
+the DiT family's q/k pack walked with the token tile on X (one head of
+consecutive rows is 512 B of a row that is 7, 4, 2 or 1 whole rotations:
+an eighth or a sixteenth of the channels). The one-line test: the same
+grid walked in the other order. Hoisting every load of a row and
+sixteen-byte lanes moved nothing at DRAM sizes, which is why P11, P12 and
+P15 each spent a hypothesis on `hc.cn` and found nothing — and a third of
+its "missing" rate was never missing: 134 GB/s counted the residual once,
+and an in-place update is a read and a write (184).
+
+**The table the gate asks for** — every streaming pass over 1 ms a block,
+before → after, GB/s of read + written against a copy's 236:
+
+| host (shape) | pass | before | after |
+|---|---|---:|---:|
+| LLM, 8,192 rows | `hc.cn` (94 a pass) | 184 (4.98 ms) | **200** (4.62–4.66 ms) |
+| | `hc.norm` | 183 | **217** |
+| | `hc.combine` | 191 real (the block output read 4x) | **210**, 1.48x |
+| `h3/dit`, 480p | `qkpack q`, `k` | 117 | **209** |
+| | `attn in`, `ffn in` | 193 | 207 |
+| | `gate attn`, `gate ffn` | 211 | 210 |
+| `h3/vae`, 8 × 1,808 rows | `qkpack q`, `k` | (no profile before; a sixteenth of the channels) | 198–199 |
+| | norms / gates | | 205 / 204–213 |
+| `ace/dit`, 7,500 rows | `qkpack q`, `cross q` / `k` | 120 / 93 | **208 / 187** |
+| | norms / gates | 181 / 193–208 | 181+ / 193–208 (hoisted: +0.6–1.8% a forward) |
+| `qimage/dit`, 1024² | `pack k`, `v` / `qkpack q` | 126 / 151 | **173 / 189** |
+| | `gate` / `dequant` | 175 / 240 | not touched |
+
+**What it is worth**, every row bit-identical to the binary before it:
+LLM prefill **1520 → 1538 tok/s at 2048, 1552 → 1570 at 4096, 1493 → 1498
+at 8192**, decode **36.87 → 37.35 tok/s** (`hc.cn` 7.0 → 2.4 µs a
+dispatch: the hoisted loads, which is where they matter); a 480p video
+forward **25.58 / 25.44 → 25.25 / 25.21 s**; a 480p VAE decode **29.95 →
+27.5 s**, 768p 55.7 → 51.6; a music forward **2113 → 2050 ms at 10 min,
+745 → 723 at 4 min, 111.4 → 109.8 at 30 s**; an image step 1.895 → 1.886 s.
+
+**What changed.** `llm_hc_{norm,combine,cn}.comp`: a stream across and a
+token down, `hc.cn` a workgroup a (token, stream) at every width (P11's
+walk and `LLM_HC_CN_SPLIT_ROWS` are gone), a row's loads hoisted.
+`h3_qk_pack`, `dit_qk_pack`, `dit_pack_f16`: `-DHEAD_X=1` builds, used by
+`h3/dit`, `h3/vae`, `ace/dit` and (at the served eight tiles) `qimage/dit`.
+`h3_norm_mod`: hoisted loads. `dit_gate_add_hoist`: a hoisted build for the
+three hosts that re-ran their gates. `h3/dit`, `h3/vae`, `ace/dit`: a
+`Bytes` field a stage and a GB/s column in the profile; `h3/vae` has a
+profile now (`Profile`, `TestGPUProfile`).
+
+**Left.** The gate fused with the norm that reads what it wrote (one read
+of the residual, ~a fifth of those two passes: ~1.5% of a music forward).
+The hoisted gate on qimage, kev, ocr, zimage and `ace/lm`. The hosts with
+no bytes column yet: kev, ocr, `zimage/qwen` (its pack walks one head of
+many rows of 2.5 rotations: predicted a quarter of the channels), the
+speech encoders (cache-resident, where the law does not bind), and the
+LLM's `move`, `moe.combine`, `dn.*`, `ple.*`.
+
+### G4b — the attention's key blocks through LDS (2026-09-30)
+
+Filed as **§3.9** in `research/3.9-attention-kv-lds.md`, with the ladder.
+
+**The build.** `h3_attn_t.comp -DKVLDS=1 -DWAVES=8 -DQT=1 -DKTIL=4
+-DLAZY=1 -DTAIL_SPLIT=1`: a workgroup of eight wave32 waves, a query tile
+each, over one head. A key block's 16 KB of K and 16 KB of V^T are each
+fetched once by the workgroup's 256 lanes (four `uvec4` a lane) and
+written to an LDS plane — K as key rows at 132 halves, V^T as component
+rows at 68, both conflict-free for `ds_load_b64` — and every K and V
+fragment is read from there. One plane each (two of each is 68.6 KB), so
+two barriers a block: K(b+1) is fetched at the top of block b and stored
+behind the barrier that ends the S^T reads, V(b+1) fetched there and
+stored behind the barrier that ends the O^T reads. 34.8 KB of LDS, four
+waves a SIMD, 256 VGPRs, no spill. The same MMAs in the same order per
+accumulator as `h3_attn_t_qt2_kt4`: **bit-identical**.
+
+| 480p forward, int8, two runs each, interleaved | attention | forward | sclk |
+|---|---:|---:|---:|
+| the one-wave build (`H3_ATTN_LDS=0`) | 9.79 / 9.82 s, 37.1–37.2 TFLOP/s | 25.23 / 25.21 s | 2653–2660 |
+| **`h3_attn_t_kvlds_w8_kt4`** | **8.91 / 8.90 s, 40.8–40.9 (1.10x)** | **24.27 / 24.35 s (1.037x)** | 2717–2718 |
+| 768p, one run each | 60.5 → **54.3 s** (34.6 → 38.6, 1.115x) | 95.9 → **92.5 s** | 2658 → 2704 |
+
+| the screen, 480p, ms (the one-wave build 193.8–197.5 across the runs) | |
+|---|---:|
+| first cut (fetches a block ahead, staging registers across the back-edge) | 196–200 |
+| fetched and stored inside one trip | 193.9–194.9 |
+| … `LAZY` / `MAX_TREE LAZY TAIL_SPLIT` | 187.4 / 177.7–178.2 |
+| **… `LAZY TAIL_SPLIT` (shipped)** | **175.1–175.6**; 768p 1.195 → 1.046 s; 3,100 keys 7.58 → 7.05 ms |
+| its controls: no barriers / staging all L0 / softmax gutted | 170.3 / 164.6 / 165.6 |
+| `KV_DEEP` / `KV_VTOP` / `KV_BSOFT` / sixteen waves / `QREG=0` / `KTIL2` | 194 / 183 / 184 / 186–202 / 220 / 200 |
+
+**The three findings.** (1) **A register carried across a loop's
+back-edge is copied there behind a wait for what it holds**: the first
+cut's staging registers crossed the back-edge, the copy into the phi's
+registers sat behind `s_waitcnt vmcnt(0)`, and the "block ahead" fetch was
+waited out every block (its L0 control read 8–9%); §2.9's rule about
+fragments holds for plain `uvec4`. The same back-edge rotated all 64
+accumulator registers. Fetch and store inside one trip. (2) **§3.8's exact
+softmax knobs were dead only at the register limit**: on a spill-free
+build at 222 of 256 VGPRs `LAZY` is 3–4% and `TAIL_SPLIT` another 6%
+(`MAX_TREE` still loses). (3) **The fetch is a quarter of the bytes** (32
+KB a block for 128 queries, not for 32), and the forward's clock rises
+60 MHz at the same package power. §3.8's estimate (≤ 2% of a forward) had
+the LDS side right — two barriers are 3% — and missed (2) and (3).
+
+**Carry-in.** `h3/dit` runs it by default wherever the transposed kernel
+runs (`AttnVariant{QT: 8, KTIL: 4, T: true}`: `QT` is query tiles a
+*workgroup*); `TestGPUForward` and `TestGPURun` pass. `h3/vae`: the
+head-64 build reads 6.10 ms against the shipped 6.22 on the VAE's screen
+(8 × 1,808 keys, 14.5 VALU an MMA), inside its spread — not embedded.
+`qimage/dit`: the transposed kernel is opt-in behind the edit gate (§3.8)
+and this is the same bits; not carried.
 
 ## How to run
 
@@ -835,6 +1027,30 @@ video forward for a session. Recorded, not built.
   the fused epilogues' controls (the v pack, the SwiGLU pass), and a
   fused-path run is gated by `H3_GEMM_REF` against a shipped-build
   reference from the same day.
+- The fused epilogues' controls on the other hosts: `ACE_DIT_FUSE=0` on
+  `ace/dit`'s `TestGPUStepTiming`, `H3_VAE_FUSE=0` on `h3/vae`'s
+  `TestGPUShapes`; `ACE_DIT_REF=file` on `TestGPUBits` writes the output
+  hashes on the first run and compares them on every later one (build the
+  old test binary first, as with `H3_GEMM_REF`); `h3/vae`'s decode tests
+  log a `bits` hash to compare across binaries by eye.
+- The streaming kernels (G6): the profiles of `h3/dit` (`H3_PROFILE=1`),
+  `h3/vae` (`H3_VAE_SHAPES=1 -test.run TestGPUProfile`) and `ace/dit`
+  (`ACE_DIT_PROFILE=<seconds>` on `TestGPUStepTiming`) print GB/s for every
+  pass that moves bytes; `LLM_HC_SPV=cn=path,norm=path,combine=path` loads
+  an hc kernel from disk, and `-DTOKEN_FAST=1` / `-DHOIST=0` on those three
+  shaders are the controls (`cmd/llm -hc` times the norm and the combine,
+  `cmd/llm -graph -layers 4` the fused `hc.cn`); `QIMAGE_PACK_TF=1` runs
+  the image DiT's packs on the old grid. A pass near 120 GB/s that does no
+  arithmetic is walking its grid the wrong way: check
+  `gcd(address step along X, 4096)` against the slice a workgroup reads.
+- The attention (G4, G4b): `H3_SCREEN=480x864 H3_BANK=q8
+  H3_ATTN_ONLY_SPV=1 H3_SCREEN_REPS=12 H3_ATTN_SPV=qt:ktil:path,…` on
+  `h3/dit`'s `TestGPUAttentionScreen`, where `qt` is the query tiles a
+  *workgroup* (8 for a `-DKVLDS=1 -DWAVES=8 -DQT=1` arm); every arm is
+  checked bit for bit against the one-wave transposed build, runs
+  `H3_SCREEN_REPS` times in one submission and logs `window <from> <to>`
+  (epoch ms) for the sampler. `H3_ATTN_LDS=0` on `TestGPUShapes` is the
+  one-wave control of a forward (run it first with `H3_GEMM_REF`).
 - Never edit a shader during a sweep; build the test binary to the
   scratchpad first, and check `ps` for another device run.
 - Driver pinned in the record: Mesa 26.2.2 (RADV), glslc 2026.3, Vulkan
@@ -896,6 +1112,92 @@ video forward for a session. Recorded, not built.
   kernel 1.40x slower at wave64 for the same reasons. Not read.
 
 ## Handoff
+
+**2026-09-30, session 13: G4b, the attention's key blocks through LDS;
+a video forward 1.037x.** `research/3.9-…` has it. `h3_attn_t.comp` has a
+`KVLDS` mode: a workgroup of eight wave32 waves, a query tile each, fetches
+a key block's K and V once (four `uvec4` a lane a plane, half a block
+ahead) into one LDS plane each, two barriers a block, and the build that
+ships (`h3_attn_t_kvlds_w8_kt4`, `-DLAZY=1 -DTAIL_SPLIT=1`) is
+**bit-identical** to the one-wave build and the default in `h3/dit`:
+the kernel 195 → 175 ms on the 480p screen and 1.195 → 1.046 s at 768p,
+in the forward 37.2 → 40.8 TFLOP/s (73 → 78% per clock), **a 480p forward
+25.22 → 24.31 s and 768p 95.9 → 92.5 s**, the clock 2657 → 2717 MHz;
+`TestGPUForward`, `TestGPURun` and `H3_GEMM_REF` at both shapes pass. Two
+facts for whoever stages anything through registers next: **a register
+that crosses a loop's back-edge is copied there behind a wait for its
+load** (the first cut fetched a block ahead, tied the old build, and its
+disassembly showed `vmcnt(0)` in front of the back-edge copies — fetch and
+store inside one trip), and **§3.8's dead exact knobs come alive on a
+spill-free build** (`LAZY` 3–4%, `TAIL_SPLIT` 6%). Measured dead: both
+fetches a whole block deep with back-to-back barriers, V fetched at the
+top, the barrier behind the softmax, sixteen waves (a 192-VGPR cap),
+`QREG=0`, `KTIL2`. Left in the kernel by its controls: softmax 6%, global
+side ≤ 6%, barriers 3%. Not carried: the VAE (6.10 against 6.22 ms on its
+screen), the image DiT (opt-in behind its edit gate; same bits). The
+screen now repeats an arm inside one submission and logs a sampler window
+(`H3_SCREEN_REPS`); its first `H3_ATTN_SPV` field is query tiles a
+workgroup. Results: the session scratchpad only (`s3`–`s10` screens,
+`fw_{ctl,new}`, `fw768_{ctl,new}` logs and samples). **The served binary
+needs a redeploy** (everything since G3; no restaging for this one).
+**Next:** G7 (the CPU's share of the power budget, and the sampler into
+`bench/sysmon.go` — this session wrote it as a scratchpad script again),
+or the rest of G6 (gate+norm fusion; a bytes column for kev, ocr,
+`zimage/qwen` and the LLM's other passes).
+
+**2026-09-30, session 12: G6, the streaming kernels; the grid's fast axis
+was the defect.** `research/5.4-…` has it. A bytes column went into the
+profiles, and the slow passes turned out to share one cause that is not in
+any kernel's body: the workgroups in flight together are neighbours along
+the grid's X axis, and where a step along X is a whole number of the 4 KB
+channel rotation they all load the same DRAM channels. Swapping the two
+grid axes — the LLM's hyper-connection kernels to a stream across and a
+token down, the DiT family's q/k packs to a head across — is the same
+workgroups and the same bits, and takes `hc.norm` 183 → 217 GB/s, the packs
+93–151 → 173–209. `hc.cn`'s long-standing "134 GB/s" was also a third
+accounting (the residual's write-back uncounted; it was at 184 and is at
+200), and the three hc kernels and the DiT norm and gate now issue a row's
+loads before waiting on any, which is nothing off DRAM and 2.9x on
+`hc.cn` at decode. Bit-identical everywhere (`TestGraphLogits`'s line to
+the digit, `H3_GEMM_REF`, the VAE's two decode hashes, `ACE_DIT_REF`, the
+image DiT's in-process control). Whole-path numbers, old and new the same
+hour: LLM prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35;
+a 480p video forward 25.5 → 25.2 s; **a 480p VAE decode 29.95 → 27.5 s**
+(34.4 this morning); a 10-minute music forward 2113 → 2050 ms; an image
+step 1.895 → 1.886 s. Refused: `vec4` lanes, a one-wave workgroup, the
+rotated walk. **The served binary needs a redeploy** (everything since G3).
+Results are in the session scratchpad only. **Next:** G4b (the attention's
+K/V block through LDS), G7 (the CPU's share of the power budget), or the
+rest of G6 — the gate+norm fusion, and a bytes column for kev, ocr,
+`zimage/qwen` and the LLM's other passes, where the same one-line test
+(walk the grid the other way) is the first thing to run.
+
+**2026-09-30, session 11: G8, G3's epilogues carried to the music DiT and
+the video VAE; the speech encoders priced and left.** Host changes only
+(the section above): `ace/dit` stores v from its GEMM on both rungs and
+runs gate|up as one GEMM ending in the SwiGLU — on the LDS build at
+every row count, which is a new row rule for that one projection (110
+against 120 ms at 375 rows) — for **a forward 1.07x at 30 s, 1.10x at
+2 min, 1.08x at 4 min, 1.06x at 10 min**; `h3/vae` does the same (its
+biases in the interleaved weight; v from the GEMM only when the batch is
+whole 128-row tiles, since its pad rows are the bias) for **a 480p
+decode 34.4 → 30.0 s and 768p 64.3 → 56.0 s (1.15x)**, which is 4.4 s
+of every 480p video request. Both bit-identical to the old binaries
+(hashes) and to their controls; every gate of both packages and the
+music pipeline's passes. Parakeet's two SiLU passes and its v pack are
+2.3% of a 13.5 ms encoder at the dispatch floor, on a rung the epilogues
+are not built for: left, with kokoro. New tests and knobs: `TestGPUBits`
+(`ACE_DIT_REF`), `ACE_DIT_FUSE=0`, `H3_VAE_FUSE=0`, the `bits` lines in
+`h3/vae`. Results: the session scratchpad only (`t_{old,new,ctl}_{1,2}`,
+`vs_{old,new,ctl}_{1,2}` logs and samples), the numbers above. **The
+served binary needs a redeploy** for all of G3 (video restages its int8
+cache once; the VAE and music have no cache). Not looked at: the other
+gated FFNs on the big GEMM (`zimage/qwen`'s text encoder, `ace/lm`'s and
+`ocr`'s prefills, `qimage/vision`) — each runs once a request on short
+inputs. **Next:** G6 (the streaming kernels; H3's `qkpack` q/k at 1.1%
+each, and with the VAE's SwiGLU and pack gone its `qkpack` and norms are
+the next thing its profile would show — it has no per-kind profile test
+yet, write that first) or G4b.
 
 **2026-09-30, session 10: G3, the epilogue priced and its consumers fused
 into it.** H4 is dead on the pipe: `-DSTORE_TILES=n` keeps every MMA and

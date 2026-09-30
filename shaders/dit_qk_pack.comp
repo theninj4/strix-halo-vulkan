@@ -53,12 +53,29 @@ shared float rows[TILE * HEAD_DIM];
 shared float partial[WG];
 shared float inv[TILE];
 
+// HEAD_X (KERNELS.md G6, research §5.4): the grid is a head across and a
+// token tile down (h3_qk_pack.comp has the argument): the workgroups in
+// flight together are then the heads of a few tokens, whose 4*HEAD_DIM-byte
+// slices of a row tile the DRAM channel rotation, not one head of many
+// tokens, which lands on the same channels row after row wherever a row is
+// close to a whole number of rotations. Same workgroups, same bits.
+#ifndef HEAD_X
+#define HEAD_X 0
+#endif
+#if HEAD_X
+#define WG_HEAD gl_WorkGroupID.x
+#define WG_GROUP gl_WorkGroupID.y
+#else
+#define WG_HEAD gl_WorkGroupID.y
+#define WG_GROUP gl_WorkGroupID.x
+#endif
+
 void main() {
-    uint head = gl_WorkGroupID.y;
+    uint head = WG_HEAD;
     uint tid = gl_LocalInvocationID.x;
 
   for (uint slab = 0u; slab < uint(TPW); ++slab) {
-    uint tt = gl_WorkGroupID.x * uint(TPW) + slab;
+    uint tt = WG_GROUP * uint(TPW) + slab;
     if (pc.span != 0u && tt >= pc.span) {
         return;
     }

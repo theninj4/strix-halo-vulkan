@@ -1,6 +1,7 @@
 package dit
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -363,7 +365,11 @@ func TestGPUStepTiming(t *testing.T) {
 	case "small":
 		g.big = gemmSmall
 	}
-	defer func() { g.big = gemmBig }()
+	// ACE_DIT_FUSE=0 runs the fused epilogues' controls (KERNELS.md G3).
+	if os.Getenv("ACE_DIT_FUSE") == "0" {
+		g.packV, g.fuseGLU = false, false
+	}
+	defer func() { g.big, g.packV, g.fuseGLU = gemmBig, true, true }()
 	if err := g.Begin(readMat(t, ditRef, "full_metas_encoder_states")); err != nil {
 		t.Fatal(err)
 	}
@@ -384,7 +390,7 @@ func TestGPUStepTiming(t *testing.T) {
 			}
 		}
 		t.Logf("%3d s (%4d tokens): %6.1f ms a forward, %5.2f s for 8", sec, g.Tokens(T), best.Seconds()*1e3, 8*best.Seconds())
-		if sec != 240 {
+		if sec != 240 && os.Getenv("ACE_DIT_PROFILE") != fmt.Sprint(sec) {
 			continue
 		}
 		st, err := g.Profile(x, ctx, 0.75)
@@ -393,10 +399,12 @@ func TestGPUStepTiming(t *testing.T) {
 		}
 		by := map[string]time.Duration{}
 		fl := map[string]float64{}
+		mv := map[string]float64{}
 		var total time.Duration
 		for _, s := range st {
 			by[s.Kind] += s.GPU
 			fl[s.Kind] += s.Flops
+			mv[s.Kind] += s.Bytes
 			total += s.GPU
 		}
 		kinds := make([]string, 0, len(by))
@@ -408,9 +416,86 @@ func TestGPUStepTiming(t *testing.T) {
 			tf := ""
 			if fl[k] > 0 {
 				tf = fmt.Sprintf("%5.1f TFLOP/s", fl[k]/by[k].Seconds()/1e12)
+			} else if mv[k] > 0 {
+				tf = fmt.Sprintf("%5.0f GB/s", mv[k]/by[k].Seconds()/1e9)
 			}
 			t.Logf("  %-18s %7.1f ms %5.1f%% %s", k, by[k].Seconds()*1e3, 100*by[k].Seconds()/total.Seconds(), tf)
 		}
+	}
+}
+
+// TestGPUBits hashes what the device graphs produce -- the condition
+// encoder's packed sequence, a forward at 30 s (the wave64 rung) and at
+// 4 minutes (the LDS-staged one), and the detokenizer's hints -- and, with
+// ACE_DIT_REF=file, writes the hashes on the first run and compares them on
+// every later one: the bit-identical gate a scheduling change to the kernels
+// goes through (KERNELS.md decision 3), across binaries. Within one binary
+// it holds the GEMM's fused epilogues to their controls.
+func TestGPUBits(t *testing.T) {
+	g := sharedGPU(t)
+	loadDitManifest(t)
+	p := "full_metas_"
+	run := func() string {
+		var lines []string
+		sum := func(name string, m *qwen.Mat) {
+			h := sha256.New()
+			binary.Write(h, binary.LittleEndian, m.Data)
+			lines = append(lines, fmt.Sprintf("%s %x", name, h.Sum(nil)[:12]))
+		}
+		enc, err := g.Encode(readMat(t, planRef, p+"text_hidden"), readMat(t, planRef, p+"lyric_embeds"), silence(t, 750))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum("encode", enc)
+		if err := g.Begin(readMat(t, ditRef, p+"encoder_states")); err != nil {
+			t.Fatal(err)
+		}
+		for _, sec := range []int{240, 30} {
+			T := sec * 25
+			x, ctx := qwen.NewMat(T, 64), qwen.NewMat(T, 128)
+			for i := range x.Data {
+				x.Data[i] = float32(math.Sin(float64(i)))
+			}
+			v, _, err := g.Step(x, ctx, 0.75)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sum(fmt.Sprintf("step %ds", sec), v)
+		}
+		hints, err := g.Detokenize(readI32(t, filepath.Join(detokRef, p+"codes.bin")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sum("detok", hints)
+		return strings.Join(lines, "\n") + "\n"
+	}
+	got := run()
+	t.Log("\n" + got)
+	// G3's fused epilogues against their controls (the pack; the SwiGLU pass
+	// over the same fp32 GEMM output): same MMAs, same expression, same bits.
+	g.packV, g.fuseGLU = false, false
+	control := run()
+	g.packV, g.fuseGLU = true, true
+	if control != got {
+		t.Errorf("the fused epilogues differ from their controls:\n%s", control)
+	}
+	ref := os.Getenv("ACE_DIT_REF")
+	if ref == "" {
+		return
+	}
+	want, err := os.ReadFile(ref)
+	if os.IsNotExist(err) {
+		if err := os.WriteFile(ref, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("wrote %s", ref)
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(want) != got {
+		t.Errorf("not bit-identical to %s:\n%s", ref, want)
 	}
 }
 

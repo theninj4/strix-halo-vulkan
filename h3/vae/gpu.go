@@ -9,6 +9,7 @@ import (
 	"strix-halo-vulkan/safetensors"
 	"strix-halo-vulkan/shaders"
 	"strix-halo-vulkan/vk"
+	"strix-halo-vulkan/zimage/qwen"
 )
 
 // GPU runs the decoder's ViT on the device, over the kernels M7 validated
@@ -72,6 +73,17 @@ type GPU struct {
 	attn                  AttnVariant
 	attnProbed, attnFixed bool
 	mods                  []*vk.ShaderModule
+	// The GEMM's fp16 epilogues (KERNELS.md G3, research §2.14), both
+	// bit-identical to the passes they replace: packV stores the v
+	// projection as the attention's fragment tiles (no "pack v" pass) when
+	// the batch's rows are whole 128-row tiles -- the served batch of 8 is;
+	// the GEMM's pad rows would otherwise land in the plane as the bias, not
+	// the +0 the pack leaves, and the bias column of an A operand is not
+	// this pass's to zero -- and fuseGLU runs gate|up as one GEMM whose
+	// epilogue is the SwiGLU (no fp32 halves, no "swiglu" pass). Off, each
+	// runs its control: the pack, and the SwiGLU pass over the fused GEMM's
+	// fp32 output.
+	packV, fuseGLU bool
 
 	H, ffn, heads, headDim, ropeHalf int
 	seqLen, stride, maxSeqs, maxRows int // tokens a sequence, its row stride, sequences a batch
@@ -118,12 +130,15 @@ const (
 	projK
 	projV
 	projO
-	projGate // the silu'd half of ff.net.0.proj, rows [ffn, 2·ffn)
-	projUp   // the linear half, rows [0, ffn)
+	// projGateUp is ff.net.0.proj as one [2·ffn, H] projection, interleaved
+	// in 64-row groups (qwen.InterleaveGLU) -- 32 rows of the silu'd half
+	// (rows [ffn, 2·ffn) of the checkpoint's), then the linear rows of the
+	// same 32 outputs: dit_gemm.comp's C_SWIGLU layout.
+	projGateUp
 	projDown
 )
 
-var projOrder = []proj{projQ, projK, projV, projO, projGate, projUp, projDown}
+var projOrder = []proj{projQ, projK, projV, projO, projGateUp, projDown}
 
 // pushConstants mirrors shaders/dit_common.glsl.
 type pushConstants struct {
@@ -146,7 +161,11 @@ func (p pushConstants) bytes() []byte {
 
 type gemmKernel int
 
-const gemmBig gemmKernel = 0 // 128x256 tiles, the image DiT's measured winner
+const (
+	gemmBig     gemmKernel = iota // 128x256 tiles, the image DiT's measured winner
+	gemmBigPack                   // gemmBig storing C as the attention's fragment tiles (G3)
+	gemmBigGLU                    // gemmBig over projGateUp with the SwiGLU epilogue (G3)
+)
 
 var gemmVariants = map[gemmKernel]struct {
 	spirv  []byte
@@ -156,7 +175,9 @@ var gemmVariants = map[gemmKernel]struct {
 }{
 	// The LDS-staged wave32 build (KERNELS.md G2, research §2.9), bit-identical
 	// to the wave64 one it replaced.
-	gemmBig: {shaders.DiTGEMMWG128x256LDSW32, 128, 256, 32, 32},
+	gemmBig:     {shaders.DiTGEMMWG128x256LDSW32, 128, 256, 32, 32},
+	gemmBigPack: {shaders.DiTGEMMWG128x256LDSW32CPack, 128, 256, 32, 32},
+	gemmBigGLU:  {shaders.DiTGEMMWG128x256LDSW32SwiGLU, 128, 256, 32, 32},
 }
 
 const (
@@ -186,6 +207,7 @@ func NewGPU(dev *vk.Device, dir string, tileH, tileW, maxSeqs int) (*GPU, error)
 		dev: dev, cfg: cfg, pipes: map[string]*vk.ComputePipeline{},
 		H: cfg.Hidden(), ffn: cfg.FFN(), heads: cfg.Heads, headDim: cfg.HeadDim, ropeHalf: cfg.RopeWidth() / 2,
 		tileH: tileH, tileW: tileW, maxSeqs: maxSeqs,
+		packV: true, fuseGLU: true,
 	}
 	g.seqLen = cfg.ClipTokens()*tileH*tileW + cfg.Registers + 1
 	g.stride = roundUp(g.seqLen, tile)
@@ -245,8 +267,8 @@ func (g *GPU) projShape(p proj) (n, k int) {
 	switch p {
 	case projQ, projK, projV, projO:
 		return g.H, g.kH
-	case projGate, projUp:
-		return g.ffn, g.kH
+	case projGateUp:
+		return 2 * g.ffn, g.kH
 	default:
 		return g.H, g.kF
 	}
@@ -520,14 +542,22 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		if err != nil {
 			return err
 		}
-		// SwiGLU is value·silu(gate) with the projection's rows [value | gate].
 		lin := map[proj][2][]float32{
 			projQ: {wq, bq}, projK: {wk, bk}, projV: {wv, bv}, projO: {wo, bo},
-			projUp: {up[:g.ffn*H], bup[:g.ffn]}, projGate: {up[g.ffn*H:], bup[g.ffn:]},
 			projDown: {down, bdown},
 		}
 		for _, pr := range projOrder {
 			n, k := g.projShape(pr)
+			if pr == projGateUp {
+				// SwiGLU is value·silu(gate) with the projection's rows
+				// [value | gate]; each half with its bias column, interleaved.
+				fused := make([]float32, n*k)
+				qwen.InterleaveGLU(fused,
+					withBias(up[g.ffn*H:], bup[g.ffn:], g.ffn, H, k),
+					withBias(up[:g.ffn*H], bup[:g.ffn], g.ffn, H, k), g.ffn, k)
+				put(bw.bank, bw.off[pr], fused, n, k)
+				continue
+			}
 			realK := g.H
 			if pr == projDown {
 				realK = g.ffn
@@ -557,8 +587,8 @@ func (g *GPU) build(*safetensors.Set) error {
 		"norm":      shaders.H3NormMod,
 		"qkpack":    shaders.H3VAEQKPackHD64,
 		"pack":      shaders.H3VAEPackHD64,
-		"gate":      shaders.DiTGateAdd,
-		"swiglu":    shaders.DiTSwiGLUF16,
+		"gate":      shaders.DiTGateAddHoist,
+		"swiglu":    shaders.DiTSwiGLUF16IL32, // over the fused gate|up output: the epilogue's control
 		"finalnorm": shaders.DiTFinalNorm,
 	} {
 		p, err := newPipe(spirv, vk.PipelineSpec{Buffers: base, PushConstantSize: pcSize})
@@ -637,7 +667,18 @@ type graph struct {
 	d     []vk.MultiDispatch
 	kinds []string
 	flops []float64
+	// bytes is what a streaming dispatch reads and writes, by its index
+	// (KERNELS.md G6): its rate against a copy's 236 GB/s.
+	bytes map[int]float64
 	base  pushConstants
+}
+
+// moved records the bytes the dispatch just added reads and writes.
+func (gr *graph) moved(b int) {
+	if gr.bytes == nil {
+		gr.bytes = map[int]float64{}
+	}
+	gr.bytes[len(gr.d)-1] = float64(b)
 }
 
 func (g *GPU) newGraph() *graph {
@@ -653,6 +694,13 @@ func (gr *graph) add(pipe *vk.ComputePipeline, kind string, gx, gy uint32, pc pu
 // gemm issues C[mPad, n] fp32 at cOff = A[m, k] fp16 at aOff (row stride
 // lda) × B, the fragment-tiled weight at bOff of bank.
 func (gr *graph) gemm(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, m, n, k, lda int) error {
+	return gr.gemmWith(kernel, bank, kind, aOff, cOff, bOff, m, n, k, lda, nil)
+}
+
+// gemmWith is gemm with the push constants an epilogue build reads beyond
+// the GEMM's own (C_PACK's plane rows, C_SWIGLU's output stride and scale)
+// set by tweak.
+func (gr *graph) gemmWith(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff uint32, m, n, k, lda int, tweak func(*pushConstants)) error {
 	v := gemmVariants[kernel]
 	if n%v.bn != 0 || k%v.bk != 0 {
 		return fmt.Errorf("vae: %s: N=%d K=%d do not tile by %d/%d", kind, n, k, v.bn, v.bk)
@@ -661,6 +709,9 @@ func (gr *graph) gemm(kernel gemmKernel, bank int, kind string, aOff, cOff, bOff
 	pc := gr.base
 	pc.InOff, pc.OutOff, pc.BOff = aOff, cOff, bOff
 	pc.GemmM, pc.GemmN, pc.GemmK, pc.LDA = uint32(mPad), uint32(n), uint32(k), uint32(lda)
+	if tweak != nil {
+		tweak(&pc)
+	}
 	gr.add(gr.g.gemms[bank][kernel], kind, uint32(n/v.bn), uint32(mPad/v.bm), pc, 2*float64(mPad)*float64(n)*float64(k))
 	return nil
 }
@@ -698,7 +749,7 @@ func (gr *graph) submit() (time.Duration, error) {
 		total += t
 		i = j
 	}
-	gr.d, gr.kinds, gr.flops = gr.d[:0], gr.kinds[:0], gr.flops[:0]
+	gr.d, gr.kinds, gr.flops, gr.bytes = gr.d[:0], gr.kinds[:0], gr.flops[:0], nil
 	return total, nil
 }
 
@@ -714,9 +765,8 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 	aK := aQ + uint32(pad*g.H)
 	aV := aK + uint32(pad*g.H)
 	aAttn := g.aS
-	aGate := aAttn + uint32(pad*g.H)
-	aUp := aGate + uint32(pad*g.ffn)
-	aFF := aUp + uint32(pad*g.ffn)
+	aGate := aAttn + uint32(pad*g.H) // gate|up, fused: [pad, 2·ffn]
+	aFF := aGate + uint32(2*pad*g.ffn)
 
 	norm := func(kind string, weight uint32) {
 		pc := gr.base
@@ -724,6 +774,7 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 		pc.InOff, pc.OutOff = g.aX, g.hA
 		pc.Aux0, pc.Aux1, pc.Eps = weight, g.aZeros, eps
 		gr.add(g.pipes["norm"], kind, uint32(rows), 1, pc, 0)
+		gr.moved(rows * g.H * (4 + 2))
 	}
 	gate := func(kind string, y, vec uint32) {
 		pc := gr.base
@@ -731,16 +782,27 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 		pc.InOff, pc.OutOff = y, g.aX
 		pc.Aux0, pc.Aux2 = vec, 1
 		gr.add(g.pipes["gate"], kind, uint32(rows), 1, pc, 0)
+		gr.moved(rows * g.H * (4 + 4 + 4))
 	}
 
 	norm("attn in", w.norm1)
 	for _, pr := range []struct {
 		p   proj
 		out uint32
-	}{{projQ, aQ}, {projK, aK}, {projV, aV}} {
+	}{{projQ, aQ}, {projK, aK}} {
 		if err := gr.gemm(gemmBig, w.bank, "gemm qkv", g.hA, pr.out, w.off[pr.p], rows, g.H, g.kH, g.ldaH); err != nil {
 			return err
 		}
+	}
+	packV := g.packV && rows == pad
+	if packV {
+		// v straight into its plane as the attention's fragment tiles.
+		if err := gr.gemmWith(gemmBigPack, w.bank, "gemm v", g.hA, g.hV, w.off[projV], rows, g.H, g.kH, g.ldaH,
+			func(pc *pushConstants) { pc.Aux1 = uint32(g.planeRows) }); err != nil {
+			return err
+		}
+	} else if err := gr.gemm(gemmBig, w.bank, "gemm qkv", g.hA, aV, w.off[projV], rows, g.H, g.kH, g.ldaH); err != nil {
+		return err
 	}
 	tiles := rows / tile
 	for _, qk := range []struct {
@@ -757,14 +819,21 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 		pc.WOff, pc.Aux0 = g.wCos, g.wSin
 		pc.Aux1, pc.Aux2 = uint32(g.planeRows), g.wOnes
 		pc.Span, pc.Eps, pc.Scale = uint32(tiles), eps, math.Float32bits(qk.scale)
-		gr.add(g.pipes["qkpack"], qk.kind, uint32((tiles+7)/8), uint32(g.heads), pc, 0)
+		// A head across, a token tile down (the HEAD_X build, KERNELS.md
+		// G6): a row is 32 heads of 256 B, two turns of the DRAM channel
+		// rotation, so one head of many tokens is a sixteenth of the channels.
+		gr.add(g.pipes["qkpack"], qk.kind, uint32(g.heads), uint32((tiles+7)/8), pc, 0)
+		gr.moved(rows * g.H * (4 + 2))
 	}
-	pc := gr.base
-	pc.Tokens, pc.Dim = uint32(rows), uint32(g.H)
-	pc.InOff, pc.OutOff = aV, g.hV
-	pc.Aux0, pc.Aux1, pc.Aux2 = 1, uint32(g.planeRows), uint32(tiles)
-	pc.Scale = math.Float32bits(1)
-	gr.add(g.pipes["pack"], "pack v", uint32((tiles+7)/8), uint32(g.heads), pc, 0)
+	if !packV {
+		pc := gr.base
+		pc.Tokens, pc.Dim = uint32(rows), uint32(g.H)
+		pc.InOff, pc.OutOff = aV, g.hV
+		pc.Aux0, pc.Aux1, pc.Aux2 = 1, uint32(g.planeRows), uint32(tiles)
+		pc.Scale = math.Float32bits(1)
+		gr.add(g.pipes["pack"], "pack v", uint32((tiles+7)/8), uint32(g.heads), pc, 0)
+		gr.moved(rows * g.H * (4 + 2))
+	}
 
 	gr.attention(seqs)
 	if err := gr.gemm(gemmBig, w.bank, "gemm o", g.hCtx, aAttn, w.off[projO], rows, g.H, g.kH, g.ldaH); err != nil {
@@ -772,17 +841,28 @@ func (gr *graph) blockPass(w blockW, seqs int) error {
 	}
 	gate("gate attn", aAttn, w.s1)
 	norm("ffn in", w.norm2)
-	if err := gr.gemm(gemmBig, w.bank, "gemm gate", g.hA, aGate, w.off[projGate], rows, g.ffn, g.kH, g.ldaH); err != nil {
-		return err
+	if g.fuseGLU {
+		// gate|up as one GEMM over the interleaved weight, its epilogue the
+		// SwiGLU into the down projection's fp16 A operand (whose bias
+		// column, past the FFN's width, it does not write).
+		if err := gr.gemmWith(gemmBigGLU, w.bank, "gemm gateup", g.hA, g.hFFN, w.off[projGateUp], rows, 2*g.ffn, g.kH, g.ldaH,
+			func(pc *pushConstants) { pc.Aux0, pc.Scale = uint32(g.ldaF), math.Float32bits(1) }); err != nil {
+			return err
+		}
+	} else {
+		// The control: the same GEMM stored as fp32 [rows, 2·ffn], then the
+		// SwiGLU pass over its interleaved columns -- the same values
+		// through the same expression.
+		if err := gr.gemm(gemmBig, w.bank, "gemm gateup", g.hA, aGate, w.off[projGateUp], rows, 2*g.ffn, g.kH, g.ldaH); err != nil {
+			return err
+		}
+		pcG := gr.base
+		pcG.Tokens, pcG.Dim, pcG.LDA = uint32(rows), uint32(g.ffn), uint32(g.ldaF)
+		pcG.InOff, pcG.OutOff = aGate, g.hFFN
+		pcG.Scale = math.Float32bits(1)
+		gr.add(g.pipes["swiglu"], "swiglu", uint32(rows), 1, pcG, 0)
+		gr.moved(rows * g.ffn * (8 + 2))
 	}
-	if err := gr.gemm(gemmBig, w.bank, "gemm up", g.hA, aUp, w.off[projUp], rows, g.ffn, g.kH, g.ldaH); err != nil {
-		return err
-	}
-	pcG := gr.base
-	pcG.Tokens, pcG.Dim, pcG.LDA = uint32(rows), uint32(g.ffn), uint32(g.ldaF)
-	pcG.InOff, pcG.KOff, pcG.OutOff = aGate, aUp, g.hFFN
-	pcG.Scale = math.Float32bits(1)
-	gr.add(g.pipes["swiglu"], "swiglu", uint32(rows), 1, pcG, 0)
 	if err := gr.gemm(gemmBig, w.bank, "gemm down", g.hFFN, aFF, w.off[projDown], rows, g.H, g.kF, g.ldaF); err != nil {
 		return err
 	}
@@ -841,14 +921,23 @@ func (g *GPU) input(clips []*Tensor) {
 // input GEMM straight into the residual, the blocks, and the tail into
 // aOut. last < 0 runs every block, and tail false stops after them.
 func (g *GPU) run(seqs, first, last int, input, tail bool) (time.Duration, error) {
-	if err := g.chooseAttention(); err != nil {
+	gr, err := g.record(seqs, first, last, input, tail)
+	if err != nil {
 		return 0, err
+	}
+	return gr.submit()
+}
+
+// record is run's graph, unsubmitted.
+func (g *GPU) record(seqs, first, last int, input, tail bool) (*graph, error) {
+	if err := g.chooseAttention(); err != nil {
+		return nil, err
 	}
 	gr := g.newGraph()
 	rows := seqs * g.stride
 	if input {
 		if err := gr.gemm(gemmBig, g.projIn.bank, "gemm proj_in", g.hIn, g.aX, g.projIn.off, rows, g.H, g.kIn, g.ldaIn); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 	if last < 0 {
@@ -856,7 +945,7 @@ func (g *GPU) run(seqs, first, last int, input, tail bool) (time.Duration, error
 	}
 	for b := first; b < last; b++ {
 		if err := gr.blockPass(g.blocks[b], seqs); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 	if tail {
@@ -865,11 +954,42 @@ func (g *GPU) run(seqs, first, last int, input, tail bool) (time.Duration, error
 		pc.InOff, pc.OutOff = g.aX, g.hA
 		pc.Aux0, pc.Eps = g.aNormOut, math.Float32bits(float32(g.cfg.NormEps))
 		gr.add(g.pipes["finalnorm"], "norm out", uint32(rows), 1, pc, 0)
+		gr.moved(rows * g.H * (4 + 2))
 		if err := gr.gemm(gemmBig, g.projOut.bank, "gemm proj_out", g.hA, g.aOut, g.projOut.off, rows, g.projOut.n, g.H, g.ldaH); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
-	return gr.submit()
+	return gr, nil
+}
+
+// Stage is one dispatch's measurement.
+type Stage struct {
+	Kind  string
+	GPU   time.Duration
+	Flops float64
+	Bytes float64 // read and written, for a streaming pass
+}
+
+// Profile runs the whole decoder over a batch of tile-clips a dispatch at a
+// time, timing each.
+func (g *GPU) Profile(clips []*Tensor) ([]Stage, error) {
+	if len(clips) == 0 || len(clips) > g.maxSeqs {
+		return nil, fmt.Errorf("vae: %d tile-clips, staged for 1..%d", len(clips), g.maxSeqs)
+	}
+	g.input(clips)
+	gr, err := g.record(len(clips), 0, -1, true, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Stage, 0, len(gr.d))
+	for i := range gr.d {
+		d, err := vk.DispatchMultiTimed(gr.d[i:i+1], 1, 1, true)
+		if err != nil {
+			return out, fmt.Errorf("vae: dispatch %d (%s): %w", i, gr.kinds[i], err)
+		}
+		out = append(out, Stage{Kind: gr.kinds[i], GPU: d, Flops: gr.flops[i], Bytes: gr.bytes[i]})
+	}
+	return out, nil
 }
 
 // DecodeTiles runs the decoder over tile-clips — post_quant_conv'd latents

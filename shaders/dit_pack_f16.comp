@@ -95,13 +95,30 @@ layout(local_size_x = WG) in;
 // 16 tokens x headDim of the head this workgroup owns.
 shared float rows[TILE * HEAD_DIM];
 
+// HEAD_X (KERNELS.md G6, research §5.4): the grid is a head across and a
+// token tile down (h3_qk_pack.comp has the argument): the workgroups in
+// flight together are then the heads of a few tokens, whose 4*HEAD_DIM-byte
+// slices of a row tile the DRAM channel rotation, not one head of many
+// tokens, which lands on the same channels row after row wherever a row is
+// close to a whole number of rotations. Same workgroups, same bits.
+#ifndef HEAD_X
+#define HEAD_X 0
+#endif
+#if HEAD_X
+#define WG_HEAD gl_WorkGroupID.x
+#define WG_GROUP gl_WorkGroupID.y
+#else
+#define WG_HEAD gl_WorkGroupID.y
+#define WG_GROUP gl_WorkGroupID.x
+#endif
+
 void main() {
-    uint head = gl_WorkGroupID.y;
+    uint head = WG_HEAD;
     uint tid = gl_LocalInvocationID.x;
     uint plane = pc.outOff + (head * (pc.aux1 / TILE)) * (HDT * TILE * TILE);
 
     for (uint s = 0u; s < uint(TPW); ++s) {
-        uint tt = gl_WorkGroupID.x * uint(TPW) + s; // token tile
+        uint tt = WG_GROUP * uint(TPW) + s; // token tile
         // pc.aux2 is how many tiles this dispatch covers; past it lies the
         // next head's plane, so the overrun a grid rounded up to TPW
         // produces has to stop rather than wrap.

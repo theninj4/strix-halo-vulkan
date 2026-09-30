@@ -20,7 +20,20 @@
 
 layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
 
+#extension GL_EXT_control_flow_attributes : enable
 #define WG 256
+// HOIST (KERNELS.md G6, research §5.4): the row's loads -- x and the two
+// modulation vectors -- all issued before anything waits on one, and kept in
+// registers for the store loop. A `for (c = t; c < pc.dim; c += WG)` loop is
+// not unrolled (the width is a push constant), so it is one 256-byte request
+// in flight a wave and a second trip through the row. Worth little where the
+// rows come off DRAM and up to 1.6x where they fit the MALL (a short clip, a
+// refiner, a decode row). STEPS bounds the width at STEPS * 256 (6144; H3's
+// 5376 is the widest host). HOIST=0 is the control.
+#ifndef HOIST
+#define HOIST 1
+#endif
+#define STEPS 24
 layout(local_size_x = WG) in;
 shared float partial[WG];
 
@@ -33,10 +46,27 @@ void main() {
     uint src = pc.inOff + r * pc.dim;
     uint dst = pc.outOff + r * pc.lda;
     float s = 0.0;
+#if HOIST
+    float x[STEPS], ga[STEPS], gb[STEPS];
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        uint c = t + j * WG;
+        if (c < pc.dim) {
+            x[j] = act[src + c];
+            ga[j] = act[pc.aux0 + c];
+            gb[j] = act[pc.aux1 + c];
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        if (t + j * WG < pc.dim) {
+            s += x[j] * x[j];
+        }
+    }
+#else
     for (uint c = t; c < pc.dim; c += WG) {
         float v = act[src + c];
         s += v * v;
     }
+#endif
     partial[t] = s;
     barrier();
     for (uint step = WG / 2u; step > 0u; step >>= 1) {
@@ -46,7 +76,16 @@ void main() {
         barrier();
     }
     float inv = inversesqrt(partial[0] / float(pc.dim) + uintBitsToFloat(pc.eps));
+#if HOIST
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        uint c = t + j * WG;
+        if (c < pc.dim) {
+            hact[dst + c] = float16_t(x[j] * inv * ga[j] + gb[j]);
+        }
+    }
+#else
     for (uint c = t; c < pc.dim; c += WG) {
         hact[dst + c] = float16_t(act[src + c] * inv * act[pc.aux0 + c] + act[pc.aux1 + c]);
     }
+#endif
 }

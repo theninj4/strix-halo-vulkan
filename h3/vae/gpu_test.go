@@ -1,6 +1,8 @@
 package vae
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -68,6 +70,15 @@ func newTestGPU(t *testing.T, th, tw, seqs int) (*GPU, func()) {
 	return g, func() { g.Destroy(); done() }
 }
 
+// bits logs a hash of a decode's values: what a scheduling change to the
+// kernels (KERNELS.md decision 3) must leave the same, across binaries.
+func bits(t *testing.T, name string, v []float32) {
+	t.Helper()
+	h := sha256.New()
+	binary.Write(h, binary.LittleEndian, v)
+	t.Logf("%s bits %x", name, h.Sum(nil)[:12])
+}
+
 // pixelGap is what a decode's error is in the video it becomes: the largest
 // and rms difference in 8-bit levels after the pipeline's denormalise and
 // clamp, and the PSNR over the whole clip.
@@ -92,14 +103,17 @@ func pixelGap(got, want *Tensor) (maxLevels, rmsLevels, psnr float64) {
 // blocks teacher-forced at four depths, one tile-clip through the whole
 // decoder, and `vae.decode` of the first 12 latent frames — two temporal
 // clips of two tiles, so the tile blend and the temporal cross-fade both
-// run, batched as one call of four sequences.
+// run, batched as one call of four sequences. Then G3's fused epilogues
+// (KERNELS.md) against their controls, bit for bit: the short decode again,
+// and a batch of eight tile-clips, whose rows are whole GEMM tiles, so v is
+// stored by its projection.
 func TestGPUDecoder(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stages 5 GB")
 	}
 	m := loadManifest(t)
 	c := testConfig(t)
-	g, done := newTestGPU(t, 16, 16, 4)
+	g, done := newTestGPU(t, 16, 16, 8)
 	defer done()
 
 	for _, b := range m.KeepBlocks {
@@ -142,6 +156,7 @@ func TestGPUDecoder(t *testing.T) {
 		t.Fatal(err)
 	}
 	wall := time.Since(start)
+	bits(t, "short decode", dec.Data)
 	want = readTensor(t, m, "short_dec")
 	if dec.C != want.C || dec.T != want.T || dec.H != want.H || dec.W != want.W {
 		t.Fatalf("decode is %dx%dx%dx%d, want %dx%dx%dx%d", dec.C, dec.T, dec.H, dec.W, want.C, want.T, want.H, want.W)
@@ -154,6 +169,41 @@ func TestGPUDecoder(t *testing.T) {
 		t.Errorf("decode rms %.2e, PSNR %.1f dB", rms, psnr)
 	}
 	_ = c
+
+	same := func(name string, a, b *Tensor) {
+		t.Helper()
+		for i := range a.Data {
+			if math.Float32bits(a.Data[i]) != math.Float32bits(b.Data[i]) {
+				t.Fatalf("%s: the fused epilogues differ from their controls at %d: %g against %g", name, i, a.Data[i], b.Data[i])
+			}
+		}
+	}
+	batch := make([]*Tensor, 8)
+	for i := range batch {
+		batch[i] = NewTensor(tileIn.C, tileIn.T, tileIn.H, tileIn.W)
+		for j, v := range tileIn.Data {
+			batch[i].Data[j] = v * (1 - float32(i)/16)
+		}
+	}
+	fused, _, err := g.DecodeTiles(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.packV, g.fuseGLU = false, false
+	defer func() { g.packV, g.fuseGLU = true, true }()
+	ctl, _, err := g.Decode(short, pqc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same("short decode", dec, ctl)
+	ctlBatch, _, err := g.DecodeTiles(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range fused {
+		same(fmt.Sprintf("batch of 8, clip %d", i), fused[i], ctlBatch[i])
+	}
+	t.Logf("fused v and SwiGLU epilogues: bit-identical to the pack and SwiGLU passes")
 }
 
 // TestGPUDecodeFull decodes the oracle's whole 124-frame clip (7 clips × 2
@@ -177,6 +227,7 @@ func TestGPUDecodeFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	wall := time.Since(start)
+	bits(t, "full decode", dec.Data)
 	want := readTensor(t, m, "full_dec")
 	rel, rms := gap(dec.Data, want.Data)
 	mx, rmsL, psnr := pixelGap(dec, want)
@@ -201,7 +252,8 @@ func TestGPUDecodeFull(t *testing.T) {
 // TestGPUShapes times the decode at the served and trained canvases on
 // random latents (the cost does not depend on the values). Opt-in with
 // H3_VAE_SHAPES=1; H3_VAE_SEQS sets the batch, H3_VAE_ATTN_PLAIN=1 runs the
-// plain attention (M11e's control arm).
+// plain attention (M11e's control arm), H3_VAE_FUSE=0 the fused epilogues'
+// controls (KERNELS.md G3).
 func TestGPUShapes(t *testing.T) {
 	if os.Getenv("H3_VAE_SHAPES") == "" {
 		t.Skip("set H3_VAE_SHAPES=1")
@@ -222,6 +274,10 @@ func TestGPUShapes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// H3_VAE_FUSE=0 runs the fused epilogues' controls (KERNELS.md G3).
+	if os.Getenv("H3_VAE_FUSE") == "0" {
+		g.packV, g.fuseGLU = false, false
+	}
 	r := rand.New(rand.NewPCG(1, 2))
 	for _, s := range []struct {
 		name   string
@@ -240,6 +296,71 @@ func TestGPUShapes(t *testing.T) {
 		flops := float64(st.Calls) * g.callFlops()
 		t.Logf("%s × 124 frames: %d tile-clips in %d batches of ≤%d; %v device (%.1f TFLOP/s), %v wall",
 			s.name, st.Calls, st.Batches, seqs, st.Device.Round(time.Millisecond), flops/st.Device.Seconds()/1e12, wall.Round(time.Millisecond))
+	}
+}
+
+// TestGPUProfile times one batch of tile-clips a dispatch at a time and
+// prints the decoder's cost by kind, with each streaming pass's GB/s against
+// the 236 a copy gets (KERNELS.md G6). Opt-in with H3_VAE_SHAPES=1;
+// H3_VAE_SEQS sets the batch.
+func TestGPUProfile(t *testing.T) {
+	if os.Getenv("H3_VAE_SHAPES") == "" {
+		t.Skip("set H3_VAE_SHAPES=1")
+	}
+	seqs := 8
+	if s := os.Getenv("H3_VAE_SEQS"); s != "" {
+		fmt.Sscan(s, &seqs)
+	}
+	c := testConfig(t)
+	g, done := newTestGPU(t, 16, 16, seqs)
+	defer done()
+	r := rand.New(rand.NewPCG(5, 6))
+	clips := make([]*Tensor, seqs)
+	for i := range clips {
+		clips[i] = NewTensor(c.LatentChannels, c.ClipTokens(), 16, 16)
+		for j := range clips[i].Data {
+			clips[i].Data[j] = float32(r.NormFloat64())
+		}
+	}
+	if _, _, err := g.DecodeTiles(clips); err != nil {
+		t.Fatal(err)
+	}
+	st, err := g.Profile(clips)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type agg struct {
+		d      time.Duration
+		fl, mv float64
+		n      int
+	}
+	by := map[string]*agg{}
+	var kinds []string
+	var total time.Duration
+	for _, s := range st {
+		a := by[s.Kind]
+		if a == nil {
+			a = &agg{}
+			by[s.Kind] = a
+			kinds = append(kinds, s.Kind)
+		}
+		a.d += s.GPU
+		a.fl += s.Flops
+		a.mv += s.Bytes
+		a.n++
+		total += s.GPU
+	}
+	slices.SortFunc(kinds, func(a, b string) int { return int(by[b].d - by[a].d) })
+	t.Logf("a batch of %d tile-clips: %v over %d dispatches", seqs, total.Round(time.Millisecond), len(st))
+	for _, k := range kinds {
+		a := by[k]
+		rate := ""
+		if a.fl > 0 {
+			rate = fmt.Sprintf("%5.1f TFLOP/s", a.fl/a.d.Seconds()/1e12)
+		} else if a.mv > 0 {
+			rate = fmt.Sprintf("%5.0f GB/s", a.mv/a.d.Seconds()/1e9)
+		}
+		t.Logf("  %-14s %4d  %8.1f ms  %5.1f%%  %s", k, a.n, a.d.Seconds()*1e3, 100*a.d.Seconds()/total.Seconds(), rate)
 	}
 }
 

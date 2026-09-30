@@ -1256,6 +1256,8 @@ var DiTAttentionWMMAQT1KT4TailMax []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=2 -o dit_pack_f16_tpw2.spv dit_pack_f16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=4 -o dit_pack_f16_tpw4.spv dit_pack_f16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -o dit_pack_f16_tpw8.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -DHEAD_X=1 -o dit_pack_f16_tpw8_hx.spv dit_pack_f16.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -DHEAD_X=1 -o dit_qk_pack_tpw8_hx.spv dit_qk_pack.comp
 
 //go:embed dit_pack_f16_tpw2.spv
 var DiTPackF16TPW2 []byte
@@ -1265,6 +1267,15 @@ var DiTPackF16TPW4 []byte
 
 //go:embed dit_pack_f16_tpw8.spv
 var DiTPackF16TPW8 []byte
+
+// The eight-tile packs on a grid of a head across and a token tile down
+// (KERNELS.md G6, research §5.4): qimage/dit's served builds.
+//
+//go:embed dit_pack_f16_tpw8_hx.spv
+var DiTPackF16TPW8HX []byte
+
+//go:embed dit_qk_pack_tpw8_hx.spv
+var DiTQKPackTPW8HX []byte
 
 //go:embed dit_pack_f16.spv
 var DiTPackF16 []byte
@@ -3673,14 +3684,21 @@ var KevGEMMQ8RBM8 []byte
 // projection's rows in the residual stream.
 
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o h3_norm_mod.spv h3_norm_mod.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHOIST=1 -o dit_gate_add_hoist.spv dit_gate_add.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o h3_bias_copy.spv h3_bias_copy.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -o h3_qk_pack_tpw8.spv h3_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DTPW=8 -DHEAD_X=1 -o h3_qk_pack_tpw8.spv h3_qk_pack.comp
 
 //go:embed h3_norm_mod.spv
 var H3NormMod []byte
 
 //go:embed h3_bias_copy.spv
 var H3BiasCopy []byte
+
+// The gated residual with every load of a row in flight before its first
+// store (KERNELS.md G6, research §5.4): h3/dit, h3/vae and ace/dit.
+//
+//go:embed dit_gate_add_hoist.spv
+var DiTGateAddHoist []byte
 
 //go:embed h3_qk_pack_tpw8.spv
 var H3QKPackTPW8 []byte
@@ -3725,6 +3743,18 @@ var H3AttnQT1KT8 []byte
 
 //go:embed h3_attn_t_qt2_kt4.spv
 var H3AttnTQT2KT4 []byte
+
+// The same kernel with the key blocks staged through LDS (KERNELS.md G4b,
+// research §3.9): a workgroup of eight waves, a query tile each, fetches a
+// block's K and V once and half a block ahead, where the one-wave build's
+// waves each load every fragment themselves. LAZY and TAIL_SPLIT are §3.8's
+// exact knobs, worth their cost once the build is spill-free. Bit-identical
+// to h3_attn_t_qt2_kt4.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DKVLDS=1 -DWAVES=8 -DLAZY=1 -DTAIL_SPLIT=1 -o h3_attn_t_kvlds_w8_kt4.spv h3_attn_t.comp
+
+//go:embed h3_attn_t_kvlds_w8_kt4.spv
+var H3AttnTKVLDSW8KT4 []byte
 
 // The image DiT on the same kernel (KERNELS.md G4, research §3.8), with
 // STORE_TAIL=0: its edit prefill repairs the prefix one segment at a time
@@ -3844,7 +3874,7 @@ var CoopMatLayoutProbe []byte
 // three axes of eight frequencies, rotate-half), and the v pack and the
 // attention are the existing sources at -DHEAD_DIM=64.
 
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DROPE_WIDTH=48 -DTPW=8 -o h3vae_qk_pack_hd64.spv h3_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DROPE_WIDTH=48 -DTPW=8 -DHEAD_X=1 -o h3vae_qk_pack_hd64.spv h3_qk_pack.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DTPW=8 -o h3vae_pack_hd64.spv dit_pack_f16.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DHEAD_DIM=64 -o h3vae_attn_hd64.spv dit_attention_wmma.comp
 
@@ -3928,7 +3958,7 @@ var H3GroupNorm []byte
 // ROPE_WIDTH = HEAD_DIM), and three attention builds, all GQA with the tail
 // kept out of the row max: full self-attention, the ±span band of the even
 // layers (WINDOW), and cross-attention onto the condition sequence (CROSS).
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DROPE_WIDTH=128 -DTPW=8 -o ace_qk_pack.spv h3_qk_pack.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DROPE_WIDTH=128 -DTPW=8 -DHEAD_X=1 -o ace_qk_pack.spv h3_qk_pack.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DTAIL_MAX=1 -o ace_attn_full.spv dit_attention_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DWINDOW=1 -o ace_attn_window.spv dit_attention_wmma.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DWAVE=32 -DOUT_F16=1 -DGQA=1 -DCROSS=1 -o ace_attn_cross.spv dit_attention_wmma.comp

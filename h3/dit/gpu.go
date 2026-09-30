@@ -81,6 +81,7 @@ type GPU struct {
 	attn       AttnVariant // a fixed build, when attnFixed; else attnFor picks
 	attnFixed  bool
 	attnT      bool // the device's element order is h3_attn_t.comp's
+	attnNoLDS  bool // the one-wave transposed build: G4b's control
 	attnProbed bool // attnT is known: probed at the first Begin
 	attnPipes  map[AttnVariant]*vk.ComputePipeline
 	downSplit  int // K pieces of the down projection (M11d); 1 for one pass
@@ -711,7 +712,7 @@ func (g *GPU) build(*safetensors.Set) error {
 		"qkpack": shaders.H3QKPackTPW8,
 		"bias":   shaders.H3BiasCopy,
 		"pack":   shaders.DiTPackF16TPW8,
-		"gate":   shaders.DiTGateAdd,
+		"gate":   shaders.DiTGateAddHoist,
 		"swiglu": shaders.DiTSwiGLUF16,
 		"narrow": shaders.DiTScaleF16,
 		// G3's controls and the C_PACK GEMM's zeroed pad rows.
@@ -899,10 +900,13 @@ func runsOf(keys []int32, rows []int32) []run {
 
 // graph accumulates one submission's dispatches.
 type graph struct {
-	g      *GPU
-	d      []vk.MultiDispatch
-	kinds  []string
-	flops  []float64
+	g     *GPU
+	d     []vk.MultiDispatch
+	kinds []string
+	flops []float64
+	// bytes is what a streaming dispatch reads and writes, by its index
+	// (KERNELS.md G6): its rate against a copy's 236 GB/s.
+	bytes  map[int]float64
 	base   pushConstants
 	noBase bool
 }
@@ -915,6 +919,14 @@ func (gr *graph) add(pipe, kind string, gx, gy uint32, pc pushConstants) {
 	gr.d = append(gr.d, vk.MultiDispatch{Pipeline: gr.g.pipes[pipe], GroupsX: gx, GroupsY: gy, PushConstants: pc.bytes()})
 	gr.kinds = append(gr.kinds, kind)
 	gr.flops = append(gr.flops, 0)
+}
+
+// moved records the bytes the dispatch just added reads and writes.
+func (gr *graph) moved(b int) {
+	if gr.bytes == nil {
+		gr.bytes = map[int]float64{}
+	}
+	gr.bytes[len(gr.d)-1] = float64(b)
 }
 
 // gemm issues C[mPad, n] fp32 at cOff (row stride n) = A[m, k] fp16 at aOff
@@ -1007,7 +1019,7 @@ func (gr *graph) submit() (time.Duration, error) {
 		total += t
 		i = j
 	}
-	gr.d, gr.kinds, gr.flops = gr.d[:0], gr.kinds[:0], gr.flops[:0]
+	gr.d, gr.kinds, gr.flops, gr.bytes = gr.d[:0], gr.kinds[:0], gr.flops[:0], nil
 	return total, nil
 }
 
@@ -1046,6 +1058,7 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 			pc.OutOff = g.hA + uint32((lo-r0)*g.ldaH)
 			pc.Aux0, pc.Aux1, pc.Eps = v[3*which], v[3*which+1], eps
 			gr.add("norm", kind, uint32(hi-lo), 1, pc)
+			gr.moved((hi - lo) * g.H * (4 + 2))
 		}
 	}
 	gate := func(kind string, r0, r1, which int, y uint32) {
@@ -1060,6 +1073,7 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 			pc.OutOff = g.aX + uint32(lo*g.H)
 			pc.Aux0, pc.Aux2 = vecs[ru.key][3*which+2], 1
 			gr.add("gate", kind, uint32(hi-lo), 1, pc)
+			gr.moved((hi - lo) * g.H * (4 + 4 + 4))
 		}
 	}
 
@@ -1122,7 +1136,12 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 			pc.WOff, pc.Aux0 = cos+uint32(r0*g.ropeHalf), sin+uint32(r0*g.ropeHalf)
 			pc.Aux1, pc.Aux2 = uint32(g.planeRows), qk.norm
 			pc.Span, pc.Eps, pc.Scale = uint32(tiles), qkEps, math.Float32bits(qk.scale)
-			gr.add("qkpack", qk.kind, uint32((tiles+7)/8), uint32(g.heads), pc)
+			// A head across, a token tile down (the HEAD_X build, KERNELS.md
+			// G6): a q row is 56 heads of 512 B, seven turns of the DRAM
+			// channel rotation, so one head of many tokens is an eighth of
+			// the channels.
+			gr.add("qkpack", qk.kind, uint32(g.heads), uint32((tiles+7)/8), pc)
+			gr.moved(n * g.inner * (4 + 2))
 		}
 		if !g.packV {
 			pc := gr.base
@@ -1131,6 +1150,7 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 			pc.Aux0, pc.Aux1, pc.Aux2 = 1, uint32(g.planeRows), uint32(tiles)
 			pc.Scale = math.Float32bits(1)
 			gr.add("pack", "pack v", uint32((tiles+7)/8), uint32(g.heads), pc)
+			gr.moved(n * g.inner * (4 + 2))
 		}
 	}
 
@@ -1169,6 +1189,7 @@ func (gr *graph) blockPass(w blockW, rows int, cos, sin uint32, runs []run, vecs
 			pcG.InOff, pcG.OutOff = aGate, g.hFFN
 			pcG.Scale = math.Float32bits(ffScale)
 			gr.add("swiglu_il", "swiglu", uint32(n), 1, pcG)
+			gr.moved(n * g.ffn * (8 + 2))
 		}
 		if g.downSplit > 1 {
 			if err := gr.gemmSplit(w.bank, "gemm down", g.hFFN, aFF, w.off[projDown], n, g.H, g.ffn, g.ldaFFN, g.downSplit); err != nil {
@@ -1496,6 +1517,7 @@ type Stage struct {
 	Kind  string
 	GPU   time.Duration
 	Flops float64 // 2× multiply-accumulates; zero for elementwise passes
+	Bytes float64 // read and written, for a streaming pass
 }
 
 // Profile runs one forward's graph a dispatch at a time, timing each on the
@@ -1512,15 +1534,16 @@ func (g *GPU) Profile(video, audio *qwen.Mat, rowT []int32) ([]Stage, error) {
 		if err != nil {
 			return out, fmt.Errorf("dit: dispatch %d (%s): %w", i, gr.kinds[i], err)
 		}
-		out = append(out, Stage{Kind: gr.kinds[i], GPU: d, Flops: gr.flops[i]})
+		out = append(out, Stage{Kind: gr.kinds[i], GPU: d, Flops: gr.flops[i], Bytes: gr.bytes[i]})
 	}
 	return out, nil
 }
 
 // AttnVariant is one build of the WMMA attention with fp16 context out: QT
-// query tiles a wave, KTIL key tiles a block, wave32. T is the transposed
-// kernel (h3_attn_t.comp, M11c). Tag names a build a screen loaded from a
-// file (AddAttention).
+// query tiles a workgroup, KTIL key tiles a block, wave32. T is the
+// transposed kernel (h3_attn_t.comp, M11c); at QT 8 it is the build whose
+// eight waves share each key block through LDS (KERNELS.md G4b). Tag names
+// a build a screen loaded from a file (AddAttention).
 type AttnVariant struct {
 	QT, KTIL int
 	T        bool
@@ -1532,13 +1555,19 @@ type AttnVariant struct {
 // plain build at 15,936 keys (194 against 297 ms) and 1.61x at 38,247 (1.17
 // against 1.87 s), at rms 1e-4 of the context (M11c). It runs wherever the
 // device's cooperative-matrix element order is the one it is written
-// against (checkCoopMatLayout, at the first Begin). Otherwise the plain builds, whose
+// against (checkCoopMatLayout, at the first Begin) -- since KERNELS.md G4b
+// as the build that stages the key blocks through LDS for eight waves,
+// bit-identical to it and 1.11x at 15,936 keys (175 against 195 ms), 1.14x
+// at 38,247 (1.05 against 1.19 s), 1.07x at 3,100. Otherwise the plain builds, whose
 // screen (2026-09-26) put QT1 KTIL4 first at 15,936 keys (26.3 TFLOP/s
 // against QT2's 24.5) and QT2 KTIL4 at 38,247 (22.4 against 19.6); the
 // switch sits between the two measured points.
 func (g *GPU) attnFor(keys int) AttnVariant {
 	if g.attnFixed {
 		return g.attn
+	}
+	if g.attnT && !g.attnNoLDS {
+		return AttnVariant{QT: 8, KTIL: 4, T: true}
 	}
 	if g.attnT {
 		return AttnVariant{QT: 2, KTIL: 4, T: true}
@@ -1566,6 +1595,7 @@ var attnBuilds = map[AttnVariant][]byte{
 	{QT: 2, KTIL: 8}:          shaders.H3AttnQT2KT8,
 	{QT: 4, KTIL: 4}:          shaders.H3AttnQT4KT4,
 	{QT: 2, KTIL: 4, T: true}: shaders.H3AttnTQT2KT4,
+	{QT: 8, KTIL: 4, T: true}: shaders.H3AttnTKVLDSW8KT4,
 }
 
 // maxKeyBlock is the longest key block any build reads past its count.
@@ -1574,7 +1604,7 @@ const maxKeyBlock = 8 * tile
 // AttnVariants lists the builds a screen chooses between.
 func AttnVariants() []AttnVariant {
 	return []AttnVariant{{QT: 1, KTIL: 4}, {QT: 1, KTIL: 8}, {QT: 2, KTIL: 4}, {QT: 2, KTIL: 8},
-		{QT: 4, KTIL: 4}, {QT: 2, KTIL: 4, T: true}}
+		{QT: 4, KTIL: 4}, {QT: 2, KTIL: 4, T: true}, {QT: 8, KTIL: 4, T: true}}
 }
 
 // AddAttention makes a candidate build of the attention available to
@@ -1615,24 +1645,35 @@ func (g *GPU) SetAttention(v AttnVariant) error {
 // layout, and returns the device time and the context of the last chunk:
 // the screen's instrument.
 func (g *GPU) TimeAttention() (time.Duration, []uint16, error) {
-	rows := len(g.lay.Pos)
-	gr := g.newGraph()
-	planeTile := uint32(g.headDim / tile * tile * tile)
-	last := 0
-	for r0 := 0; r0 < rows; r0 += g.chunk {
-		n := min(g.chunk, rows-r0)
-		pc := gr.base
-		pc.Tokens = uint32(rows)
-		pc.InOff = g.hQ + uint32(r0/tile)*planeTile
-		pc.KOff, pc.VOff = g.hK, g.hV
-		pc.OutOff, pc.LDA = g.hCtx, uint32(g.ldaInner)
-		pc.Aux1 = uint32(g.planeRows)
-		gr.attention(rows, n, pc)
-		last = n
-	}
-	took, err := gr.submit()
+	took, last, err := g.runAttention(1)
 	if err != nil {
 		return 0, nil, err
 	}
 	return took, g.hbuf.ReadUint16At(int(g.hCtx), last*g.ldaInner), nil
+}
+
+// runAttention is TimeAttention without the read-back, the block's attention
+// recorded repeat times into one submission, so a clock sampler beside it
+// sees the device busy from end to end: the device time of one repeat and
+// the last chunk's row count.
+func (g *GPU) runAttention(repeat int) (time.Duration, int, error) {
+	rows := len(g.lay.Pos)
+	gr := g.newGraph()
+	planeTile := uint32(g.headDim / tile * tile * tile)
+	last := 0
+	for rep := 0; rep < repeat; rep++ {
+		for r0 := 0; r0 < rows; r0 += g.chunk {
+			n := min(g.chunk, rows-r0)
+			pc := gr.base
+			pc.Tokens = uint32(rows)
+			pc.InOff = g.hQ + uint32(r0/tile)*planeTile
+			pc.KOff, pc.VOff = g.hK, g.hV
+			pc.OutOff, pc.LDA = g.hCtx, uint32(g.ldaInner)
+			pc.Aux1 = uint32(g.planeRows)
+			gr.attention(rows, n, pc)
+			last = n
+		}
+	}
+	took, err := gr.submit()
+	return took / time.Duration(repeat), last, err
 }
