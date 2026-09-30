@@ -366,6 +366,10 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   26.37, 37.5 → 37.9 tok/s (+1.1%)**; `GraphOpts.HeadGEMM` / `LLM_HEAD_GEMM=1`
   is the control, four bit-identity gates pin the GEMM, and
   `TestGraphHeadDecodeGEMV` prices the kernel (rms 7e-6 of the logits' max).
+  **At one row only, until the same night's postscript**: a three-slot
+  batched step ran the GEMM head and rounded unlike its solo steps
+  (`TestGraphImageDecode`); the head now plans the GEMV to GEMVMaxRows
+  like every other decode GEMV, and the gate covers three rows.
   **P21a done the same evening: `hc.up` on a GEMV** (`llm_hc_up_gemv.comp`,
   a workgroup a feature block, five waves each a share of the column's
   k-tiles, the four-stream collapse in the wave; `LLM_HC_UP_GEMM=1` the
@@ -441,7 +445,13 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   inside the routed dispatch against 15.0 on its own, which is the routed
   rate. The down half is priced at ~0.15 ms more (25.31 with
   `down_shexp=iq4_nl`) and waits on P24's eval of that width. Check every
-  re-gridded kernel at `rows == 1` (P16's `hc.cn` lesson).
+  re-gridded kernel at `rows == 1` (P16's `hc.cn` lesson). **A fold-order
+  bug found and fixed the same night** ([postscript](research/p19-decode-attribution.md)):
+  with the up split and the down folded — the checkpoint's own formats,
+  never the shipped plan — the folded shared-down tile read the shared
+  swiglu rows before the split `shexp.up` had written them (a decode step
+  0.137 rms wrong on the default banks). `shexp.up` is recorded before the
+  routed down now and `TestMoEGPUSharedFold` runs the mixed arm.
   ~~**The 196 moves**~~ — **P22b done 2026-09-30** ([Finding
   6](research/p19-decode-attribution.md)): deleted at the boundary rather
   than with L6c's shared arena. The kernel on either side binds the other

@@ -1668,6 +1668,35 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	add(moeExpertPipe("up", w.gateFmt, g.up, g.rows), "up",
 		uint32(c.FFNExpert/moeBNOf(g.up)), upTiles, up)
 
+	// 7. The shared expert's up: the same kernel over one group whose
+	//    permutation is the identity, because it is the same shape as a
+	//    routed expert and runs for every token. At decode it is folded into
+	//    the routed dispatch above where the formats allow it, and this one
+	//    is not recorded.
+	//
+	//    **It is recorded before the routed down, not after it.** The down
+	//    dispatch may carry the shared expert's down as its own last tile
+	//    (foldDown), and that tile reads the shared swiglu rows this dispatch
+	//    writes. With the up split and the down folded — the checkpoint's own
+	//    formats: a Q8_0 shared gate/up against Q4_K routed ones, a Q5_1
+	//    shared down against Q5_1 routed — the old order (up, down, shexp.up,
+	//    shexp.down) had the folded tile read rows that were written two
+	//    dispatches later, and a decode step's `result_norm` was 0.137 rms
+	//    wrong on a scale of 18.6 (TestGraphIsAChunkSplit's decode-schedule
+	//    subtests, found 2026-09-30). The shipped plan folds the up and
+	//    splits the down, and the fold's block test folded both, so neither
+	//    saw the mixed order; TestMoEGPUSharedFold now runs it.
+	shUp := base
+	shUp.MoEPermOff, shUp.MoETileOff = g.aPerm, g.aShTilesUp
+	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
+	shUp.GemmM = uint32(g.pad())
+	shUp.CtxOff = g.hSwiglu
+	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
+	if !foldUp {
+		add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
+			uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
+	}
+
 	// 6. down, weighted and scattered to its (token, slot).
 	down := base
 	down.MoEPermOff, down.MoETileOff = g.aPerm, g.downTiles()
@@ -1683,22 +1712,8 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	add(moeExpertPipe("down", w.downFmt, g.down, g.rows), "down",
 		uint32(c.NEmbd/moeBNOf(g.down)), downTiles, down)
 
-	// 7-8. The shared expert: the same two kernels over one group whose
-	//      permutation is the identity, because it is the same shape as a
-	//      routed expert and runs for every token. At decode each mode is
-	//      folded into the routed dispatch above where the formats allow
-	//      it, and the dispatch below is not recorded.
-	shUp := base
-	shUp.MoEPermOff, shUp.MoETileOff = g.aPerm, g.aShTilesUp
-	shUp.BOff, shUp.MoEBOff2 = w.shGate, w.shUp
-	shUp.GemmM = uint32(g.pad())
-	shUp.CtxOff = g.hSwiglu
-	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
-	if !foldUp {
-		add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
-			uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
-	}
-
+	// 8. The shared expert's down, the same way, unless folded into the
+	//    routed down above.
 	shDown := base
 	shDown.MoEPermOff, shDown.MoETileOff = g.aPerm, g.aShTilesDown
 	shDown.BOff = w.shDown

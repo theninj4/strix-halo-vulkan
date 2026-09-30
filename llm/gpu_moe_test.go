@@ -64,9 +64,11 @@ func TestMoEGPUGraph(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("%d dispatches: %v", len(d), kinds)
-	want := []string{"router", "route", "perm.up", "up", "down", "shexp.up", "shexp.down", "combine"}
+	// The shared up comes before the routed down since 2026-09-30: the down
+	// may carry the folded shared-down tile, which reads what shexp.up writes.
+	want := []string{"router", "route", "perm.up", "up", "shexp.up", "down", "shexp.down", "combine"}
 	if moeBM(g.down) != moeBM(g.up) {
-		want = []string{"router", "route", "perm.up", "perm.down", "up", "down", "shexp.up", "shexp.down", "combine"}
+		want = []string{"router", "route", "perm.up", "perm.down", "up", "shexp.up", "down", "shexp.down", "combine"}
 	}
 	if len(kinds) != len(want) {
 		t.Fatalf("the graph is %v, want %v", kinds, want)
@@ -1305,6 +1307,7 @@ func TestMoEGPUSharedFold(t *testing.T) {
 		t.Fatal(err)
 	}
 	lw := base.layers[0]
+	base0 := lw
 	planName := map[moeFmt]string{fmtQ4K: "q4_k", fmtQ5K: "q5_k", fmtQ51: "q5_1", fmtQ41: "q4_1", fmtIQ4NL: "iq4_nl", fmtQ80: "q8_0"}
 	if err := base.Resize(1); err != nil {
 		t.Fatal(err)
@@ -1415,4 +1418,80 @@ func TestMoEGPUSharedFold(t *testing.T) {
 			}
 		}
 	}
+
+	// **The mixed fold: up split, down folded.** It is what the checkpoint's
+	// own formats produce (a Q8_0 shared gate/up against Q4_K routed ones, a
+	// Q5_1 shared down against Q5_1 routed) and what neither the shipped
+	// plan (up folded, down split) nor the arm above (both folded) runs.
+	// Found 2026-09-30: the folded down tile read the shared swiglu rows
+	// before the split `shexp.up` had written them, because that dispatch
+	// was recorded after the routed down. The order is fixed in `graph`;
+	// this arm is what keeps it fixed.
+	if lw0 := base0; lw0.shDownFmt == lw0.downFmt || lw0.shGateFmt == lw0.gateFmt {
+		t.Logf("the checkpoint bank cannot make a down-only fold (shared %s/%s/%s, routed %s/%s/%s); the mixed arm is skipped",
+			lw0.shGateFmt, lw0.shUpFmt, lw0.shDownFmt, lw0.gateFmt, lw0.upFmt, lw0.downFmt)
+		return
+	}
+	mixedPlan, err := ParseMoEBankPlan("down_shexp="+planName[base0.downFmt], "imatrix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gm, err := NewMoEGPU(dev, c, GEMVMaxRows, []MoEWeights{w}, WithMoEBankPlan(mixedPlan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gm.Destroy()
+	if up, down := gm.foldShared(gm.layers[0]); up || !down {
+		t.Fatalf("the mixed plan folds up %v down %v, want down alone", up, down)
+	}
+	runM := func(first, rows int, fold bool) []float32 {
+		t.Helper()
+		if err := gm.Upload(in[first*c.NEmbd:(first+rows)*c.NEmbd], rows); err != nil {
+			t.Fatal(err)
+		}
+		gm.SetSharedFold(fold)
+		if err := gm.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), gm.Out()...)
+	}
+	for rows := 1; rows <= GEMVMaxRows; rows++ {
+		if err := gm.Resize(rows); err != nil {
+			t.Fatal(err)
+		}
+		gm.SetSharedFold(true)
+		_, kinds, err := gm.graph(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasKind(kinds, "shexp.up") || hasKind(kinds, "shexp.down") {
+			t.Errorf("%d rows, mixed: want shexp.up recorded and shexp.down folded: %v", rows, kinds)
+		}
+		// The split shared up must come before the routed down that carries
+		// the folded shared down, or the tile reads rows not yet written.
+		if iu, id := indexKind(kinds, "shexp.up"), indexKind(kinds, "down"); iu < 0 || id < 0 || iu > id {
+			t.Errorf("%d rows, mixed: shexp.up at %d is recorded after down at %d: %v", rows, iu, id, kinds)
+		}
+		runM(1, rows, false)
+		fold := runM(0, rows, true)
+		splitOut := runM(0, rows, false)
+		r, err := compare(fold, splitOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%d rows, mixed fold (up split, down folded) against the split dispatches: %v", rows, r)
+		if r.rms > 1e-5 || r.maxAbs > 1e-4 {
+			t.Errorf("%d rows, mixed fold: rms %.3e max %.3e at %d", rows, r.rms, r.maxAbs, r.at)
+		}
+	}
+}
+
+// indexKind is the first dispatch carrying a label, or -1.
+func indexKind(kinds []string, k string) int {
+	for i, have := range kinds {
+		if have == k {
+			return i
+		}
+	}
+	return -1
 }

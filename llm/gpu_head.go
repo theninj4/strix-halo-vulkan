@@ -231,6 +231,15 @@ func (g *HeadGPU) build() error {
 	// KSLABS = 1 alone, because at N = 248320 the grid is 15520 workgroups
 	// from the output width by itself — there is nothing for a split of K to
 	// buy, and no partial-sum arena to pay for (D11).
+	//
+	// One pipeline per row count up to GEMVMaxRows (P5b's `ROWS`
+	// specialization constant), since 2026-09-30: the head ran the GEMV at
+	// one row and the GEMM at two or three, so a batched step of three
+	// slots rounded its logits differently from the same three slots' solo
+	// steps (TestGraphImageDecode's batched-rows gate: −1.6336796 against
+	// −1.6336946). A slot's step must not depend on who it shares a pass
+	// with (CONCURRENCY.md C5), so the rung follows the row count the other
+	// decode GEMVs follow.
 	if g.bank != BankFP16 {
 		spv, ok := gemvSPIRV[gemvBankPipe(GEMVK1, g.bank)]
 		if !ok {
@@ -241,13 +250,16 @@ func (g *HeadGPU) build() error {
 			return fmt.Errorf("llm: shader head.gemv: %w", err)
 		}
 		g.mods = append(g.mods, mod)
-		pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
-			Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
-		})
-		if err != nil {
-			return fmt.Errorf("llm: pipeline head.gemv: %w", err)
+		for rows := 1; rows <= GEMVMaxRows; rows++ {
+			pipe, err := g.dev.NewPipeline(mod, vk.PipelineSpec{
+				Buffers: bufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+				SpecConstants: gemvSpec(rows),
+			})
+			if err != nil {
+				return fmt.Errorf("llm: pipeline head.gemv at %d rows: %w", rows, err)
+			}
+			g.pipes[gemvBankPipeRows(GEMVK1, g.bank, rows)] = pipe
 		}
-		g.pipes[gemvBankPipe(GEMVK1, g.bank)] = pipe
 	}
 	return nil
 }
@@ -428,10 +440,11 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 	if g.gemv != GEMVOff {
 		// The decode kernel (D15): one workgroup per sixteen output columns,
 		// no row block at all, and at KSLABS = 1 no partial sums to reduce.
-		// It reads one row of A, so the host refuses it above one — dropping
-		// rows silently is the failure mode this rule exists for.
+		// It reads ROWS rows of A, the build it was specialized to, so the
+		// host refuses it above GEMVMaxRows — dropping rows silently is the
+		// failure mode this rule exists for.
 		return []vk.MultiDispatch{{
-			Pipeline: g.pipes[gemvBankPipe(g.gemv, g.bank)],
+			Pipeline: g.pipes[gemvBankPipeRows(g.gemv, g.bank, g.rows)],
 			GroupsX:  1, GroupsY: uint32(g.vocab / coopMatTile),
 			PushConstants: pc.bytes(),
 		}}, []string{"head_gemv"}
@@ -443,8 +456,8 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 	}}, []string{"head"}
 }
 
-// SetGEMV puts the projection on `llm_gemv.comp` at one row, or GEMVOff back
-// on the GEMM. Only KSLABS = 1 is built here (see build), and only on a
+// SetGEMV puts the projection on `llm_gemv.comp` at up to GEMVMaxRows rows,
+// or GEMVOff back on the GEMM. Only KSLABS = 1 is built here (see build), and only on a
 // quantised bank. Since P19 `plan` picks the GEMV at one row by itself, so
 // this is for pinning an arm: the bench's ladder and the test's control.
 func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
@@ -461,8 +474,8 @@ func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
 	if k != GEMVK1 {
 		return fmt.Errorf("llm: the head builds GEMV rung %s only, not %s", GEMVK1, k)
 	}
-	if g.rows != 1 {
-		return fmt.Errorf("llm: the GEMV reads one row, not %d", g.rows)
+	if g.rows < 1 || g.rows > GEMVMaxRows {
+		return fmt.Errorf("llm: the GEMV reads up to %d rows, not %d", GEMVMaxRows, g.rows)
 	}
 	g.gemv = k
 	return nil
@@ -547,7 +560,7 @@ func (g *HeadGPU) plan() {
 	}
 	g.gemm = OutGEMMKernelFor(g.rows)
 	g.gemv = GEMVOff
-	if g.rows == 1 && g.bank != BankFP16 && g.decodeGEMV {
+	if g.rows >= 1 && g.rows <= GEMVMaxRows && g.bank != BankFP16 && g.decodeGEMV {
 		g.gemv = GEMVK1
 	}
 }

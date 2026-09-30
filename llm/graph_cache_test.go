@@ -213,7 +213,18 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Logf("result_norm, %d-row decode kernels: %v", rows, r)
-			if r.rms > 1e-3 {
+			// 5e-3 and not the one-token subtest's 1e-3, since 2026-09-30:
+			// on the shipped banks the three-row schedule lands between
+			// 7.6e-4 and 2.3e-3 depending on nothing but the hyper-connection
+			// down projection's split-K rung (LLM_HC_DOWN_SLABS 32 against 16,
+			// a pure reassociation) and whether its up projection is the GEMM
+			// or the row-exact GEMV — one channel (951) of one token's
+			// seventeen-step recurrence swings by 5e-2 under any of them,
+			// which is a near-tie downstream and not a kernel. The signature
+			// this bar exists to catch is the control's 1.785 (and the fold
+			// order's 0.137 was caught at 1e-3 too), both hundreds of times
+			// above it.
+			if r.rms > 5e-3 {
 				t.Errorf("%d-row decode moves result_norm by %.3e rms (%v)", rows, r.rms, r)
 			}
 		})

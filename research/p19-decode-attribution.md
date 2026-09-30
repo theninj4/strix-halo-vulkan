@@ -479,6 +479,54 @@ day's second change is worth as much as its first: **25.13 → 24.42 ms,
 39.8 → 41.0 tok/s** for the pair of them, the moves −0.50 and the pad rows
 −0.22. The 4 moves left are 0.03 ms.
 
+## Postscript — the suite's three failures at the end of the day, and what they were
+
+Run after P22b landed (2026-09-30, late), the `llm` suite failed two tests
+on its default banks (the Q8 dense bank, the checkpoint's own MoE formats)
+and one subtest on the shipped ones. All three were unchanged with
+`LLM_HC_MOVES=1`, so none was P22b's; each was bisected by the decode path's
+control knobs and found.
+
+1. **`TestGraphIsAChunkSplit`'s three decode-schedule subtests, rms 0.137 on
+   a scale of 18.6 — a wrong answer.** `LLM_MOE_SHEXP_SPLIT=1` cured it, and
+   restaging only the shared down (`LLM_MOE_BANK=down_shexp=iq4_nl`) cured
+   it too, which named the **down half of P22a's fold**. The fold's order
+   was wrong in one combination: the routed `down` dispatch, which carries
+   the folded shared-down tile, was recorded *before* the split `shexp.up`
+   that writes the shared swiglu rows that tile reads. The shipped plan
+   folds the up and splits the down; the fold's block test folded both;
+   only the checkpoint's own formats — a Q8_0 shared gate/up against Q4_K
+   routed, a Q5_1 shared down against Q5_1 routed — take the mixed path,
+   up split and down folded, and read rows written two dispatches later.
+   `MoEGPU.graph` now records `shexp.up` before the routed down, and
+   `TestMoEGPUSharedFold` has a mixed arm (down restaged alone) that agrees
+   with the split at rms 4e-10 and asserts the order. The default-bank
+   subtests pass at rms 5.7e-4 / 7.5e-4 / 8.4e-4.
+2. **`TestGraphImageDecode`'s batched-rows gate, a fifth-digit difference
+   between a batched step and the same slots' solo steps.** Not the fold,
+   not the overlap, not the prerecord, not the decode GEMVs; `LLM_HEAD_GEMM=1`
+   made it bit-identical. P19 put the head on its GEMV **at one row only**,
+   so a three-slot batched step ran the GEMM head and rounded differently
+   from three solo steps. The head now builds the GEMV per row count to
+   GEMVMaxRows (P5b's `ROWS`) and plans it there, as every other decode GEMV
+   does; `TestGraphHeadDecodeGEMV` gates the three-row pass against the GEMM
+   (rms 7.7e-6 of the logits' max) and the batched gate is bit-identical
+   again. **The rule:** a slot's step must not depend on who it shares a
+   pass with, so a decode rung applies to every row count up to
+   GEMVMaxRows or to none.
+3. **The shipped-bank 3-row decode-schedule subtest at rms 2.2e-3 against a
+   1e-3 bar.** `LLM_HC_UP_GEMM=1` brought it to 7.6e-4 and pointed at the
+   up GEMV — but `TestHCGPUUpGemvRowsAgree` (new) shows the GEMV's rows at
+   two and three rows are the *bits* of one-row dispatches on the model's
+   own weights, and its disagreement with the GEMM is the same 4e-5 rms on
+   every row. The schedule is what moves: with the up on the GEMM,
+   `LLM_HC_DOWN_SLABS=16` (a pure reassociation of the split-K down) takes
+   the same subtest from 7.6e-4 to 2.3e-3, while the 2-row schedule stays at
+   5.5–8e-4 under every arm. One channel (951) of one token's seventeen-step
+   recurrence swings by 5e-2 — a near-tie downstream, most likely a routing
+   one. The multi-row subtests' bar is 5e-3 now, with the measurement in
+   the test; the signatures it exists to catch are 0.137 and 1.785.
+
 ## What this sets up
 
 In order of `lost` and of cost to take:

@@ -175,4 +175,36 @@ func TestGraphHeadDecodeGEMV(t *testing.T) {
 		t.Errorf("the GEMV head's argmax %d is not the GEMM's %d", Argmax(gemv), Argmax(gemm))
 	}
 	t.Logf("one row, %d layers: the GEMV head against the GEMM head %v", layers, r)
+
+	// And at GEMVMaxRows rows, which the head plans onto the GEMV as well
+	// since 2026-09-30 (a batched step's rows must round as their solo steps
+	// do); the last row's logits, which is what Forward returns.
+	rowsN := func(gemv bool) []float32 {
+		g.head.DecodeGEMV(gemv)
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := g.Forward(ids[:nTok-GEMVMaxRows]); err != nil {
+			t.Fatal(err)
+		}
+		l, _, err := g.Forward(ids[nTok-GEMVMaxRows:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return append([]float32(nil), l...)
+	}
+	gemmN, gemvN := rowsN(false), rowsN(true)
+	if g.head.gemv == GEMVOff {
+		t.Fatalf("%d rows on a quantised bank did not plan the GEMV", GEMVMaxRows)
+	}
+	if r, err = compare(gemvN, gemmN); err != nil {
+		t.Fatal(err)
+	}
+	if r.rms/r.refMax > 1e-3 {
+		t.Fatalf("at %d rows the GEMV head is %v from the GEMM head", GEMVMaxRows, r)
+	}
+	if Argmax(gemvN) != Argmax(gemmN) {
+		t.Errorf("at %d rows the GEMV head's argmax %d is not the GEMM's %d", GEMVMaxRows, Argmax(gemvN), Argmax(gemmN))
+	}
+	t.Logf("%d rows, %d layers: the GEMV head against the GEMM head %v", GEMVMaxRows, layers, r)
 }
