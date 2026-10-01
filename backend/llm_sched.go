@@ -181,13 +181,15 @@ type llmUnit struct {
 	// step is a decode step, which may share a pass with other slots' (C5).
 	step bool
 	// round is a decode step that may instead run as a speculative round
-	// (P20f): pick draws each verified row's token, room is how many tokens
-	// the request may still take, and toks is what the round drew. A round
-	// that runs as a plain step returns logits like any other.
-	round bool
-	room  int
-	pick  func(row int, logits []float32) (int32, bool)
-	toks  []int32
+	// (P20f): pick draws each verified row's token, propose each draft
+	// (P20g; nil is the argmax), room is how many tokens the request may
+	// still take, and toks is what the round drew. A round that runs as a
+	// plain step returns logits like any other.
+	round   bool
+	room    int
+	pick    llmPick
+	propose func([]float32) (int32, *llm.Dist)
+	toks    []int32
 	// busy is the device time spent on it, and logits/err its result once
 	// done is closed.
 	busy   time.Duration
@@ -444,12 +446,17 @@ func (s *llmSched) step(j *llmJob, id int32) ([]float32, time.Duration, error) {
 // tokens a speculative round drew with pick (already accepted by the
 // sampler) or, when the round ran as a plain step, that step's logits. room
 // is how many tokens the request may still take.
-func (s *llmSched) decode(j *llmJob, id int32, room int, pick func(int, []float32) (int32, bool)) ([]int32, []float32, time.Duration, error) {
+// llmPick draws a verified row's token in a speculative round: row, its
+// logits, and the draft proposed after it with the distribution it was drawn
+// from (nil past the last draft, or for an argmax draft).
+type llmPick = func(row int, logits []float32, draft int32, q *llm.Dist) (int32, bool)
+
+func (s *llmSched) decode(j *llmJob, id int32, room int, pick llmPick, propose func([]float32) (int32, *llm.Dist)) ([]int32, []float32, time.Duration, error) {
 	if s.specs == nil {
 		l, wait, err := s.step(j, id)
 		return nil, l, wait, err
 	}
-	u := &llmUnit{job: j, ids: []int32{id}, step: true, round: true, room: room, pick: pick, done: make(chan struct{})}
+	u := &llmUnit{job: j, ids: []int32{id}, step: true, round: true, room: room, pick: pick, propose: propose, done: make(chan struct{})}
 	l, wait, err := s.submit(u)
 	return u.toks, l, wait, err
 }
@@ -969,7 +976,7 @@ func (s *llmSched) runRound(u *llmUnit) {
 					return err
 				}
 			}
-			out, err := sp.Round(id, nil, u.pick)
+			out, err := sp.RoundDraw(id, nil, u.propose, u.pick)
 			if err != nil {
 				// A pass may be left in flight, which would refuse every
 				// later UseSlot; the slot's sequence is lost either way.

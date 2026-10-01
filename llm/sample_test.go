@@ -220,3 +220,96 @@ func BenchmarkSampleTopK20(b *testing.B) {
 		s.Sample(row)
 	}
 }
+
+// TestSamplerVerifyIsTheDistribution (P20g): a row verified by speculative
+// sampling is distributed as Sample's, whatever the draft's distribution,
+// and keeps the draft with probability Σ min(p, q) — more often than an
+// argmax draft is kept (p at q's argmax). Under top-k/top-p cuts and with
+// none (the map path past 64 ids), and with a draft whose support differs.
+func TestSamplerVerifyIsTheDistribution(t *testing.T) {
+	cases := []struct {
+		name string
+		n    int
+		topK int
+		topP float32
+		temp float32
+	}{
+		{"topk20-topp95", 400, 20, 0.95, 1},
+		{"no-cuts", 200, 0, 0, 0.7},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := rand.New(rand.NewSource(3))
+			pl := make([]float32, c.n)
+			ql := make([]float32, c.n)
+			for i := range pl {
+				pl[i] = float32(r.NormFloat64() * 2)
+				// The draft: the trunk's row, noised.
+				ql[i] = pl[i] + float32(r.NormFloat64()*0.8)
+			}
+			s := NewSampler(c.temp, c.topK, c.topP, 7)
+			ds := s.DraftSampler(9)
+			p := s.dist(pl)
+			p = Dist{IDs: append([]int32(nil), p.IDs...), P: p.P}
+			_, q := ds.Propose(ql)
+			var keep float64
+			for i, id := range p.IDs {
+				keep += math.Min(float64(p.P[i]), float64(q.Of(id)))
+			}
+			argmaxKeep := float64(p.Of(Argmax(ql[:])))
+			if p.Of(q.IDs[0]) > 0 {
+				argmaxKeep = float64(p.Of(q.IDs[0]))
+			}
+
+			const draws = 200000
+			count := map[int32]int{}
+			kept := 0
+			for i := 0; i < draws; i++ {
+				d, q := ds.Propose(ql)
+				g := s.Verify(pl, d, q)
+				count[g]++
+				if g == d {
+					kept++
+				}
+			}
+			for id := range count {
+				if p.Of(id) == 0 {
+					t.Fatalf("drew %d, which the cuts remove", id)
+				}
+			}
+			var worst float64
+			for i, id := range p.IDs {
+				want := float64(p.P[i])
+				got := float64(count[id]) / draws
+				// Four standard errors.
+				if tol := 4*math.Sqrt(want*(1-want)/draws) + 1e-4; math.Abs(got-want) > tol {
+					t.Errorf("id %d: %.4f of the draws, p says %.4f", id, got, want)
+				}
+				worst = math.Max(worst, math.Abs(got-want))
+			}
+			got := float64(kept) / draws
+			if math.Abs(got-keep) > 0.01 {
+				t.Errorf("kept the draft %.4f of the time, Σ min(p, q) is %.4f", got, keep)
+			}
+			t.Logf("kept %.3f (Σ min(p,q) %.3f) against an argmax draft's %.3f; worst |Δp| %.4f",
+				got, keep, argmaxKeep, worst)
+		})
+	}
+}
+
+// TestSamplerVerifyNilIsSample: without a draft distribution Verify is
+// Sample, draw for draw — the seeded stream the server keeps for a client
+// that named a seed.
+func TestSamplerVerifyNilIsSample(t *testing.T) {
+	r := rand.New(rand.NewSource(4))
+	row := make([]float32, 1000)
+	a, b := NewSampler(1, 20, 0.95, 11), NewSampler(1, 20, 0.95, 11)
+	for i := 0; i < 500; i++ {
+		for j := range row {
+			row[j] = float32(r.NormFloat64() * 3)
+		}
+		if x, y := a.Sample(row), b.Verify(row, 5, nil); x != y {
+			t.Fatalf("draw %d: Sample %d, Verify %d", i, x, y)
+		}
+	}
+}

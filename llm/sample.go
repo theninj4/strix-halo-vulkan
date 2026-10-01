@@ -145,6 +145,123 @@ func (s *Sampler) Sample(logits []float32) int32 {
 	if s.Greedy() {
 		return Argmax(logits)
 	}
+	return s.draw(s.dist(logits))
+}
+
+// Dist is a sampler's distribution over the ids that survive its cuts, most
+// likely first: what Sample draws from, and what a speculative round's
+// verification (Verify) weighs a draft's proposal against.
+type Dist struct {
+	IDs []int32
+	P   []float32
+}
+
+// Of is the probability of id, zero for an id the cuts removed.
+func (d *Dist) Of(id int32) float32 {
+	for i, x := range d.IDs {
+		if x == id {
+			return d.P[i]
+		}
+	}
+	return 0
+}
+
+// Propose is a draft's pick (P20g): a draw from this sampler's distribution,
+// and that distribution, which the trunk's Verify needs. The Dist is the
+// caller's to keep. Greedy proposes the argmax and no distribution.
+func (s *Sampler) Propose(logits []float32) (int32, *Dist) {
+	if s.Greedy() {
+		return Argmax(logits), nil
+	}
+	d := s.dist(logits)
+	d.IDs = append([]int32(nil), d.IDs...)
+	return s.draw(d), &d
+}
+
+// Verify is Sample at a row where the draft proposed `draft`, drawn from q:
+// speculative sampling's rule (Leviathan et al. 2023, Chen et al. 2023).
+// The draft is kept with probability min(1, p/q) at it, and otherwise the
+// token is drawn from max(0, p − q) renormalised — which never names the
+// draft — so the token is distributed as Sample's whatever q is, and the
+// draft is kept with probability Σ min(p, q) rather than the p(draft) an
+// argmax proposal is kept with. It consumes the generator unlike Sample, so
+// a seeded stream is a different stream for having speculated (the server
+// uses it only where the client named no seed). A nil q is Sample.
+func (s *Sampler) Verify(logits []float32, draft int32, q *Dist) int32 {
+	if q == nil || s.Greedy() {
+		return s.Sample(logits)
+	}
+	defer s.penalise(logits)()
+	p := s.dist(logits)
+	pd, qd := p.Of(draft), q.Of(draft)
+	if qd <= 0 {
+		// Not a draw from q: no proposal to weigh.
+		return s.draw(p)
+	}
+	if s.rng.Float32()*qd < pd {
+		return draft
+	}
+	qOf := q.Of
+	if len(q.IDs) > 64 {
+		// No top-k cut: a map, or the residual is |p| × |q|.
+		m := make(map[int32]float32, len(q.IDs))
+		for i, id := range q.IDs {
+			m[id] = q.P[i]
+		}
+		qOf = func(id int32) float32 { return m[id] }
+	}
+	var sum float32
+	for i, id := range p.IDs {
+		r := p.P[i] - qOf(id)
+		if r < 0 {
+			r = 0
+		}
+		p.P[i] = r
+		sum += r
+	}
+	if sum <= 0 {
+		// p ≤ q everywhere and yet rejected: rounding. p is lost, so take
+		// the most likely id that is not the draft.
+		for _, id := range p.IDs {
+			if id != draft {
+				return id
+			}
+		}
+		return draft
+	}
+	r := s.rng.Float32() * sum
+	var acc float32
+	last := int32(-1)
+	for i, pr := range p.P {
+		if pr <= 0 {
+			continue
+		}
+		acc += pr
+		last = p.IDs[i]
+		if r < acc {
+			return last
+		}
+	}
+	return last
+}
+
+// draw is one draw from d.
+func (s *Sampler) draw(d Dist) int32 {
+	r := s.rng.Float32()
+	var acc float32
+	for i, p := range d.P {
+		acc += p
+		if r < acc {
+			return d.IDs[i]
+		}
+	}
+	return d.IDs[len(d.IDs)-1]
+}
+
+// dist is the distribution after the cuts and the temperature, the
+// penalties already applied by the caller. Its IDs may be the sampler's
+// buffer, good until the next call.
+func (s *Sampler) dist(logits []float32) Dist {
 	// The candidates, sorted by logit descending. A full sort of 248320 is
 	// 30 ms and would be half a decode step, so the cut comes first: TopK
 	// partitions, and TopP needs the order only over what survives it.
@@ -221,16 +338,20 @@ func (s *Sampler) Sample(logits []float32) int32 {
 			probs[i] /= re
 		}
 	}
+	return Dist{IDs: idx, P: probs}
+}
 
-	r := s.rng.Float32()
-	var acc float32
-	for i, p := range probs {
-		acc += p
-		if r < acc {
-			return idx[i]
-		}
+// DraftSampler is the sampler a speculative round's draft proposes with for
+// a request sampled by s (P20g): its cuts and temperature, none of its
+// penalties (the draft's q may be any distribution; this one is close to
+// the trunk's), and its own generator.
+func (s *Sampler) DraftSampler(seed int64) *Sampler {
+	if s.Greedy() {
+		return nil
 	}
-	return idx[len(idx)-1]
+	d := NewSampler(s.Temp, s.TopK, s.TopP, seed)
+	d.MinP = s.MinP
+	return d
 }
 
 // Argmax is the greedy sampler, and the only one a comparison against

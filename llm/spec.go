@@ -323,6 +323,18 @@ func (s *Speculator) Begin() error {
 // drew, the last of which is pending in the same sense. The trunk must be
 // speculating (Graph.Speculate) with this speculator's slot live.
 func (s *Speculator) Round(first int32, out []int32, pick func(row int, logits []float32) (int32, bool)) ([]int32, error) {
+	return s.RoundDraw(first, out, nil, func(row int, logits []float32, _ int32, _ *Dist) (int32, bool) {
+		return pick(row, logits)
+	})
+}
+
+// RoundDraw is Round with the draft's pick named too (P20g): `propose` draws
+// each draft from the draft's logits (nil: the argmax) and returns the
+// distribution it drew from, and `pick` is handed the draft proposed after
+// its row and that distribution — nil past the last draft — so it can verify
+// by speculative sampling (Sampler.Verify) rather than draw and compare.
+func (s *Speculator) RoundDraw(first int32, out []int32, propose func(logits []float32) (int32, *Dist),
+	pick func(row int, logits []float32, draft int32, q *Dist) (int32, bool)) ([]int32, error) {
 	if len(s.h) != s.wide {
 		return nil, fmt.Errorf("llm: a round without the trunk's residual")
 	}
@@ -333,7 +345,7 @@ func (s *Speculator) Round(first int32, out []int32, pick func(row int, logits [
 		}
 	}
 	s.pend = append(s.pend[:0], first)
-	return s.round(out[:0], pick)
+	return s.round(out[:0], propose, pick)
 }
 
 // Owe records a plain decode step the trunk ran on this slot — token x at its
@@ -617,10 +629,15 @@ func (s *Speculator) Next(out []int32) ([]int32, error) {
 
 // draftArgmax is the draft's pick, over DraftVocab ids when it is set.
 func (s *Speculator) draftArgmax(lg []float32) int32 {
+	return Argmax(s.draftLogits(lg))
+}
+
+// draftLogits is the draft's row cut to the DraftVocab ids it proposes from.
+func (s *Speculator) draftLogits(lg []float32) []float32 {
 	if s.DraftVocab > 0 && s.DraftVocab < len(lg) {
 		lg = lg[:s.DraftVocab]
 	}
-	return Argmax(lg)
+	return lg
 }
 
 // nextPrefix is a round of the keep-prefix loop (P20c, P20b): draft Depth
@@ -631,7 +648,7 @@ func (s *Speculator) draftArgmax(lg []float32) int32 {
 // pending, the draft is seeded from row k-1's residual, and the draft owes
 // the cells P+1..P+k-1: each from the row before it and the token at it.
 func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
-	return s.round(out, func(_ int, logits []float32) (int32, bool) { return Argmax(logits), false })
+	return s.round(out, nil, func(_ int, logits []float32, _ int32, _ *Dist) (int32, bool) { return Argmax(logits), false })
 }
 
 // round is nextPrefix with the trunk's token at each row named by `pick`
@@ -642,7 +659,11 @@ func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
 // any temperature, and only its acceptance falls. `pick` returning stop ends
 // the round at that row (an end-of-generation token, the budget): the rows
 // after it are not kept even where the draft agreed.
-func (s *Speculator) round(out []int32, pick func(row int, logits []float32) (int32, bool)) ([]int32, error) {
+func (s *Speculator) round(out []int32, propose func([]float32) (int32, *Dist),
+	pick func(row int, logits []float32, draft int32, q *Dist) (int32, bool)) ([]int32, error) {
+	if propose == nil {
+		propose = func(lg []float32) (int32, *Dist) { return Argmax(lg), nil }
+	}
 	top := time.Now()
 	defer func() { s.Stats.Wall += time.Since(top) }()
 	at := s.g.Past()
@@ -671,7 +692,9 @@ func (s *Speculator) round(out []int32, pick func(row int, logits []float32) (in
 		return nil, fmt.Errorf("llm: draft at %d: %w", at, err)
 	}
 	s.oweH, s.oweX = hs[:0], xs[:0]
-	rows = append(rows, s.draftArgmax(lg))
+	qs := make([]*Dist, 0, depth)
+	d, q := propose(s.draftLogits(lg))
+	rows, qs = append(rows, d), append(qs, q)
 	for k := 1; k < depth; k++ {
 		// A copy: the residual is in the arena the next call seeds.
 		s.dh = append(s.dh[:0], res...)
@@ -682,7 +705,8 @@ func (s *Speculator) round(out []int32, pick func(row int, logits []float32) (in
 		if lg, res, _, err = s.d.Rows(s.dh, e, 1, at+k, s.w, true); err != nil {
 			return nil, fmt.Errorf("llm: draft %d at %d: %w", k+1, at+k, err)
 		}
-		rows = append(rows, s.draftArgmax(lg))
+		d, q := propose(s.draftLogits(lg))
+		rows, qs = append(rows, d), append(qs, q)
 	}
 	s.Stats.Draft += time.Since(t0)
 
@@ -704,7 +728,11 @@ func (s *Speculator) round(out []int32, pick func(row int, logits []float32) (in
 	//    sequence up to the first draft it disagrees with.
 	n := len(rows)
 	for i := 0; i < n; i++ {
-		g, stop := pick(i, logits[i*s.vocab:(i+1)*s.vocab])
+		draft, q := int32(-1), (*Dist)(nil)
+		if i+1 < n {
+			draft, q = rows[i+1], qs[i]
+		}
+		g, stop := pick(i, logits[i*s.vocab:(i+1)*s.vocab], draft, q)
 		out = append(out, g)
 		if stop || i+1 == n {
 			break

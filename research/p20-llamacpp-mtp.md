@@ -648,3 +648,63 @@ an arena the draft could read, as §3.1 said); depth 3 (§10, ~+5%, a four-row
 pass); and an acceptance lever on thinking text. `DecodeRows` ignores
 `Graph.PinSchedule` — a pinned batched row rounds unlike a pinned solo step —
 which only a test notices (`TestServedSpeculationIsPlain` runs unpinned).
+
+## 12. Measured, 2026-10-01 — P20g, speculative sampling: sampled decode at the greedy rate
+
+**The gap.** §11 served sampled requests at 1.22x against greedy's 1.38x,
+because the round proposed the draft's **argmax** and kept it when the
+request's sampler happened to draw it: a draft kept with probability p(d).
+At temperature 1 with top-k 20 that is the trunk's mass on one token, and
+the round fell from 2.38 to 2.08 tokens.
+
+**The rule** (Leviathan et al. 2023; Chen et al. 2023). The draft *samples*
+its proposal d from q, its own row through the request's cuts and
+temperature (`Sampler.DraftSampler`: no penalties, its own generator), and
+the trunk's row keeps d with probability min(1, p(d)/q(d)), otherwise draws
+from max(0, p − q) renormalised, which never names d (`Sampler.Verify`). The
+token is distributed exactly as `Sample`'s whatever q is, and d is kept with
+probability Σ min(p, q), which is about 1 − TV(p, q) when the draft is close
+to the trunk. `Sample` is now `dist` + `draw` (the generator consumed as
+before: `TestSamplerVerifyNilIsSample`), `Speculator.RoundDraw` takes a
+`propose` and hands `pick` the draft and its q (`Round` is the argmax
+proposal), and the scheduler's unit carries both.
+
+**Which requests.** Verify consumes the generator differently from Sample,
+so a seeded stream that speculated is no longer the plain loop's. The server
+applies it **only where the client named no seed**: a seeded request keeps
+the argmax proposal and stays identical to the plain loop whether or not the
+scheduler speculated it (`TestLLMSpeculationIsPlain`'s sampled arm,
+unchanged). `LLM_SPEC_ARGMAX_DRAFT=1` is the control for everyone.
+
+**Gates.** `TestSamplerVerifyIsTheDistribution`: 200 000 verified draws
+under top-k 20 / top-p 0.95 / T 1 and under no cuts (the map path), a draft
+that is the trunk's row noised. Every id is within four standard errors of
+p, the keep rate is Σ min(p, q) (0.640 against 0.639, 0.660 against 0.659),
+and an argmax draft would have been kept 0.236 / 0.220 of the time. A
+sabotaged residual (draw from p, not p − q) fails it on 57 ids. The served
+plumbing is `TestLLMSpeculationIsPlain`'s new unseeded subtest at four
+layers.
+
+**Served, 48 layers, shipped banks, SPEED-Bench 20, 512 tokens, ctx 32768,
+3 slots, default sampling (T 1, top-k 20, top-p 0.95) and no seed**, six
+server restarts in the order plain, argmax, new, new, argmax, plain
+(`results/p20g_served.csv`; rates from the server's own line):
+
+| arm | pass A | pass B | tok/round |
+|---|---:|---:|---:|
+| plain | 41.11 | 41.18 | |
+| speculative, argmax proposal (§11's loop) | 48.34 | 50.15 | 2.01 / 2.09 |
+| **speculative sampling** | **56.80** | **56.40** | **2.37 / 2.35** |
+
+**Sampled decode 1.20x → 1.38x, 49.2 → 56.6 tok/s**: the sampled round now
+keeps as much as the greedy one did (2.36 against greedy's 2.38 tokens a
+round), so a sampled conversation decodes at §11's greedy rate. By category
+(mean of the passes): coding 59.2, rag 58.2, writing 56.3, qa 55.1,
+multilingual 54.1. The texts are coherent (at most 6% repeated 40-character
+windows in any text, plain 2%, and about half of the texts end on their own
+in every arm). The draw costs nothing measurable: the draft's row is on the
+host already, and top-k 20 is one pass over 65 536 logits.
+
+**Next.** Depth three re-priced: a₁ under sampling is now the greedy one,
+so §10's ~+5% stands for both. Priming on the device (the +9% prefill), and
+acceptance on thinking text.

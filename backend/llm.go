@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -535,11 +536,25 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	// in order, each knowing the ones before it, and queued here.
 	// pick is that draw: it stops the round at an end-of-generation token or
 	// at the budget, so the trunk never runs past what this loop would have.
+	//
+	// A sampled request the client named no seed for verifies by
+	// speculative sampling (P20g): the draft draws its proposals from a
+	// sampler like the request's, and a row keeps the draft with
+	// probability min(1, p/q) — the same distribution of text, more of the
+	// draft kept than an argmax proposal is. A seeded request keeps the
+	// argmax draft and Sample, so its stream is the plain loop's whether or
+	// not it speculated.
 	var queue []int32
-	pick := func(row int, lg []float32) (int32, bool) {
-		t := s.Sample(lg)
+	pick := func(row int, lg []float32, draft int32, q *llm.Dist) (int32, bool) {
+		t := s.Verify(lg, draft, q)
 		s.Accept(t)
 		return t, l.eog[t] || gen+row+1 >= budget
+	}
+	var propose func([]float32) (int32, *llm.Dist)
+	if req.Seed == nil && !specArgmaxDraft {
+		if ds := s.DraftSampler(int64(rand.Uint64())); ds != nil {
+			propose = ds.Propose
+		}
 	}
 	id := s.Sample(logits)
 	s.Accept(id)
@@ -588,7 +603,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		}
 		var wait time.Duration
 		var toks []int32
-		if toks, logits, wait, err = sched.decode(job, id, budget-gen, pick); err != nil {
+		if toks, logits, wait, err = sched.decode(job, id, budget-gen, pick, propose); err != nil {
 			return nil, err
 		}
 		stalled += wait
@@ -838,6 +853,10 @@ func expandedMark(mark int, short []int32, images []llm.PromptImage) int {
 	}
 	return mark
 }
+
+// specArgmaxDraft (LLM_SPEC_ARGMAX_DRAFT=1) is P20g's control: every
+// request's draft proposes its argmax and every row is drawn by Sample.
+var specArgmaxDraft = os.Getenv("LLM_SPEC_ARGMAX_DRAFT") == "1"
 
 // sampler is the request's sampling, or the checkpoint's own where the
 // request named none.

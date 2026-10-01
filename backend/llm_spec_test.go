@@ -22,11 +22,13 @@ const llmTestDraft = "../models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q
 // turn that continues the first, two conversations at once, and a voice
 // command restored from a checkpoint — and it speculated to do it.
 //
-// Sampled requests are in the comparison on purpose. A round draws each
+// Sampled requests at a seed are in the comparison on purpose. A round draws each
 // verified row's token with the request's sampler, in order, one draw per
 // token, so with the trunk's logits unchanged (every pass is at most three
 // rows, all on the row-exact decode GEMVs) the random stream is consumed
-// exactly as the plain loop consumes it and the texts must agree.
+// exactly as the plain loop consumes it and the texts must agree. (Without
+// a seed a round verifies by speculative sampling instead, P20g: the last
+// subtest.)
 //
 // On four layers the draft head is rarely right, so most rounds keep one
 // row; this gates the plumbing — priming, owed rows, checkpoints, the
@@ -137,4 +139,24 @@ func TestLLMSpeculationIsPlain(t *testing.T) {
 	if spec.sched.restores == 0 {
 		t.Error("no checkpoint was restored")
 	}
+
+	// P20g: a sampled request with no seed verifies by speculative
+	// sampling, whose stream is not the plain loop's (the draft draws), so
+	// it is checked for running, speculating and keeping drafts; that its
+	// tokens are the trunk's distribution is TestSamplerVerifyIsTheDistribution.
+	t.Run("sampled without a seed", func(t *testing.T) {
+		r0, k0 := spec.sched.rounds, spec.sched.roundTokens
+		req := greedy("Tell me about owls, at length.", 48)
+		temp := 0.8
+		req.Temperature = &temp
+		got := run(spec, req)
+		rounds, toks := spec.sched.rounds-r0, spec.sched.roundTokens-k0
+		if got == "" {
+			t.Error("empty text")
+		}
+		if rounds == 0 {
+			t.Error("no speculative round ran")
+		}
+		t.Logf("%d rounds, %.2f tokens a round; %q", rounds, float64(toks)/float64(max(rounds, 1)), got)
+	})
 }
