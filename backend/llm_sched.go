@@ -721,7 +721,9 @@ func (s *llmSched) loop() {
 		case fresh:
 			sl.held = append(sl.held[:0], keys...)
 		case restore:
-			sl.held = append(sl.held[:ck.Past()], keys...)
+			// pos, not ck.Past(): a chunk that ends at the mark re-takes
+			// the checkpoint into ck itself, which moves it to the end.
+			sl.held = append(sl.held[:pos], keys...)
 			s.restores++
 		default:
 			sl.held = append(sl.held, keys...)
