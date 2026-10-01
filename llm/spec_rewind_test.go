@@ -294,7 +294,7 @@ func TestSpeculationKeepFirstIsTheSequence(t *testing.T) {
 	dev, done := newTestDevice(t)
 	t.Cleanup(done)
 	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, NKV: nTok + 16, Layers: layers, NoHead: true,
-		Speculative: true, SpecRows: 3})
+		Speculative: true, SpecRows: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +312,11 @@ func TestSpeculationKeepFirstIsTheSequence(t *testing.T) {
 	// rows a pass carries and how many of them the sequence keeps; the rows
 	// past `keep` are a token the sequence does not have.
 	type round struct{ rows, keep int }
-	rounds := []round{{2, 1}, {2, 2}, {3, 1}, {3, 2}, {2, 1}, {3, 3}, {3, 2}, {2, 2}}
+	// Four rows (P20h) run longer than the DeltaNet's three-row ring, so row
+	// 3 lands in row 0's ring slot; a one-row pass is a round whose first
+	// draft was stopped.
+	rounds := []round{{2, 1}, {2, 2}, {3, 1}, {3, 2}, {4, 1}, {2, 1}, {3, 3}, {4, 2}, {4, 3}, {1, 1},
+		{4, 4}, {3, 2}, {2, 2}, {4, 3}}
 
 	run := func(t *testing.T, store bool) []float32 {
 		t.Helper()

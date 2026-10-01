@@ -190,7 +190,7 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 	// the same dispatches, the same weights, the same order, and none of the
 	// four histories. If the equalities above were passing because nothing
 	// carried, this would match too.
-	for _, rows := range []int{2, 3} {
+	for _, rows := range []int{2, 3, 4} {
 		t.Run(fmt.Sprintf("%d at a time, on the decode schedule", rows), func(t *testing.T) {
 			if err := g.PinSchedule(false); err != nil {
 				t.Fatal(err)

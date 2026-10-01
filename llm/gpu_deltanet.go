@@ -1109,13 +1109,8 @@ func (g *DeltaNetGPU) Speculating() bool { return g.stateSpec }
 
 // KeepFirst makes every speculative pass also leave its first row folded into
 // the committed slot (P20c), which is what lets Graph.KeepFirst accept row 0
-// of a pass without re-running it. A pass of more rows than the ring holds
-// would not store row 0 in the ring at all, so the graph refuses those.
+// of a pass without re-running it.
 func (g *DeltaNetGPU) KeepFirst(on bool) { g.keepFirst = on }
-
-// RingRows is the convolution's history length, the most rows a keep-first
-// pass may carry.
-func (g *DeltaNetGPU) RingRows() int { return g.cfg.Conv - 1 }
 
 // CommitSlot accepts whatever the last speculative pass wrote.
 func (g *DeltaNetGPU) CommitSlot() {

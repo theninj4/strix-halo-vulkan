@@ -134,7 +134,7 @@
 
 // Rows of A this dispatch carries: P5b. See the header.
 layout(constant_id = 0) const uint ROWS = 1;
-#define MAXROWS 3
+#define MAXROWS 4 // P20h: depth three is a four-row pass
 
 #define WAVE 64
 #define LANES (WAVES * WAVE)

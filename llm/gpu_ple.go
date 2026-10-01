@@ -849,9 +849,6 @@ func (g *PLEGPU) Speculate(on bool) error {
 // KeepFirst is DeltaNetGPU.KeepFirst for the ring (P20c).
 func (g *PLEGPU) KeepFirst(on bool) { g.keepFirst = on }
 
-// RingRows is the ring's length, the most rows a keep-first pass may carry.
-func (g *PLEGPU) RingRows() int { return g.cfg.ConvHist() }
-
 func (g *PLEGPU) CommitSlot() {
 	if g.histSpec {
 		g.histSlot = g.histDst()

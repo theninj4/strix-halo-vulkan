@@ -61,6 +61,7 @@ package llm
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"strix-halo-vulkan/vk"
@@ -73,6 +74,14 @@ type SpecStats struct {
 	// candidate was right, and Tokens what the loop emitted in all — the
 	// prompt's first token included.
 	Rounds, Drafted, Accepted, Tokens int
+	// Stopped is drafts StopBelow kept out of a pass (P20h).
+	Stopped int
+	// Passes and PassTime are the verification passes by row count and the
+	// time spent in them, and DraftTime the drafting before each (P20h):
+	// what a round of each width costs, which an adaptive depth trades.
+	Passes    [5]int
+	PassTime  [5]time.Duration
+	DraftTime [5]time.Duration
 	// Wall is the whole loop; Draft is the draft head, Verify the
 	// verification pass, and Decide the host between them — the two argmaxes
 	// over 248320 logits and the residual copy the next draft is seeded from.
@@ -179,6 +188,21 @@ type Speculator struct {
 	// Trace, when set, sees every keep-prefix round: the position of its
 	// row 0, the rows it verified, and how many it kept.
 	Trace func(at int, rows []int32, keep int)
+	// StopBelow, when nonzero, makes the depth adaptive (P20h): a draft
+	// whose probability under the draft (MaxProb over the DraftVocab cut)
+	// is below it is not verified and ends the round's drafting, so a round
+	// verifies one to Depth+1 rows. Below it at the first draft the round
+	// is a one-row pass.
+	StopBelow float32
+	// Probe, when set, prices deeper and adaptive drafting (P20h): every
+	// round runs one draft step past Depth that the pass does not verify,
+	// and Probe sees the drafts (Depth+1 of them, the probe last), each
+	// one's probability under the draft (its softmax maximum over the
+	// DraftVocab cut) and the tokens the round determined. Where the round
+	// kept every row, out[Depth] is the trunk's token the probe drafted
+	// for. The probe step is inside the round's wall: a probed run's rate
+	// is not a rate.
+	Probe func(at int, drafts []int32, q []float32, out []int32)
 
 	vocab int
 	wide  int
@@ -632,6 +656,23 @@ func (s *Speculator) draftArgmax(lg []float32) int32 {
 	return Argmax(s.draftLogits(lg))
 }
 
+// MaxProb is the softmax maximum of a row: the draft's confidence in its
+// argmax. A logit more than 24 under the maximum adds under 4e-11 to the sum
+// and is skipped unexponentiated, so a peaked row costs a compare a logit.
+func MaxProb(lg []float32) float32 {
+	m := lg[0]
+	for _, v := range lg {
+		m = max(m, v)
+	}
+	var z float64
+	for _, v := range lg {
+		if v > m-24 {
+			z += math.Exp(float64(v - m))
+		}
+	}
+	return float32(1 / z)
+}
+
 // draftLogits is the draft's row cut to the DraftVocab ids it proposes from.
 func (s *Speculator) draftLogits(lg []float32) []float32 {
 	if s.DraftVocab > 0 && s.DraftVocab < len(lg) {
@@ -693,9 +734,24 @@ func (s *Speculator) round(out []int32, propose func([]float32) (int32, *Dist),
 	}
 	s.oweH, s.oweX = hs[:0], xs[:0]
 	qs := make([]*Dist, 0, depth)
-	d, q := propose(s.draftLogits(lg))
-	rows, qs = append(rows, d), append(qs, q)
-	for k := 1; k < depth; k++ {
+	var pq []float32
+	// offer is a draft's turn: proposed, then kept for the pass unless the
+	// draft's confidence in it is under StopBelow, which ends the drafting.
+	offer := func(lg []float32) bool {
+		cut := s.draftLogits(lg)
+		d, q := propose(cut)
+		if s.Probe != nil {
+			pq = append(pq, MaxProb(cut))
+		}
+		if s.StopBelow > 0 && MaxProb(cut) < s.StopBelow {
+			s.Stats.Stopped++
+			return false
+		}
+		rows, qs = append(rows, d), append(qs, q)
+		return true
+	}
+	more := offer(lg)
+	for k := 1; k < depth && more; k++ {
 		// A copy: the residual is in the arena the next call seeds.
 		s.dh = append(s.dh[:0], res...)
 		e, err := s.m.Embedding(rows[k])
@@ -705,10 +761,26 @@ func (s *Speculator) round(out []int32, propose func([]float32) (int32, *Dist),
 		if lg, res, _, err = s.d.Rows(s.dh, e, 1, at+k, s.w, true); err != nil {
 			return nil, fmt.Errorf("llm: draft %d at %d: %w", k+1, at+k, err)
 		}
-		d, q := propose(s.draftLogits(lg))
-		rows, qs = append(rows, d), append(qs, q)
+		more = offer(lg)
 	}
-	s.Stats.Draft += time.Since(t0)
+	var probeD []int32
+	var probeQ []float32
+	if s.Probe != nil && len(rows) == depth+1 {
+		// One draft step past the round's, chained like the others.
+		probeQ = append(probeQ, pq...)
+		s.dh = append(s.dh[:0], res...)
+		e, err := s.m.Embedding(rows[depth])
+		if err != nil {
+			return nil, fmt.Errorf("llm: token_embd for the draft: %w", err)
+		}
+		if lg, _, _, err = s.d.Rows(s.dh, e, 1, at+depth, s.w, true); err != nil {
+			return nil, fmt.Errorf("llm: probe draft at %d: %w", at+depth, err)
+		}
+		probeD = append(append(probeD, rows[1:]...), s.draftArgmax(lg))
+		probeQ = append(probeQ, MaxProb(s.draftLogits(lg)))
+	}
+	draftDur := time.Since(t0)
+	s.Stats.Draft += draftDur
 
 	// 2. The verification pass.
 	if s.slot >= 0 && s.g.Slot() != s.slot {
@@ -720,9 +792,15 @@ func (s *Speculator) round(out []int32, propose func([]float32) (int32, *Dist),
 		return nil, fmt.Errorf("llm: verification pass at %d: %w", at, err)
 	}
 	s.Stats.Verify += time.Since(t0)
+	w := min(len(rows), 4)
+	s.Stats.Passes[w]++
+	s.Stats.PassTime[w] += time.Since(t0)
+	s.Stats.DraftTime[w] += draftDur
 	t0 = time.Now()
 	s.Stats.Rounds++
-	s.Stats.Drafted++
+	if len(rows) > 1 {
+		s.Stats.Drafted++
+	}
 
 	// 3. Row i's argmax is the trunk's token at P+i+1; the pass is the
 	//    sequence up to the first draft it disagrees with.
@@ -749,6 +827,9 @@ func (s *Speculator) round(out []int32, propose func([]float32) (int32, *Dist),
 	}
 	if s.Trace != nil {
 		s.Trace(at, rows, keep)
+	}
+	if probeD != nil {
+		s.Probe(at, probeD, probeQ, out)
 	}
 	if err := s.g.Keep(keep); err != nil {
 		return nil, err
@@ -789,7 +870,12 @@ func StageDraft(dev *vk.Device, draft *Model, g *Graph) (*MTPHead, error) {
 // SpecDepthDefault is the drafts a round (P20e, measured 2026-10-01): on
 // SPEED-Bench's qualitative prompts depth 2 reads 1.48x against depth 1's
 // 1.34x (a₁ 0.85, a₂|a₁ ~0.84); on the 73%-acceptance prose prompt it gives
-// back 0.04 (1.20x against 1.24x). A graph for it is staged with
+// back 0.04 (1.20x against 1.24x). Depth 3 (P20h, 2026-10-01, a four-row
+// pass at 1.72 steps) reads 1.53x against depth 2's 1.49x on the same set in
+// cmd/llm, 61.05 → 62.92 tok/s — but **served** it is 56.88 → 55.54 greedy
+// and level sampled: the server's template opens a thinking block, which
+// accepts 2.71 tokens a depth-3 round against a break-even of 2.77. The
+// server is the product, so 2 stays. A graph for a depth is staged with
 // GraphOpts.SpecRows = depth+1.
 const SpecDepthDefault = 2
 

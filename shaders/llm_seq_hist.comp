@@ -66,28 +66,35 @@ void main() {
         return;
     }
 
-    // The keep-prefix arm (P20c/P20b, SEQ_KEEP_FIRST): the run fits the ring
-    // (the host checks), so slot j holds the run's row d if d < tokens. The
-    // destination ring gets every row, mid ring i rows 0..1+i, and the ring
-    // read row 0 in place; everything else carries over from the ring read,
-    // which this invocation reads before it writes and nothing else reads
-    // at slot j.
+    // The keep-prefix arm (P20c/P20b, SEQ_KEEP_FIRST): slot j is where the
+    // run's rows d, d + hist, ... land. A ring that keeps the first K rows
+    // holds the last of those below K, or what the ring read held if none
+    // is: the destination ring K = tokens, mid ring i K = 2 + i, and the
+    // ring read K = 1 in place. Everything is read before anything is
+    // written, and nothing else reads slot j. A run longer than the ring
+    // (P20h: a four-row pass through the DeltaNet's three-row ring) writes
+    // each slot from its latest row.
     if (SEQ_KEEP_FIRST != 0u) {
         if (j >= hist) {
             return;
         }
         uint d = (j + hist - SEQ_PAST % hist) % hist;
         float prev = act[SEQ_HIST_PREV + j * width + c];
-        float row = d < pc.tokens ? act[SEQ_SRC + d * width + c] : 0.0;
-        act[SEQ_HIST + j * width + c] = d < pc.tokens ? row : prev;
+        float r0 = d < pc.tokens ? act[SEQ_SRC + d * width + c] : 0.0;
+        act[SEQ_HIST + j * width + c] = d < pc.tokens
+            ? act[SEQ_SRC + (d + (pc.tokens - 1u - d) / hist * hist) * width + c] : prev;
         if (SEQ_KEEP_MIDS > 0u) {
-            act[SEQ_HIST_MID0 + j * width + c] = (d < pc.tokens && d <= 1u) ? row : prev;
+            uint k = min(2u, pc.tokens);
+            act[SEQ_HIST_MID0 + j * width + c] = d < k
+                ? act[SEQ_SRC + (d + (k - 1u - d) / hist * hist) * width + c] : prev;
         }
         if (SEQ_KEEP_MIDS > 1u) {
-            act[SEQ_HIST_MID1 + j * width + c] = (d < pc.tokens && d <= 2u) ? row : prev;
+            uint k = min(3u, pc.tokens);
+            act[SEQ_HIST_MID1 + j * width + c] = d < k
+                ? act[SEQ_SRC + (d + (k - 1u - d) / hist * hist) * width + c] : prev;
         }
         if (d == 0u) {
-            act[SEQ_HIST_PREV + j * width + c] = row;
+            act[SEQ_HIST_PREV + j * width + c] = r0;
         }
         return;
     }

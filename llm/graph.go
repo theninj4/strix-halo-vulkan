@@ -1347,14 +1347,9 @@ func (g *Graph) arm(nTok int) error {
 		return fmt.Errorf("llm: a speculative pass is already in flight; commit or rewind it first")
 	}
 	if g.specFirst {
-		// Row 0 reaches the committed ring only if the ring write stores it,
-		// which it does when the run fits the ring (llm_seq_hist.comp).
-		if g.dn != nil && nTok > g.dn.RingRows() {
-			return fmt.Errorf("llm: a keep-first pass of %d rows; the deltanet ring holds %d", nTok, g.dn.RingRows())
-		}
-		if g.ple != nil && nTok > g.ple.RingRows() {
-			return fmt.Errorf("llm: a keep-first pass of %d rows; the ple ring holds %d", nTok, g.ple.RingRows())
-		}
+		// The ring write keeps any prefix of a run however it compares with
+		// the ring's length (llm_seq_hist.comp, P20h), so only the slots
+		// bound the pass.
 		// A prefix of each length but the first and the whole needs a slot.
 		if nTok > g.specWidth {
 			return fmt.Errorf("llm: a keep-prefix pass of %d rows; the graph was staged for %d (GraphOpts.SpecRows)",

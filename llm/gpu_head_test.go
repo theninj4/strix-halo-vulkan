@@ -50,7 +50,8 @@ func TestHeadGPUQ8IsTheHalves(t *testing.T) {
 	dev, done := newTestDevice(t)
 	defer done()
 
-	const nEmbd, vocab, rows = 256, 640, 4
+	// One row past the decode GEMV, so both arms are the GEMM.
+	const nEmbd, vocab, rows = 256, 640, GEMVMaxRows + 1
 	rng := rand.New(rand.NewSource(3))
 	w := q8Tensor(rng, "output.weight", nEmbd, vocab)
 
@@ -127,7 +128,8 @@ func headBankIsTheSim(t *testing.T, spec string) {
 	dev, done := newTestDevice(t)
 	defer done()
 
-	const nEmbd, vocab, rows = 256, 640, 4
+	// One row past the decode GEMV, so both arms are the GEMM.
+	const nEmbd, vocab, rows = 256, 640, GEMVMaxRows + 1
 	rng := rand.New(rand.NewSource(11))
 	w := q8Tensor(rng, "output.weight", nEmbd, vocab)
 	sim, err := ParseQuantSim(spec)

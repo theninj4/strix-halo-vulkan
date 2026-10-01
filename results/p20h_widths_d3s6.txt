@@ -1,0 +1,15 @@
+category         n     plain      spec        x       a1 tok/rnd
+coding           4     40.98     69.34    1.69x    95.8%   3.294
+multilingual     4     41.08     59.77    1.46x    83.0%   2.662
+qa               4     41.20     59.43    1.44x    89.2%   2.611
+rag              4     40.77     63.46    1.56x    92.4%   2.942
+writing          4     40.76     60.27    1.48x    90.1%   2.665
+overall         20     40.92     62.84    1.54x    90.9%   2.847
+
+pass rows  passes  pass ms (steps)  draft ms  [plain step 24.44 ms]
+        1     693    26.10 (1.068)      3.09
+        2     556    31.44 (1.287)      5.66
+        3     439    36.99 (1.514)      7.96
+        4    2804    42.58 (1.742)      7.66
+
+plain reproduces itself on 20 of 20 prompts, spec on 20; spec is the plain text on 11

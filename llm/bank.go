@@ -330,7 +330,9 @@ func GEMVFits(k GEMVKernel, gemmK int) bool {
 // every rung: C5a measured a two-row pass at 41.2 ms against 38.9 with
 // MAXROWS 2, and one row unchanged. A new count lands with its rungs in
 // TestGraphIsAChunkSplit (the decode-schedule subtests at 2 and 3).
-const GEMVMaxRows = 3
+//
+// **Four since P20h**: speculation at depth three verifies four rows.
+const GEMVMaxRows = 4
 
 // gemvBankPipe names the pipeline for a rung: the partials over one bank or
 // another, and the sum. `rows` is P5b's specialization — one module, one

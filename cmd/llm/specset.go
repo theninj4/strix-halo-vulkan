@@ -67,6 +67,9 @@ type setTally struct {
 	rounds, drafted     int
 	accepted            int
 	prompts             int
+	// passes by width (P20h): count, pass time, draft time.
+	passes        [5]int
+	passT, draftT [5]time.Duration
 }
 
 func (t *setTally) add(u setTally) {
@@ -78,6 +81,11 @@ func (t *setTally) add(u setTally) {
 	t.drafted += u.drafted
 	t.accepted += u.accepted
 	t.prompts += u.prompts
+	for w := range t.passes {
+		t.passes[w] += u.passes[w]
+		t.passT[w] += u.passT[w]
+		t.draftT[w] += u.draftT[w]
+	}
 }
 
 func (t setTally) line(name string) string {
@@ -133,6 +141,11 @@ func runSet(o specOpts, set []setPrompt, g *llm.Graph, sp *llm.Speculator,
 			u.rounds += s.stats.Rounds
 			u.drafted += s.stats.Drafted
 			u.accepted += s.stats.Accepted
+			for w := range u.passes {
+				u.passes[w] += s.stats.Passes[w]
+				u.passT[w] += s.stats.PassTime[w]
+				u.draftT[w] += s.stats.DraftTime[w]
+			}
 			for _, x := range []struct {
 				arm string
 				r   specRun
@@ -196,6 +209,16 @@ func runSet(o specOpts, set []setPrompt, g *llm.Graph, sp *llm.Speculator,
 		fmt.Println(cats[c].line(c))
 	}
 	fmt.Println(all.line("overall"))
+	// What a round of each width cost (P20h), against the plain step.
+	step := all.plainWall.Seconds() * 1000 / float64(max(all.plainTok, 1))
+	fmt.Printf("\npass rows  passes  pass ms (steps)  draft ms  [plain step %.2f ms]\n", step)
+	for w := 1; w < len(all.passes); w++ {
+		if n := all.passes[w]; n > 0 {
+			pm := all.passT[w].Seconds() * 1000 / float64(n)
+			fmt.Printf("%9d %7d %8.2f (%.3f) %9.2f\n", w, n, pm, pm/step,
+				all.draftT[w].Seconds()*1000/float64(n))
+		}
+	}
 	fmt.Printf("\nplain reproduces itself on %d of %d prompts, spec on %d; spec is the plain text on %d\n",
 		plainSelf, len(set), specSelf, lossless)
 	if o.csv != "" {

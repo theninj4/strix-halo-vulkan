@@ -78,7 +78,7 @@
 
 layout(constant_id = 0) const uint ROWS = 1;
 #ifndef MAXROWS
-#define MAXROWS 3
+#define MAXROWS 4 // P20h: depth three is a four-row pass
 #endif
 
 layout(local_size_x = LANES) in;

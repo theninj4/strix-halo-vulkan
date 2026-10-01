@@ -104,7 +104,7 @@
 // bounded by MAXROWS so the accumulators stay in registers.
 layout(constant_id = 0) const uint ROWS = 1;
 #ifndef MAXROWS
-#define MAXROWS 3 // OCR's builds are 16: a page's regions decode together (OCR.md O11)
+#define MAXROWS 4 // P20h: depth three is a four-row pass. OCR's builds are 16: a page's regions decode together (OCR.md O11)
 #endif
 
 #ifdef Q4B

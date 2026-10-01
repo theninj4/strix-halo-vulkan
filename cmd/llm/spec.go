@@ -238,7 +238,36 @@ func speculate(o specOpts) error {
 			fmt.Fprintln(f, at, rows, keep)
 		}
 	}
-	fmt.Printf("draft depth (P20b): %d\n", sp.Depth)
+	// SPEC_PROBE=<path> (P20h): every round of every speculative run as
+	// `run at keep | drafts | probabilities | out`, the drafts one deeper
+	// than the round verified — the data a deeper or adaptive depth is
+	// priced on. A probed run's rates include the probe step.
+	if path := os.Getenv("SPEC_PROBE"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		run, last := 0, 0
+		sp.Probe = func(at int, drafts []int32, q []float32, out []int32) {
+			if at <= last {
+				run++
+			}
+			last = at
+			fmt.Fprintf(f, "%d %d %d | %v | %v | %v\n", run, at, len(out), drafts, q, out)
+		}
+		fmt.Printf("probing every round one draft deeper into %s: the rates are not rates\n", path)
+	}
+	// SPEC_STOP=τ (P20h): a draft the draft head gives less than τ is not
+	// verified and ends the round's drafting; 0 is fixed depth.
+	if v := os.Getenv("SPEC_STOP"); v != "" {
+		f, err := strconv.ParseFloat(v, 32)
+		if err != nil {
+			return fmt.Errorf("SPEC_STOP: %w", err)
+		}
+		sp.StopBelow = float32(f)
+	}
+	fmt.Printf("draft depth (P20b): %d, stopping below %.2f (P20h)\n", sp.Depth, sp.StopBelow)
 	if set != nil {
 		return runSet(o, set, g, sp, tok, eog)
 	}

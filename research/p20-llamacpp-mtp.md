@@ -708,3 +708,78 @@ host already, and top-k 20 is one pass over 65 536 logits.
 **Next.** Depth three re-priced: a₁ under sampling is now the greedy one,
 so §10's ~+5% stands for both. Priming on the device (the +9% prefill), and
 acceptance on thinking text.
+
+## 13. Measured, 2026-10-01 — P20h, depth three: a win in `cmd/llm`, a loss served
+
+**Priced first, from a depth-2 run.** `SPEC_PROBE=<path>` (`Speculator.Probe`)
+runs one draft step past the round's depth that the pass does not verify,
+and records every draft's probability under the draft (`MaxProb` over the
+64k cut) and the tokens the round determined. Where a depth-2 round keeps
+all three rows, its row 2 names the token the probe drafted for, so a₃ is
+measured without a four-row pass. SPEED-Bench 20, 1024 tokens, 4938 rounds
+(`results/p20h_probe_d2.txt`, `reference/p20h_simdepth.py`): **a₁ 0.846,
+a₂|a₁ 0.836, a₃|a₂ 0.837.** Priced on §8's pass costs, the simulator gives
+fixed depth 2 **1.484x** (measured: 1.48x, so it is calibrated), depth 3
+1.54x at a 1.75-step four-row pass, and a confidence stop at τ = 0.6 (a
+draft under it is not verified and ends the drafting) 1.51x at depth 2 and
+1.56–1.65x at depth 3 across four-row costs of 1.70–1.85.
+
+**Built.** `GEMVMaxRows` and `MAXROWS` 3 → 4 in the five decode GEMVs
+(`llm_gemv`, `llm_hc_gemv`, `llm_hc_up_gemv`, `llm_moe_gemv`,
+`llm_moe_router`; the fused router tail already carried four). The scan
+already had two mid slots. The one real change is in `llm_seq_hist.comp`'s
+keep-prefix arm: a four-row pass is longer than the DeltaNet's three-row
+ring, so row 3 lands in row 0's slot. Each ring that keeps the first K rows
+now takes, for each slot, the latest of its rows below K. The graph's
+refusal of passes longer than a ring is gone. `Speculator.StopBelow` /
+`SPEC_STOP` is the confidence stop. Gates:
+`TestSpeculationKeepFirstIsTheSequence` at `SpecRows` 4 (keeps 1–4 of four,
+a one-row pass) is bit-exact, and the old ring rule fails it on every value;
+`TestGraphIsAChunkSplit` has a four-row decode-schedule subtest (rms 9.3e-4,
+bar 5e-3). The head's GEMM-identity tests moved to `GEMVMaxRows + 1` rows,
+because at four rows the quantised head now plans the GEMV. **One row is
+unchanged:** `-gen -attrib -n 256`, three same-hour pairs, 24.15 / 24.18 /
+24.18 ms at HEAD against 24.15 / 23.81 / 23.82.
+
+**`cmd/llm -spec-set`, SPEED-Bench 20, 1024 tokens, one pass, same-process
+plain** (`results/p20h_speedbench_*.csv`):
+
+| arm | tok/s | x | tok/round |
+|---|---:|---:|---:|
+| depth 2 | 61.05 | 1.49x | 2.56 |
+| depth 2, stop < 0.6 | 59.93 | 1.46x | 2.41 |
+| **depth 3** | **62.92** | **1.53x** | 3.09 |
+| depth 3, stop < 0.6 | 62.96 | 1.53x | 2.85 |
+
+At depth 3, coding goes 1.58 → 1.70x and no category is worse. The four-row
+pass is **1.72 steps** with 6.4 ms of drafting (`results/p20h_widths_*.txt`).
+**The stop is a wash.** The per-width costs are within 0.03 steps of the
+model, except the one-row speculative pass at 1.07 steps (not the
+pre-recorded plain step). The miss is in the tokens: a full-width round
+yields less than the simulator's 3.59. The simulator drew its rounds from a
+depth-2 loop, and a deeper loop's rounds start at different positions, so
+treating the rounds as interchangeable flattered the stop. It is left as a
+knob (`SPEC_STOP`), off.
+
+**Served, the result reverses** (`serve -llm-draft … -llm-spec-depth N`,
+ctx 32768, 3 slots, SPEED-Bench 20 through `/v1/chat/completions`, 512
+tokens, arms run d2 d3 d3 d2, rates from the server's line;
+`results/p20h_served.csv`):
+
+| | greedy | sampled (no seed) | tok/round greedy |
+|---|---:|---:|---:|
+| depth 2 | 56.88 / 56.88 | 55.88 / 54.97 | 2.37 |
+| depth 3 | 55.53 / 55.54 | 54.31 / 56.21 | 2.71 |
+
+A depth-3 round costs the same 48.8 ms as in `cmd/llm`. The served text
+opens with a thinking block (§11), and it accepts 2.71 tokens a round against
+3.09, where depth 3's break-even over depth 2 is 2.37 × 48.8 / 41.7 = 2.77.
+**`SpecDepthDefault` stays 2**; depth 3 is `-llm-spec-depth 3` /
+`-spec-depth 3`, +~120 MB a slot of planes. Depth 2's served 56.88
+reproduces §11's 56.83.
+
+**Next.** Depth 3 needs better acceptance on thinking text, which is the
+lever now: the draft gives a₁ 0.85 on answer text and less inside reasoning.
+A served stop priced on a served probe (the selection effect above means it
+must be measured at the depth it runs at, not simulated across depths).
+Priming on the device (+9% prefill) is unchanged.
