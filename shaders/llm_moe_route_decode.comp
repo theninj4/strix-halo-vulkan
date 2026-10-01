@@ -1,0 +1,325 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// The MoE router's tail at decode, in one dispatch (TODO.md P22c): the
+// split-K router's partial sums added up, the softmax over 512, the top ten,
+// the normalised weights and the shared expert's gate, and then the routing
+// permutation, its inverse and the tile schedule — what `llm_moe_router.comp`
+// MODE 1, `llm_moe_route.comp` and `llm_moe_perm.comp` do as three dispatches
+// at every row count. At one to three rows (GEMVMaxRows) the three are 1.2,
+// 5.7 and 2.9 µs a layer of a 24 ms step, none of them streaming a weight,
+// and each is a workgroup or three on a 40-CU device: what they cost is
+// launch and first latency, three times over (P19).
+//
+// **Bit for bit what the three produce.** The logits are the same serial
+// sum over the same slabs; the softmax's max is order-free, and its sum
+// reproduces the 256-thread kernel's — a per-thread partial over the same
+// two elements, a subgroup add over the same 64 lanes, the four wave totals
+// added in the same order — from a single wave, by giving each lane the
+// eight experts the four threads that shared its lane index held (below);
+// the ten argmaxes resolve ties to the lower index as before. The
+// permutation is a different *algorithm* over the same ≤ 48 (token, slot)
+// pairs — a rank by (expert, pair) instead of a counting sort with atomics
+// — and the only thing that changes is that rows within an expert are in
+// pair order rather than in whatever order the atomics gave, which nothing
+// reads (the combine sums by (token, slot) through the inverse). The layout
+// is the counting sort's exactly: the shared expert's group of `pad` rows
+// at the front, every touched expert's range behind it in ascending expert
+// order and padded to `pad`, the sentinel in every padding row, the tile
+// records with their real-row count, the sort's bookkeeping arrays written
+// for whatever reads them (TestMoEGPUPermutation's accessors).
+//
+// One workgroup of four waves. Phase A sums the partials for every token
+// with all four waves; phase B is a wave a token — the 512 probabilities in
+// eight registers a lane, the ten argmaxes as subgroup reductions with no
+// barrier; phase C is the permutation over pairs held in LDS.
+//
+// It carries at most MAX_TOK tokens, which the host bounds at GEMVMaxRows.
+//
+// **KSLABS is compiled in, one build per router rung (0 for the GEMM
+// router, whose logits are already a row), because the slab sum has to be
+// unrolled.** The first form of this kernel took the slab count at run
+// time, and a runtime-bounded loop of `v += act[...]` is one load, one
+// `s_waitcnt`, one add per slab — forty serial round trips a column, three
+// columns a thread — and the dispatch measured 26.8 µs against the 9.9 the
+// three kernels cost (`p22c` v1, 2026-10-01). Unrolled, the forty loads
+// are in flight together, as in llm_moe_router.comp's MODE 1.
+
+#include "llm_common.glsl"
+
+#ifndef KSLABS
+#define KSLABS 0
+#endif
+
+#define WG 256
+#define WAVE 64
+#define NWAVE (WG / WAVE)
+#define MAX_EXPERTS 512
+#define MAX_USED 16
+#define MAX_TOK 4
+#define MAX_PAIRS (MAX_TOK * MAX_USED)
+// Experts a lane holds in phase B: MAX_EXPERTS / WAVE.
+#define PER_LANE 8
+
+layout(local_size_x = WG) in;
+
+// Phase A → B: the logits, a row a token.
+shared float probs[MAX_TOK][MAX_EXPERTS];
+shared float shGate[MAX_TOK];
+// Phase B → C: the selection, (token, slot) → expert.
+shared uint shPairE[MAX_PAIRS];
+// Phase C: per pair, its expert's row count and whether it is the first
+// pair of that expert; per expert, its row offset and its tile base.
+shared uint shPairCnt[MAX_PAIRS];
+shared uint shPairFirst[MAX_PAIRS];
+shared uint shOff[MAX_EXPERTS];
+shared uint shTileBase[MAX_EXPERTS];
+shared uint shTotals[2];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint lane = gl_SubgroupInvocationID;
+    uint wave = gl_SubgroupID;
+    uint tokens = pc.tokens;
+    uint nE = pc.gemmK;          // the expert count
+    uint used = MOE_USED;
+    uint slots = used + 1u;
+    uint pairs = tokens * used;
+    uint stride = pc.gemmN;      // the logits row: 512 experts, the gate, padding
+    uint pad = MOE_ROUTE_PAD;
+    uint bm = pc.gemmM;
+    uint topk = pc.moeWeightOff + tokens * slots;
+    uint invPerm = topk + pairs;
+
+    // ---- A. The logits: the router's split-K partials summed in slab
+    // order, which is llm_moe_router.comp MODE 1's loop; or, with no split,
+    // the row the GEMM wrote. Written back where MODE 1 wrote them, so what
+    // reads `Logits()` sees the same tensor.
+    for (uint t = 0u; t < tokens; ++t) {
+        uint row = pc.qkvOff + t * stride;
+        for (uint i = tid; i <= nE; i += WG) {
+            float v;
+#if KSLABS > 0
+            v = 0.0;
+            [[unroll]] for (uint s = 0u; s < KSLABS; ++s) {
+                v += act[pc.gammaOff + (t * KSLABS + s) * stride + i];
+            }
+            act[row + i] = v;
+#else
+            v = act[row + i];
+#endif
+            if (i < nE) {
+                probs[t][i] = v;
+            } else {
+                shGate[t] = v;
+            }
+        }
+    }
+    barrier();
+
+    // ---- B. A wave a token: softmax, the top `used`, the weights.
+    if (wave < tokens) {
+        uint t = wave;
+        // Lane l holds experts l, l+64, ..., l+448 — the elements threads
+        // l, l+64, l+128, l+192 of the 256-wide kernel held between them,
+        // two each: thread tid took tid and tid+256, so wave w's lane l held
+        // experts l+64w and l+64w+256, which are this lane's j = w and
+        // j = w+4.
+        float p[PER_LANE];
+        float m = -1.0 / 0.0;
+        [[unroll]] for (uint j = 0u; j < PER_LANE; ++j) {
+            p[j] = probs[t][lane + j * WAVE];
+            m = max(m, p[j]);
+        }
+        m = subgroupMax(m);
+        [[unroll]] for (uint j = 0u; j < PER_LANE; ++j) {
+            p[j] = exp(p[j] - m);
+        }
+        // The 256-thread kernel's sum, reproduced: thread (w, l)'s partial
+        // is (0 + e[l+64w]) + e[l+64w+256], a subgroup add over wave w's 64
+        // partials, and the four wave totals added in wave order.
+        float s = 0.0;
+        [[unroll]] for (uint w = 0u; w < NWAVE; ++w) {
+            float part = 0.0;
+            part += p[w];
+            part += p[w + NWAVE];
+            s += subgroupAdd(part);
+        }
+        float inv = 1.0 / s;
+        [[unroll]] for (uint j = 0u; j < PER_LANE; ++j) {
+            p[j] *= inv;
+        }
+
+        // The top `used`, one wave argmax at a time: the largest value, and
+        // among equals the lowest index — `>` is false between equals, so a
+        // stable sort leaves them in ascending index order and the lowest
+        // wins (llm_moe_route.comp). A taken expert is marked -1, which no
+        // probability reaches.
+        float sel[MAX_USED];
+        uint selIdx[MAX_USED];
+        // Unrolled to MAX_USED and guarded, so that sel[] is indexed by
+        // constants and stays in registers.
+        [[unroll]] for (uint k = 0u; k < MAX_USED; ++k) {
+            if (k >= used) {
+                break;
+            }
+            float bv = -1.0;
+            uint bi = 0xFFFFFFFFu;
+            [[unroll]] for (uint j = 0u; j < PER_LANE; ++j) {
+                if (p[j] > bv) {
+                    bv = p[j];
+                    bi = lane + j * WAVE;
+                }
+            }
+            float wv = subgroupMax(bv);
+            uint wi = subgroupMin(bv == wv ? bi : 0xFFFFFFFFu);
+            sel[k] = wv;
+            selIdx[k] = wi;
+            [[unroll]] for (uint j = 0u; j < PER_LANE; ++j) {
+                if (lane + j * WAVE == wi) {
+                    p[j] = -1.0;
+                }
+            }
+        }
+
+        // The ten weights, `norm_w` and the reference's own clamp
+        // (ggml_clamp(weights_sum, 6.103515625e-5, INFINITY)), then the
+        // shared expert's gate — the sigmoid of the fused matrix's 513th
+        // column — in the last slot. Serial on one lane, as before.
+        if (lane == 0u) {
+            float sum = 0.0;
+            [[unroll]] for (uint k = 0u; k < MAX_USED; ++k) {
+                if (k < used) {
+                    sum += sel[k];
+                }
+            }
+            sum = max(sum, 6.103515625e-5);
+            [[unroll]] for (uint k = 0u; k < MAX_USED; ++k) {
+                if (k < used) {
+                    actu[topk + t * used + k] = selIdx[k];
+                    act[pc.moeWeightOff + t * slots + k] = sel[k] / sum;
+                    shPairE[t * used + k] = selIdx[k];
+                }
+            }
+            float g = shGate[t];
+            act[pc.moeWeightOff + t * slots + used] = 1.0 / (1.0 + exp(-g));
+        }
+    }
+    barrier();
+
+    // ---- C. The permutation. The shared expert's group takes the front of
+    // the row space (its rows are the identity and host-written); the
+    // routed experts start behind it.
+    uint reserve = ((tokens + pad - 1u) / pad) * pad;
+
+    // Per pair: how many pairs chose its expert, and whether it is the first
+    // of them — the one that stands for the expert in the sums below.
+    if (tid < pairs) {
+        uint e = shPairE[tid];
+        uint cnt = 0u;
+        uint first = 1u;
+        for (uint q = 0u; q < pairs; ++q) {
+            uint eq = shPairE[q];
+            cnt += (eq == e) ? 1u : 0u;
+            first = (eq == e && q < tid) ? 0u : first;
+        }
+        shPairCnt[tid] = cnt;
+        shPairFirst[tid] = first;
+    }
+    barrier();
+
+    // Per expert, in ascending order: its count, and the rows and tiles of
+    // every touched expert below it — the counting sort's two exclusive
+    // prefix sums, over ≤ MAX_PAIRS terms instead of 512. Written to the
+    // sort's four bookkeeping arrays as well, for whatever reads them.
+    uint book = pc.moeBOff2;
+    uint counts = book;
+    uint offsets = book + nE;
+    uint cursor = book + 2u * nE;
+    uint tileBase = book + 3u * nE;
+    for (uint e = tid; e < nE; e += WG) {
+        uint cnt = 0u;
+        uint rowsBefore = 0u;
+        uint tilesBefore = 0u;
+        for (uint q = 0u; q < pairs; ++q) {
+            uint eq = shPairE[q];
+            cnt += (eq == e) ? 1u : 0u;
+            if (shPairFirst[q] != 0u && eq < e) {
+                uint padded = ((shPairCnt[q] + pad - 1u) / pad) * pad;
+                rowsBefore += padded;
+                tilesBefore += (padded + bm - 1u) / bm;
+            }
+        }
+        uint off = reserve + rowsBefore;
+        shOff[e] = off;
+        shTileBase[e] = tilesBefore;
+        actu[counts + e] = cnt;
+        actu[offsets + e] = off;
+        actu[cursor + e] = off + cnt;
+        actu[tileBase + e] = tilesBefore;
+    }
+    // The totals: the same sums over every touched expert.
+    if (tid == 0u) {
+        uint rows = reserve;
+        uint tiles = 0u;
+        for (uint q = 0u; q < pairs; ++q) {
+            if (shPairFirst[q] != 0u) {
+                uint padded = ((shPairCnt[q] + pad - 1u) / pad) * pad;
+                rows += padded;
+                tiles += (padded + bm - 1u) / bm;
+            }
+        }
+        actu[pc.moeTileOff] = tiles;
+        actu[pc.moeTileOff + 1u] = rows;
+        shTotals[0] = tiles;
+        shTotals[1] = rows;
+    }
+    barrier();
+
+    // Every routed row starts as the sentinel — a (token, slot) one token
+    // past the batch, whose activation row is a zero pad — on to a whole 64
+    // past the end, as the counting sort fills it (llm_moe_perm.comp).
+    uint sentinel = tokens * slots;
+    uint fillEnd = ((shTotals[1] + 63u) / 64u) * 64u;
+    for (uint r = reserve + tid; r < fillEnd; r += WG) {
+        actu[pc.moePermOff + r] = sentinel;
+    }
+    barrier();
+
+    // The scatter and the inverse: a pair's row is its expert's offset plus
+    // its rank among the pairs that chose the same expert, in pair order.
+    if (tid < pairs) {
+        uint e = shPairE[tid];
+        uint rank = 0u;
+        for (uint q = 0u; q < tid; ++q) {
+            rank += (shPairE[q] == e) ? 1u : 0u;
+        }
+        uint idx = shOff[e] + rank;
+        uint tok = tid / used;
+        uint k = tid - tok * used;
+        actu[pc.moePermOff + idx] = tok * slots + k;
+        actu[invPerm + tok * slots + k] = idx;
+    }
+
+    // The tile records — expert, first row, real rows of the block — one
+    // per (touched expert, row block), from the pair that stands for the
+    // expert.
+    if (tid < pairs && shPairFirst[tid] != 0u) {
+        uint e = shPairE[tid];
+        uint cnt = shPairCnt[tid];
+        uint padded = ((cnt + pad - 1u) / pad) * pad;
+        uint off = shOff[e];
+        uint tb = shTileBase[e];
+        for (uint mb = 0u; mb * bm < padded; ++mb) {
+            uint rec = pc.moeTileOff + 2u + 3u * (tb + mb);
+            actu[rec] = e;
+            actu[rec + 1u] = off + mb * bm;
+            actu[rec + 2u] = (cnt > mb * bm) ? min(cnt - mb * bm, bm) : 0u;
+        }
+    }
+}

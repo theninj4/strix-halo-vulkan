@@ -181,7 +181,10 @@ func srcAt(in []float32, row, i, width, rows int) any {
 // it was a decode step writing zeros over the whole prefill arena twice a
 // layer — 21% of decode at an 8192-row `-llm-batch`, and the whole of what a
 // wide batch was measured to cost it (P12-7, P15). One row must pad to one
-// row block, not to the arena.
+// row block, not to the arena — and since P22b, on the decode GEMV plan,
+// to the run itself: the rungs that read the operand there read ROWS rows
+// and not one more, so no pad row is written at all. The pinned GEMM
+// schedule (Graph.PinSchedule) is where the row block still applies.
 func TestInPortPadsTheRunNotTheArena(t *testing.T) {
 	// The fixtures' own arenas are one row block deep, which cannot tell the
 	// two paddings apart, so both blocks are staged four times as wide.
@@ -205,10 +208,12 @@ func TestInPortPadsTheRunNotTheArena(t *testing.T) {
 		name                 string
 		resize               func(int) error
 		port                 func() Port
+		pin                  func(bool)
+		gemv                 func() bool
 		align, arena, maxTok int
 	}{
-		{"deltanet", dn.Resize, dn.InPort, dn.rowAlign, dn.arenaRows, dn.tokens},
-		{"attention", at.Resize, at.InPort, at.rowAlign, at.arenaRows, at.tokens},
+		{"deltanet", dn.Resize, dn.InPort, dn.PinGemv, func() bool { return dn.qkvGemv != GEMVOff }, dn.rowAlign, dn.arenaRows, dn.tokens},
+		{"attention", at.Resize, at.InPort, at.PinGemv, func() bool { return at.qkvGemv != GEMVOff }, at.rowAlign, at.arenaRows, at.tokens},
 	} {
 		if b.arena <= b.align {
 			t.Fatalf("%s: arena of %d rows is one row block of %d — the fixture cannot tell the two paddings apart",
@@ -217,9 +222,21 @@ func TestInPortPadsTheRunNotTheArena(t *testing.T) {
 		if err := b.resize(1); err != nil {
 			t.Fatal(err)
 		}
-		if got := b.port().Rows; got != b.align {
-			t.Errorf("%s: one row pads to %d rows, want the row block %d (arena %d)", b.name, got, b.align, b.arena)
+		if b.gemv() {
+			if got := b.port().Rows; got != 1 {
+				t.Errorf("%s: one row on the decode GEMV pads to %d rows, want the run itself (P22b)", b.name, got)
+			}
+		} else {
+			t.Logf("%s: no decode GEMV at one row on this plan", b.name)
 		}
+		b.pin(true)
+		if b.gemv() {
+			t.Errorf("%s: pinned to the GEMM and still on a GEMV", b.name)
+		}
+		if got := b.port().Rows; got != b.align {
+			t.Errorf("%s: one row on the pinned GEMM pads to %d rows, want the row block %d (arena %d)", b.name, got, b.align, b.arena)
+		}
+		b.pin(false)
 		if err := b.resize(b.maxTok); err != nil {
 			t.Fatal(err)
 		}

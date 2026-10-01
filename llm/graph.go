@@ -451,6 +451,10 @@ func (g *Graph) PinSchedule(on bool) error {
 	if g.dn != nil {
 		g.dn.PinGemv(on)
 	}
+	if g.ple != nil {
+		// The PLE's fused projection has a decode rung too (P21d).
+		g.ple.PinGemv(on)
+	}
 	if g.attn != nil {
 		g.attn.PinGemv(on)
 		// And P8's split decode attention, which is the sixth kernel this

@@ -381,6 +381,13 @@ layout(push_constant) uniform PC {
 #define MOE_BANK (pc.moeUsed >> 16u)
 #define MOE_SH_B pc.gateOff
 #define MOE_SH_B2 pc.loOff
+// The fused decode router tail (llm_moe_route_decode.comp, P22c) reads one
+// number more than the route and permutation kernels between them do: the
+// row alignment the permutation pads each expert to, which the standalone
+// permutation kernel takes in gemmN and the route kernel cannot, since
+// gemmN is its logits stride. A PLE field the MoE block never uses, on the
+// SEQ_PAST rule.
+#define MOE_ROUTE_PAD pc.normOff
 
 const uint NO_W = 0xffffffffu;
 

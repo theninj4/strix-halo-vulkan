@@ -26,6 +26,9 @@ package llm
 import (
 	"fmt"
 	"math"
+	"os"
+	"strconv"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -176,6 +179,13 @@ type PLEGPU struct {
 	tokens, arenaRows, rows int
 	lda                     int
 	kv                      PLEKernel
+	// kvGemv is the decode rung of the fused projection (P21d): a split-K
+	// GEMV on the quantised bank at one to GEMVMaxRows rows, GEMVOff for
+	// the GEMM. Chosen with `kv` per run; see PLEGemvFor.
+	kvGemv GEMVKernel
+	// pinGemv holds the projection on the GEMM whatever the batch: see
+	// Graph.PinSchedule and DeltaNetGPU.pinGemv.
+	pinGemv bool
 	// autoKernel re-chooses the rung per run, using PLEKernelFor. SetKernel
 	// turns it off, because a caller that named a rung meant it.
 	autoKernel bool
@@ -184,6 +194,8 @@ type PLEGPU struct {
 	wNormKey, wNormQuery, wNormConv, wConv uint32
 	// fp32 activations.
 	aRes, aKV, aGate, aGated, aNorm, aConvOut uint32
+	// aPart is the decode GEMV's partial sums, f32 [rows][KSLABS][kvN].
+	aPart uint32
 	// aHist is the convolution's ring: (Conv-1)*NGram rows of the normed
 	// gated value, addressed by **position** modulo its length, and the only
 	// tensor in this block that outlives a run (L7b).
@@ -256,6 +268,7 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 		lda:        cfg.NEmbd + gemmPad,
 		convOut:    opts.ConvOut,
 		kv:         DefaultPLEKernel(),
+		kvGemv:     GEMVOff,
 		autoKernel: true,
 		slots:      1,
 	}
@@ -315,6 +328,7 @@ func (g *PLEGPU) alloc() error {
 	}
 	g.aRes = alloc(rows * wide)
 	g.aKV = alloc(rows * g.kvN())
+	g.aPart = alloc(GEMVMaxRows * gemvMaxSlabs * g.kvN())
 	g.aGated = alloc(rows * wide)
 	g.aNorm = alloc(rows * wide)
 	g.aGate = alloc(rows * c.HC)
@@ -401,9 +415,87 @@ func (g *PLEGPU) build() error {
 				return err
 			}
 		}
+		// The decode GEMV, every rung of the bank plus the reduce, one
+		// pipeline per row count (P21d; the DeltaNet block's build).
+		for name, spirv := range gemvSPIRV {
+			for rows := 1; rows <= GEMVMaxRows; rows++ {
+				if err := g.pipeline(gemvRowName(name, rows), spirv, vk.PipelineSpec{
+					Buffers: gemmBufs, PushConstantSize: pcSize, RequiredSubgroupSize: 64,
+					SpecConstants: gemvSpec(rows),
+				}); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
+
+// pleKVGemv is the fused projection's decode rung: [2560 x 12800] on the
+// int8 bank, the shape nearest the attention block's qkv (13312 columns),
+// whose ladder chose eight slabs. `LLM_PLE_KV_SLABS=<n>` names another
+// rung for a whole-model screen (`cmd/llm -gen -attrib`), never the served
+// path.
+const pleKVGemv = GEMVK8
+
+var pleKVGemvOverride = sync.OnceValue(func() GEMVKernel {
+	v := os.Getenv("LLM_PLE_KV_SLABS")
+	if v == "" {
+		return pleKVGemv
+	}
+	for _, k := range GEMVKernels() {
+		if strconv.Itoa(gemvSlabs(k)) == v {
+			return k
+		}
+	}
+	panic(fmt.Sprintf("llm: LLM_PLE_KV_SLABS=%q names no rung of %v", v, GEMVKernels()))
+})
+
+// pleKVGEMMAtDecode is `LLM_PLE_KV_GEMM=1`: the fused projection on the
+// padded GEMM at decode, P21d's control.
+var pleKVGEMMAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_PLE_KV_GEMM") == "1" })
+
+// PLEGemvFor is the fused projection's decode rung for a batch, and GEMVOff
+// where the GEMM runs: past GEMVMaxRows, on the fp16 bank (the GEMV's
+// halves arm is not built here), or under the control.
+func (g *PLEGPU) gemvFor(tokens int) GEMVKernel {
+	if g.pinGemv || tokens < 1 || tokens > GEMVMaxRows || !g.quant() || !DecodeGEMV() || pleKVGEMMAtDecode() {
+		return GEMVOff
+	}
+	k := pleKVGemvOverride()
+	if !GEMVFits(k, g.cfg.NEmbd) {
+		return GEMVOff
+	}
+	return k
+}
+
+// PinGemv holds the projection on the GEMM whatever the batch, and releases
+// it to the decode rung when off: the graph's schedule pin (Graph.PinSchedule),
+// under which a chunked pass has to reproduce a whole one to the last bit.
+func (g *PLEGPU) PinGemv(on bool) {
+	g.pinGemv = on
+	if g.autoKernel {
+		g.kvGemv = g.gemvFor(g.rows)
+	}
+}
+
+// SetGemv names the fused projection's decode rung, GEMVOff for the GEMM
+// (the gate's arms, TestPLEGPUKVDecodeGEMV). It turns the automatic choice
+// off, as SetKernel does.
+func (g *PLEGPU) SetGemv(k GEMVKernel) error {
+	if k != GEMVOff && (gemvSlabs(k) == 0 || !g.quant() || !GEMVFits(k, g.cfg.NEmbd)) {
+		return fmt.Errorf("llm: no PLE decode rung %q on bank %v (have %v)", k, g.bank, GEMVKernels())
+	}
+	if k != GEMVOff && (g.rows < 1 || g.rows > GEMVMaxRows) {
+		return fmt.Errorf("llm: the PLE decode rung carries at most %d rows; this run is %d", GEMVMaxRows, g.rows)
+	}
+	g.kvGemv = k
+	g.autoKernel = false
+	return nil
+}
+
+// Gemv reports the decode rung in use, GEMVOff for the GEMM.
+func (g *PLEGPU) Gemv() GEMVKernel { return g.kvGemv }
 
 func (g *PLEGPU) pipeline(name string, spirv []byte, spec vk.PipelineSpec) error {
 	mod, err := g.dev.NewShaderModule(spirv)
@@ -511,6 +603,7 @@ func (g *PLEGPU) SetKernel(k PLEKernel) error {
 		return fmt.Errorf("llm: no PLE kernel %q (have %v)", k, PLEKernels())
 	}
 	g.kv = k
+	g.kvGemv = GEMVOff
 	g.autoKernel = false
 	return nil
 }
@@ -535,6 +628,7 @@ func (g *PLEGPU) Upload(res, embd []float32, nTok int) error {
 	g.rows = nTok
 	if g.autoKernel {
 		g.kv = PLEKernelFor(nTok)
+		g.kvGemv = g.gemvFor(nTok)
 	}
 	g.abuf.WriteFloat32At(int(g.aRes), res)
 	slab := make([]uint16, nTok*g.lda)
@@ -588,7 +682,23 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 		kvPipe = bankPipe(g.bank, GEMMKernel(g.kv))
 		kv.LowRank, kv.GateOff = uint32(g.kvN()), noW
 	}
-	add(kvPipe, "kv", uint32(g.kvN()/pleKVBN), uint32(roundUpInt(g.rows, v.bm)/v.bm), kv)
+	if ks := gemvSlabs(g.kvGemv); ks > 0 {
+		// The decode rung (TODO.md P21d): one to three rows, so the
+		// parallelism comes from K and not from a sixteen-row fragment
+		// with one real row in it — the same move as the head's and
+		// `hc.up`'s (P19, P21a). The partials ride `resOff`, which is the
+		// wide residual to every other dispatch of this block and to this
+		// one nothing (llm_gemv.comp).
+		kv.ResOff = g.aPart
+		kv.GemmM = uint32(g.rows)
+		add(gemvBankPipeRows(g.kvGemv, g.bank, g.rows), "kv", uint32(ks), uint32(g.kvN()/coopMatTile), kv)
+		if ks > 1 {
+			add(gemvSumPipeRows(g.kvGemv, g.rows), "kv.sum",
+				uint32(roundUpInt(g.kvN(), 64)/64), uint32(g.rows), kv)
+		}
+	} else {
+		add(kvPipe, "kv", uint32(g.kvN()/pleKVBN), uint32(roundUpInt(g.rows, v.bm)/v.bm), kv)
+	}
 
 	add("gate", "gate", uint32(c.HC), uint32(g.rows), base)
 	if g.batch != nil {
@@ -851,6 +961,7 @@ func (g *PLEGPU) UploadEmbd(embd []float32, nTok int) error {
 	g.rows = nTok
 	if g.autoKernel {
 		g.kv = PLEKernelFor(nTok)
+		g.kvGemv = g.gemvFor(nTok)
 	}
 	slab := make([]uint16, nTok*g.lda)
 	narrowRows(slab, embd, nTok, c.EmbdWidth(), g.lda)

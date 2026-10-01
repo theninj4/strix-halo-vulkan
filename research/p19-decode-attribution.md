@@ -44,8 +44,10 @@ The tables are `results/p19_decode_attrib_run{1,2}.csv` (the two 48-layer
 runs), `p19_batch_rows.csv`, `p19_graph_rows123.csv`, `p19_head_gemv.csv`,
 `p21a_hc_up_gemv.csv`, `p21b_hoisted_gemvs_dead.csv`,
 `p22_shexp_fold_{split1,fold1,split2,fold2,folddown}.csv`,
-`p21c_down_ladders.csv`, `p21c_moe_gemv_hoist_{ctl,hoist}{A,B,C}.csv` and
-`p21c_moe_up_grouped_dead_{v1,v2}{A,B}.csv`.
+`p21c_down_ladders.csv`, `p21c_moe_gemv_hoist_{ctl,hoist}{A,B,C}.csv`,
+`p21c_moe_up_grouped_dead_{v1,v2}{A,B}.csv`, and — 2026-10-01, Findings 7
+and 8 — `p22c_{ctl,new}{A,B,C}.csv` with `p22c_v1_runtime_slabs_{ctl,new}.csv`
+the dead first form.
 
 The two 24-layer runs made first (16.20 and 15.29 ms a step; the difference
 is all in the host gather, which at 64 tokens carries the two ~8 ms fault
@@ -479,6 +481,117 @@ day's second change is worth as much as its first: **25.13 → 24.42 ms,
 39.8 → 41.0 tok/s** for the pair of them, the moves −0.50 and the pad rows
 −0.22. The 4 moves left are 0.03 ms.
 
+## Finding 7 — the router's tail as one dispatch (P22c, 2026-10-01): 9.8 → 8.0 µs a layer, −0.09 ms
+
+After P22b the weightless list reads `dn.scan` 0.63 (P24's bytes),
+`moe.route` 0.27, `hc.cn` 0.25, `attn.attn.split` 0.15, `moe.combine`
+0.15, `dn.conv` 0.15, `moe.perm.up` 0.14, `dn.norm` 0.12, `hc.down_reduce`
+0.11 and a dozen under 0.1 — each a dispatch of one to forty workgroups
+whose cost is the launch. **Which of them can be folded into a neighbour
+is decided by the neighbour's parallelism, not by the bytes.** The MoE
+combine (11 weighted rows a token) and the split-K reduces (`dn.out.sum`,
+`attn.out.sum`, 32 slab rows) all feed `hc.cn`, and folding them into it
+looks like G3's epilogue pattern — but `hc.cn` is one workgroup a
+(token, stream) that keeps 2560 values in registers for its norm, so the
+fold would read the 11 (or 32) rows **four times over, serially, on one
+CU each**: ~2 µs of L2 reads a dispatch against the 3.1 (or 1.6) µs the
+separate kernel costs on forty CUs. Priced on paper and not built; the
+same arithmetic retires `hc.down_reduce` → `hc.up` (32 slabs re-summed by
+160 workgroups) and `dn.qkv.sum` → `dn.conv`.
+
+**What does fold is the router's tail, because all three of its dispatches
+are already one or three workgroups.** `llm_moe_route_decode.comp` is the
+router's split-K reduce, the softmax, the ten argmaxes, the weights and the
+counting sort's permutation and tile schedule as one workgroup of four
+waves at one to GEMVMaxRows rows (`MoEGPU.routeFused`; the one tile list
+both modes share there, `LLM_MOE_ROUTE_SPLIT=1` the control). Phase A sums
+the partials in slab order with all four waves; phase B is **a wave a
+token** with the 512 probabilities in eight registers a lane and the ten
+argmaxes as subgroup reductions — no barrier, where the route kernel paid
+three a round; phase C ranks the ≤ 48 (token, slot) pairs by (expert,
+pair) in LDS instead of a 512-wide counting sort with atomics, and writes
+the same layout (shared group in front, experts ascending and padded to
+`pad`, the sentinel in every slack row, the records' real-row word, the
+sort's four bookkeeping arrays for whatever reads them). **Bit for bit
+the three kernels' output**, which took one deliberate step: the softmax's
+sum is reproduced from a single wave by giving lane *l* the eight experts
+threads *l*, *l*+64, *l*+128, *l*+192 of the 256-wide kernel held between
+them — the per-thread partial over the same two elements, a subgroup add
+over the same 64 lanes, the four wave totals added in wave order. The only
+thing that differs is the order of rows *within* an expert when two rows
+of a batch choose it (pair order, where the atomics gave any order), which
+nothing reads. `TestMoEGPURouteFused` demands identical logits, weights,
+selection and `ffn_out` at one, two and three rows on both routers with
+the arena dirtied between arms, and checks the permutation's layout;
+`TestGraphRouteFusedBitExact` demands identical logits from the graph over
+a prefill and one-, two- and three-row passes.
+
+**The first form measured dead, and the reason is a loop bound.** It took
+the slab count at run time, and a runtime-bounded `for (s < slabs) v +=
+act[...]` compiles to one load, one `s_waitcnt vmcnt(0)`, one add a slab:
+forty serial round trips a column and three columns a thread, so the
+fused dispatch read **26.8 µs against the 9.9 the three kernels cost** —
+the step 24.40 → 25.07 ms (`p22c_v1_runtime_slabs_{ctl,new}.csv`). The
+router's own reduce (`llm_moe_router.comp` MODE 1) unrolls a compile-time
+`KSLABS`, and the fused kernel now does the same, one build a rung (k0 for
+the GEMM router, k8/10/20/40). It is P21c's lesson from the other side:
+there the loads were hoisted out of a loop the compiler had serialised;
+here the loop had to stop being a loop before the compiler could issue
+its loads together. **Count the `vmcnt(0)`s a lane pays, or compile the
+bound.**
+
+**Measured, same hour, three interleaved pairs, one binary, together with
+Finding 8** (`p22c_{ctl,new}{A,B,C}.csv`): `moe.route` + `moe.perm.up` +
+`moe.router.sum` 0.273 + 0.137 + 0.061 = **0.471 → 0.383 ms** (9.8 → 8.0
+µs a layer, 96 dispatches fewer a step), −0.09 ms. The fused
+dispatch is still 8 µs for three workgroups' worth of work that streams
+nothing: that is the floor of a dispatch which waits on forty loads, a
+softmax and ten reductions in sequence, and nothing is left in it to fold.
+
+## Finding 8 — `ple.kv` on the decode GEMV (P21d, 2026-10-01): 282 → 167 µs, −0.12 ms
+
+The weight table above carried `ple.kv` at ≤ 36 MB, 276 µs, ≤ 130 GB/s,
+with the bytes uncertain. They are certain now: the PLE's fused key/value
+projection is [2560 × 12800] on L8a's int8 bank (35 MB), and it was **the
+third projection still on the padded GEMM at one row** — the same shape
+as Finding 1's head and Finding 2's `hc.up`, running `llm_gemm.comp` MODE
+2 over a sixteen-row fragment holding one row, 200 workgroups of 64
+columns. (With `LLM_DENSE_SIM` set the block runs the fp16 bank instead,
+which is the only reading under which 276 µs would have been near the
+bus; the served path sets `LLM_DENSE_BANK`, which is the other plan.)
+
+`PLEGPU.gemvFor` puts it on `llm_gemv.comp`'s split-K rungs at one to
+GEMVMaxRows rows — the DeltaNet block's build, one pipeline a row count,
+partials in an arena of the block's own riding `resOff` — at eight slabs,
+the attention qkv's rung for the nearest shape (13312 columns);
+`LLM_PLE_KV_SLABS=<n>` names another for a screen and `LLM_PLE_KV_GEMM=1`
+is the control. The block honours the graph's schedule pin (`PinGemv`),
+which the first form did not, and `TestGraphIsAChunkSplit`'s pinned
+subtests said so at once: a two-row chunk no longer reproduced the whole
+pass to the last bit. `TestPLEGPUKVDecodeGEMV` compares every rung with
+the GEMM on the same bank at one, two and three rows (rms 1.3e-7, the
+DeltaNet's bar 1e-4) and `TestGraphImageDecode`'s batched rows stay
+bit-identical to their solo steps. The one-row decode-schedule subtest of
+`TestGraphIsAChunkSplit` moved 9.79e-4 → 1.034e-3 rms against a 1e-3 bar
+that was 98% spent before this change; the bar is 2e-3 now, measured and
+recorded in the test, for the reason the multi-row bar is 5e-3.
+
+**Measured in the same pairs as Finding 7:** `ple.kv` 0.282 / 0.293 / 0.285
+→ **0.165 / 0.163 / 0.164 + 0.002 of reduce**, 127 → 212 GB/s. The two
+together: **24.37 / 24.43 / 24.43 → 24.16 / 24.19 / 24.19 ms, 40.93–41.03 →
+41.33–41.39 tok/s** (+1.0%); every other label within 0.02 ms.
+
+## Postscript 2 — the suite on 2026-10-01
+
+Run from `llm/` without `LLM_MOE_BANK`/`LLM_DENSE_BANK` (five tests stage
+the checkpoint's own banks and read the environment as a different plan),
+everything passes but `TestInPortPadsTheRunNotTheArena`, which had been
+failing since P22b: P16's test asserted that one row pads to the row
+block, and P22b made the decode ports pad to the run. It now asserts both
+— the run on the decode GEMV plan, the row block under `PinGemv`.
+`TestGraphLogits` reproduces its 2026-09-22 digits (9 of 10 top tokens,
+the known near-tie).
+
 ## Postscript — the suite's three failures at the end of the day, and what they were
 
 Run after P22b landed (2026-09-30, late), the `llm` suite failed two tests
@@ -541,7 +654,14 @@ In order of `lost` and of cost to take:
    stays at 32 slabs with 0.4 ms nobody has an idea for.
 4. ~~**The moves** (P22, 0.54 ms): L6c's single arena.~~ Finding 6 (P22b):
    deleted at the boundary instead, 196 → 4 a step.
-5. **P20** stands on 1.23 steps for a two-row pass and a 23% break-even.
+5. ~~**The epilogue fusions**~~ — Finding 7 (P22c): the router's tail is
+   the one that folds (−0.09 ms); the combine and the reduces into `hc.cn`
+   are priced dead by its one-workgroup-a-stream shape. ~~**`ple.kv`**~~ —
+   Finding 8 (P21d), the third one-row GEMM, −0.12 ms. The weightless
+   list is now `dn.scan` (P24's bytes) and a floor of launches.
+6. **P20** stands on 1.23 steps for a two-row pass and a 23% break-even,
+   and is the only item left with a multiple: the step is 24.2 ms against
+   ~19.6 of weights at the bus and ~1.1 of host.
 
 The four big GEMVs (0.8 ms against 227) move down the list: P21's first
 suspect, the Q4 arm's load shape, was read from source and the compiler had

@@ -3190,6 +3190,11 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_route.spv llm_moe_route.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_perm.spv llm_moe_perm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -o llm_moe_combine.spv llm_moe_combine.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DKSLABS=0 -o llm_moe_route_decode_k0.spv llm_moe_route_decode.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DKSLABS=8 -o llm_moe_route_decode_k8.spv llm_moe_route_decode.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DKSLABS=10 -o llm_moe_route_decode_k10.spv llm_moe_route_decode.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DKSLABS=20 -o llm_moe_route_decode_k20.spv llm_moe_route_decode.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DKSLABS=40 -o llm_moe_route_decode_k40.spv llm_moe_route_decode.comp
 // **Every single-wave build is a `SHORT` build** (KERNELS.md G5c, §2.12):
 // the permutation aligns experts to one fragment instead of the block, and
 // the kernel runs one of WM copies of its loop on the record's real rows.
@@ -3615,6 +3620,28 @@ var LLMMoEPerm []byte
 
 //go:embed llm_moe_combine.spv
 var LLMMoECombine []byte
+
+// The router's tail at decode as one dispatch (TODO.md P22c): the split-K
+// partials summed, the softmax, the top ten, the weights and the
+// permutation with its tile schedule — what the router's reduce, the route
+// and the permutation kernels do as three, bit for bit, for one to
+// GEMVMaxRows rows. One build per router rung, the slab sum unrolled; k0
+// is the GEMM router's, whose logits are already a row.
+//
+//go:embed llm_moe_route_decode_k0.spv
+var LLMMoERouteDecodeK0 []byte
+
+//go:embed llm_moe_route_decode_k8.spv
+var LLMMoERouteDecodeK8 []byte
+
+//go:embed llm_moe_route_decode_k10.spv
+var LLMMoERouteDecodeK10 []byte
+
+//go:embed llm_moe_route_decode_k20.spv
+var LLMMoERouteDecodeK20 []byte
+
+//go:embed llm_moe_route_decode_k40.spv
+var LLMMoERouteDecodeK40 []byte
 
 // The move between two blocks' activation arenas (LLM.md L6c). Three
 // bindings of its own rather than llm_common.glsl's five, because its two

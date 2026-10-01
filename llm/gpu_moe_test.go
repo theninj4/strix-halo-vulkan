@@ -202,6 +202,17 @@ func TestMoEGPUPermutation(t *testing.T) {
 	if err := g.Run(0); err != nil {
 		t.Fatal(err)
 	}
+	checkMoEPermutation(t, g, c, nTok)
+}
+
+// checkMoEPermutation reads the permutation a run left and checks it is the
+// counting sort's: the histogram against the selection, the shared group in
+// front, every expert's real rows a bijection onto the pairs that chose it,
+// the sentinel in every padding row, and the inverse round-tripping. It is
+// TestMoEGPUPermutation's body, shared with the fused decode tail's gate
+// (TestMoEGPURouteFused), which lays the same rows out by another algorithm.
+func checkMoEPermutation(t *testing.T, g *MoEGPU, c MoEConfig, nTok int) {
+	t.Helper()
 	used, slots := c.NExpertUsed, c.NExpertUsed+1
 
 	// The histogram, against the selection the device itself emitted.
@@ -1494,4 +1505,112 @@ func indexKind(kinds []string, k string) int {
 		}
 	}
 	return -1
+}
+
+// TestMoEGPURouteFused is P22c's gate: at decode the router's tail — the
+// split-K reduce, the softmax and the top ten, the permutation and its tile
+// schedule — is one dispatch (llm_moe_route_decode.comp, MoEGPU.routeFused),
+// and it has to leave what the three kernels left: the logits, the
+// selection, the weights and `ffn_out` **bit for bit**, and a permutation
+// with the counting sort's layout. One, two and three rows, on the split-K
+// router and on the GEMM one, with the arena dirtied by other tokens between
+// the arms (P5c's lesson, TestMoEGPUDecodeTwoRows): the fused kernel writes
+// the same words the three did, so an arm that never ran would leave the
+// other's answer in place and pass a plain comparison.
+func TestMoEGPURouteFused(t *testing.T) {
+	c, w, in, nTok, _ := moeFixtures4k(t)
+	if nTok < 2*GEMVMaxRows {
+		t.Skipf("the trace is %d tokens and the control needs %d", nTok, 2*GEMVMaxRows)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+	g, err := NewMoEGPU(dev, c, GEMVMaxRows, []MoEWeights{w})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+
+	type snap struct {
+		kinds                []string
+		logits, weights, out []float32
+		topk                 []int32
+		tiles                int
+	}
+	run := func(first, rows int, split bool) snap {
+		t.Helper()
+		if err := g.Upload(in[first*c.NEmbd:(first+rows)*c.NEmbd], rows); err != nil {
+			t.Fatal(err)
+		}
+		g.SetRouteSplit(split)
+		_, kinds, err := g.graph(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+		tiles, _, _, _ := g.Tiles()
+		return snap{kinds: kinds, logits: g.Logits(), weights: g.Weights(),
+			out: append([]float32(nil), g.Out()...), topk: g.TopK(), tiles: tiles}
+	}
+	for rows := 1; rows <= GEMVMaxRows; rows++ {
+		if err := g.Resize(rows); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetPlan(MoEPlanFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SetSharedPlan(MoESharedPlanFor(rows)); err != nil {
+			t.Fatal(err)
+		}
+		for _, router := range []MoERouterKernel{MoERouterFor(rows), MoERouterGEMM} {
+			if err := g.SetRouter(router); err != nil {
+				t.Fatal(err)
+			}
+			name := fmt.Sprintf("%d rows, router %s", rows, router)
+			// The split arm on other tokens, the fused arm on tokens 0..,
+			// the fused arm on other tokens, the split arm on tokens 0..:
+			// each arm has been the last to overwrite the other's words.
+			run(rows, rows, true)
+			fused := run(0, rows, false)
+			checkMoEPermutation(t, g, c, rows)
+			run(rows, rows, false)
+			split := run(0, rows, true)
+
+			for _, k := range []string{"router.sum", "perm.up", "perm.down"} {
+				if hasKind(fused.kinds, k) {
+					t.Errorf("%s: the fused graph still records %q: %v", name, k, fused.kinds)
+				}
+			}
+			if !hasKind(split.kinds, "perm.up") || (router != MoERouterGEMM && !hasKind(split.kinds, "router.sum")) {
+				t.Errorf("%s: the split graph is missing a tail dispatch: %v", name, split.kinds)
+			}
+			if fused.tiles != split.tiles {
+				t.Errorf("%s: %d tile records fused against %d split", name, fused.tiles, split.tiles)
+			}
+			for i := range split.topk {
+				if fused.topk[i] != split.topk[i] {
+					t.Fatalf("%s: selection [%d] is expert %d fused, %d split", name, i, fused.topk[i], split.topk[i])
+				}
+			}
+			for _, arm := range []struct {
+				what      string
+				got, want []float32
+			}{
+				{"logits", fused.logits, split.logits},
+				{"weights", fused.weights, split.weights},
+				{"ffn_out", fused.out, split.out},
+			} {
+				r, err := compare(arm.got, arm.want)
+				if err != nil {
+					t.Fatalf("%s %s: %v", name, arm.what, err)
+				}
+				if r.maxAbs != 0 {
+					t.Errorf("%s: %s differs between the fused tail and the three kernels: %v", name, arm.what, r)
+				}
+			}
+			t.Logf("%-26s fused %d dispatches %v, split %d: logits, weights, selection and ffn_out identical, %d tiles",
+				name, len(fused.kinds), fused.kinds, len(split.kinds), fused.tiles)
+		}
+	}
 }

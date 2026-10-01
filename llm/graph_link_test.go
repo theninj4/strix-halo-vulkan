@@ -85,3 +85,67 @@ func TestGraphHCLinkBitExact(t *testing.T) {
 		from = to
 	}
 }
+
+// TestGraphRouteFusedBitExact is P22c's whole-graph gate: a decode step
+// whose MoE router tail is the one fused dispatch produces the same bits as
+// one whose tail is the three kernels — a prefill of eight (where the tail
+// is always the three), then one, two, three and one rows. Bit-exact and
+// not to a tolerance: the fused kernel's sums are the three kernels' sums in
+// the same order (llm_moe_route_decode.comp), and the permutation's row
+// order within an expert is the one thing that differs, which nothing reads.
+func TestGraphRouteFusedBitExact(t *testing.T) {
+	const layers, nTok = 4, 16
+	m, tr := fixtures4k(t)
+	all, _, err := tr.Tokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < nTok {
+		t.Skipf("the 4k trace has %d tokens", len(all))
+	}
+	ids := all[:nTok]
+
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, Layers: layers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(g.Destroy)
+
+	cuts := []int{8, 9, 11, 14, 15}
+	arm := func(split bool) [][]float32 {
+		g.moe.SetRouteSplit(split)
+		g.dropPrerecorded()
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		var out [][]float32
+		from := 0
+		for _, to := range cuts {
+			l, _, err := g.Forward(ids[from:to])
+			if err != nil {
+				t.Fatalf("split=%v rows [%d,%d): %v", split, from, to, err)
+			}
+			out = append(out, append([]float32(nil), l...))
+			from = to
+		}
+		return out
+	}
+	// Run 1 of a freshly staged graph diverges from runs 2+ (P1c finding
+	// 4), so the first arm is thrown away.
+	arm(true)
+	split := arm(true)
+	fused := arm(false)
+	from := 0
+	for i, to := range cuts {
+		r, err := compare(fused[i], split[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.maxAbs != 0 {
+			t.Errorf("rows [%d,%d): the fused router tail differs from the three kernels: %v", from, to, r)
+		}
+		from = to
+	}
+}

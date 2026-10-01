@@ -742,6 +742,11 @@ type MoEGPU struct {
 	// sharedSplit keeps the shared expert on its own two dispatches at
 	// decode (P22's control, `LLM_MOE_SHEXP_SPLIT=1`); see foldShared.
 	sharedSplit bool
+	// routeSplit keeps the router's tail as three dispatches at decode —
+	// the split-K reduce, the route and the permutation — where the fused
+	// kernel would run (P22c's control, `LLM_MOE_ROUTE_SPLIT=1`); see
+	// routeFused.
+	routeSplit bool
 
 	tokens, arenaRows, rows int
 	lda, ldCtx              int
@@ -842,6 +847,7 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 		autoPlan:    true,
 		bankPlan:    MoEBankPlanFromEnv(),
 		sharedSplit: moeSharedSplitAtDecode(),
+		routeSplit:  moeRouteSplitAtDecode(),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -1172,6 +1178,16 @@ func (g *MoEGPU) build() error {
 			return err
 		}
 	}
+	// The fused decode tail: one build per router rung (its slab sum is
+	// unrolled), and a wave a token, so pinned to the wave its layout
+	// assumes, as the GEMV rungs below are.
+	for slabs, spirv := range moeRouteDecodeSPIRV {
+		if err := g.pipeline(moeRouteDecodePipe(slabs), spirv, vk.PipelineSpec{
+			Buffers: bufs, Counts: counts, PushConstantSize: pcSize, RequiredSubgroupSize: moeWave,
+		}); err != nil {
+			return err
+		}
+	}
 	feat := g.dev.Features()
 	sgs, err := g.dev.Physical().SubgroupSizeControl()
 	if err != nil {
@@ -1494,6 +1510,41 @@ func (g *MoEGPU) poisonPad(v float32) {
 // on its own two dispatches at decode, P22's control arm.
 var moeSharedSplitAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_MOE_SHEXP_SPLIT") == "1" })
 
+// moeRouteSplitAtDecode is `LLM_MOE_ROUTE_SPLIT=1`: the router's tail as
+// three dispatches at decode, P22c's control.
+var moeRouteSplitAtDecode = sync.OnceValue(func() bool { return os.Getenv("LLM_MOE_ROUTE_SPLIT") == "1" })
+
+// moeRouteMaxTok is how many rows llm_moe_route_decode.comp carries — a wave
+// a token, four waves — which bounds GEMVMaxRows for the fused tail.
+const moeRouteMaxTok = 4
+
+// moeRouteDecodeSPIRV is the fused decode tail per router split, 0 for the
+// GEMM router.
+var moeRouteDecodeSPIRV = map[int][]byte{
+	0:  shaders.LLMMoERouteDecodeK0,
+	8:  shaders.LLMMoERouteDecodeK8,
+	10: shaders.LLMMoERouteDecodeK10,
+	20: shaders.LLMMoERouteDecodeK20,
+	40: shaders.LLMMoERouteDecodeK40,
+}
+
+func moeRouteDecodePipe(slabs int) string { return fmt.Sprintf("route_decode_k%d", slabs) }
+
+// SetRouteSplit keeps the router's tail split at decode (on) or lets it
+// fuse (off): the two arms of TestMoEGPURouteFused.
+func (g *MoEGPU) SetRouteSplit(on bool) { g.routeSplit = on }
+
+// routeFused reports whether this run's router tail is the one fused
+// dispatch (TODO.md P22c): the split-K reduce, the softmax and top-k, and
+// the permutation with its schedule, as `llm_moe_route_decode.comp`. It is
+// the decode shape — one to GEMVMaxRows rows — and needs the one tile list
+// both modes share there (moeBM equal, so `downTiles` reads the up list);
+// at every other length, or under the control, the three kernels run.
+func (g *MoEGPU) routeFused() bool {
+	return !g.routeSplit && g.rows >= 1 && g.rows <= GEMVMaxRows && g.rows <= moeRouteMaxTok &&
+		moeBM(g.up) == moeBM(g.down)
+}
+
 // SetSharedFold puts the shared expert on the routed dispatches (true) or on
 // its own two (false), for the gate that compares them. The environment
 // decides otherwise.
@@ -1595,26 +1646,46 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// 1. The router, with the shared expert's gate as one more output column.
 	//    At one token it is a split-K GEMV in two dispatches and at every
 	//    other length the GEMM (L8d-3); both write the same f32 logits row.
+	//    At decode the reduce is the fused tail's (P22c, step 2 below).
+	fused := g.routeFused()
+	ks := moeRouterSlabs(g.routerGemv)
 	router := base
 	router.OutOff, router.BOff = g.aLogits, w.router
 	router.GemmM = uint32(roundUpInt(g.rows, rv.bm))
 	router.GemmN, router.GemmK = uint32(g.routerN()), uint32(c.NEmbd)
-	if ks := moeRouterSlabs(g.routerGemv); ks > 0 {
+	if ks > 0 {
 		router.GammaOff = g.aRouterPart
 		add(gemvRowName(fmt.Sprintf("router_%s", g.routerGemv), g.rows), "router",
 			uint32(ks), uint32(g.routerN()/16), router)
-		add(gemvRowName(fmt.Sprintf("router_%s_r", g.routerGemv), g.rows), "router.sum",
-			uint32(roundUpInt(g.routerN(), moeWave)/moeWave), uint32(g.rows), router)
+		if !fused {
+			add(gemvRowName(fmt.Sprintf("router_%s_r", g.routerGemv), g.rows), "router.sum",
+				uint32(roundUpInt(g.routerN(), moeWave)/moeWave), uint32(g.rows), router)
+		}
 	} else {
 		add(string(g.router), "router", uint32(g.routerN()/attnBN),
 			uint32(roundUpInt(g.rows, rv.bm)/rv.bm), router)
 	}
 
-	// 2. The softmax, the ten argmaxes, the normalise and the shared gate.
+	// 2. The softmax, the ten argmaxes, the normalise and the shared gate —
+	//    and at decode, the reduce before them and the permutation after,
+	//    as one workgroup (TODO.md P22c, llm_moe_route_decode.comp): three
+	//    dispatches of a few microseconds each that stream no weight, whose
+	//    cost was three launches. Bit for bit the three kernels' output
+	//    (TestMoEGPURouteFused); the tile list is the one both modes share.
 	route := base
 	route.GemmN, route.GemmK = uint32(g.routerN()), uint32(c.NExpert)
 	route.MoEPermOff = g.aPerm
-	add("route", "route", uint32(g.rows), 1, route)
+	if fused {
+		route.GemmM = uint32(bmUp)
+		route.GammaOff = g.aRouterPart
+		route.MoETileOff, route.MoEBOff2 = g.aTilesUp, g.aBook
+		// MOE_ROUTE_PAD (llm_common.glsl) is the alignment; the router's
+		// split names the build.
+		route.NormOff = uint32(g.pad())
+		add(moeRouteDecodePipe(ks), "route", 1, 1, route)
+	} else {
+		add("route", "route", uint32(g.rows), 1, route)
+	}
 
 	// 3-4. The counting sort, and the tile schedules it implies. It runs
 	//      twice because the two modes are cut to different row blocks and a
@@ -1632,6 +1703,9 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		bm  int
 		lbl string
 	}{{g.aTilesUp, bmUp, "perm.up"}}
+	if fused {
+		passes = nil
+	}
 	if bmDown != bmUp {
 		passes = append(passes, struct {
 			off uint32

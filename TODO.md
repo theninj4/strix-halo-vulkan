@@ -33,7 +33,7 @@ here is our own ceiling, not a reference implementation.
 
 | vertical | model | headline, measured | open |
 |---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | **token generation is the focus from 2026-09-30: P19–P24 in the text section; P19 and P21a done the same day (the step attributed: 16.4 / 4.3 / 3.0 / 1.1 ms; the head and `hc.up` — the two projections still on the padded GEMM at one row — moved to GEMVs, 37.5 → 38.7 tok/s at 25.8 ms a step; P21b's load hoisting measured dead; P22a the shared expert as the eleventh tile of the routed MoE dispatch, 38.8 → 39.2 tok/s at 25.5 ms; P21c the MoE down GEMV's five serial round trips a lane hoisted and A staged sixteen bytes a load, 39.1 → 39.8 tok/s at 25.13 ms, both down rungs re-laddered and confirmed), next the rest of P22, speculation re-priced at 1.23 steps a two-row pass**; concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step; the 196 moves went in P22b (2026-09-30, 196 → 4 and no zero rows at decode, 25.13 → 24.42 ms, 41.0 tok/s) |
+| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | **token generation is the focus from 2026-09-30: P19–P24 in the text section; P19 and P21a done the same day (the step attributed: 16.4 / 4.3 / 3.0 / 1.1 ms; the head and `hc.up` — the two projections still on the padded GEMM at one row — moved to GEMVs, 37.5 → 38.7 tok/s at 25.8 ms a step; P21b's load hoisting measured dead; P22a the shared expert as the eleventh tile of the routed MoE dispatch, 38.8 → 39.2 tok/s at 25.5 ms; P21c the MoE down GEMV's five serial round trips a lane hoisted and A staged sixteen bytes a load, 39.1 → 39.8 tok/s at 25.13 ms, both down rungs re-laddered and confirmed), next the rest of P22, speculation re-priced at 1.23 steps a two-row pass**; concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step; the 196 moves went in P22b (2026-09-30, 196 → 4 and no zero rows at decode, 25.13 → 24.42 ms, 41.0 tok/s); **P22c + P21d (2026-10-01): the router's tail as one bit-exact dispatch and `ple.kv` — the third one-row GEMM — on the GEMV, 24.42 → 24.19 ms, 41.4 tok/s; the weightless list is a floor of launches now and P20 is next** |
 | speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
 | text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
 | image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt; KERNELS.md G4 (2026-09-30, research §3.8): the transposed attention (`h3_attn_t.comp`) on this DiT is 1.07x on the attention and 1.7% of a step, **opt-in** (`QIMAGE_ATTN_T=1`) because the edit oracle's teacher-forced prefill amplifies fp16-level differences in the prefix rows ~100x at three target rows — the kernel is exact on identical inputs at every block, a plain-family perturbation reads 1.73e-2 against the 2e-2 bound, and the call on that bound is this vertical's. **KERNELS.md G3 (2026-09-30, §2.14): w1|w3 as one GEMM whose epilogue is the SwiGLU**, bit-identical, a 1024² cached step **2044 → 1929–1968 ms** on the int8 bank (1.04–1.06x); the served binary needs a redeploy |
@@ -379,31 +379,73 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   (17–23 in flight, bit-identical) ran 0.7 ms *slower* — the head +0.3,
   `hc.down` +0.23 — for 60–72 VGPRs against 48 and a branch-free record
   decode at 800 MHz; removed. The four big GEMVs are not load-bound.
-- [ ] **P20 — speculation, re-priced.** The only lever with a multiple,
-  parked at 0.95x (P5c) on numbers that are now stale: C5 raised
-  `GEMVMaxRows` to 3, took the bank re-read out of the row loop and runs
-  rows side by side, so the 1.36-step verification pass and "depth 2 is
-  still the GEMM" are both out of date. Observers before machinery, each a
-  few minutes:
-  - **P20a** the draft head's acceptance on chat and code
-    (`cmd/llm -mtp`, teacher-forced, the `zero` control beside it); P5c's
-    65.6% is wikitext prose, break-even was ~0.72.
-  - **P20b** what a one-sequence two- and three-row pass costs today
-    (`cmd/llm -graph -tokens 1,2,3`, which is the right instrument *here*
-    because verification rows are one sequence).
-  - **P20c** **prompt-lookup drafting**, never built: the draft is an
-    n-gram match in the context, so it costs no draft step (the MTP head is
-    0.21 of one), has no 2048-cell limit (`blk.48`'s compress ratio) and
-    does not move with the bank widths. A host-only observer first: replay
-    real transcripts (agent turns, code edits, RAG answers) and count how
-    often the lookup names the trunk's next 1–2 tokens. Unverified
-    arithmetic: a free draft against a ~1.3-step two-row pass breaks even
-    near 30% acceptance.
-  - **P20d** build only what P20a–c price above ~1.2x: the lookup draft
-    through P5c's rollback, the recovery round (a partial accept), the
-    verification pass pre-recorded, the two drafts combined. `Reset`'s owed
-    test (P5c finding 6) comes first, and every token-for-token claim
-    prints its plain-against-plain row.
+- [ ] **P20 — speculation, re-planned 2026-10-01 against llama.cpp's MTP**
+  ([research/p20-llamacpp-mtp.md](research/p20-llamacpp-mtp.md)). The only
+  lever with a multiple, parked at 0.95x (P5c). llama.cpp PR 29761 (open,
+  2026-09-30) implements the same head with **P5a's wiring exactly** and
+  reads **1.55x on a DGX Spark at `--spec-draft-n-max 3`**: 28.36 → 43.88
+  tok/s over 24 SPEED-Bench prompts, acceptance **0.64 a drafted token**
+  (coding 0.61, qa 0.58, rag 0.69, writing 0.67), ≈2.9 tokens a round for
+  ≈1.9 steps. Four things in its loop differ from ours, and one of the four
+  is a defect here:
+  - **P20a — the draft's KV cache is complete there and not here.**
+    llama.cpp runs the draft layer over every row the trunk runs — the
+    prompt and each verified batch — paired with the trunk's residual one
+    position back, no lm head, and trims the rejected rows.
+    `Speculator.Start` resets the draft and never primes it over the prompt,
+    and `Next` writes a draft cell only on a speculating round, so the draft
+    attends over **unwritten cells for the whole prompt and at every other
+    position**. P5c's 65.6% / 46.9% against P5a's 74.0% (same head, complete
+    cache) is this before it is the narrowed trunk — §4.2 was confounded with
+    it. Fix: the catch-up rows in the draft dispatch (the committed rows
+    since the last draft plus the new one, logits for the last), the prompt
+    primed at `Start` from the prefill's residual arena a ubatch at a time
+    **on the device** (at 128k the residual is 5 GB; not through a mapped
+    buffer). Gate: the loop's acceptance on a teacher-forced sequence equals
+    the observer's count for count.
+  - **P20b — depth 2 or 3, not 1.** P5a's optimum was computed on
+    2026-09-19's pass costs and wikitext acceptance; at 0.64 a drafted token
+    and P19's 1.23 / 1.37-step two- and three-row passes the optimum moves.
+    Measure `cmd/llm -graph -tokens 1,2,3,4` on the shipped banks (one
+    sequence, the right instrument here); a four-row pass needs
+    `GEMVMaxRows` 4 (`MAXROWS` in the three decode GEMVs and the fused
+    router, a four-at-a-time rung in `TestGraphIsAChunkSplit`). The MoE's
+    expert growth bounds the depth; P20b measures it on loop traffic rather
+    than the design pass's repeated-prompt table.
+  - **P20c — partial accept by snapshot planes, not a recovery round**
+    (P5c §4 item 1, now with a reference design): llama.cpp creates the
+    target context with `n_rs_seq = n_max`, the gated-delta-net op writes
+    the state after each of the last K = n_max + 1 rows into K planes (the
+    conv ring and the PLE ring likewise, K copies), and a rollback of j sets
+    a plane index the next read takes; row 0 of a pass is always committed,
+    so no ping-pong. Here: `llm_dn_scan.comp` stores S after each of the
+    last K rows ((K − 1) × 113 MB extra a pass, ~0.07 step at K = 4, against
+    a recovery pass of ~1.2), K rings in `llm_seq_hist.comp`'s ping-pong
+    arm, `Rewind(j)`; residency 241 → 483 MB, still `GraphOpts.Speculative`;
+    `TestSpeculationRewindIsTheSequence` gains j = 1..3 of 4.
+  - **P20d — the draft step at its byte floor.** 5.71 ms is 0.236 of
+    today's 24.19 ms step (P5c §4.2's effect again) against a floor of 0.13;
+    three a round is 0.71 steps against 0.39. `nextn` on the device (four
+    host matvecs, 2.2 ms) and the draft step recorded (13 submits) — P5a's
+    owed items, on the critical path now — and depth as a parameter.
+  - **P20e — the measurement, the PR's way**: free-running on SPEED-Bench's
+    qualitative prompts (`nvidia/SPEED-Bench`, the categories above) through
+    the chat template at temperature zero, the text read for P5a's loop
+    artefact, two runs, the plain-against-plain row printed (`Reset`'s owed
+    test, P5c finding 6, first), the shipped banks. The converter in the PR
+    gives `blk.48` **the trunk's compress ratio**, so the 2051-cell refusal
+    in `NewMTPHead` comes out and the long arm runs past 2048; D5 is back
+    for the head once a build with the PR exists. Unverified arithmetic at
+    24.19 ms, the PR's acceptance and the draft at the floor: depth 1
+    **1.26x**, depth 2 **~1.4x**, depth 3 **~1.5x if a four-row pass is ~1.5
+    steps** — 52 / 58 / 63 tok/s, inside the 46–56 the outside number
+    claims; with P5a's wikitext profile instead, 1.34x / 1.32x at depths 2
+    and 3, so the workload's acceptance is the swing.
+  - **P20f** prompt-lookup drafting, demoted: a free extra draft to combine
+    with the head (llama.cpp runs several types in order), not the first
+    thing; the host-only replay observer stands as written before, and the
+    draft's confidence stop (`p_min`, unused in the PR's table) is a lever,
+    not the result.
 - [ ] **P21 — the G-treatment on the decode GEMVs.** P19's `lost` column
   sets the order; the first suspect is retired (the Q4 arm's loads are
   vectorised as compiled) and so is the second (P21b above: issuing a
@@ -422,7 +464,14 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   `moe.down` 53.3 → 49.2 µs, `moe.up` 104.5 → 100.4 from the staging alone.
   The same treatment on the up mode's quad loop measured +1.5 µs and was
   reverted (P21b a third time). `hc.down`'s 0.4 ms has no idea left; the
-  shared expert's two dispatches are P22a's eleventh tile. Method: knock-out controls, the ISA's load count, the whole model
+  shared expert's two dispatches are P22a's eleventh tile. **P21d done
+  2026-10-01** ([Finding 8](research/p19-decode-attribution.md)): `ple.kv`
+  was the third projection still on the padded GEMM at one row — the PLE's
+  [2560 × 12800] int8 key/value projection, 35 MB at 127 GB/s — and runs on
+  `llm_gemv.comp`'s eight-slab rung at one to three rows (`PLEGPU.gemvFor`,
+  `LLM_PLE_KV_GEMM=1` the control, `LLM_PLE_KV_SLABS` the screen,
+  `TestPLEGPUKVDecodeGEMV` the gate, the schedule pin honoured): 282 → 167
+  µs, −0.12 ms a step. Method: knock-out controls, the ISA's load count, the whole model
   and not the block ladder (L8e-2 and C5 both chose a rung in the graph
   that the ladder got wrong), a rate above 242 GB/s is an L3 hit (D16),
   and **VGPRs and VALU count at 800 MHz** (P21b's lesson: a decode kernel
@@ -472,9 +521,27 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   arm 0.22 ms on their own in the kernels after each move, so P22b is
   **25.13 → 24.42 ms, 39.8 → 41.0 tok/s** in all
   (`results/p22b_link_*.csv`).
+  ~~The epilogue fusions~~ — **P22c done 2026-10-01** ([Finding
+  7](research/p19-decode-attribution.md)): which small dispatch folds into a
+  neighbour is decided by the neighbour's parallelism, and `hc.cn` (one
+  workgroup a stream, 2560 values in registers) would read the combine's
+  eleven rows or a reduce's 32 slabs four times over on one CU each, so the
+  combine and the split-K reduces stay (priced dead on paper). The router's
+  tail folds: `llm_moe_route_decode.comp` is the split-K reduce, the
+  softmax and top ten (a wave a token, no barriers), the weights and the
+  permutation with its schedule as one workgroup at one to three rows,
+  **bit for bit** the three kernels' output (`TestMoEGPURouteFused`,
+  `TestGraphRouteFusedBitExact`; `LLM_MOE_ROUTE_SPLIT=1` the control; one
+  build a router rung, because the first form's runtime slab bound made the
+  reduce forty serial round trips and measured 26.8 µs against 9.9): 0.471
+  → 0.383 ms, −0.09 ms. With P21d, three same-hour pairs 24.37 / 24.43 /
+  24.43 → **24.16 / 24.19 / 24.19 ms, 41.0 → 41.4 tok/s**
+  (`results/p22c_{ctl,new}{A,B,C}.csv`).
   Left of P22: `dn.scan` (0.64 ms) is the fp32 recurrent state read and
-  written every layer — bytes, P24's fp16-state item, not scheduling — and
-  the epilogue fusions at 0.1–0.3 ms each.
+  written every layer — bytes, P24's fp16-state item, not scheduling. The
+  rest of the weightless list is a floor of launches (8 µs for a dispatch
+  that waits on forty loads and ten reductions, 1–3 µs for one that does
+  nothing), and only fewer passes — P20 — gets under it.
 - [ ] **P23 — the host gather.** ~1 ms a token, 75% of it two steps in 32
   at ~8.7 ms, unexplained. The fix on the table is residency of the 28.8 GB
   table (or of the rows a conversation can reach), a deployment decision
@@ -484,11 +551,17 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   +1.74% may no longer separate plans; fp16 DeltaNet state (+~1.3 of
   ceiling) is graded by the same instrument.
 
-P19, P21a, P22a, P21c and P22b are done (36.2 → 41.0 tok/s on the day,
-24.4 ms a step); the rest of P22 (the epilogue fusions; `dn.scan` is P24's)
-next, then P20a–c. P21–P23 together are perhaps 38.7 → 42 tok/s
-if they land; only P20 reaches the 46–56 range, and P19 re-priced its
-two-row pass at 1.23 steps (break-even 23% acceptance for a free draft). Batched throughput
+P19, P21a, P22a, P21c and P22b are done (36.2 → 41.0 tok/s on 2026-09-30,
+24.4 ms a step), and P22c with P21d (2026-10-01: 41.0 → **41.4 tok/s, 24.2
+ms**). P22 is closed but for `dn.scan`, which is P24's; **next is P20**,
+re-planned on 2026-10-01 against llama.cpp's MTP PR (the draft's KV cache
+was never primed here — P20a — and depth 3 with snapshot planes reads 1.55x
+there), because the step is now 24.2 ms
+against ~19.6 of weights at the bus and ~1.1 of host, and the 3.5 between
+is launches and small streams no fusion left on the list recovers. P21–P23
+together were priced at 38.7 → 42 tok/s and have delivered 41.4; only P20
+reaches the 46–56 range, and P19 re-priced its two-row pass at 1.23 steps
+(break-even 23% acceptance for a free draft). Batched throughput
 (65 tok/s at three rows) keeps its own list in CONCURRENCY.md *Next*. The
 instrument rules at the end of this section apply to every number: a
 same-hour control, the shipped banks and `LLM_BANK_CACHE`, nothing else on

@@ -615,3 +615,82 @@ func TestPLERowsFromIsTheTail(t *testing.T) {
 	}
 	t.Logf("%d cut points of a %d-token sequence, every row identical", len(seq)+1, len(seq))
 }
+
+// TestPLEGPUKVDecodeGEMV is P21d's gate: at decode the fused key/value
+// projection runs on llm_gemv.comp's split-K rungs over the int8 bank
+// (PLEGPU.gemvFor) instead of the padded GEMM, and every rung has to
+// agree with the GEMM on the same bank — the DeltaNet's bar
+// (TestDeltaNetGPUGemvAgrees), a reassociation of a 2560-long dot product —
+// at one, two and three rows, and the automatic choice has to be a rung.
+func TestPLEGPUKVDecodeGEMV(t *testing.T) {
+	m, tr, c, ids := pleFixtures(t)
+	nTok := len(ids)
+	w, err := m.PLEWeights(c.Layers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	embd, err := tr.Get("ple_embd", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, err := tr.Get("l_last-0", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+
+	for rows := 1; rows <= GEMVMaxRows && rows <= nTok; rows++ {
+		g, err := NewPLEGPU(dev, c, rows, w, PLEOpts{Bank: BankQ8, Layer: c.Layers[0]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, emb := in.Vals[:rows*c.Wide()], embd.Vals[:rows*c.EmbdWidth()]
+		if err := g.Upload(res, emb, rows); err != nil {
+			t.Fatal(err)
+		}
+		if auto := g.Gemv(); auto == GEMVOff {
+			t.Errorf("%d rows: the automatic choice is the GEMM", rows)
+		} else {
+			t.Logf("%d rows: the automatic rung is %s", rows, auto)
+		}
+		run := func(k GEMVKernel) (key, val []float32, kinds []string) {
+			t.Helper()
+			if err := g.SetGemv(k); err != nil {
+				t.Fatal(err)
+			}
+			_, kinds = g.graph()
+			if err := g.Run(); err != nil {
+				t.Fatalf("%d rows, %q: %v", rows, k, err)
+			}
+			return append([]float32(nil), g.Key()...), append([]float32(nil), g.Value()...), kinds
+		}
+		refKey, refVal, kinds := run(GEMVOff)
+		if hasKind(kinds, "kv.sum") {
+			t.Errorf("%d rows: the GEMM arm records a reduce: %v", rows, kinds)
+		}
+		for _, k := range GEMVKernels() {
+			if !GEMVFits(k, c.NEmbd) {
+				continue
+			}
+			key, val, kinds := run(k)
+			if gemvSlabs(k) > 1 && !hasKind(kinds, "kv.sum") {
+				t.Errorf("%d rows, %s: no reduce recorded: %v", rows, k, kinds)
+			}
+			for _, arm := range []struct {
+				what      string
+				got, want []float32
+			}{{"key", key, refKey}, {"value", val, refVal}} {
+				r, err := compare(arm.got, arm.want)
+				if err != nil {
+					t.Fatalf("%d rows, %s %s: %v", rows, k, arm.what, err)
+				}
+				t.Logf("%d rows, %-4s %-5s against the GEMM over %d values: %v", rows, k, arm.what, len(arm.want), r)
+				if r.rms > 1e-4 {
+					t.Errorf("%d rows, %s: %s is rms %.3e from the GEMM's (%v)", rows, k, arm.what, r.rms, r)
+				}
+			}
+		}
+		g.Destroy()
+	}
+}

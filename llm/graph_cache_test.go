@@ -175,7 +175,12 @@ func TestGraphIsAChunkSplit(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Logf("result_norm, the decode kernels' reassociation: %v", r)
-		if r.rms > 1e-3 {
+		// Measured, not asserted: 9.79e-4 on this fixture with the PLE's
+		// projection on the GEMM at one row, 1.03e-3 with its decode rung
+		// (P21d, a split-K reassociation of one more projection, at rms
+		// 1.3e-7 of the GEMM at the block); the multi-row bar below is 5e-3
+		// for the same reason.
+		if r.rms > 2e-3 {
 			t.Errorf("the decode schedule moves result_norm by %.3e rms, which is more than a "+
 				"reassociated dot product can account for (%v)", r.rms, r)
 		}
