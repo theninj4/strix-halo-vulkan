@@ -532,6 +532,13 @@ func StageDraft(dev *vk.Device, draft *Model, g *Graph) (*MTPHead, error) {
 	return NewMTPHead(dev, draft, g.cfg, g.Head(), DraftRows, g.NKV())
 }
 
+// SpecDepthDefault is the drafts a round (P20e, measured 2026-10-01): on
+// SPEED-Bench's qualitative prompts depth 2 reads 1.48x against depth 1's
+// 1.34x (a₁ 0.85, a₂|a₁ ~0.84); on the 73%-acceptance prose prompt it gives
+// back 0.04 (1.20x against 1.24x). A graph for it is staged with
+// GraphOpts.SpecRows = depth+1.
+const SpecDepthDefault = 2
+
 // DraftVocabDefault is the draft's vocabulary prefix (§9, measured
 // 2026-10-01): the first 65 536 ids cover 96.6% of wikitext and 98.3% of Go
 // source, the loop's acceptance is unchanged on prose (108/148) and 92.0 →

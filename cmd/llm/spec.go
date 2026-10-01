@@ -53,6 +53,7 @@ type specOpts struct {
 	layers       int
 	passes       int
 	depth        int
+	set          string
 	wire         string
 	chat         bool
 	csv          string
@@ -110,6 +111,19 @@ func speculate(o specOpts) error {
 		return fmt.Errorf("the prompt tokenizes to nothing")
 	}
 	eog := llm.EndOfGeneration(m.Set, tok)
+	// -spec-set: every prompt of a file, staged once for the longest.
+	var set []setPrompt
+	if o.set != "" {
+		if set, err = loadSet(o.set, tok); err != nil {
+			return err
+		}
+		for _, p := range set {
+			if len(p.ids) > len(ids) {
+				ids = p.ids
+			}
+		}
+		fmt.Printf("%d prompts from %s, the longest %d tokens\n", len(set), o.set, len(ids))
+	}
 
 	wire, err := parseArms(o.wire)
 	if err != nil {
@@ -220,6 +234,9 @@ func speculate(o specOpts) error {
 		}
 	}
 	fmt.Printf("draft depth (P20b): %d\n", sp.Depth)
+	if set != nil {
+		return runSet(o, set, g, sp, tok, eog)
+	}
 
 	// The two arms, interleaved. One untimed round of each first: the first
 	// pass of anything on this machine is not like the others (the banks are

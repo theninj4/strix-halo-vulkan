@@ -448,6 +448,18 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     1.19x → 1.24x (51.93 tok/s), long 1.31x → 1.32x (55.14)**; acceptance
     count for count the host-cut pricing. `SPEC_DRAFT_VOCAB=0` the control.
     Next P20e (SPEED-Bench, the number to quote), and serving the loop.
+  - **Done 2026-10-01: P20e — SPEED-Bench** ([§10](research/p20-llamacpp-mtp.md)):
+    20 complete single-turn prompts (coding/multilingual/qa/rag/writing ×
+    4; most of the split is placeholder rows), chat template, 1024 tokens,
+    two passes (`cmd/llm -spec -spec-set models/speed-bench/qualitative-20.jsonl`).
+    **Depth 1: 41.3 → 55.4 tok/s, 1.34x (a₁ 86%); depth 2: → 61.3 tok/s,
+    1.48x** (coding 1.58x, multilingual 1.35x); texts coherent, both arms
+    self-reproducing on 20/20. Depth 2 is the default now
+    (`llm.SpecDepthDefault`); prose at 73% gives back 0.04. The 2051-cell
+    draft refusal is gone (the PR writes blk.48 the trunk's ratio). **Next:
+    serving the loop** (the server does not speculate; `GraphOpts.Slots`
+    and `Speculative` share the slot index), then depth 3 (~+5%, needs a
+    four-row pass and a ring past three rows).
   - ~~**P20b — depth 2 or 3, not 1.**~~ P5a's optimum was computed on
     2026-09-19's pass costs and wikitext acceptance; at 0.64 a drafted token
     and P19's 1.23 / 1.37-step two- and three-row passes the optimum moves.
@@ -603,7 +615,8 @@ ms**). P22 is closed but for `dn.scan`, which is P24's; **next is P20**
 (P20a/c/d-first-half done 2026-10-01: `-spec` 1.19x short, 1.31x long —
 49.8 / 54.7 tok/s; P20b's depth two measured and not adopted, the third
 row is MoE bytes; the draft's head over a 64k-id prefix took short to
-1.24x / 51.9 tok/s; next P20e, then serving it),
+1.24x / 51.9 tok/s; P20e on SPEED-Bench: **1.48x, 61.3 tok/s at depth 2**;
+next serving it),
 re-planned on 2026-10-01 against llama.cpp's MTP PR (the draft's KV cache
 was never primed here — P20a — and depth 3 with snapshot planes reads 1.55x
 there), because the step is now 24.2 ms

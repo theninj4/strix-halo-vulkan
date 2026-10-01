@@ -508,3 +508,55 @@ nouns sit past id 65 536) and still nets +0.6 tok/s; prose keeps all of it.
 What is left of the draft is its one layer (~1.7 ms). Depth two re-priced on
 these costs: a 1.52-step pass + 2 × 0.093 = 1.71 steps for ~2.05 tokens
 (short) is ~1.20x against depth one's 1.25x — still not adopted.
+
+## 10. Measured, 2026-10-01 — P20e, SPEED-Bench: 1.48x at depth two
+
+**The set.** `nvidia/SPEED-Bench`'s `qualitative` split
+(`models/speed-bench/qualitative.parquet`) is 880 prompts in 11 categories,
+but most rows ship as a placeholder ("FULL BENCHMARK DATA SHOULD BE FETCHED
+FROM THE SOURCE USING SPECDEC_BENCH") for licensed sources; complete
+single-turn rows exist only for coding, multilingual, qa, rag and writing —
+which is why the PR's 24 samples are those categories plus a few roleplay
+and humanities rows. `models/speed-bench/qualitative-20.jsonl` is the first
+four complete single-turn rows of each of the five, file order, first turn
+only: 18–1586 prompt tokens through `tokenizer.ChatPrompt`, temperature
+zero, **1024 output tokens** (the PR's), two passes, plain and speculative
+interleaved per prompt, shipped banks, the 64k draft vocabulary.
+`cmd/llm -spec -spec-set <jsonl>` (`cmd/llm/specset.go`); `SPEC_SET_TEXT`
+writes the texts. Contexts reach 2614 cells, so the 2051-cell refusal in
+`NewMTPHead` came out first: the PR's converter writes `blk.48` the
+trunk's compress ratio, which is the value borrowed here.
+
+**The texts are not P5a's loop artefact**: every one is coherent, most end
+on `<|im_end|>`, and at most 2.7% of a text's 40-character windows repeat an
+earlier one. Plain reproduces itself on 20/20 prompts at both depths, spec
+on 20/20; spec is the plain text on 10 and leaves it at a near-tie on the
+rest (the two-row rounding of §6).
+
+| category | plain | depth 1 | a₁ | **depth 2** | tok/round |
+|---|---:|---:|---:|---:|---:|
+| coding | 41.4 | 57.5, 1.39x | 93.4% | **65.3, 1.58x** | 2.73 |
+| multilingual | 41.6 | 52.7, 1.27x | 75.6% | 56.1, 1.35x | 2.31 |
+| qa | 41.6 | 55.1, 1.33x | 83.7% | 59.5, 1.43x | 2.46 |
+| rag | 41.2 | 55.6, 1.35x | 87.7% | 62.7, 1.52x | 2.64 |
+| writing | 41.1 | 54.8, 1.33x | 84.9% | 60.6, 1.47x | 2.53 |
+| **overall** | 41.3 | **55.4, 1.34x** | 86.2% | **61.3, 1.48x** | 2.56 |
+
+(`results/p20e_speedbench_d{1,2}.csv`, per prompt and pass.) a₂ given a₁ is
+~0.84 here (2.56 = 1 + 0.85 + 0.85·a₂), against 0.625 on the short prose
+prompt — which is why §8 and §9 priced depth two dead and this workload
+does not: at depth two the round is 1.52 + 2 × 0.09 = 1.70 steps, and
+break-even is a₁a₂ ≈ 0.40. On the prose prompt depth two now reads 1.20x
+against depth one's 1.24x (`results/p20e_short_d2_v64k.csv`), the one place
+it gives anything back. **`llm.SpecDepthDefault` = 2**, `-spec-depth 1` the
+control.
+
+Against the PR: 1.48x at depth two on an AMD iGPU against 1.55x at depth
+three on a DGX Spark, with a first-draft acceptance (86%) well above its
+per-token 0.64 average over three positions. **Depth three** is priced at
+~+5% more (≈3.15 tokens for a ~1.75-step four-row pass + 0.28 of draft) and
+needs a four-row pass: `GEMVMaxRows` 4 in the decode GEMVs and the fused
+router, and a keep-prefix form past the DeltaNet ring's three rows (a ring
+of hist + R − 1 slots, or a stored plane per row). The larger lever is
+serving the loop at all — the server does not speculate yet, and its
+sequence slots share the carried state's slot index with speculation.

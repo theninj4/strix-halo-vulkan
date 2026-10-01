@@ -100,7 +100,8 @@ func main() {
 	spec := flag.Bool("spec", false, "P5c: generate through the speculative loop and against a same-hour plain one, and report the multiplier")
 	specPasses := flag.Int("spec-passes", 2, "for -spec: how many times to run each arm, interleaved")
 	specWire := flag.String("spec-wire", "res", "for -spec: the nextn wiring — P5a's measured winner is res")
-	specDepth := flag.Int("spec-depth", 1, "for -spec: tokens drafted a round (P20b); above 1 needs the partial accept")
+	specSet := flag.String("spec-set", "", "for -spec: a JSONL file of {id, category, text} prompts, each run through the chat template, both arms (P20e)")
+	specDepth := flag.Int("spec-depth", llm.SpecDepthDefault, "for -spec: tokens drafted a round (P20b/P20e); above 1 needs the partial accept")
 	specPrefix := flag.Int("spec-prefix", 0, "for -spec: prompt with this many tokens of -ppl-file instead of -prompt, which is the long-context arm")
 	csvPath := flag.String("csv", "", "write the -hc table here")
 	depth := flag.Bool("depth", false, "sweep prompt-processing and token-generation rate against how full the cache already is")
@@ -169,7 +170,7 @@ func main() {
 			model: *model, draft: *mtpDraft, prompt: p, file: *pplFile, prefix: *specPrefix,
 			n: *nPredict, ctx: *ctx,
 			layers: layers, passes: *specPasses, wire: specWireList(*specWire), chat: *chat, csv: *csvPath,
-			depth: *specDepth,
+			depth: *specDepth, set: *specSet,
 		}); err != nil {
 			log.Fatal(err)
 		}

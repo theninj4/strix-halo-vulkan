@@ -66,8 +66,10 @@ package llm
 // below is therefore taken from the trunk, and the consequence is nil where
 // it matters: `selWidth` is `min(top_k + ratio - 1, nKV)` = 2051, so at
 // n_ctx <= 2048 the selection names every cell and `AttnGPU` does not
-// dispatch it at all (gpu_attn.go's `sparse`). Above that the number would be
-// a guess, and `NewMTPHead` says so rather than guessing.
+// dispatch it at all (gpu_attn.go's `sparse`). Above that it was a guess and
+// `NewMTPHead` refused — until llama.cpp PR 29761's converter (P20e,
+// research/p20-llamacpp-mtp.md) was read: it writes `blk.48` **the trunk's
+// ratio**, which is the borrowing here, so the selection runs past 2048 too.
 
 import (
 	"fmt"
@@ -204,8 +206,7 @@ func (g *MTPHead) stage(dev *vk.Device, trunkCfg Config, maxTok, nKV int) error 
 	}
 	// See the file comment: the checkpoint's own ratio for this layer is 0,
 	// which is what its *linear* layers say, so it does not describe this
-	// one. The trunk's is used and the selection is refused above the
-	// context where it would start to bite.
+	// one. The trunk's is used, as llama.cpp's converter writes it.
 	if acfg.Ratio <= 0 {
 		tr, tok, terr := g.trunkRatio(trunkCfg)
 		if terr != nil {
@@ -215,11 +216,6 @@ func (g *MTPHead) stage(dev *vk.Device, trunkCfg Config, maxTok, nKV int) error 
 			return fmt.Errorf("llm: neither the draft head nor the trunk states a compress ratio")
 		}
 		acfg.Ratio = tr
-		if w := acfg.TopK + acfg.Ratio - 1; nKV > w {
-			return fmt.Errorf("llm: the draft head's compress ratio is not in its checkpoint (blk.%d says 0), "+
-				"so its QSA selection is only safe where it is the identity: n_ctx %d is past %d",
-				l, nKV, w)
-		}
 	}
 	aw, err := m.AttnWeights(l)
 	if err != nil {
