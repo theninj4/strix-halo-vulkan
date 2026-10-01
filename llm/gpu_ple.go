@@ -214,11 +214,15 @@ type PLEGPU struct {
 	// keepFirst is P20c (DeltaNetGPU.keepFirst): a speculative pass also
 	// stores its row 0 into the ring it read.
 	keepFirst bool
-	slots     int
-	// seqSlots says the slots are sequences (PLEOpts.Slots) and histSlot the
-	// live one, which a pass both reads and writes.
-	seqSlots bool
-	actElems int
+	// slots is seqs sequences of planes rings each (DeltaNetGPU.slots, P20f):
+	// sequence s owns rings [s*planes, (s+1)*planes).
+	slots, seqs, planes int
+	// seqSlots says there is more than one sequence (PLEOpts.Slots); seq is
+	// the live one and committed every other one's committed ring.
+	seqSlots  bool
+	seq       int
+	committed []int
+	actElems  int
 	// past is how many tokens of this sequence are already behind the run,
 	// which is how far back the convolution may reach. Zero is a fresh
 	// sequence, where anything before token 0 is zero.
@@ -276,16 +280,19 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 		kv:         DefaultPLEKernel(),
 		kvGemv:     GEMVOff,
 		autoKernel: true,
-		slots:      1,
+		seqs:       1,
+		planes:     1,
 	}
 	if opts.Speculative {
-		g.slots = maxInt(2, opts.SpecSlots)
+		g.planes = maxInt(2, opts.SpecSlots)
 	}
 	if opts.Slots > 1 {
-		if opts.Speculative {
-			return nil, fmt.Errorf("llm: a ple block's slots are sequences or a rollback, not both")
-		}
-		g.slots, g.seqSlots = opts.Slots, true
+		g.seqs, g.seqSlots = opts.Slots, true
+	}
+	g.slots = g.seqs * g.planes
+	g.committed = make([]int, g.seqs)
+	for s := range g.committed {
+		g.committed[s] = s * g.planes
 	}
 	align := 1
 	for _, v := range pleVariants {
@@ -342,7 +349,8 @@ func (g *PLEGPU) alloc() error {
 	// worth of `aNorm` would be, which is the other way to let a tap reach
 	// behind the run.
 	if g.slots <= 0 {
-		g.slots = 1
+		g.seqs, g.planes, g.slots = 1, 1, 1
+		g.committed = []int{0}
 	}
 	g.histStride = c.ConvHist() * wide
 	g.aHist = alloc(g.slots * g.histStride)
@@ -721,7 +729,7 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 			if rb.ConvOutOff != noW {
 				rb.ConvOutOff += uint32(r * wide)
 			}
-			rb.InjOff = g.histAt(br.slot)
+			rb.InjOff = g.histAt(g.committedOf(br.slot))
 			add("conv", "conv", uint32((wide+255)/256), 1, rb)
 			hist := rb
 			hist.LoOff = rb.NormOff // SEQ_SRC
@@ -748,7 +756,7 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 		hist.OutOff, rings = g.histAt(g.histSlot), c.ConvHist()
 		if g.keepFirst {
 			// The graph refuses a pass wider than the slots (Graph.arm).
-			mids := minInt(maxInt(0, g.rows-2), g.slots-2)
+			mids := minInt(maxInt(0, g.rows-2), g.planes-2)
 			hist.LDALo = uint32(1 + mids) // SEQ_KEEP_FIRST
 			if mids > 0 {
 				hist.GateOff = g.histAt(g.histMid(0)) // SEQ_HIST_MID0
@@ -805,23 +813,32 @@ func (g *PLEGPU) RestoreCarried(src []float32) error {
 
 func (g *PLEGPU) histDst() int {
 	if g.histSpec {
-		return (g.histSlot + 1) % g.slots
+		b := g.seq * g.planes
+		return b + (g.histSlot-b+1)%g.planes
 	}
 	return g.histSlot
 }
 
 // histMid is where a keep-prefix pass stores the ring holding rows 0..1+i.
-func (g *PLEGPU) histMid(i int) int { return (g.histSlot + 2 + i) % g.slots }
+func (g *PLEGPU) histMid(i int) int {
+	b := g.seq * g.planes
+	return b + (g.histSlot-b+2+i)%g.planes
+}
+
+// committedOf is sequence s's committed ring.
+func (g *PLEGPU) committedOf(s int) int {
+	if s == g.seq {
+		return g.histSlot
+	}
+	return g.committed[s]
+}
 
 // Speculate makes the next passes rewindable — they read the committed ring
 // and write the other one — and CommitSlot accepts what one of them wrote.
 // See DeltaNetGPU.Speculate: this block carries no recurrent state, so the
 // nine-row ring is the whole of what it has to roll back.
 func (g *PLEGPU) Speculate(on bool) error {
-	if on && g.seqSlots {
-		return fmt.Errorf("llm: this block's slots are sequences (GraphOpts.Slots); it cannot also speculate")
-	}
-	if on && g.slots < 2 {
+	if on && g.planes < 2 {
 		return fmt.Errorf("llm: this block was staged with one ring slot; a rewindable pass needs two " +
 			"(GraphOpts.Speculative)")
 	}
@@ -858,11 +875,12 @@ func (g *PLEGPU) UseSlot(s int) error {
 	if !g.seqSlots && s != 0 {
 		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
 	}
-	if s < 0 || s >= g.slots {
-		return fmt.Errorf("llm: ple sequence slot %d of %d", s, g.slots)
+	if s < 0 || s >= g.seqs {
+		return fmt.Errorf("llm: ple sequence slot %d of %d", s, g.seqs)
 	}
-	if g.seqSlots {
-		g.histSlot = s
+	if s != g.seq {
+		g.committed[g.seq] = g.histSlot
+		g.seq, g.histSlot = s, g.committed[s]
 	}
 	return nil
 }

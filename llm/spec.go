@@ -182,6 +182,9 @@ type Speculator struct {
 
 	vocab int
 	wide  int
+	// slot is the sequence slot this speculator drafts for (P20f), or -1 for
+	// the single-sequence loop, which never switches the draft's cache.
+	slot int
 
 	Stats SpecStats
 }
@@ -205,7 +208,212 @@ func NewSpeculator(g *Graph, d *MTPHead, m *Model, w Wiring) (*Speculator, error
 		return nil, fmt.Errorf("llm: the head's arena holds %d rows of logits and a verification pass needs 2 "+
 			"— GraphOpts.HeadRows", g.Head().MaxRows())
 	}
-	return &Speculator{g: g, d: d, m: m, w: w, vocab: g.Head().Vocab(), wide: d.Wide(), Depth: 1}, nil
+	return &Speculator{g: g, d: d, m: m, w: w, vocab: g.Head().Vocab(), wide: d.Wide(), Depth: 1, slot: -1}, nil
+}
+
+// The served loop (P20f, research/p20-llamacpp-mtp.md §11). The server does
+// not hand a speculator a whole prompt: its prefill is cut into chunks the
+// scheduler interleaves with other conversations', a slot keeps what it holds
+// between requests, and a token is drawn by the request's own sampler. So a
+// speculator a slot is driven in pieces, each run with the trunk's slot live:
+//
+//	Prime   after each prefill chunk, from the chunk's residual
+//	Begin   once the prompt is in
+//	Round   for each round of decode, drawing tokens with a pick function
+//	Owe     for each plain step the trunk runs on the slot instead
+//	Settle  when the request ends, so the draft's cache covers every
+//	        committed row and the next turn primes from where this left
+//	Rewind  when the trunk is restored to a checkpoint
+//
+// Between them the speculator's draft is caught up to the trunk's position:
+// every cell below it written, and `h` the trunk's residual one row before.
+
+// NewSlotSpeculator is NewSpeculator for one of a multi-slot trunk's
+// sequences, with P20's served settings: the draft catches up over every row,
+// a rejection keeps row 0, and the round is Depth drafts deep.
+func NewSlotSpeculator(g *Graph, d *MTPHead, m *Model, w Wiring, slot, depth int) (*Speculator, error) {
+	if slot < 0 || slot >= g.Slots() || slot >= d.Slots() {
+		return nil, fmt.Errorf("llm: speculator slot %d; the trunk holds %d and the draft %d", slot, g.Slots(), d.Slots())
+	}
+	s, err := NewSpeculator(g, d, m, w)
+	if err != nil {
+		return nil, err
+	}
+	s.slot, s.CatchUp, s.Partial, s.Depth = slot, true, true, max(depth, 1)
+	if g.MaxTokens() < s.Depth+1 || g.Head().MaxRows() < s.Depth+1 {
+		return nil, fmt.Errorf("llm: depth %d is a %d-row pass; the trunk's arenas hold %d and its head %d",
+			s.Depth, s.Depth+1, g.MaxTokens(), g.Head().MaxRows())
+	}
+	return s, nil
+}
+
+func (s *Speculator) useSlot() error {
+	if s.slot < 0 {
+		return nil
+	}
+	return s.d.UseSlot(s.slot)
+}
+
+// Prime writes the draft's cells at positions at..at+len(ids)-1 from a chunk
+// the trunk has just run: `res` is ExtendResidual's, row r the trunk's
+// residual at at+r. Position `at` is seeded from the residual the speculator
+// already holds — the row before it — or zeros at position 0, as Start does.
+func (s *Speculator) Prime(ids []int32, at int, res []float32) error {
+	if err := s.useSlot(); err != nil {
+		return err
+	}
+	if len(res) < len(ids)*s.wide {
+		return fmt.Errorf("llm: %d rows of residual for %d ids", len(res)/s.wide, len(ids))
+	}
+	if at > 0 && len(s.h) != s.wide {
+		return fmt.Errorf("llm: priming from position %d without the residual before it", at)
+	}
+	if at > 0 && at != s.d.Past() {
+		return fmt.Errorf("llm: priming the draft at %d; its cache holds %d", at, s.d.Past())
+	}
+	t0 := time.Now()
+	defer func() { s.Stats.Prime += time.Since(t0) }()
+	n, chunk := len(ids), s.d.MaxRows()
+	hs := make([]float32, 0, chunk*s.wide)
+	es := make([]float32, 0, chunk*s.d.NEmbd())
+	for p0 := 0; p0 < n; p0 += chunk {
+		k := minInt(chunk, n-p0)
+		hs, es = hs[:0], es[:0]
+		for p := p0; p < p0+k; p++ {
+			switch {
+			case p > 0:
+				hs = append(hs, res[(p-1)*s.wide:p*s.wide]...)
+			case at > 0:
+				hs = append(hs, s.h...)
+			default:
+				hs = append(hs, make([]float32, s.wide)...)
+			}
+			e, err := s.m.Embedding(ids[p])
+			if err != nil {
+				return fmt.Errorf("llm: token_embd for the draft: %w", err)
+			}
+			es = append(es, e...)
+		}
+		if _, _, _, err := s.d.Rows(hs, es, k, at+p0, s.w, false); err != nil {
+			return fmt.Errorf("llm: priming the draft at %d: %w", at+p0, err)
+		}
+	}
+	s.h = append(s.h[:0], res[(n-1)*s.wide:n*s.wide]...)
+	s.oweH, s.oweX = s.oweH[:0], s.oweX[:0]
+	return nil
+}
+
+// Begin checks that the draft is caught up to the trunk and arms the
+// partial accept, before the first Round.
+func (s *Speculator) Begin() error {
+	if err := s.useSlot(); err != nil {
+		return err
+	}
+	if got, want := s.d.Past()+len(s.oweX), s.g.Past(); got != want {
+		return fmt.Errorf("llm: the draft is at %d and the trunk at %d", got, want)
+	}
+	if len(s.h) != s.wide {
+		return fmt.Errorf("llm: beginning without the trunk's residual")
+	}
+	return s.g.SpeculateFirst(true)
+}
+
+// Round is one round of the served loop from `first`, the token named last
+// and not yet run: Depth drafts, one verification pass, and the tokens `pick`
+// drew, the last of which is pending in the same sense. The trunk must be
+// speculating (Graph.Speculate) with this speculator's slot live.
+func (s *Speculator) Round(first int32, out []int32, pick func(row int, logits []float32) (int32, bool)) ([]int32, error) {
+	if len(s.h) != s.wide {
+		return nil, fmt.Errorf("llm: a round without the trunk's residual")
+	}
+	if len(s.oweX)+1 > s.d.MaxRows() {
+		// A long run of plain steps (Owe) is more than one draft call.
+		if err := s.settleOwed(); err != nil {
+			return nil, err
+		}
+	}
+	s.pend = append(s.pend[:0], first)
+	return s.round(out[:0], pick)
+}
+
+// Owe records a plain decode step the trunk ran on this slot — token x at its
+// position, and `h` the trunk's residual at that row — so the draft stays
+// caught up through steps that did not speculate (the server batches the
+// conversations decoding together, CONCURRENCY.md C5). The row is written
+// into the draft's cache by the next round's draft call or by Settle.
+func (s *Speculator) Owe(x int32, h []float32) {
+	s.oweH = append(s.oweH, s.h...)
+	s.oweX = append(s.oweX, x)
+	s.h = append(s.h[:0], h...)
+}
+
+// Settle writes the draft's cells for the rows it owes — the committed rows
+// of the last round but its last — so that its cache covers everything the
+// trunk holds. Nothing is pending after it.
+func (s *Speculator) Settle() error {
+	s.pend = s.pend[:0]
+	if err := s.useSlot(); err != nil {
+		return err
+	}
+	if err := s.settleOwed(); err != nil {
+		return err
+	}
+	// A deeper draft wrote cells past the trunk; they are masked once the
+	// position says so.
+	if s.d.Past() > s.g.Past() {
+		return s.d.Rewind(s.g.Past())
+	}
+	return nil
+}
+
+// settleOwed writes the owed rows, a draft arena's worth at a time; they end
+// at the trunk's position.
+func (s *Speculator) settleOwed() error {
+	if err := s.useSlot(); err != nil {
+		return err
+	}
+	n, chunk := len(s.oweX), s.d.MaxRows()
+	at := s.g.Past() - n
+	es := make([]float32, 0, minInt(n, chunk)*s.d.NEmbd())
+	for p0 := 0; p0 < n; p0 += chunk {
+		k := minInt(chunk, n-p0)
+		es = es[:0]
+		for _, x := range s.oweX[p0 : p0+k] {
+			e, err := s.m.Embedding(x)
+			if err != nil {
+				return fmt.Errorf("llm: token_embd for the draft: %w", err)
+			}
+			es = append(es, e...)
+		}
+		if _, _, _, err := s.d.Rows(s.oweH[p0*s.wide:(p0+k)*s.wide], es, k, at+p0, s.w, false); err != nil {
+			return fmt.Errorf("llm: settling the draft at %d: %w", at+p0, err)
+		}
+	}
+	s.oweH, s.oweX = s.oweH[:0], s.oweX[:0]
+	return nil
+}
+
+// Residual is the trunk's residual one row before its position, which a
+// checkpoint keeps beside the trunk's state so Rewind can resume from it.
+func (s *Speculator) Residual() []float32 { return append([]float32(nil), s.h...) }
+
+// Rewind takes the draft back to position `past` — the trunk has just been
+// restored there — resuming from `h`, the residual Residual returned when the
+// checkpoint was taken. The cells below `past` must still be the ones the
+// checkpoint's tokens wrote, which is the caller's to know.
+func (s *Speculator) Rewind(past int, h []float32) error {
+	if err := s.useSlot(); err != nil {
+		return err
+	}
+	if len(h) != s.wide {
+		return fmt.Errorf("llm: rewinding the draft without the residual before %d", past)
+	}
+	if err := s.d.Rewind(past); err != nil {
+		return err
+	}
+	s.h = append(s.h[:0], h...)
+	s.pend, s.oweH, s.oweX = s.pend[:0], s.oweH[:0], s.oweX[:0]
+	return nil
 }
 
 // Start runs the prompt as an ordinary prefill and returns the token the
@@ -423,10 +631,25 @@ func (s *Speculator) draftArgmax(lg []float32) int32 {
 // pending, the draft is seeded from row k-1's residual, and the draft owes
 // the cells P+1..P+k-1: each from the row before it and the token at it.
 func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
+	return s.round(out, func(_ int, logits []float32) (int32, bool) { return Argmax(logits), false })
+}
+
+// round is nextPrefix with the trunk's token at each row named by `pick`
+// rather than its argmax (P20f). Row i's token is drawn from row i's logits
+// over a prefix that is the sequence — every earlier draft agreed with what
+// was drawn — so a sampler that draws each row in order is drawing from the
+// trunk's own distribution whatever the draft said: the loop is lossless at
+// any temperature, and only its acceptance falls. `pick` returning stop ends
+// the round at that row (an end-of-generation token, the budget): the rows
+// after it are not kept even where the draft agreed.
+func (s *Speculator) round(out []int32, pick func(row int, logits []float32) (int32, bool)) ([]int32, error) {
 	top := time.Now()
 	defer func() { s.Stats.Wall += time.Since(top) }()
 	at := s.g.Past()
 	depth := max(s.Depth, 1)
+	if err := s.useSlot(); err != nil {
+		return nil, err
+	}
 
 	// 1. The drafts: the owed rows and the first draft in one call, then
 	//    each further draft from the draft's own residual.
@@ -464,6 +687,9 @@ func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
 	s.Stats.Draft += time.Since(t0)
 
 	// 2. The verification pass.
+	if s.slot >= 0 && s.g.Slot() != s.slot {
+		return nil, fmt.Errorf("llm: the speculator is slot %d's and the trunk's live slot is %d", s.slot, s.g.Slot())
+	}
 	t0 = time.Now()
 	logits, vres, err := s.g.ExtendRows(rows)
 	if err != nil {
@@ -478,9 +704,9 @@ func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
 	//    sequence up to the first draft it disagrees with.
 	n := len(rows)
 	for i := 0; i < n; i++ {
-		g := Argmax(logits[i*s.vocab : (i+1)*s.vocab])
+		g, stop := pick(i, logits[i*s.vocab:(i+1)*s.vocab])
 		out = append(out, g)
-		if i+1 == n {
+		if stop || i+1 == n {
 			break
 		}
 		s.Stats.DraftedAt[min(i, 3)]++
@@ -529,7 +755,7 @@ func (s *Speculator) Stop() error { return s.g.Speculate(false) }
 // argument about `maxTok`: the draft runs one row at depth one, whatever the
 // verification pass is.
 func StageDraft(dev *vk.Device, draft *Model, g *Graph) (*MTPHead, error) {
-	return NewMTPHead(dev, draft, g.cfg, g.Head(), DraftRows, g.NKV())
+	return NewMTPHeadSlots(dev, draft, g.cfg, g.Head(), DraftRows, g.NKV(), g.Slots())
 }
 
 // SpecDepthDefault is the drafts a round (P20e, measured 2026-10-01): on

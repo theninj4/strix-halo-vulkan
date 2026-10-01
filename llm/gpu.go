@@ -1661,6 +1661,23 @@ func (g *HCGPU) Mixed() []float32 { return g.abuf.ReadFloat32At(int(g.aMixed), g
 // Res is the wide residual, [T][hc*nEmbd] — what the combine updated.
 func (g *HCGPU) Res() []float32 { return g.abuf.ReadFloat32At(int(g.aRes), g.rows*g.cfg.Wide()) }
 
+// ResRowInto reads residual row r into dst, [hc*nEmbd].
+func (g *HCGPU) ResRowInto(r int, dst []float32) {
+	g.abuf.ReadFloat32Into(int(g.aRes)+r*g.cfg.Wide(), dst[:g.cfg.Wide()])
+}
+
+// ResInto is Res into a slice the caller keeps (grown if short), so a served
+// prefill chunk's residual is not a fresh allocation of up to 335 MB (P20f).
+func (g *HCGPU) ResInto(dst []float32) []float32 {
+	n := g.rows * g.cfg.Wide()
+	if cap(dst) < n {
+		dst = make([]float32, n)
+	}
+	dst = dst[:n]
+	g.abuf.ReadFloat32Into(int(g.aRes), dst)
+	return dst
+}
+
 // Inject is the scatter weights, [T][hc], gathered out of the tile-strided
 // rows the down projection writes.
 func (g *HCGPU) Inject() []float32 {

@@ -109,8 +109,9 @@ type GraphOpts struct {
 	// Slots stages that many sequences' carried state — the KV cache, every
 	// DeltaNet layer's recurrent state and ring, the PLE ring — so that one
 	// graph can hold several conversations and switch between them with
-	// UseSlot (CONCURRENCY.md C1). Zero and one are one sequence. It is the
-	// ping-pong's allocation used for sequences, so it refuses Speculative.
+	// UseSlot (CONCURRENCY.md C1). Zero and one are one sequence. With
+	// Speculative each sequence gets its own SpecRows planes (P20f), so the
+	// served loop can speculate on whichever slot is live.
 	// At the served context a slot is ~7.4 GB, nearly all of it KV. Each slot
 	// has its own cache buffers (C6), so the 4 GiB descriptor range caps a
 	// slot's NKV at ~349k cells, not all slots' together.
@@ -275,6 +276,8 @@ type Graph struct {
 	specFirst bool
 	// specWidth is GraphOpts.SpecRows: the widest keep-prefix pass.
 	specWidth int
+	// resBuf is ExtendResidual's reused residual.
+	resBuf []float32
 
 	// Sequence slots (CONCURRENCY.md C1). `slot` is the live one; `past`,
 	// `ids` and the recorded decode step above are its, and `parked` holds
@@ -617,9 +620,6 @@ func NewGraph(dev *vk.Device, m *Model, opts GraphOpts) (*Graph, error) {
 		nKV = roundUpInt(opts.MaxTokens, 256)
 	}
 	slots := max(opts.Slots, 1)
-	if slots > 1 && opts.Speculative {
-		return nil, fmt.Errorf("llm: GraphOpts.Slots and Speculative share the carried state's slot index; pick one")
-	}
 	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV,
 		slots: slots, parked: make([]seqState, slots), ropeHW: make([]int, slots),
 		hcMoves: opts.HCMoves || os.Getenv("LLM_HC_MOVES") == "1", specWidth: max(opts.SpecRows, 2)}
@@ -826,6 +826,9 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			// One, or a row a slot, so that DecodeRows can advance every
 			// sequence the graph holds in one pass (CONCURRENCY.md C5).
 			headRows = max(1, opts.Slots)
+			if opts.Speculative {
+				headRows = max(headRows, g.specWidth)
+			}
 		}
 		// L8c-4's bank, where the plan names this family. Everything else
 		// is still the checkpoint's own width (D13): the 4.5-bit bank has a
@@ -1120,9 +1123,6 @@ func (g *Graph) Speculate(on bool) error {
 	if on == g.spec {
 		return nil
 	}
-	if on && g.slots > 1 {
-		return fmt.Errorf("llm: this graph's slots are sequences (GraphOpts.Slots); it cannot also speculate")
-	}
 	// The draft head (llm/mtp.go) has a one-layer cache of its own with a
 	// text rotary table, so behind an image it would rope 176 or 1 000
 	// positions off. It is parked (spec-loop 0.95x); refuse rather than port
@@ -1210,6 +1210,7 @@ func (g *Graph) Keep(k int) error {
 	if g.ple != nil {
 		g.ple.KeepSlot(k, g.specRows)
 	}
+	g.dropPrerecorded() // as in Commit
 	g.past = g.specPast + k
 	g.ids = g.ids[:g.specIds+k]
 	if g.attn != nil {
@@ -1247,6 +1248,10 @@ func (g *Graph) Commit() error {
 	if g.ple != nil {
 		g.ple.CommitSlot()
 	}
+	// The live slot's committed planes moved, and a decode step recorded
+	// before this speculation names the old ones (P20f: a served slot goes
+	// from rounds back to plain steps).
+	g.dropPrerecorded()
 	g.specArmed, g.specBlocks = false, nil
 	return nil
 }
@@ -1438,13 +1443,42 @@ func (g *Graph) ExtendRows(ids []int32) (logits, res []float32, err error) {
 // mixer and head a second, with the copy between them. The residual is a copy
 // the caller keeps.
 func (g *Graph) ForwardResidual(ids []int32) (logits, res []float32, err error) {
+	if err := g.Reset(); err != nil {
+		return nil, nil, err
+	}
+	logits, res, err = g.ExtendResidual(ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	return logits, append([]float32(nil), res...), nil
+}
+
+// ResidualRow is row r of the wide residual the last pass left, read into
+// dst (grown if short): after a one-token Extend row 0 is that token's, and
+// after DecodeRows row r is slot r's (P20f, Speculator.Owe).
+func (g *Graph) ResidualRow(r int, dst []float32) []float32 {
+	w := g.cfg.HC * g.cfg.NEmbd
+	if cap(dst) < w {
+		dst = make([]float32, w)
+	}
+	dst = dst[:w]
+	g.hc.ResRowInto(r, dst)
+	return dst
+}
+
+// ExtendResidual is ForwardResidual continuing the live sequence, and its
+// residual, [len(ids)][hc*nEmbd], is a buffer the graph reuses on the next
+// call: the served loop primes the draft from it a prefill chunk at a time
+// (P20f) before the trunk runs again.
+func (g *Graph) ExtendResidual(ids []int32) (logits, res []float32, err error) {
 	if g.head == nil {
 		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
 	}
-	if err := g.Prefill(ids); err != nil {
+	if err := g.Append(ids); err != nil {
 		return nil, nil, err
 	}
-	res = append([]float32(nil), g.hc.Res()...)
+	g.resBuf = g.hc.ResInto(g.resBuf)
+	res = g.resBuf[:len(ids)*g.cfg.HC*g.cfg.NEmbd]
 	top := time.Now()
 	g.record(1)
 	defer func() {

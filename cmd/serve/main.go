@@ -173,6 +173,10 @@ func main() {
 	llmVisionTokens := flag.Int("llm-vision-tokens", 4096, "the most tokens one image becomes (32x32 pixels a token, "+
 		"so 4096 is a 2048x2048 picture); capped at -llm-batch")
 	llmVisionImages := flag.Int("llm-vision-images", 8, "the most images one request may carry")
+	llmDraft := flag.String("llm-draft", "", "the MTP draft head's GGUF, e.g. "+
+		"models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf: a conversation decoding alone "+
+		"speculates (TODO.md P20f), at any temperature and with the sampler's own text; empty decodes a token a pass")
+	llmSpecDepth := flag.Int("llm-spec-depth", 0, "with -llm-draft, tokens drafted a round; 0 is the measured default (2)")
 	llmProgress := flag.Duration("llm-progress", 10*time.Second, "how often to log each in-flight completion's "+
 		"prefill/generation progress and rates; 0 turns it off")
 
@@ -551,6 +555,7 @@ func main() {
 			Slots: *llmSlots, PreemptChunk: *llmPreempt, Reserve: *llmReserve, Class: *llmClass,
 			NoCheckpoints: !*llmCheckpoints, NoBatchDecode: !*llmBatchDecode, Progress: *llmProgress,
 			MMProj: *llmMMProj, VisionTokens: *llmVisionTokens, VisionImages: *llmVisionImages,
+			Draft: *llmDraft, SpecDepth: *llmSpecDepth,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -570,8 +575,12 @@ func main() {
 		if *llmMMProj != "" {
 			vision = fmt.Sprintf("images up to %d tokens, %d a request", *llmVisionTokens, *llmVisionImages)
 		}
-		log.Printf("llm: %s, %s, %d slots of %d cells of context, %d-token batches, %s, in %v",
-			*llmModel, layers, b.Slots(), b.Context(), *llmBatch, vision, time.Since(start).Round(time.Millisecond))
+		spec := "no speculation"
+		if *llmDraft != "" {
+			spec = "speculating with " + *llmDraft
+		}
+		log.Printf("llm: %s, %s, %d slots of %d cells of context, %d-token batches, %s, %s, in %v",
+			*llmModel, layers, b.Slots(), b.Context(), *llmBatch, vision, spec, time.Since(start).Round(time.Millisecond))
 	}
 
 	// Say which it is, every time. Only logging the open case meant the

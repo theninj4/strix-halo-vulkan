@@ -35,6 +35,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -61,10 +62,14 @@ type specOpts struct {
 
 // specRun is one arm's result.
 type specRun struct {
-	ids   []int32
-	wall  time.Duration
-	stats llm.SpecStats
-	graph llm.GraphStats
+	ids []int32
+	// margins is the plain loop's top-1 minus top-2 logit at each token,
+	// with SPEC_MARGIN=1 (P20f): where speculation leaves the plain text,
+	// it says whether the trunk was at a near-tie there.
+	margins []float32
+	wall    time.Duration
+	stats   llm.SpecStats
+	graph   llm.GraphStats
 }
 
 func (r specRun) rate() float64 { return float64(len(r.ids)) / r.wall.Seconds() }
@@ -462,10 +467,14 @@ func plainLoop(g *llm.Graph, ids []int32, n int, eog map[int32]bool) (specRun, e
 	// same work in both arms and speculation does not touch it.
 	g.ResetStats()
 	out := make([]int32, 0, n)
+	var margins []float32
 	t0 := time.Now()
 	for len(out) < n {
 		id := llm.Argmax(logits)
 		out = append(out, id)
+		if specMargin {
+			margins = append(margins, topMargin(logits, id))
+		}
 		if eog[id] || len(out) == n {
 			break
 		}
@@ -473,7 +482,20 @@ func plainLoop(g *llm.Graph, ids []int32, n int, eog map[int32]bool) (specRun, e
 			return specRun{}, err
 		}
 	}
-	return specRun{ids: out, wall: time.Since(t0), graph: g.Stats}, nil
+	return specRun{ids: out, margins: margins, wall: time.Since(t0), graph: g.Stats}, nil
+}
+
+var specMargin = os.Getenv("SPEC_MARGIN") == "1"
+
+// topMargin is logits[top] less the largest other logit.
+func topMargin(logits []float32, top int32) float32 {
+	second := float32(math.Inf(-1))
+	for i, v := range logits {
+		if int32(i) != top && v > second {
+			second = v
+		}
+	}
+	return logits[top] - second
 }
 
 // specLoop is the same generation through the speculative round.

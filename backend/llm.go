@@ -114,6 +114,15 @@ type LLMOptions struct {
 	VisionTokens int
 	// VisionImages is the most images one request may carry. Zero is 8.
 	VisionImages int
+	// Draft is the MTP draft head's GGUF (TODO.md P20f). Set, a conversation
+	// that is the only one decoding in its class speculates: SpecDepth tokens
+	// drafted a round, verified in one pass of the trunk, each row's token
+	// drawn by the request's own sampler — so the text is the sampler's at
+	// any temperature, and greedy is the plain loop's token for token. Empty
+	// decodes a token a pass.
+	Draft string
+	// SpecDepth is the drafts a round; zero is llm.SpecDepthDefault.
+	SpecDepth int
 }
 
 const (
@@ -152,6 +161,11 @@ type LLM struct {
 	topK       int
 
 	class llmClass
+
+	// draft and dhead are the MTP draft head's checkpoint and its staged
+	// layer, or nil without speculation (LLMOptions.Draft).
+	draft *llm.Model
+	dhead *llm.MTPHead
 
 	closeMu sync.Mutex
 	g       *llm.Graph
@@ -221,17 +235,56 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		topP: metaFloat(m, "general.sampling.top_p", 0.95),
 		topK: int(metaFloat(m, "general.sampling.top_k", 20)),
 	}
+	if opt.Draft != "" {
+		if opt.SpecDepth <= 0 {
+			opt.SpecDepth = llm.SpecDepthDefault
+		}
+		l.opt = opt
+		if l.draft, err = llm.Open(opt.Draft); err != nil {
+			_ = m.Close()
+			return nil, fmt.Errorf("backend: the draft head %s: %w", opt.Draft, err)
+		}
+	}
+	var specs []*llm.Speculator
 	err = opt.Device.Do(func(dev *vk.Device) error {
-		g, err := llm.NewGraph(dev, m, llm.GraphOpts{
+		gopts := llm.GraphOpts{
 			MaxTokens: opt.Batch, NKV: opt.Context, Layers: opt.Layers, Slots: opt.Slots,
-		})
+		}
+		if l.draft != nil {
+			// A plane a pass row for each slot's carried state (P20f).
+			gopts.Speculative, gopts.SpecRows = true, opt.SpecDepth+1
+		}
+		g, err := llm.NewGraph(dev, m, gopts)
 		if err != nil {
 			return err
 		}
 		l.g = g
-		return nil
+		if l.draft == nil {
+			return nil
+		}
+		if l.dhead, err = llm.StageDraft(dev, l.draft, g); err != nil {
+			return err
+		}
+		if err := l.dhead.SetVocab(llm.DraftVocabDefault); err != nil {
+			return err
+		}
+		log.Printf("llm: draft head %s: depth %d, %.2f GB of weights, %.2f GB of arenas and %d draft caches",
+			opt.Draft, opt.SpecDepth, float64(l.dhead.WeightBytes())/1e9, float64(l.dhead.ActivationBytes())/1e9,
+			opt.Slots)
+		for s := range opt.Slots {
+			sp, err := llm.NewSlotSpeculator(g, l.dhead, m, llm.Wiring{Name: "res"}, s, opt.SpecDepth)
+			if err != nil {
+				return err
+			}
+			specs = append(specs, sp)
+		}
+		return g.SpeculateFirst(true)
 	})
 	if err != nil {
+		l.closeGraph()
+		if l.draft != nil {
+			_ = l.draft.Close()
+		}
 		_ = m.Close()
 		return nil, fmt.Errorf("backend: staging %s: %w", opt.Model, err)
 	}
@@ -246,11 +299,15 @@ func NewLLM(opt LLMOptions) (*LLM, error) {
 		l.opt = opt
 		if l.vision, err = newLLMVision(opt.Device, opt.MMProj, opt.VisionTokens, opt.VisionImages); err != nil {
 			l.closeGraph()
+			if l.draft != nil {
+				_ = l.draft.Close()
+			}
 			_ = m.Close()
 			return nil, err
 		}
 	}
 	l.sched = newLLMSched(l.g, opt.Device, opt.Batch, opt.PreemptChunk, opt.Reserve, opt.NoBatchDecode, opt.Progress)
+	l.sched.specs, l.sched.specDepth = specs, opt.SpecDepth
 	return l, nil
 }
 
@@ -283,6 +340,10 @@ func (l *LLM) Close() {
 		l.sched = nil
 	}
 	l.closeGraph()
+	if l.draft != nil {
+		_ = l.draft.Close()
+		l.draft = nil
+	}
 	if l.model != nil {
 		_ = l.model.Close()
 		l.model = nil
@@ -292,17 +353,21 @@ func (l *LLM) Close() {
 // closeGraph releases what NewLLM staged on the device: the graph and the
 // vision tower.
 func (l *LLM) closeGraph() {
-	if l.g == nil && l.vision == nil {
+	if l.g == nil && l.vision == nil && l.dhead == nil {
 		return
 	}
 	_ = l.opt.Device.Do(func(*vk.Device) error {
+		// The draft first: it borrows the trunk's lm head.
+		if l.dhead != nil {
+			l.dhead.Destroy()
+		}
 		if l.g != nil {
 			l.g.Destroy()
 		}
 		l.vision.close()
 		return nil
 	})
-	l.g, l.vision = nil, nil
+	l.g, l.vision, l.dhead = nil, nil, nil
 }
 
 // Complete renders the conversation, prefills it and decodes until something
@@ -440,7 +505,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 	dec.StopAt(req.Stop)
 	var text utf8Stream
 	res := &api.CompletionResult{FinishReason: "length"}
-	gen := 0
+	gen, rounds := 0, 0
 	// ttft is taken at the first token the model produces rather than at the
 	// first delta emitted: a byte-level token can be held back for a rune to
 	// finish and a `<think>` marker is never emitted at all, so timing the
@@ -462,11 +527,23 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 			prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 			queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 			total: time.Since(enter), reason: failureReason(ctx, err), images: len(prompted), tower: tower,
+			rounds: rounds,
 		})
 	}()
+	// With a draft head the scheduler may answer a decode with several
+	// tokens (a speculative round); they are drawn by this request's sampler
+	// in order, each knowing the ones before it, and queued here.
+	// pick is that draw: it stops the round at an end-of-generation token or
+	// at the budget, so the trunk never runs past what this loop would have.
+	var queue []int32
+	pick := func(row int, lg []float32) (int32, bool) {
+		t := s.Sample(lg)
+		s.Accept(t)
+		return t, l.eog[t] || gen+row+1 >= budget
+	}
+	id := s.Sample(logits)
+	s.Accept(id)
 	for gen < budget {
-		id := s.Sample(logits)
-		s.Accept(id)
 		if ttft == 0 {
 			ttft = time.Since(enter)
 		}
@@ -505,11 +582,23 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		if len(queue) > 0 {
+			id, queue = queue[0], queue[1:]
+			continue
+		}
 		var wait time.Duration
-		if logits, wait, err = sched.step(job, id); err != nil {
+		var toks []int32
+		if toks, logits, wait, err = sched.decode(job, id, budget-gen, pick); err != nil {
 			return nil, err
 		}
 		stalled += wait
+		if len(toks) > 0 {
+			rounds++
+			id, queue = toks[0], toks[1:]
+			continue
+		}
+		id = s.Sample(logits)
+		s.Accept(id)
 	}
 	decode = time.Since(start)
 
@@ -538,6 +627,7 @@ func (l *LLM) Complete(ctx context.Context, req *api.CompletionRequest,
 		prompt: len(ids), reused: reused, restored: restored, gen: gen, class: class, slot: job.slot,
 		queued: queued, stalled: stalled, prefill: prefill, ttft: ttft, decode: decode,
 		total: time.Since(enter), reason: res.FinishReason, images: len(prompted), tower: tower,
+		rounds: rounds,
 	})
 	return res, nil
 }
@@ -565,6 +655,9 @@ type runStats struct {
 	// on them, which is part of ttft and not of prefill.
 	images int
 	tower  time.Duration
+	// rounds is how many speculative rounds the generation took, zero for
+	// one token a pass (LLMOptions.Draft).
+	rounds int
 }
 
 // logRun writes the one line a completion leaves in the journal.
@@ -582,11 +675,15 @@ func (l *LLM) logRun(ctx context.Context, st runStats) {
 		pics = fmt.Sprintf(" (%d image%s, %v of tower)", st.images, map[bool]string{true: "s"}[st.images > 1],
 			st.tower.Round(time.Millisecond))
 	}
-	log.Printf("%sllm %s%s: prompt %d tokens%s%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s), %v total, %s",
+	spec := ""
+	if st.rounds > 0 {
+		spec = fmt.Sprintf(", %d speculative rounds", st.rounds)
+	}
+	log.Printf("%sllm %s%s: prompt %d tokens%s%s in %v (%.1f tok/s), ttft %s%s, generated %d tokens in %v (%.2f tok/s%s), %v total, %s",
 		logID(ctx), l.id, where, st.prompt, pics, reusedNote(st.reused, st.restored),
 		st.prefill.Round(time.Millisecond), rate(st.prompt-st.reused, st.prefill),
 		since(st.ttft), queuedNote(st.queued),
-		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode),
+		st.gen, st.decode.Round(time.Millisecond), rate(st.gen, st.decode), spec,
 		st.total.Round(time.Millisecond), st.reason)
 }
 

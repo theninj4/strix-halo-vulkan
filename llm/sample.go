@@ -44,6 +44,38 @@ type Sampler struct {
 	PresencePenalty float32
 	history         []int32
 	rng             *rand.Rand
+	// topk is topKOf's buffer, reused token to token.
+	topk []int32
+}
+
+// topKScan is the largest TopK the one-pass selection takes; above it the
+// insertion into the kept list costs more than the quickselect.
+const topKScan = 256
+
+// topKOf is the k largest logits' ids, sorted descending, ties to the lower
+// id, in one pass over the row: the kept list is sorted, and a logit enters
+// it only when it beats the smallest kept, which after the first few
+// thousand entries of a row is rare.
+func topKOf(logits []float32, k int, dst []int32) []int32 {
+	dst = dst[:0]
+	thr := float32(math.Inf(-1))
+	for i, v := range logits {
+		if len(dst) == k && !(v > thr) {
+			continue
+		}
+		// The insertion point: after every kept logit >= v, so an equal
+		// logit stays behind the lower id that came first.
+		j := sort.Search(len(dst), func(j int) bool { return logits[dst[j]] < v })
+		if len(dst) < k {
+			dst = append(dst, 0)
+		} else if j == k {
+			continue
+		}
+		copy(dst[j+1:], dst[j:len(dst)-1])
+		dst[j] = int32(i)
+		thr = logits[dst[len(dst)-1]]
+	}
+	return dst
 }
 
 // PenaltyWindow is how many trailing tokens the penalties look at. It is
@@ -116,20 +148,31 @@ func (s *Sampler) Sample(logits []float32) int32 {
 	// The candidates, sorted by logit descending. A full sort of 248320 is
 	// 30 ms and would be half a decode step, so the cut comes first: TopK
 	// partitions, and TopP needs the order only over what survives it.
-	idx := make([]int32, len(logits))
-	for i := range idx {
-		idx[i] = int32(i)
-	}
 	k := s.TopK
-	if k <= 0 || k > len(idx) {
-		k = len(idx)
+	if k <= 0 || k > len(logits) {
+		k = len(logits)
 	}
-	if k < len(idx) {
-		// Partial: the k largest, in no particular order, then sorted.
-		quickselect(logits, idx, k)
-		idx = idx[:k]
+	var idx []int32
+	if k <= topKScan {
+		// One pass, the k largest kept in order (P20f): the served default
+		// is k = 20, and the quickselect below walked a 1 MB index array
+		// over the row for ~2 ms a token — 5% of a decode step, and in a
+		// speculative round, where the scheduler samples every verified
+		// row in turn, twice or three times that.
+		idx = topKOf(logits, k, s.topk[:0])
+		s.topk = idx
+	} else {
+		idx = make([]int32, len(logits))
+		for i := range idx {
+			idx[i] = int32(i)
+		}
+		if k < len(idx) {
+			// Partial: the k largest, in no particular order, then sorted.
+			quickselect(logits, idx, k)
+			idx = idx[:k]
+		}
+		sort.Slice(idx, func(a, b int) bool { return logits[idx[a]] > logits[idx[b]] })
 	}
-	sort.Slice(idx, func(a, b int) bool { return logits[idx[a]] > logits[idx[b]] })
 
 	// Softmax over the survivors, at temperature.
 	maxL := logits[idx[0]]

@@ -116,6 +116,11 @@ type MTPHead struct {
 	// state the head carries, and `Rewind` is the whole of its rollback.
 	past int
 	nKV  int
+	// slot is the live sequence slot and pasts every slot's past while it is
+	// not the live one (P20f): the served loop speculates on whichever of
+	// the trunk's sequences is decoding, and each needs its own draft cache.
+	slot  int
+	pasts []int
 
 	// Steps counts draft steps and the two durations split what one costs:
 	// `SeedTime` is the host `nextn` block — four 13.1 M-weight matvecs on
@@ -138,6 +143,12 @@ func MTPLayer(trunk Config) int { return trunk.NLayer }
 // trunk's count. `head` is the trunk's staged lm head, borrowed rather than
 // restaged; `maxTok` and `nKV` size this head's own arenas and cache.
 func NewMTPHead(dev *vk.Device, m *Model, trunkCfg Config, head *HeadGPU, maxTok, nKV int) (*MTPHead, error) {
+	return NewMTPHeadSlots(dev, m, trunkCfg, head, maxTok, nKV, 1)
+}
+
+// NewMTPHeadSlots stages the head with a draft cache for each of `slots`
+// sequences (P20f), one for each of the trunk's (GraphOpts.Slots).
+func NewMTPHeadSlots(dev *vk.Device, m *Model, trunkCfg Config, head *HeadGPU, maxTok, nKV, slots int) (*MTPHead, error) {
 	if head == nil {
 		return nil, fmt.Errorf("llm: the MTP head borrows the trunk's lm head, and none was given")
 	}
@@ -153,7 +164,7 @@ func NewMTPHead(dev *vk.Device, m *Model, trunkCfg Config, head *HeadGPU, maxTok
 	g := &MTPHead{
 		dev: dev, m: m, cfg: m.Config, head: head, layer: l,
 		nEmbd: m.Config.NEmbd, hcN: m.Config.HC, wide: m.Config.HC * m.Config.NEmbd,
-		eps: m.Config.RMSEps, nKV: nKV,
+		eps: m.Config.RMSEps, nKV: nKV, pasts: make([]int, max(slots, 1)),
 	}
 	if err := g.stage(dev, trunkCfg, maxTok, nKV); err != nil {
 		g.Destroy()
@@ -221,7 +232,8 @@ func (g *MTPHead) stage(dev *vk.Device, trunkCfg Config, maxTok, nKV int) error 
 	if err != nil {
 		return fmt.Errorf("llm: draft attn weights: %w", err)
 	}
-	if g.attn, err = NewAttnGPU(dev, acfg, maxTok, nKV, []AttnWeights{aw}, true); err != nil {
+	if g.attn, err = NewAttnGPUBank(dev, acfg, maxTok, nKV, []AttnWeights{aw}, bankOf(true), QuantSim{},
+		WithAttnSlots(len(g.pasts))); err != nil {
 		return fmt.Errorf("llm: draft attn: %w", err)
 	}
 	aw = AttnWeights{}
@@ -481,6 +493,26 @@ func (g *MTPHead) Rewind(n int) error {
 
 // Reset starts a fresh sequence.
 func (g *MTPHead) Reset() { g.past = 0 }
+
+// Slots is how many sequences' draft caches the head holds, and UseSlot makes
+// slot s's the one every call after it reads and writes; the slot that was
+// live keeps its cells and its position for a later UseSlot.
+func (g *MTPHead) Slots() int { return len(g.pasts) }
+
+func (g *MTPHead) UseSlot(s int) error {
+	if s < 0 || s >= len(g.pasts) {
+		return fmt.Errorf("llm: draft cache slot %d of %d", s, len(g.pasts))
+	}
+	if s == g.slot {
+		return nil
+	}
+	if err := g.attn.UseSlot(s); err != nil {
+		return err
+	}
+	g.pasts[g.slot] = g.past
+	g.slot, g.past = s, g.pasts[s]
+	return nil
+}
 
 // Step runs one draft: the trunk's residual after token i, the id of token
 // i+1, and the position token i+1 sits at. It returns the logits for token

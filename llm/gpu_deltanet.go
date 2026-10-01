@@ -289,16 +289,26 @@ type DeltaNetGPU struct {
 	// the slot it read (SEQ_KEEP_FIRST), so a rejection keeps that slot and
 	// is at P+1 rather than P. Only meaningful while stateSpec is on.
 	keepFirst bool
-	// slots is 2 when this block was staged for speculation and 1 otherwise.
-	// **It is a staging choice and not a runtime one** (P5c): the second slot
-	// is 113.25 MB of state and 7.13 MB of ring across 36 layers, which is
-	// 120.75 MB a product run has no use for, so a graph that will never
-	// speculate does not allocate it and `Speculate(true)` refuses.
-	slots int
-	// seqSlots says the slots are sequences rather than P5c's ping-pong
-	// (WithDNSlots): `stateSlot` is then the live conversation, a pass reads
-	// and writes it, and Reset clears it alone.
+	// slots is how many copies of each carried tensor are staged: `seqs`
+	// sequences of `planes` each, sequence s owning slots
+	// [s*planes, (s+1)*planes). planes is 1 for a block that never
+	// speculates and the pass width otherwise (P5c's ping-pong is 2).
+	// **It is a staging choice and not a runtime one** (P5c): a plane is
+	// 113.25 MB of state and 7.13 MB of ring across 36 layers, which a
+	// product run that never speculates has no use for, so such a graph
+	// does not allocate it and `Speculate(true)` refuses.
+	//
+	// Until P20f the two uses shared one index and refused each other; the
+	// served loop needs a conversation's planes beside every other
+	// conversation's, so the index is now (sequence, plane).
+	slots, seqs, planes int
+	// seqSlots says there is more than one sequence (WithDNSlots): Reset
+	// then clears the live sequence's planes alone.
 	seqSlots bool
+	// seq is the live sequence, and committed each sequence's committed
+	// slot while it is not the live one (the live one's is stateSlot).
+	seq       int
+	committed []int
 	// past is how many tokens of this sequence are behind the run, which is
 	// what turns the ring's absolute positions into slots. Zero is a fresh
 	// sequence, where a tap reaching before token zero contributes nothing.
@@ -362,23 +372,21 @@ type DNOption func(*DeltaNetGPU)
 // convolution ring, which is what a rewindable verification pass writes (P5c).
 // It is **120.75 MB at 36 layers** and only a speculative loop has any use for
 // it, so it is opt-in and `Speculate(true)` refuses without it.
-func WithDNSpeculative() DNOption { return func(g *DeltaNetGPU) { g.slots = 2 } }
+func WithDNSpeculative() DNOption { return func(g *DeltaNetGPU) { g.planes = 2 } }
 
 // WithDNSpecSlots stages n slots for speculation (P20b): a keep-prefix pass
 // of n rows keeps row 0 in the slot it read, the whole pass in a second, and
 // rows 0..1+i in mid slot i — n slots in all.
-func WithDNSpecSlots(n int) DNOption { return func(g *DeltaNetGPU) { g.slots = maxInt(n, 2) } }
+func WithDNSpecSlots(n int) DNOption { return func(g *DeltaNetGPU) { g.planes = maxInt(n, 2) } }
 
 // WithDNSlots stages n sequences' recurrent states and rings rather than one
-// (CONCURRENCY.md C1). It is the ping-pong's allocation put to a second use:
-// P5c's two slots are the committed state and a scratch one, and here the n
-// slots are n conversations, the committed slot is whichever one UseSlot
-// named, and a pass writes the slot it read. The two uses share the index,
-// so they do not combine: a block staged this way refuses Speculate.
+// (CONCURRENCY.md C1). Combined with WithDNSpecSlots each sequence gets its
+// own speculation planes (P20f), so one conversation can speculate while the
+// others wait in theirs.
 func WithDNSlots(n int) DNOption {
 	return func(g *DeltaNetGPU) {
 		if n > 1 {
-			g.slots, g.seqSlots = n, true
+			g.seqs, g.seqSlots = n, true
 		}
 	}
 }
@@ -389,14 +397,26 @@ func (g *DeltaNetGPU) UseSlot(s int) error {
 	if !g.seqSlots && s != 0 {
 		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
 	}
-	if s < 0 || s >= g.slots {
-		return fmt.Errorf("llm: deltanet sequence slot %d of %d", s, g.slots)
+	if s < 0 || s >= g.seqs {
+		return fmt.Errorf("llm: deltanet sequence slot %d of %d", s, g.seqs)
 	}
-	if g.seqSlots {
-		g.stateSlot = s
+	if s != g.seq {
+		g.committed[g.seq] = g.stateSlot
+		g.seq, g.stateSlot = s, g.committed[s]
 	}
 	return nil
 }
+
+// committedOf is sequence s's committed slot.
+func (g *DeltaNetGPU) committedOf(s int) int {
+	if s == g.seq {
+		return g.stateSlot
+	}
+	return g.committed[s]
+}
+
+// planeBase is the live sequence's first slot.
+func (g *DeltaNetGPU) planeBase() int { return g.seq * g.planes }
 
 func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 	layers []DeltaNetWeights, bank DenseBank, sim QuantSim, opts ...DNOption) (*DeltaNetGPU, error) {
@@ -436,10 +456,16 @@ func NewDeltaNetGPUBank(dev *vk.Device, cfg DeltaNetConfig, maxTokens int,
 		gemm:     GEMMKernelFor(maxTokens),
 		outGemm:  OutGEMMKernelFor(maxTokens),
 		autoPlan: true,
-		slots:    1,
+		seqs:     1,
+		planes:   1,
 	}
 	for _, o := range opts {
 		o(g)
+	}
+	g.slots = g.seqs * g.planes
+	g.committed = make([]int, g.seqs)
+	for s := range g.committed {
+		g.committed[s] = s * g.planes
 	}
 	g.imLayer = make([]int, len(layers))
 	for i, w := range layers {
@@ -509,7 +535,8 @@ func (g *DeltaNetGPU) alloc(nLayers int) error {
 	// setter. The slots of one layer are **adjacent**, so a slot is a layer's
 	// base plus a stride and neither the kernels nor the staging notice.
 	if g.slots <= 0 {
-		g.slots = 1
+		g.seqs, g.planes, g.slots = 1, 1, 1
+		g.committed = []int{0}
 	}
 	g.winStride = hist * g.qkvN()
 	g.stateStride = c.StateSize()
@@ -1028,13 +1055,17 @@ func (g *DeltaNetGPU) winAt(layer, slot int) uint32 {
 // pass, the other one while a speculative pass is in flight.
 func (g *DeltaNetGPU) stateDst() int {
 	if g.stateSpec {
-		return (g.stateSlot + 1) % g.slots
+		b := g.planeBase()
+		return b + (g.stateSlot-b+1)%g.planes
 	}
 	return g.stateSlot
 }
 
 // midSlot is where a keep-prefix pass stores its state after row 1+i (P20b).
-func (g *DeltaNetGPU) midSlot(i int) int { return (g.stateSlot + 2 + i) % g.slots }
+func (g *DeltaNetGPU) midSlot(i int) int {
+	b := g.planeBase()
+	return b + (g.stateSlot-b+2+i)%g.planes
+}
 
 // keepPush sets SEQ_KEEP_FIRST and the mid slots on a scan or ring-write push
 // of a speculative pass (P20c/P20b); at is stateAt or winAt.
@@ -1043,9 +1074,9 @@ func (g *DeltaNetGPU) keepPush(pc *push, layer int, at func(layer, slot int) uin
 		return nil
 	}
 	mids := maxInt(0, g.rows-2)
-	if mids > g.slots-2 || mids > 2 {
+	if mids > g.planes-2 || mids > 2 {
 		return fmt.Errorf("llm: a keep-prefix pass of %d rows needs %d deltanet slots, %d are staged",
-			g.rows, mids+2, g.slots)
+			g.rows, mids+2, g.planes)
 	}
 	pc.LDALo = uint32(1 + mids) // SEQ_KEEP_FIRST
 	if mids > 0 {
@@ -1066,10 +1097,7 @@ func (g *DeltaNetGPU) keepPush(pc *push, layer int, at func(layer, slot int) uin
 // has to be, because the two slots are different push constants and P1c's
 // pre-recorded decode step is the same bytes every token.
 func (g *DeltaNetGPU) Speculate(on bool) error {
-	if on && g.seqSlots {
-		return fmt.Errorf("llm: this block's slots are sequences (GraphOpts.Slots); it cannot also speculate")
-	}
-	if on && g.slots < 2 {
+	if on && g.planes < 2 {
 		return fmt.Errorf("llm: this block was staged with one state slot; a rewindable pass needs two " +
 			"(GraphOpts.Speculative)")
 	}
@@ -1160,18 +1188,13 @@ func (g *DeltaNetGPU) Reset(layer int) error {
 		return fmt.Errorf("llm: layer %d of %d", layer, len(g.layers))
 	}
 	c := g.cfg
-	// Both slots (P5c), so that a fresh sequence does not depend on which of
-	// them the last one happened to leave committed. Which slot is live is
-	// deliberately *not* touched here: Reset is per layer and the ping-pong
-	// is not, so a caller resetting one layer of 36 must not move it.
-	//
-	// Sequence slots are the exception (CONCURRENCY.md C1): each is another
-	// conversation, live in some other request, so only the one being
-	// started is cleared.
-	lo, hi := 0, g.slots
-	if g.seqSlots {
-		lo, hi = g.stateSlot, g.stateSlot+1
-	}
+	// Every plane of the live sequence (P5c), so that a fresh sequence does
+	// not depend on which of them the last one happened to leave committed.
+	// Which plane is committed is deliberately *not* touched here: Reset is
+	// per layer and the ping-pong is not, so a caller resetting one layer of
+	// 36 must not move it. Other sequences (CONCURRENCY.md C1) are other
+	// conversations, live in some other request, and are left alone.
+	lo, hi := g.planeBase(), g.planeBase()+g.planes
 	for slot := lo; slot < hi; slot++ {
 		g.abuf.ZeroFloat32At(int(g.stateAt(layer, slot)), c.StateSize())
 		g.abuf.ZeroFloat32At(int(g.winAt(layer, slot)), (c.Conv-1)*g.qkvN())
@@ -1366,9 +1389,9 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 			rb.CtxOff += uint32(r * g.ldCtx)
 			rb.SSMGateOff += uint32(r * c.NHeadV)
 			rb.SSMBetaOff += uint32(r * c.NHeadV)
-			rb.SSMStateOff = g.stateAt(layer, br.slot)
+			rb.SSMStateOff = g.stateAt(layer, g.committedOf(br.slot))
 			rb.ResOff = rb.SSMStateOff
-			rb.InjOff = g.winAt(layer, br.slot)
+			rb.InjOff = g.winAt(layer, g.committedOf(br.slot))
 			rbs[r] = rb
 		}
 		beside := func(r int) {

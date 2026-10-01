@@ -560,3 +560,91 @@ router, and a keep-prefix form past the DeltaNet ring's three rows (a ring
 of hist + R − 1 slots, or a stored plane per row). The larger lever is
 serving the loop at all — the server does not speculate yet, and its
 sequence slots share the carried state's slot index with speculation.
+
+## 11. Measured, 2026-10-01 — P20f, the loop served
+
+**What the server needed.** `-llm-draft <mtp gguf>` (`LLMOptions.Draft`,
+`-llm-spec-depth`, default `llm.SpecDepthDefault`):
+
+- **Sequence slots and speculation planes compose.** They shared the carried
+  state's slot index and refused each other (`GraphOpts.Slots` vs
+  `Speculative`). The DeltaNet and PLE blocks now index (sequence, plane):
+  sequence s owns slots `[s·P, (s+1)·P)`, each sequence remembers its
+  committed plane across `UseSlot`, and a batched row (C5) reads its
+  sequence's committed plane, not its first. Gate
+  `TestSpeculationSlotsAreSequences` (keep-prefix rounds on slot 0, slot 1
+  stepping between, batched passes of both, bit-exact; sabotaging the batched
+  plane lookup fails it, rms 0.51). `Commit`/`Keep` drop the live slot's
+  pre-recorded step, which names the old plane.
+- **A draft cache a slot** (`NewMTPHeadSlots`, `MTPHead.UseSlot`).
+- **The loop in pieces** (`NewSlotSpeculator`; `Prime`, `Begin`, `Round`,
+  `Owe`, `Settle`, `Rewind`): a prefill chunk runs `Graph.ExtendResidual`
+  and primes the draft from its residual; a round draws each verified row's
+  token with a `pick` function — **the request's own sampler, in order**, so
+  the loop is lossless at any temperature (row i's token is drawn over a
+  prefix that is the sequence), and it stops at end-of-generation or the
+  budget so the trunk never runs past what the plain loop would; a plain step
+  the slot takes instead (batched with other conversations) is **owed** to
+  its draft (`Graph.ResidualRow`), so the draft never falls behind; a
+  checkpoint keeps the residual it resumes from. Gate
+  `TestServedSpeculationIsPlain` (two slots, chunked priming, rounds
+  alternating with batched steps, a second turn; token for token).
+- **The scheduler** (`backend/llm_sched.go`): a decode is submitted as a
+  *round*; it speculates when its conversation is the only one of its class
+  decoding and its slot's draft is caught up (`llmSlot.track`), and otherwise
+  runs as a plain step that batches (C5) — three conversations' rows are
+  worth more than one conversation's speculation. Gate
+  `TestLLMSpeculationIsPlain` (server with and without the draft: greedy,
+  seeded sampling, two turns, two at once then a second turn, a checkpoint
+  restore — identical streams; also on the shipped banks).
+
+**Served, 48 layers, shipped banks, SPEED-Bench's 20 (§10's set) through
+`/v1/chat/completions`, 512 tokens, ctx 32768, 3 slots, one client**
+(`results/p20f_served.csv`; decode rates from the server's own line):
+
+| | plain | speculative | |
+|---|---:|---:|---:|
+| greedy | 41.06 | **56.83** (2.38 tok/round) | **1.38x** |
+| greedy, again | 41.06 | 56.62 | |
+| default sampling (temp 1, top-k 20, top-p 0.95) | 37.93 | 46.22 (2.08) | 1.22x |
+| — after the top-k fix below | **41.06** | **50.08** | **1.22x** |
+
+by category, greedy: coding 1.45x, writing 1.41x, rag 1.38x, qa 1.37x,
+multilingual 1.30x. Prefill pays **+9%** time for priming the draft (8.49 →
+9.28 s over the 6960 prompt tokens): the residual comes to the host and goes
+back a 64-row draft arena at a time.
+
+**Against `cmd/llm -spec-set` at the same 512 tokens: 1.48x, 2.53
+tok/round.** The served loop costs the same per round; it accepts less,
+because the server's template opens a thinking block and terse reasoning
+drafts worse (2.38 against 2.53 tokens a round is 56.7 against 60.3 tok/s).
+Sampling lowers acceptance again (2.08) — the draft proposes the argmax, the
+sampler draws from the top 20.
+
+**Lossless, and the near-ties measured.** Each arm reproduces itself 20/20
+(plain A/B, spec A/B). Spec is plain's greedy text on 4 of 20 served and 12
+of 20 in `cmd/llm`. `SPEC_MARGIN=1` now prints the plain loop's top-2 margin
+where spec first leaves it: **0.003–0.033 logits, against medians of
+2.7–11** on all eight (`results/p20f_spec_set_margins.txt`) — the shipped
+K-quant banks' multi-row GEMVs round unlike one-row steps (P19's 2.2e-3 rms),
+and a near-tie goes the other way. §10 asserted this; it is measured now. On
+the Q8 test banks every gate is bit-exact.
+
+**The sampler cost 2 ms a token** (plain sampled 37.93 against greedy 41.06):
+`Sample` built a 1 MB index array and quickselected all 248 320 logits every
+token, and in a round the scheduler samples every verified row in turn.
+`topKOf` keeps the k largest in one pass (0.115 ms at k = 20;
+`TestTopKOfIsTheSort` against a stable sort, ties included): **plain sampled
+37.93 → 41.06, speculative sampled 46.22 → 50.08 tok/s**, the same texts 20/20.
+
+**Memory.** The draft is 1.96 GB of weights; at ctx 32768 × 3 slots its
+arenas and caches are 0.70 GB. At the deployed 262 144 × 3 the caches grow
+eightfold (~2.3 GB) and the planes add 2 × 120.75 MB a slot: **~+5 GB on the
+LLM line**, and the host keeps a residual buffer of a prefill chunk (335 MB at
+`-llm-batch 8192`).
+
+**Next.** Priming on the device (the +9% prefill; the residual is already in
+an arena the draft could read, as §3.1 said); depth 3 (§10, ~+5%, a four-row
+pass); and an acceptance lever on thinking text. `DecodeRows` ignores
+`Graph.PinSchedule` — a pinned batched row rounds unlike a pinned solo step —
+which only a test notices (`TestServedSpeculationIsPlain` runs unpinned).

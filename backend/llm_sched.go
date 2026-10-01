@@ -46,6 +46,17 @@ package backend
 // conversation whose re-rendered history no longer matches what was
 // generated, restores it and prefills only what follows. The prefill chunk
 // is cut at that boundary so the checkpoint can be taken there.
+//
+// **A conversation decoding alone speculates** (TODO.md P20f), when the
+// server was given the MTP draft head. Its decode is submitted as a *round*:
+// if no other conversation of its class is decoding, the round drafts
+// SpecDepth tokens, verifies them in one pass and returns every token the
+// request's sampler drew; otherwise it falls back to a plain step and batches
+// with the others as above — three rows of distinct conversations are worth
+// more than one conversation's speculation. To speculate the slot's draft must
+// be caught up with what the slot holds, so every prefill chunk primes it from
+// the chunk's residual, every plain step it takes is owed to it, and a
+// checkpoint keeps the residual it resumes from.
 
 import (
 	"context"
@@ -104,6 +115,13 @@ type llmSlot struct {
 	// image's cells named by the picture rather than by the pad every one of
 	// them holds (llm_vision.go). held is keys too.
 	ckptKeys []int32
+	// track is whether the slot's draft head is caught up with held — every
+	// cell written or owed, and the trunk's last residual in hand — which is
+	// what a speculative round needs (P20f). An image, an unprimed chunk or
+	// an error ends it until the slot's next fresh prefill. ckptRes is the
+	// residual a restore to ckpt resumes the draft from, nil if none.
+	track   bool
+	ckptRes []float32
 }
 
 // reuse is how much of a prompt the slot saves, and whether that is by
@@ -162,6 +180,14 @@ type llmUnit struct {
 	restore bool
 	// step is a decode step, which may share a pass with other slots' (C5).
 	step bool
+	// round is a decode step that may instead run as a speculative round
+	// (P20f): pick draws each verified row's token, room is how many tokens
+	// the request may still take, and toks is what the round drew. A round
+	// that runs as a plain step returns logits like any other.
+	round bool
+	room  int
+	pick  func(row int, logits []float32) (int32, bool)
+	toks  []int32
 	// busy is the device time spent on it, and logits/err its result once
 	// done is closed.
 	busy   time.Duration
@@ -207,6 +233,15 @@ type llmSched struct {
 	// batched decode passes and the rows they carried, for a test that has
 	// to know one happened rather than infer it from a matching answer.
 	restores, batches, batchRows int
+
+	// specs is a speculator a slot, or nil without a draft head (P20f), and
+	// specDepth its drafts a round. rounds and roundTokens count the
+	// speculative rounds run and the tokens they drew; hrow is the residual
+	// row a plain step owes its slot's draft, reused.
+	specs               []*llm.Speculator
+	specDepth           int
+	rounds, roundTokens int
+	hrow                []float32
 }
 
 func newLLMSched(g *llm.Graph, dev *Device, batch, preempt, reserve int, noBatch bool, progress time.Duration) *llmSched {
@@ -405,6 +440,20 @@ func (s *llmSched) step(j *llmJob, id int32) ([]float32, time.Duration, error) {
 	return s.submit(&llmUnit{job: j, ids: []int32{id}, step: true, done: make(chan struct{})})
 }
 
+// decode is step for a conversation that may speculate: it returns either the
+// tokens a speculative round drew with pick (already accepted by the
+// sampler) or, when the round ran as a plain step, that step's logits. room
+// is how many tokens the request may still take.
+func (s *llmSched) decode(j *llmJob, id int32, room int, pick func(int, []float32) (int32, bool)) ([]int32, []float32, time.Duration, error) {
+	if s.specs == nil {
+		l, wait, err := s.step(j, id)
+		return nil, l, wait, err
+	}
+	u := &llmUnit{job: j, ids: []int32{id}, step: true, round: true, room: room, pick: pick, done: make(chan struct{})}
+	l, wait, err := s.submit(u)
+	return u.toks, l, wait, err
+}
+
 func (s *llmSched) submit(u *llmUnit) ([]float32, time.Duration, error) {
 	start := time.Now()
 	j := u.job
@@ -459,6 +508,7 @@ func (s *llmSched) loop() {
 		s.mu.Lock()
 		var u *llmUnit
 		var steps []*llmUnit
+		spec := false
 		for {
 			if s.closed {
 				for _, p := range s.pending {
@@ -473,6 +523,9 @@ func (s *llmSched) loop() {
 				if !u.step {
 					break
 				}
+				if spec = s.speculates(u); spec {
+					break
+				}
 				steps = s.steps(u)
 				wait := s.coalesceWait(u, len(steps))
 				if wait <= 0 {
@@ -485,6 +538,10 @@ func (s *llmSched) loop() {
 				})
 			}
 			s.wake.Wait()
+		}
+		if spec {
+			s.runRound(u)
+			continue
 		}
 		if len(steps) > 1 {
 			s.runSteps(steps)
@@ -537,6 +594,9 @@ func (s *llmSched) loop() {
 		chunk, next := keyIDs(keys), keyIDs(u.ids[n:min(len(u.ids), 2*n)])
 		in.IDs = chunk
 		keep := sl.ckpt
+		sp := s.specFor(slot)
+		track, ckRes := sl.track, sl.ckptRes
+		var keepRes []float32
 		s.running = u
 		s.mu.Unlock()
 
@@ -550,6 +610,11 @@ func (s *llmSched) loop() {
 				if err := s.g.UseSlot(slot); err != nil {
 					return err
 				}
+				if s.g.Speculating() {
+					if err := s.g.Speculate(false); err != nil {
+						return err
+					}
+				}
 				if len(next) > 0 {
 					// The next chunk's n-gram pages, faulted in while this
 					// one runs (P17).
@@ -557,6 +622,26 @@ func (s *llmSched) loop() {
 				}
 				if restore {
 					if err := s.g.Restore(ck); err != nil {
+						return err
+					}
+					if sp != nil {
+						// The draft's cells below the checkpoint are still
+						// its tokens' if the draft covered what the slot held.
+						if track && ckRes != nil {
+							if err := sp.Rewind(ck.Past(), ckRes); err != nil {
+								return err
+							}
+						} else {
+							track = false
+						}
+					}
+				}
+				// A text prefill chunk primes the slot's draft (P20f): a fresh
+				// one from position zero, a continuation from where the draft
+				// is, once its owed rows are written.
+				prime := sp != nil && !u.step && len(in.Images) == 0 && (fresh || track)
+				if prime && !fresh {
+					if err := sp.Settle(); err != nil {
 						return err
 					}
 				}
@@ -569,10 +654,34 @@ func (s *llmSched) loop() {
 						}
 					}
 					logits, _, err = s.g.ExtendInput(in)
+					track = false
+				case prime:
+					if fresh {
+						if err = s.g.Reset(); err != nil {
+							return err
+						}
+					}
+					var res []float32
+					if logits, res, err = s.g.ExtendResidual(chunk); err != nil {
+						return err
+					}
+					if err = sp.Prime(chunk, pos, res); err != nil {
+						return err
+					}
+					track = true
 				case fresh:
 					logits, _, err = s.g.Forward(chunk)
+					track = false
 				default:
 					logits, _, err = s.g.Extend(chunk)
+					switch {
+					case err == nil && u.step && track:
+						// A plain step the draft did not see: owed to it.
+						s.hrow = s.g.ResidualRow(0, s.hrow)
+						sp.Owe(chunk[0], s.hrow)
+					case !u.step:
+						track = false
+					}
 				}
 				if err == nil && take {
 					// A checkpoint that cannot be taken costs the next
@@ -580,6 +689,8 @@ func (s *llmSched) loop() {
 					if keep, err = s.g.Checkpoint(keep); err != nil {
 						log.Printf("llm: slot %d: no checkpoint at %d: %v", slot, mark, err)
 						keep, err = nil, nil
+					} else if prime {
+						keepRes = sp.Residual()
 					}
 				}
 				return err
@@ -589,11 +700,14 @@ func (s *llmSched) loop() {
 
 		s.mu.Lock()
 		s.running = nil
+		if ran {
+			sl.track = track && err == nil
+		}
 		switch {
 		case err != nil && ran:
 			// Whatever the slot held is no longer something this can
 			// describe; the next request on it starts over.
-			sl.held, sl.ckpt = nil, nil
+			sl.held, sl.ckpt, sl.ckptRes = nil, nil, nil
 		case err != nil:
 			// Cancelled before the chunk ran: the device is where the held
 			// sequence says it is.
@@ -606,7 +720,7 @@ func (s *llmSched) loop() {
 			sl.held = append(sl.held, keys...)
 		}
 		if err == nil && take {
-			sl.ckpt = keep
+			sl.ckpt, sl.ckptRes = keep, keepRes
 			sl.ckptKeys = append(sl.ckptKeys[:0], sl.held...)
 		}
 		if u.step {
@@ -686,8 +800,10 @@ func (s *llmSched) runSteps(batch []*llmUnit) {
 	}
 	slots := make([]int, len(batch))
 	ids := make([]int32, len(batch))
+	tracks := make([]bool, len(batch))
 	for i, u := range batch {
 		slots[i], ids[i] = u.job.slot, u.ids[0]
+		tracks[i] = s.specs != nil && s.slots[u.job.slot].track
 	}
 	s.inflight = batch
 	s.batches++
@@ -697,9 +813,23 @@ func (s *llmSched) runSteps(batch []*llmUnit) {
 	var logits []float32
 	t0 := time.Now()
 	err := s.dev.Do(func(*vk.Device) error {
+		if s.g.Speculating() {
+			if err := s.g.Speculate(false); err != nil {
+				return err
+			}
+		}
 		var err error
-		logits, err = s.g.DecodeRows(slots, ids)
-		return err
+		if logits, err = s.g.DecodeRows(slots, ids); err != nil {
+			return err
+		}
+		// Each row a slot's draft did not see: owed to it (P20f).
+		for i := range batch {
+			if tracks[i] {
+				s.hrow = s.g.ResidualRow(i, s.hrow)
+				s.specs[slots[i]].Owe(ids[i], s.hrow)
+			}
+		}
+		return nil
 	})
 	took := time.Since(t0)
 
@@ -713,7 +843,7 @@ func (s *llmSched) runSteps(batch []*llmUnit) {
 		sl := &s.slots[u.job.slot]
 		if err != nil {
 			// Which rows' states moved is not something this can say.
-			sl.held, sl.ckpt = nil, nil
+			sl.held, sl.ckpt, sl.ckptRes, sl.track = nil, nil, nil, false
 		} else {
 			sl.held = append(sl.held, u.ids[0])
 			u.logits = logits[i*vocab : (i+1)*vocab]
@@ -784,4 +914,93 @@ func (s *llmSched) dropUnit(u *llmUnit) {
 			return
 		}
 	}
+}
+
+// specFor is the slot's speculator, or nil without a draft head.
+func (s *llmSched) specFor(slot int) *llm.Speculator {
+	if s.specs == nil {
+		return nil
+	}
+	return s.specs[slot]
+}
+
+// speculates is whether a picked decode unit runs as a speculative round
+// (P20f): it asked to, its slot's draft is caught up, the round's rows fit
+// the cache and the request's budget, and no other conversation of its class
+// is decoding — if one is, the two batch as plain rows instead (C5).
+func (s *llmSched) speculates(u *llmUnit) bool {
+	if !u.round || u.room < 2 || s.specs == nil {
+		return false
+	}
+	sl := &s.slots[u.job.slot]
+	if !sl.track || len(sl.held)+s.specDepth+1 > s.g.NKV() {
+		return false
+	}
+	for i := range s.slots {
+		if j := s.slots[i].job; j != nil && j != u.job && j.class == u.job.class && j.stepping {
+			return false
+		}
+	}
+	return true
+}
+
+// runRound runs a speculative round. It is called with the lock held and
+// returns with it released.
+func (s *llmSched) runRound(u *llmUnit) {
+	j := u.job
+	slot, id := j.slot, u.ids[0]
+	sl := &s.slots[slot]
+	sp := s.specs[slot]
+	s.running = u
+	s.mu.Unlock()
+
+	var toks []int32
+	t0 := time.Now()
+	ran := false
+	err := j.ctx.Err()
+	if err == nil {
+		ran = true
+		err = s.dev.Do(func(*vk.Device) error {
+			if err := s.g.UseSlot(slot); err != nil {
+				return err
+			}
+			if !s.g.Speculating() {
+				if err := s.g.Speculate(true); err != nil {
+					return err
+				}
+			}
+			out, err := sp.Round(id, nil, u.pick)
+			if err != nil {
+				// A pass may be left in flight, which would refuse every
+				// later UseSlot; the slot's sequence is lost either way.
+				_ = s.g.Reset()
+				return err
+			}
+			toks = append([]int32(nil), out...)
+			return nil
+		})
+	}
+	took := time.Since(t0)
+
+	s.mu.Lock()
+	s.running = nil
+	switch {
+	case err != nil && ran:
+		sl.held, sl.ckpt, sl.ckptRes, sl.track = nil, nil, nil, false
+	case err == nil:
+		// The rows the round kept: its input and every token it drew but
+		// the last, which is pending like a sampled token.
+		sl.held = append(sl.held, id)
+		sl.held = append(sl.held, toks[:len(toks)-1]...)
+		s.rounds++
+		s.roundTokens += len(toks)
+		j.progress.steps += len(toks)
+	}
+	s.lastStep = time.Now()
+	u.busy += took
+	j.served += took
+	u.toks, u.err, u.ids = toks, err, nil
+	s.dropUnit(u)
+	close(u.done)
+	s.mu.Unlock()
 }

@@ -1,0 +1,52 @@
+20 prompts from models/speed-bench/qualitative-20.jsonl, the longest 1586 tokens
+device: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
+models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+  + models/Qwen3.8-Flash-Next-GGUF/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf
+48 layers, draft blk.48, 1586 tokens of prompt, 512 to generate, 2102 cells of context, wiring res
+
+block         layers  buffers      weights      arenas   staged in
+hyper-conn        97        4      0.45 GB    139.0 MB     10.827s
+ple n-gram         1        4      0.04 GB    305.9 MB       122ms
+deltanet          36        4      1.18 GB    703.7 MB     19.091s
+attention         12        7      0.43 GB    272.2 MB      6.085s
+lm head            1        4      0.44 GB    127.8 MB      2.785s
+moe               48       52     68.45 GB    632.4 MB     17.532s
+total             48       75     70.98 GB   2180.9 MB     56.586s
+dense bank: deltanet=q4_k/32,hyper_conn=q5_k/32,lm_head=q5_k/32,full_attn=q5_k/32,qsa_indexer=q5_k/32+imatrix — [deltanet=q4_k/32 (4.500 bits) full_attn=q5_k/32 (5.500 bits) hyper_conn=q5_k/32 (5.500 bits) lm_head=q5_k/32 (5.500 bits) qsa_indexer=q5_k/32 (5.500 bits)]
+
+draft staged in 868ms: 1.93 GB of weights, 0.47 GB of arenas (the lm head is the trunk's)
+
+draft catch-up (P20a): true
+partial accept (P20c): true
+draft vocabulary: the first 65536 ids, cut on the device
+draft depth (P20b): 2
+ 1 coding          58 prompt tok  512 out  plain  40.70  spec  63.55  1.56x  a1 175/192  plain self true, spec self true, same text
+ 2 coding         298 prompt tok  512 out  plain  40.72  spec  66.23  1.63x  a1 173/184  plain self true, spec self true, same text
+ 3 coding         163 prompt tok  512 out  plain  40.59  spec  62.78  1.55x  a1 170/194  plain self true, spec self true, same text
+ 4 coding         121 prompt tok  512 out  plain  40.96  spec  67.73  1.65x  a1 171/180  plain self true, spec self true, same text
+ 5 multilingual    47 prompt tok  275 out  plain  40.99  spec  57.37  1.40x  a1  87/115  plain self true, spec self true, same text
+ 6 multilingual    39 prompt tok  258 out  plain  40.92  spec  48.82  1.19x  a1  72/129  plain self true, spec self true, same text
+ 7 multilingual    47 prompt tok  512 out  plain  40.84  spec  63.30  1.55x  a1 171/195  plain self true, spec self true, leaves plain at 266 (plain's top-2 margin 0.033 there, median 10.45)
+ 8 multilingual    49 prompt tok  300 out  plain  40.87  spec  44.35  1.09x  a1  73/163  plain self true, spec self true, same text
+ 9 qa              18 prompt tok  138 out  plain  41.47  spec  61.28  1.48x  a1  45/ 55  plain self true, spec self true, leaves plain at 89 (plain's top-2 margin 0.003 there, median 4.90)
+10 qa              22 prompt tok  159 out  plain  41.01  spec  65.22  1.59x  a1  53/ 59  plain self true, spec self true, same text
+11 qa              19 prompt tok  512 out  plain  40.74  spec  56.40  1.38x  a1 168/216  plain self true, spec self true, leaves plain at 129 (plain's top-2 margin 0.029 there, median 3.31)
+12 qa              18 prompt tok  397 out  plain  41.17  spec  60.12  1.46x  a1 132/157  plain self true, spec self true, same text
+13 rag            731 prompt tok  495 out  plain  40.51  spec  62.16  1.53x  a1 148/169  plain self true, spec self true, leaves plain at 109 (plain's top-2 margin 0.006 there, median 5.87)
+14 rag            668 prompt tok  304 out  plain  40.41  spec  60.76  1.50x  a1 102/117  plain self true, spec self true, same text
+15 rag            722 prompt tok  444 out  plain  40.43  spec  65.60  1.62x  a1 150/159  plain self true, spec self true, same text
+16 rag            758 prompt tok  412 out  plain  40.41  spec  59.98  1.48x  a1 137/161  plain self true, spec self true, same text
+17 writing       1586 prompt tok  512 out  plain  39.91  spec  60.17  1.51x  a1 174/200  plain self true, spec self true, leaves plain at 61 (plain's top-2 margin 0.011 there, median 7.00)
+18 writing        108 prompt tok  512 out  plain  40.93  spec  64.87  1.58x  a1 172/186  plain self true, spec self true, leaves plain at 255 (plain's top-2 margin 0.006 there, median 11.03)
+19 writing        130 prompt tok  512 out  plain  41.05  spec  54.99  1.34x  a1 170/224  plain self true, spec self true, leaves plain at 231 (plain's top-2 margin 0.008 there, median 2.68)
+20 writing        482 prompt tok  512 out  plain  40.64  spec  60.26  1.48x  a1 169/204  plain self true, spec self true, leaves plain at 112 (plain's top-2 margin 0.003 there, median 6.55)
+
+category         n     plain      spec        x       a1 tok/rnd
+coding           4     40.74     65.01    1.60x    91.9%   2.731
+multilingual     4     40.89     53.95    1.32x    66.9%   2.234
+qa               4     41.00     59.21    1.44x    81.7%   2.483
+rag              4     40.45     62.21    1.54x    88.6%   2.642
+writing          4     40.63     59.87    1.47x    84.2%   2.516
+overall         20     40.72     60.32    1.48x    83.2%   2.532
+
+plain reproduces itself on 20 of 20 prompts, spec on 20; spec is the plain text on 12

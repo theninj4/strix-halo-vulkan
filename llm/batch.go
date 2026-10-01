@@ -99,7 +99,7 @@ func (g *DeltaNetGPU) SetBatch(rows []batchRow) error {
 	if !g.seqSlots && len(rows) > 1 {
 		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
 	}
-	if err := checkBatch(rows, g.slots, int(^uint32(0)>>1)); err != nil {
+	if err := checkBatch(rows, g.seqs, int(^uint32(0)>>1)); err != nil {
 		return err
 	}
 	g.abuf.WriteUint32At(1, positions(rows))
@@ -115,7 +115,7 @@ func (g *PLEGPU) SetBatch(rows []batchRow) error {
 	if !g.seqSlots && len(rows) > 1 {
 		return fmt.Errorf("llm: this block was staged with one sequence slot (GraphOpts.Slots)")
 	}
-	if err := checkBatch(rows, g.slots, int(^uint32(0)>>1)); err != nil {
+	if err := checkBatch(rows, g.seqs, int(^uint32(0)>>1)); err != nil {
 		return err
 	}
 	g.abuf.WriteUint32At(1, positions(rows))

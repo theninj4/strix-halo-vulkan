@@ -161,6 +161,13 @@ func runSet(o specOpts, set []setPrompt, g *llm.Graph, sp *llm.Speculator,
 		leave := "same text"
 		if at >= 0 {
 			leave = fmt.Sprintf("leaves plain at %d", at)
+			if m := plain[0].margins; at < len(m) {
+				// The plain loop's margin there, against its median over
+				// the text: a near-tie is a small fraction of the median.
+				ms := append([]float32(nil), m...)
+				sort.Slice(ms, func(a, b int) bool { return ms[a] < ms[b] })
+				leave += fmt.Sprintf(" (plain's top-2 margin %.3f there, median %.2f)", m[at], ms[len(ms)/2])
+			}
 		}
 		fmt.Printf("%2d %-12s %5d prompt tok %4d out  plain %6.2f  spec %6.2f  %.2fx  a1 %3d/%3d  plain self %v, spec self %v, %s\n",
 			i+1, p.Category, len(p.ids), len(plain[0].ids),

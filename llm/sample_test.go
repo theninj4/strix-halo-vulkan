@@ -173,3 +173,50 @@ func TestSamplerMinP(t *testing.T) {
 		}
 	}
 }
+
+// TestTopKOfIsTheSort: the one-pass selection (P20f) names the same ids in
+// the same order as sorting the whole row, ties to the lower id, for the k a
+// request asks for and on rows with many exact ties.
+func TestTopKOfIsTheSort(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	for trial := range 40 {
+		n := 1000 + rng.Intn(5000)
+		row := make([]float32, n)
+		for i := range row {
+			row[i] = float32(rng.NormFloat64())
+			if trial%2 == 1 {
+				row[i] = float32(rng.Intn(50)) // ties everywhere
+			}
+		}
+		all := make([]int32, n)
+		for i := range all {
+			all[i] = int32(i)
+		}
+		sort.SliceStable(all, func(a, b int) bool { return row[all[a]] > row[all[b]] })
+		for _, k := range []int{1, 20, 40, 256} {
+			got := topKOf(row, k, nil)
+			if len(got) != k {
+				t.Fatalf("k %d: %d ids", k, len(got))
+			}
+			for i := range got {
+				if got[i] != all[i] {
+					t.Fatalf("trial %d, k %d: id %d is %d (%v), the sort says %d (%v)", trial, k, i, got[i],
+						row[got[i]], all[i], row[all[i]])
+				}
+			}
+		}
+	}
+}
+
+func BenchmarkSampleTopK20(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	row := make([]float32, 248320)
+	for i := range row {
+		row[i] = float32(rng.NormFloat64()) * 3
+	}
+	s := NewSampler(1, 20, 0.95, 1)
+	b.ResetTimer()
+	for range b.N {
+		s.Sample(row)
+	}
+}
