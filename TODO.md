@@ -388,7 +388,33 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   (coding 0.61, qa 0.58, rag 0.69, writing 0.67), ≈2.9 tokens a round for
   ≈1.9 steps. Four things in its loop differ from ours, and one of the four
   is a defect here:
-  - **P20a — the draft's KV cache is complete there and not here.**
+  - **Done 2026-10-01: P20a and P20d's first half** ([§6 of the
+    note](research/p20-llamacpp-mtp.md)). The draft is primed over the
+    prompt from `Graph.ForwardResidual` and catches up one owed cell a
+    round (`Speculator.CatchUp`, `SPEC_CATCHUP=0` the control); `eh_proj`
+    runs on the device and the draft step is one submit (`MTPHead.eh`,
+    `LLM_MTP_HOST_NEXTN=1` / `LLM_MTP_UNRECORDED=1` the controls,
+    `TestMTPSeedDeviceIsTheHost`). Acceptance at 1024 prompt cells 68.2 →
+    90.6% (memorised wikitext: an upper bound), unchanged at 34; the draft
+    5.6 → 3.5 ms a round. **`-spec` 1.00x → 1.29x long (41.70 → 53.95
+    tok/s) and 1.08x short (42.00 → 45.26)**, two passes each, acceptance
+    count for count the host path's. Spec leaves plain at one near-tie a
+    run (two-row rounding; recorded, not fixed).
+  - **Done 2026-10-01: P20c at depth one** ([§7 of the
+    note](research/p20-llamacpp-mtp.md)). Row 0 of a pass is always
+    committed, so the pass also folds row 0 alone into the slots it *read*
+    (the scan's in-place store of S after token 0, the ring write's row 0
+    into `SEQ_HIST_PREV`; flag `SEQ_KEEP_FIRST` = `ldaLo`), and a rejection
+    is `Graph.KeepFirst` — at P+1, drafting again, no recovery round, no
+    extra memory (`Graph.SpeculateFirst`, `Speculator.Partial`,
+    `SPEC_PARTIAL=0` the control). Gate
+    `TestSpeculationKeepFirstIsTheSequence` bit-exact, control rms 0.93.
+    **`-spec` short 1.08x → 1.19x (42.00 → 49.82 tok/s), long 1.29x →
+    1.31x (41.57 → 54.65)**, both arms self-reproducing. Covers keeping
+    row 0 of a pass up to three rows; keeping 0–1 of three needs a stored
+    plane (built in P20b below). Then P20e (SPEED-Bench, the number to
+    quote).
+  - ~~**P20a — the draft's KV cache is complete there and not here.**~~
     llama.cpp runs the draft layer over every row the trunk runs — the
     prompt and each verified batch — paired with the trunk's residual one
     position back, no lm head, and trims the rejected rows.
@@ -403,7 +429,26 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     **on the device** (at 128k the residual is 5 GB; not through a mapped
     buffer). Gate: the loop's acceptance on a teacher-forced sequence equals
     the observer's count for count.
-  - **P20b — depth 2 or 3, not 1.** P5a's optimum was computed on
+  - **Done 2026-10-01: P20b — depth two built, measured, not adopted**
+    ([§8](research/p20-llamacpp-mtp.md)). Keep-any-prefix up to three rows
+    (`GraphOpts.SpecRows`, mid slots, `Graph.Keep(k)`,
+    `Speculator.Depth` / `-spec-depth`, `SPEC_TRACE`), gate bit-exact with
+    a mid-slot sabotage that fails. **Depth 2: short 1.11x against depth
+    1's 1.19x, long 1.31x = 1.31x**: the 3-row pass is 1.52 steps against
+    1.29 (the MoE's distinct experts, 17 → 24, not a kernel) and the second
+    draft step +0.15; a₂|a₁ 62.5%. Depth 1 stays default. Next lever: the
+    draft's lm head (2 of 3.7 ms) over a trimmed frequent vocabulary
+    (FR-Spec) — price its acceptance on `-mtp` first; then P20e.
+  - **Done 2026-10-01: the draft's lm head over a vocabulary prefix**
+    ([§9](research/p20-llamacpp-mtp.md)): the draft proposes from the first
+    65 536 ids (BPE id order covers 96.6% of wikitext, 98.3% of Go; counted
+    wikitext frequencies fail on code), and `HeadGPU.RunCols` runs the
+    trunk's own head GEMV over K/16 tiles — no new weights or kernel
+    (`TestHeadGPURunCols` bit-exact). Draft 3.71 → 2.22 ms; **`-spec` short
+    1.19x → 1.24x (51.93 tok/s), long 1.31x → 1.32x (55.14)**; acceptance
+    count for count the host-cut pricing. `SPEC_DRAFT_VOCAB=0` the control.
+    Next P20e (SPEED-Bench, the number to quote), and serving the loop.
+  - ~~**P20b — depth 2 or 3, not 1.**~~ P5a's optimum was computed on
     2026-09-19's pass costs and wikitext acceptance; at 0.64 a drafted token
     and P19's 1.23 / 1.37-step two- and three-row passes the optimum moves.
     Measure `cmd/llm -graph -tokens 1,2,3,4` on the shipped banks (one
@@ -412,7 +457,8 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     router, a four-at-a-time rung in `TestGraphIsAChunkSplit`). The MoE's
     expert growth bounds the depth; P20b measures it on loop traffic rather
     than the design pass's repeated-prompt table.
-  - **P20c — partial accept by snapshot planes, not a recovery round**
+  - ~~**P20c — partial accept by snapshot planes, not a recovery round**~~
+    (done at depth one above, by an in-place row-0 store rather than planes)
     (P5c §4 item 1, now with a reference design): llama.cpp creates the
     target context with `n_rs_seq = n_max`, the gated-delta-net op writes
     the state after each of the last K = n_max + 1 rows into K planes (the
@@ -553,7 +599,11 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
 
 P19, P21a, P22a, P21c and P22b are done (36.2 → 41.0 tok/s on 2026-09-30,
 24.4 ms a step), and P22c with P21d (2026-10-01: 41.0 → **41.4 tok/s, 24.2
-ms**). P22 is closed but for `dn.scan`, which is P24's; **next is P20**,
+ms**). P22 is closed but for `dn.scan`, which is P24's; **next is P20**
+(P20a/c/d-first-half done 2026-10-01: `-spec` 1.19x short, 1.31x long —
+49.8 / 54.7 tok/s; P20b's depth two measured and not adopted, the third
+row is MoE bytes; the draft's head over a 64k-id prefix took short to
+1.24x / 51.9 tok/s; next P20e, then serving it),
 re-planned on 2026-10-01 against llama.cpp's MTP PR (the draft's KV cache
 was never primed here — P20a — and depth 3 with snapshot planes reads 1.55x
 there), because the step is now 24.2 ms

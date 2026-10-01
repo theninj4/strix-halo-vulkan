@@ -140,6 +140,9 @@ type PLEOpts struct {
 	// only a speculative loop has any use for it, and `Speculate(true)`
 	// refuses without it.
 	Speculative bool
+	// SpecSlots is how many rings Speculative stages (P20b): one a row of
+	// the widest keep-prefix pass, two at least.
+	SpecSlots int
 	// Slots stages that many sequences' rings (CONCURRENCY.md C1): the
 	// ping-pong's allocation, with the committed slot the live sequence.
 	// It does not combine with Speculative.
@@ -208,7 +211,10 @@ type PLEGPU struct {
 	aHist                uint32
 	histStride, histSlot int
 	histSpec             bool
-	slots                int
+	// keepFirst is P20c (DeltaNetGPU.keepFirst): a speculative pass also
+	// stores its row 0 into the ring it read.
+	keepFirst bool
+	slots     int
 	// seqSlots says the slots are sequences (PLEOpts.Slots) and histSlot the
 	// live one, which a pass both reads and writes.
 	seqSlots bool
@@ -273,7 +279,7 @@ func NewPLEGPU(dev *vk.Device, cfg PLEConfig, maxTokens int, w PLEWeights, opts 
 		slots:      1,
 	}
 	if opts.Speculative {
-		g.slots = 2
+		g.slots = maxInt(2, opts.SpecSlots)
 	}
 	if opts.Slots > 1 {
 		if opts.Speculative {
@@ -740,6 +746,17 @@ func (g *PLEGPU) graph() ([]vk.MultiDispatch, []string) {
 	rings := minInt(g.rows, c.ConvHist())
 	if g.histSpec {
 		hist.OutOff, rings = g.histAt(g.histSlot), c.ConvHist()
+		if g.keepFirst {
+			// The graph refuses a pass wider than the slots (Graph.arm).
+			mids := minInt(maxInt(0, g.rows-2), g.slots-2)
+			hist.LDALo = uint32(1 + mids) // SEQ_KEEP_FIRST
+			if mids > 0 {
+				hist.GateOff = g.histAt(g.histMid(0)) // SEQ_HIST_MID0
+			}
+			if mids > 1 {
+				hist.BOff = g.histAt(g.histMid(1))
+			}
+		}
 	}
 	add("hist", "hist", uint32((wide+255)/256), uint32(rings), hist)
 	return d, kinds
@@ -788,10 +805,13 @@ func (g *PLEGPU) RestoreCarried(src []float32) error {
 
 func (g *PLEGPU) histDst() int {
 	if g.histSpec {
-		return 1 - g.histSlot
+		return (g.histSlot + 1) % g.slots
 	}
 	return g.histSlot
 }
+
+// histMid is where a keep-prefix pass stores the ring holding rows 0..1+i.
+func (g *PLEGPU) histMid(i int) int { return (g.histSlot + 2 + i) % g.slots }
 
 // Speculate makes the next passes rewindable — they read the committed ring
 // and write the other one — and CommitSlot accepts what one of them wrote.
@@ -809,9 +829,26 @@ func (g *PLEGPU) Speculate(on bool) error {
 	return nil
 }
 
+// KeepFirst is DeltaNetGPU.KeepFirst for the ring (P20c).
+func (g *PLEGPU) KeepFirst(on bool) { g.keepFirst = on }
+
+// RingRows is the ring's length, the most rows a keep-first pass may carry.
+func (g *PLEGPU) RingRows() int { return g.cfg.ConvHist() }
+
 func (g *PLEGPU) CommitSlot() {
 	if g.histSpec {
-		g.histSlot = 1 - g.histSlot
+		g.histSlot = g.histDst()
+	}
+}
+
+// KeepSlot is DeltaNetGPU.KeepSlot for the ring.
+func (g *PLEGPU) KeepSlot(k, rows int) {
+	switch {
+	case !g.histSpec || k <= 1:
+	case k >= rows:
+		g.CommitSlot()
+	default:
+		g.histSlot = g.histMid(k - 2)
 	}
 }
 

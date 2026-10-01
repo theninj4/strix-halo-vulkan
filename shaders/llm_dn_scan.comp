@@ -200,6 +200,13 @@ void main() {
         if (lane == 0u) {
             act[pc.outOff + (t * pc.heads + h) * S_V + col] = o * scale;
         }
+        if (SEQ_KEEP_FIRST != 0u && t <= SEQ_KEEP_MIDS) {
+            uint kbase = t == 0u ? sbase
+                       : (t == 1u ? SSM_STATE_MID0 : SSM_STATE_MID1) + scol;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                act[kbase + r * LPC + lane] = s[r];
+            }
+        }
     }
 #else
     for (uint t = 0u; t < pc.tokens; t++) {
@@ -252,6 +259,17 @@ void main() {
 #endif
         if (lane == 0u) {
             act[pc.outOff + (t * pc.heads + h) * S_V + col] = o * scale;
+        }
+        // P20c/P20b (SEQ_KEEP_FIRST, llm_common.glsl): S after row 0, back
+        // over the slot it was loaded from, and after rows 1..mids into the
+        // mid slots. Uniform, and never set outside a speculative
+        // verification pass.
+        if (SEQ_KEEP_FIRST != 0u && t <= SEQ_KEEP_MIDS) {
+            uint kbase = t == 0u ? sbase
+                       : (t == 1u ? SSM_STATE_MID0 : SSM_STATE_MID1) + scol;
+            [[unroll]] for (uint r = 0u; r < RPL; r++) {
+                act[kbase + r * LPC + lane] = s[r];
+            }
         }
 #if !QKREG
         barrier();

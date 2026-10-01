@@ -91,6 +91,12 @@ type HeadGPU struct {
 	// GEMV. `DecodeGEMV(false)` (GraphOpts.HeadGEMM, or LLM_HEAD_GEMM=1 for
 	// every head) keeps the GEMM there.
 	decodeGEMV bool
+	// cols, when nonzero, is how many output columns the GEMV computes — a
+	// prefix of the vocabulary (P20 §9, the draft's trimmed head). The bank
+	// is tiled sixteen output rows a block, so the first cols rows are its
+	// first cols/16 workgroups' bytes; the push constants keep the whole
+	// vocabulary, because the K-quant planes are addressed from it.
+	cols int
 }
 
 // NewHeadGPU stages `output.weight` in the fragment tiling, as L8's int8 and
@@ -443,9 +449,13 @@ func (g *HeadGPU) graph() ([]vk.MultiDispatch, []string) {
 		// It reads ROWS rows of A, the build it was specialized to, so the
 		// host refuses it above GEMVMaxRows — dropping rows silently is the
 		// failure mode this rule exists for.
+		cols := g.vocab
+		if g.cols > 0 {
+			cols = g.cols
+		}
 		return []vk.MultiDispatch{{
 			Pipeline: g.pipes[gemvBankPipeRows(g.gemv, g.bank, g.rows)],
-			GroupsX:  1, GroupsY: uint32(g.vocab / coopMatTile),
+			GroupsX:  1, GroupsY: uint32(cols / coopMatTile),
 			PushConstants: pc.bytes(),
 		}}, []string{"head_gemv"}
 	}
@@ -479,6 +489,31 @@ func (g *HeadGPU) SetGEMV(k GEMVKernel) error {
 	}
 	g.gemv = k
 	return nil
+}
+
+// RunCols is Run over the first `cols` output columns only (P20 §9): the
+// draft head borrows the trunk's projection and proposes from a prefix of
+// the vocabulary. The other columns of Logits are whatever the last full run
+// left. It needs the GEMV (the decode plan at up to GEMVMaxRows rows) and a
+// whole number of sixteen-column tiles; zero or the vocabulary is Run.
+func (g *HeadGPU) RunCols(cols int) error {
+	if cols <= 0 || cols >= g.vocab {
+		return g.Run()
+	}
+	if cols%coopMatTile != 0 {
+		return fmt.Errorf("llm: %d head columns is not a whole %d-column tile", cols, coopMatTile)
+	}
+	if g.gemv == GEMVOff {
+		return fmt.Errorf("llm: a column prefix needs the head's GEMV, and %d rows run the GEMM", g.rows)
+	}
+	g.cols = cols
+	defer func() { g.cols = 0 }()
+	return g.Run()
+}
+
+// LogitsCols is row 0's first n logits, the part RunCols wrote.
+func (g *HeadGPU) LogitsCols(n int) []float32 {
+	return g.abuf.ReadFloat32At(int(g.aOut), min(n, g.vocab))
 }
 
 // Run projects whatever Upload left in the A operand.
@@ -531,6 +566,11 @@ func (g *HeadGPU) Destroy() {
 func (g *HeadGPU) InPort() Port {
 	return Port{Buf: g.hbuf, Off: g.hXn, Stride: g.lda, Width: g.nEmbd,
 		Rows: g.arenaRows, Half: true}
+}
+
+// OutPort is the projection's output, fp32 [rows][vocab], as a move's source.
+func (g *HeadGPU) OutPort() Port {
+	return Port{Buf: g.abuf, Off: g.aOut, Stride: g.vocab, Width: g.vocab}
 }
 
 // Resize sets how many rows the projection covers, without writing them.

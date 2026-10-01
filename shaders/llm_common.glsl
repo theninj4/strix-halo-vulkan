@@ -467,3 +467,30 @@ uint gathStride(uint mx, uint bm) { return 1u + mx + bm * (mx >> 5u); }
 //             second ring, which starts empty and needs every slot.
 #define SSM_STATE_DST pc.resOff
 #define SEQ_HIST_PREV pc.outOff
+
+// **P20c borrows one more, so that a rejection costs nothing either.** Row 0
+// of a verification pass is the token the trunk already emitted, so it is
+// committed whatever the draft rows behind it turn out to be. With
+// SEQ_KEEP_FIRST nonzero the pass also folds row 0 alone into the slot it
+// *read* — the scan stores S after its first token back over the state it
+// loaded, the ring write stores the run's first row into SEQ_HIST_PREV at its
+// position — so a rejection keeps that slot and is already at P+1, and the
+// full pass is in the other slot as before. Both stores are in place without
+// a race: a scan lane stores exactly the elements it loaded, and the ring
+// slot row 0 lands in is one no invocation carries over. Zero, which is
+// every push block that does not set it, is the kernels as they were.
+//
+//   ldaLo     SEQ_KEEP_FIRST: neither kernel reads an A operand.
+//
+// **P20b widens it to a prefix of any length the slots can hold.** A pass
+// of R rows can be kept to any k of them, so besides row 0 in place and the
+// whole pass at the destination it stores the state after rows 1..R-2 into
+// *mid* slots: SEQ_KEEP_FIRST is then 1 + the number of mid slots, and
+// their offsets ride two more fields neither kernel reads — S after row
+// 1 + i in SSM_STATE_MID(i), the ring holding rows 0..1+i in SEQ_HIST_MID(i).
+#define SEQ_KEEP_FIRST pc.ldaLo
+#define SEQ_KEEP_MIDS  (SEQ_KEEP_FIRST - 1u)
+#define SSM_STATE_MID0 pc.gateOff
+#define SSM_STATE_MID1 pc.bOff
+#define SEQ_HIST_MID0  pc.gateOff
+#define SEQ_HIST_MID1  pc.bOff

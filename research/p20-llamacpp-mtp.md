@@ -250,3 +250,261 @@ tok/s), so its fixed costs are proportionally smaller — P5c §4.2's rule —
 and the 1.55x is a ceiling for the same loop here, not a floor. The
 acceptance figures are the transferable part: the same head on a trunk
 quantised to a similar width, on a public prompt set we can run.
+
+---
+
+## 6. Measured, 2026-10-01 — P20a (the catch-up) and P20d's first half
+
+`cmd/llm -spec`, 48 layers, the shipped banks with `LLM_BANK_CACHE`, `-n
+256`, nothing else on the GPU. **long** is `-spec-prefix 1024 -ctx 2048`
+(the first 1024 tokens of wikitext-2's test split, generated on from there);
+**short** is the default 34-token prose prompt at `-ctx 512`.
+`SPEC_CATCHUP=0` is P5c's loop and the control. CSVs
+`results/p20a_{long,short}_cu{0,1}.csv` (one pass a run) and
+`results/p20d_{long,short}_cu1.csv` (two interleaved passes).
+
+**P20a — the catch-up.** `Speculator.Start` runs the prompt through
+`Graph.ForwardResidual` (the layers, a copy of every row's residual, then
+the mixer and head on the last row) and primes the draft at every prompt
+position, `DraftRows` = 64 a pass, position p from the trunk's residual at
+p−1 and the token at p (position 0 from a zero residual). Each committed
+two-row pass then owes the draft exactly **one** cell — P+1, from row 0's
+residual and row 1's token, because the draft step at P was already seeded
+with the true pair — and the owed row rides in front of the next drafting
+row in one `MTPHead.Rows` call. The draft never holds a cell past the
+committed sequence at depth one, so a rejection needs nothing from it.
+
+| arm | catch-up | drafted | accepted | a₁ | multiplier | draft ms a round |
+|---|---|---:|---:|---:|---:|---:|
+| long | off (P5c) | 85 | 58 | 68.2% | 1.00x | 5.56 |
+| long | **on** | 85 | 77 | **90.6%** | 1.10x | 9.01 |
+| short | off (P5c) | 128 | 85 | 66.4% | 1.00x | 5.27 |
+| short | on | 128 | 85 | 66.4% | 0.94x | 7.07 |
+
+§3.1 was right where it had room to be: at 1024 prompt cells the draft's
+attention without them is 22 points down. At 34 the counts are identical —
+the prompt is too short for its cells to move an argmax. **The long arm's
+90.6% is an upper bound, not a workload number:** the text the trunk
+continues is wikitext's first article (Robert Boulter), which it largely
+recites; P20e's SPEED-Bench prompts are the number to quote. With `nextn`
+on the host the extra row cost 2.2 ms a round and ate the gain on the short
+arm.
+
+**P20d, first half — `eh_proj` on the device and the draft as one
+submit.** `MTPHead.eh` is `nextn.eh_proj` staged as the head block's plain
+projection (`NewHeadGPU`, K = 5120, N = 2560, the int8 bank) over one A row a
+(draft row, stream): the two RMS norms and the concatenation stay on the
+host (2560-wide elementwise work), the projection writes [n·hc][2560] and
+one move puts it in the draft layer's residual arena, which is the same
+bytes as [n][hc·2560]. The whole step — `eh_proj`, the move, the layer, the
+head mixer, the borrowed lm head — is recorded into one command buffer
+(`MTPHead.record`/`flush`, the trunk's recorder) where it was fifteen
+submit-and-wait round trips. `LLM_MTP_HOST_NEXTN=1` and
+`LLM_MTP_UNRECORDED=1` are the controls; `TestMTPSeedDeviceIsTheHost` is the
+gate (rms 6e-3 of the seed's rms, the int8 rounding of a 13.1 M-weight
+matrix; a misplaced stream reads ~1.4).
+
+| arm | plain tok/s | speculative tok/s | multiplier | a₁ | draft (of a step) | verify (of a step) |
+|---|---:|---:|---:|---:|---:|---:|
+| long | 41.70 (41.55 / 41.85) | **53.95** (53.52 / 54.38) | **1.29x** | 77/85 | 3.50 ms (0.146) | 1.270 |
+| short | 42.00 (41.44 / 42.55) | **45.26** (44.54 / 45.98) | **1.08x** | 85/128 | 2.89 ms (0.121) | 1.265 |
+
+The acceptance is the host path's **count for count** on both arms, which is
+the gate the seed's tolerance cannot be. Priming is 81 ms at 1024 cells
+(1.99 s on the host). A drafting round is now pass + 0.12–0.15 of a step,
+and what is left of the draft is the borrowed lm head (2 ms, the step's
+own) — the floor §3.4 priced at 0.13.
+
+**Lossless, qualified.** Both arms reproduce themselves (plain0 = plain1,
+spec0 = spec1, token for token — P5c finding 6's non-reproducing control
+is gone), and the speculative text leaves the plain one at **one** token in
+each arm (long at 72, short at 109) and is coherent after it. Every emitted
+token is still an argmax of the trunk's own logits; what differs is that a
+two-row pass rounds row 0 unlike a one-row pass (the decode schedule's
+row-count sensitivity, the 2.2e-3 subtest of the P19 postscript), and a
+near-tie went the other way. That is the same class of difference as
+llama.cpp's batched verification; it is recorded rather than fixed.
+
+**What bounds it now** — the chain line of the short arm: speculating 1.386
+steps for 1.664 tokens, recovering 1.265 for one. The recovery round is
+`1 − a₁` of the rounds and the whole of the remaining gap to the
+partial-accept form: with P20c's snapshot planes a rejected round commits
+row 0 and costs nothing more, so the short arm would read (1.265 + 0.121) /
+1.664 = 0.83 steps a token, **~1.20x**, and depth beyond one becomes
+possible at all. **Next is P20c**, then P20b's four-row pass.
+
+## 7. Measured, 2026-10-01 — P20c (partial accept), at depth one
+
+**The form built is simpler than §3.3's planes, and it is free in memory.**
+Row 0 of a verification pass is the token the trunk already emitted, so it
+is committed whatever the draft row behind it is. With
+`Graph.SpeculateFirst` on, the pass folds row 0 alone into the slots it
+**read** — the scan stores S after its first token back over the state it
+loaded (each lane stores exactly the elements it loaded, so no race), and the
+ring write (`llm_seq_hist.comp`'s ping-pong arm) also stores row 0 into
+`SEQ_HIST_PREV` at its own position, the slot of the position `hist` back,
+which row 0's convolution has already read and which no invocation carries
+over. The whole pass still goes to the other slot. `Commit` takes the other
+slot as before; **`Graph.KeepFirst`** keeps the read slot, which is now the
+sequence at P+1, and puts back the pooled indexer blocks only the rejected
+rows completed (`AttnGPU.RestoreBlocksAfter`). No third slot: residency is
+P5c's 241 MB. The flag is `SEQ_KEEP_FIRST` (= `ldaLo`, zero in every push
+block that does not set it, so every other path runs the kernels as they
+were). A keep-first pass cannot be rewound (the read slot has row 0 in it),
+and `Graph.arm` refuses one wider than either ring (row 0 would not be
+stored) — so this is depth one and two; P20b's four-row pass needs the
+ring's 3 rows to grow or real planes.
+
+The loop (`Speculator.Partial`, `SPEC_PARTIAL=0` the control): a rejection
+is `KeepFirst`, the next round drafts at P+1 from row 0's residual and the
+token row 0 named, and the draft owes nothing (its cell at P was written this
+round from the true pair). Every round drafts; there is no recovery round.
+
+**Gate** `TestSpeculationKeepFirstIsTheSequence` (4 layers, 480-token
+prefix, two- and three-row passes kept to row 0 between passes accepted
+whole, 10 partial keeps in 32 tokens): `result_norm` **identical to the last
+place** against the one-pass prompt; the control (the in-place store off in
+both blocks) misses by rms 0.93; `Rewind` of a keep-first pass refused. The
+P5c gate is unchanged and passes. **Not guarded:** a sabotage run with the
+partial block restore removed also passes, because the next pass always
+starts at P+1 and rewrites the block a rejected row completed before
+anything reads it (and at 528 cells the selection may be the identity). The
+restore is kept, as `Rewind` keeps its own, for correctness by construction.
+
+`cmd/llm -spec`, same protocol as §6 (shipped banks, `-n 256`, two
+interleaved passes, a same-process plain control), one process an arm,
+results `results/p20c_{short,long}_p{0,1}.csv`:
+
+| arm | P20a (`SPEC_PARTIAL=0`) | **P20c** | rounds | a₁ | draft a drafted round |
+|---|---:|---:|---|---:|---:|
+| short (34-token prose, ctx 512) | 42.01 → 45.17, 1.08x | 42.00 → **49.82, 1.19x** | 170 (128 drafted) → 148 (all) | 66.4 → 73.0% | 3.85 → 3.72 ms |
+| long (1024 wikitext cells, ctx 2048) | 41.72 → 53.98, 1.29x | 41.57 → **54.65, 1.31x** | 92 (85) → 88 (all) | 90.6 → 92.0% | — |
+
+Short is §6's prediction to the hundredth (**~1.20x**): a round is 1.29
+steps of pass + 0.16 of draft for 1.73 tokens. Long barely moves because at
+90% only 8 of 85 rounds were rejections to begin with. a₁ differs between the
+arms only because the text does after the first near-tie (short leaves plain
+at token 67 here, 109 under P20a — the same two-row rounding, §6); both arms
+reproduce themselves token for token (plain0 = plain1, spec0 = spec1).
+
+Unpriced cost: the scan's extra store is ~113 MB a pass; `dn.scan` read 0.47
+ms a pass per output token here against 0.46 under P20a, inside noise. The
+uniform `t == 0` branch inside the prefill scan loop was not timed.
+
+(The summary's "a round is" line on the long arm includes Start's 1024-token
+prefill in `Stats.Wall`, ~8.5 ms a round; tok/s is timed after Start and is
+unaffected.)
+
+**Next is P20b**: depth beyond one. The verify pass is now 1.27–1.30 steps at
+two rows and the draft 0.16; with every round drafting, a third row is worth
+it only if a₂ × (rows-3 cost) beats it — §3.2's arithmetic on the shipped
+banks, after `cmd/llm -graph -tokens 1,2,3,4` prices the passes. The keep-
+first form covers keeping row 0 of any pass up to three rows wide; keeping
+rows 0–1 of three needs a second stored state (a plane), which is §3.3's
+general form.
+
+## 8. Measured, 2026-10-01 — P20b, depth two: correct, and not worth it here
+
+**Built.** P20c's keep-first generalised to keep any prefix of a pass up to
+three rows: `GraphOpts.SpecRows` stages that many slots of every carried
+tensor (three at depth two, +~120 MB, still only under `Speculative`); a
+pass reads slot c, stores row 0 back into c, the state/ring after row 1 into
+a *mid* slot, and the whole pass into the destination (`SEQ_KEEP_FIRST` = 1
++ mids, the mid offsets on `gateOff`/`bOff`; the ring write has its own
+keep-prefix arm). `Graph.Keep(k)` picks c, the mid slot or the destination.
+`Speculator.Depth` (`cmd/llm -spec-depth N`) chains the draft on its own
+residual, verifies `[x_P, d₁, d₂]` in one 3-row pass, keeps the agreeing
+prefix, and owes the draft the kept rows' cells (each from the trunk residual
+of the row before it). `SPEC_TRACE=<path>` writes each round of the last pass.
+
+**Gates.** `TestSpeculationKeepFirstIsTheSequence` now runs SpecRows 3 with
+keeps of 1/2 of two rows and 1/2/3 of three: bit-exact; a sabotage keeping
+the read slot where the mid slot is due fails on every value. At 48 layers
+the depth-2 loop is lossless as before (self-reproducing; it leaves plain at
+the same near-tie, token 67 short). The trace settles the a₁ question below:
+the depth-1 and depth-2 sequences agree to position 242, and at all **78**
+rounds that start at a common (position, pending token) the first draft is
+identical — the draft's cache is the same at both depths.
+
+**Measured** (`results/p20b_{short,long}_d{1,2}.csv`, shipped banks, two
+passes, same-process plain control):
+
+| arm | depth 1 | depth 2 | 3-row pass | draft a round | tokens a round |
+|---|---:|---:|---:|---:|---:|
+| short | 41.88 → 49.64, **1.19x** | 41.78 → 46.45, 1.11x | 1.29 → 1.52 steps | 0.16 → 0.31 | 1.73 → 2.05 |
+| long | 41.63 → 54.43, **1.31x** | 41.54 → 54.49, 1.31x | 1.30 → 1.53 | 0.16 → 0.31 | 1.93 → 2.43 |
+
+a₂ given a₁ is **62.5%** short (50/80). The per-round a₁ falls with depth
+(73 → 64% short) for a selection reason, not a defect: a depth-2 round starts
+after up to three accepted tokens, so its rounds sit at different positions.
+
+**Why it loses: the third row is MoE bytes.** Per pass, `moe.up` is 5.0 /
+8.9 / 12.6 ms at one / two / three rows — 1.78x and 2.5x for 17.3 and ~24
+distinct experts against 10 — and `moe.down` 2.4 / 3.6 / 4.6. The 3-row
+pass's +0.23 step over two rows is the experts' weight, which no kernel
+recovers, and the second draft step is another full 0.15 (its lm head is
+2 ms of 3.7). Break-even for depth 2 is tokens a round ≥ 1.73 × 1.83 / 1.45
+= 2.19 short (got 2.05) — about a₁a₂ ≥ 0.46 — which the long arm's
+memorised text reaches (a tie) and the short prose does not. llama.cpp's
+1.55x at depth 3 was on a DGX Spark whose MoE pays less for a wider pass;
+this machine's pass cost is the expert set.
+
+**So depth one stays the default.** Depth two becomes worth re-measuring
+only if the draft gets cheaper or acceptance rises (P20e's workload number).
+The lever for both depths is now the draft's **lm head** — 2 ms of a 3.7 ms
+draft step over the full 248 320-token vocabulary: a draft head over the
+most frequent ~32k tokens (FR-Spec's trimmed vocabulary; a draft outside it
+is simply never proposed, so the loop stays lossless) would take the draft
+from 0.16 to ~0.08 of a step — short 1.20 → ~1.27x on paper, and depth 2's
+break-even down to a₁a₂ ≈ 0.40. Next: price that on the observer
+(`-mtp`, acceptance with the vocabulary cut) before building it.
+
+## 9. Measured, 2026-10-01 — the draft's lm head over a vocabulary prefix
+
+After P20c the draft step was 3.7 ms a round, 2.07 ms of it the borrowed lm
+head's GEMV over all 248 320 ids. FR-Spec's idea: the draft only has to
+*propose*, so it may propose from the frequent tokens alone; the trunk still
+decides every token and the loop stays lossless.
+
+**Which tokens.** `cmd/vocabfreq` (coverage of held-out text by the top K
+under three rankings): counts from wikitext-2 train are useless on code (49%
+of Go source at 32k), and **BPE id order** — merge order, a frequency ranking
+on the tokenizer's own broad corpus — needs no data and covers both: 90.8 /
+92.5% (wikitext test / Go) at 32k, **96.6 / 98.3% at 64k**. With id order the
+subset is a prefix, which is what makes the device side free:
+
+**The device side is a smaller grid.** `output.weight`'s bank is tiled
+sixteen output rows a block, contiguous, so the first K rows are the first
+K/16 workgroups' bytes. `HeadGPU.RunCols(K)` dispatches the trunk's own
+head GEMV with `GroupsY = K/16` and the push constants unchanged (the K-quant
+planes are addressed from the full N): no new weights, no new kernel.
+`MTPHead.SetVocab`, `Speculator.DraftVocab`, `llm.DraftVocabDefault` =
+65 536; `SPEC_DRAFT_VOCAB=K` (0 = whole vocabulary, the control),
+`SPEC_DRAFT_VOCAB_HOST=1` cuts on the host instead. Gate `TestHeadGPURunCols`
+(q8, q4_k, q5_k): the prefix bit-identical to the full run's, the columns past
+K untouched.
+
+**Priced on the loop first** (host cut, acceptance only, one pass):
+
+| K | short a₁ | long a₁ |
+|---:|---:|---:|
+| all | 108/148, 73.0% | 81/88, 92.0% |
+| 65 536 | **108/148, 73.0%** | 78/91, 85.7% |
+| 32 768 | 106/149, 71.1% | 74/95, 77.9% |
+| 16 384 | 100/155, 64.5% | 73/96, 76.0% |
+
+**Measured** (device cut, two passes, same-process plain,
+`results/p20v_{short,long}_{full,65536}.csv`): the acceptance is the host
+cut's count for count; the draft is **3.71 → 2.22 ms (0.155 → 0.093 of a
+step)**.
+
+| arm | whole vocabulary | **65 536** |
+|---|---:|---:|
+| short | 41.84 → 49.76, 1.19x | 41.91 → **51.93, 1.24x** |
+| long | 41.55 → 54.51, 1.31x | 41.65 → **55.14, 1.32x** |
+
+The long arm gives back most of its saving in acceptance (wikitext's proper
+nouns sit past id 65 536) and still nets +0.6 tok/s; prose keeps all of it.
+What is left of the draft is its one layer (~1.7 ms). Depth two re-priced on
+these costs: a 1.52-step pass + 2 × 0.093 = 1.71 steps for ~2.05 tokens
+(short) is ~1.20x against depth one's 1.25x — still not adopted.

@@ -260,3 +260,192 @@ func TestSpeculationNeedsItsSlots(t *testing.T) {
 		t.Error("the DeltaNet block is speculating after a refused Speculate(true)")
 	}
 }
+
+// TestSpeculationKeepFirstIsTheSequence is P20c's gate: a pass that keeps its
+// row 0 and rejects the rest leaves the model exactly where a pass of row 0
+// alone would have (research/p20-llamacpp-mtp.md §3.3).
+//
+// With Graph.SpeculateFirst on, the scan and the ring write fold row 0 into
+// the slots the pass read while the whole pass goes to the other one, and
+// KeepFirst keeps the first. The schedule is the loop's: a two- or three-row
+// pass whose row 0 is the sequence's and whose rest is rejected, kept to row
+// 0 and **not re-run**, between passes accepted whole — so a state, a ring
+// tap or a pooled block left wrong by a partial keep is read by every pass
+// after it.
+//
+// The control runs the same schedule with the in-place store switched off in
+// both blocks, so KeepFirst keeps a slot that never saw row 0. It has to fail.
+func TestSpeculationKeepFirstIsTheSequence(t *testing.T) {
+	const (
+		layers = 4
+		nTok   = 512
+		prefix = 480
+	)
+	m, tr := fixtures4k(t)
+	all, _, err := tr.Tokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < nTok {
+		t.Skipf("the 4k trace has %d tokens", len(all))
+	}
+	ids := all[:nTok]
+
+	dev, done := newTestDevice(t)
+	t.Cleanup(done)
+	g, err := NewGraph(dev, m, GraphOpts{MaxTokens: nTok, NKV: nTok + 16, Layers: layers, NoHead: true,
+		Speculative: true, SpecRows: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(g.Destroy)
+	if err := g.PinSchedule(true); err != nil {
+		t.Fatal(err)
+	}
+	norm, err := g.Hidden(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]float32(nil), norm...)
+	wrong := ids[7]
+
+	// rows a pass carries and how many of them the sequence keeps; the rows
+	// past `keep` are a token the sequence does not have.
+	type round struct{ rows, keep int }
+	rounds := []round{{2, 1}, {2, 2}, {3, 1}, {3, 2}, {2, 1}, {3, 3}, {3, 2}, {2, 2}}
+
+	run := func(t *testing.T, store bool) []float32 {
+		t.Helper()
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Append(ids[:prefix]); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SpeculateFirst(true); err != nil {
+			t.Fatal(err)
+		}
+		if !store {
+			if g.dn != nil {
+				g.dn.KeepFirst(false)
+			}
+			if g.ple != nil {
+				g.ple.KeepFirst(false)
+			}
+		}
+		if err := g.Speculate(true); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := g.Speculate(false); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.SpeculateFirst(false); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		// Every round but the last: the last row is run alone through the
+		// final mixer, so the comparison is of a row the sequence kept.
+		at, kept := prefix, 0
+		for i := 0; at < nTok-1; i++ {
+			r := rounds[i%len(rounds)]
+			keep := minInt(r.keep, nTok-1-at)
+			n := r.rows
+			if keep < r.keep {
+				n = keep // the schedule's end: keep what is left, whole
+			}
+			pass := append([]int32(nil), ids[at:at+keep]...)
+			for len(pass) < n {
+				pass = append(pass, wrong)
+			}
+			if err := g.Append(pass); err != nil {
+				t.Fatalf("round %d, a pass of %d rows at %d: %v", i, n, at, err)
+			}
+			if keep == n {
+				err = g.Commit()
+			} else {
+				err = g.Keep(keep)
+				kept++
+			}
+			at += keep
+			if err != nil {
+				t.Fatalf("round %d: %v", i, err)
+			}
+			if g.Past() != at {
+				t.Fatalf("round %d: the graph is at %d, the schedule at %d", i, g.Past(), at)
+			}
+		}
+		got, err := g.HiddenExtend(ids[nTok-1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if kept == 0 {
+			t.Fatal("no pass was kept to a prefix")
+		}
+		t.Logf("%d passes kept to a prefix", kept)
+		return append([]float32(nil), got...)
+	}
+
+	t.Run("rejected rows, row 0 kept", func(t *testing.T) {
+		got := run(t, true)
+		bad, first := 0, -1
+		for i := range got {
+			if got[i] != want[i] {
+				bad++
+				if first < 0 {
+					first = i
+				}
+			}
+		}
+		if bad != 0 {
+			t.Errorf("result_norm: %d of %d values differ, first at %d: %v against %v",
+				bad, len(got), first, got[first], want[first])
+			return
+		}
+		t.Log("result_norm identical to the last place")
+	})
+
+	t.Run("control, row 0 never stored apart", func(t *testing.T) {
+		got := run(t, false)
+		r, err := compare(got, want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("result_norm, row 0 missing from the kept slots: %v", r)
+		if r.rms < 1e-3 {
+			t.Errorf("keeping a slot that never saw row 0 moves result_norm by only %.3e, "+
+				"so the equality above is not evidence that row 0 was kept", r.rms)
+		}
+	})
+
+	// And the refusal: a keep-first pass cannot be rewound, because the slot
+	// it read has row 0 in it.
+	t.Run("Rewind refused", func(t *testing.T) {
+		if err := g.Reset(); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Append(ids[:prefix]); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.SpeculateFirst(true); err != nil {
+			t.Fatal(err)
+		}
+		defer g.SpeculateFirst(false)
+		if err := g.Speculate(true); err != nil {
+			t.Fatal(err)
+		}
+		defer g.Speculate(false)
+		if err := g.Append(ids[prefix : prefix+2]); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.Rewind(); err == nil {
+			t.Error("Rewind accepted a keep-first pass")
+		}
+		if err := g.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}

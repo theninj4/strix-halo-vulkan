@@ -101,6 +101,11 @@ type GraphOpts struct {
 	// `llm_seq_hist.comp` takes the pure-write arm it always had, which is
 	// why a `-gen` decode measures the same rate either way.
 	Speculative bool
+	// SpecRows is the widest pass a keep-prefix speculative pass may be
+	// (P20b): every carried tensor gets that many slots so any prefix of the
+	// pass can be kept. Zero is two, P5c's ping-pong; three is depth two,
+	// +~120 MB at 48 layers.
+	SpecRows int
 	// Slots stages that many sequences' carried state — the KV cache, every
 	// DeltaNet layer's recurrent state and ring, the PLE ring — so that one
 	// graph can hold several conversations and switch between them with
@@ -263,6 +268,13 @@ type Graph struct {
 	specIds    int
 	specSpans  int
 	specBlocks []uint16
+	// specFirst is P20c: every speculative pass also folds its row 0 into
+	// the committed slots, so KeepFirst can accept it alone. It makes
+	// Rewind impossible — the slot a pass read is no longer the state
+	// before it — and is set by SpeculateFirst.
+	specFirst bool
+	// specWidth is GraphOpts.SpecRows: the widest keep-prefix pass.
+	specWidth int
 
 	// Sequence slots (CONCURRENCY.md C1). `slot` is the live one; `past`,
 	// `ids` and the recorded decode step above are its, and `parked` holds
@@ -610,7 +622,7 @@ func NewGraph(dev *vk.Device, m *Model, opts GraphOpts) (*Graph, error) {
 	}
 	g := &Graph{m: m, cfg: c, nLayer: nLayer, maxTok: opts.MaxTokens, nKV: nKV,
 		slots: slots, parked: make([]seqState, slots), ropeHW: make([]int, slots),
-		hcMoves: opts.HCMoves || os.Getenv("LLM_HC_MOVES") == "1"}
+		hcMoves: opts.HCMoves || os.Getenv("LLM_HC_MOVES") == "1", specWidth: max(opts.SpecRows, 2)}
 
 	if err := g.stage(dev, opts); err != nil {
 		g.Destroy()
@@ -689,6 +701,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			pleOpts.Bank, pleOpts.Sim = b, q
 		}
 		pleOpts.Speculative = opts.Speculative
+		pleOpts.SpecSlots = g.specWidth
 		pleOpts.Slots = g.slots
 		if g.ple, err = NewPLEGPU(dev, pleCfg, g.maxTok, w, pleOpts); err != nil {
 			return fmt.Errorf("llm: ple: %w", err)
@@ -738,7 +751,7 @@ func (g *Graph) stage(dev *vk.Device, opts GraphOpts) error {
 			dnOpts = append(dnOpts, WithDNSlots(g.slots))
 		}
 		if opts.Speculative {
-			dnOpts = append(dnOpts, WithDNSpeculative())
+			dnOpts = append(dnOpts, WithDNSpecSlots(g.specWidth))
 		}
 		if g.dn, err = NewDeltaNetGPUBank(dev, dnCfg, g.maxTok, dns, dnBank, dnSim, dnOpts...); err != nil {
 			return fmt.Errorf("llm: deltanet: %w", err)
@@ -1143,6 +1156,81 @@ func (g *Graph) Speculate(on bool) error {
 // Speculating is whether passes are rewindable.
 func (g *Graph) Speculating() bool { return g.spec }
 
+// SpeculateFirst is P20c's partial accept (research/p20-llamacpp-mtp.md
+// §3.3): with it on, a speculative pass's row 0 — the token the trunk has
+// already emitted, committed whatever the draft rows behind it are — is also
+// folded alone into the slots the pass read, by the scan and the ring write
+// (SEQ_KEEP_FIRST). A pass is then ended by Commit (all its rows) or
+// KeepFirst (row 0 only), and never by Rewind. It costs one more store of
+// every layer's state a pass and no memory.
+func (g *Graph) SpeculateFirst(on bool) error {
+	if g.specArmed {
+		return fmt.Errorf("llm: a speculative pass is in flight; commit or rewind it first")
+	}
+	g.specFirst = on
+	if g.dn != nil {
+		g.dn.KeepFirst(on)
+	}
+	if g.ple != nil {
+		g.ple.KeepFirst(on)
+	}
+	return nil
+}
+
+// KeepFirst ends the speculative pass just run by accepting its first row
+// alone (P20c): the sequence is one token on from where the pass found it,
+// the committed slots already hold that token (the pass wrote it there), and
+// the pooled indexer blocks the rejected rows completed go back.
+func (g *Graph) KeepFirst() error { return g.Keep(1) }
+
+// Keep ends the speculative pass just run by accepting its first k rows
+// (P20b): row 0 from the slots the pass read, rows 0..k-1 of a wider pass
+// from a mid slot, all of them from the destination — which is Commit.
+func (g *Graph) Keep(k int) error {
+	if !g.specArmed {
+		return fmt.Errorf("llm: nothing to keep; no speculative pass has run")
+	}
+	if !g.specFirst {
+		return fmt.Errorf("llm: this pass did not store its prefixes apart (SpeculateFirst)")
+	}
+	if k < 1 || k > g.specRows {
+		return fmt.Errorf("llm: keeping %d rows of a %d-row pass", k, g.specRows)
+	}
+	if k == g.specRows {
+		return g.Commit()
+	}
+	if g.attn != nil && g.specBlocks != nil {
+		if err := g.attn.RestoreBlocksAfter(g.specPast, g.specRows, k, g.specBlocks); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		g.dn.KeepSlot(k, g.specRows)
+	}
+	if g.ple != nil {
+		g.ple.KeepSlot(k, g.specRows)
+	}
+	g.past = g.specPast + k
+	g.ids = g.ids[:g.specIds+k]
+	if g.attn != nil {
+		if err := g.attn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.ple != nil {
+		if err := g.ple.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	if g.dn != nil {
+		if err := g.dn.SetPast(g.past); err != nil {
+			return err
+		}
+	}
+	g.specArmed, g.specBlocks = false, nil
+	return nil
+}
+
 // Commit accepts the speculative pass just run, whole.
 //
 // It is the only thing that moves the ping-pong: what the pass wrote becomes
@@ -1174,6 +1262,10 @@ func (g *Graph) Commit() error {
 func (g *Graph) Rewind() error {
 	if !g.specArmed {
 		return fmt.Errorf("llm: nothing to rewind; no speculative pass has run")
+	}
+	if g.specFirst {
+		return fmt.Errorf("llm: a keep-first pass has already folded row 0 into the committed slots; " +
+			"KeepFirst or Commit it")
 	}
 	// The pooled indexer rows first, while `specPast`/`specRows` still say
 	// which ones the pass claimed.
@@ -1249,6 +1341,21 @@ func (g *Graph) arm(nTok int) error {
 	if g.specArmed {
 		return fmt.Errorf("llm: a speculative pass is already in flight; commit or rewind it first")
 	}
+	if g.specFirst {
+		// Row 0 reaches the committed ring only if the ring write stores it,
+		// which it does when the run fits the ring (llm_seq_hist.comp).
+		if g.dn != nil && nTok > g.dn.RingRows() {
+			return fmt.Errorf("llm: a keep-first pass of %d rows; the deltanet ring holds %d", nTok, g.dn.RingRows())
+		}
+		if g.ple != nil && nTok > g.ple.RingRows() {
+			return fmt.Errorf("llm: a keep-first pass of %d rows; the ple ring holds %d", nTok, g.ple.RingRows())
+		}
+		// A prefix of each length but the first and the whole needs a slot.
+		if nTok > g.specWidth {
+			return fmt.Errorf("llm: a keep-prefix pass of %d rows; the graph was staged for %d (GraphOpts.SpecRows)",
+				nTok, g.specWidth)
+		}
+	}
 	g.specPast, g.specRows, g.specIds, g.specBlocks = g.past, nTok, len(g.ids), nil
 	g.specSpans = len(g.spans)
 	if g.attn != nil && g.past > 0 {
@@ -1319,6 +1426,56 @@ func (g *Graph) ExtendRows(ids []int32) (logits, res []float32, err error) {
 	since(&g.Stats.Glue, t0)
 	g.Stats.Total += time.Since(top)
 	return logits, res, nil
+}
+
+// ForwardResidual is Forward that also hands back the wide residual of
+// **every** prompt row, [T][hc*nEmbd], before the final mixer.
+//
+// It is what primes the draft head (P20a): the draft's cell at position p is
+// written from the trunk's residual at p-1 and the token at p, so a draft that
+// is to attend over the prompt needs all T rows — and `hidden` overwrites row
+// 0 with the last one before the mixer. The layers are one submit and the
+// mixer and head a second, with the copy between them. The residual is a copy
+// the caller keeps.
+func (g *Graph) ForwardResidual(ids []int32) (logits, res []float32, err error) {
+	if g.head == nil {
+		return nil, nil, fmt.Errorf("llm: this graph was staged without a head")
+	}
+	if err := g.Prefill(ids); err != nil {
+		return nil, nil, err
+	}
+	res = append([]float32(nil), g.hc.Res()...)
+	top := time.Now()
+	g.record(1)
+	defer func() {
+		if ferr := g.flush(); ferr != nil && err == nil {
+			logits, res, err = nil, nil, ferr
+		}
+	}()
+	last := g.hc.ResRowPort(len(ids) - 1)
+	if err := g.hc.Resize(1); err != nil {
+		return nil, nil, err
+	}
+	if err := g.move.Move(g.hc.ResRowPort(0), last, 1); err != nil {
+		return nil, nil, err
+	}
+	if err := g.hc.Run(2*g.nLayer, false); err != nil {
+		return nil, nil, fmt.Errorf("llm: head mixer: %w", err)
+	}
+	if err := g.head.Resize(1); err != nil {
+		return nil, nil, err
+	}
+	if err := g.move.Move(g.head.InPort(), g.hc.MixedPort(), 1); err != nil {
+		return nil, nil, err
+	}
+	if err := g.head.Run(); err != nil {
+		return nil, nil, err
+	}
+	if err := g.flush(); err != nil {
+		return nil, nil, err
+	}
+	g.Stats.Total += time.Since(top)
+	return g.head.Logits(), res, nil
 }
 
 // batchSabotage, when set, runs after DecodeRows has written the blocks'

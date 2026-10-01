@@ -729,6 +729,35 @@ func (g *AttnGPU) RestoreBlocks(past, rows int, snap []uint16) error {
 	return nil
 }
 
+// RestoreBlocksAfter is RestoreBlocks for a pass whose first `keep` rows are
+// committed (P20c): the blocks those rows completed are final and right, and
+// only the ones the rejected rows completed go back. The snapshot is the
+// whole pass's, as SnapshotBlocks took it.
+func (g *AttnGPU) RestoreBlocksAfter(past, rows, keep int, snap []uint16) error {
+	lo, hi := g.blockRangeAt(past, rows)
+	if hi <= lo {
+		if len(snap) != 0 {
+			return fmt.Errorf("llm: a %d-value pooled snapshot against an empty range", len(snap))
+		}
+		return nil
+	}
+	n := (hi - lo) * g.cfg.IdxDim
+	if len(snap) != len(g.layers)*n {
+		return fmt.Errorf("llm: a %d-value pooled snapshot against %d blocks of %d layers",
+			len(snap), hi-lo, len(g.layers))
+	}
+	from := maxInt(lo, (past+keep)/g.cfg.Ratio)
+	if from >= hi {
+		return nil
+	}
+	skip := (from - lo) * g.cfg.IdxDim
+	for l := range g.layers {
+		off := int(g.hIdxK) + l*g.idxKStride + from*g.cfg.IdxDim
+		g.ibuf.WriteUint16At(off, snap[l*n+skip:(l+1)*n])
+	}
+	return nil
+}
+
 // NBlocks is the indexer's block count: the cache's cell count over the
 // compress ratio, which at 7 tokens in a 256-cell cache is 64 — one real block
 // and 63 that do not exist.

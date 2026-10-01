@@ -289,3 +289,78 @@ func TestHeadGPUQ4BankSize(t *testing.T) {
 		t.Fatalf("the q4_k bank is %.3fx the halves, want 16/4.5", ratio)
 	}
 }
+
+// TestHeadGPURunCols is the trimmed draft head's gate (P20 §9): a GEMV over
+// the first k columns writes exactly the first k logits of the full run, bit
+// for bit, on every bank the head stages — and, the control, it leaves the
+// columns past k alone rather than computing them.
+func TestHeadGPURunCols(t *testing.T) {
+	for _, spec := range []string{"q8", "q4_k/32", "q5_k/32"} {
+		t.Run(spec, func(t *testing.T) {
+			dev, done := newTestDevice(t)
+			defer done()
+			const nEmbd, vocab, k = 256, 640, 192
+			rng := rand.New(rand.NewSource(17))
+			w := q8Tensor(rng, "output.weight", nEmbd, vocab)
+			var g *HeadGPU
+			var err error
+			if spec == "q8" {
+				g, err = NewHeadGPU(dev, nEmbd, w, 4, true)
+			} else {
+				sim, perr := ParseQuantSim(spec)
+				if perr != nil {
+					t.Fatal(perr)
+				}
+				sim.Mode = "rtn"
+				bank, berr := BankForSim(sim)
+				if berr != nil {
+					t.Fatal(berr)
+				}
+				g, err = NewHeadGPUBank(dev, nEmbd, w, 4, bank, sim)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer g.Destroy()
+			x := make([]float32, nEmbd)
+			for i := range x {
+				x[i] = float32(rng.NormFloat64())
+			}
+			if err := g.Upload(x, 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Run(); err != nil {
+				t.Fatal(err)
+			}
+			full := append([]float32(nil), g.Logits()[:vocab]...)
+			// Poison the arena, then run the prefix.
+			if err := g.Upload(make([]float32, nEmbd), 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Run(); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.Upload(x, 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := g.RunCols(k); err != nil {
+				t.Fatal(err)
+			}
+			got := g.Logits()[:vocab]
+			for i := 0; i < k; i++ {
+				if got[i] != full[i] {
+					t.Fatalf("column %d: %v against the full run's %v", i, got[i], full[i])
+				}
+			}
+			past := 0
+			for i := k; i < vocab; i++ {
+				if got[i] != 0 {
+					past++
+				}
+			}
+			if past != 0 {
+				t.Errorf("%d columns past %d were computed", past, k)
+			}
+		})
+	}
+}

@@ -37,7 +37,14 @@ package llm
 // it is a store inside the one loop in this model with a 512-deep carried
 // dependency and `llm_dn_scan.comp`'s header says what a store there costs.
 //
-// So the round is a two-state chain and its multiplier is not `E[tokens]/cost`
+// **P20c built that snapshot** (`Partial`, research/p20-llamacpp-mtp.md §7):
+// row 0 of a pass is the token the trunk already emitted, so the pass folds
+// it alone into the slots it read while the whole pass goes to the other one,
+// and a rejection is Graph.KeepFirst — at P+1, drafting again next round. With
+// it the chain below collapses to one round type, pass + draft for `1 + a`
+// tokens. Off, it is the chain:
+//
+// The round is then a two-state chain and its multiplier is not `E[tokens]/cost`
 // of one round type:
 //
 //	speculating   cost pass + draft,  2 tokens with probability a, else 1
@@ -70,6 +77,9 @@ type SpecStats struct {
 	// verification pass, and Decide the host between them — the two argmaxes
 	// over 248320 logits and the residual copy the next draft is seeded from.
 	Wall, Draft, Verify, Decide time.Duration
+	// Prime is the draft's catch-up over the prompt at Start (P20a), outside
+	// Wall like the prefill it follows.
+	Prime time.Duration
 	// Experts is the number of **distinct** experts the last layer's router
 	// named across a pass's two rows, summed over the rounds.
 	//
@@ -85,6 +95,11 @@ type SpecStats struct {
 	// them, so it is a sample rather than the model's total — and a sample of
 	// one layer per round over hundreds of rounds.
 	Experts, ExpertRounds int
+	// DraftedAt and AcceptedAt are per draft position (P20b): index i counts
+	// the rounds whose (i+1)th draft was checked — every earlier one was
+	// accepted — and the ones where it was right too, so AcceptedAt[i] /
+	// DraftedAt[i] is the conditional acceptance a_{i+1}.
+	DraftedAt, AcceptedAt [4]int
 }
 
 // ExpertsPerPass is the measured E(2): distinct experts a two-row pass routes
@@ -128,6 +143,42 @@ type Speculator struct {
 	// the arena it came out of.
 	pend []int32
 	h    []float32
+	// dh is the draft's own residual a deeper draft chains on (P20b).
+	dh []float32
+
+	// CatchUp is P20a (research/p20-llamacpp-mtp.md §3.1): the draft's cache
+	// is written over the prompt at Start and over every committed row, so
+	// its attention never reads a cell nobody wrote. Off is P5c's loop, which
+	// primed nothing and wrote a cell only on a speculating round — the
+	// control.
+	CatchUp bool
+	// oweH and oweX are the rows the draft's cache is behind by: the trunk's
+	// residual before each owed position and the token at it. A committed
+	// two-row pass leaves exactly one — position P+1, from row 0's residual
+	// and row 1's token — because the draft step at P was already seeded with
+	// the true residual and the true token.
+	oweH []float32
+	oweX []int32
+
+	// Partial is P20c (research/p20-llamacpp-mtp.md §3.3): every pass also
+	// folds row 0 alone into the committed slots (Graph.SpeculateFirst), so a
+	// rejected draft keeps row 0 and the next round drafts again — there is
+	// no recovery round. Off is P20a's two-state chain, the control.
+	Partial bool
+	// Depth is how many tokens a round drafts (P20b): the draft head chains
+	// on its own residual, the verification pass is Depth+1 rows, and the
+	// longest agreeing prefix is kept (Graph.Keep). Above one it needs
+	// Partial and a graph staged with GraphOpts.SpecRows of Depth+1.
+	Depth int
+	// DraftVocab, when nonzero, restricts the draft to the first DraftVocab
+	// ids (§9): BPE id order is merge order, a frequency ranking on the
+	// tokenizer's own corpus, so the subset is a prefix. The trunk still
+	// decides every token, so the loop stays lossless; a token outside the
+	// subset is only never proposed.
+	DraftVocab int
+	// Trace, when set, sees every keep-prefix round: the position of its
+	// row 0, the rows it verified, and how many it kept.
+	Trace func(at int, rows []int32, keep int)
 
 	vocab int
 	wide  int
@@ -154,7 +205,7 @@ func NewSpeculator(g *Graph, d *MTPHead, m *Model, w Wiring) (*Speculator, error
 		return nil, fmt.Errorf("llm: the head's arena holds %d rows of logits and a verification pass needs 2 "+
 			"— GraphOpts.HeadRows", g.Head().MaxRows())
 	}
-	return &Speculator{g: g, d: d, m: m, w: w, vocab: g.Head().Vocab(), wide: d.Wide()}, nil
+	return &Speculator{g: g, d: d, m: m, w: w, vocab: g.Head().Vocab(), wide: d.Wide(), Depth: 1}, nil
 }
 
 // Start runs the prompt as an ordinary prefill and returns the token the
@@ -166,22 +217,72 @@ func (s *Speculator) Start(ids []int32) (int32, error) {
 	if err := s.g.Speculate(false); err != nil {
 		return 0, err
 	}
-	s.d.Reset()
-	s.Stats = SpecStats{}
-	t0 := time.Now()
-	logits, _, err := s.g.Forward(ids)
-	if err != nil {
+	if err := s.g.SpeculateFirst(s.Partial); err != nil {
 		return 0, err
 	}
-	first := Argmax(logits)
-	// `Forward` ends in `hidden`, which moves the last row of the residual to
-	// the front and runs the final mixer on it — so the arena holds one row
-	// and it is the one the draft wants.
-	s.h = append(s.h[:0], s.g.Residual()...)
+	s.d.Reset()
+	s.Stats = SpecStats{}
+	s.oweH, s.oweX = s.oweH[:0], s.oweX[:0]
+	t0 := time.Now()
+	var first int32
+	if s.CatchUp {
+		logits, res, err := s.g.ForwardResidual(ids)
+		if err != nil {
+			return 0, err
+		}
+		first = Argmax(logits)
+		if err := s.prime(ids, res); err != nil {
+			return 0, err
+		}
+		s.h = append(s.h[:0], res[(len(ids)-1)*s.wide:]...)
+	} else {
+		logits, _, err := s.g.Forward(ids)
+		if err != nil {
+			return 0, err
+		}
+		first = Argmax(logits)
+		// `Forward` ends in `hidden`, which moves the last row of the
+		// residual to the front and runs the final mixer on it — so the
+		// arena holds one row and it is the one the draft wants.
+		s.h = append(s.h[:0], s.g.Residual()...)
+	}
 	s.pend = append(s.pend[:0], first)
 	s.Stats.Tokens = 1
-	s.Stats.Wall += time.Since(t0)
+	s.Stats.Wall += time.Since(t0) - s.Stats.Prime
 	return first, s.g.Speculate(true)
+}
+
+// prime writes the draft's cell at every prompt position: position p from
+// the trunk's residual at p-1 and the token at p, a draft-arena's rows at a
+// time. Position 0 has no predecessor and is seeded from a zero residual, so
+// the cell is a function of the prompt rather than of whatever the previous
+// sequence left there.
+func (s *Speculator) prime(ids []int32, res []float32) error {
+	t0 := time.Now()
+	defer func() { s.Stats.Prime += time.Since(t0) }()
+	n, chunk := len(ids), s.d.MaxRows()
+	hs := make([]float32, 0, chunk*s.wide)
+	es := make([]float32, 0, chunk*s.d.NEmbd())
+	for p0 := 0; p0 < n; p0 += chunk {
+		k := minInt(chunk, n-p0)
+		hs, es = hs[:0], es[:0]
+		for p := p0; p < p0+k; p++ {
+			if p == 0 {
+				hs = append(hs, make([]float32, s.wide)...)
+			} else {
+				hs = append(hs, res[(p-1)*s.wide:p*s.wide]...)
+			}
+			e, err := s.m.Embedding(ids[p])
+			if err != nil {
+				return fmt.Errorf("llm: token_embd for the draft: %w", err)
+			}
+			es = append(es, e...)
+		}
+		if _, _, _, err := s.d.Rows(hs, es, k, p0, s.w, false); err != nil {
+			return fmt.Errorf("llm: priming the draft at %d: %w", p0, err)
+		}
+	}
+	return nil
 }
 
 // Next runs one round and returns the tokens it determined: two when the
@@ -193,6 +294,12 @@ func (s *Speculator) Next(out []int32) ([]int32, error) {
 	if len(s.pend) == 0 {
 		return nil, fmt.Errorf("llm: the loop has not been started")
 	}
+	if s.Partial {
+		return s.nextPrefix(out)
+	}
+	if s.Depth > 1 {
+		return nil, fmt.Errorf("llm: depth %d needs the partial accept (Speculator.Partial)", s.Depth)
+	}
 	top := time.Now()
 	defer func() { s.Stats.Wall += time.Since(top) }()
 	at := s.g.Past()
@@ -203,15 +310,24 @@ func (s *Speculator) Next(out []int32) ([]int32, error) {
 	drafted := len(s.pend) == 1
 	if drafted {
 		t0 := time.Now()
-		embd, err := s.m.Embedding(s.pend[0])
-		if err != nil {
-			return nil, fmt.Errorf("llm: token_embd for the draft: %w", err)
+		// The owed rows ride in front of the drafting one, at the
+		// positions just before it.
+		hs := append(s.oweH, s.h...)
+		xs := append(s.oweX, s.pend[0])
+		es := make([]float32, 0, len(xs)*s.d.NEmbd())
+		for _, x := range xs {
+			e, err := s.m.Embedding(x)
+			if err != nil {
+				return nil, fmt.Errorf("llm: token_embd for the draft: %w", err)
+			}
+			es = append(es, e...)
 		}
-		lg, _, _, err := s.d.Step(s.h, embd, at, s.w)
+		lg, _, _, err := s.d.Rows(hs, es, len(xs), at-len(s.oweX), s.w, true)
 		if err != nil {
 			return nil, fmt.Errorf("llm: draft at %d: %w", at, err)
 		}
-		rows = append(rows, Argmax(lg))
+		s.oweH, s.oweX = hs[:0], xs[:0]
+		rows = append(rows, s.draftArgmax(lg))
 		s.Stats.Draft += time.Since(t0)
 	} else {
 		rows = append(rows, s.pend[1])
@@ -255,10 +371,25 @@ func (s *Speculator) Next(out []int32) ([]int32, error) {
 		}
 		out = append(out, Argmax(logits[s.vocab:]))
 		s.h = append(s.h[:0], res[s.wide:2*s.wide]...)
+		if s.CatchUp {
+			s.oweH = append(s.oweH, res[:s.wide]...)
+			s.oweX = append(s.oweX, rows[1])
+		}
 		s.pend = append(s.pend[:0], out[len(out)-1])
 		if err := s.g.Commit(); err != nil {
 			return nil, err
 		}
+	} else if s.Partial {
+		// P20c: row 0 is already in the committed slots, so the sequence is
+		// at P+1 with `first` known and not yet in the trunk — exactly a
+		// speculating round's starting point. Row 0's residual seeds the
+		// next draft with `first`, and the draft owes nothing: its cell at P
+		// was written this round from the true pair.
+		if err := s.g.KeepFirst(); err != nil {
+			return nil, err
+		}
+		s.h = append(s.h[:0], res[:s.wide]...)
+		s.pend = append(s.pend[:0], first)
 	} else {
 		// The pass ran a token the model did not emit. Throw it away; the
 		// next round re-runs `[pend[0], first]` and drafts nothing.
@@ -267,6 +398,115 @@ func (s *Speculator) Next(out []int32) ([]int32, error) {
 		}
 		s.pend = append(s.pend[:1], first)
 	}
+	s.Stats.Tokens += len(out)
+	if n := s.g.PassExperts(); n > 0 {
+		s.Stats.Experts += n
+		s.Stats.ExpertRounds++
+	}
+	s.Stats.Decide += time.Since(t0)
+	return out, nil
+}
+
+// draftArgmax is the draft's pick, over DraftVocab ids when it is set.
+func (s *Speculator) draftArgmax(lg []float32) int32 {
+	if s.DraftVocab > 0 && s.DraftVocab < len(lg) {
+		lg = lg[:s.DraftVocab]
+	}
+	return Argmax(lg)
+}
+
+// nextPrefix is a round of the keep-prefix loop (P20c, P20b): draft Depth
+// tokens, verify them in one Depth+1-row pass, keep the longest prefix the
+// trunk agrees with, and emit one token more than the drafts it accepted.
+//
+// After keeping k rows the trunk is at P+k with the token row k-1 named
+// pending, the draft is seeded from row k-1's residual, and the draft owes
+// the cells P+1..P+k-1: each from the row before it and the token at it.
+func (s *Speculator) nextPrefix(out []int32) ([]int32, error) {
+	top := time.Now()
+	defer func() { s.Stats.Wall += time.Since(top) }()
+	at := s.g.Past()
+	depth := max(s.Depth, 1)
+
+	// 1. The drafts: the owed rows and the first draft in one call, then
+	//    each further draft from the draft's own residual.
+	t0 := time.Now()
+	rows := make([]int32, 0, depth+1)
+	rows = append(rows, s.pend[0])
+	hs := append(s.oweH, s.h...)
+	xs := append(s.oweX, s.pend[0])
+	es := make([]float32, 0, len(xs)*s.d.NEmbd())
+	for _, x := range xs {
+		e, err := s.m.Embedding(x)
+		if err != nil {
+			return nil, fmt.Errorf("llm: token_embd for the draft: %w", err)
+		}
+		es = append(es, e...)
+	}
+	lg, res, _, err := s.d.Rows(hs, es, len(xs), at-len(s.oweX), s.w, true)
+	if err != nil {
+		return nil, fmt.Errorf("llm: draft at %d: %w", at, err)
+	}
+	s.oweH, s.oweX = hs[:0], xs[:0]
+	rows = append(rows, s.draftArgmax(lg))
+	for k := 1; k < depth; k++ {
+		// A copy: the residual is in the arena the next call seeds.
+		s.dh = append(s.dh[:0], res...)
+		e, err := s.m.Embedding(rows[k])
+		if err != nil {
+			return nil, fmt.Errorf("llm: token_embd for the draft: %w", err)
+		}
+		if lg, res, _, err = s.d.Rows(s.dh, e, 1, at+k, s.w, true); err != nil {
+			return nil, fmt.Errorf("llm: draft %d at %d: %w", k+1, at+k, err)
+		}
+		rows = append(rows, s.draftArgmax(lg))
+	}
+	s.Stats.Draft += time.Since(t0)
+
+	// 2. The verification pass.
+	t0 = time.Now()
+	logits, vres, err := s.g.ExtendRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("llm: verification pass at %d: %w", at, err)
+	}
+	s.Stats.Verify += time.Since(t0)
+	t0 = time.Now()
+	s.Stats.Rounds++
+	s.Stats.Drafted++
+
+	// 3. Row i's argmax is the trunk's token at P+i+1; the pass is the
+	//    sequence up to the first draft it disagrees with.
+	n := len(rows)
+	for i := 0; i < n; i++ {
+		g := Argmax(logits[i*s.vocab : (i+1)*s.vocab])
+		out = append(out, g)
+		if i+1 == n {
+			break
+		}
+		s.Stats.DraftedAt[min(i, 3)]++
+		if rows[i+1] != g {
+			break
+		}
+		s.Stats.AcceptedAt[min(i, 3)]++
+	}
+	keep := len(out)
+	if keep > 1 {
+		s.Stats.Accepted++
+	}
+	if s.Trace != nil {
+		s.Trace(at, rows, keep)
+	}
+	if err := s.g.Keep(keep); err != nil {
+		return nil, err
+	}
+	if s.CatchUp {
+		for i := 1; i < keep; i++ {
+			s.oweH = append(s.oweH, vres[(i-1)*s.wide:i*s.wide]...)
+			s.oweX = append(s.oweX, rows[i])
+		}
+	}
+	s.h = append(s.h[:0], vres[(keep-1)*s.wide:keep*s.wide]...)
+	s.pend = append(s.pend[:0], out[keep-1])
 	s.Stats.Tokens += len(out)
 	if n := s.g.PassExperts(); n > 0 {
 		s.Stats.Experts += n
@@ -289,8 +529,19 @@ func (s *Speculator) Stop() error { return s.g.Speculate(false) }
 // argument about `maxTok`: the draft runs one row at depth one, whatever the
 // verification pass is.
 func StageDraft(dev *vk.Device, draft *Model, g *Graph) (*MTPHead, error) {
-	return NewMTPHead(dev, draft, g.cfg, g.Head(), 1, g.NKV())
+	return NewMTPHead(dev, draft, g.cfg, g.Head(), DraftRows, g.NKV())
 }
+
+// DraftVocabDefault is the draft's vocabulary prefix (§9, measured
+// 2026-10-01): the first 65 536 ids cover 96.6% of wikitext and 98.3% of Go
+// source, the loop's acceptance is unchanged on prose (108/148) and 92.0 →
+// 85.7% on memorised wikitext, and the draft step is 3.7 → 2.2 ms.
+const DraftVocabDefault = 65536
+
+// DraftRows is how many rows the draft's arenas hold: the prompt is primed
+// that many positions a pass, and a round's owed rows plus its drafting row
+// (two at depth one) fit with room to spare.
+const DraftRows = 64
 
 // ResetGraphStats and GraphStats expose the trunk's own attribution, so that a
 // multiplier that is not the projected one can be charged to a block.

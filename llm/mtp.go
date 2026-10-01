@@ -71,6 +71,7 @@ package llm
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -84,6 +85,8 @@ type MTPHead struct {
 	dev *vk.Device
 	m   *Model
 	cfg Config
+	// vocab is SetVocab's prefix of the lm head's columns, or zero for all.
+	vocab int
 
 	hc   *HCGPU
 	attn *AttnGPU
@@ -91,6 +94,12 @@ type MTPHead struct {
 	move *mover
 	// head is the **trunk's**, not this checkpoint's: see the file comment.
 	head *HeadGPU
+	// eh is `nextn.eh_proj` on the device (P20d): the head's plain
+	// projection block over a [5120 -> 2560] matrix, one row a (draft row,
+	// stream). Nil is the host path, which LLM_MTP_HOST_NEXTN=1 keeps.
+	eh *HeadGPU
+	// rec is the step's one command buffer while it is being recorded.
+	rec *recorder
 
 	// The `nextn` block, on the host. `ehProj` is ggml memory order — 2560
 	// rows of 5120 values, which is the row-major [out][in] a dot product
@@ -239,7 +248,20 @@ func (g *MTPHead) stage(dev *vk.Device, trunkCfg Config, maxTok, nKV int) error 
 	mw = MoEWeights{}
 	freeHost()
 
-	return g.stageNextn()
+	if err := g.stageNextn(); err != nil {
+		return err
+	}
+	if os.Getenv("LLM_MTP_HOST_NEXTN") == "1" {
+		return nil
+	}
+	t, err := m.Set.Get(fmt.Sprintf("blk.%d.nextn.eh_proj.weight", l))
+	if err != nil {
+		return fmt.Errorf("llm: draft eh_proj: %w", err)
+	}
+	if g.eh, err = NewHeadGPU(dev, 2*g.nEmbd, t, g.hcN*maxTok, true); err != nil {
+		return fmt.Errorf("llm: draft eh_proj on the device: %w", err)
+	}
+	return nil
 }
 
 // trunkRatio finds a compress ratio the trunk states, so the draft head's
@@ -353,6 +375,45 @@ func (g *MTPHead) Seed(h, embd []float32, w Wiring) ([]float32, error) {
 	return out, nil
 }
 
+// seedDevice is Seed for n rows with eh_proj on the device: the A operand
+// is one row a (draft row, stream), `concat(e_r, hn_{r,s})` in the wiring's
+// order, and the projection's [n*hc][nEmbd] output is moved into the draft
+// layer's residual arena, whose [n][hc*nEmbd] is the same bytes.
+func (g *MTPHead) seedDevice(hs, embds []float32, n int, w Wiring) error {
+	k := 2 * g.nEmbd
+	e := make([]float32, g.nEmbd)
+	hn := make([]float32, g.wide)
+	x := make([]float32, n*g.hcN*k)
+	for r := 0; r < n; r++ {
+		groupedRMSNorm(e, embds[r*g.nEmbd:(r+1)*g.nEmbd], g.enorm, g.nEmbd, 1, g.eps)
+		groupedRMSNorm(hn, hs[r*g.wide:(r+1)*g.wide], g.hnorm, g.nEmbd, g.hcN, g.eps)
+		for s := 0; s < g.hcN; s++ {
+			row := x[(r*g.hcN+s)*k : (r*g.hcN+s+1)*k]
+			h := hn[s*g.nEmbd : (s+1)*g.nEmbd]
+			if w.Flip {
+				copy(row, h)
+				copy(row[g.nEmbd:], e)
+			} else {
+				copy(row, e)
+				copy(row[g.nEmbd:], h)
+			}
+		}
+	}
+	rows := n * g.hcN
+	if err := g.eh.Upload(x, rows); err != nil {
+		return err
+	}
+	if err := g.eh.Run(); err != nil {
+		return fmt.Errorf("llm: draft eh_proj: %w", err)
+	}
+	if err := g.hc.Resize(n); err != nil {
+		return err
+	}
+	res := g.hc.ResPort()
+	dst := Port{Buf: res.Buf, Off: res.Off, Stride: g.nEmbd, Width: g.nEmbd, Rows: rows}
+	return g.move.Move(dst, g.eh.OutPort(), rows)
+}
+
 // Broadcast repeats a 2560-wide hidden state into every stream, which is what
 // `hc_init` does with the token embedding at the top of the trunk — and the
 // competing reading of what the MTP block is handed.
@@ -433,21 +494,70 @@ func (g *MTPHead) Reset() { g.past = 0 }
 // `embd` is the embedding of token i+1 out of the **trunk's** `token_embd`
 // (`mtp_use_dedicated_embeddings` is false).
 func (g *MTPHead) Step(h, embd []float32, pos int, w Wiring) (logits, res, mixed []float32, err error) {
-	if pos < 0 || pos >= g.nKV {
-		return nil, nil, nil, fmt.Errorf("llm: draft token at position %d of a %d-cell cache", pos, g.nKV)
+	return g.Rows(h, embd, 1, pos, w, true)
+}
+
+// MaxRows is how many rows one call of Rows can carry.
+func (g *MTPHead) MaxRows() int { return g.hc.Tokens() }
+
+// Rows runs the layer over n consecutive positions pos..pos+n-1 in one pass:
+// `hs` is n trunk residuals ([n][hc*nEmbd], row r the residual **before**
+// position pos+r) and `embds` the n embeddings of the tokens at those
+// positions. Every row writes its own cell of the draft's KV cache, which is
+// the whole point of running more than one (P20a, research/p20-llamacpp-mtp.md
+// §3.1): llama.cpp's draft catches up over every row the trunk commits, so its
+// one-layer attention never reads a cell nobody wrote.
+//
+// With `head` the last row also runs the head mixer and the borrowed lm head,
+// and the logits, the wide residual and `result_norm` returned are that row's;
+// without it the call only fills the cache and returns nothing.
+func (g *MTPHead) Rows(hs, embds []float32, n, pos int, w Wiring, head bool) (logits, res, mixed []float32, err error) {
+	if n <= 0 || n > g.hc.Tokens() {
+		return nil, nil, nil, fmt.Errorf("llm: %d draft rows, the arenas hold %d", n, g.hc.Tokens())
+	}
+	if len(hs) != n*g.wide || len(embds) != n*g.nEmbd {
+		return nil, nil, nil, fmt.Errorf("llm: %d draft rows of %d residual and %d embedding values", n, len(hs), len(embds))
+	}
+	if pos < 0 || pos+n > g.nKV {
+		return nil, nil, nil, fmt.Errorf("llm: draft rows at positions %d..%d of a %d-cell cache", pos, pos+n-1, g.nKV)
+	}
+	// One command buffer for the whole step (P20d), the way the trunk's
+	// pass is one (L7d): a dozen-odd separate submits each wait on a fence,
+	// at ~150 µs a hand-over. LLM_MTP_UNRECORDED=1 is the control.
+	if !mtpUnrecorded() {
+		g.record(n, pos)
+		defer func() {
+			if ferr := g.flush(); ferr != nil && err == nil {
+				logits, res, mixed, err = nil, nil, nil, ferr
+			}
+		}()
 	}
 	t0 := time.Now()
-	seed, err := g.Seed(h, embd, w)
-	if err != nil {
-		return nil, nil, nil, err
+	if g.eh != nil {
+		// The norms and the concatenation on the host — 2560-wide
+		// elementwise work — and the 13.1 M-weight projection on the
+		// device, written straight into the residual arena as [n*hc][nEmbd],
+		// which is [n][hc*nEmbd].
+		if err := g.seedDevice(hs, embds, n, w); err != nil {
+			return nil, nil, nil, err
+		}
+	} else {
+		seed := make([]float32, 0, n*g.wide)
+		for r := 0; r < n; r++ {
+			sr, err := g.Seed(hs[r*g.wide:(r+1)*g.wide], embds[r*g.nEmbd:(r+1)*g.nEmbd], w)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			seed = append(seed, sr...)
+		}
+		if err := g.hc.Upload(seed, n); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	g.SeedTime += time.Since(t0)
 	t0 = time.Now()
 	defer func() { g.GPUTime += time.Since(t0) }()
 	g.past = pos
-	if err := g.hc.Upload(seed, 1); err != nil {
-		return nil, nil, nil, err
-	}
 	if err := g.attn.SetPast(pos); err != nil {
 		return nil, nil, nil, err
 	}
@@ -459,16 +569,23 @@ func (g *MTPHead) Step(h, embd []float32, pos int, w Wiring) (logits, res, mixed
 	if err := g.hc.Run(0, false); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft attn mix: %w", err)
 	}
-	if err := g.attn.Resize(1); err != nil {
+	if err := g.attn.Resize(n); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := g.move.Move(g.attn.InPort(), g.hc.MixedPort(), 1); err != nil {
+	if err := g.move.Move(g.attn.InPort(), g.hc.MixedPort(), n); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := g.attn.Run(0); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft attn: %w", err)
 	}
-	if err := g.move.Move(g.hc.BlockOutPort(), g.attn.OutPort(), 1); err != nil {
+	g.past = pos + n
+	if !head {
+		// The cells are written; nothing after the attention reads or
+		// writes the cache, and no caller wants the MoE's output for a
+		// row it is only catching up on.
+		return nil, nil, nil, g.flush()
+	}
+	if err := g.move.Move(g.hc.BlockOutPort(), g.attn.OutPort(), n); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := g.hc.RunCombine(0); err != nil {
@@ -478,16 +595,16 @@ func (g *MTPHead) Step(h, embd []float32, pos int, w Wiring) (logits, res, mixed
 	if err := g.hc.Run(1, false); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft ffn mix: %w", err)
 	}
-	if err := g.moe.Resize(1); err != nil {
+	if err := g.moe.Resize(n); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), 1); err != nil {
+	if err := g.move.Move(g.moe.InPort(), g.hc.MixedPort(), n); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := g.moe.Run(0); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft moe: %w", err)
 	}
-	if err := g.move.Move(g.hc.BlockOutPort(), g.moe.OutPort(), 1); err != nil {
+	if err := g.move.Move(g.hc.BlockOutPort(), g.moe.OutPort(), n); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := g.hc.RunCombine(1); err != nil {
@@ -495,23 +612,76 @@ func (g *MTPHead) Step(h, embd []float32, pos int, w Wiring) (logits, res, mixed
 	}
 
 	// The head mixer is this block's own (`nextn.hc_head_*`), staged at
-	// index 2*nLayer = 2; the projection is the trunk's.
-	res = g.hc.Res()
+	// index 2*nLayer = 2; the projection is the trunk's, over the last row.
+	// The mixer reads the residual and does not write it, so the residual is
+	// read back after the flush with the logits.
 	if err := g.hc.Run(2, false); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft head mixer: %w", err)
 	}
 	if err := g.head.Resize(1); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := g.move.Move(g.head.InPort(), g.hc.MixedPort(), 1); err != nil {
+	if err := g.move.Move(g.head.InPort(), g.hc.MixedRowPort(n-1), 1); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := g.head.Run(); err != nil {
+	if err := g.head.RunCols(g.vocab); err != nil {
 		return nil, nil, nil, fmt.Errorf("llm: draft head: %w", err)
 	}
-	g.past = pos + 1
 	g.Steps++
-	return g.head.Logits(), res, g.hc.Mixed(), nil
+	if err := g.flush(); err != nil {
+		return nil, nil, nil, err
+	}
+	all := g.hc.Res()
+	mx := g.hc.Mixed()
+	logits = g.head.Logits()
+	if g.vocab > 0 {
+		logits = g.head.LogitsCols(g.vocab)
+	}
+	return logits, all[(n-1)*g.wide : n*g.wide], mx[(n-1)*g.nEmbd : n*g.nEmbd], nil
+}
+
+// SetVocab makes the draft's lm head project onto the first k ids only (P20
+// §9): its GEMV runs k/16 workgroups of the trunk's 15 520, and the logits it
+// returns are k long, so an argmax can only name an id below k. Zero is the
+// whole vocabulary.
+func (g *MTPHead) SetVocab(k int) error {
+	if k < 0 || k%coopMatTile != 0 || k > g.head.Vocab() {
+		return fmt.Errorf("llm: a draft vocabulary of %d ids (a multiple of %d up to %d)", k, coopMatTile, g.head.Vocab())
+	}
+	if k == g.head.Vocab() {
+		k = 0
+	}
+	g.vocab = k
+	return nil
+}
+
+var mtpUnrecorded = sync.OnceValue(func() bool { return os.Getenv("LLM_MTP_UNRECORDED") == "1" })
+
+// record installs one recorder on every block the step touches, the borrowed
+// lm head included; flush submits it and hands each block back its own
+// submits. The trunk is never recording while the draft runs: the loop calls
+// them one after the other.
+func (g *MTPHead) record(rows, past int) {
+	g.rec = &recorder{rows: rows, past: past}
+	g.setRec(g.rec)
+}
+
+func (g *MTPHead) setRec(r *recorder) {
+	g.hc.rec, g.attn.rec, g.moe.rec, g.move.rec, g.head.rec = r, r, r, r, r
+	if g.eh != nil {
+		g.eh.rec = r
+	}
+}
+
+func (g *MTPHead) flush() error {
+	if g.rec == nil {
+		return nil
+	}
+	r := g.rec
+	g.rec = nil
+	g.setRec(nil)
+	_, _, _, err := r.submit()
+	return err
 }
 
 // WeightBytes and ActivationBytes are what this head cost in device memory,
@@ -526,6 +696,9 @@ func (g *MTPHead) WeightBytes() int {
 	}
 	if g.moe != nil {
 		n += g.moe.WeightBytes()
+	}
+	if g.eh != nil {
+		n += g.eh.WeightBytes()
 	}
 	return n
 }
@@ -557,6 +730,10 @@ func (g *MTPHead) Destroy() {
 	if g.hc != nil {
 		g.hc.Destroy()
 		g.hc = nil
+	}
+	if g.eh != nil {
+		g.eh.Destroy()
+		g.eh = nil
 	}
 	if g.move != nil {
 		g.move.Destroy()

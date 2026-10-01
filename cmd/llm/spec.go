@@ -52,6 +52,7 @@ type specOpts struct {
 	n, ctx       int
 	layers       int
 	passes       int
+	depth        int
 	wire         string
 	chat         bool
 	csv          string
@@ -142,9 +143,10 @@ func speculate(o specOpts) error {
 	// The arenas hold the prompt, because the prefill is one batch — and the
 	// head's hold two rows, because a verification pass wants both.
 	start := time.Now()
+	rowsPass := max(o.depth, 1) + 1
 	g, err := llm.NewGraph(dev, m, llm.GraphOpts{
-		MaxTokens: max(len(ids), 2), NKV: ctx, Layers: o.layers, HeadRows: 2,
-		Speculative: true,
+		MaxTokens: max(len(ids), rowsPass), NKV: ctx, Layers: o.layers, HeadRows: rowsPass,
+		Speculative: true, SpecRows: rowsPass,
 	})
 	if err != nil {
 		return err
@@ -166,6 +168,58 @@ func speculate(o specOpts) error {
 	if err != nil {
 		return err
 	}
+	// P20a's catch-up is on unless SPEC_CATCHUP=0, which is P5c's loop: a
+	// draft that never saw the prompt and wrote a cell only when it drafted.
+	sp.CatchUp = os.Getenv("SPEC_CATCHUP") != "0"
+	fmt.Printf("draft catch-up (P20a): %v\n", sp.CatchUp)
+	// P20c's partial accept is on unless SPEC_PARTIAL=0, which is P20a's
+	// loop: a rejection rewinds the pass and re-runs its row 0 in a recovery
+	// round.
+	sp.Partial = os.Getenv("SPEC_PARTIAL") != "0"
+	fmt.Printf("partial accept (P20c): %v\n", sp.Partial)
+	sp.Depth = max(o.depth, 1)
+	// The draft proposes only ids below K (§9): llm.DraftVocabDefault, or
+	// SPEC_DRAFT_VOCAB=K; 0 is the whole vocabulary, the control.
+	sp.DraftVocab = llm.DraftVocabDefault
+	if v := os.Getenv("SPEC_DRAFT_VOCAB"); v != "" {
+		if sp.DraftVocab, err = strconv.Atoi(v); err != nil {
+			return fmt.Errorf("SPEC_DRAFT_VOCAB: %w", err)
+		}
+	}
+	if sp.DraftVocab > 0 {
+		// The device trim (the draft's head GEMV over k/16 tiles) unless
+		// SPEC_DRAFT_VOCAB_HOST=1, the control: the full head, the argmax
+		// cut on the host. The two have to accept count for count.
+		host := os.Getenv("SPEC_DRAFT_VOCAB_HOST") == "1"
+		if !host {
+			if err := d.SetVocab(sp.DraftVocab); err != nil {
+				return err
+			}
+		}
+		fmt.Printf("draft vocabulary: the first %d ids, cut on the %s\n", sp.DraftVocab,
+			map[bool]string{true: "host (control)", false: "device"}[host])
+	}
+	// SPEC_TRACE=<path>: every round of the last speculative pass as
+	// `position pending drafts... keep`, so two depths can be compared
+	// round for round where their sequences agree.
+	if path := os.Getenv("SPEC_TRACE"); path != "" {
+		f, err := os.Create(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		last := 0
+		sp.Trace = func(at int, rows []int32, keep int) {
+			if at < last {
+				// A new pass (or the warm-up's end): keep the last one.
+				_ = f.Truncate(0)
+				_, _ = f.Seek(0, 0)
+			}
+			last = at
+			fmt.Fprintln(f, at, rows, keep)
+		}
+	}
+	fmt.Printf("draft depth (P20b): %d\n", sp.Depth)
 
 	// The two arms, interleaved. One untimed round of each first: the first
 	// pass of anything on this machine is not like the others (the banks are
@@ -201,9 +255,11 @@ func speculate(o specOpts) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("spec  %d/%d: %d tokens in %s — %.2f tok/s, %d rounds, %d drafted, %d accepted (%.1f%%)\n",
+		fmt.Printf("spec  %d/%d: %d tokens in %s — %.2f tok/s, %d rounds, %d drafted, %d accepted (%.1f%%), "+
+			"draft primed in %s\n",
 			p+1, o.passes, len(s.ids), s.wall.Round(time.Millisecond), s.rate(),
-			s.stats.Rounds, s.stats.Drafted, s.stats.Accepted, 100*s.stats.Acceptance())
+			s.stats.Rounds, s.stats.Drafted, s.stats.Accepted, 100*s.stats.Acceptance(),
+			s.stats.Prime.Round(time.Millisecond))
 		spec = append(spec, s)
 	}
 
@@ -250,6 +306,16 @@ func speculate(o specOpts) error {
 		pr, prSpread, len(plain), sr, srSpread, sr/pr)
 	fmt.Printf("  a1 %.1f%% over %d drafted rounds, %.3f tokens a round, %.2f rounds a token\n",
 		100*st.Acceptance(), st.Drafted, st.TokensPerRound(), float64(st.Rounds)/float64(st.Tokens))
+	if st.DraftedAt[1] > 0 {
+		fmt.Printf("  per draft position:")
+		for i := range st.DraftedAt {
+			if st.DraftedAt[i] > 0 {
+				fmt.Printf(" a%d %d/%d (%.1f%%)", i+1, st.AcceptedAt[i], st.DraftedAt[i],
+					100*float64(st.AcceptedAt[i])/float64(st.DraftedAt[i]))
+			}
+		}
+		fmt.Println()
+	}
 	fmt.Printf("  a two-row pass routes to %.1f distinct experts of 512 in a layer, against 10 at one row "+
 		"— the design pass read 17 off a two-token prefill\n", st.ExpertsPerPass())
 	step := 1000 / pr // ms
@@ -266,10 +332,19 @@ func speculate(o specOpts) error {
 		pass, dr := ms(st.Verify)/step, ms(st.Draft)/step
 		round := pass + dr
 		tokens := 1 + a
-		fmt.Printf("  the chain: speculating %.3f steps for %.3f tokens, recovering %.3f for 1 — "+
-			"%.3f steps a token, %.2fx\n",
-			round, tokens, pass,
-			(round+(1-a)*pass)/2, 2/(round+(1-a)*pass))
+		if st.Rounds == st.Drafted {
+			// P20c: every round drafts, a rejection keeps row 0, and the
+			// chain is one state. Its tokens are counted, not derived from
+			// a₁, so that a deeper draft (P20b) is read the same way.
+			tokens = float64(st.Tokens-len(spec)) / float64(st.Rounds)
+			fmt.Printf("  one round type (partial accept): %.3f steps for %.3f tokens — %.3f steps a token, %.2fx\n",
+				round, tokens, round/tokens, tokens/round)
+		} else {
+			fmt.Printf("  the chain: speculating %.3f steps for %.3f tokens, recovering %.3f for 1 — "+
+				"%.3f steps a token, %.2fx\n",
+				round, tokens, pass,
+				(round+(1-a)*pass)/2, 2/(round+(1-a)*pass))
+		}
 	}
 
 	// 3. Where the difference went, per block, per token of output. The two
@@ -508,8 +583,13 @@ func totalStats(rs []specRun) llm.SpecStats {
 		t.Draft += r.stats.Draft
 		t.Verify += r.stats.Verify
 		t.Decide += r.stats.Decide
+		t.Prime += r.stats.Prime
 		t.Experts += r.stats.Experts
 		t.ExpertRounds += r.stats.ExpertRounds
+		for i := range t.DraftedAt {
+			t.DraftedAt[i] += r.stats.DraftedAt[i]
+			t.AcceptedAt[i] += r.stats.AcceptedAt[i]
+		}
 	}
 	return t
 }

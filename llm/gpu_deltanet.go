@@ -285,6 +285,10 @@ type DeltaNetGPU struct {
 	stateStride, winStride int
 	stateSlot              int
 	stateSpec              bool
+	// keepFirst is P20c: a speculative pass also folds its row 0 alone into
+	// the slot it read (SEQ_KEEP_FIRST), so a rejection keeps that slot and
+	// is at P+1 rather than P. Only meaningful while stateSpec is on.
+	keepFirst bool
 	// slots is 2 when this block was staged for speculation and 1 otherwise.
 	// **It is a staging choice and not a runtime one** (P5c): the second slot
 	// is 113.25 MB of state and 7.13 MB of ring across 36 layers, which is
@@ -359,6 +363,11 @@ type DNOption func(*DeltaNetGPU)
 // It is **120.75 MB at 36 layers** and only a speculative loop has any use for
 // it, so it is opt-in and `Speculate(true)` refuses without it.
 func WithDNSpeculative() DNOption { return func(g *DeltaNetGPU) { g.slots = 2 } }
+
+// WithDNSpecSlots stages n slots for speculation (P20b): a keep-prefix pass
+// of n rows keeps row 0 in the slot it read, the whole pass in a second, and
+// rows 0..1+i in mid slot i — n slots in all.
+func WithDNSpecSlots(n int) DNOption { return func(g *DeltaNetGPU) { g.slots = maxInt(n, 2) } }
 
 // WithDNSlots stages n sequences' recurrent states and rings rather than one
 // (CONCURRENCY.md C1). It is the ping-pong's allocation put to a second use:
@@ -1019,9 +1028,33 @@ func (g *DeltaNetGPU) winAt(layer, slot int) uint32 {
 // pass, the other one while a speculative pass is in flight.
 func (g *DeltaNetGPU) stateDst() int {
 	if g.stateSpec {
-		return 1 - g.stateSlot
+		return (g.stateSlot + 1) % g.slots
 	}
 	return g.stateSlot
+}
+
+// midSlot is where a keep-prefix pass stores its state after row 1+i (P20b).
+func (g *DeltaNetGPU) midSlot(i int) int { return (g.stateSlot + 2 + i) % g.slots }
+
+// keepPush sets SEQ_KEEP_FIRST and the mid slots on a scan or ring-write push
+// of a speculative pass (P20c/P20b); at is stateAt or winAt.
+func (g *DeltaNetGPU) keepPush(pc *push, layer int, at func(layer, slot int) uint32) error {
+	if !g.stateSpec || !g.keepFirst {
+		return nil
+	}
+	mids := maxInt(0, g.rows-2)
+	if mids > g.slots-2 || mids > 2 {
+		return fmt.Errorf("llm: a keep-prefix pass of %d rows needs %d deltanet slots, %d are staged",
+			g.rows, mids+2, g.slots)
+	}
+	pc.LDALo = uint32(1 + mids) // SEQ_KEEP_FIRST
+	if mids > 0 {
+		pc.GateOff = at(layer, g.midSlot(0)) // SSM_STATE_MID0 / SEQ_HIST_MID0
+	}
+	if mids > 1 {
+		pc.BOff = at(layer, g.midSlot(1))
+	}
+	return nil
 }
 
 // Speculate makes the next passes rewindable: they read the committed slot of
@@ -1046,10 +1079,33 @@ func (g *DeltaNetGPU) Speculate(on bool) error {
 
 func (g *DeltaNetGPU) Speculating() bool { return g.stateSpec }
 
+// KeepFirst makes every speculative pass also leave its first row folded into
+// the committed slot (P20c), which is what lets Graph.KeepFirst accept row 0
+// of a pass without re-running it. A pass of more rows than the ring holds
+// would not store row 0 in the ring at all, so the graph refuses those.
+func (g *DeltaNetGPU) KeepFirst(on bool) { g.keepFirst = on }
+
+// RingRows is the convolution's history length, the most rows a keep-first
+// pass may carry.
+func (g *DeltaNetGPU) RingRows() int { return g.cfg.Conv - 1 }
+
 // CommitSlot accepts whatever the last speculative pass wrote.
 func (g *DeltaNetGPU) CommitSlot() {
 	if g.stateSpec {
-		g.stateSlot = 1 - g.stateSlot
+		g.stateSlot = g.stateDst()
+	}
+}
+
+// KeepSlot accepts the first k of a keep-prefix pass's `rows` rows (P20b):
+// row 0 is already in the slot it read, all of them in the destination, and
+// rows 0..k-1 in mid slot k-2.
+func (g *DeltaNetGPU) KeepSlot(k, rows int) {
+	switch {
+	case !g.stateSpec || k <= 1:
+	case k >= rows:
+		g.CommitSlot()
+	default:
+		g.stateSlot = g.midSlot(k - 2)
 	}
 }
 
@@ -1274,7 +1330,11 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		add("conv", "conv", planes, uint32(g.rows), base)
 
 		// 3. The delta rule.
-		add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), base)
+		scan := base
+		if err := g.keepPush(&scan, layer, g.stateAt); err != nil {
+			return nil, nil, err
+		}
+		add(string(g.scan), "scan", uint32(c.NHeadV), uint32(c.HeadDim/sv.cols()), scan)
 
 		// 4. The gated output norm, into the output projection's A operand.
 		add("norm", "norm", uint32(c.NHeadV), uint32(g.rows), base)
@@ -1379,6 +1439,9 @@ func (g *DeltaNetGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	rings := minInt(g.rows, hist)
 	if g.stateSpec {
 		win.OutOff, rings = g.winAt(layer, g.stateSlot), hist
+		if err := g.keepPush(&win, layer, g.winAt); err != nil {
+			return nil, nil, err
+		}
 	}
 	add("hist", "hist", uint32((g.qkvN()+255)/256), uint32(rings), win)
 	return d, kinds, nil
