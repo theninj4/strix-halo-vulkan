@@ -290,6 +290,11 @@ func TestAttnGPUGatherIsDispatched(t *testing.T) {
 	if !g.Sparse() {
 		t.Skip("the selection does not bite at this cache size")
 	}
+	// The token-row chain: a 4096-row pass from cell zero is half past the
+	// width and takes the heads build by default (headRows), whose dispatch
+	// list TestAttnGPUHeadRowsIsTheGather reads.
+	g.SetHeadRows(false)
+	defer g.AutoHeadRows()
 	in := make([]float32, nTok*c.NEmbd)
 
 	kindsFor := func(rows int) map[string]int {

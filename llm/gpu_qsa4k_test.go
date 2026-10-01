@@ -77,6 +77,10 @@ func TestAttnGPUSelectionEngagesAt4k(t *testing.T) {
 	if !g.Sparse() {
 		t.Fatalf("width %d of %d cells and the layer still runs dense", g.selWidth(), g.NKV())
 	}
+	// The token-row chain, which is what the order below describes; a full
+	// 4096-row pass from cell zero takes the heads build by default (headRows).
+	g.SetHeadRows(false)
+	defer g.AutoHeadRows()
 	d, kinds, err := g.graph(0)
 	if err != nil {
 		t.Fatal(err)

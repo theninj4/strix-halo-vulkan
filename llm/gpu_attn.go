@@ -1815,7 +1815,22 @@ func (g *AttnGPU) headRows() bool {
 	//	past        0     2048    4096    8192   16384  128000
 	//	tokens  11109   10406   10162    9818    9424    7817
 	//	heads   11076   10504   10590   10529   10500   10271
-	return g.past >= g.hrowsMinPast()
+	//
+	// That bound held a chunk to one side by where it *starts*, and a wide
+	// chunk from a cold cache is mostly rows past it: at ubatch 8192 three
+	// quarters of the rows select 2051 of up to 8191 cells and their sixteen-
+	// token union is most of the prefix. What decides is the share of the
+	// chunk's rows that sit past the bound. `cmd/llm -attn` from cell zero,
+	// layer µs, two runs agreeing to 1% (2026-10-01):
+	//
+	//	rows        3072    4096    5120    6144    8192
+	//	share       0.33    0.50    0.60    0.67    0.75
+	//	tokens     22079   34620   50996   69267  118590
+	//	heads      23572   33757   44865   56544   79603
+	//
+	// so heads once two fifths of the rows are past it. A chunk that starts
+	// past it is all of its rows, the old rule.
+	return 5*(g.past+g.rows-g.hrowsMinPast()) >= 2*g.rows
 }
 
 // hrowsMinPast is the prefill bound above; LLM_ATTN_GATHER_HROWS_MIN overrides.
