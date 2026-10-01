@@ -697,6 +697,19 @@ func (g *GPUEncoder) allocActivations() error {
 	g.hCtx = halloc(rows * g.ldaQ)
 	g.hFFN = halloc(rows * g.ldaFFN)
 
+	// A buffer past the storage-buffer range is legal to create and is
+	// clamped where it is bound, so its tail would read as zeros with no
+	// error. Refuse at staging instead.
+	for _, a := range []struct {
+		name  string
+		bytes int
+	}{{"fp32", g.actElems * 4}, {"fp16", g.hElems * 2}} {
+		if a.bytes > maxBankBytes {
+			return fmt.Errorf("qwen: the %s activation arena for %d rows is %d MB, past the %d MB storage-buffer limit",
+				a.name, rows, a.bytes>>20, maxBankBytes>>20)
+		}
+	}
+
 	var err error
 	if g.abuf, err = g.dev.NewBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("qwen: fp32 activation arena (%d MB): %w", (g.actElems*4)>>20, err)

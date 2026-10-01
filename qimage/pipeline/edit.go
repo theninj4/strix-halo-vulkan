@@ -276,6 +276,15 @@ func (p *Pipeline) Edit(ctx context.Context, req EditRequest) (*qvae.Tensor, *Ti
 	if err != nil {
 		return nil, nil, err
 	}
+	if lay.PrefixLen > p.maxPrefix {
+		refRows := 0
+		for _, sh := range lay.ImgShapes[:len(lay.ImgShapes)-1] {
+			refRows += sh[0] * sh[1] * sh[2]
+		}
+		return nil, nil, fmt.Errorf("%w: %d text rows and %d of reference latents against the %d-row "+
+			"prefix they share (%d tokens of text are promised with all %d reference slots full)",
+			ErrPromptTooLong, lay.PrefixLen-refRows, refRows, p.maxPrefix, EditPrompt, p.refs)
+	}
 	// The shift is a function of the *target* token count: a bigger prefix
 	// does not move the schedule.
 	sched, err := p.scfg.Timesteps(steps, g.imgTokens)

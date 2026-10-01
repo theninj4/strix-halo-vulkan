@@ -224,7 +224,8 @@ func main() {
 			"*area* is the ceiling and any shape of that area is served, both sides a multiple of 32, "+
 			"and no more than 1403584 pixels / 1184x1184 (the VAE's single-buffer arena)")
 	imgSteps := flag.Int("image-steps", 40, "denoising steps a request that names none gets; the checkpoint's default is 40")
-	imgPrompt := flag.Int("image-max-prompt", 512, "longest prompt the image text encoder is built for, in tokens")
+	imgPrompt := flag.Int("image-max-prompt", 4096,
+		"longest prompt the image text encoder is built for, in tokens; a 3-reference edit at 1024² still gets 512 (the transformer's prefix is one 4 GiB arena)")
 	imgEdits := flag.Int("edits", 0,
 		"reference images an edit may carry, 0 to refuse /v1/images/edits; editing stages the vision "+
 			"tower and the VAE encoder (~1.4 GB) and each reference costs ~2.1 GB of prefix KV cache")

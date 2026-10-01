@@ -53,7 +53,7 @@ func main() {
 	height := flag.Int("height", 0, "image height; 0 is square")
 	steps := flag.Int("steps", pipeline.DefaultSteps, "denoising steps; the checkpoint's default is 40")
 	seed := flag.Int64("seed", 1, "seed for the initial latent")
-	maxPrompt := flag.Int("maxprompt", 512, "longest prompt the text encoder is built for")
+	maxPrompt := flag.Int("maxprompt", pipeline.DefaultMaxPrompt, "longest prompt the text encoder is built for")
 	reps := flag.Int("reps", 1, "generate this many times, reporting each; the first also pays the arenas' first touch")
 	bankName := flag.String("bank", "q8", "text encoder and transformer weights: q8 (int8, the served default) or fp16 (the control)")
 	transparent := flag.Bool("transparent", false,

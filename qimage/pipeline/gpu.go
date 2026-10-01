@@ -61,9 +61,20 @@ const (
 	// DefaultSize is the pipeline's default resolution, which is also
 	// diffusers' (the README's examples use 2048² explicitly instead).
 	DefaultSize = 1024
-	// DefaultMaxPrompt is the text encoder's token ceiling. A t2i prompt is
-	// the template plus the user's text, tens of tokens in practice.
-	DefaultMaxPrompt = 512
+	// DefaultMaxPrompt is the text encoder's token ceiling: the template plus
+	// the user's text. Clients send multi-thousand-token prompts (a 766-token
+	// one was refused at the old 512), and the model has no ceiling of its
+	// own below this -- the 2.1 pipeline does not truncate, and its RoPE
+	// table runs to 8192 positions.
+	DefaultMaxPrompt = 4096
+	// EditPrompt is the text an edit is promised with every reference slot
+	// full. The DiT's prefix is one row budget shared by the text and the
+	// references' latents, sized max(MaxPrompt, refs*condTokens+EditPrompt):
+	// at three 1024² references that is 12 800 rows, and the fp32 activation
+	// arena is then ~4 MB under the 4 GiB binding limit, so the budget cannot
+	// simply be MaxPrompt on top of the references. A t2i prompt or an edit
+	// with a slot to spare gets the whole MaxPrompt out of the same rows.
+	EditPrompt = 512
 
 	// condMarginNum/condMarginDen is the slack the condition arenas carry
 	// over the square grid of CondSize.
@@ -158,6 +169,7 @@ type Pipeline struct {
 	refs       int
 	condSize   int
 	condTokens int // the latent/patch budget one reference may occupy
+	maxPrefix  int // the DiT's prefix rows: text and references together
 
 	def, max geom
 	steps    int
@@ -270,7 +282,11 @@ func New(dev *vk.Device, opt Options) (*Pipeline, error) {
 	// reference's latent rows to it, and those rows are also what the prefix
 	// KV cache is sized by.
 	condRows := p.refs * p.condTokens
-	prefix := condRows + opt.MaxPrompt
+	prefix := condRows + min(EditPrompt, opt.MaxPrompt)
+	if prefix < opt.MaxPrompt {
+		prefix = opt.MaxPrompt
+	}
+	p.maxPrefix = prefix
 	var ditKeep []int
 	if opt.Bank == qwen.BankQ8 {
 		ditKeep = dit.Q8KeepFP16
