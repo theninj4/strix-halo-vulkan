@@ -3,7 +3,7 @@
      the host; one row and three; the clock. Cited from cmd/llm -gen -attrib,
      cmd/llm -batch and cmd/llm -graph, llm/gpu_head.go, llm/gpu.go. -->
 
-[← TODO.md](../TODO.md) · [← LLM.md](llm-vertical.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P16](p16-decode-arena-width.md) · [C5](../CONCURRENCY.md)
+[← LLM plan](llm-plan.md) · [← LLM.md](llm-vertical.md) · [research index](README.md) · [P1](p1-decode-attribution.md) · [P16](p16-decode-arena-width.md) · [C5](c5-batched-decode.md)
 
 # P19 — the decode step, re-attributed: 26.7 ms in four parts, and two of the projections are still on the GEMM
 

@@ -35,7 +35,7 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 | `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
 | `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics (or just a description, sample mode) to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
-| `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`CLASSIFICATION.md`](../CLASSIFICATION.md) |
+| `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`classification-vertical.md`](classification-vertical.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -215,7 +215,7 @@ evicting each other's prefix. With more slots each holds its own, and a
 request is given the free slot already holding the longest prefix of its
 prompt, else the least recently used one.
 
-**Each slot also keeps a checkpoint** (CONCURRENCY.md C4,
+**Each slot also keeps a checkpoint** ([C4](c4-checkpoints.md),
 `-llm-checkpoints`, on by default). It is the slot's state at the end of
 everything before the last user turn: the system prompt and the history. A
 request that shares that prefix but diverges after it restores the
@@ -372,15 +372,11 @@ Broken out to [`api-jobs.md`](api-jobs.md).
 - **Constrained decoding**, which is the one refusal above that is a missing
   capability rather than a missing shape. It would close `response_format`,
   `text.format` and a `tool_choice` that names a function in one go.
-- **More than one conversation at a time is interleaved, not batched.**
-  `-llm-slots` holds several and a scheduler shares the device between them
-  (above), but each pass is still one sequence's single row, so N streams
-  split one stream's rate. Batched decode — the decoding slots' tokens as rows
-  of one pass — is CONCURRENCY.md's C5.
-- **MTP speculative decoding is built, lossless, and parked at 0.95x**
-  (research/p5c-speculative-loop.md) — it costs nothing while off. What
-  would make it pay is the draft head's acceptance on a real workload,
-  which is a measurement (`cmd/llm -mtp`), not engineering; see `TODO.md`.
+- **Speculative decoding is served** (`-llm-draft`, [`llm-plan.md`](llm-plan.md)
+  P20f–P20h): a conversation decoding alone runs the MTP draft head, 56.8 tok/s
+  greedy and 56.6 sampled against 41.1 plain. Several conversations decode as
+  rows of one pass ([C5](c5-batched-decode.md)). What is open for both is in
+  [`llm-plan.md`](llm-plan.md) and [`concurrency.md`](concurrency.md) § Next.
 - **Image editing costs more than it did**, and that is the model rather
   than the port: an edit in 2.1 is a conditional generation over a 27-layer
   vision tower (research/qimage-vertical.md Q8), not an SDEdit, so there is no truncated

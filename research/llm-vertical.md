@@ -1,7 +1,8 @@
 # LLM — the qwen3.8-flash-next vertical
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the qwen3.8-flash-next vertical (stages L0–L9a, P0–P5c; decisions D1–D21 and the open questions are at the bottom). It was
-> `LLM.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `LLM.md` at the repo root; the live state of play is now
+> [`llm-plan.md`](llm-plan.md) (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **Current work from 2026-09-17.** `speech-vertical.md` is finished-ish (74.2x real
 > time, T7 open); `zimage-pipeline.md` (z-image) is parked at 14.26 s an image. Same

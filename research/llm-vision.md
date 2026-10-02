@@ -2,14 +2,12 @@
 
 > **Moved to `research/` on 2026-10-02** — this was `LLM-VISION.md` at the repo
 > root, and code comments citing `LLM-VISION.md` resolve here. The vertical is **not closed** (V11, video, is
-> parked): [`../TODO.md`](../TODO.md) carries it in summary, and § Handoff
-> below is still where a session resumes. It is kept whole: its stages are
+> parked):
+> § Handoff below is where a session resumes, and it carries the open items. It is kept whole: its stages are
 > short bullets that read in order.
 
 > **Live tracking and session handoff doc, opened 2026-09-24.** Stage letters
-> are **V**. When the vertical closes, this file is frozen to
-> `research/llm-vision.md` like the others and `TODO.md` gets the one-line
-> summary. Until then: tick a stage when its gate passes, put its measured
+> are **V**. When the vertical closes, this file is frozen in place and [`README.md`](README.md)'s index marks it closed. Until then: tick a stage when its gate passes, put its measured
 > numbers under it, and keep **§ Handoff** at the bottom current. A new session
 > should be able to start from there.
 

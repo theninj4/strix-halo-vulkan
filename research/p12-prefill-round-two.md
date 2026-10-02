@@ -4,7 +4,7 @@
      Cited from TODO.md, shaders/llm_attn_wmma.comp, shaders/llm_moe_gemm.comp,
      shaders/llm_hc_cn.comp and llm/gpu_moe.go. -->
 
-[← TODO.md](../TODO.md) · [research index](README.md) · [P11](p11-prefill.md) · [P8](p8-decode-attention-split.md) · [L5b](l5b-moe-gpu.md)
+[← LLM plan](llm-plan.md) · [research index](README.md) · [P11](p11-prefill.md) · [P8](p8-decode-attention-split.md) · [L5b](l5b-moe-gpu.md)
 
 # P12 — prefill, round two: the lane split and the block header, and four things that are not there
 

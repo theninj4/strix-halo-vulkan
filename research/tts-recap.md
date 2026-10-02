@@ -1,7 +1,8 @@
 # TTS — text to speech, where it stands
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the kokoro recap: stage table, serving defaults, and what is left. It was
-> `TTS.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `TTS.md` at the repo root; the live state of play is now
+> [`speech-vertical.md`](speech-vertical.md)'s last section (the root `TODO.md` that held it was retired 2026-10-02).
 
 > The kokoro slice of `speech-vertical.md`, on its own. That file carries both audio
 > verticals and is the place stage write-ups land; this one is the recap:

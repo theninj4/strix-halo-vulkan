@@ -31,7 +31,7 @@ nothing: between two decode steps there is no work in flight. What is held for
 the length of a request is a *slot* of the graph, whose cache, PLE ring and
 DeltaNet state are one sequence's.
 
-**`-llm-slots N` holds N conversations at once** (CONCURRENCY.md, C1/C2). Each
+**`-llm-slots N` holds N conversations at once** ([C1](c1-sequence-slots.md)/[C2](c2-scheduler.md)). Each
 slot is its own KV cache (27.8 KB a cell, in buffers of its own since C6, so
 every slot can hold the full 262 144 cells), DeltaNet state and rings (120
 MB). The served line is `-llm-slots 3 -llm-ctx 262144`, ~98 GB resident. A
@@ -187,3 +187,12 @@ Two things would fix it, and both are measurements rather than arguments:
   and `energy` from the host (research/speech-vertical.md T7), so the host prosody that settles
   the length could feed the device vocoder directly and the phoneme side would
   not need staging at all.
+
+## Two machines
+
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.*
+
+**Deployment is two machines**: the language model alone on one (~84 GB
+resident), the other four verticals on the other (image ~32 GB, the rest
+~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
+purpose — so no footprint quantisation is planned for the small verticals.

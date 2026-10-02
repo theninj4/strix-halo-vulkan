@@ -1,9 +1,12 @@
 # OBJ-DETECTION — boxes, labels and scores (RF-DETR-L)
 
+> **Moved to `research/` on 2026-10-02** — this was `OBJ-DETECTION.md` at the
+> repo root, and anything citing `OBJ-DETECTION.md` resolves here.
+>
 > **Live tracking and session handoff doc, opened 2026-09-29.** Stage letters
-> are **B** (boxes; D and R are taken by the LLM and speech archives). When
-> the vertical closes, this file is frozen to `research/detection-vertical.md`
-> like the others and `TODO.md` gets the one-line summary. Until then: tick a
+> are **B** (boxes; D and R are taken by the LLM and speech archives). It is
+> updated here in place; when the vertical closes, it is frozen in place and
+> [`README.md`](README.md)'s index marks it closed. Long stage write-ups go in `b*.md` files beside it. Until then: tick a
 > stage when its gate passes, put its measured numbers under it, and keep
 > **§ Handoff** at the bottom current. A new session should be able to start
 > from there.

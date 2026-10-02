@@ -2,15 +2,14 @@
 
 > **Moved to `research/` on 2026-10-02** — this was `VIDEO.md` at the repo
 > root, and code comments citing `VIDEO.md` resolve here. The vertical is **not closed** (M11's performance work is
-> open): [`../TODO.md`](../TODO.md) carries it in summary, and § Handoff below
-> is still where a session resumes. The M11 performance stages are broken
+> open):
+> § Handoff below is where a session resumes, and it carries the open items. The M11 performance stages are broken
 > out into `m11*.md` files beside this one; the bring-up (M0–M10) stays
 > here. M-stages, decisions and M-o numbers still resolve here.
 
 > **Live tracking and session handoff doc, opened 2026-09-26.** Stage letters
 > are **M** (for MiniMax; `H` would read as the model's own name). When the
-> vertical closes, this file is frozen to `research/video-vertical.md` like
-> the others and `TODO.md` gets the one-line summary. Until then: tick a
+> vertical closes, this file is frozen in place and [`README.md`](README.md)'s index marks it closed. Until then: tick a
 > stage when its gate passes, put its measured numbers under it, and keep
 > **§ Handoff** at the bottom current. A new session should be able to start
 > from there.

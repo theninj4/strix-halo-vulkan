@@ -3,7 +3,7 @@
      Cited from TODO.md, backend/llm.go, cmd/serve/main.go,
      shaders/llm_moe_gemm.comp and llm/gpu_moe.go. -->
 
-[← TODO.md](../TODO.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L5b](l5b-moe-gpu.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md)
+[← LLM plan](llm-plan.md) · [research index](README.md) · [L2a](l2a-prefill-attribution.md) · [L5b](l5b-moe-gpu.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md)
 
 # P11 — prefill: the batch was the biggest number in the file, and the padding was not
 

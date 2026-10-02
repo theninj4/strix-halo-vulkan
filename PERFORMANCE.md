@@ -62,7 +62,7 @@ OpenAI-shaped API ([`research/api-server.md`](research/api-server.md)).
 | prefill at 128k context | 1011 tok/s at ubatch 2048, **1176 at the served 4096** | P17 |
 | decode at 128k context | 31.5–32.2 tok/s (0.94x of depth 0)¹ | P16/P17 |
 | full trained context | **262 144 cells** served; a 237k-token prompt prefills at 1022 tok/s and decodes at 29.9 tok/s | P18 |
-| concurrency | 3 full-context slots; batched decode of 3 conversations **56.2 tok/s aggregate** (1.64x one slot) | [`CONCURRENCY.md`](CONCURRENCY.md) C5 |
+| concurrency | 3 full-context slots; batched decode of 3 conversations **56.2 tok/s aggregate** (1.64x one slot) | [`research/concurrency.md`](research/concurrency.md) C5 |
 | quality | wikitext perplexity 4.0992, **+1.74%** of our own unquantised 4.0289; 4.0344 over positions 131k–262k | P4c, P18 |
 | footprint | ~84–98 GB resident (whole machine A) | |
 
@@ -139,7 +139,7 @@ prefix cache, bit-identically. Concurrent requests share passes, at ~29
 req/s against 19.5. Results are within 4e-4 of Kev's fp32 probabilities.
 **Kev's published accuracy is reproduced**: fp16 is within a question of
 the card on every suite, and int8 costs −0.19 pp.
-([`CLASSIFICATION.md`](CLASSIFICATION.md))
+([`research/classification-vertical.md`](research/classification-vertical.md))
 
 ### OCR: PaddleOCR-VL-1.6 + PP-DocLayoutV3
 
@@ -151,7 +151,7 @@ worst page 143 → 18 s. ([`research/ocr-vertical.md`](research/ocr-vertical.md)
 
 ### Object detection: RF-DETR-L
 
-Planned only (B-stages, [`OBJ-DETECTION.md`](OBJ-DETECTION.md)). No
+Planned only (B-stages, [`research/detection-vertical.md`](research/detection-vertical.md)). No
 numbers yet.
 
 ## 3. Serving the whole set
@@ -160,4 +160,4 @@ Deployment uses two machines: the LLM alone on one, everything else on the
 other. Image, music and video share one swap slot that sits at **9.4 GB
 at rest and peaks at 60 GB**, against ~112 GB with all three resident. A
 switch costs ~19–30 s, and speech is answered through every load
-([`TODO.md`](TODO.md), [`research/api-residency.md`](research/api-residency.md)).
+([`research/api-residency.md`](research/api-residency.md)).

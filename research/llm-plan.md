@@ -1,303 +1,26 @@
-# TODO — the state of play
+# LLM — the live plan and open items (qwen3.8-flash-next)
 
-> **Rewritten 2026-09-21.** The per-vertical progress files were
-> consolidated into [`research/`](research/README.md) on 2026-09-20 (`LLM.md`,
-> `LLM2.md`, `SPEECH.md`, `TTS.md`, `IMAGE.md`, `PIPELINE.md`,
-> `EMBEDDING.md`, `IDEAS.md` and the old session-log `TODO.md`) — see the
-> file map at the bottom. The root `IMAGE.md` then came back live for one day
-> to carry the Qwen-Image-2.1 replacement, and was frozen in turn on
-> **2026-09-21** as
-> [`research/qimage-vertical.md`](research/qimage-vertical.md). **No live
-> progress file remains at the root**: this one is it — what each vertical
-> is, what it measures today, and what is open. It is **rewritten**, not
-> appended to; a closed item's write-up goes to `research/` and history
-> lives in git.
->
-> Addresses: `§N.M` (cited from code) resolves in
-> [`research/ideas.md`](research/ideas.md); stage letters (L7d, T9, S10,
-> Q9b, E7, P6…) resolve in the vertical archives listed at the bottom;
-> decisions **D1–D21** are in
-> [`research/llm-vertical.md`](research/llm-vertical.md). A code comment
-> citing `MUSIC.md` (A-stages) resolves in
-> [`research/music-vertical.md`](research/music-vertical.md). A code comment
-> citing `IMAGE.md` resolves by what follows it: **Q-stages, numbered
-> decisions and Q-o numbers** are `research/qimage-vertical.md`, **I-stages**
-> are `research/zimage-vertical.md`. `GOALS.md` is the target; [`research/api-server.md`](research/api-server.md)
-> documents the server as it answers today.
+> **Opened 2026-10-02, when the root `TODO.md` was retired.** This is the
+> text vertical's live state of play: the decode plan (P19–P25), the open
+> items, and the instrument rules. It was `TODO.md`'s "Text generation"
+> section, moved whole; code comments citing `TODO.md` with a **P-stage**
+> (P20f, P21a, P22b, P22c, P21d …) resolve here. The closing record of
+> L0–L9a, P0–P5c and decisions **D1–D21** is
+> [`llm-vertical.md`](llm-vertical.md); each closed P-stage's write-up is its
+> own `p*.md` file. Batched throughput is
+> [`concurrency.md`](concurrency.md), image input
+> [`llm-vision.md`](llm-vision.md). Rewrite this file rather than append to
+> it; a closed stage's write-up goes to its own file.
 
-## The five verticals, at a glance
+## At a glance
 
-All five of `GOALS.md`'s models run end to end in Go on Vulkan, validated
-against a reference, and are served by `cmd/serve`. The competition from
-here is our own ceiling, not a reference implementation.
+| | |
+|---|---|
+| model | qwen3.8-flash-next (180 B, 6 B active) |
+| headline, measured | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **P25 (2026-10-01): heads-on-rows by the share of a chunk past the selection width, not by where it starts — 8192 from cell zero 1519/1523 → 1606/1601 tok/s (1.054x), 2048 and 4096 unmoved; the ladder today 1568 / 1599 / 1604 at 2048 / 4096 / 8192**; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** |
+| open | **token generation is the focus from 2026-09-30: P19–P24 in the text section; P19 and P21a done the same day (the step attributed: 16.4 / 4.3 / 3.0 / 1.1 ms; the head and `hc.up` — the two projections still on the padded GEMM at one row — moved to GEMVs, 37.5 → 38.7 tok/s at 25.8 ms a step; P21b's load hoisting measured dead; P22a the shared expert as the eleventh tile of the routed MoE dispatch, 38.8 → 39.2 tok/s at 25.5 ms; P21c the MoE down GEMV's five serial round trips a lane hoisted and A staged sixteen bytes a load, 39.1 → 39.8 tok/s at 25.13 ms, both down rungs re-laddered and confirmed), next the rest of P22, speculation re-priced at 1.23 steps a two-row pass**; concurrency and batching (P6, now [`research/concurrency.md`](concurrency.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step; the 196 moves went in P22b (2026-09-30, 196 → 4 and no zero rows at decode, 25.13 → 24.42 ms, 41.0 tok/s); **P22c + P21d (2026-10-01): the router's tail as one bit-exact dispatch and `ple.kv` — the third one-row GEMM — on the GEMV, 24.42 → 24.19 ms, 41.4 tok/s; the weightless list is a floor of launches now and P20 is next**; **P20f (2026-10-01): speculation served with `-llm-draft` — 56.8 tok/s greedy and 50.1 sampled through the server against 41.1 (1.38x / 1.22x, SPEED-Bench), and the sampler's 2 ms a token gone**; **P20g (2026-10-01): speculative sampling — sampled requests (no seed) 49.2 → 56.6 tok/s served, 1.38x, the greedy rate**; **P20h (2026-10-01): depth three built (four-row decode GEMVs, the ring past three rows) — 1.53x / 62.9 tok/s in `cmd/llm` against 1.49x, but 55.5 against 56.9 served (thinking text accepts less), so the default stays 2** |
 
-| vertical | model | headline, measured | open |
-|---|---|---|---|
-| text generation | qwen3.8-flash-next (180 B, 6 B active) | decode **36.0 tok/s through `-gen`, 34.2 through the server at every `-llm-batch`** (P16, against 25.8 at the shipped 4096), at **+1.74%** perplexity; prefill **1403.9 tok/s at 8192 rows, 3.59x** (and **1199 through the server** at 4096), still climbing where llama.cpp plateaus — **and 1.10–1.17x on top of that from KERNELS.md G5a (2026-09-29, §2.11): the MoE up GEMM's K loop as a software pipeline, `cmd/llm -graph` same-hour A/B 1194/1206 → 1407/1408 tok/s at 2048, 1317/1339 → 1494/1495 at 4096, 1306/1345 → 1459/1462 at 8192, and 1422 / 1506 at 2048 / 4096 with the IQ4_NL down pipeline on top (G5b)*, and **1.07x again from G5c (2026-09-30, §2.12): a short last tile an expert, same-hour A/B 1417/1419 → 1514/1513 tok/s at 2048, 1500/1502 → 1549/1543 at 4096, 1461/1467 → 1481/1483 at 8192**; and G5d (2026-09-30, §2.13, the nibble as an f16 denormal, bit-identical) (same-hour A/B 1513/1513 → 1521/1523 tok/s at 2048, 1549/1547 → 1554/1557 at 4096, 1484/1483 → 1491/1488 at 8192: a rounding of the prefill number, recorded so the next session does not re-run it); **P25 (2026-10-01): heads-on-rows by the share of a chunk past the selection width, not by where it starts — 8192 from cell zero 1519/1523 → 1606/1601 tok/s (1.054x), 2048 and 4096 unmoved; the ladder today 1568 / 1599 / 1604 at 2048 / 4096 / 8192**; **128 000 cells prefills at 1011 tok/s at ubatch 2048 and 1176 at the served 4096** (P17, against 834 and 900; falloff 0.88x), decode **32.2 tok/s at 128k** and **34.4 at depth zero** (P16/P17), falloff to 128k **0.94x** | **token generation is the focus from 2026-09-30: P19–P24 in the text section; P19 and P21a done the same day (the step attributed: 16.4 / 4.3 / 3.0 / 1.1 ms; the head and `hc.up` — the two projections still on the padded GEMM at one row — moved to GEMVs, 37.5 → 38.7 tok/s at 25.8 ms a step; P21b's load hoisting measured dead; P22a the shared expert as the eleventh tile of the routed MoE dispatch, 38.8 → 39.2 tok/s at 25.5 ms; P21c the MoE down GEMV's five serial round trips a lane hoisted and A staged sixteen bytes a load, 39.1 → 39.8 tok/s at 25.13 ms, both down rungs re-laddered and confirmed), next the rest of P22, speculation re-priced at 1.23 steps a two-row pass**; concurrency and batching (P6, now [`CONCURRENCY.md`](CONCURRENCY.md): three full-context slots, a priority scheduler, per-slot prefix checkpoints and batched decode, all done); the gathered attention at 34% of matrix-core peak with its four bounds eliminated; ~~`hc.cn` at prefill~~ (G6, §5.4: the grid's walk, 184 → 200 GB/s, prefill 1520 → 1538 tok/s at 2048 and decode 36.87 → 37.35); decode is now fusion at 1-2% a step; the 196 moves went in P22b (2026-09-30, 196 → 4 and no zero rows at decode, 25.13 → 24.42 ms, 41.0 tok/s); **P22c + P21d (2026-10-01): the router's tail as one bit-exact dispatch and `ple.kv` — the third one-row GEMM — on the GEMV, 24.42 → 24.19 ms, 41.4 tok/s; the weightless list is a floor of launches now and P20 is next**; **P20f (2026-10-01): speculation served with `-llm-draft` — 56.8 tok/s greedy and 50.1 sampled through the server against 41.1 (1.38x / 1.22x, SPEED-Bench), and the sampler's 2 ms a token gone**; **P20g (2026-10-01): speculative sampling — sampled requests (no seed) 49.2 → 56.6 tok/s served, 1.38x, the greedy rate**; **P20h (2026-10-01): depth three built (four-row decode GEMVs, the ring past three rows) — 1.53x / 62.9 tok/s in `cmd/llm` against 1.49x, but 55.5 against 56.9 served (thinking text accepts less), so the default stays 2** |
-| speech → text | parakeet-tdt-0.6b-v3 | an 11 s clip in **43 ms — 257x real time**, whole model resident | S10 front end (48% of the pipeline); S9 long clips |
-| text → speech | Kokoro-82M | **31 ms for 3.25 s (105x)**, **162 ms for 19.5 s (120x)** — flat per second of audio; the endpoint answers in 59 ms | the vocoder's 20 ms of arithmetic; three small boundaries |
-| image generation + editing | Qwen-Image-2.1 | 1024², 40 steps in **1m28.8s** (fp16; int8 +4% a step), **20.4 GB resident since Q13's int8 banks** (31.5 in fp16), native RGBA; streaming previews cost **0.3%**; the fp32 oracle's picture to mean **3.4e-4**. **Edits answer too**: **1m54.2s** on one reference at 1024², 39.4 GB, the oracle's edit to max abs **0.0014** | **parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt; KERNELS.md G4 (2026-09-30, research §3.8): the transposed attention (`h3_attn_t.comp`) on this DiT is 1.07x on the attention and 1.7% of a step, **opt-in** (`QIMAGE_ATTN_T=1`) because the edit oracle's teacher-forced prefill amplifies fp16-level differences in the prefix rows ~100x at three target rows — the kernel is exact on identical inputs at every block, a plain-family perturbation reads 1.73e-2 against the 2e-2 bound, and the call on that bound is this vertical's. **KERNELS.md G3 (2026-09-30, §2.14): w1|w3 as one GEMM whose epilogue is the SwiGLU**, bit-identical, a 1024² cached step **2044 → 1929–1968 ms** on the int8 bank (1.04–1.06x); the served binary needs a redeploy |
-| music | ACE-Step 1.5 XL turbo + 5 Hz LM 4B | a **60 s song with thinking in 14.4 s** (the int8 LM at the bus, ~80% of it), 4 min DiT-only in 9.6 s; a **30 s cover or repaint in ~2 s**; latents **2.8–39× closer to fp32 than upstream's own bf16** across text2music, cover and repaint; served as `/v1/music` jobs, ~18 GB resident in the swap slot | **closed 2026-09-27** (A0–A12); listening to the A10/A11 songs; not in `ai.service` |
-| embeddings | Qwen3-Embedding-0.6B | a text in **10.4 ms** served (9.6 on the device), the card's similarity matrix to 1.3e-4 over HTTP; **E7 batching: 32 short texts in 46 ms (8.3x), 128 of ~36 tokens in 305 ms (5.0x)**, bit-exact against a lone run, requests share passes | not deployed yet (`ai.service` restart); latency levers: fused qkv / gate+up, split-K on o/down, an int8 bank on the small-M kernels |
-| classification | Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) | TypeSafe's `/v1/systemone` via `-kev`, **within 4e-4 of Kev's fp32 probabilities**, questions isolated bit-exactly, the TypeSafe SDK unchanged; the README ticket in **52 ms** on an int8 bank (K7.1, K7.6); **Kev's published accuracy reproduced (K8): fp16 on every suite within a question of the card, fp16 agrees with Kev's fp32 except on exact ties, int8 −0.19 pp**; a repeated text from the prefix cache, bit-identically (K7.2), attention on the matrix cores (K7.3): the GDN scan in the LLM's l8 shape (K7.4), SwiGLU fused into the gate+up GEMM and a GEMM rung per projection (K7.6): a 2,269-token text 761 ms new, 87 ms again ; concurrent requests share passes (K7.5, ~29 req/s against 19.5) | live plan in root [`CLASSIFICATION.md`](CLASSIFICATION.md) (K-stages): bit-exact across batches, chunks and cache hits (K7.7: the WMMA residue was stale V padding); deployed in `ai.service` (2026-09-25); open: int8's −0.19 pp, int8 GEMM speed |
-
-**Vision (2026-09-24): the text vertical reads images.** `-llm-mmproj`
-stages the checkpoint's 27-layer vision tower beside the LLM, and all three
-chat doors take images, gated against HF (processor bit-exact, positions,
-PLE) and llama.cpp (the whole model's argmax). Live record and handoff:
-[`research/llm-vision.md`](research/llm-vision.md) (V-stages). V10's eval and video are
-open.
-
-**Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
-stereo sound** (`GOALS.md` item 7). The live plan and handoff is
-[`research/video-vertical.md`](research/video-vertical.md) (M-stages). M0–M10 and M11a are done: a prompt, and
-optionally a first and/or last keyframe (`fl2va`, M10), becomes an mp4 with
-sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
-OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
-runs (speech beside it ≤ 0.27 s). It takes **35.6 s a forward at the served
-480p** (~14 min a request) and 143 s at the trained 768p (~2 h for 50 steps).
-Deployed in `ai.service` beside the image model (2026-09-26). At rest the
-service leaves ~35 GB available (image is 49.7 GB with `-edits 3`), and
-since **M11a** a 480p request runs through the service with 15.4 GB still
-free (it was OOM-killed before): int8 banks for the encoder and
-transformer, and two host-memory fixes in `safetensors` and `serve`. Since
-**M11b** (2026-09-29) the int8 banks and AdaLN tables are
-cached in `bank-cache/` beside the checkpoint (47 GB of disk): a request's
-stagings take ~12 s instead of ~94, output byte-identical. Since **M11c**
-(2026-09-29) the attention runs transposed so P never
-goes through LDS: 1.55–1.61x on the kernel, a 480p forward 35.6 → 30.6 s,
-768p 144 → 111 s. **M11d** runs the down projection as two K passes,
-bit-identical: a 480p forward is ~29.9 s, **27.1 s** since KERNELS.md
-G2 (2026-09-29) put the GEMM on LDS-staged slabs at wave32, and **26.7 s**
-since G-o8 the same day kept that build's K tiles as a loop (research
-§2.10), both bit-identical. **M11e** runs the video VAE's
-attention on the same transposed kernel at head 64: a 480p decode 38.4 →
-37.1 s, PSNR unchanged. **M11f** priced the audio decode on the device at
-≤ 2.4 s a request (it already overlaps the video decode) and left it on
-the CPU. Open: the rest of performance
-(M11). The Context-IR stand-in (M12) is a client concern: the
-front-end rewrites prompts before it submits. M11b–M11e deployed 2026-09-29: the
-README prompt at 448×256 × 8 steps serves in 80 s (M9: 199 s). **M11g** timed
-the last stagings: the embedding table is under a second; the video VAE's
-is 8.5 s in a request (4.6 s alone, the audio decode contends). **M11h**
-(2026-09-29) assessed the headroom: a 480p forward runs at 33.5 TFLOP/s,
-80% of this machine's best kernel, so exact work has ≤ 1.25x left; the
-row chunk at 4096 is 1.04x measured (to ship); the multiples are lossy
-(step caching, block-sparse attention, a 4-step LoRA) and a product call.
-
-- [x] **Video in int8, to fit beside the image model** (2026-09-26,
-  VIDEO.md M11a). Encoder and transformer as int8 banks by default, every
-  teacher-forced step inside the released bf16 pipeline's error, no speed
-  cost. A 480p request through `ai.service` beside the image model
-  completed in 834 s with 15.4 GB free, after fixing what its first
-  attempt's OOM kill exposed: `safetensors` F32/F16 grew by `append` (5×
-  churn), and `serve` kept ~11 GB of staging garbage resident. That gave
-  every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
-
-**Kernels (reopened 2026-09-29): the matrix cores to their ceiling.** The
-project's first vertical, given its own live plan in
-[`research/kernels-vertical.md`](research/kernels-vertical.md) (G-stages). The fp16 GEMM has sat at **42.0 of
-55.5 TFLOP/s** since stage 4, the attention at 38, and every vertical since
-has ended on "the GEMMs are at their ceiling". Restated per clock (the GEMM
-runs at 2813 MHz and 137 W where the peak probe ran 2899 and 110) that is
-72–78%, against ~92% a mature library reaches on RDNA3 silicon. The shipped
-GEMM is 240 VGPRs, no spill, one K tile a loop with no prefetch; both
-head-128 attentions spill 112–126 VGPRs. The plan: pin the ceiling (G0),
-read the ISA (G1), a register-prefetch GEMM (G2), attention without spills
-and with lazy rescaling (G4), int8/Q4 fragments built in registers from the
-probed lane layout instead of through LDS (G5). `cmd/probe` (the ISA tool,
-deleted by accident 2026-09-22) is restored. **G0 and G1 done
-2026-09-29** (research §0.6, §6.5): the ceiling is the hardware's (480
-FLOP/clk/CU, flat across chains and wave size); **a video forward runs at
-2600 MHz and ~149 W**, so its ceiling is 49.9 TFLOP/s and the shipped
-GEMM is at 74% of it; **32 busy CPU threads halve the GPU clock** (a
-forward 1.67x slower; VIDEO.md M11f's mechanism). The GEMM's loop has no
-prefetch across K tiles, its rate is flat from 1 to 3+ workgroups a CU,
-and with every load an L0 hit it reaches 82–85% per clock: ~10 points
-memory, ~16 in-wave schedule. **G2 done 2026-09-29** (§2.9): the prefetch
-that fits is the K slab staged through LDS at wave32
-(`dit_gemm_wg128x256_lds_w32`), bit-identical, 74 → 80% per clock, and
-**G8 carried it to all nine hosts** the same day (it loses under ~40
-workgroups; `ace/dit` keeps the wave64 build up to 1024 rows). **G-o8
-done 2026-09-29** (§2.10): every VALU instruction costs the matrix pipe
-a clock on this part, the allocator's ~40 moves a tile were 7% of it, and
-the K tiles kept as a loop take the GEMM to **85% per clock** (H3's
-projections 43.5 TFLOP/s, a 480p forward 26.7 s), bit-identical again.
-Left in the GEMM: the barrier's lockstep, ≤ 9 points. **G3 done
-2026-09-30** (§2.14): the fp32 C store costs the matrix pipe nothing (a
-store-free control runs the same per-clock rate; its +9% is clock), the
-grid tail swings ≤ 5% past ~1300 rows, and the two H3 passes that read
-the fp32 C are the GEMM's epilogue now — v stored as the attention's
-fragment tiles, gate|up as one GEMM ending in the SwiGLU — bit-identical,
-**a 480p forward 26.2–26.3 → 25.6 s**; the served binary needs a redeploy
-(the int8 cache restages once). **Carried (G8) the same day**, every one
-bit-identical to what it replaces: the image DiT's SwiGLU (a 1024² step
-1.04–1.06x), the music DiT (a forward 1.07–1.10x: 30 s 120 → 111 ms,
-4 min 803 → 745, 10 min 2260 → 2124) and the video VAE (**a 480p decode
-34.4 → 30.0 s, 768p 64.3 → 56.0 s, 1.15x**); the speech encoders priced
-and left (2.3% of a 13.5 ms encoder). **G6 done 2026-09-30** (§5.4): the
-streaming kernels' shortfall was the dispatch grid's fast axis — the
-workgroups in flight together are neighbours along X, and where a step
-along X is a whole number of the 4 KB DRAM channel rotation they all load
-the same channels. The LLM's hyper-connection kernels walked
-stream-fastest and the DiT family's q/k packs head-fastest, bit-identical:
-`hc.norm` 183 → 217 GB/s, the packs 93–151 → 173–209, **LLM prefill 1520 →
-1538 tok/s at 2048 and decode 36.87 → 37.35 tok/s, a 480p VAE decode 29.95
-→ 27.5 s, a video forward 25.5 → 25.2 s, a 10-minute music forward 2113 →
-2050 ms, an image step 1.895 → 1.886 s**. **G4b done 2026-09-30** (§3.9):
-the transposed attention's K and V blocks fetched once by a workgroup of
-eight waves and shared through LDS, bit-identical, the default in
-`h3/dit`: the kernel 1.10x at 480p and 1.115x at 768p, **a 480p video
-forward 25.2 → 24.3 s, 768p 95.9 → 92.5 s**. Next: G7, or the rest of
-G6 (gate+norm fusion; kev, ocr and zimage unprofiled).
-
-**Music (2026-09-27): ACE-Step 1.5 XL turbo — closed the same day.** A
-caption and lyrics (or an uploaded song) become 48 kHz stereo; see the
-music section below and the archive
-[`research/music-vertical.md`](research/music-vertical.md).
-
-**OCR (opened 2026-09-27): PaddleOCR-VL-1.6** (`GOALS.md` item 10). The
-live plan and handoff is [`research/ocr-vertical.md`](research/ocr-vertical.md) (O-stages): element
-recognition first (the 0.9 B VLM behind `/v1/chat/completions`, which
-PaddleOCR's own pipeline can drive unchanged), then page parsing with
-PP-DocLayoutV3 and the glue in Go (`/v1/ocr`, Mistral's shape). O0–O10
-are done: every element case token-identical to fp32 HF, the glue PaddleX's
-byte for byte, and **OmniDocBench v1.6 on a 331-page subset: the Go
-pipeline 96.13, PaddleX's own pipeline on our engine 96.14 with the card's
-text edit (0.0326)** (card 96.34 on the full set). O11a batches a page's
-regions over a paged KV cache: the subset at the same score in 18 min
-instead of 66 (3.0 s a page mean, worst 143 → 18 s). Open: O11b (towers,
-the long tail), reading order through HF's layout port (O-o5).
-
-**Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
-[`research/api-residency.md`](research/api-residency.md)).** A request loads its vertical and unloads the
-other; `-swap-idle` (10 min) empties the slot. Served with the unit's full
-flags through image → music → video → image: 9.4 GB at rest with nothing
-staged, 60 GB at the worst moment (all three resident was ~112 GB), a switch
-costs ~25-30 s before an image and ~19 s before a song, and speech is
-answered through every load (loads take no device lock). This is what lets
-`-image -edits 3 -video -music` go back into the unit; deployed (the unit
-runs it, and the 2026-09-29 18:40 start logs the swaps).
-
-**The server** ([`research/api-server.md`](research/api-server.md)): one process, one flag per vertical, OpenAI-shaped
-(`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
-`/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant
-(`-wyoming`, byte-identical audio to the HTTP door). Everything unimplemented
-is refused with a reason, never faked.
-
-**Deployment is two machines**: the language model alone on one (~84 GB
-resident), the other four verticals on the other (image ~32 GB, the rest
-~3 GB together). `-llm` and `-image` do not fit in one 128 GB process, on
-purpose — so no footprint quantisation is planned for the small verticals.
-
-**Where the work goes next.** **P18 (2026-09-22): the full trained context.**
-The server now holds all **262 144** cells the model was trained for (it capped
-at ~148k: the KV cache shared a 4 GiB descriptor range with the arena). The
-cache has a buffer a plane. Perplexity is 4.0344 over positions 131k-262k, and
-a 237k-token prompt through HTTP recalls its first line at 1022 tok/s prefill
-and 29.9 tok/s decode. `ai.service`'s LLM line is `-llm-ctx 262144 -llm-batch 8192`
-([`research/p18-full-context.md`](research/p18-full-context.md)).
-**P17 (2026-09-22): heads on the fragment's
-rows.** A 128 000-cell prefill at ubatch 2048 goes **833.5 → 1011.4 tok/s**
-(64 000: 896.4 → 1048.6), and decode at depth gains ~2%, exactly
-([`research/p17-heads-on-rows.md`](research/p17-heads-on-rows.md)). The QSA
-selection is per token and twelve query heads share each kv head, so the
-gathered attention now puts a token's heads on the fragment's M axis and reads
-that token's 2 051 cells instead of a sixteen-token union of 7 049; the mask
-dispatch is gone. P17-2 faults the next prompt chunk's n-gram pages in while
-the current one runs (+3% at depth). At the served ubatch 4096, 128k goes
-**899.7 → 1175.7 tok/s**. The attention's depth terms are 0.14 ms of a 0.99 ms
-prefill token at 128k; what is left of the falloff is the flat floor. **Open
-for decode:** the host n-gram gather is ~1 ms of every token (16 dependent
-major faults; residency of the 29 GB table is a deployment decision), and
-its median step is 236 µs and two steps in 32 take ~8.7 ms at fixed token
-positions with ordinary fault counts, which is 75% of the line and needs a
-kernel-side trace to explain. **P17-3** takes decode's `attn.select` at 128k
-from 54.0 to 43.8 µs a layer (keys in registers, 10-bit digit, exact): decode
-at 128k 32.93 → 33.16 tok/s.
-**Long-context prompt processing is closed at
-the target.** **P14 (2026-09-22)** takes a 128 000-cell prefill from P13's
-**563.6** to **826.0 tok/s at ubatch 2048** and
-**946.1 at 8192**, which is the 900 tok/s `GOALS.md` asked for
-([`research/p14-prefill-at-depth.md`](research/p14-prefill-at-depth.md)).
-Four changes: the QSA selection runs over **block** scores with a per-block
-weight instead of the expanded per-cell tensor, which deletes a dispatch and
-1.14 GB of arena and is 13.8x on `attn.select`; the attention kernel runs over
-a **per-cell gather** — the union of a query tile's rows' selections, compacted
-— instead of over the key axis, which is 2.15x on `attn.attn` and needed the
-value plane to become cell-major first; the indexer's score moves onto the
-**matrix cores**, 2.3x; and `maxStorageBufferRange` gets an **error** instead of
-a comment, because exceeding it makes a run *faster* and wrong. Beyond that,
-each vertical's list is in its own rough order of value. The context-depth regression that
-stood at the head of this list is **closed** — **P7**, **P8**, **P9** and **P10**, all
-2026-09-21, take decode at 64k from **4.05 to 27.69 tok/s (6.8x)** and the
-falloff from depth zero from **6.9x down to 1.3x down** (0.14x → 0.79x of the
-depth-zero rate). P7 was three kernels that walked the *cache* rather than
-the *context* plus a QSA selection that was a mask and never a skip
-([`research/p7-context-depth.md`](research/p7-context-depth.md)); **P8, P9 and P10
-are one finding**
-([`research/p8-decode-attention-split.md`](research/p8-decode-attention-split.md))
-— **at decode this model's kernels are single waves that all fit on the
-device at once, so a dispatch costs one wave's serial walk and neither its
-traffic nor its total work.** The probe: cutting the attention grid from 24
-workgroups to 2, a twelfth of both, measured **1.00x at every depth**. P8
-splits the attention's key axis across workgroups, P9 unpins the indexer —
-which was scoring the whole context on one compute unit of forty — and P10
-widens the selection, the one kernel that cannot be split at all because its
-radix passes are a reduction, from four waves to sixteen.
-
-**P16 (2026-09-22): the wide batch never cost decode anything.** Decode is
-**1.16x at every depth** — 29.73 → **34.4 tok/s** at depth zero and 27.20 →
-**31.5** at 128 000 cells, ubatch 2048 — and through the server it is **34.2
-tok/s at `-llm-batch` 2048, 4096 and 8192 alike**, where P12-7 measured 28.04
-and 25.81 ([`research/p16-decode-arena-width.md`](research/p16-decode-arena-width.md)).
-The cost P12-7 and P15 priced for a wide batch, and could not explain, was
-**`DeltaNetGPU.InPort` and `AttnGPU.InPort` advertising the arena's rows**:
-every decode step zero-filled the whole prefill arena of both blocks' A
-operand, once a layer, and the qkv projection after each move stalled behind
-the writes draining. `cmd/llm -depth -ubatch` found it by staging wide arenas
-and prefilling narrow — the cost followed the arena, not the prefill — and the
-per-label diff put all of it on `move`, `dn.qkv` and `attn.qkv`. The port now
-pads to the row block, as the MoE's always did, and
-`TestInPortPadsTheRunNotTheArena` asserts it, because the old padding was
-*correct* and no tolerance could see it. Two smaller exact changes ride along:
-**`hc.cn` is a workgroup a (token, stream) again at ≤ 64 rows** (25.0 → 7.0 µs,
-1.06x of a token — P11's workgroup a token is one workgroup on forty CUs at
-decode), and **`attn.select`'s emit walks blocks rather than cells** (68 → 55
-µs at 128k). `-llm-batch` stays 4096; 8192 is now purely a memory decision.
-
-**Decode's side of the depth question is now closed too. P15 (2026-09-22)**
-takes a decode step at 128 000 cells from **22.58 to 27.20 tok/s** and the
-falloff from depth zero from **0.76x to 0.91x**, with prefill and depth-zero
-decode flat as the controls
-([`research/p15-decode-at-depth.md`](research/p15-decode-at-depth.md)). Three
-changes, and the largest was not on the device: **`PLERows` hashed the whole
-sequence on every token** to use sixteen of its rows, which at 128k is 8.2 MB
-allocated and 2.05 M rows per step — **5.18 ms of a 44.3 ms token and 39% of
-the whole falloff**, deleted exactly by `PLERowsFrom`. Then **`attn.score`
-was striped sixteen ways on a forty-CU device**: P9 unpinned it and stopped at
-16, the stripe is a grid and not a reduction, and 64 is **2.61x** (211.6 → 80.9
-µs) and better at *every* depth. And **the gather and the split compose, which
-P14 said they would not** — that argument is right about the gather alone and
-is measured (unsplit gather 986.7 µs against the split's 419.8), but the two
-cut different things: the split is 7.12x on the *walk* and the gather 2.99x on
-the *work*, so `GATHER`+`SPLITK` together is **3.23x** (419.8 → 129.9). A
-decode tile is one real row, so the union that costs prefill 4.9x costs decode
-nothing. It turns on at `2*selWidth` **live** cells, which makes it the first
-decode knob that is a function of the depth — so P1c's prerecorded buffer now
-carries an epoch and re-records the one step that crosses. The refusal:
-**the arenas' HOST_CACHED memory type costs the kernels nothing** even at the
-3.85 GB the KV planes now put in that buffer — every kernel within 1% under
-`LLM_ARENA_UNCACHED=1` while host glue moves 29x — which confirms L6b at the
-new scale and spends a third hypothesis for `hc.cn`. After that the two capability
-gaps are P6 batching (blocked on a product question: will the API serve more
-than one stream?) and E7's batched embeddings, worth up to 10x on short
-texts; the largest single-vertical percent is S10, the speech front end at
-48% of its pipeline.
-
----
-
-## Text generation (archive: [`research/llm-vertical.md`](research/llm-vertical.md), review: [`research/llm-review.md`](research/llm-review.md))
+## State of play
 
 **Where it stands.** Phases 1 and 2 are done on both axes and every P-stage
 through P5 is closed. The shipped configuration is **D19 + D20 + D21**
@@ -309,7 +32,7 @@ prefill **1207.7 tok/s at ubatch 2048 and 1403.9 at 8192** (P11, P12). Served wi
 prefix reuse; a second turn extends the graph's state rather than
 re-prefilling.
 
-**Speculation (P5) is built, lossless, and parked at 0.95x.** The rollback
+**Speculation (P5) was built, lossless, and parked at 0.95x** (superseded: P20 below takes it to 1.48x and serves it). The rollback
 costs nothing when off. What would take it past 1.0, in order: the draft
 head's **acceptance on a real workload** — 65.6% on prose against a
 break-even of ~0.72; measure chat/code with the observer
@@ -345,7 +68,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
 ~1–2 ms of host, mostly the n-gram gather. The stages, in order:
 
 - [x] **P19 — re-attribute the decode step.** **Done 2026-09-30**
-  ([write-up](research/p19-decode-attribution.md)). A step is **26.66 ms**
+  ([write-up](p19-decode-attribution.md)). A step is **26.66 ms**
   (37.5 tok/s, two runs 0.15% apart, every label within 0.014 ms): **16.4
   ms of weights at 242 GB/s, 4.3 ms of streams under the bus (against 227),
   3.0 ms of weightless dispatches, 1.1 ms of host** — the reconstruction
@@ -380,7 +103,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   `hc.down` +0.23 — for 60–72 VGPRs against 48 and a branch-free record
   decode at 800 MHz; removed. The four big GEMVs are not load-bound.
 - [ ] **P20 — speculation, re-planned 2026-10-01 against llama.cpp's MTP**
-  ([research/p20-llamacpp-mtp.md](research/p20-llamacpp-mtp.md)). The only
+  ([research/p20-llamacpp-mtp.md](p20-llamacpp-mtp.md)). The only
   lever with a multiple, parked at 0.95x (P5c). llama.cpp PR 29761 (open,
   2026-09-30) implements the same head with **P5a's wiring exactly** and
   reads **1.55x on a DGX Spark at `--spec-draft-n-max 3`**: 28.36 → 43.88
@@ -389,7 +112,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   ≈1.9 steps. Four things in its loop differ from ours, and one of the four
   is a defect here:
   - **Done 2026-10-01: P20a and P20d's first half** ([§6 of the
-    note](research/p20-llamacpp-mtp.md)). The draft is primed over the
+    note](p20-llamacpp-mtp.md)). The draft is primed over the
     prompt from `Graph.ForwardResidual` and catches up one owed cell a
     round (`Speculator.CatchUp`, `SPEC_CATCHUP=0` the control); `eh_proj`
     runs on the device and the draft step is one submit (`MTPHead.eh`,
@@ -401,7 +124,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     count for count the host path's. Spec leaves plain at one near-tie a
     run (two-row rounding; recorded, not fixed).
   - **Done 2026-10-01: P20c at depth one** ([§7 of the
-    note](research/p20-llamacpp-mtp.md)). Row 0 of a pass is always
+    note](p20-llamacpp-mtp.md)). Row 0 of a pass is always
     committed, so the pass also folds row 0 alone into the slots it *read*
     (the scan's in-place store of S after token 0, the ring write's row 0
     into `SEQ_HIST_PREV`; flag `SEQ_KEEP_FIRST` = `ldaLo`), and a rejection
@@ -430,7 +153,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     buffer). Gate: the loop's acceptance on a teacher-forced sequence equals
     the observer's count for count.
   - **Done 2026-10-01: P20b — depth two built, measured, not adopted**
-    ([§8](research/p20-llamacpp-mtp.md)). Keep-any-prefix up to three rows
+    ([§8](p20-llamacpp-mtp.md)). Keep-any-prefix up to three rows
     (`GraphOpts.SpecRows`, mid slots, `Graph.Keep(k)`,
     `Speculator.Depth` / `-spec-depth`, `SPEC_TRACE`), gate bit-exact with
     a mid-slot sabotage that fails. **Depth 2: short 1.11x against depth
@@ -440,7 +163,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     draft's lm head (2 of 3.7 ms) over a trimmed frequent vocabulary
     (FR-Spec) — price its acceptance on `-mtp` first; then P20e.
   - **Done 2026-10-01: the draft's lm head over a vocabulary prefix**
-    ([§9](research/p20-llamacpp-mtp.md)): the draft proposes from the first
+    ([§9](p20-llamacpp-mtp.md)): the draft proposes from the first
     65 536 ids (BPE id order covers 96.6% of wikitext, 98.3% of Go; counted
     wikitext frequencies fail on code), and `HeadGPU.RunCols` runs the
     trunk's own head GEMV over K/16 tiles — no new weights or kernel
@@ -448,7 +171,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     1.19x → 1.24x (51.93 tok/s), long 1.31x → 1.32x (55.14)**; acceptance
     count for count the host-cut pricing. `SPEC_DRAFT_VOCAB=0` the control.
     Next P20e (SPEED-Bench, the number to quote), and serving the loop.
-  - **Done 2026-10-01: P20e — SPEED-Bench** ([§10](research/p20-llamacpp-mtp.md)):
+  - **Done 2026-10-01: P20e — SPEED-Bench** ([§10](p20-llamacpp-mtp.md)):
     20 complete single-turn prompts (coding/multilingual/qa/rag/writing ×
     4; most of the split is placeholder rows), chat template, 1024 tokens,
     two passes (`cmd/llm -spec -spec-set models/speed-bench/qualitative-20.jsonl`).
@@ -460,7 +183,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     serving the loop** (the server does not speculate; `GraphOpts.Slots`
     and `Speculative` share the slot index), then depth 3 (~+5%, needs a
     four-row pass and a ring past three rows).
-  - **Done 2026-10-01: P20f — the loop served** ([§11](research/p20-llamacpp-mtp.md)):
+  - **Done 2026-10-01: P20f — the loop served** ([§11](p20-llamacpp-mtp.md)):
     `serve -llm-draft <mtp gguf>` (`-llm-spec-depth`, default 2). Sequence
     slots and speculation planes compose — the DeltaNet and PLE blocks index
     (sequence, plane), a batched row reads its sequence's committed plane
@@ -481,7 +204,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     row): one-pass top-k, plain sampled 37.93 → 41.06, the same texts.
     ~+5 GB on the deployed LLM line. **Next:** priming on the device, depth
     3, acceptance on thinking text.
-  - **Done 2026-10-01: P20g — speculative sampling** ([§12](research/p20-llamacpp-mtp.md)):
+  - **Done 2026-10-01: P20g — speculative sampling** ([§12](p20-llamacpp-mtp.md)):
     a sampled request's draft *samples* its proposal from its own row through
     the request's cuts (`Sampler.DraftSampler`/`Propose`) and the trunk keeps
     it with probability min(1, p/q), else draws from max(0, p − q)
@@ -493,7 +216,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
     **Served, SPEED-Bench 20, default sampling: 41.1 → 49.2 (argmax
     proposal) → 56.6 tok/s, 1.38x**, 2.36 tokens a round, which is greedy's.
     **Next:** priming on the device, depth 3, acceptance on thinking text.
-  - **Done 2026-10-01: P20h — depth three** ([§13](research/p20-llamacpp-mtp.md)):
+  - **Done 2026-10-01: P20h — depth three** ([§13](p20-llamacpp-mtp.md)):
     priced first with `SPEC_PROBE` (an uncounted probe draft a round, from
     a depth-2 run: a₃|a₂ 0.837). Then built: `GEMVMaxRows`/`MAXROWS` 4 in the
     five decode GEMVs (one row unchanged, 24.17 → 23.93 ms over three pairs),
@@ -556,7 +279,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   slab's loads together is slower on the big grids). ~~P21a `hc.up`~~ done
   (above, +0.44 ms). ~~Left: **P21c `moe.down` (174 GB/s, +0.6 ms) and
   `hc.down` (162, +0.4)**~~ — **P21c done 2026-09-30** ([Finding
-  5](research/p19-decode-attribution.md)): both rungs re-laddered in the
+  5](p19-decode-attribution.md)): both rungs re-laddered in the
   whole model (`LLM_MOE_DECODE_PLAN`, `LLM_HC_DOWN_SLABS`) and the shipped
   ones confirmed (v16w4; 32 slabs, with 40 D12's whole multiple at 1.9x and
   160 losing on its reduce); the ISA showed `moe.down`'s lane as five serial
@@ -569,7 +292,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   The same treatment on the up mode's quad loop measured +1.5 µs and was
   reverted (P21b a third time). `hc.down`'s 0.4 ms has no idea left; the
   shared expert's two dispatches are P22a's eleventh tile. **P21d done
-  2026-10-01** ([Finding 8](research/p19-decode-attribution.md)): `ple.kv`
+  2026-10-01** ([Finding 8](p19-decode-attribution.md)): `ple.kv`
   was the third projection still on the padded GEMM at one row — the PLE's
   [2560 × 12800] int8 key/value projection, 35 MB at 127 GB/s — and runs on
   `llm_gemv.comp`'s eight-slab rung at one to three rows (`PLEGPU.gemvFor`,
@@ -587,7 +310,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   G3's epilogue pattern (a norm, gate or combine folded into the kernel that
   produces its input) and L6c's single arena, which deletes the moves.
   ~~And **the shared expert as an eleventh tile of `moe.up`**~~ — **P22a
-  done 2026-09-30** ([Finding 4](research/p19-decode-attribution.md)):
+  done 2026-09-30** ([Finding 4](p19-decode-attribution.md)):
   `llm_moe_gemv.comp` carries the shared expert as one tile past the routed
   schedule wherever its bank is the routed bank's format (47 of 48 layers'
   up on the shipped plan; layer 2 is Q5_K and the shared down is Q5_1
@@ -599,14 +322,14 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   rate. The down half is priced at ~0.15 ms more (25.31 with
   `down_shexp=iq4_nl`) and waits on P24's eval of that width. Check every
   re-gridded kernel at `rows == 1` (P16's `hc.cn` lesson). **A fold-order
-  bug found and fixed the same night** ([postscript](research/p19-decode-attribution.md)):
+  bug found and fixed the same night** ([postscript](p19-decode-attribution.md)):
   with the up split and the down folded — the checkpoint's own formats,
   never the shipped plan — the folded shared-down tile read the shared
   swiglu rows before the split `shexp.up` had written them (a decode step
   0.137 rms wrong on the default banks). `shexp.up` is recorded before the
   routed down now and `TestMoEGPUSharedFold` runs the mixed arm.
   ~~**The 196 moves**~~ — **P22b done 2026-09-30** ([Finding
-  6](research/p19-decode-attribution.md)): deleted at the boundary rather
+  6](p19-decode-attribution.md)): deleted at the boundary rather
   than with L6c's shared arena. The kernel on either side binds the other
   block's arena at binding 11 (`HCLink`, a pipeline per foreign buffer as
   the mover had): `cn`/`combine` read a sublayer's output where it lies at
@@ -626,7 +349,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   **25.13 → 24.42 ms, 39.8 → 41.0 tok/s** in all
   (`results/p22b_link_*.csv`).
   ~~The epilogue fusions~~ — **P22c done 2026-10-01** ([Finding
-  7](research/p19-decode-attribution.md)): which small dispatch folds into a
+  7](p19-decode-attribution.md)): which small dispatch folds into a
   neighbour is decided by the neighbour's parallelism, and `hc.cn` (one
   workgroup a stream, 2560 values in registers) would read the combine's
   eleven rows or a reduce's 32 slabs four times over on one CU each, so the
@@ -655,7 +378,7 @@ stream no weight (898 of 1431 are under 12 µs; the 196 moves are 0.54), and
   +1.74% may no longer separate plans; fp16 DeltaNet state (+~1.3 of
   ceiling) is graded by the same instrument.
 - [x] **P25 — prefill: which gathered build a chunk takes.** **Done
-  2026-10-01** ([write-up](research/p25-prefill-heads-rule.md)). P17 took the
+  2026-10-01** ([write-up](p25-prefill-heads-rule.md)). P17 took the
   heads-on-rows attention only for a chunk that *starts* past the selection
   width (2051), so every first chunk of a prompt ran the token-row union
   kernel, and at the served `-llm-batch 8192` three quarters of its rows are
@@ -691,7 +414,7 @@ is launches and small streams no fusion left on the list recovers. P21–P23
 together were priced at 38.7 → 42 tok/s and have delivered 41.4; only P20
 reaches the 46–56 range, and P19 re-priced its two-row pass at 1.23 steps
 (break-even 23% acceptance for a free draft). Batched throughput
-(65 tok/s at three rows) keeps its own list in CONCURRENCY.md *Next*. The
+(65 tok/s at three rows) keeps its own list in [`research/concurrency.md`](concurrency.md) *Next*. The
 instrument rules at the end of this section apply to every number: a
 same-hour control, the shipped banks and `LLM_BANK_CACHE`, nothing else on
 the machine.
@@ -700,7 +423,7 @@ the machine.
 are folded into P19–P24 above):
 
 - ~~**Prompt processing.**~~ **P11, closed 2026-09-21**
-  ([write-up](research/p11-prefill.md)). Two changes and three measured
+  ([write-up](p11-prefill.md)). Two changes and three measured
   refusals. **The server prefilled in 512-token chunks and 512 is the worst
   rung this graph has**: llama.cpp plateaus at its best ubatch and this one
   does not, because the MoE's arithmetic intensity is the *routing's* — at 512
@@ -733,7 +456,7 @@ are folded into P19–P24 above):
   unrolled cooperative-matrix loop costs more than the work it removes**; change
   the loop's granularity, not what happens inside it.
 - ~~**The attention row max, `attn.select`, `hc.cn`, the MoE unpack.**~~
-  **P12, closed 2026-09-21** ([write-up](research/p12-prefill-round-two.md)).
+  **P12, closed 2026-09-21** ([write-up](p12-prefill-round-two.md)).
   Two changes and four measured refusals; prefill **1.012-1.025x on both
   axes** (1191.2 → **1207.7** at 2048 rows, 1370.5 → **1403.9** at 8192 —
   **3.59x** llama.cpp — and 651.3 → **667.7** at 64 000 cells), both passes of
@@ -789,14 +512,14 @@ are folded into P19–P24 above):
   128-byte line costs more to reach. That is a locality question and not a work
   one, and nothing in this vertical has asked it yet.
 - ~~**Why 1.5 GB of arenas a decode step never reads costs it 8%.**~~ **P16,
-  closed 2026-09-22** ([write-up](research/p16-decode-arena-width.md)). It was
+  closed 2026-09-22** ([write-up](p16-decode-arena-width.md)). It was
   not the memory: the block input ports padded a decode step's one row out to
   the arena, so a wider arena was more zeros written a layer. At an 8192 arena
   decode goes 23.55 → 33.87 tok/s; through the server decode is 34.2 at every
   batch. What remains between an 8192 and a 2048 sweep is depth — the wider
   prefill leaves a deeper cache — not width.
 - ~~**Prompt processing at 128k.**~~ **P13, closed 2026-09-22**
-  ([write-up](research/p13-long-context-prefill.md)). Two changes and one
+  ([write-up](p13-long-context-prefill.md)). Two changes and one
   refusal. **128 000 cells completes**: `batchFor(rows)` was P0's fit and
   every measurement behind it was taken from cell zero, so at 64 000 cells a
   2048-row pass already held the ring for 1.53 s of the 2 s cliff while the
@@ -824,7 +547,7 @@ are folded into P19–P24 above):
   per-cell gather both want it.
 - ~~**`attn.select` and `attn.expand` are 0.284 ms a token at 128 000 cells.**~~
   ~~**The gather.**~~ **Both closed by P14, 2026-09-22**
-  ([write-up](research/p14-prefill-at-depth.md)). Four changes and four measured
+  ([write-up](p14-prefill-at-depth.md)). Four changes and four measured
   refusals; **128 000 cells prefills at 826.0 tok/s at ubatch 2048 and
   946.1 at 8192**, against P13's 563.6, with the falloff from depth
   zero **0.50x → 0.72x** and decode unmoved as the control.
@@ -892,7 +615,7 @@ are folded into P19–P24 above):
   same DRAM channels; walked stream-fastest `hc.cn` is at 200 GB/s and
   `hc.norm` at 217, bit-identical.
 - **P6 — batching. Unblocked 2026-09-23 and moved to
-  [`CONCURRENCY.md`](CONCURRENCY.md)**: the answer is three concurrent
+  [`research/concurrency.md`](concurrency.md)**: the answer is three concurrent
   streams with a priority lane for voice. C1 (sequence slots), C2 (the
   scheduler, `-llm-slots`), C0 (`cmd/loadgen`), C3 (chunk curve) and C4
   (per-slot checkpoints: a voice command's TTFT goes 1.83 → 0.19 s at 48
@@ -907,7 +630,7 @@ are folded into P19–P24 above):
   its rung in `TestGraphIsAChunkSplit` — R rows were correct in a block test
   and wrong in the model three separate ways (P5c).
 - ~~**Context depth is the largest measured regression.**~~ **P7, closed
-  2026-09-21** ([write-up](research/p7-context-depth.md)). It was two terms
+  2026-09-21** ([write-up](p7-context-depth.md)). It was two terms
   and neither was the selection's width. **Three kernels walked `nKV`, the
   cells the arenas were *allocated* for, instead of the cells that exist** —
   `llm_attn_score.comp` scoring every pooled block, `llm_attn_select.comp`
@@ -1001,287 +724,113 @@ edits need `go generate` before measuring); benchmarks need
 `LLM_BANK_CACHE` set or a shipped-bank run re-fits for 8 minutes
 (`cmd/serve` sets it, `cmd/llm` does not).
 
-## Speech → text (archive: [`research/speech-vertical.md`](research/speech-vertical.md))
+## How decode and prefill got here (P7–P18)
 
-**Where it stands.** S1–S8 done: front end 21 ms + encoder 17 + decode 5 =
-43 ms for jfk.wav, transcript exact, word/segment timings from the model's
-own TDT durations, served at `/v1/audio/transcriptions` and over Wyoming
-(with resampling at that door only).
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.* This was the head of its "where the work goes next" section, kept
+because it explains the regime the P19–P25 plan starts from; the full
+write-ups are the `p7`–`p18` files.
 
-**Open:**
+**Where the work goes next.** **P18 (2026-09-22): the full trained context.**
+The server now holds all **262 144** cells the model was trained for (it capped
+at ~148k: the KV cache shared a 4 GiB descriptor range with the arena). The
+cache has a buffer a plane. Perplexity is 4.0344 over positions 131k-262k, and
+a 237k-token prompt through HTTP recalls its first line at 1022 tok/s prefill
+and 29.9 tok/s decode. `ai.service`'s LLM line is `-llm-ctx 262144 -llm-batch 8192`
+([`research/p18-full-context.md`](p18-full-context.md)).
+**P17 (2026-09-22): heads on the fragment's
+rows.** A 128 000-cell prefill at ubatch 2048 goes **833.5 → 1011.4 tok/s**
+(64 000: 896.4 → 1048.6), and decode at depth gains ~2%, exactly
+([`research/p17-heads-on-rows.md`](p17-heads-on-rows.md)). The QSA
+selection is per token and twelve query heads share each kv head, so the
+gathered attention now puts a token's heads on the fragment's M axis and reads
+that token's 2 051 cells instead of a sixteen-token union of 7 049; the mask
+dispatch is gone. P17-2 faults the next prompt chunk's n-gram pages in while
+the current one runs (+3% at depth). At the served ubatch 4096, 128k goes
+**899.7 → 1175.7 tok/s**. The attention's depth terms are 0.14 ms of a 0.99 ms
+prefill token at 128k; what is left of the falloff is the flat floor. **Open
+for decode:** the host n-gram gather is ~1 ms of every token (16 dependent
+major faults; residency of the 29 GB table is a deployment decision), and
+its median step is 236 µs and two steps in 32 take ~8.7 ms at fixed token
+positions with ordinary fault counts, which is 75% of the line and needs a
+kernel-side trace to explain. **P17-3** takes decode's `attn.select` at 128k
+from 54.0 to 43.8 µs a layer (keys in registers, 10-bit digit, exact): decode
+at 128k 32.93 → 33.16 tok/s.
+**Long-context prompt processing is closed at
+the target.** **P14 (2026-09-22)** takes a 128 000-cell prefill from P13's
+**563.6** to **826.0 tok/s at ubatch 2048** and
+**946.1 at 8192**, which is the 900 tok/s `GOALS.md` asked for
+([`research/p14-prefill-at-depth.md`](p14-prefill-at-depth.md)).
+Four changes: the QSA selection runs over **block** scores with a per-block
+weight instead of the expanded per-cell tensor, which deletes a dispatch and
+1.14 GB of arena and is 13.8x on `attn.select`; the attention kernel runs over
+a **per-cell gather** — the union of a query tile's rows' selections, compacted
+— instead of over the key axis, which is 2.15x on `attn.attn` and needed the
+value plane to become cell-major first; the indexer's score moves onto the
+**matrix cores**, 2.3x; and `maxStorageBufferRange` gets an **error** instead of
+a comment, because exceeding it makes a run *faster* and wrong. Beyond that,
+each vertical's list is in its own rough order of value. The context-depth regression that
+stood at the head of this list is **closed** — **P7**, **P8**, **P9** and **P10**, all
+2026-09-21, take decode at 64k from **4.05 to 27.69 tok/s (6.8x)** and the
+falloff from depth zero from **6.9x down to 1.3x down** (0.14x → 0.79x of the
+depth-zero rate). P7 was three kernels that walked the *cache* rather than
+the *context* plus a QSA selection that was a mask and never a skip
+([`research/p7-context-depth.md`](p7-context-depth.md)); **P8, P9 and P10
+are one finding**
+([`research/p8-decode-attention-split.md`](p8-decode-attention-split.md))
+— **at decode this model's kernels are single waves that all fit on the
+device at once, so a dispatch costs one wave's serial walk and neither its
+traffic nor its total work.** The probe: cutting the attention grid from 24
+workgroups to 2, a twelfth of both, measured **1.00x at every depth**. P8
+splits the attention's key axis across workgroups, P9 unpins the indexer —
+which was scoring the whole context on one compute unit of forty — and P10
+widens the selection, the one kernel that cannot be split at all because its
+radix passes are a reduction, from four waves to sixteen.
 
-- **S10 — the front end is 48% of the pipeline**: a few thousand 512-point
-  float64 FFTs on the host. Either a float32 radix-4 on the host or the
-  STFT + mel filterbank as two dispatches (the filterbank is a
-  `[T, 257] x [257, 128]` GEMM; `kokoro_istft.comp` is the worked inverse).
-- **The submit+fence is 38% of an emission** (40 µs of 105 per token). A
-  persistent kernel — which is also what streaming transcripts would want —
-  and/or speculating on blanks (consecutive-frame joints are independent
-  during a blank run: one GEMM at M = 16 for the price of M = 1).
-- **S9 — long clips.** Full attention means a chunk boundary changes every
-  frame; chunking belongs in the design. The quadratic term arrives around
-  1024 frames (~82 s); `-max-audio` refuses past the sizing today.
-- Small: cache `UploadMel`'s sinusoidal position rows (1 ms, depends only
-  on T); the eight per-head position-score GEMMs are §3.5's grouped shape.
+**P16 (2026-09-22): the wide batch never cost decode anything.** Decode is
+**1.16x at every depth** — 29.73 → **34.4 tok/s** at depth zero and 27.20 →
+**31.5** at 128 000 cells, ubatch 2048 — and through the server it is **34.2
+tok/s at `-llm-batch` 2048, 4096 and 8192 alike**, where P12-7 measured 28.04
+and 25.81 ([`research/p16-decode-arena-width.md`](p16-decode-arena-width.md)).
+The cost P12-7 and P15 priced for a wide batch, and could not explain, was
+**`DeltaNetGPU.InPort` and `AttnGPU.InPort` advertising the arena's rows**:
+every decode step zero-filled the whole prefill arena of both blocks' A
+operand, once a layer, and the qkv projection after each move stalled behind
+the writes draining. `cmd/llm -depth -ubatch` found it by staging wide arenas
+and prefilling narrow — the cost followed the arena, not the prefill — and the
+per-label diff put all of it on `move`, `dn.qkv` and `attn.qkv`. The port now
+pads to the row block, as the MoE's always did, and
+`TestInPortPadsTheRunNotTheArena` asserts it, because the old padding was
+*correct* and no tolerance could see it. Two smaller exact changes ride along:
+**`hc.cn` is a workgroup a (token, stream) again at ≤ 64 rows** (25.0 → 7.0 µs,
+1.06x of a token — P11's workgroup a token is one workgroup on forty CUs at
+decode), and **`attn.select`'s emit walks blocks rather than cells** (68 → 55
+µs at 128k). `-llm-batch` stays 4096; 8192 is now purely a memory decision.
 
-## Text → speech (archive: [`research/speech-vertical.md`](research/speech-vertical.md), recap: [`research/tts-recap.md`](research/tts-recap.md))
-
-**Where it stands.** T1–T10 and W1 done. Every stage on the device, staged
-once for the life of the server (T9: the endpoint went 550 → 59 ms with
-byte-identical audio); voices blend in upstream's own spelling (T8); T10
-put PL-BERT's attention on the matrix cores so synthesis is a straight
-8.0 ms per second of audio at every length. The round trip
-(`cmd/roundtrip`) closes at 70.1x real time, six prose cases exact.
-
-**Open, in order of what a round trip buys:**
-
-- **The generator's 12 ms and the tail's 8** — the only arithmetic-bound
-  parts of the model, 65% of a short utterance, measured since T4.
-- **The host embedding stack** (R1's #2): `bert` is 12 ms of a paragraph
-  and only 2.5 on the device — the "not worth a dispatch" comment is stale
-  the same way the attention kernel's was.
-- **Three boundaries, one change each**: the excitation's 0.2 ms is 88%
-  submit+readback (move the two noise convolutions onto the device and
-  nothing of that stage touches the bus); the phoneme side's remaining 6 ms
-  is readbacks and submits (move the vocoder's input boundary); a 16 kHz
-  path out of the vocoder would delete the client resample (9.7% of the
-  loop — can the iSTFT head be asked for the rate directly?).
-- **G2P on unseen text**: designed corpus 24/24; on 400 unseen sentences
-  68.8% of sentences, 92.4% of phoneme words agree with misaki. Closing the
-  gap is more *measured* rules — the syntactically obvious ones scored
-  worse than no tagger.
-- **Known, unsettled**: the style row is indexed by the phoneme *character*
-  count (upstream's behaviour), so a front end emitting different characters
-  picks a different row. And kokoro spells numbers out where parakeet writes
-  digits back — the round trip measures those three cases and does not
-  count them as failures.
-
-## Image generation — **parked** (archive: [`research/qimage-vertical.md`](research/qimage-vertical.md))
-
-**Where it stands.** Done and **parked 2026-09-21** — parked because the plan
-ran out, not because it stalled. (The superseded z-image-turbo vertical is
-[`research/zimage-vertical.md`](research/zimage-vertical.md) plus
-[`research/zimage-pipeline.md`](research/zimage-pipeline.md); its stages are
-**I0–I7** and none of its code survives except `zimage/qwen` and
-`zimage/tokenizer`, which `embed`, `llm` and `parakeet` import.) The vertical was replaced 2026-09-20
-(Z-Image-Turbo out, `Qwen/Qwen-Image-2.1` in, for native RGBA and
-reference-image editing — `GOALS.md` #4), and **stages Q0–Q12 all closed
-inside two days**. Both endpoints are served: `POST /v1/images/generations`
-answers at **1m28.8s / 1m29.8s for a 1024²/40-step image** (31.5 GB resident,
-matching the fp32 oracle's own picture at mean 3.4e-4) and `POST
-/v1/images/edits` at **1m54.2s / 1m56.6s for a 1024² edit on one reference**
-(39.4 GB, matching the oracle's edit at max abs 0.0014), both with native
-RGBA and unconditional in-progress previews (a fitted 64x4 matrix, 159 µs a
-frame, three partials for 0.3% of a request — no flag, because there is
-nothing to load). Q10 turned the ceiling from a side box into an area, so
-16:9 comes back **1344x768** instead of 1024x576; Q11 put the client's
-hang-up through to the sampler and the VAE's submit batches; Q12 finished the
-Z-Image deletion (**6,839 lines of Go and 895 of GLSL** out, every gate
-re-run with no digit changed). The full write-up, every tolerance with its
-instrument named, is in the archive.
-
-**Int8 banks (Q13, 2026-09-26, after parking)**: the text encoder and the
-DiT now stage as int8 by default (`serve -image-fp16` is the control):
-resident **31.5 → 20.4 GB**, edits the same 11 GB less, ~4% a step. Priced
-against the released bf16 pipeline: DiT teacher-forced steps 0.03–0.10x its
-error at 1024², the free run 0.81x; the encoder keeps layers 6 and 16 in
-fp16 (the massive-activation channel is written there) and lands 3x inside
-bf16 on real prompts. `ai.service` picks it up on its next deploy. Still
-open: the served peak measured inside the service, and the prefix KV cache.
-
-**What to read before touching this code again** — three precision facts,
-each of which has already caught a port:
-
-- **the VAE cannot take fp16 operands anywhere** (Q9b). Its tail norm divides
-  a per-pixel L2 out of a residual stream at absmax 2.6e5, so a 5e-4 relative
-  perturbation becomes an absolute one: **one** narrowed convolution costs the
-  decoded image max abs 0.0885 and the whole 3x3 set costs 0.178, against an
-  fp32 port sitting at 7.3e-4. The rule is not "watch the range", it is "do
-  not narrow". `TestConvFP16Ladder` is the instrument; re-run it before
-  pointing any narrowing kernel at `qimage/vae`. Q12 deleted
-  `vae_conv_wmma`/`vae_attention_wmma` outright, so the shortcut is not in
-  the tree — resurrect from git history only if that ladder says otherwise.
-- **the vision tower amplifies an input perturbation by ~10³**, so a
-  condition image must be quantized exactly as the reference's is —
-  compositing alpha over white in float rather than on 8-bit levels moves the
-  prompt embedding by rel 11 (a firing control). That is why the Lanczos
-  resampler is gated on exact 8-bit equality and not a tolerance.
-- **on a non-square condition image the fp32 dump is the less accurate
-  side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 — so
-  that stage is gated against dumped float64 rows.
-
-**If it is ever unparked**, in the archive's order:
-
-- **The 1184²-area ceiling** — the only remaining *capability*, not a
-  percent. The VAE decoder's activation arena is one storage buffer against a
-  4 GiB − 4 device limit at a measured **3060 bytes a pixel for every aspect
-  ratio** (`TestArenaShape`), which caps a request at 1,403,584 pixels
-  whatever shape they are in, so the model's own 2048² examples do not
-  decode. Two routes: tiled decode, or a multi-buffer arena
-  (`vk.PipelineSpec.Counts`, with the LLM's 77 GB bank as precedent). Tiling
-  is the less attractive of the two against a tail norm that is a per-pixel
-  L2 over the whole feature map.
-- **conv3x3's last ceiling** — after Q9b's register block it is **85.9% of
-  the decode, 3.36 s at 5.0 TFLOP/s**, and its remaining limit is one shared
-  read per multiply-add. A pixel block is priced at ~1.5 s and is the only
-  port here that would **not** be bit-identical. Low value now: the VAE is
-  4.5% of an image, the DiT is 95%.
-- **The DiT's remaining percents are fusions** — that is where the image's
-  time actually is, post-Q9.
-- **Masked edits** (Q-o3) — still a 501, but the reason moved: 2.1 *can* do
-  masked and annotated local edits; how a mask is fed is not in the diffusers
-  implementation this port follows. External research, not a port.
-- **Two watch items**: Q-o2, whether a turbo/distilled 2.1 checkpoint or
-  step-distillation LoRA appears (the examples repo and lightx2v); Q-o4,
-  whether [taehv](https://github.com/madebyollin/taehv) grows a 2.1 variant,
-  which would turn the fitted linear preview from a fallback into an upgrade.
-
-**Settled, so it does not get relitigated**: the step count — 40 stays the
-default because it is the only count safe across prompt kinds. A fox
-photograph and an impasto harbour are convincing at **12 steps**, at 36% of
-the cost; a bicycle drivetrain diagram is coherent at 24 and has
-disintegrated by 12 (floating parts, ghosted tubes, contrast collapsing
-toward white). **24 is the honest fast setting** — −35%, no visible loss on
-any of the three prompt kinds. `steps` is a request field, so a client that
-knows its prompt takes the discount itself. Note the sweep's wall clocks
-(40: 1m38–1m42, 24: 1m4, 16: 44–45 s, 12: 35–36 s) were measured **before
-Q9 and Q9b**, so the seconds are stale by the 6–7% those two took off every
-step while the *ratios* stand; re-run with `QI21_SWEEP=1 go test
-./qimage/pipeline -run TestStepSweep` (~10 minutes of device time) before
-quoting a number from it.
-
-**Not planned**: quantisation (compute-bound at every servable size, §3.4;
-int8 WMMA runs at fp16 rate, §0; and the two-machine deployment removes the
-footprint argument). Sampling the encoder's posterior (breaks seed
-reproducibility). A self-trained tiny decoder for previews — a training
-project this repo does not want. No CFG path (`true_cfg_scale` stays a
-refusal) — it would double every step.
-
-## Music generation — **closed** (archive: [`research/music-vertical.md`](research/music-vertical.md))
-
-**Where it stands.** Closed 2026-09-27: A0–A12 are all done, and the plan
-ran out. ACE-Step 1.5's three generators (the 5 Hz LM, the 4 B DiT, the
-Oobleck VAE) run upstream's default thinking path, sample mode, and the
-turbo model's audio-in tasks (cover, cover-nofsq, repaint, a reference's
-timbre). Every gate is against upstream's handler in fp32, with the drift
-priced against its bf16. `serve -music` answers `/v1/music` as
-submit-then-poll jobs (multipart audio in), sharing the swap slot with
-image and video. Code: `ace/` (`plan`, `dit`, `vae`, `lm`, `pipeline`),
-`api/music.go`, `backend/music.go`, `cmd/ace`.
-
-**Open, none of it planned:**
-
-- **Listen** to `out/ace-a10-int8-*` (the int8 LM) and `out/ace-a11-*`
-  (a cover, a repaint, a referenced song). The user listened after A8
-  ("sounds great") but not since.
-- **Deployment**: `-music` is not in `ai.service` (the user's call; it
-  belongs on the non-LLM machine).
-- **Speed past the LM**: the DiT (1.8 s of a 60 s song, 6.9 s of 4 min) and
-  the VAE are ≤ 20% of a request, and the LM's step is at the bus. A 4-bit
-  bank would be the next byte cut, and phase 1 has no headroom under bf16
-  for it.
-- Upstream's retake and flow-edit, and the base model's tasks (lego,
-  extract, complete), stay refusals.
-
-## Embeddings (archive: [`research/embedding-vertical.md`](research/embedding-vertical.md))
-
-**Where it stands.** E0–E8 and E7 done. Same `zimage/qwen` transformer,
-third caller. Cosine 0.999999+ against fp32. Served with MRL `dimensions` and
-the non-OpenAI `instruct` field.
-
-**E7, batching (done 2026-09-28).** The shape the archive proposed:
-projections batched, attention per text, with no shader changes.
-- **`qwen.GPUEncoder.RunBatch`.** The texts sit back to back in the
-  residual stream with no gap rows, so the GEMMs pay nothing for the
-  batching. Each text gets its own key-block (64-row) aligned region of the
-  packed q/k/v planes, written by a per-text pack that zero-fills its tail.
-  Attention is one dispatch per text. Positions restart per text.
-- **Bit-exact.** Because of that layout, a text's vector out of a batch is
-  **bit-identical** to its lone run under the same plan
-  (`TestGPUBatchMatchesSingle`: 10 lengths including 63/64/65, both orders,
-  two plans). A control that lets text 1 see text 0 moves it to cosine 0.896.
-- **Measured on the device** (`TestGPUBatchThroughput`, ms a text):
-
-  | tokens a text | alone | 8 texts | 32 | 64 |
-  |---|---|---|---|---|
-  | ~14 | 9.6 | 1.76 | **1.14** | 1.12 |
-  | ~38 | 9.8 | 2.80 | 2.24 | 2.28 |
-  | ~108 | 11.4 | 5.57 | 5.89 | – |
-
-- **Compute-bound past ~450 rows**, at 0.056 ms a row: 15.6 TFLOP/s, 28% of
-  peak. `reg64` stays the best rung up to 1,796 rows
-  (`TestGPUBatchLadder`), so `embed.PlanFor` is unchanged.
-- **Free latency on the side.** `PerSubmit`: a layer per command buffer
-  instead of qwen's 8 dispatches takes a lone 27-token text from
-  **11.9 → 9.6 ms** (the ~40 µs submit+fence, 84 times). Qwen's other
-  callers keep 8.
-- **Serving** (`backend/embed.go`). Inputs are tokenized in the handler and
-  queued. One worker runs passes of at most `-embed-batch-tokens` (1024)
-  rows, taken **round-robin across requests**, with one `Device.Do` a pass.
-  The arenas are 2x the pass, because 64-row plane regions make 32 short
-  queries want 2048 plane rows for 448 stream rows.
-- **Served, private `-embed` server** (production numbers in brackets):
-
-  | | new | production |
-  |---|---|---|
-  | 1 text | 10.4 ms | [12.2] |
-  | 32 short | **46 ms** | [383] |
-  | 32 × 36 tok | 82 ms | [385] |
-  | 128 × 36 tok | **305 ms** | [1535] |
-  | lone query behind a 128-text job | **94 ms** | [1523] |
-
-- **Trap found on the way.** The request path first took the model lock
-  that a pass holds, so a lone query could not even queue until the passes
-  ahead of it had drained, and it came back *with* the job at 300 ms.
-  `TestEmbedQueryOvertakesJob` pins it.
-- **Deployed** by the 2026-09-29 18:40 restart (VIDEO.md session 10).
-
-**Next, for single-query latency** (the GEMMs run at ~70 GB/s against a
-236 GB/s bus; small-M grids underfill at hidden 1024):
-- q/k/v as one projection: k and v cost nearly what q does at half its size.
-- gate+up with SwiGLU fused in: Kev's K7.6 kernel, and its lesson about grid
-  order.
-- split-K on o and down.
-- pricing an int8 bank on the LLM's small-M kernels.
-
-Also unexplained: the Sep 27 production requests ran at 47 ms a text, 4x
-the model's own time, probably another vertical holding the device.
-
-## The server, cross-vertical (docs: [`research/api-server.md`](research/api-server.md))
-
-- **Constrained decoding** — the one refusal that is a missing capability:
-  would close `response_format`, `text.format` and named `tool_choice`.
-- **More than one conversation** — the graph is one sequence's; two clients
-  take turns evicting each other's prefix. A cache per conversation is a
-  measurement (residency) plus P6's scheduler question.
-- **The image adapter holds the device lock for the whole run** (the LLM's
-  is per forward pass). Same fix shape; what a waiting speech request
-  actually gains is a measurement.
-- `n > 1` images are serial (capped at 4); a forced alignment for
-  transcript timings if the 80 ms grid ever isn't enough.
-
----
-
-## Where the old files went (2026-09-20 consolidation, IMAGE.md again on 2026-09-21, MUSIC.md on 2026-09-27, five more on 2026-10-02)
-
-| was | now |
-|---|---|
-| `LLM.md` | [`research/llm-vertical.md`](research/llm-vertical.md) — stages, decisions D1–D21, open questions, how-to-run |
-| `LLM2.md` | [`research/llm-review.md`](research/llm-review.md) — hypotheses checked, decode budget, P0–P6 as closed |
-| `SPEECH.md` | [`research/speech-vertical.md`](research/speech-vertical.md) — S1–S8, T1–T10, R1, W1 write-ups |
-| `TTS.md` | [`research/tts-recap.md`](research/tts-recap.md) |
-| `IMAGE.md` (z-image, until 2026-09-20) | [`research/zimage-vertical.md`](research/zimage-vertical.md) |
-| `IMAGE.md` (Qwen-Image-2.1, 2026-09-20–21) | [`research/qimage-vertical.md`](research/qimage-vertical.md) — frozen 2026-09-21 with the vertical; **Q-stages, decisions 1–7 and Q-o numbers resolve there** |
-| `PIPELINE.md` | [`research/zimage-pipeline.md`](research/zimage-pipeline.md) — inventory, validation rules, budget |
-| `EMBEDDING.md` | [`research/embedding-vertical.md`](research/embedding-vertical.md) |
-| `MUSIC.md` (2026-09-27) | [`research/music-vertical.md`](research/music-vertical.md) — frozen 2026-09-27 with the vertical; **A-stages, decisions 1–7 and A-o numbers resolve there** |
-| `KERNELS.md` (2026-10-02) | [`research/kernels-vertical.md`](research/kernels-vertical.md) — **still live**; G-stages, G-o numbers and decisions 1–7 resolve there; G0–G8's write-ups broken out as `research/g*.md`, sessions 1–12 of the handoff as [`research/kernels-sessions.md`](research/kernels-sessions.md) |
-| `VIDEO.md` (2026-10-02) | [`research/video-vertical.md`](research/video-vertical.md) — **still live**; M-stages and M-o numbers resolve there; M11a–M11h broken out as `research/m11*.md` |
-| `OCR.md` (2026-10-02) | [`research/ocr-vertical.md`](research/ocr-vertical.md) — **still live**; O-stages and O-o numbers resolve there; O7, O10 and O11 broken out as `research/o7-…`, `o10-…`, `o11-…` |
-| `LLM-VISION.md` (2026-10-02) | [`research/llm-vision.md`](research/llm-vision.md) — **still live**, kept whole; V-stages resolve there |
-| `API.md` (2026-10-02) | [`research/api-server.md`](research/api-server.md) — the server as it answers today, kept current; residency, extensions, the Wyoming/System One doors and the video/music jobs broken out as `research/api-*.md` |
-| `IDEAS.md` | [`research/ideas.md`](research/ideas.md) — the `§N.M` backlog and the measured roofline |
-| `TODO.md` (session log) | distilled into `research/` as each stage closed; the phase-1 tail is [`research/phase1-backlog.md`](research/phase1-backlog.md); the full log is in git history |
-
-Per-experiment findings remain one file each in [`research/`](research/README.md),
-indexed there. `§N.M` numbers are permanent addresses — never renumber.
+**Decode's side of the depth question is now closed too. P15 (2026-09-22)**
+takes a decode step at 128 000 cells from **22.58 to 27.20 tok/s** and the
+falloff from depth zero from **0.76x to 0.91x**, with prefill and depth-zero
+decode flat as the controls
+([`research/p15-decode-at-depth.md`](p15-decode-at-depth.md)). Three
+changes, and the largest was not on the device: **`PLERows` hashed the whole
+sequence on every token** to use sixteen of its rows, which at 128k is 8.2 MB
+allocated and 2.05 M rows per step — **5.18 ms of a 44.3 ms token and 39% of
+the whole falloff**, deleted exactly by `PLERowsFrom`. Then **`attn.score`
+was striped sixteen ways on a forty-CU device**: P9 unpinned it and stopped at
+16, the stripe is a grid and not a reduction, and 64 is **2.61x** (211.6 → 80.9
+µs) and better at *every* depth. And **the gather and the split compose, which
+P14 said they would not** — that argument is right about the gather alone and
+is measured (unsplit gather 986.7 µs against the split's 419.8), but the two
+cut different things: the split is 7.12x on the *walk* and the gather 2.99x on
+the *work*, so `GATHER`+`SPLITK` together is **3.23x** (419.8 → 129.9). A
+decode tile is one real row, so the union that costs prefill 4.9x costs decode
+nothing. It turns on at `2*selWidth` **live** cells, which makes it the first
+decode knob that is a function of the depth — so P1c's prerecorded buffer now
+carries an epoch and re-records the one step that crosses. The refusal:
+**the arenas' HOST_CACHED memory type costs the kernels nothing** even at the
+3.85 GB the KV planes now put in that buffer — every kernel within 1% under
+`LLM_ARENA_UNCACHED=1` while host glue moves 29x — which confirms L6b at the
+new scale and spends a third hypothesis for `hc.cn`. After that the two capability
+gaps are P6 batching (blocked on a product question: will the API serve more
+than one stream?) and E7's batched embeddings, worth up to 10x on short
+texts; the largest single-vertical percent is S10, the speech front end at
+48% of its pipeline.

@@ -1,7 +1,8 @@
 # IDEAS — experiments worth running to squeeze more out of Strix Halo
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the phase-1 experiment backlog and the measured roofline; §N.M numbers cited from code and research files resolve here. It was
-> `IDEAS.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `IDEAS.md` at the repo root; the live state of play is now
+> [`README.md`](README.md) (the root `TODO.md` that held it was retired 2026-10-02).
 
 Written after reviewing `../TODO.md`, every shader in `shaders/`, the full
 `results.csv`, and the device's actual reported capabilities (`vulkaninfo`,

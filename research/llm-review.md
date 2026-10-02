@@ -1,7 +1,8 @@
 # LLM2 — the review, the hypotheses checked, and the next priority list
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the LLM vertical's 2026-09-17 review: the hypotheses checked, the decode budget, and the P0–P6 priority list as it closed. It was
-> `LLM2.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `LLM2.md` at the repo root; the live state of play is now
+> [`llm-plan.md`](llm-plan.md) (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **Written 2026-09-17**, as a review of `llm-vertical.md` at L8c-7 / L9a. `llm-vertical.md`
 > stays the stage log; this file is the forward-looking list. Same

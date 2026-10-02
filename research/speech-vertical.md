@@ -1,7 +1,8 @@
 # SPEECH — the two audio verticals
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the two audio verticals (parakeet S1–S8, kokoro T1–T10, R1, W1 — the T6–T10/R1/W1 write-ups live only here). It was
-> `SPEECH.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `SPEECH.md` at the repo root; the live state of play is now
+> the last section, § "Where it stands, and what is open" (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **Current work.** `zimage-pipeline.md` (the z-image slice) is **parked** at 14.26 s
 > an image; this is what happens next. Same rules as that file: it is
@@ -1278,3 +1279,62 @@ put a credential, so `-token` does not reach this listener and the startup
 line says so. That is why the flag takes an address instead of a boolean —
 which interface it binds is the whole of the control, and it should be
 something somebody chose.
+
+## Where it stands, and what is open
+
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.*
+
+### Speech → text (parakeet)
+
+**Where it stands.** S1–S8 done: front end 21 ms + encoder 17 + decode 5 =
+43 ms for jfk.wav, transcript exact, word/segment timings from the model's
+own TDT durations, served at `/v1/audio/transcriptions` and over Wyoming
+(with resampling at that door only).
+
+**Open:**
+
+- **S10 — the front end is 48% of the pipeline**: a few thousand 512-point
+  float64 FFTs on the host. Either a float32 radix-4 on the host or the
+  STFT + mel filterbank as two dispatches (the filterbank is a
+  `[T, 257] x [257, 128]` GEMM; `kokoro_istft.comp` is the worked inverse).
+- **The submit+fence is 38% of an emission** (40 µs of 105 per token). A
+  persistent kernel — which is also what streaming transcripts would want —
+  and/or speculating on blanks (consecutive-frame joints are independent
+  during a blank run: one GEMM at M = 16 for the price of M = 1).
+- **S9 — long clips.** Full attention means a chunk boundary changes every
+  frame; chunking belongs in the design. The quadratic term arrives around
+  1024 frames (~82 s); `-max-audio` refuses past the sizing today.
+- Small: cache `UploadMel`'s sinusoidal position rows (1 ms, depends only
+  on T); the eight per-head position-score GEMMs are §3.5's grouped shape.
+
+### Text → speech (kokoro)
+
+**Where it stands.** T1–T10 and W1 done. Every stage on the device, staged
+once for the life of the server (T9: the endpoint went 550 → 59 ms with
+byte-identical audio); voices blend in upstream's own spelling (T8); T10
+put PL-BERT's attention on the matrix cores so synthesis is a straight
+8.0 ms per second of audio at every length. The round trip
+(`cmd/roundtrip`) closes at 70.1x real time, six prose cases exact.
+
+**Open, in order of what a round trip buys:**
+
+- **The generator's 12 ms and the tail's 8** — the only arithmetic-bound
+  parts of the model, 65% of a short utterance, measured since T4.
+- **The host embedding stack** (R1's #2): `bert` is 12 ms of a paragraph
+  and only 2.5 on the device — the "not worth a dispatch" comment is stale
+  the same way the attention kernel's was.
+- **Three boundaries, one change each**: the excitation's 0.2 ms is 88%
+  submit+readback (move the two noise convolutions onto the device and
+  nothing of that stage touches the bus); the phoneme side's remaining 6 ms
+  is readbacks and submits (move the vocoder's input boundary); a 16 kHz
+  path out of the vocoder would delete the client resample (9.7% of the
+  loop — can the iSTFT head be asked for the rate directly?).
+- **G2P on unseen text**: designed corpus 24/24; on 400 unseen sentences
+  68.8% of sentences, 92.4% of phoneme words agree with misaki. Closing the
+  gap is more *measured* rules — the syntactically obvious ones scored
+  worse than no tagger.
+- **Known, unsettled**: the style row is indexed by the phoneme *character*
+  count (upstream's behaviour), so a front end emitting different characters
+  picks a different row. And kokoro spells numbers out where parakeet writes
+  digits back — the round trip measures those three cases and does not
+  count them as failures.

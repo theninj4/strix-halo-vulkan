@@ -3,7 +3,7 @@
      compaction that is measured inert. Cited from llm/record.go,
      llm/gpu_attn.go, shaders/llm_attn_wmma.comp and shaders/llm_attn_blocks.comp. -->
 
-[← TODO.md](../TODO.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md) · [P11](p11-prefill.md) · [P12](p12-prefill-round-two.md)
+[← LLM plan](llm-plan.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md) · [P11](p11-prefill.md) · [P12](p12-prefill-round-two.md)
 
 # P13 — 128k completes, and the key block was twice as wide as it should have been
 

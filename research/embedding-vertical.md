@@ -1,7 +1,8 @@
 # EMBEDDING — the qwen3-embedding-0.6b vertical
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the qwen3-embedding-0.6b vertical (E0–E8) — its only write-up. It was
-> `EMBEDDING.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `EMBEDDING.md` at the repo root; the live state of play is now
+> the last section, § "Where it stands, E7 done, and what is next" (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **Current work from 2026-09-18.** `llm-vertical.md` (qwen3.8-flash-next) is the other
 > live file; `speech-vertical.md` is finished-ish and `zimage-pipeline.md` (z-image) is parked.
@@ -206,3 +207,74 @@ some memory, not work.
 
 **The reranker.** `Qwen3-Reranker-0.6B` is the same checkpoint shape with a
 yes/no head. Out of `../GOALS.md`'s scope.
+
+## Where it stands, E7 done, and what is next
+
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.* It supersedes
+§ "E7, the one thing open" above, which was the proposal.
+
+**Where it stands.** E0–E8 and E7 done. Same `zimage/qwen` transformer,
+third caller. Cosine 0.999999+ against fp32. Served with MRL `dimensions` and
+the non-OpenAI `instruct` field.
+
+### E7, batching (done 2026-09-28)
+
+The shape the archive proposed:
+projections batched, attention per text, with no shader changes.
+- **`qwen.GPUEncoder.RunBatch`.** The texts sit back to back in the
+  residual stream with no gap rows, so the GEMMs pay nothing for the
+  batching. Each text gets its own key-block (64-row) aligned region of the
+  packed q/k/v planes, written by a per-text pack that zero-fills its tail.
+  Attention is one dispatch per text. Positions restart per text.
+- **Bit-exact.** Because of that layout, a text's vector out of a batch is
+  **bit-identical** to its lone run under the same plan
+  (`TestGPUBatchMatchesSingle`: 10 lengths including 63/64/65, both orders,
+  two plans). A control that lets text 1 see text 0 moves it to cosine 0.896.
+- **Measured on the device** (`TestGPUBatchThroughput`, ms a text):
+
+  | tokens a text | alone | 8 texts | 32 | 64 |
+  |---|---|---|---|---|
+  | ~14 | 9.6 | 1.76 | **1.14** | 1.12 |
+  | ~38 | 9.8 | 2.80 | 2.24 | 2.28 |
+  | ~108 | 11.4 | 5.57 | 5.89 | – |
+
+- **Compute-bound past ~450 rows**, at 0.056 ms a row: 15.6 TFLOP/s, 28% of
+  peak. `reg64` stays the best rung up to 1,796 rows
+  (`TestGPUBatchLadder`), so `embed.PlanFor` is unchanged.
+- **Free latency on the side.** `PerSubmit`: a layer per command buffer
+  instead of qwen's 8 dispatches takes a lone 27-token text from
+  **11.9 → 9.6 ms** (the ~40 µs submit+fence, 84 times). Qwen's other
+  callers keep 8.
+- **Serving** (`backend/embed.go`). Inputs are tokenized in the handler and
+  queued. One worker runs passes of at most `-embed-batch-tokens` (1024)
+  rows, taken **round-robin across requests**, with one `Device.Do` a pass.
+  The arenas are 2x the pass, because 64-row plane regions make 32 short
+  queries want 2048 plane rows for 448 stream rows.
+- **Served, private `-embed` server** (production numbers in brackets):
+
+  | | new | production |
+  |---|---|---|
+  | 1 text | 10.4 ms | [12.2] |
+  | 32 short | **46 ms** | [383] |
+  | 32 × 36 tok | 82 ms | [385] |
+  | 128 × 36 tok | **305 ms** | [1535] |
+  | lone query behind a 128-text job | **94 ms** | [1523] |
+
+- **Trap found on the way.** The request path first took the model lock
+  that a pass holds, so a lone query could not even queue until the passes
+  ahead of it had drained, and it came back *with* the job at 300 ms.
+  `TestEmbedQueryOvertakesJob` pins it.
+- **Deployed** by the 2026-09-29 18:40 restart (VIDEO.md session 10).
+
+### Next, for single-query latency
+
+The open items (the GEMMs run at ~70 GB/s against a
+236 GB/s bus; small-M grids underfill at hidden 1024):
+- q/k/v as one projection: k and v cost nearly what q does at half its size.
+- gate+up with SwiGLU fused in: Kev's K7.6 kernel, and its lesson about grid
+  order.
+- split-K on o and down.
+- pricing an int8 bank on the LLM's small-M kernels.
+
+Also unexplained: the Sep 27 production requests ran at 47 ms a text, 4x
+the model's own time, probably another vertical holding the device.

@@ -2,8 +2,8 @@
 
 > **ARCHIVED 2026-09-27 — the vertical is closed, not unfinished.** This is
 > the closing record of ACE-Step 1.5 (A0–A12, all done in one day). It was
-> `MUSIC.md` at the repo root; the live state of play is
-> [`../TODO.md`](../TODO.md), which carries the open items in summary.
+> `MUSIC.md` at the repo root; what is open after closing is the
+> last section, § "After closing" (moved from the retired root `TODO.md`).
 >
 > **Stage letters `A0…A12`, decisions `1–7` and open questions
 > `A-o1…A-o7` resolve here.** They are cited from comments in `ace/`,
@@ -1689,3 +1689,29 @@ any request, and cover, cover-nofsq and repaint (§ A11). Try
 **2026-09-27: closed.** This file was frozen to `research/music-vertical.md`
 at the user's request. What was left is in the archive note at the top and
 in `TODO.md`'s music section.
+
+## After closing: where it stands, what is open
+
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.*
+
+**Where it stands.** Closed 2026-09-27: A0–A12 are all done, and the plan
+ran out. ACE-Step 1.5's three generators (the 5 Hz LM, the 4 B DiT, the
+Oobleck VAE) run upstream's default thinking path, sample mode, and the
+turbo model's audio-in tasks (cover, cover-nofsq, repaint, a reference's
+timbre). Every gate is against upstream's handler in fp32, with the drift
+priced against its bf16. `serve -music` answers `/v1/music` as
+submit-then-poll jobs (multipart audio in), sharing the swap slot with
+image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`plan`, `dit`, `vae`, `lm`, `pipeline`),
+`api/music.go`, `backend/music.go`, `cmd/ace`.
+
+**Open, none of it planned:**
+
+- **Listen** to `out/ace-a10-int8-*` (the int8 LM) and `out/ace-a11-*`
+  (a cover, a repaint, a referenced song). The user listened after A8
+  ("sounds great") but not since.
+- **Speed past the LM**: the DiT (1.8 s of a 60 s song, 6.9 s of 4 min) and
+  the VAE are ≤ 20% of a request, and the LM's step is at the bus. A 4-bit
+  bank would be the next byte cut, and phase 1 has no headroom under bf16
+  for it.
+- Upstream's retake and flow-edit, and the base model's tasks (lego,
+  extract, complete), stay refusals.

@@ -1,7 +1,8 @@
 # PIPELINE — the z-image-turbo vertical slice
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the z-image slice as built (stages 1–10): the model inventory, the validation rules, and the measured budget. It was
-> `PIPELINE.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `PIPELINE.md` at the repo root; the live state of play is now
+> [`qimage-vertical.md`](qimage-vertical.md) (the vertical that replaced it) (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **SUPERSEDED 2026-09-18 by [`zimage-vertical.md`](zimage-vertical.md)**, which is now the file
 > to read first for this vertical — it carries the current state, the

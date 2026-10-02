@@ -2,16 +2,13 @@
 
 > **Moved to `research/` on 2026-10-02** — this was `OCR.md` at the repo
 > root, and code comments citing `OCR.md` resolve here. The vertical is **not closed** (O11b is next):
-> [`../TODO.md`](../TODO.md) carries it in summary, and § Handoff below is still
-> where a session resumes. The layout model (O7), the accuracy eval (O10) and
+> § Handoff below is where a session resumes, and it carries the open items. The layout model (O7), the accuracy eval (O10) and
 > performance (O11) are broken out into `o*.md` files beside this one; the
 > element pipeline's bring-up stays here. O-stages, decisions and O-o numbers
 > still resolve here.
 
 > **Live tracking and session handoff doc, opened 2026-09-27.** Stage letters
-> are **O**. When the vertical closes, this file is frozen to
-> `research/ocr-vertical.md` like the others and `TODO.md` gets the one-line
-> summary. Until then: tick a stage when its gate passes, put its measured
+> are **O**. When the vertical closes, this file is frozen in place and [`README.md`](README.md)'s index marks it closed. Until then: tick a stage when its gate passes, put its measured
 > numbers under it, and keep **§ Handoff** at the bottom current. A new
 > session should be able to start from there.
 

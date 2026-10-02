@@ -3,8 +3,8 @@
 > **ARCHIVED 2026-09-21 — the vertical is parked, not unfinished.** This is
 > the closing record of Qwen-Image-2.1 (Q0–Q12): both endpoints served, the
 > Z-Image deletion finished, every gate dump-driven. It was `IMAGE.md` at the
-> repo root; the live state of play is now [`../TODO.md`](../TODO.md), which
-> carries the open items in summary.
+> repo root; what is open after parking is the
+> last section, § "After parking" (moved from the retired root `TODO.md`).
 >
 > **Stage letters `Q0…Q12`, decisions `1–7` and open questions `Q-o1…Q-o5`
 > resolve here** — and they are cited from about fifty comments in
@@ -17,7 +17,7 @@
 > tenses are the working session's.
 >
 > **Where to pick it up** is the "Where the work stands" table (all twelve
-> stages done), then "Open questions" and `../TODO.md`'s image section. The
+> stages done), then "Open questions" and § "After parking" at the bottom. The
 > three precision facts — the VAE refuses fp16 anywhere, the vision tower
 > amplifies an input perturbation by ~10³, and a non-square condition image
 > has the fp32 dump as the *less* accurate side — are the ones that have
@@ -1541,3 +1541,109 @@ two-run numbers.
 - ~~**Q-o5**: text-only mrope — confirmed equivalent to plain RoPE by dump?~~
   **Settled 2026-09-20 (Q0)**: gap 0.0 against a plain theta-5e6 NeoX table;
   `zimage/qwen` needs nothing mrope-shaped before Q8.
+
+## After parking: Q13, what to read first, and what is open
+
+*Moved here from the root `TODO.md` when it was retired on 2026-10-02.*
+
+**Where it stands.** Done and **parked 2026-09-21** — parked because the plan
+ran out, not because it stalled. (The superseded z-image-turbo vertical is
+[`research/zimage-vertical.md`](zimage-vertical.md) plus
+[`research/zimage-pipeline.md`](zimage-pipeline.md); its stages are
+**I0–I7** and none of its code survives except `zimage/qwen` and
+`zimage/tokenizer`, which `embed`, `llm` and `parakeet` import.) The vertical was replaced 2026-09-20
+(Z-Image-Turbo out, `Qwen/Qwen-Image-2.1` in, for native RGBA and
+reference-image editing — `GOALS.md` #4), and **stages Q0–Q12 all closed
+inside two days**. Both endpoints are served: `POST /v1/images/generations`
+answers at **1m28.8s / 1m29.8s for a 1024²/40-step image** (31.5 GB resident,
+matching the fp32 oracle's own picture at mean 3.4e-4) and `POST
+/v1/images/edits` at **1m54.2s / 1m56.6s for a 1024² edit on one reference**
+(39.4 GB, matching the oracle's edit at max abs 0.0014), both with native
+RGBA and unconditional in-progress previews (a fitted 64x4 matrix, 159 µs a
+frame, three partials for 0.3% of a request — no flag, because there is
+nothing to load). Q10 turned the ceiling from a side box into an area, so
+16:9 comes back **1344x768** instead of 1024x576; Q11 put the client's
+hang-up through to the sampler and the VAE's submit batches; Q12 finished the
+Z-Image deletion (**6,839 lines of Go and 895 of GLSL** out, every gate
+re-run with no digit changed). The full write-up, every tolerance with its
+instrument named, is in the archive.
+
+**Int8 banks (Q13, 2026-09-26, after parking)**: the text encoder and the
+DiT now stage as int8 by default (`serve -image-fp16` is the control):
+resident **31.5 → 20.4 GB**, edits the same 11 GB less, ~4% a step. Priced
+against the released bf16 pipeline: DiT teacher-forced steps 0.03–0.10x its
+error at 1024², the free run 0.81x; the encoder keeps layers 6 and 16 in
+fp16 (the massive-activation channel is written there) and lands 3x inside
+bf16 on real prompts. `ai.service` picks it up on its next deploy. Still
+open: the served peak measured inside the service, and the prefix KV cache.
+
+**What to read before touching this code again** — three precision facts,
+each of which has already caught a port:
+
+- **the VAE cannot take fp16 operands anywhere** (Q9b). Its tail norm divides
+  a per-pixel L2 out of a residual stream at absmax 2.6e5, so a 5e-4 relative
+  perturbation becomes an absolute one: **one** narrowed convolution costs the
+  decoded image max abs 0.0885 and the whole 3x3 set costs 0.178, against an
+  fp32 port sitting at 7.3e-4. The rule is not "watch the range", it is "do
+  not narrow". `TestConvFP16Ladder` is the instrument; re-run it before
+  pointing any narrowing kernel at `qimage/vae`. Q12 deleted
+  `vae_conv_wmma`/`vae_attention_wmma` outright, so the shortcut is not in
+  the tree — resurrect from git history only if that ladder says otherwise.
+- **the vision tower amplifies an input perturbation by ~10³**, so a
+  condition image must be quantized exactly as the reference's is —
+  compositing alpha over white in float rather than on 8-bit levels moves the
+  prompt embedding by rel 11 (a firing control). That is why the Lanczos
+  resampler is gated on exact 8-bit equality and not a tolerance.
+- **on a non-square condition image the fp32 dump is the less accurate
+  side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 — so
+  that stage is gated against dumped float64 rows.
+
+**If it is ever unparked**, in the archive's order:
+
+- **The 1184²-area ceiling** — the only remaining *capability*, not a
+  percent. The VAE decoder's activation arena is one storage buffer against a
+  4 GiB − 4 device limit at a measured **3060 bytes a pixel for every aspect
+  ratio** (`TestArenaShape`), which caps a request at 1,403,584 pixels
+  whatever shape they are in, so the model's own 2048² examples do not
+  decode. Two routes: tiled decode, or a multi-buffer arena
+  (`vk.PipelineSpec.Counts`, with the LLM's 77 GB bank as precedent). Tiling
+  is the less attractive of the two against a tail norm that is a per-pixel
+  L2 over the whole feature map.
+- **conv3x3's last ceiling** — after Q9b's register block it is **85.9% of
+  the decode, 3.36 s at 5.0 TFLOP/s**, and its remaining limit is one shared
+  read per multiply-add. A pixel block is priced at ~1.5 s and is the only
+  port here that would **not** be bit-identical. Low value now: the VAE is
+  4.5% of an image, the DiT is 95%.
+- **The DiT's remaining percents are fusions** — that is where the image's
+  time actually is, post-Q9.
+- **Masked edits** (Q-o3) — still a 501, but the reason moved: 2.1 *can* do
+  masked and annotated local edits; how a mask is fed is not in the diffusers
+  implementation this port follows. External research, not a port.
+- **Two watch items**: Q-o2, whether a turbo/distilled 2.1 checkpoint or
+  step-distillation LoRA appears (the examples repo and lightx2v); Q-o4,
+  whether [taehv](https://github.com/madebyollin/taehv) grows a 2.1 variant,
+  which would turn the fitted linear preview from a fallback into an upgrade.
+
+**Settled, so it does not get relitigated**: the step count — 40 stays the
+default because it is the only count safe across prompt kinds. A fox
+photograph and an impasto harbour are convincing at **12 steps**, at 36% of
+the cost; a bicycle drivetrain diagram is coherent at 24 and has
+disintegrated by 12 (floating parts, ghosted tubes, contrast collapsing
+toward white). **24 is the honest fast setting** — −35%, no visible loss on
+any of the three prompt kinds. `steps` is a request field, so a client that
+knows its prompt takes the discount itself. Note the sweep's wall clocks
+(40: 1m38–1m42, 24: 1m4, 16: 44–45 s, 12: 35–36 s) were measured **before
+Q9 and Q9b**, so the seconds are stale by the 6–7% those two took off every
+step while the *ratios* stand; re-run with `QI21_SWEEP=1 go test
+./qimage/pipeline -run TestStepSweep` (~10 minutes of device time) before
+quoting a number from it.
+
+**Not planned**: quantisation (compute-bound at every servable size, §3.4;
+int8 WMMA runs at fp16 rate, §0; and the two-machine deployment removes the
+footprint argument). Sampling the encoder's posterior (breaks seed
+reproducibility). A self-trained tiny decoder for previews — a training
+project this repo does not want. No CFG path (`true_cfg_scale` stays a
+refusal) — it would double every step.
+
+**Open, from `TODO.md`'s at-a-glance table** (the kernel carries since parking):
+**parked 2026-09-21** — Q0–Q12 all closed; the 1184²-area ceiling is the one capability left unbuilt; KERNELS.md G4 (2026-09-30, research §3.8): the transposed attention (`h3_attn_t.comp`) on this DiT is 1.07x on the attention and 1.7% of a step, **opt-in** (`QIMAGE_ATTN_T=1`) because the edit oracle's teacher-forced prefill amplifies fp16-level differences in the prefix rows ~100x at three target rows — the kernel is exact on identical inputs at every block, a plain-family perturbation reads 1.73e-2 against the 2e-2 bound, and the call on that bound is this vertical's. **KERNELS.md G3 (2026-09-30, §2.14): w1|w3 as one GEMM whose epilogue is the SwiGLU**, bit-identical, a 1024² cached step **2044 → 1929–1968 ms** on the int8 bank (1.04–1.06x); the served binary needs a redeploy

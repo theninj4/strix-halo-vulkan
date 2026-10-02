@@ -5,7 +5,7 @@
      shaders/llm_attn_gather.comp, shaders/llm_attn_wmma.comp,
      shaders/llm_attn_score_wmma.comp and shaders/llm_attn_pack.comp. -->
 
-[← TODO.md](../TODO.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md) · [P11](p11-prefill.md) · [P12](p12-prefill-round-two.md) · [P13](p13-long-context-prefill.md)
+[← LLM plan](llm-plan.md) · [research index](README.md) · [P0](p0-ring-watchdog.md) · [P7](p7-context-depth.md) · [P11](p11-prefill.md) · [P12](p12-prefill-round-two.md) · [P13](p13-long-context-prefill.md)
 
 # P14 — the gather, and 128k prefills past 900 tok/s
 

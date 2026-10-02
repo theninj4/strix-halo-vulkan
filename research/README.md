@@ -1,11 +1,37 @@
 # research/ — the findings archive
 
-One file per **completed** experiment, plus (since the 2026-09-20
-consolidation) the frozen per-vertical progress files. The live state of
-play and the open items are in [`../TODO.md`](../TODO.md); this directory
-is where a finished item's full write-up lives once it is closed, so an
-agent can load one finding without loading all of them. The phase-1
-backlog and the measured roofline are archived in [`ideas.md`](ideas.md).
+One file per **completed** experiment, plus every vertical's progress file:
+the live ones (each with its open items and handoff) and the frozen ones.
+**There is no central to-do list**: the root `TODO.md` was retired on
+2026-10-02 and its sections moved into the verticals below, so the open
+items for a vertical are in that vertical's file. Headline numbers are in
+[`../PERFORMANCE.md`](../PERFORMANCE.md), the goals in
+[`../GOALS.md`](../GOALS.md). A finished item's full write-up lives here as
+its own file, so an agent can load one finding without loading all of them.
+The phase-1 backlog and the measured roofline are archived in
+[`ideas.md`](ideas.md).
+
+## Where each vertical's open items are
+
+| vertical | state | live file — open items in |
+|---|---|---|
+| text generation (qwen3.8-flash-next) | live | [`llm-plan.md`](llm-plan.md) — the P19–P25 decode plan, *Open before this plan*, the instrument rules |
+| concurrency (several completions) | C0–C6 done, C7 conditional | [`concurrency.md`](concurrency.md) § Next |
+| LLM vision | live (V11 parked) | [`llm-vision.md`](llm-vision.md) § Handoff |
+| speech → text, text → speech | done, open items listed | [`speech-vertical.md`](speech-vertical.md) § "Where it stands, and what is open" (last section) |
+| image (Qwen-Image-2.1) | parked | [`qimage-vertical.md`](qimage-vertical.md) § "After parking" (last section) |
+| music (ACE-Step 1.5) | closed | [`music-vertical.md`](music-vertical.md) § "After closing" (last section) |
+| video (MiniMax-H3) | live (M11) | [`video-vertical.md`](video-vertical.md) § Handoff |
+| embeddings | done, latency open | [`embedding-vertical.md`](embedding-vertical.md) § "Where it stands, E7 done, and what is next" (last section) |
+| classification (Kev-4B) | live | [`classification-vertical.md`](classification-vertical.md) § Handoff |
+| OCR (PaddleOCR-VL-1.6) | live (O11b) | [`ocr-vertical.md`](ocr-vertical.md) § Handoff |
+| object detection (RF-DETR-L) | planned, not started | [`detection-vertical.md`](detection-vertical.md) § Handoff |
+| kernels (G-stages) | live | [`kernels-vertical.md`](kernels-vertical.md) § Handoff |
+| the server | kept current | [`api-server.md`](api-server.md) § What is left; deployment in [`api-residency.md`](api-residency.md) |
+
+A code comment citing `TODO.md` with a **P-stage** (P19–P25, e.g. `TODO.md
+P20f`, `P22c`) resolves in [`llm-plan.md`](llm-plan.md); any other `TODO.md`
+citation is to the retired file, in git history before 2026-10-02.
 
 ## The vertical archives
 
@@ -37,7 +63,11 @@ rewritten — same as `LLM.md` and `SPEECH.md`.
 | [`ocr-vertical.md`](ocr-vertical.md) | `OCR.md` (moved 2026-10-02) | PaddleOCR-VL-1.6, **still live**: O-stages, decisions, O-o numbers, the handoff. Broken out: [O7](o7-pp-doclayoutv3.md) (PP-DocLayoutV3), [O10](o10-omnidocbench.md) (OmniDocBench), [O11](o11-performance.md) (performance) |
 | [`llm-vision.md`](llm-vision.md) | `LLM-VISION.md` (moved 2026-10-02) | image input for the text vertical, **still live**: V0–V12, kept whole |
 | [`api-server.md`](api-server.md) | `API.md` (moved 2026-10-02) | the server as it answers today, kept current: packages, queue, flags, envelopes, what is left. Broken out: [residency](api-residency.md), [extensions](api-extensions.md) (image edits, presets), [Wyoming and System One](api-wyoming-and-systemone.md), [video and music jobs](api-jobs.md) |
+| [`classification-vertical.md`](classification-vertical.md) | `CLASSIFICATION.md` (moved 2026-10-02) | Kev-4B, **still live**: K-stages (K0–K6 inline), decisions D1–D5, the handoff. Broken out: [K7.1](k7.1-int8-bank.md) (int8 bank), [K7.2](k7.2-prefix-cache.md) (prefix cache), [K7.3](k7.3-wmma-attention.md) (WMMA attention), [K7.4](k7.4-gdn-scan.md) (GDN scan), [K7.5](k7.5-batching.md) (batching), [K7.6](k7.6-glu-fusion.md) (SwiGLU fusion), [K7.7](k7.7-stale-v-padding.md) (stale V), [K8](k8-kev-suites.md) (Kev's suites), [K9](k9-scheduler-and-streams.md) (scheduler, chunked streams) |
+| [`concurrency.md`](concurrency.md) | `CONCURRENCY.md` (moved 2026-10-02) | three LLM completions at once (P6): the plan, priority rules, stage table, *Next*, the log. Broken out: [C0+C3](c0-c3-harness-and-chunk-curve.md), [C1](c1-sequence-slots.md), [C2](c2-scheduler.md), [C4](c4-checkpoints.md), [C5a](c5a-three-row-pass.md), [C5](c5-batched-decode.md), [C6](c6-full-context-slots.md), and the follow-ons: [prefill cache size](c-prefill-cache-size.md), [MoE GEMV loads](c-moe-gemv-loads.md), [stale values](c-stale-values.md), [rows side by side](c-rows-side-by-side.md) |
+| [`detection-vertical.md`](detection-vertical.md) | `OBJ-DETECTION.md` (moved 2026-10-02) | RF-DETR-L, **still live**, planned and not started: B-stages, decisions, B-o numbers, the handoff; kept whole |
 | [`ideas.md`](ideas.md) | `IDEAS.md` | the `§N.M` backlog and the measured roofline — **the address space; never renumber** |
+| [`llm-plan.md`](llm-plan.md) | `TODO.md` (retired 2026-10-02) | the text vertical's live plan: P19–P25, the open items, the instrument rules — `TODO.md`'s "Text generation" section and its P7–P18 history. The rest of `TODO.md` went to the verticals' own files (table at the top); its at-a-glance table is [`../PERFORMANCE.md`](../PERFORMANCE.md) |
 | [`phase1-backlog.md`](phase1-backlog.md) | old `TODO.md` tail | what phase 1 built, the bugs worth remembering, the microbenchmark backlog |
 
 ## The section number is the address — do not renumber
@@ -206,8 +236,8 @@ reduction kernels: the 3.3x gap is lane count, closed as a side effect of
 | Layer | Lives in | Grows |
 |---|---|---|
 | What the chip can do | [`ideas.md`](ideas.md) — the roofline table | Rarely; only when a ceiling is re-measured |
-| What to try next | [`../TODO.md`](../TODO.md) — the open items per vertical | Shrinks as items close |
+| What to try next | each vertical's live file (table at the top) — its open items and handoff | Shrinks as items close |
 | What we learned | **here**, one file per § or stage | Forever |
 
 When an item closes: move its body here as its own file, leave one line and
-a link in `../TODO.md`, and add a row above.
+a link in its vertical's file, and add a row above.

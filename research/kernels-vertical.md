@@ -1,9 +1,8 @@
 # KERNELS — the matrix cores to their ceiling
 
 > **Moved to `research/` on 2026-10-02** — this was `KERNELS.md` at the repo
-> root, and code comments citing `KERNELS.md` resolve here. The vertical is **not closed**: [`../TODO.md`](../TODO.md)
-> carries its open items in summary, and § Handoff below is still where a
-> session resumes. The long G-stage write-ups are broken out into `g*.md`
+> root, and code comments citing `KERNELS.md` resolve here. The vertical is **not closed**:
+> § Handoff below is where a session resumes, and it carries the open items. The long G-stage write-ups are broken out into `g*.md`
 > files beside this one, linked where each stage's section was; G-stages,
 > G-o numbers and decisions 1–7 still resolve here.
 

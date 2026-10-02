@@ -1,7 +1,8 @@
 # IMAGE — the z-image-turbo vertical
 
 > **ARCHIVED 2026-09-20** — frozen as the closing record of the z-image-turbo vertical (I0–I7): serving, previews, edits, the re-checked hypotheses. It was
-> `IMAGE.md` at the repo root; the live state of play is now [`../TODO.md`](../TODO.md).
+> `IMAGE.md` at the repo root; the live state of play is now
+> [`qimage-vertical.md`](qimage-vertical.md) (the vertical that replaced it) (the root `TODO.md` that held it was retired 2026-10-02).
 
 > **Rewritten 2026-09-18 (I7), and this is the file to read first for this
 > vertical.**
