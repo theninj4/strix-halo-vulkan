@@ -1,5 +1,11 @@
 # LLM-VISION — image input for the text vertical
 
+> **Moved to `research/` on 2026-10-02** — this was `LLM-VISION.md` at the repo
+> root, and code comments citing `LLM-VISION.md` resolve here. The vertical is **not closed** (V11, video, is
+> parked): [`../TODO.md`](../TODO.md) carries it in summary, and § Handoff
+> below is still where a session resumes. It is kept whole: its stages are
+> short bullets that read in order.
+
 > **Live tracking and session handoff doc, opened 2026-09-24.** Stage letters
 > are **V**. When the vertical closes, this file is frozen to
 > `research/llm-vision.md` like the others and `TODO.md` gets the one-line

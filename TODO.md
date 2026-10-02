@@ -22,7 +22,7 @@
 > [`research/music-vertical.md`](research/music-vertical.md). A code comment
 > citing `IMAGE.md` resolves by what follows it: **Q-stages, numbered
 > decisions and Q-o numbers** are `research/qimage-vertical.md`, **I-stages**
-> are `research/zimage-vertical.md`. `GOALS.md` is the target; `API.md`
+> are `research/zimage-vertical.md`. `GOALS.md` is the target; [`research/api-server.md`](research/api-server.md)
 > documents the server as it answers today.
 
 ## The five verticals, at a glance
@@ -45,12 +45,12 @@ here is our own ceiling, not a reference implementation.
 stages the checkpoint's 27-layer vision tower beside the LLM, and all three
 chat doors take images, gated against HF (processor bit-exact, positions,
 PLE) and llama.cpp (the whole model's argmax). Live record and handoff:
-root [`LLM-VISION.md`](LLM-VISION.md) (V-stages). V10's eval and video are
+[`research/llm-vision.md`](research/llm-vision.md) (V-stages). V10's eval and video are
 open.
 
 **Video (opened 2026-09-26): MiniMax-H3, text/keyframes to video with
-stereo sound** (`GOALS.md` item 7). The live plan and handoff is the root
-[`VIDEO.md`](VIDEO.md) (M-stages). M0–M10 and M11a are done: a prompt, and
+stereo sound** (`GOALS.md` item 7). The live plan and handoff is
+[`research/video-vertical.md`](research/video-vertical.md) (M-stages). M0–M10 and M11a are done: a prompt, and
 optionally a first and/or last keyframe (`fl2va`, M10), becomes an mp4 with
 sound (`cmd/h3`), and **`serve -video` answers `/v1/videos`** as
 OpenAI's async jobs (SGLang's H3 envelope too), sharing the device while it
@@ -95,8 +95,8 @@ row chunk at 4096 is 1.04x measured (to ship); the multiples are lossy
   every vertical ~10 GB more room at rest (36.9 → 47.5 GB).
 
 **Kernels (reopened 2026-09-29): the matrix cores to their ceiling.** The
-project's first vertical, given its own live plan in root
-[`KERNELS.md`](KERNELS.md) (G-stages). The fp16 GEMM has sat at **42.0 of
+project's first vertical, given its own live plan in
+[`research/kernels-vertical.md`](research/kernels-vertical.md) (G-stages). The fp16 GEMM has sat at **42.0 of
 55.5 TFLOP/s** since stage 4, the attention at 38, and every vertical since
 has ended on "the GEMMs are at their ceiling". Restated per clock (the GEMM
 runs at 2813 MHz and 137 W where the peak probe ran 2899 and 110) that is
@@ -157,7 +157,7 @@ music section below and the archive
 [`research/music-vertical.md`](research/music-vertical.md).
 
 **OCR (opened 2026-09-27): PaddleOCR-VL-1.6** (`GOALS.md` item 10). The
-live plan and handoff is the root [`OCR.md`](OCR.md) (O-stages): element
+live plan and handoff is [`research/ocr-vertical.md`](research/ocr-vertical.md) (O-stages): element
 recognition first (the 0.9 B VLM behind `/v1/chat/completions`, which
 PaddleOCR's own pipeline can drive unchanged), then page parsing with
 PP-DocLayoutV3 and the glue in Go (`/v1/ocr`, Mistral's shape). O0–O10
@@ -170,7 +170,7 @@ instead of 66 (3.0 s a page mean, worst 143 → 18 s). Open: O11b (towers,
 the long tail), reading order through HF's layout port (O-o5).
 
 **Image, music and video share one swap slot (2026-09-27, `backend.Swap`,
-`API.md` *Residency*).** A request loads its vertical and unloads the
+[`research/api-residency.md`](research/api-residency.md)).** A request loads its vertical and unloads the
 other; `-swap-idle` (10 min) empties the slot. Served with the unit's full
 flags through image → music → video → image: 9.4 GB at rest with nothing
 staged, 60 GB at the worst moment (all three resident was ~112 GB), a switch
@@ -179,7 +179,7 @@ answered through every load (loads take no device lock). This is what lets
 `-image -edits 3 -video -music` go back into the unit; deployed (the unit
 runs it, and the 2026-09-29 18:40 start logs the swaps).
 
-**The server** (`API.md`): one process, one flag per vertical, OpenAI-shaped
+**The server** ([`research/api-server.md`](research/api-server.md)): one process, one flag per vertical, OpenAI-shaped
 (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/audio/*`,
 `/v1/images/*`, `/v1/embeddings`), plus a Wyoming door for Home Assistant
 (`-wyoming`, byte-identical audio to the HTTP door). Everything unimplemented
@@ -1247,7 +1247,7 @@ projections batched, attention per text, with no shader changes.
 Also unexplained: the Sep 27 production requests ran at 47 ms a text, 4x
 the model's own time, probably another vertical holding the device.
 
-## The server, cross-vertical (docs: [`API.md`](API.md))
+## The server, cross-vertical (docs: [`research/api-server.md`](research/api-server.md))
 
 - **Constrained decoding** — the one refusal that is a missing capability:
   would close `response_format`, `text.format` and named `tool_choice`.
@@ -1262,7 +1262,7 @@ the model's own time, probably another vertical holding the device.
 
 ---
 
-## Where the old files went (2026-09-20 consolidation, IMAGE.md again on 2026-09-21, MUSIC.md on 2026-09-27)
+## Where the old files went (2026-09-20 consolidation, IMAGE.md again on 2026-09-21, MUSIC.md on 2026-09-27, five more on 2026-10-02)
 
 | was | now |
 |---|---|
@@ -1275,6 +1275,11 @@ the model's own time, probably another vertical holding the device.
 | `PIPELINE.md` | [`research/zimage-pipeline.md`](research/zimage-pipeline.md) — inventory, validation rules, budget |
 | `EMBEDDING.md` | [`research/embedding-vertical.md`](research/embedding-vertical.md) |
 | `MUSIC.md` (2026-09-27) | [`research/music-vertical.md`](research/music-vertical.md) — frozen 2026-09-27 with the vertical; **A-stages, decisions 1–7 and A-o numbers resolve there** |
+| `KERNELS.md` (2026-10-02) | [`research/kernels-vertical.md`](research/kernels-vertical.md) — **still live**; G-stages, G-o numbers and decisions 1–7 resolve there; G0–G8's write-ups broken out as `research/g*.md`, sessions 1–12 of the handoff as [`research/kernels-sessions.md`](research/kernels-sessions.md) |
+| `VIDEO.md` (2026-10-02) | [`research/video-vertical.md`](research/video-vertical.md) — **still live**; M-stages and M-o numbers resolve there; M11a–M11h broken out as `research/m11*.md` |
+| `OCR.md` (2026-10-02) | [`research/ocr-vertical.md`](research/ocr-vertical.md) — **still live**; O-stages and O-o numbers resolve there; O7, O10 and O11 broken out as `research/o7-…`, `o10-…`, `o11-…` |
+| `LLM-VISION.md` (2026-10-02) | [`research/llm-vision.md`](research/llm-vision.md) — **still live**, kept whole; V-stages resolve there |
+| `API.md` (2026-10-02) | [`research/api-server.md`](research/api-server.md) — the server as it answers today, kept current; residency, extensions, the Wyoming/System One doors and the video/music jobs broken out as `research/api-*.md` |
 | `IDEAS.md` | [`research/ideas.md`](research/ideas.md) — the `§N.M` backlog and the measured roofline |
 | `TODO.md` (session log) | distilled into `research/` as each stage closed; the phase-1 tail is [`research/phase1-backlog.md`](research/phase1-backlog.md); the full log is in git history |
 

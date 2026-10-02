@@ -340,7 +340,7 @@ reads `inference_sdk`'s client and the server's request models whole**,
 decides the `model_id` alias (upstream uses `rfdetr-large`), and lists the fields we
 refuse rather than fake, in API.md's pattern. Image URLs are fetched, as
 the chat door fetches them (memory: *API follows OpenAI's standard*,
-behaviour not just shape). Update `API.md` and `deploy.sh`'s machine-B line.
+behaviour not just shape). Update `research/api-server.md` and `deploy.sh`'s machine-B line.
 
 Gate: `InferenceHTTPClient(api_url="http://…").infer(img,
 model_id=…)` and the visualisation path work unchanged, and the numbers

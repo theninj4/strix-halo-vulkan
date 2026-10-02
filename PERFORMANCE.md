@@ -13,8 +13,8 @@
 
 | resource | spec | measured ceiling | source |
 |---|---|---|---|
-| matrix cores, fp16 WMMA | 59.4 TFLOP/s (512 FLOP/clk/CU × 40 × 2.9 GHz) | **55.5 TFLOP/s** (478 FLOP/clk/CU at 2899 MHz, register-only `peak` probe) | [`KERNELS.md`](KERNELS.md), `results/peak.csv` |
-| int8 dot4 / packed fp16 FMA / fp32 FMA | — | 54 / 25 / 23 TOP/s | [`KERNELS.md`](KERNELS.md) §0.7 |
+| matrix cores, fp16 WMMA | 59.4 TFLOP/s (512 FLOP/clk/CU × 40 × 2.9 GHz) | **55.5 TFLOP/s** (478 FLOP/clk/CU at 2899 MHz, register-only `peak` probe) | [`research/kernels-vertical.md`](research/kernels-vertical.md), `results/peak.csv` |
+| int8 dot4 / packed fp16 FMA / fp32 FMA | — | 54 / 25 / 23 TOP/s | [`research/kernels-vertical.md`](research/kernels-vertical.md) §0.7 |
 | DRAM bandwidth | 256 GB/s | **236 GB/s** (stream, ≥ 50 MB footprint) | [`research/0-measurement-validity.md`](research/0-measurement-validity.md) |
 | MALL (32 MiB last-level cache) | — | **~805 GB/s** copy, 940–965 GB/s read-only | [`research/5.1b-mall-cliff-and-stride.md`](research/5.1b-mall-cliff-and-stride.md) |
 
@@ -49,7 +49,7 @@ draws 91 W and prefill 142 W (KERNELS.md §0.7).
 
 Every vertical runs end to end in Go on Vulkan. Each one is gated against
 a reference implementation and served by `cmd/serve` behind an
-OpenAI-shaped API ([`API.md`](API.md)).
+OpenAI-shaped API ([`research/api-server.md`](research/api-server.md)).
 
 ### Text generation: Qwen3.8-Flash-Next (180 B MoE, 6 B active, 4-bit banks)
 
@@ -73,7 +73,7 @@ tok/s, and the depth figures have not been re-run since.
 doors. The tower takes 28 ms (a QR code) to 2.1 s (a photo at the size
 cap). The V10 eval scores **17/18, the same as llama.cpp** on the same
 weights. The tower yields the device every 50 ms, so a voice turn still
-decodes at ~10 tok/s beside it ([`LLM-VISION.md`](LLM-VISION.md)).
+decodes at ~10 tok/s beside it ([`research/llm-vision.md`](research/llm-vision.md)).
 
 ### Speech → text: parakeet-tdt-0.6b-v3
 
@@ -112,7 +112,7 @@ trip runs at 70.1x real time. ([`research/tts-recap.md`](research/tts-recap.md))
 | request peak memory | 31–33 GB on int8 banks (57 GB fp16) |
 | stagings from `bank-cache/` | ~12 s, down from ~94 s |
 
-([`VIDEO.md`](VIDEO.md))
+([`research/video-vertical.md`](research/video-vertical.md))
 
 ### Music: ACE-Step 1.5 XL turbo + 5 Hz LM 4B
 
@@ -147,7 +147,7 @@ On a 331-page OmniDocBench v1.6 subset, the Go pipeline scores **96.13**.
 PaddleX's own pipeline on our engine scores 96.14, and the model card
 gives 96.34 on the full set. Batched decode over a paged KV cache (O11a)
 runs the subset in **18 min instead of 66**: 3.0 s a page mean, with the
-worst page 143 → 18 s. ([`OCR.md`](OCR.md))
+worst page 143 → 18 s. ([`research/ocr-vertical.md`](research/ocr-vertical.md))
 
 ### Object detection: RF-DETR-L
 
@@ -160,4 +160,4 @@ Deployment uses two machines: the LLM alone on one, everything else on the
 other. Image, music and video share one swap slot that sits at **9.4 GB
 at rest and peaks at 60 GB**, against ~112 GB with all three resident. A
 switch costs ~19–30 s, and speech is answered through every load
-([`TODO.md`](TODO.md), `API.md` *Residency*).
+([`TODO.md`](TODO.md), [`research/api-residency.md`](research/api-residency.md)).
