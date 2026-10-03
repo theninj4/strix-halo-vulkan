@@ -152,7 +152,7 @@ func main() {
 		"tokens the prefill arenas hold; a longer prompt is prefilled in chunks of it. "+
 			"P16, through this server: 2048 is 1052 tok/s prefill, 4096 is 1199 (1.14x), 8192 is 1233, and decode is 34.2 at all three. "+
 			"Wider costs only memory: 8192 helps prompts past 4096 tokens and holds ~3 GB more")
-	llmMax := flag.Int("llm-max-tokens", 1024, "tokens a request that names no max_tokens gets")
+	llmMax := flag.Int("llm-max-tokens", 32768, "tokens a request that names no max_tokens gets (still capped by the room left in -llm-ctx)")
 	llmLayers := flag.Int("llm-layers", 0, "stage only the first N layers; 0 is the model, anything else is a fast start and not an answer")
 	llmSlots := flag.Int("llm-slots", 1, "conversations held at once, interleaved a prefill chunk or decode step at a time (CONCURRENCY.md). "+
 		"Each is its own cache of -llm-ctx cells, ~27.8 KB a cell")

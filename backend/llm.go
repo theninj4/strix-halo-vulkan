@@ -130,7 +130,7 @@ const (
 	defaultLLMModelID  = "qwen3.8-flash-next"
 	defaultLLMContext  = 4096
 	defaultLLMBatch    = 4096
-	defaultLLMMaxToken = 1024
+	defaultLLMMaxToken = 32768
 )
 
 // LLM is the qwen3.8-flash-next adapter: an api.CompletionBackend over the

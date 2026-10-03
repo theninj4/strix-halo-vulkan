@@ -112,7 +112,7 @@ saves about 70 s on every request after the first.
 | `-llm-reserve` | `1` | slots that only interactive requests may take |
 | `-llm-class` | `background` | priority of a request that sets none |
 | `-llm-presets` | `models.ini` | llama-server preset file (see [Presets](#presets)) |
-| `-llm-max-tokens` | `1024` | `max_tokens` for a request that sets none |
+| `-llm-max-tokens` | `32768` | `max_tokens` for a request that sets none; capped by what is left of `-llm-ctx` |
 | `-embed-tokens` | `512` | longest embedding input; longer inputs are truncated |
 | `-max-audio` | `60` | longest transcription clip, in seconds |
 | `-image-size` | `1024x1024` | largest image *area*. Any aspect ratio within that many pixels is served |
