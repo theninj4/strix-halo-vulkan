@@ -10,6 +10,7 @@ set -ex
 #   loginctl enable-linger $USER
 
 cd "$(dirname "$0")"
+go generate ./...
 go build -o ai ./cmd/serve
 cat ./ai.service | sed "s|###|$(pwd)|" > ~/.config/systemd/user/ai.service
 systemctl --user daemon-reload
