@@ -65,6 +65,7 @@ shared uint rowSLo[TILE];
 shared uint rowSHi[TILE];
 shared uint useful;
 shared uint tileHi;
+shared uint tileLo;
 
 bool allowed(uint r, uint key) {
     bool inState = key >= rowSLo[r] && key < rowSHi[r];
@@ -83,6 +84,7 @@ void main() {
 
     if (tid == 0u) {
         tileHi = 0u;
+        tileLo = 0xffffffffu;
     }
     barrier();
     if (tid < TILE) {
@@ -94,6 +96,9 @@ void main() {
             sLo = floatBitsToUint(act[pc.aux1 + r * 8u + 4u]);
             sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);
             atomicMax(tileHi, cell + 1u);
+            // The lowest cell this row may see: the key loop starts at the
+            // tile's lowest (gemma4_attn.comp's tileLo).
+            atomicMin(tileLo, sHi > sLo ? sLo : lo);
         }
         rowCell[tid] = cell;
         rowLo[tid] = lo;
@@ -105,6 +110,7 @@ void main() {
     }
     barrier();
     uint hi = tileHi;
+    uint from = tileLo == 0xffffffffu ? hi : (tileLo / KB) * KB;
 
     uint qBase = pc.inOff + q0 * QROW + h * HD;
     ACC o[OT];
@@ -115,7 +121,7 @@ void main() {
     const FRAG_B ones = FRAG_B(float16_t(1.0));
 
     uint kBase = pc.kOff + g * HD, vBase = pc.vOff + g * HD + ob;
-    for (uint base = 0u; base < hi; base += KB) {
+    for (uint base = from; base < hi; base += KB) {
         // Skip a block none of the tile's rows may see a key of.
         if (tid == 0u) {
             useful = 0u;

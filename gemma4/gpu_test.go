@@ -36,7 +36,7 @@ func loadGPU(t *testing.T) *GPU {
 	gpuOnce.Do(func() {
 		dev, done := newTestDevice(t)
 		gpuDone = done
-		gpuM, gpuErr = Load(dev, runeDir, Options{Rows: 8192})
+		gpuM, gpuErr = Load(dev, runeDir, Options{Rows: 8192, Vision: true})
 	})
 	if gpuErr != nil {
 		t.Fatal(gpuErr)

@@ -189,6 +189,7 @@ func main() {
 	runeModel := flag.String("rune-model", "models/rune-26b-a4b", "Rune checkpoint directory (bf16 safetensors; quantised to int8 at load)")
 	runeRows := flag.Int("rune-rows", 8192, "the longest request one pass holds, in tokens: the shared state once plus every question's suffix")
 	runeBatch := flag.Int("rune-batch-tokens", 1024, "the most tokens concurrent requests share one pass up to; a pass reads every expert, so rows are cheapest at ~1024 (R8)")
+	runeVision := flag.Bool("rune-vision", true, "stage Rune's vision tower (~1.3 GB) so decisions requests may carry images (research/rune-vertical.md R10)")
 	runeTemp := flag.Float64("rune-temperature", 2, "the decision calibration temperature every answer is read at (decisions v1's --decision-temperature; Rune's card says 2)")
 
 	ocrOn := flag.Bool("ocr", false, "load PaddleOCR-VL-1.6 and serve it on /v1/chat/completions as model "+backend.OCRModelID+" (OCR.md)")
@@ -388,7 +389,7 @@ func main() {
 			log.Fatal("-rune needs the device; it has no CPU path")
 		}
 		start := time.Now()
-		b, err := backend.NewRune(backend.RuneOptions{Model: *runeModel, Device: dev, Rows: *runeRows, Temperature: *runeTemp, BatchTokens: *runeBatch})
+		b, err := backend.NewRune(backend.RuneOptions{Model: *runeModel, Device: dev, Rows: *runeRows, Temperature: *runeTemp, BatchTokens: *runeBatch, Vision: *runeVision})
 		if err != nil {
 			log.Fatal(err)
 		}

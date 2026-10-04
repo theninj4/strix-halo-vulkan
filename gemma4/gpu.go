@@ -34,6 +34,7 @@ package gemma4
 import (
 	"fmt"
 	"math"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -196,6 +197,8 @@ type layer struct {
 type Options struct {
 	// Rows is the longest pass: the arena's rows. Zero takes 4096.
 	Rows int
+	// Vision stages the vision tower too (R10, ~1.2 GB), for images.
+	Vision bool
 }
 
 // GPU is a staged Rune.
@@ -210,9 +213,13 @@ type GPU struct {
 
 	wbuf, abuf, hbuf, bank *vk.Buffer
 	moe                    *llm.MoEGPU
-	pipes                  map[string]*vk.ComputePipeline
-	mods                   []*vk.ShaderModule
-	layers                 []layer
+	// Vis is the vision tower, when Options.Vision staged it.
+	Vis     *Vision
+	feats   featureCache
+	imageID int32 // <|image|>, whose rows a pass takes from Segment.Soft
+	pipes   map[string]*vk.ComputePipeline
+	mods    []*vk.ShaderModule
+	layers  []layer
 
 	// GEMM forces a rung per projection ("qkv", "o", "gate+up", "down" to a
 	// gemmKernels name), for the ladder; unset ones take the schedule.
@@ -268,6 +275,13 @@ func Load(dev *vk.Device, dir string, o Options) (*GPU, error) {
 	if err := g.build(); err != nil {
 		g.Destroy()
 		return nil, err
+	}
+	g.imageID, _ = tok.ID(imageToken)
+	if o.Vision {
+		if g.Vis, err = LoadVision(dev, set, dir, c.Hidden); err != nil {
+			g.Destroy()
+			return nil, err
+		}
 	}
 	return g, nil
 }
@@ -416,6 +430,13 @@ func (g *GPU) stage() error {
 		if err != nil {
 			return err
 		}
+		if !plainQ8 {
+			// The grouped GEMM's Q8_TILED layout (R10): bit-identical,
+			// 1.15-1.4x on the experts.
+			ex.Gate.Data = tileQ8(ex.Gate.Data, c.Experts*c.MoEInter, H)
+			ex.Up.Data = tileQ8(ex.Up.Data, c.Experts*c.MoEInter, H)
+			ex.Down.Data = tileQ8(ex.Down.Data, c.Experts*H, c.MoEInter)
+		}
 		moeLayers[i] = llm.MoEWeights{
 			Router: router, SharedGate: make([]float32, H),
 			Gate:       &llm.ExpertBank{T: ex.Gate, In: H, Out: c.MoEInter, NExp: c.Experts},
@@ -432,7 +453,11 @@ func (g *GPU) stage() error {
 	g.wbuf.WriteFloat32(w)
 
 	cfg := llm.MoEConfig{NEmbd: H, NExpert: c.Experts, NExpertUsed: c.TopK, FFNExpert: c.MoEInter, FFNShared: sharedFF}
-	if g.moe, err = llm.NewMoEGPU(g.dev, cfg, R, moeLayers, llm.WithMoEGELU(), llm.WithMoENoShared()); err != nil {
+	opts := []llm.MoEOption{llm.WithMoEGELU(), llm.WithMoENoShared()}
+	if !plainQ8 {
+		opts = append(opts, llm.WithMoEQ8Tiled())
+	}
+	if g.moe, err = llm.NewMoEGPU(g.dev, cfg, R, moeLayers, opts...); err != nil {
 		return fmt.Errorf("gemma4: experts: %w", err)
 	}
 	g.moe.PinGemv(true)
@@ -622,6 +647,9 @@ func (g *GPU) Destroy() {
 	if g.moe != nil {
 		g.moe.Destroy()
 	}
+	if g.Vis != nil {
+		g.Vis.Destroy()
+	}
 	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank} {
 		if b != nil {
 			b.Destroy()
@@ -634,25 +662,37 @@ func (g *GPU) Destroy() {
 
 // ---- a pass
 
+// plainQ8 (RUNE_Q8_TILED=0) stages the experts in GGUF's own Q8_0 layout
+// and runs the plain builds: the control for the tiled ones.
+var plainQ8 = os.Getenv("RUNE_Q8_TILED") == "0"
+
+// causalImages drops the image tokens' bidirectional attention: the
+// control for TestVisionOracle's mask, never served.
+var causalImages = false
+
 // Pass is one packed forward: the state's tokens, then each branch's.
 type Pass struct {
 	n        int
 	meta     []uint32
 	ids      []int32
-	readouts []int // the row each branch is read at: its last
+	readouts []int             // the row each branch is read at: its last
+	soft     map[int][]float32 // an image token's row: its input, in place of the embedding
 }
 
 // Segment is one request's share of a pass: its state, then its branches.
+// Soft holds the state's images' features in order ([soft][hidden] each):
+// the state's image tokens take their rows from it, one a token.
 type Segment struct {
 	State    []int32
 	Branches [][]int32
+	Soft     [][]float32
 }
 
 // NewPass lays out a state and its branches as Kev's planner does: the state
 // at cells [0, len), positions [0, len); branch b at the next 64-aligned
 // cell, positions continuing from the state's end.
 func (g *GPU) NewPass(state []int32, branches [][]int32) (*Pass, error) {
-	return g.NewBatch([]Segment{{state, branches}})
+	return g.NewBatch([]Segment{{State: state, Branches: branches}})
 }
 
 // NewBatch packs several requests into one pass (R8, Kev's K7.5): each
@@ -664,6 +704,7 @@ func (g *GPU) NewPass(state []int32, branches [][]int32) (*Pass, error) {
 func (g *GPU) NewBatch(segs []Segment) (*Pass, error) {
 	p := &Pass{}
 	cursor := 0
+	H := g.Cfg.Hidden
 	for slot, sg := range segs {
 		L := len(sg.State)
 		if L == 0 {
@@ -672,9 +713,37 @@ func (g *GPU) NewBatch(segs []Segment) (*Pass, error) {
 		sLo := roundUp(cursor, keyAlign)
 		stateRow := len(p.ids)
 		end := uint32(stateRow + L) // nonzero: the state is in this pass, not resident
+		// An image's tokens attend to each other both ways on the sliding
+		// layers (HF's blockwise overlay; the full layers stay causal): a
+		// row in a run of image tokens carries the cell past the run's end
+		// in its kind word's upper bits, which gemma4_attn reads.
+		img, soft := 0, 0
 		for i, id := range sg.State {
+			kind := uint32(0)
+			if id == g.imageID && g.imageID != 0 {
+				j := i
+				for j < L && sg.State[j] == id {
+					j++
+				}
+				if !causalImages {
+					kind = uint32(sLo+j) << 1
+				}
+				if img >= len(sg.Soft) || soft >= len(sg.Soft[img])/H {
+					return nil, fmt.Errorf("gemma4: more image tokens than image features")
+				}
+				if p.soft == nil {
+					p.soft = map[int][]float32{}
+				}
+				p.soft[len(p.ids)] = sg.Soft[img][soft*H : (soft+1)*H]
+				if soft++; soft == len(sg.Soft[img])/H {
+					img, soft = img+1, 0
+				}
+			}
 			p.ids = append(p.ids, id)
-			p.meta = append(p.meta, uint32(i), 0, uint32(stateRow), uint32(sLo+i), 0, 0, uint32(slot), end)
+			p.meta = append(p.meta, uint32(i), kind, uint32(stateRow), uint32(sLo+i), 0, 0, uint32(slot), end)
+		}
+		if img != len(sg.Soft) || soft != 0 {
+			return nil, fmt.Errorf("gemma4: %d images' features for %d images' tokens", len(sg.Soft), img)
 		}
 		cursor = sLo + L
 		for _, b := range sg.Branches {
@@ -767,6 +836,10 @@ func (g *GPU) ForwardFrom(p *Pass, x []float32, from, to int) (time.Duration, er
 		go func(t int) {
 			defer wg.Done()
 			for r := t; r < min(t+64, n); r++ {
+				if f, ok := p.soft[r]; ok {
+					copy(x[r*H:(r+1)*H], f)
+					continue
+				}
 				g.Embed(p.ids[r], x[r*H:(r+1)*H])
 			}
 		}(t)

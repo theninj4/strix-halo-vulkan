@@ -26,7 +26,7 @@ would load it.
 | `-embed` | Qwen3-Embedding-0.6B | `/v1/embeddings` | 0.9 GB |
 | `-tts` | Kokoro-82M (+ misaki lexicon, espeak-ng fallback) | `/v1/audio/speech` | small |
 | `-stt` | parakeet-tdt-0.6b-v3 | `/v1/audio/transcriptions` | small |
-| `-rune` | Rune v3 (Gemma 4 26B-A4B, Q8) | `/v1/decisions` (+ `/api/alpha/decisions`, `/api/v1/decisions`), `/v1/systemone` | ~27 GB |
+| `-rune` | Rune v3 (Gemma 4 26B-A4B, Q8, + its vision tower) | `/v1/decisions` (+ `/api/alpha/decisions`, `/api/v1/decisions`), `/v1/systemone` | ~28 GB |
 | `-ocr` | PaddleOCR-VL-1.6 + PP-DocLayoutV3 | `/v1/ocr`, and `/v1/chat/completions` as model `PaddleOCR-VL-1.6-0.9B` | small |
 | `-image` / `-edits N` | Qwen-Image-2.1 | `/v1/images/generations`, `/v1/images/edits` | ~20 GB while resident |
 | `-video` | MiniMax-H3 (video with a soundtrack) | `/v1/videos` | ~0.3 GB at rest, ~31 GB per request |
@@ -218,8 +218,11 @@ authentication, so anyone who can reach that port can use both models.
 `POST /v1/decisions` is surogate's decisions v1 (OpenRouter's field names,
 also at `/api/alpha/decisions` and `/api/v1/decisions`): one state and
 typed `choice` / `noul` / `score` questions in, calibrated probabilities
-out (T = 2), with nothing generated. `order_averaging` is supported;
-`thinking` and images answer v1's 400 codes. Model names: `rune`,
+out (T = 2), with nothing generated. `order_averaging` is supported, and
+so are `images` (data or http(s) URLs, PNG/JPEG/GIF; Gemma 4's vision
+tower, on by default, `-rune-vision=false` to drop its ~1.3 GB): they go
+into every question's user turn ahead of the text, as decisions v1 renders
+them. `thinking` answers v1's 400 code. Model names: `rune`,
 `rune-26b-a4b`.
 
 `POST /v1/systemone` is TypeSafe's System One contract, as Kev served it,

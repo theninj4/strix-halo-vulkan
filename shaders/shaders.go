@@ -4131,3 +4131,82 @@ var Gemma4PostAttn []byte
 
 //go:embed gemma4_post_ffn.spv
 var Gemma4PostFFN []byte
+
+// Gemma 4's vision tower (research/rune-vertical.md R10): the joins, q/k/v
+// prep with the 2-D rope into the attention's planes, and the 3x3 pool; the GEMM and the
+// attention are the DiT's and the Qwen ViT's.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -o gemma4_vit_join.spv gemma4_vit.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -o gemma4_vit_prep.spv gemma4_vit.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=3 -o gemma4_vit_pool.spv gemma4_vit.comp
+
+//go:embed gemma4_vit_join.spv
+var Gemma4ViTJoin []byte
+
+//go:embed gemma4_vit_prep.spv
+var Gemma4ViTPrep []byte
+
+//go:embed gemma4_vit_pool.spv
+var Gemma4ViTPool []byte
+
+// The vision tower's gate+up with the GELU-tanh GLU in the epilogue
+// (research/rune-vertical.md R10): the reg64 build, and the LDS-staged
+// wave32 128x256 one (dit_gemm_wg128x256_lds_w32's) for wide row counts.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_vit_gemm_geglu.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_vit_gemm_geglu_lds.spv dit_gemm.comp
+
+//go:embed gemma4_vit_gemm_geglu.spv
+var Gemma4ViTGEMMGEGLU []byte
+
+//go:embed gemma4_vit_gemm_geglu_lds.spv
+var Gemma4ViTGEMMGEGLULDS []byte
+
+// Rune's experts in the Q8_TILED layout (research/rune-vertical.md R10): the
+// Q8_0 rungs again, up with GELU and the pipelined K loop, down plain.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_m2_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=4 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_m4_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_w2m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_w4m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWN=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_n1m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWN=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -DPIPE=1 -o llm_moe_up_q8t_n2m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -o llm_moe_down_q8t_m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -o llm_moe_down_q8t_m2.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=4 -DWAVES=1 -DSHORT=1 -DNBANK=48 -DQ8_TILED=1 -o llm_moe_down_q8t_m4.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -DQ8_TILED=1 -o llm_moe_down_q8t_w2m1.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -DQ8_TILED=1 -o llm_moe_down_q8t_w4m1.spv llm_moe_gemm.comp
+
+//go:embed llm_moe_up_q8t_m1_gelu.spv
+var LLMMoEUpQ8TM1GELU []byte
+
+//go:embed llm_moe_up_q8t_m2_gelu.spv
+var LLMMoEUpQ8TM2GELU []byte
+
+//go:embed llm_moe_up_q8t_m4_gelu.spv
+var LLMMoEUpQ8TM4GELU []byte
+
+//go:embed llm_moe_up_q8t_w2m1_gelu.spv
+var LLMMoEUpQ8TW2M1GELU []byte
+
+//go:embed llm_moe_up_q8t_w4m1_gelu.spv
+var LLMMoEUpQ8TW4M1GELU []byte
+
+//go:embed llm_moe_up_q8t_n1m1_gelu.spv
+var LLMMoEUpQ8TN1M1GELU []byte
+
+//go:embed llm_moe_up_q8t_n2m1_gelu.spv
+var LLMMoEUpQ8TN2M1GELU []byte
+
+//go:embed llm_moe_down_q8t_m1.spv
+var LLMMoEDownQ8TM1 []byte
+
+//go:embed llm_moe_down_q8t_m2.spv
+var LLMMoEDownQ8TM2 []byte
+
+//go:embed llm_moe_down_q8t_m4.spv
+var LLMMoEDownQ8TM4 []byte
+
+//go:embed llm_moe_down_q8t_w2m1.spv
+var LLMMoEDownQ8TW2M1 []byte
+
+//go:embed llm_moe_down_q8t_w4m1.spv
+var LLMMoEDownQ8TW4M1 []byte

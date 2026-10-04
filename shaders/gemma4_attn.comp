@@ -22,8 +22,14 @@
 //
 // The mask, then, per (row, key):
 //
-//	allowed(r, key) = key <= cell(r) && (key in [sLo(r), sHi(r)) || key >= lo(r))
+//	allowed(r, key) = key <= reach(r) && (key in [sLo(r), sHi(r)) || key >= lo(r))
 //	                  && (WINDOW == 0 || pos(r) - pos(r, key) < WINDOW)
+//
+// reach(r) is cell(r), except on the sliding layers for a row in a run of
+// image tokens (R10): Gemma 4's image tokens attend to their whole image
+// both ways there (HF's blockwise overlay, AND the window; the full layers
+// stay causal). Such a row's kind word (metadata word 1) holds the cell past
+// its run's end above bit 0, and reach is the run's last cell.
 //
 // Operands: q fp16 [rows][16][HD]; K and V fp16 [cells][NKV][HD]. Output:
 // o_proj's A operand, fp16, row stride lda, head h at column h*HD.
@@ -82,17 +88,19 @@ shared uint rowLo[TILE];
 shared uint rowSLo[TILE];
 shared uint rowSHi[TILE];
 shared uint rowPos[TILE];
+shared uint rowReach[TILE];
 shared uint useful;
 shared uint tileHi;
+shared uint tileLo;
 
 bool allowed(uint r, uint key) {
     bool inState = key >= rowSLo[r] && key < rowSHi[r];
-    if (!(key <= rowCell[r] && (inState || key >= rowLo[r]))) {
+    if (!(key <= rowReach[r] && (inState || key >= rowLo[r]))) {
         return false;
     }
 #if WINDOW > 0
-    uint kpos = inState ? key - rowSLo[r] : rowPos[r] - (rowCell[r] - key);
-    return rowPos[r] - kpos < uint(WINDOW);
+    int kpos = inState ? int(key - rowSLo[r]) : int(rowPos[r]) - (int(rowCell[r]) - int(key));
+    return int(rowPos[r]) - kpos < WINDOW;
 #else
     return true;
 #endif
@@ -110,20 +118,43 @@ void main() {
 
     if (lane == 0u) {
         tileHi = 0u;
+        tileLo = 0xffffffffu;
     }
     barrier();
     if (lane < TILE) {
         uint r = q0 + lane;
-        uint cell = 0u, lo = 1u, sLo = 0u, sHi = 0u, pos = 0u; // a pad row sees nothing
+        uint cell = 0u, lo = 1u, sLo = 0u, sHi = 0u, pos = 0u, reach = 0u; // a pad row sees nothing
         if (r < n) {
             cell = floatBitsToUint(act[pc.aux1 + r * 8u + 3u]);
             lo = cell - (r - floatBitsToUint(act[pc.aux1 + r * 8u + 2u]));
             sLo = floatBitsToUint(act[pc.aux1 + r * 8u + 4u]);
             sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);
             pos = floatBitsToUint(act[pc.aux1 + r * 8u]);
-            atomicMax(tileHi, cell + 1u);
+            reach = cell;
+#if WINDOW > 0
+            uint run = floatBitsToUint(act[pc.aux1 + r * 8u + 1u]) >> 1;
+            if (run != 0u) {
+                reach = run - 1u;
+            }
+#endif
+            atomicMax(tileHi, reach + 1u);
+            // The lowest cell this row may see (its request's state, else its
+            // own segment's start), raised by the window: the key loop
+            // starts at the tile's lowest, so a batched pass does not scan
+            // every other request's cells (all masked, and skipped, but
+            // checked key by key).
+            uint low = sHi > sLo ? sLo : lo;
+#if WINDOW > 0
+            if (sHi > sLo) {
+                low = pos + 1u >= uint(WINDOW) ? min(sLo + pos + 1u - uint(WINDOW), lo) : sLo;
+            } else if (cell + 1u >= uint(WINDOW)) {
+                low = max(lo, cell + 1u - uint(WINDOW));
+            }
+#endif
+            atomicMin(tileLo, low);
         }
         rowCell[lane] = cell;
+        rowReach[lane] = reach;
         rowLo[lane] = lo;
         rowSLo[lane] = sLo;
         rowSHi[lane] = sHi;
@@ -132,6 +163,7 @@ void main() {
     }
     barrier();
     uint hi = tileHi;
+    uint from = tileLo == 0xffffffffu ? hi : (tileLo / BN) * BN;
 
     uint qBase = pc.inOff + q0 * QROW + h * HD;
 #if HD == 256
@@ -148,7 +180,7 @@ void main() {
     const FRAG_B ones = FRAG_B(float16_t(1.0));
 
     uint kBase = pc.kOff + g * HD, vBase = pc.vOff + g * HD + ob;
-    for (uint base = 0u; base < hi; base += BN) {
+    for (uint base = from; base < hi; base += BN) {
         // Skip a block none of the tile's rows may see a key of: other
         // branches', other requests', or wholly outside every row's window.
         if (lane == 0u) {

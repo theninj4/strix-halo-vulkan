@@ -537,6 +537,64 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
     }                                                                                           \
   }
 #else
+// Q8_PK (research/rune-vertical.md R10, Rune's experts): a word's four int8s
+// into fp16 two at a time instead of one at a time through fp32. Each byte
+// goes into a half's low mantissa under the exponent of 1024 (0x6400 | b is
+// 1024 + b exactly), xor'd with 0x80 first so a signed byte comes out as
+// 1152 + q, and one packed subtract and one packed multiply by the block's
+// scale finish it. Bit-identical to the plain path: q * d is exact in fp32
+// (8 and 11 significant bits), so its rounding to fp16 is the correctly
+// rounded fp16 product the packed multiply computes. A third of the VALU
+// work, which in this kernel is matrix clocks (research §2.10).
+#ifndef Q8_PK
+#define Q8_PK 0
+#endif
+#if Q8_PK
+#define Q8_WORD(DST, at, w, d)                                                                  \
+    {                                                                                           \
+        uint e01 = ((w) & 0xFFu) | (((w) & 0xFF00u) << 8);                                       \
+        uint e23 = (((w) >> 16) & 0xFFu) | (((w) >> 8) & 0xFF0000u);                             \
+        f16vec2 d2 = f16vec2(float16_t(d));                                                     \
+        f16vec2 h01 = (unpackFloat2x16((e01 ^ 0x00800080u) | 0x64006400u) - f16vec2(1152.0)) * d2; \
+        f16vec2 h23 = (unpackFloat2x16((e23 ^ 0x00800080u) | 0x64006400u) - f16vec2(1152.0)) * d2; \
+        DST[(at)] = h01.x;                                                                      \
+        DST[(at) + 1u] = h01.y;                                                                 \
+        DST[(at) + 2u] = h23.x;                                                                 \
+        DST[(at) + 3u] = h23.y;                                                                 \
+    }
+#else
+#define Q8_WORD(DST, at, w, d)                                                                  \
+    [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                                 \
+        uint by = ((w) >> (8u * b)) & 0xFFu;                                                    \
+        DST[(at) + b] = float16_t(float(int(by) - int((by >> 7) << 8)) * (d));                  \
+    }
+#endif
+// Q8_TILED (research/rune-vertical.md R10): Rune's experts, quantised by us
+// as Q8_0 and laid out for this loop. Within each group of 16 bank rows the
+// blocks of one K-step are one 544-byte tile: the 16 rows' fp16 scales, then
+// their 16 x 32 int8s row by row. A lane's block is then one scale and two
+// 16-byte loads, and a step's loads over a column block are contiguous where
+// the GGUF layout puts them 34 bytes into rows 2,992 apart. A group spans the
+// same bytes its 16 rows did, so every bank size and offset is Q8_0's.
+#ifndef Q8_TILED
+#define Q8_TILED 0
+#endif
+#if QFMT == FMT_Q8_0 && Q8_TILED
+#define DEQUANT_BODY(DST)                                                                       \
+  [[unroll]] for (uint c = 0u; c < BK; c += 32u) {                                              \
+    uint r16 = (MOE_L0_BANK == 1 ? 0u : row) & 15u;                                             \
+    uint tile = rb - r16 * ((pc.gemmK / QK) * QB) + ((k0 + c) >> 5) * 544u;                     \
+    vec2 dd = unpackHalf2x16(qbank[(tile + r16 * 2u) >> 2]);                                    \
+    float d = (r16 & 1u) == 0u ? dd.x : dd.y;                                                   \
+    uint qv = (tile + 32u + r16 * 32u) >> 4;                                                    \
+    uvec4 qa = qbank4[qv];                                                                      \
+    uvec4 qb = qbank4[qv + 1u];                                                                 \
+    [[unroll]] for (uint t = 0u; t < 4u; ++t) {                                                 \
+        Q8_WORD(DST, dst + c + t * 4u, qa[t], d)                                                \
+        Q8_WORD(DST, dst + c + 16u + t * 4u, qb[t], d)                                          \
+    }                                                                                           \
+  }
+#elif QFMT == FMT_Q8_0
 // Q8_0 alone is not word-aligned below the row: 34 bytes a block puts the
 // int8s at an offset of 2 mod 4 on every other one, so the 32 bytes come out
 // of nine words through a rotating window rather than out of eight.
@@ -554,12 +612,10 @@ void NAME(uint bankBase, uint row, uint k0, uint col) {                         
         uint nxt = qbank[bw + t + 1u];                                                          \
         uint w = odd ? ((carry >> 16) | (nxt << 16)) : carry;                                   \
         carry = nxt;                                                                            \
-        [[unroll]] for (uint b = 0u; b < 4u; ++b) {                                             \
-            uint by = (w >> (8u * b)) & 0xFFu;                                                  \
-            DST[dst + c + t * 4u + b] = float16_t(float(int(by) - int((by >> 7) << 8)) * d);    \
-        }                                                                                       \
+        Q8_WORD(DST, dst + c + t * 4u, w, d)                                                    \
     }                                                                                           \
   }
+#endif
 #endif
 
 DEQUANT_SLAB(dequantB0, sB0)
@@ -610,7 +666,7 @@ float geluf(float g) {
 #define PIPE 0
 #endif
 #if PIPE
-#if !((MODE == 0 && QFMT == FMT_Q4_K) || (MODE == 1 && QFMT != FMT_Q4_K && QFMT != FMT_Q5_K)) || BK != 32
+#if !((MODE == 0 && (QFMT == FMT_Q4_K || (QFMT == FMT_Q8_0 && Q8_TILED))) || (MODE == 1 && QFMT != FMT_Q4_K && QFMT != FMT_Q5_K)) || BK != 32
 #error "PIPE is written for the Q4_K up mode and the block-32 down formats, at BK 32"
 #endif
 #endif
@@ -641,6 +697,15 @@ void pipeFetchDown(uint k0, uint tid, uint bankBase, inout uint fw[DN_W]) {
             uint pw = (rb + (m >> 1) * 36u) >> 2;
             [[unroll]] for (uint i = 0u; i < DN_W; ++i) { fw[i] = qbank[pw + i]; }
         }
+#elif QFMT == FMT_Q8_0 && Q8_TILED
+        // The block's scale (fp32 bits), then the row's 32 int8s as two uvec4.
+        uint r16 = (bankBase + tid) & 15u;
+        uint tile = rb - r16 * ((pc.gemmK / QK) * QB) + (k0 >> 5) * 544u;
+        vec2 dd = unpackHalf2x16(qbank[(tile + r16 * 2u) >> 2]);
+        fw[0] = floatBitsToUint((r16 & 1u) == 0u ? dd.x : dd.y);
+        uint qv = (tile + 32u + r16 * 32u) >> 4;
+        uvec4 qa = qbank4[qv], qb = qbank4[qv + 1u];
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) { fw[1u + i] = qa[i]; fw[5u + i] = qb[i]; }
 #else
         uint hw = (rb + (k0 >> 5) * QB) >> 2;
         [[unroll]] for (uint i = 0u; i < DN_W; ++i) { fw[i] = qbank[hw + i]; }
@@ -690,6 +755,11 @@ void pipeUnpackDown(uint k0, uint tid, uint bankBase, uint fw[DN_W]) {
                 sB0[dst + j] = float16_t(kIQ4[by & 0xFu] * d);
                 sB0[dst + j + 16u] = float16_t(kIQ4[by >> 4] * d);
             }
+        }
+#elif QFMT == FMT_Q8_0 && Q8_TILED
+        float d = uintBitsToFloat(fw[0]);
+        [[unroll]] for (uint t = 0u; t < 8u; ++t) {
+            Q8_WORD(sB0, dst + t * 4u, fw[1u + t], d)
         }
 #else
         // Q8_0: the plain body's rotating window over the fetched words,
@@ -752,6 +822,19 @@ void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
             uint base = r < BN ? pc.bOff : pc.moeBOff2;
             uint row = bankBase + (r < BN ? r : r - BN);
             uint rb = base + row * ((pc.gemmK / QK) * QB);
+#if QFMT == FMT_Q8_0
+            // Q8_TILED: hdr.x the block's scale (fp32 bits), lo and hi its 32 int8s.
+            uint r16 = row & 15u;
+            uint tile = rb - r16 * ((pc.gemmK / QK) * QB) + (k0 >> 5) * 544u;
+            vec2 dd = unpackHalf2x16(qbank[(tile + r16 * 2u) >> 2]);
+            hdr[n].x = floatBitsToUint((r16 & 1u) == 0u ? dd.x : dd.y);
+            uint qv = (tile + 32u + r16 * 32u) >> 4;
+            lo[n] = qbank4[qv];
+            hi[n] = qbank4[qv + 1u];
+        }
+    }
+}
+#else
             uint blk = rb + (k0 >> 8) * 144u;
             uint g = (k0 & 255u) >> 6;
             uint qv = (blk + 16u + g * 32u) >> 4;
@@ -775,10 +858,22 @@ void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
         }
     }
 }
+#endif
 
 // The same bytes unpacked into the slabs, the shipped arithmetic verbatim:
 // the A halves are a reinterpretation, the B values `Q_AFFINE` in the same
 // order the plain loop writes them.
+#if QFMT == FMT_Q8_0
+#define PIPE_UNPACK_COL(DST, n)                                                             \
+    {                                                                                       \
+        uint dst = col * LDS_ROW;                                                           \
+        float d = uintBitsToFloat(hdr[n].x);                                                \
+        [[unroll]] for (uint t = 0u; t < 4u; ++t) {                                         \
+            Q8_WORD(DST, dst + t * 4u, lo[n][t], d)                                         \
+            Q8_WORD(DST, dst + 16u + t * 4u, hi[n][t], d)                                   \
+        }                                                                                   \
+    }
+#else
 #define PIPE_UNPACK_COL(DST, n)                                                             \
     {                                                                                       \
         uint dst = col * LDS_ROW;                                                           \
@@ -797,6 +892,7 @@ void pipeFetch(uint k0, uint tid, uint bankBase, uint aP[A_ITERS],
             Q4K_WORD(DST, dst + t * 4u, w)                                                  \
         }                                                                                   \
     }
+#endif
 
 void pipeUnpack(uint k0, uint tid, uint aP[A_ITERS], uvec4 aV[A_ITERS], uvec4 hdr[B_ITERS], uvec4 lo[B_ITERS], uvec4 hi[B_ITERS]) {
     [[unroll]] for (uint n = 0u; n < A_ITERS; ++n) {

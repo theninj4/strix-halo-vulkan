@@ -1,0 +1,207 @@
+// Gemma 4's vision tower (research/rune-vertical.md R10): the small kernels
+// around the DiT's fp16 GEMM and the Qwen ViT's WMMA attention at head 80,
+// which carry over unchanged (the two towers share 1152 x 16 heads of 72).
+// The GEGLU is the GEMM's epilogue (dit_gemm.comp GLU_GELU). Built once a
+// MODE:
+//
+//	0 JOIN   the sandwich residual, one workgroup a row:
+//	           aux0 = 0: x += rms(y) * w             (wOff; y at inOff)
+//	           aux0 = 1: x  = y + pos                (pos at aux1: the embedding)
+//	         then, unless kOff is NO_W, rms(x) * w_next into the fp16 arena at
+//	         bOff with row stride lda (the next projection's A operand).
+//	1 PREP   q, k, v out of the fused projection (row stride aux0), one
+//	         wave a (head, row): q = rope(rms(q) * q_norm), k likewise with
+//	         k_norm (wOff, wOff + 72), v = rms(v) unscaled. Written fp16
+//	         straight into the WMMA kernel's fragment planes at outOff, kOff,
+//	         vOff (aux2 their token stride; q times `scale`), where
+//	         dit_pack_f16 used to put them from an fp32 round trip. The 2-D rope
+//	         is HF's apply_multidimensional_rope: channels [0, 36) rotate
+//	         NeoX-style in pairs (j, j + 18) at the patch's x, [36, 72) the
+//	         same at its y; the host's table at aux1 is cos [72] then sin [72]
+//	         a row.
+//	3 POOL   one workgroup an output token: the mean of its 3 x 3 patches
+//	         (the grid is aux0 pooled columns wide), times sqrt(1152), then
+//	         (h - std_bias) * std_scale (wOff, kOff): written fp32 at outOff,
+//	         then unscaled-RMS-normed into the fp16 arena at bOff (lda), the
+//	         projector's A operand.
+//
+// Norms are HF's Gemma4RMSNorm: x * (mean(x^2) + eps)^-1/2 * w, plain w.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+
+#if MODE == 1
+#define WG 64
+#else
+#define WG 256
+#endif
+#define MAXV 5 // 1152 / 256, rounded up
+
+layout(local_size_x = WG) in;
+
+shared float red[WG];
+
+float rowSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+#if MODE == 1
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#define HD 72u
+#define NH 16u
+
+// The norm then the 2-D rope of one head's channel c (and c + 64 when that
+// is still in the head) on one wave: lane l holds c = l and c = l + 64. The
+// rope's partner, (c, c +- 18) within each 36-channel half, is read from
+// memory and normalised the same way, so no lane waits on another's.
+uint partnerOf(uint c) { return (c % 36u) < 18u ? c + 18u : c - 18u; }
+#endif
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    float eps = uintBitsToFloat(pc.eps);
+
+#if MODE == 0
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint D = pc.dim;
+    float v[MAXV];
+    if (pc.aux0 == 0u) {
+        float ss = 0.0;
+        for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+            v[k] = act[pc.inOff + r * D + i];
+            ss += v[k] * v[k];
+        }
+        float inv = inversesqrt(rowSum(ss) / float(D) + eps);
+        for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+            v[k] = act[pc.outOff + r * D + i] + v[k] * inv * wbuf[pc.wOff + i];
+            act[pc.outOff + r * D + i] = v[k];
+        }
+    } else {
+        for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+            v[k] = act[pc.inOff + r * D + i] + act[pc.aux1 + r * D + i];
+            act[pc.outOff + r * D + i] = v[k];
+        }
+    }
+    if (pc.kOff == NO_W) {
+        return;
+    }
+    float ss = 0.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        ss += v[k] * v[k];
+    }
+    float inv = inversesqrt(rowSum(ss) / float(D) + eps);
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        hact[pc.bOff + r * pc.lda + i] = float16_t(v[k] * inv * wbuf[pc.kOff + i]);
+    }
+
+#elif MODE == 1
+    // x is the head: neighbouring workgroups read neighbouring bytes of one
+    // row (research §5.4; rows fast was 140 GB/s).
+    uint h = gl_WorkGroupID.x;
+    uint r = gl_WorkGroupID.y;
+    uint c1 = t + 64u;
+    bool two = c1 < HD;
+    // The fragment planes (dit_pack_f16's layout at HEAD_DIM 80): head h's
+    // plane is aux2/16 token tiles of 5 component tiles of 256 halves;
+    // q and k store (token m, component c) at m*16 + c%16 in their tile, v
+    // transposed at (c%16)*16 + m. Components 72..79 are zero from the
+    // arena's first clear and nothing writes them.
+    uint tileBase = (h * (pc.aux2 / 16u) + r / 16u) * 5u * 256u;
+    uint m16 = r % 16u;
+    if (r >= pc.tokens) {
+        // A key block's rows past the image: zeroed every run, as the pack
+        // did, so a smaller image never reads a larger one's keys.
+        [[unroll]] for (uint m = 0u; m < 3u; m++) {
+            uint plane = m == 0u ? pc.outOff : m == 1u ? pc.kOff : pc.vOff;
+            [[unroll]] for (uint k = 0u; k < 2u; k++) {
+                uint c = k == 0u ? t : c1;
+                if (k == 1u && !two) {
+                    continue;
+                }
+                uint at = m == 2u ? (c % 16u) * 16u + m16 : m16 * 16u + c % 16u;
+                hact[plane + tileBase + (c / 16u) * 256u + at] = float16_t(0.0);
+            }
+        }
+        return;
+    }
+    uint p = pc.inOff + r * pc.aux0 + h * HD;
+    uint rope = pc.aux1 + r * 2u * HD;
+    [[unroll]] for (uint m = 0u; m < 3u; m++) {
+        uint src = p + m * NH * HD;
+        float a = act[src + t];
+        float b = two ? act[src + c1] : 0.0;
+        float inv = inversesqrt(subgroupAdd(a * a + b * b) / float(HD) + eps);
+        uint plane = (m == 0u ? pc.outOff : m == 1u ? pc.kOff : pc.vOff) + tileBase;
+        float scale = m == 0u ? uintBitsToFloat(pc.scale) : 1.0;
+        [[unroll]] for (uint k = 0u; k < 2u; k++) {
+            uint c = k == 0u ? t : c1;
+            if (k == 1u && !two) {
+                continue;
+            }
+            float y = (k == 0u ? a : b) * inv;
+            if (m < 2u) {
+                uint w = pc.wOff + m * HD;
+                uint q = partnerOf(c);
+                float z = act[src + q] * inv * wbuf[w + q];
+                float rot = (c % 36u) < 18u ? -z : z;
+                y = y * wbuf[w + c] * act[rope + c] + rot * act[rope + HD + c];
+            }
+            uint at = m == 2u ? (c % 16u) * 16u + m16 : m16 * 16u + c % 16u;
+            hact[plane + (c / 16u) * 256u + at] = float16_t(y * scale);
+        }
+    }
+
+#else
+    uint o = gl_WorkGroupID.x;
+    if (o >= pc.tokens) {
+        return;
+    }
+    uint D = pc.dim;
+    uint wp = pc.aux0;
+    uint w = 3u * wp;
+    uint oy = o / wp, ox = o % wp;
+    float v[MAXV];
+    float ss = 0.0;
+    const float ninth = 1.0 / 9.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        float s = 0.0;
+        for (uint dy = 0u; dy < 3u; dy++) {
+            for (uint dx = 0u; dx < 3u; dx++) {
+                s += act[pc.inOff + ((3u * oy + dy) * w + 3u * ox + dx) * D + i] * ninth;
+            }
+        }
+        float h = (s * uintBitsToFloat(pc.scale) - wbuf[pc.wOff + i]) * wbuf[pc.kOff + i];
+        act[pc.outOff + o * D + i] = h;
+        v[k] = h;
+        ss += h * h;
+    }
+    float inv = inversesqrt(rowSum(ss) / float(D) + eps);
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        hact[pc.bOff + o * pc.lda + i] = float16_t(v[k] * inv);
+    }
+#endif
+}

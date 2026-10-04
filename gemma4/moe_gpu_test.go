@@ -1,7 +1,11 @@
 package gemma4
 
 import (
+	"encoding/binary"
+	"fmt"
 	"math"
+	"os"
+	"time"
 	"math/rand/v2"
 	"sort"
 	"testing"
@@ -206,5 +210,109 @@ func TestMoEBlockGemmaShapes(t *testing.T) {
 		T, ties, mism, rel, worst, math.Sqrt(rmsRef/float64((T-ties)*H)))
 	if rel > 2e-3 {
 		t.Errorf("relative rms error %.2e", rel)
+	}
+}
+
+// TestMoEGemmaTiming times one Rune-shaped MoE layer (random Q8_0 experts,
+// GELU, no shared expert) at RUNE_MOE_T rows (default 1024, a batched pass):
+// the harness for screening the grouped GEMM's Q8_0 builds through
+// LLM_MOE_SPV without staging the model.
+func TestMoEGemmaTiming(t *testing.T) {
+	if testing.Short() {
+		t.Skip("GPU")
+	}
+	T := 1024
+	if s := os.Getenv("RUNE_MOE_T"); s != "" {
+		fmt.Sscan(s, &T)
+	}
+	dev, done := newTestDevice(t)
+	defer done()
+	const H, E, K, F, S = 2816, 128, 8, 704, 64
+	r := rand.New(rand.NewPCG(7, 8))
+	q8 := func(in, rows int) []byte {
+		row := make([]float32, in)
+		data := make([]byte, 0, rows*in/32*34)
+		for range rows {
+			for i := range row {
+				row[i] = float32(r.NormFloat64() * 0.02)
+			}
+			data = quantQ8_0(data, row)
+		}
+		return data
+	}
+	bank := func(in, out int) *llm.ExpertBank {
+		return &llm.ExpertBank{T: &gguf.Tensor{Type: gguf.Q8_0, Dims: []int64{int64(in), int64(out), E}, Data: q8(in, out*E)},
+			In: in, Out: out, NExp: E}
+	}
+	zero := func(in, out int) *gguf.Tensor {
+		return &gguf.Tensor{Type: gguf.Q8_0, Dims: []int64{int64(in), int64(out)}, Data: make([]byte, in*out/32*34)}
+	}
+	router := make([]float32, E*H)
+	for i := range router {
+		router[i] = float32(r.NormFloat64() * 0.02)
+	}
+	w := llm.MoEWeights{Router: router, SharedGate: make([]float32, H),
+		Gate: bank(H, F), Up: bank(H, F), Down: bank(F, H),
+		GateShexpT: zero(H, S), UpShexpT: zero(H, S), DownShexpT: zero(S, H)}
+	if os.Getenv("RUNE_MOE_TILED") == "1" {
+		// The same values in Q8_TILED's layout, for builds compiled with it.
+		for _, b := range []*llm.ExpertBank{w.Gate, w.Up, w.Down} {
+			b.T.Data = tileQ8(b.T.Data, b.Out*E, b.In)
+		}
+	}
+	cfg := llm.MoEConfig{NEmbd: H, NExpert: E, NExpertUsed: K, FFNExpert: F, FFNShared: S}
+	opts := []llm.MoEOption{llm.WithMoEGELU(), llm.WithMoENoShared()}
+	if os.Getenv("RUNE_MOE_TILED") == "1" {
+		opts = append(opts, llm.WithMoEQ8Tiled())
+	}
+	g, err := llm.NewMoEGPU(dev, cfg, T, []llm.MoEWeights{w}, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Destroy()
+	g.PinGemv(true)
+	x := make([]float32, T*H)
+	for i := range x {
+		x[i] = float32(r.NormFloat64())
+	}
+	if err := g.Upload(x, T); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := g.Run(0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ref := append([]float32(nil), g.Out()[:T*H]...)
+	st, err := g.Profile(0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range st {
+		if s.GPU > 50*time.Microsecond {
+			t.Logf("T=%d %-14s %8.3f ms a layer", T, s.Kind, float64(s.GPU.Microseconds())/1000)
+		}
+	}
+	if path := os.Getenv("RUNE_MOE_REF"); path != "" {
+		// The bit-identity check across builds: the first run writes the
+		// output, later ones compare.
+		if old, err := os.ReadFile(path); err == nil {
+			diff := 0
+			for i := range ref {
+				if math.Float32bits(ref[i]) != binary.LittleEndian.Uint32(old[4*i:]) {
+					diff++
+				}
+			}
+			t.Logf("against %s: %d of %d values differ", path, diff, len(ref))
+			if diff > 0 {
+				t.Errorf("not bit-identical")
+			}
+		} else {
+			buf := make([]byte, 4*len(ref))
+			for i, v := range ref {
+				binary.LittleEndian.PutUint32(buf[4*i:], math.Float32bits(v))
+			}
+			os.WriteFile(path, buf, 0o644)
+		}
 	}
 }

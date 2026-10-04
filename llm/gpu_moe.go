@@ -725,6 +725,8 @@ type MoEGPU struct {
 	// gelu selects GELU-tanh for the gate (WithMoEGELU): Gemma 4's experts,
 	// served from this block by gemma4/ (research/rune-vertical.md R5).
 	gelu bool
+	// q8Tiled reads the Q8_0 banks in the Q8_TILED layout (WithMoEQ8Tiled).
+	q8Tiled bool
 	// bankPlan is P4's `LLM_MOE_BANK`: which of the six MoE families are
 	// staged narrower than the checkpoint ships them. Read once at
 	// construction so that `reserve`'s sizes and `stage`'s bytes cannot
@@ -820,6 +822,16 @@ func WithMoEGELU() MoEOption { return func(g *MoEGPU) { g.gelu = true } }
 // pass's experts.
 func WithMoENoShared() MoEOption { return func(g *MoEGPU) { g.noShared = true } }
 
+// WithMoEQ8Tiled reads the routed Q8_0 banks in llm_moe_gemm.comp's
+// Q8_TILED layout (research/rune-vertical.md R10): in each group of 16 rows
+// a K-step's blocks are one 544-byte tile, scales then int8s, so a lane's
+// block is three loads and a step's are contiguous. The caller lays the
+// bytes out so (gemma4's tileQ8); sizes and offsets are Q8_0's. With GELU
+// only (Rune's experts), pinned to the GEMM: there are no tiled GEMV rungs.
+// The shared expert's banks go through the same builds, so they must be
+// tiled too, or zero (WithMoENoShared's stand-in is).
+func WithMoEQ8Tiled() MoEOption { return func(g *MoEGPU) { g.q8Tiled = true } }
+
 // moeGELUSPIRV is moeSPIRV's Q8_0 up builds with -DACT_GELU=1, under the same
 // names, so the graph is unchanged.
 var moeGELUSPIRV = map[string][]byte{
@@ -830,6 +842,23 @@ var moeGELUSPIRV = map[string][]byte{
 	"up_q80_w4m1": shaders.LLMMoEUpQ80W4M1GELU,
 	"up_q80_n1m1": shaders.LLMMoEUpQ80N1M1GELU,
 	"up_q80_n2m1": shaders.LLMMoEUpQ80N2M1GELU,
+}
+
+// moeQ8TSPIRV is the Q8_0 rungs built for the Q8_TILED layout
+// (WithMoEQ8Tiled): up with GELU and the pipelined K loop, down plain.
+var moeQ8TSPIRV = map[string][]byte{
+	"up_q80_m1":     shaders.LLMMoEUpQ8TM1GELU,
+	"up_q80_m2":     shaders.LLMMoEUpQ8TM2GELU,
+	"up_q80_m4":     shaders.LLMMoEUpQ8TM4GELU,
+	"up_q80_w2m1":   shaders.LLMMoEUpQ8TW2M1GELU,
+	"up_q80_w4m1":   shaders.LLMMoEUpQ8TW4M1GELU,
+	"up_q80_n1m1":   shaders.LLMMoEUpQ8TN1M1GELU,
+	"up_q80_n2m1":   shaders.LLMMoEUpQ8TN2M1GELU,
+	"down_q80_m1":   shaders.LLMMoEDownQ8TM1,
+	"down_q80_m2":   shaders.LLMMoEDownQ8TM2,
+	"down_q80_m4":   shaders.LLMMoEDownQ8TM4,
+	"down_q80_w2m1": shaders.LLMMoEDownQ8TW2M1,
+	"down_q80_w4m1": shaders.LLMMoEDownQ8TW4M1,
 }
 
 // WithMoEBankPlan stages this block under an explicit plan rather than the
@@ -886,6 +915,9 @@ func NewMoEGPU(dev *vk.Device, cfg MoEConfig, maxTokens int, layers []MoEWeights
 	}
 	for _, opt := range opts {
 		opt(g)
+	}
+	if g.q8Tiled && !g.gelu {
+		return nil, fmt.Errorf("llm: the Q8_TILED builds are GELU builds (WithMoEGELU)")
 	}
 	g.up, g.down = MoEPlanFor(maxTokens)
 	g.shUp, g.shDown = MoESharedPlanFor(maxTokens)
@@ -1192,7 +1224,7 @@ func (g *MoEGPU) build() error {
 			f   moeFmt
 		}{{w.gate, w.gateFmt}, {w.up, w.upFmt}, {w.down, w.downFmt},
 			{w.shGate, w.shGateFmt}, {w.shUp, w.shUpFmt}, {w.shDown, w.shDownFmt}} {
-			if (r.f == fmtQ4K || r.f == fmtQ5K) && r.off%16 != 0 {
+			if (r.f == fmtQ4K || r.f == fmtQ5K || (g.q8Tiled && r.f == fmtQ80)) && r.off%16 != 0 {
 				return fmt.Errorf("llm: layer %d has a %s bank at byte %d, and the unpack reads its block header as a uvec4",
 					i, r.f, r.off)
 			}
@@ -1248,11 +1280,15 @@ func (g *MoEGPU) build() error {
 	for fi, fam := range []map[string][]byte{moeSPIRV, moeRouterSPIRV} {
 		for name, spirv := range fam {
 			wave := uint32(moeWave)
-			if o, ok := override[name]; ok && fi == 0 {
-				spirv, wave = o, overrideWave
-			}
 			if gl, ok := moeGELUSPIRV[name]; ok && g.gelu && fi == 0 {
 				spirv = gl
+			}
+			if tl, ok := moeQ8TSPIRV[name]; ok && g.q8Tiled && fi == 0 {
+				spirv = tl
+			}
+			// After the GELU swap, so a GELU build can be screened too.
+			if o, ok := override[name]; ok && fi == 0 {
+				spirv, wave = o, overrideWave
 			}
 			for rows := 1; rows <= GEMVMaxRows; rows++ {
 				rspec := spec
@@ -1666,6 +1702,9 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 		// Only the grouped GEMM has GELU builds (WithMoEGELU); a GEMV rung
 		// would run silu and be silently wrong.
 		return nil, nil, fmt.Errorf("llm: a GELU block runs only on the grouped GEMM, not %s/%s", g.up, g.shUp)
+	}
+	if g.q8Tiled && (MoEIsGemv(g.up) || MoEIsGemv(g.shUp) || MoEIsGemv(g.down) || MoEIsGemv(g.shDown)) {
+		return nil, nil, fmt.Errorf("llm: a Q8_TILED block runs only on the grouped GEMM")
 	}
 	rv, _ := gemmVariantFor(g.router)
 	bmUp, bmDown := moeBM(g.up), moeBM(g.down)

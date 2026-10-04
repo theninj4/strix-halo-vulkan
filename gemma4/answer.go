@@ -79,39 +79,64 @@ func (g *GPU) Readout(req *decide.Request, codebook []string) (Readout, error) {
 
 // Plan is a request checked and cut into its pass segment, ready to batch.
 type Plan struct {
-	req *decide.Request
-	pl  *requestPlan
+	req  *decide.Request
+	pl   *requestPlan
+	pics []*Picture
 }
 
 // Segment is the share of a pass the plan takes.
 func (p *Plan) Segment() Segment {
-	return Segment{State: p.pl.prompts[0].ids[:p.pl.pref], Branches: p.pl.branches}
+	sg := Segment{State: p.pl.prompts[0].ids[:p.pl.pref], Branches: p.pl.branches}
+	for _, pic := range p.pics {
+		sg.Soft = append(sg.Soft, pic.Feats)
+	}
+	return sg
 }
 
 // Rows is the pass rows the plan takes.
 func (p *Plan) Rows() int { return p.pl.use.InputTokens }
 
 // PlanRequest checks a request and tokenises it: everything before the
-// device, so a refusal costs no pass.
+// device, so a refusal costs no pass. A request with images goes through
+// PlanImages instead.
 func (g *GPU) PlanRequest(req *decide.Request, codebook []string) (*Plan, error) {
-	if len(req.Images) > 0 {
+	return g.PlanImages(req, codebook, nil)
+}
+
+// PlanImages is PlanRequest for a request whose images the caller has read
+// and patchified (pics, in the request's order; Picture.Feats filled by
+// EncodePictures before the pass). They go into every question's user turn
+// ahead of the text, as decisions v1 renders `images`.
+func (g *GPU) PlanImages(req *decide.Request, codebook []string, pics []*Picture) (*Plan, error) {
+	if len(req.Images) > 0 && g.Vis == nil {
 		return nil, &decide.Error{Message: "this server was started without vision; images are not accepted",
 			Param: "images", Code: "vision_disabled"}
+	}
+	if len(pics) != len(req.Images) {
+		return nil, fmt.Errorf("gemma4: %d images read for a request with %d", len(pics), len(req.Images))
 	}
 	if req.Thinking {
 		return nil, &decide.Error{Message: "thinking is not supported by this server yet",
 			Param: "thinking", Code: "decisions_thinking_not_supported"}
 	}
-	pl, err := g.Tok.plan(req, codebook)
+	var soft []int
+	for _, p := range pics {
+		soft = append(soft, p.Patches.Soft)
+	}
+	pl, err := g.Tok.plan(req, codebook, ImageText(soft))
 	if err != nil {
 		return nil, err
 	}
-	if !g.Fits([]Segment{{pl.prompts[0].ids[:pl.pref], pl.branches}}) {
+	plan := &Plan{req: req, pl: pl, pics: pics}
+	if !g.Fits([]Segment{plan.Segment()}) {
 		return nil, &decide.Error{Message: fmt.Sprintf("the request is %d tokens, longer than the model's pass of %d",
 			pl.use.InputTokens, g.rows), Param: "state", Code: "invalid_decisions_request"}
 	}
-	return &Plan{req: req, pl: pl}, nil
+	return plan, nil
 }
+
+// Pictures are the plan's images, for EncodePictures.
+func (p *Plan) Pictures() []*Picture { return p.pics }
 
 // RunPlans answers planned requests in one pass (R8): they share its weight
 // reads. The caller packs them so they fit (Fits on their segments).
@@ -221,7 +246,7 @@ type requestPlan struct {
 // wholly before "QUESTION:" and at one token less than the shortest prompt
 // (decisions v1's rule; merges can cross the state/question join, so it is
 // found on tokens).
-func (t *Tokenizer) plan(req *decide.Request, codebook []string) (*requestPlan, error) {
+func (t *Tokenizer) plan(req *decide.Request, codebook []string, images string) (*requestPlan, error) {
 	var reads []reading
 	for i := range req.Questions {
 		reads = append(reads, reading{i, false})
@@ -243,7 +268,7 @@ func (t *Tokenizer) plan(req *decide.Request, codebook []string) (*requestPlan, 
 		if err != nil {
 			return nil, err
 		}
-		user := req.StateText + r.Branch
+		user := images + req.StateText + r.Branch
 		text := DecisionPrompt(r.System, user)
 		p := prompt{ids: t.Encode(text)}
 		// The prompt ends in special tokens, so a label after it is a
@@ -256,7 +281,7 @@ func (t *Tokenizer) plan(req *decide.Request, codebook []string) (*requestPlan, 
 			}
 			p.labels = append(p.labels, lt[0])
 		}
-		before := len(turnSystem) + len(r.System) + len(turnUser) + len(req.StateText)
+		before := len(turnSystem) + len(r.System) + len(turnUser) + len(images) + len(req.StateText)
 		at := 0
 		for _, id := range p.ids {
 			if at+t.pieceLen(id) > before {
@@ -289,7 +314,7 @@ func (t *Tokenizer) plan(req *decide.Request, codebook []string) (*requestPlan, 
 
 // PassOf is the packed pass a request runs as, for the profiler.
 func (g *GPU) PassOf(req *decide.Request, codebook []string) (*Pass, error) {
-	pl, err := g.Tok.plan(req, codebook)
+	pl, err := g.Tok.plan(req, codebook, "")
 	if err != nil {
 		return nil, err
 	}

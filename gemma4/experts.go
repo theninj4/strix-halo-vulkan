@@ -169,3 +169,27 @@ func parallelFor(n int, f func(i int)) {
 	}
 	wg.Wait()
 }
+
+// tileQ8 lays a Q8_0 matrix ([rows][k], rows a multiple of 16) out as
+// llm_moe_gemm.comp's Q8_TILED reads it: in each group of 16 rows, the
+// blocks of one 32-wide K-step as one 544-byte tile, the 16 fp16 scales
+// then the 16 rows' 32 int8s. A group occupies exactly its 16 rows' bytes,
+// so the bank is Q8_0's size and every offset into it is unchanged.
+func tileQ8(data []byte, rows, k int) []byte {
+	kb := k / q8Block
+	rowBytes := kb * (2 + q8Block)
+	out := make([]byte, len(data))
+	parallelFor(rows/16, func(gi int) {
+		g := gi * 16
+		base := g * rowBytes
+		for b := range kb {
+			tile := out[base+b*544:]
+			for r := range 16 {
+				src := data[(g+r)*rowBytes+b*(2+q8Block):]
+				copy(tile[r*2:r*2+2], src[:2])
+				copy(tile[32+r*q8Block:32+(r+1)*q8Block], src[2:2+q8Block])
+			}
+		}
+	})
+	return out
+}

@@ -6,9 +6,9 @@ package backend
 // System One, Kev's endpoint, translated onto the same questions
 // (decide/systemone.go), so Kev's clients keep working.
 //
-// A request is one packed pass (gemma4.GPU.Answer), run under the device
-// lock. There is no batching across requests and no prefix cache yet; those
-// are R8's.
+// Requests are packed passes run by one worker under the device lock,
+// several to a pass (R8). Images (R10) go through the vision tower on the
+// request's own goroutine first.
 
 import (
 	"context"
@@ -23,6 +23,7 @@ import (
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/decide"
 	"strix-halo-vulkan/gemma4"
+	"strix-halo-vulkan/util"
 	"strix-halo-vulkan/vk"
 )
 
@@ -41,6 +42,9 @@ type RuneOptions struct {
 	// cheapest at ~1024 (0.36 ms) and dearest alone. A request over it runs
 	// alone. Zero takes 1024.
 	BatchTokens int
+	// Vision stages the vision tower (~1.3 GB) so requests may carry
+	// `images` (R10); without it they answer 400 vision_disabled.
+	Vision bool
 }
 
 // runeModelIDs are the names a request may carry: Rune's own, and Kev's and
@@ -93,7 +97,7 @@ func NewRune(opt RuneOptions) (*Rune, error) {
 	}
 	b := &Rune{opt: opt}
 	err := opt.Device.Do(func(dev *vk.Device) error {
-		g, err := gemma4.Load(dev, opt.Model, gemma4.Options{Rows: opt.Rows})
+		g, err := gemma4.Load(dev, opt.Model, gemma4.Options{Rows: opt.Rows, Vision: opt.Vision})
 		b.gpu = g
 		return err
 	})
@@ -141,9 +145,27 @@ func (b *Rune) answer(ctx context.Context, req *decide.Request) ([]decide.Answer
 	if g == nil {
 		return nil, gemma4.Usage{}, 0, fmt.Errorf("backend: the decision model is closed")
 	}
-	plan, err := g.PlanRequest(req, b.codebook)
+	pics, err := b.pictures(ctx, g, req)
 	if err != nil {
 		return nil, gemma4.Usage{}, 0, err
+	}
+	plan, err := g.PlanImages(req, b.codebook, pics)
+	if err != nil {
+		return nil, gemma4.Usage{}, 0, err
+	}
+	// The tower runs here, on the request's goroutine under the device
+	// lock, so the worker's passes stay text only; a picture seen in the
+	// last few requests is not run again (gemma4's feature cache).
+	var todo []*gemma4.Picture
+	for _, p := range pics {
+		if !g.Cached(p) {
+			todo = append(todo, p)
+		}
+	}
+	if len(todo) > 0 {
+		if err := b.opt.Device.Do(func(*vk.Device) error { return g.EncodePictures(todo) }); err != nil {
+			return nil, gemma4.Usage{}, 0, err
+		}
 	}
 	job := runeJob{plan: plan, start: start, done: make(chan runeResult, 1)}
 	b.mu.Lock()
@@ -172,6 +194,29 @@ func (b *Rune) answer(ctx context.Context, req *decide.Request) ([]decide.Answer
 		answers[i] = a
 	}
 	return answers, res.ro.Usage, res.ms, nil
+}
+
+// pictures reads a request's images (data or http(s) URLs, fetched as
+// OpenAI's API fetches image URLs) and patchifies them on the host.
+func (b *Rune) pictures(ctx context.Context, g *gemma4.GPU, req *decide.Request) ([]*gemma4.Picture, error) {
+	if len(req.Images) == 0 {
+		return nil, nil
+	}
+	if g.Vis == nil {
+		return nil, &decide.Error{Message: "this server was started without vision; images are not accepted",
+			Param: "images", Code: "vision_disabled"}
+	}
+	pics := make([]*gemma4.Picture, len(req.Images))
+	for i, u := range req.Images {
+		raw, err := util.FetchImage(ctx, u)
+		if err != nil {
+			return nil, &decide.Error{Message: fmt.Sprintf("images[%d]: %v", i, err), Param: "images", Code: "invalid_decisions_request"}
+		}
+		if pics[i], err = g.Vis.Cfg.NewPicture(raw); err != nil {
+			return nil, &decide.Error{Message: fmt.Sprintf("images[%d]: %v", i, err), Param: "images", Code: "invalid_decisions_request"}
+		}
+	}
+	return pics, nil
 }
 
 // work is the one goroutine that runs the model (R8). It takes a request,

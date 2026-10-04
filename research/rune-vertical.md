@@ -318,7 +318,99 @@ as Kev's K7.7 did.
   Kev's suite rows in `reference/out/kev/suites/` (the comparison).
 - [ ] **R10 — optional extensions.** `thinking` (gate 0.7, 512-token greedy
   thought, read after `<channel|>`), `order_averaging`, and images (Gemma 4's
-  vision tower, `--vision`).
+  vision tower, `--vision`). `order_averaging` was done in R6.
+  **Images done 2026-10-04** (`-rune-vision`, default on, ~1.3 GB). The
+  protocol: v1 puts `images` in every question's user turn ahead of the
+  text (surogate `generation_service.cpp`), and Gemma4Processor expands each
+  to `<|image>` + n x `<|image|>` + `<image|>`, n = soft tokens (at most 280).
+  What we built:
+  - **The processor** (`gemma4/vision.go` Patchify): RGB with alpha dropped,
+    the aspect-preserving resize to sides that are multiples of 48 inside
+    2,520 patches (`VisionSize`, every branch of HF's), torch's uint8 AA
+    bicubic (`llm/pixels.Resize`), x/255 in fp32. **Bit for bit** against the
+    processor on four PNGs (downscale, RGBA, upscale, an 8x3000 strip that
+    takes the zero-side branch).
+  - **The tower** on the matrix cores in fp16: the DiT's GEMM, the Qwen ViT's
+    WMMA attention at head 80 (the two towers share 1152 x 16 x 72), and
+    `gemma4_vit.comp` (sandwich joins, q/k/v norms plus the 2-D rope written
+    straight into the attention's fragment planes, the 3x3 pool with the
+    x sqrt(1152) and standardisation); the GEGLU is the GEMM's epilogue
+    (`dit_gemm.comp GLU_GELU`, the LDS-staged wave32 build at >= 1024 rows).
+    Features within **0.4-1.7% relative RMS of HF fp32; bf16 itself is
+    7-8% off** (`dump_rune_vision.py --bf16`), so fp16 stays. 2,295
+    patches: 118 ms wall, 105 ms GPU (first cut 147 / 133; prep+pack fused
+    -10, GEGLU fused -28).
+  - **In the text model**: image tokens take the projected features as
+    their input rows (`Segment.Soft`); on the sliding layers they attend to
+    their whole image both ways (HF's blockwise overlay AND the window; the
+    full layers stay causal), carried as the run's end cell in the metadata's
+    kind word, read by `gemma4_attn.comp`. **The mask was proven by its
+    control**: made causal (`RUNE_CAUSAL_IMAGES=1`), layer-12 drift
+    triples (0.11 -> 0.30).
+  - **Gates** (`gemma4/vision_test.go`): prompt ids equal to the processor's
+    (`TestVisionPromptIDs`); `TestVisionOracle` over four cases, every
+    choice the reference's and p within 0.008 of HF fp32 (bf16's own drift
+    0.011). The oracle's one trap: a system turn sent as a content list gets
+    a trailing space from the template; decisions sends a string.
+  - **Served**: images are fetched as OpenAI's API fetches image URLs
+    (`util.FetchImage`), patchified on the request's goroutine, the tower
+    run there under the device lock, and a 32-image feature cache keyed by
+    the file's sha256 skips it on repeats. A 3-question chart request is
+    469 tokens: **365 ms cold, 218 ms cached** (first cut 473 / 289). A
+    bad image is 400 `param: images`.
+
+- [x] **R11 — throughput.** **Done 2026-10-04.** What a batched pass
+  spent (`cmd/rune -profile-batch N -suite …`: N distinct suite records in
+  one pass, as the worker packs them): at 6 requests (964 rows) the
+  experts were 54%, and `moe.up` ran 1.95 TFLOP in 146 ms, neither at the
+  bandwidth floor nor near the matrix rate. `TestMoEGemmaTiming` (one
+  Rune-shaped layer, random weights, `LLM_MOE_SPV` screening) priced it:
+  the Q8_0 unpack is half of up and 62% of down, **and it is the loads, not
+  the arithmetic** — a packed int8->fp16 convert (`Q8_PK`, bit-identical)
+  bought 1%, `PIPE` on the down mode nothing, and aligned but scattered
+  16-byte loads were *slower* (4.1 -> 5.6 ms).
+  - **The fix is the layout: `Q8_TILED`.** We quantise Rune's experts
+    ourselves, so within each 16-row group the blocks of one K-step are one
+    544-byte tile (16 scales, then 16 x 32 int8s): a lane's block is three
+    loads, and a step's loads over a column block are contiguous. A group
+    spans exactly its rows' Q8_0 bytes, so every size and offset in the
+    loader is unchanged (`llm.WithMoEQ8Tiled`, `gemma4.tileQ8`). The up
+    builds also take `PIPE` (three loads now fit its registers). **Bit
+    for bit** the plain path's output at every row count, and the whole
+    model's logits identical over 80 suite records (`RUNE_Q8_TILED=0` is
+    the control). The shipped LLM builds are byte-identical.
+
+    | rows | up plain -> tiled (ms a layer) | down |
+    |---|---|---|
+    | 64 | 2.91 -> 2.54 | 1.59 -> 1.34 |
+    | 212 | 3.02 -> 2.56 | 1.65 -> 1.41 |
+    | 1024 | 4.13 -> 2.90 | 2.25 -> 1.90 |
+    | 4096 | 11.62 -> 8.23 | 5.61 -> 4.33 |
+
+    At small batch the up kernel is now at ~213 GB/s, the roofline.
+  - Attention's key loop starts at the lowest cell a tile's rows may see
+    (`tileLo`, window included): bit-identical, and measured to change
+    nothing here; kept as a bound.
+  - **Results.** A 64-row pass (a lone short request's floor) 110 -> 78 ms;
+    unbatched suite records 353 -> 281 ms (-20%); a 964-row batch 297 ms,
+    20 req/s. Served (`cmd/kevload`, the README ticket, a
+    server per run):
+
+    | load | R8 p50 / p90 | R11 p50 / p90 | req/s R8 -> R11 |
+    |---|---|---|---|
+    | burst of 16 | 802 / 1380 ms | 704 / 1209 ms | 11.6 -> 13.2 |
+    | 4 req/s | 192 / 354 ms | 150 / 295 ms | 4.0 -> 4.0 |
+    | 8 req/s | 322 / 517 ms | 251 / 406 ms | 7.5 -> 7.6 |
+    | 12 req/s | — | 383 / 677 ms | 11.7 |
+
+    Throughput plateaus at ~20 req/s from 6 requests a pass: past it the
+    experts are near the bandwidth floor and the dense int8 GEMMs (~32% of
+    a batch, ~35 TFLOPs) are compute-bound.
+  **Open, in order:** the dense projections on the LDS-staged fp16 GEMM
+  (~1.3x on 32% of a batch, +2 GB, and an R7 re-run since the numbers
+  change); `moe.down`'s fp32 rows and the combine that re-reads them (~20 ms
+  a batch); sliding attention grows faster than its rows in big batches
+  (13 -> 150 ms from 6 to 24 requests, not the scan).
 
 ## The GPU design (R4/R5), worked out 2026-10-03
 
@@ -374,6 +466,18 @@ device**, plus activations.
   117 GB with the swap slot at its 60 GB worst (§ Handoff).
 
 ## Handoff
+
+**2026-10-04, session 2 (end).** Images (R10) and throughput (R11) done,
+built and tested on a side server, **not yet deployed**: `ai.service` still
+runs the session-1 binary. Deploying is `deploy.sh` (it rebuilds and
+restarts the user unit, ~65 s down); the new binary holds ~1.3 GB more
+for the tower. Its staging adds the expert re-layout (`tileQ8`, parallel);
+how much was not measurable here: with the service resident the 52 GB
+checkpoint no longer fits the page cache (memory pressure ~15% full), and
+side stagings ran 39-66 s for either layout against the service's 25 s. Everything else
+from session 1's list below stands; R11's open items are under R11.
+
+**Session 1:**
 
 **2026-10-04, session 1 (end).** R0–R9 done: Rune is deployed in place of
 Kev and Kev's code is gone (git history). Results are in the stages above:

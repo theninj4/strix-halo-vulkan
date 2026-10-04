@@ -67,6 +67,8 @@ func main() {
 	every := flag.Int("every", 1, "score every k-th record (a sample for a slow reference)")
 	profile := flag.String("profile", "", "a decisions request body (file): time it dispatch by dispatch and exit (R8)")
 	reps := flag.Int("reps", 10, "with -profile: timed runs of the whole request")
+	profBatch := flag.Int("profile-batch", 0, "with -suite: pack this many of its records into one pass (as the server batches), time it dispatch by dispatch and exit")
+	profPass := flag.Int("profile-pass", 0, "time a synthetic pass of this many rows dispatch by dispatch and exit")
 	passes := flag.String("passes", "", "comma-separated pass lengths: time a whole forward at each and exit (R8)")
 	ladder := flag.String("ladder", "", "comma-separated pass lengths: time every GEMM rung on every projection at each and exit (R8)")
 	flag.Parse()
@@ -79,7 +81,7 @@ func main() {
 		compareRows(readRows(files[0]), readRows(files[1]))
 		return
 	}
-	if *suite == "" && *profile == "" && *ladder == "" && *passes == "" {
+	if *suite == "" && *profile == "" && *ladder == "" && *passes == "" && *profPass == 0 {
 		log.Fatal("-suite, -profile or -ladder is required")
 	}
 	dev, done := openDevice()
@@ -92,6 +94,16 @@ func main() {
 	fmt.Printf("staged   %s in %v\n", *model, time.Since(start).Round(time.Millisecond))
 	if *profile != "" {
 		runProfile(g, codebook, *profile, *reps)
+		return
+	}
+	if *profBatch > 0 {
+		runProfileBatch(g, codebook, *suite, *profBatch, *reps)
+		return
+	}
+	if *profPass > 0 {
+		p, err := g.SyntheticPass(*profPass)
+		must(err)
+		printProfile(g, p)
 		return
 	}
 	if *ladder != "" {
@@ -522,6 +534,10 @@ func runProfile(g *gemma4.GPU, codebook []string, path string, reps int) {
 		times[len(times)-1].Round(10*time.Microsecond), len(times))
 	p, err := g.PassOf(req, codebook)
 	must(err)
+	printProfile(g, p)
+}
+
+func printProfile(g *gemma4.GPU, p *gemma4.Pass) {
 	st, err := g.Profile(p)
 	must(err)
 	type kv struct {
@@ -574,4 +590,41 @@ func runLadder(g *gemma4.GPU, lengths string) {
 				float64(bestT[label].Microseconds())/1000, float64(st[label].Microseconds())/1000)
 		}
 	}
+}
+
+// runProfileBatch packs the first n records of a suite into one pass, the
+// shape the server's batching makes of concurrent requests (distinct
+// conversations, so the experts they touch are realistic), and times it.
+func runProfileBatch(g *gemma4.GPU, codebook []string, path string, n, reps int) {
+	f, err := os.Open(path)
+	must(err)
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 64<<20)
+	var plans []*gemma4.Plan
+	var segs []gemma4.Segment
+	rows := 0
+	for len(plans) < n && sc.Scan() {
+		req, err := decide.ParseSystemOne(append([]byte(nil), sc.Bytes()...))
+		must(err)
+		p, err := g.PlanRequest(req, codebook)
+		must(err)
+		plans, segs = append(plans, p), append(segs, p.Segment())
+		rows += p.Rows()
+	}
+	var times []time.Duration
+	for range reps + 1 {
+		t0 := time.Now()
+		_, err := g.RunPlans(plans)
+		must(err)
+		times = append(times, time.Since(t0))
+	}
+	times = times[1:]
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	fmt.Printf("batch    %d requests, %d rows: median %v a pass, %.1f req/s, %.3f ms a row\n", len(plans), rows,
+		times[len(times)/2].Round(10*time.Microsecond), float64(len(plans))/times[len(times)/2].Seconds(),
+		float64(times[len(times)/2].Microseconds())/1000/float64(rows))
+	p, err := g.NewBatch(segs)
+	must(err)
+	printProfile(g, p)
 }

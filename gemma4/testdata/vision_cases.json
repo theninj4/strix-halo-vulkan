@@ -1,0 +1,19 @@
+{
+ "images": [
+  {"name": "og", "file": "models/rune-26b-a4b/rune-og.jpg"},
+  {"name": "chart", "file": "testdata/ocr/chart_parsing_02.png"},
+  {"name": "tiny", "size": [100, 80]},
+  {"name": "strip", "size": [3000, 8]}
+ ],
+ "cases": [
+  {"name": "og/subject", "images": ["og"], "state": {"image": "attached"},
+   "question": {"instructions": "What does the attached image mainly show?",
+                "options": ["A logo or brand artwork", "A photograph of food", "A spreadsheet", "A handwritten letter"]}},
+  {"name": "chart/kind", "images": ["chart"], "state": {"task": "classify the attached figure"},
+   "question": {"instructions": "What kind of figure is attached?",
+                "options": ["A bar or column chart", "A pie chart", "A photograph of a person", "A map"]}},
+  {"name": "pair/colour", "images": ["tiny", "strip"], "state": "Two images are attached.",
+   "question": {"instructions": "Do the images contain a checkerboard texture?", "options": ["No", "Yes"]}},
+  {"name": "ticket/sentiment+og", "images": ["og"], "base": "ticket/sentiment"}
+ ]
+}

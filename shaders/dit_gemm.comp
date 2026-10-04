@@ -243,6 +243,12 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 #ifndef C_SWIGLU
 #define C_SWIGLU 0
 #endif
+// GLU_GELU (research/rune-vertical.md R10): the same epilogue with Gemma's
+// GELU-tanh on the gate in place of SiLU (the argument clamped as in
+// kev_gemm_q8_glu's GELU build): h = gelu_tanh(g) * u * pc.scale.
+#ifndef GLU_GELU
+#define GLU_GELU 0
+#endif
 #if C_SWIGLU && ((WN & 1) || C_F16 || C_PACK || KRANGE || A_CONV)
 #error "C_SWIGLU is the plain GEMM's epilogue over an even WN"
 #endif
@@ -905,7 +911,12 @@ void main() {
             coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator> h;
             for (uint e = 0u; e < h.length(); e++) {
                 float gt = acc[i][j][e];
-                h[e] = float16_t(gt / (1.0 + exp(-gt)) * acc[i][j + HALF][e] * sw);
+#if GLU_GELU
+                float act = 0.5 * gt * (1.0 + tanh(clamp(0.7978845608028654 * (gt + 0.044715 * gt * gt * gt), -15.0, 15.0)));
+#else
+                float act = gt / (1.0 + exp(-gt));
+#endif
+                h[e] = float16_t(act * acc[i][j + HALF][e] * sw);
             }
             coopMatStore(h, hact, pc.outOff + (wm0 + i * TILE) * pc.aux0 + col0 + j * TILE,
                 pc.aux0, gl_CooperativeMatrixLayoutRowMajor);

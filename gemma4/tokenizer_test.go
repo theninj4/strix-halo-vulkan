@@ -115,7 +115,7 @@ func TestPlan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		pl, err := tok.plan(req, cb)
+		pl, err := tok.plan(req, cb, "")
 		if err != nil {
 			t.Fatal(err)
 		}
