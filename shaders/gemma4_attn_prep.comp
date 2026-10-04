@@ -1,0 +1,152 @@
+// Gemma 4 (research/rune-vertical.md R5): an attention layer's front end, one
+// token a workgroup, one thread a head dimension. Kev's kev_attn_prep.comp (retired 2026-10-04, in git history)
+// with Gemma's numbers, built twice:
+//
+//	sliding  -DHD=256 -DNKV=8            P = [q 16x256 | k 8x256 | v 8x256]
+//	full     -DHD=512 -DNKV=2 -DKEQV=1   P = [q 16x512 | k 2x512]
+//
+// P is the fused projection x @ [q_proj | k_proj (| v_proj)]^T, row stride
+// aux0. Then, as HF's Gemma4TextAttention:
+//
+//	q = rope(rms(q) * q_norm)           scaled RMS norm: the weight is plain w,
+//	k = rope(rms(k) * k_norm)           not Gemma 2/3's (1 + w)
+//	v = rms(v)                          unscaled (v_norm has no weight)
+//
+// and on the full layers **V is k_proj's output** (attention_k_eq_v: there is
+// no v_proj): the raw k, before k_norm and rope, through the unscaled norm.
+//
+// RoPE is NeoX rotate-half over the whole head, (x_j, x_{j+HD/2}) for
+// j < HD/2, from a host table of cos and sin [pos][HD/2] built as HF builds
+// it (fp32 inv_freq times an fp32 position). The full layers' "proportional"
+// RoPE is the same formula with a table whose frequencies past 64 are zero
+// (cos 1, sin 0), so one kernel serves both.
+//
+// The attention's scale is 1.0 (Gemma4TextAttention.scaling): q goes to
+// gemma4_attn as q * log2(e), because that kernel exponentiates with exp2.
+//
+// Fields (dit_common.glsl):
+//
+//	inOff  P (fp32 arena)               aux0  P's row stride
+//	bOff   q, fp16 [rows][16][HD] in the fp16 arena, times log2(e)
+//	kOff   the layer's key cache, fp16 [cells][NKV][HD]
+//	vOff   its value cache, the same
+//	wOff   q_norm [HD], then k_norm [HD] (fp32 arena of weights)
+//	aux1   token metadata, 8 words a row (Kev's layout: pos, kind, segment
+//	       start row, cell, state cells [sLo, sHi), slot, resident)
+//	aux2   cos table (weights arena), sin table at +span*HD/2
+//	span   the table's rows (positions)
+//	eps    rms_norm_eps (float bits)
+//	tokens the pass's rows
+//
+// **The padding after a segment is zeroed in V**, as Kev's K7.7 does and for
+// its reason: a 64-cell key block may hold cells past a segment's end that
+// only an earlier pass wrote, and 0 x a stale V still moves the matrix
+// cores' sum.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef HD
+#define HD 256
+#endif
+#ifndef NKV
+#define NKV 8
+#endif
+#ifndef KEQV
+#define KEQV 0
+#endif
+#define NQ 16u
+#define HALF (HD / 2u)
+#define KOFF (NQ * HD)          // k in P
+#define VOFF (KOFF + NKV * HD)  // v in P (sliding layers)
+
+layout(local_size_x = HD) in;
+
+shared float red[HD];
+shared float xs[HD];
+
+float headSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = HD / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float rmsInv(float x) {
+    return inversesqrt(headSum(x * x) / float(HD) + uintBitsToFloat(pc.eps));
+}
+
+// The scaled norm then rope of one head held one value a thread.
+float normRope(float x, uint wOff, uint pos) {
+    uint t = gl_LocalInvocationID.x;
+    float y = x * rmsInv(x) * wbuf[wOff + t];
+    xs[t] = y;
+    barrier();
+    uint j = t % HALF;
+    float c = wbuf[pc.aux2 + pos * HALF + j];
+    float s = wbuf[pc.aux2 + pc.span * HALF + pos * HALF + j];
+    float out_ = t < HALF ? y * c - xs[t + HALF] * s : y * c + xs[t - HALF] * s;
+    barrier();
+    return out_;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint pos = floatBitsToUint(act[pc.aux1 + r * 8u]);
+    uint p = pc.inOff + r * pc.aux0;
+    uint cell = floatBitsToUint(act[pc.aux1 + r * 8u + 3u]);
+
+    for (uint h = 0u; h < NQ; h++) {
+        float y = normRope(act[p + h * HD + t], pc.wOff, pos);
+        hact[pc.bOff + (r * NQ + h) * HD + t] = float16_t(y * 1.4426950408889634);
+    }
+    for (uint g = 0u; g < NKV; g++) {
+        float kr = act[p + KOFF + g * HD + t];
+        float y = normRope(kr, pc.wOff + HD, pos);
+        hact[pc.kOff + (cell * NKV + g) * HD + t] = float16_t(y);
+#if KEQV
+        float vr = kr;
+#else
+        float vr = act[p + VOFF + g * HD + t];
+#endif
+        hact[pc.vOff + (cell * NKV + g) * HD + t] = float16_t(vr * rmsInv(vr));
+    }
+
+    // V padding, as Kev's kev_attn_prep.comp did: [lo, hi) cells.
+    uint seg = floatBitsToUint(act[pc.aux1 + r * 8u + 2u]);
+    uint lo = 0u, hi = 0u;
+    if (r + 1u >= pc.tokens || floatBitsToUint(act[pc.aux1 + (r + 1u) * 8u + 2u]) != seg) {
+        lo = cell + 1u; // the last row of its segment
+        hi = (lo + 63u) & ~63u;
+    }
+    for (uint i = lo * NKV * HD + t; i < hi * NKV * HD; i += HD) {
+        hact[pc.vOff + i] = float16_t(0.0);
+    }
+    uint branch = floatBitsToUint(act[pc.aux1 + r * 8u + 1u]);
+    uint sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);
+    uint slot = floatBitsToUint(act[pc.aux1 + r * 8u + 6u]);
+    bool resident = floatBitsToUint(act[pc.aux1 + r * 8u + 7u]) == 0u;
+    bool first = r == seg && (r == 0u || floatBitsToUint(act[pc.aux1 + (r - 1u) * 8u + 6u]) != slot);
+    if ((branch & 1u) != 0u && resident && first && sHi > floatBitsToUint(act[pc.aux1 + r * 8u + 4u])) {
+        for (uint i = sHi * NKV * HD + t; i < ((sHi + 63u) & ~63u) * NKV * HD; i += HD) {
+            hact[pc.vOff + i] = float16_t(0.0);
+        }
+    }
+}

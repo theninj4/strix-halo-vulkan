@@ -1,0 +1,131 @@
+// Gemma 4 (research/rune-vertical.md R5): the residual joins of a layer, one
+// row a workgroup. Two builds:
+//
+//   MODE 0, after attention:
+//     x  += rms(o) * w_post_attn                       (post_attention_layernorm)
+//     xd  = rms(x) * w_pre                             the dense MLP's input
+//     xe  = rms(x) * w_pre2                            the experts' (and router's)
+//   as fp16: xd to this block's GEMM operand (binding 2), xe to **the MoE
+//   block's input (binding 4, llm.MoEGPU's fp16 arena)**, written there
+//   directly rather than moved. The two pre-FFN norms are applied here and
+//   not folded into the int8 matrices: their weights span eight orders of
+//   magnitude within a layer (6e-6 to 175 in layer 5), and folded they put
+//   large and tiny columns in one 32-weight quantisation group (R5's first
+//   oracle run: the FFN half 20-25% off). The router's fp16 matrix carries
+//   scale x hidden^-1/2 / w_pre2 instead. Rows from `tokens` up to `gemmM`
+//   are written as zeros in both: the GEMM rungs and the MoE's sentinel row
+//   read them.
+//
+//   MODE 1, after the FFN half:
+//     x = (x + rms(rms(d) * w1 + rms(m) * w2) * w3) * layer_scalar
+//   with d the dense MLP's output, m the experts' sum (binding 3,
+//   llm.MoEGPU's fp32 arena, read where it lies), and w1, w2, w3
+//   post_feedforward_layernorm_1, _2 and post_feedforward_layernorm.
+//
+// RMS norms are Gemma 4's: x * (mean(x^2) + eps)^-1/2 * w, in fp32, the
+// weight plain (not 1 + w).
+//
+// Fields (dit_common.glsl):
+//   outOff  x, the residual (fp32 arena)          dim      hidden
+//   inOff   o (MODE 0) or d (MODE 1), fp32        eps      float bits
+//   wOff    w_post_attn (MODE 0) or w1            kOff     w_pre (MODE 0) or w2
+//   vOff    w_pre2 (MODE 0) or w3
+//   bOff    xn in this block's fp16 arena         lda      its row stride
+//   aux0    m in the MoE's fp32 arena (MODE 1); its row stride is dim
+//   aux1    xn in the MoE's fp16 arena (MODE 0)   aux2     its row stride
+//   scale   layer_scalar (float bits)             tokens, gemmM  rows, padded rows
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+layout(binding = 3) buffer MoEAct { float mact[]; };
+layout(binding = 4) buffer MoEHAct { float16_t mhact[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+#define WG 256u
+#define MAXV 16u // values a thread holds: hidden <= 4096
+
+layout(local_size_x = WG) in;
+
+shared float red[WG];
+
+float rowSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    uint D = pc.dim;
+    float eps = uintBitsToFloat(pc.eps);
+    float v[MAXV];
+
+#if MODE == 0
+    if (r >= pc.tokens) {
+        for (uint i = t; i < D; i += WG) {
+            hact[pc.bOff + r * pc.lda + i] = float16_t(0.0);
+            mhact[pc.aux1 + r * pc.aux2 + i] = float16_t(0.0);
+        }
+        return;
+    }
+    float ss = 0.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        v[k] = act[pc.inOff + r * D + i];
+        ss += v[k] * v[k];
+    }
+    float inv = inversesqrt(rowSum(ss) / float(D) + eps);
+    ss = 0.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        float x = act[pc.outOff + r * D + i] + v[k] * inv * wbuf[pc.wOff + i];
+        act[pc.outOff + r * D + i] = x;
+        v[k] = x;
+        ss += x * x;
+    }
+    inv = inversesqrt(rowSum(ss) / float(D) + eps);
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        hact[pc.bOff + r * pc.lda + i] = float16_t(v[k] * inv * wbuf[pc.kOff + i]);
+        mhact[pc.aux1 + r * pc.aux2 + i] = float16_t(v[k] * inv * wbuf[pc.vOff + i]);
+    }
+#else
+    if (r >= pc.tokens) {
+        return;
+    }
+    float m[MAXV];
+    float sd = 0.0, sm = 0.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        v[k] = act[pc.inOff + r * D + i];
+        m[k] = mact[pc.aux0 + r * D + i];
+        sd += v[k] * v[k];
+        sm += m[k] * m[k];
+    }
+    float invD = inversesqrt(rowSum(sd) / float(D) + eps);
+    float invM = inversesqrt(rowSum(sm) / float(D) + eps);
+    float ss = 0.0;
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        v[k] = v[k] * invD * wbuf[pc.wOff + i] + m[k] * invM * wbuf[pc.kOff + i];
+        ss += v[k] * v[k];
+    }
+    float inv = inversesqrt(rowSum(ss) / float(D) + eps);
+    float scalar = uintBitsToFloat(pc.scale);
+    for (uint k = 0u, i = t; i < D; i += WG, ++k) {
+        act[pc.outOff + r * D + i] = (act[pc.outOff + r * D + i] + v[k] * inv * wbuf[pc.vOff + i]) * scalar;
+    }
+#endif
+}

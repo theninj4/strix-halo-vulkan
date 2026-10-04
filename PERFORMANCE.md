@@ -131,15 +131,21 @@ short texts take **46 ms** (8.3x) and 128 texts of ~36 tokens take
 cosine is 0.999999+ against fp32. The batched path is compute-bound past
 ~450 rows at 15.6 TFLOP/s. ([`research/embedding-vertical.md`](research/embedding-vertical.md))
 
-### Classification: Kev-4B (Qwen3.5-4B + LoRA + pointer head)
+### Classification: Rune v3 (Gemma 4 26B-A4B), replacing Kev-4B
 
-The README ticket takes **52 ms** on the device and 54 ms over HTTP, on an
-int8 bank. A 2,269-token text takes **761 ms new and 87 ms again** from the
-prefix cache, bit-identically. Concurrent requests share passes, at ~29
-req/s against 19.5. Results are within 4e-4 of Kev's fp32 probabilities.
-**Kev's published accuracy is reproduced**: fp16 is within a question of
-the card on every suite, and int8 costs −0.19 pp.
-([`research/classification-vertical.md`](research/classification-vertical.md))
+At Q8 (int8 dense, Q8_0 experts), a 3-question 212-token ticket takes
+**158 ms** alone. That is ~115 ms of expert reads at the bandwidth roofline
+(every one of the 128 experts is touched, ~24 GB a request), so a lone
+short request cannot go much lower at Q8. Concurrent requests share passes:
+at 8 req/s p50 is **322 ms** (3.3 s unbatched), and a burst of 16 runs at
+11.6 req/s. A 5,500-token text takes 3.1 s. **Accuracy against Kev on its
+own suites:** +3 to +6 points on all four transfer partitions (e.g.
+transfer-v9 test 0.831 vs 0.773), −3.5 on decision-v7, Kev's
+in-distribution suite. Against HF fp32 the Q8 engine picks the same answers,
+with probabilities within 0.042, where bf16 itself moves 0.021. T = 2 is
+confirmed by NLL (fitted 1.8–2.2).
+([`research/rune-vertical.md`](research/rune-vertical.md); Kev's record:
+[`research/classification-vertical.md`](research/classification-vertical.md))
 
 ### OCR: PaddleOCR-VL-1.6 + PP-DocLayoutV3
 

@@ -569,6 +569,24 @@ DEQUANT_SLAB(dequantB1, sB1)
 
 float sigmoidf(float x) { return 1.0 / (1.0 + exp(-x)); }
 
+// MODE 0's activation on the gate: silu for the LLM, and GELU-tanh for Gemma 4
+// (`-DACT_GELU=1`, research/rune-vertical.md R5), PyTorch's
+// `gelu(x, approximate="tanh")`. The tanh argument is clamped because Mesa
+// lowers tanh through exp and returns NaN past about 44; at 15 it is already
+// 1.0 in fp32. A macro, and the GELU function only under its flag, so the
+// silu builds' SPIR-V is byte for byte what it was.
+#ifndef ACT_GELU
+#define ACT_GELU 0
+#endif
+#if ACT_GELU
+float geluf(float g) {
+    return 0.5 * g * (1.0 + tanh(clamp(0.7978845608028654 * (g + 0.044715 * g * g * g), -15.0, 15.0)));
+}
+#define GATE_ACT(g) geluf(g)
+#else
+#define GATE_ACT(g) g * sigmoidf(g)
+#endif
+
 // ---- PIPE (KERNELS.md G5): the K loop as a software pipeline.
 //
 // The shipped loop is, per K-step, one dependent chain: the permutation
@@ -1072,7 +1090,7 @@ void main() {
         ACC16_T sw;                                                                        \
         [[unroll]] for (uint e = 0u; e < acc0[i][j].length(); e++) {                       \
             float g = float(acc0[i][j][e]);                                                \
-            sw[e] = float16_t(g * sigmoidf(g) * float(acc1[i][j][e]));                     \
+            sw[e] = float16_t(GATE_ACT(g) * float(acc1[i][j][e]));                         \
         }                                                                                  \
         coopMatStore(sw, hact,                                                             \
             pc.ctxOff + (rowStart + wrow + (i) * TILE) * pc.ldCtx + n0 + (j) * TILE,       \

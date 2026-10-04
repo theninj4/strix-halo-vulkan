@@ -35,7 +35,8 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 | `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
 | `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics (or just a description, sample mode) to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
-| `POST /v1/systemone` | **done** — Kev-4B, `-kev`: TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation); the TypeSafe Python SDK works unchanged. See [`classification-vertical.md`](classification-vertical.md) |
+| `POST /v1/decisions` (+ `/api/alpha/decisions`, `/api/v1/decisions`) | **done** — Rune v3, `-rune`: surogate's decisions v1 (research/rune-vertical.md) |
+| `POST /v1/systemone` | **done** — Rune v3, `-rune`, through a translation (`decide/systemone.go`): TypeSafe's System One (typed `noul` / `choice` / `score` questions about a state, calibrated probabilities, no generation). Kev-4B served it until 2026-10-04; the TypeSafe Python SDK works unchanged. See [`classification-vertical.md`](classification-vertical.md) |
 
 Every endpoint is *routed*, including the ones that are not implemented: a
 client gets a 501 that says what is missing and, where a flag would have fixed
@@ -122,14 +123,11 @@ Broken out to [`api-residency.md`](api-residency.md).
     -music-ttl       24h          how long a finished job and its file are kept
     -music-queue     32           jobs that may wait behind the running one; past it is a 429
 
-    -kev             false        load Kev-4B (Qwen3.5-4B-Base + LoRA + pointer head) and serve /v1/systemone
-    -kev-model       models/kev-4b                 adapter, converted head (reference/convert_kev_head.py), tokenizer
-    -kev-base        models/Qwen3.5-4B-Base        the base, at the revision head.json names (1001bb4d)
-    -kev-tokens      8192         the longest request one pass holds: the state once plus every question
-    -kev-cache       4            states kept, so a repeated text pays for its questions only; 0 is off
-    -kev-cache-tokens 4096        the longest state kept (32 KB of KV a token, plus 52.7 MB a state)
-    -kev-batch       8            the most requests one pass answers; a lone request waits for nothing
-    -kev-fp16        false        stage the weights as fp16 instead of int8 (K7.1's control: 1.27x slower, 3.3 GB more)
+    -rune            false        load Rune v3 (Gemma 4 26B-A4B, Q8) and serve /v1/decisions and /v1/systemone (research/rune-vertical.md)
+    -rune-model      models/rune-26b-a4b           bf16 safetensors, quantised to int8 at load (~25 s)
+    -rune-rows       8192         the longest request one pass holds: the shared state once plus every question's suffix
+    -rune-batch-tokens 1024       the most tokens concurrent requests share one pass up to (rows are cheapest at ~1024)
+    -rune-temperature 2           the decision calibration temperature (the card's; NLL-fitted 1.8-2.2 on Kev's suites)
 
     -llm             false        load qwen3.8-flash-next
     -llm-model       models/Qwen3.8-Flash-Next-GGUF/…-00001-of-00004.gguf

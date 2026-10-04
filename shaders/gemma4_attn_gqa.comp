@@ -1,0 +1,224 @@
+// Gemma 4's full-attention layers (research/rune-vertical.md R8): head 512,
+// 2 KV heads for 16 query heads, so every KV head serves eight.
+//
+// gemma4_attn.comp gives each (16 query rows, head, half) its own
+// single-wave workgroup, and each of them reads K and V from memory itself:
+// at a 5,500-token state that is ~60 GB of key and value reads a layer, and
+// the five full layers took 1.97 s of a 4.1 s pass (65% of it attention).
+// Here one workgroup is the eight query heads that share a KV head, a wave
+// each, over the same 16 rows and the same half of V's columns, and a block
+// of 16 keys goes through LDS once for all eight: K [16][512] (16 KB) and
+// this half's V [16][256] (8 KB). The arithmetic of a wave is
+// gemma4_attn.comp's (whose header, and Kev's retired kev_attn_wmma.comp's in git history, explain
+// the flash arrangement): scores over 32 k-steps with Q streamed from
+// memory a fragment at a time, the masked running max, P through LDS, P V
+// into 16 accumulator tiles, lsum by a ones matrix.
+//
+// Grid: x the 16-row tiles, y = 2 x KV head + half. The mask is
+// gemma4_attn.comp's without the window (the full layers have none).
+//
+// Fields (dit_common.glsl): inOff q, kOff/vOff the caches, outOff the output,
+// lda its stride, aux1 the token metadata, tokens the pass's rows.
+
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 512u
+#define NKV 2u
+#define NQ 16u
+#define GQA (NQ / NKV)      // query heads a KV head serves: the waves
+#define TILE 16
+#define HDT (HD / 16u)      // k-steps of QK^T
+#define OT 16u              // output tiles a wave: 256 columns of V
+#define CELL (NKV * HD)     // halves a cache cell
+#define QROW (NQ * HD)      // halves a q row
+#define KB 16u              // keys a block
+#define WAVE 64u
+#define THREADS (GQA * WAVE)
+
+layout(local_size_x = 512) in;
+
+#define ACC  coopmat<float, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define ACCH coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
+
+shared float16_t ldsK[KB * HD];        // the block's keys, [key][512]
+shared float16_t ldsV[KB * OT * TILE]; // this half's values, [key][256]
+shared float stage[GQA][TILE * TILE];
+shared float bcorr[GQA][TILE * TILE];
+shared float16_t pbuf[GQA][TILE * KB];
+shared float rowMax[GQA][TILE];
+shared float blkMax[GQA][TILE];
+shared uint rowCell[TILE];
+shared uint rowLo[TILE];
+shared uint rowSLo[TILE];
+shared uint rowSHi[TILE];
+shared uint useful;
+shared uint tileHi;
+
+bool allowed(uint r, uint key) {
+    bool inState = key >= rowSLo[r] && key < rowSHi[r];
+    return key <= rowCell[r] && (inState || key >= rowLo[r]);
+}
+
+void main() {
+    uint q0 = gl_WorkGroupID.x * TILE;
+    uint g = gl_WorkGroupID.y / 2u;
+    uint ob = (gl_WorkGroupID.y % 2u) * OT * TILE; // the V columns this workgroup accumulates
+    uint tid = gl_LocalInvocationID.x;
+    uint w = tid / WAVE; // the wave: query head g*GQA + w
+    uint lane = tid % WAVE;
+    uint h = g * GQA + w;
+    uint n = pc.tokens;
+
+    if (tid == 0u) {
+        tileHi = 0u;
+    }
+    barrier();
+    if (tid < TILE) {
+        uint r = q0 + tid;
+        uint cell = 0u, lo = 1u, sLo = 0u, sHi = 0u; // a pad row sees nothing
+        if (r < n) {
+            cell = floatBitsToUint(act[pc.aux1 + r * 8u + 3u]);
+            lo = cell - (r - floatBitsToUint(act[pc.aux1 + r * 8u + 2u]));
+            sLo = floatBitsToUint(act[pc.aux1 + r * 8u + 4u]);
+            sHi = floatBitsToUint(act[pc.aux1 + r * 8u + 5u]);
+            atomicMax(tileHi, cell + 1u);
+        }
+        rowCell[tid] = cell;
+        rowLo[tid] = lo;
+        rowSLo[tid] = sLo;
+        rowSHi[tid] = sHi;
+    }
+    if (lane < TILE) {
+        rowMax[w][lane] = -1.0 / 0.0;
+    }
+    barrier();
+    uint hi = tileHi;
+
+    uint qBase = pc.inOff + q0 * QROW + h * HD;
+    ACC o[OT];
+    [[unroll]] for (uint j = 0u; j < OT; ++j) {
+        o[j] = ACC(0.0);
+    }
+    ACC lsum = ACC(0.0);
+    const FRAG_B ones = FRAG_B(float16_t(1.0));
+
+    uint kBase = pc.kOff + g * HD, vBase = pc.vOff + g * HD + ob;
+    for (uint base = 0u; base < hi; base += KB) {
+        // Skip a block none of the tile's rows may see a key of.
+        if (tid == 0u) {
+            useful = 0u;
+        }
+        barrier();
+        if (tid < TILE * KB) {
+            if (allowed(tid / KB, base + tid % KB)) {
+                atomicOr(useful, 1u);
+            }
+        }
+        barrier();
+        if (useful == 0u) {
+            continue;
+        }
+        // The block's K and this half's V into LDS, once for the eight heads.
+        for (uint i = tid; i < KB * HD; i += THREADS) {
+            ldsK[i] = hact[kBase + (base + i / HD) * CELL + i % HD];
+        }
+        for (uint i = tid; i < KB * OT * TILE; i += THREADS) {
+            ldsV[i] = hact[vBase + (base + i / (OT * TILE)) * CELL + i % (OT * TILE)];
+        }
+        barrier();
+
+        ACC s = ACC(0.0);
+        [[unroll]] for (uint kt = 0u; kt < HDT; ++kt) {
+            FRAG_A fq;
+            coopMatLoad(fq, hact, qBase + kt * TILE, QROW, gl_CooperativeMatrixLayoutRowMajor);
+            FRAG_B fk;
+            coopMatLoad(fk, ldsK, kt * TILE, HD, gl_CooperativeMatrixLayoutColumnMajor);
+            s = coopMatMulAdd(fq, fk, s);
+        }
+
+        coopMatStore(s, stage[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        if (lane < TILE) {
+            float mx = -1.0 / 0.0;
+            for (uint c = 0u; c < KB; ++c) {
+                if (allowed(lane, base + c)) {
+                    mx = max(mx, stage[w][lane * TILE + c]);
+                }
+            }
+            blkMax[w][lane] = mx;
+        }
+        barrier();
+        for (uint i = lane; i < TILE * TILE; i += WAVE) {
+            uint r = i / TILE;
+            float mo = rowMax[w][r];
+            float mn = max(mo, blkMax[w][r]);
+            stage[w][i] = mn;
+            bcorr[w][i] = mn == -1.0 / 0.0 ? 1.0 : exp2(mo - mn);
+        }
+        barrier();
+        if (lane < TILE) {
+            rowMax[w][lane] = max(rowMax[w][lane], blkMax[w][lane]);
+        }
+        ACC mrow, ccorr;
+        coopMatLoad(mrow, stage[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ccorr, bcorr[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+        ACC p = s - mrow;
+        [[unroll]] for (uint e = 0u; e < p.length(); ++e) {
+            p[e] = exp2(p[e]);
+        }
+        coopMatStore(ACCH(p), pbuf[w], 0u, KB, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0u; j < OT; ++j) {
+            o[j] = o[j] * ccorr;
+        }
+        lsum = lsum * ccorr;
+        barrier();
+        for (uint i = lane; i < TILE * KB; i += WAVE) {
+            if (!allowed(i / KB, base + i % KB)) {
+                pbuf[w][i] = float16_t(0.0);
+            }
+        }
+        barrier();
+
+        FRAG_A fragP;
+        coopMatLoad(fragP, pbuf[w], 0u, KB, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint j = 0u; j < OT; ++j) {
+            FRAG_B fv;
+            coopMatLoad(fv, ldsV, j * TILE, OT * TILE, gl_CooperativeMatrixLayoutRowMajor);
+            o[j] = coopMatMulAdd(fragP, fv, o[j]);
+        }
+        lsum = coopMatMulAdd(fragP, ones, lsum);
+        barrier(); // ldsK and ldsV are the next block's
+    }
+
+    coopMatStore(lsum, stage[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = lane; i < TILE * TILE; i += WAVE) {
+        bcorr[w][i] = 1.0 / stage[w][(i / TILE) * TILE];
+    }
+    barrier();
+    ACC cinv;
+    coopMatLoad(cinv, bcorr[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+    [[unroll]] for (uint j = 0u; j < OT; ++j) {
+        barrier();
+        coopMatStore(o[j] * cinv, stage[w], 0u, TILE, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint i = lane; i < TILE * TILE; i += WAVE) {
+            uint r = q0 + i / TILE;
+            if (r < n) {
+                hact[pc.outOff + r * pc.lda + h * HD + ob + j * TILE + i % TILE] = float16_t(stage[w][i]);
+            }
+        }
+    }
+}

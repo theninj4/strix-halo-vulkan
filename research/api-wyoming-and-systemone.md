@@ -79,6 +79,10 @@ again.
 
 ## System One is not an OpenAI envelope
 
+> **Since 2026-10-04 Rune answers `/v1/systemone`**, through the translation
+> in `decide/systemone.go` (`research/rune-vertical.md` R-o1); Kev and its
+> flags below are retired. The envelope and the 422s are unchanged.
+
 `POST /v1/systemone` is TypeSafe's contract, as
 [Kev](https://github.com/jaredpalmer/kev) serves it, and it is answered the
 way Kev answers it rather than translated into anything of ours:

@@ -720,6 +720,11 @@ type MoEGPU struct {
 	mods  []*vk.ShaderModule
 
 	layers []moeLayerWeights
+	// noShared skips the shared expert's dispatches (WithMoENoShared).
+	noShared bool
+	// gelu selects GELU-tanh for the gate (WithMoEGELU): Gemma 4's experts,
+	// served from this block by gemma4/ (research/rune-vertical.md R5).
+	gelu bool
 	// bankPlan is P4's `LLM_MOE_BANK`: which of the six MoE families are
 	// staged narrower than the checkpoint ships them. Read once at
 	// construction so that `reserve`'s sizes and `stage`'s bytes cannot
@@ -796,6 +801,36 @@ func (g *MoEGPU) routerN() int { return roundUpInt(g.cfg.NExpert+1, attnBN) }
 // two stagings of the same layer compared bit for bit, and `LLM_MOE_BANK` is
 // read through a `sync.Once` like every other plan here.
 type MoEOption func(*MoEGPU)
+
+// WithMoEGELU builds the gate+up kernels with GELU-tanh on the gate in place
+// of silu: Gemma 4's experts (research/rune-vertical.md R5). Only the Q8_0
+// grouped GEMM builds exist, and a GEMV rung is refused at Run: a caller pins
+// the block to the GEMM (PinGemv).
+func WithMoEGELU() MoEOption { return func(g *MoEGPU) { g.gelu = true } }
+
+// WithMoENoShared is a block whose checkpoint has no shared expert (Gemma 4):
+// the shared expert's two dispatches are not recorded. Its slot stays in the
+// layout, with a stand-in expert staged for the shapes, and its rows of the
+// gated arena -- the front of the permuted row space, [0, rows) -- are zeroed
+// by syncShared whenever the run's length is set, so the combine adds
+// exactly +0 for it: the routed experts' sum without the stand-in's ~5 ms a
+// request (research/rune-vertical.md R8). **Every run, not once:** a shorter
+// run puts routed rows where a longer one's shared rows are, and a zero made
+// once at construction had a batch of two requests reading an earlier
+// pass's experts.
+func WithMoENoShared() MoEOption { return func(g *MoEGPU) { g.noShared = true } }
+
+// moeGELUSPIRV is moeSPIRV's Q8_0 up builds with -DACT_GELU=1, under the same
+// names, so the graph is unchanged.
+var moeGELUSPIRV = map[string][]byte{
+	"up_q80_m1":   shaders.LLMMoEUpQ80M1GELU,
+	"up_q80_m2":   shaders.LLMMoEUpQ80M2GELU,
+	"up_q80_m4":   shaders.LLMMoEUpQ80M4GELU,
+	"up_q80_w2m1": shaders.LLMMoEUpQ80W2M1GELU,
+	"up_q80_w4m1": shaders.LLMMoEUpQ80W4M1GELU,
+	"up_q80_n1m1": shaders.LLMMoEUpQ80N1M1GELU,
+	"up_q80_n2m1": shaders.LLMMoEUpQ80N2M1GELU,
+}
 
 // WithMoEBankPlan stages this block under an explicit plan rather than the
 // environment's.
@@ -1216,6 +1251,9 @@ func (g *MoEGPU) build() error {
 			if o, ok := override[name]; ok && fi == 0 {
 				spirv, wave = o, overrideWave
 			}
+			if gl, ok := moeGELUSPIRV[name]; ok && g.gelu && fi == 0 {
+				spirv = gl
+			}
 			for rows := 1; rows <= GEMVMaxRows; rows++ {
 				rspec := spec
 				rspec.RequiredSubgroupSize = wave
@@ -1454,6 +1492,9 @@ func (g *MoEGPU) Upload(x []float32, nTok int) error {
 // identity and need no counting sort. The slack up to the alignment gets the
 // same sentinel a routed expert's padding does.
 func (g *MoEGPU) syncShared() {
+	if g.noShared {
+		g.abuf.ZeroFloat32At(int(g.aGated), g.rows*g.cfg.NEmbd)
+	}
 	used := g.cfg.NExpertUsed
 	slots := used + 1
 	pad := g.pad()
@@ -1574,7 +1615,7 @@ func (g *MoEGPU) SetSharedFold(on bool) { g.sharedSplit = !on }
 // own group. And the widths have to agree, which they do on this
 // checkpoint (FFNShared == FFNExpert) and are checked rather than assumed.
 func (g *MoEGPU) foldShared(w moeLayerWeights) (up, down bool) {
-	if g.sharedSplit || g.cfg.FFNShared != g.cfg.FFNExpert {
+	if g.noShared || g.sharedSplit || g.cfg.FFNShared != g.cfg.FFNExpert {
 		return false, false
 	}
 	up = MoEIsGemv(g.up) && w.shGateFmt == w.gateFmt && w.shUpFmt == w.upFmt
@@ -1621,6 +1662,11 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	}
 	c := g.cfg
 	w := g.layers[layer]
+	if g.gelu && (MoEIsGemv(g.up) || MoEIsGemv(g.shUp)) {
+		// Only the grouped GEMM has GELU builds (WithMoEGELU); a GEMV rung
+		// would run silu and be silently wrong.
+		return nil, nil, fmt.Errorf("llm: a GELU block runs only on the grouped GEMM, not %s/%s", g.up, g.shUp)
+	}
 	rv, _ := gemmVariantFor(g.router)
 	bmUp, bmDown := moeBM(g.up), moeBM(g.down)
 
@@ -1766,7 +1812,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shUp.GemmM = uint32(g.pad())
 	shUp.CtxOff = g.hSwiglu
 	shUp.GemmN, shUp.GemmK = uint32(c.FFNShared), uint32(c.NEmbd)
-	if !foldUp {
+	if !foldUp && !g.noShared {
 		add(moeExpertPipe("up", w.shGateFmt, g.shUp, g.rows), "shexp.up",
 			uint32(c.FFNShared/moeBNOf(g.shUp)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shUp))/moeBM(g.shUp)), shUp)
 	}
@@ -1794,7 +1840,7 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	shDown.GemmM = uint32(g.pad())
 	shDown.CtxOff = g.hSwiglu
 	shDown.GemmN, shDown.GemmK = uint32(c.NEmbd), uint32(c.FFNShared)
-	if !foldDown {
+	if !foldDown && !g.noShared {
 		add(moeExpertPipe("down", w.shDownFmt, g.shDown, g.rows), "shexp.down",
 			uint32(c.NEmbd/moeBNOf(g.shDown)), uint32(roundUpInt(roundUpInt(g.rows, g.pad()), moeBM(g.shDown))/moeBM(g.shDown)), shDown)
 	}
@@ -1802,6 +1848,14 @@ func (g *MoEGPU) graph(layer int) ([]vk.MultiDispatch, []string, error) {
 	// 9. `ffn_out`: the ten and the shared expert's, in slot order.
 	add("combine", "combine", uint32(roundUpInt(c.NEmbd, moeCombineWG)/moeCombineWG), uint32(g.rows), base)
 	return d, kinds, nil
+}
+
+// Dispatches is one layer's block as a dispatch sequence with a label per
+// dispatch, for a caller that records it into its own command buffer
+// beside its own work (gemma4: a whole Rune layer, attention, dense MLP and
+// experts, in one submit; research/rune-vertical.md R8).
+func (g *MoEGPU) Dispatches(layer int) ([]vk.MultiDispatch, []string, error) {
+	return g.graph(layer)
 }
 
 // Run executes one layer's block over whatever Upload left in the arenas.

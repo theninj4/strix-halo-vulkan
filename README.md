@@ -26,7 +26,7 @@ would load it.
 | `-embed` | Qwen3-Embedding-0.6B | `/v1/embeddings` | 0.9 GB |
 | `-tts` | Kokoro-82M (+ misaki lexicon, espeak-ng fallback) | `/v1/audio/speech` | small |
 | `-stt` | parakeet-tdt-0.6b-v3 | `/v1/audio/transcriptions` | small |
-| `-kev` | Kev-4B (TypeSafe System One) | `/v1/systemone` | ~9 GB |
+| `-rune` | Rune v3 (Gemma 4 26B-A4B, Q8) | `/v1/decisions` (+ `/api/alpha/decisions`, `/api/v1/decisions`), `/v1/systemone` | ~27 GB |
 | `-ocr` | PaddleOCR-VL-1.6 + PP-DocLayoutV3 | `/v1/ocr`, and `/v1/chat/completions` as model `PaddleOCR-VL-1.6-0.9B` | small |
 | `-image` / `-edits N` | Qwen-Image-2.1 | `/v1/images/generations`, `/v1/images/edits` | ~20 GB while resident |
 | `-video` | MiniMax-H3 (video with a soundtrack) | `/v1/videos` | ~0.3 GB at rest, ~31 GB per request |
@@ -71,15 +71,15 @@ models/Qwen3.8-Flash-Next-GGUF/   -llm (the UD-Q4_K_XL shards), mmproj-BF16.gguf
 models/Qwen3-Embedding-0.6B/      -embed (also used by -music)
 models/Kokoro-82M/  models/misaki/ -tts
 models/parakeet-tdt-0.6b-v3/      -stt
-models/kev-4b/  models/Qwen3.5-4B-Base/   -kev
+models/rune-26b-a4b/              -rune (bf16 safetensors, quantised to int8 at load)
 models/PaddleOCR-VL-1.6/  models/PP-DocLayoutV3/   -ocr
 models/Qwen-Image-2.1/  models/taeqi2_1/   -image
 models/MiniMax-H3/                -video
 models/acestep-v15-xl-turbo/  models/acestep-5Hz-lm-4B/  models/Ace-Step1.5/vae   -music
 ```
 
-Most of these are Hugging Face downloads used as-is. A few (Kokoro, misaki,
-the Kev head) are first converted by a script in `reference/`. Each
+Most of these are Hugging Face downloads used as-is. A few (Kokoro, misaki)
+are first converted by a script in `reference/`. Each
 vertical's file in `research/` records exactly which revision it was built
 against and any conversion step.
 
@@ -213,12 +213,19 @@ and `instruct`, an extension that sets the query instruction.
 Home Assistant's Wyoming protocol, from the same process. Wyoming has no
 authentication, so anyone who can reach that port can use both models.
 
-### Classification: System One
+### Classification: decisions v1 and System One
 
-`POST /v1/systemone` implements TypeSafe's System One contract as Kev serves it:
-one text and typed questions in, calibrated probabilities out, with nothing
-generated. The TypeSafe Python SDK works against it unchanged. Model names:
-`kev-latest`, `jev-latest`.
+`POST /v1/decisions` is surogate's decisions v1 (OpenRouter's field names,
+also at `/api/alpha/decisions` and `/api/v1/decisions`): one state and
+typed `choice` / `noul` / `score` questions in, calibrated probabilities
+out (T = 2), with nothing generated. `order_averaging` is supported;
+`thinking` and images answer v1's 400 codes. Model names: `rune`,
+`rune-26b-a4b`.
+
+`POST /v1/systemone` is TypeSafe's System One contract, as Kev served it,
+now answered by Rune through a translation, so the TypeSafe Python SDK and
+Kev's clients work unchanged. Model names: `kev-latest`, `jev-latest`
+(and Rune's).
 
 ```json
 {"state": "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card.",
@@ -301,7 +308,7 @@ from a description alone. `task_type` is `text2music` (the default), `cover`,
 tools, one per vertical, used during development; each command's `-h`
 describes it:
 
-- `llm`, `qimage`, `h3`, `ace`, `ocr`, `kev`, `tts`, `asr`, `embed`: run one model from the command line.
+- `llm`, `qimage`, `h3`, `ace`, `ocr`, `rune`, `tts`, `asr`, `embed`: run one model from the command line (`rune` also scores Kev's suites, profiles and ladders).
 - `loadgen`, `kevload`, `roundtrip`: drive a running server.
 - `bench`, `probe`, `bus`, `quanterr`, `gguf`, `inspect`: the kernel benchmark suite and other inspection tools.
 
@@ -314,7 +321,7 @@ backend/     adapters that own weights, residency and scheduling
 wyoming/     the Wyoming protocol door
 vk/          the Vulkan engine (cgo + a small C shim)
 shaders/     GLSL compute shaders, compiled with go generate
-llm/ embed/ kokoro/ parakeet/ kev/ ocr/ qimage/ h3/ ace/   one package per model
+llm/ embed/ kokoro/ parakeet/ gemma4/ ocr/ qimage/ h3/ ace/   one package per model (decide/: the decisions protocol)
 reference/   Python oracles and checkpoint converters
 research/    design notes and measurements, one file per vertical or experiment
 ```

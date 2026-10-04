@@ -55,6 +55,11 @@ func (s *Server) backends() []Backend {
 	if s.SystemOne != nil {
 		out = append(out, s.SystemOne)
 	}
+	// One backend usually serves both (Rune answers System One through the
+	// translation in decide/systemone.go); list it once.
+	if s.Decisions != nil && Backend(s.Decisions) != Backend(s.SystemOne) {
+		out = append(out, s.Decisions)
+	}
 	if s.Document != nil {
 		out = append(out, s.Document)
 	}

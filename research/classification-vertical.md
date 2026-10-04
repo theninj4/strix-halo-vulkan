@@ -1,5 +1,12 @@
 # CLASSIFICATION — typed decisions with calibrated probabilities (Kev)
 
+> **Frozen 2026-10-04: Kev is retired.** Rune v3 (Gemma 4 26B-A4B,
+> surogate's decisions v1) replaced it and answers `/v1/systemone` through a
+> translation; the live plan is [`rune-vertical.md`](rune-vertical.md). Kev's
+> code (`kev/`, `cmd/kev`, `backend/kev.go`, its shaders and its oracle) is
+> in git history before that date; `cmd/kevload`, `reference/kev_fixtures.json`,
+> `models/kev-suites/` and `kev_gemm_q8_glu.comp` (Rune's int8 GEMMs) stay.
+
 > **Moved to `research/` on 2026-10-02** — this was `CLASSIFICATION.md` at the repo
 > root, and code comments citing `CLASSIFICATION.md` resolve here. The vertical is
 > **not closed**:

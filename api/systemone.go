@@ -1,7 +1,8 @@
 package api
 
 // POST /v1/systemone (CLASSIFICATION.md K6): TypeSafe's System One contract,
-// as Kev serves it. One text (the state) and typed questions in, one
+// as Kev served it; since 2026-10-04 Rune answers it through the translation
+// in decide/systemone.go (research/rune-vertical.md R-o1). One text (the state) and typed questions in, one
 // calibrated probability distribution per question out, in one prefill.
 //
 // Unlike every other endpoint here the envelope is not OpenAI's, and it is
@@ -51,7 +52,7 @@ func (s *Server) handleSystemOne(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Typesafe-Request-Id", id)
 
 	if s.SystemOne == nil {
-		notLoaded(ctx, w, "the classification model", "-kev")
+		notLoaded(ctx, w, "the classification model", "-rune")
 		return
 	}
 	body, err := io.ReadAll(r.Body)

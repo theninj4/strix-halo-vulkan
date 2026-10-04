@@ -3243,6 +3243,14 @@ var LLMDNScanL4P []byte
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=1 -DWM=1 -DWN=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q5k_n2m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWN=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_n1m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DQFMT=3 -DWM=1 -DWN=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_n2m1.spv llm_moe_gemm.comp
+// Gemma 4's gate activation (research/rune-vertical.md R5): the same Q8_0 up builds with GELU-tanh.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_m2_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=4 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_m4_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=2 -DNBANK=48 -o llm_moe_up_q80_w2m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWAVES=4 -DNBANK=48 -o llm_moe_up_q80_w4m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWN=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_n1m1_gelu.spv llm_moe_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DACT_GELU=1 -DQFMT=3 -DWM=1 -DWN=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_up_q80_n2m1_gelu.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=1 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_down_q51_m1.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=2 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_down_q51_m2.spv llm_moe_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DQFMT=2 -DWM=4 -DWAVES=1 -DSHORT=1 -DNBANK=48 -o llm_moe_down_q51_m4.spv llm_moe_gemm.comp
@@ -3323,6 +3331,27 @@ var LLMMoEUpQ5KN2M1 []byte
 
 //go:embed llm_moe_up_q80_n1m1.spv
 var LLMMoEUpQ80N1M1 []byte
+
+//go:embed llm_moe_up_q80_m1_gelu.spv
+var LLMMoEUpQ80M1GELU []byte
+
+//go:embed llm_moe_up_q80_m2_gelu.spv
+var LLMMoEUpQ80M2GELU []byte
+
+//go:embed llm_moe_up_q80_m4_gelu.spv
+var LLMMoEUpQ80M4GELU []byte
+
+//go:embed llm_moe_up_q80_w2m1_gelu.spv
+var LLMMoEUpQ80W2M1GELU []byte
+
+//go:embed llm_moe_up_q80_w4m1_gelu.spv
+var LLMMoEUpQ80W4M1GELU []byte
+
+//go:embed llm_moe_up_q80_n1m1_gelu.spv
+var LLMMoEUpQ80N1M1GELU []byte
+
+//go:embed llm_moe_up_q80_n2m1_gelu.spv
+var LLMMoEUpQ80N2M1GELU []byte
 
 //go:embed llm_moe_up_q80_n2m1.spv
 var LLMMoEUpQ80N2M1 []byte
@@ -3653,85 +3682,21 @@ var LLMMoERouteDecodeK40 []byte
 //go:embed llm_move.spv
 var LLMMove []byte
 
-// Kev-4B, the classification vertical (CLASSIFICATION.md K4/K5). They share
-// dit_common.glsl's bindings and push block so that dit_gemm's fp16 ladder,
-// the RMS-norm pack, SwiGLU and the residual add record into the same command
-// buffers unchanged. What is new is the hybrid backbone's: the Gated DeltaNet
-// front end, its recurrence over a pass of segments, its SiLU-gated output
-// norm, and a head-256 gated attention under Kev's block-causal mask.
+// The int8 GEMM Kev-4B brought (CLASSIFICATION.md K7.6), kept for Rune when
+// Kev was retired (2026-10-04, research/rune-vertical.md R9): the
+// row-block-fastest plain build (rb), at BM = 32, 64, 128. Its GLU builds
+// are Rune's GELU ones, below with Gemma 4's other kernels; Kev's SwiGLU
+// builds and its GDN and attention kernels went with Kev.
 
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_gdn_prep.spv kev_gdn_prep.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=1 -o kev_gdn_scan_l1.spv kev_gdn_scan.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=2 -o kev_gdn_scan_l2.spv kev_gdn_scan.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=4 -o kev_gdn_scan_l4.spv kev_gdn_scan.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=8 -o kev_gdn_scan_l8.spv kev_gdn_scan.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DLPC=16 -o kev_gdn_scan_l16.spv kev_gdn_scan.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_gdn_norm.spv kev_gdn_norm.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attn_prep.spv kev_attn_prep.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attention.spv kev_attention.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_copy.spv kev_copy.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -o kev_attn_wmma.spv kev_attn_wmma.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -o kev_gemm_q8_glu_m2.spv kev_gemm_q8_glu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DPLAIN -o kev_gemm_q8_rb_m2.spv kev_gemm_q8_glu.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -o kev_gemm_q8_glu_m4.spv kev_gemm_q8_glu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DPLAIN -o kev_gemm_q8_rb_m4.spv kev_gemm_q8_glu.comp
-//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=8 -o kev_gemm_q8_glu_m8.spv kev_gemm_q8_glu.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=8 -DPLAIN -o kev_gemm_q8_rb_m8.spv kev_gemm_q8_glu.comp
-
-//go:embed kev_gdn_prep.spv
-var KevGDNPrep []byte
-
-// KevGDNScan is kev_gdn_scan.comp by LPC, lanes a state column (K7.4).
-var KevGDNScan = map[int][]byte{1: kevGDNScanL1, 2: kevGDNScanL2, 4: kevGDNScanL4, 8: kevGDNScanL8, 16: kevGDNScanL16}
-
-//go:embed kev_gdn_scan_l1.spv
-var kevGDNScanL1 []byte
-
-//go:embed kev_gdn_scan_l2.spv
-var kevGDNScanL2 []byte
-
-//go:embed kev_gdn_scan_l4.spv
-var kevGDNScanL4 []byte
-
-//go:embed kev_gdn_scan_l8.spv
-var kevGDNScanL8 []byte
-
-//go:embed kev_gdn_scan_l16.spv
-var kevGDNScanL16 []byte
-
-//go:embed kev_gdn_norm.spv
-var KevGDNNorm []byte
-
-//go:embed kev_attn_prep.spv
-var KevAttnPrep []byte
-
-//go:embed kev_attention.spv
-var KevAttention []byte
-
-//go:embed kev_copy.spv
-var KevCopy []byte
-
-//go:embed kev_attn_wmma.spv
-var KevAttnWMMA []byte
-
-// The MLP's gate and up as one int8 GEMM with a SwiGLU epilogue (K7.6), and
-// the same kernel with a plain fp32 store (rb: row-block-fastest grid), at
-// BM = 32, 64, 128.
-
-//go:embed kev_gemm_q8_glu_m2.spv
-var KevGEMMQ8GLUM2 []byte
 
 //go:embed kev_gemm_q8_rb_m2.spv
 var KevGEMMQ8RBM2 []byte
 
-//go:embed kev_gemm_q8_glu_m4.spv
-var KevGEMMQ8GLUM4 []byte
-
 //go:embed kev_gemm_q8_rb_m4.spv
 var KevGEMMQ8RBM4 []byte
-
-//go:embed kev_gemm_q8_glu_m8.spv
-var KevGEMMQ8GLUM8 []byte
 
 //go:embed kev_gemm_q8_rb_m8.spv
 var KevGEMMQ8RBM8 []byte
@@ -4120,3 +4085,49 @@ var OCRLMAttn []byte
 
 //go:embed ocr_lm_attn_combine.spv
 var OCRLMAttnCombine []byte
+
+// Gemma 4, Rune's backbone (research/rune-vertical.md R5): attention.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHD=256 -DNKV=8 -o gemma4_attn_prep_slide.spv gemma4_attn_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHD=512 -DNKV=2 -DKEQV=1 -o gemma4_attn_prep_full.spv gemma4_attn_prep.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHD=256 -DNKV=8 -DWINDOW=1024 -o gemma4_attn_slide.spv gemma4_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHD=512 -DNKV=2 -o gemma4_attn_full.spv gemma4_attn.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o gemma4_attn_gqa.spv gemma4_attn_gqa.comp
+
+//go:embed gemma4_attn_prep_slide.spv
+var Gemma4AttnPrepSlide []byte
+
+//go:embed gemma4_attn_prep_full.spv
+var Gemma4AttnPrepFull []byte
+
+//go:embed gemma4_attn_slide.spv
+var Gemma4AttnSlide []byte
+
+//go:embed gemma4_attn_full.spv
+var Gemma4AttnFull []byte
+
+//go:embed gemma4_attn_gqa.spv
+var Gemma4AttnGQA []byte
+
+// Gemma 4's dense gate+up with GELU-tanh in the epilogue (research/rune-vertical.md R5).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DGELU -o gemma4_gemm_q8_geglu_m2.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DGELU -o gemma4_gemm_q8_geglu_m4.spv kev_gemm_q8_glu.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=8 -DGELU -o gemma4_gemm_q8_geglu_m8.spv kev_gemm_q8_glu.comp
+
+//go:embed gemma4_gemm_q8_geglu_m2.spv
+var Gemma4GEMMQ8GEGLUM2 []byte
+
+//go:embed gemma4_gemm_q8_geglu_m4.spv
+var Gemma4GEMMQ8GEGLUM4 []byte
+
+//go:embed gemma4_gemm_q8_geglu_m8.spv
+var Gemma4GEMMQ8GEGLUM8 []byte
+
+// Gemma 4's residual joins (research/rune-vertical.md R5).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -o gemma4_post_attn.spv gemma4_post.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -o gemma4_post_ffn.spv gemma4_post.comp
+
+//go:embed gemma4_post_attn.spv
+var Gemma4PostAttn []byte
+
+//go:embed gemma4_post_ffn.spv
+var Gemma4PostFFN []byte

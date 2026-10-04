@@ -141,7 +141,14 @@ void main() {
             ACC_T u = acc[i][j + 2u];
             ACC16_T h;
             [[unroll]] for (uint e = 0u; e < g.length(); e++) {
+#ifdef GELU
+                // Gemma 4's dense MLP (research/rune-vertical.md R5): GELU-tanh,
+                // the argument clamped as in llm_moe_gemm.comp's geluf.
+                float x = g[e];
+                h[e] = float16_t(0.5 * x * (1.0 + tanh(clamp(0.7978845608028654 * (x + 0.044715 * x * x * x), -15.0, 15.0))) * u[e]);
+#else
                 h[e] = float16_t(g[e] / (1.0 + exp(-g[e])) * u[e]);
+#endif
             }
             coopMatStore(h, hact, pc.outOff + (wm0 + i * TILE) * pc.ldaLo + o0 + j * TILE, pc.ldaLo,
                 gl_CooperativeMatrixLayoutRowMajor);
