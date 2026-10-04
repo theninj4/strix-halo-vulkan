@@ -4148,10 +4148,12 @@ var Gemma4ViTPrep []byte
 //go:embed gemma4_vit_pool.spv
 var Gemma4ViTPool []byte
 
-// The vision tower's gate+up with the GELU-tanh GLU in the epilogue
+// The vision tower's (and Rune's fp16 dense) gate+up with the GELU-tanh GLU in the epilogue
 // (research/rune-vertical.md R10): the reg64 build, and the LDS-staged
 // wave32 128x256 one (dit_gemm_wg128x256_lds_w32's) for wide row counts.
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_vit_gemm_geglu.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=2 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DWAVE=32 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_gemm_geglu_r32x64_w32.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=1 -DWN=4 -DBK_TILES=4 -DHOIST_A=1 -DB_LAYOUT=2 -DWAVE=32 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_gemm_geglu_r16x64_w32.spv dit_gemm.comp
 //go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DWAVES_M=2 -DWAVES_N=4 -DWAVE=32 -DB_LAYOUT=2 -DSWZ=8 -DLDS_STAGE=1 -DBK_TILES=2 -DA_LPITCH=36 -DB_LPITCH=36 -DKT_LOOP=1 -DSTAGE_RW=1 -DC_SWIGLU=1 -DGLU_GELU=1 -o gemma4_vit_gemm_geglu_lds.spv dit_gemm.comp
 
 //go:embed gemma4_vit_gemm_geglu.spv
@@ -4159,6 +4161,14 @@ var Gemma4ViTGEMMGEGLU []byte
 
 //go:embed gemma4_vit_gemm_geglu_lds.spv
 var Gemma4ViTGEMMGEGLULDS []byte
+
+// The same epilogue at Rune's narrow-pass tiles (research/rune-vertical.md
+// R12, the dense projections in fp16).
+//go:embed gemma4_gemm_geglu_r32x64_w32.spv
+var Gemma4GEMMGEGLUR32x64W32 []byte
+
+//go:embed gemma4_gemm_geglu_r16x64_w32.spv
+var Gemma4GEMMGEGLUR16x64W32 []byte
 
 // Rune's experts in the Q8_TILED layout (research/rune-vertical.md R10): the
 // Q8_0 rungs again, up with GELU and the pipelined K loop, down plain.

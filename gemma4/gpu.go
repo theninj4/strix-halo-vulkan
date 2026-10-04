@@ -105,18 +105,34 @@ type gemmKernel struct {
 	spirv   []byte
 	bm, bn  int
 	rowFast bool // kev_gemm_q8_glu's grid: x = row block, y = column tile
+	// f16 is the DiT's fp16 GEMM over the fp16 bank (R12): dit_common's push
+	// block, grid (n/bn, rows/bm), and for the GELU-GLU builds (glu) an fp16
+	// output at Aux0's stride. wave is its required subgroup size.
+	f16, glu bool
+	wave     uint32
 }
 
 var gemmKernels = []gemmKernel{
-	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, false},
-	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, false},
-	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, false},
-	{"rbm2", shaders.KevGEMMQ8RBM2, 32, 64, true},
-	{"rbm4", shaders.KevGEMMQ8RBM4, 64, 64, true},
-	{"rbm8", shaders.KevGEMMQ8RBM8, 128, 64, true},
-	{"gegm2", shaders.Gemma4GEMMQ8GEGLUM2, 32, 64, true},
-	{"gegm4", shaders.Gemma4GEMMQ8GEGLUM4, 64, 64, true},
-	{"gegm8", shaders.Gemma4GEMMQ8GEGLUM8, 128, 64, true},
+	{"q8m2", shaders.LLMGEMMQ8M2, 32, 64, false, false, false, 0},
+	{"q8m4", shaders.LLMGEMMQ8M4, 64, 64, false, false, false, 0},
+	{"q8m8", shaders.LLMGEMMQ8M8, 128, 64, false, false, false, 0},
+	{"rbm2", shaders.KevGEMMQ8RBM2, 32, 64, true, false, false, 0},
+	{"rbm4", shaders.KevGEMMQ8RBM4, 64, 64, true, false, false, 0},
+	{"rbm8", shaders.KevGEMMQ8RBM8, 128, 64, true, false, false, 0},
+	{"gegm2", shaders.Gemma4GEMMQ8GEGLUM2, 32, 64, true, false, false, 0},
+	{"gegm4", shaders.Gemma4GEMMQ8GEGLUM4, 64, 64, true, false, false, 0},
+	{"gegm8", shaders.Gemma4GEMMQ8GEGLUM8, 128, 64, true, false, false, 0},
+	// fp16 (R12): the DiT's builds over the fp16 bank.
+	{"h16lds", shaders.DiTGEMMWG128x256LDSW32, 128, 256, false, true, false, 32},
+	{"h16r64", shaders.DiTGEMMReg64Tiled, 64, 64, false, true, false, 0},
+	{"h16r32x128", shaders.DiTGEMMReg32x128Tiled, 32, 128, false, true, false, 0},
+	{"h16r16x128", shaders.DiTGEMMReg16x128Tiled, 16, 128, false, true, false, 0},
+	{"h16r32x64", shaders.DiTGEMMReg32x64TiledW32, 32, 64, false, true, false, 32},
+	{"h16r16x64", shaders.DiTGEMMReg16x64TiledW32, 16, 64, false, true, false, 32},
+	{"h16glds", shaders.Gemma4ViTGEMMGEGLULDS, 128, 256, false, true, true, 32},
+	{"h16g64", shaders.Gemma4ViTGEMMGEGLU, 64, 64, false, true, true, 0},
+	{"h16g32x64", shaders.Gemma4GEMMGEGLUR32x64W32, 32, 64, false, true, true, 32},
+	{"h16g16x64", shaders.Gemma4GEMMGEGLUR16x64W32, 16, 64, false, true, true, 32},
 }
 
 func kernel(name string) gemmKernel {
@@ -129,6 +145,9 @@ func kernel(name string) gemmKernel {
 }
 
 func (k gemmKernel) grid(n, tokPad int) (uint32, uint32) {
+	if k.f16 {
+		return uint32(n / k.bn), uint32(tokPad / k.bm)
+	}
 	if k.rowFast {
 		return uint32(tokPad / k.bm), uint32(n / k.bn)
 	}
@@ -143,7 +162,10 @@ func (k gemmKernel) grid(n, tokPad int) (uint32, uint32) {
 //	o, down     q8m2   q8m2   q8m4   rbm4   rbm4   q8m8
 //
 // Everything else is within 1-5% of Kev's K7.6 schedule, which it replaces.
-func gemmFor(rows, n int) gemmKernel {
+func (g *GPU) gemmFor(rows, n int) gemmKernel {
+	if !g.int8() {
+		return gemmFor16(rows, n)
+	}
 	if n <= 4096 { // o, down
 		switch {
 		case rows <= 192:
@@ -166,7 +188,10 @@ func gemmFor(rows, n int) gemmKernel {
 
 // gegluFor: gegm2 at 64 rows, gegm4 at 128-256 (and level with gegm8 at
 // 1024), gegm8 at 512 and 2048.
-func gegluFor(rows int) gemmKernel {
+func (g *GPU) gegluFor(rows int) gemmKernel {
+	if !g.int8() {
+		return gegluFor16(rows)
+	}
 	switch {
 	case rows <= 96:
 		return kernel("gegm2")
@@ -176,10 +201,28 @@ func gegluFor(rows int) gemmKernel {
 	return kernel("gegm8")
 }
 
-// proj is one projection's place in the int8 bank.
+// gemmFor16 and gegluFor16 are the fp16 schedule (R12).
+func gemmFor16(rows, n int) gemmKernel {
+	if rows >= 1024 {
+		return kernel("h16lds")
+	}
+	return kernel("h16r64")
+}
+
+func gegluFor16(rows int) gemmKernel {
+	if rows >= 1024 {
+		return kernel("h16glds")
+	}
+	return kernel("h16g64")
+}
+
+// proj is one projection's place in the int8 bank, and (R12) in the fp16
+// one: h16 in halves, k16 its reduction there (the GLU's intermediate is
+// padded to 2176 in fp16, so down reads 2176).
 type proj struct {
-	off  uint32 // bytes
-	n, k int
+	off      uint32 // bytes
+	n, k     int
+	h16, k16 uint32
 }
 
 type layer struct {
@@ -197,6 +240,10 @@ type layer struct {
 type Options struct {
 	// Rows is the longest pass: the arena's rows. Zero takes 4096.
 	Rows int
+	// Dense is how the dense projections (q/k/v, o, the MLP) are staged:
+	// "int8" (Kev's K7.1 bank), "fp16" (R12: the DiT's fp16 GEMMs) or
+	// "both" (the ladder's). Empty takes RUNE_DENSE, else the default.
+	Dense string
 	// Vision stages the vision tower too (R10, ~1.2 GB), for images.
 	Vision bool
 }
@@ -212,6 +259,9 @@ type GPU struct {
 	norm  []float32 // the final norm
 
 	wbuf, abuf, hbuf, bank *vk.Buffer
+	bank16                 *vk.Buffer // the fp16 dense bank (R12), when staged
+	dense                  string
+	interPad               int // the GLU intermediate in the fp16 bank
 	moe                    *llm.MoEGPU
 	// Vis is the vision tower, when Options.Vision staged it.
 	Vis     *Vision
@@ -263,6 +313,16 @@ func Load(dev *vk.Device, dir string, o Options) (*GPU, error) {
 		o.Rows = 4096
 	}
 	g := &GPU{Cfg: c, Tok: tok, dev: dev, set: set, pipes: map[string]*vk.ComputePipeline{}, LayersPerSubmit: 8}
+	g.dense = o.Dense
+	if g.dense == "" {
+		g.dense = os.Getenv("RUNE_DENSE")
+	}
+	if g.dense == "" {
+		g.dense = defaultDense
+	}
+	if g.dense != "int8" && g.dense != "fp16" && g.dense != "both" {
+		return nil, fmt.Errorf("gemma4: dense %q: want int8, fp16 or both", g.dense)
+	}
 	g.rows = roundUp(o.Rows, rowAlign)
 	// Every branch starts on a key block, so the cache holds the pass plus
 	// one block of alignment slack a segment; a pass of R rows has at most R
@@ -287,6 +347,21 @@ func Load(dev *vk.Device, dir string, o Options) (*GPU, error) {
 }
 
 func roundUp(n, m int) int { return (n + m - 1) / m * m }
+
+// defaultDense is the dense projections' bank when neither Options.Dense nor
+// RUNE_DENSE says.
+const defaultDense = "int8"
+
+func (g *GPU) int8() bool { return g.dense != "fp16" }
+func (g *GPU) fp16() bool { return g.dense != "int8" }
+
+// packF16 stages a [n, k] weight in the fp16 bank in the DiT GEMM's
+// fragment tiling (B_LAYOUT 2, packF16's).
+func (g *GPU) packF16(off uint32, w []float32, n, k int) {
+	buf := make([]uint16, n*k)
+	packF16(buf, w, n, k)
+	g.bank16.WriteUint16At(int(off), buf)
+}
 
 const lmPre = "model.language_model."
 
@@ -324,8 +399,11 @@ func (g *GPU) stage() error {
 	full := c.Rope["full_attention"]
 	g.ropeFull = walloc(ropeTable(R, c.GlobalHeadDim, full.Theta, int(full.Partial*float64(c.GlobalHeadDim))/2))
 
-	// ---- the int8 bank: per layer [qkv | o | gate+up | down]
-	bankBytes := 0
+	// ---- the int8 bank: per layer [qkv | o | gate+up | down]; and the fp16
+	// one (R12) in the same order, gate+up's intermediate padded to a
+	// multiple of 128 so the fused GLU is whole 256-wide tiles.
+	bankBytes, bankHalves := 0, 0
+	g.interPad = roundUp(c.Intermediate, 128)
 	g.layers = make([]layer, c.Layers)
 	for i := range g.layers {
 		l := &g.layers[i]
@@ -338,21 +416,30 @@ func (g *GPU) stage() error {
 		if !l.full {
 			qkvN += l.nkv * l.hd
 		}
-		place := func(n, k int) proj {
-			p := proj{off: uint32(bankBytes), n: n, k: k}
-			bankBytes += roundUp(n*k+n*k/q8Group*2, 256)
+		place := func(n, k, n16, k16 int) proj {
+			p := proj{off: uint32(bankBytes), n: n, k: k, h16: uint32(bankHalves), k16: uint32(k16)}
+			if g.int8() {
+				bankBytes += roundUp(n*k+n*k/q8Group*2, 256)
+			}
+			if g.fp16() {
+				bankHalves += roundUp(n16*k16, 128)
+			}
 			return p
 		}
-		l.qkv = place(qkvN, H)
-		l.o = place(H, c.Heads*l.hd)
-		l.gu = place(2*c.Intermediate, H)
-		l.down = place(H, c.Intermediate)
+		l.qkv = place(qkvN, H, qkvN, H)
+		l.o = place(H, c.Heads*l.hd, H, c.Heads*l.hd)
+		l.gu = place(2*c.Intermediate, H, 2*g.interPad, H)
+		l.down = place(H, c.Intermediate, H, g.interPad)
 	}
-	if bankBytes > 0xfffffffc {
-		return fmt.Errorf("gemma4: the int8 bank is %d bytes, over one buffer's range", bankBytes)
+	if bankBytes > 0xfffffffc || bankHalves*2 > 0xfffffffc {
+		return fmt.Errorf("gemma4: the dense banks are %d and %d bytes, over one buffer's range", bankBytes, bankHalves*2)
 	}
-	if g.bank, err = g.dev.NewBuffer(bankBytes); err != nil {
+	// A stub when unused: the pipelines bind both banks.
+	if g.bank, err = g.dev.NewBuffer(max(bankBytes, 256)); err != nil {
 		return fmt.Errorf("gemma4: int8 bank (%d MB): %w", bankBytes>>20, err)
+	}
+	if g.bank16, err = g.dev.NewBuffer(max(bankHalves*2, 256)); err != nil {
+		return fmt.Errorf("gemma4: fp16 bank (%d MB): %w", bankHalves>>19, err)
 	}
 
 	moeLayers := make([]llm.MoEWeights, c.Layers)
@@ -400,17 +487,32 @@ func (g *GPU) stage() error {
 		l.pre, l.pre2 = walloc(pre), walloc(pre2)
 		l.scalar = scalar[0]
 
-		if err := g.packQ8(l.qkv, append(append(q, k...), v...)); err != nil {
-			return err
+		qkv := append(append(q, k...), v...)
+		if g.int8() {
+			if err := g.packQ8(l.qkv, qkv); err != nil {
+				return err
+			}
+			if err := g.packQ8(l.o, o); err != nil {
+				return err
+			}
+			if err := g.packQ8(l.gu, interleaveGLU(gate, up, c.Intermediate, H)); err != nil {
+				return err
+			}
+			if err := g.packQ8(l.down, down); err != nil {
+				return err
+			}
 		}
-		if err := g.packQ8(l.o, o); err != nil {
-			return err
-		}
-		if err := g.packQ8(l.gu, interleaveGLU(gate, up, c.Intermediate, H)); err != nil {
-			return err
-		}
-		if err := g.packQ8(l.down, down); err != nil {
-			return err
+		if g.fp16() {
+			I, P := c.Intermediate, g.interPad
+			padRows := func(w []float32) []float32 { return append(w[:I*H:I*H], make([]float32, (P-I)*H)...) }
+			downP := make([]float32, H*P)
+			for r := range H {
+				copy(downP[r*P:r*P+I], down[r*I:(r+1)*I])
+			}
+			g.packF16(l.qkv.h16, qkv, l.qkv.n, H)
+			g.packF16(l.o.h16, o, H, l.o.k)
+			g.packF16(l.gu.h16, interleaveGLU(padRows(gate), padRows(up), P, H), 2*P, H)
+			g.packF16(l.down.h16, downP, H, P)
 		}
 		// The router reads rms(x) * scale * hidden^-1/2, and the MoE block's
 		// input is rms(x) * w_pre2 (gemma4_post.comp), so its fp16 matrix
@@ -485,7 +587,7 @@ func (g *GPU) stage() error {
 		return err
 	}
 	g.lda = c.Heads*c.GlobalHeadDim + gemmPad
-	g.ldMLP = c.Intermediate + gemmPad
+	g.ldMLP = g.interPad + gemmPad
 	var halves int
 	halloc := func(n int) uint32 {
 		off := uint32(halves)
@@ -611,6 +713,20 @@ func (g *GPU) build() error {
 		}
 	}
 	for _, k := range gemmKernels {
+		if k.f16 {
+			if !g.fp16() {
+				continue
+			}
+			spec := vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank16},
+				PushConstantSize: pc, RequiredSubgroupSize: k.wave}
+			if err := g.pipeline(k.name, k.spirv, spec); err != nil {
+				return err
+			}
+			continue
+		}
+		if !g.int8() {
+			continue
+		}
 		// llm_common.glsl's bindings: the bank as halves at 3 (the scale
 		// plane) and as words at 5 (the tiles); 4 is declared and unused.
 		spec := vk.PipelineSpec{Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.abuf, g.bank},
@@ -650,7 +766,7 @@ func (g *GPU) Destroy() {
 	if g.Vis != nil {
 		g.Vis.Destroy()
 	}
-	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank} {
+	for _, b := range []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.bank, g.bank16} {
 		if b != nil {
 			b.Destroy()
 		}
@@ -914,6 +1030,21 @@ func (g *GPU) gemm(d *[]vk.MultiDispatch, labels *[]string, label string, k gemm
 		k = kernel(name)
 	}
 	tokPad := roundUp(n, k.bm)
+	if k.f16 {
+		// R12: the fp16 bank's widths (gate+up's padded intermediate).
+		nOut := pr.n
+		if k.glu {
+			nOut = 2 * g.interPad
+		}
+		pc := push{InOff: aOff, OutOff: cOff, BOff: pr.h16, GemmM: uint32(tokPad), GemmN: uint32(nOut),
+			GemmK: pr.k16, LDA: uint32(lda)}
+		if k.glu {
+			pc.Aux0, pc.Scale = uint32(ldaLo), math.Float32bits(1)
+		}
+		gx, gy := k.grid(nOut, tokPad)
+		g.dispatch(d, labels, k.name, label, gx, gy, pc.bytes())
+		return
+	}
 	pc := llmPush{xnOff: aOff, outOff: cOff, bOff: pr.off, lda: uint32(lda), ldaLo: uint32(ldaLo),
 		gemmM: uint32(tokPad), gemmN: uint32(pr.n), gemmK: uint32(pr.k)}
 	gx, gy := k.grid(pr.n, tokPad)
@@ -932,7 +1063,7 @@ func (g *GPU) attnGraph(i, n int) ([]vk.MultiDispatch, []string) {
 
 	g.dispatch(&d, &labels, "normf16", "in norm", uint32(n), 1,
 		push{InOff: g.aX, OutOff: g.hA, WOff: l.inNorm, Dim: uint32(H), LDA: uint32(g.lda), Tokens: uint32(n), Eps: eps}.bytes())
-	g.gemm(&d, &labels, "qkv", gemmFor(n, l.qkv.n), l.qkv, g.hA, g.aP, g.lda, 0, n)
+	g.gemm(&d, &labels, "qkv", g.gemmFor(n, l.qkv.n), l.qkv, g.hA, g.aP, g.lda, 0, n)
 
 	kind, rope := "slide", g.ropeSlide
 	if l.full {
@@ -947,7 +1078,7 @@ func (g *GPU) attnGraph(i, n int) ([]vk.MultiDispatch, []string) {
 	} else {
 		g.dispatch(&d, &labels, "attn_"+kind, "attention "+kind, uint32((n+15)/16), uint32(c.Heads*l.hd/256), ap)
 	}
-	g.gemm(&d, &labels, "o", gemmFor(n, l.o.n), l.o, g.hA, g.aY, g.lda, 0, n)
+	g.gemm(&d, &labels, "o", g.gemmFor(n, l.o.n), l.o, g.hA, g.aY, g.lda, 0, n)
 
 	in := g.moe.InPort()
 	pad := max(roundUp(n, rowAlign), in.Rows, n+1)
@@ -955,9 +1086,9 @@ func (g *GPU) attnGraph(i, n int) ([]vk.MultiDispatch, []string) {
 		push{OutOff: g.aX, InOff: g.aY, WOff: l.postAttn, KOff: l.pre, VOff: l.pre2, Dim: uint32(H), Eps: eps, BOff: g.hA, LDA: uint32(g.lda),
 			Aux1: in.Off, Aux2: uint32(in.Stride), Tokens: uint32(n), GemmM: uint32(pad)}.bytes())
 
-	gk := gegluFor(n)
+	gk := g.gegluFor(n)
 	g.gemm(&d, &labels, "gate+up", gk, l.gu, g.hA, g.hMLP, g.lda, g.ldMLP, n)
-	g.gemm(&d, &labels, "down", gemmFor(n, l.down.n), l.down, g.hMLP, g.aY, g.ldMLP, 0, n)
+	g.gemm(&d, &labels, "down", g.gemmFor(n, l.down.n), l.down, g.hMLP, g.aY, g.ldMLP, 0, n)
 	return d, labels
 }
 
@@ -1059,12 +1190,16 @@ func (g *GPU) Profile(p *Pass) (map[string]time.Duration, error) {
 	return out, nil
 }
 
-// GEMMRungs is every rung a projection can run: the plain ones for qkv, o
-// and down, the GELU-epilogue ones for gate+up.
-func GEMMRungs(label string) []string {
+// GEMMRungs is every rung a projection can run on the staged banks: the
+// plain ones for qkv, o and down, the GELU-epilogue ones for gate+up.
+func (g *GPU) GEMMRungs(label string) []string {
 	var out []string
 	for _, k := range gemmKernels {
-		if (label == "gate+up") == strings.HasPrefix(k.name, "gegm") {
+		glu := strings.HasPrefix(k.name, "gegm") || k.glu
+		if (k.f16 && !g.fp16()) || (!k.f16 && !g.int8()) {
+			continue
+		}
+		if (label == "gate+up") == glu {
 			out = append(out, k.name)
 		}
 	}

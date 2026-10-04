@@ -572,7 +572,7 @@ func runLadder(g *gemma4.GPU, lengths string) {
 		best := map[string]string{}
 		bestT := map[string]time.Duration{}
 		for _, label := range labels {
-			for _, rung := range gemma4.GEMMRungs(label) {
+			for _, rung := range g.GEMMRungs(label) {
 				g.GEMM = map[string]string{label: rung}
 				st, err := g.Profile(p)
 				must(err)

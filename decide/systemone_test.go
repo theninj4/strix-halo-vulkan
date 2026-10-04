@@ -73,3 +73,33 @@ func TestSystemOne(t *testing.T) {
 		}
 	}
 }
+
+// TestSystemOneImages holds System One's `images` (R10) to decisions v1's:
+// the same forms accepted in order, the same refusals, and none when absent.
+func TestSystemOneImages(t *testing.T) {
+	q := `"questions": {"x": {"type": "noul", "instructions": "?"}}`
+	r, err := ParseSystemOne([]byte(`{"state": "s", "images": ["data:image/png;base64,AA==", {"url": "https://example.com/a.png"}], ` + q + `}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Images) != 2 || r.Images[0] != "data:image/png;base64,AA==" || r.Images[1] != "https://example.com/a.png" {
+		t.Errorf("images %q", r.Images)
+	}
+	for _, body := range []string{`{"state": "s", ` + q + `}`, `{"state": "s", "images": null, ` + q + `}`} {
+		if r, err := ParseSystemOne([]byte(body)); err != nil || len(r.Images) != 0 {
+			t.Errorf("%s: images %q, err %v", body, r.Images, err)
+		}
+	}
+	for _, bad := range []string{`"images": "data:image/png;base64,AA=="`, `"images": [""]`, `"images": ["ftp://x/a.png"]`, `"images": [3]`} {
+		_, err := ParseSystemOne([]byte(`{"state": "s", ` + bad + `, ` + q + `}`))
+		var de *Error
+		if !errors.As(err, &de) || de.Param != "images" {
+			t.Errorf("%s: want a refusal naming images, got %v", bad, err)
+		}
+	}
+	// The decisions parser takes the same forms.
+	d, err := Parse([]byte(`{"model": "rune", "state": "s", "images": [{"url": "http://h/b.jpg"}], ` + q + `}`))
+	if err != nil || len(d.Images) != 1 || d.Images[0] != "http://h/b.jpg" {
+		t.Errorf("decisions images %q, err %v", d.Images, err)
+	}
+}

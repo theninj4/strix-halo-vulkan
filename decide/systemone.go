@@ -73,6 +73,13 @@ func ParseSystemOne(body []byte) (*Request, error) {
 		}
 		r.Model = m.S
 	}
+	// Images (research/rune-vertical.md R10): decisions v1's extension,
+	// same forms and meaning, ahead of the text in every question's turn.
+	// Not in TypeSafe's contract; a client that does not send it is
+	// unaffected.
+	if r.Images, err = parseImages(root); err != nil {
+		return nil, err
+	}
 	qs, ok := root.Get("questions")
 	if !ok || qs.Kind != Object {
 		return nil, unprocessable("questions must be an object of id -> question")

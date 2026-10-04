@@ -358,6 +358,11 @@ as Kev's K7.7 did.
     the file's sha256 skips it on repeats. A 3-question chart request is
     469 tokens: **365 ms cold, 218 ms cached** (first cut 473 / 289). A
     bad image is 400 `param: images`.
+  - **`/v1/systemone` takes `images` too** (2026-10-04, at the user's
+    request; deployed the same day): the same parser (`decide.parseImages`,
+    `TestSystemOneImages`), the same meaning, a bad image the endpoint's
+    422. An extension: TypeSafe's contract has no images, and a request
+    without them is unchanged.
 
 - [x] **R11 — throughput.** **Done 2026-10-04.** What a batched pass
   spent (`cmd/rune -profile-batch N -suite …`: N distinct suite records in
@@ -411,6 +416,30 @@ as Kev's K7.7 did.
   change); `moe.down`'s fp32 rows and the combine that re-reads them (~20 ms
   a batch); sliding attention grows faster than its rows in big batches
   (13 -> 150 ms from 6 to 24 requests, not the scan).
+
+- [x] **R12 — the dense projections in fp16: measured, not shipped.**
+  2026-10-04. `Options.Dense` / `RUNE_DENSE` = `int8` (default), `fp16` or
+  `both`: an fp16 bank (3.3 GB against int8's ~2 GB; the GLU intermediate
+  padded 2112 -> 2176 so the fused gate+up is whole 256-wide tiles) on the
+  DiT's fp16 GEMMs, the LDS-staged wave32 build and four register-tiled
+  ones, the GELU-GLU in the epilogue (`dit_gemm.comp GLU_GELU`, two new
+  narrow builds).
+  - **Accuracy: a wash.** Teacher-forced, every layer is 2-16x closer to HF
+    fp32 (the last 3.5% -> 0.22%), but free-running the Q8 experts dominate:
+    against Rune in bf16 on R7's 367-question sample fp16 agrees 362/367
+    (Q8 364), mean max |dp| 0.0098 (0.0103), accuracy 0.820 (0.813; bf16
+    0.817); decision-v7 dev 0.8378 (=), transfer-v4 dev 0.8399 (0.8415).
+    `TestOracle` fails its 0.05 bar under `RUNE_DENSE=fp16` on
+    `many-options/product` (0.245 vs HF 0.146; int8 0.180), the most
+    sensitive prompt, while the other five land closer than int8.
+  - **Speed: not at the served sizes** (`cmd/rune -ladder` with `both`, the
+    dense part, best rung a projection against the int8 schedule): int8
+    wins every projection to 256 rows, then -1% at 512, -3% at 1024 (94.1
+    -> 91.1 ms), -9% at 2048, -11% at 4096. The int8 GEMMs already run ~35
+    TFLOPs, and at small passes fp16 reads twice the weight bytes. The
+    server batches to 1,024 rows, where this is ~1% of a pass, for 3.3 GB
+    (both banks) or a slower lone request (fp16 alone). Revisit only if
+    `-rune-batch-tokens` goes past 2048.
 
 ## The GPU design (R4/R5), worked out 2026-10-03
 
@@ -467,11 +496,12 @@ device**, plus activations.
 
 ## Handoff
 
-**2026-10-04, session 2 (end).** Images (R10) and throughput (R11) done,
-built and tested on a side server, **not yet deployed**: `ai.service` still
-runs the session-1 binary. Deploying is `deploy.sh` (it rebuilds and
-restarts the user unit, ~65 s down); the new binary holds ~1.3 GB more
-for the tower. Its staging adds the expert re-layout (`tileQ8`, parallel);
+**2026-10-04, session 2 (end).** Images (R10) and throughput (R11) done
+and **deployed 13:23** (`ai.service`, the new binary: Rune staged in 34 s,
+listening ~90 s after the restart; image and System One requests checked
+live). R12 (fp16 dense) measured and left off: int8 stays the default and
+the served path is bit-identical to what was deployed. The new binary
+holds ~1.3 GB more for the tower. Its staging adds the expert re-layout (`tileQ8`, parallel);
 how much was not measurable here: with the service resident the 52 GB
 checkpoint no longer fits the page cache (memory pressure ~15% full), and
 side stagings ran 39-66 s for either layout against the service's 25 s. Everything else

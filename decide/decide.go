@@ -142,27 +142,8 @@ func Parse(body []byte) (*Request, error) {
 		r.Questions = append(r.Questions, q)
 	}
 
-	if images, ok := root.Get("images"); ok && images.Kind != Null {
-		if images.Kind != Array {
-			return nil, invalid("images", "images must be an array of data URLs")
-		}
-		for i, item := range images.Arr {
-			url := ""
-			if item.Kind == String {
-				url = item.S
-			} else if u, ok := item.Get("url"); item.Kind == Object && ok && u.Kind == String {
-				url = u.S
-			} else {
-				return nil, invalid("images", "images[%d] must be a data URL string or an object with a string url", i)
-			}
-			if url == "" {
-				return nil, invalid("images", "images[%d] URL must not be empty", i)
-			}
-			if !strings.HasPrefix(url, "data:") && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-				return nil, invalid("images", "images[%d] must be a data URL or an HTTP(S) URL", i)
-			}
-			r.Images = append(r.Images, url)
-		}
+	if r.Images, err = parseImages(root); err != nil {
+		return nil, err
 	}
 	if r.Thinking, err = flag(root, "thinking"); err != nil {
 		return nil, err
@@ -614,4 +595,36 @@ func Response(id, model, provider string, answers []Answer, inputTokens, outputT
 	}
 	fmt.Fprintf(&b, `}, "usage": {"input_tokens": %d, "output_tokens": %d, "cost": 0}}`, inputTokens, outputTokens)
 	return []byte(b.String())
+}
+
+// parseImages is the `images` extension (decisions v1, and System One's
+// since R10): data URLs or http(s) URLs, as strings or {"url": ...}
+// objects, in order. Absent or null is none.
+func parseImages(root Value) ([]string, error) {
+	images, ok := root.Get("images")
+	if !ok || images.Kind == Null {
+		return nil, nil
+	}
+	if images.Kind != Array {
+		return nil, invalid("images", "images must be an array of data URLs")
+	}
+	var out []string
+	for i, item := range images.Arr {
+		url := ""
+		if item.Kind == String {
+			url = item.S
+		} else if u, ok := item.Get("url"); item.Kind == Object && ok && u.Kind == String {
+			url = u.S
+		} else {
+			return nil, invalid("images", "images[%d] must be a data URL string or an object with a string url", i)
+		}
+		if url == "" {
+			return nil, invalid("images", "images[%d] URL must not be empty", i)
+		}
+		if !strings.HasPrefix(url, "data:") && !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			return nil, invalid("images", "images[%d] must be a data URL or an HTTP(S) URL", i)
+		}
+		out = append(out, url)
+	}
+	return out, nil
 }

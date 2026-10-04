@@ -228,7 +228,8 @@ them. `thinking` answers v1's 400 code. Model names: `rune`,
 `POST /v1/systemone` is TypeSafe's System One contract, as Kev served it,
 now answered by Rune through a translation, so the TypeSafe Python SDK and
 Kev's clients work unchanged. Model names: `kev-latest`, `jev-latest`
-(and Rune's).
+(and Rune's). It also takes `images`, as `/v1/decisions` does (an
+extension: TypeSafe's contract has none); a bad image is a `422`.
 
 ```json
 {"state": "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card.",
