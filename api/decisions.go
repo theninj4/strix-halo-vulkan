@@ -1,14 +1,12 @@
 package api
 
-// POST /v1/decisions (research/rune-vertical.md R6): surogate's decisions v1,
-// OpenRouter's field names, as Rune is served. `/api/alpha/decisions`
-// (OpenRouter's path) and `/api/v1/decisions` are the same endpoint.
+// POST /v1/decisions is OpenAI's Decisions API, translated onto surogate's
+// decisions v1 in decide/openai.go so Rune sees the prompt it was trained on
+// (research/rune-vertical.md).
 //
-// As with /v1/systemone the body crosses into the backend as bytes: its key
-// order, number spellings and repeated keys decide the prompt, so it is
-// parsed by `decide.Parse` with Python's reading of JSON, not here. What
-// stays here is the transport and v1's error envelope, which carries a
-// `param` and a `code` (`invalid_decisions_request`, `vision_disabled`, ...).
+// As with /v1/systemone the body crosses into the backend as bytes and is
+// parsed by the decide package. What stays here is the transport and
+// OpenAI's error envelope, whose `param` and `code` are null when unset.
 
 import (
 	"context"
@@ -23,20 +21,24 @@ import (
 type DecisionsBackend interface {
 	Backend
 	// Decisions parses and answers one request body, returning the response
-	// body. A *decide.Error is the client's (a 400); ErrUnknownModel a 404;
-	// anything else is the server's.
+	// body. A *decide.Error is the client's (a 400); anything else is the
+	// server's. Any model name is answered.
 	Decisions(ctx context.Context, body []byte) ([]byte, error)
 }
 
-// ErrUnknownModel is a decisions request naming a model this server does not
-// serve.
-var ErrUnknownModel = errors.New("unknown model")
-
 type decisionsError struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Param   string `json:"param"`
-	Code    string `json:"code"`
+	Message string  `json:"message"`
+	Type    string  `json:"type"`
+	Param   *string `json:"param"`
+	Code    *string `json:"code"`
+}
+
+// nullable is "" as JSON null, as OpenAI writes an absent param or code.
+func nullable(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
@@ -63,11 +65,7 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	case errors.As(err, &de):
 		logf(ctx, "400: %s", de.Message)
 		writeJSON(w, http.StatusBadRequest, map[string]decisionsError{"error": {
-			Message: de.Message, Type: "invalid_request_error", Param: de.Param, Code: de.Code}})
-	case errors.Is(err, ErrUnknownModel):
-		logf(ctx, "404: %v", err)
-		writeJSON(w, http.StatusNotFound, map[string]decisionsError{"error": {
-			Message: err.Error(), Type: "invalid_request_error", Param: "model", Code: "model_not_found"}})
+			Message: de.Message, Type: "invalid_request_error", Param: nullable(de.Param), Code: nullable(de.Code)}})
 	case errors.Is(err, context.Canceled):
 		logf(ctx, "decisions: client cancelled")
 	default:

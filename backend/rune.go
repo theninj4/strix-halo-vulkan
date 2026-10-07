@@ -12,8 +12,6 @@ package backend
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -283,26 +281,32 @@ func (b *Rune) work() {
 // Batching is how many passes ran and how many requests they answered.
 func (b *Rune) Batching() (passes, requests int) { return b.passes, b.batched }
 
-// Decisions answers one /v1/decisions body.
+// Decisions answers one /v1/decisions body, OpenAI's shape. Any
+// model name is Rune, as a "tts-1" request is this server's voice: the SDK's
+// examples name gpt-6-luna. The response names the model that ran.
 func (b *Rune) Decisions(ctx context.Context, body []byte) ([]byte, error) {
-	req, err := decide.Parse(body)
+	req, err := decide.ParseOpenAI(body)
 	if err != nil {
 		return nil, err
 	}
-	if !slices.Contains(runeModelIDs, req.Model) {
-		return nil, fmt.Errorf("%w: %q (this server has %v)", api.ErrUnknownModel, req.Model, runeModelIDs)
+	model := runeModelIDs[0]
+	if slices.Contains(runeModelIDs, req.Model) {
+		model = req.Model
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	answers, use, _, err := b.answer(ctx, req)
+	answers, use, _, err := b.answer(ctx, &req.Request)
+	if de := (*decide.Error)(nil); errors.As(err, &de) && (de.Param == "state" || de.Param == "images") {
+		// v1's names for what this shape calls input.
+		e := *de
+		e.Param = "input"
+		return nil, &e
+	}
 	if err != nil {
 		return nil, err
 	}
-	var id [8]byte
-	_, _ = rand.Read(id[:])
-	return decide.Response("dec-"+hex.EncodeToString(id[:]), req.Model, "strix-halo-vulkan", answers,
-		use.InputTokens, use.OutputTokens), nil
+	return decide.OpenAIResponse(req, model, answers, use.InputTokens), nil
 }
 
 // SystemOne answers one /v1/systemone body, Kev's contract, from the same

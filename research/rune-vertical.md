@@ -20,7 +20,12 @@ benchmarks. **Rune v3** (Invergent AI, Apache 2.0) is second on Decision Index
   `invergent-ai/surogate docs/inference/decisions.md`: `POST /v1/decisions`
   (aliases `/api/alpha/decisions`, `/api/v1/decisions`), OpenRouter's field
   names. It is stable and pinned by golden fixtures, so we have an exact
-  target.
+  target. **Since 2026-10-07 the served API is OpenAI's Decisions API**
+  (predicate / choice / score, `input` text and data-URL images), translated
+  onto v1 in `decide/openai.go` so the model still sees v1's prompt; v1's
+  own HTTP endpoints (all three paths) are gone. `decide.Parse` stays as
+  the prompt's reference: the golden gate, the gemma4 tests and
+  `cmd/rune` read v1 bodies.
 
 ## The model: Gemma 4 26B-A4B (`gemma4_text`)
 
@@ -362,7 +367,9 @@ as Kev's K7.7 did.
     request; deployed the same day): the same parser (`decide.parseImages`,
     `TestSystemOneImages`), the same meaning, a bad image the endpoint's
     422. An extension: TypeSafe's contract has no images, and a request
-    without them is unchanged.
+    without them is unchanged. **Removed 2026-10-07** (the user's call):
+    `/v1/systemone` refuses `images` with a 422 naming `/v1/decisions`
+    (`TestSystemOneNoImages`); images are `/v1/decisions`' alone.
 
 - [x] **R11 — throughput.** **Done 2026-10-04.** What a batched pass
   spent (`cmd/rune -profile-batch N -suite …`: N distinct suite records in

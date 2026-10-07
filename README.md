@@ -26,7 +26,7 @@ would load it.
 | `-embed` | Qwen3-Embedding-0.6B | `/v1/embeddings` | 0.9 GB |
 | `-tts` | Kokoro-82M (+ misaki lexicon, espeak-ng fallback) | `/v1/audio/speech` | small |
 | `-stt` | parakeet-tdt-0.6b-v3 | `/v1/audio/transcriptions` | small |
-| `-rune` | Rune v3 (Gemma 4 26B-A4B, Q8, + its vision tower) | `/v1/decisions` (+ `/api/alpha/decisions`, `/api/v1/decisions`), `/v1/systemone` | ~28 GB |
+| `-rune` | Rune v3 (Gemma 4 26B-A4B, Q8, + its vision tower) | `/v1/decisions`, `/v1/systemone` | ~28 GB |
 | `-ocr` | PaddleOCR-VL-1.6 + PP-DocLayoutV3 | `/v1/ocr`, and `/v1/chat/completions` as model `PaddleOCR-VL-1.6-0.9B` | small |
 | `-image` / `-edits N` | Qwen-Image-2.1 | `/v1/images/generations`, `/v1/images/edits` | ~20 GB while resident |
 | `-video` | MiniMax-H3 (video with a soundtrack) | `/v1/videos` | ~0.3 GB at rest, ~31 GB per request |
@@ -213,23 +213,39 @@ and `instruct`, an extension that sets the query instruction.
 Home Assistant's Wyoming protocol, from the same process. Wyoming has no
 authentication, so anyone who can reach that port can use both models.
 
-### Classification: decisions v1 and System One
+### Classification: decisions and System One
 
-`POST /v1/decisions` is surogate's decisions v1 (OpenRouter's field names,
-also at `/api/alpha/decisions` and `/api/v1/decisions`): one state and
-typed `choice` / `noul` / `score` questions in, calibrated probabilities
-out (T = 2), with nothing generated. `order_averaging` is supported, and
-so are `images` (data or http(s) URLs, PNG/JPEG/GIF; Gemma 4's vision
-tower, on by default, `-rune-vision=false` to drop its ~1.3 GB): they go
-into every question's user turn ahead of the text, as decisions v1 renders
-them. `thinking` answers v1's 400 code. Model names: `rune`,
-`rune-26b-a4b`.
+`POST /v1/decisions` is OpenAI's Decisions API: `input` (a string, or user
+messages of `input_text` and `input_image` parts, images as base64 data
+URLs, at most 128) and an array of `predicate` / `choice` / `score`
+questions in, an `answers` array in question order out, with nothing
+generated. Any `model` name is answered by Rune (so the SDK's `gpt-6-luna`
+works) and the response names `rune`. It is a translation onto decisions v1
+(`decide/openai.go`), so Rune sees the prompt it was trained on: the text
+parts are joined into v1's state and the images go ahead of it in every
+question. Rune never refuses, so no answer is a `refusal`.
+
+```json
+{"model": "gpt-6-luna",
+ "input": "I was charged twice for my order.",
+ "questions": [
+   {"type": "choice", "name": "department", "instructions": "Which department should handle this complaint?",
+    "choices": [{"value": "billing", "description": "Payments, invoices, and refunds."},
+                {"value": "shipping", "description": "Delivery and tracking."}]},
+   {"type": "predicate", "name": "escalate", "instructions": "Does this need urgent human attention?"},
+   {"type": "score", "name": "frustration", "instructions": "How frustrated is the customer?",
+    "levels": [{"label": "Calm"}, {"label": "Frustrated"}, {"label": "Very angry"}]}]}
+```
+
+Answers are calibrated probabilities, read at T = 2 (`-rune-temperature`).
+Images use Gemma 4's vision tower, which is on by default; pass
+`-rune-vision=false` to drop its ~1.3 GB.
 
 `POST /v1/systemone` is TypeSafe's System One contract, as Kev served it,
 now answered by Rune through a translation, so the TypeSafe Python SDK and
 Kev's clients work unchanged. Model names: `kev-latest`, `jev-latest`
-(and Rune's). It also takes `images`, as `/v1/decisions` does (an
-extension: TypeSafe's contract has none); a bad image is a `422`.
+(and Rune's). It takes no images, as TypeSafe's contract has none: a
+request with `images` gets a `422` (use `/v1/decisions`).
 
 ```json
 {"state": "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card.",

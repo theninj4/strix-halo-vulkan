@@ -709,7 +709,7 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 		for _, route := range []string{
 			"/v1/models", "/v1/chat/completions", "/v1/embeddings",
 			"/v1/audio/speech", "/v1/audio/transcriptions",
-			"/v1/images/generations", "/v1/images/edits", "/v1/systemone",
+			"/v1/images/generations", "/v1/images/edits", "/v1/decisions", "/v1/systemone",
 			"/v1/videos", "/v1/music", "/v1/ocr",
 		} {
 			log.Printf("  %s", route)

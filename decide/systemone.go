@@ -73,12 +73,12 @@ func ParseSystemOne(body []byte) (*Request, error) {
 		}
 		r.Model = m.S
 	}
-	// Images (research/rune-vertical.md R10): decisions v1's extension,
-	// same forms and meaning, ahead of the text in every question's turn.
-	// Not in TypeSafe's contract; a client that does not send it is
-	// unaffected.
-	if r.Images, err = parseImages(root); err != nil {
-		return nil, err
+	// TypeSafe's contract has no images, and since 2026-10-07 this server
+	// takes none either (they were an R10 extension, now /v1/decisions'
+	// alone). Refused rather than ignored: questions about a picture
+	// answered without it are wrong without saying so.
+	if im, ok := root.Get("images"); ok && im.Kind != Null {
+		return nil, unprocessable("images are not supported by /v1/systemone; use /v1/decisions")
 	}
 	qs, ok := root.Get("questions")
 	if !ok || qs.Kind != Object {

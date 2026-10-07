@@ -58,7 +58,7 @@ type Server struct {
 	Embedding     EmbeddingBackend
 	Image         ImageBackend
 	SystemOne     SystemOneBackend
-	// Decisions is surogate's decisions v1, /v1/decisions (decisions.go).
+	// Decisions answers /v1/decisions, OpenAI's shape (decisions.go).
 	Decisions DecisionsBackend
 	// Document parses pages: /v1/ocr (document.go).
 	Document DocumentBackend
@@ -99,11 +99,9 @@ func (s *Server) Handler() http.Handler {
 	// calibrated probabilities (systemone.go, CLASSIFICATION.md).
 	mux.Handle("POST /v1/systemone", s.route(s.handleSystemOne))
 
-	// Decisions v1 (decisions.go, research/rune-vertical.md): the same kind of
-	// question as System One, in OpenRouter's shape, at all three of its paths.
+	// OpenAI's Decisions API (decisions.go, research/rune-vertical.md): the
+	// same kind of question as System One.
 	mux.Handle("POST /v1/decisions", s.route(s.handleDecisions))
-	mux.Handle("POST /api/alpha/decisions", s.route(s.handleDecisions))
-	mux.Handle("POST /api/v1/decisions", s.route(s.handleDecisions))
 
 	// Document parsing (document.go, OCR.md O9): Mistral's OCR API.
 	mux.Handle("POST /v1/ocr", s.route(s.handleOCR))

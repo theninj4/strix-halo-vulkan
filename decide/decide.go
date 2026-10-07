@@ -573,30 +573,6 @@ func AverageOrders(z, zm []float32) []float32 {
 	return out
 }
 
-// Response is the /v1/decisions body: id, model, provider, the answers in
-// question order, and usage (input_tokens counts what was prefilled,
-// output_tokens the questions, cost is 0).
-func Response(id, model, provider string, answers []Answer, inputTokens, outputTokens int) []byte {
-	var b strings.Builder
-	b.WriteString(`{"id": `)
-	pyString(&b, id)
-	b.WriteString(`, "model": `)
-	pyString(&b, model)
-	b.WriteString(`, "provider": `)
-	pyString(&b, provider)
-	b.WriteString(`, "answers": {`)
-	for i := range answers {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		pyString(&b, answers[i].Q.Name)
-		b.WriteString(": ")
-		answers[i].AppendJSON(&b)
-	}
-	fmt.Fprintf(&b, `}, "usage": {"input_tokens": %d, "output_tokens": %d, "cost": 0}}`, inputTokens, outputTokens)
-	return []byte(b.String())
-}
-
 // parseImages is the `images` extension (decisions v1, and System One's
 // since R10): data URLs or http(s) URLs, as strings or {"url": ...}
 // objects, in order. Absent or null is none.
