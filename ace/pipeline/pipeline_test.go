@@ -114,6 +114,7 @@ const strixHaloDeviceID = 0x1586
 var shared struct {
 	once sync.Once
 	p    *Pipeline
+	dev  *vk.Device
 	err  error
 	skip string
 }
@@ -162,6 +163,7 @@ func pipeline(t *testing.T) *Pipeline {
 				return
 			}
 		}
+		shared.dev = dev
 		shared.p, shared.err = New(dev, d, 240)
 	})
 	if shared.skip != "" {

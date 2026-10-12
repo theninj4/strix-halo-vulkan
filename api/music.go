@@ -32,6 +32,15 @@ package api
 // lyrics from a description first. A caption or lyrics sent with it would
 // be discarded, as upstream discards them, so they are a 400 instead.
 //
+// Captioning a song (`full_analysis_only` with `src_audio` uploaded; MUSIC.md
+// A13) is a job too, one that writes no audio: the LM listens to the
+// source's audio codes and the job's `metadata` is what it heard -- caption,
+// genres, bpm, key, time signature, duration, language and lyrics. Upstream
+// returns that as the task's result; here the completed job carries it, and
+// /content is a 409. A field that shapes a song (a caption, a task, metas
+// to hold) would be ignored, so it is a 400; upstream's fixed temperature
+// 0.3 is lm_temperature's default rather than a constant.
+//
 // Jobs live in memory, as the video ones do: a restart forgets them and
 // their files.
 
@@ -88,6 +97,10 @@ type MusicRequest struct {
 	// itself, which also keeps phase 1 from filling a meta the song lacks.
 	Sample, SampleMode bool
 	SampleQuery        string
+	// Analysis captions SourceAudio instead of generating
+	// (full_analysis_only, MUSIC.md A13): no song is written, and the
+	// job's metadata is the result.
+	Analysis bool
 	// Seed is the DiT's noise seed and LMSeed the LM's sampling seed; nil
 	// draws one, and the plan reports it.
 	Seed, LMSeed *int64
@@ -146,10 +159,11 @@ type MusicProgress struct {
 
 // MusicMetadata is what the DiT was asked for: the request's metas where
 // it gave them and the LM's where it did not, as upstream reports `metas`.
+// For an analysis it is what the LM heard in the source.
 type MusicMetadata struct {
 	Caption string `json:"caption"`
-	// Lyrics and Genres are what sample mode wrote (empty otherwise: the
-	// lyrics are the request's own).
+	// Lyrics and Genres are what sample mode or an analysis wrote (empty
+	// otherwise: the lyrics are the request's own).
 	Lyrics        string  `json:"lyrics,omitempty"`
 	Genres        string  `json:"genres,omitempty"`
 	BPM           int     `json:"bpm,omitempty"`
@@ -166,7 +180,8 @@ type MusicInfo struct {
 	FallbackSeconds float64  `json:"fallback_seconds"` // no duration and no thinking
 	SampleRate      int      `json:"sample_rate"`
 	Formats         []string `json:"formats"`
-	Thinking        bool     `json:"thinking"` // the LM is loaded
+	Thinking        bool     `json:"thinking"`           // the LM is loaded
+	Analysis        bool     `json:"full_analysis_only"` // and its genres vocabulary: songs can be captioned
 	Steps           int      `json:"steps"`
 }
 
@@ -198,7 +213,10 @@ type MusicJob struct {
 	// query, or sample_mode with none).
 	Sample      bool   `json:"sample_mode,omitempty"`
 	SampleQuery string `json:"sample_query,omitempty"`
-	Format      string `json:"format"`
+	// Analysis is a caption of the uploaded source (A13): Metadata is the
+	// result, and there is no audio.
+	Analysis bool   `json:"full_analysis_only,omitempty"`
+	Format   string `json:"format"`
 	// Seconds is the song's length: null until known, which with thinking
 	// and no duration is when the LM has planned it.
 	Seconds *float64 `json:"seconds"`
@@ -315,7 +333,7 @@ func (q *MusicJobs) Submit(req *MusicRequest) (MusicJob, error) {
 	j := &musicJob{req: req, plan: plan, MusicJob: MusicJob{
 		ID: newMusicID(), Object: "music", Model: model, Status: MusicQueued,
 		CreatedAt: time.Now().Unix(), Caption: req.Caption, Lyrics: req.Lyrics, Thinking: req.Thinking, Task: req.Task,
-		Sample: req.Sample, SampleQuery: req.SampleQuery,
+		Sample: req.Sample, SampleQuery: req.SampleQuery, Analysis: req.Analysis,
 		Format: plan.Format, Seed: plan.Seed, LMSeed: plan.LMSeed, Steps: plan.Steps,
 		Estimated: plan.Estimate.Round(time.Second).Seconds(),
 	}}
@@ -323,7 +341,11 @@ func (q *MusicJobs) Submit(req *MusicRequest) (MusicJob, error) {
 		s := plan.Seconds
 		j.Seconds = &s
 	}
-	j.path = filepath.Join(q.dir, j.ID+"."+plan.Format)
+	if req.Analysis {
+		j.Task = ""
+	} else {
+		j.path = filepath.Join(q.dir, j.ID+"."+plan.Format)
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.ctx.Err() != nil {
@@ -390,7 +412,7 @@ func (q *MusicJobs) Delete(id string) bool {
 	if j.cancel != nil {
 		j.cancel()
 	}
-	if j.Status == MusicCompleted || j.Status == MusicFailed {
+	if (j.Status == MusicCompleted || j.Status == MusicFailed) && j.path != "" {
 		os.Remove(j.path)
 	}
 	return true
@@ -432,7 +454,9 @@ func (q *MusicJobs) expire(now time.Time) {
 	for id, j := range q.jobs {
 		if j.ExpiresAt != nil && now.Unix() >= *j.ExpiresAt {
 			delete(q.jobs, id)
-			os.Remove(j.path)
+			if j.path != "" {
+				os.Remove(j.path)
+			}
 		}
 	}
 }
@@ -445,7 +469,9 @@ func (q *MusicJobs) finish(j *musicJob, e *VideoError) {
 	j.cancel = nil
 	if e != nil {
 		j.Status, j.Error = MusicFailed, e
-		os.Remove(j.path)
+		if j.path != "" {
+			os.Remove(j.path)
+		}
 		return
 	}
 	j.Status, j.Progress = MusicCompleted, 100
@@ -485,7 +511,9 @@ func (q *MusicJobs) run(j *musicJob) {
 	defer q.mu.Unlock()
 	switch {
 	case j.gone:
-		os.Remove(j.path)
+		if j.path != "" {
+			os.Remove(j.path)
+		}
 		logf(ctx, "music %s: deleted after %v", j.ID, time.Since(start).Round(time.Millisecond))
 	case err != nil && q.ctx.Err() != nil:
 		q.finish(j, &VideoError{Code: "server_shutdown", Message: "the server shut down while this job ran"})
@@ -501,7 +529,11 @@ func (q *MusicJobs) run(j *musicJob) {
 		if j.Seconds != nil {
 			secs = *j.Seconds
 		}
-		logf(ctx, "music %s: %.1f s of %s in %v", j.ID, secs, j.Format, time.Since(start).Round(time.Millisecond))
+		if j.Analysis {
+			logf(ctx, "music %s: analysed %.1f s in %v", j.ID, secs, time.Since(start).Round(time.Millisecond))
+		} else {
+			logf(ctx, "music %s: %.1f s of %s in %v", j.ID, secs, j.Format, time.Since(start).Round(time.Millisecond))
+		}
 		q.finish(j, nil)
 	}
 }
@@ -667,6 +699,8 @@ var musicRefused = []struct {
 	{[]string{"batch_size", "batchSize"}, isOneOf("1"), "one song a job; submit one job per song"},
 	{[]string{"use_format", "useFormat", "format"}, isOneOf("false"), "format mode is not served"},
 	{[]string{"audio_code_string", "audioCodeString"}, isOneOf(""), "audio codes in are not served; thinking writes them"},
+	{[]string{"extract_codes_only", "extractCodesOnly"}, isOneOf("false"), "audio codes out are not served (nothing here takes codes in); full_analysis_only captions a song"},
+	{[]string{"analysis_only", "analysisOnly"}, isOneOf("false"), "analysis-only (phase 1 alone) is not served; thinking reports the plan on the job as it runs"},
 	{[]string{"reference_audio_path", "src_audio_path", "reference_audio", "src_audio", "ref_audio", "ctx_audio"}, isOneOf(""),
 		"this server reads no files of its own: upload the audio as a multipart file field (src_audio, reference_audio)"},
 	{[]string{"instruction"}, isOneOf("", "Fill the audio semantic mask based on the given conditions:"), "the instruction is the task's own; set task_type"},
@@ -719,6 +753,12 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 	r := &MusicRequest{Thinking: true}
 	if r.Model, err = f.str("model"); err != nil {
 		return nil, err
+	}
+	if r.Analysis, _, err = f.boolean("full_analysis_only", "fullAnalysisOnly"); err != nil {
+		return nil, err
+	}
+	if r.Analysis {
+		return f.toAnalysisRequest(r, files)
 	}
 	if r.Caption, err = f.str("caption", "prompt"); err != nil {
 		return nil, err
@@ -862,6 +902,65 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 	return r, nil
 }
 
+// analysisFields are the create request's fields an analysis reads, and
+// analysisDefaults those it tolerates at upstream's defaults (or unset):
+// they shape a song, and an analysis writes none.
+var (
+	analysisFields   = map[string]bool{"model": true, "full_analysis_only": true, "fullAnalysisOnly": true, "lm_temperature": true, "lmTemperature": true, "lm_top_p": true, "lmTopP": true, "lm_seed": true, "lmSeed": true, "use_random_seed": true, "useRandomSeed": true, "thinking": true}
+	analysisDefaults = map[string][]string{
+		"task_type": {"text2music"}, "taskType": {"text2music"}, "audio_format": {"mp3"}, "audioFormat": {"mp3"},
+		"vocal_language": {"en", "unknown"}, "vocalLanguage": {"en", "unknown"}, "language": {"en", "unknown"},
+		"inference_steps": {"8"}, "guidance_scale": {"7"}, "shift": {"3"}, "seed": {"-1"},
+		"audio_duration": {"-1"}, "duration": {"-1"}, "audioDuration": {"-1"},
+	}
+)
+
+// toAnalysisRequest reads a full_analysis_only request (MUSIC.md A13):
+// the uploaded source, the LM's temperature (upstream's fixed 0.3 is the
+// default), top-p and seed. Anything that would shape a song is a 400.
+func (f musicFields) toAnalysisRequest(r *MusicRequest, files map[string][]byte) (*MusicRequest, error) {
+	for k, v := range f {
+		if analysisFields[k] || string(v) == "null" || isOneOf(append(analysisDefaults[k], "", "false", "0")...)(v) {
+			continue
+		}
+		if (k == "metas" || k == "metadata" || k == "user_metadata") && len(v) > 0 && v[0] == '{' {
+			continue // its fields were folded in and are checked one by one
+		}
+		return nil, fmt.Errorf("%s: full_analysis_only captions the uploaded src_audio and writes no song; it reads model, lm_temperature, lm_top_p and lm_seed", k)
+	}
+	if files["ref"] != nil {
+		return nil, errors.New("reference_audio: full_analysis_only captions src_audio alone")
+	}
+	if r.SourceAudio = files["src"]; r.SourceAudio == nil {
+		return nil, errors.New("full_analysis_only needs the song uploaded as src_audio")
+	}
+	r.Thinking = false
+	random, _, err := f.boolean("use_random_seed", "useRandomSeed")
+	if err != nil {
+		return nil, err
+	}
+	if v, ok, err := f.num("lm_seed", "lmSeed"); err != nil {
+		return nil, err
+	} else if ok && v >= 0 && !random {
+		x := int64(v)
+		r.LMSeed = &x
+	}
+	for _, s := range []struct {
+		names []string
+		dst   **float64
+	}{{[]string{"lm_temperature", "lmTemperature"}, &r.LMTemperature}, {[]string{"lm_top_p", "lmTopP"}, &r.LMTopP}} {
+		v, ok, err := f.num(s.names...)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			x := v
+			*s.dst = &x
+		}
+	}
+	return r, nil
+}
+
 // readTask reads the audio-in task's fields (MUSIC.md A11) and refuses
 // what the task would not use: upstream drops a cover's strengths on
 // text2music and a repaint's span elsewhere, silently.
@@ -963,8 +1062,13 @@ func (s *Server) handleMusicCreate(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		backendError(ctx, w, "music", err)
 	default:
-		logf(ctx, "music %s queued: %s, thinking %v, sample %v, reference %v, %s, seed %d, ~%v", job.ID, job.Task, job.Thinking,
-			job.Sample, req.ReferenceAudio != nil, job.Format, job.Seed, time.Duration(job.Estimated)*time.Second)
+		if job.Analysis {
+			logf(ctx, "music %s queued: analysis of %d bytes, lm seed %d, ~%v", job.ID, len(req.SourceAudio), job.LMSeed,
+				time.Duration(job.Estimated)*time.Second)
+		} else {
+			logf(ctx, "music %s queued: %s, thinking %v, sample %v, reference %v, %s, seed %d, ~%v", job.ID, job.Task, job.Thinking,
+				job.Sample, req.ReferenceAudio != nil, job.Format, job.Seed, time.Duration(job.Estimated)*time.Second)
+		}
 		writeJSON(w, http.StatusOK, job)
 	}
 }
@@ -1051,6 +1155,11 @@ func (s *Server) handleMusicContent(w http.ResponseWriter, r *http.Request) {
 	path, job, ok := s.Music.content(r.PathValue("id"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "no music job "+r.PathValue("id"))
+		return
+	}
+	if job.Analysis {
+		writeError(w, http.StatusConflict, "invalid_request_error",
+			fmt.Sprintf("music %s is an analysis: its result is the job's metadata, and it has no audio", job.ID))
 		return
 	}
 	if job.Status != MusicCompleted {

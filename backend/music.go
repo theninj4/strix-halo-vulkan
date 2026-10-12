@@ -151,7 +151,8 @@ func formats() []string {
 func (b *Music) MusicInfo() api.MusicInfo {
 	return api.MusicInfo{MinSeconds: plan.MinSeconds, MaxSeconds: plan.MaxSeconds,
 		FallbackSeconds: plan.FallbackSeconds, SampleRate: plan.SampleRate, Formats: formats(),
-		Thinking: b.planner != nil, Steps: len(plan.Schedule(plan.DefaultShift, nil))}
+		Thinking: b.planner != nil, Analysis: b.planner != nil && b.planner.HasGenres(),
+		Steps: len(plan.Schedule(plan.DefaultShift, nil))}
 }
 
 // Close frees the device objects. The job queue must be closed first, and
@@ -175,6 +176,9 @@ func unsupported(format string, args ...any) error {
 // given, its length. Nothing touches the device; the LM's prompt is
 // tokenised to check it fits the cache with the codes behind it.
 func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
+	if req.Analysis {
+		return b.planAnalysis(req)
+	}
 	if req.Thinking && b.planner == nil {
 		return nil, unsupported("thinking needs the 5 Hz LM, which this server did not load (-music-lm)")
 	}
@@ -377,6 +381,9 @@ func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank
 
 // GenerateMusic runs a planned request and writes the audio to dst.
 func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *api.MusicPlan, dst string, progress func(api.MusicProgress)) error {
+	if req.Analysis {
+		return b.analyse(ctx, req, mp, progress)
+	}
 	r := musicRequest(req)
 	secs := cmpOr(mp.Seconds, 120)
 	audio, err := musicAudio(req)
@@ -503,4 +510,123 @@ func encodeCost(a *pipeline.Audio) time.Duration {
 		secs += 30
 	}
 	return time.Duration((0.0134*secs + 0.05) * float64(time.Second))
+}
+
+// analysisSource decodes an analysis's upload and checks it is one the
+// pipeline captions (pipeline.Understand's bounds).
+func analysisSource(req *api.MusicRequest) ([]float32, error) {
+	wav, err := pipeline.ReadAudioBytes(req.SourceAudio)
+	if err != nil {
+		return nil, unsupported("src_audio: %v", err)
+	}
+	secs := float64(len(wav)/2) / plan.SampleRate
+	switch {
+	case len(wav)/2 < plan.Hop:
+		return nil, unsupported("src_audio is shorter than one latent (%d samples)", plan.Hop)
+	case secs > plan.MaxSeconds:
+		return nil, unsupported("src_audio is %.0f s, past the %d s ceiling", secs, plan.MaxSeconds)
+	case pipeline.Silent(wav):
+		return nil, unsupported("src_audio is silent")
+	}
+	return wav, nil
+}
+
+// planAnalysis plans a full_analysis_only request (MUSIC.md A13): the
+// source decoded and measured, the seeds drawn (the VAE posterior's and
+// the LM's), and the estimate: the encode, and the LM's pass at text
+// speed for about as many steps as sample mode's.
+func (b *Music) planAnalysis(req *api.MusicRequest) (*api.MusicPlan, error) {
+	if b.planner == nil {
+		return nil, unsupported("full_analysis_only needs the 5 Hz LM, which this server did not load (-music-lm)")
+	}
+	if !b.planner.HasGenres() {
+		return nil, unsupported("full_analysis_only needs upstream's genres vocabulary (models/%s): %v", lm.GenresFile, b.genresErr)
+	}
+	if v := req.LMTemperature; v != nil && *v < 0 {
+		return nil, unsupported("lm_temperature %g is negative", *v)
+	}
+	if v := req.LMTopP; v != nil && (*v <= 0 || *v > 1) {
+		return nil, unsupported("lm_top_p %g is outside (0, 1]", *v)
+	}
+	wav, err := analysisSource(req)
+	if err != nil {
+		return nil, err
+	}
+	p := &api.MusicPlan{Seconds: float64(len(wav)/2) / plan.SampleRate}
+	b.mu.Lock()
+	p.Seed, p.LMSeed = int64(b.rng.Uint32()), int64(b.rng.Uint32())
+	b.mu.Unlock()
+	if req.LMSeed != nil {
+		p.LMSeed = *req.LMSeed
+	}
+	p.Estimate = analysisEstimate(p.Seconds, b.lmOpt.Bank)
+	return p, nil
+}
+
+// analysisEstimate is an analysis's expected wall time: the encode
+// (encodeCost's rate), the codes' prefill (~5 ms a second) and ~sampleSteps
+// steps of text.
+func analysisEstimate(seconds float64, bank lm.Bank) time.Duration {
+	text := 0.028
+	if bank == lm.BankFP16 {
+		text = 0.047
+	}
+	return time.Duration((0.0134*seconds + 0.05 + 0.005*seconds + sampleSteps*text) * float64(time.Second))
+}
+
+// analyse runs a planned full_analysis_only request: the source captioned
+// (pipeline.Understand), and what the LM heard reported as the job's plan.
+// It writes no file.
+func (b *Music) analyse(ctx context.Context, req *api.MusicRequest, mp *api.MusicPlan, progress func(api.MusicProgress)) error {
+	wav, err := analysisSource(req)
+	if err != nil {
+		return err
+	}
+	s := lm.UnderstandSampling
+	if v := req.LMTemperature; v != nil {
+		s.Temperature = *v
+	}
+	if v := req.LMTopP; v != nil {
+		s.TopP = *v
+	}
+	total := analysisEstimate(mp.Seconds, b.lmOpt.Bank).Seconds()
+	enc := (0.0134*mp.Seconds + 0.05 + 0.005*mp.Seconds) / total
+	if b.opt.Swap.Resident() != Swappable(b) {
+		progress(api.MusicProgress{Stage: "load"})
+	}
+	release, err := b.opt.Swap.Hold(ctx, b)
+	if err != nil {
+		return err
+	}
+	defer release()
+	progress(api.MusicProgress{Stage: "encode"})
+	var u *pipeline.Understanding
+	err = b.opt.Device.Do(func(*vk.Device) error {
+		var err error
+		u, err = b.pipe.Understand(wav, pipeline.Options{
+			Seed: uint64(mp.Seed), LMSeed: uint64(mp.LMSeed), Sampling: &s,
+			Between: func() error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				b.opt.Device.yield()
+				return nil
+			},
+			Progress: func(stage string, done, _ int) {
+				progress(api.MusicProgress{Stage: stage, Fraction: enc + (1-enc)*min(1, float64(done)/sampleSteps)})
+			},
+		})
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+		return fmt.Errorf("ace: %w", err)
+	}
+	g := u.Song
+	progress(api.MusicProgress{Stage: "understood", Fraction: 1, Seconds: u.Seconds, Plan: &api.MusicMetadata{
+		Caption: g.Caption, Lyrics: g.Lyrics, Genres: g.Genres, BPM: g.BPM, KeyScale: g.KeyScale,
+		TimeSignature: g.TimeSignature, Duration: g.Duration, Language: cmpStr(g.Language, "unknown")}})
+	return nil
 }

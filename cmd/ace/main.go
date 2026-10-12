@@ -12,6 +12,7 @@
 //	go run ./cmd/ace -task cover -src song.mp3 -caption "acoustic folk" -lyrics-file song.txt -out folk.mp3   # A11
 //	go run ./cmd/ace -task repaint -src song.mp3 -start 10 -end 20 -caption "..." -out fixed.mp3
 //	go run ./cmd/ace -ref voice.flac -caption "..." -duration 60   # a reference's timbre, any task
+//	go run ./cmd/ace -understand song.mp3   # caption a song (A13): JSON on stdout
 //
 // Lyrics use upstream's section tags ([Verse], [Chorus], [Instrumental]...).
 // Without -duration the LM chooses it (10-600 s); with -think=false it is
@@ -25,9 +26,15 @@
 // latents as they are) and repaint (the span [-start, -end) regenerated,
 // the rest kept); they run without the LM, as upstream's do, and the song is
 // the source's length. -ref adds a reference audio's timbre to any request.
+//
+// -understand is upstream's full_analysis_only (MUSIC.md A13): the song
+// through the VAE encoder and the audio tokenizer, and the LM writes the
+// caption, metas, genres and lyrics it hears in the codes, at temperature
+// 0.3 (-lm-temp). Nothing is generated; the result is JSON on stdout.
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"log"
 	"os"
@@ -67,7 +74,14 @@ func main() {
 	mode := flag.String("repaint-mode", "balanced", "conservative, balanced or aggressive")
 	strength := flag.Float64("repaint-strength", 0.5, "balanced mode's strength: 0 keeps the most of the source")
 	explicit := flag.Bool("explicit-mask", false, `chunk_mask_mode "explicit": the chunk mask is the span`)
+	understand := flag.String("understand", "", "caption this song instead of generating one (any format ffmpeg reads)")
+	lmTemp := flag.Float64("lm-temp", 0, "-understand's LM temperature (0: upstream's API's 0.3)")
 	flag.Parse()
+
+	if *understand != "" {
+		runUnderstand(*models, *understand, *seed, *lmSeed, *lmTemp, *lmFP16)
+		return
+	}
 
 	text := *lyrics
 	if *lyricsFile != "" {
@@ -167,6 +181,60 @@ func main() {
 		log.Printf("wrote %s: %.1f s of audio in %.2f s (text %.0f ms, encoders %.0f ms, DiT %.2f s, VAE %.2f s)",
 			*out, res.Seconds, t.Total.Seconds(), t.Text.Seconds()*1e3, t.Encode.Seconds()*1e3, t.DiT.Seconds(), t.VAE.Seconds())
 		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// runUnderstand is -understand.
+func runUnderstand(models, path string, seed, lmSeed uint64, temp float64, fp16 bool) {
+	wav, err := pipeline.ReadAudio(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	secs := float64(len(wav)/2) / plan.SampleRate
+	if secs > plan.MaxSeconds {
+		log.Fatalf("%s is %.0f s, past the %d s ceiling", path, secs, plan.MaxSeconds)
+	}
+	dev, err := backend.OpenDevice("ace")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dev.Close()
+	err = dev.Do(func(d *vk.Device) error {
+		p, err := pipeline.New(d, pipeline.DefaultDirs(models), max(secs, plan.MinSeconds))
+		if err != nil {
+			return err
+		}
+		defer p.Destroy()
+		o := lm.DefaultOptions()
+		if fp16 {
+			o.Bank = lm.BankFP16
+		}
+		if err := p.LoadLM(d, pipeline.LMDir(models), o); err != nil {
+			return err
+		}
+		opt := pipeline.Options{Seed: seed, LMSeed: lmSeed}
+		if temp > 0 {
+			s := lm.UnderstandSampling
+			s.Temperature = temp
+			opt.Sampling = &s
+		}
+		u, err := p.Understand(wav, opt)
+		if err != nil {
+			return err
+		}
+		t := u.Timings
+		log.Printf("LM (%v):\n%s", t.LM, u.Text)
+		log.Printf("%.1f s of audio: %d codes, encode %.2f s, tokenize %.0f ms, %.2f s in all", u.Seconds, len(u.Codes),
+			t.Encode.Seconds(), t.Tokenize.Seconds()*1e3, t.Total.Seconds())
+		e := json.NewEncoder(os.Stdout)
+		e.SetIndent("", "  ")
+		e.SetEscapeHTML(false)
+		return e.Encode(map[string]any{"caption": u.Song.Caption, "genres": u.Song.Genres, "bpm": u.Song.BPM,
+			"keyscale": u.Song.KeyScale, "timesignature": u.Song.TimeSignature, "duration": u.Song.Duration,
+			"language": u.Song.Language, "lyrics": u.Song.Lyrics, "seconds": u.Seconds})
 	})
 	if err != nil {
 		log.Fatal(err)

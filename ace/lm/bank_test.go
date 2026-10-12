@@ -89,8 +89,12 @@ func TestBankAgainstBF16(t *testing.T) {
 				pre = append(pre, Tok{ID: id, Slot: s, Pos: i})
 			}
 		}
-		if _, _, err := g.Pass(pre, Range{}); err != nil {
-			t.Fatal(err)
+		for len(pre) > 0 { // in passes of at most the arena's rows
+			n := min(len(pre), g.o.Rows)
+			if _, _, err := g.Pass(pre[:n], Range{}); err != nil {
+				t.Fatal(err)
+			}
+			pre = pre[n:]
 		}
 		step := make([]Tok, len(rows))
 		for s, r := range rows {

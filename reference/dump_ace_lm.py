@@ -27,12 +27,20 @@ Cases (label: what the request gives; the LM plans the rest):
   generate_music on what it wrote. The run stops once the codes phase's
   prompts are recorded; the codes path is the thinking path's. ``sample_ja``
   names its language, which the FSM then injects.
+* ``understand``, ``understand_lofi`` (MUSIC.md A13): captioning a song, as
+  upstream's API runs it for `full_analysis_only` -- the source through
+  convert_src_audio_to_codes (VAE encoder, audio tokenizer; its posterior
+  sample, `{label}_latents`, and the codes, `{label}_codes`, are dumped),
+  then understand_audio_from_codes at temperature 0.3 (phase 0: caption,
+  metas, genres and lyrics from the codes). The sources are A11's: the
+  30 s synthwave song and the 120 s lofi one.
 
     HF_HUB_OFFLINE=1 .venv-acestep/bin/python reference/dump_ace_lm.py [label ...]
 """
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -91,6 +99,8 @@ def main():
         "all_metas": base,
         "sample": {"sample_query": "a melancholy synthwave song about driving through a neon city at night"},
         "sample_ja": {"sample_query": "a gentle japanese city pop song for a summer evening"},
+        "understand": {"src_audio": "reference/out/acetasks/src.wav"},
+        "understand_lofi": {"src_audio": "reference/out/acetasks/ref.wav"},
     }
 
     for label in labels:
@@ -162,6 +172,26 @@ def main():
         t0 = time.time()
         try:
             req = requests[label]
+            if "src_audio" in req:
+                # job_analysis_runtime.py's full_analysis_only branch.
+                real_enc = h._encode_audio_to_latents
+
+                def enc(audio):
+                    lat = real_enc(audio)
+                    dump(f"{label}_latents", lat.float())
+                    return lat
+                h._encode_audio_to_latents = enc
+                torch.manual_seed(42)
+                codes = h.convert_src_audio_to_codes(req["src_audio"])
+                h._encode_audio_to_latents = real_enc
+                assert codes.startswith("<|audio_code_"), codes
+                dump(f"{label}_codes", [int(x) for x in re.findall(r"<\|audio_code_(\d+)\|>", codes)], "int32")
+                torch.manual_seed(42)
+                meta, status = lm.understand_audio_from_codes(audio_codes=codes, temperature=0.3,
+                                                               use_constrained_decoding=True)
+                assert meta, status
+                rec["understand"] = {k: str(v) for k, v in meta.items()}
+                raise Stop()
             if "sample_query" in req:
                 # llm_generation_inputs.py with sample_query set, sample_mode
                 # false and vocal_language "unknown" (this server's default).

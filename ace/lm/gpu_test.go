@@ -129,7 +129,7 @@ func TestLogits(t *testing.T) {
 	m := loadLMManifest(t)
 	g := loadGPUBank(t, BankFP16)
 	steps := map[int]bool{0: true, 1: true, 2: true, 3: true, 10: true, 50: true, 100: true}
-	for _, label := range []string{"given_duration", "all_metas", "sample", "sample_ja"} {
+	for _, label := range []string{"given_duration", "all_metas", "sample", "sample_ja", "understand", "understand_lofi"} {
 		c, ok := m.Cases[label]
 		if !ok {
 			t.Logf("%s: not in the reference", label)
@@ -153,9 +153,15 @@ func TestLogits(t *testing.T) {
 					pre = append(pre, Tok{ID: id, Slot: s, Pos: i})
 				}
 			}
-			t0 := time.Now()
-			if _, _, err := g.Pass(pre, Range{}); err != nil {
-				t.Fatal(err)
+			// In passes of at most the arena's rows (understand_lofi's
+			// 600 codes are more than one).
+			t0, nPre := time.Now(), len(pre)
+			for len(pre) > 0 {
+				n := min(len(pre), g.o.Rows)
+				if _, _, err := g.Pass(pre[:n], Range{}); err != nil {
+					t.Fatal(err)
+				}
+				pre = pre[n:]
 			}
 			tPre := time.Since(t0)
 			step := make([]Tok, len(rows))
@@ -200,11 +206,13 @@ func TestLogits(t *testing.T) {
 				}
 			}
 			t.Logf("%s phase %d: prefill %d rows %v; %d steps of %d rows, %.1f ms a step (wall)",
-				label, ph, len(pre), tPre, nDec, len(rows), float64(tDec.Microseconds())/1e3/float64(nDec))
+				label, ph, nPre, tPre, nDec, len(rows), float64(tDec.Microseconds())/1e3/float64(nDec))
 			// rel was gated at 2e-3, A7's observed worst (given_duration's
 			// phase 1 step 3, the bpm value); the sample pass's same step is
-			// 2.5e-3 at KL 5.7e-5 (MUSIC.md A12). KL is the bound that matters.
-			if !(worst.kl <= 1e-3 && worst.rel <= 3e-3) { // NaN fails too
+			// 2.5e-3 at KL 5.7e-5 (MUSIC.md A12), and understand_lofi's, after
+			// a 628-token prompt of codes, 3.3e-3 at KL 6.3e-6 (A13). KL is
+			// the bound that matters.
+			if !(worst.kl <= 1e-3 && worst.rel <= 4e-3) { // NaN fails too
 				t.Errorf("%s phase %d: worst rel %.2e KL %.2e", label, ph, worst.rel, worst.kl)
 			}
 		}

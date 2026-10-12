@@ -41,6 +41,9 @@ type lmManifest struct {
 		Prompts [][]string `json:"prompts"`
 		// Sample is create_sample's result in the sample cases (A12).
 		Sample map[string]any `json:"sample"`
+		// Understand is understand_audio_from_codes' metadata in the
+		// understand cases (A13), every value as its str().
+		Understand map[string]string `json:"understand"`
 	} `json:"cases"`
 	Tensors map[string]struct {
 		Shape []int  `json:"shape"`
@@ -150,8 +153,8 @@ func TestPrompts(t *testing.T) {
 	m := loadLMManifest(t)
 	tk := loadTokenizer(t)
 	for label, c := range m.Cases {
-		if c.Sample != nil {
-			continue // TestSamplePrompts
+		if c.Sample != nil || c.Understand != nil {
+			continue // TestSamplePrompts, TestUnderstandPrompt
 		}
 		caption, _ := c.Request["caption"].(string)
 		lyrics, _ := c.Request["lyrics"].(string)

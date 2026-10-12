@@ -230,7 +230,8 @@ func checkSurvivors(t *testing.T, name string, scores []float32, base int32, n i
 }
 
 // TestFSMSampleTrace replays the sample pass of the real LM runs
-// (reference/dump_ace_lm.py sample sample_ja): upstream's genres, its
+// (reference/dump_ace_lm.py sample sample_ja), and the understand pass
+// (understand understand_lofi, MUSIC.md A13): upstream's genres, its
 // `</think>` and the lyrics after it, taking the sampled token as the
 // argmax at each step.
 func TestFSMSampleTrace(t *testing.T) {
@@ -243,13 +244,19 @@ func TestFSMSampleTrace(t *testing.T) {
 	if v.genres, err = loadGenres(v, genresPath); err != nil {
 		t.Skipf("no genres vocabulary: %v", err)
 	}
+	// The oracle runs on the CPU, GPU tier 1, whose duration bound is
+	// 240 s (setDurationMax); understand's "30" is where that shows.
+	if err := v.setDurationMax(240); err != nil {
+		t.Fatal(err)
+	}
 	n := 0
-	for _, label := range []string{"sample", "sample_ja"} {
+	for _, label := range []string{"sample", "sample_ja", "understand", "understand_lofi"} {
 		c, ok := m.Cases[label]
 		if !ok {
 			continue
 		}
 		n++
+		// An understand case (A13) is the same pass with no user metadata.
 		q, _ := c.Request["sample_query"].(string)
 		user := Meta{}
 		if lang, _ := DescriptionHints(q); lang != "" {

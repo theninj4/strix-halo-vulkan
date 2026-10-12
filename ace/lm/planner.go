@@ -30,8 +30,9 @@ type Planner struct {
 	// Between, when set, runs after every decode step: a server yields the
 	// device there, and an error (a cancelled request) stops the phase.
 	Between func() error
-	// Step, when set, sees each phase's progress: phase 1 or 2, steps done,
-	// and the phase's length (0 for phase 1, whose length is the model's).
+	// Step, when set, sees each phase's progress: phase 1 or 2 (0 sample
+	// mode's pass, 3 understand mode's), steps done, and the phase's length
+	// (0 when it is the model's).
 	Step func(phase, done, total int)
 }
 

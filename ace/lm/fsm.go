@@ -166,69 +166,86 @@ func newFSMVocab(tk *tokenizer.Tokenizer) (*fsmVocab, error) {
 	if v.backtick, err = last("`"); err != nil {
 		return nil, err
 	}
-	build := func(values []string, match, tokenize string, firstIsNote bool) (prefixTree, error) {
-		ctx, err := tk.Encode(match)
-		if err != nil {
-			return nil, err
-		}
-		t := prefixTree{}
-		for _, val := range values {
-			full, err := tk.Encode(tokenize + val)
-			if err != nil {
-				return nil, err
-			}
-			if len(full) < len(ctx) || equalIDs(full[:len(ctx)], ctx) >= 0 {
-				continue
-			}
-			ids := full[len(ctx):]
-			if len(ids) == 0 {
-				continue
-			}
-			if firstIsNote {
-				s := strings.TrimLeftFunc(v.decode(ids[0]), isPySpace)
-				if s == "" || !strings.ContainsRune("ABCDEFG", unicode.ToUpper(firstRune(s))) {
-					continue
-				}
-			}
-			for i := 0; i <= len(ids); i++ {
-				key := treeKey(ids[:i])
-				if _, ok := t[key]; !ok {
-					t[key] = nil
-				}
-				if i < len(ids) {
-					t.add(key, ids[i])
-				} else {
-					t.add(key, v.newline)
-				}
-			}
-		}
-		return t, nil
-	}
-	nums := func(lo, hi int) []string {
-		var out []string
-		for i := lo; i <= hi; i++ {
-			out = append(out, strconv.Itoa(i))
-		}
-		return out
-	}
-	if v.bpm, err = build(nums(bpmMin, bpmMax), "bpm:", "bpm: ", false); err != nil {
+	if v.bpm, err = v.build(nums(bpmMin, bpmMax), "bpm:", "bpm: ", false); err != nil {
 		return nil, err
 	}
-	if v.duration, err = build(nums(durationMin, durationMax), "duration:", "duration: ", false); err != nil {
+	if v.duration, err = v.build(nums(durationMin, durationMax), "duration:", "duration: ", false); err != nil {
 		return nil, err
 	}
-	if v.timesig, err = build(validTimesigs, "timesignature:", "timesignature: ", false); err != nil {
+	if v.timesig, err = v.build(validTimesigs, "timesignature:", "timesignature: ", false); err != nil {
 		return nil, err
 	}
-	if v.keyscale, err = build(validKeyscales(), "keyscale:", "keyscale: ", true); err != nil {
+	if v.keyscale, err = v.build(validKeyscales(), "keyscale:", "keyscale: ", true); err != nil {
 		return nil, err
 	}
-	if v.lang, err = build(ValidLanguages, "language:", "language: ", false); err != nil {
+	if v.lang, err = v.build(ValidLanguages, "language:", "language: ", false); err != nil {
 		return nil, err
 	}
 	v.langFirst = append([]int32(nil), v.lang[""]...)
 	sort.Slice(v.langFirst, func(i, j int) bool { return v.langFirst[i] < v.langFirst[j] })
 	return v, nil
+}
+
+// build is the prefix tree of a field's values: the ids each value adds to
+// the field name's, and the newline after a whole one.
+func (v *fsmVocab) build(values []string, match, tokenize string, firstIsNote bool) (prefixTree, error) {
+	ctx, err := v.tk.Encode(match)
+	if err != nil {
+		return nil, err
+	}
+	t := prefixTree{}
+	for _, val := range values {
+		full, err := v.tk.Encode(tokenize + val)
+		if err != nil {
+			return nil, err
+		}
+		if len(full) < len(ctx) || equalIDs(full[:len(ctx)], ctx) >= 0 {
+			continue
+		}
+		ids := full[len(ctx):]
+		if len(ids) == 0 {
+			continue
+		}
+		if firstIsNote {
+			s := strings.TrimLeftFunc(v.decode(ids[0]), isPySpace)
+			if s == "" || !strings.ContainsRune("ABCDEFG", unicode.ToUpper(firstRune(s))) {
+				continue
+			}
+		}
+		for i := 0; i <= len(ids); i++ {
+			key := treeKey(ids[:i])
+			if _, ok := t[key]; !ok {
+				t[key] = nil
+			}
+			if i < len(ids) {
+				t.add(key, ids[i])
+			} else {
+				t.add(key, v.newline)
+			}
+		}
+	}
+	return t, nil
+}
+
+// nums is the decimal strings of lo..hi.
+func nums(lo, hi int) []string {
+	var out []string
+	for i := lo; i <= hi; i++ {
+		out = append(out, strconv.Itoa(i))
+	}
+	return out
+}
+
+// setDurationMax is set_max_duration: upstream bounds the duration value
+// by its GPU tier's max_duration_with_lm (gpu_config.py), 600 s on the top
+// tier, which is what this machine serves; its CPU oracle runs tier 1's
+// 240 s, and the trace tests replay that.
+func (v *fsmVocab) setDurationMax(max int) error {
+	t, err := v.build(nums(durationMin, max), "duration:", "duration: ", false)
+	if err == nil {
+		v.duration = t
+	}
+	return err
 }
 
 // decode is tokenizer.decode([id]) as the FSM uses it.

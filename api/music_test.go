@@ -54,6 +54,11 @@ func (f *fakeMusic) GenerateMusic(ctx context.Context, req *MusicRequest, p *Mus
 	if f.started != nil {
 		f.started <- req.Caption
 	}
+	if req.Analysis {
+		progress(MusicProgress{Stage: "understood", Fraction: 1, Seconds: 30,
+			Plan: &MusicMetadata{Caption: "heard", Genres: "synthwave", Lyrics: "la", BPM: 120, Duration: 30, Language: "en"}})
+		return nil
+	}
 	progress(MusicProgress{Stage: "planned", Fraction: 0.3, Seconds: 95, Estimate: 40 * time.Second,
 		Plan: &MusicMetadata{Caption: "rewritten", BPM: 128, KeyScale: "F# minor", TimeSignature: "4", Duration: 95, Language: "unknown"}})
 	if f.gate != nil {
@@ -346,5 +351,62 @@ func TestMusicAudioTasks(t *testing.T) {
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), c.want) {
 			t.Errorf("%v %v: %d %s", c.fields, c.files, rec.Code, rec.Body)
 		}
+	}
+}
+
+// TestMusicAnalysis: full_analysis_only (MUSIC.md A13) is a job whose
+// metadata is what the LM heard and which has no audio; it reads the
+// upload, the LM's knobs and upstream's defaults, and refuses what would
+// shape a song.
+func TestMusicAnalysis(t *testing.T) {
+	f := &fakeMusic{}
+	s := newMusicServer(t, f)
+	job := decodeMusic(t, do(t, s, musicForm(t, map[string]string{
+		"full_analysis_only": "true", "lm_temperature": "0.5", "lm_seed": "9", "thinking": "true",
+		"task_type": "text2music", "audio_format": "mp3", "inference_steps": "8", "vocal_language": "en", "bpm": "",
+	}, map[string]string{"src_audio": "SONG"})))
+	if !job.Analysis || job.Thinking || job.Task != "" {
+		t.Errorf("analysis job %+v", job)
+	}
+	r := f.reqs[0]
+	if !r.Analysis || string(r.SourceAudio) != "SONG" || r.LMTemperature == nil || *r.LMTemperature != 0.5 ||
+		r.LMSeed == nil || *r.LMSeed != 9 {
+		t.Errorf("analysis request %+v", r)
+	}
+	done := waitMusic(t, s, job.ID, MusicCompleted)
+	if done.Metadata == nil || done.Metadata.Caption != "heard" || done.Metadata.Genres != "synthwave" ||
+		done.Metadata.Lyrics != "la" || done.Seconds == nil || *done.Seconds != 30 {
+		t.Errorf("completed analysis %+v (metadata %+v)", done, done.Metadata)
+	}
+	if rec := do(t, s, httptest.NewRequest("GET", "/v1/music/"+job.ID+"/content", nil)); rec.Code != http.StatusConflict ||
+		!strings.Contains(rec.Body.String(), "metadata") {
+		t.Errorf("analysis content: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, s, httptest.NewRequest("DELETE", "/v1/music/"+job.ID, nil)); rec.Code != http.StatusOK {
+		t.Errorf("delete: %d %s", rec.Code, rec.Body)
+	}
+
+	for _, c := range []struct {
+		fields map[string]string
+		files  map[string]string
+		want   string
+	}{
+		{map[string]string{"full_analysis_only": "true"}, nil, "src_audio"},
+		{map[string]string{"full_analysis_only": "true", "caption": "x"}, map[string]string{"src_audio": "S"}, "caption: full_analysis_only"},
+		{map[string]string{"full_analysis_only": "true", "bpm": "120"}, map[string]string{"src_audio": "S"}, "bpm"},
+		{map[string]string{"full_analysis_only": "true", "task_type": "cover"}, map[string]string{"src_audio": "S"}, "task_type"},
+		{map[string]string{"full_analysis_only": "true", "sample_query": "a song"}, map[string]string{"src_audio": "S"}, "sample_query"},
+		{map[string]string{"full_analysis_only": "true"}, map[string]string{"src_audio": "S", "reference_audio": "R"}, "reference_audio"},
+		{map[string]string{"extract_codes_only": "true"}, map[string]string{"src_audio": "S"}, "codes out"},
+		{map[string]string{"analysis_only": "true", "caption": "x"}, nil, "analysis-only"},
+	} {
+		rec := do(t, s, musicForm(t, c.fields, c.files))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), c.want) {
+			t.Errorf("%v %v: %d %s", c.fields, c.files, rec.Code, rec.Body)
+		}
+	}
+	rec := do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"full_analysis_only": true}))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "src_audio") {
+		t.Errorf("JSON analysis without an upload: %d %s", rec.Code, rec.Body)
 	}
 }

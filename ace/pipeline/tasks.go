@@ -129,14 +129,14 @@ func (a *Audio) Check() error {
 	default:
 		return fmt.Errorf("ace: repaint mode %q (conservative, balanced or aggressive)", a.RepaintMode)
 	}
-	if a.Reference != nil && silent(a.Reference) {
+	if a.Reference != nil && Silent(a.Reference) {
 		return fmt.Errorf("ace: the reference audio is silent")
 	}
 	return nil
 }
 
-// silent is upstream's is_silence: every sample under 1e-6.
-func silent(wav []float32) bool {
+// Silent is upstream's is_silence: every sample under 1e-6.
+func Silent(wav []float32) bool {
 	for _, v := range wav {
 		if math.Abs(float64(v)) >= 1e-6 {
 			return false
@@ -362,7 +362,7 @@ func (p *Pipeline) taskPlan(r *plan.Request, a *Audio, seed uint64) (*plan.Reque
 	switch {
 	case a.SourceLatents != nil:
 		lat = a.SourceLatents
-	case silent(padded):
+	case Silent(padded):
 		lat = p.silence[:len(padded)/2/plan.Hop*plan.LatentChannels]
 	default:
 		if lat, err = p.encode(padded, seed^0x5c); err != nil {
@@ -380,7 +380,7 @@ func (p *Pipeline) taskPlan(r *plan.Request, a *Audio, seed uint64) (*plan.Reque
 		return nil, nil, err
 	}
 	dp := &ditPlan{T: T, timbre: timbre, coverNoise: a.CoverNoise}
-	hasAudio := a.SourceLatents != nil || !silent(padded)
+	hasAudio := a.SourceLatents != nil || !Silent(padded)
 
 	// _build_chunk_masks_and_src_latents.
 	dp.mask = make([]float32, T)
@@ -435,12 +435,7 @@ func (p *Pipeline) taskPlan(r *plan.Request, a *Audio, seed uint64) (*plan.Reque
 // audio tokenizer (padded to whole 5-latent groups with the silence's first
 // rows), the codes back through the detokenizer, cut to T.
 func (p *Pipeline) coverHints(src []float32, T int) ([]float32, error) {
-	const P = 5
-	n := (T + P - 1) / P * P
-	x := make([]float32, n*plan.LatentChannels)
-	k := copy(x, src[:T*plan.LatentChannels])
-	copy(x[k:], p.silence)
-	codes, _, _, err := p.DiT.Tokenize(&qwen.Mat{Rows: n, Cols: plan.LatentChannels, Data: x})
+	codes, err := p.tokenize(src, T)
 	if err != nil {
 		return nil, err
 	}
@@ -449,6 +444,19 @@ func (p *Pipeline) coverHints(src []float32, T int) ([]float32, error) {
 		return nil, err
 	}
 	return h.Data[:T*plan.LatentChannels], nil
+}
+
+// tokenize is the audio tokenizer over T latents ([T, 64], time-major),
+// padded to whole 5-latent groups with the silence's first rows (upstream's
+// model.tokenize): one code a group.
+func (p *Pipeline) tokenize(src []float32, T int) ([]int32, error) {
+	const P = 5
+	n := (T + P - 1) / P * P
+	x := make([]float32, n*plan.LatentChannels)
+	k := copy(x, src[:T*plan.LatentChannels])
+	copy(x[k:], p.silence)
+	codes, _, _, err := p.DiT.Tokenize(&qwen.Mat{Rows: n, Cols: plan.LatentChannels, Data: x})
+	return codes, err
 }
 
 // linspaceInner is torch.linspace(a, b, n+2)[1:-1] in fp32.

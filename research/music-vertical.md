@@ -377,6 +377,7 @@ flash, so no scores are materialised.
 | A10 | Performance: the LM's decode first (int8 bank?), then the DiT's small-M GEMMs and the VAE's convs | **done 2026-09-27 for the LM** (`ace/lm` `BankQ8`, the default): int8 layers priced against upstream bf16 over every teacher-forced step (text 0.88× its mean KL, codes 0.02×); a step 45 → 22 ms on the device, host sampling 10 → 1 ms; **a 60 s song 26.0 → 14.4 s**, 3 min served in 34.9 s. The DiT and VAE (≤20% of a request) are left |
 | A11 | Other tasks: reference-audio timbre, cover, cover-nofsq, repaint, via the VAE encoder and the audio tokenizer (§ A11 — the plan) | **done 2026-09-27** (`ace/vae.Encoder`, `dit.GPU.Tokenize`, `ace/pipeline/tasks.go`, `/v1/music` multipart): encoder mean 56–63 dB from fp32 (bf16 16–19), with the audio and block 0 as fp16 pairs; tokenizer codes exact but 7 of 900 at a boundary; all six oracle cases under half of bf16's drift (2.8–39×); a 30 s cover or repaint in ~2 s, served |
 | A12 | Sample mode: from a description alone the LM writes the caption, metas, genres and lyrics (upstream's `sample_query` / "simple mode"), then the thinking path runs on them | **done 2026-09-27** (`ace/lm` `Sample`, `pipeline.Options.Sample`, `sample_query` on `/v1/music`, `cmd/ace -sample`): host side exact on 358 hints, 24 prompts, 20 lyric cuts; the FSM exact over 2,001 scripted and 1,208 real steps; upstream's own song parsed field for field and its codes prompts rebuilt id for id; teacher-forced KL ≤ 5.7e-5, every argmax; served, 45 s of song in 31 s |
+| A13 | Understand (captioning): audio → VAE encoder → audio tokenizer → 5 Hz codes → the LM writes caption, genres, metas and lyrics (upstream's `understand_music`, the API's `full_analysis_only`) (§ A13 — the plan) | **done 2026-10-12** (`ace/lm` `Understand`, `pipeline.Understand`, `cmd/ace -understand`, `full_analysis_only` on `/v1/music`): prompt ids, parse and FSM exact against upstream; teacher-forced KL ≤ 1.1e-5, every argmax; int8 under bf16's mean KL; codes within boundary flips; 30 s captioned in ~15 s, most of it the lyrics |
 
 ### A0 — weights, environment, oracles
 
@@ -1507,6 +1508,179 @@ Songs to hear, from `cmd/ace` (the synthwave song as the source):
 Their lyrics lost the `[Verse 1]` tag to a test script's extraction; the
 rest is A1's `LYRICS`.
 
+### A13 — the plan: understand, i.e. captioning a song (2026-10-12)
+
+**What upstream does** (read at `ca1e85f`). Three entry points share one
+path: the Gradio "analyse source audio" / "transcribe codes" buttons
+(`llm_analysis_actions.py`), the API's `full_analysis_only` job
+(`api/job_analysis_runtime.py`), and the dataset labeller
+(`training/dataset_builder_modules/label_single.py`). The path is:
+
+1. `convert_src_audio_to_codes` (`core/generation/handler/audio_codes.py`):
+   `process_src_audio` (stereo 48 kHz), a silence check, the VAE encoder,
+   then `model.tokenize` with the silence latent's first rows padding to a
+   whole 5-latent group. This is A11's `coverHints` up to `Tokenize`, so
+   the codes already exist on our side (A11: exact but 7 of 900 at a
+   boundary).
+2. `understand_audio_from_codes` (`llm_inference.py:1850`): the chat
+   template with the system turn `# Instruction\n{DEFAULT_LM_UNDERSTAND_INSTRUCTION}\n\n`
+   (`"Understand the given musical conditions and describe the audio
+   semantics accordingly:"`), and the user turn **the codes string alone**
+   (`<|audio_code_N|>` × T/5, nothing else). No CFG, one row.
+3. `generate_from_formatted_prompt` with `generation_phase: "understand"`,
+   no user metadata, caption, language and genres all generated,
+   `stop_at_reasoning=False`, `target_duration=None`. This is A12's FSM
+   in exactly the state `Sample` drives it with an empty `Meta`.
+4. `parse_lm_output` for the metas and `_extract_lyrics_from_output`
+   (A12's `ExtractLyrics`, the same regexes). `understand_music` then turns
+   bpm into an int and duration into a float, and blanks `N/A` values.
+
+The sampling settings differ between entry points. The API job uses
+temperature **0.3**. Gradio and `understand_music` use **0.85**. Neither
+sets top-k or top-p, and repetition penalty is 1.0.
+
+**What we would build.**
+
+- `ace/lm`: `UnderstandPrompt(codes []int) []int32`. The template's text
+  parts are tokenised, and the codes are spliced in as `CodeBase+c` ids
+  rather than encoded as a 5,000-token string. The gate is id-for-id
+  against upstream's tokenizer on the oracle's prompt. Then
+  `Planner.Understand(codes, temperature, rng)` is `Sample` without the
+  query: `decode(ids, newFSM(v, Meta{}, true), …)`, then `ParseCoT` and
+  `ExtractLyrics`, with no `[Instrumental]` fill (upstream adds none
+  here).
+- `ace/pipeline`: `Understand(audio)` runs the A11 decode, encoder and
+  `Tokenize`, then the LM. This needs the VAE encoder, the DiT's tokenizer
+  weights and the LM, but not the DiT forward or the VAE decoder.
+- `cmd/ace -understand song.mp3` prints the caption, metas and lyrics as
+  JSON.
+- Serving is an open decision (A-o13 below).
+
+**Gates** (the A7/A12 kind; sampling is not compared output for output):
+
+- the oracle `reference/dump_ace_understand.py`: two or three real songs
+  (one with vocals, one instrumental, one non-English) through upstream's
+  `convert_src_audio_to_codes` and `understand_audio_from_codes` at
+  temperature 0.3, saving the codes, the prompt ids, the raw text and the
+  parsed result;
+- codes exact against the oracle's, A11's boundary flips aside;
+- prompt ids exact;
+- teacher-forced on the oracle's text: KL and every argmax over each step,
+  under the int8 bank as A10 priced it. The understand prompt is mostly
+  audio codes, which A10 priced only as *outputs*. The bank needs pricing
+  against bf16 here too, in case codes as *inputs* behave differently;
+- the FSM exact over the oracle's steps (A12's harness);
+- parsing field for field.
+
+**Costs to expect.** The prompt is T/5 codes: 300 tokens for a minute,
+1,200 for 4 min, 3,000 for 10 min. Prefill is cheap. The output is about
+100–750 tokens, which is 2–17 s at 22 ms a step. `MaxLen` is 6,144, so a
+10-minute song (3,000 codes plus up to 3,500 generated) can outgrow the
+cache. Either cap understand at about 8 minutes or raise `MaxLen` for this
+call.
+
+**A-o13: where it is served.** The options are a field on `/v1/music`
+(upstream's shape: `full_analysis_only` with `src_audio`, returning a job),
+a synchronous endpoint, or `/v1/audio/transcriptions`-style multipart.
+OpenAI has no music-analysis endpoint ([[api-follows-openai-standard]]),
+so this is the user's call.
+
+**Limits to state up front.** The LM writes lyrics from 5 Hz semantic
+codes, so lyrics are a guess, not ASR. For words, Parakeet (the speech
+vertical) on separated vocals would do better. Duration is the LM's own
+estimate. We could overwrite it with the measured length, but upstream
+does not.
+
+### A13 — result (2026-10-12)
+
+**Done, as planned, with two changes.** The oracle is two more cases of
+`reference/dump_ace_lm.py` (`understand`, `understand_lofi`) rather than a
+script of its own: the LM run, its hooks and its manifest are the ones
+TestLogits, TestFSMSampleTrace and `dump_ace_lm_tf.py` already read. Each
+case seeds torch, runs `convert_src_audio_to_codes` on A11's sources (the
+30 s synthwave `src.wav` and the 120 s lofi `ref.wav`), dumps the posterior
+sample it encoded (`{label}_latents`) and the codes, then runs
+`understand_audio_from_codes` at 0.3 (163 s and 128 s on the CPU). And the
+A-o13 serving decision went the user's way: `/v1/music` with
+`full_analysis_only`, as upstream.
+
+**Code:**
+
+- `ace/lm/understand.go`: `UnderstandInstruction`, `UnderstandSampling`
+  (0.3, top-p off), `Planner.UnderstandPrompt` (the template's text
+  tokenised, the codes spliced in as `CodeBase+c`), `Planner.Understand`
+  (A12's `decode` under `newFSM(v, Meta{}, true)`, step hook phase 3).
+  Encoding the codes as text gives the same ids, but our tokenizer is
+  slow over thousands of added tokens (TestUnderstandPrompt, which encodes
+  both prompts that way, takes 70 s), so they are spliced.
+- `ace/pipeline/understand.go`: `AudioCodes(latents)` (A11's padding and
+  `Tokenize`, now shared with `coverHints` as `tokenize`) and
+  `Understand(wav, Options)`: bounds (a latent to 600 s, `Silent` refused),
+  the encoder with `Options.Seed`'s posterior noise, the tokenizer, the LM
+  with `Options.LMSeed`; `Between` and `Progress` ("understand") at every
+  LM step.
+- `cmd/ace -understand song.mp3 [-lm-temp t]`: the JSON on stdout.
+- `/v1/music` (`api/music.go`, `backend/music.go`): `full_analysis_only`
+  (or `fullAnalysisOnly`) with `src_audio` uploaded is a job that writes no
+  audio. Its `metadata` is the result (caption, genres, bpm, keyscale,
+  timesignature, duration, vocal_language, lyrics), `seconds` the source's
+  length, `full_analysis_only: true` on the job, and `/content` is a 409.
+  It reads `lm_temperature` (default 0.3, upstream's constant), `lm_top_p`,
+  `lm_seed`; `thinking` and upstream's defaults of the generation fields
+  are tolerated, and anything that would shape a song (a caption, metas, a
+  task, a reference, sample mode) is a 400. `extract_codes_only` and
+  `analysis_only` were silently ignored before and are now 400s.
+  `GET /v1/models` reports `full_analysis_only` when the LM and the genres
+  vocabulary are loaded.
+
+**Gates:**
+
+| Gate | Result |
+|---|---|
+| prompt ids (`TestUnderstandPrompt`), spliced and text-encoded | exact: 179 and 629 ids |
+| the song parsed from upstream's text vs `understand_audio_from_codes`' dict | field for field, both cases |
+| the FSM replayed over upstream's steps (`TestFSMSampleTrace`) | exact: 252 and 167 steps |
+| teacher-forced logits vs fp32 (`TestLogits`, fp16 bank) | KL ≤ 1.1e-5, every argmax; rel ≤ 3.3e-3 (see below) |
+| int8 bank vs bf16 (`TestBankAgainstBF16`) | KL mean 0.95x / 0.43x bf16's, every argmax (bf16: 90/92); worst step 2.1x bf16's worst; text pooled 0.80x mean, 1.36x max |
+| codes from the oracle's latents (`TestUnderstandCodes`) | 0 of 150; 10 of 600 flipped, all within 0.0061 of a boundary |
+| live, end to end (`TestUnderstand`, `TestUnderstandPlanner`) | every field the FSM holds, genres in the vocabulary |
+| the API (`TestMusicAnalysis`) | job, metadata, 409 content, 8 refusals |
+
+Three things the gates turned up:
+
+- **The duration's bound is a GPU tier.** Upstream bounds `duration:` by
+  `gpu_config.max_duration_with_lm`: 240 s on tier 1, which is what the
+  CPU oracle runs, and 600 s on the top tier, which is ours. After the
+  understand case's "30", the oracle allowed only the newline (300 > 240)
+  and we allowed digits. A12's cases never showed it: their durations
+  were three digits already. `fsmVocab.setDurationMax` is
+  `set_max_duration`, and the trace test replays at 240.
+- **TestLogits' rel bound is 4e-3 now**, from 3e-3: `understand_lofi`'s
+  step 3 (the bpm value, the step that set the bound before) is 3.3e-3
+  after 628 tokens of codes, at KL 6.3e-6 and the right argmax.
+- **TestLogits and TestBankAgainstBF16 prefilled in one pass**, which the
+  test LM's 256 rows cannot take for 600 codes; both now chunk as
+  `Planner.prefill` does.
+
+**What it hears.** On `src.wav` (full_metas: synthwave, female vocals,
+120 bpm, C major, 4/4, English, A1's lyrics), upstream's oracle wrote
+"Chiptune", A major, 120 bpm, 4, French, 30 s; ours (int8, seed 42) wrote
+"Synth-pop J-pop", G major, 120 bpm, 4, English, 30 s, "a clear, powerful
+female vocal". Tempo, metre, length and the vocal are right in both; the
+key is wrong in both. The lyrics are a loop of one line ("I'm on the
+road" — the real ones are "Neon rivers run beneath the city light"): as
+planned, the codes do not carry the words. On the lofi reference, upstream
+heard instrumental funk-rock at 143 bpm.
+
+**Cost.** 30 s of audio: encode 0.4–0.6 s, tokenize 12 ms, a 179-token
+prefill in 73–90 ms, then ~490 steps at 28–30 ms: ~15 s, nearly all of it
+the lyrics.
+Served (a `serve -music` instance beside `ai.service`, the slot already
+resident): A12's 60 s pop-punk song, submitted multipart, completed in
+15 s against a 14 s estimate. It heard "high-energy pop-punk with J-rock
+influences… lead male vocal", 100 bpm, F# major, 2, 60 s, and wrote
+Catalan-ish lyrics: again, the words are the weak part.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -1715,3 +1889,6 @@ image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`p
   for it.
 - Upstream's retake and flow-edit, and the base model's tasks (lego,
   extract, complete), stay refusals.
+- **A13, understand (captioning existing audio)**: done 2026-10-12, see
+  § A13 — result. Served as `full_analysis_only` on `/v1/music`. Not
+  deployed yet: `ai.service` runs the binary from before it.
