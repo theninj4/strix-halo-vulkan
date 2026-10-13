@@ -4252,3 +4252,48 @@ var AudioboxRelBias []byte
 
 //go:embed audiobox_attn_hd64_w32.spv
 var AudioboxAttnHD64W32 []byte
+
+// ---- SongEval (MUSIC.md A14d): MuQ-large-msd-iter's first six layers and
+// SongEval's head. MuQ's Res2d front end runs its 512->512 3x3 convolutions
+// on dit_gemm's A_CONV=3 (a 2-D implicit im2col, one output frequency row a
+// dispatch) with BatchNorm folded into the weights; the 1-channel convs of
+// the mel, the blocks' epilogues, SiLU/ReLU/GLU, the rotary embedding and
+// the depthwise conv are the muq_* passes. The conformer's attention is the
+// kokoro HD64 pair, SongEval's the DiT's HD128 pair.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DWM=4 -DWN=4 -DBK_TILES=4 -DB_LAYOUT=2 -DA_CONV=3 -o muq_conv2d_reg64.spv dit_gemm.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o muq_conv_in.spv muq_conv_in.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o muq_res.spv muq_res.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o muq_act.spv muq_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o muq_rotary.spv muq_rotary.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o muq_dwconv.spv muq_dwconv.comp
+// TAIL_MAX keeps the pad keys out of the row max as well as P: SongEval's
+// head attends over unnormalised features whose scores run to thousands of
+// log2 units, so a row whose real keys all score negative would otherwise
+// take its max from a pad key's 0 and underflow to a 0/0 row.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DTAIL_MAX=1 -DHEAD_DIM=64 -DWAVE=32 -o muq_attn_hd64_tailmax_w32.spv dit_attention_wmma.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DTAIL_MAX=1 -DWAVE=32 -o songeval_attn_hd128_tailmax_w32.spv dit_attention_wmma.comp
+
+//go:embed muq_conv2d_reg64.spv
+var MuQConv2DReg64 []byte
+
+//go:embed muq_conv_in.spv
+var MuQConvIn []byte
+
+//go:embed muq_res.spv
+var MuQRes []byte
+
+//go:embed muq_act.spv
+var MuQAct []byte
+
+//go:embed muq_rotary.spv
+var MuQRotary []byte
+
+//go:embed muq_dwconv.spv
+var MuQDWConv []byte
+
+//go:embed muq_attn_hd64_tailmax_w32.spv
+var MuQAttnHD64TailMaxW32 []byte
+
+//go:embed songeval_attn_hd128_tailmax_w32.spv
+var SongEvalAttnHD128TailMaxW32 []byte

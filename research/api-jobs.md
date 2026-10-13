@@ -194,7 +194,9 @@ number is in [0, 1], higher better:
                 "keyscale": 0.83, "language": 0.838, "timesignature": 0.791},
   "pmi": {"caption": -0.036, "lyrics": 3.129},
   "lyrics_alignment": {"lm": 0.202, "dit": 0.205},
-  "aesthetics": {"pq": 8.30, "pc": 4.28, "ce": 6.94, "cu": 7.75}
+  "aesthetics": {"pq": 8.30, "pc": 4.28, "ce": 6.94, "cu": 7.75},
+  "song": {"coherence": 3.83, "musicality": 3.67, "memorability": 3.65,
+           "clarity": 3.63, "naturalness": 3.49}
 }
 ```
 
@@ -218,10 +220,20 @@ number is in [0, 1], higher better:
   ACE-Step 1.5's report quotes PQ 8.35 and CU 8.09 for its songs. White
   noise scores PQ 5.2, PC 2.1 and CE 2.9. `-music-aes=false` leaves it
   out.
+- `song` is SongEval on the whole song (A14d), on its 1–5 scale:
+  - `coherence`: overall coherence;
+  - `musicality`: overall musicality;
+  - `memorability`;
+  - `clarity`: clarity of song structure;
+  - `naturalness`: naturalness of vocal breathing and phrasing.
+
+  Our songs score about 3–4, and noise about 1.1. The score moves by about
+  ±0.05 on inputs that differ inaudibly, so read it to one decimal place.
+  `-music-songeval=false` leaves it out (~2.6 GB).
 - There is no good/fair/poor flag yet. Its thresholds wait for A14e's
   calibration against listening.
 
-It costs ~0.8 s on a 30 s song and ~3.7 s on a 200 s one.
+It costs ~0.9 s on a 30 s song and ~4.9 s on a 200 s one.
 Three jobs submitted together on this machine (MUSIC.md A9, before A10's
 int8 LM halved its step):
 

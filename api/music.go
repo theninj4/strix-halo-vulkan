@@ -171,8 +171,8 @@ type MusicProgress struct {
 }
 
 // MusicQuality is a song's auto score: upstream's own (MUSIC.md A14b),
-// every number in [0, 1], and Audiobox Aesthetics' (A14c), 1-10; higher is
-// better throughout. A part is absent when it did not run:
+// every number in [0, 1]; Audiobox Aesthetics' (A14c), 1-10; and
+// SongEval's (A14d), 1-5. Higher is better throughout. A part is absent when it did not run:
 // the LM's needs the codes the thinking path writes (not a cover, a repaint
 // or thinking false), the alignment needs lyrics.
 type MusicQuality struct {
@@ -193,6 +193,20 @@ type MusicQuality struct {
 	// Aesthetics is Meta's Audiobox Aesthetics on the audio (MUSIC.md
 	// A14c), on its own 1-10 scale rather than [0, 1].
 	Aesthetics *MusicAesthetics `json:"aesthetics,omitempty"`
+	// Song is SongEval on the whole song (MUSIC.md A14d), on its 1-5 scale.
+	Song *MusicSongEval `json:"song,omitempty"`
+}
+
+// MusicSongEval are SongEval's five dimensions, each 1-5, as its annotators
+// rated full songs: overall coherence, overall musicality, memorability,
+// clarity of song structure, and naturalness of vocal breathing and
+// phrasing.
+type MusicSongEval struct {
+	Coherence    float64 `json:"coherence"`
+	Musicality   float64 `json:"musicality"`
+	Memorability float64 `json:"memorability"`
+	Clarity      float64 `json:"clarity"`
+	Naturalness  float64 `json:"naturalness"`
 }
 
 // MusicAesthetics are Audiobox Aesthetics' four axes, each 1-10: production

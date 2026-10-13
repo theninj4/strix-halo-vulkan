@@ -73,7 +73,8 @@ func (f *fakeMusic) GenerateMusic(ctx context.Context, req *MusicRequest, p *Mus
 		progress(MusicProgress{Stage: "write", Fraction: 0.99, Quality: &MusicQuality{Score: &score,
 			Adherence: map[string]float64{"caption": 0.36, "bpm": 0.91}, PMI: map[string]float64{"caption": -0.29},
 			LyricsAlignment: &MusicAlignment{LM: 0.17, DiT: 0.14},
-			Aesthetics:      &MusicAesthetics{PQ: 8.35, PC: 6.6, CE: 7.75, CU: 8.06}}})
+			Aesthetics:      &MusicAesthetics{PQ: 8.35, PC: 6.6, CE: 7.75, CU: 8.06},
+			Song:            &MusicSongEval{Coherence: 3.7, Musicality: 3.6, Memorability: 3.6, Clarity: 3.5, Naturalness: 3.5}}})
 	}
 	return os.WriteFile(dst, []byte("not really an mp3"), 0o644)
 }
@@ -433,7 +434,8 @@ func TestMusicQuality(t *testing.T) {
 	}
 	rec := do(t, s, httptest.NewRequest("GET", "/v1/music/"+j.ID, nil))
 	for _, k := range []string{`"quality":{"score":0.65`, `"adherence":{"bpm":0.91,"caption":0.36}`, `"lyrics_alignment":{"lm":0.17,"dit":0.14}`,
-		`"aesthetics":{"pq":8.35,"pc":6.6,"ce":7.75,"cu":8.06}`} {
+		`"aesthetics":{"pq":8.35,"pc":6.6,"ce":7.75,"cu":8.06}`,
+		`"song":{"coherence":3.7,"musicality":3.6,"memorability":3.6,"clarity":3.5,"naturalness":3.5}`} {
 		if !strings.Contains(rec.Body.String(), k) {
 			t.Errorf("job JSON has no %s: %s", k, rec.Body)
 		}

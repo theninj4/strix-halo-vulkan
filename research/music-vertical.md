@@ -2164,6 +2164,143 @@ score took a 30 s song's score from 0.67 to 0.77 s and a 200 s song's from
 so nothing was tuned. The positional conv as a GEMM is the first thing to
 try if it ever matters.
 
+### A14d — result (2026-10-13)
+
+**Done and deployed.** SongEval runs on the device over MuQ's first six
+layers. Every song's `quality` now carries its five whole-song scores as
+`song` (1–5). They land within 0.0001 of upstream's fp32 from the same
+input. The resampler choice alone moves them up to 0.05.
+
+**What upstream runs.**
+
+- **Input:** SongEval's `eval.py` (`models/SongEval-src` at `848fb2f`)
+  does `librosa.load(sr=24000)`, which is mono and then soxr_hq.
+- **MuQ** (`models/MuQ-large-msd-iter`, `muq` 0.1.0) runs over the whole
+  song in one pass:
+  - a 128-band log-mel: n_fft 2048, hop 240, reflect-centred, HTK,
+    AmplitudeToDB, the last frame dropped, normalised by the checkpoint's
+    stats;
+  - two Res2d blocks: 3×3 convs at stride (2, 2), BatchNorm and ReLU, with
+    a strided shortcut. They take 128×100 Hz down to 32×25 Hz at 512
+    channels, then `rearrange("b c f t -> b t (c f)")` and a Linear
+    16384→1024;
+  - a wav2vec2-conformer. Each layer has a half-step FFN with SiLU,
+    attention with a rotary embedding applied to the normed input before
+    q and k, a convolution module (pointwise to 2048, GLU, depthwise
+    kernel 31, BatchNorm, SiLU, pointwise), a second half-step FFN and a
+    final LayerNorm.
+- **`hidden_states[6]`** is the sixth layer's output, checked to be equal
+  under transformers 4.57.1. muq 0.1.0 does not run under transformers 5:
+  it builds its config as an `EasyDict`.
+- **The head:**
+  - an FFN 1024→4096→1024 with ReLU;
+  - four 8-head self-attention layers, chained with no residuals;
+  - the mean of the last over time beside the FFN's max over time;
+  - fc to 5, tanh·2 + 3.
+
+**Code:**
+
+- **`songeval/` (new package).**
+  - `model.go`: weights, BatchNorm folded into the convs and the depthwise
+    conv.
+  - `mel.go`: `Mono24k` (torchaudio's sinc at 2:1) and `Mel`, on the
+    repo's `audio.STFT` and `audio.MelFilters`.
+  - `gpu.go`: the graph.
+  - `songeval.go`: `Load`, `Score`, `ScoreMono`, and the head's tail on
+    the host.
+- **The front end runs in chunks of 512 tokens with a 3-token halo.**
+  - Each level is computed over its local range, and positions outside
+    the song are zeroed, which is each conv's padding. Activations stay a
+    few hundred MB at any length.
+  - The 512→512 convs are a new `dit_gemm` mode, `A_CONV=3`: a 3×3
+    implicit im2col with the tap offset carried across the K loop, one
+    output frequency row per dispatch (`muq_conv2d_reg64`). The
+    A_CONV=2/1 builds are byte-identical to before.
+  - `muq_conv_in` runs the 1-channel convs in fp32, and `muq_res` the
+    blocks' epilogues.
+- **The conformer:**
+  - `muq_act` (SiLU, ReLU, GLU), `muq_rotary` and `muq_dwconv`;
+  - parakeet's LayerNorm and residual, and the LDS GEMM with
+    bias-as-K-column;
+  - the kokoro HD64 pack, and the DiT HD128 pack for the head.
+- **Attention builds with `TAIL_MAX`** (`muq_attn_hd64_tailmax_w32`,
+  `songeval_attn_hd128_tailmax_w32`). The plain builds took every score
+  NaN in the head; the trap is in the findings below.
+- **Wiring.**
+  - `pipeline.LoadSongEval`, `Quality.Song`.
+  - The backend loads it when the MuQ checkpoint and the head exist
+    (`-music-songeval`, default on).
+  - `MusicSongEval` in the API.
+  - `cmd/ace -aesthetics file` now prints both models' scores.
+- **Oracle:** `reference/dump_songeval.py` in `.venv-aes`, with muq,
+  librosa 0.11.0, hydra-core and transformers 4.57.1 added. SongEval's
+  head is restated inline rather than imported from the clone. The three
+  cases:
+  - the 30 s synthwave song;
+  - the 120 s lofi song;
+  - 12.5 s of noise.
+
+  Each is scored twice, once from librosa's soxr input and once from
+  torchaudio's.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| 48 → 24 kHz resample, normalised mel (`TestHost`) | rms 9e-8; mel rms 5.4e-6 |
+| conv front end through the chunks and their halos, hidden_states[0] (`TestStages`) | rms 1.7e-4–1.9e-4 |
+| hidden_states 1–6 | rms 2.0e-4–4.2e-4, max 7e-3 |
+| the head's FFN | rms 1.4e-4–1.6e-4 |
+| the five scores (`TestScores`) | within 0.0001 of fp32 from the same input; the resampler gap (soxr against torchaudio) is 0.024–0.049 |
+| end to end (`TestScoreGenerate`), served (`ai.service`) | present, on 1–5 |
+
+**What the gates turned up:**
+
+- **The plain attention builds keep padding keys in the row max.** A
+  padding key scores exactly 0. On a row whose real scores are all
+  strongly negative, the max is 0, every real exp2 underflows, and the row
+  is 0/0. SongEval's head attends over unnormalised features, whose
+  scores run to thousands of log2 units. Every score came out NaN, and the
+  first `TestScores` passed anyway, because `worst > bar` is false for
+  NaN. The gate is now `!(worst <= bar)`.
+- **The score is sensitive to tiny input changes, not just to the
+  resampler.** A resampler that agrees with soxr to 45 dB, Kaiser-best
+  64 taps, still moves a score by 0.02–0.03, and torchaudio's 6-zero Hann
+  by 0.024–0.049. No resampler reproduces `eval.py` exactly. We keep
+  torchaudio's, already ported, and treat ±0.05 as the score's own
+  resolution.
+- `muq` pulls in torchvision, whose PyPI build does not load against the
+  CPU torch. It has to come from the CPU index, `0.25.0+cpu`.
+
+**What it says:**
+
+| song | coherence | musicality | memorability | clarity | naturalness |
+|---|---|---|---|---|---|
+| synthwave, 30 s (A11's source) | 3.73 | 3.67 | 3.63 | 3.61 | 3.53 |
+| synthwave, generated by TestScoreGenerate | 3.91 | 3.81 | 3.96 | 3.76 | 3.68 |
+| lofi, 120 s | 3.26 | 2.94 | 3.08 | 2.84 | 2.84 |
+| 200 s, twelve identical verses | 3.83 | 3.58 | 3.83 | 3.49 | 3.61 |
+| A10's techno, 180 s | 3.65 | 3.41 | 3.35 | 3.15 | 3.18 |
+| white noise | about 1.07–1.10 on all five | | | | |
+
+So it separates noise from music by a wide margin, as Audiobox's PC and CE
+do. Among songs, the instrumentals (lofi, techno) score lower on clarity
+and naturalness, the vocal dimensions.
+
+**Cost.**
+
+- On the device: 95 ms for 30 s, 315 ms for 120 s, 575 ms for 180 s.
+- The host's resample and mel add about 0.1–0.5 s more.
+- The whole auto score now takes 0.94 s on a 30 s song (was 0.77 s) and
+  4.9 s on a 200 s one (was 3.7 s, 11% of that request). The LM's
+  teacher-forced passes are still most of it.
+- Memory: ~2.6 GB staged at the 600 s ceiling. Of that, ~0.4 GB is fp16
+  weights, and the rest is activations for one pass over a 10-minute
+  song.
+- `ai.service`'s memory peak during the deploy's smoke test was 83.8 GB,
+  against 70.2 GB earlier the same day. The swap slot's music footprint
+  grew by Audiobox and SongEval.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -2392,8 +2529,11 @@ image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`p
   - **A14c is done and deployed** (same day): Audiobox Aesthetics' PQ,
     PC, CE and CU on every song, within 0.0015 of upstream. See § A14c —
     result.
-  - **Next: A14d**, SongEval (MuQ's first six layers and its head), then
-    A14e's calibration and the flag.
+  - **A14d is done and deployed** (same day): SongEval's five whole-song
+    scores on every song, within 0.0001 of upstream from the same input.
+    See § A14d — result.
+  - **Next: A14e**, calibration against listening, and the good/fair/poor
+    flag.
 - **A13, understand (captioning existing audio)**: done 2026-10-12, see
   § A13 — result. Served as `full_analysis_only` on `/v1/music`. Not
   deployed yet: `ai.service` runs the binary from before it.

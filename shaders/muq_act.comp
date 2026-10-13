@@ -1,0 +1,36 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// An fp32 [tokens][dim] tensor into the fp16 GEMM operand (MUSIC.md A14d):
+// aux2 0 narrows, 1 is SiLU (MuQ's "swish"), 2 ReLU (SongEval's FFN), and 3
+// the conformer's GLU over [tokens][2·dim] input: a · sigmoid(b), a the
+// first dim columns. aux2 bit 4 writes fp32 to act instead (row pitch lda
+// either way).
+#include "dit_common.glsl"
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+layout(local_size_x = 256) in;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.y;
+    if (c >= pc.dim || r >= pc.tokens) {
+        return;
+    }
+    uint mode = pc.aux2 & 3u;
+    float x;
+    if (mode == 3u) {
+        uint i = pc.inOff + r * 2u * pc.dim + c;
+        x = act[i] / (1.0 + exp(-act[i + pc.dim]));
+    } else {
+        x = act[pc.inOff + r * pc.dim + c];
+        if (mode == 1u) {
+            x = x / (1.0 + exp(-x));
+        } else if (mode == 2u) {
+            x = max(x, 0.0);
+        }
+    }
+    if ((pc.aux2 & 4u) != 0u) {
+        act[pc.outOff + r * pc.lda + c] = x;
+    } else {
+        hact[pc.outOff + r * pc.lda + c] = float16_t(x);
+    }
+}

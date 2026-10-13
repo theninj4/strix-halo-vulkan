@@ -275,19 +275,27 @@ func TestScoreGenerate(t *testing.T) {
 			t.Skip(err)
 		}
 	}
+	if p.SongEval == nil {
+		if err := p.LoadSongEval(shared.dev, models, 240); err != nil {
+			t.Skip(err)
+		}
+	}
 	for _, label := range []string{"full_metas", "long_caption"} {
 		res, err := p.Generate(request(t, label), Options{Seed: 42, LMSeed: 42, Think: true, Score: true})
 		if err != nil {
 			t.Fatal(err)
 		}
 		q := res.Quality
-		if q == nil || q.LM == nil || q.Lyrics == nil || q.Aesthetics == nil {
+		if q == nil || q.LM == nil || q.Lyrics == nil || q.Aesthetics == nil || q.Song == nil {
 			t.Fatalf("%s: quality %+v", label, q)
 		}
 		t.Logf("%s: %.0f s song in %v, scored in %v (LM %v); reward %.4f %v pmi %v; lyrics lm %+v dit %+v",
 			label, res.Seconds, res.Timings.Total.Round(time.Millisecond), q.Took.Round(time.Millisecond), q.LM.Stats,
 			q.LM.Reward, q.LM.Conditions, q.LM.PMI, q.Lyrics.LM, q.Lyrics.DiT)
-		t.Logf("%s: aesthetics %+v", label, *q.Aesthetics)
+		t.Logf("%s: aesthetics %+v; songeval %+v", label, *q.Aesthetics, *q.Song)
+		if s := q.Song; s.Coherence < 1 || s.Coherence > 5 || math.IsNaN(s.Naturalness) {
+			t.Errorf("%s: songeval %+v", label, *s)
+		}
 		if a := q.Aesthetics; a.PQ < 1 || a.PQ > 10 || math.IsNaN(a.CE) {
 			t.Errorf("%s: aesthetics %+v", label, *a)
 		}

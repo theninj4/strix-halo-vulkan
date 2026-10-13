@@ -1,0 +1,53 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// MuQ's first Res2d block's two convolutions of the mel input (MUSIC.md
+// A14d): conv1 and the shortcut conv3, both 1 -> 512 channels, 3x3, stride
+// (2, 2), padding 1, BatchNorm folded in. One input channel makes them 9
+// multiply-adds an output, so they run here in fp32 rather than on the GEMM.
+//
+//   mid = relu(conv1 + b1) -> hact, bordered [66][span][512] at (f+1, t+1),
+//         zero where the time is outside the song
+//   sc  = conv3 + b3       -> act[kOff + (f*kStride + t)*512 + c]
+//
+//   pc.inOff   the chunk's mel, act [128][aux0] (zeros outside the song)
+//   pc.wOff    w1 [512][9], b1 [512], w3 [512][9], b3 [512], wbuf
+//   pc.outOff  mid, hact      pc.span  mid's bordered time pitch
+//   pc.kOff    sc, act        pc.kStride  sc's time pitch
+//   pc.tokens  output times this chunk
+//   pc.aux0    the mel chunk's frames
+//   pc.aux1    the chunk's first output time, global (an int)
+//   pc.aux2    the song's output times
+#include "dit_common.glsl"
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+layout(local_size_x = 256) in;
+void main() {
+    uint c = gl_GlobalInvocationID.x & 511u;
+    uint t = gl_GlobalInvocationID.x >> 9;
+    uint f = gl_WorkGroupID.y;
+    if (t >= pc.tokens) {
+        return;
+    }
+    float a = 0.0, b = 0.0;
+    [[unroll]] for (uint df = 0u; df < 3u; ++df) {
+        int mf = int(2u * f + df) - 1;
+        [[unroll]] for (uint dt = 0u; dt < 3u; ++dt) {
+            int mt = int(2u * t + dt) - 1;
+            float x = 0.0;
+            if (mf >= 0 && mf < 128 && mt >= 0 && uint(mt) < pc.aux0) {
+                x = act[pc.inOff + uint(mf) * pc.aux0 + uint(mt)];
+            }
+            uint k = df * 3u + dt;
+            a += wbuf[pc.wOff + c * 9u + k] * x;
+            b += wbuf[pc.wOff + 5120u + c * 9u + k] * x;
+        }
+    }
+    a = max(a + wbuf[pc.wOff + 4608u + c], 0.0);
+    int g = int(pc.aux1) + int(t);
+    if (g < 0 || g >= int(pc.aux2)) {
+        a = 0.0;
+    }
+    hact[pc.outOff + ((f + 1u) * pc.span + t + 1u) * 512u + c] = float16_t(a);
+    act[pc.kOff + (f * pc.kStride + t) * 512u + c] = b + wbuf[pc.wOff + 9728u + c];
+}

@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// wav2vec2-conformer's rotary embedding (MUSIC.md A14d), applied to the
+// layer-normed hidden states before the q and k projections, 16 heads of
+// 64: x·cos + rotate_half(x)·sin, with rotate_half = (−x[32:], x[:32]) and
+// cos/sin of (t·inv_freq, t·inv_freq). Out to the fp16 operand.
+//
+//   pc.inOff  x [tokens][1024], act   pc.outOff  hact, row pitch lda
+//   pc.aux0   cos [tokens][32], act   pc.aux1    sin, the same
+#include "dit_common.glsl"
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+layout(local_size_x = 256) in;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.y;
+    if (c >= 1024u || r >= pc.tokens) {
+        return;
+    }
+    uint i = c & 63u, j = i & 31u;
+    float x = act[pc.inOff + r * 1024u + c];
+    float o = i < 32u ? -act[pc.inOff + r * 1024u + c + 32u] : act[pc.inOff + r * 1024u + c - 32u];
+    float cs = act[pc.aux0 + r * 32u + j], sn = act[pc.aux1 + r * 32u + j];
+    hact[pc.outOff + r * pc.lda + c] = float16_t(x * cs + o * sn);
+}

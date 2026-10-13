@@ -37,6 +37,9 @@ type MusicOptions struct {
 	// NoAesthetics leaves Audiobox Aesthetics out of the auto score
 	// (MUSIC.md A14c). It is loaded when models/audiobox-aesthetics exists.
 	NoAesthetics bool
+	// NoSongEval leaves SongEval out of the auto score (MUSIC.md A14d). It
+	// is loaded when models/MuQ-large-msd-iter and SongEval's head exist.
+	NoSongEval bool
 	// ID is the model id this backend answers to.
 	ID string
 	// Swap is the residency slot this pipeline takes turns in with image
@@ -123,6 +126,15 @@ func (b *Music) Load() error {
 	if aes := pipeline.AesDir(b.opt.Models); err == nil && !b.opt.NoAesthetics {
 		if _, serr := os.Stat(aes); serr == nil {
 			if err = p.LoadAesthetics(d, aes); err != nil {
+				p.Destroy()
+			}
+		}
+	}
+	if muq, head := pipeline.SongEvalDirs(b.opt.Models); err == nil && !b.opt.NoSongEval {
+		_, e1 := os.Stat(muq)
+		_, e2 := os.Stat(head)
+		if e1 == nil && e2 == nil {
+			if err = p.LoadSongEval(d, b.opt.Models, plan.MaxSeconds); err != nil {
 				p.Destroy()
 			}
 		}
@@ -385,6 +397,8 @@ func scoreCost(r *plan.Request, thinking bool, seconds float64) time.Duration {
 	// Audiobox Aesthetics: ~17 ms of device a 10 s window (A14c), and the
 	// host's resample.
 	s += 0.03 + 0.002*seconds
+	// SongEval: the host's resample and mel, and ~3 ms of device a second.
+	s += 0.05 + 0.004*seconds
 	return time.Duration(s * float64(time.Second))
 }
 
@@ -534,7 +548,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 
 // musicQuality is the auto score as the API reports it, or nil.
 func musicQuality(q *pipeline.Quality) *api.MusicQuality {
-	if q == nil || (q.LM == nil && q.Lyrics == nil && q.Aesthetics == nil) {
+	if q == nil || (q.LM == nil && q.Lyrics == nil && q.Aesthetics == nil && q.Song == nil) {
 		return nil
 	}
 	out := &api.MusicQuality{}
@@ -547,6 +561,10 @@ func musicQuality(q *pipeline.Quality) *api.MusicQuality {
 	}
 	if a := q.Aesthetics; a != nil {
 		out.Aesthetics = &api.MusicAesthetics{PQ: a.PQ, PC: a.PC, CE: a.CE, CU: a.CU}
+	}
+	if s := q.Song; s != nil {
+		out.Song = &api.MusicSongEval{Coherence: s.Coherence, Musicality: s.Musicality, Memorability: s.Memorability,
+			Clarity: s.Clarity, Naturalness: s.Naturalness}
 	}
 	return out
 }

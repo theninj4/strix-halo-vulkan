@@ -145,6 +145,17 @@ layout(binding = 2) buffer HAct { float16_t hact[]; };
 //   pc.aux0  the padded channel count, a multiple of BK; also pc.lda
 //   pc.aux1  d*lda
 //   pc.aux2  unused
+//
+// A_CONV=3 is A_CONV=2 over a 3x3 two-dimensional kernel (MUSIC.md A14d,
+// MuQ's Res2d blocks): K is nine taps of pc.aux0 channels, tap j = 3*df + dt,
+// at row offset df*pc.ldb + dt*pc.aux1 -- so the carried offset steps by
+// pc.aux1 between time taps and by pc.ldb - 2*pc.aux1 when dt wraps. A
+// dispatch is one output frequency row; its rows are output times, at a row
+// stride of pc.lda (the time stride times the channel pitch).
+//
+//   pc.aux0  the padded channel count, a multiple of BK
+//   pc.aux1  the time tap's offset (the channel pitch)
+//   pc.ldb   the frequency tap's offset (a bordered time row's halves)
 #ifndef A_CONV
 #define A_CONV 0
 #endif
@@ -488,7 +499,7 @@ layout(local_size_x = NTHREADS) in;
 #define FRAG_A_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseA>
 #define FRAG_B_T coopmat<float16_t, gl_ScopeSubgroup, TILE, TILE, gl_MatrixUseB>
 
-#if A_CONV == 2
+#if A_CONV >= 2
 // A: the implicit im2col, with the tap index carried by the K loop rather than
 // divided out. aTap and aCol are declared and advanced in main().
 #define LOAD_FRAG_A(dst, i, k0, kt)                                            \
@@ -703,11 +714,14 @@ void main() {
     }
 #endif
 
-#if A_CONV == 2
+#if A_CONV >= 2
     // The tap's row offset and the column inside it, carried across the loop.
     // pc.aux0 is a multiple of BK, so the rollover is exact and a whole slab
     // is always inside one tap.
     uint aTap = 0u, aCol = 0u;
+#endif
+#if A_CONV == 3
+    uint aDt = 0u;
 #endif
 #if KRANGE
     const uint kStart = pc.aux0, kEnd = pc.aux1;
@@ -892,11 +906,20 @@ void main() {
         [[unroll]] for (uint i = 0u; i < WM; i++) { aAt[i] += BK; }
         [[unroll]] for (uint j = 0u; j < WN; j++) { bAt[j] += B_STEP; }
 #endif
-#if A_CONV == 2
+#if A_CONV >= 2
         aCol += BK;
         if (aCol >= pc.aux0) {
             aCol -= pc.aux0;
+#if A_CONV == 3
+            if (++aDt == 3u) {
+                aDt = 0u;
+                aTap += pc.ldb - 2u * pc.aux1;
+            } else {
+                aTap += pc.aux1;
+            }
+#else
             aTap += pc.aux1;
+#endif
         }
 #endif
     }

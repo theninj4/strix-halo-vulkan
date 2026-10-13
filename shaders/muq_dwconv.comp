@@ -1,0 +1,30 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The conformer convolution module's depthwise conv (MUSIC.md A14d): 31
+// taps, padding 15, no bias, then its BatchNorm (folded to a scale and a
+// shift) and SiLU, out to the fp16 operand of the second pointwise conv.
+//
+//   pc.inOff  x [tokens][1024] (the GLU's output), act
+//   pc.wOff   w [1024][31], then scale [1024], shift [1024], wbuf
+//   pc.outOff hact, row pitch lda
+#include "dit_common.glsl"
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+layout(local_size_x = 256) in;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.y;
+    if (c >= 1024u || r >= pc.tokens) {
+        return;
+    }
+    float s = 0.0;
+    [[unroll]] for (uint k = 0u; k < 31u; ++k) {
+        int t = int(r) + int(k) - 15;
+        if (t >= 0 && uint(t) < pc.tokens) {
+            s += wbuf[pc.wOff + c * 31u + k] * act[pc.inOff + uint(t) * 1024u + c];
+        }
+    }
+    s = s * wbuf[pc.wOff + 31744u + c] + wbuf[pc.wOff + 32768u + c];
+    hact[pc.outOff + r * pc.lda + c] = float16_t(s / (1.0 + exp(-s)));
+}

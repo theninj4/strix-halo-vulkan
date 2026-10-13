@@ -50,6 +50,7 @@ import (
 	"strix-halo-vulkan/embed"
 	h3vae "strix-halo-vulkan/h3/vae"
 	"strix-halo-vulkan/safetensors"
+	"strix-halo-vulkan/songeval"
 	"strix-halo-vulkan/vk"
 	"strix-halo-vulkan/zimage/qwen"
 	"strix-halo-vulkan/zimage/tokenizer"
@@ -94,6 +95,26 @@ type Pipeline struct {
 	// Aes is Audiobox Aesthetics (MUSIC.md A14c), when loaded: the auto
 	// score's production and enjoyment half.
 	Aes *audiobox.Model
+	// SongEval is SongEval over MuQ (MUSIC.md A14d), when loaded: the auto
+	// score's whole-song half.
+	SongEval *songeval.Model
+}
+
+// SongEvalDirs are MuQ's checkpoint and SongEval's head under models/.
+func SongEvalDirs(models string) (muq, head string) {
+	return filepath.Join(models, "MuQ-large-msd-iter"), filepath.Join(models, "SongEval-src", "ckpt", "model.safetensors")
+}
+
+// LoadSongEval stages SongEval for songs of up to maxSeconds (~2.6 GB at
+// the 600 s ceiling, most of it activations: it hears a song in one pass).
+func (p *Pipeline) LoadSongEval(dev *vk.Device, models string, maxSeconds float64) error {
+	muq, head := SongEvalDirs(models)
+	m, err := songeval.Load(dev, muq, head, maxSeconds)
+	if err != nil {
+		return err
+	}
+	p.SongEval = m
+	return nil
 }
 
 // AesDir is Audiobox Aesthetics' checkpoint under models/.
@@ -201,6 +222,9 @@ func (p *Pipeline) Destroy() {
 	if p.Aes != nil {
 		p.Aes.Destroy()
 	}
+	if p.SongEval != nil {
+		p.SongEval.Destroy()
+	}
 	if p.Enc != nil {
 		p.Enc.Destroy()
 	}
@@ -296,8 +320,8 @@ type Options struct {
 	Sampled func(song lm.Song)
 	// Score runs upstream's auto score on the song (MUSIC.md A14b): the
 	// LM's PMI when the LM wrote codes, the DiT's lyric alignment when the
-	// song has lyrics; and Audiobox Aesthetics on the audio when it is
-	// loaded (A14c).
+	// song has lyrics; Audiobox Aesthetics (A14c) and SongEval (A14d) on
+	// the audio when they are loaded.
 	Score bool
 }
 
@@ -746,6 +770,13 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 				return nil, err
 			}
 			res.Quality.Aesthetics = &a.Scores
+		}
+		if p.SongEval != nil {
+			s, err := p.SongEval.Score(wav)
+			if err != nil {
+				return nil, err
+			}
+			res.Quality.Song = &s.Scores
 		}
 		res.Quality.Took = time.Since(t0)
 		res.Timings.Score = res.Quality.Took

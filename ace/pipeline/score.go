@@ -24,6 +24,7 @@ import (
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/audiobox"
 	h3vae "strix-halo-vulkan/h3/vae"
+	"strix-halo-vulkan/songeval"
 	"strix-halo-vulkan/zimage/qwen"
 )
 
@@ -36,7 +37,9 @@ type Quality struct {
 	// Aesthetics is Audiobox Aesthetics' four scores on the audio
 	// (MUSIC.md A14c), 1-10.
 	Aesthetics *audiobox.Scores
-	Took       time.Duration
+	// Song is SongEval's five whole-song scores (MUSIC.md A14d), 1-5.
+	Song *songeval.Scores
+	Took time.Duration
 }
 
 // LyricScore is get_lyric_score's pair: "lm" from pure noise at t = 1 (the

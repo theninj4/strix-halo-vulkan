@@ -47,6 +47,7 @@ import (
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/audiobox"
 	"strix-halo-vulkan/backend"
+	"strix-halo-vulkan/songeval"
 	"strix-halo-vulkan/vk"
 )
 
@@ -80,7 +81,7 @@ func main() {
 	understand := flag.String("understand", "", "caption this song instead of generating one (any format ffmpeg reads)")
 	lmTemp := flag.Float64("lm-temp", 0, "-understand's LM temperature (0: upstream's API's 0.3)")
 	score := flag.Bool("score", true, "score the song as upstream's auto score does (MUSIC.md A14b): the LM's PMI over its codes, the DiT's lyric alignment")
-	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c) instead of generating: PQ, PC, CE, CU as JSON")
+	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c) and SongEval (A14d) instead of generating, as JSON")
 	flag.Parse()
 
 	if *aesthetics != "" {
@@ -175,6 +176,11 @@ func main() {
 					return err
 				}
 			}
+			if muq, head := pipeline.SongEvalDirs(*models); fileExists(muq) && fileExists(head) {
+				if err := p.LoadSongEval(d, *models, ceiling); err != nil {
+					return err
+				}
+			}
 		}
 		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp, Audio: audio,
 			Score: *score})
@@ -206,6 +212,9 @@ func main() {
 			}
 			if a := q.Aesthetics; a != nil {
 				log.Printf("aesthetics: PQ %.2f PC %.2f CE %.2f CU %.2f", a.PQ, a.PC, a.CE, a.CU)
+			}
+			if s := q.Song; s != nil {
+				log.Printf("songeval: %+v", *s)
 			}
 			log.Printf("scored in %v", q.Took.Round(time.Millisecond))
 		}
@@ -239,8 +248,24 @@ func runAesthetics(models, path string) {
 		if err != nil {
 			return err
 		}
-		log.Printf("%.1f s, %d windows, %v on the device", float64(len(wav)/2)/plan.SampleRate, len(r.Windows), r.Took)
-		out, err := json.Marshal(map[string]float64{"pq": r.PQ, "pc": r.PC, "ce": r.CE, "cu": r.CU})
+		secs := float64(len(wav)/2) / plan.SampleRate
+		log.Printf("%.1f s, %d windows, %v on the device", secs, len(r.Windows), r.Took)
+		scores := map[string]float64{"pq": r.PQ, "pc": r.PC, "ce": r.CE, "cu": r.CU}
+		if muq, head := pipeline.SongEvalDirs(models); fileExists(muq) && fileExists(head) {
+			se, err := songeval.Load(d, muq, head, secs)
+			if err != nil {
+				return err
+			}
+			defer se.Destroy()
+			s, err := se.Score(wav)
+			if err != nil {
+				return err
+			}
+			log.Printf("songeval: %d tokens, %v on the device", s.Tokens, s.Took)
+			scores["coherence"], scores["musicality"], scores["memorability"] = s.Coherence, s.Musicality, s.Memorability
+			scores["clarity"], scores["naturalness"] = s.Clarity, s.Naturalness
+		}
+		out, err := json.Marshal(scores)
 		if err != nil {
 			return err
 		}
@@ -250,6 +275,11 @@ func runAesthetics(models, path string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func runUnderstand(models, path string, seed, lmSeed uint64, temp float64, fp16 bool) {
