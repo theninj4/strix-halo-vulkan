@@ -172,7 +172,9 @@ type MusicProgress struct {
 
 // MusicQuality is a song's auto score: upstream's own (MUSIC.md A14b),
 // every number in [0, 1]; Audiobox Aesthetics' (A14c), 1-10; and
-// SongEval's (A14d), 1-5. Higher is better throughout. A part is absent when it did not run:
+// SongEval's (A14d), 1-5; the LM's verdict over the render's own codes
+// (A-o16); the loop measure (A14e). Higher is better throughout, except
+// the loops. A part is absent when it did not run:
 // the LM's needs the codes the thinking path writes (not a cover, a repaint
 // or thinking false), the alignment needs lyrics.
 type MusicQuality struct {
@@ -195,6 +197,34 @@ type MusicQuality struct {
 	Aesthetics *MusicAesthetics `json:"aesthetics,omitempty"`
 	// Song is SongEval on the whole song (MUSIC.md A14d), on its 1-5 scale.
 	Song *MusicSongEval `json:"song,omitempty"`
+	// Render is the LM's verdict again, over codes re-tokenized from the
+	// finished audio instead of the codes it planned: it scores what was
+	// made. A cover or a repaint has one too.
+	Render *MusicAdherence `json:"render,omitempty"`
+	// Loops is how much of the song copies itself at one short lag
+	// (MUSIC.md A14e).
+	Loops *MusicLoops `json:"loops,omitempty"`
+}
+
+// MusicAdherence is the LM's verdict on one set of codes: Score,
+// Adherence and PMI as on MusicQuality.
+type MusicAdherence struct {
+	Score     float64            `json:"score"`
+	Adherence map[string]float64 `json:"adherence,omitempty"`
+	PMI       map[string]float64 `json:"pmi,omitempty"`
+}
+
+// MusicLoops is the song's self-repetition (ace/loops): Repetition is the
+// share of it at least 0.9 alike at RepetitionLag seconds; LoopSeconds the
+// longest stretch that copies what came LoopLag seconds before (0.98
+// alike, the first period included), LoopShare its share of the song. A
+// tiled clip scores 1; generated songs so far reach 0.54.
+type MusicLoops struct {
+	Repetition    float64 `json:"repetition"`
+	RepetitionLag float64 `json:"repetition_lag"`
+	LoopSeconds   float64 `json:"loop_seconds"`
+	LoopShare     float64 `json:"loop_share"`
+	LoopLag       float64 `json:"loop_lag"`
 }
 
 // MusicSongEval are SongEval's five dimensions, each 1-5, as its annotators

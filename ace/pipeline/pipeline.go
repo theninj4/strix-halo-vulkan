@@ -44,6 +44,7 @@ import (
 
 	"strix-halo-vulkan/ace/dit"
 	"strix-halo-vulkan/ace/lm"
+	"strix-halo-vulkan/ace/loops"
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/ace/vae"
 	"strix-halo-vulkan/audiobox"
@@ -391,9 +392,13 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 		res.DiT = d
 		out, err := p.generate(d, o, dp, res)
 		if err == nil {
-			out.Timings.Total = time.Since(start)
+			err = p.scoreRender(r, out)
 		}
-		return out, err
+		if err != nil {
+			return nil, err
+		}
+		out.Timings.Total = time.Since(start)
+		return out, nil
 	}
 	var rng *rand.Rand
 	if o.Think || o.Sample != nil {
@@ -428,9 +433,13 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 		}
 		out, err := p.generate(r, o, dp, res)
 		if err == nil {
-			out.Timings.Total = time.Since(start)
+			err = p.scoreRender(r, out)
 		}
-		return out, err
+		if err != nil {
+			return nil, err
+		}
+		out.Timings.Total = time.Since(start)
+		return out, nil
 	}
 	var (
 		meta lm.Meta
@@ -471,6 +480,9 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 		return nil, err
 	}
 	if err := p.scoreCodes(r, out); err != nil {
+		return nil, err
+	}
+	if err := p.scoreRender(r, out); err != nil {
 		return nil, err
 	}
 	out.Timings.Total = time.Since(start)
@@ -778,6 +790,8 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 			}
 			res.Quality.Song = &s.Scores
 		}
+		l := loops.Measure(wav)
+		res.Quality.Loops = &l
 		res.Quality.Took = time.Since(t0)
 		res.Timings.Score = res.Quality.Took
 	}
@@ -796,6 +810,27 @@ func (p *Pipeline) scoreCodes(r *plan.Request, res *Result) error {
 		return err
 	}
 	res.Quality.LM = &sc
+	res.Quality.Took += time.Since(t0)
+	res.Timings.Score = res.Quality.Took
+	return nil
+}
+
+// scoreRender adds the LM's verdict over the render's own codes (the
+// latents through the audio tokenizer) to a scored result, on any path.
+func (p *Pipeline) scoreRender(r *plan.Request, res *Result) error {
+	if res.Quality == nil || p.LM == nil || len(res.Latents) == 0 {
+		return nil
+	}
+	t0 := time.Now()
+	codes, err := p.AudioCodes(res.Latents)
+	if err != nil {
+		return err
+	}
+	sc, err := p.LM.Score(codes, ScoreConditions(r, res.DiT, res.Meta), lm.ScoreScale)
+	if err != nil {
+		return err
+	}
+	res.Quality.Render = &sc
 	res.Quality.Took += time.Since(t0)
 	res.Timings.Score = res.Quality.Took
 	return nil

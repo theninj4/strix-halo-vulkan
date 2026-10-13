@@ -2301,6 +2301,127 @@ and naturalness, the vocal dimensions.
   against 70.2 GB earlier the same day. The swap slot's music footprint
   grew by Audiobox and SongEval.
 
+### A14e — the set, built and scored (2026-10-13)
+
+- **`cmd/acecal`** builds the set from `cmd/acecal/set.json` (20 requests,
+  seeds 11 and 12, 30-240 s, 6 instrumental, one Spanish; 17 controls) and
+  scores every item into `out/a14e/<id>.{mp3,flac,lat,json}`, resuming from
+  whatever records exist. 57 items in ~20 min beside `ai.service`.
+- **`pipeline.Rescore`** (`ace/pipeline/rescore.go`) scores a finished
+  song against any request, or audio no request made (it encodes it):
+  the alignment against the given request, the LM's half over the plan's
+  codes, and over codes re-tokenized from the render (`render` in the
+  record, for A-o16). For every song it reproduced the generation's
+  score bit for bit (alignment, PMI, Audiobox, SongEval), and a rerun of
+  `n02-11` matched the smoke run's record exactly.
+- **What the controls are.** steps (1 or 2 DiT steps, the LM's plan kept);
+  caption and lyric swaps (the song's audio, the other's conditions);
+  a lyric loop (one line 24 times); audio loops (2-3 s tiled); cover at
+  strength 0; white noise; silence. Noise, loops and silence are scored
+  against their source song's request and plan.
+- **First look, before the ratings.** The audio models catch noise and
+  silence (PQ 5.0/6.7, CE 2.7/3.2, musicality 1.1-1.3 against 7.5-8.5,
+  7-8 and 2.6-4.5 for songs). The LM's reward over the *plan* misses all
+  of them (0.72-0.75: the plan is the source's); over the *render* it
+  drops for noise and a 3 s loop (0.61, 0.60) but not silence (0.72).
+  The 1- and 2-step songs score like songs on every component (latents
+  60-70% off the 8-step render, so they are real renders): the listening
+  says whether they are bad. Lyric swaps show in the DiT alignment
+  (0.025, 0.034 against their sources' 0.28); caption swaps cost the
+  reward only 0.04 and 0.14, lyric swaps 0.02 and 0.07. Silence's
+  alignment is high (0.54): the instrumental issue.
+- **The listening panel**: https://claude.ai/artifact/H2WVUjBnUW1F6gP5uwAJgz
+  (private; db collections `clips` and `ratings`, doc id `cNN` = clip
+  NN). 30 clips: the 20 seed-12 songs and controls c01-c04, c09-c14,
+  shuffled; the clip-to-item map is `out/a14e/panel.json` (kept out of
+  the page). Read the ratings with ArtifactData `list` on `ratings`.
+- **Next**: the user rates; then Spearman per component, the weights,
+  the PMI scale (from the stored raw `PMI`), plan vs render (A-o16), the
+  flag's thresholds.
+
+### A14e — the first ratings (2026-10-13)
+
+The user rated all 30 panel clips in ~11 minutes (skimming 45 min of
+audio); `out/a14e/ratings.json`, mean 3.6 for songs and 2.7 for controls.
+
+- **The rater is consistent where the audio is plainly broken**: both
+  audio loops and the noise got 1. The prompts with a song and a control
+  side by side mostly agree too (1-step synth-pop 2 vs its song 4, lyric
+  loop 2 vs 4, the 2-step country 4 = 4). Two exceptions: the 1-step
+  orchestral rock got 5 where its 8-step sibling got 2, and both covers at
+  strength 0 got 4-5. The covers were never broken (strength 0 is a
+  text2music render over silence, a song like any other), a flaw in the
+  control, not the rating.
+- **Spearman against the ratings** (chance |rho| at 95%: 0.36 for 30,
+  0.44 for the 20 songs):
+
+  | component | all 30 | songs 20 |
+  |---|---|---|
+  | PMI caption, render codes | **+0.60** | **+0.56** |
+  | PMI caption, plan codes | +0.39 | +0.42 |
+  | LM reward, render / plan | +0.37 / +0.24 | +0.41 / +0.37 |
+  | Audiobox CE | +0.44 | +0.33 |
+  | Audiobox PQ, CU, PC | +0.30, +0.20, -0.05 | +0.04, +0.02, -0.08 |
+  | SongEval (five) | +0.34 to +0.38 | +0.18 to +0.31 |
+  | lyric alignment DiT / LM | -0.28 / -0.33 | -0.48 / -0.30 |
+  | PMI lyrics, render / plan | -0.27 / -0.31 | -0.20 / -0.26 |
+
+- **Readings.** Only the caption PMI over the render's codes clears
+  chance on both sets: A-o16 leans to the render. The negative alignment
+  and lyric PMI are the instrumental confound: instrumentals score high
+  on alignment and the user rated them lower (3.1 against 3.85 for the
+  sung songs). No component sees a 2 s loop (rated 1): every score of
+  `c11` sits among the songs'. A loop needs its own detector
+  (self-similarity), which no scorer here has. The caption PMI alone is
+  not a flag either: the Spanish reggaeton (`n11-12`, rated 3) sits at
+  -0.24, below the noise control `c14`.
+- **Thin data.** One rater, 30 clips, many ties; enough to rank the
+  components roughly, not to fit weights or thresholds.
+
+### A14e — the loop measure (2026-10-13)
+
+The ratings showed a 2 s tiled clip (rated 1) scoring like a song on every
+component. **`ace/loops`** measures repetition on the audio, on the CPU, no
+model: 64 log-mel bands (30 Hz-8 kHz) every 1024 samples, centred on the
+song's mean and normalised; each frame against the frame 0.5-12 s later
+(or one frame after that, so a period between frames costs nothing);
+frames 50 dB under the loudest never match. Two measures:
+
+- **repetition**: the share of frames ≥ 0.9 alike at the best lag;
+- **the longest loop**: the longest stretch ≥ 0.98 alike at one lag (gaps
+  under 0.25 s bridged) plus the lag, in seconds and as a share.
+
+Chosen on a numpy prototype over the set, then ported (the Go numbers
+within 0.01 of it). In `Quality.Loops` on every scored song and in
+`Rescore`; `cmd/ace -aesthetics` prints it; `cmd/acecal -loops` added it to
+the 57 records without the device. ~0.13 s for 60 s, 0.23 s for 120 s.
+Not in the served `quality` yet (A14f maps fields one by one).
+
+- **Tiles**: every 1-8 s tile of six songs scores 1.000, and 1.000 again
+  after an mp3 round trip (the 8 kHz cap is what survives mp3; at 16 kHz
+  and 0.99 an mp3'd 2 s tile fell to 0.34 coverage). A song whose second
+  half is a 4 s loop scores 0.50. Silence 0. `go test ./ace/loops` holds
+  these on synthetic audio.
+- **Real songs repeat too, near-exactly.** The deep house `n04-12` has a
+  48 s stretch 0.98 alike at 8 s (0.40 of it), the chiptune `n16-12` 16 of
+  its 30 s (0.54). The LM's plans do not loop (the longest exact code
+  repeat in any plan is 6.8 s): the DiT renders near-copies from codes
+  that differ. The user rated both 2.
+- **Against the ratings** (chance |rho| 0.44 at 20, 0.36 at 30):
+
+  | measure | all 30 | songs 20 |
+  |---|---|---|
+  | loop share | -0.41 | **-0.69** |
+  | loop seconds | -0.40 | -0.67 |
+  | repetition | -0.35 | -0.57 |
+
+  The strongest single component yet among the songs (the render's
+  caption PMI was +0.56). Over all 30 it is weaker: the noise control
+  (rated 1) has no loop at all, which CE catches instead.
+- **No flag yet.** Loops score 1.00; the most looped real song 0.54, and a
+  half-looped song 0.50. Where "poor" starts is the fit's, with the second
+  panel's data.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -2532,8 +2653,18 @@ image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`p
   - **A14d is done and deployed** (same day): SongEval's five whole-song
     scores on every song, within 0.0001 of upstream from the same input.
     See § A14d — result.
-  - **Next: A14e**, calibration against listening, and the good/fair/poor
-    flag.
+  - **A14e under way**: the set is built and scored, the user rated the
+    panel (§ A14e — the first ratings), and `ace/loops` measures the
+    repetition nothing else saw (§ A14e — the loop measure). Calibration
+    paused 2026-10-13 at the user's call; next, when it resumes: a second
+    panel (repeats for consistency, more songs), then the fit, the headline
+    number and the good/fair/poor flag.
+  - **A14f in part (2026-10-13)**: `quality` now carries every component:
+    `render` (the LM's verdict over the render's own codes, A-o16's
+    numbers, on any path with the LM loaded, covers included) and `loops`
+    beside the rest; no headline number, no flag, by the user's choice.
+    Scoring a 30 s song went 0.9 → 1.8 s. `cmd/ace` logs both. Not
+    deployed yet. Still to do from A14f: `-score-only` on any file.
 - **A13, understand (captioning existing audio)**: done 2026-10-12, see
-  § A13 — result. Served as `full_analysis_only` on `/v1/music`. Not
-  deployed yet: `ai.service` runs the binary from before it.
+  § A13 — result. Served as `full_analysis_only` on `/v1/music`, and
+  deployed: the `ai` binary of 2026-10-13 20:15 postdates it.

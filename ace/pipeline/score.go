@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"strix-halo-vulkan/ace/lm"
+	"strix-halo-vulkan/ace/loops"
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/audiobox"
 	h3vae "strix-halo-vulkan/h3/vae"
@@ -39,7 +40,15 @@ type Quality struct {
 	Aesthetics *audiobox.Scores
 	// Song is SongEval's five whole-song scores (MUSIC.md A14d), 1-5.
 	Song *songeval.Scores
-	Took time.Duration
+	// Render is the LM's verdict over codes re-tokenized from the finished
+	// song rather than the codes it planned (MUSIC.md A-o16): what was
+	// made, not what was meant. It runs whenever the LM is loaded, so a
+	// cover or a repaint has one too.
+	Render *lm.Score
+	// Loops is how much of the song repeats itself at one short lag
+	// (MUSIC.md A14e), on the CPU.
+	Loops *loops.Result
+	Took  time.Duration
 }
 
 // LyricScore is get_lyric_score's pair: "lm" from pure noise at t = 1 (the

@@ -386,11 +386,19 @@ func (c musicCost) total() time.Duration {
 }
 
 // scoreCost is the auto score's share of a request.
-func scoreCost(r *plan.Request, thinking bool, seconds float64) time.Duration {
+func scoreCost(r *plan.Request, thinking, withLM bool, seconds float64) time.Duration {
 	s := 0.0
+	lmScore := 0.35 + 0.0027*seconds + 0.13*math.Ceil(float64(len(r.Lyrics))/200)
 	if thinking {
-		s += 0.35 + 0.0027*seconds + 0.13*math.Ceil(float64(len(r.Lyrics))/200)
+		s += lmScore
 	}
+	if withLM {
+		// The render's own codes: the tokenizer (~0.4 ms a second) and
+		// the same LM pass again.
+		s += lmScore + 0.0004*seconds
+	}
+	// The loop measure, on the host.
+	s += 0.002 * seconds
 	if strings.TrimSpace(r.Lyrics) != "" {
 		s += 0.05 + 0.003*seconds
 	}
@@ -439,7 +447,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank)
 	c.encode = encodeCost(audio)
 	if req.Score {
-		c.score = scoreCost(r, req.Thinking, secs)
+		c.score = scoreCost(r, req.Thinking, !b.opt.NoLM, secs)
 	}
 	var sampling *lm.Sampling
 	if req.LMTemperature != nil || req.LMCFGScale != nil || req.LMTopP != nil {
@@ -522,7 +530,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank)
 				c.think, c.sample, c.encode = spent, sampled, enc
 				if req.Score {
-					c.score = scoreCost(d, req.Thinking, seconds)
+					c.score = scoreCost(d, req.Thinking, !b.opt.NoLM, seconds)
 				}
 				m := &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM, KeyScale: d.KeyScale,
 					TimeSignature: d.TimeSignature, Duration: seconds, Language: cmpStr(d.Language, "unknown")}
@@ -548,7 +556,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 
 // musicQuality is the auto score as the API reports it, or nil.
 func musicQuality(q *pipeline.Quality) *api.MusicQuality {
-	if q == nil || (q.LM == nil && q.Lyrics == nil && q.Aesthetics == nil && q.Song == nil) {
+	if q == nil || (q.LM == nil && q.Lyrics == nil && q.Aesthetics == nil && q.Song == nil && q.Render == nil && q.Loops == nil) {
 		return nil
 	}
 	out := &api.MusicQuality{}
@@ -565,6 +573,13 @@ func musicQuality(q *pipeline.Quality) *api.MusicQuality {
 	if s := q.Song; s != nil {
 		out.Song = &api.MusicSongEval{Coherence: s.Coherence, Musicality: s.Musicality, Memorability: s.Memorability,
 			Clarity: s.Clarity, Naturalness: s.Naturalness}
+	}
+	if s := q.Render; s != nil {
+		out.Render = &api.MusicAdherence{Score: s.Reward, Adherence: s.Conditions, PMI: s.PMI}
+	}
+	if l := q.Loops; l != nil {
+		out.Loops = &api.MusicLoops{Repetition: l.Repetition, RepetitionLag: l.RepetitionLag, LoopSeconds: l.LoopSeconds,
+			LoopShare: l.LoopShare, LoopLag: l.LoopLag}
 	}
 	return out
 }

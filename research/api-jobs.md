@@ -196,7 +196,11 @@ number is in [0, 1], higher better:
   "lyrics_alignment": {"lm": 0.202, "dit": 0.205},
   "aesthetics": {"pq": 8.30, "pc": 4.28, "ce": 6.94, "cu": 7.75},
   "song": {"coherence": 3.83, "musicality": 3.67, "memorability": 3.65,
-           "clarity": 3.63, "naturalness": 3.49}
+           "clarity": 3.63, "naturalness": 3.49},
+  "render": {"score": 0.664, "adherence": {"bpm": 0.908, "caption": 0.505, "duration": 0.8, "keyscale": 0.82, "language": 0.825, "lyrics": 0.819, "timesignature": 0.8},
+             "pmi": {"caption": 0.01, "lyrics": 0.756}},
+  "loops": {"repetition": 0.097, "repetition_lag": 0.5, "loop_seconds": 1.3,
+            "loop_share": 0.02, "loop_lag": 0.6}
 }
 ```
 
@@ -230,10 +234,30 @@ number is in [0, 1], higher better:
   Our songs score about 3–4, and noise about 1.1. The score moves by about
   ±0.05 on inputs that differ inaudibly, so read it to one decimal place.
   `-music-songeval=false` leaves it out (~2.6 GB).
-- There is no good/fair/poor flag yet. Its thresholds wait for A14e's
-  calibration against listening.
+- `render` is the LM's verdict again (`score`, `adherence`, `pmi` as
+  above), but over codes re-tokenized from the finished audio instead of
+  the codes the LM planned: it scores what was made. It runs whenever the
+  LM is loaded, so a cover or a repaint has one where it has no `score`.
+  On the first listening panel (A14e) its caption PMI tracked the ratings
+  best of the LM's numbers (Spearman +0.60, against +0.39 for the plan's).
+- `loops` is how much of the song copies itself at one short lag
+  (`ace/loops`, A14e), from the audio alone. Lower is better. (The
+  example's `render` and `loops` come from another song, A14e's `n01-12`.)
+  - `repetition`: the share of the song at least 0.9 alike to itself
+    `repetition_lag` seconds later.
+  - `loop_seconds`: the longest stretch that is a near-copy (0.98 alike)
+    of what came `loop_lag` seconds before, the first period included;
+    `loop_share` is its share of the song.
 
-It costs ~0.9 s on a 30 s song and ~4.9 s on a 200 s one.
+  A clip tiled to a song's length scores 1. Generated songs reached 0.54,
+  and the more a song looped, the lower it was rated (Spearman -0.69 over
+  20 songs).
+- There is no headline number combining these and no good/fair/poor
+  flag yet. Both wait for A14e's calibration against listening.
+
+It cost ~0.9 s on a 30 s song and ~4.9 s on a 200 s one before `render`
+and `loops`; with them a 30 s song measured 1.8 s (longer songs not
+re-measured; the estimate adds the LM pass again and ~2 ms a second).
 Three jobs submitted together on this machine (MUSIC.md A9, before A10's
 int8 LM halved its step):
 

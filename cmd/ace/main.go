@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"strix-halo-vulkan/ace/lm"
+	"strix-halo-vulkan/ace/loops"
 	"strix-halo-vulkan/ace/pipeline"
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/audiobox"
@@ -81,7 +82,7 @@ func main() {
 	understand := flag.String("understand", "", "caption this song instead of generating one (any format ffmpeg reads)")
 	lmTemp := flag.Float64("lm-temp", 0, "-understand's LM temperature (0: upstream's API's 0.3)")
 	score := flag.Bool("score", true, "score the song as upstream's auto score does (MUSIC.md A14b): the LM's PMI over its codes, the DiT's lyric alignment")
-	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c) and SongEval (A14d) instead of generating, as JSON")
+	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c), SongEval (A14d) and the loop measure (A14e) instead of generating, as JSON")
 	flag.Parse()
 
 	if *aesthetics != "" {
@@ -207,6 +208,9 @@ func main() {
 			if s := q.LM; s != nil {
 				log.Printf("score %.4f (LM %v): adherence %v, PMI %v", s.Reward, s.Stats, s.Conditions, s.PMI)
 			}
+			if s := q.Render; s != nil {
+				log.Printf("score over the render's codes %.4f: adherence %v, PMI %v", s.Reward, s.Conditions, s.PMI)
+			}
 			if a := q.Lyrics; a != nil {
 				log.Printf("lyric alignment: lm %.4f %+v, dit %.4f %+v", a.LM.Score, a.LM, a.DiT.Score, a.DiT)
 			}
@@ -215,6 +219,10 @@ func main() {
 			}
 			if s := q.Song; s != nil {
 				log.Printf("songeval: %+v", *s)
+			}
+			if l := q.Loops; l != nil {
+				log.Printf("loops: repetition %.3f at %.1f s, longest loop %.1f s (%.2f of the song) at %.1f s",
+					l.Repetition, l.RepetitionLag, l.LoopSeconds, l.LoopShare, l.LoopLag)
 			}
 			log.Printf("scored in %v", q.Took.Round(time.Millisecond))
 		}
@@ -250,7 +258,9 @@ func runAesthetics(models, path string) {
 		}
 		secs := float64(len(wav)/2) / plan.SampleRate
 		log.Printf("%.1f s, %d windows, %v on the device", secs, len(r.Windows), r.Took)
-		scores := map[string]float64{"pq": r.PQ, "pc": r.PC, "ce": r.CE, "cu": r.CU}
+		l := loops.Measure(wav)
+		scores := map[string]float64{"pq": r.PQ, "pc": r.PC, "ce": r.CE, "cu": r.CU,
+			"repetition": l.Repetition, "loop_seconds": l.LoopSeconds, "loop_share": l.LoopShare}
 		if muq, head := pipeline.SongEvalDirs(models); fileExists(muq) && fileExists(head) {
 			se, err := songeval.Load(d, muq, head, secs)
 			if err != nil {
