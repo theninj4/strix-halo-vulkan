@@ -36,13 +36,16 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"strix-halo-vulkan/ace/lm"
 	"strix-halo-vulkan/ace/pipeline"
 	"strix-halo-vulkan/ace/plan"
+	"strix-halo-vulkan/audiobox"
 	"strix-halo-vulkan/backend"
 	"strix-halo-vulkan/vk"
 )
@@ -76,8 +79,14 @@ func main() {
 	explicit := flag.Bool("explicit-mask", false, `chunk_mask_mode "explicit": the chunk mask is the span`)
 	understand := flag.String("understand", "", "caption this song instead of generating one (any format ffmpeg reads)")
 	lmTemp := flag.Float64("lm-temp", 0, "-understand's LM temperature (0: upstream's API's 0.3)")
+	score := flag.Bool("score", true, "score the song as upstream's auto score does (MUSIC.md A14b): the LM's PMI over its codes, the DiT's lyric alignment")
+	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c) instead of generating: PQ, PC, CE, CU as JSON")
 	flag.Parse()
 
+	if *aesthetics != "" {
+		runAesthetics(*models, *aesthetics)
+		return
+	}
 	if *understand != "" {
 		runUnderstand(*models, *understand, *seed, *lmSeed, *lmTemp, *lmFP16)
 		return
@@ -160,7 +169,15 @@ func main() {
 				return err
 			}
 		}
-		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp, Audio: audio})
+		if aes := pipeline.AesDir(*models); *score {
+			if _, err := os.Stat(aes); err == nil {
+				if err := p.LoadAesthetics(d, aes); err != nil {
+					return err
+				}
+			}
+		}
+		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp, Audio: audio,
+			Score: *score})
 		if err != nil {
 			return err
 		}
@@ -180,6 +197,18 @@ func main() {
 		}
 		log.Printf("wrote %s: %.1f s of audio in %.2f s (text %.0f ms, encoders %.0f ms, DiT %.2f s, VAE %.2f s)",
 			*out, res.Seconds, t.Total.Seconds(), t.Text.Seconds()*1e3, t.Encode.Seconds()*1e3, t.DiT.Seconds(), t.VAE.Seconds())
+		if q := res.Quality; q != nil {
+			if s := q.LM; s != nil {
+				log.Printf("score %.4f (LM %v): adherence %v, PMI %v", s.Reward, s.Stats, s.Conditions, s.PMI)
+			}
+			if a := q.Lyrics; a != nil {
+				log.Printf("lyric alignment: lm %.4f %+v, dit %.4f %+v", a.LM.Score, a.LM, a.DiT.Score, a.DiT)
+			}
+			if a := q.Aesthetics; a != nil {
+				log.Printf("aesthetics: PQ %.2f PC %.2f CE %.2f CU %.2f", a.PQ, a.PC, a.CE, a.CU)
+			}
+			log.Printf("scored in %v", q.Took.Round(time.Millisecond))
+		}
 		return nil
 	})
 	if err != nil {
@@ -188,6 +217,41 @@ func main() {
 }
 
 // runUnderstand is -understand.
+// runAesthetics is -aesthetics: any file ffmpeg reads, as 48 kHz stereo,
+// through Audiobox Aesthetics alone.
+func runAesthetics(models, path string) {
+	wav, err := pipeline.ReadAudio(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	dev, err := backend.OpenDevice("ace")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer dev.Close()
+	err = dev.Do(func(d *vk.Device) error {
+		m, err := audiobox.Load(d, pipeline.AesDir(models), audiobox.DefaultWindows)
+		if err != nil {
+			return err
+		}
+		defer m.Destroy()
+		r, err := m.Score(wav)
+		if err != nil {
+			return err
+		}
+		log.Printf("%.1f s, %d windows, %v on the device", float64(len(wav)/2)/plan.SampleRate, len(r.Windows), r.Took)
+		out, err := json.Marshal(map[string]float64{"pq": r.PQ, "pc": r.PC, "ce": r.CE, "cu": r.CU})
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
 func runUnderstand(models, path string, seed, lmSeed uint64, temp float64, fp16 bool) {
 	wav, err := pipeline.ReadAudio(path)
 	if err != nil {

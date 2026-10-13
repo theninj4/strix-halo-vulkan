@@ -4220,3 +4220,35 @@ var LLMMoEDownQ8TW2M1 []byte
 
 //go:embed llm_moe_down_q8t_w4m1.spv
 var LLMMoEDownQ8TW4M1 []byte
+
+// ---- Audiobox Aesthetics (MUSIC.md A14c): Meta's WavLM-base song scorer.
+// The GEMMs are dit_gemm's (the kokoro conv builds for the strided feature
+// extractor, the plain rungs for the projections), the packs kokoro's HD64;
+// what is new is the fp32 first conv, column statistics, the exact-erf GELU
+// narrow, the grouped positional conv, and the gated relative-position bias
+// plane the attention's REL_BIAS build adds at a head width of 64.
+
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o audiobox_conv0.spv audiobox_conv0.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o audiobox_colstats.spv audiobox_colstats.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o audiobox_act.spv audiobox_act.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o audiobox_posconv.spv audiobox_posconv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o audiobox_relbias.spv audiobox_relbias.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DQT=1 -DKTIL=4 -DREL_BIAS=1 -DOUT_F16=1 -DHEAD_DIM=64 -DWAVE=32 -o audiobox_attn_hd64_w32.spv dit_attention_wmma.comp
+
+//go:embed audiobox_conv0.spv
+var AudioboxConv0 []byte
+
+//go:embed audiobox_colstats.spv
+var AudioboxColStats []byte
+
+//go:embed audiobox_act.spv
+var AudioboxAct []byte
+
+//go:embed audiobox_posconv.spv
+var AudioboxPosConv []byte
+
+//go:embed audiobox_relbias.spv
+var AudioboxRelBias []byte
+
+//go:embed audiobox_attn_hd64_w32.spv
+var AudioboxAttnHD64W32 []byte

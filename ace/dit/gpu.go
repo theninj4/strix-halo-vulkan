@@ -1365,6 +1365,25 @@ func (g *GPU) Step(x, ctx *qwen.Mat, t float32) (*qwen.Mat, time.Duration, error
 }
 
 func (g *GPU) stepGraph(x, ctx *qwen.Mat, t float32) (*graph, int, error) {
+	gr, n, err := g.inputGraph(x, ctx, t)
+	if err != nil {
+		return nil, 0, err
+	}
+	for l, w := range g.ditL {
+		if err := gr.layer(g.dit, w, n, g.vecs(l), true); err != nil {
+			return nil, 0, err
+		}
+	}
+	gr.norm(g.dit, "norm out", n, g.aTail, g.aTail+uint32(g.dit.H))
+	if err := gr.gemm(gemmSmall, g.projOut.bank, "gemm proj out", g.hA, g.aS, g.projOut.off, n, g.projOut.n, g.dit.H, g.dit.ldaH); err != nil {
+		return nil, 0, err
+	}
+	return gr, n, nil
+}
+
+// inputGraph uploads forward t's vectors and the patch operand, and records
+// the patch embedding: a forward up to its first layer.
+func (g *GPU) inputGraph(x, ctx *qwen.Mat, t float32) (*graph, int, error) {
 	c := g.cfg
 	T := x.Rows
 	n := g.Tokens(T)
@@ -1403,15 +1422,6 @@ func (g *GPU) stepGraph(x, ctx *qwen.Mat, t float32) (*graph, int, error) {
 		return nil, 0, err
 	}
 	g.zeroKeyTail([]uint32{g.hK, g.hV}, g.dit.kv, g.rows, n)
-	for l, w := range g.ditL {
-		if err := gr.layer(g.dit, w, n, g.vecs(l), true); err != nil {
-			return nil, 0, err
-		}
-	}
-	gr.norm(g.dit, "norm out", n, g.aTail, g.aTail+uint32(g.dit.H))
-	if err := gr.gemm(gemmSmall, g.projOut.bank, "gemm proj out", g.hA, g.aS, g.projOut.off, n, g.projOut.n, g.dit.H, g.dit.ldaH); err != nil {
-		return nil, 0, err
-	}
 	return gr, n, nil
 }
 

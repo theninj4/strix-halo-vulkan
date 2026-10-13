@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// WavLM's positional convolution (MUSIC.md A14c), with its GELU and the
+// residual add: out[t][c] = x[t][c] + gelu(b[c] + sum_{j<48, k<128}
+// W[c][j][k] · x[t + k − 64][48·g + j]), g = c / 48, over a window's frames
+// t < tokens. Kernel 128 with padding 64 gives one frame too many and
+// SamePad drops it, which is the t + k − 64 above. Frames at or past aux1
+// (the window's valid length) are read as zero -- upstream zeroes the
+// padded frames before the convolution -- and so are t + k − 64 < 0.
+//
+// fp32 throughout: 2.35 GMAC a window, 1% of a song's request. A workgroup
+// is one group's 48 channels over 64 frames: 192 threads, a channel and 16
+// frames each, the 192 input frames it reads staged in LDS. The weight
+// (weight norm folded on the host) is [16 groups][48 j][128 k][48 c] so a
+// wave's 48 channels read one 192-byte line.
+//
+//   pc.inOff   x [tokens][768], act      pc.outOff  out [tokens][768], act
+//   pc.wOff    W as above, wbuf          pc.aux0    bias [768], wbuf
+#include "dit_common.glsl"
+#include "audiobox_common.glsl"
+#define TT 64u
+#define HALO 64u
+#define ROWS (TT + 2u * HALO)
+layout(local_size_x = 192) in;
+shared float xs[ROWS * 48u];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint g = gl_WorkGroupID.y;
+    uint t0 = gl_WorkGroupID.x * TT;
+    for (uint i = tid; i < ROWS * 48u; i += 192u) {
+        uint row = i / 48u, j = i % 48u;
+        int t = int(t0 + row) - int(HALO);
+        float v = 0.0;
+        if (t >= 0 && uint(t) < pc.aux1 && uint(t) < pc.tokens) {
+            v = act[pc.inOff + uint(t) * 768u + g * 48u + j];
+        }
+        xs[i] = v;
+    }
+    barrier();
+    uint c = tid % 48u, lane = tid / 48u; // frames lane, lane + 4, ...
+    float acc[16];
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        acc[i] = 0.0;
+    }
+    uint wg = pc.wOff + g * 48u * 128u * 48u;
+    for (uint j = 0u; j < 48u; ++j) {
+        for (uint k = 0u; k < 128u; ++k) {
+            float w = wbuf[wg + (j * 128u + k) * 48u + c];
+            // out frame t0 + lane + 4i reads x[t0 + lane + 4i + k - 64],
+            // which is LDS row lane + 4i + k.
+            [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+                acc[i] += w * xs[(lane + 4u * i + k) * 48u + j];
+            }
+        }
+    }
+    uint ch = g * 48u + c;
+    float b = wbuf[pc.aux0 + ch];
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        uint t = t0 + lane + 4u * i;
+        if (t < pc.tokens) {
+            uint o = t * 768u + ch;
+            act[pc.outOff + o] = act[pc.inOff + o] + ab_gelu(acc[i] + b);
+        }
+    }
+}

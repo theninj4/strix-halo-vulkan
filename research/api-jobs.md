@@ -178,8 +178,50 @@ it; after the CoT when the LM chose it), `metadata` holds what the DiT was
 asked for (the rewritten caption, bpm, key, time signature, duration,
 language, and in sample mode the `lyrics` and `genres` the LM wrote, there
 as soon as it has written them), `stage` is `sample`, `think`, `codes`,
-`dit`, `vae` or `write`, and
+`dit`, `vae`, `score` or `write`, and
 `estimated_seconds` is redone from measured rates once the length is known.
+
+**A finished song carries a `quality` object** (MUSIC.md A14b): upstream
+ACE-Step's own auto score, which its Gradio app shows and its API does not
+return. It is on by default and filled in before the job completes;
+Gradio's `auto_score: false` turns it off (`quality` is then null). Every
+number is in [0, 1], higher better:
+
+```json
+"quality": {
+  "score": 0.709,
+  "adherence": {"caption": 0.482, "lyrics": 0.998, "bpm": 0.908, "duration": 0.86,
+                "keyscale": 0.83, "language": 0.838, "timesignature": 0.791},
+  "pmi": {"caption": -0.036, "lyrics": 3.129},
+  "lyrics_alignment": {"lm": 0.202, "dit": 0.205},
+  "aesthetics": {"pq": 8.30, "pc": 4.28, "ce": 6.94, "cu": 7.75}
+}
+```
+
+- `score` and `adherence` come from the 5 Hz LM. It reads the song's
+  codes and is asked how strongly they predict each requested condition:
+  the caption and the lyrics by PMI through a sigmoid (`pmi` holds the
+  raw values, in nats a token), and each meta by top-10 recall. `score`
+  weighs caption 0.5, lyrics 0.3 and the metas 0.2. It needs the codes the
+  thinking path writes, so a cover, a repaint or `thinking: false` has
+  none.
+- `lyrics_alignment` comes from the DiT. It measures whether the
+  cross-attention follows each lyric line once and in order, and is there
+  whenever the song has lyrics.
+- `aesthetics` is Meta's Audiobox Aesthetics on the audio itself (A14c),
+  on its own 1–10 scale:
+  - `pq`: production quality (clarity, fidelity, dynamics);
+  - `pc`: production complexity (how many components);
+  - `ce`: content enjoyment;
+  - `cu`: content usefulness (as material for further work).
+
+  ACE-Step 1.5's report quotes PQ 8.35 and CU 8.09 for its songs. White
+  noise scores PQ 5.2, PC 2.1 and CE 2.9. `-music-aes=false` leaves it
+  out.
+- There is no good/fair/poor flag yet. Its thresholds wait for A14e's
+  calibration against listening.
+
+It costs ~0.8 s on a 30 s song and ~3.7 s on a 200 s one.
 Three jobs submitted together on this machine (MUSIC.md A9, before A10's
 int8 LM halved its step):
 

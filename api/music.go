@@ -41,6 +41,14 @@ package api
 // to hold) would be ignored, so it is a 400; upstream's fixed temperature
 // 0.3 is lm_temperature's default rather than a constant.
 //
+// A finished song carries upstream's auto score (MUSIC.md A14b) as the
+// job's `quality`, filled in before the job completes: the 5 Hz LM's
+// verdict on how well its codes match each thing the song was asked for
+// (`adherence`, 0-1 each; `score`, their weighted reward), and the DiT's
+// lyric alignment when there are lyrics. Upstream computes it in its Gradio
+// app ("Auto Score") and its API never returns it; Gradio's own
+// `auto_score` field turns it off here (it costs ~0.7 s on a 30 s song).
+//
 // Jobs live in memory, as the video ones do: a restart forgets them and
 // their files.
 
@@ -127,6 +135,9 @@ type MusicRequest struct {
 	RepaintMode              string
 	RepaintStrength          *float64
 	ExplicitMask             bool
+	// Score runs the auto score on the finished song (MUSIC.md A14b):
+	// `auto_score`, on unless it is false.
+	Score bool
 }
 
 // Music tasks the turbo model runs (upstream's TASK_TYPES_TURBO).
@@ -155,6 +166,50 @@ type MusicProgress struct {
 	Plan     *MusicMetadata
 	Seconds  float64
 	Estimate time.Duration
+	// Quality is the auto score, once the song is scored.
+	Quality *MusicQuality
+}
+
+// MusicQuality is a song's auto score: upstream's own (MUSIC.md A14b),
+// every number in [0, 1], and Audiobox Aesthetics' (A14c), 1-10; higher is
+// better throughout. A part is absent when it did not run:
+// the LM's needs the codes the thinking path writes (not a cover, a repaint
+// or thinking false), the alignment needs lyrics.
+type MusicQuality struct {
+	// Score is the LM's reward: adherence weighted caption 0.5, lyrics 0.3
+	// and the metadata's mean 0.2 (upstream's "Global Quality Score").
+	Score *float64 `json:"score"`
+	// Adherence is per condition: caption and lyrics by PMI (how much the
+	// song's codes raise the LM's belief in them, through a sigmoid), bpm,
+	// duration, keyscale, language, timesignature and genres by the LM's
+	// top-10 recall of the requested value.
+	Adherence map[string]float64 `json:"adherence,omitempty"`
+	// PMI is the caption's and the lyrics' raw PMI, in nats a token.
+	PMI map[string]float64 `json:"pmi,omitempty"`
+	// LyricsAlignment is the DiT's: whether each lyric line is attended to
+	// once, in order (coverage² · monotonicity² · confidence), from pure
+	// noise ("lm") and from the finished song ("dit").
+	LyricsAlignment *MusicAlignment `json:"lyrics_alignment,omitempty"`
+	// Aesthetics is Meta's Audiobox Aesthetics on the audio (MUSIC.md
+	// A14c), on its own 1-10 scale rather than [0, 1].
+	Aesthetics *MusicAesthetics `json:"aesthetics,omitempty"`
+}
+
+// MusicAesthetics are Audiobox Aesthetics' four axes, each 1-10: production
+// quality (clarity, fidelity, dynamics), production complexity (how many
+// components), content enjoyment, and content usefulness (as material for
+// further work).
+type MusicAesthetics struct {
+	PQ float64 `json:"pq"`
+	PC float64 `json:"pc"`
+	CE float64 `json:"ce"`
+	CU float64 `json:"cu"`
+}
+
+// MusicAlignment is get_lyric_score's pair.
+type MusicAlignment struct {
+	LM  float64 `json:"lm"`
+	DiT float64 `json:"dit"`
 }
 
 // MusicMetadata is what the DiT was asked for: the request's metas where
@@ -227,6 +282,9 @@ type MusicJob struct {
 	Steps     int            `json:"steps"`
 	Stage     string         `json:"stage,omitempty"`
 	Estimated float64        `json:"estimated_seconds"`
+	// Quality is the auto score (MusicQuality): null until the song is
+	// scored, and when auto_score is false.
+	Quality *MusicQuality `json:"quality"`
 }
 
 type musicJob struct {
@@ -505,6 +563,10 @@ func (q *MusicJobs) run(j *musicJob) {
 		if p.Estimate > 0 {
 			j.Estimated = p.Estimate.Round(time.Second).Seconds()
 		}
+		if p.Quality != nil {
+			q := *p.Quality
+			j.Quality = &q
+		}
 	})
 
 	q.mu.Lock()
@@ -750,7 +812,7 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 		}
 	}
 	var err error
-	r := &MusicRequest{Thinking: true}
+	r := &MusicRequest{Thinking: true, Score: true}
 	if r.Model, err = f.str("model"); err != nil {
 		return nil, err
 	}
@@ -793,6 +855,11 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 		return nil, err
 	} else if ok {
 		r.Thinking = b
+	}
+	if b, ok, err := f.boolean("auto_score", "autoScore"); err != nil {
+		return nil, err
+	} else if ok {
+		r.Score = b
 	}
 	if musicSourceTask(r.Task) {
 		// Upstream skips the LM for these tasks whatever thinking says

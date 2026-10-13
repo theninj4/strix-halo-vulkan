@@ -1,0 +1,63 @@
+#version 450
+// WavLM's gated relative-position bias as the attention's REL_BIAS plane
+// (MUSIC.md A14c), for one window and one layer:
+//
+//   plane[h][i][j] = gate(h, i) · table[h][j − i + aux1 − 1]
+//
+// The table is layer 0's relative_attention_bias at each offset's bucket,
+// already in log2 units (the host multiplies by log2 e; the kernel adds the
+// plane to q·k scaled the same way). The gate is gru_rel_pos's, from the
+// layer's input x (the query before its projection), head h's 64 columns:
+// eight dot products through grep_linear, the first four and the last four
+// summed and squashed, gate = a·(b·grep_a[h] − 1) + 2.
+//
+// A workgroup is one row i of one head; rows and columns past the window's
+// frames get the same formula over finite values -- the attention masks
+// those keys and nothing reads those queries.
+//
+//   pc.inOff   x [tokens][768], act (the window's first row)
+//   pc.outOff  plane [12][aux1][aux1], act
+//   pc.wOff    grep_linear W [8][64], then b [8], then grep_a [12], wbuf
+//   pc.aux0    table [12][2·aux1 − 1], wbuf
+//   pc.aux1    the plane's rows, the padded frame count
+//   pc.tokens  frames that hold an x row
+#include "dit_common.glsl"
+layout(local_size_x = 256) in;
+shared float part[8 * 32];
+shared float gate;
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint i = gl_WorkGroupID.x, h = gl_WorkGroupID.y;
+    uint n = pc.aux1;
+    // 8 outputs x 32 lanes, each lane two of the 64 inputs.
+    {
+        uint m = tid / 32u, d = (tid % 32u) * 2u;
+        float s = 0.0;
+        if (i < pc.tokens) {
+            uint x = pc.inOff + i * 768u + h * 64u + d;
+            s = wbuf[pc.wOff + m * 64u + d] * act[x] + wbuf[pc.wOff + m * 64u + d + 1u] * act[x + 1u];
+        }
+        part[tid] = s;
+    }
+    barrier();
+    if (tid == 0u) {
+        float g[8];
+        for (uint m = 0u; m < 8u; ++m) {
+            float s = wbuf[pc.wOff + 512u + m];
+            for (uint k = 0u; k < 32u; ++k) {
+                s += part[m * 32u + k];
+            }
+            g[m] = s;
+        }
+        float a = 1.0 / (1.0 + exp(-(g[0] + g[1] + g[2] + g[3])));
+        float b = 1.0 / (1.0 + exp(-(g[4] + g[5] + g[6] + g[7])));
+        gate = a * (b * wbuf[pc.wOff + 520u + h] - 1.0) + 2.0;
+    }
+    barrier();
+    float ga = gate;
+    uint tab = pc.aux0 + h * (2u * n - 1u) + (n - 1u) - i;
+    uint dst = pc.outOff + (h * n + i) * n;
+    for (uint j = tid; j < n; j += 256u) {
+        act[dst + j] = ga * wbuf[tab + j];
+    }
+}

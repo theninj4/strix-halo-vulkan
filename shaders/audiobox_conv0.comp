@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// The feature extractor's first convolution (MUSIC.md A14c): 1 channel in,
+// 512 out, 10 taps at stride 5, no bias, in fp32 -- raw audio narrowed to
+// fp16 is what cost the Oobleck encoder 45 dB (A11a), and this layer is 1% of
+// the extractor's arithmetic, so it does not go through the GEMM.
+//
+//   pc.inOff   the window's 16 kHz samples, act
+//   pc.outOff  [tokens][512] out, act
+//   pc.wOff    [512][10] taps, wbuf
+//   pc.tokens  output frames
+#include "dit_common.glsl"
+layout(local_size_x = 256) in;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint t = i >> 9, c = i & 511u;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint src = pc.inOff + 5u * t;
+    uint w = pc.wOff + c * 10u;
+    float s = 0.0;
+    [[unroll]] for (uint k = 0u; k < 10u; ++k) {
+        s += wbuf[w + k] * act[src + k];
+    }
+    act[pc.outOff + i] = s;
+}

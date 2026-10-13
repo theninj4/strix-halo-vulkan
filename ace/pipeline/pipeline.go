@@ -46,6 +46,7 @@ import (
 	"strix-halo-vulkan/ace/lm"
 	"strix-halo-vulkan/ace/plan"
 	"strix-halo-vulkan/ace/vae"
+	"strix-halo-vulkan/audiobox"
 	"strix-halo-vulkan/embed"
 	h3vae "strix-halo-vulkan/h3/vae"
 	"strix-halo-vulkan/safetensors"
@@ -90,6 +91,23 @@ type Pipeline struct {
 	// GenresErr is why the genres vocabulary did not load (sample mode
 	// needs it), or nil.
 	GenresErr error
+	// Aes is Audiobox Aesthetics (MUSIC.md A14c), when loaded: the auto
+	// score's production and enjoyment half.
+	Aes *audiobox.Model
+}
+
+// AesDir is Audiobox Aesthetics' checkpoint under models/.
+func AesDir(models string) string { return filepath.Join(models, "audiobox-aesthetics") }
+
+// LoadAesthetics stages Audiobox Aesthetics (~0.6 GB with its arenas) for
+// Options.Score.
+func (p *Pipeline) LoadAesthetics(dev *vk.Device, dir string) error {
+	m, err := audiobox.Load(dev, dir, audiobox.DefaultWindows)
+	if err != nil {
+		return err
+	}
+	p.Aes = m
+	return nil
 }
 
 // LMDir is the 5 Hz LM's checkpoint under models/.
@@ -180,6 +198,9 @@ func (p *Pipeline) Destroy() {
 	if p.lmGPU != nil {
 		p.lmGPU.Destroy()
 	}
+	if p.Aes != nil {
+		p.Aes.Destroy()
+	}
 	if p.Enc != nil {
 		p.Enc.Destroy()
 	}
@@ -199,6 +220,7 @@ type Timings struct {
 	Sample                        lm.Stats // sample mode's pass
 	Think, Codes                  lm.Stats // the LM's two phases (thinking path)
 	Text, Encode, DiT, VAE, Total time.Duration
+	Score                         time.Duration   // the auto score (Options.Score)
 	Steps                         []time.Duration // device time a forward
 }
 
@@ -219,6 +241,8 @@ type Result struct {
 	// Sample mode's song and the text it was parsed from.
 	Song       *lm.Song
 	SampleText string
+	// Quality is the auto score, when Options.Score asked for it.
+	Quality *Quality
 }
 
 // Sample is sample mode's request (upstream's sample_query/sample_mode):
@@ -270,6 +294,11 @@ type Options struct {
 	Planned func(d *plan.Request, seconds float64)
 	// Sampled, when set, sees sample mode's song as soon as it is written.
 	Sampled func(song lm.Song)
+	// Score runs upstream's auto score on the song (MUSIC.md A14b): the
+	// LM's PMI when the LM wrote codes, the DiT's lyric alignment when the
+	// song has lyrics; and Audiobox Aesthetics on the audio when it is
+	// loaded (A14c).
+	Score bool
 }
 
 func (o *Options) between() error {
@@ -415,6 +444,9 @@ func (p *Pipeline) Generate(r *plan.Request, o Options) (*Result, error) {
 	}
 	out, err := p.generate(res.DiT, o, dp, res)
 	if err != nil {
+		return nil, err
+	}
+	if err := p.scoreCodes(r, out); err != nil {
 		return nil, err
 	}
 	out.Timings.Total = time.Since(start)
@@ -608,6 +640,7 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 		shift = plan.DefaultShift
 	}
 	sched := plan.Schedule(shift, o.Timesteps)
+	inferSteps := len(sched) // the request's step count, before cover noise trims it
 	x0 := noise
 	if dp.coverNoise > 0 {
 		// Start from the source renoised to the schedule entry nearest
@@ -697,7 +730,44 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 	tm.VAE = time.Since(t0)
 	tm.Total = time.Since(start)
 	res.Audio, res.Latents, res.Seconds, res.Timings = wav, lat, float64(T*plan.Hop)/plan.SampleRate, tm
+	if o.Score {
+		// The DiT still holds this song's condition: the alignment's
+		// forwards read it.
+		t0 := time.Now()
+		o.progress("score", 0, 1)
+		ls, err := p.LyricAlignment(r, lat, ctx, inferSteps, nil)
+		if err != nil {
+			return nil, err
+		}
+		res.Quality = &Quality{Lyrics: ls}
+		if p.Aes != nil {
+			a, err := p.Aes.Score(wav)
+			if err != nil {
+				return nil, err
+			}
+			res.Quality.Aesthetics = &a.Scores
+		}
+		res.Quality.Took = time.Since(t0)
+		res.Timings.Score = res.Quality.Took
+	}
 	return res, nil
+}
+
+// scoreCodes adds the LM's half of the auto score to a thinking-path
+// result: the codes against what the song was asked for.
+func (p *Pipeline) scoreCodes(r *plan.Request, res *Result) error {
+	if res.Quality == nil || p.LM == nil || len(res.Codes) == 0 {
+		return nil
+	}
+	t0 := time.Now()
+	sc, err := p.LM.Score(res.Codes, ScoreConditions(r, res.DiT, res.Meta), lm.ScoreScale)
+	if err != nil {
+		return err
+	}
+	res.Quality.LM = &sc
+	res.Quality.Took += time.Since(t0)
+	res.Timings.Score = res.Quality.Took
+	return nil
 }
 
 // FFmpeg is the encoder (decision 7): we write none of our own.

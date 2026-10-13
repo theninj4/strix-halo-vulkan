@@ -1,0 +1,39 @@
+#version 450
+// An fp32 [tokens][dim] tensor into the fp16 GEMM operand (MUSIC.md A14c),
+// optionally normalised per column and optionally through the exact GELU:
+//
+//   y = x                                               aux2 = 0 (a narrow)
+//   y = gelu(x)                                         aux2 = 2
+//   y = gelu((x − mean[c])·rsqrt(var[c] + eps)·g[c] + b[c])   aux2 = 3
+//
+// mean and var are at act[aux1] and act[aux1 + dim] (audiobox_colstats'
+// combine), g at wbuf[wOff], b at wbuf[aux0]: the first conv's GroupNorm,
+// whose groups are its channels. Out at hact[outOff + row·lda + c], or
+// with aux2 bit 4 in fp32 at act[outOff + row·lda + c] (in place is fine:
+// each element is read and written by one invocation).
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#include "dit_common.glsl"
+#include "audiobox_common.glsl"
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+layout(local_size_x = 256) in;
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint r = gl_WorkGroupID.y;
+    if (c >= pc.dim || r >= pc.tokens) {
+        return;
+    }
+    float x = act[pc.inOff + r * pc.dim + c];
+    if ((pc.aux2 & 1u) != 0u) {
+        float mean = act[pc.aux1 + c], var = act[pc.aux1 + pc.dim + c];
+        x = (x - mean) * inversesqrt(var + uintBitsToFloat(pc.eps)) * wbuf[pc.wOff + c] + wbuf[pc.aux0 + c];
+    }
+    if ((pc.aux2 & 2u) != 0u) {
+        x = ab_gelu(x);
+    }
+    if ((pc.aux2 & 4u) != 0u) {
+        act[pc.outOff + r * pc.lda + c] = x;
+    } else {
+        hact[pc.outOff + r * pc.lda + c] = float16_t(x);
+    }
+}

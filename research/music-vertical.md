@@ -1681,6 +1681,489 @@ resident): A12's 60 s pop-punk song, submitted multipart, completed in
 influences… lead male vocal", 100 bpm, F# major, 2, 60 s, and wrote
 Catalan-ish lyrics: again, the words are the weak part.
 
+### A14 — the plan: a quality score on every song (2026-10-13)
+
+**What the user asked for.** An automatic score on a finished song, plus a
+flag a client can read when it polls the job, to judge the result before
+listening. How it is computed is open. The user mentioned MusicCNN and CLAP
+as examples, not as requirements.
+
+**What "good" can mean here.** No single number covers it. There are three
+separate questions, and published music-generation evaluations score each
+one separately:
+
+1. **Did it follow the request?** Does the song match the caption, the
+   lyrics and the metas that were asked for? This is adherence.
+2. **Does it sound well made?** Is it clean, with no artefacts, mush or
+   clipping? This is production or signal quality.
+3. **Is it a good song?** Is it coherent, with a clear structure, natural
+   vocals and something memorable? This is musical or aesthetic quality.
+
+ACE-Step 1.5's own report (arXiv 2602.00744) scores (2) and (3) with Meta's
+**Audiobox Aesthetics** and **SongEval**. For (1) it uses its own
+ACE-Caption-Reward and ACE-Lyric-Reward models, not CLAP or MuQ-MuLan. The
+v1 report used CLAP and MuLan, and v1.5 dropped them. The report quotes
+AudioBox CU 8.09, PQ 8.35 and SongEval Coherence 4.72 for this model.
+That gives us a reference distribution for the same model on the same
+metrics, so a port that scores our songs far from those numbers is
+suspect.
+
+**What upstream already ships (read at `ca1e85f`).** Gradio's
+"Auto Score" checkbox (`auto_score`, `ui/gradio/events/results/scoring.py`)
+runs two scorers. Its API (`release_task`, `openrouter/`) exposes neither,
+so how we serve it is our own call (A-o14).
+
+- **LM PMI** (`core/scoring/lm_score.py`,
+  `calculate_pmi_score_per_condition`). The 5 Hz LM reads the song's
+  codes in the A13 understand prompt and is teacher-forced on the
+  conditions. It runs one forward over the whole sequence and takes the
+  log-softmax at each target position, with no sampling.
+  - The caption and the lyrics are scored by **PMI**: the mean log p of
+    `<think>\ncaption: …\n</think>\n` (or `<think>\n</think>\n# Lyric\n…`)
+    given the codes, minus the same given the codes string
+    `"NO USER INPUT"`. The result is squashed by `sigmoid(PMI / scale)`.
+  - bpm, duration, genres, keyscale, language and timesignature are
+    scored by **top-10 recall**: the rank-weighted share of the field's
+    YAML tokens that sit in the LM's top 10.
+  - `calculate_reward_score` combines them 0.5 caption, 0.3 lyrics and
+    0.2 mean metadata, and renormalises the weights when one is absent.
+  - `scale` is 0.1 in the function and 0.5 in Gradio's saved preferences
+    (`user_preferences.py`), so the 0–1 number depends on that knob.
+  - This is question (1) only. It also scores the **codes the LM planned**,
+    not the audio the DiT rendered, and Gradio skips it for cover and
+    repaint, which have no LM codes.
+- **DiT lyric alignment** (`core/generation/handler/lyric_score.py`,
+  `core/scoring/dit_score.py`). This runs only when there are lyrics.
+  - One decoder forward on two rows: pure noise at t = 1 (`lm_score`), and
+    the final latent noised to t = 1/steps (`dit_score`). Both use the
+    song's conditioning and seed 42, and the forward exits early after the
+    last listed layer.
+  - It reads the cross-attention probabilities of the heads in the
+    checkpoint's `lyric_alignment_layers_config`. For XL turbo those are
+    `{3: [18, 27], 4: [22], 5: [5, 6, 7], 6: [2, 12, 13], 7: [20, 21]}`,
+    not the handler's default.
+  - The heads are averaged over the lyric tokens (structure tags masked)
+    and min-max normalised, and a DTW path is found on energy².
+  - The score is **coverage² × monotonicity² × path confidence**, in 0–1.
+    It asks whether every lyric line is sung once, in order. That is half
+    of question (1), the half that PMI cannot hear, because the codes do
+    not carry words (A13).
+
+**The outside models, and why each is in or out:**
+
+| model | answers | input | size | weights' licence | verdict |
+|---|---|---|---|---|---|
+| Audiobox Aesthetics (`facebook/audiobox-aesthetics`) | (2), partly (3): PQ production quality, PC complexity, CE enjoyment, CU usefulness, each 1–10 | 16 kHz mono, 10 s windows at a 10 s hop, averaged | WavLM-base: CNN front end + 12 × 768 transformer, plus four layer-weighted MLP heads, ~95 M | CC-BY 4.0 (code CC-BY 4.0 + MIT) | **in** (A14c) |
+| SongEval (`ASLP-lab/SongEval`) | (3): coherence, musicality, memorability, structure clarity, vocal naturalness, each 1–5 | 24 kHz mono, the whole song in one pass | MuQ-large-msd-iter (~300 M; only its first 6 layers are read) + a small head (FFN 1024→4096→1024, 4 × 8-head self-attention, mean+max pool, `tanh·2+3`) | MuQ weights CC-BY-NC 4.0; SongEval's README says CC BY-NC-SA 4.0, its LICENSE file says Apache-2.0 | **in, if the licence is acceptable** (A14d, A-o15) |
+| CLAP (LAION) / MuQ-MuLan | (1): text–audio cosine | 48 kHz / 24 kHz | ~200 M / ~700 M | CLAP permissive; MuLan CC-BY-NC | **out** for now: same question as the LM PMI, with a general-purpose text encoder; ACE-Step dropped them in v1.5 |
+| ACE-Caption-Reward / ACE-Lyric-Reward | (1) | ? | ? | ? | **check** whether they are released (A14a); if so, they replace CLAP |
+| MusicCNN | a tagger (genre, mood, instruments) | 16 kHz | small | ISC | **out**: it labels, it does not judge. Tags could feed an adherence check, but the PMI already does that with the model's own vocabulary |
+| FAD / KAD | distribution distance | — | — | — | **out**: a property of a set of songs, not of one song |
+| Parakeet ASR → WER against the lyrics | (1), intelligibility | 16 kHz | resident already | — | **parked**: words over a full mix need source separation first; DiT alignment covers "sung in order" without it |
+
+**What we would build.** The stages run cheapest first. Each one can ship
+on its own and adds fields to the same object.
+
+- **A14a — survey close-out (no code).** Look for released ACE reward
+  models (HF `ACE-Step/*`, the 1.5 report's links). Read SongEval's
+  actual weights licence (the `ckpt/` folder, the HF dataset card) and
+  MuQ's `LICENSE_weights`. Put both to the user as A-o15.
+- **A14b — upstream's auto-score, ported.** No new weights; it is the LM
+  and the DiT we already have resident.
+  - `ace/lm`: `Planner.Score(codes, Meta, caption, lyrics)`. It prefills
+    the understand prompt once and keeps the KV prefix (A13's
+    `UnderstandPrompt`), then teacher-forces each target with
+    full-vocabulary logits at every target row. TestLogits'
+    harness already teacher-forces this way. The unconditional prompt is the same template over
+    `"NO USER INPUT"`, prefilled once. That means about 10 short forwards
+    after one prefill of T/5 + ~30 tokens. Expect well under a second for
+    a 60 s song; A13 measured a 179-token prefill at 73–90 ms.
+  - `ace/dit`: an attention-probability output for the listed heads of
+    layers 3–7 from the `CROSS` attention build: the softmax over the
+    encoder tokens, written out for those 11 heads only. Then an
+    early-exit forward, layers 0–7 of 32 on two rows. Expect about a
+    quarter of one denoising step.
+  - The DTW, median filter, mask and metrics on the host in Go
+    (`core/scoring/_dtw.py` is 110 lines).
+  - **A departure to measure, not assume:** also run PMI on codes
+    re-tokenized from the *rendered* latent (A13's `AudioCodes`). That
+    scores what was made rather than what was planned, and it gives
+    cover, repaint and DiT-only songs a PMI. Compare the two on A14e's
+    set before choosing.
+  - Oracle `reference/dump_ace_score.py` (`.venv-acestep`): upstream's
+    `calculate_pmi_score_per_condition` and `get_lyric_score` on A7/A12's
+    cases, dumping the per-target mean log-probs, the recalls, the
+    attention energy matrices, the DTW path and the scores.
+  - Gates: log-probs to the TestLogits bound under the fp16 bank, then
+    priced against bf16 under int8 as in A10. Recall exact. The energy
+    matrix to fp16 tolerance. The DTW path exact on the oracle's matrix.
+    Scores to 1e-3.
+- **A14c — Audiobox Aesthetics.** This is the cheapest outside model and
+  the safest licence, and it is the metric the report quotes.
+  - Port WavLM-base to the device in a new `aes/` package. The conv front
+    end goes through kokoro's/ace's conv GEMM. The 12 transformer layers
+    use the DiT GEMM rungs, plus WavLM's gated relative position bias,
+    which is the only unusual piece. Then the per-axis layer weighting
+    and the MLPs.
+  - Input: resample 48 kHz stereo to 16 kHz mono (the reference's
+    torchaudio resample, matched to the oracle), then 10 s windows.
+    Batch the windows: a 4-minute song is 24 rows of ~500 frames.
+  - Oracle `reference/dump_aes.py` in its own venv (`audiobox_aesthetics`
+    from PyPI, torch CPU). Gates: per-layer hidden states, then the four
+    axes to ~1e-3 on A10/A11's songs and a few non-generated clips.
+  - Sanity check: our songs' mean PQ and CU should land near the report's
+    8.35 and 8.09.
+- **A14d — SongEval** (A-o15: yes, 2026-10-13). It is the only model on the list
+  that judges whole-song qualities such as structure, memorability and
+  vocal phrasing, which is closest to "is it good".
+  - Port MuQ's first 6 layers (a mel front end with a Conformer stack at
+    25 Hz; to be confirmed against `muq` at A14a). MuQ wants fp32
+    ("NaN otherwise", its README), so price fp16 against fp32 the way A2
+    did. Then the SongEval head.
+  - The whole song goes in as one sequence: 4 min is about 6,000 frames.
+    The attention is long but cheap at 6 layers, and the DiT attention
+    kernels already handle that length.
+  - Oracle `reference/dump_songeval.py` (`muq`, `hydra`, the repo's
+    `ckpt/`), gated the same way as A14c, with the report's Coherence 4.72
+    as the sanity check.
+- **A14e — calibration: does the score track what a listener hears?**
+  - Build a set:
+    - ~40 normal requests (varied genres, with and without vocals,
+      30 s–4 min, two seeds each);
+    - known-bad controls: 1–2 DiT steps, a caption swapped with another
+      song's, lyrics swapped, A12's degenerate loops, a cover at
+      strength 0, white noise and silence.
+  - Score all of it, and have the user rate ~30 songs blind on a 1–5
+    scale.
+  - Gates:
+    - every control is flagged;
+    - Spearman correlation of each component with the ratings, recorded;
+    - choose the components and the weights for the headline number, the
+      PMI `scale` (0.1 or 0.5), and the flag's thresholds from this
+      set, not invented in advance.
+- **A14f — serve it.**
+  - A `quality` object on `MusicJob`, filled before the job turns
+    `completed`, so a client resolving the job sees it alongside the
+    audio. A shape to propose (A-o14):
+    `{"flag": "good"|"fair"|"poor", "score": 0–1, "adherence":
+    {"caption", "lyrics", "metadata", "lyrics_alignment"}, "production":
+    {"pq", "pc", "ce", "cu"}, "song": {"coherence", "musicality",
+    "memorability", "clarity", "naturalness"}}`. Components that did not
+    run are omitted, not zero.
+  - `cmd/ace -score` prints it, and `cmd/ace -score-only song.mp3` scores
+    any file. The audio models need no request, so this also works on
+    uploads.
+  - The estimate in `backend/music.go` gains the scoring cost.
+  - Memory: Audiobox is ~0.2 GB fp16 and MuQ's 6 layers ~0.3 GB, against
+    the music pipeline's ~21 GB resident. Both stay resident with the music
+    pipeline.
+
+**Costs to expect.** For a 60 s song, A14b should take under ~0.5 s. A14c
+is six 10 s windows through a 95 M model, well under a second. A14d is one
+6-layer pass, about a second. In total that is ≤ ~2 s against a 14.4 s
+request (15%), and the order to build them in is the cost order. If the
+total comes in over that, the flag can be computed after `completed`, with
+`quality` null until then (A-o14).
+
+**Limits to state up front.**
+
+- No automatic score is a listener. Audiobox and SongEval were trained on
+  human ratings of human-made and other models' music. They can be fooled
+  by artefacts that never appeared in their training data, which is what
+  A14e's controls are for.
+- PMI depends on the LM's own vocabulary and biases: a caption the LM
+  writes badly will score badly whatever the audio.
+- Lyric alignment says the words are *placed* in order, not that they
+  are *intelligible*. That would take ASR on separated vocals (parked).
+
+### A14a — result (2026-10-13)
+
+**The survey is closed, and the user answered A-o14 and A-o15 the same
+day: non-commercial weights are fine, so A14d is in, and the score is on
+by default.**
+
+- **ACE's reward models are not released.** HF's `ACE-Step` organisation
+  has no ACE-Caption-Reward or ACE-Lyric-Reward; a search for both names
+  finds nothing. The organisation does publish two Qwen2.5-Omni models,
+  `acestep-captioner` and `acestep-transcriber`. The transcriber is a
+  lyrics ASR, a candidate for intelligibility (lyric WER) if the
+  alignment score proves too weak, and it would not need source
+  separation.
+- **Licences:**
+  - MuQ's weights are CC-BY-NC 4.0 (`LICENSE_weights`, and the HF card
+    for `OpenMuQ/MuQ-large-msd-iter`);
+  - SongEval's head is a 100 MB `ckpt/model.safetensors` in the GitHub
+    repo, whose README and HF dataset card both say CC BY-NC-SA 4.0 (the
+    repo's LICENSE file is Apache-2.0);
+  - Audiobox Aesthetics is CC-BY 4.0.
+- **MuQ, for A14d** (`config.json`):
+  - input: a 128-mel spectrogram at 24 kHz with hop 240 (100 Hz),
+    normalised by the stats in the config;
+  - a conv front end down to 25 Hz, then a 12-layer, 1024-wide
+    wav2vec2-Conformer: rotary positions, a depthwise conv of kernel 31,
+    16 heads, FFN 4096;
+  - SongEval reads `hidden_states[6]`, the output of layer 6, so six
+    layers are needed. Its head is FFN 1024→4096→1024, four 8-head
+    self-attention layers, mean and max pooling, then a linear to five
+    scores through `tanh·2+3`.
+  - the whole song goes through at 24 kHz in one pass (`eval.py`).
+
+### A14b — result (2026-10-13)
+
+**Done.** Upstream's Gradio "Auto Score" is ported, both halves, gated
+against upstream's own functions in fp32 and priced against its bf16. It
+is served by default as the job's `quality` (research/api-jobs.md § Music
+is a job).
+
+**The oracle** is `reference/dump_ace_score.py` (`--bf16` for the twin),
+which writes to `reference/out/acescore{,_bf16}`; each run takes ~3 min
+on the CPU. It has five cases:
+
+- `pmi_match`: A13's `understand` codes, which are A1's full_metas song,
+  scored against the full_metas request.
+- `pmi_mismatch`: the lofi reference's codes against the same request,
+  as the control.
+- `align_full_metas`, `align_zh_odd`, `align_instrumental_60`: A1's
+  requests, generated with seed 42 and then scored. The script records
+  the decoder's inputs, the noise, the attention probabilities of the
+  11 heads for both rows, the energy, the DTW path and the metrics.
+
+It spies on `_get_logits_and_target_for_scoring` and on the decoder's
+forward, and otherwise calls upstream's code unchanged.
+
+**Code:**
+
+- **`ace/lm/score.go`.**
+  - `Planner.Score(codes, Conditions, scale)` is
+    `calculate_pmi_score_per_condition` and `calculate_reward_score`.
+  - `ScoreTargets` gives the YAML of one field and the lyric block, in
+    upstream's order.
+  - `ScorePrompts` gives the understand prompt and the `NO USER INPUT`
+    prompt.
+  - `Teach` is one target's teacher-forced pass.
+  - `Reward`.
+- **`ace/lm/gpu.go`.**
+  - `GPU.Teacher` runs a pass of up to 64 rows (`ScoreRows`) and returns
+    each row's log-softmax and rank over the whole vocabulary. The head
+    runs as the fp16 `reg32x128` GEMM rung rather than `llm_gemv`'s
+    three rows.
+  - The head bank is padded to 128 rows for it (`headRows`), and its
+    logits take a 56 MB region of the host-cached arena.
+  - `Pass` is now `run` plus a tail.
+- **`ace/dit/align.go`.**
+  - `GPU.CrossProbs` runs a forward up to the last listed layer and
+    rebuilds the listed heads' cross-attention softmax on the host, from
+    the packed cross q and k (fp16, qkpack's fragment tiling, base-2
+    logits).
+  - `Config.AlignHeads` reads `lyric_alignment_layers_config`.
+  - `stepGraph`'s input stage is split out as `inputGraph`.
+- **`ace/pipeline/score.go`.**
+  - `LyricAlignment` covers the seed-42 noise, the two rows, `LyricSpan`,
+    `TypeMask`, `HeadEnergy`, `Normalize`, `DTW` (fp32 with numba's
+    tie-breaking) and `Metrics`.
+  - `ScoreConditions` is Gradio's `_build_score_metadata`.
+  - `Options.Score` and `Result.Quality`. The alignment runs at the end of
+    `generate`, while the DiT still holds the song's condition, and the
+    PMI runs in `Generate` after the codes path.
+- **`api/music.go` and `backend/music.go`.**
+  - `MusicQuality` on the job (`quality`).
+  - `auto_score`/`autoScore` (Gradio's name) turns the score off; it is
+    on by default.
+  - A `score` stage and a `scoreCost` in the estimate.
+- **`cmd/ace -score`**, on by default, logs the score.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| targets and ids, prompt + target (`TestScoreTargets`) | exact, 18 forwards, incl. `timesignature: '4'` |
+| teacher-forced mean log p, fp16 bank (`TestScore`, `ACE_LM_BANK=fp16`) | ≤ 5.2e-3 a forward (bf16: 5e-3–2.5e-1); 1.9e-3 / 2.0e-3 pooled; rewards 0.6454 / 0.4454 vs fp32 0.6448 / 0.4454 |
+| int8 bank (`TestScore`), pooled as A10 prices it | 3.76e-2 / 5.76e-2 a forward vs bf16 3.89e-2 / 8.96e-2; every condition and the reward within bf16's drift of fp32 (or 0.01) |
+| our seed-42 noise | TorchRandn to an ulp (TestNoise's 1e-6) |
+| lyric ids, span, type mask (`TestAlignHost`) | exact, 3 cases |
+| head average and min-max energy from upstream's probabilities | ≤ 2.2e-8 |
+| DTW path, over upstream's energy and over ours | exact, 6 paths (180–753 steps) |
+| metrics from upstream's probabilities | coverage and monotonicity exact; confidence ≤ 1e-6; score to upstream's 4 places |
+| attention probabilities from upstream's decoder inputs (`TestLyricAlignment`) | rms 6.7e-4–1.7e-2 of fp32's, against bf16's 4.0e-2–0.75 (19–60× closer) |
+| alignment scores end to end | within 0.0012 of fp32 (bf16 is up to 0.041 off) |
+| the API (`TestMusicQuality`) | on by default, both spellings of `auto_score: false`, JSON shape |
+| served (`serve -music` beside ai.service) | 30 s song with lyrics in 11.1 s against a 10 s estimate, `quality` on the job |
+
+**What the gates turned up:**
+
+- **Upstream's "early exit" never exits.** `AceStepDiTModel.forward` works
+  out the last layer it needs and then runs all 32. Layers 3–7's
+  attention depends only on layers 0–7, so we stop after layer 7.
+- **The alignment heads are the checkpoint's, not the handler's.** The XL
+  turbo `config.json` names 11 heads in layers 3–7, and the handler's
+  `_DEFAULT_LAYERS_CONFIG` (layers 2–6) only applies when a config has
+  none.
+- **The alignment score favours an instrumental.** `[Instrumental]`
+  scores 0.33/0.34, because it has no sung rows: coverage and
+  monotonicity are 1, and the score is the path's confidence alone. The
+  30 s sung song scores 0.17/0.14, the Chinese one 0.09/0.0005, and the
+  200 s song with 12 identical verses 0.014/0.018. As upstream defines it,
+  the number is not comparable between a song and an instrumental. A14e
+  has to decide how to read it.
+- **The LM scores its own plan.** `adherence` reads the CoT's metas, so a
+  meta the request left out is one the LM chose and then recalls: bpm
+  0.91 on a song whose bpm the LM picked. That is upstream's behaviour,
+  but it is "the codes agree with the plan", not "the song is good".
+- **PMI separates matched from mismatched codes,** though not by much on
+  everything. The reward is 0.645 on the matched song and 0.445 on the
+  mismatched one, and the caption 0.36 against 0.015, but the lyrics only
+  0.988 against 0.944. The caption's PMI is negative even when the song
+  matches. The user's short caption is not how this LM writes captions;
+  served with thinking, the LM's own rewritten caption scored 0.48.
+- The bf16 run is a noisy bar on the alignment. bf16 alone moves
+  `instrumental_60`'s `lm` score 0.327 → 0.287 and flips coverage counts.
+
+**Departures:**
+
+- **The scale is 0.5,** Gradio's shipped `score_scale`, not the
+  function's default of 0.1.
+- **A language of "unknown" is not scored.** Gradio would recall its own
+  default `language: unknown`, and that measures nothing.
+- **The two prompts are prefilled once** (slots 0 and 1), and each target
+  is a teacher-forced pass from the prompt's last token. That gives the
+  same logits as upstream's full forward per target, at a tenth of the
+  cost.
+- **The probabilities are rebuilt on the host** from fp16 q and k. Our
+  attention is a flash kernel and never forms them.
+
+**Cost** (TestScoreGenerate, both halves):
+
+| song | LM part | alignment | total | share of the request |
+|---|---|---|---|---|
+| 30 s | 0.56 s: 211-token prefill 90 ms, 185 target tokens in 9 passes, 466 ms | ~0.11 s | 0.67 s | 5.7 s, 12% |
+| 200 s, 12 verses | 2.65 s: 1,061-token prefill 0.53 s, 1,481 target tokens, 2.1 s | ~0.6 s | 3.3 s | 44.7 s, 7% |
+
+A teacher-forced pass costs ~45 ms whatever its row count up to 64,
+because the int8 layers are read once a pass. If this ever matters, the
+nine short targets could share passes across more slots.
+
+**Not done, by design:**
+
+- the plan-versus-render question (A-o16) and a PMI for the DiT-only,
+  cover and repaint paths, which upstream does not score either;
+- the good/fair/poor flag, which waits for A14e;
+- the deployment, which the user then asked for: deployed 2026-10-13. A
+  20 s folk song with lyrics came back from `ai.service` in 10 s with its
+  `quality`.
+
+### A14c — result (2026-10-13)
+
+**Done and deployed.** Meta's Audiobox Aesthetics runs on the device, and
+every song's `quality` now carries its four axes as `aesthetics` (1–10).
+Every score lands within 0.0015 of upstream's fp32 predictor.
+
+**What upstream runs** (`audiobox_aesthetics` 0.0.4, `infer.AesPredictor`):
+
+- The audio is resampled to 16 kHz with torchaudio's Hann sinc, and the
+  channels are averaged.
+- It is cut into 10 s windows at a 10 s hop. The last window is
+  zero-padded, and its padding is masked: a frame of 320 samples is padding
+  when all of them are.
+- Each window goes through WavLM-base:
+  - a 7-layer conv extractor, with GroupNorm(512, 512) and GELU on the
+    first layer and GELU on the rest;
+  - LayerNorm(512) and a 512→768 projection;
+  - a positional conv (kernel 128, 16 groups, weight-normed) with GELU,
+    added to the input, then LayerNorm;
+  - 12 post-LN layers whose attention adds layer 0's bucketed
+    relative-position bias, gated per layer from the query's input
+    (`gru_rel_pos`).
+- Each of the four axes takes a softmax-weighted sum of the 13 hidden
+  states, a mean over the valid frames, L2 normalisation, a 5-layer MLP
+  (Linear–LayerNorm–GELU ×4, then Linear) and the checkpoint's mean and
+  std.
+- The song's score is the windows' mean, weighted by their length.
+- It is fp32 even though the predictor says "bf16": `enable_autocast`
+  compares a torch dtype to strings and is never true.
+
+**Code:**
+
+- **`audiobox/` (new package).**
+  - `model.go`: weights, weight norm folded, `bucket`.
+  - `heads.go`: the four MLPs on the host.
+  - `resample.go`: `Mono16k`.
+  - `gpu.go`: arenas, staging and the graph.
+  - `score.go`: `Load`, `Score`, `ScoreMono`, the windows.
+- **Shaders**, `shaders/audiobox_*.comp`:
+  - `conv0`: the first conv in fp32 (raw audio in fp16 is the A11a trap);
+  - `colstats`: the column mean and M2 in 1,024-row chunks, combined by
+    Chan's formula. It serves the GroupNorm over 31,999 frames and the
+    heads' pooling.
+  - `act`: an optional norm, then the exact erf GELU (the repo's other
+    GELUs are the tanh approximation), out as fp16 or fp32;
+  - `posconv`: the grouped conv, fp32 with LDS-staged input, fused with
+    the GELU and the residual;
+  - `relbias`: the gated bias plane, in log2 units.
+- **Reused kernels:**
+  - kokoro's A_CONV GEMM runs conv layers 1–6 as strided convolutions
+    (A row stride = stride·512, tap stride one input row);
+  - the LDS-staged GEMM runs every projection, with the bias as an extra
+    K column (kokoro's PL-BERT trick);
+  - parakeet's LayerNorm and residual, and kokoro's HD64 pack;
+  - `dit_attention_wmma`'s REL_BIAS build, rebuilt at head width 64
+    (`audiobox_attn_hd64_w32`). It takes each window's valid frames as
+    its key count.
+- **Wiring.**
+  - `pipeline.LoadAesthetics`, `Quality.Aesthetics`, scored over the final
+    -1 dBFS audio in `Options.Score`.
+  - The backend loads it when `models/audiobox-aesthetics` exists
+    (`-music-aes`, default on, ~0.6 GB).
+  - `MusicAesthetics` in the API.
+  - `cmd/ace -aesthetics file` scores any file and prints JSON.
+- **Oracle:** `reference/dump_aes.py` in `.venv-aes` (torch 2.10 CPU,
+  torchaudio, `audiobox_aesthetics==0.0.4`). The weights are loaded from
+  `models/audiobox-aesthetics/model.safetensors` (HF), and the source is
+  cloned at `models/audiobox-aesthetics-src` (`2618e9d`). The four cases:
+  - A11's 30 s synthwave source and 120 s lofi reference;
+  - the source cut to 23.7 s, which ends in a padded window;
+  - 12.5 s of seeded white noise.
+
+**Gates:**
+
+| gate | result |
+|---|---|
+| relative-position buckets, every offset −498..498 (`TestBuckets`) | exact |
+| 48 kHz stereo → 16 kHz mono (`TestResample`) | rms 1.2e-7, max 1.8e-7 |
+| extractor output, projection (`TestEncoder`, first and last window of each case) | rms 5.6e-4–9.0e-4 |
+| the 13 hidden states over each window's valid frames | rms 6.5e-4–5.1e-3 (synthwave's first window peaks at layers 9–10), max 0.36 |
+| valid frames and window weights | exact |
+| every window's four scores (`TestScores`) | within 0.0015 |
+| each song's four scores | within 0.001: synthwave PQ 8.476 PC 6.619 CE 7.774 CU 8.062 |
+| end to end (`TestScoreGenerate`), served (`ai.service`) | present, on the 1–10 scale |
+
+**What it says.**
+
+- The synthwave song scores PQ 8.48 and CU 8.06. ACE-Step 1.5's report
+  quotes PQ 8.35 and CU 8.09 for the model, so our port's songs sit where
+  the paper's do.
+- White noise scores PQ 5.16, PC 2.07, CE 2.91 and CU 6.11.
+- The lofi song scores PQ 7.92 and CE 7.15. The 200 s song with twelve
+  identical verses scores PQ 7.78 and CE 7.21. The A10 techno track scores
+  PQ 8.32.
+- CU barely separates noise from music (6.1 against 7.8–8.1). PC and CE
+  carry the difference, and PQ halfway.
+
+**Cost.** On the device, a 10 s window costs ~17 ms over a batch of eight.
+By stage:
+
+| stage | share |
+|---|---|
+| the naive positional conv | 26% |
+| conv1–conv3 | 23% |
+| relbias | 6.5% |
+| attention | 6% |
+
+The 180 s techno song took 373 ms on the device. Adding it to the auto
+score took a 30 s song's score from 0.67 to 0.77 s and a 200 s song's from
+3.3 to 3.7 s, including the host resample. That is under 1% of a request,
+so nothing was tuned. The positional conv as a GEMM is the first thing to
+try if it ever matters.
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -1719,6 +2202,18 @@ Catalan-ish lyrics: again, the words are the weak part.
   whole of the path's drift from fp32 (§ A2/A3 result), still 3.6–16×
   under upstream bf16's. It is worth doing if an end-to-end listen or a
   later gate wants the path closer to fp32.
+- **A-o14: the served shape of the score (A14f).** Upstream's API has
+  none (Gradio only) and OpenAI has no music endpoint
+  ([[api-follows-openai-standard]]). **Partly answered by the user
+  (2026-10-13): on by default.** A14b serves it as `quality` on the job,
+  filled before `completed`, with Gradio's `auto_score: false` to turn it
+  off. The flag and the outside models' fields are still to come.
+- **A-o15: are non-commercial weights acceptable?** SongEval's head
+  (CC BY-NC-SA per its README) sits on MuQ (CC-BY-NC 4.0). **Answered by
+  the user (2026-10-13): yes**, so A14d is in.
+- **A-o16: score the plan or the render?** Upstream's PMI reads the LM's
+  codes. Codes re-tokenized from the rendered latent score what was
+  actually made. A14e decides between them.
 
 ## Handoff
 
@@ -1889,6 +2384,16 @@ image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`p
   for it.
 - Upstream's retake and flow-edit, and the base model's tasks (lego,
   extract, complete), stay refusals.
+- **A14, a quality score on every song**: planned 2026-10-13; see
+  § A14 — the plan (A14a–f).
+  - **A14a and A14b are done** (same day): upstream's auto score is
+    served as the job's `quality`, on by default. See § A14b — result.
+  - **Deployed** on `ai.service` the same day.
+  - **A14c is done and deployed** (same day): Audiobox Aesthetics' PQ,
+    PC, CE and CU on every song, within 0.0015 of upstream. See § A14c —
+    result.
+  - **Next: A14d**, SongEval (MuQ's first six layers and its head), then
+    A14e's calibration and the flag.
 - **A13, understand (captioning existing audio)**: done 2026-10-12, see
   § A13 — result. Served as `full_analysis_only` on `/v1/music`. Not
   deployed yet: `ai.service` runs the binary from before it.

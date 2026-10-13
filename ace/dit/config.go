@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 )
 
 // Config is the part of config.json the device path reads.
@@ -37,6 +39,9 @@ type Config struct {
 	Theta        float64  `json:"rope_theta"`
 	Eps          float64  `json:"rms_norm_eps"`
 	LayerTypes   []string `json:"layer_types"`
+	// AlignLayers is lyric_alignment_layers_config: the cross-attention
+	// heads, by layer, whose attention follows the lyrics (MUSIC.md A14b).
+	AlignLayers map[string][]int `json:"lyric_alignment_layers_config"`
 }
 
 // LoadConfig reads dir/config.json.
@@ -57,6 +62,33 @@ func LoadConfig(dir string) (*Config, error) {
 		return nil, fmt.Errorf("dit: %d layer types for %d layers", len(c.LayerTypes), c.Layers)
 	}
 	return &c, nil
+}
+
+// AlignHeads is AlignLayers as (layer, head) pairs, layers ascending and
+// each layer's heads as listed: the order upstream averages them in.
+func (c *Config) AlignHeads() ([][2]int, error) {
+	var ls []int
+	for k := range c.AlignLayers {
+		l, err := strconv.Atoi(k)
+		if err != nil || l < 0 || l >= c.Layers {
+			return nil, fmt.Errorf("dit: lyric_alignment_layers_config layer %q", k)
+		}
+		ls = append(ls, l)
+	}
+	sort.Ints(ls)
+	var hs [][2]int
+	for _, l := range ls {
+		for _, h := range c.AlignLayers[strconv.Itoa(l)] {
+			if h < 0 || h >= c.Heads {
+				return nil, fmt.Errorf("dit: lyric_alignment_layers_config head %d", h)
+			}
+			hs = append(hs, [2]int{l, h})
+		}
+	}
+	if len(hs) == 0 {
+		return nil, fmt.Errorf("dit: no lyric_alignment_layers_config in config.json")
+	}
+	return hs, nil
 }
 
 // Windowed reports whether layer i of any stack is a sliding-window layer.

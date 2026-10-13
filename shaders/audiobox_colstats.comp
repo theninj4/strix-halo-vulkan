@@ -1,0 +1,81 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+// Column statistics of an fp32 [rows][pc.dim] matrix (MUSIC.md A14c): the
+// first conv's GroupNorm(512, 512) -- a mean and a biased variance per
+// channel over a window's 31,999 frames -- and the mean over valid frames
+// the aesthetics heads pool.
+//
+// aux2 = 0, the partial pass: workgroup (x, y) takes 64 columns of rows
+// [y·aux1, min((y+1)·aux1, tokens)) and writes that chunk's count, mean and
+// M2 (a two-pass mean and sum of squared deviations) to
+// outOff + (y·3 + {0,1,2})·dim. One chunk is the whole answer for a matrix
+// of at most aux1 rows: its mean is at outOff, M2/count at outOff + 2·dim.
+//
+// aux2 = 1, the combine pass: workgroup x folds aux0 chunks of partials at
+// inOff by Chan's formula and writes the mean to outOff and the biased
+// variance to outOff + dim.
+#include "dit_common.glsl"
+#define COLS 64u
+#define LANES 4u
+layout(local_size_x = 256) in;
+shared float red[256];
+
+float sumLanes(float v, uint c, uint l) {
+    red[l * COLS + c] = v;
+    barrier();
+    float s = 0.0;
+    [[unroll]] for (uint k = 0u; k < LANES; ++k) {
+        s += red[k * COLS + c];
+    }
+    barrier();
+    return s;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint c = tid % COLS, l = tid / COLS;
+    uint col = gl_WorkGroupID.x * COLS + c;
+    bool live = col < pc.dim;
+    if (pc.aux2 == 0u) {
+        uint lo = gl_WorkGroupID.y * pc.aux1;
+        uint hi = min(lo + pc.aux1, pc.tokens);
+        float s = 0.0;
+        for (uint r = lo + l; live && r < hi; r += LANES) {
+            s += act[pc.inOff + r * pc.dim + col];
+        }
+        float n = float(hi > lo ? hi - lo : 0u);
+        float mean = sumLanes(s, c, l) / max(n, 1.0);
+        float m2 = 0.0;
+        for (uint r = lo + l; live && r < hi; r += LANES) {
+            float d = act[pc.inOff + r * pc.dim + col] - mean;
+            m2 += d * d;
+        }
+        m2 = sumLanes(m2, c, l);
+        if (l == 0u && live) {
+            uint o = pc.outOff + gl_WorkGroupID.y * 3u * pc.dim + col;
+            act[o] = n;
+            act[o + pc.dim] = mean;
+            act[o + 2u * pc.dim] = m2;
+        }
+        return;
+    }
+    if (l != 0u || !live) {
+        return;
+    }
+    float n = 0.0, mean = 0.0, m2 = 0.0;
+    for (uint y = 0u; y < pc.aux0; ++y) {
+        uint o = pc.inOff + y * 3u * pc.dim + col;
+        float nb = act[o];
+        if (nb == 0.0) {
+            continue;
+        }
+        float mb = act[o + pc.dim], m2b = act[o + 2u * pc.dim];
+        float tot = n + nb;
+        float d = mb - mean;
+        mean += d * nb / tot;
+        m2 += m2b + d * d * n * nb / tot;
+        n = tot;
+    }
+    act[pc.outOff + col] = mean;
+    act[pc.outOff + pc.dim + col] = m2 / max(n, 1.0);
+}

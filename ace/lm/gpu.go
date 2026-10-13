@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -282,6 +283,9 @@ type GPU struct {
 	embed    []uint16 // bf16 [vocab][2560], gathered on the host
 	vocab    int
 	vocabPad int
+	// headRows is the head bank's rows: the vocabulary padded to the GEMM
+	// rung's BN, so Teacher can run the head as one GEMM (MUSIC.md A14b).
+	headRows int
 
 	w         []layerWeights
 	finalNorm uint32
@@ -290,6 +294,7 @@ type GPU struct {
 	arenaRows int
 	// fp32 arena
 	aX, aQ, aK, aV, aO, aGate, aUp, aFF, aMeta, aPart, aRes, aLogits uint32
+	aScore                                                           uint32 // [ScoreRows][headRows], Teacher's logits
 	aUnscale                                                         uint32 // [2560] of 1/ffScale, the residual add's gate
 	actElems                                                         int
 	// fp16 arena
@@ -376,6 +381,7 @@ func (g *GPU) layout(set *safetensors.Set) error {
 	}
 	g.vocab = emb.Shape[0]
 	g.vocabPad = roundUp(g.vocab, tile)
+	g.headRows = roundUp(g.vocab, gemmKernels[0].bn)
 
 	// Weight banks: the layers in order, a new bank when one is full, and
 	// the head (fp16) in a bank of its own.
@@ -402,7 +408,7 @@ func (g *GPU) layout(set *safetensors.Set) error {
 		}
 	}
 	g.head = len(bankBytes)
-	bankBytes = append(bankBytes, g.vocabPad*hidden*2)
+	bankBytes = append(bankBytes, g.headRows*hidden*2)
 	for i, n := range bankBytes {
 		b, err := g.dev.NewBuffer(n)
 		if err != nil {
@@ -446,6 +452,7 @@ func (g *GPU) layout(set *safetensors.Set) error {
 	g.aPart = alloc(partBudget * partStride)
 	g.aRes = alloc(MaxRows * 40 * ffn) // 40: the widest split-K rung
 	g.aLogits = alloc(MaxRows * g.vocabPad)
+	g.aScore = alloc(ScoreRows * g.headRows)
 	g.aUnscale = alloc(hidden)
 	if g.abuf, err = g.dev.NewHostCachedBuffer(g.actElems * 4); err != nil {
 		return fmt.Errorf("lm: fp32 arena (%d MB): %w", (g.actElems*4)>>20, err)
@@ -540,6 +547,15 @@ func (g *GPU) build() error {
 			bb = []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, bank, g.abuf, bank}
 			gemms, gemvs, table = q8Kernels, gemvQ8SPIRV, gemvSlabsQ8
 		}
+		if b == g.head {
+			// Teacher's head: the fp16 rung for a pass of up to ScoreRows.
+			k := gemmFor(ScoreRows)
+			p, err := g.pipeline("gemm head "+k.name, k.spirv, vk.PipelineSpec{Buffers: bb, PushConstantSize: pc})
+			if err != nil {
+				return err
+			}
+			g.gemms[b][k.name] = p
+		}
 		if b != g.head {
 			for _, k := range gemms {
 				spec := vk.PipelineSpec{Buffers: bb, PushConstantSize: pc}
@@ -622,7 +638,7 @@ func (g *GPU) stage(set *safetensors.Set) error {
 		g.embed[i] = binary.LittleEndian.Uint16(emb.Data[2*i:])
 	}
 	// The tied head: the embedding, tiled; the pad rows stay zero.
-	head := make([]uint16, g.vocabPad*hidden)
+	head := make([]uint16, g.headRows*hidden)
 	tileB(head, g.vocab, hidden, func(i int, buf []float32) {
 		for j := range buf {
 			buf[j] = bf16(g.embed[i*hidden+j])
@@ -764,9 +780,6 @@ type Range struct{ Lo, Hi int }
 // returns each row's logits over it (at most MaxRows rows).
 func (g *GPU) Pass(toks []Tok, head Range) ([][]float32, time.Duration, error) {
 	n := len(toks)
-	if n == 0 || n > g.o.Rows {
-		return nil, 0, fmt.Errorf("lm: a pass of %d rows; 1 to %d", n, g.o.Rows)
-	}
 	logits := head.Hi > head.Lo
 	if logits && n > MaxRows {
 		return nil, 0, fmt.Errorf("lm: logits for %d rows; at most %d", n, MaxRows)
@@ -775,15 +788,39 @@ func (g *GPU) Pass(toks []Tok, head Range) ([][]float32, time.Duration, error) {
 	if logits && (lo < 0 || hi > g.vocabPad) {
 		return nil, 0, fmt.Errorf("lm: head range %v outside the vocabulary", head)
 	}
+	var tail []vk.MultiDispatch
+	if logits {
+		tail = g.headGraph(n, lo, hi)
+	}
+	total, err := g.run(toks, tail)
+	if err != nil || !logits {
+		return nil, total, err
+	}
+	out := make([][]float32, n)
+	w := hi - lo
+	for r := range out {
+		row := g.abuf.ReadFloat32At(int(g.aLogits)+r*w, w)
+		out[r] = row[head.Lo-lo : head.Hi-lo]
+	}
+	return out, total, nil
+}
+
+// run uploads toks and runs every layer over them, with tail recorded after
+// the last layer in the same submit.
+func (g *GPU) run(toks []Tok, tail []vk.MultiDispatch) (time.Duration, error) {
+	n := len(toks)
+	if n == 0 || n > g.o.Rows {
+		return 0, fmt.Errorf("lm: a pass of %d rows; 1 to %d", n, g.o.Rows)
+	}
 	x := make([]float32, n*hidden)
 	meta := make([]uint32, 2*n)
 	maxKeys := 0
 	for r, t := range toks {
 		if t.ID < 0 || int(t.ID) >= g.vocab {
-			return nil, 0, fmt.Errorf("lm: token %d outside the vocabulary", t.ID)
+			return 0, fmt.Errorf("lm: token %d outside the vocabulary", t.ID)
 		}
 		if t.Slot < 0 || t.Slot >= g.o.Slots || t.Pos < 0 || t.Pos >= g.o.MaxLen {
-			return nil, 0, fmt.Errorf("lm: row %d at slot %d position %d; the cache is %d x %d", r, t.Slot, t.Pos, g.o.Slots, g.o.MaxLen)
+			return 0, fmt.Errorf("lm: row %d at slot %d position %d; the cache is %d x %d", r, t.Slot, t.Pos, g.o.Slots, g.o.MaxLen)
 		}
 		e := g.embed[int(t.ID)*hidden : (int(t.ID)+1)*hidden]
 		for j, v := range e {
@@ -816,25 +853,83 @@ func (g *GPU) Pass(toks []Tok, head Range) ([][]float32, time.Duration, error) {
 		for j := i; j < min(i+per, len(g.w)); j++ {
 			d = append(d, g.layerGraph(j, n, chunks, chunkLen)...)
 		}
-		if logits && i+per >= len(g.w) {
-			d = append(d, g.headGraph(n, lo, hi)...)
+		if i+per >= len(g.w) {
+			d = append(d, tail...)
 		}
 		dur, err := vk.DispatchMultiTimed(d, 1, 1, true)
 		if err != nil {
-			return nil, total, fmt.Errorf("lm: layers %d..: %w", i, err)
+			return total, fmt.Errorf("lm: layers %d..: %w", i, err)
 		}
 		total += dur
 	}
-	if !logits {
-		return nil, total, nil
+	return total, nil
+}
+
+// ScoreRows is the most rows a Teacher pass scores: its logits are
+// [ScoreRows][vocab] fp32 in the host-cached arena, 56 MB.
+const ScoreRows = 64
+
+// Teacher runs toks as Pass does and scores each row's next token against
+// the row's logits over the whole vocabulary (MUSIC.md A14b): the log
+// softmax of next[r], and its rank, 1 + how many logits are greater (what
+// torch.topk's position is, ties aside). The head runs as a GEMM over the
+// rows rather than llm_gemv's 1-3, over the same fp16 weight.
+func (g *GPU) Teacher(toks []Tok, next []int32) (logp []float64, rank []int, took time.Duration, err error) {
+	n := len(toks)
+	if n > ScoreRows || len(next) != n {
+		return nil, nil, 0, fmt.Errorf("lm: teacher pass of %d rows and %d targets; at most %d", n, len(next), ScoreRows)
 	}
-	out := make([][]float32, n)
-	w := hi - lo
-	for r := range out {
-		row := g.abuf.ReadFloat32At(int(g.aLogits)+r*w, w)
-		out[r] = row[head.Lo-lo : head.Hi-lo]
+	for _, id := range next {
+		if id < 0 || int(id) >= g.vocab {
+			return nil, nil, 0, fmt.Errorf("lm: target %d outside the vocabulary", id)
+		}
 	}
-	return out, total, nil
+	if took, err = g.run(toks, g.scoreGraph(n)); err != nil {
+		return nil, nil, took, err
+	}
+	all := g.abuf.ReadFloat32At(int(g.aScore), n*g.headRows)
+	logp, rank = make([]float64, n), make([]int, n)
+	var wg sync.WaitGroup
+	for r := 0; r < n; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			row := all[r*g.headRows : r*g.headRows+g.vocab]
+			tv := row[next[r]]
+			mx := float32(math.Inf(-1))
+			above := 0
+			for _, v := range row {
+				mx = max(mx, v)
+				if v > tv {
+					above++
+				}
+			}
+			sum := 0.0
+			for _, v := range row {
+				sum += math.Exp(float64(v - mx))
+			}
+			logp[r] = float64(tv-mx) - math.Log(sum)
+			rank[r] = above + 1
+		}(r)
+	}
+	wg.Wait()
+	return logp, rank, took, nil
+}
+
+// scoreGraph is the final norm and the tied head over every vocabulary row
+// as one GEMM, into the score logits at a row stride of headRows.
+func (g *GPU) scoreGraph(n int) []vk.MultiDispatch {
+	eps := math.Float32bits(float32(g.Cfg.RMSEps))
+	k := gemmFor(ScoreRows)
+	tokPad := roundUp(n, k.bm)
+	return []vk.MultiDispatch{
+		{Pipeline: g.pipes["normf16"], GroupsX: uint32(n), GroupsY: 1,
+			PushConstants: push{InOff: g.aX, OutOff: g.hA, WOff: g.finalNorm, Tokens: uint32(n), Dim: hidden,
+				LDA: uint32(g.ldaDim), Eps: eps}.bytes()},
+		{Pipeline: g.gemms[g.head][k.name], GroupsX: uint32(g.headRows / k.bn), GroupsY: uint32(tokPad / k.bm),
+			PushConstants: push{InOff: g.hA, OutOff: g.aScore, BOff: 0, GemmM: uint32(tokPad), GemmN: uint32(g.headRows),
+				GemmK: hidden, LDA: uint32(g.ldaDim)}.bytes()},
+	}
 }
 
 // gemv is one projection at n ≤ MaxRows rows: split-K partials and their

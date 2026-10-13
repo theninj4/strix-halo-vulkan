@@ -68,6 +68,13 @@ func (f *fakeMusic) GenerateMusic(ctx context.Context, req *MusicRequest, p *Mus
 			return ctx.Err()
 		}
 	}
+	if req.Score {
+		score := 0.65
+		progress(MusicProgress{Stage: "write", Fraction: 0.99, Quality: &MusicQuality{Score: &score,
+			Adherence: map[string]float64{"caption": 0.36, "bpm": 0.91}, PMI: map[string]float64{"caption": -0.29},
+			LyricsAlignment: &MusicAlignment{LM: 0.17, DiT: 0.14},
+			Aesthetics:      &MusicAesthetics{PQ: 8.35, PC: 6.6, CE: 7.75, CU: 8.06}}})
+	}
 	return os.WriteFile(dst, []byte("not really an mp3"), 0o644)
 }
 
@@ -408,5 +415,38 @@ func TestMusicAnalysis(t *testing.T) {
 	rec := do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"full_analysis_only": true}))
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "src_audio") {
 		t.Errorf("JSON analysis without an upload: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// TestMusicQuality: the auto score is on by default and lands on the
+// completed job as `quality`; auto_score false (or Gradio's autoScore)
+// turns it off and leaves the field null.
+func TestMusicQuality(t *testing.T) {
+	f := &fakeMusic{}
+	s := newMusicServer(t, f)
+	j := decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"prompt": "synthwave"})))
+	done := waitMusic(t, s, j.ID, MusicCompleted)
+	q := done.Quality
+	if q == nil || q.Score == nil || *q.Score != 0.65 || q.Adherence["bpm"] != 0.91 || q.LyricsAlignment == nil ||
+		q.LyricsAlignment.DiT != 0.14 {
+		t.Errorf("quality %+v", q)
+	}
+	rec := do(t, s, httptest.NewRequest("GET", "/v1/music/"+j.ID, nil))
+	for _, k := range []string{`"quality":{"score":0.65`, `"adherence":{"bpm":0.91,"caption":0.36}`, `"lyrics_alignment":{"lm":0.17,"dit":0.14}`,
+		`"aesthetics":{"pq":8.35,"pc":6.6,"ce":7.75,"cu":8.06}`} {
+		if !strings.Contains(rec.Body.String(), k) {
+			t.Errorf("job JSON has no %s: %s", k, rec.Body)
+		}
+	}
+	for _, field := range []string{"auto_score", "autoScore"} {
+		j = decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{"prompt": "synthwave", field: false})))
+		done = waitMusic(t, s, j.ID, MusicCompleted)
+		if done.Quality != nil {
+			t.Errorf("%s false: quality %+v", field, done.Quality)
+		}
+		rec = do(t, s, httptest.NewRequest("GET", "/v1/music/"+j.ID, nil))
+		if !strings.Contains(rec.Body.String(), `"quality":null`) {
+			t.Errorf("%s false: %s", field, rec.Body)
+		}
 	}
 }

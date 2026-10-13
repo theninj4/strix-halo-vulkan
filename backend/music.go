@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -32,6 +34,9 @@ type MusicOptions struct {
 	// LMFP16 stages the LM's layers as fp16 instead of int8 (MUSIC.md A10):
 	// the control, 2x slower a step and 3.4 GB more.
 	LMFP16 bool
+	// NoAesthetics leaves Audiobox Aesthetics out of the auto score
+	// (MUSIC.md A14c). It is loaded when models/audiobox-aesthetics exists.
+	NoAesthetics bool
 	// ID is the model id this backend answers to.
 	ID string
 	// Swap is the residency slot this pipeline takes turns in with image
@@ -113,6 +118,13 @@ func (b *Music) Load() error {
 	if err == nil && !b.opt.NoLM {
 		if err = p.LoadLM(d, pipeline.LMDir(b.opt.Models), b.lmOpt); err != nil {
 			p.Destroy()
+		}
+	}
+	if aes := pipeline.AesDir(b.opt.Models); err == nil && !b.opt.NoAesthetics {
+		if _, serr := os.Stat(aes); serr == nil {
+			if err = p.LoadAesthetics(d, aes); err != nil {
+				p.Destroy()
+			}
 		}
 	}
 	if err != nil {
@@ -345,15 +357,35 @@ func musicLatents(r *plan.Request, thinking bool) int {
 // host; the VAE is 10.4 ms a second of audio (A6); encoding the file is
 // ffmpeg's. Sample mode's pass is ~sampleSteps (a caption, the metas and
 // a song's lyrics), and the song it writes usually has every meta, so
-// phase 1 is then skipped.
+// phase 1 is then skipped. The auto score (A14b) is two parts: the LM's,
+// a prefill of the codes at ~0.5 ms a token and a teacher-forced pass of
+// ~45 ms for each 64 tokens of a target (the lyrics twice, ~200 characters
+// a pass); the DiT's alignment, two forwards to layer 7 and the host's
+// softmax, ~3 ms a second of audio (TestScoreGenerate: 0.67 s for a 30 s
+// song, 3.3 s for a 200 s one with 12 verses).
 type musicCost struct {
-	sample, think, codes, encode, dit, vae, write time.Duration
+	sample, think, codes, encode, dit, vae, score, write time.Duration
 }
 
 const sampleSteps = 450
 
 func (c musicCost) total() time.Duration {
-	return c.sample + c.think + c.codes + c.encode + c.dit + c.vae + c.write
+	return c.sample + c.think + c.codes + c.encode + c.dit + c.vae + c.score + c.write
+}
+
+// scoreCost is the auto score's share of a request.
+func scoreCost(r *plan.Request, thinking bool, seconds float64) time.Duration {
+	s := 0.0
+	if thinking {
+		s += 0.35 + 0.0027*seconds + 0.13*math.Ceil(float64(len(r.Lyrics))/200)
+	}
+	if strings.TrimSpace(r.Lyrics) != "" {
+		s += 0.05 + 0.003*seconds
+	}
+	// Audiobox Aesthetics: ~17 ms of device a 10 s window (A14c), and the
+	// host's resample.
+	s += 0.03 + 0.002*seconds
+	return time.Duration(s * float64(time.Second))
 }
 
 func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank lm.Bank) musicCost {
@@ -392,6 +424,9 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 	}
 	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank)
 	c.encode = encodeCost(audio)
+	if req.Score {
+		c.score = scoreCost(r, req.Thinking, secs)
+	}
 	var sampling *lm.Sampling
 	if req.LMTemperature != nil || req.LMCFGScale != nil || req.LMTopP != nil {
 		s := lm.DefaultSampling
@@ -425,6 +460,8 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 			return (c.sample+c.think+c.codes+c.encode).Seconds()/t + part(c.dit, done, total)/t
 		case "vae":
 			return (c.sample + c.think + c.codes + c.encode + c.dit).Seconds() / t
+		case "score":
+			return (c.sample + c.think + c.codes + c.encode + c.dit + c.vae).Seconds() / t
 		}
 		return 0
 	}
@@ -446,7 +483,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 		var err error
 		res, err = b.pipe.Generate(r, pipeline.Options{
 			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling, Sample: smp,
-			Shift: req.Shift, Timesteps: req.Timesteps, Audio: audio,
+			Shift: req.Shift, Timesteps: req.Timesteps, Audio: audio, Score: req.Score,
 			Between: func() error {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -470,6 +507,9 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 				spent, sampled, enc := c.think, c.sample, c.encode
 				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank)
 				c.think, c.sample, c.encode = spent, sampled, enc
+				if req.Score {
+					c.score = scoreCost(d, req.Thinking, seconds)
+				}
 				m := &api.MusicMetadata{Caption: d.Caption, BPM: d.BPM, KeyScale: d.KeyScale,
 					TimeSignature: d.TimeSignature, Duration: seconds, Language: cmpStr(d.Language, "unknown")}
 				if song != nil {
@@ -487,8 +527,28 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 		}
 		return fmt.Errorf("ace: %w", err)
 	}
-	progress(api.MusicProgress{Stage: "write", Fraction: 1 - c.write.Seconds()/c.total().Seconds()})
+	progress(api.MusicProgress{Stage: "write", Fraction: 1 - c.write.Seconds()/c.total().Seconds(),
+		Quality: musicQuality(res.Quality)})
 	return pipeline.Write(dst, res.Audio)
+}
+
+// musicQuality is the auto score as the API reports it, or nil.
+func musicQuality(q *pipeline.Quality) *api.MusicQuality {
+	if q == nil || (q.LM == nil && q.Lyrics == nil && q.Aesthetics == nil) {
+		return nil
+	}
+	out := &api.MusicQuality{}
+	if s := q.LM; s != nil {
+		r := s.Reward
+		out.Score, out.Adherence, out.PMI = &r, s.Conditions, s.PMI
+	}
+	if a := q.Lyrics; a != nil {
+		out.LyricsAlignment = &api.MusicAlignment{LM: a.LM.Score, DiT: a.DiT.Score}
+	}
+	if a := q.Aesthetics; a != nil {
+		out.Aesthetics = &api.MusicAesthetics{PQ: a.PQ, PC: a.PC, CE: a.CE, CU: a.CU}
+	}
+	return out
 }
 
 func cmpStr(a, b string) string {
