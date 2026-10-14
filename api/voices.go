@@ -11,6 +11,19 @@ package api
 // plus two extensions OpenAI's guide leaves to its dashboard: GET
 // /v1/audio/voices lists them and DELETE /v1/audio/voices/{id} removes one.
 //
+// Designed voices are an extension: POST /v1/audio/voices with a JSON body
+// {name, instructions, input, seed} has the model speak input in the voice
+// instructions describe and keeps the result as a voice (a clone of its own
+// output), since without a reference the model draws a new speaker every
+// request and a seed holds one only for the same text. The same fields on
+// /v1/audio/speech give the same clip, so a caller auditions seeds there
+// and keeps the one it likes. No consent is asked: no one's voice is
+// recorded. GET /v1/audio/voices/{id}/sample returns its clip.
+//
+// A voice's name is an address too (an extension): `voice: "narrator"`
+// reaches the voice named narrator, so names are unique, and may not be a
+// built-in voice's.
+//
 // What the server checks, and what it cannot:
 //
 //   - the consent recording is transcribed (the speech-to-text model, so
@@ -26,8 +39,11 @@ package api
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -58,6 +74,9 @@ type Voice struct {
 	CreatedAt  int64   `json:"created_at"`
 	Transcript string  `json:"transcript"`
 	Seconds    float64 `json:"seconds"`
+	// Instructions and Seed are a designed voice's: what made it.
+	Instructions string  `json:"instructions,omitempty"`
+	Seed         *uint64 `json:"seed,omitempty"`
 }
 
 // VoiceBackend stores consents and voices for a speech model that clones.
@@ -66,6 +85,12 @@ type VoiceBackend interface {
 	CreateConsent(ctx context.Context, name, language string, rec *audio.Clip) (*VoiceConsent, error)
 	// CreateVoice encodes a sample against a stored consent.
 	CreateVoice(ctx context.Context, name string, sample *audio.Clip, transcript, consent string) (*Voice, error)
+	// DesignVoice speaks input in the voice instructions describe, under
+	// seed, and keeps it as a voice.
+	DesignVoice(ctx context.Context, name, instructions, input string, seed uint64) (*Voice, error)
+	// VoiceSample is a designed voice's clip as WAV; ErrNotFound for one
+	// that has none.
+	VoiceSample(id string) ([]byte, error)
 	// ListVoices is every stored voice, oldest first.
 	ListVoices() []Voice
 	// DeleteVoice removes one; ErrNotFound if there is none.
@@ -205,10 +230,52 @@ func (s *Server) handleVoiceConsent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c)
 }
 
+// voiceNamed is the stored voice called name, ignoring case; nil if none.
+func (s *Server) voiceNamed(name string) *Voice {
+	if s.Voices == nil || name == "" {
+		return nil
+	}
+	for _, v := range s.Voices.ListVoices() {
+		if strings.EqualFold(v.Name, name) {
+			return &v
+		}
+	}
+	return nil
+}
+
+// checkVoiceName refuses a name that cannot be an address: taken, a
+// built-in voice's, an id's, or a kokoro mix's spelling.
+func (s *Server) checkVoiceName(name string) string {
+	switch {
+	case name == "":
+		return "name is required"
+	case strings.ContainsAny(name, ",:") || strings.HasPrefix(name, "voice_"):
+		return "a voice's name is how requests reach it, so it may not contain ',' or ':' or start with voice_"
+	case s.voiceNamed(name) != nil:
+		return "there is already a voice named " + strconv.Quote(name) + " (" + s.voiceNamed(name).ID +
+			"); DELETE /v1/audio/voices/{id} it first"
+	}
+	for _, b := range []SpeechBackend{s.Speech, s.InstructedSpeech} {
+		if b == nil {
+			continue
+		}
+		for _, v := range b.Voices() {
+			if strings.EqualFold(v, name) {
+				return strconv.Quote(name) + " is a built-in voice's name"
+			}
+		}
+	}
+	return ""
+}
+
 func (s *Server) handleVoiceCreate(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if s.Voices == nil {
 		notLoaded(ctx, w, "custom voices", "-tts-instruct")
+		return
+	}
+	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt == "application/json" {
+		s.handleVoiceDesign(w, r)
 		return
 	}
 	clip, ok := voiceUpload(w, r, "audio_sample")
@@ -218,6 +285,10 @@ func (s *Server) handleVoiceCreate(w http.ResponseWriter, r *http.Request) {
 	name, consent, transcript := r.FormValue("name"), r.FormValue("consent"), r.FormValue("transcript")
 	if name == "" || consent == "" {
 		badRequest(ctx, w, "name and consent are required")
+		return
+	}
+	if msg := s.checkVoiceName(name); msg != "" {
+		badRequest(ctx, w, msg)
 		return
 	}
 	if sec := clip.Duration(); sec > maxVoiceSeconds || sec < minVoiceSeconds {
@@ -247,6 +318,73 @@ func (s *Server) handleVoiceCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 
+// VoiceDesignRequest is a designed voice (an extension): the fields of the
+// /v1/audio/speech request that auditioned it.
+type VoiceDesignRequest struct {
+	Name         string  `json:"name"`
+	Instructions string  `json:"instructions"`
+	Input        string  `json:"input"`
+	Seed         *uint64 `json:"seed,omitempty"`
+}
+
+func (s *Server) handleVoiceDesign(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	var req VoiceDesignRequest
+	if !decodeJSON(ctx, w, r, &req) {
+		return
+	}
+	if msg := s.checkVoiceName(req.Name); msg != "" {
+		badRequest(ctx, w, msg)
+		return
+	}
+	if req.Instructions == "" {
+		badRequest(ctx, w, "instructions describe the voice to design; they are required")
+		return
+	}
+	if len(strings.Fields(req.Input)) < 10 {
+		badRequest(ctx, w, "input is the line the voice is kept from; give it a sentence or two (5-20 s of speech)")
+		return
+	}
+	var seed uint64
+	if req.Seed != nil {
+		seed = *req.Seed
+	} else {
+		var b [8]byte
+		_, _ = crand.Read(b[:])
+		seed = binary.LittleEndian.Uint64(b[:])
+	}
+	v, err := s.Voices.DesignVoice(ctx, req.Name, req.Instructions, req.Input, seed)
+	if err != nil {
+		backendError(ctx, w, "voice", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+func (s *Server) handleVoiceSample(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if s.Voices == nil {
+		notLoaded(ctx, w, "custom voices", "-tts-instruct")
+		return
+	}
+	id := r.PathValue("id")
+	if v := s.voiceNamed(id); v != nil {
+		id = v.ID
+	}
+	b, err := s.Voices.VoiceSample(id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "invalid_request_error",
+				"no sample for "+strconv.Quote(id)+": only designed voices keep their clip")
+			return
+		}
+		backendError(ctx, w, "voice", err)
+		return
+	}
+	w.Header().Set("Content-Type", "audio/wav")
+	_, _ = w.Write(b)
+}
+
 func (s *Server) handleVoiceList(w http.ResponseWriter, r *http.Request) {
 	if s.Voices == nil {
 		notLoaded(r.Context(), w, "custom voices", "-tts-instruct")
@@ -262,6 +400,9 @@ func (s *Server) handleVoiceDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
+	if v := s.voiceNamed(id); v != nil {
+		id = v.ID
+	}
 	if err := s.Voices.DeleteVoice(id); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeError(w, http.StatusNotFound, "invalid_request_error", "no voice "+strconv.Quote(id))

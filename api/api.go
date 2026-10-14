@@ -122,6 +122,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /v1/audio/voices", s.route(s.handleVoiceCreate))
 	mux.Handle("GET /v1/audio/voices", s.route(s.handleVoiceList))
 	mux.Handle("DELETE /v1/audio/voices/{id}", s.route(s.handleVoiceDelete))
+	mux.Handle("GET /v1/audio/voices/{id}/sample", s.route(s.handleVoiceSample))
 
 	// Input: TranscriptionRequest{}, Output: TranscriptionResponse{}
 	mux.Handle("POST /v1/audio/transcriptions", s.route(s.handleTranscription))

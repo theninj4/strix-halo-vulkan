@@ -133,6 +133,7 @@ That should be well under 300 ms (estimate). Kokoro has to refuse
 | B6 | Serving (`backend/breeze.go`, `api/speech.go`, `cmd/serve -tts-instruct`): OpenAI's `instructions`, `stream_format` (`audio`: a chunked body, WAV with streaming sizes; `sse`: `speech.audio.delta`/`.done`), `voice` as a name or `{"id": ...}`; routed by model (`breeze-tts-2`, `gpt-4o-mini-tts*`) or by those fields, kokoro the default; instructions sent to kokoro are refused as OpenAI refuses them for tts-1; a `seed` extension. The device lock is taken a pass at a time, so an utterance does not hold other models off the GPU | **done** (deployed 2026-10-14) — served radio-DJ clip transcribes exactly; first streamed byte 147 ms; kokoro unchanged |
 | B7 | Performance: int8 layer banks (fp16 heads), fused q\|k\|v and gate\|up projections and the residual join folded into the next norm (`breeze_dec.comp`), the split-K ladder (`TestSlabLadder`), then the **device frame** (`breeze/frame.go`, `breeze_frame.comp`): the sampler, the input gathers and the frame embedding on the device, a frame recorded once (`vk.Prerecorded`) and replayed as four submits | **done** — int8 KL against fp32 is 0.03–0.33x upstream bf16's own; device sampler 0 of 3,000 draws off the host's; seeded audio identical to the host loop; two streams share a frame, each bit-identical to alone; **1.93x real time** alone, 1.59x throughput with two (was 0.78x, then 1.65x, 1.80x) |
 | B8 | Cloning (`breeze/clone.go`: the codec encoder, Mimi, on the host in fp32; `api/voices.go` + `backend/breeze_voices.go`: OpenAI's consent → voice → `voice: {"id"}` flow, a file store) | **done** — codes exact against `Qwen3TTSTokenizer.encode` (3,264 of 3,264, jfk past the nominal 250-frame window); served clone and direction transcribe exactly |
+| B9 | Designed voices kept by name (`DesignVoice` in `backend/breeze_voices.go`; the JSON form of `POST /v1/audio/voices`; `voice: "<name>"`) | **done** (2026-10-14, not deployed) — kept clip bit-identical to the audition; ECAPA similarity to it 0.80–0.85 cloned vs 0.21–0.52 instruction-only |
 
 ## Decisions to make before B0
 
@@ -281,6 +282,62 @@ are extensions. **Not checked: that consent and sample are one speaker** —
 OpenAI rejects a mismatch and nothing here can tell two speakers apart.
 The consent recording is kept beside the voice.
 
+## B9 — designed voices, kept by name (2026-10-14)
+
+**The model has no voice identity of its own.** The checkpoint has no
+speaker embedding or table of preset voices. `[S0]`–`[S9]` are turn tags
+from CSM's dialogue format, and every upstream path uses `[S0]`. The voice
+comes only from the instruction (drawn again on every request) or from a
+reference clip (cloned). A seed fixes the draw only for the same text,
+because the text changes every logit after it. Upstream's README offers
+nothing between the two either. So keeping a designed voice means designing
+it once and cloning that clip from then on: the B8 machinery, fed by the
+model's own output in place of a recording.
+
+What is kept is the **frames the model sampled** (`Stats.Codes`), not a
+re-encode of its audio. They are exact and on the model's own
+distribution, and the codec encoder is never loaded. The line becomes the
+transcript. Codes past the kept audio are the closing breath the ending
+check cut, so they are dropped: a reference that ends on a breath would
+teach every clone to. No consent is asked, because no person's voice is
+recorded. The clip is kept as `<id>.wav` beside the record.
+
+The API (extensions; OpenAI has no designed voices):
+
+```
+# 1. audition: the same request with seeds until one sounds right
+POST /v1/audio/speech  {"model": "breeze-tts-2", "instructions": "...", "input": "<a line, 5-20 s>", "seed": 7}
+# 2. keep it: same fields + a name; the server re-runs it and stores the frames
+POST /v1/audio/voices  (application/json) {"name": "storyteller", "instructions": "...", "input": "...", "seed": 7}
+# 3. use it, by name or OpenAI's {"id": ...}; instructions still direct the delivery (RefEdit)
+POST /v1/audio/speech  {"input": "...", "voice": "storyteller"}
+GET  /v1/audio/voices/storyteller/sample    DELETE /v1/audio/voices/storyteller
+```
+
+Step 2 reproduces step 1 exactly: a seeded generation is the same whether
+it runs alone or shared (B7). Names are now addresses for every custom
+voice, cloned ones included. They are matched without regard to case
+before routing, so `voice: "storyteller"` goes to the instructed model even
+though kokoro is the default. A name has to be unique and cannot be a
+built-in voice's name, contain `,` or `:` (kokoro's mix syntax), or start
+with `voice_`.
+
+Checked on a test server (port 18088, ai.service also up). Instruction "A
+warm, gravelly older man with a slow, deliberate storyteller's delivery",
+a 13 s line, seed 7:
+
+| check | result |
+| --- | --- |
+| kept clip vs the audition | bit-identical (624,000 bytes) |
+| 4 new lines through `voice: "storyteller"`, seeds 100–103 | all transcribe correctly |
+| ECAPA (speechbrain spkrec-ecapa-voxceleb) cosine to the kept clip | **0.80, 0.85, 0.80, 0.80** |
+| the same 4 lines, instruction only, same seeds | 0.41, 0.52, 0.41, 0.21 |
+| pairwise among the 4 | cloned mean 0.75 (min 0.69); instruction-only mean 0.39 (min 0.30) |
+| storyteller + `instructions: "Whispering..."` | transcribes correctly |
+
+The clips are in `out/breeze-samples/designed-voice/`. The ECAPA scorer
+ran in a scratch venv and is not part of the repo.
+
 ## The closing breath (2026-10-14)
 
 The served narrator line "...with a light breeze from the west." came back
@@ -355,6 +412,8 @@ seeds whether the request runs alone or shared: see the closing breath above
 
 ## Handoff
 
-Next: nothing planned. B7 closed with the device frame and shared passes (1.93x alone, two streams at once). The
+B9 (designed voices by name) is built and tested on a test server, **not
+deployed**: deploying needs ai.service restarted (`deploy.sh`), which waits
+for the user's go. Before B9: nothing planned. B7 closed with the device frame and shared passes (1.93x alone, two streams at once). The
 oracle's venv is `.venv-breeze` (gitignored); `models/breeze-tts-src` is
 upstream at 6eba901. Samples to listen to are in `out/breeze-samples/`.

@@ -201,6 +201,9 @@ type Stats struct {
 	Wait                             time.Duration // waiting for a stream slot
 	FirstAudio, Total                time.Duration
 	Trimmed                          time.Duration // the closing breath dropped (tail.go)
+	// Codes are the frames sampled, in order: what a designed voice keeps
+	// as its reference (backend/breeze_voices.go).
+	Codes [][16]int32
 }
 
 // stream is an utterance in the scheduler.
@@ -453,6 +456,7 @@ func (m *Model) generate(ctx context.Context, req *Request, o GenOptions, emit f
 			}
 			st.Frame += f.took
 			st.Frames++
+			st.Codes = append(st.Codes, f.frame)
 			pending = append(pending, f.frame)
 			if len(pending) >= o.Chunk {
 				if err := flush(); err != nil {
@@ -520,6 +524,7 @@ func (m *Model) generate(ctx context.Context, req *Request, o GenOptions, emit f
 			st.Depth += dt
 		}
 		st.Frames++
+		st.Codes = append(st.Codes, frame)
 		pending = append(pending, frame)
 		if len(pending) >= o.Chunk {
 			if err := flush(); err != nil {

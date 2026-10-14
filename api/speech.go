@@ -149,6 +149,9 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, "input is empty")
 		return
 	}
+	if v := s.voiceNamed(req.Voice); v != nil && !req.CustomVoice {
+		req.Voice, req.CustomVoice = v.ID, true
+	}
 	backend, err := s.speechFor(&req)
 	if err != nil {
 		badRequest(ctx, w, err.Error())

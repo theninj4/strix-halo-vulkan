@@ -9,6 +9,13 @@ package backend
 // A voice is its reference codes (the codec encoder's, on the host, ~0.25 s
 // a second of sample) and the sample's exact transcript: what a clone's
 // prompt is built from. The sample's audio is not kept; the codes are it.
+//
+// A designed voice (DesignVoice) has no recording and no consent: the model
+// speaks a line in the voice an instruction describes, and the frames it
+// sampled are kept as the reference, exactly, with the line as transcript.
+// The model has no other way to hold a speaker: without a reference every
+// request draws one, and a seed pins it only for the same text. Its clip is
+// kept beside the record (<id>.wav) to be listened to.
 
 import (
 	"context"
@@ -167,6 +174,70 @@ func (b *Breeze) CreateVoice(_ context.Context, name string, sample *audio.Clip,
 	return &v.Voice, nil
 }
 
+// DesignVoice speaks input in the voice instructions describe and keeps it as
+// a voice: the same request to /v1/audio/speech with the same seed is the
+// same clip, so a caller auditions there first.
+func (b *Breeze) DesignVoice(ctx context.Context, name, instructions, input string, seed uint64) (*api.Voice, error) {
+	s, err := b.needStore()
+	if err != nil {
+		return nil, err
+	}
+	o := breeze.GenOptions{Seed: seed}
+	if b.Hear != nil {
+		o.Ending = b.ending(ctx, input)
+	}
+	clip := &audio.Clip{Rate: breeze.SampleRate}
+	st, err := b.m.Generate(ctx, &breeze.Request{Text: input, Instruction: instructions}, o,
+		func(w []float32) error { clip.Samples = append(clip.Samples, w...); return nil })
+	if err != nil {
+		return nil, err
+	}
+	// The codes past the kept audio are the closing breath (tail.go): a
+	// reference that ends on it teaches every clone to.
+	codes := st.Codes
+	if n := (len(clip.Samples) + breeze.FrameSamples - 1) / breeze.FrameSamples; n < len(codes) {
+		codes = codes[:n]
+	}
+	if sec := clip.Duration(); sec < 3 || len(codes) == 0 {
+		return nil, fmt.Errorf("the line came out %.1f s long; a voice needs a few sentences: %w", sec, api.ErrUnsupported)
+	}
+	v := &storedVoice{Voice: api.Voice{ID: newID("voice_"), Object: "audio.voice", Name: name,
+		CreatedAt: time.Now().Unix(), Transcript: strings.TrimSpace(input), Seconds: clip.Duration(),
+		Instructions: instructions, Seed: &seed}, Codes: codes}
+	base := filepath.Join(s.dir, "voices", v.ID)
+	if err := clip.WriteWAV(base + ".wav"); err != nil {
+		return nil, err
+	}
+	j, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeAtomic(base+".json", j); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.byID[v.ID] = v
+	s.mu.Unlock()
+	return &v.Voice, nil
+}
+
+// VoiceSample is a designed voice's clip as a WAV file; ErrNotFound for a
+// cloned voice, whose recording is not kept.
+func (b *Breeze) VoiceSample(id string) ([]byte, error) {
+	s, err := b.needStore()
+	if err != nil {
+		return nil, err
+	}
+	if s.get(id) == nil {
+		return nil, api.ErrNotFound
+	}
+	w, err := os.ReadFile(filepath.Join(s.dir, "voices", id+".wav"))
+	if os.IsNotExist(err) {
+		return nil, api.ErrNotFound
+	}
+	return w, err
+}
+
 // ListVoices is every stored voice, oldest first.
 func (b *Breeze) ListVoices() []api.Voice {
 	if b.store == nil {
@@ -189,6 +260,7 @@ func (b *Breeze) DeleteVoice(id string) error {
 	if err := os.Remove(filepath.Join(s.dir, "voices", id+".json")); err != nil {
 		return err
 	}
+	_ = os.Remove(filepath.Join(s.dir, "voices", id+".wav"))
 	delete(s.byID, id)
 	return nil
 }
