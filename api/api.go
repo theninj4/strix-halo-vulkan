@@ -52,7 +52,14 @@ type Server struct {
 	Presets []Preset
 
 	// The backends, any of which may be nil.
-	Speech        SpeechBackend
+	Speech SpeechBackend
+	// InstructedSpeech is the speech model that takes a description of the
+	// voice (`instructions`) and custom voices, and streams (Breeze-TTS-2,
+	// research/tts-instruct-vertical.md B6). /v1/audio/speech routes to it
+	// by model or by those fields; Speech stays the default.
+	InstructedSpeech StreamingSpeechBackend
+	// Voices stores custom voices for it (voices.go, B8).
+	Voices        VoiceBackend
 	Transcription TranscriptionBackend
 	Completion    CompletionBackend
 	Embedding     EmbeddingBackend
@@ -108,6 +115,13 @@ func (s *Server) Handler() http.Handler {
 
 	// Input: SpeechRequest{}, Output: SpeechResponse{}
 	mux.Handle("POST /v1/audio/speech", s.route(s.handleSpeech))
+
+	// Custom voices, OpenAI's flow (voices.go).
+	mux.Handle("GET /v1/audio/consent_phrases", s.route(s.handleConsentPhrases))
+	mux.Handle("POST /v1/audio/voice_consents", s.route(s.handleVoiceConsent))
+	mux.Handle("POST /v1/audio/voices", s.route(s.handleVoiceCreate))
+	mux.Handle("GET /v1/audio/voices", s.route(s.handleVoiceList))
+	mux.Handle("DELETE /v1/audio/voices/{id}", s.route(s.handleVoiceDelete))
 
 	// Input: TranscriptionRequest{}, Output: TranscriptionResponse{}
 	mux.Handle("POST /v1/audio/transcriptions", s.route(s.handleTranscription))

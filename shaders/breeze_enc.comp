@@ -1,0 +1,153 @@
+// Breeze-TTS-2's text encoder (breeze/encoder.go, research/tts-instruct-
+// vertical.md B2): T5Gemma2's attention, 4 q heads and 1 kv head of 256,
+// bidirectional, every sixth layer full and the rest a window. The norms,
+// projections and GEGLU are Gemma 4's vision tower's kernels (gemma4_vit
+// JOIN, dit_gemm GLU_GELU); these are the two that differ. Built once a MODE:
+//
+//	0 PREP  one workgroup a (row, head) over 4 q heads, then k, then v, one
+//	        thread a channel, out of the fused q|k|v projection (row stride
+//	        aux0): q and k RMS-normed with (1 + w) (staged so: wOff q_norm,
+//	        wOff + 256 k_norm), then NeoX rope from the host's table at bOff
+//	        (cos [pos][128], sin kStride positions later); q times `scale`
+//	        (query_pre_attn_scalar^-1/2). Written fp16: q as [head][aux1][256]
+//	        at outOff, k and v as [row][256] at kOff, vOff.
+//	1 ATTN  one workgroup a (row, q head): scores against every key the row
+//	        sees -- all of them in a full layer, keys r-255 .. r+256 in a
+//	        sliding one (aux2 = 1: HF's mask with window 512, left (512+1)/2
+//	        and right 512/2 + 1, exclusive) -- softmax in fp32, then p.V one
+//	        thread a channel, into the o projection's fp16 A operand at outOff
+//	        (row stride lda, head h at column h * 256).
+//
+// Fields (dit_common.glsl): tokens = rows. ATTN scores up to MAXK keys.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+#define HD 256u
+#define NQ 4u
+#define WG 256u
+#define MAXK 2048u
+
+layout(local_size_x = WG) in;
+
+shared float red[WG];
+
+float rowSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float rowMax(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] = max(red[t], red[t + s]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+#if MODE == 0
+
+shared float xs[HD];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    float x = act[pc.inOff + r * pc.aux0 + h * HD + t];
+    if (h == NQ + 1u) {
+        hact[pc.vOff + r * HD + t] = float16_t(x);
+        return;
+    }
+    bool isQ = h < NQ;
+    float inv = inversesqrt(rowSum(x * x) / float(HD) + uintBitsToFloat(pc.eps));
+    float xn = x * inv * wbuf[pc.wOff + (isQ ? 0u : HD) + t];
+    xs[t] = xn;
+    barrier();
+    uint i = t % (HD / 2u);
+    float c = wbuf[pc.bOff + r * (HD / 2u) + i];
+    float s = wbuf[pc.bOff + pc.kStride * (HD / 2u) + r * (HD / 2u) + i];
+    float y = t < HD / 2u ? xn * c - xs[t + HD / 2u] * s : xn * c + xs[t - HD / 2u] * s;
+    if (isQ) {
+        hact[pc.outOff + (h * pc.aux1 + r) * HD + t] = float16_t(y * uintBitsToFloat(pc.scale));
+    } else {
+        hact[pc.kOff + r * HD + t] = float16_t(y);
+    }
+}
+
+#else
+
+shared float qs[HD];
+shared float ps[MAXK];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint lo = 0u, hi = pc.tokens;
+    if (pc.aux2 != 0u) {
+        lo = r >= 255u ? r - 255u : 0u;
+        hi = min(pc.tokens, r + 257u);
+    }
+    uint n = hi - lo;
+    qs[t] = float(hact[pc.inOff + (h * pc.aux1 + r) * HD + t]);
+    barrier();
+
+    float m = -1.0 / 0.0;
+    for (uint j = t; j < n; j += WG) {
+        uint k = pc.kOff + (lo + j) * HD;
+        float s = 0.0;
+        for (uint c = 0u; c < HD; c += 4u) {
+            f16vec4 kv = f16vec4(hact[k + c], hact[k + c + 1u], hact[k + c + 2u], hact[k + c + 3u]);
+            s += dot(vec4(kv), vec4(qs[c], qs[c + 1u], qs[c + 2u], qs[c + 3u]));
+        }
+        ps[j] = s;
+        m = max(m, s);
+    }
+    m = rowMax(m);
+    float z = 0.0;
+    for (uint j = t; j < n; j += WG) {
+        float p = exp(ps[j] - m);
+        ps[j] = p;
+        z += p;
+    }
+    z = rowSum(z); // its barriers also publish ps
+
+    float o = 0.0;
+    for (uint j = 0u; j < n; ++j) {
+        o += ps[j] * float(hact[pc.vOff + (lo + j) * HD + t]);
+    }
+    hact[pc.outOff + r * pc.lda + h * HD + t] = float16_t(o / z);
+}
+
+#endif

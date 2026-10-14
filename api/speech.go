@@ -1,11 +1,15 @@
 package api
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,6 +30,22 @@ type SpeechRequest struct {
 	ResponseFormat string  `json:"response_format"` // mp3, wav, opus, flac, pcm
 	Speed          float64 `json:"speed"`           // 0.5 - 2.0
 	Stream         bool    `json:"stream"`          // false
+	// Instructions describe the voice and its delivery ("An enthusiastic
+	// radio DJ"): OpenAI's field, for gpt-4o-mini-tts and not tts-1. Here it
+	// is answered by the instructed model (InstructedSpeech), and a request
+	// that carries it for kokoro is refused rather than read as nothing.
+	Instructions string `json:"instructions,omitempty"`
+	// StreamFormat is OpenAI's: "audio" streams the body as the samples are
+	// made (chunked), "sse" as speech.audio.delta events of base64 audio
+	// and a closing speech.audio.done. Empty is one whole body.
+	StreamFormat string `json:"stream_format,omitempty"`
+	// CustomVoice is set when `voice` was OpenAI's custom-voice object,
+	// {"id": "voice_..."}; Voice then holds the id.
+	CustomVoice bool `json:"-"`
+	// Seed is an extension, not OpenAI's: the instructed model samples, and
+	// without a reference its speaker is a draw, so a seed is how a caller
+	// gets the same reading twice. Kokoro is deterministic and ignores it.
+	Seed *uint64 `json:"seed,omitempty"`
 	// Phonemes is an extension, not OpenAI's: IPA to speak directly,
 	// bypassing grapheme-to-phoneme. Kokoro's vocabulary is 178 IPA symbols
 	// and the front end that reaches them is a separate model's worth of
@@ -34,6 +54,43 @@ type SpeechRequest struct {
 	// here and the server does not guess. It wins over Input when both are
 	// set.
 	Phonemes string `json:"phonemes,omitempty"`
+}
+
+// UnmarshalJSON takes `voice` as OpenAI does: a name, or a custom voice as
+// {"id": "voice_..."}.
+func (r *SpeechRequest) UnmarshalJSON(b []byte) error {
+	type plain SpeechRequest
+	aux := struct {
+		*plain
+		Voice json.RawMessage `json:"voice"`
+	}{plain: (*plain)(r)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	if len(aux.Voice) == 0 || string(aux.Voice) == "null" {
+		return nil
+	}
+	if aux.Voice[0] == '"' {
+		return json.Unmarshal(aux.Voice, &r.Voice)
+	}
+	var obj struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(aux.Voice, &obj); err != nil || obj.ID == "" {
+		return errors.New(`"voice" is a name or {"id": "voice_..."}`)
+	}
+	r.Voice, r.CustomVoice = obj.ID, true
+	return nil
+}
+
+// StreamingSpeechBackend is a speech model that makes its audio as it goes,
+// so the endpoint can send it as it goes: the instructed model's frames are
+// 80 ms of audio each, decoded a couple at a time.
+type StreamingSpeechBackend interface {
+	SpeechBackend
+	// SpeakStream synthesises req, handing emit mono samples at the
+	// returned rate, chunk by chunk. rate is known before the first chunk.
+	SpeakStream(ctx context.Context, req *SpeechRequest, start func(rate int) error, emit func([]float32) error) error
 }
 
 // SpeechResponse is the OpenAI Speech Response
@@ -47,16 +104,40 @@ const (
 	maxSpeed = 4.0
 )
 
-// handleSpeech synthesises an utterance and returns it as one body.
-//
-// It does not stream. OpenAI's streaming speech is chunked audio as the model
-// produces it, and kokoro does not produce it that way: the durations for the
-// whole utterance are decided before a single sample exists (SPEECH.md T2),
-// so there is nothing to send early. A request with stream:true is refused
-// rather than answered with a whole body pretending to be a stream.
+// speechFor picks the model a request is for. The instructed model answers
+// to its own ids, to OpenAI's instruction-taking gpt-4o-mini-tts, to a
+// custom voice, and to any request that carries instructions and names no
+// other model; kokoro to everything else, as before. An instruction for a
+// model that cannot take one is refused, as OpenAI refuses it for tts-1.
+func (s *Server) speechFor(req *SpeechRequest) (SpeechBackend, error) {
+	instructed := s.InstructedSpeech != nil && (owns(s.InstructedSpeech, req.Model) ||
+		strings.HasPrefix(req.Model, "gpt-4o-mini-tts"))
+	kokoro := s.Speech != nil && req.Model != "" && owns(s.Speech, req.Model)
+	switch {
+	case instructed:
+		return s.InstructedSpeech, nil
+	case kokoro && (req.Instructions != "" || req.CustomVoice):
+		return nil, errors.New("model " + strconv.Quote(req.Model) + " takes neither instructions nor a custom voice; " +
+			"ask for the instructed model (GET /v1/models) or drop them")
+	case !kokoro && (req.Instructions != "" || req.CustomVoice):
+		if s.InstructedSpeech == nil {
+			return nil, errors.New("instructions and custom voices need the instructed speech model, " +
+				"which this server was not started with (-tts-instruct)")
+		}
+		return s.InstructedSpeech, nil
+	case s.Speech != nil:
+		return s.Speech, nil
+	case s.InstructedSpeech != nil:
+		return s.InstructedSpeech, nil
+	}
+	return nil, nil
+}
+
+// handleSpeech synthesises an utterance: one body, or streamed as it is made
+// when stream_format asks and the model can.
 func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if s.Speech == nil {
+	if s.Speech == nil && s.InstructedSpeech == nil {
 		notLoaded(ctx, w, "text to speech", "-tts")
 		return
 	}
@@ -68,8 +149,23 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 		badRequest(ctx, w, "input is empty")
 		return
 	}
-	if req.Stream {
-		badRequest(ctx, w, "streaming speech is not implemented; the utterance's durations are decided before any samples exist")
+	backend, err := s.speechFor(&req)
+	if err != nil {
+		badRequest(ctx, w, err.Error())
+		return
+	}
+	stream, streaming := backend.(StreamingSpeechBackend)
+	switch req.StreamFormat {
+	case "", "audio", "sse":
+	default:
+		badRequest(ctx, w, "stream_format "+strconv.Quote(req.StreamFormat)+" is not one of audio, sse")
+		return
+	}
+	if req.Stream && req.StreamFormat == "" {
+		req.StreamFormat = "audio"
+	}
+	if req.StreamFormat != "" && !streaming {
+		badRequest(ctx, w, "streaming speech is not implemented for this model; the utterance's durations are decided before any samples exist")
 		return
 	}
 	if req.Speed == 0 {
@@ -104,13 +200,17 @@ func (s *Server) handleSpeech(w http.ResponseWriter, r *http.Request) {
 			" is not supported; this server encodes wav and pcm (16-bit signed, little endian, mono)")
 		return
 	}
+	if req.StreamFormat != "" {
+		s.streamSpeech(ctx, w, stream, &req, format)
+		return
+	}
 
 	// The synthesis is timed on its own, not just as part of the request:
 	// what it costs per second of audio produced is the number that says
 	// whether this endpoint got faster, and the request's total duration
 	// includes encoding and the write to the client.
 	start := time.Now()
-	clip, err := s.Speech.Speak(r.Context(), &req)
+	clip, err := backend.Speak(r.Context(), &req)
 	if err != nil {
 		backendError(ctx, w, "speech", err)
 		return
@@ -175,3 +275,94 @@ func encodePCM16(samples []float32) []byte {
 // backend error, and a backend that returned nothing without saying why --
 // are distinguishable in the log.
 var errEmptyAudio = errors.New("the speech backend returned no samples")
+
+// streamSpeech sends the audio as the model makes it. "audio" is the
+// response_format's bytes over a chunked body -- a WAV header first, its
+// sizes the streaming placeholder 0xffffffff, since the length is not known
+// until the end -- and "sse" the same bytes base64'd in speech.audio.delta
+// events, then speech.audio.done. Once the first byte is out a failure can
+// only end the stream: the status is already 200.
+func (s *Server) streamSpeech(ctx context.Context, w http.ResponseWriter, b StreamingSpeechBackend, req *SpeechRequest, format string) {
+	start := time.Now()
+	var ev *sse
+	rc := http.NewResponseController(w)
+	samples := 0
+	rate := 0
+	write := func(p []byte) error {
+		if ev != nil {
+			return ev.send("", speechDelta{Type: "speech.audio.delta", Audio: base64.StdEncoding.EncodeToString(p)})
+		}
+		if _, err := w.Write(p); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
+	begin := func(r int) error {
+		rate = r
+		if req.StreamFormat == "sse" {
+			ev = newSSE(w)
+		} else {
+			w.Header().Set("Content-Type", map[string]string{"wav": "audio/wav", "pcm": "audio/pcm"}[format])
+			w.Header().Set("X-Sample-Rate", strconv.Itoa(r))
+			w.WriteHeader(http.StatusOK)
+		}
+		if format == "wav" {
+			return write(streamingWAVHeader(r))
+		}
+		return nil
+	}
+	emit := func(chunk []float32) error {
+		samples += len(chunk)
+		return write(encodePCM16(chunk))
+	}
+	err := b.SpeakStream(ctx, req, begin, emit)
+	if err != nil {
+		if rate == 0 {
+			backendError(ctx, w, "speech", err)
+			return
+		}
+		logf(ctx, "speech: stream ended early: %v", err)
+		return
+	}
+	if ev != nil {
+		_ = ev.send("", speechDone{Type: "speech.audio.done"})
+	}
+	if rate > 0 {
+		audioLen := float64(samples) / float64(rate)
+		took := time.Since(start)
+		logf(ctx, "speech: %d characters -> %.2fs of audio at %d Hz, streamed (%s, %s), in %v (%.1fx real time)",
+			len(req.Input), audioLen, rate, req.StreamFormat, format, took.Round(time.Millisecond), audioLen/took.Seconds())
+	}
+}
+
+// speechDelta and speechDone are OpenAI's streamed speech events.
+type speechDelta struct {
+	Type  string `json:"type"`
+	Audio string `json:"audio"`
+}
+
+type speechDone struct {
+	Type string `json:"type"`
+}
+
+// streamingWAVHeader is a 16-bit mono WAV header whose RIFF and data sizes
+// are 0xffffffff: the length is not known when it is sent, and that is the
+// value players and ffmpeg read as "until the end of the stream".
+func streamingWAVHeader(rate int) []byte {
+	b := make([]byte, 0, 44)
+	put32 := func(v uint32) { b = binary.LittleEndian.AppendUint32(b, v) }
+	put16 := func(v uint16) { b = binary.LittleEndian.AppendUint16(b, v) }
+	b = append(b, "RIFF"...)
+	put32(0xffffffff)
+	b = append(b, "WAVEfmt "...)
+	put32(16)
+	put16(1)
+	put16(1)
+	put32(uint32(rate))
+	put32(uint32(rate * 2))
+	put16(2)
+	put16(16)
+	b = append(b, "data"...)
+	put32(0xffffffff)
+	return b
+}

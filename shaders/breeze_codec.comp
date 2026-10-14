@@ -1,0 +1,274 @@
+// Breeze-TTS-2's codec decoder (breeze/codec.go, research/tts-instruct-
+// vertical.md B5): Qwen3-TTS's 12.5 Hz tokenizer decoder, streamed in chunks
+// of frames with every causal state carried. The convolutions and the
+// projections run on dit_gemm.comp (A_CONV=2 for the convolutions, over a
+// channel-last fp16 operand whose left border holds the previous chunk's
+// last rows); these are the kernels between them. Built once a MODE:
+//
+//   0 NARROW  fp32 [tokens][dim] (+ bias at kOff unless NO_W) through
+//             SnakeBeta (wOff: alpha then 1/(beta + 1e-9), both already
+//             exponentiated; NO_W skips it) into the fp16 operand at outOff,
+//             row stride lda; columns dim..lda and `span` rows after the data
+//             are written as zeros (the convolution's channel padding and
+//             the M tile's rows read them). Flat over (tokens + span) * lda.
+//   1 BIAS    x[t][c] += b[c] (outOff, kOff), flat over tokens * dim.
+//   2 LN      LayerNorm (eps 1e-6) of fp32 rows with weight wOff, bias kOff,
+//             into the fp16 operand at outOff (lda). One workgroup a row,
+//             dim <= 1024.
+//   3 GELU    fp32 [tokens][dim] + b (kOff) through erf GELU into fp16 (lda).
+//   4 RESID   x[t][c] += g[c] * (y[t][c] + b[c]): x at outOff, y at inOff,
+//             g at wOff and b at kOff, each optional (NO_W: 1 and 0).
+//   5 DWCONV  the ConvNeXt's depthwise causal k7: out[t][c] = b[c] +
+//             sum_j w[c][j] * in[t + j - 6][c], in at inOff with its six
+//             history rows before row 0; fp32 to fp32 (outOff).
+//   6 COPY32  tokens floats from inOff to outOff (the activation arena).
+//   7 COPY16  tokens halves from inOff to outOff (the fp16 arena).
+//   8 OUT     wav[t] = clamp(y[t * lda] + b, -1, 1): the last convolution's
+//             one real column out of its padded tile (inOff, kOff the bias's
+//             offset) to outOff.
+//   9 PREP    the transformer's q, k and v out of the fused projection (row
+//             stride 3072), one 64-wide workgroup a (row, head) over 16 q, 16
+//             k and 16 v heads: NeoX rope at the row's absolute position
+//             (aux0 + row) from the host's table at wOff (cos [pos][32], sin
+//             kStride positions later) for q and k, q times `scale`; q fp16
+//             [row][16][64] at outOff, k and v into the caches at kOff, vOff,
+//             [pos][16][64].
+//  10 ATTN    one 64-wide workgroup a (row, head): causal attention over the
+//             last `span` positions (the sliding window, 72) of the caches,
+//             into the o projection's fp16 operand at outOff (lda).
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+
+#if MODE >= 9
+#define WG 64u
+#define HD 64u
+#define NH 16u
+#define MAXW 128u
+#else
+#define WG 256u
+#endif
+
+layout(local_size_x = WG) in;
+
+shared float red[WG];
+
+float rowSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+float rowMax(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] = max(red[t], red[t + s]);
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+#if MODE == 9
+shared float xs[HD];
+#endif
+#if MODE == 10
+shared float qs[HD];
+shared float ps[MAXW];
+#endif
+
+void main() {
+#if MODE == 0
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= (pc.tokens + pc.span) * pc.lda) {
+        return;
+    }
+    uint t = idx / pc.lda, c = idx % pc.lda;
+    float v = 0.0;
+    if (t < pc.tokens && c < pc.dim) {
+        v = act[pc.inOff + t * pc.dim + c];
+        if (pc.kOff != NO_W) {
+            v += wbuf[pc.kOff + c];
+        }
+        if (pc.wOff != NO_W) {
+            float s = sin(v * wbuf[pc.wOff + c]);
+            v += wbuf[pc.wOff + pc.dim + c] * s * s;
+        }
+    }
+    hact[pc.outOff + t * pc.lda + c] = float16_t(v);
+
+#elif MODE == 1
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    act[pc.outOff + idx] += wbuf[pc.kOff + idx % pc.dim];
+
+#elif MODE == 2
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    float v[4];
+    float s = 0.0;
+    for (uint k = 0u, i = t; i < pc.dim; i += WG, ++k) {
+        v[k] = act[pc.inOff + r * pc.dim + i];
+        s += v[k];
+    }
+    float mean = rowSum(s) / float(pc.dim);
+    float ss = 0.0;
+    for (uint k = 0u, i = t; i < pc.dim; i += WG, ++k) {
+        float d = v[k] - mean;
+        ss += d * d;
+    }
+    float inv = inversesqrt(rowSum(ss) / float(pc.dim) + 1e-6);
+    for (uint k = 0u, i = t; i < pc.dim; i += WG, ++k) {
+        hact[pc.outOff + r * pc.lda + i] = float16_t((v[k] - mean) * inv * wbuf[pc.wOff + i] + wbuf[pc.kOff + i]);
+    }
+
+#elif MODE == 3
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint t = idx / pc.dim, c = idx % pc.dim;
+    float x = act[pc.inOff + idx] + wbuf[pc.kOff + c];
+    // erf by Abramowitz-Stegun 7.1.26 is 1.5e-7 absolute; GLSL has no erf.
+    float z = abs(x) * 0.7071067811865476;
+    float k = 1.0 / (1.0 + 0.3275911 * z);
+    float e = 1.0 - (((((1.061405429 * k - 1.453152027) * k) + 1.421413741) * k - 0.284496736) * k + 0.254829592) * k * exp(-z * z);
+    float erfx = x < 0.0 ? -e : e;
+    hact[pc.outOff + t * pc.lda + c] = float16_t(0.5 * x * (1.0 + erfx));
+
+#elif MODE == 4
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint c = idx % pc.dim;
+    float y = act[pc.inOff + idx];
+    if (pc.kOff != NO_W) {
+        y += wbuf[pc.kOff + c];
+    }
+    if (pc.wOff != NO_W) {
+        y *= wbuf[pc.wOff + c];
+    }
+    act[pc.outOff + idx] += y;
+
+#elif MODE == 5
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint t = idx / pc.dim, c = idx % pc.dim;
+    float s = wbuf[pc.kOff + c];
+    for (uint j = 0u; j < 7u; ++j) {
+        // in[t + j - 6]: rows before the chunk are its history.
+        s += wbuf[pc.wOff + c * 7u + j] * act[pc.inOff + (t + j) * pc.dim + c - 6u * pc.dim];
+    }
+    act[pc.outOff + idx] = s;
+
+#elif MODE == 6
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.tokens) {
+        act[pc.outOff + idx] = act[pc.inOff + idx];
+    }
+
+#elif MODE == 7
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.tokens) {
+        hact[pc.outOff + idx] = hact[pc.inOff + idx];
+    }
+
+#elif MODE == 8
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < pc.tokens) {
+        act[pc.outOff + idx] = clamp(act[pc.inOff + idx * pc.lda] + wbuf[pc.kOff], -1.0, 1.0);
+    }
+
+#elif MODE == 9
+    uint r = gl_WorkGroupID.x;
+    uint y = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint pos = pc.aux0 + r;
+    float x = act[pc.inOff + r * 3u * NH * HD + y * HD + t];
+    if (y >= 2u * NH) {
+        hact[pc.vOff + (pos * NH + y - 2u * NH) * HD + t] = float16_t(x);
+        return;
+    }
+    xs[t] = x;
+    barrier();
+    uint i = t % (HD / 2u);
+    float c = wbuf[pc.wOff + pos * (HD / 2u) + i];
+    float s = wbuf[pc.wOff + pc.kStride * (HD / 2u) + pos * (HD / 2u) + i];
+    float o = t < HD / 2u ? x * c - xs[t + HD / 2u] * s : x * c + xs[t - HD / 2u] * s;
+    if (y < NH) {
+        hact[pc.outOff + (r * NH + y) * HD + t] = float16_t(o * uintBitsToFloat(pc.scale));
+    } else {
+        hact[pc.kOff + (pos * NH + y - NH) * HD + t] = float16_t(o);
+    }
+
+#elif MODE == 10
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint pos = pc.aux0 + r;
+    uint lo = pos + 1u > pc.span ? pos + 1u - pc.span : 0u;
+    uint n = pos + 1u - lo;
+    qs[t] = float(hact[pc.inOff + (r * NH + h) * HD + t]);
+    barrier();
+    float m = -1.0 / 0.0;
+    for (uint j = t; j < n; j += WG) {
+        uint k = pc.kOff + ((lo + j) * NH + h) * HD;
+        float s = 0.0;
+        for (uint d = 0u; d < HD; ++d) {
+            s += qs[d] * float(hact[k + d]);
+        }
+        ps[j] = s;
+        m = max(m, s);
+    }
+    m = rowMax(m);
+    float z = 0.0;
+    for (uint j = t; j < n; j += WG) {
+        float p = exp(ps[j] - m);
+        ps[j] = p;
+        z += p;
+    }
+    z = rowSum(z);
+    float o = 0.0;
+    for (uint j = 0u; j < n; ++j) {
+        o += ps[j] * float(hact[pc.vOff + ((lo + j) * NH + h) * HD + t]);
+    }
+    hact[pc.outOff + r * pc.lda + h * HD + t] = float16_t(o / z);
+#endif
+}

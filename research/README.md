@@ -19,6 +19,7 @@ The phase-1 backlog and the measured roofline are archived in
 | concurrency (several completions) | C0–C6 done, C7 conditional | [`concurrency.md`](concurrency.md) § Next |
 | LLM vision | live (V11 parked) | [`llm-vision.md`](llm-vision.md) § Handoff |
 | speech → text, text → speech | done, open items listed | [`speech-vertical.md`](speech-vertical.md) § "Where it stands, and what is open" (last section) |
+| instructed TTS (Breeze-TTS-2, beside kokoro) | planned, not started | [`tts-instruct-vertical.md`](tts-instruct-vertical.md) § Decisions, Handoff |
 | image (Qwen-Image-2.1) | parked | [`qimage-vertical.md`](qimage-vertical.md) § "After parking" (last section) |
 | music (ACE-Step 1.5) | closed; A14 quality score: A14a–d done and deployed, next A14e (calibration, flag) | [`music-vertical.md`](music-vertical.md) § "After closing" (last section) |
 | video (MiniMax-H3) | live (M11) | [`video-vertical.md`](video-vertical.md) § Handoff |

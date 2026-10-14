@@ -1,0 +1,138 @@
+// Breeze-TTS-2's backbone and depth decoder (breeze/decoder.go, research/
+// tts-instruct-vertical.md B7): the kernels that let a layer's q|k|v and
+// gate|up run as one projection each, and fold the residual add into the
+// next norm. A decode step is latency, not bandwidth (a depth-decoder pass
+// was ~250 dispatches at ~17 us each), so the lever is dispatches. Built
+// once a MODE (and, for PREP, a stack's heads):
+//
+//   0 PREP     ace_lm_prep.comp's step over a fused projection: q, k and v of
+//              row r at inOff + r * dim (+ NQ*128, + (NQ+NKV)*128); q/k
+//              RMS-normed when QK_NORM (wOff q_norm, wOff + 128 k_norm),
+//              NeoX rope at the row's position from bOff (cos [pos][64], sin
+//              kStride positions later), q times `scale` into fp16 at outOff,
+//              k and v into the caches aux1, aux2 at (slot, pos) of a plane
+//              `span` positions a slot. Row metadata (slot, pos) at aux0.
+//   1 SWIGLU   silu(g) * u * scale into fp16 (outOff, row stride lda): g and
+//              u are columns [0, dim) and [dim, 2 dim) of row r at inOff + r *
+//              2 dim, the fused gate|up projection's output.
+//   2 ADDNORM  one workgroup a row: x += y * scale (x at outOff, y at inOff,
+//              both dim wide), then rms(x) * w (wOff, eps) into the fp16
+//              operand at bOff (lda). The residual join and the next norm.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+#define HD 128u
+#ifndef NQ
+#define NQ 16u
+#endif
+#ifndef NKV
+#define NKV 8u
+#endif
+#ifndef QK_NORM
+#define QK_NORM 1
+#endif
+
+#if MODE == 0
+#define WG 128u
+#else
+#define WG 256u
+#endif
+#define MAXV 8u // ADDNORM: dim <= 2048
+
+layout(local_size_x = WG) in;
+
+shared float red[WG];
+
+float rowSum(float v) {
+    uint t = gl_LocalInvocationID.x;
+    red[t] = v;
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            red[t] += red[t + s];
+        }
+        barrier();
+    }
+    float r = red[0];
+    barrier();
+    return r;
+}
+
+void main() {
+#if MODE == 0
+    uint r = gl_WorkGroupID.x;
+    uint y = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint slot = floatBitsToUint(act[pc.aux0 + r * 2u]);
+    uint pos = floatBitsToUint(act[pc.aux0 + r * 2u + 1u]);
+    uint cell = ((slot * pc.span + pos) * NKV) * HD;
+    uint row = pc.inOff + r * pc.dim;
+
+    if (y >= NQ + NKV) {
+        uint h = y - NQ - NKV;
+        hact[pc.aux2 + cell + h * HD + t] = float16_t(act[row + (NQ + NKV + h) * HD + t]);
+        return;
+    }
+    bool isQ = y < NQ;
+    float x = act[row + y * HD + t];
+#if QK_NORM
+    float inv = inversesqrt(rowSum(x * x) / float(HD) + uintBitsToFloat(pc.eps));
+    float xn = x * inv * wbuf[pc.wOff + (isQ ? 0u : HD) + t];
+#else
+    float xn = x;
+#endif
+    red[t] = xn;
+    barrier();
+    uint i = t % 64u;
+    float c = wbuf[pc.bOff + pos * 64u + i];
+    float s = wbuf[pc.bOff + pc.kStride * 64u + pos * 64u + i];
+    float o = t < 64u ? xn * c - red[t + 64u] * s : xn * c + red[t - 64u] * s;
+    if (isQ) {
+        hact[pc.outOff + (r * NQ + y) * HD + t] = float16_t(o * uintBitsToFloat(pc.scale));
+    } else {
+        hact[pc.aux1 + cell + (y - NQ) * HD + t] = float16_t(o);
+    }
+
+#elif MODE == 1
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.tokens * pc.dim) {
+        return;
+    }
+    uint r = idx / pc.dim, c = idx % pc.dim;
+    float g = act[pc.inOff + r * 2u * pc.dim + c];
+    float u = act[pc.inOff + r * 2u * pc.dim + pc.dim + c];
+    hact[pc.outOff + r * pc.lda + c] = float16_t(g / (1.0 + exp(-g)) * u * uintBitsToFloat(pc.scale));
+
+#elif MODE == 2
+    uint r = gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    float sc = uintBitsToFloat(pc.scale);
+    float v[MAXV];
+    float ss = 0.0;
+    for (uint k = 0u, i = t; i < pc.dim; i += WG, ++k) {
+        uint at = pc.outOff + r * pc.dim + i;
+        v[k] = act[at] + act[pc.inOff + r * pc.dim + i] * sc;
+        act[at] = v[k];
+        ss += v[k] * v[k];
+    }
+    float inv = inversesqrt(rowSum(ss) / float(pc.dim) + uintBitsToFloat(pc.eps));
+    for (uint k = 0u, i = t; i < pc.dim; i += WG, ++k) {
+        hact[pc.bOff + r * pc.lda + i] = float16_t(v[k] * inv * wbuf[pc.wOff + i]);
+    }
+#endif
+}

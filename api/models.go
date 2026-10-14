@@ -46,6 +46,9 @@ func (s *Server) backends() []Backend {
 	if s.Speech != nil {
 		out = append(out, s.Speech)
 	}
+	if s.InstructedSpeech != nil {
+		out = append(out, s.InstructedSpeech)
+	}
 	if s.Transcription != nil {
 		out = append(out, s.Transcription)
 	}
@@ -100,11 +103,14 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 	}
-	if s.Speech != nil {
-		voices := s.Speech.Voices()
+	for _, sb := range []SpeechBackend{s.Speech, s.InstructedSpeech} {
+		if sb == nil {
+			continue
+		}
+		voices := sb.Voices()
 		sort.Strings(voices)
 		for i := range resp.Data {
-			if owns(s.Speech, resp.Data[i].ID) {
+			if owns(sb, resp.Data[i].ID) {
 				resp.Data[i].Voices = voices
 			}
 		}

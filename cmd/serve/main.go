@@ -136,6 +136,12 @@ func main() {
 	tts := flag.Bool("tts", false, "load Kokoro-82M and serve /v1/audio/speech")
 	ttsModel := flag.String("tts-model", "models/Kokoro-82M", "converted kokoro checkpoint directory")
 	ttsGPU := flag.Bool("tts-gpu", true, "run kokoro on the device")
+	ttsInstruct := flag.Bool("tts-instruct", false,
+		"load Breeze-TTS-2 and serve /v1/audio/speech requests with instructions (a description of the voice), "+
+			"model breeze-tts-2 or gpt-4o-mini-tts, and stream_format (research/tts-instruct-vertical.md)")
+	ttsInstructModel := flag.String("tts-instruct-model", "models/Breeze-TTS-2", "Breeze-TTS-2 checkpoint directory")
+	ttsInstructVoices := flag.String("tts-instruct-voices", "data/voices",
+		"where custom voices and their consent recordings are kept (/v1/audio/voices); empty keeps none")
 	ttsFrames := flag.Int("tts-frames", 0,
 		"longest utterance the kokoro arenas are staged for, in 25 ms frames; 0 takes the backend's default")
 	lexicon := flag.String("lexicon", "models/misaki", "misaki lexicon directory; empty takes phonemes only")
@@ -250,7 +256,7 @@ func main() {
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
 
-	if !*tts && !*stt && !*llmOn && !*embedOn && !*imgOn && !*runeOn && !*ocrOn && !*videoOn && !*musicOn {
+	if !*tts && !*ttsInstruct && !*stt && !*llmOn && !*embedOn && !*imgOn && !*runeOn && !*ocrOn && !*videoOn && !*musicOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -329,7 +335,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *runeOn || *ocrOn || *videoOn || *musicOn || (*tts && *ttsGPU)) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *runeOn || *ocrOn || *videoOn || *musicOn || (*tts && *ttsGPU) || *ttsInstruct) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -356,6 +362,23 @@ func main() {
 		srv.Speech = b
 		log.Printf("tts: %s, %d voices, %s, in %v", *ttsModel, len(b.Voices()),
 			where(ttsDev != nil), time.Since(start).Round(time.Millisecond))
+	}
+
+	if *ttsInstruct {
+		if dev == nil {
+			log.Fatal("-tts-instruct runs on the device; drop -gpu=false")
+		}
+		start := time.Now()
+		b, err := backend.NewBreeze(backend.BreezeOptions{Model: *ttsInstructModel, Device: dev, VoiceDir: *ttsInstructVoices})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer b.Close()
+		srv.InstructedSpeech = b
+		if *ttsInstructVoices != "" {
+			srv.Voices = b
+		}
+		log.Printf("tts-instruct: %s on the device, in %v", *ttsInstructModel, time.Since(start).Round(time.Millisecond))
 	}
 
 	if *stt {
@@ -761,4 +784,3 @@ func listen(srv *api.Server, addr string, wy *wyoming.Server, wyLn net.Listener)
 		return nil
 	}
 }
-

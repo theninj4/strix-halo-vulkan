@@ -4,6 +4,8 @@
 .venv/
 .venv-acestep/
 .venv-paddle/
+.venv-breeze/
 reference/out/
 ai
 /out/
+/data/
