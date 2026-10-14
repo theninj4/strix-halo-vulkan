@@ -364,6 +364,7 @@ func main() {
 			where(ttsDev != nil), time.Since(start).Round(time.Millisecond))
 	}
 
+	var instructed *backend.Breeze
 	if *ttsInstruct {
 		if dev == nil {
 			log.Fatal("-tts-instruct runs on the device; drop -gpu=false")
@@ -375,6 +376,7 @@ func main() {
 		}
 		defer b.Close()
 		srv.InstructedSpeech = b
+		instructed = b
 		if *ttsInstructVoices != "" {
 			srv.Voices = b
 		}
@@ -391,6 +393,9 @@ func main() {
 		}
 		defer b.Close()
 		srv.Transcription = b
+		if instructed != nil {
+			instructed.Hear = b
+		}
 		log.Printf("stt: %s, clips to %.0f s, %s, in %v", *sttModel, *maxAudio,
 			where(dev != nil), time.Since(start).Round(time.Millisecond))
 	}

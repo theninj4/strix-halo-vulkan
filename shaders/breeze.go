@@ -99,3 +99,95 @@ var BreezeDecSwiGLU []byte
 
 //go:embed breeze_dec_addnorm.spv
 var BreezeDecAddNorm []byte
+
+// B7's device frame: the depth decoder's input gather, the backbone's summed
+// frame embedding, a hidden-state copy, and the sampler (top-k by radix
+// select), so a frame records once and replays.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -o breeze_frame_gather.spv breeze_frame.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -o breeze_frame_embed.spv breeze_frame.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=2 -o breeze_frame_copyh.spv breeze_frame.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=3 -o breeze_frame_sample.spv breeze_frame.comp
+
+//go:embed breeze_frame_gather.spv
+var BreezeFrameGather []byte
+
+//go:embed breeze_frame_embed.spv
+var BreezeFrameEmbed []byte
+
+//go:embed breeze_frame_copyh.spv
+var BreezeFrameCopyH []byte
+
+//go:embed breeze_frame_sample.spv
+var BreezeFrameSample []byte
+
+// B7's shared frames: llm_gemv at MAXROWS 8, so two streams' CFG pairs (a
+// depth pass 0 of eight rows) stay on the GEMV and every row comes out as it
+// does alone.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DMAXROWS=8 -o breeze_gemv_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=1 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k1.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -DMAXROWS=8 -o breeze_gemv_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=2 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=2 -DMAXROWS=8 -o breeze_gemv_sum_k2.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -DMAXROWS=8 -o breeze_gemv_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=4 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=4 -DMAXROWS=8 -o breeze_gemv_sum_k4.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DMAXROWS=8 -o breeze_gemv_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=8 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=8 -DMAXROWS=8 -o breeze_gemv_sum_k8.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DMAXROWS=8 -o breeze_gemv_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=16 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=16 -DMAXROWS=8 -o breeze_gemv_sum_k16.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DMAXROWS=8 -o breeze_gemv_k32.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=0 -DKSLABS=32 -DMAXROWS=8 -DQ8B -DDENSE_Q8 -o breeze_gemv_q8_k32.spv llm_gemv.comp
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DMODE=1 -DKSLABS=32 -DMAXROWS=8 -o breeze_gemv_sum_k32.spv llm_gemv.comp
+
+//go:embed breeze_gemv_k1.spv
+var BreezeGEMVK1 []byte
+
+//go:embed breeze_gemv_q8_k1.spv
+var BreezeGEMVQ8K1 []byte
+
+//go:embed breeze_gemv_k2.spv
+var BreezeGEMVK2 []byte
+
+//go:embed breeze_gemv_q8_k2.spv
+var BreezeGEMVQ8K2 []byte
+
+//go:embed breeze_gemv_sum_k2.spv
+var BreezeGEMVSumK2 []byte
+
+//go:embed breeze_gemv_k4.spv
+var BreezeGEMVK4 []byte
+
+//go:embed breeze_gemv_q8_k4.spv
+var BreezeGEMVQ8K4 []byte
+
+//go:embed breeze_gemv_sum_k4.spv
+var BreezeGEMVSumK4 []byte
+
+//go:embed breeze_gemv_k8.spv
+var BreezeGEMVK8 []byte
+
+//go:embed breeze_gemv_q8_k8.spv
+var BreezeGEMVQ8K8 []byte
+
+//go:embed breeze_gemv_sum_k8.spv
+var BreezeGEMVSumK8 []byte
+
+//go:embed breeze_gemv_k16.spv
+var BreezeGEMVK16 []byte
+
+//go:embed breeze_gemv_q8_k16.spv
+var BreezeGEMVQ8K16 []byte
+
+//go:embed breeze_gemv_sum_k16.spv
+var BreezeGEMVSumK16 []byte
+
+//go:embed breeze_gemv_k32.spv
+var BreezeGEMVK32 []byte
+
+//go:embed breeze_gemv_q8_k32.spv
+var BreezeGEMVQ8K32 []byte
+
+//go:embed breeze_gemv_sum_k32.spv
+var BreezeGEMVSumK32 []byte

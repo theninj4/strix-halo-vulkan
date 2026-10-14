@@ -1,0 +1,272 @@
+// Breeze-TTS-2's frame on the device (breeze/frame.go, research/
+// tts-instruct-vertical.md B7): the steps between the decoders' passes that
+// the host did, so a frame is recorded once and resubmitted. Built once a
+// MODE:
+//
+//   0 GATHER   one stream's depth decoder input rows into the fp16 operand
+//              (row stride lda): `tokens` rows at outOff copy the backbone's
+//              hidden states (fp16 at inOff, 2048 apart); `heads` rows at
+//              kOff are codebook aux1's row of the shared code embedding
+//              (bf16 bits in binding 3 at bOff, [16*2051][2048]) for the code
+//              at act[aux0 + aux1]. aux2 = 1 (pass 0) reads the code from slot
+//              16, the token the backbone sampled last frame, and moves it to
+//              slot 0, where the frame starts.
+//   1 FRAME    the backbone's next input: sum over k of codebook k's row for
+//              act[aux0 + k], in fp32 in k order (frameEmbed's), into rows
+//              [0, tokens) of act at outOff.
+//   2 COPYH    `tokens` fp16 rows of 2048 from inOff (stride lda) to outOff
+//              (stride 2048).
+//   3 SAMPLE   upstream's sample_logits as breeze/generate.go's sampler does
+//              it, one workgroup: CFG uncond + s * (cond - uncond) (cond at
+//              inOff, uncond at kOff, none when they are equal; s = scale),
+//              the repetition penalty (hi/lo pair gemmM/gemmN, as float64)
+//              over the ids marked in act[aux2 ...] (NO_W: none), ids [span,
+//              headDim) masked, divided by the temperature (pair eps/ldb),
+//              top-k (heads) by a radix select of the k-th largest, softmax,
+//              one draw against the uniform at act[wOff]. The id lands at
+//              act[aux0 + aux1] (as a uint) and, with a penalty, is marked.
+//              `tokens` logits (2051, or 2052 with the backbone's EOS).
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "dit_common.glsl"
+
+layout(binding = 1) buffer ActU { uint actu[]; };
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+layout(binding = 3) readonly buffer Emb { uint16_t emb[]; };
+
+#ifndef MODE
+#define MODE 0
+#endif
+#define WG 256u
+#define DIM 2048u
+#define VOCAB 2051u
+
+layout(local_size_x = WG) in;
+
+float bf16(uint i) { return uintBitsToFloat(uint(emb[i]) << 16); }
+
+#if MODE == 3
+#define PER 9u // 256 * 9 >= 2052
+#define NEG_INF uintBitsToFloat(0xff800000u)
+
+shared uint hist[256];
+shared uint selBin, selLeft;
+shared float wsum[WG / 64u];
+shared float wmax[WG / 64u];
+shared uint pick, lastKept;
+
+// key orders floats as unsigned ints.
+uint key(float f) {
+    uint u = floatBitsToUint(f);
+    return (u & 0x80000000u) != 0u ? ~u : u | 0x80000000u;
+}
+
+float unkey(uint k) {
+    return uintBitsToFloat((k & 0x80000000u) != 0u ? k & 0x7fffffffu : ~k);
+}
+
+// mulD is fl32(v * (hi + lo)): the product a float64 multiplier gives,
+// rounded once, as the host's float32(float64(v) * p).
+float mulD(float v, float hi, float lo) {
+    precise float p = v * hi;
+    precise float e = fma(v, hi, -p);
+    precise float r = p + (e + v * lo);
+    return r;
+}
+
+// divD is fl32(v / (hi + lo)), the host's float32(float64(v) / d): a
+// quotient refined by its residual against the pair.
+float divD(float v, float hi, float lo) {
+    precise float q = v / hi;
+    precise float r = fma(-q, hi, v) - q * lo;
+    precise float o = q + r / (hi + lo);
+    return o;
+}
+#endif
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+#if MODE == 0
+    uint r = gl_WorkGroupID.x;
+    if (r < pc.tokens) {
+        for (uint j = t; j < DIM; j += WG) {
+            hact[pc.outOff + r * pc.lda + j] = hact[pc.inOff + r * DIM + j];
+        }
+        return;
+    }
+    uint dst = pc.kOff + (r - pc.tokens) * pc.lda;
+    uint code = actu[pc.aux0 + (pc.aux2 != 0u ? 16u : pc.aux1)];
+    if (pc.aux2 != 0u && r == pc.tokens && t == 0u) {
+        actu[pc.aux0] = code;
+    }
+    uint src = pc.bOff + (pc.aux1 * VOCAB + code) * DIM;
+    for (uint j = t; j < DIM; j += WG) {
+        hact[dst + j] = float16_t(bf16(src + j));
+    }
+#elif MODE == 1
+    uint j = gl_WorkGroupID.x * WG + t;
+    float s = 0.0;
+    for (uint k = 0u; k < 16u; k++) {
+        precise float a = s + bf16(pc.bOff + (k * VOCAB + actu[pc.aux0 + k]) * DIM + j);
+        s = a;
+    }
+    for (uint b = 0u; b < pc.tokens; b++) {
+        act[pc.outOff + b * DIM + j] = s;
+    }
+#elif MODE == 2
+    uint r = gl_WorkGroupID.x;
+    for (uint j = t; j < DIM; j += WG) {
+        hact[pc.outOff + r * DIM + j] = hact[pc.inOff + r * pc.lda + j];
+    }
+#else
+    uint n = pc.tokens;
+    float cfg = uintBitsToFloat(pc.scale);
+    float penHi = uintBitsToFloat(pc.gemmM), penLo = uintBitsToFloat(pc.gemmN);
+    float tHi = uintBitsToFloat(pc.eps), tLo = uintBitsToFloat(pc.ldb);
+    bool penalty = pc.aux2 != NO_W;
+
+    // This thread's contiguous ids [t*PER, t*PER + PER).
+    float v[PER];
+    float mx = NEG_INF;
+    for (uint i = 0u; i < PER; i++) {
+        uint id = t * PER + i;
+        float x = NEG_INF;
+        if (id < n) {
+            x = act[pc.inOff + id];
+            if (pc.kOff != pc.inOff) {
+                precise float u = act[pc.kOff + id];
+                precise float d = x - u;
+                precise float m = cfg * d;
+                precise float c = u + m;
+                x = c;
+            }
+            if (penalty && actu[pc.aux2 + id] != 0u) {
+                x = x > 0.0 ? divD(x, penHi, penLo) : mulD(x, penHi, penLo);
+            }
+            if (id >= pc.span && id < pc.headDim) {
+                x = NEG_INF;
+            } else {
+                x = divD(x, tHi, tLo);
+            }
+        }
+        v[i] = x;
+        mx = max(mx, x);
+    }
+
+    // The k-th largest, a byte of its key at a time from the top.
+    uint prefix = 0u, mask = 0u, left = pc.heads;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        hist[t] = 0u;
+        barrier();
+        for (uint i = 0u; i < PER; i++) {
+            if (t * PER + i < n) {
+                uint k = key(v[i]);
+                if ((k & mask) == prefix) {
+                    atomicAdd(hist[(k >> uint(shift)) & 255u], 1u);
+                }
+            }
+        }
+        barrier();
+        if (t < 64u) {
+            // Lane l holds bins 255-4l down to 252-4l: a descending scan.
+            uint b0 = 255u - 4u * t;
+            uint h0 = hist[b0], h1 = hist[b0 - 1u], h2 = hist[b0 - 2u], h3 = hist[b0 - 3u];
+            uint mine = h0 + h1 + h2 + h3;
+            uint before = subgroupExclusiveAdd(mine);
+            if (before < left && before + mine >= left) {
+                uint c = before;
+                uint b = b0;
+                if (c + h0 < left) {
+                    c += h0;
+                    b--;
+                    if (c + h1 < left) {
+                        c += h1;
+                        b--;
+                        if (c + h2 < left) {
+                            c += h2;
+                            b--;
+                        }
+                    }
+                }
+                selBin = b;
+                selLeft = left - c;
+            }
+        }
+        barrier();
+        prefix |= selBin << uint(shift);
+        mask |= 255u << uint(shift);
+        left = selLeft;
+        barrier();
+    }
+    float thr = unkey(prefix);
+
+    // The largest, then this thread's share of the kept mass.
+    mx = subgroupMax(mx);
+    uint wave = t / 64u;
+    if (gl_SubgroupInvocationID == 0u) {
+        wmax[wave] = mx;
+    }
+    if (t == 0u) {
+        pick = 0xffffffffu;
+        lastKept = 0u;
+    }
+    barrier();
+    mx = max(max(wmax[0], wmax[1]), max(wmax[2], wmax[3]));
+    float e[PER];
+    float mine = 0.0;
+    for (uint i = 0u; i < PER; i++) {
+        e[i] = v[i] >= thr ? exp(v[i] - mx) : 0.0;
+        mine += e[i];
+    }
+    float incl = subgroupInclusiveAdd(mine);
+    if (gl_SubgroupInvocationID == 63u) {
+        wsum[wave] = incl;
+    }
+    barrier();
+    float before = incl - mine;
+    float z = 0.0;
+    for (uint w = 0u; w < WG / 64u; w++) {
+        if (w < wave) {
+            before += wsum[w];
+        }
+        z += wsum[w];
+    }
+    float target = act[pc.wOff] * z;
+    for (uint i = PER; i > 0u; i--) {
+        if (v[i - 1u] >= thr) {
+            atomicMax(lastKept, t * PER + i - 1u);
+            break;
+        }
+    }
+
+    // The first kept id whose running mass reaches the target.
+    float c = before;
+    for (uint i = 0u; i < PER; i++) {
+        if (v[i] >= thr) {
+            c += e[i];
+            if (c >= target) {
+                atomicMin(pick, t * PER + i);
+                break;
+            }
+        }
+    }
+    barrier();
+    if (t == 0u) {
+        uint id = pick;
+        if (id == 0xffffffffu) {
+            // Rounding left the target past the total: the last kept id,
+            // where the host's walk falls through to.
+            id = lastKept;
+        }
+        actu[pc.aux0 + pc.aux1] = id;
+        if (penalty) {
+            actu[pc.aux2 + id] = 1u;
+        }
+    }
+#endif
+}

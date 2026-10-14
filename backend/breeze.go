@@ -6,20 +6,24 @@ package backend
 // of the voice), name it or gpt-4o-mini-tts, or name a custom voice, and it
 // streams: a frame is 80 ms of audio, decoded two at a time.
 //
-// **The device lock is taken a pass at a time**, not for the utterance:
-// one encoder segment, one backbone step, one depth pass, one codec chunk.
-// An utterance is ~17 device passes a frame for seconds on end, and holding
-// the lock across it would put Rune's classifications (latency first,
-// rune-always-resident) behind a whole paragraph. The FIFO lock hands the
-// device to every waiter between two passes instead.
+// **The device lock is taken a submit at a time**, not for the utterance:
+// one encoder segment, one prefill pass, a quarter of a frame (<= ~11 ms),
+// one codec chunk. Holding it across an utterance would put Rune's
+// classifications (latency first, rune-always-resident) behind a whole
+// paragraph. The FIFO lock hands the device to every waiter between two
+// submits instead.
+//
+// **Two utterances run at once** and share every frame's passes (breeze's
+// scheduler, B7); a third waits for a slot.
 
 import (
 	"context"
 	crand "crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"strings"
-	"sync"
+	"unicode"
 
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/audio"
@@ -44,9 +48,11 @@ type BreezeOptions struct {
 type Breeze struct {
 	opt BreezeOptions
 	m   *breeze.Model
-	// mu serialises utterances: the model holds one stream's state (two
-	// KV slots, the codec's carried context).
-	mu sync.Mutex
+
+	// Hear is the speech-to-text model that finds where an utterance's
+	// words end, so the breath the model may close on can be cut (the
+	// closing breath, breeze/tail.go); nil keeps every ending.
+	Hear api.TranscriptionBackend
 
 	// The custom voices (breeze_voices.go).
 	store *voiceStore
@@ -66,6 +72,9 @@ func NewBreeze(opt BreezeOptions) (*Breeze, error) {
 		b.m = m
 		return err
 	})
+	if err == nil {
+		b.m.Lock = func(f func() error) error { return opt.Device.Do(func(*vk.Device) error { return f() }) }
+	}
 	if err != nil {
 		return nil, fmt.Errorf("backend: staging breeze: %w", err)
 	}
@@ -79,8 +88,6 @@ func NewBreeze(opt BreezeOptions) (*Breeze, error) {
 
 // Close releases the model.
 func (b *Breeze) Close() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	_ = b.opt.Device.Do(func(*vk.Device) error { b.m.Destroy(); return nil })
 }
 
@@ -143,14 +150,12 @@ func (b *Breeze) SpeakStream(ctx context.Context, req *api.SpeechRequest, start 
 		_, _ = crand.Read(s[:])
 		seed = binary.LittleEndian.Uint64(s[:])
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	started := false
-	_, err := b.m.Generate(ctx, r,
-		breeze.GenOptions{
-			Seed: seed,
-			Lock: func(f func() error) error { return b.opt.Device.Do(func(*vk.Device) error { return f() }) },
-		},
+	o := breeze.GenOptions{Seed: seed}
+	if b.Hear != nil {
+		o.Ending = b.ending(ctx, req.Input)
+	}
+	_, err := b.m.Generate(ctx, r, o,
 		func(s []float32) error {
 			if !started {
 				started = true
@@ -162,3 +167,46 @@ func (b *Breeze) SpeakStream(ctx context.Context, req *api.SpeechRequest, start 
 		})
 	return err
 }
+
+// ending is where the speech in wav (the utterance's last seconds) ends:
+// the end of the last heard word that is the text's last word, when words
+// follow it (the closing breath, heard as "and"); len(wav) otherwise.
+func (b *Breeze) ending(ctx context.Context, text string) func([]float32) (int, error) {
+	return func(wav []float32) (int, error) {
+		c, err := audio.Resample(&audio.Clip{Samples: wav, Rate: breeze.SampleRate}, 16000)
+		if err != nil {
+			return 0, err
+		}
+		resp, err := b.Hear.Transcribe(ctx, c, &api.TranscriptionRequest{Language: "en"})
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, err
+			}
+			// The audio has streamed: keep its ending rather than fail it.
+			log.Printf("breeze: the ending check: %v", err)
+			return len(wav), nil
+		}
+		if sec, ok := speechEnd(resp.Words, text); ok {
+			return min(len(wav), int(sec*breeze.SampleRate)), nil
+		}
+		return len(wav), nil
+	}
+}
+
+// speechEnd is the end of the last heard word that is text's last word,
+// when other words follow it.
+func speechEnd(heard []api.TranscriptionWord, text string) (float64, bool) {
+	ws := strings.FieldsFunc(text, notWord)
+	if len(ws) == 0 {
+		return 0, false
+	}
+	last := strings.ToLower(ws[len(ws)-1])
+	for i := len(heard) - 2; i >= 0; i-- {
+		if w := strings.FieldsFunc(heard[i].Word, notWord); len(w) == 1 && strings.ToLower(w[0]) == last {
+			return heard[i].End, true
+		}
+	}
+	return 0, false
+}
+
+func notWord(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '\'' }

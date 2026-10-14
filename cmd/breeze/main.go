@@ -28,12 +28,15 @@ func main() {
 	instruction := flag.String("instruction", "", "a description of the voice and its delivery")
 	cfg := flag.Float64("cfg", 0, "guidance scale; 0 takes 4 with an instruction and 1 without")
 	seed := flag.Uint64("seed", 1, "sampling seed")
+	temp := flag.Float64("temp", 0, "sampling temperature; 0 takes 0.9")
 	chunk := flag.Int("chunk", 2, "frames handed to the codec at once")
 	out := flag.String("o", "out/breeze.wav", "write the 24 kHz WAV here")
 	reps := flag.Int("reps", 1, "runs; the stats of each are printed")
 	cpuprof := flag.String("cpuprofile", "", "write a CPU profile of the runs here")
 	ref := flag.String("ref", "", "a reference clip to clone (16-bit PCM WAV, any rate); needs -ref-text")
 	refText := flag.String("ref-text", "", "the reference clip's exact transcript")
+	hostSampler := flag.Bool("host-sampler", false, "sample on the host after every pass (the B4 loop, the control)")
+	fp16 := flag.Bool("fp16", false, "stage the layers in fp16, not int8 (the control)")
 	flag.Parse()
 
 	dev, done, err := openDevice()
@@ -42,7 +45,11 @@ func main() {
 	}
 	defer done()
 	t0 := time.Now()
-	m, err := breeze.LoadModel(dev, *dir, breeze.DefaultModelOptions())
+	mo := breeze.DefaultModelOptions()
+	if *fp16 {
+		mo.Decoder.Bank = breeze.BankFP16
+	}
+	m, err := breeze.LoadModel(dev, *dir, mo)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,7 +86,7 @@ func main() {
 	}
 	for r := 0; r < *reps; r++ {
 		var wav []float32
-		st, err := m.Generate(context.Background(), req, breeze.GenOptions{CFG: *cfg, Seed: *seed, Chunk: *chunk},
+		st, err := m.Generate(context.Background(), req, breeze.GenOptions{CFG: *cfg, Temperature: *temp, Seed: *seed, Chunk: *chunk, HostSampler: *hostSampler},
 			func(s []float32) error { wav = append(wav, s...); return nil })
 		if err != nil {
 			log.Fatal(err)
@@ -91,8 +98,9 @@ func main() {
 			st.Prompt, ms(st.Encode), ms(st.Prefill), ms(st.Backbone), ms(st.Depth), ms(st.Sample), ms(st.Codec))
 		if st.Frames > 0 {
 			f := float64(st.Frames)
-			log.Printf("  a frame: backbone %.2f ms, depth %.2f ms, sample %.2f ms, codec %.2f ms",
-				st.Backbone.Seconds()*1e3/f, st.Depth.Seconds()*1e3/f, st.Sample.Seconds()*1e3/f, st.Codec.Seconds()*1e3/f)
+			log.Printf("  a frame: backbone %.2f ms, depth %.2f ms, sample %.2f ms, device frame %.2f ms, codec %.2f ms, wall %.2f ms",
+				st.Backbone.Seconds()*1e3/f, st.Depth.Seconds()*1e3/f, st.Sample.Seconds()*1e3/f, st.Frame.Seconds()*1e3/f,
+				st.Codec.Seconds()*1e3/f, (st.Total-st.Encode-st.Prefill).Seconds()*1e3/f)
 		}
 		if r == 0 && *out != "" {
 			if err := (&audio.Clip{Samples: wav, Rate: breeze.SampleRate}).WriteWAV(*out); err != nil {

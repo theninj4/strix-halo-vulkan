@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	"strix-halo-vulkan/gemma4"
@@ -24,7 +25,22 @@ type Model struct {
 	Tok   *gemma4.Tokenizer
 	Enc   *Encoder
 	Dec   *Decoder
-	Codec *Codec
+	Codec *Codec // stream 0's; the others are Streams over its weights
+	// Lock, when set, wraps every use of the device (a server's device
+	// lock): one encoder segment, one prefill pass, a quarter of a frame,
+	// one codec chunk. Between them the device is free, so a long utterance
+	// does not hold other models off it. Set it before the first Generate.
+	Lock func(func() error) error
+
+	once    sync.Once
+	initErr error
+	// mu orders every use of the model's buffers, the scheduler's frames and
+	// the requests' prefills and codec chunks alike.
+	mu     sync.Mutex
+	codecs []*Codec
+	free   chan int // stream slots
+	join   chan *stream
+	quit   chan struct{}
 }
 
 // ModelOptions size the device state.
@@ -37,7 +53,7 @@ type ModelOptions struct {
 }
 
 // DefaultModelOptions is upstream's bounds: 2048 backbone positions (prompt
-// and frames), segments of up to 1024 tokens.
+// and frames), segments of up to 1024 tokens; two utterances at once.
 func DefaultModelOptions() ModelOptions {
 	return ModelOptions{Decoder: DefaultOptions(), EncoderTokens: 1024, CodecChunk: 32}
 }
@@ -60,11 +76,45 @@ func LoadModel(dev *vk.Device, dir string, o ModelOptions) (*Model, error) {
 		m.Destroy()
 		return nil, err
 	}
+	if err := m.init(); err != nil {
+		m.Destroy()
+		return nil, err
+	}
 	return m, nil
 }
 
-// Destroy releases every part.
+// init makes the codec streams and the slot pool (once; a Model built from
+// its parts gets them at its first Generate).
+func (m *Model) init() error {
+	m.once.Do(func() {
+		n := m.Dec.o.Streams
+		m.codecs = []*Codec{m.Codec}
+		for len(m.codecs) < n {
+			c, err := m.Codec.Stream()
+			if err != nil {
+				m.initErr = err
+				return
+			}
+			m.codecs = append(m.codecs, c)
+		}
+		m.free = make(chan int, n)
+		for j := 0; j < n; j++ {
+			m.free <- j
+		}
+		m.join, m.quit = make(chan *stream), make(chan struct{})
+		go m.schedule()
+	})
+	return m.initErr
+}
+
+// Destroy releases every part. No Generate may be running.
 func (m *Model) Destroy() {
+	if m.quit != nil {
+		close(m.quit)
+	}
+	for _, c := range m.codecs[min(1, len(m.codecs)):] {
+		c.Destroy()
+	}
 	if m.Enc != nil {
 		m.Enc.Destroy()
 	}
@@ -74,6 +124,16 @@ func (m *Model) Destroy() {
 	if m.Codec != nil {
 		m.Codec.Destroy()
 	}
+}
+
+// run is one use of the device: the model's buffers, then the device lock.
+func (m *Model) run(f func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Lock != nil {
+		return m.Lock(f)
+	}
+	return f()
 }
 
 // GenOptions are the sampling settings; the zero value of each field takes
@@ -90,11 +150,15 @@ type GenOptions struct {
 	// Chunk is the frames handed to the codec at once (2, upstream's eager
 	// chunk; at most the codec's Chunk).
 	Chunk int
-	// Lock, when set, wraps every use of the device (a server's device
-	// lock): one encoder segment, one prefill pass, one backbone step, one
-	// depth pass, one codec chunk. Between them the device is free, so a
-	// long utterance does not hold other models off it.
-	Lock func(func() error) error
+	// HostSampler runs the B4 loop: logits back to the host after every
+	// pass, sampled there, the next pass recorded, alone. The control for
+	// the device frame (frame.go), which is the default and shares its
+	// passes with the other utterances in flight.
+	HostSampler bool
+	// Ending, when set, cuts the breath the model may end on (tail.go): it
+	// is handed the utterance's last seconds, unvoiced tail held back, and
+	// returns where the speech in them ends (len(wav): keep it all).
+	Ending func(wav []float32) (int, error)
 }
 
 // DefaultCFG is the README's scale for a template with a negative prompt
@@ -133,17 +197,123 @@ type Stats struct {
 	Prompt                           int // backbone prompt rows (the longest branch)
 	Encode, Prefill, Backbone, Depth time.Duration
 	Codec, Sample                    time.Duration
+	Frame                            time.Duration // the device frames' submits, shared with other streams (Backbone and Depth then stay 0)
+	Wait                             time.Duration // waiting for a stream slot
 	FirstAudio, Total                time.Duration
+	Trimmed                          time.Duration // the closing breath dropped (tail.go)
+}
+
+// stream is an utterance in the scheduler.
+type stream struct {
+	ctx    context.Context
+	j      int
+	pos    []int // its branches' next backbone positions
+	steps  int   // frames still allowed
+	tok    int32
+	sp     sampling
+	rng    *rand.Rand
+	frames chan streamFrame
+}
+
+type streamFrame struct {
+	frame [16]int32
+	took  time.Duration
+	err   error
+}
+
+// schedule runs every stream in flight a frame at a time, all in one frame.
+// A stream ends at EOS, at its frame budget, or at the cache's end; it is
+// dropped when its context is done.
+func (m *Model) schedule() {
+	var active []*stream
+	end := func(s *stream, err error) {
+		if err != nil {
+			s.frames <- streamFrame{err: err}
+		}
+		close(s.frames)
+	}
+	for {
+		if len(active) == 0 {
+			select {
+			case s := <-m.join:
+				active = append(active, s)
+			case <-m.quit:
+				return
+			}
+		}
+	drain:
+		for {
+			select {
+			case s := <-m.join:
+				active = append(active, s)
+			default:
+				break drain
+			}
+		}
+		keep := active[:0]
+		for _, s := range active {
+			switch {
+			case s.ctx.Err() != nil:
+				end(s, s.ctx.Err())
+			case s.tok == CodebookEOS || s.steps <= 0 || s.pos[0] >= m.Dec.o.MaxLen-1:
+				end(s, nil)
+			default:
+				keep = append(keep, s)
+			}
+		}
+		active = keep
+		if len(active) == 0 {
+			continue
+		}
+		fs := make([]frameStream, len(active))
+		for i, s := range active {
+			u := make([]float32, Codebooks)
+			for k := range u {
+				u[k] = float32(s.rng.Float64())
+			}
+			fs[i] = frameStream{j: s.j, pos: append([]int(nil), s.pos...), u: u, sp: s.sp}
+		}
+		out, took, err := m.Dec.frame(fs, m.run)
+		for i, s := range active {
+			if err != nil {
+				end(s, err)
+				continue
+			}
+			s.frames <- streamFrame{frame: out[i].frame, took: took}
+			s.tok = out[i].next
+			s.steps--
+			for b := range s.pos {
+				s.pos[b]++
+			}
+		}
+		if err != nil {
+			active = active[:0]
+		}
+	}
 }
 
 // Generate synthesises a request, handing the audio to emit chunk by chunk
-// (24 kHz mono, [-1, 1]).
+// (24 kHz mono, [-1, 1]). Up to Options.Streams calls run at once, sharing
+// every frame's passes; another waits for a slot. With o.Ending, the breath
+// the model may end on is cut (tail.go).
 func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit func([]float32) error) (*Stats, error) {
-	t0 := time.Now()
-	do := o.Lock
-	if do == nil {
-		do = func(f func() error) error { return f() }
+	if o.Ending == nil {
+		return m.generate(ctx, req, o, emit)
 	}
+	tr := &tailTrim{emit: emit, ending: o.Ending}
+	st, err := m.generate(ctx, req, o, tr.push)
+	if err == nil {
+		st.Trimmed, err = tr.finish()
+	}
+	return st, err
+}
+
+func (m *Model) generate(ctx context.Context, req *Request, o GenOptions, emit func([]float32) error) (*Stats, error) {
+	t0 := time.Now()
+	if err := m.init(); err != nil {
+		return nil, err
+	}
+	do := m.run
 	p, err := BuildPrompt(m.Tok, req)
 	if err != nil {
 		return nil, err
@@ -161,6 +331,17 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 	}
 	st := &Stats{}
 	d := m.Dec
+
+	// A stream slot: two KV slots in each stack and a codec stream.
+	var j int
+	select {
+	case j = <-m.free:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { m.free <- j }()
+	st.Wait = time.Since(t0)
+	codec := m.codecs[j]
 
 	// The prompts, prefilled one slot each: [L][2048] embeddings.
 	lens := make([]int, len(branches))
@@ -182,7 +363,7 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 			n := min(d.o.Rows, L-at)
 			rows := make([]Row, n)
 			for i := range rows {
-				rows[i] = Row{b, at + i}
+				rows[i] = Row{2*j + b, at + i}
 			}
 			want := 0
 			if at+n == L {
@@ -222,7 +403,7 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 	tok := s.sample(cfg(logits, Vocab+1), nil, 1, Codes, Vocab)
 	st.Sample += time.Since(ts)
 
-	m.Codec.Reset()
+	codec.Reset()
 	var pending [][16]int32
 	flush := func() error {
 		if len(pending) == 0 {
@@ -231,7 +412,7 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 		var wav []float32
 		var dt time.Duration
 		err := do(func() (err error) {
-			wav, dt, err = m.Codec.Decode(pending)
+			wav, dt, err = codec.Decode(pending)
 			return err
 		})
 		st.Codec += dt
@@ -246,6 +427,45 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 	}
 
 	nb := len(branches)
+	if !o.HostSampler {
+		if err := do(func() error { d.startFrames(j, hidden, tok); return nil }); err != nil {
+			return st, err
+		}
+		sctx, cancel := context.WithCancel(ctx)
+		sm := &stream{ctx: sctx, j: j, pos: append([]int(nil), lens...), steps: o.MaxFrames, tok: tok, rng: rng,
+			sp:     sampling{cfg: float32(o.CFG), temp: o.Temperature, topK: o.TopK, pen: o.RepPenalty},
+			frames: make(chan streamFrame, o.MaxFrames+1)}
+		// The slot goes back only once the scheduler has let the stream go.
+		defer func() {
+			cancel()
+			for range sm.frames {
+			}
+		}()
+		select {
+		case m.join <- sm:
+		case <-ctx.Done():
+			close(sm.frames)
+			return st, ctx.Err()
+		}
+		for f := range sm.frames {
+			if f.err != nil {
+				return st, f.err
+			}
+			st.Frame += f.took
+			st.Frames++
+			pending = append(pending, f.frame)
+			if len(pending) >= o.Chunk {
+				if err := flush(); err != nil {
+					return st, err
+				}
+			}
+		}
+		if err := flush(); err != nil {
+			return st, err
+		}
+		st.Total = time.Since(t0)
+		return st, nil
+	}
 	in := make([]float32, 2*nb*bbHidden)
 	x := make([]float32, nb*bbHidden)
 	for step := 0; step < o.MaxFrames && tok != CodebookEOS; step++ {
@@ -263,11 +483,11 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 		heads := make([]int, 0, 2*nb)
 		for b := 0; b < nb; b++ {
 			copy(in[b*bbHidden:], hidden[b])
-			rows, heads = append(rows, Row{b, 0}), append(heads, -1)
+			rows, heads = append(rows, Row{2*j + b, 0}), append(heads, -1)
 		}
 		for b := 0; b < nb; b++ {
 			d.codeEmbed(in[(nb+b)*bbHidden:(nb+b+1)*bbHidden], 0, tok)
-			rows, heads = append(rows, Row{b, 1}), append(heads, 0)
+			rows, heads = append(rows, Row{2*j + b, 1}), append(heads, 0)
 		}
 		var lg [][]float32
 		var dt time.Duration
@@ -289,7 +509,7 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 			rows, heads = rows[:0], heads[:0]
 			for b := 0; b < nb; b++ {
 				d.codeEmbed(in[b*bbHidden:(b+1)*bbHidden], k, frame[k])
-				rows, heads = append(rows, Row{b, k + 1}), append(heads, k)
+				rows, heads = append(rows, Row{2*j + b, k + 1}), append(heads, k)
 			}
 			if err = do(func() (err error) {
 				lg, dt, err = d.Depth(in[:nb*bbHidden], rows, heads)
@@ -312,7 +532,7 @@ func (m *Model) Generate(ctx context.Context, req *Request, o GenOptions, emit f
 		brow := make([]Row, nb)
 		for b := 0; b < nb; b++ {
 			d.frameEmbed(x[b*bbHidden:(b+1)*bbHidden], frame)
-			brow[b] = Row{b, lens[b] + step}
+			brow[b] = Row{2*j + b, lens[b] + step}
 		}
 		var h, lgs [][]float32
 		err = do(func() (err error) {
@@ -478,6 +698,9 @@ func (m *Model) Bytes() int {
 		if b != nil {
 			n += b.Size()
 		}
+	}
+	for _, c := range m.codecs[min(1, len(m.codecs)):] {
+		n += c.abuf.Size() + c.hbuf.Size()
 	}
 	return n
 }

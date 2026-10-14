@@ -146,6 +146,9 @@ type Codec struct {
 	hOp, hQ, hCtx, hF uint32
 	ldT, ldCtx, ldF   int
 
+	// shared: a Stream of another codec, which owns the weights
+	shared bool
+
 	// the stream
 	pos     int       // frames decoded
 	qHist   []float32 // the last two quantizer rows, the k3 conv's context
@@ -558,6 +561,28 @@ func (c *Codec) build() error {
 	return nil
 }
 
+// Stream is another stream over c's weights: its own arenas (the KV cache,
+// the carried conv state) and pipelines, so two utterances decode at once.
+func (c *Codec) Stream() (*Codec, error) {
+	n := *c
+	n.shared, n.pipes, n.mods, n.abuf, n.hbuf = true, map[string]*vk.ComputePipeline{}, nil, nil, nil
+	var err error
+	if n.abuf, err = c.dev.NewHostCachedBuffer(c.abuf.Size()); err != nil {
+		return nil, err
+	}
+	if n.hbuf, err = c.dev.NewBuffer(c.hbuf.Size()); err != nil {
+		n.Destroy()
+		return nil, err
+	}
+	n.hbuf.Zero()
+	if err := n.build(); err != nil {
+		n.Destroy()
+		return nil, err
+	}
+	n.Reset()
+	return &n, nil
+}
+
 // Destroy releases the codec's device objects.
 func (c *Codec) Destroy() {
 	for _, p := range c.pipes {
@@ -566,7 +591,11 @@ func (c *Codec) Destroy() {
 	for _, m := range c.mods {
 		m.Destroy()
 	}
-	for _, b := range []*vk.Buffer{c.wbuf, c.abuf, c.hbuf, c.bank} {
+	own := []*vk.Buffer{c.wbuf, c.abuf, c.hbuf, c.bank}
+	if c.shared {
+		own = []*vk.Buffer{c.abuf, c.hbuf}
+	}
+	for _, b := range own {
 		if b != nil {
 			b.Destroy()
 		}

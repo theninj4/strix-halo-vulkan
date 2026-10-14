@@ -60,14 +60,14 @@ func profile(t *testing.T, d *Decoder, name string, g []vk.MultiDispatch) {
 func TestProfileStep(t *testing.T) {
 	d := loadDecoder(t)
 	rows := []Row{{0, 100}, {1, 90}}
-	g, err := d.stackGraph(d.bb, rows)
+	g, err := d.stackGraph(d.bb, rows, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	g = append(g, d.proj(headBank, 1, d.bb.hA, d.bb.ldaDim, d.aLogits, d.lmHead, d.headPad, bbHidden, 2)...)
 	profile(t, d, "backbone step", g)
 	rows = []Row{{0, 7}, {1, 7}}
-	if g, err = d.stackGraph(d.dd, rows); err != nil {
+	if g, err = d.stackGraph(d.dd, rows, 0); err != nil {
 		t.Fatal(err)
 	}
 	g = append(d.proj(headBank, 8, d.hIn, d.ldaIn, d.dd.aX, d.projIn, ddHidden, bbHidden, 2), g...)

@@ -1,11 +1,10 @@
 # Instructed TTS — Breeze-TTS-2 beside kokoro (B-stages)
 
-> **Live (2026-10-14).** B0–B5 are done and every part runs on the device
-> to its gate; `cmd/breeze` speaks end to end (the radio-DJ case
-> transcribes exactly), at 0.78x real time on fp16 banks before any of B7.
-> Next: B6 (serving), B7 (int8, one submit a frame), B8 (cloning; the user
-> asked for it, 2026-10-14). Stage letters are **B0–B8**; code in
-> `breeze/`, `cmd/breeze`, `shaders/breeze*.{go,comp}`.
+> **Live (2026-10-14).** B0–B8 are done and every part runs on the device
+> to its gate; **deployed on ai.service** (`-tts-instruct`) the same day.
+> The device frame (B7) runs it at 1.93x real time, first audio ~160 ms,
+> and two requests share every frame (1.59x the throughput). Stage letters are **B0–B8**;
+> code in `breeze/`, `cmd/breeze`, `shaders/breeze*.{go,comp}`.
 
 **Target**: `/v1/audio/speech` takes OpenAI's own `instructions` field ("An
 enthusiastic radio DJ") and answers it with
@@ -131,8 +130,8 @@ That should be well under 300 ms (estimate). Kokoro has to refuse
 | B3 | `breeze/decoder.go`: ace/lm's decoder generalised to two stacks in one set of buffers; prep/attn rebuilt at 16/8 heads | **done** — teacher-forced over 415 rows: hidden ≤5.1e-4, KL ≤1.3e-6, every argmax |
 | B4 | Depth decoder (same file, 8/2 heads, no q/k norm, llama3 rope from a host table, per-position heads) and `breeze/generate.go` (the loop, a host sampler) | **done (host sampler)** — logits ≤1.1e-3, KL ≤6.8e-6, 12 argmax missed of 15,030 (near-ties). The device sampler moved to B7 |
 | B5 | `breeze/codec.go` + `breeze_codec.comp`: streamed in chunks with every causal state carried (KV cache, conv tails, depthwise tails); pre_conv∘input_proj and output_proj∘ConvT folded at load; convs on kokoro's A_CONV=2 GEMM | **done** — 57.9–63.7 dB against fp32, identical at chunks of 1, 7, 25 and whole; 27.8 s in 104 ms |
-| B6 | Serving (`backend/breeze.go`, `api/speech.go`, `cmd/serve -tts-instruct`): OpenAI's `instructions`, `stream_format` (`audio`: a chunked body, WAV with streaming sizes; `sse`: `speech.audio.delta`/`.done`), `voice` as a name or `{"id": ...}`; routed by model (`breeze-tts-2`, `gpt-4o-mini-tts*`) or by those fields, kokoro the default; instructions sent to kokoro are refused as OpenAI refuses them for tts-1; a `seed` extension. The device lock is taken a pass at a time, so an utterance does not hold other models off the GPU | **done** (test server; ai.service not redeployed) — served radio-DJ clip transcribes exactly; first streamed byte 147 ms; kokoro unchanged |
-| B7 | Performance: int8 layer banks (fp16 heads), fused q\|k\|v and gate\|up projections and the residual join folded into the next norm (`breeze_dec.comp`), the split-K ladder (`TestSlabLadder`), a heap top-k on the host. **Not done**: the device sampler and one submit a frame | **in part** — int8 KL against fp32 is 0.03–0.33x upstream bf16's own, fewer argmax misses; **1.65x real time**, first audio 150 ms (was 0.78x) |
+| B6 | Serving (`backend/breeze.go`, `api/speech.go`, `cmd/serve -tts-instruct`): OpenAI's `instructions`, `stream_format` (`audio`: a chunked body, WAV with streaming sizes; `sse`: `speech.audio.delta`/`.done`), `voice` as a name or `{"id": ...}`; routed by model (`breeze-tts-2`, `gpt-4o-mini-tts*`) or by those fields, kokoro the default; instructions sent to kokoro are refused as OpenAI refuses them for tts-1; a `seed` extension. The device lock is taken a pass at a time, so an utterance does not hold other models off the GPU | **done** (deployed 2026-10-14) — served radio-DJ clip transcribes exactly; first streamed byte 147 ms; kokoro unchanged |
+| B7 | Performance: int8 layer banks (fp16 heads), fused q\|k\|v and gate\|up projections and the residual join folded into the next norm (`breeze_dec.comp`), the split-K ladder (`TestSlabLadder`), then the **device frame** (`breeze/frame.go`, `breeze_frame.comp`): the sampler, the input gathers and the frame embedding on the device, a frame recorded once (`vk.Prerecorded`) and replayed as four submits | **done** — int8 KL against fp32 is 0.03–0.33x upstream bf16's own; device sampler 0 of 3,000 draws off the host's; seeded audio identical to the host loop; two streams share a frame, each bit-identical to alone; **1.93x real time** alone, 1.59x throughput with two (was 0.78x, then 1.65x, 1.80x) |
 | B8 | Cloning (`breeze/clone.go`: the codec encoder, Mimi, on the host in fp32; `api/voices.go` + `backend/breeze_voices.go`: OpenAI's consent → voice → `voice: {"id"}` flow, a file store) | **done** — codes exact against `Qwen3TTSTokenizer.encode` (3,264 of 3,264, jfk past the nominal 250-frame window); served clone and direction transcribe exactly |
 
 ## Decisions to make before B0
@@ -200,13 +199,72 @@ oracle at temperature 0.9 is 0.03–0.22x bf16's on the backbone and
 (backbone 3 vs 11 of 1,322; depth 177 vs 365 of 15,030). The gate is "no
 worse than bf16" (`q8VsBF16 = 1`). `BREEZE_BANK=fp16` runs the control.
 
-**What is left, by size**: the depth decoder is 70% of a frame, 15
-dependent passes. One submit a frame — the sampler on the device (top-k
-50 over 2,051, CFG, a host-seeded uniform) and the next code's row gathered
-there — removes the ~4.5 ms of gaps and the 15 readbacks; after it the
-floor is the passes themselves (~2 ms each, GEMVs at ~200 GB/s). Two
-concurrent requests could share a pass (rows of four), which is how the
-LLM's batching paid.
+**The device frame (done 2026-10-14).** `breeze_frame.comp` does what the
+host did between passes: GATHER (the backbone's hidden rows and the next
+code's bf16 embedding row into the depth decoder's fp16 input), FRAME (the
+16 code rows summed in fp32, frameEmbed's order, into the backbone's input),
+COPYH (the hidden rows kept for the next frame) and SAMPLE (CFG, the
+penalty and the temperature with float64 constants as fp32 hi/lo pairs, a
+radix select of the 50th-largest key a byte at a time, softmax, one draw
+against a host uniform by an inclusive scan). The frame's state is data —
+codes `fr[0..16]`, the penalty's marks, sixteen uniforms a frame from the
+same PCG stream in the host loop's order, the backbone rows' positions — so
+the dispatches never change and are recorded once: three recordings of five
+depth passes and one backbone step, keyed by the backbone's key-chunk count
+(it moves every 64 positions) and the sampler settings. Four submits a
+frame, each under `GenOptions.Lock`, at most ~11 ms of device time each, so
+a waiting model is never held off for a whole frame.
+
+Gates: `TestDeviceSampler` (0 of 3,000 random draws differ from the host
+sampler, CFG on and off, penalty, EOS column) and `TestDeviceFrames` (a
+seeded utterance gives **identical audio** from both loops, design with CFG
+and plain). `GenOptions.HostSampler` / `cmd/breeze -host-sampler` runs the
+old loop as the control.
+
+Radio-DJ prompt, CFG 4, GPU idle: a frame is **41.6 ms of device time + 1.5
+ms codec, 43.9 ms wall** (was 48), **1.80x real time**, first audio 150
+ms. Plain (no CFG) 40 ms wall.
+
+**What is left is the passes themselves.** The depth decoder reads its
+whole 367 M int8 weights once a pass, fifteen times a frame (~5.5 GB), at
+~160 GB/s; the backbone ~1.4 GB at ~175 GB/s. That is close to the
+bandwidth floor (~31 ms a frame at 220 GB/s), so one request will not get
+much faster; throughput comes from sharing the passes.
+
+**Shared passes (done 2026-10-14).** Two utterances run at once and ride
+the same frame (`frame.go`; `Model.Generate`'s scheduler in
+`generate.go`). Each has a stream slot: two KV slots in each stack, its own
+fr/marks/uniforms and its own codec stream (`Codec.Stream`: new arenas over
+the shared weights). A request prefills in its own goroutine between frame
+submits (every device use goes through `Model.run`: the model's mutex,
+then the device lock), seeds its slot, and joins the scheduler, which runs
+every active stream's frame as one: a gather and a sample a stream, every
+row through one set of passes. The recordings are keyed by the
+composition. A third request waits for a slot.
+
+Two things this needed:
+
+1. **The split-K scratch was too small.** One partials buffer serves every
+   GEMV, and it was sized for the backbone at three rows; the depth
+   decoder's gate|up at four rows (16 slabs x 4 x 16,384) ran past it into
+   the depth decoder's own residual stream. Two rows fitted, so nothing
+   showed until a four-row GEMV. It is now sized for the widest projection
+   at `MaxRows`.
+2. **Eight-row GEMVs** (`breeze_gemv*`: llm_gemv at MAXROWS 8). A depth
+   pass 0 is a hidden row and a code row a branch, eight rows for two CFG
+   pairs; past MaxRows it fell to the GEMM, whose sums round differently,
+   so a request's audio depended on its neighbour. On the GEMV every row's
+   arithmetic is independent of the others: `TestSharedFrames` gets each
+   request's audio **bit-identical** alone and shared. It is also faster
+   alone: a CFG request's four-row pass 0 used to be a GEMM.
+
+Numbers (GPU idle): a CFG + a plain request, 2.58 s together against 4.11
+s one after the other (**1.59x the throughput**); a frame of three branches
+is ~40-41 ms of device time against ~38 alone. Alone, the radio-DJ line is
+now 40.8 ms a frame, **1.93x real time**, first audio 165 ms. Served (a
+test server): two instructed requests at once both stream from ~0.25 s and
+transcribe exactly; a third waits for a slot. Device memory **5.08 GB** (the
+second KV pair and codec stream: +0.6 GB).
 
 ## B8 — voices, consent, and what is not checked
 
@@ -223,17 +281,80 @@ are extensions. **Not checked: that consent and sample are one speaker** —
 OpenAI rejects a mismatch and nothing here can tell two speakers apart.
 The consent recording is kept beside the voice.
 
-## Deployment (not done)
+## The closing breath (2026-10-14)
 
-ai.service's line lacks `-tts-instruct`. Adding it costs **4.34 GB of
-device memory** (measured, `Model.Bytes`: the int8 layers, the fp16
-encoder, heads and codec, the backbone's 2 x 2048-position KV cache, the
-arenas) and ~0.9 GB of host memory (the encoder's embedding table and the
-code embedding), and ~4 s at startup. A restart
-was not done in this session: the server was serving other clients.
+The served narrator line "...with a light breeze from the west." came back
+from parakeet as "...from the west, and". It is the model, not the port:
+
+| run (narrator, CFG 4) | ends in an extra word |
+| --- | --- |
+| upstream's own loop, fp32 on the CPU (`dump_breeze.generate`) | 3 of 8 seeds |
+| ours, int8 (served) | 5 of 8 |
+| ours, fp16 layers (`cmd/breeze -fp16`) | 10 of 12 |
+| ours, temperature 0.6 / 0.3 (`-temp`) | 4 of 8 / 4 of 8 |
+| CFG 1 | 3 of 6 ("turning" once) |
+
+The extra "word" ("and", "said", "turning") is an exhale: the 0.2-0.8 s
+after the last word's voicing is unvoiced (pitch autocorrelation 0.1-0.3
+against 0.7-0.9 in speech) at speech level (-25 to -33 dB). Clips that
+transcribe clean end on the same kind of tail. Text with no final full stop
+can draw a real voiced word ("west to"); that is not touched.
+
+Ruled out:
+- **Stopping on EOS sooner.** EOS is all or nothing: its log10 probability
+  is -5 to -10 on every frame, the breath's included, then ~0 on the last.
+- **Telling the breath from the signal.** A voicing rule cut 25 of 27 test
+  clips clean, but on a wider set it cut a rough, excited "breakfast show"
+  (the DJ voice has voicing 0.2-0.5, like a breath) and a whispered "us".
+- **Parakeet on the last 3 s alone.** It heard "west." and nothing after.
+  It heard the breath as a word only with the sentence before it.
+
+The fix (`breeze/tail.go`, `GenOptions.Ending`; `backend/breeze.go`
+`ending`/`speechEnd`):
+- **Hold back the unvoiced tail.** `Generate` passes audio on as it comes,
+  holding back only what follows the last voiced run (two 40 ms windows),
+  at most 1 s.
+- **Find where the words end.** At the end the backend runs the server's
+  parakeet (`-stt`) on the last 30 s. When the text's last word is heard
+  with more words after it, the speech ends at that word.
+- **Cut only held audio.** The held audio past that point is cut behind a
+  40 ms fade. Audio already passed on is never cut.
+- **No STT, no change.** Without `-stt`, or if the check fails, the ending
+  stays as it is.
+
+Served on a test server (port 18088), seeded:
+
+| check | result |
+| --- | --- |
+| narrator line | **12 of 12 clean**, was 7 of 12 with "and" |
+| four more texts (a DJ, plain "...the facts before you post", whisper, podcast host) | unchanged, all endings kept |
+| first audio, streamed | 164 ms (live 164 ms) |
+| end of request | +30-40 ms for the check |
+| streamed bytes | equal to the whole response |
+
+The six transcripts on the four texts that still differ were already off
+without the fix, and none at the end: a "sighing" voice opening with
+"Uh"/"Ah", whisper misreads, "See ya". Tests: `TestTailTrim`,
+`TestSpeechEnd`.
+
+## Deployment (2026-10-14)
+
+`-tts-instruct` is on ai.service's line (the `ai.service` template),
+deployed on the user's go. It costs **~4.5 GB of device memory**
+(`Model.Bytes`: the int8 layers, the fp16 encoder, heads and codec, the
+code embedding's bf16 copy the device frame gathers from (134 MB), the
+backbone's 2 x 2048-position KV cache, the arenas), ~0.9 GB of host memory,
+and 3.7 s at startup. Custom voices live in `data/voices` under the unit's
+working directory. The first deployment ran the host-sampler loop (1.65x);
+the device frame was redeployed the same day, and shared passes (5.08 GB)
+at 12:18 that day: two instructed requests sent at once both streamed from
+one set of frames (9.3 s of audio in 3.0 s of wall time), and both transcribed
+correctly. A trailing breath that parakeet hears as "and" shows up on some
+seeds whether the request runs alone or shared: see the closing breath above
+(cut since, not yet deployed).
 
 ## Handoff
 
-Next: B7's one submit a frame (device sampler), then concurrency. The
+Next: nothing planned. B7 closed with the device frame and shared passes (1.93x alone, two streams at once). The
 oracle's venv is `.venv-breeze` (gitignored); `models/breeze-tts-src` is
 upstream at 6eba901. Samples to listen to are in `out/breeze-samples/`.

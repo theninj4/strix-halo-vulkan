@@ -55,9 +55,11 @@ const (
 
 	hd = 128 // both stacks' head dim
 
-	// MaxRows is llm_gemv's MAXROWS: a pass of at most this many rows runs
-	// its projections as GEMVs.
-	MaxRows = 3
+	// MaxRows is the GEMV builds' MAXROWS: a pass of at most this many rows
+	// runs its projections as GEMVs. Eight is a depth pass 0 of two
+	// streams' CFG pairs (a hidden row and a code row a branch), so a
+	// shared frame never changes a row's arithmetic.
+	MaxRows = 8
 	// keyBlock is how many keys ace_lm_attn scores at once (one per lane).
 	keyBlock   = 64
 	partBudget = 1 << 16
@@ -134,13 +136,13 @@ var projParts = [nProj][]string{
 }
 
 var gemvSPIRV = map[int][]byte{
-	1: shaders.LLMGEMVK1, 2: shaders.LLMGEMVK2, 4: shaders.LLMGEMVK4, 8: shaders.LLMGEMVK8,
-	16: shaders.LLMGEMVK16, 32: shaders.LLMGEMVK32,
+	1: shaders.BreezeGEMVK1, 2: shaders.BreezeGEMVK2, 4: shaders.BreezeGEMVK4, 8: shaders.BreezeGEMVK8,
+	16: shaders.BreezeGEMVK16, 32: shaders.BreezeGEMVK32,
 }
 
 var gemvSumSPIRV = map[int][]byte{
-	2: shaders.LLMGEMVSumK2, 4: shaders.LLMGEMVSumK4, 8: shaders.LLMGEMVSumK8,
-	16: shaders.LLMGEMVSumK16, 32: shaders.LLMGEMVSumK32,
+	2: shaders.BreezeGEMVSumK2, 4: shaders.BreezeGEMVSumK4, 8: shaders.BreezeGEMVSumK8,
+	16: shaders.BreezeGEMVSumK16, 32: shaders.BreezeGEMVSumK32,
 }
 
 // gemmKernel is a DiT GEMM rung over the fragment-tiled weight.
@@ -220,7 +222,7 @@ type stack struct {
 	rope      uint32
 	rows      int // the longest pass
 	// fp32 arena
-	aX, aQKV, aO, aGU, aFF, aMeta, aPart, aRes uint32
+	aX, aQKV, aO, aGU, aFF, aMeta, aPart uint32
 	// fp16 arena
 	hA, hQ, hCtx, hFFN     uint32
 	ldaDim, ldaQ, ldaF     int
@@ -237,6 +239,9 @@ type Options struct {
 	// Bank is the layers' weight width: int8 (the zero value) or fp16. The
 	// heads and the depth decoder's input projector stay fp16 either way.
 	Bank Bank
+	// Streams is how many utterances share a frame (frame.go): each holds
+	// two KV slots (its CFG pair) in both stacks.
+	Streams int
 }
 
 // Bank is the width the stacks' projections are staged in (B7).
@@ -271,8 +276,8 @@ func (b Bank) projBytes(n, k int) int {
 }
 
 var gemvQ8SPIRV = map[int][]byte{
-	1: shaders.LLMGEMVQ8K1, 2: shaders.LLMGEMVQ8K2, 4: shaders.LLMGEMVQ8K4, 8: shaders.LLMGEMVQ8K8,
-	16: shaders.LLMGEMVQ8K16, 32: shaders.LLMGEMVQ8K32,
+	1: shaders.BreezeGEMVQ8K1, 2: shaders.BreezeGEMVQ8K2, 4: shaders.BreezeGEMVQ8K4, 8: shaders.BreezeGEMVQ8K8,
+	16: shaders.BreezeGEMVQ8K16, 32: shaders.BreezeGEMVQ8K32,
 }
 
 // q8Kernels are the int8 bank's GEMM rungs for a pass of many rows (BN 64).
@@ -288,7 +293,7 @@ const (
 )
 
 // DefaultOptions is upstream's bound: 2048 positions, two slots for CFG.
-func DefaultOptions() Options { return Options{MaxLen: 2048, Rows: 512} }
+func DefaultOptions() Options { return Options{MaxLen: 2048, Rows: 512, Streams: 2} }
 
 // Decoder is the backbone, the depth decoder and their heads, resident.
 type Decoder struct {
@@ -315,15 +320,27 @@ type Decoder struct {
 	lmHead, projIn, ddHeads uint32
 	headPad                 int
 	aLogits                 uint32 // [rows][headPad]
+	aRes                    uint32 // the GEMVs' split-K partials
 	hIn                     uint32 // fp16 depth decoder input rows, [rows][2048+pad]
 	ldaIn                   int
+
+	// The device frame (frame.go): the code embedding's bf16 bits in the
+	// head bank, the backbone's last hidden rows, the frame's codes, the
+	// penalty's marks, the frame's uniforms, and the recordings.
+	embOff                  uint32
+	hHid                    uint32
+	aFrame, aSeen, aUniform uint32
+	recs                    map[string]*vk.Prerecorded
 
 	actElems, hElems, w32 int
 }
 
 // Load stages the decoder half of the checkpoint in dir.
 func Load(dev *vk.Device, dir string, o Options) (*Decoder, error) {
-	if o.MaxLen <= 0 || o.Rows <= 0 {
+	if o.Streams <= 0 {
+		o.Streams = 1
+	}
+	if o.MaxLen <= 0 || o.Rows <= 0 || 4*o.Streams > MaxRows {
 		return nil, fmt.Errorf("breeze: options %+v", o)
 	}
 	set, err := safetensors.OpenSet(dir)
@@ -334,7 +351,7 @@ func Load(dev *vk.Device, dir string, o Options) (*Decoder, error) {
 	d := &Decoder{o: o, dev: dev, pipes: map[string]*vk.ComputePipeline{}}
 	d.bb = &stack{shape: shape{
 		name: "backbone", prefix: "backbone_model.layers.", hidden: bbHidden, nq: 16, nkv: 8, ffn: 6144,
-		layers: 28, eps: 1e-6, qkNorm: true, maxLen: o.MaxLen, slots: 2,
+		layers: 28, eps: 1e-6, qkNorm: true, maxLen: o.MaxLen, slots: 2 * o.Streams,
 		// TestSlabLadder at two rows on the int8 bank (B7): every projection
 		// is fastest at 32 slabs, 204-230 GB/s, where the first table's
 		// k4/k8 read 77-117.
@@ -346,7 +363,7 @@ func Load(dev *vk.Device, dir string, o Options) (*Decoder, error) {
 	}, rows: o.Rows}
 	d.dd = &stack{shape: shape{
 		name: "depth", prefix: "depth_decoder.model.layers.", hidden: ddHidden, nq: 8, nkv: 2, ffn: 8192,
-		layers: 12, eps: 1e-5, maxLen: Codebooks, slots: 2,
+		layers: 12, eps: 1e-5, maxLen: Codebooks, slots: 2 * o.Streams,
 		// The ladder again: 16 slabs except the down projection (K 8192),
 		// whose 4 reads 158 GB/s to 16's 96.
 		slabs: [nProj]int{pQKV: 16, pO: 16, pGU: 16, pDown: 4},
@@ -462,6 +479,7 @@ func (d *Decoder) layout() error {
 	d.lmHead = balloc(d.headPad * bbHidden)
 	d.projIn = balloc(ddHidden * bbHidden)
 	d.ddHeads = balloc((Codebooks - 1) * d.headPad * ddHidden)
+	d.embOff = balloc(Codebooks * Vocab * bbHidden)
 	if lbytes > maxBankBytes {
 		return fmt.Errorf("breeze: the layer bank is %d MB, past one binding", lbytes>>20)
 	}
@@ -485,9 +503,8 @@ func (d *Decoder) layout() error {
 		s.aO = d.alloc(rows * s.hidden)
 		s.aGU = d.alloc(rows * 2 * s.ffn)
 		s.aFF = d.alloc(rows * s.hidden)
-		s.aMeta = d.alloc(rows * 2)
+		s.aMeta = d.alloc(rows * 2 * (1 + metaPasses))
 		s.aPart = d.alloc(partBudget * partStride)
-		s.aRes = d.alloc(MaxRows * 32 * max(s.ffn, s.hidden))
 		s.hA = d.halloc(rows * s.ldaDim)
 		s.hQ = d.halloc(rows * q)
 		s.hCtx = d.halloc(rows * s.ldaQ)
@@ -498,9 +515,23 @@ func (d *Decoder) layout() error {
 			s.w[i].vc = d.halloc(cache)
 		}
 	}
+	// The split-K partials every GEMV shares: [slabs][rows][nOut] of the
+	// widest (the depth decoder's gate|up at four rows is 1M floats).
+	res := 8 * ddHidden // the projector
+	for _, s := range []*stack{d.bb, d.dd} {
+		for p := proj(0); p < nProj; p++ {
+			n, _ := s.projShape(p)
+			res = max(res, s.slabs[p]*n)
+		}
+	}
+	d.aRes = d.alloc(MaxRows * res)
 	d.aLogits = d.alloc(roundUp(max(d.bb.rows, d.dd.rows), rowAlign) * d.headPad)
 	d.ldaIn = bbHidden + gemmPad
 	d.hIn = d.halloc(roundUp(d.dd.rows, rowAlign) * d.ldaIn)
+	d.hHid = d.halloc(2 * d.o.Streams * bbHidden)
+	d.aFrame = d.alloc(d.o.Streams * frameSlots)
+	d.aSeen = d.alloc(d.o.Streams * seenStride)
+	d.aUniform = d.alloc(d.o.Streams * Codebooks)
 	if d.hElems*2 > maxBankBytes {
 		return fmt.Errorf("breeze: the fp16 arena is %d MB, past one binding", d.hElems*2>>20)
 	}
@@ -547,6 +578,10 @@ func (d *Decoder) build() error {
 		{"normf16", shaders.DiTNormScaleF16, 0},
 		{"swiglu", shaders.BreezeDecSwiGLU, 0},
 		{"addnorm", shaders.BreezeDecAddNorm, 0},
+		{"gather", shaders.BreezeFrameGather, 0},
+		{"embed", shaders.BreezeFrameEmbed, 0},
+		{"copyh", shaders.BreezeFrameCopyH, 0},
+		{"sample", shaders.BreezeFrameSample, 64},
 	} {
 		if err := add(s.name, s.name, s.spirv, vk.PipelineSpec{RequiredSubgroupSize: s.wave}); err != nil {
 			return err
@@ -825,11 +860,15 @@ func (d *Decoder) stage(set *safetensors.Set) error {
 	for i := range d.Embed {
 		d.Embed[i] = binary.LittleEndian.Uint16(t.Data[2*i:])
 	}
+	d.banks[headBank].WriteUint16At(int(d.embOff), d.Embed)
 	return nil
 }
 
 // Destroy releases every Vulkan object.
 func (d *Decoder) Destroy() {
+	for _, r := range d.recs {
+		r.Destroy()
+	}
 	for _, p := range d.pipes {
 		p.Destroy()
 	}
@@ -887,7 +926,7 @@ func (d *Decoder) proj(bank, slabs int, aOff uint32, lda int, cOff, bOff uint32,
 	if kt%slabs != 0 || (kt/slabs)%4 != 0 {
 		panic(fmt.Sprintf("breeze: %d slabs do not split K %d", slabs, k))
 	}
-	p := gemvPush{resOff: d.bb.aRes, xnOff: aOff, outOff: cOff, bOff: bOff, lda: uint32(lda),
+	p := gemvPush{resOff: d.aRes, xnOff: aOff, outOff: cOff, bOff: bOff, lda: uint32(lda),
 		gemmN: uint32(nOut), gemmK: uint32(k)}
 	out := []vk.MultiDispatch{{Pipeline: d.gemvs[bank][fmt.Sprintf("k%d_r%d", slabs, n)],
 		GroupsX: uint32(slabs), GroupsY: uint32(nOut / tile), PushConstants: p.bytes()}}
@@ -912,7 +951,7 @@ func keyChunks(n, nq, maxKeys int) (chunks, chunkLen int) {
 // layerGraph is layer i of s over n rows whose metadata is at s.aMeta, from
 // the layer's normed input in s.hA to the next layer's (or, after the last,
 // the final norm's) in s.hA.
-func (d *Decoder) layerGraph(s *stack, i, n, chunks, chunkLen int) []vk.MultiDispatch {
+func (d *Decoder) layerGraph(s *stack, i, n, chunks, chunkLen int, meta uint32) []vk.MultiDispatch {
 	w := &s.w[i]
 	eps := math.Float32bits(float32(s.eps))
 	var out []vk.MultiDispatch
@@ -932,12 +971,12 @@ func (d *Decoder) layerGraph(s *stack, i, n, chunks, chunkLen int) []vk.MultiDis
 	qkv, _ := s.projShape(pQKV)
 	pj(pQKV, s.hA, s.ldaDim, s.aQKV)
 	add(s.pPrep, uint32(n), uint32(s.nq+2*s.nkv), push{InOff: s.aQKV, Dim: uint32(qkv), OutOff: s.hQ,
-		WOff: w.qkNorm, Aux0: s.aMeta, Aux1: w.kc, Aux2: w.vc, Span: uint32(s.maxLen), BOff: s.rope,
+		WOff: w.qkNorm, Aux0: meta, Aux1: w.kc, Aux2: w.vc, Span: uint32(s.maxLen), BOff: s.rope,
 		KStride: uint32(s.maxLen), Eps: eps, Scale: math.Float32bits(float32(1 / math.Sqrt(hd))), Tokens: uint32(n)})
 	add(s.pAttn, uint32(n), uint32(s.nq*chunks), push{InOff: s.hQ, OutOff: s.aPart, KOff: w.kc, VOff: w.vc,
-		Aux0: s.aMeta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Span: uint32(s.maxLen), Tokens: uint32(n)})
+		Aux0: meta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Span: uint32(s.maxLen), Tokens: uint32(n)})
 	add(s.pCombine, uint32(n), uint32(s.nq), push{InOff: s.aPart, OutOff: s.hCtx, Dim: uint32(s.ldaQ),
-		Aux0: s.aMeta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Tokens: uint32(n)})
+		Aux0: meta, Aux1: uint32(chunkLen), Aux2: uint32(chunks), Tokens: uint32(n)})
 	pj(pO, s.hCtx, s.ldaQ, s.aO)
 	addNorm(s.aO, 1, w.ffnNorm)
 	pj(pGU, s.hA, s.ldaDim, s.aGU)
@@ -952,32 +991,44 @@ func (d *Decoder) layerGraph(s *stack, i, n, chunks, chunkLen int) []vk.MultiDis
 	return out
 }
 
-// stackGraph writes rows' metadata and returns every layer of s over them,
-// then the final norm into s.hA (fp16, row stride ldaDim).
-func (d *Decoder) stackGraph(s *stack, rows []Row) ([]vk.MultiDispatch, error) {
+// stackGraph writes rows' metadata (at s.aMeta, or in a recorded pass's own
+// slot: metaSlot 1..metaPasses) and returns every layer of s over them, then
+// the final norm into s.hA (fp16, row stride ldaDim).
+func (d *Decoder) stackGraph(s *stack, rows []Row, metaSlot int) ([]vk.MultiDispatch, error) {
+	metaOff, maxKeys, err := d.writeMeta(s, rows, metaSlot)
+	if err != nil {
+		return nil, err
+	}
 	n := len(rows)
-	if n == 0 || n > s.rows {
-		return nil, fmt.Errorf("breeze: a %s pass of %d rows; 1 to %d", s.name, n, s.rows)
-	}
-	meta := make([]uint32, 2*n)
-	maxKeys := 0
-	for r, row := range rows {
-		if row.Slot < 0 || row.Slot >= s.slots || row.Pos < 0 || row.Pos >= s.maxLen {
-			return nil, fmt.Errorf("breeze: %s row %d at slot %d position %d; the cache is %d x %d",
-				s.name, r, row.Slot, row.Pos, s.slots, s.maxLen)
-		}
-		meta[2*r], meta[2*r+1] = uint32(row.Slot), uint32(row.Pos)
-		maxKeys = max(maxKeys, row.Pos+1)
-	}
-	d.abuf.WriteUint32At(int(s.aMeta), meta)
 	chunks, chunkLen := keyChunks(n, s.nq, maxKeys)
 	g := []vk.MultiDispatch{{Pipeline: d.pipes["normf16"], GroupsX: uint32(n), GroupsY: 1,
 		PushConstants: push{InOff: s.aX, OutOff: s.hA, WOff: s.w[0].attnNorm, Tokens: uint32(n),
 			Dim: uint32(s.hidden), LDA: uint32(s.ldaDim), Eps: math.Float32bits(float32(s.eps))}.bytes()}}
 	for i := range s.w {
-		g = append(g, d.layerGraph(s, i, n, chunks, chunkLen)...)
+		g = append(g, d.layerGraph(s, i, n, chunks, chunkLen, metaOff)...)
 	}
 	return g, nil
+}
+
+// writeMeta writes rows' (slot, position) pairs into metaSlot's metadata and
+// returns its offset and the keys the longest row attends to.
+func (d *Decoder) writeMeta(s *stack, rows []Row, metaSlot int) (off uint32, maxKeys int, err error) {
+	n := len(rows)
+	if n == 0 || n > s.rows {
+		return 0, 0, fmt.Errorf("breeze: a %s pass of %d rows; 1 to %d", s.name, n, s.rows)
+	}
+	meta := make([]uint32, 2*n)
+	for r, row := range rows {
+		if row.Slot < 0 || row.Slot >= s.slots || row.Pos < 0 || row.Pos >= s.maxLen {
+			return 0, 0, fmt.Errorf("breeze: %s row %d at slot %d position %d; the cache is %d x %d",
+				s.name, r, row.Slot, row.Pos, s.slots, s.maxLen)
+		}
+		meta[2*r], meta[2*r+1] = uint32(row.Slot), uint32(row.Pos)
+		maxKeys = max(maxKeys, row.Pos+1)
+	}
+	off = s.aMeta + uint32(metaSlot*2*roundUp(s.rows, rowAlign))
+	d.abuf.WriteUint32At(int(off), meta)
+	return off, maxKeys, nil
 }
 
 // readRows reads n fp16 rows of width w at off (row stride lda) as fp32.
@@ -1011,7 +1062,7 @@ func (d *Decoder) Backbone(x []float32, rows []Row, logits int) (hidden, lg [][]
 	if len(x) != n*bbHidden || logits > n {
 		return nil, nil, 0, fmt.Errorf("breeze: backbone input of %d values for %d rows, %d logits", len(x), n, logits)
 	}
-	g, err := d.stackGraph(d.bb, rows)
+	g, err := d.stackGraph(d.bb, rows, 0)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -1045,9 +1096,31 @@ func (d *Decoder) Depth(in []float32, rows []Row, heads []int) (lg [][]float32, 
 		}
 	}
 	d.hbuf.WriteUint16At(int(d.hIn), h)
-	g, err := d.stackGraph(d.dd, rows)
+	g, err := d.depthGraph(rows, heads, 0)
 	if err != nil {
 		return nil, 0, err
+	}
+	if took, err = vk.DispatchMultiTimed(g, 1, 1, true); err != nil {
+		return nil, took, err
+	}
+	all := d.readLogits(n, Vocab)
+	lg = make([][]float32, n)
+	for r, k := range heads {
+		if k >= 0 {
+			lg[r] = all[r]
+		}
+	}
+	return lg, took, nil
+}
+
+// depthGraph is the depth decoder over rows whose inputs are in d.hIn: the
+// projector, the stack (its metadata in metaSlot), and each row's head into
+// the logits arena at the row's index.
+func (d *Decoder) depthGraph(rows []Row, heads []int, metaSlot int) ([]vk.MultiDispatch, error) {
+	n := len(rows)
+	g, err := d.stackGraph(d.dd, rows, metaSlot)
+	if err != nil {
+		return nil, err
 	}
 	pre := d.proj(headBank, 8, d.hIn, d.ldaIn, d.dd.aX, d.projIn, ddHidden, bbHidden, n)
 	g = append(pre, g...)
@@ -1064,17 +1137,7 @@ func (d *Decoder) Depth(in []float32, rows []Row, heads []int) (lg [][]float32, 
 		}
 		r = e
 	}
-	if took, err = vk.DispatchMultiTimed(g, 1, 1, true); err != nil {
-		return nil, took, err
-	}
-	all := d.readLogits(n, Vocab)
-	lg = make([][]float32, n)
-	for r, k := range heads {
-		if k >= 0 {
-			lg[r] = all[r]
-		}
-	}
-	return lg, took, nil
+	return g, nil
 }
 
 // frameEmbed is the backbone's input for a frame: the sum of its 16 code
