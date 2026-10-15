@@ -5,6 +5,7 @@
 .venv-acestep/
 .venv-paddle/
 .venv-breeze/
+.venv-flux3/
 reference/out/
 ai
 /out/
