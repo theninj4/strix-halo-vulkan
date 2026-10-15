@@ -59,6 +59,14 @@ type GPU struct {
 	// runs its control: the pack, and the SwiGLU pass over the fused GEMM's
 	// fp32 output. TestGPUBits compares them.
 	packV, fuseGLU bool
+	// nullConst (A15 S1, on by default on a guided checkpoint): the null
+	// row's cross-attention is one constant a layer. Every key and value of
+	// null_condition_emb's rows is the same and none is masked, so the
+	// softmax is uniform and the block is o_proj(v_proj(condition_embedder(
+	// null))), whatever x and t are: added from aNullCross in place of the
+	// norm, the q projection, the attention and the o projection. Off, the
+	// null planes run the block (the control).
+	nullConst bool
 
 	wbuf, abuf, hbuf *vk.Buffer
 	banks            []*vk.Buffer
@@ -90,13 +98,14 @@ type GPU struct {
 	aX, aS, aMod, aTail, aZeros, aOnes uint32
 	aProjInB, aLyricB, aTimbreB        uint32
 	aDetokNorm, aPoolNorm              uint32
+	aNullCross                         uint32 // [layers, hidden] (S1)
 	actElems                           int
 	// hbuf (fp16): planes, A operands, the cross planes.
 	hQ, hK, hV, hA, hCtx, hFFN, hIn uint32
 	hElems                          int
 
-	// Per-request state (Begin).
-	encLen int
+	// Per-request state (Begin, BeginNull).
+	encLen, nullLen int
 
 	// detokChunk, when set, is how many codes Detokenize runs at a time:
 	// the test's way to exercise the chunking at a short song.
@@ -142,12 +151,16 @@ type layerW struct {
 	// many rows, with rope positions restarting every group (the
 	// detokenizer's 5-row sequences).
 	group int
+	// index is the layer's place in its stack.
+	index int
 	// wbuf: q/k norm weights; cross-attention's own pair on the DiT.
 	normQ, normK, cnormQ, cnormK uint32
 	// abuf: the encoders' input/post-attention norms, the DiT's cross norm.
 	norm1, norm2, crossNorm uint32
-	// hbuf: the DiT layer's cross-attention key and value planes.
+	// hbuf: the DiT layer's cross-attention key and value planes, and on a
+	// guided (base) checkpoint the null condition's (A15).
 	crossK, crossV uint32
+	nullK, nullV   uint32
 }
 
 // pushConstants mirrors shaders/dit_common.glsl.
@@ -239,7 +252,8 @@ func NewGPU(dev *vk.Device, dir string, maxTokens int) (*GPU, error) {
 	if err != nil {
 		return nil, err
 	}
-	g := &GPU{dev: dev, cfg: cfg, Host: host, maxTokens: maxTokens, pipes: map[string]*vk.ComputePipeline{}, big: gemmBig, packV: true, fuseGLU: true}
+	g := &GPU{dev: dev, cfg: cfg, Host: host, maxTokens: maxTokens, pipes: map[string]*vk.ComputePipeline{}, big: gemmBig, packV: true, fuseGLU: true,
+		nullConst: !cfg.IsTurbo}
 	g.dit = dims{H: cfg.Hidden, heads: cfg.Heads, kv: cfg.KVHeads, ffn: cfg.FFN}
 	g.enc = dims{H: cfg.EncHidden, heads: cfg.EncHeads, kv: cfg.EncKVHeads, ffn: cfg.EncFFN}
 	for _, d := range []*dims{&g.dit, &g.enc} {
@@ -353,7 +367,7 @@ func (g *GPU) stage(set *safetensors.Set) error {
 	g.wCosP, g.wSinP = uint32(6*g.rows*ropeHalf), uint32(7*g.rows*ropeHalf)
 	w32 := 8 * g.rows * ropeHalf
 	newLayer := func(d dims, i int, cross bool) layerW {
-		w := layerW{off: map[proj]uint32{}, window: c.Windowed(i)}
+		w := layerW{off: map[proj]uint32{}, window: c.Windowed(i), index: i}
 		ps := selfProjs
 		if cross {
 			ps = append(append([]proj(nil), selfProjs...), crossProjs...)
@@ -628,6 +642,9 @@ func (g *GPU) allocActivations(set *safetensors.Set) error {
 	for i := range g.ditL {
 		g.ditL[i].crossNorm = alloc(g.dit.H)
 	}
+	if !c.IsTurbo {
+		g.aNullCross = alloc(c.Layers * g.dit.H)
+	}
 
 	halloc := func(n int) uint32 {
 		off := uint32(g.hElems)
@@ -644,6 +661,10 @@ func (g *GPU) allocActivations(set *safetensors.Set) error {
 	for i := range g.ditL {
 		g.ditL[i].crossK = halloc(g.dit.kv * g.encRows * headDim)
 		g.ditL[i].crossV = halloc(g.dit.kv * g.encRows * headDim)
+		if !c.IsTurbo {
+			g.ditL[i].nullK = halloc(g.dit.kv * g.encRows * headDim)
+			g.ditL[i].nullV = halloc(g.dit.kv * g.encRows * headDim)
+		}
 	}
 	for _, a := range []struct {
 		name  string
@@ -688,7 +709,54 @@ func (g *GPU) allocActivations(set *safetensors.Set) error {
 	for i, w := range g.ditL {
 		g.abuf.WriteFloat32At(int(w.crossNorm), l.f32(fmt.Sprintf("decoder.layers.%d.cross_attn_norm.weight", i), g.dit.H))
 	}
+	if !c.IsTurbo && l.err == nil {
+		g.abuf.WriteFloat32At(int(g.aNullCross), g.nullCross(l))
+	}
 	return l.err
+}
+
+// nullCross is S1's constants, in fp32 from the checkpoint's fp32 weights
+// (float64 sums): per layer o_proj · (each q head's kv head of v_proj ·
+// (condition_embedder · null_condition_emb + bias)), [layers, hidden].
+func (g *GPU) nullCross(l *loader) []float32 {
+	H, E := g.dit.H, g.enc.H
+	matvec := func(w []float32, x []float64, rows, cols int) []float64 {
+		y := make([]float64, rows)
+		parallel(rows, func(o int) {
+			var s float64
+			for j, v := range w[o*cols : (o+1)*cols] {
+				s += float64(v) * x[j]
+			}
+			y[o] = s
+		})
+		return y
+	}
+	null := make([]float64, E)
+	for i, v := range g.Host.NullCond {
+		null[i] = float64(v)
+	}
+	ce := matvec(l.f32("decoder.condition_embedder.weight", H, E), null, H, E)
+	for i := range ce {
+		ce[i] += float64(g.Host.CondB[i])
+	}
+	kvW, qW, group := g.dit.kvW(), g.dit.qW(), g.dit.heads/g.dit.kv
+	out := make([]float32, len(g.ditL)*H)
+	for i := range g.ditL {
+		p := fmt.Sprintf("decoder.layers.%d.cross_attn.", i)
+		v := matvec(l.f32(p+"v_proj.weight", kvW, H), ce, kvW, H)
+		ctx := make([]float64, qW)
+		for h := 0; h < g.dit.heads; h++ {
+			copy(ctx[h*headDim:(h+1)*headDim], v[(h/group)*headDim:(h/group+1)*headDim])
+		}
+		o := matvec(l.f32(p+"o_proj.weight", H, qW), ctx, H, qW)
+		if l.err != nil {
+			return nil
+		}
+		for j, x := range o {
+			out[i*H+j] = float32(x)
+		}
+	}
+	return out
 }
 
 func (g *GPU) build(*safetensors.Set) error {
@@ -703,11 +771,12 @@ func (g *GPU) build(*safetensors.Set) error {
 		return g.dev.NewPipeline(mod, spec)
 	}
 	for name, spirv := range map[string][]byte{
-		"norm":   shaders.H3NormMod,
-		"qkpack": shaders.ACEQKPack,
-		"bias":   shaders.H3BiasCopy,
-		"pack":   shaders.DiTPackF16TPW8,
-		"gate":   shaders.DiTGateAddHoist,
+		"norm":       shaders.H3NormMod,
+		"qkpack":     shaders.ACEQKPack,
+		"bias":       shaders.H3BiasCopy,
+		"pack":       shaders.DiTPackF16TPW8,
+		"gate":       shaders.DiTGateAddHoist,
+		"gate bcast": shaders.DiTGateAddHoistBcast,
 		// The SwiGLU pass over the fused gate|up GEMM's interleaved fp32
 		// output (the epilogue's control), and the
 		// zeroing of the A pad rows ahead of a GEMM that stores v's tiles.
@@ -797,6 +866,8 @@ type graph struct {
 	// bytes is what a streaming dispatch reads and writes (KERNELS.md G6):
 	// its rate against the 236 GB/s a copy gets is its TFLOP/s.
 	bytes []float64
+	// null makes a DiT layer's cross-attention read the null planes.
+	null bool
 }
 
 func (g *GPU) newGraph() *graph { return &graph{g: g} }
@@ -1034,19 +1105,29 @@ func (gr *graph) layer(d dims, w layerW, n int, v modVecs, cross bool) error {
 	}
 	gr.residual(d, "gate attn", n, aAttn, v[2])
 
-	if cross {
+	if cross && gr.null && g.nullConst {
+		var pc pushConstants
+		pc.Tokens, pc.Dim = uint32(n), uint32(d.H)
+		pc.InOff, pc.OutOff = g.aNullCross+uint32(w.index*d.H), g.aX
+		gr.add("gate bcast", "null cross add", uint32(n), 1, pc, 0)
+		gr.moved(n * d.H * (4 + 4))
+	} else if cross {
+		ck, cv, encLen := w.crossK, w.crossV, g.encLen
+		if gr.null {
+			ck, cv, encLen = w.nullK, w.nullV, g.nullLen
+		}
 		gr.norm(d, "cross in", n, w.crossNorm, g.aZeros)
 		if err := gr.gemm(g.big, w.bank, "gemm cross q", g.hA, aQ, w.off[pCQ], n, d.qW(), d.H, d.ldaH); err != nil {
 			return err
 		}
 		gr.qkpack("qkpack cross q", n, d.heads, aQ, g.hQ, R, g.wCosID, g.wSinID, w.cnormQ, qScale)
 		var pc pushConstants
-		pc.Tokens, pc.KStride, pc.Heads = uint32(g.encLen), uint32(n), uint32(d.heads)
-		pc.InOff, pc.KOff, pc.VOff = g.hQ, w.crossK, w.crossV
+		pc.Tokens, pc.KStride, pc.Heads = uint32(encLen), uint32(n), uint32(d.heads)
+		pc.InOff, pc.KOff, pc.VOff = g.hQ, ck, cv
 		pc.OutOff, pc.LDA = g.hCtx, uint32(d.ldaQ)
 		pc.Aux1, pc.Aux2, pc.LDB = uint32(R), uint32(d.heads/d.kv), uint32(g.encRows)
 		gr.add("attn cross", "cross attention", uint32((n+tile-1)/tile), uint32(d.heads), pc,
-			4*nf*float64(g.encLen)*headDim*float64(d.heads))
+			4*nf*float64(encLen)*headDim*float64(d.heads))
 		if err := gr.gemm(g.big, w.bank, "gemm cross o", g.hCtx, aAttn, w.off[pCO], n, d.H, d.qW(), d.ldaQ); err != nil {
 			return err
 		}
@@ -1261,6 +1342,35 @@ func (g *GPU) Encode(text, lyric, timbre *qwen.Mat) (*qwen.Mat, error) {
 // cross-attention keys (k_proj, k_norm, no rotation) and values into that
 // layer's planes.
 func (g *GPU) Begin(enc *qwen.Mat) error {
+	if err := g.begin(enc, false); err != nil {
+		return err
+	}
+	g.encLen = enc.Rows
+	return nil
+}
+
+// BeginNull prepares CFG's unconditional cross-attention on a guided
+// checkpoint: L rows of null_condition_emb (upstream's expand_as of the
+// request's condition) into the null planes. StepNull reads them.
+func (g *GPU) BeginNull(L int) error {
+	if g.cfg.IsTurbo {
+		return fmt.Errorf("dit: a turbo checkpoint has no null planes")
+	}
+	enc := qwen.NewMat(L, g.enc.H)
+	for r := 0; r < L; r++ {
+		copy(enc.Row(r), g.Host.NullCond)
+	}
+	if err := g.begin(enc, true); err != nil {
+		return err
+	}
+	g.nullLen = L
+	return nil
+}
+
+// Guided reports whether the checkpoint runs CFG (the base model).
+func (g *GPU) Guided() bool { return !g.cfg.IsTurbo }
+
+func (g *GPU) begin(enc *qwen.Mat, null bool) error {
 	if enc.Cols != g.enc.H || enc.Rows > g.maxEnc || enc.Rows == 0 {
 		return fmt.Errorf("dit: condition sequence %v, staged for %d rows", enc, g.maxEnc)
 	}
@@ -1286,20 +1396,21 @@ func (g *GPU) Begin(enc *qwen.Mat) error {
 	aV := aK + uint32(g.encRows*g.dit.kvW())
 	kv := g.dit.kvW()
 	for _, w := range g.ditL {
-		g.zeroKeyTail([]uint32{w.crossK, w.crossV}, g.dit.kv, g.encRows, L)
+		pk, pv := w.crossK, w.crossV
+		if null {
+			pk, pv = w.nullK, w.nullV
+		}
+		g.zeroKeyTail([]uint32{pk, pv}, g.dit.kv, g.encRows, L)
 		if err := gr.gemm(g.big, w.bank, "gemm cross k", g.hIn, aK, w.off[pCK], L, kv, H, H+gemmPad); err != nil {
 			return err
 		}
-		if err := gr.projV(w.bank, "cross v", g.hIn, aV, w.off[pCV], w.crossV, L, g.dit.kv, H, H+gemmPad, g.encRows); err != nil {
+		if err := gr.projV(w.bank, "cross v", g.hIn, aV, w.off[pCV], pv, L, g.dit.kv, H, H+gemmPad, g.encRows); err != nil {
 			return err
 		}
-		gr.qkpack("qkpack cross k", L, g.dit.kv, aK, w.crossK, g.encRows, g.wCosID, g.wSinID, w.cnormK, 1)
+		gr.qkpack("qkpack cross k", L, g.dit.kv, aK, pk, g.encRows, g.wCosID, g.wSinID, w.cnormK, 1)
 	}
-	if _, err := gr.submit(); err != nil {
-		return err
-	}
-	g.encLen = L
-	return nil
+	_, err := gr.submit()
+	return err
 }
 
 // uploadStep writes forward t's vectors: per layer a1 = self_attn_norm ·
@@ -1353,7 +1464,20 @@ func (g *GPU) Tokens(frames int) int { return (frames + g.cfg.Patch - 1) / g.cfg
 // [T, 128] (source latents | chunk mask), t the timestep. It returns the
 // velocity [T, 64] and the device time.
 func (g *GPU) Step(x, ctx *qwen.Mat, t float32) (*qwen.Mat, time.Duration, error) {
-	gr, n, err := g.stepGraph(x, ctx, t)
+	return g.step(x, ctx, t, false)
+}
+
+// StepNull is Step with the null condition's cross-attention (BeginNull):
+// CFG's unconditional row.
+func (g *GPU) StepNull(x, ctx *qwen.Mat, t float32) (*qwen.Mat, time.Duration, error) {
+	if g.nullLen == 0 {
+		return nil, 0, fmt.Errorf("dit: StepNull before BeginNull")
+	}
+	return g.step(x, ctx, t, true)
+}
+
+func (g *GPU) step(x, ctx *qwen.Mat, t float32, null bool) (*qwen.Mat, time.Duration, error) {
+	gr, n, err := g.stepGraph(x, ctx, t, null)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1364,11 +1488,12 @@ func (g *GPU) Step(x, ctx *qwen.Mat, t float32) (*qwen.Mat, time.Duration, error
 	return g.readVelocity(n, x.Rows), took, nil
 }
 
-func (g *GPU) stepGraph(x, ctx *qwen.Mat, t float32) (*graph, int, error) {
+func (g *GPU) stepGraph(x, ctx *qwen.Mat, t float32, null bool) (*graph, int, error) {
 	gr, n, err := g.inputGraph(x, ctx, t)
 	if err != nil {
 		return nil, 0, err
 	}
+	gr.null = null
 	for l, w := range g.ditL {
 		if err := gr.layer(g.dit, w, n, g.vecs(l), true); err != nil {
 			return nil, 0, err
@@ -1475,7 +1600,7 @@ type Stage struct {
 
 // Profile runs one forward a dispatch at a time, timing each.
 func (g *GPU) Profile(x, ctx *qwen.Mat, t float32) ([]Stage, error) {
-	gr, _, err := g.stepGraph(x, ctx, t)
+	gr, _, err := g.stepGraph(x, ctx, t, false)
 	if err != nil {
 		return nil, err
 	}

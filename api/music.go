@@ -60,6 +60,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
@@ -117,6 +118,13 @@ type MusicRequest struct {
 	// Shift and Timesteps are the DiT's schedule (zero and nil: shift 3).
 	Shift     float64
 	Timesteps []float64
+	// The base model's diffusion (research/music-vertical.md A15):
+	// inference_steps (0: Gradio's 32, not the API's 8), guidance_scale
+	// (nil: 7; 1 or less turns CFG off) and cfg_interval_start/end (nil: 0
+	// and 1). The turbo model ignores them, as upstream's does.
+	InferenceSteps   int
+	GuidanceScale    *float64
+	CFGStart, CFGEnd *float64
 	// The LM's sampling, nil for upstream's (0.85, 2.0, 0.9).
 	LMTemperature, LMCFGScale, LMTopP *float64
 
@@ -152,7 +160,10 @@ type MusicPlan struct {
 	Format       string
 	// Seconds is the song's length when it is known before the LM runs,
 	// and zero when the LM is to choose it.
-	Seconds  float64
+	Seconds float64
+	// Model is the id of the model the job runs on: the request's when
+	// it names one this backend serves, else the default.
+	Model    string
 	Steps    int
 	Estimate time.Duration
 }
@@ -428,8 +439,8 @@ func (q *MusicJobs) Submit(req *MusicRequest) (MusicJob, error) {
 	if err != nil {
 		return MusicJob{}, err
 	}
-	model := req.Model
-	if ms := q.backend.Models(); len(ms) > 0 {
+	model := plan.Model
+	if ms := q.backend.Models(); model == "" && len(ms) > 0 {
 		model = ms[0].ID
 	}
 	j := &musicJob{req: req, plan: plan, MusicJob: MusicJob{
@@ -801,7 +812,7 @@ var musicRefused = []struct {
 	ok    func(v json.RawMessage) bool
 	why   string
 }{
-	{[]string{"task_type", "taskType"}, isOneOf("text2music", "cover", "cover-nofsq", "repaint"), "lego, extract and complete are the base model's tasks; this is turbo (text2music, cover, cover-nofsq, repaint)"},
+	{[]string{"task_type", "taskType"}, isOneOf("text2music", "cover", "cover-nofsq", "repaint"), "lego, extract and complete are not served (text2music, cover, cover-nofsq, repaint)"},
 	{[]string{"batch_size", "batchSize"}, isOneOf("1"), "one song a job; submit one job per song"},
 	{[]string{"use_format", "useFormat", "format"}, isOneOf("false"), "format mode is not served"},
 	{[]string{"audio_code_string", "audioCodeString"}, isOneOf(""), "audio codes in are not served; thinking writes them"},
@@ -822,7 +833,7 @@ var musicRefused = []struct {
 	{[]string{"use_cot_language", "cot_language", "cot-language"}, isOneOf("true"), "the LM always writes the language, as upstream's default does"},
 	{[]string{"use_cot_metas"}, isOneOf("true"), "the LM always fills the missing metas, as upstream's default does"},
 	{[]string{"constrained_decoding", "constrainedDecoding", "constrained"}, isOneOf("true"), "the LM always decodes under its FSM"},
-	{[]string{"use_adg"}, isOneOf("false"), "ADG is for the base model; this is turbo"},
+	{[]string{"use_adg"}, isOneOf("false"), "ADG is not served; the base model guides through APG, upstream's default"},
 	{[]string{"lora", "lora_path", "lm_model_path"}, isOneOf(""), "the models are fixed at startup"},
 }
 
@@ -857,7 +868,7 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 	}
 	var err error
 	r := &MusicRequest{Thinking: true, Score: true}
-	if r.Model, err = f.str("model"); err != nil {
+	if r.Model, err = f.str("model", "model_name", "modelName", "dit_model", "ditModel"); err != nil {
 		return nil, err
 	}
 	if r.Analysis, _, err = f.boolean("full_analysis_only", "fullAnalysisOnly"); err != nil {
@@ -1002,13 +1013,38 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 			*s.dst = &x
 		}
 	}
-	// inference_steps and guidance_scale are accepted and do nothing: the
-	// turbo model runs its fixed 8-step table without CFG, which is what
-	// upstream does with them too (MUSIC.md A1).
-	for _, n := range []string{"inference_steps", "guidance_scale"} {
-		if _, _, err := f.num(n); err != nil {
+	// The base model's diffusion; the turbo model runs its fixed 8-step
+	// table without CFG and ignores them, as upstream does (MUSIC.md A1).
+	if v, ok, err := f.num("inference_steps", "inferenceSteps"); err != nil {
+		return nil, err
+	} else if ok {
+		if v != math.Trunc(v) || v < 1 || v > 200 {
+			return nil, fmt.Errorf("inference_steps: %v is not a whole number of steps in 1-200", v)
+		}
+		r.InferenceSteps = int(v)
+	}
+	for _, s := range []struct {
+		names    []string
+		dst      **float64
+		min, max float64
+	}{{[]string{"guidance_scale", "guidanceScale"}, &r.GuidanceScale, 0, 30},
+		{[]string{"cfg_interval_start", "cfgIntervalStart"}, &r.CFGStart, 0, 1},
+		{[]string{"cfg_interval_end", "cfgIntervalEnd"}, &r.CFGEnd, 0, 1}} {
+		v, ok, err := f.num(s.names...)
+		if err != nil {
 			return nil, err
 		}
+		if !ok {
+			continue
+		}
+		if v < s.min || v > s.max {
+			return nil, fmt.Errorf("%s: %v is outside %g-%g", s.names[0], v, s.min, s.max)
+		}
+		x := v
+		*s.dst = &x
+	}
+	if r.CFGStart != nil && r.CFGEnd != nil && *r.CFGStart > *r.CFGEnd {
+		return nil, fmt.Errorf("cfg_interval_start %v is past cfg_interval_end %v", *r.CFGStart, *r.CFGEnd)
 	}
 	return r, nil
 }
@@ -1021,7 +1057,7 @@ var (
 	analysisDefaults = map[string][]string{
 		"task_type": {"text2music"}, "taskType": {"text2music"}, "audio_format": {"mp3"}, "audioFormat": {"mp3"},
 		"vocal_language": {"en", "unknown"}, "vocalLanguage": {"en", "unknown"}, "language": {"en", "unknown"},
-		"inference_steps": {"8"}, "guidance_scale": {"7"}, "shift": {"3"}, "seed": {"-1"},
+		"inference_steps": {"8", "32"}, "guidance_scale": {"7"}, "shift": {"3"}, "seed": {"-1"},
 		"audio_duration": {"-1"}, "duration": {"-1"}, "audioDuration": {"-1"},
 	}
 )

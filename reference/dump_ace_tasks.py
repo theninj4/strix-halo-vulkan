@@ -32,6 +32,11 @@ DiT, the text encoder and the VAE in bfloat16 (the handler's dtype there),
 from the fp32 run's DiT noise, into reference/out/acetasks_bf16 -- the bar
 a device path's drift from the fp32 oracle is priced against (decision 2).
 Its VAE samples its own posterior noise, as upstream's does.
+
+--model base runs the XL base checkpoint (research/music-vertical.md A15d) at
+Gradio's base settings -- 32 steps, CFG 7 through APG -- into
+reference/out/acetasks_base{,_bf16}; the source and reference wavs stay
+acetasks'.
 """
 
 import json
@@ -54,10 +59,13 @@ from acestep.inference import GenerationConfig, GenerationParams, generate_music
 from dump_ace_plan import LYRICS, PROJECT  # noqa: E402
 
 BF16 = "--bf16" in sys.argv
-FP32_OUT = "reference/out/acetasks"
-OUT = "reference/out/acetasks_bf16" if BF16 else FP32_OUT
-SRC_WAV = os.path.join(FP32_OUT, "src.wav")
-REF_WAV = os.path.join(FP32_OUT, "ref.wav")
+BASE = "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "base"
+FP32_OUT = "reference/out/acetasks_base" if BASE else "reference/out/acetasks"
+OUT = FP32_OUT + "_bf16" if BF16 else FP32_OUT
+SRC_WAV = os.path.join("reference/out/acetasks", "src.wav")
+REF_WAV = os.path.join("reference/out/acetasks", "ref.wav")
+MODEL = "acestep-v15-xl-base" if BASE else "acestep-v15-xl-turbo"
+EXTRA = dict(inference_steps=32, guidance_scale=7.0) if BASE else {}
 
 SYNTH = dict(caption="upbeat synthwave with female vocals", lyrics=LYRICS, bpm=120, keyscale="C major",
              timesignature="4", vocal_language="en")
@@ -90,7 +98,7 @@ class RandLog:
 
 
 def main():
-    labels = [a for a in sys.argv[1:] if not a.startswith("--")] or [c[0] for c in CASES]
+    labels = [a for a in sys.argv[1:] if not a.startswith("--") and a != "base"] or [c[0] for c in CASES]
     os.makedirs(OUT, exist_ok=True)
     manifest_path = os.path.join(OUT, "manifest.json")
     manifest = {"cases": {}, "tensors": {}}
@@ -109,13 +117,13 @@ def main():
             fh.write(arr.tobytes())
         manifest["tensors"][name] = {"shape": list(arr.shape), "dtype": np.dtype(dtype).name}
 
-    for path, label in () if BF16 else ((SRC_WAV, "full_metas"), (REF_WAV, "defaults")):
+    for path, label in () if BF16 or BASE else ((SRC_WAV, "full_metas"), (REF_WAV, "defaults")):
         wav = np.fromfile(f"reference/out/acevae/{label}_final.bin", dtype=np.float32).reshape(2, -1)
         sf.write(path, wav.T, 48000, subtype="FLOAT")
 
     torch.set_grad_enabled(False)
     h = AceStepHandler()
-    msg, ok = h.initialize_service(project_root=PROJECT, config_path="acestep-v15-xl-turbo", device="cpu",
+    msg, ok = h.initialize_service(project_root=PROJECT, config_path=MODEL, device="cpu",
                                    use_mlx_dit=False)
     assert ok, msg
     model = h.model
@@ -197,7 +205,7 @@ def main():
         kw = dict(cases[label])
         task = kw.get("task_type", "text2music")
         params = GenerationParams(thinking=False, shift=3.0, seed=42, use_cot_metas=False, use_cot_caption=False,
-                                  use_cot_language=False, instruction=TASK_INSTRUCTIONS[task], **kw)
+                                  use_cot_language=False, instruction=TASK_INSTRUCTIONS[task], **EXTRA, **kw)
         random.seed(0)
         torch.manual_seed(0)
         t0 = time.time()

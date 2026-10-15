@@ -67,6 +67,12 @@ var taskLabels = []string{"ref_t2m", "cover", "cover_mix", "cover_nofsq", "repai
 // segment draws, and its noise.
 func taskRequest(t *testing.T, label string) (*plan.Request, Options, taskCase) {
 	t.Helper()
+	return taskRequestIn(t, tasksRef, label)
+}
+
+// taskRequestIn is taskRequest from the oracle in dir.
+func taskRequestIn(t *testing.T, tasksRef, label string) (*plan.Request, Options, taskCase) {
+	t.Helper()
 	buf, err := os.ReadFile(filepath.Join(tasksRef, "manifest.json"))
 	if err != nil {
 		t.Skipf("no reference dump in %s (%v); run reference/dump_ace_tasks.py", tasksRef, err)
@@ -101,7 +107,7 @@ func taskRequest(t *testing.T, label string) (*plan.Request, Options, taskCase) 
 	}
 	if a.needsSource() {
 		a.Source = interleaved(t, filepath.Join(tasksRef, label+"_src_wav.bin"))
-		a.SourceLatents = sourceLatents(t, label, task)
+		a.SourceLatents = sourceLatents(t, tasksRef, label, task)
 	}
 	o := Options{Seed: 42, Audio: a, Noise: readF32(t, filepath.Join(tasksRef, label+"_noise.bin"))}
 	return r, o, c
@@ -110,7 +116,7 @@ func taskRequest(t *testing.T, label string) (*plan.Request, Options, taskCase) 
 // sourceLatents are the oracle's sampled latents of the (padded) source,
 // before the pad to 128 latents and before any span is silenced: the
 // repaint's clean_src, a cover's src_latents.
-func sourceLatents(t *testing.T, label, task string) []float32 {
+func sourceLatents(t *testing.T, tasksRef, label, task string) []float32 {
 	t.Helper()
 	if task == Repaint {
 		return readF32(t, filepath.Join(tasksRef, label+"_clean_src.bin"))
@@ -195,7 +201,7 @@ func TestTaskInputs(t *testing.T) {
 			codes := readI64(t, filepath.Join(tasksRef, label+"_codes.bin"))
 			n := (dp.T + 4) / 5 * 5
 			x := make([]float32, n*64)
-			copy(copy2(x, sourceLatents(t, label, Cover)), p.silence)
+			copy(copy2(x, sourceLatents(t, tasksRef, label, Cover)), p.silence)
 			ours, _, _, err := p.DiT.Tokenize(&qwen.Mat{Rows: n, Cols: 64, Data: x})
 			if err != nil {
 				t.Fatal(err)
@@ -317,6 +323,86 @@ func TestTasksOwnEncode(t *testing.T) {
 		_, rms, _ := gap(res.Latents, want)
 		_, bfRMS, _ := gap(readF32(t, filepath.Join(tasksBF16, label+"_latents.bin")), want)
 		t.Logf("%-12s own encode: latents rms %.2e; upstream bf16 %.2e (%.1fx)", label, rms, bfRMS, bfRMS/rms)
+		if rms > bfRMS/2 {
+			t.Errorf("%s: latents rms %.2e, more than half of bf16's %.2e", label, rms, bfRMS)
+		}
+	}
+}
+
+// TestBaseTasks is A15d's gate: a cover, a cover that starts from the
+// renoised source and switches to the text2music condition halfway (its
+// null planes rebuilt at the new length), and a repaint, on the XL base
+// model at Gradio's settings (32 steps, CFG 7 through APG), against
+// dump_ace_tasks.py --model base and held under half of its bf16 run's
+// drift.
+//
+// A full cover is held from the oracle's own hints. Through our tokenizer
+// one code of 150 flips at an FSQ boundary (upstream's unseeded posterior
+// noise flips ~2; TestTaskInputs bounds ours), and 32 guided steps carry
+// that one flip's 5 rows to 0.46 rms, against 0.12 from the oracle's
+// hints and bf16's 0.72 (which flips half the codes).
+func TestBaseTasks(t *testing.T) {
+	const ref, bf16 = "../../reference/out/acetasks_base", "../../reference/out/acetasks_base_bf16"
+	p := basePipeline(t)
+	for _, label := range []string{"cover", "cover_mix", "repaint"} {
+		r, o, _ := taskRequestIn(t, ref, label)
+		res, err := p.Generate(r, o)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := readF32(t, filepath.Join(ref, label+"_latents.bin"))
+		if len(want) != len(res.Latents) {
+			t.Fatalf("%s: %d latent values, want %d", label, len(res.Latents), len(want))
+		}
+		_, rms, _ := gap(res.Latents, want)
+		audio := interleaved(t, filepath.Join(ref, label+"_audio.bin"))
+		_, _, snr := gap(res.Audio, audio)
+		tm := res.Timings
+		t.Logf("%-12s latents rms %.2e, audio SNR %5.1f dB; %.1f s of audio in %.2f s (DiT %.2f, %d forwards)",
+			label, rms, snr, res.Seconds, tm.Total.Seconds(), tm.DiT.Seconds(), len(tm.Steps))
+		full := o.Audio.Task == Cover && o.Audio.CoverStrength == 1 && o.Audio.CoverNoise == 0
+		if full {
+			// What the code flips cost: the same cover from the oracle's own
+			// hints (its context latents' source rows).
+			codes := readI64(t, filepath.Join(ref, label+"_codes.bin"))
+			d, dp, err := p.taskPlan(r, o.Audio, o.Seed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := (dp.T + 4) / 5 * 5
+			x := make([]float32, n*64)
+			copy(copy2(x, sourceLatents(t, ref, label, Cover)), p.silence)
+			ours, _, _, err := p.DiT.Tokenize(&qwen.Mat{Rows: n, Cols: 64, Data: x})
+			if err != nil {
+				t.Fatal(err)
+			}
+			flips := 0
+			for i := range codes {
+				if ours[i] != codes[i] {
+					flips++
+				}
+			}
+			ctx := readF32(t, filepath.Join(ref, label+"_cond0_ctx.bin"))
+			hints := make([]float32, dp.T*64)
+			for i := 0; i < dp.T; i++ {
+				copy(hints[i*64:(i+1)*64], ctx[i*128:i*128+64])
+			}
+			dp.src, dp.hidden = hints, hints
+			res2, err := p.generate(d, o, dp, &Result{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, rms2, _ := gap(res2.Latents, want)
+			t.Logf("%-12s %d of %d codes flipped; from the oracle's hints, latents rms %.2e", label, flips, len(codes), rms2)
+			rms = rms2
+		}
+		bfPath := filepath.Join(bf16, label+"_latents.bin")
+		if _, err := os.Stat(bfPath); err != nil {
+			t.Logf("%s: no bf16 reference (%v)", label, err)
+			continue
+		}
+		_, bfRMS, _ := gap(readF32(t, bfPath), want)
+		t.Logf("%-12s upstream bf16: latents rms %.2e (%.1fx ours)", label, bfRMS, bfRMS/rms)
 		if rms > bfRMS/2 {
 			t.Errorf("%s: latents rms %.2e, more than half of bf16's %.2e", label, rms, bfRMS)
 		}

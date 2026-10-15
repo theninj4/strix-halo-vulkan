@@ -31,6 +31,7 @@ package pipeline
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"math"
@@ -38,6 +39,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -73,20 +75,46 @@ func DefaultDirs(models string) Dirs {
 	}
 }
 
+// DiTModels are the DiT checkpoints by name under models/ (A15): the XL
+// base model, which runs CFG over 32 steps, and turbo, CFG-distilled to 8.
+var DiTModels = map[string]string{
+	"base":  "acestep-v15-xl-base",
+	"turbo": "acestep-v15-xl-turbo",
+}
+
+// DirsFor is DefaultDirs with the named DiT checkpoint (DiTModels).
+func DirsFor(models, dit string) (Dirs, error) {
+	d := DefaultDirs(models)
+	name, ok := DiTModels[dit]
+	if !ok {
+		return d, fmt.Errorf("ace: no DiT checkpoint %q (base or turbo)", dit)
+	}
+	d.DiT = filepath.Join(models, name)
+	return d, nil
+}
+
 // VAEWindow is the decode tile, in latents (20 s of audio).
 const VAEWindow = 512
 
 // Pipeline holds every model of the DiT-only path on the device.
 type Pipeline struct {
-	Text  *embed.GPU
-	Tok   *tokenizer.Tokenizer
-	DiT   *dit.GPU
+	Text *embed.GPU
+	Tok  *tokenizer.Tokenizer
+	// DiT is the checkpoint a request runs on: dits' entry UseDiT chose,
+	// New's at first.
+	DiT *dit.GPU
+	// dits are the staged DiT checkpoints by directory name
+	// ("acestep-v15-xl-base"): New's, and AddDiT's (A15, a request's
+	// model).
+	dits  map[string]*dit.GPU
 	VAE   *vae.GPU
 	Enc   *vae.Encoder // the VAE encoder, over VAE's activations (A11)
 	table []float32    // the text encoder's embedding rows, for the lyrics
 	width int
 	// silence is silence_latent [15000, 64], time-major.
 	silence []float32
+	// maxTokens is every DiT's staged sequence length.
+	maxTokens int
 	// The 5 Hz LM, when loaded.
 	LM    *lm.Planner
 	lmGPU *lm.GPU
@@ -204,6 +232,8 @@ func New(dev *vk.Device, d Dirs, maxSeconds float64) (*Pipeline, error) {
 		p.Destroy()
 		return nil, err
 	}
+	p.dits = map[string]*dit.GPU{filepath.Base(d.DiT): p.DiT}
+	p.maxTokens = (max(latents, plan.MinLatents) + 1) / 2
 	if p.VAE, err = vae.NewGPU(dev, d.VAE, VAEWindow); err != nil {
 		p.Destroy()
 		return nil, err
@@ -213,6 +243,44 @@ func New(dev *vk.Device, d Dirs, maxSeconds float64) (*Pipeline, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// AddDiT stages another DiT checkpoint beside New's (the directory dir,
+// a sibling of New's: the same encoders' shapes, the same detokenizer),
+// for UseDiT. Every DiT is ~10 GB on the device.
+func (p *Pipeline) AddDiT(dev *vk.Device, dir string) error {
+	name := filepath.Base(dir)
+	if p.dits[name] != nil {
+		return nil
+	}
+	g, err := dit.NewGPU(dev, dir, p.maxTokens)
+	if err != nil {
+		return err
+	}
+	p.dits[name] = g
+	return nil
+}
+
+// UseDiT makes the named staged checkpoint (its directory's name) the one
+// requests run on, until the next UseDiT. Requests are serial on the
+// device, so the switch is the caller's to make before each.
+func (p *Pipeline) UseDiT(name string) error {
+	g, ok := p.dits[name]
+	if !ok {
+		return fmt.Errorf("ace: no staged DiT %q", name)
+	}
+	p.DiT = g
+	return nil
+}
+
+// DiTNames are the staged checkpoints' names.
+func (p *Pipeline) DiTNames() []string {
+	var out []string
+	for n := range p.dits {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Destroy releases the device objects.
@@ -232,7 +300,10 @@ func (p *Pipeline) Destroy() {
 	if p.VAE != nil {
 		p.VAE.Destroy()
 	}
-	if p.DiT != nil {
+	for _, g := range p.dits {
+		g.Destroy()
+	}
+	if p.dits == nil && p.DiT != nil {
 		p.DiT.Destroy()
 	}
 	if p.Text != nil {
@@ -298,9 +369,15 @@ type Options struct {
 	// Sampling overrides the LM's (lm.DefaultSampling when zero).
 	Sampling *lm.Sampling
 	// Shift and Timesteps are the DiT schedule: plan.Schedule's (0 and nil
-	// take shift 3's table).
+	// take shift 3's table). On the base model (A15) Timesteps is taken as
+	// given, its pairs the steps, and otherwise Steps entries of
+	// plan.BaseSchedule (0 is plan.BaseSteps) at the shift.
 	Shift     float64
 	Timesteps []float64
+	Steps     int
+	// Guidance is the base model's CFG (nil: plan.DefaultGuidance). Turbo
+	// ignores Steps and Guidance, as upstream does.
+	Guidance *plan.Guidance
 	// Audio is the audio-in part (MUSIC.md A11): a reference's timbre, or a
 	// cover or repaint of a source. A task other than text2music runs the
 	// DiT-only path, as upstream skips the LM for it.
@@ -544,6 +621,41 @@ func (p *Pipeline) sample(r *plan.Request, o Options, rng *rand.Rand, res *Resul
 	return &d, nil
 }
 
+// Render renders a thinking result's plan again -- its DiT request and
+// codes, the LM not run -- under o's DiT options, and scores it as Generate
+// does: the same song from another sampler, schedule or checkpoint (A15's
+// step sweep). from must hold codes.
+func (p *Pipeline) Render(r *plan.Request, from *Result, o Options) (*Result, error) {
+	if len(from.Codes) == 0 || from.DiT == nil {
+		return nil, fmt.Errorf("ace: Render needs a thinking result's codes")
+	}
+	start := time.Now()
+	res := &Result{Meta: from.Meta, CoT: from.CoT, Codes: from.Codes, DiT: from.DiT}
+	T := max(plan.MinLatents, lm.CodesPerSecond*len(from.Codes))
+	hints, err := p.Hints(from.Codes, T)
+	if err != nil {
+		return nil, err
+	}
+	dp, err := p.textPlan(o, T, hints)
+	if err != nil {
+		return nil, err
+	}
+	out, err := p.generate(res.DiT, o, dp, res)
+	if err != nil {
+		return nil, err
+	}
+	if p.LM != nil {
+		if err := p.scoreCodes(r, out); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.scoreRender(r, out); err != nil {
+		return nil, err
+	}
+	out.Timings.Total = time.Since(start)
+	return out, nil
+}
+
 // DiTRequest is what the DiT is asked for after the LM has planned
 // (_update_metadata_from_lm): the CoT's bpm, key, time signature and
 // duration where the request left them out, and -- when phase 1 ran -- its
@@ -645,7 +757,11 @@ func (p *Pipeline) condition(r *plan.Request, timbre []float32) (textTook, encTo
 	if err != nil {
 		return 0, 0, err
 	}
-	err = p.DiT.Begin(enc)
+	if err = p.DiT.Begin(enc); err == nil && p.DiT.Guided() {
+		// CFG's null row: null_condition_emb expanded to this condition's
+		// rows.
+		err = p.DiT.BeginNull(enc.Rows)
+	}
 	return textTook, time.Since(t0), err
 }
 
@@ -671,18 +787,37 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 	}
 
 	t0 := time.Now()
+	guided := p.DiT.Guided()
 	shift := o.Shift
 	if shift == 0 {
 		shift = plan.DefaultShift
 	}
-	sched := plan.Schedule(shift, o.Timesteps)
-	inferSteps := len(sched) // the request's step count, before cover noise trims it
+	// A turbo schedule is the steps' timesteps; a base one is steps + 1
+	// entries, each step running from one to the next (A15).
+	var sched []float32
+	switch {
+	case !guided:
+		sched = plan.Schedule(shift, o.Timesteps)
+	case o.Timesteps != nil:
+		// generate_audio takes a base request's list as it is: its pairs
+		// are the steps.
+		for _, t := range o.Timesteps {
+			sched = append(sched, float32(t))
+		}
+	default:
+		sched = plan.BaseSchedule(cmp.Or(o.Steps, plan.BaseSteps), shift)
+	}
+	last := len(sched) // entries a step starts from
+	if guided {
+		last--
+	}
+	inferSteps := last // the request's step count, before cover noise trims it
 	x0 := noise
 	if dp.coverNoise > 0 {
 		// Start from the source renoised to the schedule entry nearest
 		// 1 − strength, and drop the entries before it.
 		at := 0
-		for i, t := range sched {
+		for i, t := range sched[:last] {
 			if math.Abs(float64(t)-(1-dp.coverNoise)) < math.Abs(float64(sched[at])-(1-dp.coverNoise)) {
 				at = i
 			}
@@ -693,8 +828,9 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 			x0[i] = float32(t*noise[i]) + float32((1-t)*dp.hidden[i])
 		}
 		sched = sched[at:]
+		last -= at
 	}
-	steps := len(sched)
+	steps := last
 	switchAt := steps
 	if dp.alt != nil {
 		switchAt = int(float64(steps) * dp.switchFrac)
@@ -704,27 +840,29 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 		cutoff = int(math.RoundToEven(dp.rp.ratio * float64(steps)))
 	}
 	done := 0
-	lat, err := plan.Sample(x0, sched, plan.DefaultDCW, func(x []float32, t float32) ([]float32, error) {
+	xm := func(x []float32) *qwen.Mat { return &qwen.Mat{Rows: T, Cols: plan.LatentChannels, Data: x} }
+	before := func() error {
 		if err := o.between(); err != nil {
-			return nil, err
+			return err
 		}
 		if done == switchAt {
 			// audio_cover_strength: the text2music condition over silence.
 			if _, _, err := p.condition(dp.alt, dp.timbre); err != nil {
-				return nil, err
+				return err
 			}
 			ctx = dp.context(p.silence[:T*plan.LatentChannels])
 		}
-		v, took, err := p.DiT.Step(&qwen.Mat{Rows: T, Cols: plan.LatentChannels, Data: x}, ctx, t)
-		if err != nil {
-			return nil, err
-		}
+		return nil
+	}
+	after := func(took time.Duration) {
 		done++
 		tm.Steps = append(tm.Steps, took)
-		o.progress("dit", len(tm.Steps), len(sched))
-		return v.Data, nil
-	}, func(i int, x []float32) {
-		if rp := dp.rp; rp != nil && i < cutoff && i < steps-1 {
+		o.progress("dit", len(tm.Steps), steps)
+	}
+	inject := func(i int, x []float32) {
+		// Turbo breaks out of its loop before the last step's injection;
+		// base injects after every step under the cutoff.
+		if rp := dp.rp; rp != nil && i < cutoff && (guided || i < steps-1) {
 			// _repaint_step_injection: outside the span, the source noised
 			// to the next entry.
 			tn := sched[i+1]
@@ -740,7 +878,48 @@ func (p *Pipeline) generate(r *plan.Request, o Options, dp *ditPlan, res *Result
 		if o.Step != nil {
 			o.Step(i, x)
 		}
-	})
+	}
+	var lat []float32
+	if guided {
+		g := plan.DefaultGuidance
+		if o.Guidance != nil {
+			g = *o.Guidance
+		}
+		lat, err = plan.SampleGuided(x0, sched, g, func(x []float32, t float32, uncond bool) ([]float32, []float32, error) {
+			if err := before(); err != nil {
+				return nil, nil, err
+			}
+			v, took, err := p.DiT.Step(xm(x), ctx, t)
+			if err != nil {
+				return nil, nil, err
+			}
+			var null []float32
+			if uncond {
+				if err := o.between(); err != nil {
+					return nil, nil, err
+				}
+				n, tookN, err := p.DiT.StepNull(xm(x), ctx, t)
+				if err != nil {
+					return nil, nil, err
+				}
+				null, took = n.Data, took+tookN
+			}
+			after(took)
+			return v.Data, null, nil
+		}, inject)
+	} else {
+		lat, err = plan.Sample(x0, sched, plan.DefaultDCW, func(x []float32, t float32) ([]float32, error) {
+			if err := before(); err != nil {
+				return nil, err
+			}
+			v, took, err := p.DiT.Step(xm(x), ctx, t)
+			if err != nil {
+				return nil, err
+			}
+			after(took)
+			return v.Data, nil
+		}, inject)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -52,7 +52,12 @@ func (p *Pipeline) Rescore(r, d *plan.Request, meta lm.Meta, wav, lat []float32,
 		return nil, nil, err
 	}
 	q = &Quality{}
-	if q.Lyrics, err = p.LyricAlignment(d, lat, dp.context(hints), len(plan.Schedule(plan.DefaultShift, nil)), nil); err != nil {
+	// t_last is 1/steps: the default request's count on either checkpoint.
+	steps := len(plan.Schedule(plan.DefaultShift, nil))
+	if p.DiT.Guided() {
+		steps = plan.BaseSteps
+	}
+	if q.Lyrics, err = p.LyricAlignment(d, lat, dp.context(hints), steps, nil); err != nil {
 		return nil, nil, err
 	}
 	conds := ScoreConditions(r, d, meta)

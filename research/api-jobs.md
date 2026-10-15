@@ -117,8 +117,32 @@ changes the URL and reads a job instead of a `task_id`.
   still draws); drawn, they are 32-bit and reported, so a job can be rerun.
 - `shift` and `timesteps` (the DiT's schedule), `lm_temperature` (0 is
   greedy), `lm_cfg_scale`, `lm_top_p`.
-- `inference_steps` and `guidance_scale` are accepted and change nothing,
-  as upstream's turbo model ignores them too (MUSIC.md A1).
+- **`model` picks the DiT** (2026-10-15, research/music-vertical.md
+  A15). Upstream's aliases are `model_name` and `dit_model`.
+  - `-music-dit base,turbo` (the default) stages both, ~10 GB each; the
+    first is the default.
+  - `model` matches a served id (`acestep-v15-xl-base`,
+    `acestep-v15-xl-turbo`), `base` or `turbo`, or a name with either
+    as a word: upstream's `acestep-v15-turbo` runs XL turbo.
+  - Anything else runs the default, as upstream falls back to its
+    primary. That includes an empty model, a client's own default, or a
+    checkpoint that is not staged.
+  - The job's `model` says which ran, and `GET /v1/models` lists both.
+- **The base model** guides by classifier-free guidance through APG over
+  `inference_steps` steps.
+  - `inference_steps` (1–200) defaults to **32**, Gradio's value for a
+    base model. Upstream's API defaults it to 8 on every model, which on
+    base is 8 guided steps; that is a departure, chosen by the user.
+  - `guidance_scale` (0–30, default 7; 1 or less turns CFG off) and
+    `cfg_interval_start`/`cfg_interval_end` (0–1, default 0 and 1: the
+    timesteps CFG applies over).
+  - `timesteps` on base is taken as given, its pairs the steps, so it
+    needs at least two entries and should end with 0.
+  - `use_adg: true` is a 400: ADG is not served, APG (upstream's
+    default) is.
+  - Under `-music-dit turbo` (the control) `inference_steps`,
+    `guidance_scale` and the interval change nothing, as upstream's turbo
+    model ignores them too (MUSIC.md A1).
 
 **Audio in** (MUSIC.md A11) is upstream's multipart upload, in any format
 ffmpeg reads:
@@ -131,8 +155,8 @@ curl -s localhost:8080/v1/music -F task_type=repaint -F src_audio=@song.mp3 \
 curl -s localhost:8080/v1/music -F reference_audio=@voice.flac -F prompt="…" -F audio_duration=60
 ```
 
-- `task_type`: `text2music` (default), or the turbo model's three audio
-  tasks. They need `src_audio` (or `ctx_audio`), skip the LM as upstream's
+- `task_type`: `text2music` (default), or three audio tasks (upstream's
+  turbo task list; the base model runs them too). They need `src_audio` (or `ctx_audio`), skip the LM as upstream's
   do whatever `thinking` says, and last as long as the source, so an
   `audio_duration` is a 400.
   - `cover`: the source through the audio tokenizer is what the DiT
@@ -156,8 +180,8 @@ curl -s localhost:8080/v1/music -F reference_audio=@voice.flac -F prompt="…" -
   name files on its server, and this server reads none of its own, so they
   are a 400 that says to upload. A source at another rate is resampled by
   ffmpeg, not by torchaudio, and a file of more than two channels is
-  downmixed rather than cut to its first two. The base model's tasks
-  (`lego`, `extract`, `complete`) are a 400. So is a field its task would
+  downmixed rather than cut to its first two. The base model's own tasks
+  (`lego`, `extract`, `complete`) are not served yet: a 400. So is a field its task would
   not use, which upstream drops silently: a cover's strengths on
   text2music, a repaint's span on anything else, a custom `instruction`,
   and the crossfade fields that `repaint_mode` overrides.

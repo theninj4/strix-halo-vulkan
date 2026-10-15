@@ -3723,6 +3723,14 @@ var H3BiasCopy []byte
 //go:embed dit_gate_add_hoist.spv
 var DiTGateAddHoist []byte
 
+// The same with y one row added to every row (BCAST): the base model's
+// null-condition cross-attention, a constant a layer (research/music-vertical.md
+// A15 S1).
+//
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHOIST=1 -DBCAST=1 -o dit_gate_add_hoist_bcast.spv dit_gate_add.comp
+//go:embed dit_gate_add_hoist_bcast.spv
+var DiTGateAddHoistBcast []byte
+
 //go:embed h3_qk_pack_tpw8.spv
 var H3QKPackTPW8 []byte
 

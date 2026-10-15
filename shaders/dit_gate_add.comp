@@ -26,6 +26,11 @@
 #ifndef HOIST
 #define HOIST 0
 #endif
+// BCAST (research/music-vertical.md A15 S1): y is one row, added to every
+// row -- the base model's null-condition cross-attention, a constant a layer.
+#ifndef BCAST
+#define BCAST 0
+#endif
 #define STEPS 24
 
 layout(local_size_x = 256) in;
@@ -39,12 +44,17 @@ void main() {
     // the column, and a flat grid would pay an integer division by a width
     // that is not a power of two (3840) on every element (IDEAS §1.2).
     uint base = r * pc.dim;
+#if BCAST
+    uint ybase = 0u;
+#else
+    uint ybase = base;
+#endif
 #if HOIST
     float x[STEPS], y[STEPS], g[STEPS];
     [[unroll]] for (uint j = 0u; j < STEPS; j++) {
         uint c = gl_LocalInvocationID.x + j * 256u;
         if (c < pc.dim) {
-            y[j] = act[pc.inOff + base + c];
+            y[j] = act[pc.inOff + ybase + c];
             x[j] = act[pc.outOff + base + c];
             if (pc.aux2 != 0u) {
                 g[j] = act[pc.aux0 + c];
@@ -63,7 +73,7 @@ void main() {
     }
 #else
     for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
-        float v = act[pc.inOff + base + c];
+        float v = act[pc.inOff + ybase + c];
         if (pc.aux2 != 0u) {
             v *= act[pc.aux0 + c];
         }

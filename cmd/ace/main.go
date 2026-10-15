@@ -82,6 +82,12 @@ func main() {
 	understand := flag.String("understand", "", "caption this song instead of generating one (any format ffmpeg reads)")
 	lmTemp := flag.Float64("lm-temp", 0, "-understand's LM temperature (0: upstream's API's 0.3)")
 	score := flag.Bool("score", true, "score the song as upstream's auto score does (MUSIC.md A14b): the LM's PMI over its codes, the DiT's lyric alignment")
+	ditName := flag.String("dit", "turbo", "the DiT checkpoint: base (CFG, 32 steps) or turbo (8 steps)")
+	steps := flag.Int("steps", 0, "base: diffusion steps (0: Gradio's 32)")
+	guidance := flag.Float64("guidance", plan.BaseGuidance, "base: CFG scale through APG (1 turns CFG off)")
+	cfgStart := flag.Float64("cfg-start", 0, "base: cfg_interval_start")
+	cfgEnd := flag.Float64("cfg-end", 1, "base: cfg_interval_end")
+	shift := flag.Float64("shift", 0, "timestep shift (0: 3)")
 	aesthetics := flag.String("aesthetics", "", "score this audio file with Audiobox Aesthetics (MUSIC.md A14c), SongEval (A14d) and the loop measure (A14e) instead of generating, as JSON")
 	flag.Parse()
 
@@ -157,7 +163,11 @@ func main() {
 		if s := audio.Seconds(); s > 0 {
 			ceiling = s
 		}
-		p, err := pipeline.New(d, pipeline.DefaultDirs(*models), ceiling)
+		dirs, err := pipeline.DirsFor(*models, *ditName)
+		if err != nil {
+			return err
+		}
+		p, err := pipeline.New(d, dirs, ceiling)
 		if err != nil {
 			return err
 		}
@@ -184,7 +194,8 @@ func main() {
 			}
 		}
 		res, err := p.Generate(req, pipeline.Options{Seed: *seed, Think: *think, LMSeed: *lmSeed, Sample: smp, Audio: audio,
-			Score: *score})
+			Score: *score, Shift: *shift, Steps: *steps,
+			Guidance: &plan.Guidance{Scale: *guidance, IntervalStart: *cfgStart, End: *cfgEnd}})
 		if err != nil {
 			return err
 		}

@@ -25,7 +25,8 @@ type fakeMusic struct {
 }
 
 func (f *fakeMusic) Models() []Model {
-	return []Model{{ID: "acestep-v15-xl-turbo", Object: "model", OwnedBy: "local"}}
+	return []Model{{ID: "acestep-v15-xl-base", Object: "model", OwnedBy: "local"},
+		{ID: "acestep-v15-xl-turbo", Object: "model", OwnedBy: "local"}}
 }
 
 func (f *fakeMusic) MusicInfo() MusicInfo {
@@ -41,6 +42,9 @@ func (f *fakeMusic) PlanMusic(req *MusicRequest) (*MusicPlan, error) {
 	f.reqs = append(f.reqs, req)
 	f.mu.Unlock()
 	p := &MusicPlan{Seed: 7, LMSeed: 8, Format: "mp3", Steps: 8, Seconds: req.Duration, Estimate: 26 * time.Second}
+	if strings.Contains(req.Model, "turbo") {
+		p.Model = "acestep-v15-xl-turbo" // as the backend resolves it
+	}
 	if req.Format != "" {
 		p.Format = req.Format
 	}
@@ -126,7 +130,7 @@ func TestMusicLifecycle(t *testing.T) {
 	j := decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", map[string]any{
 		"prompt": "lo-fi hip-hop", "lyrics": "[Instrumental]",
 	})))
-	if j.Object != "music" || j.Model != "acestep-v15-xl-turbo" || !j.Thinking || j.Seconds != nil ||
+	if j.Object != "music" || j.Model != "acestep-v15-xl-base" || !j.Thinking || j.Seconds != nil ||
 		j.Metadata != nil || j.Format != "mp3" || j.Seed != 7 || j.LMSeed != 8 || j.Estimated != 26 {
 		t.Errorf("created job %+v", j)
 	}
@@ -162,7 +166,8 @@ func TestMusicUpstreamFields(t *testing.T) {
 		"metas":          map[string]any{"bpm": 120, "keyScale": "C major", "timesignature": 4, "duration": "30"},
 		"vocal_language": "en", "audio_format": "flac", "seed": 42, "lm_seed": 9, "use_random_seed": false,
 		"shift": 2, "timesteps": "0.97,0.76,0.5,0", "lm_temperature": 0.7, "lm_cfg_scale": 2.5, "lm_top_p": 1,
-		"inference_steps": 8, "guidance_scale": 7, "task_type": "text2music", "batch_size": 1,
+		"inference_steps": 24, "guidance_scale": 5.5, "cfg_interval_start": 0.1, "cfg_interval_end": 0.9,
+		"task_type": "text2music", "batch_size": 1,
 	})))
 	form := url.Values{"prompt": {"jazz"}, "audio_duration": {"45.5"}, "key_scale": {"Bb major"},
 		"time_signature": {"3"}, "thinking": {"true"}, "timesteps": {"[1, 0.5]"}}
@@ -174,11 +179,12 @@ func TestMusicUpstreamFields(t *testing.T) {
 	if a.Caption != "synthwave" || a.Thinking || a.BPM != 120 || a.KeyScale != "C major" || a.TimeSignature != "4" ||
 		a.Duration != 30 || a.Language != "en" || a.Format != "flac" || a.Seed == nil || *a.Seed != 42 ||
 		a.LMSeed == nil || *a.LMSeed != 9 || a.Shift != 2 || len(a.Timesteps) != 4 || a.LMTemperature == nil ||
-		*a.LMTemperature != 0.7 || *a.LMCFGScale != 2.5 || *a.LMTopP != 1 {
+		*a.LMTemperature != 0.7 || *a.LMCFGScale != 2.5 || *a.LMTopP != 1 || a.InferenceSteps != 24 ||
+		a.GuidanceScale == nil || *a.GuidanceScale != 5.5 || *a.CFGStart != 0.1 || *a.CFGEnd != 0.9 {
 		t.Errorf("JSON request %+v", a)
 	}
 	if b.Caption != "jazz" || !b.Thinking || b.Duration != 45.5 || b.KeyScale != "Bb major" || b.TimeSignature != "3" ||
-		len(b.Timesteps) != 2 || b.Seed != nil {
+		len(b.Timesteps) != 2 || b.Seed != nil || b.InferenceSteps != 0 || b.GuidanceScale != nil || b.CFGStart != nil {
 		t.Errorf("form request %+v", b)
 	}
 }
@@ -198,6 +204,13 @@ func TestMusicRefusals(t *testing.T) {
 		{map[string]any{"caption": "x", "audio_code_string": "<|audio_code_1|>"}, "audio_code_string"},
 		{map[string]any{"caption": "x", "src_audio_path": "/tmp/a.wav"}, "src_audio_path"},
 		{map[string]any{"caption": "x", "lm_top_k": 40}, "lm_top_k"},
+		{map[string]any{"caption": "x", "use_adg": true}, "use_adg"},
+		{map[string]any{"caption": "x", "inference_steps": 0}, "inference_steps"},
+		{map[string]any{"caption": "x", "inference_steps": 12.5}, "inference_steps"},
+		{map[string]any{"caption": "x", "inference_steps": 201}, "inference_steps"},
+		{map[string]any{"caption": "x", "guidance_scale": -1}, "guidance_scale"},
+		{map[string]any{"caption": "x", "cfg_interval_end": 1.5}, "cfg_interval_end"},
+		{map[string]any{"caption": "x", "cfg_interval_start": 0.8, "cfg_interval_end": 0.2}, "cfg_interval_start"},
 		{map[string]any{"caption": "x", "use_cot_caption": false}, "use_cot_caption"},
 		{map[string]any{"caption": "x", "infer_method": "sde"}, "infer_method"},
 		{map[string]any{"lyrics": " "}, "caption"},
@@ -343,7 +356,7 @@ func TestMusicAudioTasks(t *testing.T) {
 		want   string
 	}{
 		{map[string]string{"caption": "x"}, map[string]string{"src_audio": "S"}, "text2music reads no source"},
-		{map[string]string{"caption": "x", "task_type": "lego"}, map[string]string{"src_audio": "S"}, "base model"},
+		{map[string]string{"caption": "x", "task_type": "lego"}, map[string]string{"src_audio": "S"}, "not served"},
 		{map[string]string{"caption": "x", "task_type": "cover"}, nil, "src_audio"},
 		{map[string]string{"caption": "x", "task_type": "cover"}, map[string]string{"song": "S"}, "src_audio (or ctx_audio)"},
 		{map[string]string{"caption": "x", "task_type": "cover", "audio_duration": "30"}, map[string]string{"src_audio": "S"}, "audio_duration"},
@@ -453,6 +466,30 @@ func TestMusicQuality(t *testing.T) {
 		rec = do(t, s, httptest.NewRequest("GET", "/v1/music/"+j.ID, nil))
 		if !strings.Contains(rec.Body.String(), `"quality":null`) {
 			t.Errorf("%s false: %s", field, rec.Body)
+		}
+	}
+}
+
+// TestMusicModel: the request's model (or upstream's aliases for it)
+// reaches the backend, and the job reports the model the backend resolved,
+// or the default when it resolved none.
+func TestMusicModel(t *testing.T) {
+	f := &fakeMusic{}
+	s := newMusicServer(t, f)
+	for _, c := range []struct {
+		body map[string]any
+		sent string
+		want string
+	}{
+		{map[string]any{"caption": "x"}, "", "acestep-v15-xl-base"},
+		{map[string]any{"caption": "x", "model": "acestep-v15-xl-turbo"}, "acestep-v15-xl-turbo", "acestep-v15-xl-turbo"},
+		{map[string]any{"caption": "x", "dit_model": "turbo"}, "turbo", "acestep-v15-xl-turbo"},
+		{map[string]any{"caption": "x", "model": "gpt-4o"}, "gpt-4o", "acestep-v15-xl-base"},
+	} {
+		j := decodeMusic(t, do(t, s, jsonRequest("POST", "/v1/music", c.body)))
+		got := f.reqs[len(f.reqs)-1].Model
+		if got != c.sent || j.Model != c.want {
+			t.Errorf("%v: sent %q, job %q; want %q, %q", c.body, got, j.Model, c.sent, c.want)
 		}
 	}
 }

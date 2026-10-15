@@ -125,35 +125,9 @@ func pipeline(t *testing.T) *Pipeline {
 		t.Skip("stages the whole model")
 	}
 	shared.once.Do(func() {
-		inst, err := vk.NewInstance("ace-pipeline-test")
-		if err != nil {
-			shared.skip = err.Error()
-			return
-		}
-		devices, err := inst.PhysicalDevices()
-		if err != nil || len(devices) == 0 {
-			shared.skip = "no Vulkan devices"
-			return
-		}
-		phys := &devices[0]
-		for i := range devices {
-			if devices[i].DeviceID == strixHaloDeviceID {
-				phys = &devices[i]
-			}
-		}
-		qf, err := phys.ComputeQueueFamily()
-		if err != nil {
-			shared.skip = err.Error()
-			return
-		}
-		sgs, err := phys.SubgroupSizeControl()
-		if err != nil {
-			shared.skip = err.Error()
-			return
-		}
-		dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{Float16: true, CoopMatrix: true, SubgroupSizeControl: sgs.Supported})
-		if err != nil {
-			shared.skip = err.Error()
+		dev, skip := testDevice()
+		if skip != "" {
+			shared.skip = skip
 			return
 		}
 		d := DefaultDirs(models)
@@ -173,6 +147,89 @@ func pipeline(t *testing.T) *Pipeline {
 		t.Fatal(shared.err)
 	}
 	return shared.p
+}
+
+var device struct {
+	once sync.Once
+	dev  *vk.Device
+	skip string
+}
+
+// testDevice opens the Strix Halo device once for the package's stagings.
+func testDevice() (*vk.Device, string) {
+	device.once.Do(func() {
+		inst, err := vk.NewInstance("ace-pipeline-test")
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+		devices, err := inst.PhysicalDevices()
+		if err != nil || len(devices) == 0 {
+			device.skip = "no Vulkan devices"
+			return
+		}
+		phys := &devices[0]
+		for i := range devices {
+			if devices[i].DeviceID == strixHaloDeviceID {
+				phys = &devices[i]
+			}
+		}
+		qf, err := phys.ComputeQueueFamily()
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+		sgs, err := phys.SubgroupSizeControl()
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+		device.dev, err = vk.NewDevice(phys, qf, vk.DeviceFeatures{Float16: true, CoopMatrix: true, SubgroupSizeControl: sgs.Supported})
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+	})
+	return device.dev, device.skip
+}
+
+var sharedBase struct {
+	once sync.Once
+	p    *Pipeline
+	err  error
+	skip string
+}
+
+// basePipeline is pipeline with the XL base DiT (A15). It is a second
+// ~10 GB staging beside pipeline's, so run the base tests on their own.
+func basePipeline(t *testing.T) *Pipeline {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("stages the whole model")
+	}
+	sharedBase.once.Do(func() {
+		dev, skip := testDevice()
+		if skip != "" {
+			sharedBase.skip = skip
+			return
+		}
+		d, err := DirsFor(models, "base")
+		if err == nil {
+			_, err = os.Stat(d.DiT)
+		}
+		if err != nil {
+			sharedBase.skip = err.Error()
+			return
+		}
+		sharedBase.p, sharedBase.err = New(dev, d, 240)
+	})
+	if sharedBase.skip != "" {
+		t.Skip(sharedBase.skip)
+	}
+	if sharedBase.err != nil {
+		t.Fatal(sharedBase.err)
+	}
+	return sharedBase.p
 }
 
 // TestCondition: the caption's last hidden state through `embed` against

@@ -39,6 +39,9 @@ type Config struct {
 	Theta        float64  `json:"rope_theta"`
 	Eps          float64  `json:"rms_norm_eps"`
 	LayerTypes   []string `json:"layer_types"`
+	// IsTurbo is the CFG-distilled checkpoint (8 fixed steps, no guidance);
+	// the base model runs CFG against null_condition_emb (A15).
+	IsTurbo bool `json:"is_turbo"`
 	// AlignLayers is lyric_alignment_layers_config: the cross-attention
 	// heads, by layer, whose attention follows the lyrics (MUSIC.md A14b).
 	AlignLayers map[string][]int `json:"lyric_alignment_layers_config"`

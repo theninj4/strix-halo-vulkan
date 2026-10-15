@@ -127,11 +127,19 @@ func gate(t *testing.T, name string, got, want *qwen.Mat, maxRel, maxRMS float64
 // bf16 drift on the same tensor, when the bf16 dump is there.
 func underBF16(t *testing.T, name, ref string, rms float64) {
 	t.Helper()
-	if _, err := os.Stat(filepath.Join(bf16Ref, ref+".bin")); err != nil {
-		t.Logf("%s: no bf16 reference (%v)", name, err)
-		return
+	underBF16In(t, ditRef, bf16Ref, name, ref, rms)
+}
+
+// underBF16In is underBF16 between any fp32 oracle and its bf16 run.
+func underBF16In(t *testing.T, fp32, bf16, name, ref string, rms float64) {
+	t.Helper()
+	for _, f := range []string{ref + ".bin", "manifest.json"} {
+		if _, err := os.Stat(filepath.Join(bf16, f)); err != nil {
+			t.Logf("%s: no bf16 reference (%v)", name, err)
+			return
+		}
 	}
-	_, bf := relGap(readMat(t, bf16Ref, ref), readMat(t, ditRef, ref))
+	_, bf := relGap(readMat(t, bf16, ref), readMat(t, fp32, ref))
 	t.Logf("%-28s bf16 rms %.2e (%.1fx ours)", name, bf, bf/rms)
 	if rms > bf/2 {
 		t.Errorf("%s: rms %.2e is more than half of upstream bf16's %.2e", name, rms, bf)
@@ -186,35 +194,9 @@ func sharedGPU(t *testing.T) *GPU {
 		t.Skip("stages the whole model")
 	}
 	shared.once.Do(func() {
-		inst, err := vk.NewInstance("ace-dit-test")
-		if err != nil {
-			shared.skip = fmt.Sprintf("no Vulkan instance: %v", err)
-			return
-		}
-		devices, err := inst.PhysicalDevices()
-		if err != nil || len(devices) == 0 {
-			shared.skip = fmt.Sprintf("no Vulkan devices: %v", err)
-			return
-		}
-		phys := &devices[0]
-		for i := range devices {
-			if devices[i].DeviceID == strixHaloDeviceID {
-				phys = &devices[i]
-			}
-		}
-		qf, err := phys.ComputeQueueFamily()
-		if err != nil {
-			shared.skip = err.Error()
-			return
-		}
-		sgs, err := phys.SubgroupSizeControl()
-		if err != nil {
-			shared.skip = err.Error()
-			return
-		}
-		dev, err := vk.NewDevice(phys, qf, vk.DeviceFeatures{Float16: true, CoopMatrix: true, SubgroupSizeControl: sgs.Supported})
-		if err != nil {
-			shared.skip = err.Error()
+		dev, skip := testDevice()
+		if skip != "" {
+			shared.skip = skip
 			return
 		}
 		if _, err := os.Stat(filepath.Join(modelDir, "config.json")); err != nil {
@@ -230,6 +212,49 @@ func sharedGPU(t *testing.T) *GPU {
 		t.Fatal(shared.err)
 	}
 	return shared.g
+}
+
+var device struct {
+	once sync.Once
+	dev  *vk.Device
+	skip string
+}
+
+// testDevice opens the Strix Halo device once for the package's stagings.
+func testDevice() (*vk.Device, string) {
+	device.once.Do(func() {
+		inst, err := vk.NewInstance("ace-dit-test")
+		if err != nil {
+			device.skip = fmt.Sprintf("no Vulkan instance: %v", err)
+			return
+		}
+		devices, err := inst.PhysicalDevices()
+		if err != nil || len(devices) == 0 {
+			device.skip = fmt.Sprintf("no Vulkan devices: %v", err)
+			return
+		}
+		phys := &devices[0]
+		for i := range devices {
+			if devices[i].DeviceID == strixHaloDeviceID {
+				phys = &devices[i]
+			}
+		}
+		qf, err := phys.ComputeQueueFamily()
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+		sgs, err := phys.SubgroupSizeControl()
+		if err != nil {
+			device.skip = err.Error()
+			return
+		}
+		device.dev, err = vk.NewDevice(phys, qf, vk.DeviceFeatures{Float16: true, CoopMatrix: true, SubgroupSizeControl: sgs.Supported})
+		if err != nil {
+			device.skip = err.Error()
+		}
+	})
+	return device.dev, device.skip
 }
 
 func silence(t *testing.T, rows int) *qwen.Mat {

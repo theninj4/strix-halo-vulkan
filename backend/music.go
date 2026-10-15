@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,9 +25,15 @@ import (
 
 // MusicOptions is what cmd/serve's flags come to.
 type MusicOptions struct {
-	// Models is the checkpoint root: acestep-v15-xl-turbo/, Ace-Step1.5/vae,
-	// Qwen3-Embedding-0.6B/ and acestep-5Hz-lm-4B/ under it.
+	// Models is the checkpoint root: acestep-v15-xl-base/ (or -turbo/),
+	// Ace-Step1.5/vae, Qwen3-Embedding-0.6B/ and acestep-5Hz-lm-4B/ under it.
 	Models string
+	// DiTs are the DiT checkpoints to stage, pipeline.DiTModels' names:
+	// "base" (research/music-vertical.md A15: CFG over 32 steps) and
+	// "turbo" (8 distilled steps). The first is the default; a request's
+	// model picks another (resolveModel). Each is ~10 GB resident. Empty is
+	// base alone.
+	DiTs []string
 	// Device is required.
 	Device *Device
 	// NoLM leaves the 5 Hz LM out (5 GB of weights and 1.8 GB of KV
@@ -46,8 +54,6 @@ type MusicOptions struct {
 	// and video. Required.
 	Swap *Swap
 }
-
-const defaultMusicModelID = "acestep-v15-xl-turbo"
 
 // Music is the ACE-Step 1.5 adapter: an api.MusicBackend over ace/pipeline
 // (MUSIC.md A9).
@@ -73,6 +79,10 @@ type Music struct {
 	genresErr error
 	lmOpt     lm.Options
 
+	// dits are the staged DiT checkpoints' directory names, the default
+	// first (MusicOptions.DiTs).
+	dits []string
+
 	mu  sync.Mutex // rng
 	rng *rand.Rand
 }
@@ -80,8 +90,21 @@ type Music struct {
 // NewMusic stages the models on the device, through the slot: they are
 // resident when this returns, until something else is asked for.
 func NewMusic(opt MusicOptions) (*Music, error) {
+	if len(opt.DiTs) == 0 {
+		opt.DiTs = []string{"base"}
+	}
+	var dits []string
+	for _, n := range opt.DiTs {
+		dir, ok := pipeline.DiTModels[n]
+		if !ok {
+			return nil, fmt.Errorf("backend: no music DiT %q (base or turbo)", n)
+		}
+		if !slices.Contains(dits, dir) {
+			dits = append(dits, dir)
+		}
+	}
 	if opt.ID == "" {
-		opt.ID = defaultMusicModelID
+		opt.ID = dits[0]
 	}
 	if opt.Device == nil {
 		return nil, fmt.Errorf("backend: the music pipeline needs a device; there is no host path for it")
@@ -89,7 +112,7 @@ func NewMusic(opt MusicOptions) (*Music, error) {
 	if opt.Swap == nil {
 		return nil, fmt.Errorf("backend: the music pipeline needs a swap slot")
 	}
-	b := &Music{opt: opt, id: opt.ID, lmOpt: lm.DefaultOptions(), rng: rand.New(rand.NewSource(rand.Int63()))}
+	b := &Music{opt: opt, id: opt.ID, dits: dits, lmOpt: lm.DefaultOptions(), rng: rand.New(rand.NewSource(rand.Int63()))}
 	if opt.LMFP16 {
 		b.lmOpt.Bank = lm.BankFP16
 	}
@@ -117,7 +140,16 @@ func (b *Music) SwapName() string { return "music" }
 // Load stages the pipeline. It takes no device lock (TestStagingSkipsTheQueue).
 func (b *Music) Load() error {
 	d := b.opt.Device.dev
-	p, err := pipeline.New(d, pipeline.DefaultDirs(b.opt.Models), plan.MaxSeconds)
+	dirs := pipeline.DefaultDirs(b.opt.Models)
+	dirs.DiT = filepath.Join(b.opt.Models, b.dits[0])
+	p, err := pipeline.New(d, dirs, plan.MaxSeconds)
+	for _, name := range b.dits[1:] {
+		if err == nil {
+			if err = p.AddDiT(d, filepath.Join(b.opt.Models, name)); err != nil {
+				p.Destroy()
+			}
+		}
+	}
 	if err == nil && !b.opt.NoLM {
 		if err = p.LoadLM(d, pipeline.LMDir(b.opt.Models), b.lmOpt); err != nil {
 			p.Destroy()
@@ -156,9 +188,44 @@ func (b *Music) Unload() {
 	b.pipe = nil
 }
 
-// Models reports the one model this backend serves.
+// Models reports the DiT checkpoints this backend serves, the default
+// first (its id is MusicOptions.ID when one was given).
 func (b *Music) Models() []api.Model {
-	return []api.Model{{ID: b.id, Object: "model", OwnedBy: "local"}}
+	out := []api.Model{{ID: b.id, Object: "model", OwnedBy: "local"}}
+	for _, d := range b.dits[1:] {
+		out = append(out, api.Model{ID: d, Object: "model", OwnedBy: "local"})
+	}
+	return out
+}
+
+// resolveModel is the staged DiT a request's model names, as upstream's
+// select_generation_handler matches a loaded model's name: the id, or
+// "base"/"turbo", or a name with either as a word ("acestep-v15-turbo",
+// upstream's 2B default, runs XL turbo). Anything else -- an empty model,
+// a client's own default, a checkpoint not staged -- runs the default, as
+// upstream falls back to its primary; the job's model says which ran.
+func (b *Music) resolveModel(model string) string {
+	if model == "" || model == b.id {
+		return b.dits[0]
+	}
+	if slices.Contains(b.dits, model) {
+		return model
+	}
+	words := strings.FieldsFunc(strings.ToLower(model), func(r rune) bool { return r == '-' || r == '_' || r == '/' || r == ' ' })
+	for _, short := range []string{"turbo", "base"} {
+		if slices.Contains(words, short) && slices.Contains(b.dits, pipeline.DiTModels[short]) {
+			return pipeline.DiTModels[short]
+		}
+	}
+	return b.dits[0]
+}
+
+// modelID is the id a resolved model is reported as.
+func (b *Music) modelID(model string) string {
+	if model == b.dits[0] {
+		return b.id
+	}
+	return model
 }
 
 // formats is pipeline.Formats' keys, sorted.
@@ -176,7 +243,48 @@ func (b *Music) MusicInfo() api.MusicInfo {
 	return api.MusicInfo{MinSeconds: plan.MinSeconds, MaxSeconds: plan.MaxSeconds,
 		FallbackSeconds: plan.FallbackSeconds, SampleRate: plan.SampleRate, Formats: formats(),
 		Thinking: b.planner != nil, Analysis: b.planner != nil && b.planner.HasGenres(),
-		Steps: len(plan.Schedule(plan.DefaultShift, nil))}
+		Steps: b.steps(b.dits[0], &api.MusicRequest{})}
+}
+
+// guided reports whether the model (a staged DiT's name) is the base
+// model, which runs CFG.
+func guided(model string) bool { return model != pipeline.DiTModels["turbo"] }
+
+// steps is how many DiT steps a request runs on the model: turbo's table
+// (snapped timesteps or the shift's 8), or on base its timesteps' pairs,
+// its inference_steps, or Gradio's 32.
+func (b *Music) steps(model string, req *api.MusicRequest) int {
+	switch {
+	case !guided(model):
+		return len(plan.Schedule(cmpOr(req.Shift, plan.DefaultShift), req.Timesteps))
+	case req.Timesteps != nil:
+		return len(req.Timesteps) - 1
+	}
+	return cmp.Or(req.InferenceSteps, plan.BaseSteps)
+}
+
+// guidance is a base request's CFG.
+func guidance(req *api.MusicRequest) *plan.Guidance {
+	g := plan.DefaultGuidance
+	if v := req.GuidanceScale; v != nil {
+		g.Scale = *v
+	}
+	if v := req.CFGStart; v != nil {
+		g.IntervalStart = *v
+	}
+	if v := req.CFGEnd; v != nil {
+		g.End = *v
+	}
+	return &g
+}
+
+// forwards is a step's DiT forwards on the model, in conditional-forward
+// units: the null row costs ~0.81 of one under S1 (A15).
+func forwards(model string, req *api.MusicRequest) float64 {
+	if guided(model) && guidance(req).Scale > 1 {
+		return 1.81
+	}
+	return 1
 }
 
 // Close frees the device objects. The job queue must be closed first, and
@@ -258,7 +366,11 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &api.MusicPlan{Format: format, Steps: len(plan.Schedule(cmpOr(req.Shift, plan.DefaultShift), req.Timesteps))}
+	model := b.resolveModel(req.Model)
+	if guided(model) && req.Timesteps != nil && len(req.Timesteps) < 2 {
+		return nil, unsupported("timesteps: the base model steps between entries, so it needs at least 2 (end with 0 to land on the song)")
+	}
+	p := &api.MusicPlan{Format: format, Model: b.modelID(model), Steps: b.steps(model, req)}
 	if audio != nil && audio.Task != pipeline.Text2Music {
 		p.Seconds = audio.Seconds()
 		if p.Seconds > plan.MaxSeconds {
@@ -302,7 +414,7 @@ func (b *Music) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 				need, secs, b.lmOpt.MaxLen)
 		}
 	}
-	c := musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120), b.lmOpt.Bank)
+	c := musicEstimate(r, req.Thinking, req.Sample, cmpOr(p.Seconds, 120), b.lmOpt.Bank, p.Steps, forwards(model, req))
 	c.encode = encodeCost(audio)
 	p.Estimate = c.total()
 	return p, nil
@@ -410,7 +522,7 @@ func scoreCost(r *plan.Request, thinking, withLM bool, seconds float64) time.Dur
 	return time.Duration(s * float64(time.Second))
 }
 
-func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank lm.Bank) musicCost {
+func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank lm.Bank, steps int, forwards float64) musicCost {
 	sec := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
 	text, code := 0.028, 0.025
 	if bank == lm.BankFP16 {
@@ -427,7 +539,7 @@ func musicEstimate(r *plan.Request, thinking, sample bool, seconds float64, bank
 		c.codes = sec((seconds*lm.CodesPerSecond + 1) * code)
 	}
 	L := seconds * 12.5
-	c.dit = sec(8 * (2.65e-4*L + 7.16e-9*L*L + 0.035))
+	c.dit = sec(float64(steps) * forwards * (2.65e-4*L + 7.16e-9*L*L + 0.035))
 	c.vae = sec(0.0104*seconds + 0.1)
 	c.write = sec(0.004 * seconds)
 	return c
@@ -438,13 +550,14 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 	if req.Analysis {
 		return b.analyse(ctx, req, mp, progress)
 	}
+	model := b.resolveModel(req.Model)
 	r := musicRequest(req)
 	secs := cmpOr(mp.Seconds, 120)
 	audio, err := musicAudio(req)
 	if err != nil {
 		return err
 	}
-	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank)
+	c := musicEstimate(r, req.Thinking, req.Sample, secs, b.lmOpt.Bank, b.steps(model, req), forwards(model, req))
 	c.encode = encodeCost(audio)
 	if req.Score {
 		c.score = scoreCost(r, req.Thinking, !b.opt.NoLM, secs)
@@ -503,9 +616,13 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 	var res *pipeline.Result
 	err = b.opt.Device.Do(func(*vk.Device) error {
 		var err error
+		if err := b.pipe.UseDiT(model); err != nil {
+			return err
+		}
 		res, err = b.pipe.Generate(r, pipeline.Options{
 			Seed: uint64(mp.Seed), Think: req.Thinking, LMSeed: uint64(mp.LMSeed), Sampling: sampling, Sample: smp,
-			Shift: req.Shift, Timesteps: req.Timesteps, Audio: audio, Score: req.Score,
+			Shift: req.Shift, Timesteps: req.Timesteps, Steps: req.InferenceSteps, Guidance: guidance(req),
+			Audio: audio, Score: req.Score,
 			Between: func() error {
 				if err := ctx.Err(); err != nil {
 					return err
@@ -527,7 +644,7 @@ func (b *Music) GenerateMusic(ctx context.Context, req *api.MusicRequest, mp *ap
 				// The plan fixes the length, so the estimate is redone
 				// around it; what is spent is kept.
 				spent, sampled, enc := c.think, c.sample, c.encode
-				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank)
+				c = musicEstimate(d, req.Thinking, req.Sample, seconds, b.lmOpt.Bank, b.steps(model, req), forwards(model, req))
 				c.think, c.sample, c.encode = spent, sampled, enc
 				if req.Score {
 					c.score = scoreCost(d, req.Thinking, !b.opt.NoLM, seconds)

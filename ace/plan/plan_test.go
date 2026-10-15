@@ -25,6 +25,7 @@ const (
 )
 
 type planManifest struct {
+	dir   string // the oracle's directory; planRef when empty
 	Cases map[string]struct {
 		Params struct {
 			Caption       string  `json:"caption"`
@@ -82,7 +83,11 @@ func readRaw(t *testing.T, m *planManifest, name, dtype string) []byte {
 	if meta.Dtype != dtype {
 		t.Fatalf("%s is %s, want %s", name, meta.Dtype, dtype)
 	}
-	raw, err := os.ReadFile(filepath.Join(planRef, name+".bin"))
+	dir := m.dir
+	if dir == "" {
+		dir = planRef
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, name+".bin"))
 	if err != nil {
 		t.Fatal(err)
 	}

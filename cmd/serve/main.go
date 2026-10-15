@@ -241,8 +241,9 @@ func main() {
 	videoTTL := flag.Duration("video-ttl", 24*time.Hour, "how long a finished video job and its file are kept")
 	videoQueue := flag.Int("video-queue", 16, "video jobs that may wait behind the running one")
 	videoPrompt := flag.Int("video-max-prompt", 0, "longest video prompt in tokens; 0 is the pipeline's 4096")
-	musicOn := flag.Bool("music", false, "load ACE-Step 1.5 (XL turbo + the 5 Hz LM) and serve /v1/music (asynchronous jobs; ~18 GB resident)")
-	musicModels := flag.String("music-models", "models", "root holding acestep-v15-xl-turbo/, acestep-5Hz-lm-4B/, Ace-Step1.5/vae and Qwen3-Embedding-0.6B/")
+	musicOn := flag.Bool("music", false, "load ACE-Step 1.5 (XL base + the 5 Hz LM) and serve /v1/music (asynchronous jobs; ~18 GB resident)")
+	musicDiT := flag.String("music-dit", "base,turbo", "the music DiTs to stage, the first the default: base (CFG over 32 steps, research/music-vertical.md A15), turbo (8 distilled steps); a request's model picks one, ~10 GB each")
+	musicModels := flag.String("music-models", "models", "root holding acestep-v15-xl-base/ (or -turbo/), acestep-5Hz-lm-4B/, Ace-Step1.5/vae and Qwen3-Embedding-0.6B/")
 	musicLM := flag.Bool("music-lm", true, "load the 5 Hz LM, for thinking (upstream's default path); without it only thinking=false is served, ~7 GB lighter")
 	musicAes := flag.Bool("music-aes", true, "score songs with Audiobox Aesthetics too (MUSIC.md A14c) when models/audiobox-aesthetics exists; ~0.6 GB")
 	musicSongEval := flag.Bool("music-songeval", true, "score songs with SongEval too (MUSIC.md A14d) when models/MuQ-large-msd-iter and SongEval's head exist; ~2.6 GB")
@@ -524,7 +525,7 @@ func main() {
 			log.Fatal("-music needs the device; it has no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, Device: dev, NoLM: !*musicLM, LMFP16: *musicLMFP16,
+		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, DiTs: strings.Split(*musicDiT, ","), Device: dev, NoLM: !*musicLM, LMFP16: *musicLMFP16,
 			NoAesthetics: !*musicAes, NoSongEval: !*musicSongEval, Swap: swap})
 		if err != nil {
 			log.Fatal(err)

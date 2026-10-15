@@ -53,6 +53,9 @@ type Host struct {
 	OutTable []float32
 	ProjOutB []float32 // [Latent]
 	CondB    []float32 // condition_embedder bias
+	// NullCond is null_condition_emb [2048]: CFG's unconditional row puts
+	// it in every row of the packed condition (A15).
+	NullCond []float32
 	// The encoders' final norms and the timbre encoder's CLS row.
 	LyricNorm, TimbreNorm *qwen.RMSNorm
 	TimbreCLS             []float32
@@ -134,6 +137,7 @@ func LoadHost(set *safetensors.Set, c *Config) (*Host, error) {
 		OutTable:     l.f32("decoder.scale_shift_table", 2, c.Hidden),
 		ProjOutB:     l.f32("decoder.proj_out.1.bias", c.Latent),
 		CondB:        l.f32("decoder.condition_embedder.bias", c.Hidden),
+		NullCond:     l.f32("null_condition_emb", 1, 1, c.EncHidden),
 		LyricNorm:    &qwen.RMSNorm{Weight: l.f32("encoder.lyric_encoder.norm.weight", c.EncHidden), Eps: c.Eps},
 		TimbreNorm:   &qwen.RMSNorm{Weight: l.f32("encoder.timbre_encoder.norm.weight", c.EncHidden), Eps: c.Eps},
 		TimbreCLS:    l.f32("encoder.timbre_encoder.special_token", c.EncHidden),

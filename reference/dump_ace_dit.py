@@ -26,6 +26,12 @@ defaults, 120 s, 1,500 tokens).
 handler's dtype there is bfloat16; on ROCm and the CPU it is fp32), into
 reference/out/acedit_bf16: the bar a device path's own drift from the fp32
 oracle is priced against (decision 2).
+
+--model base runs the XL base checkpoint (research/music-vertical.md A15)
+the way Gradio runs a pure base model -- 32 steps, shift 3, CFG 7 through
+APG, DCW off -- into reference/out/acedit_base{,_bf16}. Every forward is
+then the CFG pair: v{f} is the conditional row and vnull{f} the null
+condition's, and layer{l}_null the null row's layer outputs.
 """
 
 import json
@@ -44,7 +50,12 @@ from acestep.inference import GenerationConfig, GenerationParams, generate_music
 from dump_ace_plan import CASES, PROJECT  # noqa: E402
 
 BF16 = "--bf16" in sys.argv
-OUT = "reference/out/acedit_bf16" if BF16 else "reference/out/acedit"
+BASE = "--model" in sys.argv and sys.argv[sys.argv.index("--model") + 1] == "base"
+FP32_OUT = "reference/out/acedit_base" if BASE else "reference/out/acedit"
+OUT = FP32_OUT + "_bf16" if BF16 else FP32_OUT
+MODEL = "acestep-v15-xl-base" if BASE else "acestep-v15-xl-turbo"
+# Gradio's settings for a pure base model; turbo's are upstream's defaults.
+EXTRA = dict(inference_steps=32, guidance_scale=7.0) if BASE else {}
 KEEP_LAYERS = (0, 1, 2, 15, 31)
 
 
@@ -53,7 +64,8 @@ class Stop(Exception):
 
 
 def main():
-    labels = [a for a in sys.argv[1:] if not a.startswith("--")] or ["full_metas", "defaults"]
+    args = [a for a in sys.argv[1:] if a != "base"]
+    labels = [a for a in args if not a.startswith("--")] or ["full_metas", "defaults"]
     os.makedirs(OUT, exist_ok=True)
     manifest = {"cases": {}, "tensors": {}}
     manifest_path = os.path.join(OUT, "manifest.json")
@@ -66,7 +78,7 @@ def main():
 
     torch.set_grad_enabled(False)
     h = AceStepHandler()
-    msg, ok = h.initialize_service(project_root=PROJECT, config_path="acestep-v15-xl-turbo", device="cpu",
+    msg, ok = h.initialize_service(project_root=PROJECT, config_path=MODEL, device="cpu",
                                    use_mlx_dit=False)
     assert ok, msg
     model = h.model
@@ -88,7 +100,7 @@ def main():
 
         model.generate_audio = capture
         params = GenerationParams(thinking=False, shift=3.0, seed=42, use_cot_metas=False, use_cot_caption=False,
-                                  use_cot_language=False, **cases[label])
+                                  use_cot_language=False, **EXTRA, **cases[label])
         generate_music(h, None, params, GenerationConfig(batch_size=1, use_random_seed=False, seeds=[42]))
         model.generate_audio = real_generate
         assert captured, label
@@ -137,6 +149,8 @@ def main():
 
         def dec_out(_m, _args, _kwargs, out):
             dump(p + f"v{state['forward']}", out[0][0])
+            if out[0].shape[0] == 2:
+                dump(p + f"vnull{state['forward']}", out[0][1])
         hooks.append(dec.register_forward_pre_hook(dec_pre, with_kwargs=True))
         hooks.append(dec.register_forward_hook(dec_out, with_kwargs=True))
 
@@ -170,6 +184,8 @@ def main():
                 stats[state["forward"]][li]["residual_out"] = amax(out[0])
                 if state["forward"] == 0 and li in KEEP_LAYERS:
                     dump(p + f"layer{li}", out[0][0])
+                    if out[0].shape[0] == 2:
+                        dump(p + f"layer{li}_null", out[0][1])
             hooks.append(layer.register_forward_pre_hook(layer_in, with_kwargs=True))
             hooks.append(layer.register_forward_hook(layer_out, with_kwargs=True))
             hooks.append(layer.self_attn.q_proj.register_forward_pre_hook(rec("sa_in")))
@@ -189,7 +205,7 @@ def main():
         if BF16:
             # The fp32 run's noise, so the two runs start from the same x:
             # a bf16 prepare_noise draws a different tensor.
-            ref = np.fromfile(f"reference/out/acedit/{label}_noise.bin", dtype=np.float32)
+            ref = np.fromfile(f"{FP32_OUT}/{label}_noise.bin", dtype=np.float32)
             ref = torch.from_numpy(ref.reshape(1, -1, 64))
 
             def fixed_noise(context_latents, seed, ref=ref):
@@ -213,6 +229,7 @@ def main():
                     if v > worst.get(k, (0, 0))[0]:
                         worst[k] = (v, li)
         c["worst"] = {k: {"absmax": v, "layer": li} for k, (v, li) in worst.items()}
+        c["model"], c["guidance"] = MODEL, captured.get("diffusion_guidance_scale")
         print(f"{label}: T={out.shape[0]} enc {c['encoder_len']} in {elapsed:.1f} s; timesteps {c['timesteps']}")
         for k, (v, li) in sorted(worst.items()):
             print(f"  {k:13s} absmax {v:10.4g} (layer {li})")

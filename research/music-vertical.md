@@ -2422,6 +2422,349 @@ Not in the served `quality` yet (A14f maps fields one by one).
   half-looped song 0.50. Where "poor" starts is the fit's, with the second
   panel's data.
 
+### A15 — the plan: the XL base model (2026-10-15)
+
+**What the user asked for.** Pivot the music vertical from
+`acestep-v15-xl-turbo` to the base model, then look for ways to cut
+generation time or raise concurrent throughput. The user's answers on
+2026-10-15:
+
+- the checkpoint is **`ACE-Step/acestep-v15-xl-base`** (read at
+  `220c116`), not `-xl-sft`;
+- the default is **Gradio's for a pure base model: 32 steps**, and S3
+  prices fewer;
+- **turbo stays available as a flag**, as the control and the fallback.
+
+**What changes, and what doesn't.** The architecture is the same.
+`config.json` differs from turbo's in `is_turbo` (false) and
+`model_version` ("base") only. The safetensors index is the same 829
+tensors at 19,949,242,904 bytes, so `ace/dit`, `ace/vae` and the LM
+carry over unchanged. `silence_latent.pt` ships again, byte-identical
+to turbo's. The weights were already on disk:
+`models/ace-checkpoints/checkpoints/acestep-v15-xl-base` (and `-xl-sft`),
+fetched 2026-10-15 00:00–00:10. All four shards match HF's LFS sha256s
+(checked 2026-10-15). What changes is the
+sampler:
+
+| | turbo (A0–A14) | base (Gradio's pure-base defaults) |
+|---|---|---|
+| steps | 8, a fixed table per shift | **32**: `linspace(1, 0, N+1)` then `shift·t/(1+(shift−1)·t)` |
+| shift | 3 | 3 |
+| guidance | none (CFG distilled in) | **CFG 7.0 through APG** (`apg_guidance.py`) |
+| forwards a song | 8 | **64**: a conditional and an unconditional row a step |
+| DCW | on | **off** (`_resolve_dcw_enabled` → `is_turbo`) |
+| CFG interval | n/a | 0–1 (every step) |
+| tasks | text2music, cover, repaint | adds lego, extract, complete |
+
+- **The step default is a trap, as the shift was.** `GenerationParams`
+  and `release_task` default `inference_steps` to 8 on any model, so
+  upstream's literal API default on base is 8 CFG steps. Gradio sets 32
+  for a pure base model, 50 for SFT and 8 for turbo
+  (`ui/gradio/events/generation/model_config.py`). The HF card says 50.
+- **APG.** The unconditional row's condition is `null_condition_emb`
+  broadcast to every row of the packed condition, with the same mask.
+  Then, per step:
+  - `diff = cond − uncond`;
+  - a momentum buffer, `avg = diff + (−0.75)·avg`;
+  - the diff's L2 norm is clamped to 2.5, `dims=[1]`, which is the
+    **time** axis of `[B, T, 64]`;
+  - the clamped diff's component parallel to `cond` is projected out
+    (fp64 in upstream);
+  - `v = cond + (g − 1)·orthogonal`.
+
+  This is host arithmetic on `[T, 64]`, like DCW was.
+- **Euler throughout.** The last entry is t = 0, so the last step's
+  `x − v·(t − 0)` is the turbo path's x0 jump in other words. N entries
+  are still N steps.
+
+**What it costs (estimate; A15e's baseline replaces it).** A forward is
+~0.22 s at 60 s of song (750 tokens) and ~0.86 s at 4 minutes (6.9 s / 8,
+§ After closing). At 64 forwards:
+
+| song | turbo DiT | base DiT | LM (int8, A10) | request, turbo → base |
+|---|---|---|---|---|
+| 60 s | 1.8 s | ~14 s | ~7 s | 14.4 → ~27 s |
+| 4 min | 6.9 s | ~55 s | ~26 s | ~35 → ~85 s |
+
+**The DiT becomes the request**, where the LM was before. The speed work
+moves with it.
+
+**The stages:**
+
+| stage | what | gate |
+|---|---|---|
+| A15a | Weights and oracle. Go reads `models/acestep-v15-xl-base` (the files moved there, the checkpoint dir symlinks them as turbo's does; sha256s already checked); `dump_ace_dit.py`, `dump_ace_detok.py` and `dump_ace_tasks.py` grow a `--model` and rerun on base, in fp32 and `--bf16` | the oracle's outputs exist, and the turbo dumps are untouched |
+| A15b | The sampler in `ace/plan`: any N with shift, CFG through APG (ADG behind a flag, plain CFG for completeness), the CFG interval, DCW off; the stepper takes a two-row velocity | **bit-exact** against upstream's own loop with a stub decoder, as A1 did, over N ∈ {8, 32, 50} × shift {1, 3} × APG/ADG × an interval |
+| A15c | The DiT with CFG, as two forwards a step (the control the speed stages are measured against): `Begin` holds both condition sets' cross planes, `null_condition_emb` staged | end to end against upstream fp32, priced against its bf16. **The risk stage**: CFG scales the fp16 drift in `cond − uncond` by up to g − 1 = 6, less APG's clamp. If base's layer-0 q/k drift lands over bf16, A-o7's split-precision QK is built here |
+| A15d | Everything else that reads the DiT checkpoint, re-gated on base: the detokenizer (the LM's hints), the tokenizer, cover/cover-nofsq/repaint (`cover_steps` and the injection cutoff now follow `infer_steps`), the A14 score (`CrossProbs`; `t_last = 1/steps` moves with N) | the A11/A14 gates' oracles rerun on base |
+| A15e | Served: `serve -music-dit base\|turbo` (base the default), `cmd/ace -dit`. `/v1/music` honours `inference_steps`, `guidance_scale`, `use_adg`, `cfg_interval_start/end` and `shift` on base, which turbo ignores. The estimate is rated per model. A baseline table (turbo vs base, 30 s / 60 s / 4 min, per stage) | the API tests; a listen; deployment is the user's call |
+| A15f | Optional: lego, extract, complete (the base model's tasks, refused today) | upstream's handler, one case each |
+
+**Speed: one request (after A15e's baseline).**
+
+- **S1 — skip the unconditional half's cross-attention.** Every row of
+  the unconditional condition is the same vector. After
+  `condition_embedder` and the k norm, every key and every value is the
+  same, and no row is masked with one request. So the softmax is uniform,
+  and the cross-attention's output is `o_proj(v_null)`: **one constant
+  vector a layer, whatever x and t are**. We compute it once at load and
+  add it as a bias. The unconditional half then skips its cross q, the
+  attention and the o projection. Estimate ~8–10% of a step. It is the
+  same maths in a different order, so it is gated against A15c to
+  rounding.
+- **S2 — run the CFG pair as one forward of 2T rows.** The weights are
+  read once, and a 60 s song's 750 rows become 1,500, past the wave32
+  LDS GEMM's ~1,000-row knee ([[lds-gemm-needs-a-full-machine]]).
+  Self-attention runs as two groups. Most of the gain is at ≤ 60 s, and
+  about none at 4 minutes. (A side note: layer 0's self-attention comes
+  before the first cross-attention, so it is the same for both rows.)
+- **S3 — the step budget, priced by A14.** 32 against 24 and 16 steps,
+  and a CFG interval that drops the unconditional row on the last steps
+  (each such step costs half). This is the biggest lever, and it changes
+  the output, so it is decided by A14's components on the `acecal` set
+  and by the user's ears, not by a gate.
+
+**Speed: concurrent throughput.** Today there is one music worker
+(`MusicJobs`), and a job holds the device a step at a time.
+
+- **T1 — overlap the LM and the DiT across two jobs.** Job B's LM step is
+  latency-bound (22 ms of thin GEMVs), and job A's DiT forward is
+  compute-bound. Overlapped, the LM's time disappears into the DiT's:
+  throughput up to (LM + DiT) / DiT, about 1.5× at 60 s. First, measure
+  whether two submissions overlap on this GPU at all. Then the cost: a
+  second KV cache and a second activation set.
+- **T2 — batch the LM across jobs.** Two jobs' CFG pairs make 4 rows. At
+  the bus, a step should cost about the same 22 ms, which would double
+  the LM's throughput. `llm_gemv` stops at 3 rows, so it needs a 4-row
+  rung. This only pays if T1 shows the LM still showing through.
+- **T3 — batch DiT rows across jobs.** This only helps short songs, after
+  S2 has already doubled their rows. Lowest priority.
+
+### A15a–c, S1 — result (2026-10-15)
+
+**A15a.** The weights were already on disk and match HF's sha256s. They
+moved to `models/acestep-v15-xl-base/` (with turbo's
+`silence_latent.safetensors`; the `.pt` is byte-identical), and the
+oracle's checkpoint directory symlinks them, as it does turbo's. Most of
+the checkpoint is shared with turbo, byte for byte: the detokenizer, the
+audio tokenizer (pooler, FSQ) and nearly all of both encoders. What
+differs is the DiT, `condition_embedder`, `text_projector`,
+`null_condition_emb`, and the first and last tensors of each encoder. So
+A4's and A11c's gates (detokenizer, tokenizer) carry over unchanged.
+
+**A15b: the sampler is bit-exact.** `plan.BaseSchedule`,
+`plan.SampleGuided` and `plan.Guidance` (`ace/plan/cfg.go`) were run
+against `reference/dump_ace_base_sampler.py`: upstream's base
+`generate_audio` over a stub decoder whose conditional and null rows
+differ. All 11 cases come back bit for bit: 8–50 steps, shifts 1–3,
+guidance 1/3/7, an interval, DCW, and 37 to 3,000 latents. Four torch CPU
+details had to be matched:
+
+- `linspace` is one fused multiply-add per entry (its vectorised loop),
+  counted down from the end for the second half;
+- `tensor.norm(dim=1)` sums its squares in order in fp32;
+- `tensor.sum(dim=1)` over a non-innermost dimension is SumKernel's
+  four-level cascade (`plan.cascadeSum`); this applies to the projection's
+  fp64 dot product;
+- `2.5 / tensor` is `reciprocal() · 2.5`, so it rounds twice.
+
+The oracle also records what `generate_music` hands the base model at
+Gradio's settings: 32 steps, guidance 7, APG, interval 0–1, DCW off, Euler
+(`TestBaseRequest`). ADG is not ported: a `use_adg: true` is a 400.
+
+**A15c: the DiT with CFG, without split precision.**
+
+- Code: `dit.GPU.BeginNull` stages the null condition's cross planes and
+  `StepNull` reads them. They are only allocated on a guided checkpoint
+  (`is_turbo` false in its config.json, `Guided()`).
+- The oracle is `dump_ace_dit.py --model base [--bf16] full_metas`
+  (30 s, 375 tokens, 32 CFG steps; about 3 min on the CPU).
+- The gate is `ace/dit`'s `TestBaseDiT`. Run the base tests on their own
+  (`-run Base`), since they stage a second checkpoint.
+
+| | ours vs fp32 (rms) | upstream bf16 vs fp32 | bf16 / ours |
+|---|---|---|---|
+| encoder states | 3.2e-4 | | |
+| first forward, conditional row | 4.4e-3 | 1.54e-2 | 3.5× |
+| first forward, null row | 3.8e-3 | 1.71e-2 | 4.5× |
+| forwards 1–31, either row | 0.5–2.7e-3 | | |
+| latents after 32 guided steps | 7.4e-2 | 0.302 | 4.1× |
+
+- **Base's forwards are 10× tighter than turbo's** (turbo: 3–7% rms on a
+  velocity, all from layer 0's q/k).
+- The trajectory still amplifies drift: 0.4% on a forward becomes 7% on
+  the latents over 32 steps, and upstream's bf16 lands at 30%.
+- The activations stay in turbo's range. fp16 operands peak at 5.4e3, and
+  the residual reaches 6.35e5 (fp32).
+- **A-o7's split-precision q/k is not needed.**
+
+**S1, done: the null row's cross-attention as one constant a layer.**
+`GPU.nullCross` computes `o_proj · (each q head's kv head of v_proj ·
+(condition_embedder · null_condition_emb + bias))` once at load, in fp32
+from the checkpoint's fp32 weights with float64 sums. The null forward
+then adds it through `dit_gate_add_hoist_bcast.spv` (the gate kernel's
+`BCAST` build: y is one row), in place of the cross norm, q projection,
+attention and o projection.
+
+- It is on by default; `nullConst` off runs the null planes as the control.
+- `TestBaseNullCross` holds it against the control and the oracle: S1 is
+  1.5–3.4e-4 rms from the control, and as close to upstream as the
+  control or closer.
+- The null forward goes **111.4 → 90.8 ms at 375 tokens (1.23×)**, so a
+  CFG step is 9% shorter.
+
+**What a forward costs now** (`TestBaseTiming`, the median of 5):
+
+| song | tokens | conditional | null (S1) | CFG step | per token-row |
+|---|---|---|---|---|---|
+| 15 s | 188 | 90.1 ms | 74.0 ms | 164 ms | 0.437 ms |
+| 30 s | 375 | 111.0 | 89.7 | 201 | 0.268 |
+| 60 s | 750 | 178.8 | 144.5 | 323 | 0.216 |
+| 2 min | 1,500 | 345.7 | 282.0 | 628 | 0.209 |
+| 4 min | 3,000 | 731.4 | 604.1 | 1,336 | 0.223 |
+
+The big GEMMs run at ~42 TFLOP/s (gate|up at 60 s), so the DiT is
+compute-bound from 750 tokens up. **S2 (the CFG pair as one forward of 2n
+rows) is therefore worth little.** At the 2n rate it would save ~1.6× at
+15 s, ~1.24× at 30 s, ~1.03× at 60 s and nothing beyond. It is not built;
+it is worth building only if short songs matter. Past 60 s, only fewer
+FLOPs help (S3).
+
+**The first base song** (`cmd/ace -dit base`, a 60 s synthwave song,
+thinking, before S1) took 28.1 s: the LM 11.9 s, the DiT 12.7 s (64
+forwards), the VAE 0.6 s. Turbo rendering the same plan took 17.3 s (DiT
+1.7 s). Their scores, base then turbo:
+
+| | base | turbo |
+|---|---|---|
+| PQ | 8.42 | 8.32 |
+| CE | 7.47 | 7.60 |
+| SongEval coherence | 3.95 | 3.84 |
+| SongEval naturalness | 3.47 | 3.69 |
+| DiT lyric alignment | 0.40 | 0.18 |
+
+The songs are `out/a15/{base,turbo}-synthwave-60.mp3`. S3's sweep scores
+the whole A14e set.
+
+**A15d: the audio tasks on base, gated.** The oracle is
+`dump_ace_tasks.py --model base [--bf16] cover cover_mix repaint` (32
+steps, CFG 7; about 3 min a case on the CPU). The gate is `ace/pipeline`'s
+`TestBaseTasks`. Results, against upstream fp32:
+
+| case | ours (rms) | upstream bf16 | bf16 / ours |
+|---|---|---|---|
+| cover_mix (renoised source, condition switch at step 7 of 14) | 4.85e-3 | 0.186 | 38× |
+| repaint | 5.7e-2 | 0.416 | 7.3× |
+| cover, from the oracle's hints | 0.116 | 0.721 | 6.2× |
+| cover, through our tokenizer | 0.46 | 0.721 | 1.6× |
+
+- **The cover's gap is one code.** One code in 150 flips at an FSQ
+  boundary (as on turbo, § A11b–e). That replaces 5 hint rows, and 32
+  steps of CFG 7 carry it from turbo's 0.13 to 0.46. Upstream's own
+  unseeded posterior noise flips ~2, and bf16 flips half the codes. So
+  the full cover is held from the oracle's hints, and the flips stay with
+  the tokenizer's gate (`TestTaskInputs`).
+- The pipeline changes behind these:
+  - a base schedule has steps + 1 entries;
+  - a cover's renoise searches all but the last;
+  - `cover_steps` and the injection cutoff count steps;
+  - base injects after every step under the cutoff (turbo stops before
+    its last);
+  - `condition()` rebuilds the null planes at the new condition's length
+    when a cover switches to text2music.
+- **The A14b score on base:** `t_last = 1/steps` follows the request
+  (`Rescore` uses 32 on base). `CrossProbs` reads the conditional planes
+  only, as upstream's `lyric_score` does. The implementation is gated on
+  turbo; base runs the same code over its own weights. Its alignment
+  heads are the same config entry.
+
+**A15e: served, not deployed.**
+
+- `serve -music-dit base|turbo` (default base) and `cmd/ace -dit`,
+  `-steps`, `-guidance`, `-cfg-start`, `-cfg-end`, `-shift`.
+- `/v1/music` reads `inference_steps` (1–200, default 32),
+  `guidance_scale` (0–30, default 7) and `cfg_interval_start`/`_end`. On
+  base, a `timesteps` list is taken as given (at least 2 entries).
+  `use_adg: true` is a 400.
+- **A request picks the model (2026-10-15, the user's request).**
+  - `-music-dit base,turbo` (the default) stages both DiTs through
+    `Pipeline.AddDiT`. `UseDiT` switches between them per job, which is
+    safe because jobs are serial on the device.
+  - `model` (and upstream's `model_name`/`dit_model`) matches an id, the
+    short name, or a word in the name. Anything else runs the first
+    model, as upstream's `select_generation_handler` falls back to its
+    primary, and the job's `model` reports which ran.
+  - Measured served: a 20 s song in 1.5 s on turbo (8 steps) and 7.0 s
+    on base (32 steps), one after the other in one server.
+  - Music's residency is ~31 GB with both DiTs and the LM (scorers off),
+    ~10 GB over base alone. That is still under video's 60 GB in the same
+    swap slot.
+- The model ids are the checkpoints' directories (`acestep-v15-xl-base`,
+  `acestep-v15-xl-turbo`).
+- The estimate counts steps × 1.81 forwards.
+- `research/api-jobs.md` is updated.
+- `ai.service` has not been redeployed: that is the user's call, and it
+  will change the deployed model's default.
+
+**S3, the sweep (2026-10-15): fewer steps cost nothing measurable, and
+turbo outscores base.** `cmd/acesteps -out out/a15/steps` covered the
+A14e set's 20 songs (30 s to 4 min, 29 min of audio, seed 11). Each song
+was planned once by the LM. Every arm rendered the same codes from the
+same noise and went through the whole auto score. The table gives each
+arm's mean, then the mean paired difference from b32 and on how many of
+the 20 songs the arm scored at least b32's:
+
+| component | b32 | b24 | b16 | b32, CFG for t ≥ 0.5 | turbo |
+|---|---|---|---|---|---|
+| Audiobox PQ | 7.91 | −0.02 (6) | −0.06 (4) | −0.01 (11) | **+0.28 (17)** |
+| Audiobox CE | 7.20 | −0.02 (5) | −0.07 (4) | −0.02 (7) | **+0.29 (18)** |
+| Audiobox CU | 7.77 | −0.01 (6) | −0.04 (6) | −0.01 (13) | +0.14 (12) |
+| SongEval coherence | 3.60 | +0.02 (14) | +0.07 (16) | +0.04 (15) | **+0.29 (17)** |
+| SongEval musicality | 3.39 | +0.02 (14) | +0.07 (15) | +0.05 (16) | **+0.27 (17)** |
+| SongEval naturalness | 3.27 | 0.00 (12) | +0.05 (15) | +0.03 (17) | **+0.24 (16)** |
+| render reward (adherence) | 0.725 | 0.000 | +0.002 | −0.001 | −0.004 |
+| DiT lyric alignment | 0.233 | +0.003 | −0.001 | 0.000 | −0.001 |
+| loop share | 0.047 | −0.013 | −0.004 | −0.001 | −0.007 |
+| DiT s a second of song | 0.227 | 0.171 | 0.113 | 0.206 | 0.028 |
+
+(PC, memorability and clarity move the same way. The DiT times of the
+first ~half of the base pass ran beside a CPU oracle and read ~1.5×
+slow, so compare them across arms, not with `TestBaseTiming`.)
+
+- **The step budget.** Between 32 and 16 steps, Audiobox drops 0.04–0.07
+  and SongEval rises 0.05–0.07. Both are well inside the spread between
+  songs, and adherence does not move. 24 steps is indistinguishable from
+  32. Restricting CFG to t ≥ 0.5 is neutral, but it only saves 10% of a
+  step's work.
+- **On these metrics, base is not better than turbo.** Turbo leads every
+  production and musicality score, by ~0.25 on 16–18 of the 20 songs.
+  Adherence (the LM's verdict over the render, lyric alignment) is a
+  tie. This matches the HF card, which rates turbo's quality "Very
+  High" and base's "High", with base's own advantage in diversity and
+  tasks.
+- These are automatic scores. Panel 1 found they track the user's
+  ratings only partly (§ A14e). **Which model to serve is the user's
+  ears' call**, and the renders are there to be heard:
+  `out/a15/steps/<song>-<arm>.mp3`.
+
+**T1, measured: the LM and the DiT do overlap.** A 4-minute song's LM
+phase 2 (`cmd/ace`, turbo) ran in one process while `TestBaseTiming`
+looped in another:
+
+- the LM step went 25.1 → 68.9 ms;
+- the DiT's forwards ran within 0–5% of their speed alone (0.223 ms a
+  token-row at 4 min, as alone);
+- the pair's work, 30 s of LM and ~79 s of DiT alone, finished in ~83 s,
+  against ~109 s back to back.
+
+So the LM's work fits into the DiT's gaps. That is ~1.3× the throughput
+of the two, at the cost of the planning job's latency.
+`backend.Device`'s premise ("two of them interleaved would not go
+faster") holds for two compute-bound models, but not for a latency-bound
+decode beside a compute-bound one. Building T1 means a second queue (or
+device) for the LM, which changes the server's one-queue, one-lock design
+for every vertical. **That is the user's call** (A-o17).
+
 ## Open questions
 
 - **A-o1: does fp16 hold in the DiT's activations?** Answered above: fp32
@@ -2469,6 +2812,12 @@ Not in the served `quality` yet (A14f maps fields one by one).
 - **A-o15: are non-commercial weights acceptable?** SongEval's head
   (CC BY-NC-SA per its README) sits on MuQ (CC-BY-NC 4.0). **Answered by
   the user (2026-10-13): yes**, so A14d is in.
+- **A-o17: a second queue for the music LM (A15 T1)?** Measured: a
+  latency-bound LM decode beside the compute-bound base DiT costs the DiT
+  0–5% and finishes the pair ~1.3× sooner than back to back, but each LM
+  step is 2.75× slower while they overlap. Serving it means two queues,
+  or two devices, where `backend.Device` has one queue behind one lock.
+  That is the user's call.
 - **A-o16: score the plan or the render?** Upstream's PMI reads the LM's
   codes. Codes re-tokenized from the rendered latent score what was
   actually made. A14e decides between them.
@@ -2665,6 +3014,20 @@ image and video; `-music` is on the deployed `ai.service` line. Code: `ace/` (`p
     beside the rest; no headline number, no flag, by the user's choice.
     Scoring a 30 s song went 0.9 → 1.8 s. `cmd/ace` logs both. Not
     deployed yet. Still to do from A14f: `-score-only` on any file.
+- **A15, the XL base model** (2026-10-15, the user's request):
+  - A15a–e are done: the sampler is bit-exact, the DiT and the tasks are
+    gated under bf16, and it is served as `-music-dit base` (now the
+    default), not deployed;
+  - S1 is done (the null cross-attention is a constant, 1.23× on the
+    null forward);
+  - S2 is priced and not built (≤ 30 s only);
+  - S3 swept: 16 steps cost nothing measurable, and **turbo outscores
+    base on every quality component**, so which to serve awaits the
+    user's listening;
+  - T1 is measured (1.3×) and needs a second queue (A-o17);
+  - A15f is not started.
+
+  See § A15 — the plan, and the result sections after it.
 - **A13, understand (captioning existing audio)**: done 2026-10-12, see
   § A13 — result. Served as `full_analysis_only` on `/v1/music`, and
   deployed: the `ai` binary of 2026-10-13 20:15 postdates it.
