@@ -20,12 +20,15 @@ import (
 //	.venv-flux3/bin/python -I reference/dump_flux3_run.py t2i
 const (
 	runDir   = "../../reference/out/flux3run_t2i"
+	editDir  = "../../reference/out/flux3run_edit"
 	modelDir = "../../models/flux-3-image-klein/transformer"
 )
 
 type run struct {
-	Steps int `json:"steps"`
-	Calls []struct {
+	dir    string
+	Prompt string `json:"prompt"`
+	Steps  int    `json:"steps"`
+	Calls  []struct {
 		Step   int     `json:"step"`
 		T      float64 `json:"timestep"`
 		Target float64 `json:"target_timestep"`
@@ -38,11 +41,17 @@ type run struct {
 
 func loadRun(t *testing.T) *run {
 	t.Helper()
-	buf, err := os.ReadFile(filepath.Join(runDir, "manifest.json"))
+	return loadRunDir(t, runDir)
+}
+
+// loadRunDir reads a run dump's manifest: runDir (t2i) or editDir.
+func loadRunDir(t *testing.T, dir string) *run {
+	t.Helper()
+	buf, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
-		t.Skipf("no run dump in %s (%v); run reference/dump_flux3_run.py t2i", runDir, err)
+		t.Skipf("no run dump in %s (%v); run reference/dump_flux3_run.py", dir, err)
 	}
-	r := &run{}
+	r := &run{dir: dir}
 	if err := json.Unmarshal(buf, r); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +64,7 @@ func (r *run) mat(t *testing.T, name string) *qwen.Mat {
 	if !ok {
 		t.Fatalf("run dump has no tensor %q", name)
 	}
-	raw, err := os.ReadFile(filepath.Join(runDir, name+".bin"))
+	raw, err := os.ReadFile(filepath.Join(r.dir, name+".bin"))
 	if err != nil {
 		t.Fatal(err)
 	}

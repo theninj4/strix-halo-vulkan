@@ -1,0 +1,96 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Pack one fp32 [rows, DIM] activation into the fp16 fragment-tile layout
+// vae_attention_wmma.comp's cooperative-matrix loads want, adding the
+// projection's bias and folding in a scale on the way.
+//
+// This is shaders/dit_pack_f16.comp's argument on the VAE's binding layout,
+// and the argument is IDEAS §5.1b's coverage law applied to a `coopMatLoad`:
+// a 16x16 fp16 fragment holds 32 bytes of each of the 16 rows it touches, so
+// reading one out of a matrix with any natural row stride puts 16 chunks of
+// 32 B, one stride apart, in a single instruction -- an eighth of the bus or
+// less. Stored *as fragments*, tile (t, c) -- token rows 16t.., component
+// columns 16c.. -- is one contiguous 512 B block and the same load is one
+// fully covered read. Stage 3c measured that difference at 1.56x against 30x.
+//
+// Two modes, built as two pipelines rather than branched at runtime, because
+// the two matmuls of attention reduce over different axes and the hardware
+// operand layout is K-contiguous for both operands:
+//
+//   TRANSPOSE 0  stores (row, component) at m*16 + d. That serves q as the A
+//     operand of q.k^T, read row-major, *and* k as its B operand, read
+//     column-major -- the reduction axis is the component for both.
+//   TRANSPOSE 1  stores each tile transposed, at d*16 + m, which serves v as
+//     the B operand of p.v, whose reduction axis is the row.
+//
+// The bias is added here rather than in the GEMM epilogue: the projections
+// run on shaders/dit_gemm.comp unmodified, which has no bias, and every one
+// of them is read next by either this shader or vae_rows_to_nchw_add.comp.
+// So the VAE's four biases live in the two passes that were already reading
+// the tensor, and cost nothing.
+//
+// Rows past pc.aux0 are zeroed rather than skipped: the attention kernel
+// reads whole key blocks, so a pad key has to score something finite, and a
+// zero key scores zero.
+//
+// pc.inOff is the fp32 source, pc.outOff the fp16 destination in halves,
+// pc.aux0 the real row count, pc.aux1 a scale as a bit pattern and pc.aux2
+// the bias in the weight arena, or NO_BIAS.
+
+#include "vae_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+#define TILE 16
+#ifndef DIM
+#define DIM 512
+#endif
+#ifndef TRANSPOSE
+#define TRANSPOSE 0
+#endif
+#define DT (DIM / TILE)
+#define WG 256
+
+layout(local_size_x = WG) in;
+
+// 16 rows x DIM of the tile this workgroup owns, fp16 so the staging is 16 KB
+// rather than 32 at DIM=512. Both sides of the transpose are coalesced
+// through it: the read walks whole rows, the write walks whole tiles.
+shared float16_t rows[TILE * DIM];
+
+void main() {
+    uint tt = gl_WorkGroupID.x;          // row tile
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = tt * TILE;
+    float scale = uintBitsToFloat(pc.aux1);
+
+    for (uint i = tid; i < TILE * DIM; i += WG) {
+        uint m = i / DIM, d = i % DIM;
+        uint row = row0 + m;
+        float v = 0.0;
+        if (row < pc.aux0) {
+            v = act[pc.inOff + row * DIM + d];
+            if (pc.aux2 != NO_BIAS) {
+                v += wbuf[pc.aux2 + d];
+            }
+            v *= scale;
+        }
+        rows[i] = float16_t(v);
+    }
+    barrier();
+
+    uint base = pc.outOff + tt * (DT * TILE * TILE);
+    for (uint o = tid; o < DT * TILE * TILE; o += WG) {
+        uint c = o / (TILE * TILE);      // component tile
+        uint rem = o % (TILE * TILE);
+#if TRANSPOSE
+        uint m = rem % TILE;
+        uint d = c * TILE + rem / TILE;
+#else
+        uint m = rem / TILE;
+        uint d = c * TILE + rem % TILE;
+#endif
+        hact[base + o] = rows[m * DIM + d];
+    }
+}

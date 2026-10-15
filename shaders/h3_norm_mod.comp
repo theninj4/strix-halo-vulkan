@@ -16,6 +16,12 @@
 // The same shader with a = weight, b = 0 is the token refiner's plain norm.
 //
 // One workgroup per row; one reduction, since an RMS norm has no mean.
+//
+// LAYER=1 is FLUX 3's pre-norm (research/flux3-vertical.md X5): a
+// non-affine LayerNorm, so the mean is subtracted, and with a = 1 + scale
+// it is the same modulation. Two reductions -- the mean, then the variance
+// about it -- as dit_final_norm.comp does and for its reason: FLUX 3's text
+// rows reach 1e7, and E[x^2] - mean^2 cancels where the mean nears the RMS.
 #include "dit_common.glsl"
 
 layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
@@ -34,6 +40,9 @@ layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
 #define HOIST 1
 #endif
 #define STEPS 24
+#ifndef LAYER
+#define LAYER 0
+#endif
 layout(local_size_x = WG) in;
 shared float partial[WG];
 
@@ -56,12 +65,38 @@ void main() {
             gb[j] = act[pc.aux1 + c];
         }
     }
+#if LAYER
+    // The mean first; x is centred in registers, so everything below --
+    // the variance's reduction and the store -- is the RMS build's.
+    float m = 0.0;
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        if (t + j * WG < pc.dim) {
+            m += x[j];
+        }
+    }
+    partial[t] = m;
+    barrier();
+    for (uint step = WG / 2u; step > 0u; step >>= 1) {
+        if (t < step) {
+            partial[t] += partial[t + step];
+        }
+        barrier();
+    }
+    float mean = partial[0] / float(pc.dim);
+    barrier();
+    [[unroll]] for (uint j = 0u; j < STEPS; j++) {
+        x[j] -= mean;
+    }
+#endif
     [[unroll]] for (uint j = 0u; j < STEPS; j++) {
         if (t + j * WG < pc.dim) {
             s += x[j] * x[j];
         }
     }
 #else
+#if LAYER
+#error LAYER is built on HOIST's registers
+#endif
     for (uint c = t; c < pc.dim; c += WG) {
         float v = act[src + c];
         s += v * v;

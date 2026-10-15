@@ -20,7 +20,7 @@ The phase-1 backlog and the measured roofline are archived in
 | LLM vision | live (V11 parked) | [`llm-vision.md`](llm-vision.md) § Handoff |
 | speech → text, text → speech | done, open items listed | [`speech-vertical.md`](speech-vertical.md) § "Where it stands, and what is open" (last section) |
 | instructed TTS (Breeze-TTS-2, beside kokoro) | planned, not started | [`tts-instruct-vertical.md`](tts-instruct-vertical.md) § Decisions, Handoff |
-| image (FLUX 3 Image Klein; Qwen-Image-2.1 superseded 2026-10-15, still served until X6/X7) | live (X0) | [`flux3-vertical.md`](flux3-vertical.md) § Handoff; Qwen-Image's record frozen in [`qimage-vertical.md`](qimage-vertical.md) |
+| image (FLUX 3 Image Klein; Qwen-Image-2.1 superseded 2026-10-15, no longer served since X7, code until X8) | live (X0–X7 done: FLUX 3 serves generations, 19.5 s at 1024², and edits, 40.7 s for one ~1 MP reference; next X8 deletes Qwen-Image) | [`flux3-vertical.md`](flux3-vertical.md) § Handoff; Qwen-Image's record frozen in [`qimage-vertical.md`](qimage-vertical.md) |
 | music (ACE-Step 1.5) | A14 quality score: A14a–d done and deployed, A14e paused; **A15 2026-10-15: XL base served as `-music-dit base`** (gated, S1 done, not deployed); S3 sweep: turbo outscores base on every quality score, 16 steps ≈ 32 — serving choice awaits listening | [`music-vertical.md`](music-vertical.md) § "After closing" (last section) |
 | video (MiniMax-H3) | live (M11) | [`video-vertical.md`](video-vertical.md) § Handoff |
 | embeddings | done, latency open | [`embedding-vertical.md`](embedding-vertical.md) § "Where it stands, E7 done, and what is next" (last section) |

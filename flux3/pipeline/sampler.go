@@ -104,18 +104,30 @@ func roundBF16(f float32) float32 {
 	return math.Float32frombits(u &^ 0xffff)
 }
 
-// Denoise runs the schedule from in.Img (the noise) and returns the final
-// latent. in's T and TNext are overwritten each step; progress, if not nil,
-// sees each step's result. The context is checked between steps.
+// Denoise runs the schedule from in.Img (the noise) through the CPU model
+// and returns the final latent. in's T and TNext are overwritten each step;
+// progress, if not nil, sees each step's result.
 func Denoise(ctx context.Context, m *dit.Model, in *dit.Input, s *Schedule, progress func(step int, x *qwen.Mat)) (*qwen.Mat, error) {
-	x := in.Img.Clone()
 	step := *in
+	return DenoiseWith(ctx, in.Img, s, func(x *qwen.Mat, t, tNext float64) (*qwen.Mat, error) {
+		step.Img, step.T, step.TNext = x, t, tNext
+		return m.Forward(&step)
+	}, progress)
+}
+
+// Velocity is one model call: the velocity of x at time t in a step that
+// jumps to tNext. The CPU model and dit.GPU's Forward both are one.
+type Velocity func(x *qwen.Mat, t, tNext float64) (*qwen.Mat, error)
+
+// DenoiseWith runs the schedule from noise with any model. The context is
+// checked between steps.
+func DenoiseWith(ctx context.Context, noise *qwen.Mat, s *Schedule, model Velocity, progress func(step int, x *qwen.Mat)) (*qwen.Mat, error) {
+	x := noise.Clone()
 	for i := 0; i < s.Steps(); i++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		step.Img, step.T, step.TNext = x, float64(s.T(i)), float64(s.T(i+1))
-		v, err := m.Forward(&step)
+		v, err := model(x, float64(s.T(i)), float64(s.T(i+1)))
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: step %d: %w", i, err)
 		}

@@ -133,6 +133,14 @@ layout(binding = 2) readonly buffer HAct { float16_t hact[]; };
 #ifndef CAUSAL
 #define CAUSAL 0
 #endif
+// PAD_LAST (with CAUSAL): the last query row does not see its own key either
+// -- FLUX 3's text encoder's pad row (flux3/textenc), which stands for every
+// right-padding row of the reference's window: one token at one position,
+// attending to the real keys and, under the padding mask, not to itself.
+#ifndef PAD_LAST
+#define PAD_LAST 0
+#endif
+#define PAD_SELF(qi, kj) ((qi) == n - 1u && (kj) == (qi))
 #ifndef GQA
 #define GQA 0
 #endif
@@ -417,7 +425,11 @@ void main() {
                 float mx = blkMax[i];
                 for (uint c = 0u; c < TILE; ++c) {
 #if CAUSAL
+#if PAD_LAST
+                    if (base + kk * TILE + c > q0 + i || PAD_SELF(q0 + i, base + kk * TILE + c)) {
+#else
                     if (base + kk * TILE + c > q0 + i) {
+#endif
                         break;      // and every c after it, the row is done
                     }
 #endif
@@ -516,7 +528,11 @@ void main() {
         if (cnt < BN || base + BN > q0) {
             for (uint i = lane; i < BM * BN; i += WAVE) {
                 uint col = i & (BN - 1u);
+#if PAD_LAST
+                if (col >= cnt || base + col > q0 + i / BN || PAD_SELF(q0 + i / BN, base + col)) {
+#else
                 if (col >= cnt || base + col > q0 + i / BN) {
+#endif
                     pbuf[i] = float16_t(0.0);
                 }
             }

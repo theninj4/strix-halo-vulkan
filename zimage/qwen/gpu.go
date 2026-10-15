@@ -1420,6 +1420,27 @@ func (g *GPUEncoder) Layers() int    { return len(g.w) }
 func (g *GPUEncoder) Tokens() int    { return g.tokens }
 func (g *GPUEncoder) Plan() GEMMPlan { return g.plan }
 
+// UsePadLastAttention swaps the attention for the build whose last query
+// row is also masked off its own key (shaders' PAD_LAST): FLUX 3's text
+// encoder appends one pad row that stands for its window's right padding,
+// which the reference's padding mask keeps from attending to itself
+// (flux3/textenc). Only the wave32 QT1 KTIL4 build exists in that form.
+func (g *GPUEncoder) UsePadLastAttention() error {
+	if g.attn.name != "qt1_kt4_w32" {
+		return fmt.Errorf("qwen: the pad-last attention is built for qt1_kt4_w32, the encoder runs %s", g.attn.name)
+	}
+	old := g.pipes["attention"]
+	if err := g.pipeline("attention", shaders.QwenAttentionQT1KT4W32PadLast, vk.PipelineSpec{
+		Buffers: []*vk.Buffer{g.wbuf, g.abuf, g.hbuf, g.banks[0]}, PushConstantSize: uint32(unsafe.Sizeof(pushConstants{})),
+		RequiredSubgroupSize: g.attn.wave,
+	}); err != nil {
+		return err
+	}
+	old.Destroy()
+	g.attn.name += "_padlast"
+	return nil
+}
+
 // SetPlan changes which kernel each projection runs on. Every rung reads the
 // same fragment-tiled weight, so this moves a pipeline and a tile and
 // restages nothing -- the ladder is one 7 GB load, not one per rung.

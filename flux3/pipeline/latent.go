@@ -105,3 +105,14 @@ func (b *BN) FromVAE(z []float32, h, w int) (*qwen.Mat, error) {
 	}
 	return out, nil
 }
+
+// Unpatchify is ToVAE without the de-normalisation: tokens [h*w, 128] to
+// [32, 2h, 2w] in the DiT's normalised space, which is what taef2 takes.
+func Unpatchify(x *qwen.Mat, h, w int) ([]float32, error) {
+	c := x.Cols
+	id := &BN{Mean: make([]float32, c), Std: make([]float32, c)}
+	for i := range id.Std {
+		id.Std[i] = 1
+	}
+	return id.ToVAE(x, h, w)
+}
