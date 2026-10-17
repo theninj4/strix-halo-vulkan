@@ -12,24 +12,25 @@
 //	go run ./cmd/serve -stt -max-audio 300          # five-minute clips
 //	go run ./cmd/serve -embed                       # embeddings, 0.88 GB resident
 //	go run ./cmd/serve -rune                        # decisions and System One classification (Rune v3), ~27 GB resident
-//	go run ./cmd/serve -image                       # flux-3-image-klein, ~22 GB while resident
+//	go run ./cmd/serve -image                       # qwen-image-2.1, ~20 GB while resident
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~31 GB a request
 //	go run ./cmd/serve -music                       # ACE-Step 1.5 music jobs; ~18 GB while resident
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
-// Every endpoint answers today. **-image serves FLUX 3 Image Klein**
-// (research/flux3-vertical.md X6, X7): 16 steps, ~19.5 s at 1024², previews
-// always on through taef2 (`taef2/` beside -image-model, 99 ms a frame), RGB
-// only -- `background: "transparent"` is a 400. POST /v1/images/edits needs
-// `-edits N`, N the most reference images an edit may carry (the model's
-// limit is 10): it stages the VAE encoder (~1.9 GB) and sizes the
-// transformer's rows for N references' tokens. References are prepared as
-// BFL's own pipeline does -- one fitted under the staging's area and
-// reflect-padded to the 16 grid, the output cropped back to it; several each
-// under 1 MiP, centre-cropped -- and an edit that names no size gets its
-// first reference's.
+// Every endpoint answers today. POST /v1/images/edits needs `-edits N`, where
+// N is how many reference images an edit may carry: an edit in
+// Qwen-Image-2.1 is a conditional generation over a vision tower rather than
+// an SDEdit, so the references are rows of the transformer's own sequence and
+// their cost is residency (IMAGE.md Q8).
+//
+// **There is no -preview flag any more, and that is the change rather than
+// an omission.** Under Z-Image it loaded madebyollin/taef1 and cost 1.0 GB
+// of activation arena, so streaming was a residency decision. This model's
+// preview decoder, TAEQI2.1, is 29 MB of weights and 224 MB of arena at
+// 1024², always staged from `taeqi2_1/` beside -image-model, so
+// `stream: true` is always answerable and there is nothing to turn on.
 //
 // **-image, -video and -music take turns in one slot** (backend.Swap). A
 // request makes its vertical resident, unloading whichever other one is,
@@ -50,12 +51,15 @@
 //
 // **-image-size is a ceiling, it is an *area*, and it has a hard limit.** The
 // arenas are allocated once for it and every request inside that many pixels
-// runs in them, in any shape (both sides a multiple of 16): every arena is
-// sized by the pixel count alone, so `-image-size 1024x1024` answers 1344x768
-// as readily as its own square. The limit is 1,517,824 pixels -- 1232x1232 --
-// set by the VAE decoder's fp32 activation arena, one storage buffer, which
-// this device caps at 4 GiB - 4 (flux3/vae TestArenaCeiling). Anything larger
-// is refused at startup.
+// runs in them, so what the number buys is the largest image and nothing
+// else. The shape is free: every arena in the image pipeline is sized by the
+// pixel count alone (`qimage/vae`'s TestArenaShape measures the VAE's at 3060
+// bytes a pixel for every aspect ratio), so `-image-size 1024x1024` answers
+// `aspect_ratio: "16:9"` with 1344x768 rather than with 1024x576. The limit
+// is 1,403,584 pixels -- 1184x1184 square, 1536x864 at 16:9 -- and it is not
+// a budget: the VAE decoder's activation arena is a single storage buffer and
+// this device caps one at 4 GiB - 4, which a 1216x1216 decode is already
+// past. Anything larger is refused at startup with the arithmetic.
 //
 // **-llm stages D19's widths and D20's MoE bank by default** (P3a, P4b).
 // D19 is D18's 4.5-bit plan with `ple_proj` on int8, plus P3a's fifth bit on
@@ -215,17 +219,22 @@ func main() {
 	wyMaxConns := flag.Int("wyoming-max-conns", 0,
 		"concurrent Wyoming connections; 0 takes the package default")
 
-	imgOn := flag.Bool("image", false, "load FLUX 3 Image Klein and serve /v1/images/generations (edits stay on Qwen-Image-2.1, -edits N)")
-	imgModel := flag.String("image-model", "models/flux-3-image-klein", "FLUX 3 Image Klein checkpoint root (diffusers layout); taef2/ beside it gives the previews")
+	imgOn := flag.Bool("image", false, "load Qwen-Image-2.1 and serve /v1/images/generations")
+	imgModel := flag.String("image-model", "models/Qwen-Image-2.1", "Qwen-Image-2.1 checkpoint root")
 	imgSize := flag.String("image-size", "1024x1024",
 		"largest image the arenas are built for, and the size a request that names none gets; its "+
-			"*area* is the ceiling and any shape of that area is served, both sides a multiple of 16, "+
-			"and no more than 1517824 pixels / 1232x1232 (the VAE's single-buffer arena)")
-	imgSteps := flag.Int("image-steps", 16, "flow-map steps a request that names none gets; FLUX 3 Klein is distilled to 16")
-	imgPrompt := flag.Int("image-max-prompt", 4096, "longest prompt the image text encoder is built for, in tokens")
+			"*area* is the ceiling and any shape of that area is served, both sides a multiple of 32, "+
+			"and no more than 1403584 pixels / 1184x1184 (the VAE's single-buffer arena)")
+	imgSteps := flag.Int("image-steps", 40, "denoising steps a request that names none gets; the checkpoint's default is 40")
+	imgPrompt := flag.Int("image-max-prompt", 4096,
+		"longest prompt the image text encoder is built for, in tokens; a 3-reference edit at 1024² still gets 512 (the transformer's prefix is one 4 GiB arena)")
 	imgEdits := flag.Int("edits", 0,
-		"reference images an edit may carry (at most 10), 0 to refuse /v1/images/edits; editing stages "+
-			"the VAE encoder (~1.9 GB at 1024²) and every reference adds its tokens to each step")
+		"reference images an edit may carry, 0 to refuse /v1/images/edits; editing stages the vision "+
+			"tower and the VAE encoder (~1.4 GB) and each reference costs ~2.1 GB of prefix KV cache")
+	imgCond := flag.Int("image-condition-size", 1024,
+		"square whose area every reference image is resized to, and the default output size of an edit "+
+			"that names none; diffusers' output_resolution")
+	imgFP16 := flag.Bool("image-fp16", false, "stage the image text encoder and transformer as fp16 instead of int8: the control, 27.9 GB of weights instead of 16.0")
 	videoOn := flag.Bool("video", false, "load MiniMax-H3 and serve /v1/videos (asynchronous jobs; ~50 GB at a request's peak, nothing staged at rest)")
 	videoModel := flag.String("video-model", "models/MiniMax-H3", "MiniMax-H3 checkpoint root")
 	videoDir := flag.String("video-dir", "", "where finished videos are kept until they expire; empty is a temporary directory")
@@ -455,25 +464,36 @@ func main() {
 
 	if *imgOn {
 		start := time.Now()
-		gen, err := backend.NewFlux3(backend.Flux3Options{
+		b, err := backend.NewImage(backend.ImageOptions{
 			Model: *imgModel, Device: dev, Width: imgW, Height: imgH,
-			Steps: *imgSteps, MaxPrompt: *imgPrompt, Refs: *imgEdits, Swap: swap,
+			Steps: *imgSteps, MaxPrompt: *imgPrompt, Refs: *imgEdits, CondSize: *imgCond,
+			FP16: *imgFP16, Swap: swap,
 		})
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer gen.Close()
-		enc, tr, vaes, act := gen.Residency()
-		edits := "no edits (start with -edits N)"
-		if *imgEdits > 0 {
-			edits = fmt.Sprintf("edits with up to %d reference images", *imgEdits)
+		defer b.Close()
+		srv.Image = b
+		enc, tr, vaeW, act := b.Residency()
+		geo := b.Geometry()
+		previews := "no previews"
+		if geo.Previews {
+			previews = fmt.Sprintf("previews to %d partial images", geo.MaxPartials)
 		}
-		log.Printf("image: %s, to %dx%d (%d pixels in any shape), %d steps, previews to %d partial images (taef2), %s, "+
-			"%.1f GB (%.1f encoder + %.1f transformer + %.2f vaes + %.1f activations), in %v",
-			*imgModel, imgW, imgH, imgW*imgH, *imgSteps, gen.Geometry().MaxPartials, edits,
-			float64(enc+tr+vaes+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaes)/1e9, float64(act)/1e9,
+		edits := "no edits (start with -edits N)"
+		if geo.Edits {
+			ref := "reference images"
+			if geo.MaxRefs == 1 {
+				ref = "reference image"
+			}
+			edits = fmt.Sprintf("edits with up to %d %s at %d², ", geo.MaxRefs, ref, *imgCond)
+			ew, ec := b.EditResidency()
+			edits += fmt.Sprintf("%.1f GB + %.1f GB of prefix cache", float64(ew)/1e9, float64(ec)/1e9)
+		}
+		log.Printf("image: %s, to %dx%d, %d steps, %s, %s, %.1f GB (%.1f encoder + %.1f transformer + %.1f vae + %.1f activations), in %v",
+			*imgModel, imgW, imgH, *imgSteps, previews, edits,
+			float64(enc+tr+vaeW+act)/1e9, float64(enc)/1e9, float64(tr)/1e9, float64(vaeW)/1e9, float64(act)/1e9,
 			time.Since(start).Round(time.Millisecond))
-		srv.Image = gen
 	}
 
 	if *videoOn {

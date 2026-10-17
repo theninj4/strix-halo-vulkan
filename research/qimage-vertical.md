@@ -1,16 +1,5 @@
 # IMAGE — the Qwen-Image-2.1 vertical
 
-> **SUPERSEDED 2026-10-15 by FLUX 3 Image Klein** — `GOALS.md` item 4 now
-> names `black-forest-labs/flux-3-image-klein`; the live vertical is
-> [`flux3-vertical.md`](flux3-vertical.md) (X-stages). This file is frozen as
-> Qwen-Image's record: nothing below is open any more, including § "After
-> parking"'s list. `qimage/` keeps serving both endpoints until FLUX 3's X6
-> and X7 replace them, then X8 deletes `qimage/{dit,pipeline,vae}` and
-> `cmd/qimage`; `qimage/textenc` and `qimage/vision` survive (FLUX 3's text
-> encoder, `h3`, `ocr` and `llm` vision import them). What carries over —
-> the precision facts below, the edit-oracle method, Q13's int8 method — is
-> cited from the new file, not copied into it.
-
 > **ARCHIVED 2026-09-21 — the vertical is parked, not unfinished.** This is
 > the closing record of Qwen-Image-2.1 (Q0–Q12): both endpoints served, the
 > Z-Image deletion finished, every gate dump-driven. It was `IMAGE.md` at the
@@ -1609,7 +1598,7 @@ each of which has already caught a port:
   side** — rel 1.4e-3 from a float64 run where the Go tower sits 2.1e-4 — so
   that stage is gated against dumped float64 rows.
 
-**If it is ever unparked** *(moot since 2026-10-15: superseded, not unparked — kept as written)*, in the archive's order:
+**If it is ever unparked**, in the archive's order:
 
 - **The 1184²-area ceiling** — the only remaining *capability*, not a
   percent. The VAE decoder's activation arena is one storage buffer against a

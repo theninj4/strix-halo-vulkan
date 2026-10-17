@@ -305,21 +305,9 @@ type Layer struct {
 	Heads, KVHeads, HeadDim int
 }
 
-// AttentionFunc is the attention a layer runs between its rotated q/k and
-// its output projection; Attention, the causal one, is what Forward uses.
-type AttentionFunc func(q, k, v *Mat, heads, kvHeads, headDim int) (*Mat, error)
-
 // Forward runs the layer: pre-norm attention with a residual, then pre-norm
 // SwiGLU with a residual. prefix names the trace entries.
 func (l *Layer) Forward(x *Mat, rope *RoPE, tr Trace, prefix string) (*Mat, error) {
-	return l.ForwardAttn(x, rope, Attention, tr, prefix)
-}
-
-// ForwardAttn is Forward with the attention supplied by the caller. FLUX 3's
-// text encoding (flux3/textenc) needs it for one row: a right-padded window
-// whose pad query attends to the real keys and not to itself, which no
-// causal mask expresses.
-func (l *Layer) ForwardAttn(x *Mat, rope *RoPE, attnFn AttentionFunc, tr Trace, prefix string) (*Mat, error) {
 	normed, err := l.AttnNorm.Apply(x)
 	if err != nil {
 		return nil, err
@@ -362,7 +350,7 @@ func (l *Layer) ForwardAttn(x *Mat, rope *RoPE, attnFn AttentionFunc, tr Trace, 
 	tr.put(prefix+"q_roped", q)
 	tr.put(prefix+"k_roped", k)
 
-	ctx, err := attnFn(q, k, v, l.Heads, l.KVHeads, l.HeadDim)
+	ctx, err := Attention(q, k, v, l.Heads, l.KVHeads, l.HeadDim)
 	if err != nil {
 		return nil, err
 	}

@@ -20,7 +20,7 @@ The phase-1 backlog and the measured roofline are archived in
 | LLM vision | live (V11 parked) | [`llm-vision.md`](llm-vision.md) § Handoff |
 | speech → text, text → speech | done, open items listed | [`speech-vertical.md`](speech-vertical.md) § "Where it stands, and what is open" (last section) |
 | instructed TTS (Breeze-TTS-2, beside kokoro) | planned, not started | [`tts-instruct-vertical.md`](tts-instruct-vertical.md) § Decisions, Handoff |
-| image (FLUX 3 Image Klein; Qwen-Image-2.1 superseded 2026-10-15, no longer served since X7, code until X8) | live (X0–X7 done: FLUX 3 serves generations, 19.5 s at 1024², and edits, 40.7 s for one ~1 MP reference; next X8 deletes Qwen-Image) | [`flux3-vertical.md`](flux3-vertical.md) § Handoff; Qwen-Image's record frozen in [`qimage-vertical.md`](qimage-vertical.md) |
+| image (Qwen-Image-2.1) | parked | [`qimage-vertical.md`](qimage-vertical.md) § "After parking" (last section) |
 | music (ACE-Step 1.5) | A14 quality score: A14a–d done and deployed, A14e paused; **A15 2026-10-15: XL base served as `-music-dit base`** (gated, S1 done, not deployed); S3 sweep: turbo outscores base on every quality score, 16 steps ≈ 32 — serving choice awaits listening | [`music-vertical.md`](music-vertical.md) § "After closing" (last section) |
 | video (MiniMax-H3) | live (M11) | [`video-vertical.md`](video-vertical.md) § Handoff |
 | embeddings | done, latency open | [`embedding-vertical.md`](embedding-vertical.md) § "Where it stands, E7 done, and what is next" (last section) |
@@ -41,8 +41,7 @@ each vertical's closing record; stage letters (L7d, P4c, T9, S10, I7, E7…)
 resolve inside them.
 
 **`IMAGE.md` named two different files**, so a citation of it needs one
-extra step (the live image vertical, FLUX 3 Image Klein, has never been
-`IMAGE.md`: its stages are **X0…** in [`flux3-vertical.md`](flux3-vertical.md)): with a **Q-stage, a numbered decision or a Q-o number** it is
+extra step: with a **Q-stage, a numbered decision or a Q-o number** it is
 [`qimage-vertical.md`](qimage-vertical.md) (Qwen-Image-2.1, the root file
 from 2026-09-20 to 2026-09-21); with an **I-stage (I0–I7)** it is
 [`zimage-vertical.md`](zimage-vertical.md) (z-image-turbo, the root file
@@ -55,7 +54,8 @@ rewritten — same as `LLM.md` and `SPEECH.md`.
 | [`llm-review.md`](llm-review.md) | `LLM2.md` | the review: hypotheses checked, the honest decode budget, P0–P6 as closed |
 | [`speech-vertical.md`](speech-vertical.md) | `SPEECH.md` | parakeet S1–S8 and kokoro T1–T10, R1, W1 — the **T6–T10/R1/W1 write-ups live only here** |
 | [`tts-recap.md`](tts-recap.md) | `TTS.md` | the kokoro recap: stage table, serving defaults |
-| [`qimage-vertical.md`](qimage-vertical.md) | `IMAGE.md` (2026-09-20–21) | Qwen-Image-2.1 **Q0–Q12**: both endpoints served, decisions **1–7**, open questions **Q-o1–Q-o5** — the vertical's closing record, parked 2026-09-21, **superseded 2026-10-15** by FLUX 3 Image Klein ([`flux3-vertical.md`](flux3-vertical.md)) |
+| [`qimage-vertical.md`](qimage-vertical.md) | `IMAGE.md` (2026-09-20–21) | Qwen-Image-2.1 **Q0–Q12**: both endpoints served, decisions **1–7**, open questions **Q-o1–Q-o5** — the vertical's closing record, parked 2026-09-21 |
+| [`flux3-vertical.md`](flux3-vertical.md) | — | FLUX 3 Image Klein **X0–X7**: served 2026-10-15/16, **reverted 2026-10-17** in favour of Qwen-Image-2.1 (code in `849ddee`) |
 | [`zimage-vertical.md`](zimage-vertical.md) | `IMAGE.md` (until 2026-09-20) | z-image I0–I7: serving, previews, edits, re-checked hypotheses |
 | [`zimage-pipeline.md`](zimage-pipeline.md) | `PIPELINE.md` | the slice as built: inventory, the five validation rules, the budget |
 | [`embedding-vertical.md`](embedding-vertical.md) | `EMBEDDING.md` | Qwen3-Embedding E0–E8 — its only write-up |

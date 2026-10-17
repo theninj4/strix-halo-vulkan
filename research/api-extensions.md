@@ -86,8 +86,7 @@ are `image_generation.partial_image` — `b64_json`, `size`, `output_format`
 and `partial_image_index`, plus a `step`/`steps` pair this server adds so a
 client watching one arrive knows how much is left — followed by one
 `image_generation.completed` carrying the finished image and the `seed` and
-`steps` that produced it (`image_edit.partial_image` and
-`image_edit.completed` on `/v1/images/edits`, as OpenAI names them). There is **no `[DONE]` sentinel**: these events are
+`steps` that produced it. There is **no `[DONE]` sentinel**: these events are
 named, so the terminal one is already unambiguous, and the sentinel exists on
 the chat endpoint only because its frames are not.
 

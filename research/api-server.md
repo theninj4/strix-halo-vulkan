@@ -31,8 +31,8 @@ See [Home Assistant speaks Wyoming](#home-assistant-speaks-wyoming-not-openai).
 | `POST /v1/audio/speech` | **done** — kokoro, `-tts` |
 | `POST /v1/audio/transcriptions` | **done** — parakeet, `-stt`, with word and segment timings |
 | `POST /v1/embeddings` | **done** — Qwen3-Embedding-0.6B, `-embed`, float or base64, MRL widths |
-| `POST /v1/images/generations` | **done** — flux-3-image-klein, `-image`, any size the arenas hold (sides a multiple of 16, ≤ 1232² of area), opaque RGB only (`background: "transparent"` is a 400), streaming previews with no flag |
-| `POST /v1/images/edits` | **done** — flux-3-image-klein, `-edits N`, up to N (≤ 10) reference images, conditional generation rather than SDEdit (no `strength`); no `size` gives the first reference's own size; streams as `image_edit.*` |
+| `POST /v1/images/generations` | **done** — qwen-image-2.1, `-image`, any size the arenas hold, RGBA with `background: "transparent"`, streaming previews with no flag |
+| `POST /v1/images/edits` | **done** — qwen-image-2.1, `-edits N`, up to N reference images, conditional generation rather than SDEdit (no `strength`), RGBA with `background: "transparent"` |
 | `POST /v1/videos` (+ `GET /v1/videos`, `GET`/`DELETE /v1/videos/{id}`, `GET /v1/videos/{id}/content`) | **done** — MiniMax-H3, `-video`: OpenAI's asynchronous video jobs, text (and optionally a first and/or last keyframe, `fl2va`) to a 24 fps mp4 with a 32 kHz stereo soundtrack; SGLang's H3 request shape too. See [Videos are jobs](#videos-are-jobs) |
 | `POST /v1/music` (+ `GET /v1/music`, `GET`/`DELETE /v1/music/{id}`, `GET /v1/music/{id}/content`) | **done** — ACE-Step 1.5 XL turbo + its 5 Hz LM, `-music`: caption and lyrics (or just a description, sample mode) to a 48 kHz stereo song of 10 s to 10 min, as jobs in `/v1/videos`' shape; ACE-Step's own `release_task` fields and aliases are read. See [Music is a job](#music-is-a-job) |
 | `POST /v1/decisions` | **done** — Rune v3, `-rune`: OpenAI's Decisions API (2026-10-07, a translation onto surogate's decisions v1 in `decide/openai.go`; any model name, data-URL images only; v1's own endpoints, incl. `/api/alpha/decisions` and `/api/v1/decisions`, removed the same day), images included (`-rune-vision`, default on; research/rune-vertical.md R10) |
@@ -170,19 +170,18 @@ Broken out to [`api-residency.md`](api-residency.md).
     -embed-model   models/Qwen3-Embedding-0.6B
     -embed-tokens  512            longest input the arenas hold; longer inputs are truncated
 
-    -image             false                      load FLUX 3 Image Klein
-    -image-model       models/flux-3-image-klein  diffusers layout; taef2/ beside it
-    -image-size        1024x1024                  the largest area the arenas hold, any shape, and the default; <= 1232x1232
-    -image-steps       16                         what a request that names no steps gets (the checkpoint is distilled to 16)
-    -image-max-prompt  4096                       longest prompt the image text encoder is built for
-    -edits             0                          reference images an edit may carry (<= 10); 0 refuses /v1/images/edits
+    -image             false               load Qwen-Image-2.1
+    -image-model       models/Qwen-Image-2.1
+    -image-size        1024x1024           the largest image the arenas hold, and the default; <= 1184x1184
+    -image-steps       40                  what a request that names no steps gets
+    -image-max-prompt  512                 longest prompt the image text encoder is built for
+    -edits                   0              reference images an edit may carry; 0 refuses /v1/images/edits
+    -image-condition-size    1024           the area every reference image is resized to, and an edit's
+                                            default output size (diffusers' output_resolution)
 
-There is no `-preview`/`-previews` flag: the preview decoder, taef2, is
-always staged from `taef2/` beside `-image-model`, so `stream: true` always
-answers. References are prepared as BFL's pipeline does
-(research/flux3-vertical.md X7): one is fitted under the staging's area and
-reflect-padded to the 16 grid, and an edit with no `size` comes back at its
-own fitted size; several are each fitted under 1 MiP and centre-cropped.
+There is no `-preview`/`-previews` flag: this model's preview decoder,
+TAEQI2.1, is always staged (29 MB of weights, 224 MB of arena at 1024²) from
+`taeqi2_1/` beside `-image-model`, so `stream: true` always answers.
 
 **-llm and -image do not fit together.** ~84 GB and ~32 GB against 128 GB of
 unified memory the rest of the machine is also in: they are separate
@@ -376,12 +375,12 @@ Broken out to [`api-jobs.md`](api-jobs.md).
   greedy and 56.6 sampled against 41.1 plain. Several conversations decode as
   rows of one pass ([C5](c5-batched-decode.md)). What is open for both is in
   [`llm-plan.md`](llm-plan.md) and [`concurrency.md`](concurrency.md) § Next.
-- **An edit costs about twice a generation**, and that is the model rather
-  than the port: the references are tokens of the transformer's own
-  sequence at every step (research/flux3-vertical.md X7), not an SDEdit, so
-  there is no truncated schedule to make it cheap. ~41 s for a ~1 MP
-  one-reference edit against a generation's 19.5 s, ~69 s with two
-  references, and no `strength` to trade quality for time with.
+- **Image editing costs more than it did**, and that is the model rather
+  than the port: an edit in 2.1 is a conditional generation over a 27-layer
+  vision tower (research/qimage-vertical.md Q8), not an SDEdit, so there is no truncated
+  schedule to make it cheap. 1m54s at 1024² against a generation's 1m28.8s, and
+  no `strength` to trade quality for time with. The endpoint's shape is
+  unchanged underneath; what changed is that `image[]` is a real list.
 - **The image adapter holds the device lock for the whole run**, where the
   language model's takes it per forward pass. The same fix applies — between
   two denoising steps there is no work in flight — but it would mean the

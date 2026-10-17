@@ -722,11 +722,10 @@ func TestImageEditStreams(t *testing.T) {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body)
 	}
 	body := rec.Body.String()
-	// OpenAI names an edit's frames image_edit.*.
-	if n := strings.Count(body, "event: "+eventEditPartial); n != 2 {
+	if n := strings.Count(body, "event: "+eventPartialImage); n != 2 {
 		t.Errorf("%d partial frames in the stream, want 2:\n%s", n, body)
 	}
-	if !strings.Contains(body, "event: "+eventEditDone) {
+	if !strings.Contains(body, "event: "+eventImageDone) {
 		t.Error("no completion event")
 	}
 	if len(fake.reqs[0].Init) == 0 {

@@ -1,5 +1,14 @@
 # IMAGE — generation and editing (FLUX 3 Image Klein)
 
+> **REVERTED 2026-10-17 — Qwen-Image-2.1 serves again.** After trying FLUX 3
+> served, the user preferred Qwen-Image-2.1's output, so both FLUX 3 commits
+> (`3fa18cd`, `849ddee`) were reverted: `flux3/`, `cmd/flux3`,
+> `backend/flux3.go`, its shaders and dumps are gone from the tree (recover
+> them from `849ddee`), and `qimage/` was never deleted (X8 never ran).
+> `qimage-vertical.md` is the live record again. The weights stay in
+> `models/flux-3-image-klein` and `models/taef2`. This file is frozen as
+> FLUX 3's record: X0–X7 below were done and measured, nothing is open.
+
 > **Live tracking and session handoff doc, opened 2026-10-15.** This
 > replaces Qwen-Image-2.1 ([`qimage-vertical.md`](qimage-vertical.md), Q0–Q14,
 > now frozen) as `GOALS.md` item 4, the same day

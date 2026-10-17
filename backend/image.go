@@ -79,12 +79,6 @@ type ImageOptions struct {
 	// Swap is the residency slot this pipeline takes turns in with music
 	// and video. Required.
 	Swap *Swap
-	// Lazy skips the staging at construction: the first request makes it
-	// resident. It is how Qwen-Image serves edits behind FLUX 3's
-	// generations (ImageRouter, research/flux3-vertical.md X6), so that
-	// startup stages only the model most requests want. Until the first
-	// load, Geometry reports only Edits and MaxRefs.
-	Lazy bool
 }
 
 const (
@@ -146,10 +140,6 @@ func NewImage(opt ImageOptions) (*Image, error) {
 		return nil, fmt.Errorf("backend: the image pipeline needs a swap slot")
 	}
 	b := &Image{opt: opt, id: opt.ID, rng: rand.New(rand.NewSource(rand.Int63()))}
-	if opt.Lazy {
-		b.geo = api.ImageGeometry{Edits: opt.Refs > 0, MaxRefs: opt.Refs}
-		return b, nil
-	}
 	if err := opt.Swap.Load(b); err != nil {
 		return nil, err
 	}

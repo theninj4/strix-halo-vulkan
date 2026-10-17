@@ -13,11 +13,10 @@ Ultimately we want to be able to run these tasks:
   3. Text to Speech via Hexgrad's `kokoro-82M`:
     * https://huggingface.co/hexgrad/Kokoro-82M
     * https://arxiv.org/html/2306.07691v2
-  4. Image generation and editing via Black Forest Labs' `FLUX 3 Image Klein` (replaced `Qwen-Image-2.1` on 2026-10-15):
-    * https://huggingface.co/black-forest-labs/flux-3-image-klein
-    * https://github.com/black-forest-labs/flux-3-image-klein
-    * Previews via https://github.com/madebyollin/taesd (`taef2` — the autoencoder is FLUX.2's, byte for byte)
-    * (was https://huggingface.co/Qwen/Qwen-Image-2.1)
+  4. Image generation and editing via Qwen's `Qwen-Image-2.1`:
+    * https://huggingface.co/Qwen/Qwen-Image-2.1
+    * https://qwen.ai/blog?id=qwen-image-2.1
+    * Previews via https://github.com/madebyollin/taesd
   5. Compute embeddings via Qwen's `Qwen3-Embedding-0.6B`:
     * https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
     * https://arxiv.org/html/2506.05176v3
