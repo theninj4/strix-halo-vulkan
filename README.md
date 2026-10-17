@@ -152,7 +152,8 @@ Every route is under `/v1` and needs `Authorization: Bearer <token>` unless the
 server was started with `-token=`. CORS preflight is answered. Errors use
 OpenAI's `{"error": {...}}` envelope. The server follows OpenAI's documented
 behaviour as well as its request shapes: for example, an image URL is fetched
-wherever OpenAI would fetch it. Parameters the server cannot honour are refused
+wherever OpenAI would fetch it (`-fetch-urls=false` takes base64 `data:` URLs
+only, for a host whose LAN a client must not reach). Parameters the server cannot honour are refused
 by name, not silently ignored.
 
 ### Discovery

@@ -57,3 +57,30 @@ func TestFetchImage(t *testing.T) {
 		t.Errorf("error %v", err)
 	}
 }
+
+func TestFetchURLsOff(t *testing.T) {
+	dialled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dialled = true
+		w.Write([]byte("\x89PNG"))
+	}))
+	defer srv.Close()
+	FetchURLs = false
+	defer func() { FetchURLs = true }()
+	ctx := context.Background()
+	for _, url := range []string{srv.URL + "/a.png", strings.Replace(srv.URL, "http:", "https:", 1)} {
+		if _, err := FetchImage(ctx, url); !errors.Is(err, ErrImageURL) {
+			t.Errorf("%s: %v, want ErrImageURL", url, err)
+		}
+		if _, err := FetchDocument(ctx, url); !errors.Is(err, ErrImageURL) {
+			t.Errorf("document %s: %v, want ErrImageURL", url, err)
+		}
+	}
+	if dialled {
+		t.Error("a URL was fetched with FetchURLs off")
+	}
+	b, err := FetchImage(ctx, "data:image/png;base64,"+base64.StdEncoding.EncodeToString([]byte("x")))
+	if err != nil || string(b) != "x" {
+		t.Errorf("data: URL with FetchURLs off: %q, %v", b, err)
+	}
+}

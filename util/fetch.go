@@ -26,7 +26,14 @@ import (
 // only, MaxImageBytes of body, FetchTimeout end to end, and a 2xx status.
 // It fetches whatever the client names, the local network included, as a
 // server speaking OpenAI's API does; a deployment that must not reach its
-// own LAN on a client's say-so has to put that boundary in front of it.
+// own LAN on a client's say-so has to put that boundary in front of it, or
+// turn URLs off (FetchURLs, -fetch-urls=false), and take data: URLs alone.
+
+// FetchURLs is whether an http(s) URL is fetched at all. Off, every door
+// takes only data: URLs, and a URL is the client's error: nothing a request
+// names is dialled, so it can't reach the LAN or carry anything out in a
+// query string. Set once at start (cmd/serve's -fetch-urls).
+var FetchURLs = true
 
 // MaxImageBytes caps a fetched image: OpenAI's own per-image limit is
 // 50 MB, and nothing this server decodes needs more.
@@ -88,6 +95,9 @@ func fetchBytes(ctx context.Context, url, accept string) ([]byte, error) {
 			kind = "a " + url[:i]
 		}
 		return nil, fmt.Errorf("%w: %s URL; an image URL is http(s) or a base64 data: URL", ErrImageURL, kind)
+	}
+	if !FetchURLs {
+		return nil, fmt.Errorf("%w: this server takes only base64 data: URLs, not http(s)", ErrImageURL)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

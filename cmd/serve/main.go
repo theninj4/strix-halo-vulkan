@@ -110,6 +110,7 @@ import (
 	"strix-halo-vulkan/api"
 	"strix-halo-vulkan/backend"
 	"strix-halo-vulkan/llm"
+	"strix-halo-vulkan/util"
 	"strix-halo-vulkan/wyoming"
 )
 
@@ -130,6 +131,8 @@ func main() {
 	token := flag.String("token", defaultToken, "bearer token; empty serves without authorization")
 	gpu := flag.Bool("gpu", true, "run the models on Vulkan where they have a resident path")
 	maxUpload := flag.Int64("max-upload", 128, "largest request body that carries a file, in MB")
+	fetchURLs := flag.Bool("fetch-urls", true,
+		"fetch the http(s) image and document URLs a request names; false takes base64 data: URLs only, so no request makes this host dial anything")
 	logBodies := flag.Bool("log-bodies", false,
 		"print each request and response body in the access log; off because they are conversations")
 
@@ -256,6 +259,7 @@ func main() {
 	videoCache := flag.Bool("video-bank-cache", true, "keep the video int8 banks and AdaLN tables in bank-cache/ beside the checkpoint (~50 GB of disk, written by the first request): ~70 s off every later request")
 	videoFP16 := flag.Bool("video-fp16", false, "stage the video text encoder and transformer as fp16 instead of int8: the control, ~50 GB a request instead of ~27")
 	flag.Parse()
+	util.FetchURLs = *fetchURLs
 
 	if !*tts && !*ttsInstruct && !*stt && !*llmOn && !*embedOn && !*imgOn && !*runeOn && !*ocrOn && !*videoOn && !*musicOn {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
