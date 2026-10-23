@@ -76,6 +76,13 @@ layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
 #define HEAD_X 0
 #endif
 
+// QK_NORM=0 (MiniMax-Music3's DiT, mm3/dit.go): no per-head RMS norm -- the
+// model has none -- so a real token's inv is 1 (a pad token's stays 0) and
+// the weight read is pc.aux2's, which the host points at ones.
+#ifndef QK_NORM
+#define QK_NORM 1
+#endif
+
 layout(local_size_x = WG) in;
 
 shared float rows[TILE * HEAD_DIM];
@@ -134,9 +141,13 @@ void main() {
     if (lane == 0u) {
         // A pad row is all zeros; giving it inv = 0 keeps the zeros zero
         // instead of propagating the 1/sqrt(eps) a real norm would produce.
+#if QK_NORM
         inv[m] = (tok0 + m < pc.tokens)
             ? inversesqrt(partial[tid] / float(HEAD_DIM) + uintBitsToFloat(pc.eps))
             : 0.0;
+#else
+        inv[m] = (tok0 + m < pc.tokens) ? 1.0 : 0.0;
+#endif
     }
     barrier();
 

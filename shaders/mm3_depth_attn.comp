@@ -1,0 +1,74 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// MiniMax-Music3's local LM (mm3/depth.go, research/music-minimax.md N2):
+// causal attention over a frame's depth sequence, at most 16 positions.
+//
+// The model is 16 heads of 256, no rope (a learned position table is added
+// to the input) and no q/k norm, so there is no prep step: the k and v
+// projections write straight into the caches, fp32 [pos][slot][4096] in the
+// activation arena, and this reads them. One workgroup a (row, head), one
+// thread a dim; a row's keys are positions 0..pos of its slot.
+//
+// Fields:
+//
+//	inOff   q fp32 [rows][4096]           outOff  context fp16 [rows][lda]
+//	kOff    key cache, vOff value cache: fp32 [pos][span][4096]
+//	aux0    row metadata: (slot, pos) as uint bits, 2 a row
+//	span    slots a position holds        scale   1/sqrt(256), float bits
+//	tokens  rows                          lda     the context's row stride
+
+#include "dit_common.glsl"
+
+layout(binding = 2) buffer HAct { float16_t hact[]; };
+
+#define HD 256u
+#define WIDTH 4096u
+#define MAXPOS 16u
+
+layout(local_size_x = 256) in;
+
+shared float red[256];
+shared float score[MAXPOS];
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint t = gl_LocalInvocationID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    uint slot = floatBitsToUint(act[pc.aux0 + r * 2u]);
+    uint pos = min(floatBitsToUint(act[pc.aux0 + r * 2u + 1u]), MAXPOS - 1u);
+    uint col = h * HD + t;
+    float q = act[pc.inOff + r * WIDTH + col] * uintBitsToFloat(pc.scale);
+
+    for (uint j = 0u; j <= pos; j++) {
+        red[t] = q * act[pc.kOff + (j * pc.span + slot) * WIDTH + col];
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1) {
+            if (t < s) {
+                red[t] += red[t + s];
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            score[j] = red[0];
+        }
+        barrier();
+    }
+
+    float mx = score[0];
+    for (uint j = 1u; j <= pos; j++) {
+        mx = max(mx, score[j]);
+    }
+    float sum = 0.0;
+    float o = 0.0;
+    for (uint j = 0u; j <= pos; j++) {
+        float p = exp(score[j] - mx);
+        sum += p;
+        o += p * act[pc.vOff + (j * pc.span + slot) * WIDTH + col];
+    }
+    hact[pc.outOff + r * pc.lda + col] = float16_t(o / sum);
+}

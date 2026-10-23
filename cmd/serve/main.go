@@ -16,6 +16,7 @@
 //	go run ./cmd/serve -image -image-size 512x512   # a quarter of the tokens, a quarter of the arenas
 //	go run ./cmd/serve -video                       # minimax-h3 video jobs; ~0.3 GB at rest, ~31 GB a request
 //	go run ./cmd/serve -music                       # ACE-Step 1.5 music jobs; ~18 GB while resident
+//	go run ./cmd/serve -music -music-mm3            # and MiniMax-Music3 for model "MiniMax-Music3"; its own ~19 GB turn
 //	go run ./cmd/serve -tts -tts-gpu=false          # the CPU reference
 //	go run ./cmd/serve -tts -stt -wyoming :10300    # and the same two over Wyoming
 //
@@ -245,6 +246,8 @@ func main() {
 	videoQueue := flag.Int("video-queue", 16, "video jobs that may wait behind the running one")
 	videoPrompt := flag.Int("video-max-prompt", 0, "longest video prompt in tokens; 0 is the pipeline's 4096")
 	musicOn := flag.Bool("music", false, "load ACE-Step 1.5 (XL base + the 5 Hz LM) and serve /v1/music (asynchronous jobs; ~18 GB resident)")
+	mm3On := flag.Bool("music-mm3", false, "also serve MiniMax-Music3 on /v1/music, for requests whose model names it (research/music-minimax.md N8; text to music only, its own swap entry, ~19 GB resident); ACE stays the default, and alone it takes every request")
+	mm3FP16 := flag.Bool("music-mm3-fp16", false, "stage MiniMax-Music3's LMs as fp16 instead of int8: the control")
 	musicDiT := flag.String("music-dit", "base,turbo", "the music DiTs to stage, the first the default: base (CFG over 32 steps, research/music-vertical.md A15), turbo (8 distilled steps); a request's model picks one, ~10 GB each")
 	musicModels := flag.String("music-models", "models", "root holding acestep-v15-xl-base/ (or -turbo/), acestep-5Hz-lm-4B/, Ace-Step1.5/vae and Qwen3-Embedding-0.6B/")
 	musicLM := flag.Bool("music-lm", true, "load the 5 Hz LM, for thinking (upstream's default path); without it only thinking=false is served, ~7 GB lighter")
@@ -261,7 +264,7 @@ func main() {
 	flag.Parse()
 	util.FetchURLs = *fetchURLs
 
-	if !*tts && !*ttsInstruct && !*stt && !*llmOn && !*embedOn && !*imgOn && !*runeOn && !*ocrOn && !*videoOn && !*musicOn {
+	if !*tts && !*ttsInstruct && !*stt && !*llmOn && !*embedOn && !*imgOn && !*runeOn && !*ocrOn && !*videoOn && !*musicOn && !*mm3On {
 		log.Printf("warning: no model was asked for; every endpoint will answer 501. " +
 			"Pass -llm, -embed, -image, -tts and/or -stt.")
 	}
@@ -340,7 +343,7 @@ func main() {
 	// for decide whether it is needed at all: a CPU-only run should not fail
 	// on a machine without Vulkan.
 	var dev *backend.Device
-	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *runeOn || *ocrOn || *videoOn || *musicOn || (*tts && *ttsGPU) || *ttsInstruct) {
+	if *gpu && (*stt || *llmOn || *embedOn || *imgOn || *runeOn || *ocrOn || *videoOn || *musicOn || *mm3On || (*tts && *ttsGPU) || *ttsInstruct) {
 		d, err := backend.OpenDevice("strix-halo-serve")
 		if err != nil {
 			log.Fatalf("opening the device: %v", err)
@@ -461,7 +464,7 @@ func main() {
 	// runs last: after the job queues have stopped, the backends' Closes
 	// have freed what they held, and nothing can take it back.
 	var swap *backend.Swap
-	if *imgOn || *videoOn || *musicOn {
+	if *imgOn || *videoOn || *musicOn || *mm3On {
 		swap = backend.NewSwap(*swapIdle)
 		defer swap.Close()
 	}
@@ -524,27 +527,44 @@ func main() {
 			time.Since(start).Round(time.Millisecond))
 	}
 
-	if *musicOn {
+	if *musicOn || *mm3On {
 		if dev == nil {
-			log.Fatal("-music needs the device; it has no host path (drop -gpu=false)")
+			log.Fatal("-music and -music-mm3 need the device; they have no host path (drop -gpu=false)")
 		}
 		start := time.Now()
-		b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, DiTs: strings.Split(*musicDiT, ","), Device: dev, NoLM: !*musicLM, LMFP16: *musicLMFP16,
-			NoAesthetics: !*musicAes, NoSongEval: !*musicSongEval, Swap: swap})
+		router := &backend.MusicRouter{}
+		// MiniMax first, so ACE -- the default -- is the one resident when
+		// staging is done.
+		if *mm3On {
+			b, err := backend.NewMusicMM3(backend.MusicMM3Options{Models: *musicModels, Device: dev, Swap: swap, LMFP16: *mm3FP16})
+			if err != nil {
+				log.Fatal(err)
+			}
+			router.MM3 = b
+		}
+		if *musicOn {
+			b, err := backend.NewMusic(backend.MusicOptions{Models: *musicModels, DiTs: strings.Split(*musicDiT, ","), Device: dev, NoLM: !*musicLM, LMFP16: *musicLMFP16,
+				NoAesthetics: !*musicAes, NoSongEval: !*musicSongEval, Swap: swap})
+			if err != nil {
+				log.Fatal(err)
+			}
+			router.ACE = b
+		}
+		defer router.Close()
+		jobs, err := api.NewMusicJobs(router, api.MusicJobsOptions{Dir: *musicDir, TTL: *musicTTL, MaxQueued: *musicQueue})
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer b.Close()
-		jobs, err := api.NewMusicJobs(b, api.MusicJobsOptions{Dir: *musicDir, TTL: *musicTTL, MaxQueued: *musicQueue})
-		if err != nil {
-			log.Fatal(err)
-		}
-		// Deferred after the backend's Close, so it runs first.
+		// Deferred after the backends' Close, so it runs first.
 		defer jobs.Close()
 		srv.Music = jobs
-		info := b.MusicInfo()
-		log.Printf("music: %s (thinking %v), jobs in %s (kept %v, %d queued at most), %g-%g s songs, in %v",
-			*musicModels, info.Thinking, jobs.Dir(), *musicTTL, *musicQueue, info.MinSeconds, info.MaxSeconds,
+		info := router.MusicInfo()
+		var ids []string
+		for _, m := range router.Models() {
+			ids = append(ids, m.ID)
+		}
+		log.Printf("music: %s (%s; thinking %v), jobs in %s (kept %v, %d queued at most), %g-%g s songs, in %v",
+			*musicModels, strings.Join(ids, ", "), info.Thinking, jobs.Dir(), *musicTTL, *musicQueue, info.MinSeconds, info.MaxSeconds,
 			time.Since(start).Round(time.Millisecond))
 	}
 

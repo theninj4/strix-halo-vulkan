@@ -4056,6 +4056,28 @@ var ACELMAttnCombine []byte
 //go:embed ocr_lm_prep.spv
 var OCRLMPrep []byte
 
+// MiniMax-Music3's local LM (mm3/depth.go, research/music-minimax.md N2):
+// causal attention over a frame's ≤ 16 depth positions at 16 heads of 256.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o mm3_depth_attn.spv mm3_depth_attn.comp
+
+//go:embed mm3_depth_attn.spv
+var MM3DepthAttn []byte
+
+// MiniMax-Music3's DiT (mm3/dit.go, research/music-minimax.md N4): the H3
+// VAE's head-64 q/k pack with a 1-D rope over 32 of the 64 channels and no
+// q/k norm (QK_NORM=0); the v pack and the attention are the VAE's builds.
+//go:generate glslc --target-env=vulkan1.2 -O -I. -DHEAD_DIM=64 -DROPE_WIDTH=32 -DTPW=8 -DHEAD_X=1 -DQK_NORM=0 -o mm3_qk_pack_hd64.spv h3_qk_pack.comp
+
+//go:embed mm3_qk_pack_hd64.spv
+var MM3QKPackHD64 []byte
+
+// The DiT's residual narrowed into proj_out's fp16 A operand (it has no
+// final norm).
+//go:generate glslc --target-env=vulkan1.2 -O -I. -o mm3_narrow.spv mm3_narrow.comp
+
+//go:embed mm3_narrow.spv
+var MM3Narrow []byte
+
 // PP-DocLayoutV3's convolution trunk (ocr/layout/gpu.go, OCR.md O7): the
 // im2col, depthwise, pooling, upsampling, add and channel-copy kernels
 // around dit_gemm, one build a mode.

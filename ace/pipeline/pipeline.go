@@ -1028,14 +1028,18 @@ var Formats = map[string][]string{
 
 // Write encodes interleaved 48 kHz stereo to path, in the format its
 // extension names, through ffmpeg.
-func Write(path string, audio []float32) error {
+func Write(path string, audio []float32) error { return WriteRate(path, audio, plan.SampleRate) }
+
+// WriteRate is Write at another sample rate (MiniMax-Music3's 44.1 kHz,
+// research/music-minimax.md N8).
+func WriteRate(path string, audio []float32, rate int) error {
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
 	codec, ok := Formats[ext]
 	if !ok {
 		return fmt.Errorf("ace: no encoder for %q (wav, flac, mp3, opus)", ext)
 	}
 	args := append([]string{"-hide_banner", "-loglevel", "error", "-y",
-		"-f", "f32le", "-ar", fmt.Sprint(plan.SampleRate), "-ac", "2", "-i", "pipe:0"}, codec...)
+		"-f", "f32le", "-ar", fmt.Sprint(rate), "-ac", "2", "-i", "pipe:0"}, codec...)
 	args = append(args, path)
 	cmd := exec.Command(FFmpeg, args...)
 	stdin, err := cmd.StdinPipe()

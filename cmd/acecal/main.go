@@ -7,6 +7,7 @@
 //
 //	go run ./cmd/acecal -out out/a14e
 //	go run ./cmd/acecal -out out/a14e -loops   # add ace/loops to the records, no device
+//	go run ./cmd/acecal -ext out/mm3-n0        # score another model's renders of the set
 //
 // A record holds the score as generated ("quality"), the score again
 // through pipeline.Rescore ("rescore", which for a song must reproduce
@@ -108,6 +109,8 @@ func main() {
 	out := flag.String("out", "out/a14e", "output directory")
 	only := flag.String("only", "", "comma-separated ids to run (and what they need); empty runs the set")
 	loopsOnly := flag.Bool("loops", false, "add the loop measure (ace/loops) to every record already in -out, from its flac, and stop: no device")
+	ext := flag.String("ext", "", "score another model's renders of the set songs in this directory (<id>-<seed>*.wav, reference/render_mm3.py) into <ext>/score, and stop; nothing is generated (research/music-minimax.md N0)")
+	setFile := flag.String("set", "", "read the set from this file instead of the built-in set.json (for -ext: research/music-minimax.md N0b's guitar set)")
 	flag.Parse()
 	if *loopsOnly {
 		if err := addLoops(*out); err != nil {
@@ -117,6 +120,13 @@ func main() {
 	}
 
 	var s set
+	if *setFile != "" {
+		b, err := os.ReadFile(*setFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		setJSON = b
+	}
 	if err := json.Unmarshal(setJSON, &s); err != nil {
 		log.Fatal(err)
 	}
@@ -158,6 +168,9 @@ func main() {
 		c := &cal{p: p, dir: *out, items: map[string]*item{}, songs: map[string]song{}}
 		for _, sg := range s.Songs {
 			c.songs[sg.ID] = sg
+		}
+		if *ext != "" {
+			return c.external(*ext, run)
 		}
 		need := map[string]bool{}
 		for _, ct := range s.Controls {
@@ -392,6 +405,51 @@ func (c *cal) control(ct control, seed uint64) (*item, error) {
 		lat = []float32{} // the encode's latents are not kept
 	}
 	return &item{rec: rec, wav: wav, lat: lat}, nil
+}
+
+// external scores renders the ACE pipeline did not make -- another model's
+// songs from the set's requests (research/music-minimax.md N0) -- the way
+// the noise and loop controls are scored: Rescore against the song's
+// request, with no CoT (the DiT gets the request as asked) and the
+// render's own codes. The alignment and the LM's half are ACE's models
+// judging the audio; Audiobox, SongEval and the loops know no model.
+func (c *cal) external(dir string, run func(string) bool) error {
+	wavs, err := filepath.Glob(filepath.Join(dir, "*.wav"))
+	if err != nil {
+		return err
+	}
+	c.dir = filepath.Join(dir, "score")
+	if err := os.MkdirAll(c.dir, 0o755); err != nil {
+		return err
+	}
+	for _, w := range wavs {
+		tag := strings.TrimSuffix(filepath.Base(w), ".wav")
+		id, rest, _ := strings.Cut(tag, "-")
+		sg, ok := c.songs[id]
+		if !ok || !run(id) && !run(tag) {
+			continue
+		}
+		var seed uint64
+		fmt.Sscan(strings.SplitN(rest, "-", 2)[0], &seed)
+		err := c.do(tag, func() (*item, error) {
+			wav, err := pipeline.ReadAudio(w)
+			if err != nil {
+				return nil, err
+			}
+			r := request(sg)
+			d := *r
+			rec := &record{ID: tag, Kind: "external", Of: id, Seed: seed, Request: r, DiT: &d,
+				Seconds: float64(len(wav)/2) / plan.SampleRate}
+			if rec.Rescore, rec.Render, err = c.p.Rescore(r, &d, nil, wav, nil, nil, seed); err != nil {
+				return nil, err
+			}
+			return &item{rec: rec, wav: wav, lat: []float32{}}, nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // addLoops measures every record's audio with ace/loops and writes the

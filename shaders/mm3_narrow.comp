@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// MiniMax-Music3's DiT (mm3/dit.go, research/music-minimax.md N4) has no
+// norm before its output projection: the residual goes into proj_out as it
+// is. This is that narrowing, fp32 rows into the fp16 arena as a GEMM A
+// operand at the padded stride (§2.3), one workgroup a row.
+//
+//   pc.inOff   fp32 source, row stride pc.dim
+//   pc.outOff  fp16 destination, row stride pc.lda
+//   pc.tokens  rows, pc.dim the width
+
+#include "dit_common.glsl"
+
+layout(binding = 2) writeonly buffer HAct { float16_t hact[]; };
+
+layout(local_size_x = 256) in;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    if (r >= pc.tokens) {
+        return;
+    }
+    for (uint c = gl_LocalInvocationID.x; c < pc.dim; c += 256u) {
+        hact[pc.outOff + r * pc.lda + c] = float16_t(act[pc.inOff + r * pc.dim + c]);
+    }
+}
