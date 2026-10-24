@@ -58,7 +58,8 @@ type MusicMM3Options struct {
 //   - everything that is ACE's -- thinking, sample mode, captioning, the
 //     audio-in tasks, the DiT schedule and the LM's sampling -- is a 400
 //     that names ACE, and so is auto_score until the scorers are shared
-//     (N-d6).
+//     (N-d6). thinking and auto_score default to on in the API, so only a
+//     client's explicit true is refused; the defaults are ignored.
 type MusicMM3 struct {
 	opt  MusicMM3Options
 	tok  *tokenizer.Tokenizer
@@ -217,7 +218,7 @@ func (b *MusicMM3) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 	switch {
 	case req.Analysis:
 		return nil, refuseACE("full_analysis_only (captioning)")
-	case req.Thinking:
+	case req.Thinking && req.ThinkingSet:
 		return nil, refuseACE("thinking")
 	case req.Sample:
 		return nil, refuseACE("sample mode")
@@ -232,7 +233,7 @@ func (b *MusicMM3) PlanMusic(req *api.MusicRequest) (*api.MusicPlan, error) {
 		return nil, refuseACE("the 5 Hz LM's sampling")
 	case req.LMSeed != nil:
 		return nil, refuseACE("lm_seed")
-	case req.Score:
+	case req.Score && req.ScoreSet:
 		return nil, unsupported("auto_score is not served for MiniMax-Music3 yet (research/music-minimax.md N-d6); score with model %q", pipeline.DiTModels["base"])
 	case strings.TrimSpace(req.Caption) == "":
 		return nil, unsupported("MiniMax-Music3 needs a caption (it works best long and structured: research/music-minimax.md N0)")

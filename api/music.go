@@ -101,6 +101,10 @@ type MusicRequest struct {
 	Language      string
 	// Thinking runs the 5 Hz LM before the DiT: upstream's default path.
 	Thinking bool
+	// ThinkingSet and ScoreSet say the client sent thinking and auto_score
+	// rather than taking their defaults (both on), for a backend that
+	// refuses them (MiniMax-Music3, research/music-minimax.md N8).
+	ThinkingSet, ScoreSet bool
 	// Sample has the LM write the song from SampleQuery first (sample mode):
 	// upstream's sample_mode flag, or a query given. SampleMode is the flag
 	// itself, which also keeps phase 1 from filling a meta the song lacks.
@@ -909,12 +913,12 @@ func (f musicFields) toMusicRequest(files map[string][]byte) (*MusicRequest, err
 	if b, ok, err := f.boolean("thinking"); err != nil {
 		return nil, err
 	} else if ok {
-		r.Thinking = b
+		r.Thinking, r.ThinkingSet = b, true
 	}
 	if b, ok, err := f.boolean("auto_score", "autoScore"); err != nil {
 		return nil, err
 	} else if ok {
-		r.Score = b
+		r.Score, r.ScoreSet = b, true
 	}
 	if musicSourceTask(r.Task) {
 		// Upstream skips the LM for these tasks whatever thinking says

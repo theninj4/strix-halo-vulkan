@@ -133,7 +133,7 @@ token a row (≤ 4.1 GB at 5,000 + 9,000 tokens × 2 rows), scorers 3.2 GB:
 | **N5** | Window sampler: 30 steps, CFG 1.7 vs zeros, overlap blend and carry | latents vs the oracle's, its noise | **done 2026-10-23** (`mm3/window.go`, `TestWindows`): final latents rel 4.6e-4 / 7.4e-4 (2 windows); 6.7 s a window |
 | **N6** | Vocoder from `ace/vae`'s Snake/conv kernels, per-channel, per-window crop | waveform vs the oracle |**done 2026-10-24** (`mm3/vocoder.go`, `TestVocoder`): SNR 61–64 dB a window and on the cropped song; 220 ms an 8 s window |
 | **N7** | End to end in `cmd/ace -model minimax` (or `cmd/mm3`) | the oracle's run reproduced; listening |**running 2026-10-24** (`cmd/mm3`, `mm3/pipeline.go`, `mm3/prompt.go`): prompt ids 44/44 cases; 30 s in 107 s (3.57 s a second), PQ 8.18 CE 7.60; N0c's four songs rendering for the panel |
-| **N8** | Served: router, `music-mm3` swap entry, the request mapping (N-d3, N-d5), duration default 120 s and cap 360 s, `estimated_seconds` from measured rates, progress by frame and window, `quality` (N-d6) | API tests; one served song |**built 2026-10-24** (`backend/music_mm3.go`, `music_router.go`, `serve -music-mm3`): unit tests pass; served song pending; `quality` refused for now |
+| **N8** | Served: router, `music-mm3` swap entry, the request mapping (N-d3, N-d5), duration default 120 s and cap 360 s, `estimated_seconds` from measured rates, progress by frame and window, `quality` (N-d6) | API tests; one served song |**done 2026-10-24** (`backend/music_mm3.go`, `music_router.go`, `serve -music-mm3`, in `ai.service`): a 20 s song served in 75 s (estimate 66); `quality` refused for now |
 | **N9** | Speed, each priced: fewer DiT steps (as S3), 4-bit LM bank, LM/DiT overlap (needs A-o17's second queue), streaming window by window | measured served | |
 | **N10** | Deploy: one flag on the `ai.service` line | the user's call | |
 
@@ -608,7 +608,7 @@ new set. MiniMax hit every requested length (12.6 min CPU per 40 s).
   captions) are rendering on the device into `out/mm3-n0c/*-gpu-sc.wav`,
   for the panel N0c could not finish on the CPU.
 
-### N8 — serving (2026-10-24, built; the served song is pending)
+### N8 — serving (2026-10-24)
 
 - **`backend.MusicMM3`** is an `api.MusicBackend` and its own `Swappable`
   ("music-mm3", N-d2), resident at ~19 GB while it holds the slot. Planning
@@ -649,8 +649,41 @@ new set. MiniMax hit every requested length (12.6 min CPU per 40 s).
   too.
 - **Tests**: `TestIsMusicMM3`, `TestMusicMM3Caption`,
   `TestMusicMM3Refusals` (before any device work) and `TestMusicRouter`
-  pass. One served song (a `serve -music-mm3` instance, POST
-  `/v1/music`) is the gate still open.
+  pass. **Served**: a `serve -music-mm3` instance on a spare port, POST
+  `/v1/music` (model `MiniMax-Music3`, h1's caption and lyrics, 20 s,
+  bpm 76, keyscale "D major", seed 11). It completed in 75 s against an
+  estimate of 66 s and wrote a 20.0 s 44.1 kHz stereo mp3. The request's
+  metas replaced the ones on the caption's own `Basic Attributes:` line. An
+  explicit `thinking: true` got the 400 naming ACE.
+- **Found by the served test**: the API defaults `thinking` and
+  `auto_score` to on, so N-d5's refusals caught every request.
+  `api.MusicRequest` now carries `ThinkingSet`/`ScoreSet`, and MiniMax
+  refuses only a client's explicit true. A job still echoes
+  `"thinking": true` (the default); that is cosmetic.
+- `ai.service` now carries `-music-mm3` (the user, 2026-10-24); not yet
+  deployed.
+
+### N0c — the full-length panel (2026-10-24)
+
+- MiniMax rendered on the device (`cmd/mm3`, seed 11, the skill-style
+  captions). Each song took ~11.2 min: 6.0 min of frames, 5.0 of DiT,
+  10 s of vocoder. h2 and h4 ended by the LM at 177.7 s and 179.0 s. h1
+  and h3 ran to the 180.2 s cap and were trimmed to 180 s, because
+  acecal's ACE alignment scorer is sized by the set's duration and
+  overflowed by 5 latents (originals in `out/mm3-n0c/full/`). ACE turbo
+  and base were served earlier (`ace_n0c.py`).
+
+  | song | turbo PQ / CE / mus | base | MiniMax |
+  |---|---|---|---|
+  | h1 folk | 8.42 / 7.86 / 4.18 | 8.02 / 7.61 / 4.08 | **8.48 / 8.01 / 4.48** |
+  | h2 heartland | 8.02 / 7.39 / 4.06 | **8.33** / 7.51 / 4.16 | 8.24 / **7.51 / 4.44** |
+  | h3 blues rock | 8.23 / 7.06 / **4.26** | 6.91 / 7.22 / 2.80 | **8.30 / 7.59** / 4.13 |
+  | h4 grunge | **8.05** / 7.02 / 3.92 | 7.63 / 7.03 / **4.29** | 7.83 / **7.44** / 3.95 |
+
+  MiniMax has the best CE on all four and the best musicality on two. The
+  blind panel (three takes a song, `scratchpad/panel-h`, hidden map
+  `out/mm3-n0c/panel.json`) is https://claude.ai/artifact/7EBvFbRo3zREVKkVarVgzV
+  and awaits the user's ratings.
 
 ## Open questions
 

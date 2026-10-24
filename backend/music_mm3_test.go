@@ -51,12 +51,12 @@ func TestMusicMM3Refusals(t *testing.T) {
 	f := 1.0
 	var seed int64 = 3
 	for name, req := range map[string]api.MusicRequest{
-		"thinking": {Caption: "x", Thinking: true}, "sample": {Caption: "x", Sample: true},
+		"thinking": {Caption: "x", Thinking: true, ThinkingSet: true}, "sample": {Caption: "x", Sample: true},
 		"analysis": {Analysis: true}, "cover": {Caption: "x", Task: "cover"},
 		"reference": {Caption: "x", ReferenceAudio: []byte{1}}, "shift": {Caption: "x", Shift: 3},
 		"steps": {Caption: "x", InferenceSteps: 8}, "guidance": {Caption: "x", GuidanceScale: &f},
 		"lm": {Caption: "x", LMTemperature: &f}, "lm seed": {Caption: "x", LMSeed: &seed},
-		"score": {Caption: "x", Score: true}, "no caption": {Caption: "  "},
+		"score": {Caption: "x", Score: true, ScoreSet: true}, "no caption": {Caption: "  "},
 	} {
 		_, err := b.PlanMusic(&req)
 		if !errors.Is(err, api.ErrUnsupported) {
