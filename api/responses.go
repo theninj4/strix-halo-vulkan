@@ -231,6 +231,7 @@ func (s *Server) streamResponses(w http.ResponseWriter, r *http.Request,
 ) {
 	ctx := r.Context()
 	stream := newSSE(w)
+	defer stream.keepAlive(s.keepAliveEvery())()
 	fail := func(err error) {
 		if r.Context().Err() != nil {
 			logf(ctx, "responses: client cancelled")

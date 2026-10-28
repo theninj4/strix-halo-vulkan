@@ -87,6 +87,7 @@ func (s *Server) streamCompletion(w http.ResponseWriter, r *http.Request,
 ) {
 	ctx := r.Context()
 	stream := newSSE(w)
+	defer stream.keepAlive(s.keepAliveEvery())()
 	frame := func(v any) error { return stream.send("", v) }
 	chunk := func(d *Delta, finish *string) Chunk {
 		return Chunk{

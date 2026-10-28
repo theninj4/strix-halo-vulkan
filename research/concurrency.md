@@ -191,6 +191,133 @@ Broken out to [`c-stale-values.md`](c-stale-values.md).
 
 Broken out to [`c-rows-side-by-side.md`](c-rows-side-by-side.md).
 
+## Agent sessions past two (diagnosed 2026-10-28, proposals, not built)
+
+The served line is `-llm-slots 3 -llm-reserve 1 -llm-preempt-chunk 2048
+-llm-class background`, with opencode sessions as background. The numbers
+below are from `journalctl --user -u ai` on kube7.
+
+### Why a neighbour's prefill starves decode (C7's condition, met)
+
+While r10848 prefilled 200k tokens on slot 2, r10846 on slot 0 fell from
+~27 to 0.7 tok/s at "3% of the device", with 4m53.993s stalled. It was then
+cancelled by its client. **The cause is not the chunk size; it is when the
+scheduler picks.** The loop takes the next unit as soon as the device is
+free. A decoding job has *no unit queued* at that moment, because it is on
+its own goroutine, sampling the token it was just given. The only pending
+unit is the neighbour's prefill, so the loop runs that. Rule 1's hold ("an
+interactive job holds the device between its own units") covers only the
+interactive class. `coalesceWait` waits only once a decode step has already
+been picked. So two background jobs alternate **one decode round : one
+2048-token chunk**. At depth ~190k a chunk is 2048 / 819 tok/s ≈ 2.5 s and
+a round ~60–70 ms, which gives decode ≈ 2.5–3% of the device and ~0.7 tok/s.
+That is what the progress line showed. Rule 2 (least device time first)
+never acts, because the decode job is never pending when the choice is made.
+
+**Proposal: extend the hold to rule 2.** When the unit picked is a prefill
+chunk, and another job of its class is `stepping` with less `served` time
+and nothing queued, wait for that job's step. Use the existing
+`coalesce` window measured from `lastStep` (5 ms; sampling takes 1–2 ms),
+the way `coalesceWait` already does for batching. Deficit round-robin by
+time then does what rule 2 says: the two jobs split the device about 50/50.
+It is ~20 lines in `pick`/`loop` plus a test that a background decode keeps
+≥40% of the device beside a background prefill.
+
+The trade-off, **modelled from the logged rates, not measured**: device
+time is conserved, so total throughput moves only by the hold itself, ≤1–2
+ms on a 37–70 ms step (≲3% of the decode's share, ≲1.5% overall). What
+moves is who waits:
+
+| prefill share | decode beside it | prefill slowdown while overlapped |
+|---|---|---|
+| ~97% (today) | ~0.7 tok/s | 1.03x |
+| 90% | ~2.7 tok/s | 1.11x |
+| 75% | ~6.8 tok/s | 1.33x |
+| **50% (rule 2 as written)** | **~13.5 tok/s** | **2x** |
+
+In the r10846/r10848 case at 50%, r10846's 2021 tokens finish in ~2.5 min
+instead of being cancelled at 11m44s. r10848's prefill runs at half rate for
+those 2.5 min and so lands ~1.3 min later. Today the cancelled turn also
+throws away the 2021 tokens and the client regenerates them, which costs far
+more than that minute. **Recommendation: 50%, no new flag.** Gate it with
+C0's `cmd/loadgen` (two background streams, one of them a 200k prefill) with
+`ai.service` stopped, recording decode tok/s beside the prefill and the
+prefill's wall time. C7 (decode rows riding in a prefill chunk) remains the
+option that adds throughput rather than sharing it out, and is the bigger
+build.
+
+### Why the prefix cache thrashed with a third session
+
+**How a slot is chosen today** (`llm_sched.go`). A freed slot goes to the
+best waiter: interactive first, then the oldest. Among the free slots,
+`freeSlot` takes the one that saves most of the prompt (`reuse`: the held
+sequence as a whole prefix, or the slot's one checkpoint). On a tie,
+`cheaper` decides: **the smaller checkpoint first**, then LRU. At most
+`slots − reserve` background jobs run at once, but they may sit in any slot.
+Nothing is evicted explicitly. A slot's prefix is lost when another sequence
+prefills fresh into it. There is no notion of a session: affinity is only
+implicit, through the token prefix, and `X-Session-Affinity` is ignored.
+
+**What happened on 2026-10-28.** Slot 1 held a session that ended at
+15:08:54 (229 466 tokens, `stop`). It was never chosen for eviction, because
+an agent's checkpoint sits at its *last user turn*. For most sessions that is
+early (tens of thousands of tokens), and for this one it was late. So
+`cheaper` always ranked slots 0 and 2 as cheaper to overwrite. Three live
+sessions shared two slots for two hours while a dead one held the third,
+until a voice request took slot 1 at 17:00. By hour, background requests of
+≥ 20k tokens that re-prefilled ≥ 20k:
+
+| hour | requests | ≥ 20k | re-prefilled | re-prefill | queued | stalled |
+|---|---|---|---|---|---|---|
+| 14 | 74 | 71 | 2 | 2.1 min | 4.1 min | 10.2 min |
+| 15 | 42 | 32 | 6 | 6.4 min | 8.7 min | 6.7 min |
+| 16 | 21 | 21 | **19** | **33.8 min** | **40.7 min** | **39.5 min** |
+| 17 | 40 | 25 | 0 | 0 | 3.1 min | 2.5 min |
+
+**What a 200k prefix costs to keep.** KV is 27.8 KB a cell, so 5.56 GB,
+plus 113 MB of DeltaNet state and the PLE ring: **≈ 5.7 GB**. kube7's
+`free -g` on 2026-10-28 read 125 GB total and **4 GB available**, with 1 GB
+of swap in use. So there is no host RAM for even one parked prefix without
+unloading something. The NVMe has 559 GB free. At an assumed 2–3 GB/s
+(not measured on this box) a prefix spills or returns in ~2–3 s, against
+~3m20s to prefill it.
+
+**Proposals, in the order to build them:**
+
+1. **Evict by what is lost, not by checkpoint size** (small, `cheaper` and
+   `freeSlot`). First take a slot whose last request ended more than a
+   staleness window ago (~15 min; an agent's next turn arrives within
+   seconds of a tool result), LRU among those. Otherwise take the smallest
+   *reusable length*, `max(len(held), ckpt)`. Voice keeps its protection
+   because its prefix is ~2k tokens and ~1.8 s to rebuild; or protect a slot
+   last used by the interactive class for a short TTL. Expected effect:
+   **three sessions keep three prefixes resident, hit rate ≈ 100%**. The
+   exception is when a voice request lands on a parked agent prefix, which
+   that session then rebuilds once (117 interactive requests over the day).
+2. **Use `X-Session-Affinity` as a hint, never as the match.** Record it per
+   slot. A slot whose session's last turn ended in `tool_calls` gets a grace
+   window (~60 s) against other background waiters. The header also tells a
+   live session from a stale one better than a timer can. Reuse stays
+   decided by the token prefix, so a wrong or shared header costs time and
+   never correctness.
+3. **Four or more sessions: spill to NVMe.** Three slots cannot hold four
+   200k prefixes. Write the evicted prefix (KV cells + C4 checkpoint) to a
+   file and restore it into any free slot. That is C4's unbuilt cross-slot
+   restore plus a KV copy. Expected: with only (1), four sessions on a
+   round-robin pattern defeat LRU and the hit rate falls to roughly half
+   or below (an estimate). With spilling it stays ≈ 100% at ~2–3 s a swap.
+   Host RAM would do the same at ~0.1 s, but only after ~6 GB a prefix is
+   freed.
+4. **The 1–5 min queue is a separate cost, from `-llm-reserve 1`.** Only
+   two agents run at once. A small fourth slot for the interactive class
+   (16k cells ≈ 0.45 GB KV + 0.11 GB state) would let `-llm-reserve 0` run
+   three agents together, batched at ~18 tok/s each against 27, with voice
+   never waiting on them. That needs per-slot context sizes (C6 made them
+   uniform), and 0.6 GB of the 4 GB that is free.
+
+**Recommendation: (1) now, (2) with it, (3) when four sessions are routine,
+(4) only if the queue still hurts after (1).**
+
 ## Next
 
 - **What is left in a batched pass (46.2 ms at three rows):**
@@ -204,8 +331,9 @@ Broken out to [`c-rows-side-by-side.md`](c-rows-side-by-side.md).
     out of the push constants, as P1c did for the position.
   - DeltaNet's per-row scan is bandwidth (a slot's state each), and PLE's
     per-row work is 0.1 ms.
-- **C7 (mixed passes)** stays conditional on background decode starving
-  behind prefill, which C0's numbers have not shown.
+- **C7 (mixed passes)** was conditional on background decode starving
+  behind prefill. The journal showed it on 2026-10-28 (above), but the cause
+  is the pick order, and the hold proposed above fixes that first.
 
 ## Log
 
@@ -245,3 +373,9 @@ Broken out to [`c-rows-side-by-side.md`](c-rows-side-by-side.md).
   within a stage. A three-row pass goes 48.4 → 46.2 ms (62.0 → 65.0 tok/s
   aggregate) and two rows 39.9 → 38.5, bit-identical. `moe.down` and the
   IQ4_NL layout are closed as not worth it.
+- **2026-10-28**: **agent sessions past two diagnosed**, with proposals and
+  nothing built (above). A background decode beside a background prefill
+  gets ~3% of the device, because the loop picks while the decode job is
+  sampling. A third session thrashed the prefix cache because `cheaper`
+  ranks by checkpoint size and a finished session held slot 1 for two
+  hours. A 200k prefix is ≈ 5.7 GB, and kube7 has 4 GB of RAM available.

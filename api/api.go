@@ -46,6 +46,11 @@ type Server struct {
 	// the duration and the sizes.
 	LogBodies bool
 
+	// KeepAlive is how long a streamed chat completion, response or message
+	// may go without a byte before an SSE comment is written to keep the
+	// connection alive (sse.go). Zero takes defaultKeepAlive.
+	KeepAlive time.Duration
+
 	// Presets are the virtual models a chat request's `model` may name
 	// (presets.go). Empty serves the checkpoint's own defaults to every
 	// request, whatever model it names.

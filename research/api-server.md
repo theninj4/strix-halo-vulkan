@@ -278,6 +278,23 @@ integer parameter and the text `"123"` for a string one. They are also the one
 thing that is not streamed — a call is not a call until it has closed, and a
 client sent half of one would have to be told to take it back.
 
+**A silent stream still sends bytes (2026-10-28).** Holding a call back means
+a stream can say nothing for minutes while it is busy: a 9k-token `write` is
+5–10 minutes at a background slot's rate, and a request can wait as long
+again for a slot and its prefill. Clients read that as a dead connection.
+Measured against a stub on 2026-10-28, opencode 2.0.16 with its default
+provider settings cut a silent stream at **5m59.8s** and regenerated the
+whole turn. That matches the `client cancelled` lines at 6m0.26s in the
+journal. With a comment every 10 s, the same client sat through 8 minutes
+of silence. (A provider `chunkTimeout` set in opencode's config is different:
+it is reset only by parsed SSE *events*, so a comment does not feed it.) So
+after `Server.KeepAlive` (10 s) without a byte, all three envelopes write an
+SSE comment, `: keep-alive`. Every SSE parser is required to drop a comment,
+so it changes no frame: it carries no data and takes no Responses sequence
+number. `api/sse_test.go` pins this over a real connection: no gap past the
+interval through a silent queue wait and a silent tool call, and the frames
+identical to an unhurried run.
+
 ### Images in a conversation
 
 With `-llm-mmproj` the three chat endpoints read images, which this
