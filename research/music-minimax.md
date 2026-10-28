@@ -132,7 +132,7 @@ token a row (≤ 4.1 GB at 5,000 + 9,000 tokens × 2 rows), scorers 3.2 GB:
 | **N4** | Condition encoder + DiT forward on the LDS wave32 GEMM (1,378 rows, above its floor) and the G4b attention at head 64; partial rotary | per layer vs fp32 | **done 2026-10-23** (`mm3/dit.go`, `TestDiTForward`): guided velocity rel 3.3e-4; 216 ms a CFG forward |
 | **N5** | Window sampler: 30 steps, CFG 1.7 vs zeros, overlap blend and carry | latents vs the oracle's, its noise | **done 2026-10-23** (`mm3/window.go`, `TestWindows`): final latents rel 4.6e-4 / 7.4e-4 (2 windows); 6.7 s a window |
 | **N6** | Vocoder from `ace/vae`'s Snake/conv kernels, per-channel, per-window crop | waveform vs the oracle |**done 2026-10-24** (`mm3/vocoder.go`, `TestVocoder`): SNR 61–64 dB a window and on the cropped song; 220 ms an 8 s window |
-| **N7** | End to end in `cmd/ace -model minimax` (or `cmd/mm3`) | the oracle's run reproduced; listening |**running 2026-10-24** (`cmd/mm3`, `mm3/pipeline.go`, `mm3/prompt.go`): prompt ids 44/44 cases; 30 s in 107 s (3.57 s a second), PQ 8.18 CE 7.60; N0c's four songs rendering for the panel |
+| **N7** | End to end in `cmd/ace -model minimax` (or `cmd/mm3`) | the oracle's run reproduced; listening |**running 2026-10-24** (`cmd/mm3`, `mm3/pipeline.go`, `mm3/prompt.go`): prompt ids 44/44 cases; 30 s in 107 s (3.57 s a second), PQ 8.18 CE 7.60; N0c full-length panel rated 2026-10-24: MiniMax 4.50, turbo 3.50, base 1.75 |
 | **N8** | Served: router, `music-mm3` swap entry, the request mapping (N-d3, N-d5), duration default 120 s and cap 360 s, `estimated_seconds` from measured rates, progress by frame and window, `quality` (N-d6) | API tests; one served song |**done 2026-10-24** (`backend/music_mm3.go`, `music_router.go`, `serve -music-mm3`, in `ai.service`): a 20 s song served in 75 s (estimate 66); `quality` refused for now |
 | **N9** | Speed, each priced: fewer DiT steps (as S3), 4-bit LM bank, LM/DiT overlap (needs A-o17's second queue), streaming window by window | measured served | |
 | **N10** | Deploy: one flag on the `ai.service` line | the user's call | |
@@ -682,8 +682,23 @@ new set. MiniMax hit every requested length (12.6 min CPU per 40 s).
 
   MiniMax has the best CE on all four and the best musicality on two. The
   blind panel (three takes a song, `scratchpad/panel-h`, hidden map
-  `out/mm3-n0c/panel.json`) is https://claude.ai/artifact/7EBvFbRo3zREVKkVarVgzV
-  and awaits the user's ratings.
+  `out/mm3-n0c/panel.json`) is https://claude.ai/artifact/7EBvFbRo3zREVKkVarVgzV.
+- **Rated 2026-10-24** (12 of 12 clips; no keep picks saved), unblinded:
+
+  | song | ACE turbo | ACE base | MiniMax (skill captions) |
+  |---|---|---|---|
+  | h1 folk | 4 | 2 | **5** |
+  | h2 heartland | 1 | 3 | **5** |
+  | h3 blues rock | **5** | 1 | 3 |
+  | h4 grunge | 4 | 1 | **5** |
+  | **mean** | 3.50 | 1.75 | **4.50** |
+
+  MiniMax is top on 3 of 4 and rated "would keep" on all three; turbo
+  wins the blues again (as on N0b's g4). Against N0b (MiniMax 2.50,
+  turbo 2.00, base 1.00) every arm rose, but the songs, lengths and
+  captions all changed, so the rise is not one cause. Scorers: MiniMax's
+  best-CE-on-all-four overcalls h3; SongEval musicality picked the user's
+  top take on 3 of 4 (missed h4, where it favoured base, rated 1).
 
 ## Open questions
 
